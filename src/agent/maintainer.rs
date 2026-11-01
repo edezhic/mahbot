@@ -1,7 +1,7 @@
 //! Maintainer — autonomous periodic codebase investigation agent.
 //!
-//! The Maintainer scans workspaces for refactoring opportunities and creates
-//! planning tickets on the board. It does NOT make direct code changes.
+//! The Maintainer scans workspaces for refactoring opportunities and creates planning tickets on
+//! the board. It does NOT make direct code changes.
 
 use chrono::{DateTime, Utc};
 use std::fmt::Write;
@@ -17,12 +17,12 @@ use crate::WorkspaceStatus;
 use crate::agent::run_default_agent;
 use crate::db;
 
-/// Maximum number of tickets allowed in Analysis + Planning + Queued
-/// before the maintainer pauses ticket creation.
+/// Maximum number of tickets allowed in Analysis + Planning + Queued before the maintainer pauses
+/// ticket creation.
 const MAX_PRE_DEV_TICKETS: i64 = 5;
 
-/// Char budget for the persisted recommendations JSON blob — a pathological
-/// extraction is truncated/dropped at save time, never at injection time.
+/// Char budget for the persisted recommendations JSON blob — a pathological extraction is
+/// truncated/dropped at save time, never at injection time.
 const MAINTAINER_RECOMMENDATIONS_BUDGET_BYTES: usize = 2048;
 /// Recommendations older than this are stale: not injected, cleared at dispatch.
 const MAINTAINER_RECOMMENDATIONS_MAX_AGE_DAYS: i64 = 7;
@@ -43,34 +43,29 @@ struct StoredMaintainerRecommendations {
 
 /// Run the maintainer background loop.
 ///
-/// Runs a Maintainer agent per workspace with the investigation prompt.
-/// The agent id is deterministic (`maintainer_{ws}`) so runs are resumable:
-/// a content-bearing session means an interrupted run, which is resumed with
-/// an empty message and `resume = true` (bypassing the debounce gate — it is
-/// not a new run). On success the created tickets are the durable outcome and
-/// the session is deleted so the next cycle starts fresh; `maintainer_last_run_at`
-/// is updated only on success. On failure or cancellation the session is kept
-/// so the next cycle naturally resumes — unlike the pre-resume behavior, a
-/// failed run is retried on the very next 1-minute cycle (resume bypasses the
-/// debounce gate), which is accepted: repeated insta-deaths are a bug to fix
-/// at root cause, not to paper over.
+/// Runs a Maintainer agent per workspace with the investigation prompt. The agent id is
+/// deterministic (`maintainer_{ws}`) so runs are resumable: a content-bearing session means an
+/// interrupted run, which is resumed with an empty message and `resume = true` (bypassing the
+/// debounce gate — it is not a new run). On success the created tickets are the durable outcome and
+/// the session is deleted so the next cycle starts fresh; `maintainer_last_run_at` is updated only
+/// on success. On failure or cancellation the session is kept so the next cycle naturally resumes —
+/// unlike the pre-resume behavior, a failed run is retried on the very next 1-minute cycle (resume
+/// bypasses the debounce gate), which is accepted: repeated insta-deaths are a bug to fix at root
+/// cause, not to paper over.
 ///
 /// ## Cross-round recommendations
 ///
-/// On success a fail-open extraction runs over the completed session (before the
-/// session is deleted, so the full transcript — including a resumed run's
-/// accumulated history — is available) and stores a replace-only
-/// `maintainer_recommendations` blob for the next fresh run. Fresh starts
-/// prepend a short advisory block from the previous round's list; resume runs
-/// already carry that block in their session. The whole path is strictly
-/// best-effort — any failure leaves the task text unchanged and never affects
-/// the run's success.
+/// On success a fail-open extraction runs over the completed session (before the session is
+/// deleted, so the full transcript — including a resumed run's accumulated history — is available)
+/// and stores a replace-only `maintainer_recommendations` blob for the next fresh run. Fresh starts
+/// prepend a short advisory block from the previous round's list; resume runs already carry that
+/// block in their session. The whole path is strictly best-effort — any failure leaves the task
+/// text unchanged and never affects the run's success.
 ///
 /// ## Concurrency
 ///
-/// Workspaces are processed **concurrently** via `tokio::spawn` + `join_all`,
-/// matching the pattern used by `poll_round`.
-/// Each workspace's agent run is independent (disjoint agent IDs, no shared
+/// Workspaces are processed **concurrently** via `tokio::spawn` + `join_all`, matching the pattern
+/// used by `poll_round`. Each workspace's agent run is independent (disjoint agent IDs, no shared
 /// mutable state between runs) so concurrency is safe.
 ///
 /// ## Behavioural notes
@@ -89,10 +84,8 @@ struct StoredMaintainerRecommendations {
 ///   cancellation before the LLM call. The original sequential loop's
 ///   immediate-break-on-cancellation is replaced by a cooperative per-task
 ///   check, which is consistent with the rest of the codebase (neither
-///   `poll_round` nor
-///   `process_single_workspace`
-///   check cancellation mid-batch). Mid-execution cancellation within a
-///   running agent is handled by the global `CancellationToken` inside
+///   `poll_round` nor `process_single_workspace` check cancellation mid-batch). Mid-execution
+///   cancellation within a running agent is handled by the global `CancellationToken` inside
 ///   `Agent::work`.
 pub async fn run_maintainer_loop() {
     let interval = Duration::from_mins(1);
@@ -103,7 +96,6 @@ pub async fn run_maintainer_loop() {
             break;
         }
 
-        // Fetch all workspaces
         let workspaces = match crate::workspace::store().list().await {
             Ok(list) => list,
             Err(e) => {
@@ -120,8 +112,6 @@ pub async fn run_maintainer_loop() {
         // Load prompt once before spawning (each spawned task gets its own clone).
         let prompt = crate::prompt::load_prompt("maintain.md");
 
-        // Concurrent dispatch: sync pre-checks in `.filter()`, async DB check
-        // and cancellation check inside each spawned task.
         let tasks: Vec<_> = workspaces
             .into_iter()
             .filter(|ws| {
@@ -138,17 +128,16 @@ pub async fn run_maintainer_loop() {
                 let prompt = prompt.clone();
                 let shutdown = shutdown.clone();
                 tokio::spawn(async move {
-                    // Deterministic agent ID — the session doubles as the resume state.
                     let agent_id = crate::session::maintainer_agent_id(&ws.name);
 
-                    // Defensive double-dispatch guard: never re-dispatch a live
-                    // run for the same deterministic ID.
+                    // Defensive double-dispatch guard: never re-dispatch a live run for the same
+                    // deterministic ID.
                     if crate::agent::registry::AGENT_REGISTRY.contains(&agent_id) {
                         return;
                     }
 
-                    // Resume decision: a session with content is an interrupted run to
-                    // continue — resume bypasses the debounce gate (it is not a new run).
+                    // Resume decision: a session with content is an interrupted run to continue —
+                    // resume bypasses the debounce gate (it is not a new run).
                     let resume = crate::session::store().has_content(&agent_id).await;
                     if !resume && should_skip_maintainer_debounce(&ws) {
                         return;
@@ -186,15 +175,14 @@ pub async fn run_maintainer_loop() {
                     if let Some(_response) = response {
                         info!(workspace = %ws.name, "Maintainer: run complete");
 
-                        // Post-run recommendation extraction — BEFORE session cleanup so the
-                        // full accumulated transcript (including a resumed run's) is available.
-                        // Strictly fail-open: any failure leaves the previous blob untouched.
+                        // Post-run recommendation extraction — BEFORE session cleanup so the full
+                        // accumulated transcript (including a resumed run's) is available. Strictly
+                        // fail-open: any failure leaves the previous blob untouched.
                         extract_and_store_recommendations(&agent, &ws).await;
 
-                        // ── Completion: clean state for the next cycle ─────────────────────────
-                        // The created tickets are the durable outcome, not the transcript —
-                        // delete the session so the next run starts fresh (does not rely on
-                        // TTL cleanup), then record the last-run timestamp.
+                        // The created tickets are the durable outcome, not the transcript — delete
+                        // the session so the next run starts fresh (does not rely on TTL cleanup),
+                        // then record the last-run timestamp.
                         if let Err(e) = crate::session::store().delete(&agent_id).await {
                             warn!(workspace = %ws.name, error = %e, "Maintainer: failed to delete completed session");
                         }
@@ -205,13 +193,13 @@ pub async fn run_maintainer_loop() {
                             warn!(workspace = %ws.name, error = %e, "Maintainer: failed to update last-run timestamp");
                         }
                     } else {
-                        // Error or cancellation — keep the session so the next cycle
-                        // naturally resumes; do NOT update last_run_at.
+                        // Error or cancellation — keep the session so the next cycle naturally
+                        // resumes; do NOT update last_run_at.
                         info!(workspace = %ws.name, "Maintainer: run failed or cancelled — session kept for resume, last_run_at unchanged");
                     }
 
-                    // Backlog tickets are discovered by the poll loop (BacklogAnalysis),
-                    // not via explicit notification — no Manager notification needed here.
+                    // Backlog tickets are discovered by the poll loop (BacklogAnalysis), not via
+                    // explicit notification — no Manager notification needed here.
                 })
             })
             .collect();
@@ -225,15 +213,12 @@ pub async fn run_maintainer_loop() {
     }
 }
 
-// ── Cross-round recommendations ──────────────────────────────────────
-
-/// Post-run extraction: one short-budget structured LLM call over the completed
-/// session, producing recommendations for the next fresh maintainer round.
-/// Strictly fail-open — any failure is logged and skipped; the previously
-/// stored blob stays untouched and the run's success is unaffected.
-/// Runs BEFORE session cleanup so the full accumulated transcript (including a
-/// resumed run's) is available. An empty extraction still saves an empty blob
-/// (replace-only semantics: the next run simply gets no block).
+/// Post-run extraction: one short-budget structured LLM call over the completed session, producing
+/// recommendations for the next fresh maintainer round. Strictly fail-open — any failure is logged
+/// and skipped; the previously stored blob stays untouched and the run's success is unaffected.
+/// Runs BEFORE session cleanup so the full accumulated transcript (including a resumed run's) is
+/// available. An empty extraction still saves an empty blob (replace-only semantics: the next run
+/// simply gets no block).
 async fn extract_and_store_recommendations(agent: &Agent, ws: &Workspace) {
     let prompt = crate::prompt::load_prompt("extraction/maintainer.md");
     let extracted = match agent
@@ -272,9 +257,9 @@ async fn extract_and_store_recommendations(agent: &Agent, ws: &Workspace) {
     }
 }
 
-/// Bound the persisted recommendations to [`MAINTAINER_RECOMMENDATIONS_BUDGET_BYTES`]:
-/// trim/drop empty items, then keep whole items only while the serialized blob
-/// fits the budget (a lone oversized item is dropped, not split).
+/// Bound the persisted recommendations to [`MAINTAINER_RECOMMENDATIONS_BUDGET_BYTES`]: trim/drop
+/// empty items, then keep whole items only while the serialized blob fits the budget (a lone
+/// oversized item is dropped, not split).
 #[must_use]
 fn cap_recommendations(recs: Vec<String>) -> Vec<String> {
     let mut kept: Vec<String> = Vec::new();
@@ -294,13 +279,11 @@ fn cap_recommendations(recs: Vec<String>) -> Vec<String> {
     kept
 }
 
-/// Read the previous round's recommendations and return the fresh-start initial
-/// message: an advisory `<maintainer-recommendations>` block prepended to
-/// `task_text`, or `task_text` unchanged when there is nothing injectable
-/// (absent/corrupt blob, or a blob older than
-/// [`MAINTAINER_RECOMMENDATIONS_MAX_AGE_DAYS`] — stale blobs are cleared
-/// best-effort). Resume runs never come through here; their session already
-/// contains the block from the original start.
+/// Read the previous round's recommendations and return the fresh-start initial message: an
+/// advisory `<maintainer-recommendations>` block prepended to `task_text`, or `task_text` unchanged
+/// when there is nothing injectable (absent/corrupt blob, or a blob older than
+/// [`MAINTAINER_RECOMMENDATIONS_MAX_AGE_DAYS`] — stale blobs are cleared best-effort). Resume runs
+/// never come through here; their session already contains the block from the original start.
 #[must_use]
 async fn prepend_recommendations(task_text: &str, ws_name: &str) -> String {
     let blob = match crate::workspace::store()
@@ -353,8 +336,6 @@ async fn prepend_recommendations(task_text: &str, ws_name: &str) -> String {
     )
 }
 
-/// Format the advisory block prepended to the fresh-run task text. The block
-/// ends with a blank line; the caller concatenates the task text.
 #[must_use]
 fn recommendations_block(
     recs: &[String],
@@ -375,17 +356,12 @@ fn recommendations_block(
     out
 }
 
-/// `true` when the recommendations are older than
-/// [`MAINTAINER_RECOMMENDATIONS_MAX_AGE_DAYS`] — an exactly-boundary age is
-/// still injectable, one second past is stale.
 #[must_use]
 fn is_stale(generated_at: &DateTime<Utc>, now: DateTime<Utc>) -> bool {
     now.signed_duration_since(*generated_at)
         > chrono::Duration::days(MAINTAINER_RECOMMENDATIONS_MAX_AGE_DAYS)
 }
 
-/// Humanize a duration as the two most significant units (e.g. "5 days 3 hours",
-/// "2 hours 15 minutes", "34 minutes"), falling back to "less than a minute".
 #[must_use]
 fn format_age(elapsed: chrono::Duration) -> String {
     let total_mins = elapsed.num_minutes();
@@ -412,14 +388,12 @@ fn format_age(elapsed: chrono::Duration) -> String {
     }
 }
 
-/// Returns `true` if the maintainer should skip this workspace due to the
-/// fixed debounce gate.
+/// Returns `true` if the maintainer should skip this workspace due to the fixed debounce gate.
 ///
-/// Checks whether enough time has passed since the last maintainer run by
-/// parsing `maintainer_last_run_at`, computing elapsed time relative to the
-/// [`Workspace::MAINTAINER_DEBOUNCE_MINS`] interval. On parse errors (stale data) or
-/// when `last_run_at` is `None` (first run), returns `false` to allow the run
-/// (fail-open).
+/// Checks whether enough time has passed since the last maintainer run by parsing
+/// `maintainer_last_run_at`, computing elapsed time relative to the
+/// [`Workspace::MAINTAINER_DEBOUNCE_MINS`] interval. On parse errors (stale data) or when
+/// `last_run_at` is `None` (first run), returns `false` to allow the run (fail-open).
 fn should_skip_maintainer_debounce(ws: &Workspace) -> bool {
     let now = Utc::now();
     if let Some(ref last_str) = ws.maintainer_last_run_at {
@@ -443,12 +417,12 @@ fn should_skip_maintainer_debounce(ws: &Workspace) -> bool {
     false
 }
 
-/// Returns `true` if the maintainer should skip because the pre-dev pipeline
-/// (Analysis + Planning + Queued) has reached `MAX_PRE_DEV_TICKETS`.
+/// Returns `true` if the maintainer should skip because the pre-dev pipeline (Analysis + Planning +
+/// Queued) has reached `MAX_PRE_DEV_TICKETS`.
 ///
-/// One statement over all three phases: separate per-phase counts are not one
-/// snapshot, so a ticket transitioning between them could be counted twice.
-/// Fails open — an unavailable board or a failed count lets the run through.
+/// One statement over all three phases: separate per-phase counts are not one snapshot, so a ticket
+/// transitioning between them could be counted twice. Fails open — an unavailable board or a failed
+/// count lets the run through.
 async fn is_maintainer_pipeline_full(ws: &Workspace) -> bool {
     let Some(board) = crate::pipeline::board::BOARD.get() else {
         return false;
@@ -501,9 +475,8 @@ mod tests {
 
     /// Table-driven test for all `should_skip_maintainer_debounce` cases.
     ///
-    /// Reasoning for the "just ran" case: `now_str` evaluates against the
-    /// same instant, so any near-zero elapsed time produces
-    /// `elapsed < debounce` → `true`.
+    /// Reasoning for the "just ran" case: `now_str` evaluates against the same instant, so any
+    /// near-zero elapsed time produces `elapsed < debounce` → `true`.
     #[test]
     fn should_skip_maintainer_debounce_cases() {
         let now_str = Utc::now().to_rfc3339();
@@ -538,18 +511,14 @@ mod tests {
         }
     }
 
-    // ── Recommendation helpers ────────────────────────────────────────────
-
-    /// The recommendation cap: every item within the budget survives
-    /// untouched, a set that overflows it is cut where the budget ends, and an
-    /// item too large to fit on its own is dropped.
+    /// The recommendation cap: every item within the budget survives untouched, a set that
+    /// overflows it is cut where the budget ends, and an item too large to fit on its own is
+    /// dropped.
     #[test]
     fn cap_recommendations_cases() {
-        // All within budget: the list comes back unchanged.
         let recs = vec!["a".to_string(), "bb".to_string(), "ccc".to_string()];
         assert_eq!(cap_recommendations(recs), vec!["a", "bb", "ccc"]);
 
-        // 20 items of 100 bytes each: 19 fit (1 + 103k <= 2048), the 20th does not.
         let recs: Vec<String> = (0..20).map(|_| "x".repeat(100)).collect();
         let out = cap_recommendations(recs);
         assert_eq!(out.len(), 19);
@@ -557,7 +526,6 @@ mod tests {
             serde_json::to_string(&out).unwrap().len() <= MAINTAINER_RECOMMENDATIONS_BUDGET_BYTES
         );
 
-        // A lone item larger than the whole budget is dropped.
         assert!(cap_recommendations(vec!["y".repeat(3000)]).is_empty());
     }
 

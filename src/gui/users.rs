@@ -1,5 +1,4 @@
-//! Settings Users section state — user list, delete confirmation, and Telegram
-//! channel binding.
+//! Settings Users section state — user list, delete confirmation, Telegram channel binding.
 
 use crate::users::{UserRecordEntry, UserStore};
 
@@ -15,16 +14,14 @@ pub(crate) fn user_store() -> Result<&'static UserStore, String> {
         .ok_or_else(|| "User store not initialized".to_string())
 }
 
-/// Run a single-field `set_selected_workspace`, mapping an empty value (or a
-/// `personal:{user}` workspace name) to `None` — the personal workspace is
-/// stored as NULL and computed on the fly. Updates the workspace column.
+/// Run a single-field `set_selected_workspace`, mapping an empty value (or a `personal:{user}`
+/// workspace name) to `None` — the personal workspace is stored as NULL and computed on the fly.
 pub(crate) async fn set_selected_workspace_field(
     sender: String,
     workspace: String,
 ) -> Result<(), String> {
     let store = user_store()?;
-    // Empty and personal-workspace values both mean "no managed workspace
-    // selected" → NULL.
+    // Empty and personal-workspace values both mean "no managed workspace selected" → NULL.
     let val = if workspace.is_empty() || crate::users::is_personal_workspace(&workspace) {
         None
     } else {
@@ -51,18 +48,15 @@ pub enum UsersMessage {
     CloseBindInput,
     /// Inline binding text input changed.
     BindInputChanged(EditorAction),
-    /// Confirm binding the entered Telegram @username or numeric id to the
-    /// target user.
+    /// Confirm binding the entered Telegram @username or numeric id to the target user.
     SubmitBind(String),
     /// Unbind a Telegram channel from a user.
     UnbindChannel(String, String),
     /// Result of a bind/unbind operation.
     BindResult(Result<(), String>, String),
 
-    /// Dismiss modals/panels (Escape key).
     Escape,
 
-    /// Request toast notification.
     Toast(super::ToastMessage),
 }
 
@@ -207,8 +201,7 @@ impl UsersState {
             }
             UsersMessage::BindResult(Err(e), user_name) => {
                 self.binding = false;
-                // A failed bind leaves the editor open with the toast as its
-                // only signal; a failed unbind has no editor to keep.
+                // A failed bind leaves the editor open with the toast as its only signal.
                 if self.bind_target.as_deref() != Some(&user_name) {
                     self.load_state.fail(format!("Failed to unbind: {e}"));
                 }

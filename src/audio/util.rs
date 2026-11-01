@@ -17,7 +17,7 @@ use std::path::Path;
 
 use crate::util::hex_string;
 
-// ── PCM resampling ─────────────────────────────────────────────────────
+// PCM resampling
 
 /// Resample PCM audio from one sample rate to another using linear
 /// interpolation with a 3-tap binomial anti-aliasing filter for downsampling.
@@ -88,7 +88,7 @@ pub(crate) fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> V
     output
 }
 
-// ── Shared model-integrity verifier ────────────────────────────────────
+// Shared model-integrity verifier
 
 /// Verify a file's SHA256 hash matches the expected hex string.
 ///
@@ -176,7 +176,7 @@ mod verify_sha256_tests {
     }
 }
 
-// ── Audio utility functions (canonical implementations) ────────────────
+// Audio utility functions (canonical implementations)
 
 /// Generate pink noise (1/f spectrum) using the Voss-McCartney algorithm.
 ///
@@ -306,7 +306,7 @@ pub(crate) fn speed_perturbation(samples: &[f32], sample_rate: u32, factor: f32)
     resample_audio(samples, effective_rate, sample_rate)
 }
 
-// ── Audio utility regression tests ─────────────────────────────────────
+// Audio utility regression tests
 // In-place regression net for speed perturbation, gain, noise, and pink noise.
 // The utilities are `cfg(test)`-gated, like the tests that exercise them.
 
@@ -440,7 +440,7 @@ mod audio_util_tests {
     }
 }
 
-// ── Embedding similarity ────────────────────────────────────────────────
+// Embedding similarity
 /// Cosine similarity between two embedding vectors. Returns 0.0–1.0.
 ///
 /// The wake-word matcher compares a captured window embedding against its

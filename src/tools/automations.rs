@@ -1,10 +1,8 @@
-//! Automation tools — add, list, and remove the Assistant's own automations.
+//! Automation tools — add, list, and remove the Assistant's own automations: create one that
+//! fires a notification back into its conversation when due, list the active ones, remove one.
 //!
-//! They let the Assistant create an automation that fires a notification back
-//! into its conversation when due, list the active ones, and remove one.
-//!
-//! What they return is a tool result like any other, so it keeps the
-//! product-wide agent-level credential scrub (see [`crate::automations`]).
+//! A result is a tool result like any other, so it keeps the agent-level credential scrub
+//! ([`crate::automations`]).
 
 use std::fmt::Write as _;
 
@@ -19,15 +17,13 @@ use crate::automations::{
 };
 use crate::tools::Tool;
 
-/// The calling Assistant's personal-session identity: the agent id plus the
-/// raw user name (for storing the automation owner and routing the firing).
+/// The agent id plus the raw user name (for storing the owner and routing the firing).
 struct AssistantIdentity {
     agent_id: String,
     user_name: String,
 }
 
-/// Read the calling Assistant's identity from the tool task-locals, or bail if
-/// there is no user/agent context.
+/// From the tool task-locals; bails when there is no user/agent context.
 fn identity() -> Result<AssistantIdentity> {
     let (agent_id, user_name) = crate::agent::tool_identity()?;
     Ok(AssistantIdentity {
@@ -36,9 +32,8 @@ fn identity() -> Result<AssistantIdentity> {
     })
 }
 
-/// The `add_automation` tool. An automation may carry a `trigger`: one custom tool
-/// available to its owner plus that tool's arguments, run at fire time so the
-/// Assistant is woken only when the check reports something.
+/// An automation may carry a `trigger`: one custom tool available to its owner plus that tool's
+/// arguments, run at fire time so the Assistant is woken only when the check reports something.
 pub struct AddAutomationTool;
 
 #[async_trait]
@@ -107,9 +102,9 @@ impl Tool for AddAutomationTool {
     }
 
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
-        // The shell-command arm was removed: refuse the parameter rather than
-        // quietly arming a plain automation. An explicit null counts as not passing
-        // it, as elsewhere in the product; any other value is refused.
+        // The shell-command arm was removed: refuse the parameter rather than quietly arming a
+        // plain automation. An explicit null counts as not passing it, as elsewhere; any other
+        // value is refused.
         if args.get("command").is_some_and(|v| !v.is_null()) {
             anyhow::bail!(
                 "forbidden: the `command` parameter was removed — hint: a trigger names a \
@@ -122,8 +117,8 @@ impl Tool for AddAutomationTool {
         let interval_seconds = super::get_opt_u64(&args, "interval_seconds")?;
         let trigger = read_trigger(&args, &ident.user_name).await?;
         let target = read_target(&args)?;
-        // `add_automation` resolves the owner's assistant session itself for a
-        // custom-role caller — the raw agent id is passed through.
+        // A custom-role caller's session is resolved inside `add_automation`; the raw agent id is
+        // passed through.
         let automation = add_automation(
             &ident.agent_id,
             &ident.user_name,
@@ -152,11 +147,9 @@ impl Tool for AddAutomationTool {
     }
 }
 
-/// Read the optional custom-role target from the call's `role`, `identifier`
-/// and `workspace` parameters. An empty/whitespace value counts as absent;
-/// `identifier`/`workspace` given without a `role` are a caller error. The
-/// authority check (only the admin may address a role) lives in [`add_automation`],
-/// so the value is passed through as supplied.
+/// An empty/whitespace value counts as absent; `identifier`/`workspace` without a `role` are a
+/// caller error. The authority check (only the admin may address a role) lives in
+/// [`add_automation`].
 fn read_target(args: &serde_json::Value) -> Result<Option<AutomationTarget>> {
     let normalized = |key: &str| {
         super::get_opt_str(args, key)
@@ -179,11 +172,10 @@ fn read_target(args: &serde_json::Value) -> Result<Option<AutomationTarget>> {
     }))
 }
 
-/// Read and validate the optional `trigger` parameter for `caller`: the named
-/// custom tool must be one the caller can call and the stored arguments must
-/// fit its declared interface exactly — an argument the tool does not declare
-/// is refused here rather than stored, because an automation that sits there passing
-/// arguments which do nothing is exactly the dead state this exists to avoid.
+/// The named custom tool must be one the caller can call, and the stored arguments must fit its
+/// declared interface exactly — an argument the tool does not declare is refused here rather than
+/// stored, because an automation passing arguments that do nothing is the dead state this exists
+/// to avoid.
 async fn read_trigger(args: &serde_json::Value, caller: &str) -> Result<Option<Trigger>> {
     let trigger = match args.get("trigger") {
         None | Some(serde_json::Value::Null) => return Ok(None),
@@ -218,9 +210,8 @@ impl Tool for ListAutomationsTool {
     }
 
     fn preserve_full_output(&self) -> bool {
-        // The Assistant asks to see its automations, so the whole listing must reach
-        // it: sandwich-truncating would drop every automation between the head and
-        // the tail, invisibly to both the Assistant and the user.
+        // The Assistant asks to see its automations, so the whole listing must reach it:
+        // sandwich-truncating would drop every automation between head and tail, invisibly.
         true
     }
 
@@ -304,10 +295,9 @@ mod tests {
             .await
     }
 
-    /// The arming gate: the removed `command` parameter is refused for any
-    /// value (an explicit null counts as not passing it), a tool the caller
-    /// cannot call is refused before anything is looked up, and an argument the
-    /// named tool does not declare is refused rather than stored.
+    /// The removed `command` parameter is refused for any value (an explicit null counts as not
+    /// passing it), a tool the caller cannot call is refused before anything is looked up, and an
+    /// argument the named tool does not declare is refused rather than stored.
     #[tokio::test]
     async fn arming_refuses_the_removed_command_an_unavailable_tool_and_undeclared_arguments() {
         crate::util::test::init_management_test_stores().await;
@@ -341,8 +331,7 @@ mod tests {
         .to_string();
         assert!(err.contains("is not granted to you"), "got: {err}");
 
-        // ...and an argument the nominated tool does not declare is refused,
-        // rather than stored to do nothing.
+        // ...and an argument the nominated tool does not declare is refused.
         let dir =
             crate::users::personal_workspace_path(crate::users::ADMIN_USER_NAME).join("shared");
         std::fs::create_dir_all(&dir).expect("create the shared folder");
@@ -392,9 +381,8 @@ mod tests {
             .expect("a guest granted the tool arms its trigger");
     }
 
-    /// The role-target parameters are passed through to `add_automation`: a branch
-    /// without a role is a usage error, and an addressing call names the role
-    /// in its confirmation.
+    /// A branch without a role is a usage error, and an addressing call names the role in its
+    /// confirmation.
     #[tokio::test]
     async fn arming_passes_the_role_target_through() {
         crate::util::test::init_management_test_stores().await;

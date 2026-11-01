@@ -70,110 +70,30 @@
 //!
 //! # No console window (windows)
 //!
-//! A process this service starts must never put a console window on the screen.
-//! Spawning with `CREATE_NO_WINDOW` hands the child a console that has no window
-//! — and any process the child starts in turn inherits that console unless it
-//! asks for its own — so for a console-program child the guarantee covers
-//! descendants too. (macOS/Linux need nothing — a process started there cannot
-//! create a window. The images the flag cannot act on are named below.)
+//! A process this service starts must never put a console window on the screen: every site this
+//! service spawns from sets `CREATE_NO_WINDOW` in its own builder, and a console child inherits
+//! that console, so the guarantee covers descendants. The flag is inert for the three images that
+//! have no console to suppress anyway (the browser, the file manager, this service's own windowed
+//! image), and `DETACHED_PROCESS` is forbidden because a console child started from a detached
+//! parent gets a brand-new visible console. The covered sites are the tripwire's own data
+//! (`every_production_spawn_is_windowless`), which names every one of them and compares the count.
 //!
-//! A parent with no console at all hands every console child it starts without
-//! creation flags a brand-new **visible** console. The replacement instance is
-//! therefore never created detached: it gets `CREATE_NO_WINDOW` like every other
-//! spawn, and its own children get the same flag from it — the flag is inert for
-//! the instance itself (see below), and it is what keeps the console programs it
-//! starts in turn from putting a window on the screen. The rationale for the
-//! instance's own spawn is in `self_update::spawn_new_instance_from`.
+//! No usable standard input either: an agent's command inherits no console for its input, so a
+//! command that would have read the console (`set /p`, `pause`, `more`, anything interactive) gets
+//! none instead of waiting for the owner's keystrokes. What a command must read it takes from a
+//! file (`<`), a pipe (`… | cmd`), or a redirection the runner applies itself ([`super::plan`]);
+//! the background form gives it null stdin.
 //!
-//! Three of the images those sites launch are not console programs at all — the
-//! browser, the file manager, and this service's own image — and the flag is inert
-//! for them: the platform gives such a program no console in the first place, so
-//! `CREATE_NO_WINDOW` has nothing to suppress. The service is that kind of image
-//! (it is built for the windowed subsystem, `windows_subsystem = "windows"`). Its
-//! own sites — the grep engine's probe, the runner's own-image steps
-//! ([`super::plan`], through the same builders) and the replacement instance —
-//! still set the flag, and what such an image starts in turn is outside the
-//! service's reach, exactly as it is for the browser and the file manager. The one
-//! spawn of this image that is not the service's to flag — the `self-replace` crate
-//! starts its file-swap copy itself — is the residual below. What changes for such
-//! an image is that it owns no console of its own: it has none to hand on to a child,
-//! and a launch from a console leaves it with that console's handles rather than a
-//! console of its own. The flag is inert for a windowed image either way.
-//!
-//! Covered, one entry per spawn site: the one shared start a program named by a
-//! bare name is given (`tools::shell::program_command`, which names it by the path
-//! its own search list resolves and carries the flag) — the agent's shell, git, and
-//! the grep engine's locale-parity battery
-//! (`tools::shell::grep_engine::parity::agent_command`); the cargo probe and runner
-//! of the update that builds from sources (`self_update::verify_cargo_on_path`,
-//! `self_update::run_cargo_with_timeout` — an update of a downloaded copy runs no
-//! cargo at all); that update's host probes (`self_update::host_probe`: `sw_vers` or
-//! `getconf`, Windows answering from the running system and spawning nothing); the
-//! replacement instance (`self_update::spawn_new_instance_from`); the managed bun
-//! runtime's version probe (`tools::bun::installed_version`) — the runtime's own
-//! `--version`, which decides whether a download is due at all; the
-//! browser-automation CLI (`tools::chrome_daemon::cli_probe`, `cli_version`,
-//! `tasklist_has`, `register_native_host`, `run_cli`) with the shared
-//! `chrome::spawn::spawn_cli` and the browser itself
-//! (`tools::chrome_daemon::spawn_chrome_detached`); every agent command through the
-//! shell builders (`tools::shell::program_command_with`, the shared start of the
-//! direct-program builders `tools::shell::build_program_command` and
-//! `tools::shell::internal_program_command`, and
-//! `tools::shell::build_shell_command` through the shared start above — the shell
-//! tool, the diagnostics runner, the `custom` tool's script, a user's automation program,
-//! and every step of a rewritten line's plan, [`super::plan`] included) with the grep
-//! engine's own probe (`tools::shell::grep_engine::probe_engine`); the
-//! self-hosted Telegram Bot API server (`channels::telegram_local::server::spawn`
-//! for the process it supervises, and `channels::telegram_local::server::reported_version_at`
-//! for the artifact's own `--version`); the file manager
-//! (`gui::reveal_in_file_manager`); and the product's own ffmpeg pair
-//! (`ffmpeg::run_tool`, which every one of its probes, frames, WAV and the
-//! downloaded copy's own `-version` goes through).
-//!
-//! Not covered, on purpose: the terminal the owner opens inside the app
-//! (`gui::shell`, spawned through a pseudoconsole) and the owner's own browser
-//! (`gui::open_url` hands the address to `ShellExecuteExW` in process, so no
-//! console program exists to flash) — their windows are the owner's business.
-//! Residual, stated rather than implied: a command that asks the platform for a
-//! window of its own (`CREATE_NEW_CONSOLE`, or `cmd`'s `start` builtin) gets one,
-//! and so does anything it starts; a console program started by one of the three
-//! non-console images (the browser, the file manager, this service's own image)
-//! is beyond this flag's reach; and an un-flagged console child of a console-less
-//! parent gets a new visible console. The `self-replace` crate's file-swap copy of
-//! this service's own binary is an un-flagged child of a console-less parent, and it
-//! is the windowed subsystem, not a creation flag, that keeps it off the screen: the
-//! copy is this service's image, so the platform gives it no console to show. An
-//! instance launched by an earlier build runs the older, console-program image for
-//! its lifetime, so its own file-swap copy can still show one window during an
-//! update started by it.
-//!
-//! A console program this service starts therefore owns a console of its own — one
-//! extra hidden `conhost.exe` per spawn — and it is not attached to the console its
-//! parent would otherwise have handed it, so console control events on that console
-//! (a console-window close) never reach it. A console handle such a child inherits
-//! from this process keeps its value, but that value belongs to another console.
-//!
-//! No usable standard input either: an agent's command inherits no console for its
-//! input — a console-less process has none to hand on — so a command that would
-//! have read the console (`set /p`, `pause`, `more`, anything interactive) has
-//! none instead of waiting for the owner's keystrokes. The shell tool never hands
-//! a command the owner's prompt, and its background form gives the command no
-//! input at all (null stdin, unless the command's own redirect took it over). What
-//! a command must read it takes from a file (`<`), from a pipe (`… | cmd`), or from
-//! a redirection the runner applies itself ([`super::plan`]).
-//!
-//! The guarantee is a per-spawn flag, so a new spawn site could be added without
-//! one and nothing would say so: `every_production_spawn_is_windowless` below is
-//! the tripwire, and the count of sites it insists on, and the names it reads back
-//! out of the inventory above, are the covered list itself.
+//! Not covered, on purpose: the terminal the owner opens inside the app (`gui::shell`, spawned
+//! through a pseudoconsole) and the owner's own browser (`gui::open_url` hands the address to
+//! `ShellExecuteExW` in process) — their windows are the owner's business.
 //!
 //! # When containment cannot be established (windows)
 //!
 //! The assignment can be refused — a job the platform cannot nest ours under, a
 //! security limit, a job that is already terminating. The run then proceeds
 //! exactly as it did before, without added delay, and the reason is written to
-//! the service log: visible, never silent, and never an error the caller has to
-//! handle.
+//! the service log: visible, never silent, and never an error the caller has to handle.
 //!
 //! # Accepted limitations (windows)
 //!
@@ -224,7 +144,7 @@ pub(super) enum RunOwner {
     Service,
 }
 
-// ── Unix ─────────────────────────────────────────────────────────────
+// Unix
 
 /// Unix containment is the process group the child leads from the moment it is
 /// spawned — see the module docs.
@@ -290,7 +210,7 @@ impl Tree {
     pub(super) fn retain_after_completion(self) {}
 }
 
-// ── Windows ──────────────────────────────────────────────────────────
+// Windows
 
 /// Windows containment is a job object — see the module docs.
 #[cfg(not(unix))]
@@ -455,8 +375,7 @@ impl Job {
         let assigned = unsafe { AssignProcessToJobObject(self.raw(), process) };
         // The last error must be read before anything else can overwrite it.
         let failure = std::io::Error::last_os_error();
-        // SAFETY: `process` came from the `OpenProcess` above and is not used
-        // again.
+        // SAFETY: `process` came from the `OpenProcess` above and is not used again.
         unsafe { CloseHandle(process) };
         if assigned == 0 {
             return Err(failure);
@@ -632,13 +551,9 @@ mod tests {
     const WINDOWLESS_FLAG: &str = "CREATE_NO_WINDOW";
 
     /// `CREATE_NEW_CONSOLE` is a window by construction; `DETACHED_PROCESS` is
-    /// forbidden for the reason the module docs' guarantee section gives.
+    /// forbidden because a console child started from a detached parent gets a
+    /// brand-new visible console.
     const FORBIDDEN_FLAGS: [&str; 2] = ["CREATE_NEW_CONSOLE", "DETACHED_PROCESS"];
-
-    /// The number of spawn sites the sweep must see — the module docs' inventory,
-    /// counted. A site that constant and that inventory do not account for fails
-    /// the sweep, and a scan that stopped reading the tree finds far fewer.
-    const SPAWN_SITES: usize = 19;
 
     fn indent(line: &str) -> usize {
         line.len() - line.trim_start().len()
@@ -666,8 +581,7 @@ mod tests {
     /// holds a line of exactly that shape (the item's indentation, then `}`), which
     /// still ends the item early and leaves the rest of its body scanned as
     /// production. No such literal line exists in the tree today, and the direction
-    /// is the loud one — a test-only spawn reported as a violation, never a spawn
-    /// hidden.
+    /// is the loud one — a test-only spawn reported as a violation, never a spawn hidden.
     fn gated_item_end(lines: &[&str], at: usize) -> usize {
         let gate_indent = indent(lines[at]);
         // The item's own attributes and doc comments, then the line that opens it.
@@ -785,54 +699,45 @@ mod tests {
         false
     }
 
-    /// The names the module docs' "No console window (windows)" section writes in
-    /// backticks: the covered sites as they are recorded for a reader. That section
-    /// *is* the covered list, so the sweep reads it back rather than trusting it —
-    /// a site the sweep finds and the section does not name fails.
-    fn inventoried_sites() -> Vec<String> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file!());
-        let source = std::fs::read_to_string(&path).expect("read this module");
-        let section = source
-            .lines()
-            .skip_while(|l| !l.contains(" # No console window (windows)"))
-            .skip(1)
-            .take_while(|l| !l.trim_start().starts_with("//! # "))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !section.is_empty(),
-            "the module docs' window-guarantee section is gone"
-        );
-        section
-            .split('`')
-            .skip(1)
-            .step_by(2)
-            .map(|token| token.rsplit("::").next().unwrap_or(token))
-            .map(|token| token.trim_end_matches("()"))
-            .filter(|token| {
-                !token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            })
-            .map(str::to_string)
-            .collect()
-    }
+    /// Every function that starts a process, named once. The sweep finds the sites
+    /// and fails on one this list does not name; its length is the count of sites
+    /// the tree must hold.
+    const INVENTORIED_SITES: [&str; 19] = [
+        "reported_version_at",
+        "spawn",
+        "spawn_cli",
+        "run_tool",
+        "reveal_in_file_manager",
+        "host_probe",
+        "run_cargo_with_timeout",
+        "spawn_new_instance_from",
+        "verify_cargo_on_path",
+        "installed_version",
+        "cli_probe",
+        "cli_version",
+        "register_native_host",
+        "run_cli",
+        "spawn_chrome_detached",
+        "tasklist_has",
+        "probe_engine",
+        "program_command",
+        "program_command_with",
+    ];
 
-    /// Tripwire: every process the service starts must be created without a
-    /// console window. See the module docs' "No console window (windows)"
-    /// section, whose inventory this test reads back.
+    /// Tripwire: every process the service starts must be created without a console window, and
+    /// every one of them is named in [`INVENTORIED_SITES`], whose length is the site count the tree
+    /// must hold.
     ///
     /// It is a source scan, not a proof: it reads rustfmt-shaped code and
     /// best-effort `#[cfg]` gating, it judges per enclosing function (a second
     /// spawn added to a function that already applies the flag is caught by the
     /// site count, not site-specifically), and a `#[cfg]` on a `mod` declaration
     /// elsewhere in the tree is invisible to it — such a site fails loudly, and
-    /// gating the spawn itself is the fix. A `(file, symbol)` allow-list plus the
-    /// count would also catch an added site, but the count alone would not say
-    /// which site it was, and the list would need hand-maintenance on every site
-    /// change; the scan names the offending site itself.
+    /// gating the spawn itself is the fix.
     #[test]
     fn every_production_spawn_is_windowless() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let inventory = inventoried_sites();
+        let inventory = INVENTORIED_SITES;
 
         let mut sites = 0_usize;
         let mut violations: Vec<String> = Vec::new();
@@ -869,15 +774,15 @@ mod tests {
                         ));
                     } else if !inventory.iter().any(|listed| listed == &name) {
                         violations.push(format!(
-                            "{rel}:{} `{name}` applies {WINDOWLESS_FLAG} but the module docs' \
-                             covered-site inventory does not name it",
+                            "{rel}:{} `{name}` applies {WINDOWLESS_FLAG} but the covered-site \
+                             inventory does not name it",
                             i + 1
                         ));
                     }
                 }
                 if let Some(flag) = reserved {
                     violations.push(format!(
-                        "{rel}:{} `{name}` uses {flag} — see the module docs' window guarantee",
+                        "{rel}:{} `{name}` uses {flag} — a window by construction",
                         i + 1
                     ));
                 }
@@ -885,10 +790,12 @@ mod tests {
         }
 
         assert_eq!(
-            sites, SPAWN_SITES,
-            "the spawn sweep saw {sites} sites, not the {SPAWN_SITES} the module docs \
-             inventory lists — a new site needs the flag and a name in that list, and a \
-             scan that stopped reading the tree would find fewer"
+            sites,
+            INVENTORIED_SITES.len(),
+            "the spawn sweep saw {sites} sites, not the {} the inventory lists — a new site \
+             needs the flag and a name in that list, and a scan that stopped reading the \
+             tree would find fewer",
+            INVENTORIED_SITES.len()
         );
         assert!(
             violations.is_empty(),
@@ -896,8 +803,8 @@ mod tests {
         );
     }
 
-    /// The one line the module docs' premise about this service's own image rests
-    /// on: it is a windowed image because the crate root says so, and with the
+    /// The one line the module docs' premise about this service's own image rests on: it is a
+    /// windowed image because the crate root says so, and with the
     /// `not(test)` guard the binary's own test harness stays a console program. No
     /// other lane would notice the attribute's removal (the cross-checks only
     /// compile), so the source is read back — the same cheap tripwire the spawn

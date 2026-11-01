@@ -1,32 +1,10 @@
-//! Direct graph evaluator for the pinned Supertonic 3 TTS models.
+//! Minimal ONNX graph evaluator on top of candle: the TTS pipeline calls [`simple_eval`] once per
+//! model per chunk/flow step.
 //!
-//! This is a focused re-implementation of the removed `candle-onnx-mahbot`
-//! fork's `simple_eval`, keeping only the 39 ops the four models use:
-//!
-//! * implicit dtype promotion for mixed I64/F32 arithmetic
-//!   ([`promote_types`] — `duration_predictor`/`text_encoder` contain many
-//!   mixed-dtype nodes);
-//! * `Pad` `edge` mode (used by all convnext `dwconv` pads) and constant
-//!   mode with an empty-string opset-18 third input treated as "not
-//!   provided" (zero padding); a *provided* non-zero pad value is honored;
-//! * `LayerNormalization` with the explicit `epsilon` attribute (1e-6 in all
-//!   71 nodes, not the 1e-5 default), population variance via
-//!   mean → square → mean;
-//! * negative `Slice` steps (60 nodes use `step = -1`), 4- and 5-input
-//!   forms, and clamp rules;
-//! * `Concat` majority-dtype promotion plus the trailing-singleton-squeeze
-//!   rank hack;
-//! * `Unsqueeze` negative-axis off-by-one math;
-//! * `Gather` negative-index normalization (axis 0);
-//! * `Pow` with negative base via `powf` and I64→F32 base conversion;
-//! * `Softplus` stable branch (`x > 20 ? x : ln(exp(x) + 1)`);
-//! * `Gemm` `transB = 1`; `Reshape` 0 → input dim; `Cast` BOOL→U8 and
-//!   INT32→I64;
-//! * input dtype validation that skips initializer-overridden graph inputs.
-//!
-//! The evaluator runs on CPU (the TTS pipeline's device).  Initializers and
-//! `Constant` tensor attributes are pre-converted at load time, so each
-//! `simple_eval` call performs no weight re-materialization.
+//! Only the op set those models use is implemented, and the helpers below exist to absorb what
+//! ONNX exporters emit but candle's kernels do not accept as-is — scalars wrapped in extra
+//! dimensions, implicit dtype promotion in binary ops, non-commutative broadcast shapes, and
+//! non-zero pad values (which candle only supports as zeros).
 
 use crate::onnx::{AttrKind, Model, Node};
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, bail};
@@ -34,8 +12,6 @@ use candle_nn::activation::PReLU;
 use std::collections::HashMap;
 
 type Value = Tensor;
-
-// ── Attribute access ──────────────────────────────────────────────────
 
 fn get_attr<'a>(node: &'a Node, name: &str) -> Result<&'a AttrKind> {
     get_attr_opt(node, name).ok_or_else(|| {
@@ -120,8 +96,6 @@ fn attr_tensor<'a>(attr: &'a AttrKind, node: &Node, name: &str) -> Result<&'a Te
     }
 }
 
-// ── Scalar extraction helpers ─────────────────────────────────────────
-
 /// Extract a scalar from tensors that may be wrapped in extra dimensions
 /// (some ONNX exports use shape `[1]`/`[1,1]` where scalars are expected).
 /// Only accepts single-element tensors.
@@ -133,22 +107,15 @@ fn to_scalar_flexible<T: candle_core::WithDType>(t: &Tensor) -> Result<T> {
     }
 }
 
-// ── Dtype promotion helpers ───────────────────────────────────────────
-
 /// Ensure two tensors have the same dtype by upcasting the smaller type.
 /// ONNX allows implicit type promotion in binary ops; candle-core's
 /// `broadcast_*` ops require matching dtypes.
-///
-/// Promotes within type families (float→float, int→int) and promotes
-/// integers to floats when mixed with float types.  Mixed float pairs prefer
-/// F32 over F64 (inference-friendly).
 fn promote_types(a: &Tensor, b: &Tensor) -> Result<(Tensor, Tensor)> {
     if a.dtype() == b.dtype() {
         return Ok((a.clone(), b.clone()));
     }
     let a_f = a.dtype().is_float();
     let b_f = b.dtype().is_float();
-    // Mixed float+int: promote int to the float type.
     if a_f != b_f {
         if a_f {
             return Ok((a.clone(), b.to_dtype(a.dtype())?));
@@ -200,14 +167,10 @@ fn safe_matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     a.broadcast_matmul(&b)
 }
 
-/// `where_cond` with automatic dtype promotion for the two value branches.
-/// The condition tensor is not promoted.
 fn safe_where(cond: &Tensor, a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let (a, b) = promote_types(a, b)?;
     cond.where_cond(&a, &b)
 }
-
-// ── Broadcasting helpers ──────────────────────────────────────────────
 
 fn broadcast_shape(shape_a: &[usize], shape_b: &[usize]) -> Result<Vec<usize>> {
     let (longest, shortest) = if shape_a.len() > shape_b.len() {
@@ -242,8 +205,6 @@ fn broadcast_shape_from_many(shapes: &[&[usize]]) -> Result<Vec<usize>> {
     Ok(shape_out)
 }
 
-// ── Evaluator ─────────────────────────────────────────────────────────
-
 /// Evaluate the model graph with the provided inputs, returning a map from
 /// graph output name to tensor.  The TTS pipeline calls this once per model
 /// per chunk/flow step.
@@ -253,8 +214,6 @@ pub fn simple_eval(
 ) -> Result<HashMap<String, Value>> {
     let graph = &model.graph;
 
-    // Initializers override caller-provided inputs of the same name
-    // (initializer-overridden graph inputs).  Pre-converted at load time.
     for (name, tensor) in &graph.initializers {
         values.insert(name.clone(), tensor.clone());
     }
@@ -358,8 +317,6 @@ pub fn simple_eval(
             "Reshape" => {
                 let input0 = get(&node.inputs[0])?;
                 let input1 = get(&node.inputs[1])?.to_vec1::<i64>()?;
-                // At most a single -1 or 0 is expected (0 keeps the input
-                // dimension at that index).
                 let mut other_than_minus1 = 1usize;
                 for &v in &input1 {
                     if v != -1 && v != 0 {
@@ -391,7 +348,6 @@ pub fn simple_eval(
             }
             "Softplus" => {
                 let input = get(&node.inputs[0])?;
-                // Numerically stable softplus: x > 20 ? x : ln(exp(x) + 1)
                 let mask = input.gt(20.0f64)?;
                 let ones = Tensor::ones(input.dims(), input.dtype(), input.device())?;
                 let exp_add_one = safe_add(&input.exp()?, &ones)?;
@@ -443,8 +399,6 @@ pub fn simple_eval(
             "Squeeze" => {
                 let xs = get(&node.inputs[0])?;
                 let mut axes = if node.inputs.len() <= 1 {
-                    // Contract all the dimensions with size 1 except the
-                    // batch dim.
                     xs.dims()
                         .iter()
                         .enumerate()
@@ -583,8 +537,6 @@ pub fn simple_eval(
                 if inputs.is_empty() {
                     bail!("empty concat");
                 }
-                // Find minimum rank among inputs and squeeze trailing
-                // singleton dims to match.
                 let min_rank = inputs.iter().map(Tensor::rank).min().unwrap();
                 let inputs: Vec<_> = inputs
                     .into_iter()
@@ -673,8 +625,6 @@ pub fn simple_eval(
             "PRelu" => {
                 let input = get(&node.inputs[0])?;
                 let slope = get(&node.inputs[1])?;
-                // ONNX PReLU allows a single scalar slope applied to all
-                // channels; set is_scalar=true when the slope has 1 element.
                 let is_scalar = slope.elem_count() == 1;
                 let output = PReLU::new(slope.clone(), is_scalar).forward(input)?;
                 values.insert(node.outputs[0].clone(), output);
@@ -794,8 +744,6 @@ pub fn simple_eval(
                 let default_steps;
                 let axes: &Tensor;
                 let steps: &Tensor;
-                // If axes are omitted they are [0, ..., r-1]; if steps are
-                // omitted they are all 1.
                 match node.inputs.len() {
                     3 => {
                         let len = starts.dims()[0];
@@ -823,13 +771,11 @@ pub fn simple_eval(
 
                 let mut out = data.clone();
                 for (i, ax) in axes.to_vec1::<i64>()?.into_iter().enumerate() {
-                    // Negative axes are made non-negative by adding r.
                     let norm_axis = if ax < 0 { ax + data.rank() as i64 } else { ax } as usize;
 
                     let data_dim = data.dims()[norm_axis] as i64;
                     let mut s = to_scalar_flexible::<i64>(&starts.get(i)?)?;
                     let mut e = to_scalar_flexible::<i64>(&ends.get(i)?)?;
-                    // Negative starts/ends get dims[axes[i]] added.
                     if s < 0 {
                         s += data_dim;
                     }
@@ -887,8 +833,6 @@ pub fn simple_eval(
                 let axis = attr_i_opt(node, "axis")?.unwrap_or(0);
                 let axis = input_tensor.normalize_axis(axis)?;
 
-                // Determine split sizes: from the split input when provided,
-                // else equal division with the remainder added to the last.
                 let splits = if node.inputs.len() > 1 {
                     let split_tensor = get(&node.inputs[1])?.to_vec1::<i64>()?;
                     split_tensor.iter().map(|&x| x as usize).collect::<Vec<_>>()
@@ -964,8 +908,6 @@ pub fn simple_eval(
                     axis as usize
                 };
 
-                // Compute mean and population variance along the normalized
-                // axis (mean → center → square → mean).
                 let mean = input.mean_keepdim(vec![normal_axis])?;
                 let centered = safe_sub(input, &mean)?;
                 let pop_var = centered.sqr()?.mean_keepdim(vec![normal_axis])?;
@@ -978,7 +920,6 @@ pub fn simple_eval(
                 let denom = pop_var_plus_eps.sqrt()?;
                 let normalized = safe_div(&centered, &denom)?;
 
-                // Scale and shift: gamma * normalized + beta
                 let output = if let Some(beta) = beta {
                     safe_add(&safe_mul(&normalized, gamma)?, beta)?
                 } else {
@@ -1021,10 +962,8 @@ pub fn simple_eval(
                 }
                 let xs = get(&node.inputs[0])?;
                 let ws = get(&node.inputs[1])?;
-                // Ensure input and weight have the same dtype.
                 let (xs, ws) = promote_types(xs, ws)?;
                 let ys = match ws.rank() {
-                    // 1-D convolution only (all four TTS models).
                     3 => {
                         let (pads, xs) = match pads {
                             None => (0, xs.clone()),
@@ -1097,8 +1036,6 @@ pub fn simple_eval(
                 let a = get(&node.inputs[1])?;
                 let b = get(&node.inputs[2])?;
 
-                // where_cond requires all inputs the same shape; the ONNX
-                // Where op only requires broadcastability — broadcast first.
                 let shape = broadcast_shape_from_many(&[cond.dims(), a.dims(), b.dims()])?;
                 let cond = cond.broadcast_as(shape.clone())?;
                 let a = a.broadcast_as(shape.clone())?;
@@ -1134,8 +1071,6 @@ fn pad_constant(
         None => t.pad_with_zeros(dim, left, right),
         Some(v) if scalar_is_zero(v)? => t.pad_with_zeros(dim, left, right),
         Some(v) => {
-            // Explicit constant-value padding: build full tensors of the pad
-            // value and concatenate along the padded dimension.
             let mut parts: Vec<Tensor> = Vec::new();
             if left > 0 {
                 let mut l_shape = t.dims().to_vec();
@@ -1165,7 +1100,6 @@ fn scalar_is_zero(t: &Tensor) -> Result<bool> {
     Ok(v == 0.0)
 }
 
-/// Build a tensor filled with the (single-element) value of `value`.
 fn full_with(value: &Tensor, shape: Vec<usize>) -> Result<Tensor> {
     let dev = value.device();
     let t = match value.dtype() {

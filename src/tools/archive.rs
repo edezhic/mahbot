@@ -1,5 +1,4 @@
-//! The `archive` tool: move one file or folder out of the way without losing
-//! it.
+//! The `archive` tool: move one file or folder out of the way without losing it.
 //!
 //! A guest Assistant has no shell, so without this its only way to retire a file
 //! was to empty or overwrite it — leaving a stale file that reads later exactly
@@ -28,8 +27,7 @@ const ARCHIVE_DIR: &str = "archive";
 
 /// The workspace's own service areas — top-level names that are never
 /// archivable: `.compaction/` is the compaction store and `.git/` the repository
-/// `ensure_personal_workspace` initialises for the personal-folder change
-/// baseline.
+/// `ensure_personal_workspace` initialises for the personal-folder change baseline.
 const SERVICE_AREAS: &[&str] = &[
     "shared",
     "uploads",

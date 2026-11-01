@@ -1,41 +1,32 @@
-//! The deep-research cancel action and the cancelled-run sweep (durable row
-//! removal, folder release, archive deletion). The shared per-round cancel
-//! signal registry itself lives in [`crate::round_cancel`].
+//! The deep-research cancel action and the cancelled-run sweep (durable row removal, folder
+//! release, archive deletion). The shared per-round cancel signal registry lives in
+//! [`crate::round_cancel`].
 //!
-//! A manual cancel from the Running Agents page is a DISTINCT, PERMANENT stop:
-//! unlike the shutdown/drain abort (the run stays alive and resumes at boot),
-//! a manual cancel stops the run so it can never resume, re-dispatch, or
-//! deliver a report. But the run folder is the cleanup intent: the
-//! ORCHESTRATOR's cancelled-exit path owns dump finalization, cleanup
-//! dispatch, and folder release; the GUI/abandon action only fires the signal
-//! (plus sweeps rows itself only when no orchestrator is alive to observe it).
+//! A manual cancel from the Running Agents page is a DISTINCT, PERMANENT stop: unlike the
+//! shutdown/drain abort (the run stays alive and resumes at boot), a manual cancel stops the run so
+//! it can never resume, re-dispatch, or deliver a report. The run folder is the cleanup intent: the
+//! ORCHESTRATOR's cancelled-exit path owns dump finalization, cleanup dispatch and folder release;
+//! the GUI/abandon action only fires the signal, and sweeps rows itself only when no orchestrator
+//! is alive to observe it.
 
 use crate::Workspace;
 use crate::agent::registry::ParentKey;
 use crate::research_cleanup::COMMAND_DUMP_FILE;
 
-/// The manual cancel action, run from the GUI on confirm and the workspace
-/// abandon path:
-/// 1. Fire the run's cancel signal FIRST (before any row deletion) so the
-///    orchestrator observes it at its next round/stage boundary and stops —
-///    it must not spawn further rounds, synthesize, terminalize, or dispatch
-///    a cleanup agent.
-/// 2. Cancel every agent of the run (analysts, verifier, worker, and the
-///    cleanup agent if one was already dispatched) as a group via the run's
-///    parent key. Cancellation is cooperative: an in-flight tool or LLM call
-///    may finish, but no further work happens and no new sub-agents spawn.
-/// 3. Remove the run's observational call-registry rows so the group
-///    disappears from Running Agents immediately (the guards' drops become
-///    no-ops).
-/// 4. If no orchestrator is alive to observe the signal
-///    ([`crate::round_cancel::is_registered`]), sweep the durable rows
-///    directly ([`sweep_cancelled_run`] — the folder release is dump-guarded)
-///    and log it; if an orchestrator IS alive, return and let its
-///    cancelled-exit handoff own the rest (cleanup dispatch + folder release).
+/// The manual cancel action, run from the GUI on confirm and the workspace abandon path:
 ///
-/// Infallible by design: the orchestrator's cancelled-exit path (or the no-
-/// orchestrator sweep) always makes progress, so there is nothing for the GUI
-/// to surface as a cancel failure.
+/// 1. Fire the run's cancel signal FIRST, before any row deletion, so the orchestrator observes it
+///    at its next round/stage boundary and stops — it must not spawn further rounds, synthesize,
+///    terminalize or dispatch a cleanup agent.
+/// 2. Cancel every agent of the run as a group via the run's parent key. Cancellation is
+///    cooperative: an in-flight tool or LLM call may finish, but no further work happens and no new
+///    sub-agents spawn.
+/// 3. Remove the run's call-registry rows so the group leaves Running Agents immediately.
+/// 4. If no orchestrator is alive to observe the signal, sweep the durable rows directly (the
+///    folder release is dump-guarded) and log it; if one IS alive, return and let its
+///    cancelled-exit handoff own the rest.
+///
+/// Infallible by design: some path always makes progress, so the GUI has no cancel failure.
 pub(crate) async fn cancel_research_run(job_id: &str) {
     crate::round_cancel::cancel(job_id);
     crate::agent::registry::AGENT_REGISTRY
@@ -49,25 +40,20 @@ pub(crate) async fn cancel_research_run(job_id: &str) {
     }
 }
 
-/// Remove a cancelled run's durable state terminally and idempotently — the
-/// no-orchestrator path (runs with NO cleanup intent, or a cancelled run whose
-/// orchestrator is already gone so no live cancelled-exit handoff can sweep).
-/// - the durable rows — the pending_jobs row (a persisted report would be
-///   replayed at boot) and the jobs row, in ONE tx
-///   ([`crate::jobs::delete_round_rows`]), which also owns the ordering rule.
-///   The jobs DELETE cascades research_jobs and the roster; it also removes the
-///   `research_cleanup` row when the run already terminalized (the cleanup row
-///   reuses id == run_id, and at most one of the research/cleanup job rows
-///   exists at any time — the research row is deleted by the completion
-///   boundary before the cleanup row is created).
-/// - the run folder ONLY when it has NO command dump: a folder holding a
-///   `commands.dump` is the run's cleanup intent, which must survive for the
-///   cleanup tail (or the periodic temp cleaner). See [`command_dump_exists`].
-/// - the results.md archive (no archive file).
+/// Remove a cancelled run's durable state terminally and idempotently — the no-orchestrator path
+/// (runs with NO cleanup intent, or a cancelled run whose orchestrator is gone):
 ///
-/// Idempotent and safe to run concurrently — every statement is a no-op on
-/// missing rows. The tx is the only fallible part; folder/archive failures are
-/// logged, never fatal.
+/// - the durable rows: the pending_jobs row (a persisted report would be replayed at boot) and the
+///   jobs row, in ONE tx ([`crate::jobs::delete_round_rows`]), which owns the ordering rule. The
+///   jobs DELETE cascades research_jobs and the roster, and also removes the `research_cleanup` row
+///   when the run already terminalized (that row reuses id == run_id, and at most one of the two
+///   exists at any time).
+/// - the run folder ONLY when it has NO command dump: a folder holding `commands.dump` carries the
+///   cleanup intent, which must survive for the cleanup tail (or the periodic temp cleaner).
+/// - the results.md archive.
+///
+/// Idempotent and safe concurrently — every statement is a no-op on missing rows. The tx is the
+/// only fallible part; folder/archive failures are logged, never fatal.
 pub(crate) async fn sweep_cancelled_run(job_id: &str) -> Result<(), String> {
     let conn = &crate::session::store().conn;
     crate::jobs::delete_round_rows(conn, job_id)
@@ -85,15 +71,12 @@ pub(crate) async fn sweep_cancelled_run(job_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The orchestrator's cancelled-exit cleanup, the owner of the run-folder
-/// release for a cancelled run. Called from the orchestrator's Cancelled exit
-/// (fresh dispatch and boot resume) and the terminalize cancel gates.
-///
-/// The command dump on disk is ALREADY FINAL at this point BY CONSTRUCTION:
-/// [`ResearchState::capture_round`](crate::tools::research) writes are awaited
-/// inline by the orchestrator, and the Cancelled exit is only reachable after
-/// the current round's members were reaped — so the GUI/abandon action no
-/// longer deletes the folder out from under the dump (the ENOENT race is dead).
+/// The orchestrator's cancelled-exit cleanup, owner of the run-folder release for a cancelled run.
+/// Called from the Cancelled exit (fresh dispatch and boot resume) and the terminalize cancel
+/// gates. The command dump is ALREADY FINAL here BY CONSTRUCTION: the capture writes are awaited
+/// inline by the orchestrator and the Cancelled exit is reachable only after the round's members
+/// were reaped — so the GUI/abandon action no longer deletes the folder out from under the dump
+/// (the ENOENT race is dead).
 pub(crate) async fn hand_off_cancelled_run(
     job_id: &str,
     ws: &Workspace,
@@ -105,24 +88,20 @@ pub(crate) async fn hand_off_cancelled_run(
     Ok(())
 }
 
-/// The row/fs part of [`hand_off_cancelled_run`], extracted for testability:
-/// returns `Some(prompt)` when the run's research row was transitioned to a
-/// `research_cleanup` row (the caller must spawn the cleanup agent with that
-/// prompt), or `None` when the handoff was suppressed (a cleanup row already
-/// exists, so the boot-resumable tail owns the folder) or swept (no dump —
-/// nothing to clean).
+/// The row/fs part of [`hand_off_cancelled_run`], extracted for testability: `Some(prompt)` when
+/// the research row was transitioned to a `research_cleanup` row (the caller must spawn the cleanup
+/// agent with that prompt), or `None` when the handoff was suppressed (a cleanup row already
+/// exists, so the boot-resumable tail owns the folder) or swept (no dump — nothing to clean).
 async fn hand_off_rows(job_id: &str, ws: &Workspace) -> Result<Option<String>, String> {
     let conn = &crate::session::store().conn;
     if crate::research_cleanup::research_cleanup_row_exists(conn, job_id)
         .await
         .map_err(|e| format!("{e:#}"))?
     {
-        // DEFENSIVE: a `research_cleanup` row already existing here is NOT
-        // expected on the Cancelled exits — cleanup dispatch only happens after
-        // the completion boundary that a Cancelled exit never reaches. The
-        // branch exists to keep the racing-completion window safe: if the row
-        // is there, the running/boot-resumable cleanup tail owns the folder,
-        // so we suppress the pending envelope + archive and spawn nothing.
+        // DEFENSIVE: a `research_cleanup` row already existing here is NOT expected on the
+        // Cancelled exits — cleanup dispatch follows a completion boundary a Cancelled exit never
+        // reaches. The branch keeps the racing-completion window safe: the running/boot-resumable
+        // cleanup tail owns the folder, so nothing is enveloped, archived or spawned.
         if let Err(e) = conn
             .execute(
                 "DELETE FROM pending_jobs WHERE id = ?1",
@@ -136,13 +115,12 @@ async fn hand_off_rows(job_id: &str, ws: &Workspace) -> Result<Option<String>, S
         return Ok(None);
     }
     if !crate::research_cleanup::command_dump_exists(job_id).await {
-        // No agent ever ran — nothing to clean; delegate to the sweep (which
-        // releases the dump-less folder).
+        // No agent ever ran — delegate to the sweep, which releases the dump-less folder.
         sweep_cancelled_run(job_id).await?;
         return Ok(None);
     }
-    // Canonical run root — NEVER ensure_run_root: a manual cancel must not
-    // resurrect a folder the periodic temp cleaner (or a prior release) already removed.
+    // Canonical run root — NEVER ensure_run_root: a manual cancel must not resurrect a folder the
+    // temp cleaner (or a prior release) already removed.
     let run_root = crate::research_cleanup::canonical_run_root(job_id)
         .await
         .map_err(|e| format!("{e:#}"))?;
@@ -155,11 +133,9 @@ async fn hand_off_rows(job_id: &str, ws: &Workspace) -> Result<Option<String>, S
     Ok(Some(prompt))
 }
 
-/// Delete the run's results.md archive
-/// (`<storage_root>/research/results/{run_id}.md`). Fail-open: a leftover
-/// archive is a bounded race with a racing terminalize write (the accepted
-/// envelope-race class — the file is never routed to any session); the
-/// terminalize gates keep that window to a single racing write.
+/// Delete the run's results.md archive. Fail-open: a leftover archive is a bounded race with a
+/// racing terminalize write (the accepted envelope-race class — the file is never routed to any
+/// session).
 async fn delete_results_archive(job_id: &str) {
     let Some(path) = crate::research_cleanup::results_archive_path(job_id) else {
         return;
@@ -180,15 +156,11 @@ mod tests {
     use crate::util::test::JobRowBuilder;
     use std::path::PathBuf;
 
-    // ── Fixture ───────────────────────────────────────────────────────────
-    // A cancelled run's durable state, stated once and never patched at the
-    // call site: the jobs row shape (one constructor each), the folder's
-    // contents, and whether the run left a persisted report. No `agents` roster
-    // rows are seeded — every path here names the run by id, and the one roster
-    // row the handoff test asserts is written by the handoff itself.
-
-    /// The run folder's contents — the axis that decides whether the sweep may
-    /// release the folder: a `commands.dump` is the cleanup intent.
+    // A cancelled run's durable state, stated once and never patched per test: the jobs row shape
+    // (one constructor each), the folder's contents, and whether the run left a persisted report.
+    // No `agents` roster rows are seeded — every path names the run by id. The folder's contents
+    // are the axis that decides whether the sweep may release it: a `commands.dump` is the cleanup
+    // intent.
     enum Folder {
         /// The folder exists and holds nothing.
         Empty,
@@ -198,9 +170,8 @@ mod tests {
         Dump,
     }
 
-    /// The report a run left for boot replay: the completion boundary writes a
-    /// `pending_jobs` envelope AND its results archive; a run cancelled before
-    /// that boundary has neither.
+    /// The report a run left for boot replay: the completion boundary writes a `pending_jobs`
+    /// envelope AND its results archive; a run cancelled before that boundary has neither.
     enum Report {
         /// No envelope, no archive.
         None,
@@ -216,9 +187,8 @@ mod tests {
     }
 
     impl Seeded {
-        /// A research run mid-flight: `kind='research'` plus its `research_jobs`
-        /// child, written through the production dispatch — the sweep's jobs
-        /// DELETE is what cascades the child.
+        /// A research run mid-flight: `kind='research'` plus its `research_jobs` child, written
+        /// through the production dispatch — the sweep's jobs DELETE is what cascades the child.
         async fn research(id: &'static str, folder: Folder, report: Report) -> Self {
             crate::util::test::init_management_test_stores().await;
             crate::jobs::spawn_job(
@@ -240,8 +210,8 @@ mod tests {
             Self::seed(id, folder, report).await
         }
 
-        /// The same `kind='research'` row with NO `research_jobs` child:
-        /// `spawn_job` always writes the child, so this shape is seeded directly.
+        /// The same `kind='research'` row with NO `research_jobs` child: `spawn_job` always writes
+        /// the child, so this shape is seeded directly.
         async fn research_without_child(id: &'static str, folder: Folder, report: Report) -> Self {
             crate::util::test::init_management_test_stores().await;
             JobRowBuilder::new(
@@ -261,8 +231,8 @@ mod tests {
             Self::seed(id, folder, report).await
         }
 
-        /// A terminalized run: its `research_cleanup` row reuses the run id and
-        /// carries no child row — the cleanup prompt lives in its `task`.
+        /// A terminalized run: its `research_cleanup` row reuses the run id and carries no child
+        /// row — the cleanup prompt lives in its `task`.
         async fn terminalized(id: &'static str, folder: Folder, report: Report) -> Self {
             crate::util::test::init_management_test_stores().await;
             crate::jobs::spawn_job(
@@ -284,14 +254,11 @@ mod tests {
             Self::seed(id, folder, report).await
         }
 
-        /// The rest of the run's state: the folder in the state under test, plus
-        /// the persisted report — the `pending_jobs` envelope boot replay would
-        /// deliver and its archive — when the run got that far.
-        ///
-        /// Every constructor reaches this only after the test stores are up:
-        /// `results_archive_path` falls back to the real `~/.mahbot` root while
-        /// `CONFIG` has none set, so resolving earlier would seed (and then
-        /// delete) a file in the owner's storage.
+        /// The rest of the run's state: the folder, plus the persisted report (the `pending_jobs`
+        /// envelope and its archive) when the run got that far. Every constructor reaches this only
+        /// after the test stores are up: `results_archive_path` falls back to the real `~/.mahbot`
+        /// root while `CONFIG` has none set, so resolving earlier would seed (and then delete) a
+        /// file in the owner's storage.
         async fn seed(id: &'static str, folder: Folder, report: Report) -> Self {
             let root = crate::research_cleanup::ensure_run_root(id).await;
             match folder {
@@ -309,8 +276,8 @@ mod tests {
             }
             let archive = crate::research_cleanup::results_archive_path(id).unwrap();
             if matches!(report, Report::Persisted) {
-                // The router's own persist: the envelope is the production
-                // serialization, never a hand-written copy of it.
+                // The router's own persist: the envelope is the production serialization, never a
+                // hand-written copy.
                 crate::agent::message_router::persist_pending(
                     &crate::agent::message_router::AgentJob {
                         content: "report".to_string(),
@@ -338,11 +305,10 @@ mod tests {
             Self { id, root, archive }
         }
 
-        /// How many rows `table` holds for this run: a count, not a presence
-        /// flag, because a leftover duplicate is one of the failures these
-        /// tests watch for. The three tables it serves are keyed by `id`; the
-        /// roster is keyed by `job_id` and its one assertion reads the row's
-        /// value, so it stays a bespoke query.
+        /// How many rows `table` holds for this run: a count, not a presence flag, because a
+        /// leftover duplicate is one of the failures these tests watch for. The three tables it
+        /// serves are keyed by `id`; the roster is keyed by `job_id` and its one assertion reads
+        /// the row's value, so it stays a bespoke query.
         async fn rows(&self, table: &str) -> usize {
             crate::session::store()
                 .conn
@@ -356,11 +322,10 @@ mod tests {
         }
     }
 
-    /// The sweep removes everything the run left behind — its jobs row, the
-    /// `research_jobs` child (by cascade), the pending report row (so boot replay
-    /// has nothing to deliver), the folder and the archive — for a run cancelled
-    /// mid-flight and for one already terminalized into its `research_cleanup`
-    /// row (whose cleanup must not resume).
+    /// The sweep removes everything the run left behind — jobs row, `research_jobs` child (by
+    /// cascade), the pending report row, the folder and the archive — for a run cancelled
+    /// mid-flight and for one already terminalized into its `research_cleanup` row (whose cleanup
+    /// must not resume).
     #[tokio::test]
     async fn sweep_removes_rows_folder_and_archive_for_a_dump_less_run() {
         let run = Seeded::research(
@@ -405,10 +370,9 @@ mod tests {
         assert!(!run.archive.exists());
     }
 
-    /// A folder WITH a command dump is the run's cleanup intent: the sweep
-    /// removes the jobs/pending rows and the archive, but the folder AND the
-    /// dump survive (the cleanup tail / periodic temp cleaner owns their release). The warn
-    /// log is not asserted.
+    /// A folder WITH a command dump is the run's cleanup intent: the sweep removes the jobs/pending
+    /// rows and the archive, but the folder AND the dump survive (the cleanup tail / temp cleaner
+    /// owns their release).
     #[tokio::test]
     async fn sweep_never_releases_folder_with_command_dump() {
         // No `research_jobs` child row: the dump guard does not depend on it.
@@ -434,10 +398,9 @@ mod tests {
         assert!(!run.archive.exists(), "results.md archive removed");
     }
 
-    /// The cancelled-run handoff with a live command dump: research + roster
-    /// transition atomically to a `research_cleanup` row (+ cleanup roster),
-    /// the pending envelope is dropped, and the archive removed — while the
-    /// run folder AND its dump survive for the cleanup tail.
+    /// The handoff with a live command dump: research + roster transition atomically to a
+    /// `research_cleanup` row (+ cleanup roster), the pending envelope is dropped and the archive
+    /// removed — while the folder AND its dump survive for the cleanup tail.
     #[tokio::test]
     async fn cancel_handoff_transitions_rows_and_holds_folder() {
         let run = Seeded::research(
@@ -506,9 +469,8 @@ mod tests {
         assert!(!run.archive.exists(), "results.md archive removed");
     }
 
-    /// A cancelled-run handoff with NO command dump has nothing to clean: the
-    /// handoff delegates to the sweep and returns `None`; the research row and
-    /// the dump-less folder are gone.
+    /// A handoff with NO command dump has nothing to clean: it delegates to the sweep and returns
+    /// `None`; the research row and the dump-less folder are gone.
     #[tokio::test]
     async fn cancel_handoff_without_dump_sweeps() {
         let run =
@@ -529,12 +491,11 @@ mod tests {
         crate::util::test::init_management_test_stores().await;
         let job_id = "research_cancel_double_1";
         sweep_cancelled_run(job_id).await.unwrap();
-        // Second pass with nothing present must not fail.
         sweep_cancelled_run(job_id).await.unwrap();
     }
 
-    /// The in-tx cancel gate: a completion racing a cancel must roll back —
-    /// no pending row may survive, and the jobs row stays for the sweep.
+    /// The in-tx cancel gate: a completion racing a cancel must roll back — no pending row may
+    /// survive, and the jobs row stays for the sweep.
     #[tokio::test]
     async fn complete_durable_job_rolls_back_when_run_cancelled() {
         crate::util::test::init_management_test_stores().await;
@@ -569,8 +530,8 @@ mod tests {
             None,
         )
         .await;
-        // The in-tx gate rolled the completion back: no pending row exists
-        // (no boot replay), and the jobs row survives for the cancel sweep.
+        // The gate rolled the completion back: no pending row exists (no boot replay), and the jobs
+        // row survives for the cancel sweep.
         let conn = &crate::session::store().conn;
         let pending = conn
             .query(

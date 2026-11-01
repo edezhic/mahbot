@@ -1,6 +1,6 @@
-//! Shared rendering components for the agent-session ledger — the tool block,
-//! one-line key-value pairs summary, and boundary-aware truncation used by
-//! both the Sessions page (full view) and the Running Agents page (compact).
+//! Shared rendering components for the agent-session ledger — the tool block, the one-line
+//! key-value pairs summary, and boundary-aware truncation — used by both the Sessions page (full
+//! view) and the Running Agents page (compact).
 
 use iced::widget::{Column, Row, container, text, tooltip};
 use iced::{Alignment, Element, Length};
@@ -9,28 +9,26 @@ use crate::agent::registry::RunningTool;
 use crate::gui::theme;
 use crate::gui::widgets;
 
-/// Max display length (Unicode chars) of a single argument VALUE in the
-/// one-line key-value pairs summary. Hover tooltip always shows full value.
+/// Max display length (Unicode chars) of a single argument VALUE in the pairs summary; the tooltip
+/// always shows the full value.
 const MAX_TOOL_VALUE_CHARS: usize = 104;
 
-/// Max display length of the whole key-value pairs line (values already
-/// per-value truncated). Cut at a pair boundary with "…".
+/// Max display length of the whole pairs line (values already truncated per value), cut at a pair
+/// boundary.
 const MAX_TOOL_PAIRS_LINE_CHARS: usize = 208;
 
 /// Max width (px) of hover tooltip content; long values wrap within it.
 pub(crate) const MAX_TOOL_TOOLTIP_WIDTH: f32 = 560.0;
 
-/// A word/path-delimiter boundary at which wrapped/truncated text may be
-/// cut: whitespace (word wrap) and `/`, `_`, `-` (paths, URLs, identifiers).
+/// A boundary at which wrapped/truncated text may be cut: whitespace (word wrap) and `/`, `_`, `-`
+/// (paths, URLs, identifiers).
 fn is_delim(c: char) -> bool {
     c.is_whitespace() || matches!(c, '/' | '_' | '-')
 }
 
-/// Truncate `s` to at most `max_chars` Unicode chars, choosing a cut at a word
-/// or path/URL delimiter boundary (whitespace, `/`, `_`, `-`) rather than
-/// mid-token, and appending "…" when truncated. When no delimiter falls within
-/// the cap the cut falls back to a hard char boundary so the limit is always
-/// honoured.
+/// Truncate `s` to at most `max_chars` Unicode chars, cutting at a word or path/URL delimiter
+/// (whitespace, `/`, `_`, `-`) rather than mid-token, with "…" appended when truncated. With no
+/// delimiter inside the cap
 pub(crate) fn truncate_at_boundary(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         return s.to_string();
@@ -40,14 +38,13 @@ pub(crate) fn truncate_at_boundary(s: &str, max_chars: usize) -> String {
         .nth(max_chars)
         .map(|(byte_idx, _)| byte_idx)
         .expect("char count exceeds max_chars, so a char exists at index max_chars");
-    // If the cut lands right before a delimiter, the first `max_chars` chars
-    // already end at a complete word/path segment — cut exactly there.
+    // The cut lands right before a delimiter: the first `max_chars` chars already end a complete
+    // segment.
     if s[hard_end..].chars().next().is_some_and(is_delim) {
         return format!("{}…", s[..hard_end].trim_end());
     }
-    // Otherwise back up to the last delimiter strictly inside the cap so the
-    // cut lands at a wrap boundary (the delimiter is the wrapped segment's
-    // final char) instead of mid-word.
+    // Otherwise back up to the last delimiter strictly inside the cap, so the cut lands at a wrap
+    // boundary (the delimiter is the wrapped segment's final char) instead of mid-word.
     let mut cut = None;
     for (char_pos, (byte_idx, c)) in s.char_indices().enumerate() {
         if char_pos >= max_chars {
@@ -61,10 +58,9 @@ pub(crate) fn truncate_at_boundary(s: &str, max_chars: usize) -> String {
     format!("{}…", s[..end].trim_end())
 }
 
-/// Single-line display form of `s`: control characters (newlines, tabs)
-/// collapsed to spaces, collecting at most `max_chars + 1` chars — all that
-/// [`truncate_at_boundary`] can need to honour a `max_chars` cap, so a long
-/// source is never fully scanned per render.
+/// Single-line display form of `s`: control characters collapsed to spaces, collecting at most
+/// `max_chars + 1` chars — all [`truncate_at_boundary`] can need — so a long source is never fully
+/// scanned per render.
 fn collapse_control_chars(s: &str, max_chars: usize) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -72,10 +68,9 @@ fn collapse_control_chars(s: &str, max_chars: usize) -> String {
         .collect()
 }
 
-/// Single-line display form of a value: control characters (newlines, tabs)
-/// collapsed to spaces, then truncated to [`MAX_TOOL_VALUE_CHARS`] chars at a
-/// word/path-delimiter boundary with "…" when cut. The bool reports whether
-/// the value was char-cut (drives the hover tooltip).
+/// Single-line display form of a value: control characters collapsed to spaces, then truncated to
+/// [`MAX_TOOL_VALUE_CHARS`] at a delimiter boundary with "…" when cut. The bool reports whether the
+/// value was char-cut (it drives the hover tooltip).
 fn value_display(value: &str) -> (String, bool) {
     let single_line = collapse_control_chars(value, MAX_TOOL_VALUE_CHARS);
     let was_char_cut = single_line.chars().count() > MAX_TOOL_VALUE_CHARS;
@@ -83,14 +78,12 @@ fn value_display(value: &str) -> (String, bool) {
     (display, was_char_cut)
 }
 
-/// One-line args summary plus whether it omits any information (drives the
-/// hover tooltip): a per-value char cut, the whole-line cap cut, or — in the
-/// compact view — a hidden single argument name. Renders `name: value` pairs,
-/// comma-separated, each value collapsed to a single line and truncated at a
-/// word/path-delimiter boundary to [`MAX_TOOL_VALUE_CHARS`] chars. The whole
-/// line is capped at [`MAX_TOOL_PAIRS_LINE_CHARS`] chars, cut at a pair
-/// boundary with "…". In the compact view a single argument renders just the
-/// value, omitting the argument name.
+/// One-line args summary plus whether it omits any information (drives the tooltip): a per-value
+/// char cut, the whole-line cap cut, or — in the compact view — a hidden single argument name.
+/// Renders `name: value` pairs, comma-separated, each value collapsed to one line and truncated at
+/// a delimiter boundary to [`MAX_TOOL_VALUE_CHARS`]; the whole line is capped at
+/// [`MAX_TOOL_PAIRS_LINE_CHARS`], cut at a pair boundary with "…". In the compact view a single
+/// argument renders just its value.
 fn tool_pairs_summary(tool: &RunningTool, view: ToolBlockView) -> (String, bool) {
     let compact = view == ToolBlockView::Compact;
     if tool.args.is_empty() {
@@ -114,8 +107,8 @@ fn tool_pairs_summary(tool: &RunningTool, view: ToolBlockView) -> (String, bool)
     if joined.chars().count() <= MAX_TOOL_PAIRS_LINE_CHARS {
         return (joined, omits);
     }
-    // Over budget: keep whole pairs while they fit (leaving room for the
-    // trailing "…"), then mark the cut.
+    // Over budget: keep whole pairs while they fit (leaving room for the trailing "…"), then mark
+    // the cut.
     let mut out = String::new();
     for pair in &rendered {
         let sep = if out.is_empty() { "" } else { ", " };
@@ -127,8 +120,8 @@ fn tool_pairs_summary(tool: &RunningTool, view: ToolBlockView) -> (String, bool)
         out.push_str(pair);
     }
     if out.is_empty() {
-        // Even the first pair alone does not fit — truncate at a delimiter
-        // boundary so the cut lands at a sensible wrap point.
+        // Even the first pair alone does not fit — truncate at a delimiter so the cut lands at a
+        // wrap point.
         (
             truncate_at_boundary(&rendered[0], MAX_TOOL_PAIRS_LINE_CHARS),
             true,
@@ -138,11 +131,10 @@ fn tool_pairs_summary(tool: &RunningTool, view: ToolBlockView) -> (String, bool)
     }
 }
 
-/// Render the hover tooltip: the tool name header (bold white) followed by
-/// every argument pair on its own line, sorted by FULL value length ascending
-/// (stable, so equal-length pairs keep registration order) — the shortest
-/// pairs sit at the top and stay visible even when the longest values extend
-/// beyond the viewport. Values are full and untruncated, including secrets.
+/// The hover tooltip: the tool name header (bold white) followed by every argument pair on its own
+/// line, sorted by FULL value length ascending (stable, so equal-length pairs keep registration
+/// order) — the shortest pairs stay visible even when the longest values extend past the viewport.
+/// Values are full and untruncated, including secrets.
 fn tool_tooltip<Message: 'static>(tool: &RunningTool) -> Element<'static, Message> {
     let mut pairs = tool.args.clone();
     pairs.sort_by_key(|(_, v)| v.chars().count());
@@ -165,28 +157,18 @@ fn tool_tooltip<Message: 'static>(tool: &RunningTool) -> Element<'static, Messag
     container(content).max_width(MAX_TOOL_TOOLTIP_WIDTH).into()
 }
 
-/// Which session surface renders a tool block. `Compact` is the Running
-/// Agents card line (plain text, glyph-wrapped so long unbroken values fold; a
-/// single-argument tool renders just the value, omitting the argument name).
-/// `Full` is the Sessions transcript bubble (selectable text, word/glyph
-/// wrapping).
+/// Which session surface renders a tool block. `Compact` is the Running Agents card line (plain
+/// text, glyph-wrapped so long unbroken values fold; a single argument renders just its value).
+/// `Full` is the Sessions transcript bubble (selectable text, word/glyph wrapping).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolBlockView {
     Compact,
     Full,
 }
 
-/// One shared tool block: bold tool name + one-line key-value args summary
-/// (boundary-truncated), with a hover tooltip showing the tool name and every
-/// full unscrubbed argument pair (sorted by value length ascending, shortest
-/// at top). Values are RAW and unscrubbed in both views — a deliberate,
-/// user-approved decision (local-first GUI; the durable stats logs stay
-/// scrubbed).
-///
-/// The tooltip is only shown when the rendered line omits information — a
-/// per-value cut, the whole-line cap cut, or a hidden single argument name in
-/// the compact view. Zero-arg tools and fully visible full-view lines get no
-/// tooltip.
+/// One shared tool block: bold tool name plus the one-line pairs summary, with a hover tooltip
+/// showing the cap cut, or a hidden argument name in the compact view. Zero-arg tools and fully
+/// visible full-view lines get none.
 pub(crate) fn tool_block<Message: 'static>(
     tool: &RunningTool,
     view: ToolBlockView,
@@ -220,8 +202,8 @@ pub(crate) fn tool_block<Message: 'static>(
                 .width(Length::Fill)
                 .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                 .into(),
-            // Wrap at glyph level so a long unbroken value (path, URL) folds
-            // instead of overflowing the card edge.
+            // Wrap at glyph level so a long unbroken value (path, URL) folds instead of overflowing
+            // the card.
             ToolBlockView::Compact => text(args_text)
                 .size(theme::TEXT_11)
                 .color(theme::TEXT_SECONDARY)
@@ -252,7 +234,8 @@ mod tests {
         }
     }
 
-    /// Every cut happens at the last delimiter at or before the cap, falls back to a hard char cut, and reports omission.
+    /// Every cut happens at the last delimiter at or before the cap, falls back to a hard char cut,
+    /// and reports omission.
     #[test]
     fn truncation_cases() {
         let boundary: &[(&str, &str, usize, &str)] = &[

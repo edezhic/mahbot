@@ -1,14 +1,13 @@
-//! Ephemeral anonymous media upload bridge (video_edit local-clip and
-//! image-input support, video transcription transport).
+//! Ephemeral anonymous media upload bridge (video_edit local clips, image inputs, video
+//! transcription transport).
 //!
-//! Uploads a local media file to the first available host in a fallback chain
-//! and returns a GET-verified public HTTPS URL suitable for OpenRouter
-//! `input_references`. All uploads are ephemeral by design; the caller owns
-//! cleanup of the local temp file. Video uploads must be served back as
-//! `video/*`; image uploads as `image/*` — verification stays per-kind.
+//! Uploads a local media file to the first available host in a fallback chain and returns a
+//! GET-verified public HTTPS URL for OpenRouter `input_references`. All uploads are ephemeral;
+//! the caller owns cleanup of the local temp file. Video uploads must be served back as `video/*`
+//! and images as `image/*` — verification stays per-kind.
 //!
-//! Chain: tmpfile.link (7-day) → uguu.se (3-h) → 0807.st (PoW + one 302) →
-//! catbox.moe (hash-deduped, GET-validate) → x0.at (HEAD-404 trap — GET only).
+//! Chain: tmpfile.link (7-day) → uguu.se (3-h) → 0807.st (PoW + one 302) → catbox.moe
+//! (hash-deduped, GET-validate) → x0.at (HEAD-404 trap — GET only).
 
 use anyhow::Context;
 use futures_util::StreamExt;
@@ -18,15 +17,13 @@ use sha2::{Digest, Sha256};
 /// Maximum attempts for the 0807.st hashcash solve (expected 2^bits).
 const POW_MAX_ATTEMPTS: u64 = 1 << 26;
 
-/// Hard cap on the server-controlled PoW difficulty: solving past 2^24
-/// hashes (~seconds) is never worth it — an over-cap challenge fails fast
-/// and the fallback chain engages instead of pinning a blocking thread.
-/// 0807.st's live challenge is 13 bits.
+/// Hard cap on the server-controlled PoW difficulty: solving past 2^24 hashes (~seconds) is
+/// never worth it, so an over-cap challenge fails fast and the fallback chain engages instead of
+/// pinning a blocking thread. 0807.st's live challenge is 13 bits.
 const POW_MAX_BITS: u32 = 24;
 
-/// Parameters for one ephemeral upload: the bytes, the file name presented to
-/// the host, the MIME declared in the multipart form, and the content-type
-/// prefix the verified URL must be served with ("video/" or "image/").
+/// The bytes, the file name presented to the host, the MIME declared in the multipart form, and
+/// the content-type prefix the verified URL must be served with ("video/" or "image/").
 struct UploadRequest<'a> {
     bytes: &'a [u8],
     file_name: &'a str,
@@ -34,24 +31,18 @@ struct UploadRequest<'a> {
     expected_prefix: &'a str,
 }
 
-/// An ephemeral-host uploader: takes the upload parameters and returns a
-/// verified public HTTPS URL.
+/// Takes the upload parameters and returns a verified public HTTPS URL.
 type Uploader<'a> =
     fn(&'a UploadRequest<'a>) -> futures_util::future::BoxFuture<'a, anyhow::Result<String>>;
 
-/// Upload a video clip to the first working ephemeral host.
-///
-/// The multipart form always declares `video/mp4` — every video_edit clip
-/// that uses this path is mp4. The GET-verified URL must be served back as
-/// `video/*` regardless of container.
+/// The multipart form always declares `video/mp4` — every video_edit clip on this path is mp4 —
+/// and the verified URL must be served back as `video/*` regardless of container.
 pub(crate) async fn upload_video_ephemeral(path: &std::path::Path) -> anyhow::Result<String> {
     upload_ephemeral(path, "video/mp4", "video/").await
 }
 
-/// Upload a video clip declaring the MIME derived from its extension (mp4
-/// fallback). Used by the video-transcription path so the whitelisted
-/// non-mp4 formats are served with their real content type instead of the
-/// video_edit form's hardcoded `video/mp4`.
+/// Declares the MIME derived from the extension (mp4 fallback), so the video-transcription
+/// path's whitelisted non-mp4 formats keep their real content type.
 pub(crate) async fn upload_video_ephemeral_typed(path: &std::path::Path) -> anyhow::Result<String> {
     let mime = crate::util::mime_for_extension(path);
     let mime = if mime.starts_with("video/") {
@@ -68,16 +59,15 @@ pub(crate) async fn upload_image_ephemeral(path: &std::path::Path) -> anyhow::Re
     upload_ephemeral(path, mime, "image/").await
 }
 
-/// Upload `path` to the first working ephemeral host and return the verified
-/// public HTTPS URL. Each host's URL is GET-validated (status, expected
-/// content-type prefix, non-empty body) before being accepted.
+/// Each host's URL is GET-validated (status, expected content-type prefix, non-empty body)
+/// before being accepted.
 async fn upload_ephemeral(
     path: &std::path::Path,
     mime: &str,
     expected_prefix: &str,
 ) -> anyhow::Result<String> {
-    // Unreachable in practice (canonicalized files always have a file name),
-    // but keep the fallback extension-bearing so hosts see a sane name.
+    // Unreachable in practice (canonicalized files always have a name), but keep the fallback
+    // extension-bearing so hosts see a sane name.
     let fallback_name = if mime.starts_with("image/") {
         format!("image.{}", mime.trim_start_matches("image/"))
     } else {
@@ -125,12 +115,10 @@ async fn upload_ephemeral(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No ephemeral upload host available")))
 }
 
-/// GET-validate a media URL: 2xx status, expected content-type prefix,
-/// non-empty body. Used to verify ephemeral-host uploads and user-supplied
-/// public image URLs before they reach a billed request. The body is streamed
-/// and discarded — only the first chunk is inspected. This is a served-type
-/// check only, not magic-byte validation — a mislabeled container still
-/// reaches OpenRouter, which rejects it at job time.
+/// GET-validate a media URL: 2xx status, expected content-type prefix, non-empty body. Verifies
+/// ephemeral-host uploads and user-supplied public image URLs before they reach a billed request.
+/// Only the first chunk is inspected and discarded. A served-type check only, not magic-byte
+/// validation — a mislabeled container still reaches OpenRouter, which rejects it at job time.
 pub(crate) async fn verify_media_url(url: &str, expected_prefix: &str) -> anyhow::Result<()> {
     let resp = crate::util::http::media_http_client()
         .get(url)
@@ -157,8 +145,7 @@ pub(crate) async fn verify_media_url(url: &str, expected_prefix: &str) -> anyhow
     }
 }
 
-/// Multipart helper: one file part with the given field name and the
-/// request's declared MIME.
+/// One file part with the given field name and the request's declared MIME.
 fn file_part(field: &str, req: &UploadRequest<'_>) -> anyhow::Result<Form> {
     let part = Part::bytes(req.bytes.to_vec())
         .file_name(req.file_name.to_string())
@@ -166,8 +153,8 @@ fn file_part(field: &str, req: &UploadRequest<'_>) -> anyhow::Result<Form> {
     Ok(Form::new().part(field.to_string(), part))
 }
 
-/// Read a JSON response body, bailing with the raw body on non-2xx or parse
-/// failure (hosts return both JSON and plain-text error bodies).
+/// Bail with the raw body on non-2xx or a parse failure (hosts return both JSON and plain-text
+/// error bodies).
 async fn expect_json(resp: reqwest::Response, host: &str) -> anyhow::Result<serde_json::Value> {
     let status = resp.status();
     let body = resp
@@ -181,8 +168,7 @@ async fn expect_json(resp: reqwest::Response, host: &str) -> anyhow::Result<serd
         .with_context(|| format!("{host} returned non-JSON response: {body}"))
 }
 
-/// Read a plain-text URL response body, bailing with the raw body on non-2xx
-/// or a non-HTTPS response.
+/// Bail with the raw body on non-2xx or a non-HTTPS response.
 async fn expect_url(resp: reqwest::Response, host: &str) -> anyhow::Result<String> {
     let status = resp.status();
     let body = resp
@@ -199,9 +185,9 @@ async fn expect_url(resp: reqwest::Response, host: &str) -> anyhow::Result<Strin
     Ok(url.to_string())
 }
 
-/// tmpfile.link — global Cloudflare/R2 CDN, 7-day lifetime, zero redirects.
-/// The MIME declaration is required; without a correct `mime` the served type
-/// degrades to `application/octet-stream`.
+/// tmpfile.link — global Cloudflare/R2 CDN, 7-day lifetime, no redirects. The MIME declaration
+/// is required; without a correct `mime` the served type degrades to
+/// `application/octet-stream`.
 async fn upload_tmpfile_link(req: &UploadRequest<'_>) -> anyhow::Result<String> {
     let form = file_part("file", req)?;
     let resp = crate::util::http::media_http_client()
@@ -220,8 +206,8 @@ async fn upload_tmpfile_link(req: &UploadRequest<'_>) -> anyhow::Result<String> 
     Ok(url.to_string())
 }
 
-/// uguu.se — EU direct, 3-hour lifetime, zero redirects. Field is exactly
-/// `files[]`; the server sniffs the MIME itself.
+/// uguu.se — EU direct, 3-hour lifetime, no redirects. Field is exactly `files[]`; the server
+/// sniffs the MIME itself.
 async fn upload_uguu(req: &UploadRequest<'_>) -> anyhow::Result<String> {
     let form = file_part("files[]", req)?;
     let resp = crate::util::http::media_http_client()
@@ -245,9 +231,9 @@ async fn upload_uguu(req: &UploadRequest<'_>) -> anyhow::Result<String> {
     Ok(url.to_string())
 }
 
-/// 0807.st — global CDN, requires a hashcash proof-of-work and follows exactly
-/// one 302 to a signed download URL. The signed URL must be verified at upload
-/// time; OpenRouter follows the same redirect at job time.
+/// 0807.st — global CDN, requires a hashcash proof-of-work and follows exactly one 302 to a
+/// signed download URL, which must be verified at upload time (OpenRouter follows the same
+/// redirect at job time).
 async fn upload_0807_st(req: &UploadRequest<'_>) -> anyhow::Result<String> {
     let client = crate::util::http::media_http_client();
 
@@ -270,8 +256,8 @@ async fn upload_0807_st(req: &UploadRequest<'_>) -> anyhow::Result<String> {
     )
     .context("0807.st PoW bits out of range")?;
     let bits = declared_bits.min(POW_MAX_BITS);
-    // ts arrives as a number today but may be string-typed; serializing a
-    // JSON Value directly would quote a string field and break the submit.
+    // ts arrives as a number today but may be string-typed; serializing a JSON Value directly
+    // would quote a string field and break the submit.
     let ts = pow
         .get("ts")
         .and_then(|v| {
@@ -320,8 +306,8 @@ async fn upload_0807_st(req: &UploadRequest<'_>) -> anyhow::Result<String> {
     Ok(url.to_string())
 }
 
-/// catbox.moe — US origin, hash-deduped: always GET-validate the returned URL
-/// (a dedup hit may point at an existing upload).
+/// catbox.moe — US origin, hash-deduped: always GET-validate the returned URL, since a dedup hit
+/// may point at an existing upload.
 async fn upload_catbox(req: &UploadRequest<'_>) -> anyhow::Result<String> {
     let part = Part::bytes(req.bytes.to_vec()).file_name(req.file_name.to_string());
     let form = Form::new()
@@ -338,8 +324,8 @@ async fn upload_catbox(req: &UploadRequest<'_>) -> anyhow::Result<String> {
     Ok(url)
 }
 
-/// x0.at — EU last resort. HEAD requests 404 even though GET works, so the
-/// post-upload verification must use GET (which it does).
+/// x0.at — EU last resort. HEAD requests 404 even though GET works, so post-upload verification
+/// must use GET.
 async fn upload_x0_at(req: &UploadRequest<'_>) -> anyhow::Result<String> {
     let form = file_part("file", req)?;
     let resp = crate::util::http::media_http_client()
@@ -353,8 +339,8 @@ async fn upload_x0_at(req: &UploadRequest<'_>) -> anyhow::Result<String> {
     Ok(url)
 }
 
-/// Find a nonce such that `SHA-256(id + "." + nonce)` has at least `bits`
-/// leading zero bits (hashcash-style, bytewise leading-zero counting).
+/// Find a nonce such that `SHA-256(id + "." + nonce)` has at least `bits` leading zero bits
+/// (bytewise leading-zero counting).
 fn solve_pow(id: &str, bits: u32) -> anyhow::Result<u64> {
     for nonce in 0..POW_MAX_ATTEMPTS {
         let mut hasher = Sha256::new();
@@ -369,8 +355,7 @@ fn solve_pow(id: &str, bits: u32) -> anyhow::Result<u64> {
     anyhow::bail!("0807.st proof-of-work unsolved after {POW_MAX_ATTEMPTS} attempts (bits={bits})")
 }
 
-/// Count leading zero bits of a digest: each 0x00 byte contributes 8, then the
-/// leading zeros of the first non-zero byte.
+/// Each 0x00 byte contributes 8, then the leading zeros of the first non-zero byte.
 fn leading_zero_bits(digest: &[u8]) -> u32 {
     let mut count = 0;
     for &byte in digest {
@@ -398,9 +383,9 @@ mod tests {
 
     #[test]
     fn solve_pow_matches_example_nonce() {
-        // Live-observed example: id "cf25698ba143dc6051399132c33359fc", bits 13,
-        // nonce 12582 yields 000538c9... (13 leading zero bits). The solver may
-        // find an earlier nonce, so only assert the bound.
+        // Live-observed: id "cf25698ba143dc6051399132c33359fc", bits 13, nonce 12582 yields
+        // 000538c9... (13 leading zero bits). The solver may find an earlier nonce, so only the
+        // bound is asserted.
         let nonce = solve_pow("cf25698ba143dc6051399132c33359fc", 13).unwrap();
         let mut hasher = Sha256::new();
         hasher.update(b"cf25698ba143dc6051399132c33359fc.");

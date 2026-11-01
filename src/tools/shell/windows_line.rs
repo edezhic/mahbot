@@ -1,145 +1,69 @@
 //! One reading of a command text's line breaks, for the platform whose own
 //! reader ends a command at them.
 //!
-//! On unix this module is a no-op: `sh -c` runs a `\n`-separated script as written, so
-//! [`executable`] hands the text back byte for byte and no rule below is reached. On
-//! Windows it is the reading the *execution* uses — the value
-//! [`build_shell_command`](crate::tools::shell::build_shell_command) hands over as its
-//! `/C` argument — because `cmd.exe` reads one line and ends the command at a bare
-//! break: the lines after it never run, no error is reported and the call returns the
-//! first line's status. A plain break is therefore respelled as the platform's
-//! unconditional separator `&`: the lines run in order, a failing line does not stop
-//! the rest, and the status reported is the last line's. A break is one break however
-//! it is spelled — `\n`, `\r\n` and a longer run of carriage returns all end the line
-//! before them ([`line_end`]) — so a rule that reads the line before a break reads the
-//! same shape under any of them. A trailing break, and blank lines, add no command of
-//! their own: a text whose breaks all stand at its end is the one line it was written
-//! as, handed over as that line — byte for byte the text the same command without them
-//! hands over ([`spans_commands`] decides which texts those are). A text ending on an
-//! odd caret run is the one shape a trailing break changes: that break is the character
-//! the caret escapes, so the text is refused whole rather than handed over.
+//! On unix this module is a no-op: [`executable`] hands the text back byte for
+//! byte. On Windows it is the reading the *execution* uses — the value
+//! [`build_shell_command`](crate::tools::shell::build_shell_command) hands over
+//! as its `/C` argument — because `cmd.exe` reads one line and ends the command
+//! at a bare break: the lines after it never run, no error is reported and the
+//! call returns the first line's status. A break is therefore respelled as the
+//! platform's unconditional separator `&`: the lines run in order, a failing
+//! line does not stop the rest, and the status reported is the last line's. A
+//! break behind `&`/`&&`/`|`/`||`/`<`/`>` goes instead, joined to the operand
+//! its line takes from the next one. `\n`, `\r\n` and longer carriage runs are
+//! one break ([`line_end`]); a trailing break or a blank line adds no command.
 //! A line this reader *swallows* rather than separates (a comment, a label:
-//! [`SWALLOWING_LINE`]) is refused whole rather than run as less than it is. The text
-//! is kept exactly as written only where the reader is left waiting for the rest of a
-//! command: behind an odd caret run (whose escape reaches the first character of the
-//! line it continues) and inside a group this reading has proved the reader opened
-//! ([`opens_group`]). A break behind `&`/`&&`/`|`/`||`/`<`/`>` is the third shape, and
-//! the one that goes rather than stays: the operator was written for an operand this
-//! platform takes from the line after it, so the two lines are joined into the one
-//! command both readers already read there.
+//! [`SWALLOWING_LINE`]) is refused whole, as is a text ending on an odd caret
+//! run whose escape would take the trailing break.
 //!
 //! # The rules that run a text as this platform reads it
 //!
-//! The model takes [`ShellPlatform`] and [`ShellMode`] as data (never a `cfg` branch
-//! of its own), so both lanes are unit-testable from any host. Every rule fails toward
-//! a refusal when its premise does not hold — a wrong premise there costs a command
-//! that would have run — except the rules below, which run a text *as this platform
-//! reads it* rather than refuse it: a wrong premise about one of those runs a
-//! different command. The list is the caret's reach
-//! (1), the spelling of an escaped operator (2), the operator's operand (3), the
-//! group proof ([`opens_group`] — where the reader is looking for a command decides
-//! whether a `(` opens the block a break may stand inside; 4–5), the spelling the
-//! comment command is recognised by (6), a line that begins with a redirection (7)
-//! and a line break spelled as one lone carriage return (8). The trailing-break rule
-//! is not part of this list: the interpreter reads no line past the first break.
+//! The model takes [`ShellPlatform`] and [`ShellMode`] as data (never a `cfg`
+//! branch of its own), so both lanes are unit-testable from any host. Every
+//! rule fails toward a refusal when its premise does not hold, except the eight
+//! below: a wrong premise there runs a different command, so each is stated with
+//! the text it decides — the caret's reach (1), an escaped operator (2), an
+//! operator's operand (3), the group proof ([`opens_group`]; 4-5), the comment
+//! command's spelling (6), a line opening with a redirection (7) and a lone
+//! carriage return (8).
 //!
-//! 1. `copy a.txt ^` and `b.txt` on the next line: the caret's escape reaches past
-//!    the break into the line it continues — this reading hands the two lines over as
-//!    written, so a caret that stopped at the break would run `b.txt` as a command of
-//!    its own.
-//! 2. `dir ^& x` and `dir y` on the next line: the escaped `&` is ordinary text, so
-//!    the break after it is the separator this reading respells. (The same holds for
-//!    `^|`, `^<`, `^>`, `^(` and `^)`; the read-only mode's own checks read each of
-//!    them as an operator and refuse the text, [`ESCAPED_SYNTAX`].)
-//! 3. `dir &&` and `next` on the next line: an operator at the end of a line takes its
-//!    operand from the next one — this reading joins the two lines into one command,
-//!    so a wrong reading here would run what the platform does not.
-//! 4. `for %f in (a` and `b) do echo %f`: the `(` opens the block its `in` set is, so
-//!    a break inside it belongs to the block — this reading hands the two lines over
-//!    as written, so a `(` that opened nothing would lose the second.
-//! 5. `echo (a) done` and `dir` on the next line: a `(` in an argument opens no block
-//!    to this reading ([`opens_group`]), so it respells the break and runs
-//!    `echo (a) done&dir`.
-//! 6. `rem. note` and `dir` on the next line: a character appended to `rem` is not the
-//!    comment command and the separator after it stands, so this reading respells the
-//!    break and runs both lines. A spelling that *is* the comment command takes the
-//!    rest of the line, and the line after the break is swallowed — which is why a
-//!    plain `rem` or a label is refused in every mode ([`SWALLOWING_LINE`]).
-//! 7. `dir` and `> out.txt` on the next line: the redirection stays that line's own —
-//!    this reading respells the break as `& `, so the next line keeps its redirect.
-//! 8. `dir`, a single carriage return, then `del x`: a lone carriage return with no
-//!    line feed behind it is no break to this reading — such a text is handed over as
-//!    written, so a platform reader that ended a line there would lose everything
-//!    after it.
+//! 1. `copy a.txt ^` / `b.txt`: the caret's escape reaches past the break.
+//! 2. `dir ^& x` / `dir y`: the escaped `&` is text, so the break is respelled.
+//! 3. `dir &&` / `next`: the operator takes its operand from the next line.
+//! 4. `for %f in (a` / `b) do echo %f`: the `(` opens the block it breaks in.
+//! 5. `echo (a) done` / `dir`: a `(` in an argument opens no block.
+//! 6. `rem. note` / `dir`: an appended character is no comment command, while a
+//!    real `rem` or a label swallows the next line ([`SWALLOWING_LINE`]).
+//! 7. `dir` / `> out.txt`: respelled as `& `, so the redirect stays line-local.
+//! 8. `dir`, one `\r`, `del x`: a lone carriage return is no break.
 //!
-//! Five residuals are recorded rather than read:
-//!
-//! - a break whose next line opens with a redirection is respelled as `& ` rather than
-//!   `&`, so no `&>` is spelled and the redirection stays the next line's own. Where
-//!   the interpreter takes a bare redirection as a command, that is what unix does
-//!   with the two lines; where it does not, that line fails with the interpreter's own
-//!   error instead of creating the file (rule 7);
-//! - a caret-continued break is left as written although the guard's reader ends a
-//!   command there and judges the words after it as a command of its own, while this
-//!   platform runs them as ARGUMENTS of the command the caret spread over the two
-//!   lines. Acceptable because the verb that executes is the verb the guard judged
-//!   (never one it never looked at: a character the caret escapes into that reader's
-//!   syntax is refused above) and because this shape must keep running as this
-//!   platform reads it. It is the one place the words that reach a program differ
-//!   from the guard's judgment, and the verbs whose rule gates their *destination*
-//!   (`copy`, `move`, `ren`, `xcopy`) are where those extra operands could land in it;
-//! - a redirection written immediately before a caret suppresses the escape of the
-//!   line the caret continues, so a `&` there is a connector where this reading takes
-//!   it for the escaped literal: read-only mode refuses that shape
-//!   ([`ESCAPED_SYNTAX`]), the full mode keeps the text exactly as written;
-//! - a break this reading *keeps* (inside a proven group, or behind a caret) reaches
-//!   the grep engine with the break still in it, where that engine's Windows segmenter
-//!   fails closed: a search inside such a command is refused as an unserved search, so
-//!   a text does the same work whether or not it holds a search only where its breaks
-//!   are the plain ones. That policy is the engine's own and unchanged here — the same
-//!   text was handed to the same segmenter before this reading existed — and the
-//!   refusal that carries it ends with this reading's own remedy, offered by the text's
-//!   own shape (through the engine's
-//!   [`unserved_failure`](crate::tools::shell::grep_engine::unserved_failure)), because
-//!   a text only a file can run is exactly what a file fixes;
-//! - a break standing at the very end of the text — the only break a single-line text
-//!   has, and the last one a longer text has — is not part of the line this platform
-//!   runs, while the guard's reader reads the ORIGINAL text and folds such a break into
-//!   the line it stands on (a `\` immediately before it is that reader's line
-//!   continuation, so its last word ends one character earlier than the one that runs).
-//!   The command and every word before that character are the same, and this is the
-//!   reading a single-line text always had: the platform's own reader reaches past no
-//!   break.
+//! Five residuals are recorded rather than read: the `& ` of rule 7, where the
+//! interpreter does not take a bare redirection as a command; a caret-continued
+//! break left as written although the guard's reader ends a command there — the
+//! verb that executes is the one the guard judged, and only a destination-gating
+//! verb (`copy`, `move`, `ren`, `xcopy`) could see the extra operands; a
+//! redirection written immediately before a caret, which suppresses the escape;
+//! a kept break reaching the grep engine, whose Windows segmenter fails closed
+//! on it; and a break at the very end of the text, which the platform never reads.
 //!
 //! # Where a `(` opens a group
 //!
-//! Only where this platform's reader is looking for a command: at the start of the
-//! text or of a command, after a separator this interpreter runs itself (`&`, `&&`,
-//! `||`), first inside a group, after the `)` of a block it runs itself, where its `@`
-//! prefixes the block, and where an `if`/`for` statement writes its body (the command
-//! its condition governs, the `do`/`else` after the statement's own `)`, the `in (…)`
-//! set). A `(` in an argument is ordinary text whose command ends at a break inside it,
-//! so the two shapes cannot be told apart from the text alone: [`opens_group`] proves
-//! the group where it can and the whole command is refused where it cannot
-//! ([`UNPROVEN_GROUP`]) — as for a `(` anywhere in the command a single `|` hands to a
-//! child interpreter, and for a `)` reaching past a `(` the reading cannot name
-//! ([`UNPAIRED_PAREN`]). A `(` or `)` on a line a comment or a label has taken is that
-//! line's text, so the reader's counter never sees it and [`Words::swallowing`] leaves
-//! the group it stands in open — which is the text ending inside a group
-//! ([`unclosed_cause`]) rather than a shape of its own.
+//! Only where this platform's reader is looking for a command: the start of the
+//! text or of a command, after a separator this interpreter runs itself (`&`,
+//! `&&`, `||`), first inside a group, after the `)` of a block it runs itself,
+//! where its `@` prefixes the block, and where an `if`/`for` statement writes its
+//! body. A `(` in an argument is ordinary text, and the two shapes cannot be
+//! told apart from the text alone: [`opens_group`] proves the group where it can
+//! and the command is refused where it cannot ([`UNPROVEN_GROUP`],
+//! [`UNPAIRED_PAREN`]).
 //!
 //! # Refusals
 //!
-//! Every other shape is refused whole, with the mode's own remedy ([`refusal`]); each
-//! cause constant below states its own rule. The one split among them is the reading
-//! they belong to: a divergence of a *break* belongs to the read-only guard's reader
-//! (`readonly/windows.rs`), which reads the ORIGINAL text and is handed the text it
-//! judged in [`ShellMode::ReadOnly`] alone — so those shapes are refused there and run
-//! as this platform reads them in the other mode ([`divergent`], and the `bash_quote`
-//! leg of [`unclosed_at_end`]). What this reading takes from that reader in both modes
-//! is only [`TEXT_BLOCK`]: whether a `<<` sits inside a quoted word tells a text block
-//! from text that merely spells one.
-//!
+//! Every other shape is refused whole with the mode's own remedy ([`refusal`]).
+//! A divergence of a *break* belongs to the read-only guard's reader
+//! (`readonly/windows.rs`), which reads the ORIGINAL text, so those shapes are
+//! refused in [`ShellMode::ReadOnly`] alone ([`divergent`]); both modes take
+//! only [`TEXT_BLOCK`] from that reader.
 
 use std::borrow::Cow;
 
@@ -168,154 +92,94 @@ const HANDOFF_RESERVE: usize = 64 + super::WINDOWS_COMMAND_SWITCHES.len() + 1;
 /// so neither advertises a limit the text is refused under while it is shorter.
 pub(super) const TEXT_UNIT_LIMIT: usize = COMMAND_LINE_CAP - HANDOFF_RESERVE;
 
-/// A break inside the platform's own `"` span: its reader ends the command there.
 const BREAK_IN_DOUBLE_QUOTES: &str = "a line break falls inside a double-quoted argument, and this platform's reader \
      ends the command at that break, so the argument would reach its program \
      truncated";
 
-/// A break behind an odd run of `\`: ordinary text for `cmd.exe`, a line
-/// continuation for the guard's bash-based reader.
 const ODD_BACKSLASHES: &str = "an odd number of backslashes immediately before a line break, and this platform \
      treats `\\` as an ordinary character: the break there is a command separator, \
      while the read-only guard's reader folds the two lines into one";
 
-/// A `<<` outside both readings' quotes: a text block fed to the interpreter,
-/// which this platform has no text blocks for.
 const TEXT_BLOCK: &str = "the command feeds a text block to the interpreter, and this platform has no \
      text blocks";
 
-/// A caret over a character the read-only guard's reader reads as an operator or a
-/// group (`&`, `|`, `<`, `>`, or a `(`/`)` inside the line): this platform reads the
-/// escaped character literally, so the two readings do not agree about which text is
-/// a command and neither can be shown to be what the other judged.
 const ESCAPED_SYNTAX: &str = "a caret escapes a character this platform reads literally and the read-only \
      guard's reader reads as an operator or a group (`&`, `|`, `<`, `>`, `(`, `)`): \
      the two do not agree about which text is a command";
 
-/// A caret at the end of a line whose escape reaches the `(` or `)` the next line
-/// opens with: the escape makes that character ordinary text to this platform's
-/// reader, and this reading takes a character an escape carried across a break as
-/// nothing but a character, so the pairing it would read the following breaks from is
-/// not the platform's own (`read_paren` counts parens this reading names itself).
 const ESCAPED_PAREN: &str = "a caret at the end of a line escapes the `(` or `)` the next line opens with, and \
      this platform's reader takes that character as an ordinary one: its own group \
      counter is left out of step with the text, so the lines after the break cannot \
      be read as written";
 
-/// A caret at the end of a line whose escape is spent on the break of a blank line:
-/// this platform's reader takes the break itself as the escaped character, which a
-/// respelling of the lines cannot carry — the break a blank line ends on is one the
-/// rebuilt text drops.
 const CARET_INTO_BLANK_LINE: &str = "a caret at the end of a line escapes the first character of the line it \
      continues, and that line is blank: this platform's reader is left taking the \
      line break itself as the escaped character, which the respelt lines cannot carry";
 
-/// A break whose first significant character after it is `&` or `|`: the
-/// connector has no left-hand command to join, so neither respelling can leave
-/// the operator the agent wrote intact (the guard's reader refuses such a line
-/// outright, and this platform reads it as a command opening with the connector).
 const LEADING_CONNECTOR: &str = "the first significant character after a line break is a connector (`&` or `|`), \
      which joins the text after the break to nothing: this platform's reader has no \
      left-hand command for it, and no respelling of the break can leave the \
      operator the command was written with intact";
 
-/// A `(` whose group this reading cannot prove: this platform's reader opens one
-/// only where it is looking for a command, so a `(` written in an argument
-/// (`echo a (`) is ordinary text whose line the reader ends at a break inside it,
-/// while the same text may be the block an `if` statement or a `for` body was
-/// written as. Running either as the other is what is refused here.
 const UNPROVEN_GROUP: &str = "a `(` in the command may or may not open a bracketed group — this platform's \
      reader opens one only where it is looking for a command, and a `(` written in an \
      argument is ordinary text whose command ends where the arguments end — so \
      nothing that follows it can be read for certain";
 
-/// A `)` this platform's counter cannot pair, written where its reader is looking
-/// for a command: the reader discards the rest of that line, so nothing written
-/// after it runs.
 const UNPAIRED_PAREN: &str = "a `)` closes no group and stands where this platform's reader is looking for a \
      command: the reader discards the rest of that line, so the text after it cannot \
      be run as written";
 
-/// A command whose last line leaves an `if`/`for` statement waiting for its own
-/// text — its `do`, the command its condition governs, or the statement its set
-/// belongs to: this platform's reader is left waiting for what the text never
-/// supplies.
 const UNFINISHED_STATEMENT: &str = "the command's last line leaves an `if`/`for` statement waiting for its own \
      text (its `do`, or the command its condition governs), and this platform's \
      reader is left waiting for what the text never supplies";
 
-/// A break behind an `if`/`for` statement whose own text is written on the same
-/// line: this platform's reader runs that text to the end of the line (or of the
-/// block the statement is written in), so a separator here would join it — the
-/// line after the break would run under the condition, or once per iteration.
 const STATEMENT_SPANS_LINE: &str = "the line before the break ends an `if`/`for` statement whose own command is \
      written on it, and this platform's reader runs that command to the end of the \
      line: a separator here would become part of the statement, so the line after \
      the break would run only under the condition — or once per iteration — rather \
      than as a command of its own";
 
-/// A comment (`rem`) or a label (`:`) line: this platform's reader takes the rest
-/// of such a line as the comment's own text or the label's own name — the
-/// separator a break would be joined with included — so the lines after the break
-/// would be swallowed with no error and no status of their own.
 const SWALLOWING_LINE: &str = "the line before the break is a comment (`rem`) or a label (`:`), and this \
      platform's reader takes the rest of such a line as the comment's text or the \
      label's name: the separator a break would be joined with would be part of it, \
      so the lines after the break would never run";
 
-/// A break whose join would put two operator characters together: `>`+`>` spells
-/// an append, `<`+`<` a text block, and `&`+`>` a separator followed by a
-/// redirection — none of which the command wrote.
 const DOUBLED_OPERATOR: &str = "joining the lines at this break would put two operator characters together, \
      spelling an operator the command never wrote (`>>`, `<<`, `&>` where it wrote the \
      characters separately)";
 
-/// A caret whose escape has nothing left to take, at the end of the text that
-/// would run: the reader is left waiting for what the caret escapes. An escaped
-/// caret (`^^`) is not this shape.
 const DANGLING_CARET: &str = "the command ends with a caret whose escape has nothing left to take, and this \
      platform's reader is left waiting for what it escapes";
 
 /// What one line break means to the platform's own reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Break<'a> {
-    /// The reader continues across it: the break stays exactly as written,
-    /// whichever spelling it had.
+    /// The reader continues across it: the break stays exactly as written.
     Continued(&'a str),
-    /// The break goes: the operator before it and the operand after it become
-    /// the one line the shell parser already read there.
+    /// The break goes: the operator before it and the operand after it become one line.
     Joined,
     /// The reader ends the command there: respelled as `&`. The first significant
-    /// byte after the break travels with it — `None` where nothing but the
-    /// platform's own separators follows, i.e. where the break separates nothing —
-    /// because that byte is what the separator is owed to and spaced by.
+    /// byte after the break travels with it (`None` where only separators follow),
+    /// because that byte is what the separator is spaced by.
     Separator(Option<u8>),
 }
 
-/// The bracketed group a `(` opened, as far as the walk must know it: this
-/// platform's reader pairs a `)` with the group its own counter holds open, and a
-/// statement reads its `)` differently from a plain group's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Group {
-    /// A `(` at a command position: no statement owns its `)`, which leaves a new
-    /// command and nothing else.
+    /// A `(` at a command position: no statement owns its `)`, which leaves a new command.
     Plain,
     /// A `for`'s `in (…)` set: its `)` leaves the statement waiting for its `do`.
     Set,
-    /// A statement's own body: its `)` satisfies the statement, and only a `do`/
-    /// `else` of the same statement may still follow.
+    /// A statement's own body: its `)` satisfies the statement.
     Body,
-    /// A `(` this reading cannot prove opened one. A `)` is counted against whatever
-    /// this platform's counter holds even where the `)` stands in an argument, so an
-    /// entry is recorded for a `(` this reading cannot name (the `)`s then pair the
-    /// way this platform pairs them) and refused where a break or a `)` reaches it.
+    /// A `(` this reading cannot prove opened one; counted so the `)`s pair the way this
+    /// platform pairs them, and refused where a break or a `)` reaches it.
     Unproven,
 }
 
-/// Where in a statement's own grammar the command being read is. This platform's
-/// `if` and `for` are the two commands whose word positions can open a bracketed
-/// group at an argument position, so their words are the ones read here and nothing
-/// else is.
+/// Where in a statement's own grammar the command being read is: only `if` and `for`
+/// words can open a group at an argument position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Stmt {
     /// Nothing of the command has been read: a `@` may still prefix its first word.
@@ -329,64 +193,52 @@ enum Stmt {
     If,
     /// `if not` was read: its condition follows.
     Not,
-    /// A condition keyword, a comparison operator or a `for`'s `in` was read: the
-    /// word that completes it follows.
+    /// A condition keyword, a comparison operator or a `for`'s `in` was read.
     Keyword,
     /// `for` was read: its variable and its `in` set follow.
     For,
     /// A `for`'s `in` was read: the set's `(` follows.
     Set,
-    /// The statement's own text is still to come: the `do`/`else` of the statement
-    /// whose group just closed, or the command a completed condition governs.
+    /// The statement's own text is still to come: the `do`/`else` of the statement whose
+    /// group just closed, or the command a completed condition governs.
     Await,
     /// The command has left any statement: no `(` here opens a group.
     Done,
 }
 
-/// The word being read: where it starts, and what its first character was — whether it
-/// stands where this platform's reader is looking for a command ([`Walk::at_command`],
-/// which is what tells a command's first word from a later one), and whether a caret
-/// escape carried it.
+/// The word being read: where it starts, what its first character was, and whether a
+/// caret escape carried it.
 struct Word {
     at: usize,
     command: bool,
     escaped: bool,
 }
 
-/// The command being read, word by word: the positions a statement puts at an
-/// argument position — an `if` condition, a `for` set, a `do`/`else` body — are read
-/// off the words, because only they say where this platform's reader is looking for
-/// a command. A word is the bytes since its first significant character; this
-/// platform's separators end it, and so do `(` and `)`.
+/// The command being read, word by word: only words say where this platform's reader is
+/// looking for a command, which is what a statement's own positions are read off. A word
+/// ends at a separator, a `(` or a `)`.
 #[derive(Default)]
 struct Words {
     /// The word being read, when one is open.
     open: Option<Word>,
     /// Where in a statement's grammar the command is.
     stmt: Stmt,
-    /// Whether the `)` last read closed a group of a statement: the `do`/`else` that
-    /// may follow it is what the chain is for.
+    /// Whether the `)` last read closed a group of a statement: the `do`/`else` that may
+    /// follow it is what the chain is for.
     chain: bool,
-    /// Whether this line holds a word where this platform's reader looks for a
-    /// command that makes it take the rest of the LINE — a separator joined at the
-    /// break behind it, and a paren and a label's `:` included — as text: its parser
-    /// switches to a comment at such a `rem`, and a label is its own line's name, so
-    /// the lines after such a break would be swallowed ([`SWALLOWING_LINE`]).
+    /// Whether this line holds a word where the reader looks for a command that makes it
+    /// take the rest of the LINE as text: the lines after such a break would be swallowed
+    /// ([`SWALLOWING_LINE`]).
     swallowing: bool,
-    /// Whether an `if`/`for` statement's own text is written on this line: this
-    /// platform's reader runs such a text to the end of the line, so a `&` appended
-    /// at a break would be read as part of the statement rather than as a separator
-    /// ([`STATEMENT_SPANS_LINE`]).
+    /// Whether an `if`/`for` statement's own text is written on this line: the reader runs
+    /// such a text to the line's end, so a `&` there would join it ([`STATEMENT_SPANS_LINE`]).
     absorbing: bool,
-    /// The group depth that bounds it: the block the statement is written in, whose
-    /// end (like the line's) this platform's reader bounds such a text at.
+    /// The group depth that bounds it: the block the statement is written in.
     absorbing_bound: usize,
 }
 
 impl Words {
-    /// Start a word at `at`, unless one is open: the word's first character decides
-    /// where it begins, whether the reader is looking for a command there, and
-    /// whether a caret escape carried it.
+    /// Start a word at `at`, unless one is open.
     fn start(&mut self, at: usize, command: bool, escaped: bool) {
         if self.open.is_none() {
             self.open = Some(Word {
@@ -397,9 +249,8 @@ impl Words {
         }
     }
 
-    /// End the word being read at `end`, reading it the way a statement's own words
-    /// are read off a command. `depth` is the group the word is read in, which is what
-    /// bounds a statement whose text starts here.
+    /// End the word being read at `end`, reading it the way a statement's words are read
+    /// off a command; `depth` bounds a statement whose text starts here.
     fn finish(&mut self, bytes: &[u8], end: usize, depth: usize) {
         let Some(open) = self.open.take() else { return };
         let word = &bytes[open.at..end];
@@ -408,24 +259,17 @@ impl Words {
         let previous = self.stmt;
         let chain = self.chain;
         self.stmt = stmt_step(previous, chain, word, command);
-        // A word read where this platform's reader looks for a command — at the start
-        // of one (its `@` prefix included), after a completed condition, or after a
-        // statement's own `)` — makes it take the rest of the LINE when its spelling is
-        // the comment command (`rem`) or a label (`:name`). A label's name is its own
-        // first character, so the escape a caret carried over that character makes it
-        // inert and names no label — while the word a `rem` is written as still spells
-        // itself (`^rem` is this platform's `rem`: the escape was over a letter, which
-        // had no special meaning to lose).
+        // A word read where the reader looks for a command — the start of one (its `@`
+        // prefix included), after a completed condition, or after a statement's own `)` —
+        // makes it take the rest of the LINE when it spells the comment command or a
+        // label. A caret-escaped label's name is inert, while `^rem` still spells `rem`.
         if (command || matches!(previous, Stmt::Prefixed | Stmt::Await) || chain)
             && (is_comment_command(word) || (!escaped_start && is_label_word(word)))
         {
             self.swallowing = true;
         }
-        // The word a statement's own text starts with opens a text this platform's
-        // reader runs to the end of the line, so a break behind it cannot carry a
-        // separator. A comparison's other string is that text's condition rather than
-        // its start, and a `do`/`else` a statement's own `)` leaves still only awaits
-        // the text — the word after either is where the body begins.
+        // The word a statement's own text starts with opens a text the reader runs to the
+        // line's end, so a break behind it cannot carry a separator.
         if (previous == Stmt::Await || chain)
             && matches!(self.stmt, Stmt::Done | Stmt::If | Stmt::For)
         {
@@ -436,23 +280,16 @@ impl Words {
         self.chain = false;
     }
 
-    /// End that absorption where the block the statement is written in has closed:
-    /// this platform's reader bounds the statement's text at the line's end or at the
-    /// end of that block, and only the second of the two is reached mid-text.
+    /// End that absorption where the block the statement is written in has closed.
     fn bounded(&mut self, depth: usize) {
         if self.absorbing && depth < self.absorbing_bound {
             self.absorbing = false;
         }
     }
 
-    /// Start a fresh statement machine and discard the words after it, keeping the one
-    /// thing that outlives them: a statement's own text already running
-    /// ([`Words::absorbing`]), whose words belong to the statement that opened the
-    /// group — only the line's end and the block the statement is written in bound
-    /// such a text ([`Words::bounded`]) — so losing it at a parenthesis would join the
-    /// line after a break into the statement. A `(` or `)` a comment's or a label's
-    /// line has taken never reaches here ([`read_paren`] returns before this, the
-    /// reader's counter never seeing that paren).
+    /// Start a fresh statement machine and discard the words after it, keeping only a
+    /// statement's own text already running ([`Words::absorbing`]), which a parenthesis
+    /// must not end ([`Words::bounded`]).
     fn restart(&mut self) {
         let (absorbing, bound) = (self.absorbing, self.absorbing_bound);
         *self = Self::default();
@@ -460,9 +297,7 @@ impl Words {
         self.absorbing_bound = bound;
     }
 
-    /// Whether the command read so far is a statement still waiting for its own
-    /// text: a `for` without its `do`, an `if` without the command its condition
-    /// governs, a set without the statement it belongs to.
+    /// Whether the command read so far is a statement still waiting for its own text.
     fn unfinished(&self) -> bool {
         matches!(
             self.stmt,
@@ -477,20 +312,14 @@ impl Words {
     }
 }
 
-/// One word further into the statement a command spells out: `command` marks a word
-/// standing where this platform's reader is looking for a command, and `chain`
-/// whether the `)` just read closed a group of a statement.
+/// One word further into the statement a command spells out.
 fn stmt_step(stmt: Stmt, chain: bool, word: &[u8], command: bool) -> Stmt {
-    // `@` in front of a word is this platform's own suppression prefix, not part of
-    // it. A word that was nothing but `@` leaves the state as it was — the word it
-    // prefixes, or the group it precedes, still follows.
+    // `@` in front of a word is this platform's suppression prefix, not part of it.
     let word = word.strip_prefix(b"@").unwrap_or(word);
     if word.is_empty() {
         return if command { Stmt::Prefixed } else { stmt };
     }
-    // The `do`/`else` a statement's own `)` leaves room for, and nothing else: the
-    // statement's own text is written already, so any other word is a command the
-    // `)` left — and the `(` a statement's text would open is not one after it.
+    // The `do`/`else` a statement's own `)` leaves room for, and nothing else.
     if chain {
         return if word.eq_ignore_ascii_case(b"else") || word.eq_ignore_ascii_case(b"do") {
             Stmt::Await
@@ -502,11 +331,8 @@ fn stmt_step(stmt: Stmt, chain: bool, word: &[u8], command: bool) -> Stmt {
         return statement_word(word, Stmt::Plain);
     }
     match stmt {
-        // A statement starts only where this platform's reader looks for a command,
-        // and one that is over never starts again.
         Stmt::Start | Stmt::Prefixed | Stmt::Plain | Stmt::Done => Stmt::Plain,
-        // `if`: its `not`, its `/i` switch, a condition keyword, a comparison
-        // operator, or the string a comparison reads.
+        // `if`: its `not`, its `/i` switch, a condition, or a comparison's string.
         Stmt::If | Stmt::Not => {
             if stmt == Stmt::If && word.eq_ignore_ascii_case(b"not") {
                 Stmt::Not
@@ -519,9 +345,7 @@ fn stmt_step(stmt: Stmt, chain: bool, word: &[u8], command: bool) -> Stmt {
                 Stmt::Await
             }
         }
-        // The condition keyword's own operand, or a comparison's other string.
         Stmt::Keyword => Stmt::Await,
-        // `for %f in (…) do …`: the variable, then the `in`, then the set's `(`.
         Stmt::For => {
             if word.eq_ignore_ascii_case(b"in") {
                 Stmt::Set
@@ -529,7 +353,6 @@ fn stmt_step(stmt: Stmt, chain: bool, word: &[u8], command: bool) -> Stmt {
                 Stmt::For
             }
         }
-        // The set is written: the `do` the statement owes follows.
         Stmt::Set => {
             if word.eq_ignore_ascii_case(b"do") {
                 Stmt::Await
@@ -537,12 +360,8 @@ fn stmt_step(stmt: Stmt, chain: bool, word: &[u8], command: bool) -> Stmt {
                 Stmt::Done
             }
         }
-        // The statement's own text: the `do`/`else` its group's `)` leaves, and a
-        // body, which may be a statement of its own. A comparison's own spelling is
-        // the condition's text rather than the statement's command: its spaced
-        // operator still awaits its second string, and the operator with its second
-        // string joined to it (`x ==1`) leaves only the command the condition
-        // governs.
+        // The statement's own text: the `do`/`else` its group's `)` leaves, and a body,
+        // which may be a statement of its own.
         Stmt::Await => {
             if is_comparison_operator(word) {
                 Stmt::Keyword
@@ -555,8 +374,7 @@ fn stmt_step(stmt: Stmt, chain: bool, word: &[u8], command: bool) -> Stmt {
     }
 }
 
-/// What a word that may be a statement's own text opens: a nested `if`/`for`, or
-/// nothing at all — with `none` the state a word that is one leaves.
+/// What a word that may be a statement's own text opens: a nested `if`/`for`, or `none`.
 fn statement_word(word: &[u8], none: Stmt) -> Stmt {
     if word.eq_ignore_ascii_case(b"if") {
         Stmt::If
@@ -567,32 +385,20 @@ fn statement_word(word: &[u8], none: Stmt) -> Stmt {
     }
 }
 
-/// The text the platform's interpreter is handed: the reading of the line the agent
-/// wrote ([`executable`]) — what runs.
-///
-/// A type of its own, beside [`Written`], because both texts are `&str` and a call
-/// that passed them the other way round would compile while quoting the agent a
-/// command it never wrote.
+/// The text the platform's interpreter is handed: the reading of the line the agent wrote
+/// ([`executable`]) — what runs. A type of its own beside [`Written`], because a call that
+/// passed the two the other way round would still compile.
 #[derive(Clone, Copy)]
 pub(super) struct Executed<'a>(pub(super) &'a str);
 
-/// The line the agent wrote, exactly as it wrote it: what a refusal and a
-/// started-session message quote, and what never runs.
+/// The line the agent wrote, exactly as it wrote it: what a refusal quotes, never run.
 #[derive(Clone, Copy)]
 pub(super) struct Written<'a>(pub(super) &'a str);
 
-/// The text the platform actually reads for `command`.
-///
-/// On unix this is `command` itself, unchanged byte for byte: that interpreter reads
-/// the whole text. On Windows it is the reading further down for a text whose breaks
-/// separate commands, and otherwise the text itself — or, where every break stands at
-/// its end ([`spans_commands`]), the one line that text is, which has no break for this
-/// platform's reader to reach. `Err` is the agent-facing refusal (nothing runs): a shape
-/// the two readings disagree about.
-///
-/// The reading is only the reading: the platform's line limit is measured on the texts
-/// actually handed to the interpreter, at each hand-off, and [`check_command_line`] is
-/// where that measurement and its rule live.
+/// The text the platform actually reads for `command`: on unix `command` itself, on Windows
+/// the reading below, or the one line a text whose breaks all stand at its end is
+/// ([`spans_commands`]). `Err` is the agent-facing refusal. The platform's line limit is
+/// measured on the texts actually handed over ([`check_command_line`]).
 pub(super) fn executable(
     command: &str,
     platform: ShellPlatform,
@@ -602,11 +408,8 @@ pub(super) fn executable(
     if platform == ShellPlatform::Unix {
         return Ok(Cow::Borrowed(command));
     }
-    // A text whose breaks all stand at its end is the one line it was written as: this
-    // platform's reader ends the command at the first of them and never reaches the
-    // rest, so the reading below — every rule of it about what the line *after* a break
-    // is read as — has nothing to decide, and a single-line command is never respelled,
-    // the shapes only this platform accepts included.
+    // A text whose breaks all stand at its end is the one line it was written as: the
+    // reader ends the command at the first break and never reaches the rest.
     let text = if spans_commands(command) {
         Cow::Owned(respell(command, mode)?)
     } else {
@@ -615,14 +418,8 @@ pub(super) fn executable(
     Ok(text)
 }
 
-/// Where the line a break at `break_at` ends stops: every `\r` standing immediately
-/// before the break belongs to the break rather than to the line, so one break reads as
-/// one break however it is spelled and a rule that reads the line before it — the caret
-/// the reader is left waiting for, the comment command, the guard's own `\` — reads the
-/// same shape under any run of them. Every spelling of the platform's break this module
-/// takes is measured here: the walk's own ([`break_ends`]), the one line a text with no
-/// second command is ([`before_first_break`]), and the caret run the reader leaves
-/// pending ([`spans_commands`]).
+/// Where the line a break at `break_at` ends stops: every `\r` before the break belongs to
+/// the break, so one break reads as one break however it is spelled.
 fn line_end(text: &str, break_at: usize) -> usize {
     let bytes = text.as_bytes();
     let mut end = break_at;
@@ -632,26 +429,19 @@ fn line_end(text: &str, break_at: usize) -> usize {
     end
 }
 
-/// Whether this platform's reader is given anything to read after a break: a character
-/// after the break that is not one of the platform's own separators — a blank line and
-/// the break after it give it nothing — or a caret escaping the break, whose line is the
-/// continued one's own text. Neither is true of the break a text whose breaks all stand
-/// at its end has, which is the one line [`executable`] hands over as written.
-/// `cmd.exe` ends the command at the first break and the lines after it never run, so a
-/// reading of them has nothing to decide.
+/// Whether this platform's reader is given anything to read after a break: a character that
+/// is not one of its separators, or a caret escaping the break.
 fn spans_commands(command: &str) -> bool {
     let bytes = command.as_bytes();
     let Some(break_at) = bytes.iter().position(|b| *b == b'\n') else {
         return false;
     };
     bytes[break_at + 1..].iter().any(|b| !is_separator(*b))
-        // Every `\r` of a break is part of it, not a character of the line the caret
-        // stands on.
+        // Every `\r` of a break is part of it, not a character of the caret's line.
         || trailing_run(&command[..line_end(command, break_at)], b'^') % 2 == 1
 }
 
-/// The line a text with no second command is: everything before its first break — or
-/// the whole text, when it carries no break at all.
+/// The line a text with no second command is.
 fn before_first_break(command: &str) -> &str {
     match command.find('\n') {
         Some(i) => &command[..line_end(command, i)],
@@ -659,24 +449,12 @@ fn before_first_break(command: &str) -> &str {
     }
 }
 
-/// The platform's own command-line limit, measured on one text the interpreter is
-/// handed: nothing on the platform whose interpreter takes the text as it comes
-/// (`sh -c`), the refusal below on the one that reads a single line.
-///
-/// The refusal: the text the platform reads has to fit that line, and the interpreter
-/// refuses a longer one with its own line-length error instead of reporting a status
-/// for the command the agent wrote. The measurement is in the platform's own unit —
-/// UTF-16 code units, where a character outside the basic plane counts twice — so a
-/// line of astral-plane characters is not under-measured the way a `chars()` count
-/// under-measures it. `mode` selects the remedy, exactly as every shape refusal does.
-///
-/// The shell measures it at each hand-off to an interpreter, and nowhere else. What is
-/// measured is therefore always the text being handed over: a fold of a served rewrite,
-/// or the reading the shell is spawned with when no plan serves it. A served rewrite's
-/// whole reading is never measured: it is handed over one fold at a time and is longer
-/// than the line it replaced, so measuring it whole would refuse a command whose own
-/// folds all fit. A text no interpreter is handed — a lone call of this service's own
-/// image, which the runner spawns from its own argv — is measured nowhere.
+/// The platform's own command-line limit, measured on one text the interpreter is handed:
+/// nothing on the platform whose interpreter takes the text as it comes (`sh -c`), the
+/// refusal below on the one that reads a single line. Measured in the platform's own unit
+/// (UTF-16 code units), at each hand-off and nowhere else — a served rewrite is handed over
+/// one fold at a time, so measuring it whole would refuse a command whose folds all fit.
+/// `mode` selects the remedy.
 pub(super) fn check_command_line(
     text: &str,
     platform: ShellPlatform,
@@ -699,23 +477,16 @@ pub(super) fn check_command_line(
     Err(refusal(&cause, mode))
 }
 
-/// The line the break at `i` ends, where that line stops, and that break's own bytes —
-/// the run of `\r`s standing immediately before it and the break itself. A break the
-/// reader continues across is re-emitted from those bytes, byte for byte, and the
-/// position is the word end the walk measures ([`line_end`]), returned here rather
-/// than re-derived from the bytes' length.
+/// The line the break at `i` ends, where that line stops, and that break's own bytes — the
+/// run of `\r`s before it and the break itself.
 fn break_ends(command: &str, i: usize, start: usize) -> (&str, usize, &str) {
     let end = line_end(command, i);
     (&command[start..end], end, &command[end..=i])
 }
 
-/// The first significant byte at or after every position of `bytes`, computed once
-/// from the end: the break rules read it and so does the separator the rebuild
-/// spells from it, so one fold answers both (a blank run would otherwise be
-/// rescanned for every break inside it). Byte-level on purpose — `&` and `|` are
-/// ASCII, so a multi-byte character can never be mistaken for either (a
-/// continuation byte of one is not one of them). `None` where nothing but the
-/// platform's own separators follows.
+/// The first significant byte at or after every position of `bytes`, computed once from the
+/// end. Byte-level on purpose: `&` and `|` are ASCII, so a multi-byte character's
+/// continuation byte can never be mistaken for either.
 fn next_significant(bytes: &[u8]) -> Vec<Option<u8>> {
     let mut following = vec![None; bytes.len() + 1];
     let mut seen = None;
@@ -728,7 +499,6 @@ fn next_significant(bytes: &[u8]) -> Vec<Option<u8>> {
     following
 }
 
-/// What the walk's group stack holds when a break or a `)` reaches it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Open {
     /// No group is open.
@@ -739,49 +509,37 @@ enum Open {
     Unknown,
 }
 
-/// A line that does not end where its break is: this platform's reader runs such a
-/// line to its own end, so a separator joined at the break behind it would be read as
-/// part of the line rather than as a separator — the lines after it would run under a
-/// statement's condition, once per iteration, or never at all.
+/// A line that does not end where its break is: a separator joined at the break behind it
+/// would be read as part of the line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Takes {
     /// Nothing: the line ends at the break, as a line is meant to.
     #[default]
     Nothing,
-    /// The line ends an `if`/`for` statement's own command, which the reader runs to
-    /// the end of the line ([`STATEMENT_SPANS_LINE`]).
+    /// The line ends an `if`/`for` statement's own command ([`STATEMENT_SPANS_LINE`]).
     Statement,
-    /// The line is one the reader takes whole — a comment or a label
-    /// ([`SWALLOWING_LINE`]).
+    /// The line is one the reader takes whole — a comment or a label.
     Line,
 }
 
-/// What the walk has read when it meets a break: the line that ends on it and the
-/// state the rules read.
+/// What the walk has read when it meets a break.
 struct BreakSite<'a> {
     /// The line the break ends.
     segment: &'a str,
-    /// The first significant byte after the break, `None` where nothing but the
-    /// platform's own separators follows: a break with nothing after it separates
-    /// nothing, so the rules that would otherwise refuse the break leave it alone.
+    /// The first significant byte after the break, `None` where nothing but the platform's own
+    /// separators follows: a break with nothing after it separates nothing.
     following: Option<u8>,
-    /// The character a caret at the end of the line escapes — the first character
-    /// of the line after the break — when the line ends on an odd caret run: this
-    /// platform's own way of spreading one command over several lines, whose escape
-    /// reaches into the line it continues. `None` with [`BreakSite::caret_unescaped`]
-    /// set when there is no such line at all.
+    /// The character a caret at the end of the line escapes — this platform's way of spreading
+    /// one command over lines. `None` with [`BreakSite::caret_unescaped`] set when there is no
+    /// such line at all.
     caret_escapes: Option<u8>,
-    /// Whether the line ends on a caret whose escape has nothing to take: the text
-    /// ends here, so this platform's reader is left waiting for what it escapes
-    /// ([`DANGLING_CARET`]).
+    /// Whether the line ends on a caret whose escape has nothing to take ([`DANGLING_CARET`]).
     caret_unescaped: bool,
     /// What the groups this reading has opened and paired left open.
     groups: Open,
-    /// Whether the command read so far is a statement still waiting for its own
-    /// text — a `for` without its `do`, an `if` without its command.
+    /// Whether the command read so far is a statement still waiting for its own text.
     statement_unfinished: bool,
-    /// The guard's own reading of the text so far, when one of its quoted words is
-    /// open: this platform's reader quotes with `"` alone.
+    /// The guard's own reading of the text so far, when one of its quoted words is open.
     bash_quote: Option<u8>,
     /// The line's last significant character.
     last: Option<u8>,
@@ -789,87 +547,64 @@ struct BreakSite<'a> {
     takes: Takes,
 }
 
-/// What this platform's reader makes of one break, in the reading's own order: the
-/// caret's continuation first, then the two readings' disagreement, then the groups
-/// and statements that are open, then the operator the line ends on (and the
-/// redirection the line after it opens with). `Err` is the refusal for a break
-/// nothing can be respelled into.
+/// What this platform's reader makes of one break, in the reading's own order. `Err` is the
+/// refusal for a break nothing can be respelled into.
 fn break_kind<'a>(
     site: &BreakSite<'_>,
     spelling: &'a str,
     mode: ShellMode,
 ) -> Result<Break<'a>, String> {
     if site.caret_unescaped {
-        // The text ends on a caret: the character its escape would take is not there,
-        // and this platform's reader is left waiting for it. Refused here rather than
-        // at the end of the walk because the break behind such a caret is one the
-        // ordinary rules would drop — the rebuilt text would end in an even caret run
-        // and lose the shape.
+        // The text ends on a caret whose escape has nothing to take. Refused here rather than
+        // at the end of the walk because the rebuilt text would end in an even caret run and
+        // lose the shape.
         return Err(refusal(DANGLING_CARET, mode));
     }
     if let Some(target) = site.caret_escapes {
-        // The caret escapes the break and the first character of the line it
-        // continues, which this reading consumes as literal text (the walk's own
-        // escape), so the two lines are read as the one command here.
+        // The caret escapes the break and the first character of the line it continues.
         if target == b'\n' {
-            // A break is not a character the respelling can carry: the rebuilt text
-            // drops the break a blank line ends on.
+            // A break is not a character the respelling can carry.
             return Err(refusal(CARET_INTO_BLANK_LINE, mode));
         }
-        // A paren is the other target that cannot be read that way: pairing it is the
-        // group stack's own work, and a group this platform's counter does not open
-        // would leave a break after it with no reading the two agree on.
+        // A paren is the group stack's own work, so an escape over one cannot be paired.
         if matches!(target, b'(' | b')') {
             return Err(refusal(ESCAPED_PAREN, mode));
         }
-        // An operator is literal text here and structure to the read-only guard's
-        // reader: that reader judged a different text, so that mode refuses the shape
-        // while the full mode runs it as written.
+        // An operator is literal text here and structure to the read-only guard's reader.
         if mode == ShellMode::ReadOnly && matches!(target, b'&' | b'|' | b'<' | b'>') {
             return Err(refusal(ESCAPED_SYNTAX, mode));
         }
         return Ok(Break::Continued(spelling));
     }
-    // Nothing follows the break: this platform's reader ends the command here and the
-    // text after it is the platform's own separators alone — a blank line, another
-    // break, a run of both — so every rule below, each of them about what the line
-    // *after* the break is read as, has nothing to decide. The break is dropped:
-    // [`rebuild`] joins nothing at it, and the text is the one line it was written as.
+    // Nothing follows the break, so every rule below — each about what the line *after* the
+    // break is read as — has nothing to decide.
     if site.following.is_none() {
         return Ok(Break::Separator(None));
     }
-    // The shapes the two readings disagree about are the same inside a group as
-    // outside it, so they are decided before anything continues.
+    // The shapes the two readings disagree about are decided before anything continues.
     if let Some(cause) = divergent(site, mode) {
         return Err(refusal(&cause, mode));
     }
     match site.groups {
-        // A break continues the command if the `(` opened a group and ends it there if
-        // it did not, and the text cannot be shown to be the block it may have been.
+        // A break continues the command if the `(` opened a group, and ends it there if not.
         Open::Unknown => return Err(refusal(UNPROVEN_GROUP, mode)),
         // A break inside a bracketed group: this platform's own block spans lines.
         Open::Proven => return Ok(Break::Continued(spelling)),
         Open::None => {}
     }
     if site.statement_unfinished {
-        // A statement's own text is missing, and the group it belongs to has closed:
-        // this platform's reader is left waiting for what the text never supplies.
+        // A statement's own text is missing and the group it belongs to has closed.
         return Err(refusal(UNFINISHED_STATEMENT, mode));
     }
-    // The line before the break takes the text after it with it, so a separator joined
-    // here would be read as part of that line.
+    // The line before the break takes the text after it with it.
     match site.takes {
-        // The reader runs a statement's own command to the end of the line: the line
-        // after the break would run under the condition — or once per iteration —
-        // instead of as a command of its own.
+        // The reader runs a statement's own command to the end of the line.
         Takes::Statement => return Err(refusal(STATEMENT_SPANS_LINE, mode)),
-        // The reader takes the line whole — a comment or a label — so the lines after
-        // the break would never run at all.
+        // The reader takes the line whole, so the lines after the break would never run.
         Takes::Line => return Err(refusal(SWALLOWING_LINE, mode)),
         Takes::Nothing => {}
     }
-    // A line opening with a redirection behind an operator: joining would put the
-    // two characters together into an operator the command never wrote.
+    // Joining here would put two operator characters together.
     let operator = site
         .last
         .is_some_and(|c| matches!(c, b'&' | b'|' | b'<' | b'>'));
@@ -877,30 +612,18 @@ fn break_kind<'a>(
         return Err(refusal(DOUBLED_OPERATOR, mode));
     }
     if operator {
-        // The operand after the break joins the operator before it on one line, the
-        // single command the shell parser already reads there.
+        // The operand joins the operator before it on one line.
         return Ok(Break::Joined);
     }
     Ok(Break::Separator(site.following))
 }
 
-/// The divergence of one break, when this platform's reader and the guard's own
-/// would read it differently: an odd run of `\` (a line continuation for the guard's
-/// reader, an ordinary character here) and a break the guard's reader holds inside a
-/// quoted word while this platform's reader ends the command there, where the two do
-/// not agree about which text is a command. A quoted word holding the break is named
-/// first, and the odd `\` run only where no quoted word does: a `\` inside a `'…'`
-/// word is ordinary text to that reader, and one before a break inside a `"…"`
-/// word escapes the break itself, so in either spelling what diverges is the word
-/// the reader carries across the break.
-///
-/// Both are the *guard's* reading, so both are decided in the mode whose guard reads
-/// the original text ([`ShellMode::ReadOnly`]): the full mode consults no such reader
-/// (`readonly::check_command` is called on the read-only path alone), and there the
-/// platform's own reading of the two lines is the only one there is.
+/// The divergence of one break, when this platform's reader and the guard's own would read
+/// it differently: an odd run of `\\` (a continuation there, an ordinary character here) and
+/// a break the guard holds inside a quoted word. Both are the *guard's* reading, so both are
+/// decided in [`ShellMode::ReadOnly`], the only mode whose guard reads the original text.
 fn divergent(site: &BreakSite<'_>, mode: ShellMode) -> Option<String> {
-    // A connector with no left-hand command to join is a shape neither reader can
-    // run, in either mode.
+    // A connector with no left-hand command to join is a shape neither reader can run.
     if matches!(site.following, Some(b'&' | b'|')) {
         return Some(LEADING_CONNECTOR.to_owned());
     }
@@ -916,8 +639,7 @@ fn divergent(site: &BreakSite<'_>, mode: ShellMode) -> Option<String> {
     None
 }
 
-/// Read `command` line by line and rebuild the text the platform will run: the
-/// reading the module doc describes, spelled out for a reader that has one line.
+/// Read `command` line by line and rebuild the text the platform will run.
 fn respell(command: &str, mode: ShellMode) -> Result<String, String> {
     let bytes = command.as_bytes();
     let mut lines: Vec<(&str, Break<'_>)> = Vec::new();
@@ -929,10 +651,7 @@ fn respell(command: &str, mode: ShellMode) -> Result<String, String> {
     while i < bytes.len() {
         let b = bytes[i];
 
-        // A break is never the character an escape takes: `cmd.exe`'s caret before
-        // one is its own continuation (read below), the shell parser's `\` before
-        // one is the line continuation refused below, and a break inside the
-        // platform's `"` span is refused outright.
+        // A break is never the character an escape takes (see each shape below).
         if b == b'\n' {
             let (segment, kind) = walk.at_break(command, bytes, i, start, &following, mode)?;
             lines.push((segment, kind));
@@ -941,38 +660,27 @@ fn respell(command: &str, mode: ShellMode) -> Result<String, String> {
             continue;
         }
 
-        // The shell parser's own reading of this character, tracked beside the
-        // platform's own.
+        // The shell parser's own reading of this character, tracked beside the platform's.
         let (quote, escaped) = bash_step(walk.bash_quote, walk.bash_escaped, b);
         walk.bash_quote = quote;
         walk.bash_escaped = escaped;
 
-        // A carriage return is not a character this platform's reader sees in the
-        // phase these rules read: it ends no word, is not the one the line's last is,
-        // and is not the one an escape takes (a `^` before it escapes the break after
-        // it). It stays in the text as written.
+        // A carriage return is not a character this platform's reader sees in this phase: it
+        // stays in the text as written.
         if b == b'\r' {
             i += 1;
             continue;
         }
 
-        // Two adjacent `<` are a text block to the shell parser whether or not a
-        // caret escape is pending over the first one: the escape makes it literal
-        // here while the parser, which has no caret escape, still reads `<<`. This
-        // platform has no text block, so a spelling it cannot run as written must
-        // not have its lines respelled into commands. Checked outside both
-        // readings' quotes, and before the escape below consumes the character.
+        // Two adjacent `<` are a text block to the shell parser whether or not a caret escape
+        // is pending, and this platform has none.
         if b == b'<' && bytes.get(i + 1) == Some(&b'<') && !walk.quote && walk.bash_quote.is_none()
         {
             return Err(refusal(TEXT_BLOCK, mode));
         }
 
-        // The character a caret escapes opens no span and changes no group for this
-        // platform's reader — it is ordinary text — so it is consumed here, and what
-        // the guard's own reader makes of it is what [`read_escaped`] decides. It does
-        // open the word it is written in, though: a token whose first letter an escape
-        // carried is the token it spells (`^rem` is this platform's `rem`), while the
-        // character itself is inert ([`Word::escaped`]).
+        // The character a caret escapes is ordinary text: it opens no span and changes no
+        // group, though it does open the word it is written in ([`Word::escaped`]).
         if walk.escaped {
             read_escaped(b, mode)?;
             walk.words.start(i, walk.at_command(), true);
@@ -987,62 +695,44 @@ fn respell(command: &str, mode: ShellMode) -> Result<String, String> {
 
     // The line the run ends on, kept verbatim.
     let tail = &command[start..];
-    // The word the text ends on is finished for the same reason a break's own word is
-    // (`Words::finish`'s separators): a statement completed by the last word is not one
-    // still waiting for its own text.
+    // The word the text ends on is finished for the same reason a break's own word is.
     walk.words.finish(bytes, bytes.len(), walk.groups.len());
     walk.close(&lines, tail, mode)
 }
 
-/// The state one line of the walk leaves for the next: the spans the reader holds
-/// open, the groups it counts, the words a statement's own positions are read off,
-/// and the escape a caret leaves pending. Each `bool` here is a separate notion a
-/// reader of this text keeps — an open span of one grammar, an escape of the other,
-/// a caret's escape, a pipeline, and the block position a `(` after a `)` is read
-/// from — so they are kept apart on purpose.
+/// The state one line of the walk leaves for the next: the spans the reader holds open, the
+/// groups it counts, the words a statement's positions are read off, and the escape a caret
+/// leaves pending. Each `bool` is a separate notion a reader of this text keeps.
 #[expect(clippy::struct_excessive_bools)] // each bool a notion of its own
 #[derive(Default)]
 struct Walk {
-    /// The platform's own `"` span, when one is open: `cmd.exe` quotes with `"`
-    /// only, and a caret's escape swallows a quote it precedes.
+    /// The platform's own `"` span, when one is open: `cmd.exe` quotes with `"` only.
     quote: bool,
-    /// The shell parser's own reading of the same text (the read-only guard's bash
-    /// grammar), advanced beside it because the two do not agree: `'` quotes there
-    /// and not here, and `\` escapes there and not here. The open span, when one is
-    /// open, and a `\` whose escape is pending.
+    /// The shell parser's own reading of the same text (the read-only guard's bash grammar),
+    /// advanced beside it because the two do not agree.
     bash_quote: Option<u8>,
     bash_escaped: bool,
-    /// A caret's escape is pending over the next character — or was left pending by
-    /// the break a caret at the end of a line escapes.
+    /// A caret's escape is pending over the next character, or over the break a caret at the
+    /// end of a line escapes.
     escaped: bool,
-    /// The bracketed groups this reading has opened, each with the shape that opened
-    /// it. A `)` is counted against whatever this platform's counter holds — wherever
-    /// the `)` itself stands — so an entry is recorded for every `(`, including one
-    /// whose group the reading cannot prove; such an entry is refused where a break or
-    /// a `)` reaches it ([`read_paren`]).
+    /// The bracketed groups this reading has opened, each with the shape that opened it. Every
+    /// `(`, even an unprovable one, is an entry so the `)`s pair as this platform pairs them;
+    /// such an entry is refused where a break or a `)` reaches it.
     groups: Vec<Group>,
-    /// How many entries of [`Walk::groups`] are [`Group::Unproven`], kept beside the
-    /// stack so the break rules and a `)` read it without rescanning a stack a text
-    /// can make as long as itself ([`Walk::open`], [`Walk::pop_group`]).
+    /// How many entries of [`Walk::groups`] are [`Group::Unproven`], kept beside the stack so
+    /// the break rules read it without rescanning.
     unproven: usize,
-    /// The last unescaped character of the line that is not a space or a tab — what a
-    /// break's separator reading looks at, and where a `(` sits.
+    /// The last unescaped character of the line that is not a space or a tab.
     last: Option<u8>,
-    /// Whether that last character is the `|` of a pipeline: a single `|` is, while
-    /// the `||` this platform concatenates command lines with is not, and the group a
-    /// `(` after either of them opens is counted by a different interpreter
-    /// ([`opens_group`]).
+    /// Whether that last character is the `|` of a pipeline: a single `|` is, the `||` this
+    /// platform concatenates with is not ([`opens_group`]).
     piped: bool,
-    /// Whether the command being read is the right-hand side of that single `|` — a
-    /// command a child interpreter runs. Set where that connector is read and cleared
-    /// where the connector after it is read, or where a break leaves the walk the new
-    /// command it ends — but, unlike [`Walk::piped`], kept across the ordinary
-    /// characters of the command, because `| @(` is the pipeline's own spelling too
-    /// ([`opens_group`]).
+    /// Whether the command being read is the right-hand side of that single `|` — one a child
+    /// interpreter runs. Kept across the command's characters, because `| @(` is the pipeline's
+    /// own spelling too ([`opens_group`]).
     child_pipe: bool,
     /// Whether the `)` last read closed a block of this platform's own rather than a
-    /// statement's: its reader is looking for a command again there, so a `(` after it
-    /// is a block of its own ([`opens_group`]).
+    /// statement's ([`opens_group`]).
     after_block: bool,
     /// The words of the command being read, for the statement positions that sit at
     /// an argument position ([`opens_group`]).
@@ -1050,16 +740,12 @@ struct Walk {
 }
 
 impl Walk {
-    /// Read one ordinary character of a line into the state above: this platform's
-    /// quote, the caret's pending escape, a group's `(`/`)`, and the words a
-    /// statement's own positions are read off. A `<<` is checked by the caller, which
-    /// is where the guard's own reading of it is known.
+    /// Read one ordinary character of a line into the state above. A `<<` is checked by the
+    /// caller, which is where the guard's own reading of it is known.
     fn step(&mut self, bytes: &[u8], i: usize, b: u8, mode: ShellMode) -> Result<(), String> {
         match b {
-            // A quote is a character of the line like any other — an argument
-            // boundary — so it becomes the break's last significant character:
-            // `dir >"out.txt"` ends its command after the quoted target, not
-            // after the operator the target was written behind.
+            // A quote is an argument boundary like any other, so it becomes the break's last
+            // significant character: `dir >"out.txt"` ends its command after it.
             b'"' => {
                 self.words.start(i, self.at_command(), false);
                 self.quote = true;
@@ -1079,19 +765,14 @@ impl Walk {
                 self.piped = false;
             }
             b' ' | b'\t' => {
-                // The word being read ends here, but the command's own words
-                // outlive the separator: an `if` condition and a `do`/`else` are
-                // words, and the `(` they open follows a space.
+                // The word ends here, but the command's own words outlive the separator.
                 self.words.finish(bytes, i, self.groups.len());
             }
             b'&' | b'|' => {
-                // A connector ends the word before it and starts a command after it
-                // (`&&if exist x (` is the statement `&& if exist x (`), so the
-                // `do`/`else` a statement's own `)` leaves can no longer follow.
+                // A connector ends the word before it and starts a command after it.
                 self.words.finish(bytes, i, self.groups.len());
                 self.words.chain = false;
-                // One `|` hands the command after it to a child interpreter; `||`, like
-                // `&`/`&&`, is a command this interpreter runs itself.
+                // One `|` hands the command after it to a child interpreter; `||` does not.
                 self.piped = b == b'|' && self.last != Some(b'|');
                 self.child_pipe = self.piped;
                 self.after_block = false;
@@ -1107,14 +788,10 @@ impl Walk {
         Ok(())
     }
 
-    /// Whether this platform's reader is looking for a command at the character about
-    /// to be read: the start of a command (after a separator this interpreter runs
-    /// itself — the single `|` included, whose right-hand side a child interpreter
-    /// runs as a command of its own), the first word inside a group this reading
-    /// proved (a `for`'s set holds files, not commands), the word after the `)` of a
-    /// block it proved, and the word this platform's own `@` prefixes. [`opens_group`]
-    /// reads the `(` such a position opens off the same state — except at the pipeline,
-    /// whose group the child interpreter counts and this reading cannot.
+    /// Whether this platform's reader is looking for a command at the character about to be
+    /// read: the start of a command, the first word inside a proven group, the word after the
+    /// `)` of a proven block, and the word its `@` prefixes. [`opens_group`] reads the `(` such
+    /// a position opens off the same state.
     fn at_command(&self) -> bool {
         match self.last {
             None | Some(b'&' | b'|') => true,
@@ -1163,20 +840,15 @@ impl Walk {
         mode: ShellMode,
     ) -> Result<(&'a str, Break<'a>), String> {
         let (segment, end, spelling) = break_ends(command, i, start);
-        // The word the line ends on is finished here, before the break rules read the
-        // statement state: this platform's separators end a word at a break too, so a
-        // statement completed on this line is not read as one still waiting. The line
-        // stops where the break's own bytes start, every `\r` of them included
-        // ([`line_end`]).
+        // The word the line ends on is finished before the break rules read the statement
+        // state: a statement completed here is not read as one still waiting.
         self.words.finish(bytes, end, self.groups.len());
         self.bash_escaped = false;
         if self.quote {
             return Err(refusal(BREAK_IN_DOUBLE_QUOTES, mode));
         }
-        // A caret at the end of the line — the walk's own pending escape — escapes this
-        // break and reaches the first byte after it that this platform's reader sees: a
-        // carriage return is one it never sees, the same skip the walk makes inside a
-        // line.
+        // A caret at the end of the line escapes this break and reaches the first byte after
+        // it that this platform's reader sees (a carriage return is not one).
         let caret = self.escaped;
         let target = caret
             .then(|| bytes[i + 1..].iter().copied().find(|b| *b != b'\r'))
@@ -1199,14 +871,11 @@ impl Walk {
             },
         };
         let kind = break_kind(&site, spelling, mode)?;
-        // A pending escape survives the break by itself — the walk's own escape branch
-        // consumes it on the next line — and the comment's or the label's reach is the
-        // line's own, so what follows the break is otherwise read afresh.
+        // A pending escape survives the break by itself, and a comment's or a label's reach is
+        // the line's own, so what follows is otherwise read afresh.
         self.words.swallowing = false;
-        // A break that ends a command leaves the next line a new one, and the
-        // statement machine starts again; the breaks `carried` names leave it
-        // running instead, and under a joined one the operand continues the line
-        // the operator was written on — so what `(` opens is still read off it.
+        // A break that ends a command leaves the next line a new one and restarts the statement
+        // machine; the breaks `carried` names leave it running instead.
         match kind {
             Break::Joined => {}
             _ if carried(&site) => {}
@@ -1221,20 +890,16 @@ impl Walk {
         Ok((segment, kind))
     }
 
-    /// The text the lines rebuild into, or the refusal for a text that ends inside a
-    /// span or bracket it never closes, mid-way through a statement's own grammar, or
-    /// with a caret that has nothing left to escape.
+    /// The text the lines rebuild into, or the refusal for a text that ends inside a span or
+    /// bracket it never closes, mid-way through a statement, or on a dangling caret.
     fn close(
         &self,
         lines: &[(&str, Break<'_>)],
         tail: &str,
         mode: ShellMode,
     ) -> Result<String, String> {
-        // A caret the walk left pending where the text ends has nothing to escape either
-        // — the text ends without a break for it to reach, which is the same shape the
-        // break site refuses a step earlier ([`DANGLING_CARET`]). Read before the open
-        // spans and groups, as the break site reads it, so a text ending in one is
-        // refused for the same cause with and without a break behind it.
+        // A caret the walk left pending where the text ends has nothing to escape either. Read
+        // before the open spans, as the break site reads it.
         if self.escaped {
             return Err(refusal(DANGLING_CARET, mode));
         }
@@ -1251,12 +916,9 @@ impl Walk {
     }
 }
 
-/// Read the character a caret escape reaches: literal text here, while the guard's
-/// reader reads a `&`/`|`/`<`/`>`/`(`/`)` as an operator or a group — so the shape
-/// is refused ([`ESCAPED_SYNTAX`]) in the mode whose guard read the original text,
-/// and run as written in the other. Either way the character is consumed as this
-/// platform reads it: it opens no span and changes no group here, and stays part of
-/// the word it is written in.
+/// Read the character a caret escape reaches: literal text here, while the guard's reader reads
+/// a `&`/`|`/`<`/`>`/`(`/`)` as an operator or a group, so that shape is refused
+/// ([`ESCAPED_SYNTAX`]) in the mode whose guard read the original text.
 fn read_escaped(b: u8, mode: ShellMode) -> Result<(), String> {
     if mode == ShellMode::ReadOnly && matches!(b, b'&' | b'|' | b'<' | b'>' | b'(' | b')') {
         return Err(refusal(ESCAPED_SYNTAX, mode));
@@ -1264,27 +926,19 @@ fn read_escaped(b: u8, mode: ShellMode) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether a break leaves the word being read and the statement machine running: the
-/// caret's continuation does, and so does a break inside a group while a statement
-/// still waits for its own text — this platform's reader appending the next line to
-/// that statement — and so does a break with nothing after it, which separates nothing
-/// and so ends nothing: the text is read as the same line whether it stands there or
-/// not ([`spans_commands`]).
+/// Whether a break leaves the word being read and the statement machine running: the caret's
+/// continuation, a break inside a group while a statement still waits for its text, and a
+/// break with nothing after it ([`spans_commands`]).
 fn carried(site: &BreakSite<'_>) -> bool {
     site.caret_escapes.is_some()
         || site.following.is_none()
         || (site.groups == Open::Proven && site.statement_unfinished)
 }
 
-/// Read one `(` or `)`: which group it opens, or what closing one leaves the
-/// statement being read. An unprovable `(` is still an entry — this platform's
-/// reader counts one wherever it stands, so the stack mirrors its counter — and
-/// what it hides is refused where a break or a `)` reaches it.
-///
-/// `Err` is the refusal for the one shape that would put this reading's groups and
-/// this platform's own counter out of step ([`UNPROVEN_GROUP`]), and for a `)` the
-/// counter cannot pair where this platform's reader is looking for a command
-/// ([`UNPAIRED_PAREN`]).
+/// Read one `(` or `)`: which group it opens, or what closing one leaves the statement being
+/// read. An unprovable `(` is still an entry, so the stack mirrors this platform's counter.
+/// `Err` is the refusal for a shape that would put the two out of step ([`UNPROVEN_GROUP`],
+/// [`UNPAIRED_PAREN`]).
 fn read_paren(
     paren: u8,
     bytes: &[u8],
@@ -1292,14 +946,10 @@ fn read_paren(
     walk: &mut Walk,
     mode: ShellMode,
 ) -> Result<(), String> {
-    // The word the paren ends is finished before the opener is read: the statement
-    // positions that sit at an argument position are read off it — and that word is
-    // what decides that this line's rest is this platform's comment text or a label's
-    // name, the paren that ends it included.
+    // The word the paren ends is finished first: it is what decides this line's rest is a
+    // comment's text or a label's name.
     walk.words.finish(bytes, i, walk.groups.len());
-    // A paren the line's own text has taken is text to this platform's reader: its
-    // counter never sees it ([`SWALLOWING_LINE`]), so nothing here closes and nothing
-    // opens one.
+    // A paren the line's own text has taken is text to this platform's reader.
     if walk.words.swallowing {
         return Ok(());
     }
@@ -1313,10 +963,8 @@ fn read_paren(
         )
         .unwrap_or(Group::Unproven);
         walk.push_group(group);
-        // A group at a command position starts a command of its own, so the words read
-        // so far belong to the statement that opened it. A `(` this reading could not
-        // prove opened none: its words are an argument's and stay, or the statement a
-        // break behind it is refused for would look finished here.
+        // A group at a command position starts a command of its own. A `(` this reading could
+        // not prove opened none: its words are an argument's and stay.
         if group != Group::Unproven {
             walk.words.restart();
         }
@@ -1324,16 +972,13 @@ fn read_paren(
     }
     match walk.pop_group() {
         Some(Group::Plain) => {
-            // The block this platform's reader runs itself is closed, so it is looking
-            // for a command again: a `(` after the `)` opens a group of its own.
+            // The block this reader runs itself is closed, so it looks for a command again.
             walk.words.restart();
             walk.after_block = true;
         }
         Some(Group::Body) => {
-            // The statement's own group is closed: only its `do`/`else` may still
-            // follow, and it is read off this `)` and no other. Its own text is
-            // written, and this platform's reader runs that text to the end of the
-            // line or of the block the statement sits in.
+            // The statement's own group is closed: only its `do`/`else` may still follow, and
+            // the reader runs its text to the line's end or the block's.
             walk.words.restart();
             walk.words.chain = true;
             walk.words.absorbing = true;
@@ -1344,40 +989,28 @@ fn read_paren(
             walk.words.restart();
             walk.words.stmt = Stmt::Set;
         }
-        // A `)` this platform's reader counts against a `(` this reading cannot
-        // name, with a proven group below it: it may be closing that group, so what
-        // the text after it holds is not known either.
+        // A `)` counting a `(` this reading cannot name, with a proven group below it.
         Some(Group::Unproven) if walk.groups.len() != walk.unproven => {
             return Err(refusal(UNPROVEN_GROUP, mode));
         }
-        // A `)` this platform's counter cannot pair, where its reader is looking for
-        // a command — behind a separator, first inside a group, after a statement's own
-        // group (`if exist x (echo a) )`) or at the start: the reader discards the rest
-        // of the line there, so nothing written after it runs.
+        // A `)` this platform's counter cannot pair, where its reader looks for a command: the
+        // reader discards the rest of the line, so nothing after it runs.
         None if matches!(walk.last, None | Some(b'&' | b'|' | b'(' | b')')) => {
             return Err(refusal(UNPAIRED_PAREN, mode));
         }
-        // A group whose `)` leaves a new command, a `)` counting a `(` this reading
-        // only recorded, and a `)` this platform's counter ignores where its reader
-        // is not looking for a command: nothing follows from any of them.
+        // A group whose `)` leaves a new command, a `)` counting a recorded `(`, and a `)`
+        // ignored where the reader is not looking for a command: nothing follows.
         Some(Group::Unproven) | None => {}
     }
-    // A block that closed here may hold the statement a text of its own is bounded
-    // by: the end of that block bounds it as the line's end does.
+    // The end of a block bounds a statement written in it as the line's end does.
     walk.words.bounded(walk.groups.len());
     Ok(())
 }
 
-/// The cause for a text that ends inside a span or bracket it never closes or mid-way
-/// through a statement's own grammar: this platform's reader would be left waiting for
-/// the rest of the command. `None` when the text ends where it should. A caret left
-/// with nothing to escape is the same kind of waiting, refused where the walk reads it
-/// ([`DANGLING_CARET`]).
-///
-/// `bash_quote` is the guard's reader alone, so a span it holds open is decided in
-/// the mode whose guard read the original text ([`divergent`] says why): no
-/// *divergence* of a break is decided anywhere but there, and a `'`-word or a
-/// caret-escaped quote is no span to this platform's.
+/// The cause for a text that ends inside a span or bracket it never closes or mid-way through
+/// a statement's grammar. `None` when the text ends where it should. `bash_quote` is the
+/// guard's reader alone, so a span it holds open is decided in the mode whose guard read the
+/// original text ([`divergent`] says why).
 fn unclosed_at_end(
     platform_quote: bool,
     bash_quote: Option<u8>,
@@ -1404,29 +1037,23 @@ fn unclosed_at_end(
     None
 }
 
-/// Rebuild the platform's one line from the lines the walk read: each segment
-/// verbatim, minus the break it ended on — or with that break exactly as written,
-/// carriage returns and all, where the reader continues across it.
+/// Rebuild the platform's one line: each segment verbatim, minus the break it ended on.
 fn rebuild(lines: &[(&str, Break<'_>)], tail: &str) -> String {
     let mut out = String::new();
-    // Whether the text emitted so far ends a command: the separator a break owes is
-    // owed only to a command it separates from, so a blank run — of lines, or of the
-    // spaces a blank line holds — takes one separator, not one per break. What
-    // follows a break travels on the `Break` itself, folded once with the break rules.
+    // The separator a break owes is owed only to a command it separates from, so a blank run
+    // takes one separator, not one per break.
     let mut ends_command = false;
     for (segment, kind) in lines {
         out.push_str(segment);
         ends_command |= !is_blank(segment);
         match kind {
-            // Always as written, a blank line included: the blank line stays
-            // inside the continued shape.
+            // Always as written, a blank line included.
             Break::Continued(spelling) => out.push_str(spelling),
             Break::Joined => {}
             Break::Separator(following) => {
                 if ends_command && following.is_some() {
                     out.push('&');
-                    // Spaced where a redirection opens the line after it: no `&>` is
-                    // spelled, and the redirection stays the next line's own.
+                    // Spaced where a redirection opens the next line: no `&>` is spelled.
                     if matches!(following, Some(b'<' | b'>')) {
                         out.push(' ');
                     }
@@ -1439,8 +1066,7 @@ fn rebuild(lines: &[(&str, Break<'_>)], tail: &str) -> String {
     out
 }
 
-/// The reading of a text that ends inside a span or bracket `open` never closes:
-/// the platform's reader would be left waiting for the rest of the command.
+/// The reading of a text that ends inside a span or bracket `open` never closes.
 fn unclosed_cause(open: u8) -> String {
     let shape = match open {
         b'"' => "double-quoted argument",
@@ -1453,13 +1079,8 @@ fn unclosed_cause(open: u8) -> String {
     )
 }
 
-/// The reading of a break this platform's reader ends the command at, while the
-/// shell parser that read the command reads one quoted word straight across it:
-/// `open` is the quote that opened that word's span. `cmd.exe` quotes with `"`
-/// only, and each reader's own escape (`\` there, `^` here) hides a quote from
-/// one of them, so the two spans do not line up and the readers do not agree about
-/// which text is a command — neither deleting the break nor respelling it keeps
-/// what either reader took as quoted.
+/// The reading of a break this platform's reader ends the command at while the shell parser
+/// reads one quoted word straight across it: `open` is the quote that opened it.
 fn divergent_quote_cause(open: u8) -> String {
     let shape = match open {
         b'\'' => "single-quoted word",
@@ -1473,13 +1094,9 @@ fn divergent_quote_cause(open: u8) -> String {
     )
 }
 
-/// Which group the `(` reached now opens, read off where it sits and the statement
-/// before it: this platform's reader opens one only where it is looking for a
-/// command, and only an `if`/`for` statement puts one at an argument position.
-/// `None` is a `(` written where this reading cannot prove one — in an argument, or
-/// anywhere in the command a single `|` handed to a child interpreter, whose own
-/// group counting is not modelled here (`echo x | (` … `)`) — so a break reaching it
-/// is refused rather than read.
+/// Which group the `(` reached now opens, read off where it sits and the statement before it.
+/// `None` is a `(` written where this reading cannot prove one, so a break reaching it is
+/// refused rather than read.
 fn opens_group(
     last: Option<u8>,
     piped: bool,
@@ -1487,62 +1104,48 @@ fn opens_group(
     after_block: bool,
     words: &Words,
 ) -> Option<Group> {
-    // The right-hand side of a single `|` is a command a child interpreter runs, and
-    // its own command line is what counts the groups in it — a reading this module
-    // does not model, so nothing there can be proven. The pipeline's prefix is part of
-    // its spelling (`| @(` is the same position), which is what makes this a state of
-    // the command rather than of the last character ([`Walk::child_pipe`]).
+    // The right-hand side of a single `|` is a command a child interpreter runs, and its own
+    // group counting is not modelled here (`| @(` is the same position).
     if child_pipe {
         return None;
     }
     match last {
-        // The start of the text or of a command: after a separator — `||` included,
-        // which this platform runs in this interpreter like `&`/`&&` — or first inside
-        // a group.
+        // The start of the text or of a command: after a separator, or first inside a group.
         None | Some(b'&' | b'(') => Some(Group::Plain),
         Some(b'|') if !piped => Some(Group::Plain),
-        // The `)` that closed a block of this platform's own leaves the reader looking
-        // for a command again, and so does the `@` its no-echo prefix is written with:
-        // `@( … )` is one of the blocks it suppresses the echo of.
+        // The `)` that closed a block of this platform's own, and its `@` prefix.
         Some(b')') if after_block => Some(Group::Plain),
         Some(b'@') if words.stmt == Stmt::Prefixed => Some(Group::Plain),
         // A `for`'s `in` set: the statement awaits its `do` after it.
         _ if words.stmt == Stmt::Set => Some(Group::Set),
-        // A statement's own body: the command that follows a completed condition, the
-        // `do`/`else` body, and the block a statement's own `)` leaves room for.
+        // A statement's own body: the command a condition governs, and a `do`/`else` body.
         _ if words.stmt == Stmt::Await || words.chain => Some(Group::Body),
         _ => None,
     }
 }
 
-/// Whether `word` is one of the condition keywords this platform's `if` takes
-/// before its operand.
+/// Whether `word` is one of the condition keywords this platform's `if` takes.
 fn is_condition_keyword(word: &[u8]) -> bool {
     [&b"exist"[..], b"defined", b"errorlevel", b"cmdextversion"]
         .iter()
         .any(|keyword| word.eq_ignore_ascii_case(keyword))
 }
 
-/// Whether `word` is one of the comparison operators this platform's `if` takes
-/// between the two strings it compares — the spaced spelling of a comparison, and
-/// the `==` of the joined one.
+/// Whether `word` is one of the comparison operators this platform's `if` takes.
 fn is_comparison_operator(word: &[u8]) -> bool {
     [&b"=="[..], b"equ", b"neq", b"lss", b"leq", b"gtr", b"geq"]
         .iter()
         .any(|operator| word.eq_ignore_ascii_case(operator))
 }
 
-/// How many `c` characters end `text` — the run a break's caret and backslash
-/// rules count immediately before it.
+/// How many `c` characters end `text`.
 fn trailing_run(text: &str, c: u8) -> usize {
     text.bytes().rev().take_while(|b| *b == c).count()
 }
 
-/// The shell parser's own quote state after `b`: the open span, when one is open,
-/// and whether a `\`'s escape is pending over the next character. `\` outside a
-/// single-quoted word escapes the next character, so a quote it escapes opens or
-/// closes no word; `cmd.exe`'s caret escapes nothing there, which is why the two
-/// readings of the same text are tracked separately.
+/// The shell parser's own quote state after `b`. `\\` outside a single-quoted word escapes
+/// the next character, and `cmd.exe`'s caret escapes nothing there, which is why the two
+/// readings are tracked separately.
 fn bash_step(quote: Option<u8>, escaped: bool, b: u8) -> (Option<u8>, bool) {
     if escaped {
         (quote, false)
@@ -1563,12 +1166,9 @@ fn bash_step(quote: Option<u8>, escaped: bool, b: u8) -> (Option<u8>, bool) {
     }
 }
 
-/// Whether `c` is one of the separators the platform's own reader skips over: a
-/// space, a tab, a carriage return, and — for the forward-looking scan, which has
-/// to find the first character of the next line that is not blank — a break.
-/// Nothing else is blank to `cmd.exe`: a character Unicode calls whitespace
-/// (U+00A0, U+3000) is an ordinary character here, so a line holding one has text
-/// on it and its break is not dropped.
+/// Whether `c` is one of the separators the platform's own reader skips over. Nothing else is
+/// blank to `cmd.exe`: a character Unicode calls whitespace (U+00A0, U+3000) is ordinary, so a
+/// line holding one has text on it and its break is not dropped.
 fn is_separator(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n')
 }
@@ -1578,12 +1178,9 @@ fn is_blank(text: &str) -> bool {
     !text.bytes().any(|b| !is_separator(b))
 }
 
-/// Whether `word` is this platform's comment command: `rem` (its own `@` prefix
-/// allowed), read with one of the delimiters its parser ends a word at — or with
-/// nothing after it. The `,`/`;`/`=` delimiters count like the spaces, so `rem,x`
-/// takes its line here as well. A character appended to `rem` (`.`, `/`, `:`, `[`,
-/// `+`) is not the command: the parser drops that character later and the control
-/// operators after it are read as commands of their own.
+/// Whether `word` is this platform's comment command: `rem` (its own `@` prefix allowed), read
+/// with one of the delimiters its parser ends a word at. A character appended to `rem` (`.`,
+/// `/`, `:`, `[`, `+`) is not the command.
 fn is_comment_command(word: &[u8]) -> bool {
     let word = word.strip_prefix(b"@").unwrap_or(word);
     word.split(|b| matches!(b, b',' | b';' | b'='))
@@ -1591,28 +1188,22 @@ fn is_comment_command(word: &[u8]) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(b"rem"))
 }
 
-/// Whether `word` is a label's own name: this platform's reader takes the rest of
-/// such a line — the separator a break would join there included — as that name
-/// ([`SWALLOWING_LINE`]). Read where its reader is looking for a command, like the
-/// comment command above, and under the same `@` prefix.
+/// Whether `word` is a label's own name, read where the reader looks for a command and under
+/// the same `@` prefix ([`SWALLOWING_LINE`]).
 fn is_label_word(word: &[u8]) -> bool {
     word.strip_prefix(b"@").unwrap_or(word).starts_with(b":")
 }
 
-/// The agent-facing refusal for one cause, in the reading's mode-selected form: the
-/// shared frame ([`REFUSAL_FRAME`], so the four refusal renderers cannot word it
-/// differently), the cause, that nothing ran, and the mode's remedy ([`remedy`], which
-/// owns the choice between the two).
+/// The agent-facing refusal for one cause: the shared frame ([`REFUSAL_FRAME`], so the four
+/// refusal renderers cannot word it differently), the cause, and the mode's remedy.
 fn refusal(cause: &str, mode: ShellMode) -> String {
     format!("{REFUSAL_FRAME}{cause}. Nothing ran. {}", remedy(mode))
 }
 
-/// The remedy a refusal offers in `mode` ([`refusal`]), and the sentence the guidance
-/// hands the agent for the same shapes ([`super::render_command_line_notes`]) — one
-/// prompt asset for both, so the tool cannot promise a way out its own refusals do not
-/// honour, nor word the same sentence twice. The mode picks the asset, never the cause:
-/// a file runs any of these texts whole, line breaks and all, so the full mode offers it
-/// for every cause, while the read-only mode has none to offer and says so itself.
+/// The remedy a refusal offers in `mode`, and the sentence the guidance hands the agent for the
+/// same shapes ([`super::render_command_line_notes`]): one prompt asset for both, so the tool
+/// cannot promise a way out its refusals do not honour. The mode picks the asset, never the
+/// cause: a file runs any of these texts whole.
 pub(super) fn remedy(mode: ShellMode) -> String {
     crate::prompt::load_prompt(match mode {
         ShellMode::Full => "tool/shell_command_lines_remedy_full.md",
@@ -1631,14 +1222,13 @@ mod tests {
         executable(command, ShellPlatform::Windows, ShellMode::Full).map(Cow::into_owned)
     }
 
-    /// The refusal for `command`: a shape the two readings disagree about, or one
-    /// this platform's reader cannot be left with.
+    /// The refusal for `command`: a shape the two readings disagree about, or one this platform's
+    /// reader cannot be left with.
     fn refused(command: &str) -> String {
         read(command).expect_err("the shape is refused, not read")
     }
 
-    /// The refusal for `command` in the mode whose guard reads the original text:
-    /// the divergences of that reader alone are decided there.
+    /// The refusal for `command` in the mode whose guard reads the original text.
     fn refused_read_only(command: &str) -> String {
         match executable(command, ShellPlatform::Windows, ShellMode::ReadOnly) {
             Err(cause) => cause,
@@ -1674,20 +1264,17 @@ mod tests {
     struct ReadOnlyCase {
         name: &'static str,
         text: &'static str,
-        /// Whether the full mode reads the same text (both readers were consulted
-        /// by the original guard-divergence rows).
+        /// Whether the full mode reads the same text (both readers were consulted).
         reads_in_full: bool,
         expected: ReadOnlyExpect,
     }
 
-    /// The full mode's reading of every shape the rules in the module header
-    /// cover, as one table: one row per spelling, each case named.
+    /// The full mode's reading of every shape the module header's rules cover, one row per
+    /// spelling.
     #[test]
     #[expect(clippy::too_many_lines)] // one cohesive table over the reading's shapes
     fn reading_cases() {
         let cases: &[ReadingCase] = &[
-            // A bare break is the unconditional separator: a failing first line
-            // does not stop the rest, and the status reported is the last line's.
             ReadingCase {
                 name: "a bare break is the unconditional separator",
                 text: "dir C:\\ws\ndel C:\\ws\\x.txt",
@@ -1698,7 +1285,6 @@ mod tests {
                 text: "dir C:\\ws\\\\\ndel x",
                 expected: "dir C:\\ws\\\\&del x",
             },
-            // Blank lines and a trailing break change nothing.
             ReadingCase {
                 name: "a blank line drops its break",
                 text: "a\n\nb",
@@ -1734,8 +1320,6 @@ mod tests {
                 text: "a\n\u{3000}\nb",
                 expected: "a&\u{3000}&b",
             },
-            // A text whose breaks all stand at its end is the single line it was
-            // written as, in either mode.
             ReadingCase {
                 name: "a trailing break leaves an unclosed paren shape",
                 text: "echo a (\n",
@@ -1766,9 +1350,6 @@ mod tests {
                 text: "rem note\n",
                 expected: "rem note",
             },
-            // Nothing after the break is true of a break wherever it stands, so a
-            // longer text is read as the same line with and without its trailing
-            // break.
             ReadingCase {
                 name: "a trailing break leaves a comment after a separator",
                 text: "dir\nrem note\n",
@@ -1784,8 +1365,6 @@ mod tests {
                 text: "dir\ndir C:\\ws\\\n",
                 expected: "dir&dir C:\\ws\\",
             },
-            // A break the platform's reader continues across is kept byte for
-            // byte, carriage returns included; a lone `\r` is no break.
             ReadingCase {
                 name: "a caret continuation keeps the carriage-run break",
                 text: "echo a ^\r\r\nb",
@@ -1806,7 +1385,6 @@ mod tests {
                 text: "echo a\rb",
                 expected: "echo a\rb",
             },
-            // The platform's own continuations stay as written.
             ReadingCase {
                 name: "an odd caret run continues the command",
                 text: "echo a ^\nb",
@@ -1892,7 +1470,6 @@ mod tests {
                 text: "for %f in (*.txt\n*.md) do (\ndel %f\n)",
                 expected: "for %f in (*.txt\n*.md) do (\ndel %f\n)",
             },
-            // A `(` opening no group is ordinary text.
             ReadingCase {
                 name: "a closed argument paren is ordinary text",
                 text: "echo (a) done\nmore",
@@ -1903,7 +1480,6 @@ mod tests {
                 text: "echo (see the log) below\ndir",
                 expected: "echo (see the log) below&dir",
             },
-            // A statement body on the block's last line is not still waiting.
             ReadingCase {
                 name: "a statement body on a block's last line is complete",
                 text: "if exist x (\ndir\n) echo b",
@@ -1919,8 +1495,6 @@ mod tests {
                 text: "for %f in (*.txt) do (\necho %f\n)& dir",
                 expected: "for %f in (*.txt) do (\necho %f\n)& dir",
             },
-            // A statement's own text written on a line runs to that line's end;
-            // a statement whose text the text itself ends is followed by nothing.
             ReadingCase {
                 name: "a statement behind a break is a command of its own",
                 text: "echo a\nif exist x echo b",
@@ -1941,7 +1515,6 @@ mod tests {
                 text: "if exist x (\ndir\n) echo b\n",
                 expected: "if exist x (\ndir\n) echo b",
             },
-            // A block bounds the statement written in it.
             ReadingCase {
                 name: "a block bounds a statement written in it",
                 text: "(if exist x mkdir out)\ncopy a b",
@@ -1962,7 +1535,6 @@ mod tests {
                 text: "if not exist out mkdir out",
                 expected: "if not exist out mkdir out",
             },
-            // A `(` a pipeline hands to another interpreter is not proven.
             ReadingCase {
                 name: "a pipeline right-hand group under || is read as written",
                 text: "dir || (a\nb)",
@@ -1983,8 +1555,6 @@ mod tests {
                 text: "dir || @(\nb\n)",
                 expected: "dir || @(\nb\n)",
             },
-            // A `)` closing this platform's own block leaves the reader looking
-            // for a command, so the next `(` opens a block.
             ReadingCase {
                 name: "a block after a closed block is a separator apart",
                 text: "(\ndir\n)\n(\ndel x\n)",
@@ -2005,7 +1575,6 @@ mod tests {
                 text: "if exist x (dir) if exist y (b\nc)",
                 expected: "if exist x (dir) if exist y (b\nc)",
             },
-            // A break behind an operator is joined to its operand.
             ReadingCase {
                 name: "a break behind && joins the next line",
                 text: "dir &&\nnext",
@@ -2036,7 +1605,6 @@ mod tests {
                 text: "dir &&\n(echo a\necho b)",
                 expected: "dir &&(echo a\necho b)",
             },
-            // A plain break before a redirection is a separator.
             ReadingCase {
                 name: "a plain break before > stays a separator",
                 text: "dir\n> out.txt",
@@ -2057,7 +1625,6 @@ mod tests {
                 text: "dir\n\n> out.txt",
                 expected: "dir& > out.txt",
             },
-            // A caret with a line to reach runs as written.
             ReadingCase {
                 name: "a caret continuation runs as written",
                 text: "echo a ^\nb",
@@ -2083,8 +1650,6 @@ mod tests {
                 text: "echo a ^\n \t\nb",
                 expected: "echo a ^\n \t&b",
             },
-            // The full mode consults no guard reader: the same texts are read as
-            // the platform reads them.
             ReadingCase {
                 name: "a single-quoted word is ordinary text in the full mode",
                 text: "echo 'a\nb'",
@@ -2110,7 +1675,6 @@ mod tests {
                 text: "dir /b *.txt ^\n| findstr x",
                 expected: "dir /b *.txt ^\n| findstr x",
             },
-            // A comment or label word read where the reader looks for a command.
             ReadingCase {
                 name: "a word merely spelling rem is ordinary text",
                 text: "remainder\ndir",
@@ -2191,8 +1755,6 @@ mod tests {
                 case.text
             );
         }
-        // A carriage return run immediately before a break belongs to the break:
-        // the reading goes on to re-spell the lines exactly as under one `\r`.
         for (name, one, run) in [
             (
                 "an operator join reads the same under a carriage run",
@@ -2215,8 +1777,6 @@ mod tests {
     #[expect(clippy::too_many_lines)] // one cohesive table over the refusal's shapes
     fn refusal_cases() {
         let cases: &[RefusalCase] = &[
-            // A statement the reader is left waiting for: the same text with and
-            // without a trailing break, and the same refusal.
             RefusalCase {
                 name: "a statement waiting for its own text",
                 text: "dir\nif exist x",
@@ -2227,8 +1787,6 @@ mod tests {
                 text: "dir\nif exist x\n",
                 needle: "waiting for its own",
             },
-            // A statement's own `)` ends its word positions; the word after it is
-            // a command of its own and the break behind it is refused.
             RefusalCase {
                 name: "a break behind a statement's own group is refused",
                 text: "if exist x (dir) cls\ndir",
@@ -2239,7 +1797,6 @@ mod tests {
                 text: "if exist x (dir)\ndir",
                 needle: "runs that command",
             },
-            // A statement's own text runs to the line's end.
             RefusalCase {
                 name: "a statement's governed command absorbs the next line",
                 text: "if exist x echo a\ndel C:\\ws\\x.txt",
@@ -2310,8 +1867,6 @@ mod tests {
                 text: "if exist x (\ndir\n) & echo b\ndir2",
                 needle: "runs that command",
             },
-            // A `)` the reading cannot pair, and a `(` whose group cannot be
-            // proven.
             RefusalCase {
                 name: "a paren inside a group counts against an untellable group",
                 text: "if exist x (\ndir C:\\ws\\(a)\ndel C:\\ws\\x.txt\n)",
@@ -2392,7 +1947,6 @@ mod tests {
                 text: "if exist x (dir) cls (b\nc)",
                 needle: "bracketed group",
             },
-            // A join that would spell an operator of its own.
             RefusalCase {
                 name: "joining > and > spells an operator",
                 text: "dir >\n> next",
@@ -2428,8 +1982,6 @@ mod tests {
                 text: "dir &&\n> out.txt",
                 needle: "operator",
             },
-            // Shapes the two readers disagree about: an open span, a caret over
-            // a paren, a text block, and an unclosed span or bracket.
             RefusalCase {
                 name: "a break inside the platform's own quote span",
                 text: "echo \"a\nb\"",
@@ -2525,7 +2077,6 @@ mod tests {
                 text: "echo (a\necho b)",
                 needle: "bracketed group",
             },
-            // A caret left with nothing to escape, whichever break follows it.
             RefusalCase {
                 name: "a caret at the last line's end",
                 text: "dir\necho b^",
@@ -2576,7 +2127,6 @@ mod tests {
                 text: "dir ^\n\n(x)",
                 needle: "left taking",
             },
-            // A comment or label word at a command position swallows its line.
             RefusalCase {
                 name: "a rem comment at a command position swallows the line",
                 text: "rem note\ndir",
@@ -2692,14 +2242,11 @@ mod tests {
                 refused(case.text)
             );
         }
-        // A trailing break changes nothing about the statement the text ends on.
         assert_eq!(
             refused("dir\nif exist x\n"),
             refused("dir\nif exist x"),
             "a trailing break changes nothing about the statement the text ends on"
         );
-        // One break reads as one break however it is spelled: a shape refused
-        // under one `\r` is refused under a run of them.
         for (name, one, run, needle) in [
             (
                 "a dangling caret is refused under a carriage run",
@@ -2744,30 +2291,19 @@ mod tests {
         let at_cap = "a".repeat(TEXT_UNIT_LIMIT);
         let over_cap = "a".repeat(TEXT_UNIT_LIMIT + 1);
         assert!(check_command_line(&at_cap, ShellPlatform::Windows, ShellMode::Full).is_ok());
-        // The limit is on the platform's own unit, the UTF-16 code unit: a line of
-        // characters outside the basic plane counts twice, so a line that looks
-        // short to a `chars()` count still does not fit.
         let astral = "\u{1F600}".repeat(TEXT_UNIT_LIMIT / 2 + 1);
         assert!(astral.chars().count() < TEXT_UNIT_LIMIT);
         let over_cap_in_units =
             check_command_line(&astral, ShellPlatform::Windows, ShellMode::Full)
                 .expect_err("over the cap in the platform's units");
         assert!(over_cap_in_units.contains("8191"), "{over_cap_in_units}");
-        // Nothing but this platform has the limit: the unix lane takes the text
-        // itself, whatever its length.
         assert!(check_command_line(&over_cap, ShellPlatform::Unix, ShellMode::Full).is_ok());
         assert!(check_command_line(&astral, ShellPlatform::Unix, ShellMode::Full).is_ok());
-        // The limit is measured by `check_command_line` alone: `executable` produces
-        // the reading of an over-cap text without complaint, and measuring that
-        // reading is what refuses it.
         let over_cap_reading =
             read(&over_cap).expect("the reading of an over-cap text is produced");
         assert!(
             check_command_line(&over_cap_reading, ShellPlatform::Windows, ShellMode::Full).is_err()
         );
-        // The limit is on the text that will be executed, and a trailing break the
-        // platform never reads is no part of it: the line that fits still fits with
-        // one, and the line that does not is still refused.
         assert!(
             check_command_line(
                 &read(&format!("{at_cap}\n")).expect("read"),
@@ -2789,9 +2325,6 @@ mod tests {
             .expect_err("over the cap");
         let read_only = check_command_line(&over_cap, ShellPlatform::Windows, ShellMode::ReadOnly)
             .expect_err("over the cap");
-        // The message states the line's own limit, what the interpreter's hand-off
-        // takes of it, and the number left for the text — a text refused under it
-        // is never left looking shorter than the limit it was refused by.
         assert!(full.contains("8191"), "{full}");
         assert!(full.contains(&TEXT_UNIT_LIMIT.to_string()), "{full}");
         assert!(full.contains("Nothing ran."), "{full}");
@@ -2810,8 +2343,6 @@ mod tests {
     #[expect(clippy::too_many_lines)] // one cohesive table over the guard's cases
     fn read_only_cases() {
         let cases: &[ReadOnlyCase] = &[
-            // A trailing break is never reached by this reader: the same text
-            // reads as `before_first_break` reads it.
             ReadOnlyCase {
                 name: "a trailing break leaves an unclosed paren shape",
                 text: "echo a (\n",
@@ -2866,8 +2397,6 @@ mod tests {
                 reads_in_full: true,
                 expected: ReadOnlyExpect::Reads("dir&dir C:\\ws\\"),
             },
-            // The guard's divergences: refused whole, because the reader it used
-            // judged a text this platform would not run.
             ReadOnlyCase {
                 name: "a single-quoted word spanning a break",
                 text: "echo 'a\nb'",
@@ -2946,7 +2475,6 @@ mod tests {
                 reads_in_full: true,
                 expected: ReadOnlyExpect::Refused("Nothing ran."),
             },
-            // Each divergence is named by the rule that actually holds.
             ReadOnlyCase {
                 name: "a quoted word's own break is the single-quoted word",
                 text: "echo 'a\\\nb'",
@@ -2959,7 +2487,6 @@ mod tests {
                 reads_in_full: true,
                 expected: ReadOnlyExpect::Refused("odd number of backslashes"),
             },
-            // The statement reading is the same in both modes.
             ReadOnlyCase {
                 name: "a paren on a statement's line in the guard mode",
                 text: "if exist x echo (a) done\nmore",
@@ -2984,7 +2511,6 @@ mod tests {
                 reads_in_full: false,
                 expected: ReadOnlyExpect::Refused("runs that command"),
             },
-            // A comment or label swallowed at a break is refused in both modes.
             ReadOnlyCase {
                 name: "a rem comment in the guard mode",
                 text: "rem note\ndir",
@@ -3118,8 +2644,6 @@ mod tests {
                 ),
             }
         }
-        // A carriage return run immediately before a break belongs to the break:
-        // the guard's reader refuses the same shapes under either spelling.
         for (name, one, run) in [
             (
                 "a backslash-run break is refused under a carriage run",

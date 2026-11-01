@@ -17,9 +17,6 @@ pub enum WorkspacesMessage {
     DeleteWorkspace(String),
     ConfirmDelete(String),
     CancelDelete,
-    /// A deletion finished: the project removed and the admin's active project
-    /// afterwards (`None` = the personal folder), as the deletion's own
-    /// transaction left it.
     DeleteResult(Result<(String, Option<String>), String>),
     Reanalyze(String),
     ReanalyzeResult(Result<(), String>),
@@ -27,51 +24,34 @@ pub enum WorkspacesMessage {
     /// User clicked a role icon to view per-agent context (read-only markdown).
     ViewContext(String, String), // workspace_name, role
 
-    /// User clicked the general-context icon to view the workspace's
-    /// non-role context (read-only markdown).
+    /// User clicked the general-context icon to view the workspace's non-role context (read-only
+    /// markdown).
     ViewGeneralContext(String), // workspace_name
 
-    /// Async fetch of workspace context completed.
     ContextViewed(String, ContextKind, Result<Option<String>, String>), // ws_name, kind, result
 
-    /// Markdown link clicked in the context view.
     LinkClicked(String),
 
-    /// Show diagnostics modal for a workspace.
     ShowDiagnostics(String),
 
-    /// A diagnostics command field was edited: (workspace_name, field_index, new_value).
-    /// Field index corresponds to the order in [`crate::DiagnosticsCommands::commands`].
     DiagnosticsFieldEdited(String, usize, EditorAction),
-    /// Save diagnostics commands for a workspace.
     SaveDiagnostics(String),
-    /// Async result of saving diagnostics.
     DiagnosticsSaved(String, Result<(), String>),
-    /// Re-discover diagnostics commands for a workspace (from scratch).
     RediscoverDiagnostics(String),
-    /// Async result of re-discovering diagnostics.
     RediscoverDiagnosticsResult(String, Result<(), String>),
 
-    /// Dismiss modals/panels (Escape key or a popup's corner cross).
     Escape,
 
-    /// Request toast notification.
     Toast(super::ToastMessage),
 
-    // ── Workspace rules popup ────────────────────────────────────
-    /// Open the rules popup for a workspace. The popup's backdrop covers the
-    /// page, so it is the only surface reachable until it closes.
+    /// Open the rules popup for a workspace. The popup's backdrop covers the page, so it is the
+    /// only surface reachable until it closes.
     OpenRules(String),
-    /// Rules editor content changed.
     RulesEdited(super::editor_widget::EditorAction),
-    /// Save the rules buffer to the store.
     SaveRules,
-    /// Async result of saving rules: (workspace, result).
     RulesSaved(String, Result<(), String>),
-    /// Close the rules popup, throwing the buffer away — its corner cross.
     RulesDiscard,
-    /// Escape or a click outside the popup: close it only when nothing is
-    /// unsaved.
+    /// Escape or a click outside the popup: close it only when nothing is unsaved.
     RulesDismiss,
     /// Close the read-only contexts popup.
     ContextsClose,
@@ -80,9 +60,7 @@ pub enum WorkspacesMessage {
 /// Which context entry the read-only context panel is showing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ContextKind {
-    /// Per-role discovery context (`workspace_contexts.role = <role>`).
     Role(String),
-    /// General workspace context (the `role IS NULL` row).
     General,
 }
 
@@ -91,42 +69,29 @@ pub struct WorkspacesState {
     pub(crate) load_state: super::common::AsyncLoadState,
     pub(crate) delete_target: Option<String>,
 
-    /// Read-only context view modal: (workspace_name, context kind, parsed_markdown_items).
-    /// `None` while the modal is not open, `Some` with `None` items while loading.
+    /// Read-only context view modal: (workspace_name, context kind, parsed_markdown_items). `None`
+    /// while the modal is not open, `Some` with `None` items while loading.
     pub(crate) context_view: Option<(String, ContextKind, Option<Vec<markdown::Item>>)>,
     pub(crate) context_view_error: Option<String>,
 
-    /// Diagnostics modal: workspace name being viewed/edited.
     pub(crate) diagnostics_modal: Option<String>,
-    /// Edit buffers for the 7 diagnostics command fields (when modal is open).
-    /// Keyed by workspace name. Each entry is a 7-element array corresponding
-    /// to the order in [`crate::DiagnosticsCommands::commands`].
     pub(crate) diagnostics_edit_buffers:
         HashMap<String, [SingleLineEditorState; crate::DiagnosticsCommands::COMMAND_COUNT]>,
-    /// Whether a diagnostics save or rediscover operation is in progress.
     pub(crate) diagnostics_busy: bool,
-    /// Last save error for diagnostics (resets on modal open).
     pub(crate) diagnostics_error: Option<String>,
 
-    // ── Rules popup ──────────────────────────────────────────────
-    /// The open rules popup, or nothing — one at a time, so its buffer and undo
-    /// stack live here rather than in a per-workspace map.
+    /// The open rules popup, or nothing — one at a time, so its buffer and undo stack live here
+    /// rather than in a per-workspace map.
     pub(crate) rules_editor: Option<RulesEditor>,
 }
 
-/// The focus id of the rules popup's editor — one popup at a time, so one id.
 pub(crate) const RULES_EDITOR_ID: &str = "workspace_rules";
 
-/// The open rules popup: the workspace it edits, the text as the store holds
-/// it, the unsaved buffer, and the last save failure shown in the popup.
 pub(crate) struct RulesEditor {
     pub(crate) workspace: String,
-    /// What the store had when the popup opened — the yardstick for "unsaved".
     saved: String,
     pub(crate) buffer: super::editor_widget::EditorBuffer,
     pub(crate) undo: super::common::UndoStack,
-    /// A failed save, reported inside the popup; the buffer stays as it was so
-    /// a retry needs no retyping.
     pub(crate) error: Option<String>,
 }
 
@@ -136,8 +101,8 @@ impl RulesEditor {
             &saved,
             Some(super::highlight::HighlightLanguage::Markdown),
         );
-        // Opened over existing rules to add to them: the caret goes to the end
-        // so the first keystroke appends instead of rewriting the first line.
+        // Opened over existing rules to add to them: the caret goes to the end so the first
+        // keystroke appends instead of rewriting the first line.
         buffer.move_to_end();
         Self {
             workspace,
@@ -148,7 +113,6 @@ impl RulesEditor {
         }
     }
 
-    /// Whether the buffer holds anything the store does not.
     fn is_dirty(&self) -> bool {
         self.buffer.text() != self.saved
     }
@@ -173,9 +137,9 @@ impl WorkspacesState {
 
     #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: WorkspacesMessage) -> Task<WorkspacesMessage> {
-        // Allow match_same_arms: separate error variants that happen to share the
-        // same error-handling body after initial processing (e.g. logging variant
-        // info). Narrowing per-arm would duplicate the handler across variants.
+        // Allow match_same_arms: separate error variants that happen to share the same
+        // error-handling body after initial processing (e.g. logging variant info). Narrowing
+        // per-arm would duplicate the handler across variants.
         #[expect(clippy::match_same_arms)]
         match msg {
             WorkspacesMessage::DeleteWorkspace(name) => {
@@ -199,9 +163,6 @@ impl WorkspacesState {
                 self.delete_target = None;
                 Task::none()
             }
-            // Successful mutations are refreshed by the Dashboard's shared-map
-            // reload (see process_settings_message) — no local store read. The
-            // Dashboard also reports the deletion.
             WorkspacesMessage::DeleteResult(Ok(_)) => {
                 self.load_state.clear_error();
                 Task::none()
@@ -276,12 +237,11 @@ impl WorkspacesState {
                 )
             }
             WorkspacesMessage::ContextViewed(ws_name, kind, result) => {
-                // A fetch that lands after the popup was dismissed has nowhere
-                // to go: reopening it would undo the dismissal.
+                // A fetch that lands after the popup was dismissed has nowhere to go: reopening it
+                // would undo the dismissal.
                 if self.context_view.is_none() {
                     return Task::none();
                 }
-                // No context set yet — an empty item list is the empty state.
                 let items = match &result {
                     Ok(Some(content)) => markdown::parse(content).collect(),
                     Ok(None) | Err(_) => Vec::new(),
@@ -291,8 +251,8 @@ impl WorkspacesState {
                 Task::none()
             }
             WorkspacesMessage::LinkClicked(_url) => {
-                // Handled by the Dashboard (mod.rs) which intercepts this
-                // variant to call open_url() before forwarding to update().
+                // Handled by the Dashboard (mod.rs) which intercepts this variant to call
+                // open_url() before forwarding to update().
                 Task::none()
             }
             WorkspacesMessage::ShowDiagnostics(name) => {
@@ -300,10 +260,9 @@ impl WorkspacesState {
                 self.diagnostics_busy = false;
                 self.diagnostics_error = None;
 
-                // Populate edit buffers from current diagnostics. An absent or
-                // empty blob is legitimately empty; a non-empty blob that
-                // fails to parse must surface instead of rendering as the
-                // "(skipped)" placeholders.
+                // Populate edit buffers from current diagnostics. An absent or empty blob is
+                // legitimately empty; a non-empty blob that fails to parse must surface instead of
+                // rendering as the "(skipped)" placeholders.
                 let raw = self
                     .workspaces
                     .iter()
@@ -349,8 +308,6 @@ impl WorkspacesState {
                 self.diagnostics_busy = true;
                 self.diagnostics_error = None;
 
-                // Build DiagnosticsCommands from edit buffers using the
-                // canonical from_buffers method.
                 let buffers: [String; crate::DiagnosticsCommands::COMMAND_COUNT] = match self
                     .diagnostics_edit_buffers
                     .get(&name)
@@ -381,7 +338,6 @@ impl WorkspacesState {
             WorkspacesMessage::DiagnosticsSaved(_name, Err(e)) => {
                 self.diagnostics_busy = false;
                 self.diagnostics_error = Some(e.clone());
-                // Keep modal open so user can retry
                 Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
             }
             WorkspacesMessage::RediscoverDiagnostics(name) => {
@@ -410,7 +366,6 @@ impl WorkspacesState {
                 Task::done(WorkspacesMessage::Toast(super::ToastMessage::Error(e)))
             }
 
-            // ── Rules popup ──────────────────────────────────────
             WorkspacesMessage::OpenRules(workspace) => {
                 let saved = self
                     .workspaces
@@ -418,19 +373,15 @@ impl WorkspacesState {
                     .find(|w| w.name == workspace)
                     .map_or_else(String::new, |w| w.notes.clone());
                 self.rules_editor = Some(RulesEditor::new(workspace, saved));
-                // The popup is the thing that was just asked for: the keyboard
-                // goes there, so the first keystroke lands without a click.
                 iced::widget::operation::focus(iced::widget::Id::from(RULES_EDITOR_ID))
             }
             WorkspacesMessage::RulesEdited(action) => {
                 let Some(rules) = self.rules_editor.as_mut() else {
                     return Task::none();
                 };
-                // The shared undo-aware path, so Cmd+Z / Cmd+Shift+Z work here
-                // like in every other editor.
                 super::common::apply_editor_action(&mut rules.buffer, &mut rules.undo, action);
-                // The store cuts at the cap; the buffer must not grow past it,
-                // or the counter would promise what a save throws away.
+                // The store cuts at the cap; the buffer must not grow past it, or the counter would
+                // promise what a save throws away.
                 let current = rules.buffer.text();
                 let truncated = truncate_workspace_notes(&current);
                 if truncated.len() < current.len() {
@@ -479,8 +430,8 @@ impl WorkspacesState {
                 self.rules_editor = None;
                 Task::none()
             }
-            // Escape and a click outside are not ways out of unsaved text: only
-            // Save and the corner cross are.
+            // Escape and a click outside are not ways out of unsaved text: only Save and the corner
+            // cross are.
             WorkspacesMessage::RulesDismiss => self.dismiss_rules(),
             WorkspacesMessage::ContextsClose => {
                 self.context_view = None;
@@ -488,8 +439,8 @@ impl WorkspacesState {
                 Task::none()
             }
 
-            // One dismissal closes one surface — the topmost that is open — and
-            // leaves the others alone. Unsaved rules survive it.
+            // One dismissal closes one surface — the topmost that is open — and leaves the others
+            // alone. Unsaved rules survive it.
             WorkspacesMessage::Escape => {
                 if self.rules_editor.is_some() {
                     self.dismiss_rules()
@@ -512,9 +463,9 @@ impl WorkspacesState {
         }
     }
 
-    /// Close the rules popup unless it holds unsaved text — the one place that
-    /// decides what "unsaved" means for a dismissal. A refused dismissal puts
-    /// the focus back in the editor: a click outside has just taken it away.
+    /// Close the rules popup unless it holds unsaved text — the one place that decides what
+    /// "unsaved" means for a dismissal. A refused dismissal puts the focus back in the editor: a
+    /// click outside has just taken it away.
     fn dismiss_rules(&mut self) -> Task<WorkspacesMessage> {
         let Some(rules) = self.rules_editor.as_ref() else {
             return Task::none();
@@ -542,8 +493,6 @@ mod tests {
         state
     }
 
-    /// `ShowDiagnostics` parses the stored blob: unparsable content surfaces an
-    /// error, an absent or blank blob reads as empty.
     #[test]
     fn show_diagnostics_reads_the_stored_blob() {
         for (blob, expect_error) in [

@@ -13,8 +13,7 @@
 //! the engine's own "zero means no limit" applies to the engine's limit, not to
 //! this one, which the engine never sees.
 //!
-//! Two mechanisms enforce it, and the second exists because the first cannot
-//! always run:
+//! Two mechanisms enforce it, and the second exists because the first cannot always run:
 //! - [`Read::check`] is the cooperative half: a read asks the budget whether it
 //!   is spent before each step, before each statement of a multi-statement walk,
 //!   and once the read is over. A spent budget is the limit's failure wherever it
@@ -66,8 +65,7 @@ const MAX_SECS: u64 = 86_400;
 /// This is the cooperative half's own margin, and it is small: a read that yields
 /// (each step, each round trip) notices the spent budget as soon as it returns, so
 /// the watchdog is here for the read that never returns to its loop — and the
-/// closer it fires to the limit, the closer the command ends to the limit it
-/// promised.
+/// closer it fires to the limit, the closer the command ends to the limit it promised.
 pub(crate) const WATCHDOG_GRACE_SECS: u64 = 1;
 
 /// What the process the watchdog ends exits with: the command's error output and
@@ -125,14 +123,11 @@ impl Budget {
         }
     }
 
-    /// What is left of the budget; zero once it is spent.
     fn remaining(&self) -> Duration {
         self.deadline.saturating_duration_since(Instant::now())
     }
 }
 
-/// One read of a command in flight: the target the user asked about (what a
-/// failure names) and the budget the whole command runs under.
 #[derive(Clone, Copy)]
 pub(crate) struct Read<'a> {
     target: &'a str,
@@ -141,7 +136,6 @@ pub(crate) struct Read<'a> {
 }
 
 impl<'a> Read<'a> {
-    /// A read this process makes of a store it opened itself.
     #[must_use]
     pub(crate) fn direct(target: &'a str, budget: &'a Budget) -> Self {
         Self {
@@ -163,8 +157,6 @@ impl<'a> Read<'a> {
         }
     }
 
-    /// What is left of the command's budget, for a wait this read hands to
-    /// something else (the instance's answer).
     pub(crate) fn remaining(&self) -> Duration {
         self.budget.remaining()
     }
@@ -230,8 +222,7 @@ static PROCESS_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 
 /// Let this process end itself when the read limit is spent. Called only by the
 /// child process of the debug watchdog test: "the process is gone" is observable
-/// across two processes, and a watchdog firing inside the test binary would end
-/// the whole run.
+/// across two processes, and a watchdog firing inside the test binary would end the whole run.
 #[cfg(test)]
 pub(crate) fn enable_process_exit() {
     PROCESS_EXIT.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -248,8 +239,6 @@ impl Watchdog {
             if rx.recv_timeout(cutoff.saturating_duration_since(Instant::now()))
                 == Err(RecvTimeoutError::Timeout)
             {
-                // The same shape and status the read's own failure would take
-                // (see [`WATCHDOG_EXIT_CODE`]).
                 crate::util::print_stderr(&format!("Error: {message}"));
                 std::process::exit(WATCHDOG_EXIT_CODE);
             }
@@ -263,16 +252,14 @@ mod tests {
     use super::*;
 
     /// The limit one knob value yields, with the knob removed again before the
-    /// next value is set (the guard holds the shared env lock, so only one may
-    /// live at a time).
+    /// next value is set (the guard holds the shared env lock, so only one may live at a time).
     fn limit_with(value: Option<&str>) -> Duration {
         let _env = crate::util::test::set_env_var(ENV, value);
         limit()
     }
 
     /// Unset means the default, an override is taken as given, an absurd one is
-    /// clamped — and the smallest value is an immediate failure, never an
-    /// engine-style "no limit".
+    /// clamped — and the smallest value is an immediate failure, never an engine-style "no limit".
     #[test]
     #[serial_test::serial(read_limit)]
     fn limit_reads_the_knob_within_its_bounds() {

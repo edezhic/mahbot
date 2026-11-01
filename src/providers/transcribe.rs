@@ -1,27 +1,21 @@
-//! Provider-backed video transcription for channel enrichment: a video (via
-//! the ephemeral upload bridge's public URL) becomes a text description, so the
-//! main agent loop only ever sees text.
-//!
-//! Not the document converter and not local speech recognition — this is the
-//! remote transcription path; microphone audio on macOS goes through
+//! Provider-backed video transcription for channel enrichment: a video (via the ephemeral upload
+//! bridge's public URL) becomes a text description, so the main agent loop only ever sees text. Not
+//! the document converter and not local speech recognition — microphone audio on macOS goes through
 //! `crate::audio`.
 
 use crate::util::UnwrapPoison;
 
-/// The transcriber for one configured endpoint and model. Its API key comes
-/// from the live config at request time, read by
-/// [`bearer_auth_header()`](crate::util::http::bearer_auth_header), so config
-/// reloads take effect immediately without recreating the transcriber.
+/// The transcriber for one configured endpoint and model. Its API key comes from the live config
+/// at request time ([`bearer_auth_header()`](crate::util::http::bearer_auth_header)), so config
+/// reloads take effect without recreating the transcriber.
 #[derive(Clone)]
 pub(crate) struct MediaTranscriber {
     api_url: String,
     model: String,
 }
 
-/// Overall cap for one video transcription (ephemeral upload + model call).
-/// Bounds the fail-open stall of both callers — the enrichment annotation and
-/// the video tool-result path — well under the worst-case sum of the upload
-/// bridge's per-host timeouts.
+/// Overall cap for one video transcription (upload + model call): bounds the fail-open stall of
+/// both callers well under the worst case of the upload bridge's per-host timeouts.
 const VIDEO_TRANSCRIPTION_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(3);
 
 impl MediaTranscriber {
@@ -34,11 +28,9 @@ impl MediaTranscriber {
         crate::providers::ensure_chat_completions_url(&self.api_url)
     }
 
-    /// Perform the model call and parse the assistant text, WITHOUT any live
-    /// or durable telemetry — the caller owns recording (see
-    /// `transcribe_video_file`). When `marker` is given, it is stamped
-    /// immediately before the HTTP request is sent so the caller's cap-drop
-    /// path can attribute a timeout to the LLM call.
+    /// Perform the model call and parse the assistant text, WITHOUT any live or durable telemetry
+    /// — the caller owns recording. When `marker` is given it is stamped immediately before the
+    /// request, so the caller's cap-drop path can attribute a timeout to the LLM call.
     async fn transcribe_media_raw(
         &self,
         content_part: serde_json::Value,
@@ -65,11 +57,9 @@ impl MediaTranscriber {
         }
 
         // NOTE: `post_json_to_provider` returns non-2xx responses as typed
-        // [`HttpError`](crate::util::error::HttpError) (accessible via
-        // `downcast_ref`).  This is safe because the error is caught by the
-        // fail-open callers (enrichment annotation, video tool result) which
-        // log a warning and fall back — it never reaches the retry logic in
-        // the provider layer.
+        // [`HttpError`](crate::util::error::HttpError) (via `downcast_ref`). Safe because the
+        // fail-open callers log a warning and fall back — it never reaches the retry logic in the
+        // provider layer.
         let result =
             crate::util::http::post_json_to_provider(&self.chat_url(), &body, "transcription")
                 .await?;
@@ -87,20 +77,17 @@ impl MediaTranscriber {
             return Ok(RawTranscription::EmptyContent);
         }
 
-        // Transcription text is embedded in tool outcomes and enriched messages
-        // that the trusted marker scans parse — neutralize any marker-shaped
-        // substring the model quoted from the media (the maximally-detailed
-        // prompt explicitly captures on-screen text) so it cannot be misparsed
-        // as a media reference. Applies to video transcription output.
+        // Transcription text is embedded in tool outcomes and enriched messages that the trusted
+        // marker scans parse — neutralize any marker-shaped substring the model quoted from the
+        // media (the detailed prompt captures on-screen text) so it cannot be misparsed.
         Ok(RawTranscription::Success {
             text: scrub_marker_like(&text),
             finish_reason,
         })
     }
 
-    /// Resolve the live-view tracker and the durable-call carrier for a
-    /// transcription call from the live context: the agent task-local wins
-    /// when present (in-agent path), else the explicit `workspace` (inbound
+    /// Resolve the live-view tracker and the durable-call carrier for a transcription call: the
+    /// agent task-local wins when present (in-agent path), else the explicit `workspace` (inbound
     /// path). Exactly one live entry is ever created per call.
     fn transcription_context(
         &self,
@@ -152,9 +139,8 @@ impl MediaTranscriber {
     }
 }
 
-/// Raw outcome of one media-transcription model call — telemetry-free, so the
-/// caller owns the durable record (a video-cap drop can then never lose or
-/// duplicate the row for the same logical call).
+/// Raw outcome of one media-transcription model call — telemetry-free, so the caller owns the
+/// durable record (a video cap-drop can then never lose or duplicate the row).
 enum RawTranscription {
     /// Model returned non-empty assistant text.
     Success {
@@ -165,10 +151,9 @@ enum RawTranscription {
     EmptyContent,
 }
 
-/// Shared marker between the capped video-transcription future and the
-/// cap-drop path: stamped when the model call launches so the drop path can
-/// attribute a timeout to the LLM call (recording a durable failure) instead
-/// of the upload phase, and measure the model-call duration honestly.
+/// Shared marker between the capped video-transcription future and the cap-drop path: stamped
+/// when the model call launches, so the drop path attributes a timeout to the LLM call rather
+/// than the upload phase, and measures the model-call duration honestly.
 struct ModelCallMarker(std::sync::Mutex<Option<std::time::Instant>>);
 
 impl ModelCallMarker {
@@ -176,22 +161,19 @@ impl ModelCallMarker {
         Self(std::sync::Mutex::new(None))
     }
 
-    /// Stamp the model-call launch; called immediately before the HTTP request
-    /// is sent.
+    /// Stamp the model-call launch; called immediately before the HTTP request is sent.
     fn mark(&self) {
         *self.0.lock().unwrap_poison() = Some(std::time::Instant::now());
     }
 
-    /// `Some(start)` when the model call launched.
     fn started_at(&self) -> Option<std::time::Instant> {
         self.0.lock().unwrap_poison().as_ref().copied()
     }
 }
 
-/// Record the rows for one media-transcription call (fail-open;
-/// usage columns stay NULL, retry_attempts always 1). `finish_reason` on
-/// success, `failure_class` + `error_chain` on failure — a failure also
-/// persists one `llm_failures` row (attempt 1) under a fresh operation id.
+/// Record the rows for one media-transcription call (fail-open; usage columns stay NULL,
+/// retry_attempts always 1). A failure also persists one `llm_failures` row under a fresh
+/// operation id.
 #[expect(clippy::cast_possible_truncation)]
 fn record_transcription(
     call: &crate::stats::LlmCallMeta,
@@ -214,10 +196,9 @@ fn record_transcription(
     }
 }
 
-/// Record the durable rows for a raw transcription outcome and resolve it to
-/// text (or the original error). The single place that maps video-transcription
-/// outcomes to `llm_requests`/`llm_failures` rows, so every call records
-/// exactly once.
+/// Record the durable rows for a raw transcription outcome and resolve it to text (or the
+/// original error). The single place that maps outcomes to `llm_requests`/`llm_failures`, so
+/// every call records exactly once.
 fn finish_transcription(
     call: &crate::stats::LlmCallMeta,
     started: std::time::Instant,
@@ -242,10 +223,8 @@ fn finish_transcription(
             anyhow::bail!("media transcription returned empty content");
         }
         Err(e) => {
-            // Classify through the canonical error cascade so 4xx client
-            // errors (auth, quota) land as `non_retryable` instead of the
-            // blanket `transport` label; the single-shot path never retries,
-            // but the durable `failure_class` column stays honest.
+            // Classify through the canonical error cascade so 4xx client errors (auth, quota) land
+            // as `non_retryable` instead of the blanket `transport` label.
             let failure = crate::providers::failure_class(
                 crate::providers::error_class::classify_err(&e),
                 false,
@@ -257,13 +236,11 @@ fn finish_transcription(
     }
 }
 
-/// One live-view tracker per media-transcription call — either the owning
-/// agent's activity indicator (in-agent path) or a non-agent call row
-/// (inbound path). Exactly one variant is live at a time; the guard clears it
-/// on every exit path (success, failure, cancellation).
+/// One live-view tracker per media-transcription call — either the owning agent's activity
+/// indicator (in-agent path) or a non-agent call row (inbound path). Exactly one variant is live
+/// at a time; the guard clears it on every exit path.
 ///
-/// The `_guard` field is named with a leading underscore because it is held
-/// purely for its RAII Drop side effect — it is never read by name.
+/// `_guard` is held purely for its RAII Drop side effect and never read.
 enum LiveTrackingGuard {
     Agent {
         _guard: crate::agent::registry::ActivityGuard,
@@ -273,26 +250,19 @@ enum LiveTrackingGuard {
     },
 }
 
-/// Transcribe a local video file — the shared fail-open helper for the
-/// inbound-enrichment annotation and the video tool-result paths. Uploads the
-/// file via the ephemeral host bridge and describes the returned public URL,
-/// returning `None` on unavailable transcriber, unsupported format,
-/// upload/model failure, or empty output so callers degrade to their plain
-/// annotation. The whole flow is capped by [`VIDEO_TRANSCRIPTION_TIMEOUT`] so
-/// both callers are uniformly bounded.
+/// Transcribe a local video file — the shared fail-open helper for the inbound-enrichment
+/// annotation and the video tool-result paths. Uploads the file via the ephemeral host bridge and
+/// describes the returned public URL, returning `None` on unavailable transcriber, unsupported
+/// format, upload/model failure or empty output, so callers degrade to their plain annotation.
+/// The whole flow is capped by [`VIDEO_TRANSCRIPTION_TIMEOUT`].
 ///
-/// `workspace` names the workspace for telemetry and for the live non-agent
-/// call row when no agent context is present (inbound enrichment); inside an
-/// agent run the transcription shows under the owning agent's activity
-/// indicator instead.
+/// `workspace` names the workspace for telemetry and for the live non-agent call row when no
+/// agent context is present.
 ///
-/// The live tracker and the durable record are owned by THIS scope — the
-/// capped future below only performs the model call (telemetry-free via
-/// [`MediaTranscriber::transcribe_media_raw`]). A cap drop therefore cannot
-/// race the inner future's own write, so one launched model call always
-/// produces exactly one `llm_requests` row (success, failure, or the
-/// drop's transport row), never two; upload-phase failures — no model call
-/// launched — record nothing (no phantom rows).
+/// The live tracker and the durable record are owned by THIS scope — the capped future only
+/// performs the model call, telemetry-free ([`MediaTranscriber::transcribe_media_raw`]). A cap
+/// drop therefore cannot race the inner future's write: one launched model call produces exactly
+/// one `llm_requests` row, and upload-phase failures record nothing.
 pub(crate) async fn transcribe_video_file(
     path: &std::path::Path,
     workspace: Option<&str>,
@@ -315,14 +285,12 @@ pub(crate) async fn transcribe_video_file(
             .await
     })
     .await;
-    // Duration measured from the model call's launch (consistent with every
-    // other transcription row); the upload phase is not an LLM call.
+    // Duration measured from the model call's launch (consistent with every other transcription
+    // row); the upload phase is not an LLM call.
     let started = marker.started_at().unwrap_or_else(std::time::Instant::now);
     if let Ok(inner) = outcome {
-        // An upload-phase failure never reaches the model call (the marker is
-        // unstamped) — record nothing for it, matching the cap-drop branch
-        // below: no LLM request was made, so a durable row would be a phantom.
-        // Only outcomes after a launched model call map to a row.
+        // An upload-phase failure never reaches the model call (the marker is unstamped) — record
+        // nothing for it: no LLM request was made, so a durable row would be a phantom.
         if marker.started_at().is_none() {
             if let Err(e) = inner {
                 tracing::warn!(
@@ -341,11 +309,9 @@ pub(crate) async fn transcribe_video_file(
             }
         }
     } else {
-        // The cap fired. If the model call had launched, the dropped attempt
-        // is a failed LLM call and is recorded durably here (the inner future
-        // never records, so this cannot duplicate a row). A timeout during the
-        // upload phase records nothing: no LLM request was made. The live
-        // tracker clears when this scope ends.
+        // The cap fired. If the model call had launched, the dropped attempt is a failed LLM call
+        // and is recorded durably here (the inner future never records, so this cannot duplicate a
+        // row). A timeout during the upload phase records nothing.
         if marker.started_at().is_some() {
             record_transcription(
                 &call,
@@ -360,10 +326,9 @@ pub(crate) async fn transcribe_video_file(
     }
 }
 
-/// Neutralize marker-shaped substrings (e.g. `[IMAGE:`, `[video:`) in LLM
-/// transcription text so the media-marker scans cannot treat quoted text as a
-/// real media reference. Case-insensitive: the Telegram mirror path's marker
-/// regex matches any case.
+/// Neutralize marker-shaped substrings (e.g. `[IMAGE:`, `[video:`) in LLM transcription text so
+/// the media-marker scans cannot treat quoted text as a real reference. Case-insensitive: the
+/// Telegram mirror path's marker regex matches any case.
 fn scrub_marker_like(text: &str) -> String {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?i)\[(image|audio|video):").expect("marker scrub regex must compile")

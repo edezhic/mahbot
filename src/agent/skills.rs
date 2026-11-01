@@ -1,26 +1,19 @@
 //! Skills subsystem — loads workspace skills and injects them into prompts.
 //!
-//! Skills live in any of these locations (prioritised in order):
-//! - `<workspace>/skills/<name>/SKILL.md`
-//! - `<workspace>/.claude/skills/<name>/SKILL.md`
-//! - `<workspace>/.agents/skills/<name>/SKILL.md`
-//!
-//! Each SKILL.md is markdown with optional YAML frontmatter for `name` and
-//! `description`. Loaded skills are rendered into the system prompt as name +
+//! Skills live in `<workspace>/skills/<name>/SKILL.md`, then `.claude/skills/`, then
+//! `.agents/skills/` (priority order). Each SKILL.md is markdown with optional YAML frontmatter
+//! for `name` and `description`; loaded skills render into the system prompt as name +
 //! description, with a `<location>` path the model can `read` for full content.
 //!
-//! Within each location, skill subdirectories are scanned in deterministic
-//! byte-sorted directory-name order (never `read_dir` enumeration order), so
-//! identical directories always render byte-identically — keeping the provider
-//! prompt-prefix cache stable across renders.
+//! Within each location, subdirectories are scanned in byte-sorted name order (never `read_dir`
+//! order), so identical directories render byte-identically — keeping the provider prompt-prefix
+//! cache stable across renders.
 
 use crate::Skill;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::Path;
-
-// ── Frontmatter parsing ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
 struct SkillMarkdownMeta {
@@ -29,7 +22,6 @@ struct SkillMarkdownMeta {
 }
 
 /// Parse a minimal YAML frontmatter block (`---` delimited) from markdown.
-/// Only `name:` and `description:` keys are extracted; everything else is ignored.
 fn parse_frontmatter(content: &str) -> SkillMarkdownMeta {
     /// Strip leading/trailing whitespace and surrounding quotes.
     fn strip_quotes(s: &str) -> String {
@@ -61,16 +53,8 @@ fn parse_frontmatter(content: &str) -> SkillMarkdownMeta {
     meta
 }
 
-// ── Loading ─────────────────────────────────────────────────────────────
-
-/// Load all skills from the workspace skills directories.
-///
-/// Scans three locations (in priority order):
-/// 1. `<workspace>/skills/`
-/// 2. `<workspace>/.claude/skills/`
-/// 3. `<workspace>/.agents/skills/`
-///
-/// If multiple directories contain a skill with the same name, the first one wins.
+/// Load all skills from the workspace skills directories, in priority order. If several
+/// directories hold a skill with the same name, the first wins.
 #[must_use]
 pub async fn load_skills(ws: &crate::Workspace) -> Vec<Skill> {
     let workspace = ws.as_path();
@@ -96,12 +80,10 @@ pub async fn load_skills(ws: &crate::Workspace) -> Vec<Skill> {
 
 /// Scan a single directory for skill subdirectories (each containing `SKILL.md`).
 ///
-/// Entries are processed in deterministic raw directory-name order (byte
-/// sort), not in `read_dir` enumeration order, so identical directories always
-/// render byte-identically. Directory names within a single directory are
-/// unique, so the sort cannot tie — case-only differences (e.g. `A` vs `a`)
-/// order cleanly and two subdirs declaring the same frontmatter name resolve
-/// to the byte-earliest directory name.
+/// Entries are processed in deterministic raw directory-name order (byte sort), not `read_dir`
+/// order. Names within a directory are unique, so the sort cannot tie — case-only differences
+/// order cleanly and two subdirs declaring the same frontmatter name resolve to the
+/// byte-earliest name.
 async fn scan_skills_dir(dir: &Path) -> Vec<Skill> {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return Vec::new();
@@ -155,12 +137,10 @@ async fn load_skill(path: &Path, skill_dir: &Path) -> Result<Skill> {
     })
 }
 
-// ── Prompt rendering ────────────────────────────────────────────────────
-
 /// Render skills into the system prompt.
 ///
-/// Only name and description are inlined. The LLM must use `read` with
-/// the `<location>` path to get the full content.
+/// Only name and description are inlined; the model must use `read` with the `<location>` path
+/// for the full content.
 #[must_use]
 pub fn skills_to_prompt(skills: &[Skill], ws: &crate::Workspace) -> String {
     let mut skills_xml = String::new();
@@ -180,7 +160,7 @@ pub fn skills_to_prompt(skills: &[Skill], ws: &crate::Workspace) -> String {
     )
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────
+// Helpers
 
 fn write_xml_text_element(w: &mut String, indent: usize, name: &str, value: &str) {
     let padding = " ".repeat(indent);

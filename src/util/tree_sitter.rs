@@ -1,30 +1,23 @@
-//! Canonical mapping from file extensions to tree-sitter [`Language`] objects.
-//!
-//! This is the **single source of truth** for which file extension maps to which
-//! tree-sitter grammar. Both the `read` tool's symbol extraction
-//! ([`crate::tools::read`]) and the GUI editor's syntax highlighting
+//! Canonical mapping from file extensions to tree-sitter [`Language`] objects — the **single source
+//! of truth** for which extension maps to which grammar. Both the `read` tool's symbol extraction
+//! and the GUI editor's syntax highlighting
 //! ([`crate::gui::highlight::HighlightLanguage::from_extension`]) delegate here.
 //!
-//! ## Adding support for a new language
-//!
-//! 1. Add the extension(s) and grammar to `GRAMMARS` (this file).
-//! 2. Add a variant to [`HighlightLanguage`] and a `language_and_query` arm in
-//!    [`crate::gui::highlight`] — the reverse-lookup map is derived automatically.
-//! 3. Add a `line_comment_prefix` arm in [`crate::gui::editor_widget`] (if
-//!    applicable for the language).
-//! 4. Add a `language_support` arm in [`crate::tools::read`] if the language
-//!    should have symbol extraction (the `_ => ""` fallback gives empty symbols).
+//! Adding a language: the extension(s) and grammar in `GRAMMARS`; a [`HighlightLanguage`] variant
+//! and a `language_and_query` arm (the reverse-lookup map is derived automatically); a
+//! `line_comment_prefix` arm in [`crate::gui::editor_widget`] if applicable; and a
+//! `language_support` arm in the read tool if it should have symbol extraction (the `_ => ""`
+//! fallback gives empty symbols).
 //!
 //! [`HighlightLanguage`]: crate::gui::highlight::HighlightLanguage
 
 use tree_sitter::Language;
 
-/// One `GRAMMARS` row: a file extension and a constructor for its grammar.
 type Grammar = (&'static str, fn() -> Language);
 
-/// The canonical extension-to-grammar mapping, one row per extension.
-/// Declaration order is the order `supported_extensions` — and therefore the
-/// `read` tool's unsupported-extension error message — lists extensions in.
+/// The canonical extension-to-grammar mapping, one row per extension. Declaration order is the
+/// order `supported_extensions` — and therefore the read tool's unsupported-extension error — lists
+/// extensions in.
 const GRAMMARS: &[Grammar] = &[
     ("rs", || tree_sitter_rust::LANGUAGE.into()),
     ("js", || tree_sitter_javascript::LANGUAGE.into()),
@@ -53,15 +46,11 @@ const GRAMMARS: &[Grammar] = &[
     ("markdown", || tree_sitter_md::LANGUAGE.into()),
 ];
 
-/// Every extension recognized by [`tree_sitter_language_for_extension`], in
-/// declaration order. Used by the `read` tool's unsupported-extension error.
+/// Every extension [`tree_sitter_language_for_extension`] recognizes, in declaration order.
 pub(crate) fn supported_extensions() -> impl Iterator<Item = &'static str> {
     GRAMMARS.iter().map(|(ext, _)| *ext)
 }
 
-/// Map a file extension to its corresponding tree-sitter [`Language`].
-///
-/// The mapping itself lives in `GRAMMARS`; this is only the lookup.
 #[must_use]
 pub fn tree_sitter_language_for_extension(ext: &str) -> Option<Language> {
     GRAMMARS

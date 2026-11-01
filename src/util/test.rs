@@ -1,36 +1,14 @@
-//! Shared test utilities for initializing global stores and building test
-//! tickets.
+//! Shared test infrastructure: global stores, builders and guards.
 //!
-//! Provides a single temporary directory shared across all test initializations,
-//! instead of the previous per-module pattern that leaked a separate temp dir
-//! per store.
+//! One temporary directory is shared across all test initializations rather than one per store. The
+//! root is created once per process and removed at exit on unix; since global [`OnceCell`]s can
+//! only be set once, each store is initialized at most once per test run.
 //!
-//! The shared test root is created once per process; on unix it is removed at
-//! process exit via an exit hook (pass, failure, and per-test panics all exit
-//! the process normally), and on other platforms it is left for the OS temp
-//! sweep. Since global [`OnceCell`]s can only be set once, each store is
-//! initialized at most once per test run.
-//!
-//! Also provides [`TicketBuilder`], a builder for creating test tickets that was
-//! historically defined in the `board` module and imported from there by sibling
-//! modules, and [`TicketFixture`], the in-memory `Ticket` value the GUI and
-//! channel tests share. Moved here so all test infrastructure lives in one place.
-//!
-//! Also provides [`JobRowBuilder`], a builder for inserting test `jobs` rows
-//! (the durability/resume substrate in the consolidated domain database) that
-//! mirrors the production INSERT in [`crate::jobs::spawn_job`].
-//!
-//! Also provides [`create_test_workspace`] (inserting a workspace into the test DB)
-//! and [`init_management_test_stores`] (initializing all stores plus the manager
-//! queue), relocated from `management.rs` tests so they are discoverable alongside
-//! the rest of the shared test infrastructure.
-//!
-//! Also provides [`seed_session_row`], a session-seeding helper shared by the
-//! analyze/implement tool tests (it exists because the session store's
-//! `batch_append` is `session`-module private); [`ProbeFile`], a self-removing
-//! probe file for the tests that author a tool into a shared catalogue folder;
-//! and [`rs_files_under`] with [`rel_source_path`], the file list and the
-//! relative-path spelling the source-scanning tripwires walk.
+//! Also here: [`TicketBuilder`] and [`TicketFixture`] (tickets), [`JobRowBuilder`] (mirroring the
+//! production INSERT in [`crate::jobs::spawn_job`]), [`create_test_workspace`],
+//! [`init_management_test_stores`], [`seed_session_row`] (the session store's `batch_append` is
+//! module-private), [`ProbeFile`], and [`rs_files_under`] with [`rel_source_path`] for the
+//! source-scanning tripwires.
 
 #![cfg(test)]
 
@@ -43,28 +21,17 @@ use crate::workspace::test_ws_named;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-/// Shared test root directory, created once per process.
-///
-/// Removed at process exit on unix via [`register_test_root_cleanup`]; on
-/// other platforms it is left for the OS temp sweep. This is the process-level
-/// shared root only — per-test temp dirs (`open_test_store!`,
-/// `init_temp_repo`, per-test `TempDir`s) keep their own create/drop
-/// lifecycle.
+/// Shared test root directory, created once per process and removed at exit on unix via
+/// [`register_test_root_cleanup`]. Per-test temp dirs keep their own lifecycle.
 static TEST_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
-/// PID of the process that created [`TEST_ROOT`].
-///
-/// Guards the exit-time cleanup: `atexit` handlers registered before `fork()`
-/// run in the child too, and a fork child must never remove its parent's
-/// live root.
+/// PID of the process that created [`TEST_ROOT`]: `atexit` handlers registered before `fork()` run
+/// in the child too, and a fork child must never remove its parent's live root.
 #[cfg(unix)]
 static TEST_ROOT_CREATOR_PID: OnceLock<libc::pid_t> = OnceLock::new();
 
-/// Mutex serializing env-var-modifying tests to prevent thread-safety
-/// issues with `std::env::set_var` (which is `unsafe` in Rust 2024).
-///
-/// All test modules that modify environment variables should use this
-/// shared lock to prevent data races between concurrent tests.
+/// Mutex serializing env-var-modifying tests: `std::env::set_var` is `unsafe` in Rust 2024, and
+/// every test module touching the environment must take this lock.
 pub fn env_lock() -> &'static std::sync::Mutex<()> {
     static ENV_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
     ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
@@ -79,40 +46,21 @@ impl Drop for ProbeFile {
     }
 }
 
-// ── Test-global exclusion via serial_test keys ─────────────
+// Test-global exclusion is via [`serial_test`] keys: `provider` guards the fake-provider and
+// retry-policy globals, `drain` the shutdown drain flag. A test needs a key whenever it MUTATES
+// the guarded global or its assertions depend on its value — a reader asserting non-drain
+// behaviour needs `drain` as much as a mutator does (a test awaiting a routed manager envelope:
+// routing skips the live route while the flag is set, so its wait would never resolve). Keys may
+// be listed in any order, since the derive macro sorts them at expansion. Tests touching no
+// guarded global carry no key and must not share process-global state of their own.
 
-// Test-global exclusion is via [`serial_test`] keys: `provider` guards the
-// process-global fake-provider + retry-policy globals, `drain` guards the
-// shutdown drain flag. A test needs a key whenever it MUTATES the guarded
-// global or its assertions depend on the global's value — a drain-flag reader
-// asserting non-drain behavior needs `drain` just as much as a mutator does.
-// A test awaiting a routed manager envelope is such a reader: manager-envelope
-// routing skips the live route while the flag is set, so its wait would never
-// resolve.
-// Multi-key attributes may list keys in any order: serial_test's derive macro
-// sorts them alphabetically at expansion ("avoids dining philosopher issues"),
-// so the library itself guarantees a consistent global acquisition order.
-// Tests that touch no guarded global carry no key and must not share
-// process-global state of their own (unique workspace/job ids against the
-// shared test store), e.g. the jobs boot-recovery and research-cancel tests.
-
-/// The process-global store lock: tests that write the shared `OnceCell` stores
-/// hold it for their whole body, so no two of them touch the same rows at once.
-/// Async-aware, so a guard may be held across `.await` points.
-///
-/// Taken by the pipeline suite in the tests that drive the shared stores, and by
-/// the `workspace` tool's pause tests, which write workspace rows there. Its
-/// fleet-wide test drives a store of its own and needs no lock.
+/// The process-global store lock: tests writing the shared `OnceCell` stores hold it for their
+/// whole body, so no two touch the same rows at once. Async-aware, so a guard may be held across
+/// `.await` points.
 pub(crate) static STORE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-// ── Retry-policy guard for scoped-retry tests ──────────────
-
-/// RAII guard restoring the previous test retry-policy override on drop.
-///
-/// Returned by [`install_test_retry_policy`] — holding it (typically
-/// `let _policy_guard`) restores the pre-test override (or unset state) when
-/// the test finishes, including on panic, so a tiny test policy never leaks
-/// into other tests. Mirrors [`FakeProviderGuard`].
+/// RAII guard restoring the previous test retry-policy override on drop, on panic included, so a
+/// tiny test policy never leaks into other tests. Mirrors [`FakeProviderGuard`].
 #[must_use]
 pub(crate) struct RetryPolicyGuard {
     previous: Option<crate::retry::RetryPolicy>,
@@ -124,37 +72,26 @@ impl Drop for RetryPolicyGuard {
     }
 }
 
-/// Install a test retry-policy override for the duration of the returned
-/// guard.
-///
-/// The caller must be annotated `#[serial_test::serial(provider)]` (the
-/// serial key guards the process-global retry-policy override) and keep the
-/// returned guard alive — dropping it restores the previous override.
+/// Install a test retry-policy override for the duration of the returned guard. The caller must be
+/// annotated `#[serial_test::serial(provider)]` and keep the guard alive.
 pub(crate) fn install_test_retry_policy(policy: crate::retry::RetryPolicy) -> RetryPolicyGuard {
     let previous = crate::retry::swap_test_retry_policy(policy);
     RetryPolicyGuard { previous }
 }
 
-// ── Fake provider for scoped-retry tests ──────────────────
-
-/// Scripted [`crate::Provider`] test double for the scoped retry loops.
-///
-/// Each [`chat_scoped`](crate::Provider::chat_scoped) call pops the next
-/// scripted outcome: either `Ok(ChatResponse)` or an error carrying an
-/// explicit [`FailureClass`] (so classification is exercised without HTTP).
-/// Every request's `Debug` fingerprint is recorded so tests can assert
-/// byte-identical retries vs. parse-failure re-prompts.
+/// Scripted [`crate::Provider`] test double for the scoped retry loops: each
+/// [`chat_scoped`](crate::Provider::chat_scoped) call pops the next outcome — `Ok(ChatResponse)`
+/// or an error carrying an explicit [`FailureClass`], so classification needs no HTTP. Every
+/// request's `Debug` fingerprint is recorded for byte-identity assertions.
 pub(crate) struct FakeProvider {
     script: std::sync::Mutex<
         std::collections::VecDeque<Result<crate::ChatResponse, crate::providers::ScopedCallError>>,
     >,
     /// `Debug` fingerprint of every request received (byte-identity checks).
     pub request_fingerprints: std::sync::Mutex<Vec<String>>,
-    /// `Debug` fingerprint of just each request's message list — the
-    /// byte-stable-prefix property (append-only growth of the continuation
-    /// tail) is asserted on this. Per-message `Debug` joined with NUL (which
-    /// cannot appear in `Debug` output — control chars are escaped), so a
-    /// plain `starts_with` prefix check holds for appended-only growth.
+    /// `Debug` fingerprint of just each request's message list, on which the byte-stable-prefix
+    /// property is asserted: per-message `Debug` joined with NUL (which cannot appear in `Debug`
+    /// output), so a plain `starts_with` check holds for appended-only growth.
     pub request_messages: std::sync::Mutex<Vec<String>>,
 }
 
@@ -174,8 +111,7 @@ impl FakeProvider {
         self.ok_with_finish(text, None)
     }
 
-    /// Push a scripted successful response with an explicit finish_reason
-    /// (e.g. "length" to simulate provider truncation).
+    /// Push a successful response with an explicit finish_reason (e.g. "length").
     #[must_use]
     pub(crate) fn ok_with_finish(self, text: &str, finish_reason: Option<&str>) -> Self {
         self.script
@@ -189,10 +125,8 @@ impl FakeProvider {
         self
     }
 
-    /// Push a scripted reasoning-only response (empty content, no tool calls,
-    /// reasoning fields set) — the reasoning-only-stop class. `reasoning` is
-    /// mirrored into both `reasoning` and `reasoning_content` (the DeepSeek
-    /// wire shape).
+    /// Push a reasoning-only response (empty content, no tool calls): `reasoning` is mirrored into
+    /// both `reasoning` and `reasoning_content`, the DeepSeek wire shape.
     #[must_use]
     pub(crate) fn ok_reasoning_only(self, reasoning: &str, finish_reason: Option<&str>) -> Self {
         self.script
@@ -211,9 +145,8 @@ impl FakeProvider {
         self
     }
 
-    /// Like [`Self::ok_reasoning_only`] but with real provider usage on the
-    /// envelope — a real reasoning-only response always carries usage, and the
-    /// session-length recording tests need usage-bearing fakes.
+    /// Like [`Self::ok_reasoning_only`] but with real usage on the envelope, which a real
+    /// reasoning-only response always carries.
     #[must_use]
     pub(crate) fn ok_reasoning_only_with_usage(
         self,
@@ -282,9 +215,7 @@ impl FakeProvider {
         self
     }
 
-    /// Push a scripted response with accompanying text AND one or more tool
-    /// calls (ids `call_test_0`, `call_test_1`, ... in order) — the
-    /// sleep-delivery-guard violation shapes.
+    /// Push text AND one or more tool calls (ids `call_test_0`, … in order).
     #[must_use]
     pub(crate) fn ok_text_and_tool_calls(
         self,
@@ -327,11 +258,8 @@ impl FakeProvider {
         self
     }
 
-    /// Push a scripted non-retryable HTTP failure with a raw provider body,
-    /// formatted exactly like the production `HttpError` display
-    /// (`"{context} API error ({status}): {body}"`), so detection logic that
-    /// scans the error-trail text (e.g. the input-image-rejection strip) sees
-    /// the same shape as a real provider rejection.
+    /// Push a non-retryable HTTP failure formatted exactly like the production `HttpError` display
+    /// (`"{context} API error ({status}): {body}"`), so error-trail scanning sees a real shape.
     #[must_use]
     pub(crate) fn err_http(self, status: u16, body: &str) -> Self {
         let msg = format!("OpenRouter API error ({status}): {body}");
@@ -372,14 +300,9 @@ impl crate::Provider for FakeProvider {
     }
 }
 
-/// RAII guard restoring the previous global provider on drop.
-///
-/// Returned by [`install_fake_provider`] — holding it (typically `let _guard`)
-/// restores the pre-test provider (or unset state) when the test finishes,
-/// including on panic, so the fake never leaks into other tests. The restore is
-/// conditional on the provider not having been replaced by a concurrent test
-/// (see [`restore_provider_for_test_if`]), so a guard never clobbers a newer
-/// fake installed by another test.
+/// RAII guard restoring the previous global provider on drop, on panic included, so the fake never
+/// leaks into other tests. The restore is conditional on the provider not having been replaced
+/// meanwhile (see [`restore_provider_for_test_if`]), so it never clobbers a newer fake.
 #[must_use]
 pub(crate) struct FakeProviderGuard {
     previous: Option<Arc<dyn crate::Provider>>,
@@ -392,12 +315,8 @@ impl Drop for FakeProviderGuard {
     }
 }
 
-/// Install a [`FakeProvider`] as the global provider for tests.
-///
-/// The caller must be annotated `#[serial_test::serial(provider)]` (the
-/// serial key guards the process-global fake provider) and keep the returned
-/// guard alive — dropping it (on test end or panic) restores the previous
-/// provider without clobbering a newer fake installed concurrently.
+/// Install a [`FakeProvider`] as the global provider for tests. The caller must be annotated
+/// `#[serial_test::serial(provider)]` and keep the returned guard alive.
 pub(crate) fn install_fake_provider(provider: Arc<dyn crate::Provider>) -> FakeProviderGuard {
     let previous = crate::providers::swap_provider_for_test(provider.clone());
     FakeProviderGuard {
@@ -406,27 +325,19 @@ pub(crate) fn install_fake_provider(provider: Arc<dyn crate::Provider>) -> FakeP
     }
 }
 
-// ── Combined retry+provider test seam ────────────────────
-
-/// RAII guard for [`install_retry_seam`]: holds the tiny retry-policy
-/// override and the fake provider until dropped, so both restore at scope
-/// exit (including on panic). Fields are ordered so the drop restores
-/// provider → policy (reverse of install).
-///
-/// The caller must be annotated `#[serial_test::serial(provider)]` (the
-/// serial key guards the process-global fake provider + retry-policy
-/// override).
+/// RAII guard for [`install_retry_seam`]: holds the tiny retry-policy override and the fake
+/// provider until dropped, restoring both at scope exit. Fields are ordered so the drop restores
+/// provider → policy, the reverse of install. The caller must be annotated
+/// `#[serial_test::serial(provider)]`.
 #[must_use]
 pub(crate) struct RetrySeam {
     _fake: FakeProviderGuard,
     _retry: RetryPolicyGuard,
 }
 
-/// Scoped install of the full retry-provider test seam: installs
-/// [`crate::retry::tiny_test_policy`] and `provider` as the global provider.
-/// Everything restores when the returned [`RetrySeam`] drops.
-///
-/// The caller must be annotated `#[serial_test::serial(provider)]`.
+/// Scoped install of the full retry-provider test seam: [`crate::retry::tiny_test_policy`] and
+/// `provider` as the global provider, both restored when the [`RetrySeam`] drops. The caller must
+/// be annotated `#[serial_test::serial(provider)]`.
 pub(crate) fn install_retry_seam(provider: impl crate::Provider + 'static) -> RetrySeam {
     install_retry_seam_dyn(Arc::new(provider))
 }
@@ -441,12 +352,9 @@ pub(crate) fn install_retry_seam_dyn(provider: Arc<dyn crate::Provider>) -> Retr
     }
 }
 
-/// Recording [`crate::Channel`] test double: every sent message is pushed
-/// into a shared buffer, `listen` is a no-op.
-///
-/// `name` is required because the registry keys channels by name and
-/// silently drops duplicate registrations — call sites pass distinct names
-/// to avoid cross-test collisions.
+/// Recording [`crate::Channel`] test double: every sent message is pushed into a shared buffer,
+/// `listen` is a no-op. `name` is required because the registry keys channels by name and silently
+/// drops duplicates, so call sites pass distinct names.
 pub(crate) struct SpyChannel {
     name: &'static str,
     sent: Arc<std::sync::Mutex<Vec<crate::SendMessage>>>,
@@ -492,28 +400,21 @@ impl crate::Channel for SpyChannel {
     }
 }
 
-/// Install a caller-owned logs store for the telemetry queue's writes for the
-/// duration of the returned guard (mirrors [`install_fake_provider`]).
+/// Install a caller-owned logs store for the telemetry queue's writes for the duration of the
+/// returned guard (mirrors [`install_fake_provider`]).
 ///
-/// The boot `LOG_STORE` is a process-global `OnceCell` set by `init_tracing`,
-/// which tests never run — so telemetry recording is normally a silent no-op.
-/// This seam redirects EVERY record the queue writes (not only `record_llm_*`)
-/// to a test store so end-to-end tests can assert on the recorded rows.
-///
-/// While the guard is alive the redirect is PROCESS-GLOBAL: every record any
-/// concurrently-running test produces lands in this store. Callers must hold the
-/// serial_test keys covering every global their test touches for the guard's
-/// lifetime — `provider` covers the telemetry drain's records — and filter
-/// queries by a test-unique identifier. A test that reads the rows a record
-/// produced must first await [`crate::telemetry::drain_for_test`]: no test runs
-/// the boot that starts the drain task.
+/// The boot `LOG_STORE` is a `OnceCell` set by `init_tracing`, which tests never run, so telemetry
+/// recording is normally a silent no-op; this seam redirects EVERY record the queue writes to a
+/// test store. The redirect is PROCESS-GLOBAL: callers must hold the serial_test keys covering
+/// every global their test touches and filter queries by a test-unique identifier. A test reading
+/// those rows must first await [`crate::telemetry::drain_for_test`] — no test runs the boot that
+/// starts the drain task.
 pub(crate) fn install_test_log_store(store: crate::logs::LogStore) -> TestLogStoreGuard {
     let previous = crate::telemetry::swap_test_log_store(Some(store));
     TestLogStoreGuard { previous }
 }
 
-/// RAII guard restoring the previous test log-store override on drop
-/// (including during a panic), so it never leaks into other tests.
+/// RAII guard restoring the previous test log-store override on drop, panic included.
 #[must_use]
 pub(crate) struct TestLogStoreGuard {
     previous: Option<crate::logs::LogStore>,
@@ -525,23 +426,14 @@ impl Drop for TestLogStoreGuard {
     }
 }
 
-/// RAII guard that restores an environment variable to its original value
-/// on drop, including during a panic (unwind safety).
-///
-/// Created by [`set_env_var`]. Holds the shared [`env_lock()`] for the
-/// entire duration to serialize concurrent env access across tests.
-///
-/// # Panic safety
-///
-/// The `Drop` implementation restores the original value even if the
-/// enclosing scope panics, preventing test-isolation leaks. This is the
-/// key advantage over a closure-based `with_env_var` helper.
+/// RAII guard restoring an environment variable to its original value on drop, panic included —
+/// the key advantage over a closure-based helper. Created by [`set_env_var`]; holds the shared
+/// [`env_lock()`] for its entire duration to serialize concurrent env access.
 pub struct EnvVarGuard {
     /// Serializes concurrent env access — held for the guard's entire lifetime.
     _lock: std::sync::MutexGuard<'static, ()>,
     key: String,
-    /// Original value captured before mutation. Stored as [`OsString`] to
-    /// preserve arbitrary (non-UTF-8) env var values on restore.
+    /// Original value, as [`OsString`] to preserve non-UTF-8 values on restore.
     original: Option<std::ffi::OsString>,
 }
 
@@ -558,21 +450,9 @@ impl Drop for EnvVarGuard {
     }
 }
 
-/// Set an environment variable for the duration of the returned guard.
-///
-/// The environment variable `key` is immediately set to `value` (or
-/// removed if `value` is `None`). When the returned [`EnvVarGuard`] is
-/// dropped — including on panic — the original value is restored.
-///
-/// Acquires the shared [`env_lock()`] to prevent data races with other
-/// tests that manipulate environment variables.
-///
-/// # Example
-///
-/// ```ignore
-/// let _guard = set_env_var("SOME_TEST_VAR", Some("value"));
-/// // _guard drops here, restoring the variable to its original value
-/// ```
+/// Set an environment variable for the duration of the returned guard: `key` is set to `value` (or
+/// removed when `value` is `None`) and restored on drop, panic included. Acquires the shared
+/// [`env_lock()`] to prevent races with other tests.
 #[must_use]
 pub fn set_env_var(key: &str, value: Option<&str>) -> EnvVarGuard {
     let guard = env_lock().lock().unwrap_poison();
@@ -629,20 +509,15 @@ pub(crate) fn tiny_png_data_uri() -> String {
     format!("data:image/png;base64,{}", STANDARD.encode(&buf))
 }
 
-/// The single process-level test temp root.
-///
-/// All test-owned process-global state that needs a temp directory — the
-/// CONFIG storage root (stores, user workspaces, models) — resolves under this
-/// one root, so the whole process owns exactly one test temp directory that
-/// self-cleans on normal exit (unix).
+/// The single process-level test temp root: all test-owned global state needing a temp directory
+/// (the CONFIG storage root: stores, user workspaces, models) resolves under it, so the process
+/// owns one directory that self-cleans on normal exit (unix).
 pub(crate) fn test_root() -> &'static PathBuf {
     TEST_ROOT.get_or_init(|| {
         let tmp = tempfile::TempDir::new().expect("failed to create test temp dir");
         let path = tmp.path().to_path_buf();
-        // Deliberately leak the TempDir guard: keeping it around would race
-        // with the exit-time removal below (both would try to delete the same
-        // directory). The directory is instead removed by the atexit handler
-        // (unix) or reclaimed by the OS temp sweep otherwise.
+        // Deliberately leaked: keeping the TempDir guard would race with the exit-time removal
+        // below. The atexit handler removes the directory (unix), else the OS temp sweep does.
         std::mem::forget(tmp);
         #[cfg(unix)]
         register_test_root_cleanup();
@@ -652,18 +527,10 @@ pub(crate) fn test_root() -> &'static PathBuf {
 
 /// Register exit-time removal of the shared test root (unix).
 ///
-/// Runs on normal process exit — pass, failure, and per-test panics alike
-/// (the test harness catches panics and the process still exits via
-/// `exit()`, which runs atexit handlers under the default `panic = "unwind"`
-/// profile). Killed processes (abort, signals) skip atexit handlers entirely
-/// — leftovers from killed test processes are intentionally out of scope
-/// (the OS reclaims them).
-///
-/// Race safety: each test process creates its own unique root (one per
-/// process via [`TEST_ROOT`]) and removes only that one. The handler is
-/// panic-free and guarded by the creator PID, so a `fork()` child spawned by
-/// a test never removes its parent's root (exec'd children replace the
-/// process image and lose the atexit list anyway).
+/// Runs on normal exit — pass, failure and per-test panics alike, since the harness catches them
+/// and the process still exits via `exit()`. Killed processes skip atexit handlers. Each process
+/// creates its own root and removes only that one, and the handler is panic-free and guarded by the
+/// creator PID, so a `fork()` child never removes its parent's root.
 #[cfg(unix)]
 fn register_test_root_cleanup() {
     // Runs exactly once per process (called only from the TEST_ROOT
@@ -692,26 +559,13 @@ extern "C" fn cleanup_test_root() {
     }
 }
 
-/// Open a temporary store for testing.
+/// Open a temporary store for testing: `(store, TempDir)`, and the `TempDir` MUST be held for the
+/// store's lifetime (typically bound to `_tmp` / `_dir`).
 ///
-/// Creates a temporary directory and opens the given store inside it.
-/// Returns `(store, TempDir)`.  The `TempDir` MUST be held for the store's
-/// lifetime (typically bound to `_tmp` / `_dir` in the calling test).
-///
-/// `store_name` is used in the panic message if opening the store fails,
-/// so it should be a human-readable identifier (e.g. `"workspace"`, `"board"`).
-///
-/// This is a macro (not a generic function) because Rust's type system cannot
-/// express the lifetime relationship between a closure argument and the future
-/// returned by `async fn open(path: &Path) -> Result<T>` — the future captures
-/// a borrow of the argument, which would require higher-ranked lifetime bounds
-/// that `FnOnce` / `AsyncFnOnce` cannot express in the current edition without
-/// boxing.
-///
-/// # Panics
-///
-/// Panics if the temporary directory cannot be created, or if opening the
-/// store fails.
+/// This is a macro, not a generic function, because the lifetime relationship between a closure
+/// argument and the future of `async fn open(path: &Path) -> Result<T>` cannot be expressed by
+/// `FnOnce` / `AsyncFnOnce` without boxing. Panics if the directory cannot be created or the store
+/// fails to open.
 #[macro_export]
 macro_rules! open_test_store {
     ($store:ty, $store_name:expr) => {{
@@ -726,29 +580,8 @@ macro_rules! open_test_store {
     }};
 }
 
-/// Convenience helper to create a test ticket with just a title and phase.
-///
-/// Reduces the common boilerplate:
-/// ```ignore
-/// let id = TicketBuilder::new(&store, &ws)
-///     .title("My Ticket")
-///     .phase(TicketPhase::Backlog)
-///     .create()
-///     .await
-///     .expect("create my ticket");
-/// ```
-/// to:
-/// ```ignore
-/// let id = make_ticket(&store, &ws, "My Ticket", TicketPhase::Backlog).await;
-/// ```
-///
-/// For tickets that need `.desc()` or `.prereqs()`, use [`TicketBuilder`]
-/// directly.
-///
-/// # Panics
-///
-/// Panics if the ticket cannot be created. The panic message includes the title
-/// and phase for debugging.
+/// Create a test ticket with just a title and phase; use [`TicketBuilder`] directly for `.desc()`
+/// or `.prereqs()`. Panics if the ticket cannot be created, naming the title and phase.
 pub(crate) async fn make_ticket(
     store: &BoardStore,
     ws: &crate::Workspace,
@@ -763,22 +596,7 @@ pub(crate) async fn make_ticket(
         .unwrap_or_else(|e| panic!("make_ticket({title}, {phase}) failed: {e}"))
 }
 
-/// Fetch a ticket by ID, panicking if the DB query fails or the ticket
-/// does not exist.
-///
-/// Replaces the common test boilerplate:
-/// ```ignore
-/// let ticket = store.get_ticket(&id).await.expect("get").expect("exists");
-/// ```
-/// with the more concise:
-/// ```ignore
-/// let ticket = expect_ticket(&store, &id).await;
-/// ```
-///
-/// # Panics
-///
-/// Panics if the DB query fails or the ticket is not found (returns `None`).
-/// The panic originates from within this helper function.
+/// Fetch a ticket by ID, panicking if the query fails or the ticket does not exist.
 pub async fn expect_ticket(store: &BoardStore, id: &str) -> Ticket {
     store
         .get_ticket(id)
@@ -787,22 +605,7 @@ pub async fn expect_ticket(store: &BoardStore, id: &str) -> Ticket {
         .expect("expected ticket to exist")
 }
 
-/// Fetch a ticket's phase by ID, panicking if the DB query fails or the
-/// ticket does not exist.
-///
-/// Replaces the common test boilerplate:
-/// ```ignore
-/// let phase = store.get_ticket_phase(&id).await.expect("query").expect("exists");
-/// ```
-/// with the more concise:
-/// ```ignore
-/// let phase = expect_ticket_phase(&store, &id).await;
-/// ```
-///
-/// # Panics
-///
-/// Panics if the DB query fails or the ticket is not found (returns `None`).
-/// The panic originates from within this helper function.
+/// Fetch a ticket's phase by ID, panicking if the query fails or the ticket does not exist.
 pub async fn expect_ticket_phase(store: &BoardStore, id: &str) -> TicketPhase {
     store
         .get_ticket_phase(id)
@@ -811,23 +614,8 @@ pub async fn expect_ticket_phase(store: &BoardStore, id: &str) -> TicketPhase {
         .expect("expected ticket phase to exist")
 }
 
-/// Builder for creating test tickets with common defaults.
-///
-/// Defaults: `desc="desc"`, `phase=Backlog`, `prerequisites=[]`, `reporter="test"`.
-/// Title is required (no default) via `.title()`.
-///
-/// # Examples
-/// ```ignore
-/// // Simple ticket with defaults
-/// TicketBuilder::new(&store, &ws).title("A").create().await?;
-///
-/// // Custom phase and prerequisites
-/// TicketBuilder::new(&store, &ws)
-///     .title("B")
-///     .phase(TicketPhase::InDevelopment)
-///     .prereqs(&[a_id, b_id])
-///     .create().await?;
-/// ```
+/// Builder for test tickets: `desc="desc"`, `phase=Backlog`, `prerequisites=[]`,
+/// `reporter="test"`, with the title required via `.title()`.
 pub(crate) struct TicketBuilder<'a> {
     store: &'a BoardStore,
     ws: crate::Workspace,
@@ -840,7 +628,6 @@ pub(crate) struct TicketBuilder<'a> {
 }
 
 impl<'a> TicketBuilder<'a> {
-    /// Start building a test ticket for `store` in workspace `ws`.
     pub(crate) fn new(store: &'a BoardStore, ws: &crate::Workspace) -> Self {
         Self {
             store,
@@ -854,37 +641,31 @@ impl<'a> TicketBuilder<'a> {
         }
     }
 
-    /// Set the ticket title (required).
     pub(crate) fn title(mut self, title: impl Into<String>) -> Self {
         self.title = title.into();
         self
     }
 
-    /// Set the description (default: `"desc"`).
     pub(crate) fn desc(mut self, desc: impl Into<String>) -> Self {
         self.desc = desc.into();
         self
     }
 
-    /// Set the phase (default: [`TicketPhase::Backlog`]).
     pub(crate) fn phase(mut self, phase: TicketPhase) -> Self {
         self.phase = phase;
         self
     }
 
-    /// Set prerequisites (default: empty).
     pub(crate) fn prereqs(mut self, prereqs: &[String]) -> Self {
         self.prereqs = prereqs.to_vec();
         self
     }
 
-    /// Set the priority (default: 1).
     pub(crate) fn priority(mut self, priority: i64) -> Self {
         self.priority = priority;
         self
     }
 
-    /// Create the ticket with the accumulated parameters.
     pub(crate) async fn create(self) -> anyhow::Result<String> {
         let (store, params) = self.into_parts();
         store.create_ticket(&params).await
@@ -1339,15 +1120,10 @@ pub(crate) fn assert_contains_not_contains(
     }
 }
 
-// ── EnvVarGuard tests ─────────────────────────────────────────────────
-//
-// These tests use `unsafe { std::env::set_var/remove_var }` directly for
-// setup and cleanup rather than going through the guard — ironic given the
-// helper's purpose. This is an accepted trade-off: we're testing the
-// wrapper's correctness, and the env_lock is independently exercised by
-// every non-helper caller. Unique-per-test variable names prevent
-// collisions within this module, but per std::env docs even writes to
-// *different* variables are a data race without the lock.
+// These tests use `unsafe { std::env::set_var/remove_var }` directly rather than the guard — they
+// test the wrapper's correctness. Accepted trade-off: unique-per-test names prevent collisions
+// within this module, though per std::env docs even writes to different variables are a data race
+// without the lock.
 
 #[cfg(test)]
 mod env_var_guard_tests {
@@ -1355,8 +1131,7 @@ mod env_var_guard_tests {
 
     #[test]
     fn sets_and_restores_the_value_it_replaced() {
-        // Absent before the guard (unique name, first use): drop returns it to
-        // absent.
+        // Absent before the guard (unique name, first use): drop returns it to absent.
         let guard = set_env_var("MAHBOT_TEST_SET_RESTORE", Some("hello"));
         assert_eq!(std::env::var("MAHBOT_TEST_SET_RESTORE"), Ok("hello".into()));
         drop(guard);

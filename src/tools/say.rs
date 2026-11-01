@@ -15,8 +15,7 @@
 //!
 //! The refusal for an absent user is the tool's one use of the machine-wide
 //! user-activity state ([`crate::user_activity`]), and it comes last in the
-//! engine's gates so the answers for speech that cannot be produced at all keep
-//! precedence.
+//! engine's gates so the answers for speech that cannot be produced at all keep precedence.
 //!
 //! macOS only, where the speech engine lives — the module is `cfg`-gated in
 //! `tools/mod.rs`, and the admin's Assistant is its only holder.
@@ -62,8 +61,6 @@ impl Tool for SayTool {
                 "Nothing was spoken: `text` is required and names the phrase to say.".into(),
             );
         };
-        // Counted as the model wrote it, minus the whitespace around it, and as
-        // the characters a person sees rather than bytes.
         let text = text.trim();
         if text.is_empty() {
             return Ok("Nothing was spoken: the phrase is empty.".into());
@@ -110,8 +107,7 @@ mod tests {
 
     /// Run `args` through the tool with speech output switched OFF for the
     /// duration, restoring the config afterwards: every answer below then comes
-    /// from the length gate or from the engine's own refusal, never from a
-    /// device.
+    /// from the length gate or from the engine's own refusal, never from a device.
     async fn say(args: serde_json::Value) -> String {
         let snapshot = crate::config::CONFIG.snapshot();
         assert!(

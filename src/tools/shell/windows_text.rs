@@ -41,8 +41,7 @@
 /// The lines that are valid UTF-8 are kept byte for byte; each line that is not
 /// is handed to this platform's fallback whole (`decode_fallback` on Windows, a
 /// lossy UTF-8 read everywhere else — where the result is exactly the one a
-/// whole-buffer lossy read gives, since a replacement never reaches across a line
-/// break).
+/// whole-buffer lossy read gives, since a replacement never reaches across a line break).
 pub(super) fn decode(bytes: &[u8]) -> String {
     decode_lines(bytes, decode_fallback)
 }

@@ -1,47 +1,37 @@
 //! The runtime locale-parity gate for the grep engine's fast served path.
 //!
-//! The engine's matching model is its own — Rust regex over UTF-8, with the
-//! C.UTF-8 deltas the module header lists (Unicode simple case folding, ASCII
-//! POSIX classes, invalid-UTF-8 lines treated as non-matches) — while the search
-//! it stands in for is a locale-aware `grep` running in the environment the
-//! owner's own terminal gives the agent's command. That environment is the
-//! owner's ([`super::super::agent_env_pairs`]), so its locale is unknown to the
-//! product: the engine may no longer assume the `LC_ALL=C.UTF-8` it was written
-//! against.
+//! The engine's matching model is its own — Rust regex over UTF-8, with the C.UTF-8
+//! deltas the module header lists — while the search it stands in for is a locale-aware
+//! `grep` running in the environment the owner's terminal gives the agent's command
+//! ([`super::super::agent_env_pairs`]). That locale is unknown to the product, so the
+//! engine may no longer assume the `LC_ALL=C.UTF-8` it was written against and a serve
+//! decision cannot rest on the engine's own say-so.
 //!
-//! A serve decision therefore cannot rest on the engine's own say-so. This
-//! module publishes a coarse, runtime-measured verdict ([`Established`], read
-//! through [`serve_allowed`]) and the parent-side serve path consults it on every
-//! member: the fast path may stand only where the product established, under the
-//! locale actually in effect, that the engine agrees with the real search for
-//! that member's shape ([`Need`]). Where nothing was established the real search
-//! runs instead; where there is no real search at all — Windows, or a unix
-//! environment whose search path resolves none — the fast path is the only search
-//! and stands.
+//! This module publishes a coarse, runtime-measured verdict ([`Established`], read through
+//! [`serve_allowed`]) that the parent-side serve path consults on every member: the fast
+//! path may stand only where the product established, under the locale actually in effect,
+//! that the engine agrees with the real search for that member's shape ([`Need`]).
+//! Otherwise the real search runs; where there is no real search at all — Windows, or a
+//! unix environment whose search path resolves none — the fast path is the only search.
 //!
-//! The verdict comes from a bounded differential battery ([`measure`]) over a
-//! byte-exact fixture: the same rows run through the production parent path
-//! in-process and through the real `grep`/`sh` under the agent's environment, and
-//! a capability is established only when every compared row agreed (stdout bytes
-//! and exit code; sorted record sets for recursive walks). The battery logs
-//! booleans, counts and its probe's own finding only — never a locale name, never
-//! anything else read from the environment.
+//! The verdict comes from a bounded differential battery ([`measure`]) over a byte-exact
+//! fixture: the same rows through the production parent path in-process and through the
+//! real `grep`/`sh` under the agent's environment, a capability being established only
+//! when every compared row agreed (stdout bytes and exit code; sorted record sets for
+//! recursive walks). Only booleans, counts and the probe's finding are logged — never a
+//! locale name, never anything else read from the environment.
 //!
-//! Its rows deliberately include the engine's own approved deltas — the Unicode
-//! simple case folding that makes `-i k` match KELVIN, the ASCII-only POSIX
-//! classes, the C.UTF-8 reading of invalid UTF-8 — so [`Need::General`] is
-//! *expected* to stay unestablished on a host whose `grep` folds case by
-//! lowercase comparison, and a `C` locale is expected to unestablish
-//! [`Need::Plain`] as well. That is the point: the fast path kept for a shape is
-//! the shape this host's own search was measured to agree with, and everything
-//! else runs the real search.
+//! The rows deliberately include the engine's approved deltas (Unicode simple case
+//! folding that makes `-i k` match KELVIN, ASCII-only POSIX classes, the C.UTF-8 reading
+//! of invalid UTF-8), so [`Need::General`] is *expected* to stay unestablished on a host
+//! whose `grep` folds case by lowercase comparison, and a `C` locale is expected to
+//! unestablish [`Need::Plain`] too. That is the point: the fast path kept for a shape is
+//! the shape this host's own search was measured to agree with.
 //!
 //! A verdict belongs to the environment it was measured under: the refresher
-//! ([`refresh_if_environment_changed`]) drops the published one before measuring
-//! a changed environment — normally in the reader's own step, before the new
-//! environment is in place — so the window a battery takes is served fail-closed
-//! — by the real search — rather than under a verdict for an environment no
-//! command is running in any more.
+//! ([`refresh_if_environment_changed`]) drops the published one before measuring a changed
+//! environment — normally in the reader's own step, before the new environment is in place
+//! — so the window a battery takes is served fail-closed by the real search.
 
 use std::ffi::OsString;
 use std::io::{self, Read, Seek};
@@ -61,49 +51,35 @@ use super::{
     expand_glob, has_unquoted_glob, serve_into, serve_one_grep,
 };
 
-/// Deadline on one battery child.
-///
-/// Generous against the milliseconds a real `grep` or `sh` takes on the fixture,
-/// and small enough that an owner-`PATH` program which never finishes cannot
-/// wedge the measurement, the blocking thread it runs on, or the environment
-/// reader that waits for it.
+/// Deadline on one battery child: generous against the milliseconds a real `grep` or `sh`
+/// takes, and small enough that an owner-`PATH` program which never finishes cannot wedge
+/// the measurement, its blocking thread or the environment reader that waits for it.
 const BATTERY_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Cap on one battery child's stdout, both what is read back and what a child may
-/// write before it is killed.
-///
-/// A row's output is a few lines over a handful of tiny fixture files, so this is
-/// far above anything a comparison needs: it bounds what a runaway program on the
-/// owner's `PATH` can cost the reader's private temp root and its memory.
+/// Cap on one battery child's stdout, both read back and writable before it is killed: far
+/// above anything a comparison needs, bounding what a runaway owner-`PATH` program can cost
+/// the reader's private temp root and memory.
 const BATTERY_STDOUT_CAP: u64 = 1024 * 1024;
 
-// ── Capabilities ──────────────────────────────────────────────────────────
-
-/// The one thing a member's shape is judged by, deliberately coarse.
-///
-/// A served search agrees with the real one either because its matching cannot
-/// involve a locale at all ([`Need::Plain`]) or because it can and the engine's
-/// model of it was proven under the locale in effect ([`Need::General`]); glob
-/// operands and filters add a separate dimension ([`Need::Glob`]) because the
-/// engine globs with libc `fnmatch` from a process that never calls `setlocale`,
-/// while the shell and grep glob under the locale they were handed.
+/// The one thing a member's shape is judged by, deliberately coarse. A served search agrees
+/// with the real one either because its matching cannot involve a locale at all
+/// ([`Need::Plain`]) or because it can and the model was proven under the locale in effect
+/// ([`Need::General`]); glob operands and filters add a dimension of their own
+/// ([`Need::Glob`]) because the engine globs with libc `fnmatch` from a process that never
+/// calls `setlocale`, while the shell and grep glob under the locale they were handed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Need {
-    /// A literal, case-sensitive byte search: no `-i`, no `-w`, and no regex
-    /// metacharacter or backslash in any raw pattern (`-F` patterns are literal
-    /// whatever they contain). This is the one shape whose *engine-side* matching
-    /// has no locale input at all, so it is the shape worth measuring instead of
-    /// assuming: whether the real search agrees byte for byte is what the battery
-    /// establishes, and it demonstrably does not under every locale (a `C` locale
-    /// reads an invalid-UTF-8 line the engine's model treats as a non-match).
+    /// A literal, case-sensitive byte search: no `-i`, no `-w`, and no regex metacharacter
+    /// or backslash in any raw pattern. The one shape whose *engine-side* matching has no
+    /// locale input, so it is worth measuring rather than assuming — the real search does
+    /// not agree byte for byte under every locale (a `C` locale reads an invalid-UTF-8 line
+    /// the engine treats as a non-match).
     Plain,
-    /// Everything else — case-insensitive matching, POSIX classes, `.`,
-    /// brackets, `-w`: the engine's model of it differs from a locale-aware
-    /// grep's, so it needs a proof under the locale in effect.
+    /// Everything else — case-insensitive matching, POSIX classes, `.`, brackets, `-w`: the
+    /// engine's model differs from a locale-aware grep's, so it needs a proof.
     General,
-    /// The member's operands carry an unquoted glob, or it carries
-    /// `--include`/`--exclude`/`--exclude-dir` filters: `fnmatch` is
-    /// locale-sensitive.
+    /// The operands carry an unquoted glob, or the member carries
+    /// `--include`/`--exclude`/`--exclude-dir` filters: `fnmatch` is locale-sensitive.
     Glob,
 }
 
@@ -118,14 +94,10 @@ impl Need {
     }
 }
 
-/// The capabilities one member's shape needs: always exactly one of
-/// [`Need::Plain`]/[`Need::General`], plus [`Need::Glob`] when its operands or
-/// filters carry a glob surface.
-///
-/// Fail-closed by construction: anything the reading below does not positively
-/// recognise as a byte-literal shape is [`Need::General`]. The platform is the
-/// caller's own value, so the shape reading cannot silently disagree with the
-/// serve decision taken for the same member.
+/// The capabilities one member's shape needs: exactly one of [`Need::Plain`]/
+/// [`Need::General`], plus [`Need::Glob`] when its operands or filters carry a glob surface.
+/// Fail-closed by construction: anything the reading does not positively recognise as a
+/// byte-literal shape is [`Need::General`].
 #[must_use]
 pub(super) fn needs(parsed: &ParsedGrep, platform: ShellPlatform) -> Vec<Need> {
     let mut needs = Vec::with_capacity(2);
@@ -140,20 +112,17 @@ pub(super) fn needs(parsed: &ParsedGrep, platform: ShellPlatform) -> Vec<Need> {
     needs
 }
 
-/// Whether the member's matching cannot depend on either search's locale.
-///
-/// True when every raw pattern is a literal in every dialect — `-F` makes that
-/// true by definition, and outside it a pattern containing a metacharacter or a
-/// backslash is not read as one — and no flag puts case or word boundaries
-/// between the pattern and the bytes. What the *engine* does with such a pattern
-/// has no locale input; what the real search does with it is what the battery
-/// measures before the fast path may stand.
+/// Whether the member's matching cannot depend on either search's locale: every raw pattern
+/// is a literal in every dialect (`-F` by definition; otherwise a metacharacter or backslash
+/// disqualifies it) and no flag puts case or word boundaries between pattern and bytes.
+/// What the *engine* does with such a pattern has no locale input; what the real search does
+/// with it is what the battery measures before the fast path may stand.
 fn is_byte_literal(parsed: &ParsedGrep) -> bool {
     if parsed.flags.i || parsed.flags.w {
         return false;
     }
-    // `-F` patterns are fixed strings whatever they contain; the engine
-    // escapes them into a literal matcher, and the real search compares bytes.
+    // `-F` patterns are fixed strings whatever they contain; the engine escapes them into a
+    // literal matcher, and the real search compares bytes.
     parsed.mode == MatchMode::Fixed
         || parsed.patterns.iter().all(|pattern| {
             !pattern.contains([
@@ -162,9 +131,8 @@ fn is_byte_literal(parsed: &ParsedGrep) -> bool {
         })
 }
 
-/// Whether the member carries a glob surface the shell would expand under its
-/// own locale: an unquoted glob in an operand token, or an
-/// `--include`/`--exclude`/`--exclude-dir` filter.
+/// Whether the member carries a glob surface the shell would expand under its own locale:
+/// an unquoted glob in an operand token, or an include/exclude filter.
 fn has_glob_surface(parsed: &ParsedGrep, platform: ShellPlatform) -> bool {
     !parsed.filters.is_empty()
         || !parsed.exclude_dir.is_empty()
@@ -174,10 +142,8 @@ fn has_glob_surface(parsed: &ParsedGrep, platform: ShellPlatform) -> bool {
             .any(|tok| has_unquoted_glob(tok, platform))
 }
 
-// ── The published verdict ─────────────────────────────────────────────────
-
-/// What the battery established for the locale a measurement was taken under,
-/// one flag per [`Need`]. `Default` is all false: fail-closed until measured.
+/// What the battery established for the locale it was measured under, one flag per [`Need`].
+/// `Default` is all false: fail-closed until measured.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Established {
     plain: bool,
@@ -186,7 +152,6 @@ struct Established {
 }
 
 impl Established {
-    /// Every capability established.
     const fn all() -> Self {
         Established {
             plain: true,
@@ -195,7 +160,6 @@ impl Established {
         }
     }
 
-    /// Whether this verdict covers `need`.
     const fn covers(self, need: Need) -> bool {
         match need {
             Need::Plain => self.plain,
@@ -208,19 +172,15 @@ impl Established {
 /// The verdict the serve path reads, lock-free, on every member.
 static ESTABLISHED: ArcSwapOption<Established> = ArcSwapOption::const_empty();
 
-// A per-thread verdict override, installed by test lanes.
-//
-// A lane that publishes a verdict is describing its own runs only: a
-// process-global publish would race the sibling lanes that run concurrently in
-// the same test binary, so the override is per-thread.
+// A per-thread verdict override, installed by test lanes: a lane publishing a verdict
+// describes its own runs only, and a process-global publish would race sibling lanes.
 #[cfg(test)]
 thread_local! {
     static TEST_VERDICT: std::cell::Cell<Option<Established>> =
         const { std::cell::Cell::new(None) };
 }
 
-/// The verdict in effect: a test thread's override when one is installed, else
-/// the measured global (fail-closed until a measurement publishes one).
+/// The verdict in effect: a test thread's override when installed, else the measured global.
 fn established() -> Established {
     #[cfg(test)]
     if let Some(verdict) = TEST_VERDICT.with(std::cell::Cell::get) {
@@ -234,23 +194,17 @@ fn publish(verdict: Established) {
     ESTABLISHED.store(Some(Arc::new(verdict)));
 }
 
-// Whether the calling thread is inside the battery's own row building.
-//
-// The battery builds each row's spec through the production parent path, which
-// consults this same gate: without the flag, a fail-closed verdict would demote
-// the very rows the verdict is measured from. It is per-thread, so no other
-// thread's serve decision is ever affected, and it is scoped to the one call that
-// reads the gate ([`spec_for`]).
+// Whether the calling thread is inside the battery's own row building. The battery builds
+// each row's spec through the production parent path, which consults this same gate: without
+// the flag, a fail-closed verdict would demote the very rows the verdict is measured from.
 thread_local! {
     static MEASURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Suspends the gate for its lifetime (see [`MEASURING`]); the drop covers a
-/// parent-path panic, so a thread can never be left gated open.
+/// Suspends the gate for its lifetime; the drop covers a panic, so a thread is never left open.
 struct Measuring;
 
 impl Measuring {
-    /// Suspend the gate on this thread until the returned guard drops.
     fn enter() -> Self {
         MEASURING.with(|flag| flag.set(true));
         Measuring
@@ -263,38 +217,24 @@ impl Drop for Measuring {
     }
 }
 
-/// The environment the verdict in effect was measured for: set by [`record`]
-/// together with the verdict, cleared by [`invalidate_verdict_for`] (before a
-/// command can see the new environment) and by [`record`] when a run measured
-/// nothing. Read by the changed-check of [`refresh_if_environment_changed`] and by
-/// [`invalidate_verdict_for`], which must know whether the verdict in effect
-/// belongs to the environment being replaced. Every access holds this lock, and
-/// the value never leaves the process.
+/// The environment the verdict in effect was measured for: set by [`record`] with the
+/// verdict, cleared by [`invalidate_verdict_for`] before a command can see the new
+/// environment. Every access holds this lock, and the value never leaves the process.
 static LAST_MEASURED: Mutex<Option<EnvKey>> = Mutex::new(None);
 
-/// What "the locale in effect" is read from: the whole environment an agent's
-/// command would get, in a canonical order, so that the same environment always
-/// produces the same key.
+/// What "the locale in effect" is read from: the whole environment an agent's command would
+/// get, in a canonical order, so the same environment always produces the same key.
 ///
-/// Not just `LC_ALL`/`LC_CTYPE`/`LANG`: what the real search does depends on more
-/// of the environment than its locale (a GNU grep reads `POSIXLY_CORRECT`, and
-/// `PATH` decides *which* grep the comparison even ran), and keying on the whole
-/// environment is both simpler to reason about and impossible to get subtly
-/// wrong. It costs one comparison per read — the environment only changes when a
-/// read returns something new — and it never holds a value anywhere but in
-/// memory.
-///
-/// A verdict therefore stands for as long as this key does: replacing a program
-/// the environment does not name (the owner's `grep` binary under an unchanged
-/// `PATH`) is not noticed until the environment itself moves. The bar is the
-/// environment his commands get, which is what the key holds.
+/// Not just `LC_ALL`/`LC_CTYPE`/`LANG`: a GNU grep reads `POSIXLY_CORRECT`, and `PATH`
+/// decides *which* grep the comparison ran. A verdict therefore stands for as long as this
+/// key does — replacing a program the environment does not name (the owner's `grep` under
+/// an unchanged `PATH`) is not noticed until the environment moves.
 #[derive(PartialEq, Eq)]
 struct EnvKey(Vec<(OsString, OsString)>);
 
 impl EnvKey {
-    /// The key of an environment pair list, canonically ordered: an environment
-    /// is a map, so an identical one delivered in a different order is the same
-    /// key and keeps the verdict it was measured for.
+    /// The key of an environment pair list, canonically ordered, so an identical environment
+    /// delivered in a different order keeps the verdict it was measured for.
     fn new(env: &[(OsString, OsString)]) -> Self {
         let mut pairs = env.to_vec();
         pairs.sort();
@@ -304,18 +244,16 @@ impl EnvKey {
 
 /// Whether the fast path may stand for a member needing `needs` on `platform`.
 ///
-/// `Ok(())` only when every need was established for the environment in effect;
-/// the `Err` is the unmet capability's word, which the parent-side serve path
-/// records as the demotion's reason. On Windows there is no real search to run:
-/// the fast path is the only search and stands, and no battery is ever run there.
-/// The platform arrives as the caller's own value — the same one the member was
-/// read under — so the Windows behaviour is drivable (and tested) from any host.
+/// `Ok(())` only when every need was established for the environment in effect; the `Err`
+/// is the unmet capability's word, recorded as the demotion's reason. On Windows there is
+/// no real search: the fast path stands and no battery is ever run, a behaviour drivable
+/// from any host because the platform arrives as the caller's own value.
 pub(super) fn serve_allowed(needs: &[Need], platform: ShellPlatform) -> Result<(), &'static str> {
     if platform == ShellPlatform::Windows {
         return Ok(());
     }
-    // The battery's own row building runs through the production serve path, so
-    // it must not be gated by the verdict it is measuring (see [`Measuring`]).
+    // The battery's rows run through the production serve path: they must not be gated by
+    // the verdict being measured (see [`Measuring`]).
     if MEASURING.with(std::cell::Cell::get) {
         return Ok(());
     }
@@ -326,46 +264,32 @@ pub(super) fn serve_allowed(needs: &[Need], platform: ShellPlatform) -> Result<(
         .map_or(Ok(()), |need| Err(need.capability()))
 }
 
-/// Re-measure the verdict when the environment an agent's command runs under
-/// differs from the one the published verdict was measured for.
+/// Re-measure the verdict when the environment an agent's command runs under differs from
+/// the one the published verdict was measured for.
 ///
-/// Blocking — the battery runs the real search — so callers hand it to a
-/// blocking pool. The environment reader is the right trigger: it is what changes
-/// the environment an agent's commands get, and it calls this right after
-/// publishing a read (and after a failed read, where it measures the fallback if
-/// that has not been measured yet). An environment already measured returns
-/// `true` without measuring, which is the common case. Nothing read from the
-/// environment is ever logged.
+/// Blocking — the battery runs the real search — so callers hand it to a blocking pool; the
+/// environment reader is the trigger. An environment already measured returns `true` without
+/// measuring, the common case; nothing read from the environment is ever logged.
 ///
-/// The verdict for the previous environment is dropped before the new one is
-/// measured ([`invalidate_verdict_for`] has normally done it already, in the
-/// reader's own step), so the two never mix: while the battery runs, the fast
-/// path is closed and the real search answers instead. A run that produced no
-/// verdict claims nothing — no key is kept and the gate stays closed — so a
-/// transient failure (no fixture, a panic, an unusable probe) is measured again
-/// by the next refresh instead of closing the fast path for the life of the
-/// process. Such a run is only ever attempted by a refresh, so its cost is
-/// bounded by the reader's own cadence and by the battery's per-child deadline;
-/// a shutdown starts no measurement and stops one in flight at its next row
-/// boundary.
+/// The verdict for the previous environment is dropped before the new one is measured, so
+/// the two never mix: while the battery runs the fast path is closed and the real search
+/// answers. A run that produced no verdict claims nothing — no key is kept and the gate
+/// stays closed — so a transient failure is measured again by the next refresh rather than
+/// closing the fast path for the life of the process; a shutdown starts no measurement and
+/// stops one in flight at its next row boundary.
 ///
-/// Returns whether a verdict for the environment in effect stands afterwards.
-///
-/// `env` must be the pairs a command gets right now — the same list
-/// [`invalidate_verdict_for`] was given for the environment being adopted, or
-/// [`super::super::agent_env_pairs`] when no read replaced it. The caller derives
-/// it once and passes the same list to both, so the verdict, the key it is filed
-/// under and what a command actually runs under cannot drift apart.
+/// Returns whether a verdict for the environment in effect stands afterwards. `env` must be
+/// the pairs a command gets right now — the same list [`invalidate_verdict_for`] was given,
+/// or [`super::super::agent_env_pairs`] — so the verdict, the key it is filed under and what
+/// a command runs under cannot drift apart.
 pub(crate) fn refresh_if_environment_changed(env: &[(OsString, OsString)]) -> bool {
-    // On Windows there is no real search to run, so there is nothing to measure:
-    // this arm is the gate's own statement of the rule. The reader checks the
-    // platform too, so a failed read there does not ask the pool for this `false`.
+    // On Windows there is no real search, so there is nothing to measure; the reader checks
+    // the platform too, so a failed read there does not ask the pool for this `false`.
     if cfg!(windows) {
         return false;
     }
-    // Nothing new starts during a shutdown, and a battery already running stops at
-    // its next row boundary ([`run_battery`]), so the reader's join can be held
-    // only by the child in flight — bounded by [`BATTERY_SPAWN_TIMEOUT`].
+    // Nothing new starts during a shutdown, and a running battery stops at its next row
+    // boundary, so the reader's join is bounded by [`BATTERY_SPAWN_TIMEOUT`].
     if crate::shutdown::aborting() {
         return ESTABLISHED.load().is_some();
     }
@@ -373,22 +297,16 @@ pub(crate) fn refresh_if_environment_changed(env: &[(OsString, OsString)]) -> bo
     if LAST_MEASURED.lock().unwrap_poison().as_ref() == Some(&key) {
         return true;
     }
-    // Fail-closed for the window the battery takes. The reader has normally done
-    // this already, in the step that put the environment in place; the store
-    // covers any other way it moved.
+    // Fail-closed for the window the battery takes; the reader has normally done this
+    // already, and this covers any other way the environment moved.
     ESTABLISHED.store(None);
     record(key, measure(env))
 }
 
-/// Drop the verdict in effect when the environment commands are about to get is
-/// not the one it was measured for.
-///
-/// The reader calls this with the environment a fresh read will publish, in the
-/// step *before* it publishes: the verdict is gone before any command can run
-/// under the new environment, so the two never mix (a command served in between
-/// still sees the old environment, which is the one the verdict belongs to). No
-/// blocking, and nothing is measured here — [`refresh_if_environment_changed`]
-/// does that on the blocking pool.
+/// Drop the verdict in effect when the environment commands are about to get is not the one
+/// it was measured for. The reader calls this with the environment a fresh read will publish,
+/// in the step *before* it publishes, so a command served in between still sees the old
+/// environment — the one the verdict belongs to. Nothing is measured here.
 pub(crate) fn invalidate_verdict_for(env: &[(OsString, OsString)]) {
     if cfg!(windows) {
         return;
@@ -402,13 +320,9 @@ pub(crate) fn invalidate_verdict_for(env: &[(OsString, OsString)]) {
     *last = None;
 }
 
-/// Record a measurement's outcome for `key`, and report whether a verdict is in
-/// effect afterwards.
-///
-/// A measured verdict is published together with the key it was measured for; a
-/// run that produced none claims nothing, clearing both the key and the gate, so
-/// the next refresh measures again rather than a closed gate standing for the
-/// life of the process.
+/// Record a measurement's outcome for `key`, and report whether a verdict is in effect
+/// afterwards. A measured verdict is published with the key it was measured for; a run that
+/// produced none clears both the key and the gate, so the next refresh measures again.
 fn record(key: EnvKey, verdict: Option<Established>) -> bool {
     let mut last = LAST_MEASURED.lock().unwrap_poison();
     if let Some(verdict) = verdict {
@@ -422,13 +336,10 @@ fn record(key: EnvKey, verdict: Option<Established>) -> bool {
     }
 }
 
-/// Install a verdict for the calling thread.
-///
-/// The in-crate lanes that exercise the served path (`parity_tests`, and every
-/// serve pin whose rows would be demoted by a closed gate) are about the engine's
-/// own equivalence proof against the locale those lanes pin, not about the runtime
-/// gate; the gate has its own tests below. The verdict rides a per-thread override
-/// (see [`TEST_VERDICT`]) so a lane does not race a sibling lane's own publish.
+/// Install a verdict for the calling thread. The in-crate lanes that exercise the served path
+/// are about the engine's equivalence proof against the locale those lanes pin, not about the
+/// runtime gate, which has its own tests below; the per-thread override keeps a lane from
+/// racing a sibling lane's publish.
 #[cfg(test)]
 pub(super) fn publish_for_test(verdict: (bool, bool, bool)) {
     TEST_VERDICT.with(|cell| {
@@ -440,36 +351,27 @@ pub(super) fn publish_for_test(verdict: (bool, bool, bool)) {
     });
 }
 
-// ── The differential battery ──────────────────────────────────────────────
-
 /// The battery's tallies, and the verdict they fold into.
 #[derive(Default)]
 struct Battery {
-    /// The capabilities this run proved for the locale it ran under. `None` when
-    /// nothing usable was measured (an unusable probe, so no row was ever compared)
-    /// or when a row that had to be compared could not be (see `unmeasured`): the
-    /// run then establishes nothing and the caller records nothing.
+    /// The capabilities this run proved. `None` when nothing usable was measured (an unusable
+    /// probe, or a row that had to be compared and could not be): the run establishes nothing.
     verdict: Option<Established>,
-    /// Rows attempted / compared / skipped / not measurable, as the measured
-    /// record reports them.
+    /// Rows attempted / compared / skipped / not measurable, as the record reports them.
     rows: usize,
     compared: usize,
     skipped: usize,
-    /// Rows that were meant to be compared but could not be: one side did not run
-    /// (the real search is missing or unusable, or the deadline expired). Counted
-    /// apart from skipped rows, because such a row is evidence of *nothing* and
-    /// must not let a group be established from the rows that did run.
+    /// Rows meant to be compared but not (one side did not run). Counted apart from skipped
+    /// rows, because such a row is evidence of *nothing* and must not let a group be
+    /// established from the rows that did run.
     unmeasured: usize,
     /// What the probe that decides whether a real search exists here found.
     real_search: Probe,
 }
 
-/// One capability's row tally. A capability is established only when at least
-/// one row was actually compared and no row failed — a disagreement, or a
-/// capability the engine never served, or one with no rows at all, leaves it
-/// fail-closed. A row that could not be compared at all is not this group's to
-/// fail: it is counted on the battery, where it stops a verdict being folded from a
-/// partial run (see [`Battery::fold`]).
+/// One capability's row tally. A capability is established only when at least one row was
+/// compared and no row failed; a row that could not be compared is counted on the battery,
+/// where it stops a verdict being folded from a partial run (see [`Battery::fold`]).
 #[derive(Default)]
 struct Group {
     compared: usize,
@@ -477,11 +379,9 @@ struct Group {
 }
 
 impl Battery {
-    /// Fold a run's groups into its verdict: every capability from its own group,
-    /// and nothing at all when a row that had to be compared could not be. Such a
-    /// run is not a verdict for the environment — it claims nothing, so the next
-    /// read measures again rather than one transient row failure keeping a
-    /// capability on the real search for the life of the process.
+    /// Fold a run's groups into its verdict: every capability from its own group, and nothing
+    /// at all when a row that had to be compared could not be — such a run claims nothing, so
+    /// the next read measures again rather than one transient failure keeping the real search.
     fn fold(&mut self, plain: &Group, general: &Group, glob: &Group) {
         if self.unmeasured > 0 {
             return;
@@ -499,12 +399,10 @@ impl Battery {
 enum RowOutcome {
     /// Both sides ran and agreed, or disagreed.
     Compared(bool),
-    /// No parity question: the engine cannot serve this shape (the gate would
-    /// demote it anyway), or the row does not apply to this host.
+    /// No parity question: the engine cannot serve this shape, or the row does not apply here.
     Skipped,
-    /// The row had to be compared and could not be: one side did not run. Claims
-    /// nothing about the capability it belongs to — it is counted on the battery,
-    /// which then folds no verdict at all.
+    /// The row had to be compared and could not be: one side did not run. Claims nothing about
+    /// its capability — counted on the battery, which then folds no verdict at all.
     Unmeasured,
 }
 
@@ -523,20 +421,15 @@ impl Group {
         }
     }
 
-    /// Whether this capability came out established.
     const fn established(&self) -> bool {
         self.compared > 0 && !self.failed
     }
 }
 
-/// Measure every capability under `env`, with nothing allowed to panic out of the
-/// run: a fixture that cannot be built, a panic inside, a probe that could not be
-/// run, or a row that had to be compared and could not be yields no verdict at all,
-/// and only booleans and counts are ever logged.
-///
-/// `None` is "no verdict could be taken", as opposed to a verdict that established
-/// nothing: nothing is claimed for such a run, so the caller records no key for it
-/// and measures again later.
+/// Measure every capability under `env`, with nothing allowed to panic out of the run: a
+/// fixture that cannot be built, a panic inside, a probe that could not be run or a row that
+/// had to be compared and could not yields no verdict at all, and only booleans and counts
+/// are logged. `None` is "no verdict could be taken", as opposed to establishing nothing.
 fn measure(env: &[(OsString, OsString)]) -> Option<Established> {
     let started = Instant::now();
     let Some(fixture) = Fixture::create() else {
@@ -565,13 +458,10 @@ fn measure(env: &[(OsString, OsString)]) -> Option<Established> {
     verdict
 }
 
-/// Run every row and fold the verdict.
-///
-/// A host with no real search at all answers immediately: the fast path is then
-/// the only search there is, so it stands for every capability. A probe that
-/// could not be *run* is not that case — it establishes nothing, so the verdict
-/// stays `None` and the caller's fail-closed default stands. A shutdown begun
-/// mid-run stops the rows at the next boundary, with the same effect.
+/// Run every row and fold the verdict. A host with no real search answers immediately — the
+/// fast path is the only search, so it stands for every capability — while a probe that could
+/// not be *run* establishes nothing, leaving the caller's fail-closed default. A shutdown
+/// begun mid-run stops the rows at the next boundary, with the same effect.
 fn run_battery(fixture: &Fixture, env: &[(OsString, OsString)]) -> Battery {
     let mut battery = Battery {
         real_search: real_search_exists(fixture, env),
@@ -586,10 +476,8 @@ fn run_battery(fixture: &Fixture, env: &[(OsString, OsString)]) -> Battery {
         Probe::Present => {}
     }
 
-    // A shutdown stops the battery at the next row boundary: the reader's join
-    // waits for the whole run, so this is what keeps teardown from waiting for it.
-    // The rows not run are simply not claimed — no verdict is folded — so the gate
-    // stays closed and the next read measures again.
+    // A shutdown stops the battery at the next row boundary: the reader's join waits for the
+    // whole run. The rows not run are not claimed, so the gate stays closed.
     let mut plain = Group::default();
     for row in plain_rows(fixture) {
         if crate::shutdown::aborting() {
@@ -611,8 +499,7 @@ fn run_battery(fixture: &Fixture, env: &[(OsString, OsString)]) -> Battery {
         }
         glob.record(&mut battery, compare_glob_row(fixture, env, pattern));
     }
-    // The trailing filter row runs a child too, so the shutdown check covers it
-    // like any row above.
+    // The trailing filter row runs a child too, so the shutdown check covers it like any row.
     if crate::shutdown::aborting() {
         return battery;
     }
@@ -621,26 +508,22 @@ fn run_battery(fixture: &Fixture, env: &[(OsString, OsString)]) -> Battery {
         compare_grep_row(fixture, env, &filter_row(fixture)),
     );
 
-    // A row that could not be compared is evidence of nothing, and a run that could
-    // not compare every row it set out to is not a verdict for this environment (see
-    // [`Battery::fold`]).
+    // A row that could not be compared is evidence of nothing, and such a run is not a verdict
+    // for this environment (see [`Battery::fold`]).
     battery.fold(&plain, &general, &glob);
     battery
 }
 
-// ── Rows ──────────────────────────────────────────────────────────────────
-
-/// One differential row: the verb-first argv both sides receive, plus whether
-/// the row's stdout compares as a sorted record set (recursive walks only — the
-/// parallel walk orders files across workers, an approved delta).
+/// One differential row: the verb-first argv both sides receive, plus whether the row's stdout
+/// compares as a sorted record set (recursive walks only — the parallel walk is an approved one).
 struct Row {
     argv: Vec<String>,
     sorted: bool,
 }
 
 impl Row {
-    /// A row over `argv` (verb first), with absolute operand paths so both sides
-    /// print the same `file:` prefixes.
+    /// A row over `argv` (verb first), with absolute operand paths so both sides print the same
+    /// `file:` prefixes.
     fn new(argv: &[&str], sorted: bool) -> Self {
         Row {
             argv: argv.iter().map(|word| (*word).to_string()).collect(),
@@ -649,9 +532,8 @@ impl Row {
     }
 }
 
-/// The literal shapes: byte matching over the ascii, unicode, invalid-UTF-8 and
-/// binary fixtures, every flag that does not put case or word boundaries between
-/// the pattern and the bytes, one two-file row, and one clean recursive walk.
+/// The literal shapes: byte matching over the ascii, unicode, invalid-UTF-8 and binary fixtures,
+/// every flag that adds no case or word boundary, one two-file row, and one clean recursive walk.
 fn plain_rows(fixture: &Fixture) -> Vec<Row> {
     let a = fixture.abs("a.txt");
     let b = fixture.abs("b.txt");
@@ -681,10 +563,9 @@ fn plain_rows(fixture: &Fixture) -> Vec<Row> {
     ]
 }
 
-/// The shapes whose matching a locale reaches into: Unicode case folding over
-/// the tricky code points, POSIX classes against non-ASCII data, `.` over the
-/// multibyte data, a bracket set holding an accented character, a word boundary,
-/// and `-i` over the invalid-UTF-8 and binary fixtures.
+/// The shapes a locale reaches into: Unicode case folding over tricky code points, POSIX classes
+/// against non-ASCII data, `.` over multibyte data, an accented bracket set, a word boundary, and
+/// `-i` over the invalid-UTF-8 and binary fixtures.
 fn general_rows(fixture: &Fixture) -> Vec<Row> {
     let a = fixture.abs("a.txt");
     let uni = fixture.abs("uni.txt");
@@ -709,13 +590,12 @@ fn general_rows(fixture: &Fixture) -> Vec<Row> {
     ]
 }
 
-/// The glob operands the glob rows expand. The names tree holds an
-/// ASCII-uppercase name, an accented pair and a plain name, so a locale's
-/// collation and character classes have something to disagree about.
+/// The glob operands the glob rows expand. The names tree holds an ASCII-uppercase name, an
+/// accented pair and a plain name, so collation and character classes can disagree.
 const GLOB_PATTERNS: &[&str] = &["*.txt", "?.txt", "[à]*.txt", "[a-z]*.txt", "[!a]*.txt"];
 
-/// The filter row: `--include`'s `fnmatch` is read by the engine from a process
-/// that never calls `setlocale` and by the real search under the locale in effect.
+/// The filter row: `--include`'s `fnmatch` is read by the engine from a process that never calls
+/// `setlocale`, and by the real search under the locale in effect.
 fn filter_row(fixture: &Fixture) -> Row {
     Row::new(
         &[
@@ -729,15 +609,10 @@ fn filter_row(fixture: &Fixture) -> Row {
     )
 }
 
-// ── Row comparison ────────────────────────────────────────────────────────
-
-/// Compare one grep row end to end: same argv, same environment, engine
-/// in-process against the real search.
-///
-/// A shape the engine cannot serve is no parity question ([`RowOutcome::Skipped`]
-/// — the gate would demote it anyway), while a real search that did not run says
-/// nothing about the row ([`RowOutcome::Unmeasured`]), so the capability stays
-/// fail-closed instead of being established from the rows that did run.
+/// Compare one grep row end to end: same argv, same environment, engine in-process against
+/// the real search. A shape the engine cannot serve is no parity question
+/// ([`RowOutcome::Skipped`]), while a real search that did not run says nothing about the row
+/// ([`RowOutcome::Unmeasured`]), so the capability stays fail-closed.
 fn compare_grep_row(fixture: &Fixture, env: &[(OsString, OsString)], row: &Row) -> RowOutcome {
     let Some(spec) = spec_for(&segment_text(&row.argv), fixture, ShellPlatform::Unix) else {
         return RowOutcome::Skipped;
@@ -757,17 +632,11 @@ fn compare_grep_row(fixture: &Fixture, env: &[(OsString, OsString)], row: &Row) 
     ))
 }
 
-/// Build the spec the production parent path builds for `segment`, so the
-/// comparison exercises the served shape rather than a hand-built one. `None`
-/// when that path refuses the member.
-///
-/// One deliberate deviation from a unix serve decision: `allow_single` is `true`
-/// (the Windows production value), which bypasses the unix single-file perf gate.
-/// A single-file lookup is exactly one of the shapes the engine must be held to
-/// even though the unix path hands it to the real search for speed.
-///
-/// The call suspends the gate for its duration (see [`Measuring`]): the row under
-/// measurement must be built whatever the verdict currently says.
+/// Build the spec the production parent path builds for `segment`, so the comparison
+/// exercises the served shape rather than a hand-built one; `None` when that path refuses.
+/// One deliberate deviation: `allow_single` is `true` (the Windows production value), which
+/// bypasses the unix single-file perf gate — a single-file lookup is exactly a shape the
+/// engine must be held to. The call suspends the gate for its duration (see [`Measuring`]).
 fn spec_for(segment: &str, fixture: &Fixture, platform: ShellPlatform) -> Option<EngineSpec> {
     let _measuring = Measuring::enter();
     serve_one_grep(
@@ -781,8 +650,7 @@ fn spec_for(segment: &str, fixture: &Fixture, platform: ShellPlatform) -> Option
             piped: false,
             stdin_fed: false,
             marker_ok: true,
-            // The battery builds one member at a time, never a line that has
-            // already exported something.
+            // The battery builds one member at a time, never a line that exported something.
             env_changed: false,
         },
     )
@@ -790,10 +658,9 @@ fn spec_for(segment: &str, fixture: &Fixture, platform: ShellPlatform) -> Option
     .map(|(spec, _redirects)| spec)
 }
 
-/// Compare [`expand_glob`] with the shell's own expansion of the same operand:
-/// same members, same order. The same distinction as [`compare_grep_row`]: an
-/// operand the engine cannot expand is no parity question, a shell that did not
-/// run is nothing to measure.
+/// Compare [`expand_glob`] with the shell's own expansion of the same operand: same members,
+/// same order. As in [`compare_grep_row`], a shape the engine cannot serve is no parity
+/// question and a shell that did not run is nothing to measure.
 fn compare_glob_row(fixture: &Fixture, env: &[(OsString, OsString)], pattern: &str) -> RowOutcome {
     let Some(engine) = expand_glob(pattern, &fixture.names, ShellPlatform::Unix).ok() else {
         return RowOutcome::Skipped;
@@ -805,8 +672,8 @@ fn compare_glob_row(fixture: &Fixture, env: &[(OsString, OsString)], pattern: &s
 }
 
 /// The shell's own expansion of one glob operand, one name per line:
-/// `sh -c 'printf "%s\n" <pattern>'` under the agent's environment, cwd = the
-/// names tree. `None` when `sh` could not be run at all, which measures nothing.
+/// `sh -c 'printf "%s\n" <pattern>'` under the agent's environment, cwd = the names tree.
+/// `None` when `sh` could not be run at all, which measures nothing.
 fn shell_glob(
     pattern: &str,
     fixture: &Fixture,
@@ -826,8 +693,7 @@ fn shell_glob(
     )
 }
 
-/// Run the real search by name with the agent's environment applied and the
-/// fixture root as cwd.
+/// Run the real search by name with the agent's environment applied and the fixture root as cwd.
 fn real_search(argv: &[String], env: &[(OsString, OsString)], cwd: &Path) -> Child {
     let Some((verb, operands)) = argv.split_first() else {
         // No program name at all: nothing ran, so nothing was measured.
@@ -838,20 +704,16 @@ fn real_search(argv: &[String], env: &[(OsString, OsString)], cwd: &Path) -> Chi
     bounded_output(&mut cmd)
 }
 
-/// A command with the agent's environment applied whole (nothing inherited), run
-/// in `cwd`, and its stdin and stderr taken away: the battery runs the owner's own
-/// programs unattended in the background, so nothing here may read the daemon's
-/// stdin or spill its diagnostics into the daemon's stderr. Its stdout is the
-/// row's capture ([`bounded_output`]).
+/// A command with the agent's environment applied whole (nothing inherited), run in `cwd`,
+/// with stdin and stderr taken away: the battery runs the owner's own programs unattended in
+/// the background, so nothing may read the daemon's stdin or spill into its stderr. Stdout is
+/// the row's capture ([`bounded_output`]).
 ///
-/// The program is named by the path that environment's own search list resolves it
-/// to ([`crate::tools::shell::program_command`]), which is why `cwd` sits here
-/// rather than with the callers: an empty or relative search entry is resolved
-/// against it, and a name nothing in the list resolves stays bare — so today's
-/// [`Child::Missing`] classification is unchanged. The window guarantee
-/// `tools::shell::tree` documents holds here too: that shared start is the one
-/// place the windowless creation flag is applied (the battery never runs on
-/// Windows, but the flag is what every spawn in the tree carries).
+/// The program is named by the path that environment's search list resolves it to
+/// ([`crate::tools::shell::program_command`]), which is why `cwd` sits here: an empty or
+/// relative search entry resolves against it and an unresolvable name stays bare, leaving
+/// [`Child::Missing`] unchanged. The window guarantee `tools::shell::tree` documents holds too.
+/// The battery never runs on Windows.
 fn agent_command(program: &str, env: &[(OsString, OsString)], cwd: &Path) -> Command {
     let mut cmd = crate::tools::shell::program_command(program, env, Some(cwd));
     cmd.stdin(std::process::Stdio::null())
@@ -859,41 +721,30 @@ fn agent_command(program: &str, env: &[(OsString, OsString)], cwd: &Path) -> Com
     cmd
 }
 
-/// One battery child's result: its stdout and exit code, or why it produced
-/// neither. The distinction between the two failure arms is what
-/// [`real_search_exists`] needs — "not installed here" and "could not be
-/// started" are not the same finding.
+/// One battery child's result: its stdout and exit code, or why it produced neither. The two
+/// failure arms are what [`real_search_exists`] needs — "not installed here" is not "could not
+/// be started".
 enum Child {
     /// Ran to completion inside the deadline.
     Ran(Vec<u8>, i32),
-    /// Could not be started because nothing in this environment's search path
-    /// resolves to it: the program is not on the system.
+    /// Nothing in this environment's search path resolves to it: the program is not installed.
     Missing,
-    /// No usable result: it could not be started for any reason other than not
-    /// being there, it failed to be waited on, or it outlived
-    /// [`BATTERY_SPAWN_TIMEOUT`] and was killed.
+    /// No usable result: it could not be started for another reason, failed to be waited on, or
+    /// outlived [`BATTERY_SPAWN_TIMEOUT`] and was killed.
     Unusable,
 }
 
-/// Run one battery child to completion under a deadline, and hand back what it
-/// wrote.
+/// Run one battery child to completion under a deadline, and hand back what it wrote.
 ///
-/// A deadline is what keeps the battery — and so the environment reader that
-/// hands the measurement to a blocking pool and waits for it — from depending on
-/// a program the owner's own `PATH` resolves: a `grep` that hangs would otherwise
-/// wedge a blocking thread and stop every later read. The child is killed on
-/// expiry.
+/// The deadline keeps the battery — and the environment reader that hands the measurement to a
+/// blocking pool and waits for it — from depending on a program the owner's `PATH` resolves: a
+/// `grep` that hangs would otherwise wedge a blocking thread and stop every later read.
 ///
-/// The child's stdout is a file, not a pipe, and that is what makes the deadline
-/// cover the whole row: a pipe has to be read to EOF, and an EOF a stray holder of
-/// the write end never produces would block this thread for good, while a file
-/// needs no reader at all — once the child has exited, what it wrote is there.
-/// A killed child is handed to [`reap`], so not even one that survives SIGKILL can
-/// hold this thread. The capture is then bounded whatever the owner's program does:
-/// what is read back is capped at [`BATTERY_STDOUT_CAP`], and a child that has
-/// already written past it is killed rather than waited for. (Its stdout is still
-/// not a terminal, so a program that formats for one is not what either side of a
-/// comparison sees.)
+/// The child's stdout is a file, not a pipe, which is what makes the deadline cover the whole
+/// row: a pipe must be read to EOF, and an EOF a stray holder of the write end never produces
+/// would block this thread for good. A killed child is handed to [`reap`]. The capture is
+/// capped at [`BATTERY_STDOUT_CAP`], and a child already past it is killed rather than waited
+/// for. (Its stdout is still not a terminal.)
 fn bounded_output(cmd: &mut Command) -> Child {
     let Ok(sink) = tempfile::tempfile_in(crate::temp::shell_tmpdir()) else {
         return Child::Unusable;
@@ -904,8 +755,7 @@ fn bounded_output(cmd: &mut Command) -> Child {
     };
     let mut child = match cmd.stdout(std::process::Stdio::from(sink)).spawn() {
         Ok(child) => child,
-        // "Not on this system" is a finding; any other spawn failure — a
-        // permission refusal, a resource limit — is not evidence of absence.
+        // "Not on this system" is a finding; any other spawn failure is not evidence of absence.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Child::Missing,
         Err(_) => return Child::Unusable,
     };
@@ -919,9 +769,8 @@ fn bounded_output(cmd: &mut Command) -> Child {
                 reap(&mut child);
                 return Child::Unusable;
             }
-            // Nothing a row needs comes anywhere near the cap, so a child already
-            // past it is a runaway: killed, and the row is unusable rather than
-            // captured.
+            // Nothing a row needs comes near the cap, so a child already past it is a runaway:
+            // killed, and the row is unusable rather than captured.
             Ok(None)
                 if captured
                     .metadata()
@@ -948,14 +797,11 @@ fn bounded_output(cmd: &mut Command) -> Child {
     Child::Ran(out, status.code().unwrap_or(-1))
 }
 
-/// Kill a battery child and collect it, under the same bound as the row it belongs
-/// to.
+/// Kill a battery child and collect it, under the same bound as the row it belongs to.
 ///
-/// The wait is bounded for the same reason the row's is: a child that survives
-/// SIGKILL (uninterruptible I/O is the case the deadline exists for) must not park
-/// the blocking thread — the environment reader joins that thread, so a parked one
-/// would stop every later read. A child still running when the bound expires is left
-/// to the OS rather than waited for.
+/// The wait is bounded for the row's reason: a child that survives SIGKILL must not park the
+/// blocking thread the environment reader joins. One still running at the bound is left to
+/// the OS rather than waited for.
 fn reap(child: &mut std::process::Child) {
     let _ = child.kill();
     let deadline = std::time::Instant::now() + BATTERY_SPAWN_TIMEOUT;
@@ -968,11 +814,9 @@ fn reap(child: &mut std::process::Child) {
     }
 }
 
-/// Whether a real search exists here at all. Three-way, because "there is
-/// nothing on this system to compare against" is a verdict of its own — the fast
-/// path is then the only search and stands — while a probe that could not be
-/// *run* says nothing about whether a real search is there, and must leave the
-/// verdict fail-closed rather than publish one nothing was measured under.
+/// Whether a real search exists here at all. Three-way, because "nothing on this system to
+/// compare against" is a verdict of its own — the fast path is then the only search and
+/// stands — while a probe that could not be *run* must leave the verdict fail-closed.
 fn real_search_exists(fixture: &Fixture, env: &[(OsString, OsString)]) -> Probe {
     let argv = [
         "grep".to_string(),
@@ -991,19 +835,15 @@ fn real_search_exists(fixture: &Fixture, env: &[(OsString, OsString)]) -> Probe 
 enum Probe {
     /// The real search ran: the battery compares against it.
     Present,
-    /// Nothing in this environment resolves to a real search: the fast path is
-    /// the only search here, so it stands for every capability.
+    /// Nothing here resolves to a real search: the fast path is the only search and stands.
     Absent,
-    /// The probe itself could not be run. Not evidence of absence: nothing is
-    /// established, and the real search answers if one turns up.
+    /// The probe itself could not be run. Not evidence of absence: nothing is established.
     #[default]
     Unknown,
 }
 
-/// Run one spec in-process the way the existing in-process lanes do: the
-/// production matcher builder, a buffer sink standing in for the capture pipe, and
-/// empty stdin. `None` when the matcher cannot build — the parent path has
-/// already validated the spec, so that is a fail-closed arm, not a parity row.
+/// Run one spec in-process as the existing lanes do: the production matcher builder, a buffer
+/// sink standing in for the capture pipe, and empty stdin. `None` when the matcher cannot build.
 fn engine_run(spec: &EngineSpec) -> Option<(Vec<u8>, i32)> {
     let matcher = build_matcher(&spec.patterns, spec.mode, &spec.flags).ok()?;
     let mut out = Output::new(OutputSink::Buffer(Vec::new()), StdoutDest::of(spec, true));
@@ -1013,8 +853,7 @@ fn engine_run(spec: &EngineSpec) -> Option<(Vec<u8>, i32)> {
     Some((bytes, code))
 }
 
-/// Byte-exact stdout plus an equal exit code, relaxed to sorted record sets for
-/// the recursive rows (the parallel walk's cross-file order is an approved delta).
+/// Byte-exact stdout plus an equal exit code, relaxed to sorted record sets for recursive rows.
 fn equivalent(engine: &[u8], engine_code: i32, real: &[u8], real_code: i32, sorted: bool) -> bool {
     if engine_code != real_code {
         return false;
@@ -1036,9 +875,8 @@ fn sorted_lines(bytes: &[u8]) -> Vec<&[u8]> {
     records
 }
 
-/// The shell segment the engine's parent-side reader is handed for a row: the
-/// same argv words, shell-quoted, so the quoted spellings the tokenizer sees are
-/// the words the real search receives.
+/// The shell segment the parent-side reader is handed for a row: the same argv words,
+/// shell-quoted, so the tokenizer sees the spellings the real search receives.
 fn segment_text(argv: &[String]) -> String {
     argv.iter()
         .map(|word| shell_quote(word))
@@ -1046,35 +884,26 @@ fn segment_text(argv: &[String]) -> String {
         .join(" ")
 }
 
-// ── Fixture ───────────────────────────────────────────────────────────────
-
-/// The byte-exact fixture the battery searches: a scratch tree under the shell
-/// temp root, removed when the run ends.
+/// The byte-exact fixture the battery searches: a scratch tree under the shell temp root.
 struct Fixture {
-    /// Owns the tree: dropping the battery removes every fixture file.
     _tmp: tempfile::TempDir,
-    /// The tree's root, which is also each grep row's cwd.
     root: PathBuf,
-    /// A home directory, for the operand resolution the parent path runs.
     home: PathBuf,
-    /// The tree the glob rows expand within (`names/`).
     names: PathBuf,
 }
 
 impl Fixture {
-    /// Build the fixture tree inside [`crate::temp::shell_tmpdir`]. `None` when
-    /// the directory or any fixture file cannot be created — the caller stays
-    /// fail-closed.
+    /// Build the fixture tree inside [`crate::temp::shell_tmpdir`]. `None` when the directory
+    /// or any fixture file cannot be created — the caller stays fail-closed.
     fn create() -> Option<Self> {
         let tmp = tempfile::tempdir_in(crate::temp::shell_tmpdir()).ok()?;
         let root = tmp.path().to_path_buf();
         std::fs::create_dir_all(root.join("dir/sub")).ok()?;
         std::fs::create_dir_all(root.join("names")).ok()?;
         std::fs::create_dir_all(root.join("home")).ok()?;
-        // Byte-exact: the rows depend on these code points and on these invalid
-        // bytes, not on any encoding a writer might apply. The `dir/` tree has no
-        // hidden entries, no ignore files and no binary files, so the engine's
-        // rg-default walk exclusions can never be the cause of a difference.
+        // Byte-exact: the rows depend on these code points and invalid bytes, not on any
+        // encoding a writer might apply. The `dir/` tree has no hidden entries, no ignore files
+        // and no binary files, so the rg-default walk exclusions cannot cause a difference.
         let files: &[(&str, &[u8])] = &[
             ("a.txt", b"alpha\nbeta\nneedle\n"),
             ("b.txt", b"needle\nother\n"),
@@ -1110,25 +939,20 @@ impl Fixture {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::super::{Fallback, PipelineCtx, grep_tokenize, parse_grep_words, serve_one_grep};
     use super::*;
 
-    /// Parse a grep segment exactly as the serve path does, so a `needs` row
-    /// reads the same [`ParsedGrep`] the gate sees.
+    /// Parse a grep segment as the serve path does, so a `needs` row reads the same [`ParsedGrep`].
     fn parsed(segment: &str) -> ParsedGrep {
         let mut words = grep_tokenize(segment, ShellPlatform::Unix).expect("tokenize");
         words.remove(0);
         parse_grep_words(&words, "grep", ShellPlatform::Unix).expect("parse")
     }
 
-    /// Each row outcome lands in its own tally, and a run that could not compare a
-    /// row it had to folds no verdict at all — so the next read measures again
-    /// instead of one transient row failure keeping a capability on the real search
-    /// for the life of the process.
+    /// Each row outcome lands in its own tally, and a run that could not compare a row it had
+    /// to folds no verdict at all — so the next read measures again.
     #[test]
     fn a_run_with_a_row_it_could_not_compare_folds_no_verdict() {
         let mut battery = Battery::default();
@@ -1163,14 +987,11 @@ mod tests {
         );
     }
 
-    /// The verdict and the key it was measured for move together: a verdict is in
-    /// effect only while the environment it belongs to is, and a measurement that
-    /// produced none claims nothing at all — so a transient failure cannot leave
-    /// the gate closed for the life of the process, and an environment that moves
-    /// loses the old verdict before it can be served under it.
+    /// The verdict and the key it was measured for move together: a verdict is in effect only
+    /// while its environment is, and a measurement that produced none claims nothing — so a
+    /// transient failure cannot leave the gate closed for the life of the process.
     ///
     /// Driven directly, because a real measurement spawns the owner's own programs.
-    ///
     /// `#[serial]`: the verdict and its key are process-global.
     #[cfg(unix)]
     #[serial_test::serial(shell_env)]
@@ -1178,13 +999,11 @@ mod tests {
     fn a_verdict_stands_only_for_the_environment_it_was_measured_for() {
         let in_effect = || EnvKey::new(&crate::tools::shell::agent_env_pairs());
         let other = [(OsString::from("ONE"), OsString::from("two"))];
-        // The gate itself, not `established()`: the latter prefers the test-only
-        // per-thread override, which another lane may have installed on this
-        // thread, and this lane is about the process-global verdict.
+        // The gate itself, not `established()`: the latter prefers the test-only per-thread
+        // override, and this lane is about the process-global verdict.
         let gate = || ESTABLISHED.load().as_deref().copied().unwrap_or_default();
 
-        // A measured environment is in effect, and looking again at the *same*
-        // environment takes no measurement at all.
+        // A measured environment is in effect; looking again at the *same* one measures nothing.
         assert!(record(in_effect(), Some(Established::all())));
         assert_eq!(gate(), Established::all());
         assert!(
@@ -1192,22 +1011,19 @@ mod tests {
             "an environment measured with a verdict is a no-op"
         );
 
-        // A run that produced no verdict claims nothing: the gate closes and no key
-        // is left, which is what makes the next refresh measure again.
+        // A run that produced no verdict claims nothing: the gate closes and no key is left.
         assert!(!record(in_effect(), None));
         assert_eq!(gate(), Established::default());
         assert!(LAST_MEASURED.lock().unwrap_poison().is_none());
 
-        // An environment that is not the measured one drops the verdict in the
-        // caller's own step — and leaves no key behind either.
+        // An environment that is not the measured one drops the verdict and leaves no key.
         assert!(record(EnvKey::new(&other), Some(Established::all())));
         assert_eq!(gate(), Established::all());
         invalidate_verdict_for(&crate::tools::shell::agent_env_pairs());
         assert_eq!(gate(), Established::default());
         assert!(LAST_MEASURED.lock().unwrap_poison().is_none());
 
-        // An environment that *is* the measured one keeps its verdict: the check is
-        // about the environment, not about being called.
+        // An environment that *is* the measured one keeps its verdict.
         assert!(record(EnvKey::new(&other), Some(Established::all())));
         invalidate_verdict_for(&other);
         assert_eq!(gate(), Established::all());
@@ -1218,9 +1034,8 @@ mod tests {
         *LAST_MEASURED.lock().unwrap_poison() = None;
     }
 
-    /// `needs` in one table: byte literals keep the fast path, anything whose
-    /// matching a locale reaches into is general, and a glob operand or a filter
-    /// adds the glob dimension.
+    /// `needs` in one table: byte literals keep the fast path, anything a locale reaches into
+    /// is general, and a glob operand or a filter adds the glob dimension.
     #[test]
     fn needs_follows_the_member_shape() {
         let rows: &[(&str, &[Need])] = &[
@@ -1253,8 +1068,7 @@ mod tests {
         }
     }
 
-    /// The gate demotes every capability that was not established, naming the
-    /// unmet one; with everything established it serves.
+    /// The gate demotes every capability that was not established, naming the unmet one.
     #[test]
     fn the_gate_demotes_what_was_not_established() {
         publish_for_test((false, false, false));
@@ -1286,10 +1100,8 @@ mod tests {
         );
     }
 
-    /// A host with no real search to compare against: the battery answers with
-    /// every capability established — the fast path is the only search there —
-    /// rather than with the fail-closed default a probe that could not be *run*
-    /// leaves in place.
+    /// A host with no real search: the battery establishes every capability rather than leaving
+    /// the fail-closed default a probe that could not be *run* leaves in place.
     #[cfg(unix)]
     #[test]
     fn a_host_without_a_real_search_establishes_every_capability() {
@@ -1309,9 +1121,8 @@ mod tests {
         assert_eq!(battery.rows, 0, "nothing was compared");
     }
 
-    /// The gate never fires on Windows: there is no real search to run there, so
-    /// the fast path is the only search and stands however the verdict stands.
-    /// The platform is a value, so this is drivable from this host.
+    /// The gate never fires on Windows: the fast path is the only search and stands however the
+    /// verdict stands. The platform is a value, so this is drivable from this host.
     #[test]
     fn a_windows_member_is_served_however_the_verdict_stands() {
         publish_for_test((false, false, false));

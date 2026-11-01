@@ -1,38 +1,22 @@
 //! `mahbot chrome` — browser automation CLI over the shared core.
 //!
-//! Dispatched from `main()` before temp-root/lock init (runs alongside the
-//! daemon), so it must not rely on the `/tmp/mahbot` temp root or initialized
-//! config; chrome-use resolves to the product's own copy at its standard
-//! install directory, which needs no config to work out.
-//! Sessions are namespaced `mahbot-chrome-*` so they can never collide with
-//! the interactive tool's `agent-tab-*`.
+//! Runs before temp-root/lock init, alongside the daemon, so it needs no
+//! initialized config. Sessions are namespaced `mahbot-chrome-*` and can never
+//! collide with the interactive tool's `agent-tab-*`.
 //!
 //! stdout is exactly ONE line of JSON (the [`OutEnvelope`]); stderr carries
-//! human-readable diagnostics. Exit codes follow the contract: 0 success,
-//! 1 site/data step failure (schedulable), 2 environment failure (fix the
-//! environment, don't blind-retry), 3 usage error — and 128+signal when the call was
-//! interrupted or terminated, in which case no envelope is emitted. Every step runs to the two
-//! clocks the [chrome policy](crate::chrome) defines — chrome-use's clock,
-//! declared to it, and the product's own kill above that — as [`StepClocks`]
-//! derives them for this surface. The wait action never exposes `--load`; its one
-//! raw-argv use is `open`'s internal best-effort post-navigation settle. A tab an `open` or `click`
-//! step creates in a NAMED session is left as an ordinary tab, outside chrome-use's group, before
-//! the envelope is out; the whole rule, including which verbs report their tab, is
-//! [`crate::tools::chrome_groups`]'. That move needs the session's own tabs, and when the browser
-//! will not answer for them the tab stays inside chrome-use's group: the step still succeeds, and
-//! the miss is silent — the command line's tail reports nothing ([`crate::tools::chrome_groups`]
-//! says why). An ephemeral session is closed right after its command and its tab closes with it.
-//!
-//! ## Session lifetime
+//! diagnostics. Exit codes: 0 success, 1 site/data step failure (schedulable),
+//! 2 environment failure (fix it, don't blind-retry), 3 usage error, 128+signal
+//! when interrupted or terminated — then no envelope. Steps run to the two
+//! clocks of the [chrome policy](crate::chrome), as [`StepClocks`] derives them.
+//! A tab an `open`/`click` step creates in a NAMED session leaves chrome-use's
+//! group before the envelope, silently skipped when the browser will not answer
+//! ([`crate::tools::chrome_groups`]).
 //!
 //! Without `--session` a call runs in a throwaway session, closed right after the
-//! envelope and, if the call is interrupted or terminated, before it exits (a hard kill
-//! is covered by the lifetime). A named session's lifetime, the `--keep` mark and the
-//! sweeps that enforce them are [`crate::chrome::cli_sessions`]'s; this module records
-//! each call's use, adds the session's in-flight mark while the call runs — which is what
-//! keeps every sweep away from it, for as long as the mark holds (an hour; a call running
-//! longer than that falls back to the ordinary lifetime) — and hands
-//! chrome-use the same number as its cleanup backstop.
+//! envelope. A named session's lifetime, `--keep` and its sweeps are
+//! [`crate::chrome::cli_sessions`]'s; this module records each call's use and
+//! holds its in-flight mark (an hour) while the call runs.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -73,39 +57,28 @@ use crate::tools::chrome_groups::{self, Opened};
 use crate::util::{TOOL_OUTPUT_BUDGET_BYTES, truncate_sandwich};
 use serde_json::{Value, json};
 
-/// Product-side bound on the daemon-free `session list` enumerate `session
-/// status` opens with: it only asks the daemon what sessions exist (it never
-/// drives the browser), so a probe bound well under chrome-use's own budget is
-/// what the product wants there — the relay self-heal would be pure waste.
+/// Product-side bound on the daemon-free `session list` enumerate: it only asks
+/// the daemon what sessions exist, so it stays well under chrome-use's budget.
 const SESSION_LIST_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// `session status` probe bound: the product's own bounded liveness question —
-/// "does the session answer at all" — so it deliberately does not wait out
-/// chrome-use's own client tolerance, and declares that same short bound to
-/// chrome-use ([`probe_clocks`]) rather than a longer one it would never let run.
-/// A session that does not answer within it is [`Liveness::Unresponsive`] to
-/// [`probe_session_liveness`]. Opt-in — never part of the default per-command path.
+/// `session status` probe bound: the product's own bounded liveness question,
+/// declared to chrome-use ([`probe_clocks`]) rather than a longer bound it would
+/// never let run. No answer within it is [`Liveness::Unresponsive`]. Opt-in.
 const SESSION_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The manual recovery flow for a wedged named session — named only where the
-/// automatic recovery did not confirm or never started a stop
-/// ([`wedge_recovery_note`]). References only verbs that exist in the mahbot
-/// surface.
+/// The manual recovery flow for a wedged named session, naming only verbs that
+/// exist in the mahbot surface.
 const SESSION_RECOVERY_FLOW: &str = "`mahbot chrome session stop <name>`, then re-run the action with \
      `--session <name>` to re-create it (cookies persist in the profile; open \
      tabs do not)";
 
 /// The sentence appended to a wedge-shaped envelope: what the automatic recovery
-/// did, or — where the stop was only issued and not confirmed, or never started —
-/// the manual flow that remains. Shares the recovery summary with the tool so the
-/// two surfaces cannot drift.
+/// did, or the manual flow that remains. Shares the tool's own summary.
 fn wedge_recovery_note(recovery: SessionRecovery) -> String {
     match recovery {
         SessionRecovery::Stopped => recovery.summary().to_string(),
         SessionRecovery::Unanswered | SessionRecovery::NotStarted => {
-            // The summary itself says what happened (the stop was issued and
-            // keeps running, or none could be started); what is appended is only
-            // the manual flow left to the caller.
+            // The summary says what happened; this appends the manual flow left.
             format!(
                 "{} If it is still wedged, recover with {SESSION_RECOVERY_FLOW}.",
                 recovery.summary()
@@ -126,20 +99,12 @@ enum WedgeAction {
     Leave,
 }
 
-/// The wedge fact is WHO ended the step, not the envelope's kind on its own.
-/// chrome-use's own session-unresponsive classification is a diagnosis, so it
-/// recovers directly. A deadline-expiration label — Timeout, or the Redesign
-/// `open --expect --structural` gives a deadline expiration — counts only when
-/// the PRODUCT's own clock ended the step ([`CLI_STEP_KILLED_BY_CLOCK`]): only
-/// then was chrome-use cut off before it could classify anything, leaving the
-/// session's liveness genuinely unknown, whereas the same labels also carry
-/// chrome-use's own honest timeout verdicts. Every other failure is left alone —
-/// a failed `expect` / `open --expect` / `wait` produces a Timeout as its normal
-/// verdict, and neither it nor an unprobed error may stop a session and lose its
-/// tabs. Ephemeral sessions are left to the caller's own cleanup (the `<name>`
-/// verbs are unactionable for them).
-///
-/// Pure so tests pin the keying.
+/// The wedge fact is WHO ended the step, not the envelope's kind: chrome-use's
+/// own session-unresponsive verdict is a diagnosis, so it recovers directly, while
+/// a deadline label counts only when the PRODUCT's clock ended the step
+/// ([`CLI_STEP_KILLED_BY_CLOCK`]) — otherwise it is chrome-use's honest timeout,
+/// which must never cost a session its tabs. Ephemeral sessions are left to the
+/// caller. Pure so tests pin the keying.
 #[must_use]
 fn wedge_action(env: &OutEnvelope, named: bool, killed_by_clock: bool) -> WedgeAction {
     if !named {
@@ -170,10 +135,8 @@ fn append_error_note(env: &mut OutEnvelope, note: &str) {
     }
 }
 
-/// Recover a wedge the envelope points at (bounded) and put what was done into
-/// its error text (see [`wedge_action`] for which envelopes count). An ephemeral
-/// session is left to the caller's own cleanup, and a session the agent chose is
-/// the only one whose recovery text can name the manual flow.
+/// Recover a wedge the envelope points at (bounded), putting what was done into its
+/// error text ([`wedge_action`] says which envelopes count).
 async fn recover_session_wedge(
     env: &mut OutEnvelope,
     session: &str,
@@ -184,9 +147,8 @@ async fn recover_session_wedge(
         WedgeAction::Leave => return,
         WedgeAction::Recover => wedge_recovery_note(recover_unresponsive_session(session).await),
         WedgeAction::Probe => {
-            // The product's own kill preempted chrome-use's verdict, so the wedge
-            // is only a candidate: confirm it with the same bounded `get url`
-            // liveness probe the `session status` verb uses.
+            // The product's kill preempted chrome-use's verdict: confirm with the same bounded
+            // `get url` probe the `session status` verb uses.
             match probe_session_liveness(session).await {
                 Liveness::Unresponsive => {
                     wedge_recovery_note(recover_unresponsive_session(session).await)
@@ -216,16 +178,13 @@ enum Liveness {
     Answered,
     /// No answer within [`SESSION_PROBE_TIMEOUT`]: the session is wedged.
     Unresponsive,
-    /// The probe could not be run, or its outcome could not be established (no
-    /// binary, spawn failure, unparseable envelope): nothing was learned about
-    /// the session, so nothing is recovered on its account.
+    /// The probe could not run or establish anything (no binary, spawn failure,
+    /// unparseable envelope): nothing is recovered on its account.
     Inconclusive,
 }
 
-/// Bounded liveness probe of a named session (read-only `get url`, the probe the
-/// `session status` verb uses). [`Liveness::Inconclusive`] is deliberately not
-/// [`Liveness::Answered`] and not [`Liveness::Unresponsive`]: a probe that could
-/// not run answers nothing about the session, so its daemon is left alone.
+/// Bounded liveness probe of a named session (read-only `get url`).
+/// [`Liveness::Inconclusive`] is neither answered nor unresponsive: no recovery.
 async fn probe_session_liveness(session: &str) -> Liveness {
     let Some(path) = cli_path() else {
         return Liveness::Inconclusive;
@@ -343,10 +302,9 @@ fn action_help(name: &str) -> String {
     out
 }
 
-/// A per-action help request: the first positional token names a CLI action
-/// and a token after it is `-h`/`--help`. Flags/session values before the
-/// action word are skipped. Within the tokens after the action word everything
-/// from `--` on is literal text, never help. Returns the action's registry name.
+/// A per-action help request: the first positional names a CLI action and a later
+/// token is `-h`/`--help`; flags before the action word are skipped, and from `--`
+/// on every token is literal text, never help. Returns the action's registry name.
 fn action_help_request(args: &[String]) -> Option<&'static str> {
     let (i, word) = first_positional(args)?;
     let d = actions::desc(word)?;
@@ -381,15 +339,10 @@ struct Invocation {
 
 /// One parsed `mahbot chrome` action.
 ///
-/// `timeout` on `Open`/`Wait`/`Expect` is the deadline the action declares for
-/// the step (the user's `--timeout`, or the action's own default — forwarded to
-/// chrome-use for wait/expect, and for `open` the budget that bounds the waits the
-/// operation drives); `bound` on the rest is the user's own `--timeout`, or `None`
-/// when they gave none — those verbs forward no `--timeout` chrome-use honours, so
-/// their clock is the one mahbot declares to chrome-use (its own client tolerance
-/// less the 2 s margin), a bound below that clock is REFUSED as a usage error
-/// (nothing could honour it) and a longer one widens only the product's own kill
-/// (see [`StepClocks`], [`parse_bound_timeout`]).
+/// `timeout` (on `Open`/`Wait`/`Expect`) is the deadline declared for the step;
+/// `bound` on the rest is the user's own `--timeout`, or `None` — those verbs
+/// forward nothing chrome-use honours, so a bound below the declared clock is
+/// refused and a longer one widens only the product's kill ([`StepClocks`]).
 enum Action {
     Status,
     Open {
@@ -461,17 +414,14 @@ enum Action {
 }
 
 impl Action {
-    /// Whether this action drives the browser in a session. The verbs that report and
-    /// repair (`status`, `session …`) run in none — the same declaration field
-    /// ([`CliHelp::session_refusal`]) that decides whether their help prints the
-    /// session-wide rows and whether the parser takes them.
+    /// Whether this action drives the browser in a session; the report/repair verbs
+    /// (`status`, `session …`) run in none — the parser and the help both read it.
     fn runs_in_session(&self) -> bool {
         session_refusal_for(self.name()).is_none()
     }
 
-    /// The shared-registry name of this action — the envelope's `action` field
-    /// and the help lookup key. The `session` subcommands emit under
-    /// `"session"`, the word the owner typed.
+    /// The shared-registry name of this action — the envelope's `action` field and the
+    /// help lookup key; the `session` subcommands emit as `"session"`.
     fn name(&self) -> &'static str {
         match self {
             Action::Status => "status",
@@ -496,11 +446,8 @@ impl Action {
 
 /// Where `fill` gets its text.
 enum TextInput {
-    /// Inline positional text (multi-word joined with spaces).
     Inline(String),
-    /// `--file <path>` passthrough — chrome-use reads the file.
     File(String),
-    /// `--stdin` — mahbot reads its own stdin and pipes the bytes.
     Stdin,
 }
 
@@ -516,10 +463,8 @@ impl TextInput {
     }
 }
 
-/// A failed chrome-use step: the classified [`OutKind`] plus the error text
-/// (empty for a mahbot-side deadline kill). The session-wedge recovery and its
-/// text are applied after dispatch (see [`recover_session_wedge`]) — the one
-/// place the resolved session name is in scope.
+/// A failed chrome-use step: the classified [`OutKind`] plus its error text (empty
+/// for a mahbot-side kill); wedge recovery is applied later ([`recover_session_wedge`]).
 #[derive(Debug)]
 struct StepFailure {
     kind: OutKind,
@@ -527,16 +472,10 @@ struct StepFailure {
 }
 
 impl StepFailure {
-    /// The failure envelope for `action`, layering the failure detail onto
-    /// `base` params: a deadline kill reports `timeout_ms` (the product's own
-    /// bound for the step — its kill) plus a factual `error` that says the
-    /// product's own bound ended the call and which clock chrome-use was working
-    /// to; any other failure reports the chrome-use `error` text with the
-    /// accurate remediation layered on (unreachable-tab guidance), and Network
-    /// failures carry the extracted net error token as `error_code` when the
-    /// message contains one. The session-wedge recovery and its text are applied
-    /// later, where the session name is known (see
-    /// [`recover_session_wedge`]).
+    /// The failure envelope for `action`, layering the failure detail onto `base`: a
+    /// deadline kill reports the product's own `timeout_ms` plus a factual `error`; any
+    /// other failure the chrome-use error with remediation layered on, and a Network
+    /// failure its net error token as `error_code` when there is one.
     fn envelope(self, action: &str, base: Value, clocks: StepClocks) -> OutEnvelope {
         let mut obj = match base {
             Value::Object(m) => m,
@@ -576,46 +515,28 @@ impl StepFailure {
 /// Outcome of one spawned chrome-use step.
 type StepOutcome = Result<ChromeResponse, StepFailure>;
 
-/// Whether any session-scoped chrome-use spawn has been attempted this
-/// process — an ephemeral session can only exist after such a spawn, so
-/// cleanup is skipped (no stderr noise) when every failure happened before
-/// any spawn attempt. Never read before `run_cli` resets it.
+/// Whether any session-scoped chrome-use spawn was attempted this process: a
+/// throwaway can exist only after one, so cleanup is skipped (no stderr noise).
 static CHROME_USE_SPAWNED: AtomicBool = AtomicBool::new(false);
 
-/// Whether any chrome-use step this process ran exited while a process it left
-/// behind still held the step's output channel
-/// ([`CliOutput::leftover_pipes`]) — including the ephemeral close's own spawn,
-/// whose envelope is already out, so [`run_cli`] reports that leftover on stderr.
-/// The CLI handles ONE invocation per process, so this is the invocation's whole
-/// record; [`run_action`] turns a step's leftover into a note on the envelope
-/// ([`chrome_leftover_pipe_note`]) — on a failure too — and never into a failure.
-/// Never read before `run_cli` resets it.
+/// Whether a step this process ran exited while a process it left behind still held
+/// the output channel ([`CliOutput::leftover_pipes`]). ONE invocation per process, so
+/// this is its record; [`run_action`] turns it into a note
+/// ([`chrome_leftover_pipe_note`]), even on failure, never a failure.
 static CHROME_USE_LEFTOVER_PIPES: AtomicBool = AtomicBool::new(false);
 
-/// Whether the PRODUCT's own clock ended a step whose outcome IS the caller's
-/// verdict ([`CliRun::TimedOut`]) ABOVE the clock chrome-use itself was working
-/// to — the step's kill rode above its `chrome_side` (every step declares that
-/// clock to chrome-use through `AGENT_BROWSER_DEFAULT_TIMEOUT`, see
-/// [`crate::chrome::spawn::apply_chrome_side`]). chrome-use was then cut off
-/// before it could classify anything, so what a named session's liveness is
-/// remains unknown to it, which is exactly what [`recover_session_wedge`] keys
-/// on. ONE rule decides the mark, applied where the step ends ([`spawn_step`]):
-/// only a step that may run chrome-use's relay self-heal
-/// ([`CliRecovery::Allowed`]) attributes anything, and only when its kill sat
-/// above that `chrome_side`. The product's own probes and the operation's
-/// best-effort sub-steps are [`CliRecovery::Suppressed`] — the product bounds
-/// them on purpose and their outcome never becomes the envelope — so they can
-/// never attribute. [`run_action`] resets the mark before the step and reads it
-/// right after it returns; a later step of a composite operation cannot
-/// erase an earlier decisive step's mark, and the wedge probe's own steps cannot
-/// leak into it.
+/// Whether the PRODUCT's own clock ended a step whose outcome IS the caller's verdict
+/// ([`CliRun::TimedOut`]) above the `chrome_side` clock chrome-use was working to — so
+/// chrome-use was cut off before classifying anything, which is what
+/// [`recover_session_wedge`] keys on. Only a step that may run the relay self-heal
+/// ([`CliRecovery::Allowed`]) attributes; probes and best-effort sub-steps
+/// ([`CliRecovery::Suppressed`]) never can. [`run_action`] resets the mark before the
+/// step and reads it right after, so a later step cannot erase a decisive one's mark.
 static CLI_STEP_KILLED_BY_CLOCK: AtomicBool = AtomicBool::new(false);
 
-/// Whether this call created the session's record (rather than restarting one that
-/// already existed). Read through [`record_materialized`] by everything that ends the call
-/// early — the interrupt path and a pre-flight refusal — to drop a record whose session
-/// never reached the browser, exactly as the normal tail does, so a kept or interrupted
-/// session cannot leave a row nothing will ever reap. Never read before `run_cli` resets it.
+/// Whether this call created the session's record. Read through [`record_materialized`]
+/// by every early exit to drop a record whose session never reached the browser — a
+/// kept one would otherwise never be reaped.
 static SESSION_RECORD_CREATED: AtomicBool = AtomicBool::new(false);
 
 /// `mahbot chrome` CLI entry — returns the process exit code.
@@ -632,15 +553,10 @@ pub async fn run_cli(args: &[String]) -> i32 {
         print!("{}", top_help());
         return 0;
     }
-    // A `-h`/`--help` after the action word is per-action help — anywhere before
-    // the first `--`, not just immediately after the action word (so
-    // `open <url> --help` and `--session x open -h` work too). From that `--` on
-    // the tokens are the action's text, never help (`type '#q' -- --help` types
-    // it); on a verb with no literal text such a token stays the usage error it
-    // always was. A `-h` before any action word falls through to top-level help /
-    // normal parsing: no valid invocation starts with a `-h`-looking token, and
-    // parse_flags rejects those as usage errors, so per-action help only turns
-    // would-be usage errors into help.
+    // A `-h`/`--help` after the action word is per-action help, anywhere before the first
+    // `--` (`open <url> --help`, `--session x open -h`); from that `--` on the tokens are
+    // the action's text (`type '#q' -- --help` types it) and nowhere else. A `-h` before
+    // any action word falls through to top-level help.
     if let Some(action) = action_help_request(args) {
         print!("{}", action_help(action));
         return 0;
@@ -661,8 +577,8 @@ pub async fn run_cli(args: &[String]) -> i32 {
     };
 
     let session = call_session(&invocation, keep);
-    // The action's own call races the platform's interruption signals, so an
-    // interrupted call still closes the throwaway session it created.
+    // The action's call races the interruption signals, so an interrupted call still
+    // closes the throwaway session it created.
     let mut call = Box::pin(dispatch(&invocation, &session));
     let mut interrupted = Box::pin(wait_for_interruption());
     let outcome = tokio::select! {
@@ -675,16 +591,10 @@ pub async fn run_cli(args: &[String]) -> i32 {
         }
     };
     outcome.envelope.emit();
-    // The action is answered and its envelope is out: what is left is best-effort cleanup, and
-    // its closes are raced against a second interruption, which must end the process at once
-    // instead of waiting one out. A record left by an aborted close is durable and the lifetime
-    // sweep closes it. A step whose tab tail ran collapsed its groups before the envelope, where
-    // the caller can see its result ([`run_action`]); any other step collapses its groups here,
-    // after the answer — including an `open` whose baseline the browser would not answer.
-    //
-    // A record this call created that no session-scoped chrome-use spawn was ever
-    // attempted for describes nothing: drop it rather than let it linger — especially a
-    // kept one, which has no lifetime to expire it.
+    // The action is answered and its envelope is out: what is left is best-effort cleanup,
+    // raced against a second interruption, which must end the process at once. A record
+    // left by an aborted close is closed by the lifetime sweep; a record this call created
+    // that never reached the browser is dropped here.
     let materialized = record_materialized();
     if !materialized && let Some(s) = outcome.session.as_ref() {
         cli_sessions::forget(&s.name);
@@ -702,9 +612,8 @@ pub async fn run_cli(args: &[String]) -> i32 {
         && CHROME_USE_SPAWNED.load(Ordering::Relaxed)
     {
         if s.ephemeral {
-            // The close runs after the envelope is emitted, so a helper it leaves
-            // behind cannot be noted in it — it is reported here, like every other
-            // diagnostic of that close.
+            // The close runs after the envelope, so a helper it leaves behind can only be
+            // reported here, like every other diagnostic of that close.
             CHROME_USE_LEFTOVER_PIPES.store(false, Ordering::Relaxed);
             if close_ephemeral_unless_interrupted(&s.name).await
                 && CHROME_USE_LEFTOVER_PIPES.load(Ordering::Relaxed)
@@ -716,18 +625,13 @@ pub async fn run_cli(args: &[String]) -> i32 {
             && let Some(cli) = tail_cli(&outcome.envelope, s)
         {
             // A named session outlives the command, so the groups this step used are still there
-            // to leave collapsed — unless the step failed on its environment, where the tail cannot
-            // reach the browser either ([`tail_cli`]). A step whose tab tail ran did this before
-            // the envelope ([`run_action`], [`chrome_groups`]); the rest do it here, including an
-            // `open` whose baseline the browser would not answer. Cosmetic and best-effort: it
-            // reports nothing.
+            // to leave collapsed — unless the step failed on its environment, where the tail
+            // cannot reach the browser either ([`tail_cli`]). Cosmetic and silent.
             chrome_groups::collapse_own_groups(&cli, &s.name).await;
         }
     }
-    // The call is over: its in-flight mark goes, so the session is idle from here — and a
-    // sweep that waited the whole call out may now close it on the ordinary clock. A
-    // session that was just forgotten (an unmaterialized record, a closed throwaway) has
-    // nothing to clear.
+    // The call is over: its in-flight mark goes, so a sweep may now close the session on
+    // the ordinary clock. A forgotten session has nothing to clear.
     if let Some(s) = outcome.session.as_ref() {
         cli_sessions::note_end(&s.name);
     }
@@ -735,8 +639,7 @@ pub async fn run_cli(args: &[String]) -> i32 {
 }
 
 /// The session this call runs in, resolved once for the interrupt path and the action
-/// alike. Only an action that drives the browser owns a throwaway session: the verbs
-/// that report and repair run in none, so an interrupted one has nothing to close.
+/// alike; only a browser-driving action owns a throwaway session.
 fn call_session(invocation: &Invocation, keep: bool) -> CliSession {
     let (name, ephemeral) = resolve_session(invocation.session.as_deref());
     CliSession {
@@ -746,9 +649,8 @@ fn call_session(invocation: &Invocation, keep: bool) -> CliSession {
     }
 }
 
-/// What `dispatch` produced: the envelope, the session the action ran in (for the close/collapse
-/// tails), whether this call set the keep mark, and whether the tab tail ran before the envelope
-/// with a client resolved for it — its collapse is then done, and the post-envelope one is skipped.
+/// What `dispatch` produced: the envelope, the session it ran in (for the close and
+/// collapse tails), whether this call set `--keep`, and whether the tab tail ran.
 struct DispatchOutcome {
     envelope: OutEnvelope,
     session: Option<CliSession>,
@@ -768,10 +670,8 @@ impl DispatchOutcome {
     }
 }
 
-/// The wait an action's own call races against: Ctrl-C, a closed terminal or a
-/// parent's kill ends the CLI, whose throwaway session must still be closed first.
-/// Resolves to the conventional 128+signal exit code; a failed registration leaves
-/// the platform's own handling in place (and this waits forever).
+/// The wait an action's own call races against: an interrupt ends the CLI, whose
+/// throwaway session must be closed first. Resolves to the `128+signal` exit code.
 async fn wait_for_interruption() -> i32 {
     #[cfg(unix)]
     {
@@ -797,11 +697,8 @@ async fn wait_for_interruption() -> i32 {
 }
 
 /// An interrupted call still closes the throwaway session it created (a named one is
-/// not the call's to close), then exits with the interruption's `128+signal` code. A
-/// second interruption ends the process at once instead of waiting the close out — the
-/// close is raced against it ([`close_ephemeral_unless_interrupted`]). A record this call
-/// created whose session never reached the browser describes nothing and is dropped, as
-/// it is without an interruption.
+/// not its to close), then exits `128+signal`; a second interruption ends the process
+/// at once instead of waiting the close out. Unmaterialized records are dropped.
 async fn close_throwaway_then_exit(session: &CliSession, code: i32) -> ! {
     if session.ephemeral && CHROME_USE_SPAWNED.load(Ordering::Relaxed) {
         CHROME_USE_LEFTOVER_PIPES.store(false, Ordering::Relaxed);
@@ -809,31 +706,26 @@ async fn close_throwaway_then_exit(session: &CliSession, code: i32) -> ! {
     } else if !record_materialized() {
         cli_sessions::forget(&session.name);
     }
-    // The process is going: its mark must not outlive it, even though a sweep would call
-    // the mark stale as soon as this pid is gone (a named session is unaffected by the
-    // interruption and stays alive on the ordinary clock).
+    // The process is going: its mark must not outlive it (a sweep calls a dead pid's mark
+    // stale); a named session stays alive on the ordinary clock.
     cli_sessions::note_end(&session.name);
     std::process::exit(code);
 }
 
-/// Whether this call's record describes a session that actually reached the browser: no
-/// record was created (a later call's record already described one), or a session-scoped
-/// step of this call was attempted ([`CHROME_USE_SPAWNED`]).
+/// Whether this call's record describes a session that reached the browser: no record
+/// was created, or a session-scoped step of this call was attempted.
 fn record_materialized() -> bool {
     !SESSION_RECORD_CREATED.load(Ordering::Relaxed) || CHROME_USE_SPAWNED.load(Ordering::Relaxed)
 }
 
-/// [`close_ephemeral`], abandoned when a second interruption arrives first: the call is
-/// already answered (or already interrupted), so a close the user interrupted again must
-/// not keep the process alive for its bound. `true` when the close ran to completion.
+/// [`close_ephemeral`], abandoned when a second interruption arrives: an answered call
+/// must not keep the process alive for its bound. `true` when it completed.
 async fn close_ephemeral_unless_interrupted(name: &str) -> bool {
     tokio::select! {
         () = close_ephemeral(name) => true,
         _ = wait_for_interruption() => false,
     }
 }
-
-// ── Parsing ──────────────────────────────────────────────────────
 
 /// The flags `word` declares — the same rows its help prints. The session-wide
 /// pair is not here: [`session_refusal_for`] carries that decision.
@@ -857,8 +749,7 @@ fn parse_invocation(args: &[String]) -> Result<(Invocation, bool), String> {
         .ok_or_else(|| "no action given".to_string())?;
     let rest = &remaining[1..];
     let allowed: Vec<&CliFlag> = declared_flags(action_word).iter().collect();
-    // The declaration is the one decision on which actions take the session-wide
-    // pair: the help renders their rows from the same field.
+    // The one declaration decision on which actions take the session-wide pair.
     if session.is_some()
         && let Some(refusal) = session_refusal_for(action_word)
     {
@@ -882,9 +773,8 @@ fn parse_invocation(args: &[String]) -> Result<(Invocation, bool), String> {
         other => Err(format!("unknown action '{other}'")),
     }?;
     if keep {
-        // The mark is a property of a named session the call drives, so it needs both a
-        // browser-driving action and a name — checked once the action is known, so the
-        // refusal never names a flag the action itself forbids.
+        // The mark needs both a browser-driving action and a name, checked once the action is
+        // known so the refusal never names a flag the action itself forbids.
         if !invocation.action.runs_in_session() {
             return Err(format!("--keep is not valid for {action_word}"));
         }
@@ -898,9 +788,8 @@ fn parse_invocation(args: &[String]) -> Result<(Invocation, bool), String> {
     Ok((invocation, keep))
 }
 
-/// Pull the global `--session` and `--keep` flags out of anywhere before the `--`
-/// end-of-options marker, returning the session value (last occurrence wins), the
-/// keep request, and the remaining tokens (everything from `--` on kept verbatim).
+/// Pull the global `--session` (last wins) and `--keep` out of anywhere before `--`,
+/// returning the rest with everything from `--` on kept verbatim.
 fn extract_global_flags(args: &[String]) -> Result<(Option<String>, bool, Vec<String>), String> {
     let mut session: Option<String> = None;
     let mut keep = false;
@@ -908,8 +797,7 @@ fn extract_global_flags(args: &[String]) -> Result<(Option<String>, bool, Vec<St
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
-        // `--` ends option parsing (the fill/type text escape hatch): the
-        // rest is verbatim text, never scanned for --session.
+        // `--` ends option parsing (the fill/type escape hatch): the rest is verbatim text.
         if a == "--" {
             remaining.extend_from_slice(&args[i..]);
             break;
@@ -966,17 +854,14 @@ fn recognized_action(args: &[String]) -> String {
     }
 }
 
-/// Split action args into positional tokens and a `--flag` map, handling both
-/// `--flag value` and `--flag=value`. `accepted` is the action's declaration:
-/// each flag's `takes_value` decides whether a value is read.
+/// Split action args into positionals and a `--flag` map (`--flag value` and
+/// `--flag=value`); `accepted` is the action's declaration deciding values.
 fn parse_flags(args: &[String], accepted: &[&CliFlag]) -> Result<(Vec<String>, Flags), String> {
     parse_flags_impl(args, accepted, false)
 }
 
-/// [`parse_flags`] for the fill/type text actions: a single-dash token is
-/// taken as literal positional text (these actions have no single-dash
-/// flags, so `fill '#q' -tail` fills the text `-tail` naturally instead of
-/// demanding the `--` shield). Unknown `--flags` are still rejected.
+/// [`parse_flags`] for fill/type: a single-dash token is literal positional text (they
+/// have no single-dash flags), so `fill '#q' -tail` needs no `--` shield.
 fn parse_flags_text(
     args: &[String],
     accepted: &[&CliFlag],
@@ -994,8 +879,7 @@ fn parse_flags_impl(
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
-        // `--` ends option parsing: the rest are positionals verbatim (the
-        // escape hatch for a leading-dash fill/type text).
+        // `--` ends option parsing: the rest are positionals verbatim (dash-leading text).
         if a == "--" {
             positionals.extend(args[i + 1..].iter().cloned());
             break;
@@ -1140,11 +1024,10 @@ fn parse_expect(
     })
 }
 
-/// chrome-use 1.5.101 selector-first expect grammar, validated against the
-/// safe allowlist: `<sel> <visible|hidden|present>`, `count <sel> <op> <n>`,
+/// chrome-use 1.5.101 selector-first expect grammar, validated against the safe
+/// allowlist: `<sel> <visible|hidden|present>`, `count <sel> <op> <n>`,
 /// `text|value <sel> <pred> <value>`, `attr <sel> <name> <pred> <value>`,
-/// `url <pred> <pattern>`. Trailing words of a text/value/attr/url payload
-/// are joined with spaces (shell quoting is the normal path).
+/// `url <pred> <pattern>`; trailing payload words join with spaces.
 #[expect(clippy::too_many_lines)]
 fn parse_expect_cond(ps: &[String]) -> Result<ExpectCond, String> {
     let usage = "expect <selector> <visible|hidden|present> | count <sel> <op> <n> | text|value <sel> <equals|contains|matches> <value> | attr <sel> <name> <pred> <value> | url <pred> <pattern>";
@@ -1397,9 +1280,8 @@ fn parse_press(
     })
 }
 
-/// `upload <selector> <path...>` — the paths stay as the caller wrote them here;
-/// the action resolves each against this command's working directory at dispatch,
-/// so a bad path is reported with the reason it failed, not as a shape error.
+/// `upload <selector> <path...>` — the paths are resolved at dispatch against this
+/// command's directory, so a bad path reports why it failed, not a shape error.
 fn parse_upload(
     session: Option<&str>,
     rest: &[String],
@@ -1426,9 +1308,7 @@ fn parse_upload(
 }
 
 /// `screenshot [--output-dir <dir>]` — the destination is resolved at dispatch
-/// ([`crate::cli::resolve_output_dir`]), the same rule every producing command
-/// line follows: it must already exist, be the caller's own, and the picture is
-/// never written over anything.
+/// ([`crate::cli::resolve_output_dir`]): existing, the caller's own, never overwritten.
 fn parse_screenshot(
     session: Option<&str>,
     rest: &[String],
@@ -1501,15 +1381,11 @@ fn reject_extra_positionals(positionals: &[String], expected: usize) -> Result<(
     Ok(())
 }
 
-/// The value of a forwarded `--timeout` — the deadline this verb IS given
-/// (`wait`, `expect`, and `open`, whose `--expect` wait forwards its remaining
-/// budget), so chrome-use honours it in full. A value at or above chrome-use's own
-/// client tolerance ([`CHROME_USE_OWN_BUDGET`]) is refused: chrome-use cannot work
-/// past that tolerance, so a deadline at it makes the tool run out of tolerance
-/// instead of reporting its own reason, and its session-unresponsive verdict
-/// (which stops the session and loses its tabs) replaces the honest one. At least
-/// 1 s, and `None` when the user gave no `--timeout` (the verb's own default then
-/// applies at its parse site).
+/// The value of a forwarded `--timeout` — the deadline this verb IS given (`wait`,
+/// `expect`, `open`'s `--expect` wait), so chrome-use honours it in full. At or above
+/// [`CHROME_USE_OWN_BUDGET`] it is refused: chrome-use would run out of tolerance and
+/// its session-unresponsive verdict (losing the tabs) would replace the honest one.
+/// `None` when the user gave none (the verb's own default then applies).
 fn parse_forwarded_timeout(flags: &Flags) -> Result<Option<Duration>, String> {
     let Some(secs) = parse_timeout_secs(flags)? else {
         return Ok(None);
@@ -1527,17 +1403,13 @@ fn parse_forwarded_timeout(flags: &Flags) -> Result<Option<Duration>, String> {
     Ok(Some(Duration::from_secs(secs)))
 }
 
-/// The value of a bound `--timeout` — every verb chrome-use takes no per-call
-/// deadline for (count, eval, extract, click, fill, type, press, upload). Nothing
-/// can make chrome-use give up earlier on those, so a bound below the clock the
-/// product declares to chrome-use ([`CHROME_USE_DECLARED_BUDGET`]) CANNOT be
-/// honoured: it is refused as a usage error rather than accepted and silently
-/// discarded. A bound at or above that clock is accepted: the call is never cut off
-/// below it, and above the clock it widens the product's own kill
-/// ([`StepClocks::tool_clock`]).
-/// There is no upper limit here: while the call runs, its session is not closed — the call
-/// says so through `cli_sessions`' in-flight mark, honoured for an hour (a call longer than
-/// that falls back to the session's ordinary lifetime).
+/// The value of a bound `--timeout` — every verb chrome-use takes no per-call deadline
+/// for (count, eval, extract, click, fill, type, press, upload). A bound below the clock
+/// the product declares to chrome-use ([`CHROME_USE_DECLARED_BUDGET`]) cannot be
+/// honoured and is refused rather than discarded; at or above it the call is never cut
+/// off below it, and above it only the product's own kill widens
+/// ([`StepClocks::tool_clock`]). No upper limit: the in-flight mark keeps the session
+/// alive for an hour.
 fn parse_bound_timeout(flags: &Flags) -> Result<Option<Duration>, String> {
     let Some(secs) = parse_timeout_secs(flags)? else {
         return Ok(None);
@@ -1556,13 +1428,11 @@ fn parse_bound_timeout(flags: &Flags) -> Result<Option<Duration>, String> {
     Ok(Some(Duration::from_secs(secs)))
 }
 
-/// The user's own `--timeout` in seconds, or `None` when they gave none — the one
-/// seconds parser behind [`parse_forwarded_timeout`] and [`parse_bound_timeout`],
-/// which the parse sites call by name. There is deliberately no per-step default
-/// any more: a step's declared clock is [`CHROME_USE_DECLARED_BUDGET`] unless the
-/// verb forwards a deadline chrome-use honours in full (`wait`/`expect`), and the
-/// actions that declare a deadline of their own (`wait`, `expect`, `open`) apply
-/// their default at their parse site.
+/// The user's own `--timeout` in seconds, or `None`: the one parser behind
+/// [`parse_forwarded_timeout`] and [`parse_bound_timeout`]. There is no per-step default
+/// — the declared clock is [`CHROME_USE_DECLARED_BUDGET`] unless the verb forwards a
+/// deadline (`wait`/`expect`), and `wait`/`expect`/`open` apply their own default at
+/// their parse site.
 fn parse_timeout_secs(flags: &Flags) -> Result<Option<u64>, String> {
     match flags.value("timeout") {
         Some(v) => {
@@ -1590,14 +1460,9 @@ fn parse_limit_flag(flags: &Flags) -> Result<Option<usize>, String> {
     }
 }
 
-// ── Session resolution ───────────────────────────────────────────
-
-/// Resolve the session name and whether it is ephemeral: a named `--session`
-/// becomes `mahbot-chrome-<name>` (idempotent for an already-prefixed name);
-/// no flag yields an ephemeral `mahbot-chrome-ephemeral-<suffix>` session.
-///
-/// The flag's own value is validated at extraction ([`extract_global_flags`]),
-/// so a name reaching here is already a plain identifier.
+/// Resolve the session name and whether it is ephemeral: a named `--session` becomes
+/// `mahbot-chrome-<name>` (idempotent); no flag yields an ephemeral
+/// `mahbot-chrome-ephemeral-<suffix>`. The value is validated at extraction.
 fn resolve_session(flag: Option<&str>) -> (String, bool) {
     match flag {
         Some(name) => {
@@ -1615,19 +1480,15 @@ fn resolve_session(flag: Option<&str>) -> (String, bool) {
     }
 }
 
-/// Session namespaces the CLI must never stop without an explicit `--force`:
-/// the interactive tool's per-run sessions and link enrichment's sessions.
+/// Session namespaces the CLI must never stop without an explicit `--force`: the
+/// interactive tool's per-run sessions and link enrichment's.
 const PROTECTED_SESSION_PREFIXES: [&str; 2] = ["agent-tab-", "link-enricher-"];
 
-/// Validate a caller-supplied session name. The name becomes part of a command
-/// recipe the agent is told to run (`mahbot chrome session stop <name> --force`
-/// in a leftover note), so it is restricted to the plain identifier the tool
-/// mints for its own sessions; anything else is a usage error rather than a
-/// name that could turn that recipe into a different command. The alphabet is
-/// chrome-use's own (`validation::is_valid_session_name`: alphanumerics, '-' and
-/// '_'): a '.' is refused, because chrome-use refuses it on `session stop` — a
-/// name the product accepted but chrome-use will not stop is a session that can
-/// be neither cleared by hand nor recovered, its daemon and tabs left behind.
+/// Validate a caller-supplied session name. It becomes part of a command recipe the
+/// agent is told to run (`session stop <name> --force` in a leftover note), so it is
+/// restricted to chrome-use's own alphabet (`validation::is_valid_session_name`:
+/// alphanumerics, '-' and '_'). A '.' is refused because chrome-use refuses it on
+/// `session stop`, leaving a session neither cleared by hand nor recovered.
 fn validate_session_name(name: &str) -> Result<(), String> {
     let plain = !name.is_empty()
         && name
@@ -1642,12 +1503,9 @@ fn validate_session_name(name: &str) -> Result<(), String> {
     }
 }
 
-/// Resolve a session name for a session-word subcommand. A bare name is
-/// treated as a CLI session name and prefixed (consistent with `--session`);
-/// CLI-namespace and protected-namespace names pass through as-is (status may
-/// probe protected sessions read-only; only stop gates them behind --force).
-/// The name is validated when the invocation is parsed
-/// ([`validate_session_name`]).
+/// Resolve a session name for a session-word subcommand: a bare name is prefixed like
+/// `--session`, while CLI-namespace and protected names pass through as-is (status may
+/// probe protected sessions read-only; only stop gates on `--force`).
 fn resolve_session_target(name: &str) -> String {
     if name.starts_with(CLI_SESSION_PREFIX)
         || PROTECTED_SESSION_PREFIXES
@@ -1674,13 +1532,9 @@ fn resolve_stop_target(name: &str, force: bool) -> Result<String, String> {
     Ok(target)
 }
 
-// ── Dispatch ─────────────────────────────────────────────────────
-
-/// The caller-operand checks the pre-action arm runs BEFORE the readiness gate —
-/// the usage errors an action can answer without probing the environment, so they
-/// are never buried under an environment refusal: `open`'s URL and `--expect`
-/// validation, an attach's local paths, and a capture's destination. Each verb
-/// re-runs its own check for the values it actually uses.
+/// The caller-operand checks the pre-action arm runs BEFORE the readiness gate, so a
+/// usage error is never buried under an environment refusal: `open`'s URL and
+/// `--expect`, an attach's paths, a capture's destination. Each verb re-runs them.
 fn validate_action_args(action: &Action) -> Option<OutEnvelope> {
     match action {
         Action::Open { url, expect, .. } => open_args(url, expect.as_deref()).err(),
@@ -1703,9 +1557,8 @@ fn validate_action_args(action: &Action) -> Option<OutEnvelope> {
     }
 }
 
-/// Resolve an attach's paths against the directory this command was run in — the
-/// caller's own operand check, run by the pre-flight (before any environment probe)
-/// and again by the verb for the files it hands chrome-use.
+/// Resolve an attach's paths against this command's directory — run by the pre-flight
+/// (before any environment probe) and again by the verb itself.
 fn resolve_upload_files(files: &[String]) -> Result<Vec<std::path::PathBuf>, (OutKind, String)> {
     let cwd = std::env::current_dir().map_err(|e| {
         (
@@ -1722,15 +1575,13 @@ fn resolve_upload_files(files: &[String]) -> Result<Vec<std::path::PathBuf>, (Ou
         .collect()
 }
 
-/// One parsed call: the verbs that run in no session (they report and repair) are answered
-/// as they are; every other action drives the browser in the call's session through
-/// [`run_action`].
+/// One parsed call: the verbs that run in no session are answered as they are; every
+/// other action drives the browser in the call's session via [`run_action`].
 async fn dispatch(invocation: &Invocation, session: &CliSession) -> DispatchOutcome {
     if invocation.action.runs_in_session() {
         run_action(&invocation.action, session).await
     } else {
-        // These calls run no step, but they are still clocked for their envelope. None of them
-        // opens a page, so the tab report the browser actions keep has no reader here.
+        // Still clocked for their envelope; none opens a page, so no tab report is kept.
         let started = Instant::now();
         let (mut env, _) = execute(&invocation.action, &session.name).await;
         stamp_elapsed(&mut env, started);
@@ -1738,14 +1589,11 @@ async fn dispatch(invocation: &Invocation, session: &CliSession) -> DispatchOutc
     }
 }
 
-/// One action that drives the browser in its session: the pre-flight, the record of this
-/// call's use, the step itself, and the envelope's post-step facts. The action's clock starts
-/// before the pre-flight and is stamped onto the envelope right after the step, so `elapsed_ms`
-/// covers the pre-flight, `open`'s baseline read and the step; the wedge recovery and the group
-/// tail that follow are outside it (the tail is still inside the caller's wall time).
+/// One action that drives the browser in its session: the pre-flight, the record of
+/// this call's use, the step, and the envelope's post-step facts. `elapsed_ms` covers
+/// the pre-flight, `open`'s baseline read and the step.
 async fn run_action(action: &Action, session: &CliSession) -> DispatchOutcome {
-    // The action's own clock: every envelope it returns — refusals included — is stamped
-    // with it (see [`stamp_elapsed`]).
+    // The action's own clock: every envelope it returns is stamped with it.
     let started = Instant::now();
     let use_outcome = match preflight(action, session, started).await {
         Ok(outcome) => outcome,
@@ -1755,45 +1603,31 @@ async fn run_action(action: &Action, session: &CliSession) -> DispatchOutcome {
     // backstop, or the cleanup switched off for a kept one.
     set_group_cleanup_backstop(cli_sessions::backstop_ms(use_outcome.kept));
     CLI_STEP_KILLED_BY_CLOCK.store(false, Ordering::Relaxed);
-    // `open` names no tab in its reply, so the tabs the session already had are read before the
-    // step to tell the one it creates apart later; every other verb's own tab comes from its
-    // reply ([`chrome_groups`]). An unreadable answer only costs the moving — the tab then stays in
-    // chrome-use's group. The pre-flight has already refused a step its own arguments reject, so no
-    // listing is spent on one.
+    // `open` names no tab in its reply, so the tabs the session already had are read
+    // before the step; an unreadable answer only costs the moving. The pre-flight already
+    // refused a step its own arguments reject, so no listing is spent on one.
     let tabs_before = match action {
         Action::Open { .. } if !session.ephemeral => tabs_before_open(&session.name).await,
         _ => None,
     };
     let (mut env, opened_tab) = execute(action, &session.name).await;
-    // Read the kill attribution before ANY recovery call — hygiene only: the wedge
-    // probe's own steps are probes ([`CliRecovery::Suppressed`]), so they cannot
+    // Read the kill attribution before ANY recovery: the probe's own steps cannot
     // re-attribute this action's ending.
     let killed_by_clock = CLI_STEP_KILLED_BY_CLOCK.load(Ordering::Relaxed);
-    // The resolved session (named or defaulted ephemeral) and the call's own wall time ride
-    // every envelope (see [`situate`]).
+    // The resolved session and the call's wall time ride every envelope ([`situate`]).
     situate(&mut env, &session.name, started);
-    // A process chrome-use left behind still holding a step's output channel is a NOTE
-    // whatever the call's own outcome — also on a failure: the call finished, its exit
-    // status and output are the answer, and the leftover was started deliberately and is
-    // left running. It sits alongside `error` and never changes the kind or the exit
-    // code.
+    // A process chrome-use left behind holding a step's output channel is a NOTE whatever
+    // the outcome, alongside `error`, never changing the kind or the exit code.
     if CHROME_USE_LEFTOVER_PIPES.load(Ordering::Relaxed) {
         surface_leftover_note(&mut env, &session.name);
     }
-    // A session that stopped answering is RECOVERED here — the one place the resolved
-    // session name is in scope — and the envelope's error text says what was done
-    // ([`recover_session_wedge`]). Whether the session is named is the resolution's own
-    // answer ([`CliSession::ephemeral`]), not re-derived from the name. It runs before the group
-    // tail below: a wedged session answers no listing, so the tail would spend its bound on a
-    // daemon the recovery is about to replace.
+    // A session that stopped answering is RECOVERED here — the one place the resolved name
+    // is in scope. It runs before the group tail below: a wedged session answers no listing,
+    // so the tail would spend its bound on a daemon about to be replaced.
     recover_session_wedge(&mut env, &session.name, !session.ephemeral, killed_by_clock).await;
-    // The tab this step created is taken out of chrome-use's group here, before the caller sees
-    // the result, and the groups this session's tabs sit in are collapsed — see [`chrome_groups`]
-    // for the whole rule. Best-effort and silent: its trouble never becomes the step's own failure
-    // and is reported nowhere. A step whose tab the tail has no way to establish — no
-    // tab created, or an `open` baseline the browser would not answer — leaves the collapse to the
-    // post-envelope tail ([`run_cli`]), so its answer is not held back by browser work it does not
-    // depend on.
+    // The tab this step created leaves chrome-use's group here, before the caller sees the
+    // result, and the session's groups are collapsed ([`chrome_groups`]). Best-effort and
+    // silent; a step with no established tab leaves it to the post-envelope tail.
     let opened = match (tabs_before.as_ref(), opened_tab.as_deref()) {
         (Some(before), _) => Some(Opened::Baseline(before)),
         (None, Some(tab)) => Some(Opened::Tab(tab)),
@@ -1812,18 +1646,15 @@ async fn run_action(action: &Action, session: &CliSession) -> DispatchOutcome {
     }
 }
 
-/// The tabs the session has created before an `open` step — the baseline its reply cannot give.
-/// `None` when there is nothing to compare against: the browser would not answer (the step's tab
-/// then stays in chrome-use's group) or the helper cannot be resolved at all.
+/// The tabs the session held before an `open` step: its baseline. `None` when there is
+/// nothing to compare against (the browser would not answer, no helper).
 async fn tabs_before_open(session: &str) -> Option<std::collections::BTreeSet<i64>> {
     let cli = cli_path()?;
     chrome_groups::created_tabs(&cli, session).await
 }
 
-/// The chrome-use binary a step's group tail drives, when the step's session can be reached at all:
-/// a named session whose step ran — not one refused on its environment — after the helper actually
-/// spawned. The one place that condition is spelled out; the pre-envelope tab tail and the
-/// post-envelope collapse both read it here.
+/// The chrome-use binary a step's group tail drives, when the step's session can be
+/// reached at all: a named session whose step ran and whose helper spawned.
 fn tail_cli(env: &OutEnvelope, session: &CliSession) -> Option<std::path::PathBuf> {
     if env.kind == OutKind::Environment
         || !CHROME_USE_SPAWNED.load(Ordering::Relaxed)
@@ -1834,10 +1665,8 @@ fn tail_cli(env: &OutEnvelope, session: &CliSession) -> Option<std::path::PathBu
     cli_path()
 }
 
-/// Every action's own work, in one place: the report/repair verbs [`dispatch`] answers
-/// session-unscoped, and the browser actions it wraps in the pre-flight and the tail. `opened` is
-/// the tab a verb's reply named as one its page opened — a `click` sets it, every other verb leaves
-/// it alone; it is the caller's own local, never process state.
+/// Every action's own work in one place. `opened` is the tab a verb's reply named as one
+/// its page opened — the caller's own local, never process state.
 async fn execute(action: &Action, name: &str) -> (OutEnvelope, Option<String>) {
     let mut opened = None;
     let env = match action {
@@ -1897,40 +1726,30 @@ async fn execute(action: &Action, name: &str) -> (OutEnvelope, Option<String>) {
 }
 
 /// The action's pre-flight: the pure argument checks, the keep contract, the helper's
-/// presence, this call's own record of use, and the pre-action readiness gate. An `Err` is
-/// the refusal envelope to return; the usage and missing-helper refusals come before anything
-/// is recorded, so such a call never restarts a lifetime, while a readiness refusal ends the
-/// use it recorded a moment earlier.
+/// presence, this call's record of use and the readiness gate. An `Err` is the refusal
+/// envelope; the early refusals come before anything is recorded.
 async fn preflight(
     action: &Action,
     session: &CliSession,
     started: Instant,
 ) -> Result<cli_sessions::UseOutcome, DispatchOutcome> {
     let name = session.name.as_str();
-    // A malformed URL or `--expect` selector is a usage error whatever the environment
-    // looks like, so it is answered without a readiness probe that could bury the precise
-    // usage error under an environment refusal (see [`validate_action_args`]).
+    // A malformed URL or `--expect` selector is a usage error whatever the environment, so
+    // it is answered without a readiness probe that would bury it.
     if let Some(mut refused) = validate_action_args(action) {
         situate(&mut refused, name, started);
         return Err(DispatchOutcome::plain(refused));
     }
-    // A session's lifetime contract is fixed when it is created: a keep request on a
-    // session that already exists without the mark is a usage error, answered before any
-    // environment probe.
+    // A session's lifetime contract is fixed at creation: `--keep` on an existing unmarked
+    // session is a usage error, answered before any environment probe.
     let recorded = match cli_sessions::check_keep(name, session.keep) {
         Ok(recorded) => recorded,
         Err(error) => return Err(refusal(action, name, OutKind::Usage, &error, started)),
     };
-    // The pre-action gate: no action is dispatched until the connection to the owner's
-    // REAL browser is established, so the work can never quietly land in a browser
-    // chrome-use launches itself. The probe/cleanup verbs (`status`, `session …`) are
-    // answered before this and are deliberately not gated — they are what reports and
-    // repairs.
-    //
-    // A missing helper is its own case, checked BEFORE the gate: the gate's refusal is
-    // about a connection it cannot even probe, so running it (and its recovery pass)
-    // would answer an absent helper with the long speculative readiness refusal instead of
-    // this precise missing-install report — the same envelope `require_cli` builds.
+    // The pre-action gate: no action is dispatched until the connection to the owner's REAL
+    // browser is established, so work never lands in a browser chrome-use launched itself.
+    // The probe/cleanup verbs are answered before it. A missing helper is checked BEFORE the
+    // gate, so it reports its own precise refusal rather than the long readiness one.
     let Some(path) = cli_path() else {
         return Err(refusal(
             action,
@@ -1940,11 +1759,8 @@ async fn preflight(
             started,
         ));
     };
-    // A keep request on a session this record has never seen is a creating call only if
-    // chrome-use is not already running it: a session that predates the record (or came
-    // from elsewhere) already carries the idle cleanup its daemon started with, and the `0`
-    // this call hands its own spawns cannot reach it — the stop-and-restart refusal applies
-    // to it as much as to a recorded one.
+    // `--keep` on an unseen session creates only if chrome-use is not already running it:
+    // one predating the record keeps the idle cleanup its daemon started with.
     if session.keep && !recorded && session_running(&path, name).await {
         return Err(refusal(
             action,
@@ -1954,18 +1770,15 @@ async fn preflight(
             started,
         ));
     }
-    // This call's use restarts the session's lifetime, applies the keep request and adds
-    // this call's in-flight mark — from here no sweep closes the session, including one that
-    // runs during the readiness gate below.
+    // This call's use restarts the lifetime, applies `--keep` and adds the in-flight mark:
+    // from here no sweep closes the session, not even during the gate below.
     let use_outcome = match cli_sessions::note_use(name, session.keep) {
         Ok(outcome) => outcome,
         Err(error) => return Err(refusal(action, name, OutKind::Usage, &error, started)),
     };
     SESSION_RECORD_CREATED.store(use_outcome.created, Ordering::Relaxed);
     if let Err(why) = ensure_ready_for_actions().await {
-        // The call ends without a step, so it ends its use itself: the mark goes, and a
-        // record it created for a session that never reached the browser is dropped (the
-        // same cleanup `run_cli`'s tail does after a step).
+        // No step: the mark goes and an unmaterialized record is dropped, as the tail does.
         if record_materialized() {
             cli_sessions::note_end(name);
         } else {
@@ -1991,21 +1804,16 @@ fn refusal(
     DispatchOutcome::plain(env)
 }
 
-/// The facts every action's envelope carries: the resolved session (so a swallowed or
-/// silently defaulted `--session` is always observable) and the call's own wall time — a
-/// failing call's duration is read straight off it, while `timeout_ms` (the declared/kill
-/// bound) stays a separate fact.
+/// The facts every action's envelope carries: the resolved session (so a defaulted
+/// `--session` is observable) and the wall time; `timeout_ms` stays separate.
 fn situate(env: &mut OutEnvelope, name: &str, started: Instant) {
     surface_session(env, name);
     stamp_elapsed(env, started);
 }
 
-/// Insert the leftover-helper note as a top-level envelope field on the result —
-/// success or failure (the payload is flattened, so a payload key is a top-level
-/// stdout key, sitting alongside `error`). The note carries a `session stop` recipe,
-/// so it names the session the way a person writes it ([`cli_sessions::display_name`]),
-/// exactly like the envelope's own `session` field: `session stop` resolves a bare name
-/// into the record's, so the recipe works as written.
+/// Insert the leftover-helper note as a top-level field. It carries a `session stop`
+/// recipe, so it names the session the way a person writes it
+/// ([`cli_sessions::display_name`]) — which `session stop` resolves.
 fn surface_leftover_note(env: &mut OutEnvelope, name: &str) {
     if let Some(obj) = env.payload.as_object_mut() {
         let name = cli_sessions::display_name(name);
@@ -2013,37 +1821,27 @@ fn surface_leftover_note(env: &mut OutEnvelope, name: &str) {
     }
 }
 
-/// Insert the session's name as a top-level envelope field (the payload is flattened, so
-/// a payload key is a top-level stdout key): the name a person reads
-/// ([`cli_sessions::display_name`]), never the record's own key. The `session` subcommand
-/// envelopes carry their own `session` key and skip this — they run session-unscoped.
+/// Insert the session's name as a top-level envelope field: the name a person reads
+/// ([`cli_sessions::display_name`]), never the record's own key.
 fn surface_session(env: &mut OutEnvelope, name: &str) {
     if let Some(obj) = env.payload.as_object_mut() {
         obj.insert("session".into(), json!(cli_sessions::display_name(name)));
     }
 }
 
-/// Stamp one action envelope with how long the call took, from the instant the
-/// action's own clock started. Every envelope of an action that RAN carries it —
-/// a success, a failure of any kind, and an argument/environment refusal alike —
-/// because a call's duration is a fact about the call itself, not something a
-/// reader should have to infer or time for itself; the one envelope without it is
-/// the usage refusal of a command line that never parsed ([`run_cli`]), where no
-/// action ever started. `timeout_ms`, the declared or killed bound, stays a
-/// separate fact.
+/// Stamp one action envelope with how long the call took, from the instant its clock
+/// started: every envelope of an action that RAN carries it, because a duration is a
+/// fact about the call. The one exception is a usage refusal of a command line that
+/// never parsed ([`run_cli`]).
 fn stamp_elapsed(env: &mut OutEnvelope, started: Instant) {
     if let Some(obj) = env.payload.as_object_mut() {
         obj.insert("elapsed_ms".into(), json!(started.elapsed().as_millis()));
     }
 }
 
-// ── Step runner ──────────────────────────────────────────────────
-
-/// The clocks one CLI step runs to. The two-clock rule itself — which clock is
-/// declared to chrome-use, and where the product's own kill rides — is
-/// [the chrome policy](crate::chrome)'s; each constructor below states which
-/// shape a step of this surface takes. A product-side kill reports the product's
-/// own bound for the step — its `kill` — as the envelope's `timeout_ms`.
+/// The clocks one CLI step runs to. The two-clock rule is
+/// [the chrome policy](crate::chrome)'s; each constructor states which shape a step of
+/// this surface takes. A product kill reports its own `kill` as `timeout_ms`.
 #[derive(Debug, Clone, Copy)]
 struct StepClocks {
     /// The two clocks of this step ([`crate::chrome::ChromeCallClocks`]).
@@ -2053,9 +1851,8 @@ struct StepClocks {
 }
 
 impl StepClocks {
-    /// Assemble a step's clocks from the declared deadline and the recovery
-    /// policy bound ONCE for the step — the derived pair plus that same binding,
-    /// so a step's kill and the policy it spawns with can never disagree.
+    /// Assemble a step's clocks once for the step — the derived pair plus that same
+    /// binding, so a step's kill and the policy it spawns with can never disagree.
     fn of(declared: Option<Duration>, recovery: CliRecovery) -> Self {
         Self {
             call: clocks(declared, recovery),
@@ -2063,27 +1860,17 @@ impl StepClocks {
         }
     }
 
-    /// `wait`/`expect`: the step forwards its declared deadline as `--timeout`,
-    /// which chrome-use honours in full, so the declared value IS the
-    /// chrome-side clock; its relay self-heal is allowed.
+    /// `wait`/`expect`: the step forwards its declared deadline as `--timeout`, which
+    /// chrome-use honours in full, so that value IS the chrome-side clock.
     fn forwarded(deadline: Duration) -> Self {
         Self::of(Some(deadline), CliRecovery::Allowed)
     }
 
-    /// Every other agent-facing verb (click, count, eval, extract, fill, type,
-    /// press, upload): the step forwards no `--timeout` chrome-use
-    /// honours, so [`CHROME_USE_DECLARED_BUDGET`] — one [`KILL_SLACK`] under
-    /// chrome-use's own client tolerance — is the clock it is given.
-    /// `own_bound` is the caller's `--timeout`, which [`parse_bound_timeout`]
-    /// accepts only at or above that clock (a shorter one is refused there:
-    /// chrome-use takes no per-call deadline for these verbs, so nothing could
-    /// honour it). A larger bound is one the PRODUCT must really let the call run
-    /// to, so it widens the kill alone: chrome-use cannot work past its own
-    /// tolerance, and declaring a larger deadline to it would make it run out of
-    /// that tolerance and fail as a wedged session instead of reporting its own
-    /// reason (see [the chrome policy](crate::chrome)). The reported `timeout_ms`
-    /// is then the bound the call really ran to, never one it was killed below.
-    /// Its relay self-heal is allowed.
+    /// Every other agent-facing verb (click, count, eval, extract, fill, type, press,
+    /// upload): no `--timeout` chrome-use honours is forwarded, so
+    /// [`CHROME_USE_DECLARED_BUDGET`] is the clock it is given. `own_bound` is the caller's
+    /// `--timeout`, accepted only at or above that clock; a larger one widens the kill
+    /// alone, since declaring it to chrome-use would make it fail as a wedged session.
     fn tool_clock(own_bound: Option<Duration>) -> Self {
         let recovery = CliRecovery::Allowed;
         let bound = own_bound.unwrap_or(CHROME_USE_DECLARED_BUDGET);
@@ -2096,28 +1883,18 @@ impl StepClocks {
         }
     }
 
-    /// The composite operation's OWN step (the `open` navigation): chrome-use
-    /// runs it to its own client tolerance — it neither reads nor honours a
-    /// `--timeout` for `open`'s navigate — so the clock declared to it is
-    /// [`CHROME_USE_DECLARED_BUDGET`] and the kill is
-    /// [`crate::chrome::kill_bound`] above it; its relay self-heal is allowed.
-    /// The operation's budget is deliberately NOT a kill bound here: a navigation
-    /// chrome-use was still working on must be allowed to report its own reason,
-    /// so the operation may legitimately outlive `--timeout`.
+    /// The composite operation's OWN step (`open`'s navigation): chrome-use runs it to its
+    /// own tolerance, so the declared clock is [`CHROME_USE_DECLARED_BUDGET`] and the kill
+    /// rides [`crate::chrome::kill_bound`] above it — the operation may outlive `--timeout`.
     fn operation() -> Self {
         Self::of(None, CliRecovery::Allowed)
     }
 
-    /// A step of an operation the product bounds itself: `bound` is the
-    /// product-side budget for the step, `chrome_side` the clock declared to
-    /// chrome-use. It is a probe in everything but name (see the
-    /// [chrome policy](crate::chrome)): it declares `chrome_side` honestly to
-    /// chrome-use, suppresses the relay self-heal, and its kill rides
-    /// [`KILL_SLACK`] above `bound` ([`kill_bound`]) — so a product bound, never
-    /// chrome-use's verdict, is what ends it. Its failure never fails the
-    /// operation. Every one of the operation's best-effort sub-steps (the
-    /// error-page probe, the post-navigation settle, the content capture) takes this
-    /// shape.
+    /// A step of an operation the product bounds itself: `bound` is the product-side budget,
+    /// `chrome_side` the clock declared to chrome-use. A probe in all but name (see the
+    /// [chrome policy](crate::chrome)): the relay self-heal is suppressed and the kill rides
+    /// [`KILL_SLACK`] above `bound`, so a product bound ends it, never chrome-use's verdict.
+    /// Its failure never fails the operation.
     fn bounded(chrome_side: Duration, bound: Duration) -> Self {
         let recovery = CliRecovery::Suppressed;
         Self {
@@ -2129,12 +1906,9 @@ impl StepClocks {
         }
     }
 
-    /// The product's own probe (`session stop`, `session status`): `bound` IS the
-    /// kill and [`probe_clocks`] declares that same bound to chrome-use — capped at
-    /// [`CHROME_USE_DECLARED_BUDGET`] for a probe whose own bound sits above it, as
-    /// the `session stop` paths do — and its relay self-heal is suppressed: the
-    /// documented exception, where the product reports "the tool did not answer"
-    /// instead of spending the recovery window.
+    /// The product's own probe (`session stop`, `session status`): `bound` IS the kill and
+    /// [`probe_clocks`] declares it to chrome-use (capped at [`CHROME_USE_DECLARED_BUDGET`]);
+    /// the relay self-heal is suppressed — the documented exception.
     fn probe(bound: Duration) -> Self {
         let recovery = CliRecovery::Suppressed;
         Self {
@@ -2144,10 +1918,8 @@ impl StepClocks {
     }
 }
 
-/// Run one chrome-use step under `clocks` and classify its output. `session`
-/// scopes the call via `--session`; `None` leaves the call session-unscoped
-/// (`session stop` names its session via the positional instead). `input` pipes
-/// a stdin payload (only `fill --stdin` uses one).
+/// Run one chrome-use step under `clocks` and classify its output. `session` scopes the
+/// call; `None` leaves it unscoped; `input` pipes a stdin payload.
 async fn spawn_step(
     path: &Path,
     args: &[&str],
@@ -2155,9 +1927,8 @@ async fn spawn_step(
     clocks: StepClocks,
     input: Option<&[u8]>,
 ) -> StepOutcome {
-    // A session-scoped spawn attempt may materialize the ephemeral session
-    // (a vanished-binary race still sets this; the close attempt is then a
-    // harmless best-effort no-op).
+    // A session-scoped spawn attempt may materialize the ephemeral session (a
+    // vanished-binary race still sets this; the close is then a harmless no-op).
     if session.is_some() {
         CHROME_USE_SPAWNED.store(true, Ordering::Relaxed);
     }
@@ -2181,14 +1952,9 @@ async fn spawn_step(
             "chrome-use CLI could not be spawned/found".to_string(),
         ),
         CliRun::TimedOut => {
-            // The product's own clock ended this step. That is wedge evidence
-            // only when the step's outcome IS the caller's verdict
-            // ([`CliRecovery::Allowed`]) and its kill rode above the clock
-            // chrome-use itself was working to: every step declares that clock
-            // to chrome-use (as `AGENT_BROWSER_DEFAULT_TIMEOUT`), so a kill above
-            // it means the tool did not answer its own deadline. A step the
-            // product bounds itself (probes and the operation's best-effort
-            // sub-steps) is [`CliRecovery::Suppressed`] and can never attribute
+            // The product's own clock ended this step: wedge evidence only when the step's outcome
+            // IS the caller's verdict ([`CliRecovery::Allowed`]) and its kill rode above the clock
+            // chrome-use worked to — otherwise chrome-use did not answer its own deadline
             // (see [`CLI_STEP_KILLED_BY_CLOCK`]).
             if matches!(clocks.recovery, CliRecovery::Allowed)
                 && clocks.call.kill > clocks.call.chrome_side
@@ -2201,11 +1967,8 @@ async fn spawn_step(
             })
         }
         CliRun::Output(out) => {
-            // The child's exit decides the step; a process it left behind holding
-            // the output channel is recorded here and reported as a NOTE on the
-            // envelope, never as a failure (see [`chrome_leftover_pipe_note`]).
-            // OR-ed, not stored: a composite operation runs several steps, and one
-            // step's clean finish must not erase an earlier step's leftover.
+            // The child's exit decides the step; a process it left behind holding the
+            // output channel is recorded here as a NOTE, never a failure. OR-ed, not stored.
             CHROME_USE_LEFTOVER_PIPES.fetch_or(out.leftover_pipes, Ordering::Relaxed);
             classify_step_output(
                 args.first() == Some(&"expect"),
@@ -2219,17 +1982,11 @@ async fn spawn_step(
     }
 }
 
-/// Classify one chrome-use output (the `CliRun::Output` payload) into a step
-/// outcome. Pure so tests pin the mapping. `expect` is the one chrome-use
-/// action whose `--json` envelope can succeed on a non-zero exit — a failed
-/// assertion arrives as `success:true` with exit 1, the verdict riding in
-/// `data` — so envelope-success is trusted over the exit code there and
-/// nowhere else. `truncated` is the product's own flag
-/// ([`crate::chrome::spawn::CliOutput::truncated`]): whenever there is no parsed
-/// envelope — whatever the exit status — an answer the product cut off names
-/// itself rather than reading as chrome-use's malformed output. The parse is the
-/// shared tolerant one ([`crate::chrome::contract::parse_first`]), so trailing
-/// bytes a leftover process wrote after the envelope are ignored.
+/// Classify one chrome-use output into a step outcome. `expect` is the one action whose
+/// envelope can succeed on a non-zero exit (the verdict rides in `data`), so there — and
+/// nowhere else — envelope-success is trusted over the code. `truncated` names an answer
+/// the product cut off; the parse is the shared tolerant one ([`parse_first`]). Pure so
+/// tests pin the mapping.
 fn classify_step_output(
     expect_style: bool,
     truncated: bool,
@@ -2259,9 +2016,9 @@ fn classify_step_output(
             Some(resp) => classified(resp),
             None if truncated => failed(OutKind::Error, truncated_output_error()),
             None => {
-                // The stderr fallback can also carry a timeout phrasing plus the
-                // canned hint (chrome-use prints diagnostics there when stdout is
-                // non-JSON), so it is classified and sanitized too.
+                // The stderr fallback can carry a timeout phrasing plus the canned hint
+                // (chrome-use prints diagnostics there when stdout is non-JSON), so it is
+                // classified and sanitized.
                 let msg = fallback();
                 let kind = classify_call_failure(None, &msg);
                 failed(kind, sanitize_timeout_message(kind, &msg))
@@ -2284,16 +2041,10 @@ fn classify_step_output(
     }
 }
 
-/// A successful step whose envelope carries chrome-use's browser-replacement
-/// note is a plain failure, never a quiet success: the command ran in a browser
-/// chrome-use launched ITSELF rather than the owner's real one, so the page state
-/// the caller assumed is not there and nothing it read or wrote happened in the
-/// owner's session.
-///
-/// Classified [`OutKind::Environment`] (rc 2 — fix the environment rather than
-/// blind-retry), and deliberately NOT the daemon-down path: the daemon and the
-/// relay may be healthy, and only the connection to the real browser was lost, so
-/// daemon health is left untouched and auto-recovery is not woken.
+/// A successful step whose envelope carries chrome-use's browser-replacement note is a
+/// plain failure: the command ran in a browser chrome-use launched ITSELF, so the page
+/// state the caller assumed is not there. [`OutKind::Environment`] (rc 2), and
+/// deliberately not the daemon-down path — only the real-browser connection was lost.
 fn self_launched_failure(resp: &ChromeResponse) -> Option<StepFailure> {
     self_launched_browser_note(resp).map(|note| StepFailure {
         kind: OutKind::Environment,
@@ -2313,13 +2064,9 @@ fn fallback_step_message(status_code: Option<i32>, stderr: &str) -> String {
     }
 }
 
-// ── Actions ─────────────────────────────────────────────────────
-
-/// The `out_env` kind contract: a kind emitted for a registered CLI action
-/// must be declared in that action's shared-registry kind list, so the help
-/// text cannot drift from runtime emission. Unregistered pseudo-actions (the
-/// `"usage"` fallback) and non-CLI actions are exempt. Kept a pure predicate
-/// so the unit test exercises it in every build profile, not just debug.
+/// The `out_env` kind contract: a kind emitted for a registered CLI action must be
+/// declared in that action's kind list, so help cannot drift. Pure, so it is testable in
+/// every profile; the `"usage"` pseudo-action is exempt.
 fn kind_contract_holds(action: &str, kind: OutKind) -> bool {
     match actions::desc(action) {
         None => true,
@@ -2327,7 +2074,6 @@ fn kind_contract_holds(action: &str, kind: OutKind) -> bool {
     }
 }
 
-/// Construct an [`OutEnvelope`].
 #[must_use]
 fn out_env(action: &str, ok: bool, kind: OutKind, payload: Value) -> OutEnvelope {
     debug_assert!(
@@ -2343,16 +2089,9 @@ fn out_env(action: &str, ok: bool, kind: OutKind, payload: Value) -> OutEnvelope
     }
 }
 
-/// Resolve the chrome-use CLI path, or build the environment-failure envelope that
-/// carries the action's own params plus the reason.
-///
-/// The standalone `mahbot chrome` CLI deliberately resolves ONLY the product's
-/// own copy ([`crate::tools::chrome_daemon::cli_path`], the location the
-/// helper's own installer uses) — never a `chrome-use` found on the owner's
-/// search path or in a home location, so a foreign or leftover copy is never
-/// run. A host whose product-owned install has not happened yet therefore
-/// reports `chrome-use CLI not found` even when some other `chrome-use` is on
-/// PATH.
+/// Resolve the chrome-use CLI path, or build the environment-failure envelope. Only the
+/// product's own copy is resolved ([`crate::tools::chrome_daemon::cli_path`]), never one
+/// on the owner's PATH, so a foreign copy is never run.
 fn require_cli(
     action: &str,
     request: serde_json::Map<String, Value>,
@@ -2364,9 +2103,8 @@ fn require_cli(
     })
 }
 
-/// The request fields an action reports when its own envelope cannot be built, as the
-/// object a refusal extends with its reason. Taking them as pairs is what makes the
-/// payload an object by construction, so a refusal can never lose either half.
+/// The request fields an action reports when its own envelope cannot be built. Pairs make
+/// the payload an object by construction, so a refusal loses neither half.
 fn request(
     fields: impl IntoIterator<Item = (&'static str, Value)>,
 ) -> serde_json::Map<String, Value> {
@@ -2376,22 +2114,13 @@ fn request(
         .collect()
 }
 
-/// `status` — pure preflight: the readiness report and RAW probes only (never
-/// Chrome auto-launch, no environment mutation, no recovery — only the on-demand
-/// verbs and the pre-action gate recover).
-///
-/// It reports what WAS established about the owner's real browser
-/// ([`crate::tools::chrome_daemon::Readiness::report`]) rather than a list of raw
-/// probes, and states the machine-readable `verdict` it amounts to: `ready`
-/// (rc 0), `blocked` (rc 2 — a fact established the connection cannot work), or
-/// `not-proven` (rc 0 — nothing could be established either way, and the
-/// pre-action gate would still dispatch an action). A CLI that cannot state its
-/// version is rc 2 as well. The `chrome_use`, `relay_up`, `chrome_running` and
-/// `display` keys stay for scripts that read them — the last three as the raw
-/// tri-state facts of the same snapshot the report renders.
+/// `status` — pure preflight: the readiness report and RAW probes only (never the verbs
+/// and the gate that recover). It states the `verdict` the report amounts to: `ready`
+/// (rc 0), `blocked` (rc 2 — a fact established the connection cannot work), `not-proven`
+/// (rc 0 — nothing established, and the gate would still dispatch).
 async fn status() -> OutEnvelope {
-    // One `--version` spawn in the happy path: a parsed version proves the
-    // CLI is available; `cli_probe` only re-runs to classify WHY it didn't.
+    // One `--version` spawn in the happy path: a parsed version proves the CLI is
+    // available; `cli_probe` only re-runs to classify WHY it didn't.
     let (chrome_use, version_ok) = match cli_version().await {
         Some(v) => (v.to_string(), true),
         None => match cli_path() {
@@ -2403,9 +2132,8 @@ async fn status() -> OutEnvelope {
             },
         },
     };
-    // One bounded, daemon-free readiness snapshot (cached for HEALTH_TTL), every
-    // fact tri-state — including the display fact, taken from the snapshot
-    // instead of re-probed here.
+    // One bounded, daemon-free readiness snapshot (cached for HEALTH_TTL), every fact
+    // tri-state, the display fact included.
     let readiness = readiness().await;
 
     let mut payload = serde_json::Map::new();
@@ -2417,10 +2145,8 @@ async fn status() -> OutEnvelope {
         "ready_for_actions".into(),
         json!(readiness.ready_for_actions()),
     );
-    // The three-way state in one word, so a machine read does not have to infer
-    // it from the report text: `ready` is PROVEN, `blocked` means a fact
-    // established the connection cannot work, and `not-proven` means nothing was
-    // established either way (the gate still dispatches an action there).
+    // The three-way state in one word, so a machine read does not infer it from the report
+    // text: `ready` is PROVEN, `blocked` ruled out, `not-proven` neither.
     payload.insert(
         "verdict".into(),
         json!(if readiness.ready_for_actions() {
@@ -2436,13 +2162,9 @@ async fn status() -> OutEnvelope {
     if readiness.ready_for_actions() {
         return out_env("status", true, OutKind::Ok, Value::Object(payload));
     }
-    // Three states, mirroring the pre-action gate. A CLI that cannot state its
-    // version, and a fact that RULES THE CONNECTION OUT, are both environment
-    // failures. A snapshot that established nothing wrong — not proven, nothing
-    // ruled out — is a reporting gap: the gate would still dispatch an action,
-    // so the report's own verdict is the answer and this is not reported as a
-    // broken environment (the readiness snapshot cannot name an absent/broken
-    // CLI, which is why the version probe's verdict leads there).
+    // Three states, mirroring the pre-action gate. A CLI that cannot state its version, and a
+    // fact RULING the connection out, are environment failures; a snapshot that established
+    // nothing is a reporting gap, not a broken environment.
     let error = if !version_ok {
         Some(format!(
             "chrome-use CLI: {chrome_use}. {}",
@@ -2466,9 +2188,8 @@ async fn status() -> OutEnvelope {
     )
 }
 
-/// The honest `error` text for a committed-Chrome-error-page network failure:
-/// the specific cause when the net error code was extracted, the generic
-/// fallback otherwise (never lose the honest generic reason).
+/// The honest `error` text for a committed Chrome error page: the specific cause when a net
+/// error code was extracted, the generic reason otherwise.
 fn network_failure_error(code: Option<&str>) -> String {
     match code {
         Some(c) => {
@@ -2481,16 +2202,10 @@ fn network_failure_error(code: Option<&str>) -> String {
     }
 }
 
-/// The factual `error` text for a product-side deadline kill; `what` names the
-/// step that did not complete. `chrome_side` is the clock that step declared to
-/// chrome-use and `kill` the product's own bound that ended it.
-///
-/// It says plainly that the PRODUCT's own bound ended the call — never that
-/// chrome-use timed out. When the kill rode above the declared clock (a step
-/// whose outcome is the caller's verdict) it says so, so a truncated call is
-/// never mistaken for chrome-use's own verdict; otherwise (a probe, or the
-/// operation's own budget ending one of its best-effort sub-steps) it says the
-/// bound was the product's own.
+/// The factual `error` text for a product-side deadline kill; `what` names the step. It
+/// says the PRODUCT's bound ended the call, never that chrome-use timed out, and on a step
+/// whose outcome is the caller's verdict it adds that the kill rode above the declared
+/// clock, so a truncated call is not mistaken for chrome-use's verdict.
 fn deadline_error(chrome_side: Duration, kill: Duration, what: &str) -> String {
     let kill = kill.as_millis();
     if kill > chrome_side.as_millis() {
@@ -2501,8 +2216,7 @@ fn deadline_error(chrome_side: Duration, kill: Duration, what: &str) -> String {
             chrome_side.as_millis()
         )
     } else {
-        // The product bounded this step itself: its own probe bound, or the
-        // operation's own budget ending one of its best-effort sub-steps.
+        // The product bounded this step itself: its probe bound or the operation's budget.
         format!(
             "deadline reached after {kill}ms — {what}: that is the product's own bound for the \
              step (chrome-use was given {}ms), so a product-side bound — not chrome-use's \
@@ -2513,32 +2227,25 @@ fn deadline_error(chrome_side: Duration, kill: Duration, what: &str) -> String {
 }
 
 /// Post-navigation settle cap for `open`'s plain path: a best-effort
-/// `wait --load networkidle` (what the interactive tool does after its open)
-/// so the first step after `open` on heavy SPAs is not racing a still-settling
-/// page under daemon contention.
+/// `wait --load networkidle`, so the next step is not racing a settling SPA.
 const SETTLE_CAP: Duration = Duration::from_secs(10);
 
-/// Budget reserved for content capture so the settle can never consume the
-/// whole remaining operation budget and silently drop the open's snapshot.
+/// Budget reserved for content capture, so the settle cannot drop the snapshot.
 const CAPTURE_RESERVE: Duration = Duration::from_millis(2500);
 
 /// Below this a settle spawn is not worth its startup cost — skipped.
 const MIN_SETTLE_BUDGET: Duration = Duration::from_secs(1);
 
-/// Settle budget for `open`'s plain path: capped at [`SETTLE_CAP`], must leave
-/// [`CAPTURE_RESERVE`] for content capture, skipped (None) when the remainder
-/// is too small for both. Pure so tests pin the policy.
+/// Settle budget for `open`'s plain path: capped at [`SETTLE_CAP`], leaving
+/// [`CAPTURE_RESERVE`], `None` when the remainder is too small for both. Pure.
 fn settle_budget(remaining: Duration) -> Option<Duration> {
     let budget = remaining.saturating_sub(CAPTURE_RESERVE).min(SETTLE_CAP);
     (budget >= MIN_SETTLE_BUDGET).then_some(budget)
 }
 
-/// The pure argument checks of `open`, run both by [`preflight`] (before the
-/// readiness gate) and by [`open`] itself. The URL must be one this product may
-/// navigate to, and the `--expect` selector goes through the shared wait-target
-/// policy (so the numeric silent-sleep form is rejected here too) — both checked
-/// before navigating, never after. The resolved wait target is the check's own
-/// by-product.
+/// The pure argument checks of `open`, run by [`preflight`] (before the readiness gate)
+/// and by [`open`] itself: the URL must be one this product may navigate to, and
+/// `--expect` goes through the shared wait-target policy — both before navigating.
 fn open_args(url: &str, expect: Option<&str>) -> Result<Option<WaitTarget>, OutEnvelope> {
     if let Err(e) = crate::util::http::validate_url(url) {
         return Err(out_env(
@@ -2561,15 +2268,10 @@ fn open_args(url: &str, expect: Option<&str>) -> Result<Option<WaitTarget>, OutE
         })
 }
 
-/// `open` — navigate to `url`, optionally wait for `--expect` (redesign-aware
-/// via `--structural`), report the committed final URL and best-effort attach
-/// the page content (compact accessibility snapshot). On the plain path (no
-/// `--expect`, which already serves as the settle) the navigation is followed
-/// by a best-effort network settle, capped at [`SETTLE_CAP`]. `timeout` bounds
-/// the waits the operation drives — the error-page probe, the settle /
-/// `--expect` wait, and the content capture — NOT the navigation, which runs to
-/// the clock mahbot declares to chrome-use: the operation may therefore
-/// legitimately outlive `timeout`.
+/// `open` — navigate to `url`, optionally wait for `--expect` (redesign-aware via
+/// `--structural`), report the committed URL and best-effort attach the content. On the
+/// plain path a best-effort settle follows, capped at [`SETTLE_CAP`]. `timeout` bounds the
+/// waits the operation drives, NOT the navigation: the operation may outlive it.
 #[expect(clippy::too_many_lines)]
 async fn open(
     url: &str,
@@ -2589,19 +2291,11 @@ async fn open(
 
     let started = Instant::now();
     let total = timeout + KILL_SLACK;
-    // The operation's own step: neither `timeout` (the budget `--timeout`
-    // declared, the CLI's whole-operation default otherwise) nor `total` bounds
-    // the NAVIGATION. `--timeout` is no deadline chrome-use honours for `open`'s
-    // navigate: chrome-use runs it to the clock mahbot declares to it, and killing it
-    // on the operation's budget would end a call chrome-use was still working on
-    // — losing chrome-use's own reason for the failure, which is exactly what the
-    // product's kill must never do. The navigation's kill therefore rides
-    // `kill_bound` above chrome-use's own budget, and the operation may
-    // legitimately outlive `--timeout`. `total` is then the operation's own
-    // bookkeeping — `timeout` plus the slack reserved for the error-page probe —
-    // for that probe, the settle and the content capture; the `--expect` wait
-    // declares what remains of `timeout` instead (see below), and every other step
-    // of the operation rides [`StepClocks::bounded`].
+    // The operation's own step: neither `timeout` nor `total` bounds the NAVIGATION —
+    // chrome-use runs it to the clock mahbot declares, and killing it on the operation's
+    // budget would lose chrome-use's own reason for the failure. The kill rides `kill_bound`
+    // above that budget; `total` (`timeout` plus the error-page slack) is the operation's own
+    // bookkeeping for the probe, the settle and the capture.
     let operation = StepClocks::operation();
     let resp = match spawn_step(&path, &["open", url], Some(session), operation, None).await {
         Ok(resp) => resp,
@@ -2625,13 +2319,9 @@ async fn open(
             }),
         );
     }
-    // One of the operation's best-effort sub-steps (the policy exception in
-    // [`crate::chrome`]): the product reserves it up to the 2 s slack so it runs
-    // even when the navigation consumed the whole declared deadline, and its kill
-    // rides that slack above the reserved bound. Best-effort (inconclusive =
-    // pass); skipped when nothing is left. One eval yields both the error-page
-    // verdict and the net error token Chrome renders in `div.error-code`
-    // (empty until the neterror script runs — the generic message covers it).
+    // One of the operation's best-effort sub-steps (the policy exception): reserved up to the
+    // 2 s slack so it runs even when the navigation spent the deadline, its kill riding that
+    // slack above it. One eval yields the error-page verdict and the net error code.
     let probe_budget = total.saturating_sub(started.elapsed()).min(KILL_SLACK);
     if probe_budget >= Duration::from_millis(500)
         && let Ok(probe) = spawn_step(
@@ -2659,8 +2349,8 @@ async fn open(
     if let Some(target) = wait_for {
         let target_desc = target.describe();
         let mut payload = json!({ "url": final_url, "target": target_desc });
-        // A missed `--expect` after a committed navigation is a suspected
-        // redesign when `--structural` was declared, a plain timeout otherwise.
+        // A missed `--expect` after a committed navigation is a suspected redesign when
+        // `--structural` was declared, a plain timeout otherwise.
         let (timeout_kind, hint) = if structural {
             (
                 OutKind::Redesign,
@@ -2672,20 +2362,12 @@ async fn open(
                 "selector not found — may be structural change, empty region, or content-dependent",
             )
         };
-        // The wait's declared deadline is what REMAINS of the caller's own
-        // --timeout — never the operation's bookkeeping `total`, whose extra
-        // slack belongs to the error-page probe. A declaration that crosses
-        // chrome-use's own client tolerance is what makes chrome-use run out of
-        // tolerance instead of answering, and `parse_forwarded_timeout` already
-        // refuses a --timeout at or above it, so the remaining part of one stays
-        // below it.
+        // The wait's declared deadline is what REMAINS of the caller's `--timeout`, never the
+        // bookkeeping `total`, whose slack belongs to the error-page probe. A declaration at or
+        // above chrome-use's tolerance is already refused at parse time.
         let wait_budget = timeout.saturating_sub(started.elapsed());
-        // No budget left for the wait (or its capture) — emit the same timeout
-        // envelope the wait-timeout arm produces, without content. What ran out
-        // here is the OPERATION's own budget, spent before the wait step was given
-        // any of it, so no deadline was ever declared to chrome-use for that step:
-        // the envelope reports the operation's own budget, and says so rather than
-        // naming a chrome-use clock that was never given a value.
+        // No budget left for the wait (or its capture): the same timeout envelope, reporting the
+        // OPERATION's own budget, since no deadline was ever declared to chrome-use for it.
         if wait_budget < Duration::from_millis(250) {
             payload["timeout_ms"] = json!(timeout.as_millis());
             payload["error"] = json!(format!(
@@ -2699,19 +2381,14 @@ async fn open(
             payload["hint"] = json!(hint);
             return out_env("open", false, timeout_kind, payload);
         }
-        // The wait forwards its remaining budget as --timeout, which chrome-use
-        // honours in full — so that remaining budget IS the step's chrome-side
-        // clock — and its failure IS the caller's verdict, so it runs to the
-        // forwarded clocks with the relay self-heal allowed: a relay drop during
-        // the wait is healed exactly the way it is for any reported step.
+        // The wait forwards its remaining budget as `--timeout`, so that IS the step's chrome-side
+        // clock, and its failure IS the caller's verdict: relay self-heal allowed.
         let wait_clocks = StepClocks::forwarded(wait_budget);
         let wargs = wait_args(&target, wait_budget.as_millis());
         let refs: Vec<&str> = wargs.iter().map(String::as_str).collect();
         let waited = spawn_step(&path, &refs, Some(session), wait_clocks, None).await;
-        // The page is open regardless of the wait outcome, so the content
-        // rides on failure envelopes too: it is exactly what diagnoses a
-        // redesign. Same remaining-budget rule as the plain path — slow
-        // waits simply exhaust it and the content is omitted.
+        // The page is open regardless of the wait outcome, so content rides on failure envelopes
+        // too — it is what diagnoses a redesign. Slow waits simply exhaust it.
         let content =
             capture_open_content(&path, session, total.saturating_sub(started.elapsed())).await;
         if let Some(content) = content {
@@ -2720,16 +2397,16 @@ async fn open(
         return match waited {
             Ok(_) => out_env("open", true, OutKind::Ok, payload),
             Err(f) if f.kind == OutKind::Timeout => {
-                // chrome-use's own verdict reports the deadline it was given; a
-                // product kill reports the product's own bound (the kill).
+                // chrome-use's verdict reports the deadline it was given; a product kill
+                // reports its own bound.
                 let reported = if f.message.is_empty() {
                     wait_clocks.call.kill
                 } else {
                     wait_clocks.call.chrome_side
                 };
                 payload["timeout_ms"] = json!(reported.as_millis());
-                // The chrome-side timeout message when chrome-use phrased the
-                // timeout itself, a factual deadline text on a product kill.
+                // The chrome-side message when chrome-use phrased it; a factual deadline
+                // text on a product kill.
                 if f.message.is_empty() {
                     payload["error"] = json!(deadline_error(
                         wait_clocks.call.chrome_side,
@@ -2745,16 +2422,11 @@ async fn open(
             Err(f) => f.envelope("open", payload, wait_clocks),
         };
     }
-    // Best-effort settle: heavy SPAs keep the network busy right after the
-    // navigation commits, so the first following step can otherwise start
-    // racing a still-settling page. Raw argv — the `wait` action deliberately
-    // does not expose `--load`. chrome-use honours no `--timeout` for this form:
-    // its clock is the AGENT_BROWSER_DEFAULT_TIMEOUT this step declares (the
-    // remaining operation budget), and the product's own bound on the step is the
-    // same number — one of the operation's best-effort sub-steps, so its kill
-    // rides [`KILL_SLACK`] above that bound and the operation still stays within
-    // its budget plus that slack. The result is discarded — a settle timeout
-    // never downgrades a committed navigation.
+    // Best-effort settle: heavy SPAs keep the network busy right after the navigation commits,
+    // so the next step would otherwise race a still-settling page. Raw argv (the `wait` action
+    // does not expose `--load`); its clock is the declared AGENT_BROWSER_DEFAULT_TIMEOUT and
+    // the product's own bound the remaining budget, so the kill rides `KILL_SLACK` above it.
+    // Discarded: a settle timeout never downgrades a committed navigation.
     if let Some(budget) = settle_budget(total.saturating_sub(started.elapsed())) {
         let _ = spawn_step(
             &path,
@@ -2765,14 +2437,9 @@ async fn open(
         )
         .await;
     }
-    // Content capture is best-effort and bounded: it runs on the budget the
-    // navigation (+ error probe + settle) left over, and a failure, exhaustion,
-    // or content-free page simply omits `content` — a successful navigation is
-    // never downgraded. The step declares the product's clock for a verb it
-    // forwards no `--timeout` to ([`CHROME_USE_DECLARED_BUDGET`]) while the
-    // product's own bound on it is the remaining operation budget — the
-    // operation's last best-effort sub-step, so its kill rides [`KILL_SLACK`]
-    // above that bound.
+    // Content capture is best-effort and bounded: a failure, exhaustion or content-free page
+    // simply omits `content`, never downgrading a successful navigation. Its product bound is
+    // the remaining budget, the kill riding `KILL_SLACK` above it.
     let mut payload = json!({ "url": final_url });
     let budget = total.saturating_sub(started.elapsed());
     if let Some(content) = capture_open_content(&path, session, budget).await {
@@ -2781,14 +2448,10 @@ async fn open(
     out_env("open", true, OutKind::Ok, payload)
 }
 
-/// Best-effort compact page snapshot for the `open` envelope — the same
-/// content form the interactive chrome tool surfaces after an open. One of the
-/// operation's bounded sub-steps ([`StepClocks::bounded`]): skipped
-/// under 500 ms of budget (mirroring the error-page probe); a failed step,
-/// an unrecognized response shape, or a content-free page yields no content.
-/// Non-empty content is byte-truncated so the single-line JSON envelope stays
-/// valid: `TOOL_OUTPUT_BUDGET_BYTES` triggers the head/tail sandwich and the
-/// omission marker it inserts is additional to that trigger.
+/// Best-effort compact page snapshot for the `open` envelope, the content form the
+/// interactive chrome tool surfaces: bounded ([`StepClocks::bounded`]), skipped under 500 ms,
+/// and a failed step or content-free page yields none. Byte-truncated so the single-line
+/// envelope stays valid (`TOOL_OUTPUT_BUDGET_BYTES`, plus its marker).
 async fn capture_open_content(path: &Path, session: &str, budget: Duration) -> Option<String> {
     if budget < Duration::from_millis(500) {
         return None;
@@ -2814,9 +2477,8 @@ async fn capture_open_content(path: &Path, session: &str, budget: Duration) -> O
     ))
 }
 
-/// Run the count-eval shim for `selector` — shared by the `count` action and
-/// the `extract` honest-empty gate. The eval shim is a step of the action that
-/// called it, so it runs to that action's clocks.
+/// Run the count-eval shim for `selector`, shared by `count` and the `extract` honest-empty
+/// gate: a step of the action that called it, so it runs to its clocks.
 async fn count_via_eval(
     path: &Path,
     selector: &str,
@@ -2854,11 +2516,9 @@ async fn count(selector: &str, bound: Option<Duration>, session: &str) -> OutEnv
     }
 }
 
-/// `wait` — bounded wait for a safe [`WaitTarget`] (the numeric sleep form is
-/// rejected at parse time). The requested `--timeout` IS chrome-use's deadline
-/// (its wait forms honour it in full), so its honest timeout error surfaces at
-/// the declared clock; the product's kill rides the relay-recovery window +
-/// [`crate::chrome::KILL_SLACK`] above it (see [`StepClocks::forwarded`]).
+/// `wait` — bounded wait for a safe [`WaitTarget`] (the numeric sleep form is rejected at
+/// parse). `--timeout` IS chrome-use's deadline, so its honest error surfaces at the declared
+/// clock; the kill rides the relay-recovery window above it.
 async fn wait(target: &WaitTarget, timeout: Duration, session: &str) -> OutEnvelope {
     let base = request([("target", json!(target.describe()))]);
     let path = match require_cli("wait", base.clone()) {
@@ -2882,10 +2542,8 @@ async fn wait(target: &WaitTarget, timeout: Duration, session: &str) -> OutEnvel
     }
 }
 
-/// Map a parsed expect verdict to the envelope: pass → rc 0; deadline
-/// expiration → kind timeout; a plain false (only reachable if a future
-/// chrome-use stops folding it into timedOut) → kind error. Pure so tests
-/// pin the mapping.
+/// Map a parsed expect verdict to the envelope: pass → rc 0, deadline expiration →
+/// timeout, plain false → error. Pure so tests pin the mapping.
 fn expect_envelope(condition: &str, outcome: ExpectOutcome) -> OutEnvelope {
     let mut payload = json!({ "condition": condition });
     if let Some(actual) = outcome.actual {
@@ -2909,10 +2567,8 @@ fn expect_envelope(condition: &str, outcome: ExpectOutcome) -> OutEnvelope {
     out_env("expect", false, kind, payload)
 }
 
-/// `expect` — assert a condition with a bounded wait. The envelope (not the
-/// exit code) is authoritative: a failed assertion arrives as
-/// `success:true` with the verdict in `data`, which [`expect_outcome`]
-/// parses (see [`spawn_step`]).
+/// `expect` — assert a condition with a bounded wait. The envelope, not the exit code, is
+/// authoritative: a failed assertion arrives as `success:true` (see [`spawn_step`]).
 async fn expect(cond: &ExpectCond, timeout: Duration, session: &str) -> OutEnvelope {
     let condition = describe(cond);
     let base = request([("condition", json!(condition))]);
@@ -2920,8 +2576,7 @@ async fn expect(cond: &ExpectCond, timeout: Duration, session: &str) -> OutEnvel
         Ok(p) => p,
         Err(e) => return e,
     };
-    // Same rule as wait: the forwarded `--timeout` is chrome-use's own clock,
-    // and the product's kill rides the relay-recovery window + slack above it.
+    // Same rule as wait: the forwarded `--timeout` is chrome-use's own clock.
     let clocks = StepClocks::forwarded(timeout);
     let args = expect_args(cond, timeout.as_millis());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -2942,8 +2597,8 @@ async fn expect(cond: &ExpectCond, timeout: Duration, session: &str) -> OutEnvel
     }
 }
 
-/// `eval` — run JS and emit the unwrapped result as a JSON value (number,
-/// string, object, or null).
+/// `eval` — run JS and emit the unwrapped result as a JSON value (number, string, object,
+/// or null).
 async fn eval(js: &str, bound: Option<Duration>, session: &str) -> OutEnvelope {
     let path = match require_cli("eval", request([("js", json!(js))])) {
         Ok(p) => p,
@@ -2959,9 +2614,8 @@ async fn eval(js: &str, bound: Option<Duration>, session: &str) -> OutEnvelope {
     }
 }
 
-/// `extract` — schema-driven rows extraction, gated by a count so an empty
-/// region is reported honestly (chrome-use's rows-mode `extract` returns
-/// phantom rows when the rows selector matches 0).
+/// `extract` — schema-driven rows extraction, gated by a count so an empty region is
+/// reported honestly (rows-mode `extract` returns phantom rows on a 0 match).
 async fn extract(
     schema_file: &str,
     limit: Option<usize>,
@@ -3000,8 +2654,8 @@ async fn extract(
     };
 
     let clocks = StepClocks::tool_clock(bound);
-    // Honest-empty gate: when the rows selector matches 0, report empty without
-    // invoking chrome-use's phantom-row `extract`.
+    // Honest-empty gate: when the rows selector matches 0, report empty without invoking
+    // chrome-use's phantom-row `extract`.
     if let Some(rows_sel) = schema.get("rows").and_then(Value::as_str) {
         let count = count_via_eval(&path, rows_sel, session, clocks).await;
         match extract_gate(count) {
@@ -3018,10 +2672,8 @@ async fn extract(
         }
     }
 
-    // `--schema-file` is the installed chrome-use 1.5.101's own documented
-    // form (`extract --help`); rows-mode extract answers
-    // `data = {extracted: [...], count, origin, meta}` and single-object mode
-    // with the bare object; extract_output tolerates a plain array too.
+    // `--schema-file` is the installed chrome-use's own documented form; rows-mode answers
+    // `{extracted, count, origin, meta}`, single-object mode the bare object.
     let args = [
         "extract".to_string(),
         "--schema-file".to_string(),
@@ -3039,8 +2691,8 @@ async fn extract(
     }
 }
 
-/// `click` — click a selector, forwarding `--if-present` verbatim when set
-/// (chrome-use itself treats an `--if-present` miss as a no-op success).
+/// `click` — click a selector, forwarding `--if-present` verbatim when set (chrome-use
+/// treats an `--if-present` miss as a no-op success).
 async fn click(
     selector: &str,
     if_present: bool,
@@ -3059,9 +2711,8 @@ async fn click(
     let clocks = StepClocks::tool_clock(bound);
     match spawn_step(&path, &refs, Some(session), clocks, None).await {
         Ok(resp) => {
-            // A page the click opens is reported by chrome-use (its reply names the tab); the
-            // step's tail takes it out of chrome-use's group ([`chrome_groups`]), which is why the
-            // id rides back with the envelope rather than into its result.
+            // A page the click opens is reported by chrome-use (its reply names the tab); the tail
+            // takes it out of the group, which is why the id rides back with the envelope.
             let opened = resp
                 .data
                 .as_ref()
@@ -3080,8 +2731,8 @@ async fn click(
     }
 }
 
-/// Read this process's stdin to EOF for `fill --stdin`, capped so an
-/// oversized/accidental stream is a usage error, not a memory event.
+/// Read this process's stdin to EOF for `fill --stdin`, capped so an oversized or
+/// accidental stream is a usage error, not a memory event.
 const STDIN_TEXT_CAP: usize = 10 * 1024 * 1024;
 async fn read_stdin_capped() -> Result<Vec<u8>, String> {
     use tokio::io::AsyncReadExt;
@@ -3105,15 +2756,10 @@ async fn read_stdin_capped() -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-/// The fill/type/press success handling, pure for tests: a success envelope
-/// carrying chrome-use's degraded-success `warning` ([`chrome_use_warning`]) is
-/// classified as kind error (rc 1) with the warning surfaced — the action may not
-/// have taken effect, so it must never exit 0. A clean success emits kind ok with
-/// the action params plus chrome-use's `data`.
-///
-/// The browser-replacement note is never one of these: [`classify_step_output`]
-/// already turned such an envelope into an Environment failure before it could
-/// reach here (see [`self_launched_browser_cli_error`]).
+/// The fill/type/press success handling, pure for tests: a success carrying chrome-use's
+/// degraded-success `warning` ([`chrome_use_warning`]) is kind error (rc 1) with the warning
+/// surfaced — the action may not have taken effect. A clean success emits kind ok. Browser
+/// replacement never reaches here ([`classify_step_output`] already failed it).
 fn text_input_ok_envelope(action: &str, base: &Value, resp: ChromeResponse) -> OutEnvelope {
     let warning = chrome_use_warning(&resp);
     let mut payload = base.as_object().cloned().unwrap_or_default();
@@ -3127,8 +2773,8 @@ fn text_input_ok_envelope(action: &str, base: &Value, resp: ChromeResponse) -> O
     out_env(action, true, OutKind::Ok, Value::Object(payload))
 }
 
-/// `fill` — clear + verified fill. Exactly one text source (inline text,
-/// --file passthrough, or mahbot-piped --stdin).
+/// `fill` — clear + verified fill. Exactly one text source (inline text, --file
+/// passthrough, or mahbot-piped --stdin).
 async fn fill(
     selector: &str,
     source: &TextInput,
@@ -3194,8 +2840,7 @@ async fn r#type(
     if key_events {
         argv.push("--key-events".to_string());
     }
-    // Leading-dash text rides after the `--` shield; action flags must come
-    // BEFORE it (everything after is a verbatim value).
+    // Leading-dash text rides after the `--` shield; action flags must come before it.
     argv.extend(text_value_argv(text));
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let clocks = StepClocks::tool_clock(bound);
@@ -3205,9 +2850,8 @@ async fn r#type(
     }
 }
 
-/// `press` — press a key at the focused element, optionally trying to focus a
-/// `--selector` first (a no-op for non-focusable elements) and holding `--hold`
-/// ms before release.
+/// `press` — press a key at the focused element, optionally focusing `--selector` first
+/// (a no-op for non-focusable elements) and holding `--hold` ms before release.
 async fn press(
     key: &str,
     selector: Option<&str>,
@@ -3244,10 +2888,9 @@ async fn press(
     }
 }
 
-/// The delivery verdict a failed attach carries: a kill at the step's own clock
-/// never learned what reached the page, and a failure chrome-use did report may
-/// have streamed part of a file before it gave up — so neither ever claims the
-/// files are on the input.
+/// The delivery verdict a failed attach carries: a kill at the step's clock learned nothing,
+/// and a reported failure may have streamed part of a file — so neither claims the files
+/// are on the input.
 const ATTACH_INCOMPLETE_NOTE: &str =
     "the attach did not complete — treat the files as not attached";
 const DELIVERY_UNCONFIRMED_NOTE: &str =
@@ -3260,20 +2903,16 @@ fn upload_base(selector: &str, files: &[String]) -> serde_json::Map<String, Valu
     base
 }
 
-/// An attach that never reached the browser, reported against the same payload a
-/// successful one carries.
+/// An attach that never reached the browser, on the same payload as a success.
 fn upload_refusal(selector: &str, files: &[String], kind: OutKind, error: &str) -> OutEnvelope {
     let mut payload = upload_base(selector, files);
     payload.insert("error".into(), json!(error));
     out_env("upload", false, kind, Value::Object(payload))
 }
 
-/// An attach's envelope from chrome-use's answer: the success carries its
-/// `uploaded`/`attached` counts, the absolute files that were read, and its
-/// `warning` verbatim when it could not confirm the input still holds them — a
-/// delivered attach only while something was uploaded, and never a claim about the
-/// page's own validation, which nothing here can see. A stated zero upload is the
-/// failure envelope: nothing reached the page.
+/// An attach's envelope from chrome-use's answer: the `uploaded`/`attached` counts, the
+/// absolute files read, and its `warning` verbatim when it could not confirm the input still
+/// holds them. A stated zero upload is the failure envelope.
 fn upload_ok_envelope(
     selector: &str,
     files: &[String],
@@ -3301,8 +2940,7 @@ fn upload_ok_envelope(
     if let Some(warning) = chrome_use_warning(response) {
         payload.insert("warning".into(), warning);
     }
-    // A stated zero is the opposite of delivery: nothing reached the page, so the
-    // attach is a failure whatever the browser's exit said.
+    // A stated zero is the opposite of delivery: the attach failed whatever the exit said.
     if uploaded == Some(0) {
         payload.insert(
             "error".into(),
@@ -3322,15 +2960,10 @@ fn upload_ok_envelope(
     out_env("upload", true, OutKind::Ok, Value::Object(payload))
 }
 
-/// `upload` — attach local files to the page's file input, the label that pairs
-/// with it, or the container holding it.
-///
-/// Paths resolve against the directory this command was run in and are handed to
-/// chrome-use as absolute files, which is also what the result reports. A success
-/// carries chrome-use's own `uploaded`/`attached` counts and, verbatim, the
-/// warning it raises when it could not confirm the input still holds the files —
-/// that warning is a degraded success, never this action's failure, and it is
-/// never a claim about the page's own validation, which nothing here can see.
+/// `upload` — attach local files to the page's file input, the label that pairs with it, or
+/// the container holding it. Paths resolve against this command's directory and are handed
+/// to chrome-use absolute, which is what the result reports. A `warning` it raises is a
+/// degraded success, never a claim about the page's own validation.
 async fn upload(
     selector: &str,
     files: &[String],
@@ -3377,9 +3010,8 @@ async fn upload(
     }
 }
 
-/// Ask the page the one-file question the files module puts to a several-file
-/// attach, and hand back its verdict. The probe is the product's own bounded
-/// question, so it runs to [`DEFAULT_STEP_TIMEOUT`] rather than a step's clock.
+/// Ask the page the one-file question the files module puts to a several-file attach. It is
+/// the product's own bounded question, so it runs to [`DEFAULT_STEP_TIMEOUT`].
 async fn probe_one_file_target(
     path: &Path,
     selector: &str,
@@ -3406,10 +3038,8 @@ async fn probe_one_file_target(
     )
 }
 
-/// A screenshot's reserved file: removed on every path that is not a reported
-/// capture — a spawn failure, a corrupt write, and an interrupted call, whose
-/// future is dropped mid-step. [`ReservedPicture::commit`] is what hands the file
-/// to the caller.
+/// A screenshot's reserved file: removed on every path that is not a reported capture —
+/// spawn failure, corrupt write, interrupted call. [`ReservedPicture::commit`] hands it over.
 struct ReservedPicture {
     path: std::path::PathBuf,
     keep: bool,
@@ -3429,13 +3059,10 @@ impl Drop for ReservedPicture {
     }
 }
 
-/// `screenshot` — capture the visible page into a produced PNG.
-///
-/// The destination is the caller's own directory ([`crate::cli::resolve_output_dir`]):
-/// it is resolved here, where the command ran, and the picture is written under a
-/// name nothing occupies yet — a produced file never overwrites one. The result
-/// reports the absolute path that was written, in the platform's own spelling
-/// (never the verbatim form), so the caller can open it as it is.
+/// `screenshot` — capture the visible page into a produced PNG. The destination is the
+/// caller's own directory ([`crate::cli::resolve_output_dir`]), resolved here, and the
+/// picture is written under a name nothing occupies yet. The result reports the absolute
+/// path written, in the platform's own spelling.
 async fn screenshot(output_dir: Option<&str>, session: &str) -> OutEnvelope {
     let action = "screenshot";
     let dir = match crate::cli::resolve_output_dir(output_dir) {
@@ -3448,8 +3075,7 @@ async fn screenshot(output_dir: Option<&str>, session: &str) -> OutEnvelope {
         Ok(p) => p,
         Err(e) => return e,
     };
-    // The claim IS the collision check, and chrome-use writes over the reserved
-    // file it is handed, so a name already present can never be taken.
+    // The claim IS the collision check: chrome-use writes over the file it is handed.
     let (file, file_path) = match crate::util::create_unique_file(&dir, "screenshot.png").await {
         Ok(claimed) => claimed,
         Err(e) => {
@@ -3462,8 +3088,8 @@ async fn screenshot(output_dir: Option<&str>, session: &str) -> OutEnvelope {
         }
     };
     drop(file);
-    // The reservation is removed on every path that does not become a reported
-    // capture — including a call interrupted mid-step, whose future is dropped here.
+    // The reservation is removed on every path that does not become a reported capture —
+    // including a call interrupted mid-step, whose future is dropped here.
     let picture = ReservedPicture {
         path: file_path.clone(),
         keep: false,
@@ -3502,9 +3128,8 @@ async fn screenshot(output_dir: Option<&str>, session: &str) -> OutEnvelope {
             if let Some(origin) = resp.data.as_ref().and_then(|d| d.get("origin")) {
                 payload.insert("origin".into(), origin.clone());
             }
-            // chrome-use warns when the pixels did not come from the page the
-            // caller thinks it captured; the file is still written, so the capture
-            // stands and the warning is repeated rather than swallowed.
+            // chrome-use warns when the pixels did not come from the page the caller thinks it
+            // captured; the file is written, so the capture stands and the warning is repeated.
             if let Some(warning) = chrome_use_warning(&resp) {
                 payload.insert("warning".into(), warning);
             }
@@ -3515,9 +3140,8 @@ async fn screenshot(output_dir: Option<&str>, session: &str) -> OutEnvelope {
     }
 }
 
-/// `session stop` — name-gated stop of a CLI session (protects the interactive
-/// tool's `agent-tab-*` sessions unless `--force`). The envelope echoes the name the
-/// owner wrote ([`cli_sessions::display_name`]), which is also what `session list` shows.
+/// `session stop` — name-gated stop of a CLI session (protects `agent-tab-*` unless
+/// `--force`). The envelope echoes the name the owner wrote.
 async fn session_stop(name: &str, force: bool) -> OutEnvelope {
     let target = match resolve_stop_target(name, force) {
         Ok(t) => t,
@@ -3536,11 +3160,8 @@ async fn session_stop(name: &str, force: bool) -> OutEnvelope {
         Ok(p) => p,
         Err(e) => return e,
     };
-    // A product probe (the probe exception in [`StepClocks::probe`], see the
-    // policy in [`crate::chrome`]), not agent work: bounded by the product itself
-    // with chrome-use's relay self-heal suppressed. The bound is the shared
-    // [`SESSION_STOP_TIMEOUT`] — a product bound, not a declared deadline
-    // (chrome-use forwards no `--timeout` to `session stop`).
+    // A product probe ([`StepClocks::probe`]), not agent work: bounded by the shared
+    // [`SESSION_STOP_TIMEOUT`] with the relay self-heal suppressed.
     let clocks = StepClocks::probe(SESSION_STOP_TIMEOUT);
     match spawn_step(&path, &["session", "stop", &target], None, clocks, None).await {
         Ok(_) => {
@@ -3552,9 +3173,8 @@ async fn session_stop(name: &str, force: bool) -> OutEnvelope {
     }
 }
 
-/// Whether chrome-use is running this session right now: the same daemon-free
-/// `session list` read `session status` starts with. `false` when the list cannot be
-/// read — an unknown answer must not turn a creating call into a refusal.
+/// Whether chrome-use is running this session right now: the daemon-free `session list`
+/// read. `false` when the list cannot be read — an unknown answer must not refuse.
 async fn session_running(path: &std::path::Path, name: &str) -> bool {
     match spawn_step(
         path,
@@ -3570,9 +3190,8 @@ async fn session_running(path: &std::path::Path, name: &str) -> bool {
     }
 }
 
-/// `session list` — the sessions this CLI created: name, keep mark, and how long
-/// since each was last used. The listing itself reads the local record only, never
-/// the browser.
+/// `session list` — the sessions this CLI created: name, keep mark, time since last use.
+/// Reads the local record only, never the browser.
 fn session_list() -> OutEnvelope {
     let rows = cli_sessions::list();
     let sessions: Vec<Value> = rows
@@ -3593,17 +3212,11 @@ fn session_list() -> OutEnvelope {
     )
 }
 
-/// `session status <name>` — opt-in liveness probe for a named session. A
-/// daemon-free `session list` preflight (never creates a session or spawns a
-/// daemon) reports a stopped session as `empty` (rc 0); a listed session is
-/// probed with a real bounded `get url`. Any timeout on that probe is wedge
-/// evidence (the probe reads the current URL, it never navigates), so it
-/// re-classifies as Environment (rc 2), says plainly that the session stopped
-/// answering, and names the recovery. This verb is a diagnostic and stops
-/// nothing; the paths that ACT on the browser — the action verbs and the watchdog
-/// — recover such a session themselves
-/// ([`recover_unresponsive_session`]), so its text also says the next action
-/// does it automatically. An honest non-wedge cause passes through unnamed.
+/// `session status <name>` — opt-in liveness probe: a daemon-free preflight reports a stopped
+/// session as `empty` (rc 0), a listed one is probed with a real bounded `get url`. A timeout
+/// there is wedge evidence, so it re-classifies as Environment (rc 2) and names the recovery.
+/// This verb stops nothing; the action verbs and the watchdog recover such a session
+/// themselves ([`recover_unresponsive_session`]).
 async fn session_status(name: &str) -> OutEnvelope {
     let target = resolve_session_target(name);
     // What the envelopes echo: the name the owner wrote, as `session list` shows it.
@@ -3612,15 +3225,12 @@ async fn session_status(name: &str) -> OutEnvelope {
         Ok(p) => p,
         Err(e) => return e,
     };
-    // A diagnostic is still a later call with the same name: it restarts the lifetime,
-    // and it must spawn the session's daemon with the same cleanup backstop its mark asks
-    // for. A session this CLI did not create is left to chrome-use's own defaults.
+    // A diagnostic is still a later call with the same name: it restarts the lifetime and
+    // spawns the daemon with the backstop its mark asks for. Foreign sessions are left alone.
     if let Some(kept) = cli_sessions::touch(&target) {
         set_group_cleanup_backstop(cli_sessions::backstop_ms(kept));
     }
-    // Both steps are the product's own probes — the probe exception: bounded by
-    // the product, with chrome-use's relay self-heal suppressed
-    // ([`StepClocks::probe`]).
+    // Both steps are the product's own probes ([`StepClocks::probe`]).
     let enumerate = StepClocks::probe(SESSION_LIST_TIMEOUT);
     let list = match spawn_step(&path, &["session", "list"], None, enumerate, None).await {
         Ok(resp) => resp,
@@ -3657,14 +3267,10 @@ async fn session_status(name: &str) -> OutEnvelope {
             )
         }
         Err(mut f) => {
-            // Any timeout on the probe is wedge evidence (it reads the
-            // current URL, it never navigates) — re-classify as Environment
-            // with chrome-use's own signature phrasing, exactly like its
-            // session-unresponsive classification. The probe deliberately does
-            // NOT auto-recover (it is the diagnostic an owner runs to see the
-            // state), so its text names the manual flow instead — the one place
-            // the automatic recovery never ran. Other failures pass through with
-            // their honest cause (not every failure is a wedge).
+            // Any timeout on the probe is wedge evidence (it reads the current URL, never
+            // navigates): re-classify as Environment with chrome-use's own phrasing. It does
+            // NOT auto-recover — it is the diagnostic — so its text names the manual flow.
+            // Other causes pass through.
             if f.kind == OutKind::Timeout {
                 f = StepFailure {
                     kind: OutKind::Environment,
@@ -3677,22 +3283,17 @@ async fn session_status(name: &str) -> OutEnvelope {
                     ),
                 };
             }
-            // A protected-namespace wedge needs `--force` to stop — make the
-            // recovery flow directly actionable for that edge. Only wedges
-            // get the note (an honest non-wedge cause must not carry stop
-            // guidance), and only protected ones (an ordinary session's stop
-            // needs no --force).
+            // A protected-namespace wedge needs `--force` to stop: make the recovery flow
+            // actionable for that edge. Only wedges, and only protected ones, get the note.
             append_protected_stop_note(&mut f.message, &target);
             f.envelope("session", json!({ "session": shown }), probe)
         }
     }
 }
 
-/// Append the protected-namespace `--force` note to a probe-failure message
-/// that reads as a session wedge on a protected (`agent-tab-*` /
-/// `link-enricher-*`) target: the recovery flow names
-/// `session stop <name>`, which is only actionable with `--force` here. Pure
-/// so tests pin both gates (protected membership, wedge-shaped message).
+/// Append the protected-namespace `--force` note to a message that reads as a wedge on a
+/// protected (`agent-tab-*` / `link-enricher-*`) target: the recovery flow's
+/// `session stop <name>` is only actionable with `--force` there. Pure, so tests pin both.
 fn append_protected_stop_note(message: &mut String, target: &str) {
     if PROTECTED_SESSION_PREFIXES
         .iter()
@@ -3707,11 +3308,9 @@ fn append_protected_stop_note(message: &mut String, target: &str) {
     }
 }
 
-/// Tolerance-first membership check over a `session list` envelope: only an
-/// explicit failure verdict rules the target out as a hard miss; a payload
-/// with no verdict key still gets its names extracted. Handles both chrome-use
-/// shapes — latest `{"ok":true,"sessions":[{"name":..},..]}` (the top-level
-/// `sessions` key lands in `extra`) and legacy `{"data":{"sessions":["name",..]}}`.
+/// Tolerance-first membership check over a `session list` envelope: only an explicit failure
+/// verdict rules the target out. Handles both shapes — latest
+/// `{"ok":true,"sessions":[{"name":..}]}` and legacy `{"data":{"sessions":["name"]}}`.
 fn session_listed(resp: &ChromeResponse, target: &str) -> bool {
     if resp.verdict() == Some(false) {
         return false;
@@ -3730,13 +3329,10 @@ fn session_listed(resp: &ChromeResponse, target: &str) -> bool {
     })
 }
 
-/// Best-effort close of an ephemeral session AFTER the action envelope is
-/// emitted — never changes the action's exit code; its diagnostics, including
-/// the report of a helper it leaves behind, go to stderr. A successful close
-/// forgets the session's record; a failed one leaves it for the lifetime sweep.
+/// Best-effort close of an ephemeral session AFTER the envelope — never changes the exit
+/// code; diagnostics go to stderr. A successful close forgets the record.
 async fn close_ephemeral(name: &str) {
-    // Every line below is read by a person, so the session is named the way its owner
-    // would name it, not by the record's own key.
+    // Every line here is read by a person, so the session is named as its owner would.
     let display = cli_sessions::display_name(name);
     let Some(path) = cli_path() else {
         eprintln!(
@@ -3744,9 +3340,8 @@ async fn close_ephemeral(name: &str) {
         );
         return;
     };
-    // A lifecycle close, not agent work: the shared product probe
-    // ([`run_cli_bounded_at`]) bounds it with its own product clock and suppresses
-    // the relay self-heal, exactly like the CLI's other probes.
+    // A lifecycle close, not agent work: [`run_cli_bounded_at`] bounds it with a product clock
+    // and suppresses the relay self-heal, like the CLI's other probes.
     match run_cli_bounded_at(
         &path,
         &["session", "stop", name],
@@ -3756,9 +3351,8 @@ async fn close_ephemeral(name: &str) {
     .await
     {
         CliRun::Output(out) => {
-            // A helper the close itself leaves holding the call's output channel
-            // is recorded here for the caller ([`run_cli`]) to report — the
-            // action envelope went out before this ran, so it cannot carry it.
+            // A helper the close leaves holding the call's channel is recorded for [`run_cli`] to
+            // report: the action envelope went out before this ran.
             CHROME_USE_LEFTOVER_PIPES.fetch_or(out.leftover_pipes, Ordering::Relaxed);
             if out.status.success() {
                 cli_sessions::forget(name);
@@ -3777,8 +3371,6 @@ async fn close_ephemeral(name: &str) {
     }
 }
 
-// ── Tests ────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3791,14 +3383,13 @@ mod tests {
         s.iter().copied().map(String::from).collect()
     }
 
-    /// [`parse_invocation`] for a test that only cares about the action (the keep
-    /// request has its own test).
+    /// [`parse_invocation`] for a test that only cares about the action.
     fn parse_action(args: &[String]) -> Result<Invocation, String> {
         parse_invocation(args).map(|(invocation, _)| invocation)
     }
 
-    /// The rows `help` prints under `Flags:` — `(spelling, description)`, in order.
-    /// An action whose help has no flags block yields no rows.
+    /// The rows `help` prints under `Flags:` — `(spelling, description)`, in order. An
+    /// action whose help has no flags block yields no rows.
     fn printed_flag_rows(help: &str) -> Vec<(&str, &str)> {
         let Some((_, tail)) = help.split_once("\nFlags:\n") else {
             return Vec::new();
@@ -3829,8 +3420,7 @@ mod tests {
         (t.starts_with('-') && !name.is_empty()).then_some(name)
     }
 
-    /// The `Usage:` line of a rendered action help, without its
-    /// `mahbot chrome <action>` prefix.
+    /// The `Usage:` line of a rendered action help, without its `mahbot chrome <action>`.
     fn printed_usage(help: &str) -> String {
         let line = help
             .split_once("\nUsage:\n")
@@ -3885,10 +3475,8 @@ mod tests {
         out
     }
 
-    /// The action words the top-level help advertises, in printed order.
-    ///
-    /// An action's line is indented two spaces; its purpose line, four more, so
-    /// only the shallower lines name actions.
+    /// The action words the top-level help advertises, in printed order: an action's line is
+    /// indented two spaces, its purpose line four more, so only the shallower lines count.
     fn advertised_actions(help: &str) -> Vec<String> {
         let Some((_, tail)) = help.split_once("\nActions:\n") else {
             return Vec::new();
@@ -3903,9 +3491,8 @@ mod tests {
             .collect()
     }
 
-    /// The session-wide pair — handled outside the common flag path
-    /// (`extract_global_flags`), so it has its own guard below rather than a shape
-    /// probe.
+    /// The session-wide pair — handled outside the common flag path (`extract_global_flags`),
+    /// so it has its own guard rather than a shape probe.
     const SESSION_PAIR: [&str; 2] = ["session", "keep"];
 
     #[test]
@@ -3980,12 +3567,10 @@ mod tests {
         }
     }
 
-    /// The alphabet is chrome-use's own for `session stop`
-    /// (`validation::is_valid_session_name`: alphanumerics, '-' and '_'). A name
-    /// with a '.' parses and opens fine, but chrome-use then refuses to stop it,
-    /// so the session's daemon and tabs stay behind and neither the hand recipe
-    /// nor the automatic recovery can clear it — the name has to be refused here,
-    /// where the caller can still choose another one.
+    /// The alphabet is chrome-use's own for `session stop` (`is_valid_session_name`:
+    /// alphanumerics, '-' and '_'). A name with a '.' parses and opens fine, but chrome-use then
+    /// refuses to stop it, leaving a session nothing can clear — refused here, where the caller
+    /// can still choose another.
     #[test]
     fn session_names_stay_within_the_alphabet_chrome_use_can_stop() {
         for name in ["qa-2933", "qa_2933", "Qa2933"] {
@@ -4014,16 +3599,13 @@ mod tests {
 
     #[test]
     fn step_clocks_ride_the_kill_above_the_clock_they_declare() {
-        // The arithmetic has one home ([`crate::chrome::clocks`] /
-        // [`crate::chrome::kill_bound`], pinned there); these assertions are about
-        // which shape the CLI takes, so they derive their expectations from it
-        // rather than repeating its literals.
+        // The arithmetic has one home ([`crate::chrome::clocks`] / [`crate::chrome::kill_bound`]);
+        // these assertions are about which shape the CLI takes, derived from it.
         let chrome_own = clocks(None, CliRecovery::Allowed);
 
-        // The operation's own step (`open`'s navigation): chrome-use runs it to
-        // its own client tolerance, and the operation's budget does NOT bound
-        // the kill — a navigation chrome-use is still working on must be free to
-        // report its own reason.
+        // The operation's own step (`open`'s navigation): chrome-use runs it to its own client
+        // tolerance, and the operation's budget does NOT bound the kill, so a navigation still in
+        // progress can report its own reason.
         let navigation = StepClocks::operation();
         assert_eq!(navigation.call.chrome_side, CHROME_USE_DECLARED_BUDGET);
         assert_eq!(
@@ -4031,22 +3613,17 @@ mod tests {
             kill_bound(CHROME_USE_DECLARED_BUDGET, CliRecovery::Allowed)
         );
 
-        // A verb chrome-use accepts no `--timeout` for: with no user bound the kill
-        // is the one the declared clock derives, and a user bound IS the bound the
-        // call really runs to — the parse refuses anything below the declared clock
-        // (pinned at that layer), so the kill is never shorter than the declaration.
+        // A verb chrome-use accepts no `--timeout` for: with no user bound the kill is the one the
+        // declared clock derives, and a user bound IS the bound the call runs to.
         let no_bound = StepClocks::tool_clock(None);
         assert_eq!(no_bound.call.chrome_side, CHROME_USE_DECLARED_BUDGET);
         assert_eq!(no_bound.call.kill, chrome_own.kill);
         let at_the_clock = StepClocks::tool_clock(Some(CHROME_USE_DECLARED_BUDGET));
         assert_eq!(at_the_clock.call.kill, chrome_own.kill);
 
-        // A LONGER one (`eval --timeout 300`) is a bound the product must really
-        // let the call run to, so it widens the kill — and the kill alone: the
-        // clock DECLARED to chrome-use stays one kill margin under its own client
-        // tolerance, which nothing can raise without making chrome-use fail as a
-        // wedged session. The product's own kill is what the envelope reports as
-        // `timeout_ms`.
+        // A LONGER one (`eval --timeout 300`) widens the kill alone: the clock DECLARED to
+        // chrome-use stays under its own tolerance, which nothing can raise without making it fail
+        // as a wedged session. The product's kill is what the envelope reports as `timeout_ms`.
         let wide = StepClocks::tool_clock(Some(Duration::from_secs(300)));
         assert_eq!(wide.call.chrome_side, CHROME_USE_DECLARED_BUDGET);
         assert_eq!(
@@ -4068,17 +3645,16 @@ mod tests {
             env.payload["error"]
         );
 
-        // A bounded step of the operation: a probe in everything but name — it
-        // suppresses the relay self-heal and its kill rests [`KILL_SLACK`] above
-        // the product's own bound, never chrome-use's clock.
+        // A bounded step of the operation: a probe in everything but name — it suppresses
+        // the relay self-heal and its kill rests [`KILL_SLACK`] above the product's bound.
         let probe = StepClocks::bounded(CHROME_USE_DECLARED_BUDGET, Duration::from_secs(2));
         assert_eq!(probe.call.kill, Duration::from_secs(2) + KILL_SLACK);
         assert!(matches!(probe.recovery, CliRecovery::Suppressed));
         let settle = StepClocks::bounded(Duration::from_secs(6), Duration::from_secs(6));
         assert_eq!(settle.call.chrome_side, Duration::from_secs(6));
         assert_eq!(settle.call.kill, Duration::from_secs(6) + KILL_SLACK);
-        // A bound above chrome-use's own clock is still the PRODUCT's bound: the
-        // step is cut off at it, not at chrome-use's clock.
+        // A bound above chrome-use's own clock is still the PRODUCT's bound: the step is
+        // cut off at it.
         let oversized = StepClocks::bounded(CHROME_USE_DECLARED_BUDGET, Duration::from_secs(600));
         assert_eq!(oversized.call.kill, Duration::from_secs(600) + KILL_SLACK);
         assert!(oversized.call.kill > chrome_own.kill);
@@ -4124,8 +3700,7 @@ mod tests {
 
     #[test]
     fn resolve_session_target_resolves_namespaces() {
-        // A bare name is prefixed like `--session`; both namespace names pass
-        // through as-is (status may probe protected sessions read-only).
+        // A bare name is prefixed like `--session`; both namespace names pass through as-is.
         assert_eq!(resolve_session_target("docs"), "mahbot-chrome-docs");
         assert_eq!(
             resolve_session_target("mahbot-chrome-foo"),
@@ -4165,8 +3740,7 @@ mod tests {
                 "case {case}: --session is not a session subcommand's flag"
             );
 
-            // `--force` is `stop`'s flag alone (the declaration the parser reads): the other
-            // subcommands accept no flags.
+            // `--force` is `stop`'s flag alone: the other subcommands accept no flags.
             let allowed: Vec<&CliFlag> = declared_flags("session").iter().collect();
             let err = parse_session(
                 &["status".into(), "docs".into(), "--force".into()],
@@ -4199,8 +3773,7 @@ mod tests {
 
         {
             let case = "session listed handles both shapes";
-            // Latest shape: the top-level `sessions` array of objects (lands in
-            // `extra`), listed by name.
+            // Latest shape: the top-level `sessions` array of objects (lands in `extra`).
             let latest: ChromeResponse = serde_json::from_value(json!({
                 "ok": true, "sessions": [{ "name": "mahbot-chrome-docs" }]
             }))
@@ -4253,9 +3826,8 @@ mod tests {
                 json!({ "url": "https://x", "error": error }),
             )
         };
-        // chrome-use's own session-unresponsive classification (Environment) is
-        // the one wedge signal that needs no confirmation: chrome-use diagnosed
-        // it rather than being cut off.
+        // chrome-use's own session-unresponsive classification (Environment) is the one
+        // wedge signal needing no confirmation: chrome-use diagnosed it, not cut off.
         let diagnosed = env(
             OutKind::Environment,
             "session unresponsive: no response within 45s",
@@ -4267,20 +3839,17 @@ mod tests {
         );
         assert_eq!(wedge_action(&cdp, true, false), WedgeAction::Recover);
 
-        // A Timeout chrome-use itself reported — what a failed `expect` /
-        // `open --expect` / `wait` produces normally — is NOT a wedge: stopping
-        // that session would only lose its tabs.
+        // A Timeout chrome-use itself reported — what a failed `expect`/`wait` produces
+        // normally — is NOT a wedge: stopping that session would only lose its tabs.
         let verdict = env(OutKind::Timeout, "Wait timed out after 15000ms");
         assert_eq!(wedge_action(&verdict, true, false), WedgeAction::Leave);
 
-        // A Timeout the PRODUCT's own clock ended is only a candidate: chrome-use
-        // was cut off before it could classify anything, so the session's
-        // liveness is unknown and the bounded probe has to confirm it.
+        // A Timeout the PRODUCT's own clock ended is only a candidate: chrome-use was cut
+        // off before classifying, so the bounded probe has to confirm it.
         let killed = env(OutKind::Timeout, "deadline reached after 92000ms");
         assert_eq!(wedge_action(&killed, true, true), WedgeAction::Probe);
 
-        // `open --expect --structural` labels a deadline expiration Redesign
-        // instead of Timeout, so a product-clock ending keys the same way.
+        // `open --expect --structural` labels a deadline expiration Redesign, so it keys the same.
         let redesign = env(
             OutKind::Redesign,
             "possible DOM redesign or structural change",
@@ -4288,8 +3857,7 @@ mod tests {
         assert_eq!(wedge_action(&redesign, true, true), WedgeAction::Probe);
         assert_eq!(wedge_action(&redesign, true, false), WedgeAction::Leave);
 
-        // Other kinds and other Environment messages are no evidence either, and
-        // an ephemeral (unnamed for recovery) session is never touched.
+        // Other kinds and messages are no evidence, and an ephemeral session is never touched.
         let relay = env(OutKind::Environment, "relay isn't connected");
         assert_eq!(wedge_action(&relay, true, true), WedgeAction::Leave);
         let missing = env(OutKind::Error, "element not found");
@@ -4299,9 +3867,8 @@ mod tests {
         assert_eq!(wedge_action(&killed, false, true), WedgeAction::Leave);
     }
 
-    /// The end of the keying: an envelope the action left for
-    /// [`WedgeAction::Leave`] reaches the caller untouched — no session stop, no
-    /// annotation.
+    /// The end of the keying: an envelope left for [`WedgeAction::Leave`] reaches the caller
+    /// untouched — no session stop, no annotation.
     #[tokio::test]
     async fn wedge_recovery_leaves_a_normal_timeout_alone() {
         let failure =
@@ -4315,27 +3882,21 @@ mod tests {
         assert_eq!(env.payload["error"], "condition not met");
     }
 
-    /// The spawn-level classification, case by case: the envelope decides over the
-    /// exit code (a failed expect assertion arrives as `success:true` with exit 1
-    /// and its verdict in `data`), a browser chrome-use launched itself is never a
-    /// success, an unparseable or truncated answer names itself, and the canned
+    /// The spawn-level classification, case by case: the envelope decides over the exit code (a
+    /// failed expect assertion arrives as `success:true` with exit 1), a browser chrome-use
+    /// launched itself is never a success, an unparseable answer names itself, and the canned
     /// stale-relay hint is stripped from Timeout-classified text only.
     #[expect(clippy::too_many_lines)]
     #[test]
     fn classify_step_output_decides_from_the_envelope_and_sanitises() {
-        /// What a case's outcome must be.
         enum Want {
-            /// Any success.
             Ok,
-            /// The expect verdict read back out of the returned data.
             Verdict {
                 pass: bool,
                 timed_out: bool,
                 actual: Option<Value>,
             },
-            /// A failure with this kind and message.
             Fail(OutKind, String),
-            /// A failure of this kind, whatever its message.
             FailKind(OutKind),
         }
 
@@ -4376,8 +3937,7 @@ mod tests {
                 },
             },
             Case {
-                // …but only for expect: the same payload on another action is a
-                // generic failure (fallback message, no envelope error).
+                // …but only for expect: the same payload elsewhere is a generic failure.
                 name: "same_payload_outside_expect_is_a_generic_failure",
                 expect_style: false,
                 truncated: false,
@@ -4460,9 +4020,8 @@ mod tests {
                 want: Want::Fail(OutKind::Timeout, "Wait timed out after 15000ms".into()),
             },
             Case {
-                // A non-timeout envelope carrying the hint keeps it verbatim (kind
-                // Error, not stripped — only Timeout-classified messages are
-                // rewritten).
+                // A non-timeout envelope carrying the hint keeps it verbatim (only
+                // Timeout-classified messages are rewritten).
                 name: "non_timeout_envelope_keeps_the_hint",
                 expect_style: false,
                 truncated: false,
@@ -4487,10 +4046,8 @@ mod tests {
                 want: Want::Fail(OutKind::Timeout, "Wait timed out after 15000ms".into()),
             },
             Case {
-                // A successful envelope carrying chrome-use's browser-replacement
-                // note is a failure, never a quiet success — and it is
-                // deliberately NOT the daemon-down path (the daemon is fine; the
-                // connection to the real browser was lost).
+                // A successful envelope carrying the browser-replacement note is a failure, never
+                // a quiet success — and NOT the daemon-down path (the daemon itself is fine).
                 name: "self_launched_browser_note_is_an_environment_failure",
                 expect_style: false,
                 truncated: false,
@@ -4504,8 +4061,8 @@ mod tests {
                 ),
             },
             Case {
-                // The expect-style success path (envelope trusted over a non-zero
-                // exit) applies the same rule.
+                // The expect-style success path (envelope over a non-zero exit) applies the same
+                // rule.
                 name: "self_launched_browser_note_fails_the_expect_style_path",
                 expect_style: true,
                 truncated: false,
@@ -4518,8 +4075,7 @@ mod tests {
                 want: Want::FailKind(OutKind::Environment),
             },
             Case {
-                // A degraded-success warning is NOT browser replacement: the step
-                // still succeeds and the action-specific envelope judges it.
+                // A degraded-success warning is NOT browser replacement: the step still succeeds.
                 name: "degraded_success_warning_stays_a_success",
                 expect_style: false,
                 truncated: false,
@@ -4554,8 +4110,7 @@ mod tests {
                 want: Want::Fail(OutKind::Error, "chrome-use returned non-JSON output".into()),
             },
             Case {
-                // A non-zero exit with an unparsed, truncated answer names the
-                // truncation too, instead of the stderr fallback.
+                // A non-zero exit with an unparsed, truncated answer names the truncation too.
                 name: "truncated_answer_beats_the_stderr_fallback",
                 expect_style: false,
                 truncated: true,
@@ -4628,9 +4183,8 @@ mod tests {
 
     #[test]
     fn step_failure_envelope_reports_timeout_vs_error() {
-        // A declared (forwarded) deadline kill: the envelope reports the
-        // product's own bound for the step (its kill) as `timeout_ms`, and the
-        // error names that bound and the clock chrome-use was working to.
+        // A declared (forwarded) deadline kill: the envelope reports the product's own bound as
+        // `timeout_ms`, and the error names that bound and the clock chrome-use worked to.
         let clocks = StepClocks::forwarded(Duration::from_secs(10));
         let env = StepFailure {
             kind: OutKind::Timeout,
@@ -4665,8 +4219,7 @@ mod tests {
         assert_eq!(env.payload["error_code"], "ERR_NAME_NOT_RESOLVED");
         assert!(env.payload.get("timeout_ms").is_none());
 
-        // A Network failure with no recognizable net error token gets no
-        // error_code.
+        // A Network failure with no recognizable net error token gets no error_code.
         let env = StepFailure {
             kind: OutKind::Network,
             message: "connection refused by peer".into(),
@@ -4744,20 +4297,13 @@ mod tests {
         assert!(env.payload.get("actual").is_none());
     }
 
-    /// The `--timeout` of a verb that DECLARES its value to chrome-use
-    /// (`wait`/`expect`, and `open` through its `--expect` wait) is capped below
-    /// chrome-use's own client tolerance ([`CHROME_USE_OWN_BUDGET`]). A deadline at
-    /// or above the tolerance makes chrome-use run OUT of tolerance instead of
-    /// answering, so its session-unresponsive classification — which stops the
-    /// session and loses its open tabs — replaces the honest "condition was not
-    /// met". The rule is enforced at parse time: a too-long deadline is refused with
-    /// a usage error instead of accepted and then silently mis-reported.
-    ///
-    /// A verb that forwards nothing is refused the OTHER way: chrome-use takes no
-    /// per-call deadline for it, so nothing can honour a bound below the clock
-    /// mahbot declares to chrome-use — such a request is refused rather than
-    /// accepted and discarded, while a bound at or above it (`eval --timeout 300`)
-    /// is one the call really runs to.
+    /// The `--timeout` of a verb that DECLARES its value to chrome-use (`wait`/`expect`, and
+    /// `open` through its `--expect` wait) is capped below [`CHROME_USE_OWN_BUDGET`]: at or above
+    /// the tolerance chrome-use runs OUT of tolerance instead of answering, so its
+    /// session-unresponsive classification — which stops the session and loses its tabs —
+    /// replaces the honest "condition was not met". Refused at parse time, not silently
+    /// mis-reported. A verb forwarding nothing is refused the OTHER way: nothing can honour a
+    /// bound below the declared clock, while a bound at or above it is one the call really runs to.
     #[test]
     fn timeout_flag_is_capped_below_chrome_use_client_tolerance() {
         let err = parse_action(&["wait".into(), "#x".into(), "--timeout".into(), "45".into()])
@@ -4782,17 +4328,15 @@ mod tests {
             let err = parse_action(&argv)
                 .err()
                 .unwrap_or_else(|| panic!("{argv:?} must refuse a deadline at the tolerance"));
-            // The tolerance refusal itself, not another rejection of the line: it
-            // names both the value asked for and the tolerance it crossed.
+            // The tolerance refusal itself: it names the value asked for and the tolerance crossed.
             assert!(
                 err.contains("45") && err.contains("client tolerance"),
                 "{argv:?} must be refused on the value: {err}"
             );
         }
 
-        // A verb chrome-use takes no per-call deadline for: a bound below the clock
-        // mahbot declares to chrome-use cannot be honoured, so it is refused — with
-        // the value the caller asked for and the shortest one that IS honoured.
+        // A bound below the clock mahbot declares cannot be honoured: it is refused, with the value
+        // asked for and the shortest one that IS honoured.
         let declared = CHROME_USE_DECLARED_BUDGET.as_secs().to_string();
         for action in [
             &["count".into(), ".x".into()][..],
@@ -4917,8 +4461,7 @@ mod tests {
     /// verbatim text, even one that names a flag.
     #[test]
     fn parse_dash_separator_takes_text_verbatim() {
-        // Post-`--` tokens are verbatim text, never scanned for `--session` by
-        // either layer.
+        // Post-`--` tokens are verbatim text, never scanned for `--session` by either layer.
         let after_dash = argv(&["fill", "#q", "--", "--session", "sneaky", "rest"]);
         let (session, _, remaining) =
             extract_global_flags(&after_dash).expect("the terminator parses");
@@ -4945,8 +4488,7 @@ mod tests {
         }
     }
 
-    /// Single-dash text is accepted naturally in fill/type (they have no
-    /// single-dash flags, so any `-token` is literal text), while other
+    /// Single-dash text is accepted in fill/type (they have no single-dash flags), while other
     /// actions keep rejecting it as an unknown flag.
     #[test]
     fn fill_type_accept_single_dash_text() {
@@ -4996,8 +4538,7 @@ mod tests {
         );
     }
 
-    /// The resolved session lands as a top-level stdout field, under the name a person
-    /// reads (the record's namespace prefix is not part of it).
+    /// The resolved session lands as a top-level field, under the name a person reads.
     #[test]
     fn surface_session_adds_top_level_field() {
         let mut env = out_env("fill", true, OutKind::Ok, json!({ "selector": "#q" }));
@@ -5012,8 +4553,7 @@ mod tests {
         assert_eq!(wire["kind"], json!("ok"), "the payload stays flattened");
     }
 
-    /// A text input's read-back and key-listener notes are expected; a warning
-    /// in the data or at the top level makes the envelope an error.
+    /// Read-back and key-listener notes are expected; a `warning` makes the envelope an error.
     #[test]
     fn a_text_input_envelope_is_ok_unless_a_warning_says_otherwise() {
         {
@@ -5040,10 +4580,9 @@ mod tests {
 
         {
             let case = "text input ok envelope read back and key listeners without warning are ok";
-            // chrome-use emits `readBack` on EVERY readable `type` success and
-            // `keyListeners` on every listener-dependent `press` — they are not the
-            // degraded signal. Without chrome-use's `warning` field these are clean
-            // successes (rc 0).
+            // chrome-use emits `readBack` on EVERY readable `type` success and `keyListeners`
+            // on every listener-dependent `press` — not the degraded signal. Without its
+            // `warning` field these are clean successes (rc 0).
             let typed = ChromeResponse {
                 success: Some(true),
                 data: Some(json!({ "typed": "hi", "readBack": "hi" })),
@@ -5290,8 +4829,7 @@ mod tests {
                 .1
         );
         // The mark is not offered to the report/repair verbs: they refuse `--session`
-        // outright, and a bare `--keep` on one is refused for the action itself rather
-        // than told to pass a flag the action forbids.
+        // outright, and a bare `--keep` on one is refused for the action itself.
         assert!(parse_invocation(&argv(&["--keep", "--session", "docs", "status"])).is_err());
         let err = parse_invocation(&argv(&["--keep", "status"]))
             .err()
@@ -5352,9 +4890,9 @@ mod tests {
                 if SESSION_PAIR.contains(&name) {
                     continue; // its own guard: it never reaches the common flag path
                 }
-                // The printed placeholder is the shape a reader is promised; the
-                // declaration's `takes_value` must agree with it, and the parser must
-                // enforce that shape through its own shape error alone.
+                // The printed placeholder is the shape a reader is promised; the declaration's
+                // `takes_value` must agree with it, and the parser enforce that shape through
+                // its own shape error alone.
                 let printed_takes_value = spelling
                     .split_whitespace()
                     .nth(1)
@@ -5404,8 +4942,7 @@ mod tests {
                 "{}: the pair is printed as a pair",
                 d.name
             );
-            // A documented example is a valid invocation, so it proves acceptance
-            // without this guard inventing positionals of its own.
+            // A documented example is a valid invocation, so it proves acceptance.
             let example = printed_examples(&help).first().map_or_else(
                 || panic!("{}: no documented example to probe the pair with", d.name),
                 |example| shell_words(example),
@@ -5471,8 +5008,8 @@ mod tests {
                 let (invocation, _) = parse_invocation(&words[2..]).unwrap_or_else(|err| {
                     panic!("{}: documented example refuses: {example}: {err}", d.name)
                 });
-                // The parsed action's name is also the declaration key the
-                // session-wide decision and the envelope read.
+                // The parsed action's name is also the declaration key the session-wide decision
+                // reads.
                 assert_eq!(
                     invocation.action.name(),
                     d.name,
@@ -5517,8 +5054,8 @@ mod tests {
                 }
             }
         }
-        // Description prose is deliberately NOT scanned; `session`'s and `wait`'s
-        // details mention flags of other actions or of none, and this guard passes.
+        // Description prose is deliberately NOT scanned; `session`'s and `wait`'s details mention
+        // other actions' flags and this guard passes.
         assert!(
             seen > 0,
             "the guard must have seen flags in usage lines and examples"
@@ -5554,8 +5091,7 @@ mod tests {
         assert_eq!(action_help_request(&argv(&["snapshot", "-h"])), None);
         assert_eq!(action_help_request(&argv(&["frobnicate", "-h"])), None);
         assert_eq!(action_help_request(&argv(&["--timeout", "5"])), None);
-        // A `--` after the action word ends help lookup: what follows it is text,
-        // while the unshielded form stays help.
+        // A `--` after the action word ends help lookup: what follows it is text.
         assert_eq!(
             action_help_request(&argv(&["type", "#q", "-h"])),
             Some("type")

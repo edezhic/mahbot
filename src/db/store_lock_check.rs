@@ -1,48 +1,24 @@
-//! Cross-process verification of the store locks: that the running service holds
-//! them, and that it refuses to run without them.
-//!
-//! The engine's whole-file record locks belong to the process that takes them,
-//! so no process can observe its own — only a foreign client can (wal_guard's
-//! lock rule). [`verify`] therefore boots the real stores, drives the real paths
-//! that used to lose the lock (the periodic inspection round and the
-//! engine-produced pre-reindex snapshot), and then has a stock `sqlite3` read and
-//! write both live stores' main files: both must be refused as locked, and the
-//! store directory's metadata fingerprint must be unchanged. That refusal is the
-//! whole-file lock on the MAIN file, which a client's own byte-range lock
-//! conflicts with — a lock left only on a `-wal` would not show up this way.
-//!
-//! The pre-shrink gate ([`crate::db::shrink_gate::shrink_allowed`]) is another
-//! path that must not cost the lock: [`verify`] runs it on every live store,
-//! through the store's own maintenance connection — the connection the periodic
-//! round uses — and requires it to allow the shrink; the foreign probes that
-//! follow then prove the lock survived both that connection's creation and its
-//! probe.
-//!
-//! [`tests::a_store_held_by_another_process_refuses_the_boot`] covers the other
-//! half: while a foreign process holds a store's lock, the daemon's bring-up must
-//! refuse — recorded on the boot-diagnostic channel — rather than open what it
-//! cannot lock.
-//!
-//! [`tests::an_unusable_store_file_refuses_the_boot`] and
-//! [`tests::both_unusable_stores_are_named_in_the_durable_record`] cover the
-//! sibling rule: a store file that exists but is not usable refuses the boot
-//! before either store is opened, leaving both stores untouched and recording a
-//! refusal that names every unusable store.
-//!
-//! [`tests::an_unreadable_store_file_refuses_the_boot_as_an_environment_cause`]
-//! adds the environment-caused half of that rule with a real permission failure:
-//! the refusal is recorded as an environment condition, never as damage (skipped
-//! when the test runs as root, where mode 000 denies nothing).
-//!
-//! Unix-only. Driven by this module's own test drivers, which re-execute this test
-//! binary as the second process.
-//!
-//! The foreign probes need the stock `sqlite3` CLI and are skipped without it,
-//! which the evidence line then says in place of their results: the project's
-//! test run must never depend on a tool that may be absent from the machine
-//! running it. The boot bring-up, the paths above and the fingerprint run either
-//! way — only the foreign-client observation is left to a machine that has the
-//! CLI (see [`crate::db::test_support::sqlite3_available`]).
+//! Cross-process verification of the store locks: that the running service holds them, and that it
+//! refuses to run without them. The engine's whole-file record locks belong to the taking process,
+//! so only a foreign client can observe one (wal_guard's lock rule). [`verify`] boots the real
+//! stores, drives the real paths that used to lose the lock (the periodic inspection round and the
+//! engine-produced pre-reindex snapshot), then has a stock `sqlite3` read and write both stores'
+//! main files: both must be refused as locked and the store directory's metadata fingerprint must
+//! be unchanged. That refusal is the whole-file lock on the MAIN file — a lock left only on a
+//! `-wal` would not show up. The pre-shrink gate ([`crate::db::shrink_gate::shrink_allowed`]) is
+//! another path that must not cost the lock: [`verify`] runs it on every live store through the
+//! store's own maintenance connection and requires it to allow the shrink, after which the foreign
+//! probes prove the lock survived that connection's creation and probe.
+//! [`tests::a_store_held_by_another_process_refuses_the_boot`] covers the other half: while a
+//! foreign process holds a store's lock, bring-up must refuse — recorded on the boot-diagnostic
+//! channel — rather than open what it cannot lock. Its siblings cover a store file that exists but
+//! is unusable (refused before either store is opened, both left untouched, every unusable store
+//! named in the durable record) and the environment-caused variant: a real permission failure is
+//! recorded as an environment condition, never as damage (skipped as root, where mode 000 denies
+//! nothing). Unix-only, driven by this module's own test drivers, which re-execute the test binary
+//! as the second process. The foreign probes need the stock `sqlite3` CLI and are skipped without
+//! it (the evidence line says so in place of their results): the project's test run must never
+//! depend on a tool that may be absent.
 
 use std::path::Path;
 use std::process::Command;
@@ -51,19 +27,17 @@ use anyhow::{Context, Result, ensure};
 
 use crate::db::test_support::{PROBES, probe_store, sqlite3_available};
 
-/// Boot the real stores, exercise the real inspection/snapshot paths, then
-/// prove from a foreign process that every store is locked. Returns the
-/// evidence lines on success.
+/// Boot the real stores, exercise the real inspection/snapshot paths, then prove from a foreign
+/// process that every store is locked. Returns the evidence lines on success.
 async fn verify() -> Result<String> {
     crate::config::load_or_init().await?;
     let root = crate::config::CONFIG
         .try_storage_root()
         .context("verify: config::load_or_init() did not set the storage root")?;
-    // This check boots real stores — it migrates them and may quarantine family
-    // files — so it must only ever be pointed at a fresh hermetic root. The `db`
-    // directory is created by the first store open and by nothing else, so its
-    // existence is what makes a root someone's install: refuse it rather than
-    // touch it (path-based stats, like everything else here).
+    // This check boots real stores — migrating them and possibly quarantining family files — so
+    // it must only be pointed at a fresh hermetic root. The `db` directory is created by the
+    // first store open and nothing else, so its existence marks someone's install: refuse
+    // rather than touch it.
     let store_dir = super::store_dir(&root);
     ensure!(
         !store_dir.exists(),
@@ -71,14 +45,13 @@ async fn verify() -> Result<String> {
          root it is given and must be pointed at a fresh hermetic $HOME",
         store_dir.display(),
     );
-    // The daemon's own store bring-up, driven verbatim (see `boot::open_stores`)
-    // so a future boot-order change cannot silently weaken this check.
+    // The daemon's own bring-up, driven verbatim (see `boot::open_stores`) so a boot-order
+    // change cannot silently weaken this check.
     crate::boot::open_stores().await?;
 
-    // The real snapshot path, with the live consolidated connection. It is here
-    // to exercise the path (the probe below is what catches a regression): a
-    // reintroduced in-process open would still let this succeed, it would just
-    // cost the lock.
+    // The real snapshot path on the live consolidated connection, here to exercise the path
+    // (the probe below catches a regression): a reintroduced in-process open would still
+    // succeed, it would just cost the lock.
     let conn = super::DOMAIN_CONN
         .get()
         .context("the consolidated store connection is not initialized")?;
@@ -88,28 +61,22 @@ async fn verify() -> Result<String> {
     )
     .await?;
 
-    // Let the boot's background work settle: the log writer flushes on a 500 ms
-    // timer and the CDC drainer polls, so the probes then read a store nothing
-    // is writing to.
+    // Let background work settle: the log writer flushes on a 500 ms timer and the CDC drainer
+    // polls, so the probes read a store nothing is writing.
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
-    // The real inspection round — the other path that historically dropped the
-    // lock — runs last on purpose: it folds the settled WAL into the main files
-    // immediately before the read-only gate probe and the fingerprint below, so
-    // the engine's own auto-checkpoint cannot move a store inside the probe
-    // window. Repeated, because the rounds are not identical: the first folds a
-    // settled WAL and the later ones inspect the already-folded state.
+    // The real inspection round — the other path that historically dropped the lock — runs last
+    // on purpose: it folds the settled WAL immediately before the gate probe and fingerprint,
+    // so the engine's auto-checkpoint cannot move a store inside the probe window. Repeated
+    // because the rounds differ: the first folds a settled WAL, later ones inspect the folded
+    // state.
     for _ in 0..3 {
         crate::db::checkpoint::periodic_checkpoint_and_verify().await;
     }
 
-    // The pre-shrink gate is another path that must not cost the store's lock:
-    // it is a stat-only probe plus one pragma in the product. It runs through
-    // the very connection the periodic round uses — the store's maintenance
-    // connection, opened from the live store — so this proves the lock survives
-    // that connection's creation and its probe. Run it against every live store
-    // and require it to allow the shrink on a healthy store — the fingerprint
-    // and foreign probes below then prove it kept the lock.
+    // The pre-shrink gate must not cost the lock either (a stat-only probe plus one pragma in
+    // the product). It runs through the store's own maintenance connection, so this proves the
+    // lock survives that connection's creation and probe.
     let mut gated = Vec::new();
     for (name, store_conn) in super::iter_checkpoint_stores() {
         let Some(store_conn) = store_conn else {
@@ -155,8 +122,7 @@ async fn verify() -> Result<String> {
     ))
 }
 
-/// One store-directory entry as the check sees it: the name of every entry, plus
-/// size and mtime for the store's MAIN files.
+/// One store-directory entry: the name of every entry, plus size and mtime for the MAIN files.
 #[derive(Debug, PartialEq)]
 struct EntryFingerprint {
     name: String,
@@ -164,14 +130,10 @@ struct EntryFingerprint {
     mtime: Option<std::time::SystemTime>,
 }
 
-/// Path-based fingerprint of a store directory (see [`EntryFingerprint`]).
-///
-/// Metadata only — this must never open a store file, because opening and
-/// closing one is exactly the regression the check exists to catch. Sidecars
-/// carry no size/mtime, so the service's own `-wal` writes (its log writer
-/// flushes on a 500 ms timer) cannot look like a foreign write; a foreign client
-/// is caught by the name set (it creates sidecars of its own) and by the main
-/// files' size+mtime, which move only when a store could actually be written.
+/// Path-based fingerprint of a store directory, metadata only — it must never open a store file,
+/// since opening and closing one is exactly the regression the check exists to catch. Sidecars
+/// carry no size/mtime, so the service's own `-wal` writes cannot look like a foreign write; a
+/// foreign client is caught by the name set and by the main files' size+mtime.
 fn dir_fingerprint(dir: &Path) -> Result<Vec<EntryFingerprint>> {
     let mut fingerprint = Vec::new();
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
@@ -197,24 +159,22 @@ mod tests {
     use super::*;
     use crate::util::UnwrapPoison;
 
-    /// Marker for the spawned child: it runs the check instead of the suite's
-    /// tests. Set only by the driver below.
+    /// Marker for the spawned child: it runs the check instead of the suite's tests.
     const CHILD_ENV: &str = "MAHBOT_STORE_LOCK_CHECK_CHILD";
 
-    /// Child mode for [`a_store_held_by_another_process_refuses_the_boot`]: boots
-    /// the daemon's store bring-up against the `HOME` the driver prepared.
+    /// Child mode for [`a_store_held_by_another_process_refuses_the_boot`]: boots the store
+    /// bring-up against the `HOME` the driver prepared.
     const BOOT_CHILD_ENV: &str = "MAHBOT_STORE_BOOT_CHILD";
 
-    /// A command for one of the child modes, with `HOME` pointed at the hermetic
-    /// root the driver prepared.
+    /// A command for one of the child modes, with `HOME` at the hermetic root the driver prepared.
     fn child(home: &tempfile::TempDir) -> Command {
         let mut command = Command::new(std::env::current_exe().expect("test binary path"));
         command.env("HOME", home.path());
         command
     }
 
-    /// Run the daemon's store bring-up in a child: creates the stores on a fresh
-    /// root, and must refuse a root whose store another process holds.
+    /// Run the store bring-up in a child: creates the stores on a fresh root, and must refuse a
+    /// root whose store another process holds.
     fn boot_stores(home: &tempfile::TempDir) -> std::process::Output {
         child(home)
             .args(["--ignored", "--nocapture", "store_boot_child"])
@@ -231,8 +191,8 @@ mod tests {
             .collect())
     }
 
-    /// The child's stdout and stderr as one string (the harness reports a panicking
-    /// test on stderr, the evidence on stdout).
+    /// The child's stdout and stderr as one string (the harness reports a panicking test on
+    /// stderr).
     fn child_text(output: &std::process::Output) -> String {
         format!(
             "{}{}",
@@ -241,11 +201,9 @@ mod tests {
         )
     }
 
-    /// Take the engine's own lock on `store` — fcntl `F_SETLK`, `F_WRLCK`, the
-    /// whole file to its end — and return the descriptor that owns it, so the
-    /// lock lives until that file is dropped. This process never boots the
-    /// stores, so taking the lock here makes it the foreign process a boot must
-    /// refuse.
+    /// Take the engine's own lock on `store` (fcntl `F_SETLK`, `F_WRLCK`, whole file) and
+    /// return the descriptor that owns it, so the lock lives until the file is dropped. This
+    /// process never boots the stores, which makes it the foreign process a boot must refuse.
     fn hold_store_lock(store: &Path) -> std::fs::File {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -267,12 +225,11 @@ mod tests {
         file
     }
 
-    /// The check as the project's own tests run it: a separate process is the
-    /// whole point (a process cannot observe its own record locks), so this
-    /// re-executes the test binary with the marker set and asserts on the
-    /// evidence the child prints. The filter below names
-    /// [`store_lock_check_child`]; if that test is ever renamed the child runs
-    /// nothing and this driver fails on the missing evidence line.
+    /// The check as the project's tests run it: a separate process is the whole point (a
+    /// process cannot observe its own record locks), so this re-executes the test binary with
+    /// the marker set and asserts on the evidence the child prints. The filter names
+    /// [`store_lock_check_child`]; a rename would make the child run nothing and this driver
+    /// fail on the missing evidence line.
     #[test]
     fn live_stores_stay_locked_for_a_foreign_client() {
         // The child inherits this process's environment, so hold the env lock
@@ -298,13 +255,10 @@ mod tests {
         );
     }
 
-    /// The other half of the guarantee, end to end and across two processes:
-    /// while another process holds the engine's own lock on a store's main file,
-    /// the daemon's bring-up must refuse — must not quarantine or replace what it
-    /// cannot open, and must record the refusal on the boot-diagnostic
-    /// channel. The holder takes the lock the way the service does: an fcntl
-    /// `F_WRLCK` over the whole main file, held for as long as the process holds
-    /// the descriptor.
+    /// The other half of the guarantee, end to end across two processes: while another process
+    /// holds the engine's own lock on a store's main file, bring-up must refuse — not
+    /// quarantine or replace what it cannot open — and record the refusal on the
+    /// boot-diagnostic channel.
     #[test]
     fn a_store_held_by_another_process_refuses_the_boot() {
         let _env = crate::util::test::env_lock().lock().unwrap_poison();
@@ -345,10 +299,10 @@ mod tests {
         );
     }
 
-    /// A store file that exists but is not usable refuses the boot, and does so
-    /// before either store is opened: the logs store is never created, the
-    /// unusable file is left byte-for-byte and timestamp-for-timestamp as it
-    /// was, and the refusal lands in the storage root's durable record.
+    /// A store file that exists but is unusable refuses the boot before either store is opened: the
+    /// logs store is never created, the unusable file is left byte-for-byte and
+    /// timestamp-for-timestamp as it was, and the refusal lands in the storage root's durable
+    /// record.
     #[test]
     fn an_unusable_store_file_refuses_the_boot() {
         let _env = crate::util::test::env_lock().lock().unwrap_poison();
@@ -389,11 +343,9 @@ mod tests {
         );
     }
 
-    /// A store the process cannot read (permissions) refuses the boot like any
-    /// other unusable file, and its refusal is recorded as environment-caused —
-    /// the file is intact and the cause is outside it, so it must never be filed
-    /// as damage. Skipped when the suite runs as root, where mode 000 denies
-    /// nothing (the classification itself is unit-tested in `wal_guard`/`boot`).
+    /// A store the process cannot read refuses the boot like any other unusable file, recorded
+    /// as environment-caused: the file is intact and the cause outside it, so it must never be
+    /// filed as damage. Skipped as root, where mode 000 denies nothing.
     #[test]
     fn an_unreadable_store_file_refuses_the_boot_as_an_environment_cause() {
         use std::os::unix::fs::PermissionsExt;
@@ -407,9 +359,8 @@ mod tests {
         let root = home.path().join(".mahbot");
         let store_dir = root.join("db");
         std::fs::create_dir_all(&store_dir).expect("create the store dir");
-        // Long enough to carry a header (512 bytes), so the defect is the read
-        // and not the size: this file is a store the process is not allowed to
-        // open, not a damaged one.
+        // Long enough to carry a header (512 bytes), so the defect is the read and not the
+        // size: a store the process may not open, not a damaged one.
         let core = store_dir.join("core.db");
         std::fs::write(&core, [0x42; 512]).expect("write the store");
         std::fs::set_permissions(&core, std::fs::Permissions::from_mode(0o000))
@@ -440,8 +391,8 @@ mod tests {
         );
     }
 
-    /// Both physical stores unusable: the refusal names every one of them, in the
-    /// diagnostic output and in the durable record, and neither is touched.
+    /// Both physical stores unusable: the refusal names every one of them in the diagnostic
+    /// output and in the durable record, and neither is touched.
     #[test]
     fn both_unusable_stores_are_named_in_the_durable_record() {
         let _env = crate::util::test::env_lock().lock().unwrap_poison();
@@ -477,8 +428,8 @@ mod tests {
         );
     }
 
-    /// Boots the daemon's stores for the child's `HOME` — the setup and the
-    /// refusal half of [`a_store_held_by_another_process_refuses_the_boot`].
+    /// Boots the stores for the child's `HOME` — the setup and refusal half of
+    /// [`a_store_held_by_another_process_refuses_the_boot`].
     #[test]
     #[ignore = "driven by a_store_held_by_another_process_refuses_the_boot"]
     fn store_boot_child() {
@@ -499,8 +450,8 @@ mod tests {
         }
     }
 
-    /// Runs in the spawned child only; `#[ignore]` keeps it out of an ordinary
-    /// test run, where the driver above is the entry point.
+    /// Runs in the spawned child only; `#[ignore]` keeps it out of an ordinary test run, where
+    /// the driver above is the entry point.
     #[test]
     #[ignore = "driven by the driver above, in a child process"]
     fn store_lock_check_child() {

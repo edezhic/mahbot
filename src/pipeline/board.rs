@@ -17,11 +17,6 @@ crate::define_store! {
 }
 
 /// Background task: auto-archive cancelled tickets older than 1 hour.
-///
-/// Runs every 5 minutes, respects the global shutdown token via
-/// [`crate::shutdown::sleep_or_shutdown_or_drain`] (same pattern as
-/// [`crate::agent::maintainer::run_maintainer_loop`]).
-/// Logs per-pass failures and continues.
 pub async fn run_archive_cancelled_loop() {
     let interval = std::time::Duration::from_mins(5);
 
@@ -30,10 +25,9 @@ pub async fn run_archive_cancelled_loop() {
             break;
         }
 
-        // Session-pin terminal deletion (S5): remove permanently-NULL seats
-        // for tickets in a terminal phase — the TTL guard stops protecting
-        // the accumulated stage session once the pin is gone
-        // (idempotent, ≤5-min delay against the session TTL).
+        // Session-pin terminal deletion (S5): remove permanently-NULL seats for tickets in a
+        // terminal phase — with the pin gone the TTL guard stops protecting the accumulated
+        // stage session (idempotent, ≤5-min delay against the session TTL).
         crate::jobs::purge_terminal_session_pins().await;
 
         let Some(board) = BOARD.get() else {
@@ -49,28 +43,23 @@ pub async fn run_archive_cancelled_loop() {
     }
 }
 
-/// Stale-cancelled archival window (hours): Cancelled tickets this old are
-/// archived by [`run_archive_cancelled_loop`].
+/// Stale-cancelled archival window (hours): Cancelled tickets this old are archived by
+/// [`run_archive_cancelled_loop`].
 const CANCELLED_ARCHIVE_HOURS: i64 = 1;
 
-/// The acting identity recorded for pipeline-driven phase transitions (poller
-/// claims, breaker-trip drain-to-planning). Stage finalizations, supersede
-/// cancels and the `UpdateTicketTool`/GUI manual paths write role labels or
-/// `"user"` instead.
+/// The acting identity for pipeline-driven phase transitions (poller claims, breaker-trip
+/// drain-to-planning). Stage finalizations, supersede cancels and the manual tool/GUI paths write
+/// role labels or `"user"` instead.
 ///
-/// Invariant: every phase-changing UPDATE on `tickets` must write
-/// `last_transition_actor` in the same statement — the chronicle materializer
-/// reads whatever value is current in the CDC after-row, so a phase change
-/// that leaves the column stale would misattribute the *previous* actor.
+/// Invariant: every phase-changing UPDATE on `tickets` writes `last_transition_actor` in the same
+/// statement — the chronicle materializer reads the CDC after-row, so a stale column misattributes
+/// the *previous* actor.
 ///
-/// Invariant: a finished (`done`) ticket's phase is immutable. Every phase
-/// statement whose source phase could be `done` must carry `phase <> 'done'`
-/// (writing `done` onto an already-`done` ticket is not a transition and stays
-/// allowed), so no writer — tool, GUI, pipeline stage or future raw UPDATE —
-/// can reopen or re-route a finished ticket. The claim and drain statements are
-/// safe only because their source is pinned to `backlog`/`queued`; keep any new
-/// phase writer inside this rule. Only archiving (`is_archived`) remains
-/// available.
+/// Invariant: a finished (`done`) ticket's phase is immutable. Every phase statement whose source
+/// could be `done` must carry `phase <> 'done'` (writing `done` onto a `done` ticket is not a
+/// transition and stays allowed), so no writer — tool, GUI, stage or future raw UPDATE — reopens a
+/// finished ticket. Claim and drain are safe only because their source is pinned to
+/// `backlog`/`queued`; keep any new phase writer inside this rule. Only archiving remains.
 pub(crate) const PIPELINE_ACTOR: &str = "pipeline";
 
 // Column definitions for ticket SELECT/RETURNING queries.
@@ -100,12 +89,9 @@ crate::columns! {
     }
 }
 
-// Column definitions for comment SELECT queries.
-// Note: `id` and `ticket_id` are intentionally excluded from the column list
-// because they are not consumed by the comment rendering path:
-// - `ticket_id` is already known from the parent ticket query context
-// - `id` is not read by any comment consumer
-// These columns remain in the database schema and are not candidates for removal.
+// Column definitions for comment SELECT queries: `id` and `ticket_id` are excluded because no
+// comment consumer reads them (`ticket_id` is known from the parent query context). Both stay in
+// the schema and are not candidates for removal.
 crate::columns! {
     COMMENT_COLUMNS [COMMENT] {
         ROLE       => "role",
@@ -115,24 +101,6 @@ crate::columns! {
 }
 
 /// Phases where a ticket occupies the dev/verification pipeline.
-///
-/// Only one ticket at a time per workspace may be in this pipeline. Any ticket in one of these
-/// phases blocks new Engineer dispatches for that workspace. The Maintainer uses a separate
-/// pre-development count (Analysis + Planning + Queued) and is no longer directly suppressed
-/// by this constant.
-///
-/// Occupancy is owned by the phase job (a short-lived job whose `kind` is the
-/// ticket's current phase) — a ticket in any of these phases always has a
-/// live phase job, and that job is the single authority that runs the stage
-/// then advances the ticket to the next phase. `tickets.phase` is both the
-/// displayed pipeline state and the input gate for the claim step
-/// (Backlog → Analysis, Queued → InDevelopment) — not a mirror
-/// of a long-lived job.
-///
-/// [`TicketPhase::Failed`] is deliberately NOT a member: a failure awaiting
-/// Manager triage parks new starts through the claim predicate's own
-/// failed-sibling gate, not through this set. Adding it here would also
-/// suppress Manager triage — this set gates in-flight-ticket updates.
 const PIPELINE_OCCUPIED_PHASES: &[TicketPhase] = &[
     TicketPhase::InDevelopment,
     TicketPhase::Verification,
@@ -140,11 +108,6 @@ const PIPELINE_OCCUPIED_PHASES: &[TicketPhase] = &[
 ];
 
 /// The four phases the poll loop drives with phase jobs, in dispatch order.
-///
-/// Note: this is deliberately NOT the [`TicketPhase`] declaration order —
-/// `InSanitation` is dispatched last, after verification. Both the dispatch
-/// snapshot query and its phase-major grouping derive from this constant, as
-/// does the `jobs.kind` vocabulary of ticket phase jobs.
 pub(crate) const WORKING_PHASES: &[TicketPhase] = &[
     TicketPhase::Analysis,
     TicketPhase::InDevelopment,
@@ -152,41 +115,27 @@ pub(crate) const WORKING_PHASES: &[TicketPhase] = &[
     TicketPhase::InSanitation,
 ];
 
-/// Phases that unblock dependent tickets.
+/// Phases that unblock dependent tickets: on entering one, dependents become claimable (their
+/// prerequisite filter no longer blocks them).
 ///
-/// When a ticket transitions to one of these phases, any tickets that
-/// depend on it become eligible for claiming (their prerequisite filter
-/// no longer blocks them).
-///
-/// [`TicketPhase::Failed`] is intentionally excluded — a failed ticket
-/// permanently blocks its dependents, requiring manual intervention.
-///
-/// [`TicketPhase::is_unblocking`] delegates to this constant to ensure
-/// the unblocking set is always authoritative. If a new phase is added
-/// here, `is_unblocking()` automatically picks it up; if the set ever
-/// needs to diverge from the unblocking set, this delegation must be
-/// broken explicitly.
+/// [`TicketPhase::Failed`] is intentionally excluded — a failed ticket permanently blocks its
+/// dependents, requiring manual intervention. [`TicketPhase::is_unblocking`] delegates here, so
+/// a phase added to this set is picked up automatically; if the two must ever diverge, that
+/// delegation has to be broken explicitly.
 const UNBLOCKING_PHASES: &[TicketPhase] = &[TicketPhase::Done, TicketPhase::Cancelled];
 
 /// Terminal phases — a ticket in one of these can no longer be claimed.
-///
-/// [`TicketPhase::is_terminal`] delegates to this constant.
-///
-/// Note: `Failed` is deliberately included here even though it is excluded
-/// from [`UNBLOCKING_PHASES`] (a failed ticket permanently blocks dependents).
 const TERMINAL_PHASES: &[TicketPhase] = &[
     TicketPhase::Done,
     TicketPhase::Cancelled,
     TicketPhase::Failed,
 ];
 
-/// Produces an SQL fragment listing phases as quoted, comma-separated
-/// strings — e.g. `'done', 'cancelled'`.
+/// SQL fragment listing phases as quoted, comma-separated strings — e.g. `'done', 'cancelled'`.
 ///
 /// # Precondition
 ///
-/// The input slice must be non-empty. Passing an empty slice produces
-/// `WHERE phase IN ()` which is invalid SQL.
+/// The input slice must be non-empty: an empty slice yields `WHERE phase IN ()`, invalid SQL.
 fn phase_list_sql_fragment(phases: &[TicketPhase]) -> String {
     phases
         .iter()
@@ -195,13 +144,12 @@ fn phase_list_sql_fragment(phases: &[TicketPhase]) -> String {
         .join(", ")
 }
 
-/// The claim-candidate eligibility predicate, shared verbatim by the claim
-/// UPDATE and its read-only probe (single source — the two cannot drift).
-/// `source` selects the claim shape: only Backlog→Analysis applies the
-/// [`BACKLOG_CLAIM_GRACE`] cutoff, only Queued→InDevelopment enforces the
-/// single-pipeline-occupancy and failed-sibling start gates. Placeholders are
-/// numbered from `base`: `?{base}` = source phase, `?{base+1}` = workspace name
-/// and, for Backlog, `?{base+2}` = grace cutoff.
+/// The claim-candidate eligibility predicate, shared verbatim by the claim UPDATE and its
+/// read-only probe (single source — the two cannot drift). `source` selects the claim shape: only
+/// Backlog→Analysis applies the [`BACKLOG_CLAIM_GRACE`] cutoff, only Queued→InDevelopment enforces
+/// the single-pipeline-occupancy and failed-sibling start gates. Placeholders are numbered from
+/// `base`: `?{base}` = source phase, `?{base+1}` = workspace name and, for Backlog, `?{base+2}` =
+/// grace cutoff.
 fn claim_candidate_where(base: usize, source: TicketPhase) -> String {
     let mut parts = vec![
         format!("t1.phase = ?{base}"),
@@ -220,11 +168,10 @@ fn claim_candidate_where(base: usize, source: TicketPhase) -> String {
                 AND t2.id != t1.id)",
             phase_list_sql_fragment(PIPELINE_OCCUPIED_PHASES),
         ));
-        // A failed ticket awaiting Manager triage parks the workspace until it is
-        // cancelled or superseded (both move it out of Failed). Failed is
-        // deliberately NOT in [`PIPELINE_OCCUPIED_PHASES`], so the gate lives
-        // here — on the start decision itself, where the read-only probe inherits
-        // it through this shared builder.
+        // A failed ticket awaiting Manager triage parks the workspace until it is cancelled or
+        // superseded (both move it out of Failed). Failed is deliberately NOT in
+        // [`PIPELINE_OCCUPIED_PHASES`], so the gate lives here, on the start decision itself,
+        // where the read-only probe inherits it through this shared builder.
         parts.push(format!(
             "NOT EXISTS (SELECT 1 FROM tickets t2 \
                 WHERE t2.workspace_name = t1.workspace_name \
@@ -252,10 +199,9 @@ fn parse_prereqs(raw: &str) -> Result<Vec<String>> {
     })
 }
 
-/// Bundled parameters for ticket creation.
-///
-/// Reduces parameter explosion across [`BoardStore::insert_ticket_tx`],
-/// [`BoardStore::create_ticket`], and [`BoardStore::supersede_and_create`].
+/// Bundled parameters for ticket creation, to avoid parameter explosion across
+/// [`BoardStore::insert_ticket_tx`], [`BoardStore::create_ticket`] and
+/// [`BoardStore::supersede_and_create`].
 #[derive(Debug, Clone)]
 pub(crate) struct TicketParams {
     pub title: String,
@@ -287,11 +233,10 @@ pub struct Ticket {
     pub comments: Vec<TicketComment>,
     /// IDs of tickets that must be completed before this one can be claimed.
     pub prerequisites: Vec<String>,
-    /// ID of the ticket this one supersedes (set when created via supersede).
-    /// The superseded ticket is cancelled atomically during creation.
+    /// ID of the ticket this one supersedes (set when created via supersede); the superseded
+    /// ticket is cancelled atomically during creation.
     pub supersedes: Option<String>,
-    /// ID of the ticket that supersedes this one (set on the old ticket when
-    /// it is superseded). Purely informational — never drives logic.
+    /// ID of the ticket that supersedes this one. Purely informational — never drives logic.
     pub superseded_by: Option<String>,
     /// Full commit SHA (40 hex chars), `None` if no commit recorded.
     pub commit_hash: Option<String>,
@@ -299,67 +244,51 @@ pub struct Ticket {
     pub lines_added: Option<i64>,
     /// Lines removed (non-negative) from the associated commit.
     pub lines_removed: Option<i64>,
-    /// Creator/tool identity — set at construction time.
-    /// Also used in the GUI board display: when the value matches a known role
-    /// name, the role's display label is shown (e.g. "Manager"); otherwise the
-    /// content is shown with the first character uppercased (e.g. "Test" for
-    /// "test"). May be empty when no reporter is recorded.
+    /// Creator/tool identity, set at construction time. Also shown by the GUI board: a value
+    /// matching a role name renders that role's label (e.g. "Manager"), otherwise the value with
+    /// its first character uppercased. May be empty when no reporter is recorded.
     pub reporter: String,
     /// Whether this ticket has been archived (hidden from normal listings).
     pub is_archived: bool,
     pub priority: i64,
-    /// Classification label, fixed when the ticket is created and never
-    /// written again. It prefixes every commit the pipeline makes for the
-    /// ticket and selects whether the release changelog keeps that commit.
+    /// Classification label, fixed at creation and never written again. It prefixes every commit
+    /// the pipeline makes for the ticket and decides whether the release changelog keeps it.
     pub label: TicketLabel,
-    /// HEAD commit hash of the content the code reviewers were handed, as
-    /// written by `verification::record_reviewed_base` — a round whose code
-    /// review ran and which then moved the ticket on. `None` until the first
-    /// such recording; used by the reviewer skip-gate to detect brand-new
-    /// content that must never skip review.
+    /// HEAD hash of the content the code reviewers were handed, as written by
+    /// `verification::record_reviewed_base` for a round whose review ran and which then moved the
+    /// ticket on. `None` until the first such recording; the reviewer skip-gate uses it to detect
+    /// brand-new content that must never skip review.
     pub reviewed_head: Option<String>,
-    /// The working tree identity of the same content: what a `git add -A` would
-    /// have staged. Together with [`reviewed_head`](Self::reviewed_head) and a
-    /// clean porcelain this identifies the exact content reviewers saw.
+    /// The working tree identity of the same content: what a `git add -A` would have staged.
+    /// With [`reviewed_head`](Self::reviewed_head) and a clean porcelain this identifies the
+    /// exact content reviewers saw.
     pub reviewed_tree: Option<String>,
-    /// Exact completion timestamp: set on transition to Done and never cleared —
-    /// a finished ticket's phase is immutable. `None` for tickets that never
-    /// reached Done.
+    /// Set on transition to Done and never cleared — a finished ticket's phase is immutable.
+    /// `None` for tickets that never reached Done.
     pub done_at: Option<String>,
-    /// Number of times this ticket bounced back into development from a
-    /// non-success in either post-development stage.
-    /// Drives the bounce-based circuit breaker (max 10). Engineer hard failures are
-    /// pause-only (workspace pause, implementation frozen) and do not consume this
+    /// Times this ticket bounced back into development from a non-success in either
+    /// post-development stage. Drives the bounce-based circuit breaker (max 10). Engineer hard
+    /// failures are pause-only (workspace pause, implementation frozen) and do not consume this
     /// budget.
     pub bounce_count: i64,
 }
 
 impl Ticket {
-    /// Whether the maintainer filed this ticket — the workspace-cleanup tickets
-    /// only the maintainer creates.
+    /// Whether the maintainer filed this ticket — the workspace-cleanup tickets only the
+    /// maintainer creates.
     #[must_use]
     pub(crate) fn filed_by_maintainer(&self) -> bool {
         self.reporter == crate::Role::Maintainer.as_str()
     }
 
-    /// Short single-line display for listing tickets in agent-facing output.
+    /// Short single-line display for listing tickets in agent-facing output:
+    /// `"  [{reporter}] [{phase}] {id}: {title}"` (the two-space indent aligns within a multi-line
+    /// block). No trailing newline — callers add it. `{phase}` is the snake_case Display form of
+    /// [`TicketPhase`]; for user-facing labels use [`TicketPhase::display_name()`].
     ///
-    /// Returns `"  [{reporter}] [{phase}] {id}: {title}"` (note the leading
-    /// two-space indent for alignment within a multi-line block). The trailing
-    /// newline is omitted — callers add it via `writeln!` or equivalent.
-    ///
-    /// The `{phase}` field uses the snake_case Display representation from
-    /// [`TicketPhase`] (e.g. `"in_development"`), which is the canonical form
-    /// for agent-facing output. For user-facing labels with spaces instead of
-    /// underscores, use [`TicketPhase::display_name()`] directly.
-    ///
-    /// ## Related formatting (not duplicated here)
-    ///
-    /// - `crate::prompt::format_ticket_block` produces a Markdown
-    ///   `<current-ticket>` block for system messages — intentionally different
-    ///   format and should not be unified.
-    /// - `search_archived_tickets` format omits the reporter field
-    ///   (`"  [{workspace}] [{phase}] {id}: {title}"`) — intentionally different.
+    /// Not unified with two deliberately different formats: `crate::prompt::format_ticket_block`
+    /// (a Markdown `<current-ticket>` block for system messages) and `search_archived_tickets`
+    /// (which omits the reporter).
     #[must_use]
     pub fn short_display(&self) -> String {
         format!(
@@ -368,40 +297,19 @@ impl Ticket {
         )
     }
 
-    /// Produce a detailed multi-line display of the ticket, suitable for
-    /// [`GetTicketTool`](crate::tools::ticket::GetTicketTool) and other agent-facing output.
+    /// Detailed multi-line display of the ticket for
+    /// [`GetTicketTool`](crate::tools::ticket::GetTicketTool) and other agent-facing output:
+    /// id, title, description, snake_case phase, P0–P4+ priority, reporter, workspace, dates,
+    /// supersede/prerequisite links and the archived flag when set, then [`Self::format_comments`].
     ///
-    /// The output includes these fields (when present):
+    /// `commit_hash` and `lines_added`/`lines_removed` are deliberately omitted — available in
+    /// the board UI, not meaningful for agent context.
     ///
-    /// - Ticket ID, Title, Description
-    /// - Phase (snake_case — e.g. `queued`)
-    /// - Priority (P0–P4+ label)
-    /// - Reporter, Workspace, Created, Updated
-    /// - Supersedes, Superseded by, Prerequisites (conditionally when non-empty)
-    /// - Archived flag (conditionally when `true`)
-    /// - Comments block (via [`Self::format_comments`])
-    ///
-    /// ## Fields *not* displayed
-    ///
-    /// The following [`Ticket`] fields are deliberately omitted — they are
-    /// available in the board UI but not meaningful for agent context:
-    ///
-    /// - `commit_hash`
-    /// - `lines_added` / `lines_removed`
-    ///
-    /// ## Output size
-    ///
-    /// The returned string can be arbitrarily large (unbounded descriptions
-    /// and comments). Callers that need truncation should apply their own
-    /// limits (see `GetTicketTool::preserve_full_output` for an example that
-    /// disables the default ~5 KB tool-output truncation). `GetTicketTool` uses
-    /// [`Self::detailed_display_limited`] for its default truncated view.
-    ///
-    /// ## Changing this output
-    ///
-    /// Because agent tool calls depend on this exact format, changes to
-    /// displayed fields or layout must be kept in sync with
-    /// [`crate::tools::ticket::GetTicketTool`] (the primary consumer).
+    /// The result can be arbitrarily large (unbounded descriptions and comments). Callers that
+    /// need truncation apply their own limits (see `GetTicketTool::preserve_full_output`, which
+    /// disables the default ~5 KB tool-output truncation); `GetTicketTool` uses
+    /// [`Self::detailed_display_limited`] for its default truncated view. Agent tool calls depend
+    /// on this exact format, so any change here must be kept in sync with that consumer.
     #[must_use]
     pub fn detailed_display(&self) -> String {
         let mut out = self.header(&self.description);
@@ -409,15 +317,10 @@ impl Ticket {
         out
     }
 
-    /// Return a truncated version of [`Self::detailed_display`] for agent-facing
-    /// output where the caller only needs the ticket's latest state.
-    ///
-    /// The description value is capped at `desc_max_chars` characters (a trailing
-    /// `…` is appended when it exceeds the cap) and each comment's content is
-    /// capped at `comment_max_chars` characters, EXCEPT the newest `last_n_full`
-    /// comments which are always shown in full. Header metadata (id, title, phase,
-    /// priority, reporter, workspace, dates, supersede/prerequisite links,
-    /// archived flag) is never truncated.
+    /// A truncated [`Self::detailed_display`] for callers that only need the ticket's latest
+    /// state: the description is capped at `desc_max_chars` (with a trailing `…`), each comment's
+    /// content at `comment_max_chars`, EXCEPT the newest `last_n_full` comments, shown in full.
+    /// Header metadata is never truncated.
     #[must_use]
     pub(crate) fn detailed_display_limited(
         &self,
@@ -431,8 +334,8 @@ impl Ticket {
         out
     }
 
-    /// Build the shared header of [`Self::detailed_display`] and
-    /// [`Self::detailed_display_limited`], rendering `description` verbatim.
+    /// The shared header of [`Self::detailed_display`] and [`Self::detailed_display_limited`],
+    /// rendering `description` verbatim.
     #[must_use]
     fn header(&self, description: &str) -> String {
         let mut out = format!(
@@ -470,19 +373,15 @@ impl Ticket {
         out
     }
 
-    /// Format comments as a `"Comments:"` block suitable for [`crate::tools::ticket::GetTicketTool`].
-    ///
-    /// Renders every comment in full by delegating to [`Self::format_comments_limited`]
-    /// with unlimited characters and no truncation window; returns
-    /// `"Comments:\n  (no comments)"` when the list is empty.
+    /// Comments as a `"Comments:"` block for [`crate::tools::ticket::GetTicketTool`]: every
+    /// comment in full, or `"Comments:\n  (no comments)"` when there are none.
     #[must_use]
     fn format_comments(&self) -> String {
         self.format_comments_limited(usize::MAX, self.comments.len())
     }
 
-    /// Like [`Self::format_comments`], but caps each comment's content at
-    /// `max_chars` characters (appending `…` when truncated) except for the
-    /// newest `last_n_full` comments, which are shown in full.
+    /// Like [`Self::format_comments`], but caps each comment's content at `max_chars`
+    /// (appending `…`) except for the newest `last_n_full`, shown in full.
     #[must_use]
     fn format_comments_limited(&self, max_chars: usize, last_n_full: usize) -> String {
         let mut s = String::from("Comments:");
@@ -502,10 +401,8 @@ impl Ticket {
         s
     }
 
-    /// Format a single comment line: `"\n  [{role}] ({timestamp}): {content}"`.
-    ///
-    /// Timestamps are truncated to seconds (`[..19]` of the RFC 3339 string),
-    /// with a defensive `min()` guard against abnormally short strings.
+    /// A single comment line: `"\n  [{role}] ({timestamp}): {content}"`. Timestamps are cut to
+    /// seconds (`[..19]`), with a `min()` guard for abnormally short strings.
     #[must_use]
     fn comment_line(c: &TicketComment, content: &str) -> String {
         let end = 19.min(c.created_at.len());
@@ -514,18 +411,13 @@ impl Ticket {
     }
 }
 
-/// The single classification label every ticket carries: `feat` for work that
-/// adds a capability, `fix` for work that repairs a problem, `maint` for
-/// everything else.
+/// The single classification label every ticket carries: `feat` for work that adds a capability,
+/// `fix` for work that repairs a problem, `maint` for everything else.
 ///
-/// Stated once, when the ticket is created (see
-/// [`CreateTicketTool`](crate::tools::ticket::CreateTicketTool)); no writer
-/// updates it afterwards, so it never changes for the ticket's whole life. The
-/// product does not read it beyond the `[feat] `/`[fix] `/`[maint] ` prefix it
-/// puts on the ticket's pipeline commits.
-///
-/// Stored exactly like [`TicketPhase`]: lowercase snake_case strings matching
-/// the DB column values.
+/// Stated once, at creation (see [`CreateTicketTool`](crate::tools::ticket::CreateTicketTool));
+/// no writer updates it afterwards, so it never changes for the ticket's whole life. The product
+/// reads it only for the `[feat] `/`[fix] `/`[maint] ` prefix it puts on the ticket's pipeline
+/// commits. Stored like [`TicketPhase`]: lowercase snake_case matching the DB column values.
 #[derive(Debug, Clone, Copy, PartialEq, strum::Display, strum::AsRefStr, strum::EnumIter)]
 #[strum(serialize_all = "snake_case")]
 pub enum TicketLabel {
@@ -535,8 +427,8 @@ pub enum TicketLabel {
 }
 
 impl TicketLabel {
-    /// The tag the subject of every commit the pipeline makes for a ticket
-    /// starts with — `[feat] `, `[fix] ` or `[maint] `, before the title.
+    /// The tag every pipeline commit subject starts with — `[feat] `, `[fix] ` or `[maint] `,
+    /// before the title.
     #[must_use]
     pub(crate) fn commit_prefix(self) -> String {
         format!("[{self}] ")
@@ -566,10 +458,9 @@ impl std::str::FromStr for TicketLabel {
     }
 }
 
-/// Lowercase snake_case strings matching the DB column values — no schema
-/// migration needed. Display, AsRefStr (the borrow-side token), IntoStaticStr
-/// (the same strings with a `'static` lifetime — the `jobs.kind` vocabulary) and
-/// EnumIter are derived via `strum`; FromStr is implemented manually for
+/// Lowercase snake_case strings matching the DB column values — no schema migration needed.
+/// `strum` derives Display, `AsRefStr` (the borrow-side token), `IntoStaticStr` (the same strings
+/// with a `'static` lifetime — the `jobs.kind` vocabulary) and `EnumIter`; `FromStr` is manual for
 /// user-friendly error messages.
 #[derive(
     Debug,
@@ -587,80 +478,48 @@ impl std::str::FromStr for TicketLabel {
 pub enum TicketPhase {
     Backlog,
     Analysis,
-    /// Ticket is waiting for Manager review. Not picked up automatically by any agent —
-    /// the Manager or user must manually advance it to Queued or cancel it.
+    /// Waiting for Manager review. Not picked up automatically by any agent — the Manager or
+    /// user must advance it to Queued or cancel it.
     Planning,
     Queued,
     InDevelopment,
     InSanitation,
-    /// The merged code-review + functional-check stage: the code reviewers and
-    /// the single functional tester run concurrently on one phase job and
-    /// produce one consolidated result. The round also runs the workspace's own
-    /// project commands alongside its participants.
+    /// The merged code-review + functional-check stage: the code reviewers and the single
+    /// functional tester run concurrently on one phase job and produce one consolidated result.
+    /// The round also runs the workspace's own project commands alongside its participants.
     Verification,
-    /// Finished for good: the phase is immutable — only archiving remains, plus
-    /// reading and commenting, which never touch the phase.
+    /// Finished for good: the phase is immutable — only archiving remains, plus reading and
+    /// commenting, which never touch the phase.
     Done,
     Cancelled,
     Failed,
 }
 
 impl TicketPhase {
-    /// Returns `true` for phases that unblock dependent tickets (`Done`,
-    /// `Cancelled`).
+    /// Whether the phase unblocks dependent tickets (`Done`, `Cancelled`).
     ///
-    /// Delegates to the crate-private unblocking-phase set so the sets can
-    /// never accidentally diverge from the prerequisite-unblocking set.
-    /// [`TicketPhase::Failed`] is deliberately excluded — a failed ticket
-    /// permanently blocks its dependents and remains visible in active views
-    /// for manual triage.
+    /// Delegates to the crate-private set so the two can never diverge.
+    /// [`TicketPhase::Failed`] is deliberately excluded — a failed ticket permanently blocks its
+    /// dependents and stays visible in active views for manual triage.
     #[must_use]
     pub fn is_unblocking(&self) -> bool {
         UNBLOCKING_PHASES.contains(self)
     }
 
-    /// Returns `true` for terminal phases (`Done`, `Cancelled`, `Failed`) — a
-    /// ticket in one of these can no longer be claimed, so its phase job is
-    /// finished.
-    ///
-    /// Delegates to the crate-private terminal-phase set so the terminal set
-    /// is authoritative for both the manual transition's phase-job completion
-    /// and the terminal session-pin cleanup
-    /// (`jobs::purge_terminal_session_pins`).
+    /// Whether the phase is terminal (`Done`, `Cancelled`, `Failed`) — such a ticket can no
+    /// longer be claimed, so its phase job is finished.
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         TERMINAL_PHASES.contains(self)
     }
 
-    /// Returns `true` if the ticket is in a pipeline-occupied phase.
-    ///
-    /// Tickets in these phases occupy the dev/verification pipeline — only one
-    /// ticket per workspace may be in the pipeline at a time. Each phase is
-    /// owned by its own short-lived phase job (development, verification,
-    /// sanitation). The automated
-    /// create-ticket tool (when superseding an existing ticket) and the
-    /// update-ticket tool refuse to modify tickets in any of these phases to
-    /// prevent race conditions during phase transitions. `add_comment` is the
-    /// exception: it is allowed during any phase and delivers to a running
-    /// agent as a soft deferred message (or persists for the next agent).
+    /// Whether the ticket holds a pipeline-occupied phase.
     #[must_use]
     pub fn is_pipeline_occupied(&self) -> bool {
         PIPELINE_OCCUPIED_PHASES.contains(self)
     }
 
-    /// Human-readable display label with spaces instead of underscores
-    /// (e.g. `"in development"` from [`TicketPhase::InDevelopment`]).
-    ///
-    /// This is the presentation-oriented counterpart to `AsRefStr::as_ref`
-    /// (which returns the machine-oriented `snake_case` form like
-    /// `"in_development"`). Use `display_name()` for user-facing UI labels;
-    /// keep `as_ref()` for tool output, SQL fragments, and agent-facing text
-    /// where agents expect the snake_case phase string.
-    ///
-    /// [`TicketPhase::Verification`] is the one phase whose token carries no
-    /// `in_`: it is still a phase a ticket is *in*, so the display label is
-    /// prefixed and it reads like its neighbours `in development` and
-    /// `in sanitation`.
+    /// Human-readable label with spaces instead of underscores (e.g. `"in development"`).
     #[must_use]
     pub fn display_name(&self) -> String {
         let token = self.as_ref();
@@ -696,15 +555,14 @@ impl std::str::FromStr for TicketPhase {
     }
 }
 
-// Display and AsRefStr are provided by strum derives. FromStr is implemented
-// manually above to produce user-friendly error messages.
+// Display and AsRefStr come from the strum derives; FromStr above is manual for user-friendly
+// error messages.
 
-/// Bundles an `UPDATE tickets` statement with its bound parameters and the
-/// ticket id the update targets. Phase transitions execute the SQL directly
-/// (their zero-row outcome needs its own explanation); the other producers go
-/// through [`PreparedUpdate::execute_no_cancel`], [`PreparedUpdate::execute_tx`]
-/// or [`PreparedUpdate::execute_and_cancel`], which use `ticket_id` for the
-/// not-found check.
+/// Bundles an `UPDATE tickets` statement with its bound parameters and the ticket id it targets.
+/// Phase transitions execute the SQL directly (their zero-row outcome needs its own explanation);
+/// the other producers go through [`PreparedUpdate::execute_no_cancel`],
+/// [`PreparedUpdate::execute_tx`] or [`PreparedUpdate::execute_and_cancel`], which use
+/// `ticket_id` for the not-found check.
 struct PreparedUpdate {
     sql: String,
     params: Vec<db::Value>,
@@ -712,41 +570,25 @@ struct PreparedUpdate {
 }
 
 impl PreparedUpdate {
-    /// Execute within an existing transaction, verifying that a row was
-    /// affected. Does NOT cancel registered agents — the caller manages
-    /// transaction lifecycle and should cancel agents before starting the
-    /// transaction when needed.
+    /// Execute within an existing transaction, verifying a row was affected. Does NOT cancel
+    /// registered agents — the caller owns the transaction lifecycle and cancels agents before
+    /// starting it when needed.
     async fn execute_tx(self, tx: &db::TxGuard<'_>) -> Result<()> {
         let rows = tx.execute(&self.sql, self.params).await?;
         BoardStore::ensure_ticket_found(rows, &self.ticket_id)?;
         Ok(())
     }
 
-    /// Execute the update without cancelling any agent.
-    ///
-    /// Use this for post-agent operations where the caller knows no agent
-    /// is running and the implicit cancellation of
-    /// [`execute_and_cancel`](Self::execute_and_cancel) is unnecessary.
+    /// Execute the update without cancelling any agent — for post-agent operations where the
+    /// caller knows no agent is running.
     async fn execute_no_cancel(self, conn: &db::Connection) -> Result<()> {
         let rows = conn.execute(&self.sql, self.params).await?;
         BoardStore::ensure_ticket_found(rows, &self.ticket_id)?;
         Ok(())
     }
 
-    /// Execute the update, verify it affected a row, then cancel any agent
-    /// registered on this ticket.
-    ///
-    /// This is a convenience for single-ticket mutations that follow the
-    /// pattern: execute → verify → cancel stale agent.
-    ///
-    /// # When NOT to use
-    ///
-    /// Do **not** use this helper for operations where cancellation is
-    /// unnecessary or has different semantics. Prefer [`execute_no_cancel`](Self::execute_no_cancel)
-    /// for simple post-agent updates that do not need stale-agent cancellation.
-    /// Additionally, avoid this helper for:
-    /// - **`BoardStore::supersede_and_create`** — runs inside a transaction, cancels
-    ///   before commit via a different pattern.
+    /// Execute the update, verify it affected a row, then cancel any agent registered on this
+    /// ticket — the execute → verify → cancel pattern for single-ticket mutations.
     async fn execute_and_cancel(self, conn: &db::Connection) -> Result<()> {
         let rows = conn.execute(&self.sql, self.params).await?;
         BoardStore::ensure_ticket_found(rows, &self.ticket_id)?;
@@ -766,22 +608,6 @@ pub(crate) enum LoadComments {
 
 impl BoardStore {
     /// Post-open setup: ensure the FTS index exists with the correct tokenizer.
-    ///
-    /// The index is ALSO declared in the schema catalog
-    /// ([`crate::db::migrations`]) so the consolidated schema creates it before
-    /// the one-time import (guaranteeing imported tickets are FTS-searchable).
-    /// This hook therefore only tokenizer-migrates an existing index (drops
-    /// and recreates if the tokenizer changed); it is idempotent and runs from
-    /// both [`crate::db::init_all_stores`] (production, on the shared
-    /// consolidated connection) and each isolated board store open. The board
-    /// schema changes are NOT run here — every schema change is an entry in the
-    /// append-only catalog ([`crate::db::migrations`]) applied once by
-    /// [`crate::db::open_consolidated_store`].
-    ///
-    /// It deliberately does NOT scan the index for corruption: the periodic
-    /// round's own repair ([`crate::db::repair_ticket_title_fts_runtime`]) owns
-    /// that, and the open's repair scan (when the start warrants one) runs
-    /// before this hook.
     pub(crate) async fn after_open(&self) -> anyhow::Result<()> {
         crate::db::ensure_fts_index(
             &self.conn,
@@ -793,11 +619,9 @@ impl BoardStore {
         Ok(())
     }
 
-    /// Shared INSERT logic for [`BoardStore::create_ticket`] and [`BoardStore::supersede_and_create`].
-    ///
-    /// Computes the timestamp and serializes prerequisites internally. Does NOT
-    /// commit the transaction — the caller is responsible for calling
-    /// `tx.commit()` after any additional writes.
+    /// Shared INSERT logic for [`BoardStore::create_ticket`] and
+    /// [`BoardStore::supersede_and_create`]. Computes the timestamp and serializes prerequisites;
+    /// does NOT commit — the caller calls `tx.commit()` after any further writes.
     async fn insert_ticket_tx(
         tx: &TxGuard<'_>,
         ticket_id: &str,
@@ -829,12 +653,10 @@ impl BoardStore {
         Ok(())
     }
 
-    /// Rewire dependents after supersede: tickets whose prerequisites mention
-    /// `supersede_id` get updated to point to `new_id`. Queried and updated within
-    /// the same transaction — no TOCTOU window between SELECT and UPDATE.
-    ///
-    /// Uses `json_each()` for exact prerequisite matching (consistent with
-    /// [`claim_backlog_for_analysis`](Self::claim_backlog_for_analysis)).
+    /// Rewire dependents after supersede: tickets whose prerequisites mention `supersede_id` are
+    /// updated to point to `new_id`, queried and updated in one transaction — no TOCTOU window.
+    /// `json_each()` gives exact prerequisite matching, as in
+    /// [`claim_backlog_for_analysis`](Self::claim_backlog_for_analysis).
     async fn rewire_dependents_tx(
         tx: &TxGuard<'_>,
         supersede_id: &str,
@@ -874,37 +696,27 @@ impl BoardStore {
         Ok(())
     }
 
-    /// Begin a transaction, generate a ticket ID, and validate prerequisites.
+    /// Begin a transaction, generate a ticket ID, and validate prerequisites — the shared preamble
+    /// of [`BoardStore::create_ticket`] and [`BoardStore::supersede_and_create`]. The new id must
+    /// not appear in its own prerequisites, and every prerequisite must exist in the same
+    /// workspace.
     ///
-    /// Performs the shared validation preamble used by both [`BoardStore::create_ticket`]
-    /// and [`BoardStore::supersede_and_create`]: starts a transaction, generates a
-    /// sequential ticket ID from the ticket counter, checks that the new ID
-    /// doesn't appear in its own prerequisites, then validates all
-    /// prerequisites exist and belong to the same workspace.
-    ///
-    /// Callers must not call `self.conn` methods until the guard is dropped
-    /// or committed — `TxGuard` holds a tokio mutex lock.
-    ///
-    /// # Correctness (TOCTOU)
-    ///
-    /// Correctness relies on both the tokio mutex inside `conn` (serializes
-    /// Rust-level writes) and the Turso transaction `tx` (provides
-    /// database-level isolation) — no concurrent write can change
-    /// prerequisite tickets between validation and the caller's INSERT.
-    /// Validation runs inside the transaction through its own guard; see
-    /// [`TxGuard::query`] for why that is the only read the transaction's work
-    /// may use.
+    /// Callers must not call `self.conn` methods until the guard is dropped or committed —
+    /// `TxGuard` holds a tokio mutex lock. Correctness (TOCTOU) rests on that mutex serializing
+    /// Rust-level writes plus the Turso transaction isolating them at the database level, so no
+    /// concurrent write can change a prerequisite between validation and the caller's INSERT.
+    /// Validation runs inside the transaction through its own guard; see [`TxGuard::query`] for
+    /// why that is the only read the transaction's work may use.
     async fn begin_tx_and_validate_prerequisites(
         &self,
         workspace_name: &str,
         prerequisites: &[String],
     ) -> Result<(TxGuard<'_>, String)> {
         let tx = self.conn.begin_tx().await?;
-        // Seed-then-bump, not the engine's unusable `INSERT ... ON CONFLICT ...
-        // DO UPDATE` form (see `db::Connection::upsert_row`); the two-step
-        // helper cannot serve this call because the new id has to be read back.
-        // A fresh workspace seeds `next_id` at 0, then the bump stores 1 and
-        // returns `next_id - 1` — the first ticket is still `<workspace>-0`.
+        // Seed-then-bump, not the engine's unusable `INSERT ... ON CONFLICT ... DO UPDATE` form
+        // (see `db::Connection::upsert_row`); the two-step helper cannot serve this call because
+        // the new id has to be read back. A fresh workspace seeds `next_id` at 0, then the bump
+        // stores 1 and returns `next_id - 1` — the first ticket is still `<workspace>-0`.
         tx.execute(
             "INSERT INTO ticket_counters (workspace_name, next_id) VALUES (?1, 0) \
              ON CONFLICT(workspace_name) DO NOTHING",
@@ -924,8 +736,7 @@ impl BoardStore {
             !prerequisites.contains(&id),
             "Ticket cannot depend on itself: {id}"
         );
-        // Validate prerequisites inside the transaction — see
-        // [`TxGuard::query`].
+        // Validate prerequisites inside the transaction — see [`TxGuard::query`].
         Self::validate_prerequisites(&tx, prerequisites, workspace_name).await?;
         Ok((tx, id))
     }
@@ -943,22 +754,6 @@ impl BoardStore {
     }
 
     /// Create a new ticket that supersedes (replaces) an existing ticket.
-    ///
-    /// Atomically cancels `supersede_id`, creates the new ticket with a
-    /// `supersedes` back-link, and rewires any dependent tickets' prerequisites
-    /// to point to the new ID. All writes happen in a single transaction
-    /// via `begin_tx()` + parameterized queries.
-    ///
-    /// Before commit, any running agent on the superseded ticket is cancelled.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The superseded ticket does not exist
-    /// - The superseded ticket is finished (`done`) — its phase is immutable
-    /// - The superseded ticket is in a different workspace
-    /// - A self-reference is detected (supersede ID in the new ticket's prerequisites)
-    /// - Any prerequisite is invalid (doesn't exist or cross-workspace)
     pub(crate) async fn supersede_and_create(
         &self,
         supersede_id: &str,
@@ -974,10 +769,9 @@ impl BoardStore {
             .begin_tx_and_validate_prerequisites(&params.workspace_name, &params.prerequisites)
             .await?;
 
-        // Verify the superseded ticket exists, belongs to the same workspace,
-        // and is not finished — a finished ticket's phase is immutable, and
-        // supersede is a phase write (it cancels the old ticket).
-        // This runs INSIDE the transaction — see [`TxGuard::query`].
+        // Verify the superseded ticket exists, belongs to the same workspace, and is not finished
+        // — a finished phase is immutable and supersede is a phase write. Inside the transaction:
+        // see [`TxGuard::query`].
         let rows = tx
             .query(
                 "SELECT workspace_name, phase FROM tickets WHERE id = ?1",
@@ -1023,25 +817,22 @@ impl BoardStore {
 
         Self::rewire_dependents_tx(&tx, supersede_id, &new_id, &params.workspace_name).await?;
 
-        // Cancel agents on the superseded ticket BEFORE the transaction commits.
-        // If the process crashes between commit and cancellation, the superseded
-        // ticket is Cancelled in the database but its agents remain registered and
-        // keep running (orphaned agents on a cancelled ticket). Cancelling first
-        // flips the trade-off: if the commit subsequently fails, agents were
-        // cancelled unnecessarily but will be re-registered on re-dispatch.
+        // Cancel agents on the superseded ticket BEFORE the transaction commits. A crash between
+        // commit and cancellation would leave a Cancelled ticket with agents still registered and
+        // running (orphaned agents on a cancelled ticket); cancelling first flips the trade-off —
+        // if the commit then fails, agents were cancelled unnecessarily but re-register on
+        // re-dispatch.
         crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(supersede_id);
 
-        // No chronicle push for the cancellation: supersede is only reachable
-        // through agent tools (Manager or Maintainer CreateTicketTool) and agent
-        // actions are intentionally silent — the GUI board path is the user
-        // surface that notifies the Manager.
+        // No chronicle push for the cancellation: supersede is only reachable through agent tools
+        // (Manager or Maintainer CreateTicketTool) and agent actions are intentionally silent — the
+        // GUI board path is the user surface that notifies the Manager.
         tx.commit().await?;
 
         Ok(new_id)
     }
 
-    /// Build a [`Ticket`] from a row returned by a
-    /// [`TICKET_COLUMNS`] SELECT, optionally including its comments.
+    /// Build a [`Ticket`] from a [`TICKET_COLUMNS`] SELECT row, optionally with its comments.
     async fn ticket_from_row(&self, row: &db::Row, load_comments: LoadComments) -> Result<Ticket> {
         let id: String = row.get(COL_TICKET_ID)?;
         let comments = if load_comments == LoadComments::Yes {
@@ -1086,14 +877,11 @@ impl BoardStore {
     /// [`claim_backlog_for_analysis`](Self::claim_backlog_for_analysis).
     pub(crate) const BACKLOG_CLAIM_GRACE: Duration = Duration::seconds(5);
 
-    /// Claim a workspace's oldest eligible [`TicketPhase::Backlog`] ticket and
-    /// transition it to Analysis. See [`claim_for_phase`] for the shared
-    /// semantics. The Backlog shape additionally applies a `created_at <= ?6`
-    /// cutoff excluding tickets younger than [`BACKLOG_CLAIM_GRACE`], so a
-    /// fresh ticket stays in Backlog ~5s — claiming it into Analysis within
-    /// the window would spawn analysts that immediately get cancelled (plus a
-    /// spurious phase-change notification), while the Manager gets time to
-    /// move it straight to Planning/Queued.
+    /// Claim a workspace's oldest eligible [`TicketPhase::Backlog`] ticket and transition it to
+    /// Analysis; see [`claim_for_phase`] for the shared semantics. The `created_at <= ?6` cutoff
+    /// excludes tickets younger than [`BACKLOG_CLAIM_GRACE`], so a fresh ticket stays in Backlog
+    /// ~5s: claiming it sooner would spawn analysts that are immediately cancelled (plus a spurious
+    /// phase-change notification), while the Manager gets time to move it to Planning/Queued.
     pub(crate) async fn claim_backlog_for_analysis(
         &self,
         workspace_name: &str,
@@ -1110,26 +898,21 @@ impl BoardStore {
         .await
     }
 
-    /// Claim a workspace's oldest eligible [`TicketPhase::Queued`] ticket and
-    /// transition it to InDevelopment. See [`claim_for_phase`] for the shared
-    /// semantics. The Queued shape additionally rejects the claim (returns
-    /// `None`) in two cases, both evaluated against the committed state at the
-    /// claim instant:
+    /// Claim a workspace's oldest eligible [`TicketPhase::Queued`] ticket and transition it to
+    /// InDevelopment; see [`claim_for_phase`] for the shared semantics. Two extra checks reject
+    /// the claim (returning `None`), both against the committed state at the claim instant:
     ///
-    /// - while any pipeline-occupied ticket ([`PIPELINE_OCCUPIED_PHASES`]) exists
-    ///   in the same workspace, enforcing a single ticket at a time in the
-    ///   dev/verification pipeline;
-    /// - while any non-archived [`TicketPhase::Failed`] ticket exists in the same
-    ///   workspace — a failure awaiting Manager triage parks the workspace so no
-    ///   new work starts next to the unresolved failure (and its uncommitted
-    ///   state). The park lifts by itself: cancelling or superseding the failed
-    ///   ticket moves it out of Failed. Nothing else is paused — the Manager
-    ///   keeps full triage control.
+    /// - while any pipeline-occupied ticket ([`PIPELINE_OCCUPIED_PHASES`]) exists in the same
+    ///   workspace, enforcing a single ticket at a time in the dev/verification pipeline;
+    /// - while any non-archived [`TicketPhase::Failed`] ticket exists in the same workspace — a
+    ///   failure awaiting Manager triage parks the workspace so no new work starts next to the
+    ///   unresolved failure and its uncommitted state. The park lifts by itself: cancelling or
+    ///   superseding the failed ticket moves it out of Failed. Nothing else is paused, so the
+    ///   Manager keeps full triage control.
     ///
-    /// The two occupancy checks' `t2.is_archived = 0` guard is a deliberate
-    /// no-op for the pipeline phases (only Done/Cancelled tickets get archived
-    /// and neither is a pipeline phase) but load-bearing for `Failed`, which
-    /// stays non-archived until triage.
+    /// The two occupancy checks' `t2.is_archived = 0` guard is a deliberate no-op for the pipeline
+    /// phases (only Done/Cancelled tickets get archived, and neither is a pipeline phase) but
+    /// load-bearing for `Failed`, which stays non-archived until triage.
     pub(crate) async fn claim_queued_for_development(
         &self,
         workspace_name: &str,
@@ -1145,41 +928,30 @@ impl BoardStore {
         .await
     }
 
-    /// Core claim: atomically transition a workspace's oldest eligible ticket
-    /// from `source` to `target` in a single `UPDATE..RETURNING`. Always
-    /// filters by `workspace_name` so only tickets from that workspace are
-    /// eligible. The WHERE clause includes `t1.phase = ?4` bound to `source`,
-    /// providing CAS-style atomicity — if no matching ticket exists, the claim
-    /// returns `None`.
+    /// Core claim: atomically transition a workspace's oldest eligible ticket from `source` to
+    /// `target` in one `UPDATE..RETURNING`. The `workspace_name` filter keeps the claim inside one
+    /// workspace, and `t1.phase = ?4` bound to `source` gives CAS-style atomicity — no matching
+    /// ticket means `None`.
     ///
-    /// The WHERE predicate comes from [`claim_candidate_where`] with base
-    /// placeholder offset 4 (`?1`–`?3` are the SET-clause phase/updated_at/
-    /// actor binds), the same builder the read-only probe uses — so the claim and
-    /// its probe cannot drift. Only Backlog carries the `grace_cutoff` bind
-    /// (it must be `Some` only for [`TicketPhase::Backlog`]); only Queued
-    /// enforces the pipeline-occupancy and failed-sibling start gates. `now` and `grace_cutoff` are supplied by
-    /// the caller, computed once per poll round and shared with the probe, so
-    /// the probe and the claim can never disagree about the clock or the
-    /// cutoff.
+    /// The WHERE predicate comes from [`claim_candidate_where`] with base offset 4 (`?1`–`?3` are
+    /// the SET-clause phase/updated_at/actor binds) — the same builder the read-only probe uses, so
+    /// claim and probe cannot drift. Only Backlog carries the `grace_cutoff` bind (it must be
+    /// `Some` only for [`TicketPhase::Backlog`]); only Queued enforces the pipeline-occupancy and
+    /// failed-sibling start gates. `now` and `grace_cutoff` come from the caller, computed once per
+    /// poll round and shared with the probe, so the two never disagree about clock or cutoff.
     ///
-    /// The prereq filter is part of the same atomic UPDATE (no separate
-    /// SELECT+UPDATE window): a candidate with an unmet prerequisite is excluded
-    /// via `NOT EXISTS` over `json_each(t1.prerequisites)`, joining to each
-    /// prerequisite ticket and rejecting the candidate unless every
-    /// prerequisite is in an unblocking phase ([`UNBLOCKING_PHASES`]) — so a
-    /// Manager moving a Backlog ticket straight to Queued (or a prereq being
-    /// re-opened after its dependent entered the pipeline) cannot advance it
-    /// out of dependency order.
+    /// The prereq filter is part of the same atomic UPDATE (no separate SELECT+UPDATE window):
+    /// `NOT EXISTS` over `json_each(t1.prerequisites)` rejects a candidate unless every
+    /// prerequisite ticket is in an unblocking phase ([`UNBLOCKING_PHASES`]) — so a Manager moving
+    /// a Backlog ticket straight to Queued (or a prereq re-opened after its dependent entered the
+    /// pipeline) cannot advance it out of dependency order.
     ///
-    /// The candidate subquery orders by `priority ASC, created_at ASC` so
-    /// tickets with lower priority (higher urgency) are claimed first, then
-    /// the oldest ticket (earliest created_at) first.
+    /// Ordering is `priority ASC, created_at ASC`: higher urgency first, then oldest.
     ///
-    /// The SQL text per (source, grace_cutoff) combination is invariant, which
-    /// the [`Connection::execute_rows_cached`] cache contract requires. Note: the
-    /// claim SELECT is kept to the tickets table, and the agents roster is a
-    /// separate logical table checked by the caller (via the phase-job +
-    /// launched-roster guard) — Backlog/Queued tickets have no running agent.
+    /// The SQL text per (source, grace_cutoff) combination is invariant, which the
+    /// [`Connection::execute_rows_cached`] cache contract requires. The claim SELECT stays on the
+    /// tickets table; the agents roster is a separate table checked by the caller (phase-job +
+    /// launched-roster guard) since Backlog/Queued tickets have no running agent.
     async fn claim_for_phase(
         &self,
         workspace_name: &str,
@@ -1234,10 +1006,9 @@ impl BoardStore {
         }
     }
 
-    /// Read-only existence probe for the Backlog→Analysis claim: `true` when at
-    /// least one ticket satisfies the exact claim predicate (same shared
-    /// builder, same bound grace cutoff — no drift). Existence only: no ORDER
-    /// BY, no column fetch.
+    /// Read-only existence probe for the Backlog→Analysis claim: `true` when at least one ticket
+    /// satisfies the exact claim predicate (same shared builder, same bound grace cutoff — no
+    /// drift). Existence only: no ORDER BY, no column fetch.
     pub(crate) async fn backlog_claim_candidate_exists(
         &self,
         workspace_name: &str,
@@ -1253,14 +1024,12 @@ impl BoardStore {
             .await
     }
 
-    /// Core probe: `SELECT 1 FROM tickets t1 WHERE {claim_candidate_where} LIMIT 1`
-    /// through the prepared-cached path. The SQL text is invariant (phase lists
-    /// are compile-time constants; workspace/cutoff are bound parameters), which
-    /// the [`Connection::query_cached`] cache contract requires. The text is a
-    /// plain SELECT: `query_cached` is a read entry and does not check the SQL
-    /// itself, so the statement being read-only is what keeps the read where it
-    /// belongs. Existence only, so unlike the claim there is no ORDER BY sorter
-    /// to pay for.
+    /// Core probe: `SELECT 1 FROM tickets t1 WHERE {claim_candidate_where} LIMIT 1` through the
+    /// prepared-cached path. The SQL text is invariant (phase lists are compile-time constants;
+    /// workspace and cutoff are bound parameters), which the [`Connection::query_cached`] cache
+    /// contract requires. `query_cached` is a read entry that does not check the SQL itself, so
+    /// the statement being a plain read-only SELECT is what keeps the read where it belongs.
+    /// Existence only, so unlike the claim there is no ORDER BY sorter to pay for.
     async fn claim_candidate_exists(
         &self,
         source: TicketPhase,
@@ -1286,13 +1055,10 @@ impl BoardStore {
         Ok(!rows.is_empty())
     }
 
-    /// Select tickets matching a SQL suffix (everything after `FROM tickets`),
-    /// parsing each row via [`ticket_from_row`](Self::ticket_from_row).
-    ///
-    /// This is the shared building block for all `SELECT {TICKET_COLUMNS}` queries.
-    /// Accepts the full suffix — typically starting with `WHERE` and optionally
-    /// including `ORDER BY`, `LIMIT`, etc. — and forwards `params` directly to
-    /// the underlying query so callers can use `db::params![]` without conversions.
+    /// Select tickets matching a SQL suffix (everything after `FROM tickets`), parsing each row via
+    /// [`ticket_from_row`](Self::ticket_from_row) — the shared building block for all
+    /// `SELECT {TICKET_COLUMNS}` queries. `suffix` typically starts with `WHERE` and may include
+    /// `ORDER BY`, `LIMIT`, …; `params` is forwarded to the underlying query unchanged.
     pub(crate) async fn select_tickets(
         &self,
         suffix: &str,
@@ -1317,11 +1083,8 @@ impl BoardStore {
             .next())
     }
 
-    /// Fetch multiple tickets by their IDs.
-    ///
-    /// Returns an empty vec if `ids` is empty (no SQL round-trip).
-    /// Tickets are returned in **arbitrary order** — callers that need to
-    /// preserve input ordering must re-sort after receiving the result.
+    /// Fetch multiple tickets by their IDs. An empty `ids` returns an empty vec without a SQL
+    /// round-trip; the result order is **arbitrary**, so callers needing input order re-sort.
     pub(crate) async fn get_tickets_by_ids(
         &self,
         ids: &[String],
@@ -1334,11 +1097,8 @@ impl BoardStore {
         self.select_tickets(&suffix, params, load_comments).await
     }
 
-    /// Build a `WHERE id IN (?, ?, ...)` suffix and parameter vector from
-    /// ticket IDs.
-    ///
-    /// Callers must ensure `ids` is non-empty — the resulting SQL is invalid
-    /// (syntax error from Turso) when the list is empty.
+    /// Build a `WHERE id IN (?, ?, ...)` suffix and parameter vector from ticket IDs.
+    /// `ids` must be non-empty — an empty list yields invalid SQL (a Turso syntax error).
     fn in_clause_for_ids(ids: &[String]) -> (String, Vec<Value>) {
         let suffix = format!("WHERE id IN ({})", db::sql_in_placeholders(ids.len()));
         let params: Vec<Value> = ids.iter().map(|id| Value::Text(id.clone())).collect();
@@ -1361,11 +1121,10 @@ impl BoardStore {
 
     /// Get a ticket's priority by id — lightweight, no comments loaded.
     ///
-    /// Used by the priority-inheritance path in `CreateTicketTool::execute` to
-    /// read the superseded ticket's priority without loading comments. Priority
-    /// is immutable after ticket creation, so this single-column read outside
-    /// the supersede transaction is safe — there is no TOCTOU race with the
-    /// supersede transaction's own SELECT for existence/workspace/phase checks.
+    /// Used by the priority-inheritance path in `CreateTicketTool::execute` to read the superseded
+    /// ticket's priority without loading comments. Priority is immutable after ticket creation, so
+    /// this single-column read outside the supersede transaction is safe — there is no TOCTOU race
+    /// with the supersede transaction's own SELECT for existence/workspace/phase checks.
     pub(crate) async fn get_ticket_priority(&self, ticket_id: &str) -> Result<Option<i64>> {
         let sql = "SELECT priority FROM tickets WHERE id = ?1";
         self.conn
@@ -1373,14 +1132,8 @@ impl BoardStore {
             .await
     }
 
-    /// Build a [`PreparedUpdate`] for an `UPDATE tickets` statement, appending
-    /// `updated_at = ?` and `WHERE id = ?` as the last two parameters.
-    ///
-    /// Callers provide the SET-clause-specific columns (without `updated_at` or
-    /// `WHERE`) together with their parameter values.  The helper appends the
-    /// current timestamp and the ticket id as the final parameters, keeping the
-    /// parameter ordering consistent across all `UPDATE tickets` producers.
-    ///
+    /// Build a [`PreparedUpdate`] for an `UPDATE tickets` statement, appending `updated_at = ?`
+    /// and `WHERE id = ?` as the last two parameters.
     fn build_ticket_update_with_updated_at(
         set_clause: &str,
         set_params: Vec<db::Value>,
@@ -1398,25 +1151,21 @@ impl BoardStore {
         }
     }
 
-    /// Build the SQL, params, and action description for a ticket phase
-    /// transition. Shared by [`transition_to`](Self::transition_to) and
-    /// [`transition_to_tx`](Self::transition_to_tx).
+    /// Build the SQL and params for a ticket phase transition. Shared by
+    /// [`transition_to`](Self::transition_to) and [`transition_to_tx`](Self::transition_to_tx).
     ///
-    /// Note: this does **not** use [`Self::build_ticket_update_with_updated_at`]
-    /// because it has extra SET columns (`last_transition_actor = ?3` and
-    /// `done_at = CASE ...`) and extra WHERE conditions (the optional CAS guard
-    /// `AND (?5 IS NULL OR phase = ?5)` and the finished-ticket guard) that
-    /// don't fit the helper's fixed pattern.
+    /// This does **not** use [`Self::build_ticket_update_with_updated_at`]: it has extra SET
+    /// columns (`last_transition_actor = ?3`, `done_at = CASE ...`) and extra WHERE conditions (the
+    /// optional CAS guard `AND (?5 IS NULL OR phase = ?5)` plus the finished-ticket guard) that do
+    /// not fit that helper's fixed pattern.
     ///
-    /// `done_at` is set to `?2` (now) when the target is `done` and never
-    /// cleared: a finished ticket's phase is immutable, so no transition ever
-    /// leaves `done`.
+    /// `done_at` is set to `?2` (now) when the target is `done` and never cleared: a finished phase
+    /// is immutable, so no transition ever leaves `done`.
     ///
-    /// `AND (phase <> 'done' OR ?1 = 'done')` is the finished-ticket rule in the
-    /// statement itself: any attempt to move a `done` ticket to another phase
-    /// matches zero rows, so no writer can slip a finished ticket back into
-    /// work. Writing `done` onto an already-`done` ticket is not a transition
-    /// and stays allowed (the existing overwrite of `done_at` is kept).
+    /// `AND (phase <> 'done' OR ?1 = 'done')` puts the finished-ticket rule in the statement:
+    /// moving a `done` ticket elsewhere matches zero rows, so no writer can slip a finished ticket
+    /// back into work. Writing `done` onto an already-`done` ticket is not a transition and stays
+    /// allowed (its `done_at` overwrite is kept).
     fn build_transition_sql(
         ticket_id: &str,
         expected_phase: Option<TicketPhase>,
@@ -1444,19 +1193,8 @@ impl BoardStore {
         }
     }
 
-    /// Update ticket phase, optionally guarded by an expected phase for CAS-style
-    /// atomicity. Always cancels running agents.
-    ///
-    /// `actor` is recorded as `last_transition_actor` for the transition:
-    /// manual/GUI callers pass a role label or `"user"`; pipeline callers pass
-    /// [`PIPELINE_ACTOR`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the ticket does not exist, when the CAS guard
-    /// misses (the ticket is in another phase), when a `done` ticket is asked
-    /// to move to any other phase (its phase is immutable), or on a database
-    /// error. A `done → done` write is not a transition and succeeds.
+    /// Update ticket phase, optionally guarded by an expected phase for CAS-style atomicity. Always
+    /// cancels running agents.
     pub async fn transition_to(
         &self,
         ticket_id: &str,
@@ -1481,13 +1219,12 @@ impl BoardStore {
             });
         }
         crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(ticket_id);
-        // A terminal transition (Done/Cancelled/Failed) completes the ticket's
-        // phase jobs (idempotent; no-op when the ticket has none) so a manual
-        // Done/Cancelled does not leave a lingering 'launched' phase job. The
-        // pipeline path completes the phase jobs at its own Done handoff
+        // A terminal transition (Done/Cancelled/Failed) completes the ticket's phase jobs
+        // (idempotent; no-op when it has none), so a manual Done/Cancelled does not leave a
+        // lingering 'launched' phase job. The pipeline path completes them at its own Done handoff
         // functions, so this only fires for external/manual callers.
-        // Guard on the session store being initialized: this is the MANUAL
-        // path, and some board-only contexts (tests) never open the session DB.
+        // Guard on the session store being initialized: this is the MANUAL path, and some
+        // board-only contexts (tests) never open the session DB.
         if target_phase.is_terminal()
             && let Some(session) = crate::session::SESSIONS.get()
         {
@@ -1496,27 +1233,23 @@ impl BoardStore {
         Ok(())
     }
 
-    /// Transactional variant of [`transition_to`](Self::transition_to) —
-    /// uses an existing transaction instead of `self.conn.execute()`.
-    /// Does NOT cancel registered agents — the caller is responsible for
-    /// cancelling agents **before** beginning the transaction (or at least
-    /// before `tx.commit()`) to avoid orphaned agents on crash.
+    /// Transactional variant of [`transition_to`](Self::transition_to), using an existing
+    /// transaction instead of `self.conn.execute()`. Does NOT cancel registered agents — the caller
+    /// cancels them **before** beginning the transaction (or at least before `tx.commit()`) to
+    /// avoid orphaned agents on crash.
     ///
     /// # Return value
     ///
-    /// Returns `Ok(true)` when the guard matched and the row was updated;
-    /// `Ok(false)` when no row matched — the ticket is no longer in the
-    /// expected phase (moved externally while the stage finished) or does not
-    /// exist. The guard miss follows the board layer's claim convention
-    /// (expected no-op, not an error), unlike
-    /// [`transition_to`](Self::transition_to) whose callers perform
-    /// user-initiated actions on a ticket that must exist.
+    /// `Ok(true)` when the guard matched and the row was updated; `Ok(false)` when no row matched —
+    /// the ticket left the expected phase (moved externally while the stage finished) or does not
+    /// exist. That miss follows the board layer's claim convention (expected no-op, not an error),
+    /// unlike [`transition_to`](Self::transition_to), whose callers perform user-initiated actions
+    /// on a ticket that must exist.
     ///
-    /// A `done` ticket asked to move to another phase is the exception: it
-    /// returns the finished-ticket refusal as an error, because "the ticket
-    /// moved externally" would be a false reason for a phase that can never
-    /// move. Carrying a stale guard onto `done` itself is not a transition, so
-    /// it keeps the benign `Ok(false)`.
+    /// A `done` ticket asked to move elsewhere is the exception: it returns the finished-ticket
+    /// refusal as an error, because "the ticket moved externally" would be a false reason for a
+    /// phase that can never move. A stale guard onto `done` itself is not a transition, so it keeps
+    /// the benign `Ok(false)`.
     pub(crate) async fn transition_to_tx(
         tx: &TxGuard<'_>,
         ticket_id: &str,
@@ -1546,16 +1279,14 @@ impl BoardStore {
         Ok(false)
     }
 
-    /// Whether a zero-row phase write was refused by the finished-ticket rule:
-    /// the ticket is `done` and the target is not (`done → done` is not a
-    /// transition, so it keeps the CAS-miss semantics).
+    /// Whether a zero-row phase write was refused by the finished-ticket rule: the ticket is `done`
+    /// and the target is not (`done → done` is not a transition, so it keeps CAS-miss semantics).
     fn is_finished_phase_refusal(current: Option<TicketPhase>, target: TicketPhase) -> bool {
         current == Some(TicketPhase::Done) && target != TicketPhase::Done
     }
 
-    /// The one refusal for a phase write on a finished ticket: names the ticket,
-    /// the attempted action, and what still works, so no caller mistakes it for
-    /// "not found" or a silent no-op.
+    /// The one refusal for a phase write on a finished ticket: names the ticket, the attempted
+    /// action and what still works, so no caller mistakes it for "not found" or a silent no-op.
     fn finished_ticket_error(ticket_id: &str, action: &str) -> anyhow::Error {
         anyhow::anyhow!(
             "Ticket {ticket_id} is finished (phase 'done') — a finished ticket's phase is \
@@ -1564,21 +1295,20 @@ impl BoardStore {
         )
     }
 
-    /// The refusal for a phase transition on a finished ticket — the shared
-    /// action wording for both transition paths.
+    /// The refusal for a phase transition on a finished ticket — the shared action wording for
+    /// both transition paths.
     fn finished_transition_error(ticket_id: &str, target: TicketPhase) -> anyhow::Error {
         Self::finished_ticket_error(ticket_id, &format!("moved to '{}'", target.as_ref()))
     }
 
-    /// Verify that a mutation query affected at least one row, returning an
-    /// error with a descriptive message if the ticket was not found.
+    /// Verify that a mutation affected at least one row, erroring when the ticket was not found.
     fn ensure_ticket_found(rows: u64, ticket_id: &str) -> Result<()> {
         anyhow::ensure!(rows > 0, "Ticket {ticket_id} not found");
         Ok(())
     }
 
-    /// Record commit metadata on a ticket using an existing transaction.
-    /// Does NOT commit or rollback the transaction; the caller controls that.
+    /// Record commit metadata on a ticket using an existing transaction; the caller commits or
+    /// rolls back.
     pub(crate) async fn set_commit_info_tx(
         tx: &TxGuard<'_>,
         ticket_id: &str,
@@ -1594,7 +1324,6 @@ impl BoardStore {
             lines_removed >= 0,
             "lines_removed must be non-negative: {lines_removed}"
         );
-        // Build the SQL and params for setting commit info.
         let prepared = Self::build_ticket_update_with_updated_at(
             "commit_hash = ?, lines_added = ?, lines_removed = ?",
             vec![
@@ -1607,11 +1336,10 @@ impl BoardStore {
         prepared.execute_tx(tx).await
     }
 
-    /// Record the reviewed content base on a ticket — the content the code
-    /// reviewers were handed, read before the round's participants ran. Written
-    /// only by a round whose code review ran and which then moved the ticket on;
-    /// see `verification::record_reviewed_base`. `None` values clear the base
-    /// (ticket becomes never-reviewed).
+    /// Record the reviewed content base — the content the code reviewers were handed, read before
+    /// the round's participants ran. Written only by a round whose code review ran and which then
+    /// moved the ticket on; see `verification::record_reviewed_base`. `None` values clear the base
+    /// (the ticket becomes never-reviewed).
     pub(crate) async fn set_reviewed_base(
         &self,
         ticket_id: &str,
@@ -1626,15 +1354,10 @@ impl BoardStore {
         prepared.execute_no_cancel(&self.conn).await
     }
 
-    /// Increment the ticket's shared return-to-development counter inside an
-    /// existing transaction. Every non-success in either post-development
-    /// stage goes through this one counter.
-    ///
-    /// Called atomically with the bounce-back transition so the counter can
-    /// never drift from the transitions that produce it. Returns the
-    /// post-increment count.
-    ///
-    /// The change runs through the guard's row-returning change entry — see
+    /// Increment the ticket's shared return-to-development counter inside an existing transaction:
+    /// every non-success in either post-development stage goes through this one counter, updated
+    /// atomically with the bounce-back transition so it can never drift. Returns the
+    /// post-increment count. Uses the guard's row-returning change entry — see
     /// [`TxGuard::execute_one`].
     pub(crate) async fn increment_bounce_count_tx(
         tx: &TxGuard<'_>,
@@ -1657,15 +1380,13 @@ impl BoardStore {
 
     /// Add a comment to a ticket (append-only).
     ///
-    /// After persisting the comment, routes it to any running agents assigned
-    /// to this ticket via the message router. A comment delivered to a running
-    /// agent is a SOFT DEFERRED message consumed at the start of the agent's
-    /// next tool round — it never cancels or aborts the agent. If no agent is
-    /// registered (the agent finished before the comment arrived), the comment
-    /// is surfaced by the next agent that works on the ticket: a fresh dispatch
-    /// on a new session re-renders the ticket comment block, and a resumed
-    /// deterministic stage session (engineer/sanitation) injects outstanding
-    /// comments at the empty-message resume point.
+    /// After persisting it, the comment is routed to any running agents assigned to this ticket via
+    /// the message router. Delivery to a running agent is a SOFT DEFERRED message consumed at the
+    /// start of the agent's next tool round — it never cancels or aborts the agent. With no agent
+    /// registered (it finished before the comment arrived), the next agent working the ticket
+    /// surfaces it: a fresh dispatch on a new session re-renders the ticket comment block, and a
+    /// resumed deterministic stage session (engineer/sanitation) injects outstanding comments at
+    /// the empty-message resume point.
     pub async fn add_comment(&self, ticket_id: &str, role: &str, content: &str) -> Result<()> {
         crate::db::with_tx(&self.conn, ticket_id, "add comment", async |tx| {
             Self::add_comment_tx(tx, ticket_id, role, content).await
@@ -1678,20 +1399,16 @@ impl BoardStore {
         Ok(())
     }
 
-    /// Route a newly-persisted comment to any running agents assigned to the ticket.
-    ///
-    /// Looks up the ticket's currently-running agents (`launched` roster rows
-    /// across the ticket's jobs — the replacement for the historical
-    /// `tickets.assigned_to`). If agents are registered in the message router,
-    /// the comment is delivered to each one. This is best-effort — failures
-    /// are logged but not propagated.
+    /// Route a newly-persisted comment to any running agents assigned to the ticket: the ticket's
+    /// `launched` roster rows across its jobs (the replacement for the historical
+    /// `tickets.assigned_to`), delivered through the message router. Best-effort — failures are
+    /// logged, not propagated.
     async fn route_comment_to_agents(&self, ticket_id: &str, role: &str, content: &str) {
-        // Best-effort: if the sessions store isn't initialized (e.g. a
-        // board-only test), there are no active agents to route to.
+        // Best-effort: with no sessions store (e.g. a board-only test) there are no agents to route
+        // to.
         let Some(sessions) = crate::session::SESSIONS.get() else {
             return;
         };
-        // Fetch the ticket's workspace_name.
         let ticket = match self.get_ticket(ticket_id).await {
             Ok(Some(t)) => t,
             Ok(None) => {
@@ -1723,12 +1440,11 @@ impl BoardStore {
                 continue;
             }
 
-            // Use the commenter's role. If it doesn't parse as a standard Role
-            // (e.g. "engineer_1" from parallel-agent verdict comments), fall
-            // back to Manager. This fallback is safe: pipeline agents receive
-            // comments via try_route() → direct inbox delivery, NOT via the
-            // consumer loop. AgentJob.role is only used for response delivery
-            // in the consumer loop path, which pipeline agents never enter.
+            // The commenter's role. If it does not parse as a standard Role (e.g. "engineer_1" from
+            // parallel-agent verdict comments), fall back to Manager — safe because pipeline agents
+            // receive comments via try_route() → direct inbox delivery, NOT via the consumer loop;
+            // `AgentJob.role` only matters for response delivery in that loop, which pipeline
+            // agents never enter.
             let commenter_role = role.parse::<crate::Role>().unwrap_or(crate::Role::Manager);
 
             let job = crate::agent::message_router::AgentJob {
@@ -1756,19 +1472,11 @@ impl BoardStore {
         }
     }
 
-    /// Transactional variant of [`add_comment`](Self::add_comment) —
-    /// uses an existing transaction instead of opening its own.
-    /// Does NOT commit or rollback; the caller controls outer transaction lifecycle.
-    ///
-    /// Inserts the comment record AND updates the ticket's `updated_at` timestamp.
-    ///
-    /// NOTE: Unlike [`add_comment`](Self::add_comment), this method does NOT route
-    /// the comment to running agents via the message router. All current callers
-    /// (verdict recording, system comments, failure reports) are post-agent phases
-    /// where no running agent exists to receive the comment. If adding a new caller
-    /// that runs mid-execution, use [`add_comment`](Self::add_comment) instead, or
-    /// call [`route_comment_to_agents`](Self::route_comment_to_agents) manually
-    /// after the transaction commits.
+    /// Transactional [`add_comment`](Self::add_comment): inserts the comment and bumps
+    /// `updated_at`, without committing or rollback. It does NOT route the comment to running
+    /// agents — every current caller is a post-agent phase where none runs; a mid-execution
+    /// caller must use `add_comment` or call
+    /// [`route_comment_to_agents`](Self::route_comment_to_agents) after the commit.
     pub(crate) async fn add_comment_tx(
         tx: &TxGuard<'_>,
         ticket_id: &str,
@@ -1808,34 +1516,25 @@ impl BoardStore {
         Ok(comments)
     }
 
-    /// Validate prerequisites for a new ticket being created.
-    ///
-    /// Checks that every prerequisite ticket exists and belongs to the same
-    /// workspace. Self-reference is checked separately by the caller (before
-    /// this function is called, using the real ID generated within the transaction).
-    ///
-    /// At creation time, transitive cycles cannot exist because no existing
-    /// ticket depends on the new ticket yet. Redundant prerequisites (e.g.,
-    /// A and B where B already depends on A) are allowed — they do not form
-    /// a cycle.
+    /// Validate prerequisites for a new ticket: each must exist and belong to the same
+    /// workspace. Self-reference is checked separately by the caller (before this call, with
+    /// the real ID generated inside the transaction).
     async fn validate_prerequisites(
         tx: &TxGuard<'_>,
         prerequisite_ids: &[String],
         workspace_name: &str,
     ) -> Result<()> {
-        // Guard against empty list — Turso rejects WHERE id IN ().
+        // Turso rejects `WHERE id IN ()`.
         if prerequisite_ids.is_empty() {
             return Ok(());
         }
 
-        // Batch query: fetch id + workspace_name for all prerequisites in one
-        // round trip. Reads through the transaction's own entry — see
+        // One round trip for every prerequisite; read through the transaction's own entry — see
         // [`TxGuard::query`].
         let (suffix, params) = Self::in_clause_for_ids(prerequisite_ids);
         let sql = format!("SELECT id, workspace_name FROM tickets {suffix}");
         let rows = tx.query(&sql, params).await?;
 
-        // Build a lookup map for O(1) prerequisite resolution.
         let mut found: HashMap<String, String> = HashMap::new();
         for row in rows {
             let id: String = row.get(0)?;
@@ -1858,10 +1557,8 @@ impl BoardStore {
         Ok(())
     }
 
-    /// List all tickets, optionally filtered by workspace and/or phase.
-    /// Used by the dashboard to show tickets across all workspaces. The
-    /// `is_archived = 0` gate means a ticket appears here iff it is live,
-    /// which also backs the CDC removal decision.
+    /// List all tickets, optionally filtered by workspace and/or phase. The `is_archived = 0`
+    /// gate means a ticket appears here iff it is live, which also backs the CDC removal decision.
     pub async fn list_all_tickets(
         &self,
         workspace_name: Option<&str>,
@@ -1879,22 +1576,17 @@ impl BoardStore {
         .await
     }
 
-    /// List the live tickets of a workspace across all working phases
-    /// ([`WORKING_PHASES`]) in one snapshot, grouped phase-major in dispatch
-    /// order with `priority ASC, created_at DESC` within each phase (the
-    /// global `ORDER BY` plus stable per-phase bucketing preserves each
-    /// phase's internal order).
-    ///
-    /// Unlike [`list_all_tickets`](Self::list_all_tickets) (which the GUI
-    /// still uses), this is a single snapshot so the polling dispatch sees
-    /// one consistent view per tick.
+    /// The live tickets of a workspace across all working phases ([`WORKING_PHASES`]) in one
+    /// snapshot, grouped phase-major in dispatch order with `priority ASC, created_at DESC`
+    /// inside each phase (the global `ORDER BY` plus stable bucketing keeps each phase's
+    /// order). A single snapshot, so the polling dispatch sees one consistent view per tick.
     pub(crate) async fn list_working_tickets(
         &self,
         workspace_name: &str,
     ) -> Result<Vec<(TicketPhase, Ticket)>> {
-        // The IN-list placeholders are derived from WORKING_PHASES so the SQL
-        // cannot drift from the constant; the interpolated text stays
-        // invariant across calls, keeping the statement-cache contract.
+        // The IN-list placeholders derive from WORKING_PHASES so the SQL cannot drift from the
+        // constant; the interpolated text stays invariant across calls, keeping the
+        // statement-cache contract.
         let phase_placeholders = (2..=WORKING_PHASES.len() + 1)
             .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
@@ -1909,9 +1601,8 @@ impl BoardStore {
         let mut params: Vec<Value> = vec![Value::from(workspace_name)];
         params.extend(WORKING_PHASES.iter().map(|p| Value::from(p.as_ref())));
         let rows = self.conn.query_cached(&sql, params).await?;
-        // Bucket each ticket by its index in WORKING_PHASES. Bucketing is
-        // stable, so the global `priority ASC, created_at DESC` order is
-        // preserved within each phase.
+        // Bucket each ticket by its index in WORKING_PHASES. Bucketing is stable, so the global
+        // `priority ASC, created_at DESC` order is preserved within each phase.
         let mut buckets: Vec<Vec<Ticket>> = vec![Vec::new(); WORKING_PHASES.len()];
         for row in rows {
             let ticket = self.ticket_from_row(&row, LoadComments::No).await?;
@@ -1927,13 +1618,10 @@ impl BoardStore {
         Ok(out)
     }
 
-    /// Count the maintainer's pre-development tickets (Analysis + Planning +
-    /// Queued) for one workspace in a single snapshot — the ticket-creation
-    /// throttle reading.
-    ///
-    /// Archived tickets are excluded: the GUI can archive a ticket in any
-    /// phase, and archived work must not throttle new tickets. Callers treat
-    /// an `Err` as fail-open.
+    /// The maintainer's pre-development ticket count (Analysis + Planning + Queued) for one
+    /// workspace in a single snapshot — the ticket-creation throttle reading. Archived tickets
+    /// are excluded (the GUI can archive in any phase, and archived work must not throttle);
+    /// callers treat `Err` as fail-open.
     pub(crate) async fn count_pre_dev_tickets(&self, workspace_name: &str) -> Result<i64> {
         self.conn
             .query_row(
@@ -1953,30 +1641,19 @@ impl BoardStore {
             .map_err(Into::into)
     }
 
-    /// Archive a single ticket by ID.
+    /// Archive a single ticket by ID: sets `is_archived = 1`, erroring if the ticket does not
+    /// exist.
     ///
-    /// Sets `is_archived = 1`. Returns an error if the ticket does not exist.
-    ///
-    /// **Ordering constraint:** The caller must transition the ticket to a
-    /// terminal state (`done` or `cancelled`) *before* calling this method.
+    /// **Ordering constraint:** the caller must transition the ticket to a terminal state (`done`
+    /// or `cancelled`) *before* calling this.
     pub async fn set_archived(&self, ticket_id: &str) -> Result<()> {
         let prepared =
             Self::build_ticket_update_with_updated_at("is_archived = 1", vec![], ticket_id);
         prepared.execute_and_cancel(&self.conn).await
     }
 
-    /// Move all non-archived Queued tickets in the given workspace
-    /// to Planning.
-    ///
-    /// Used by the circuit breaker to drain sibling Queued tickets
-    /// when a ticket in the same workspace fails.
-    ///
-    /// Uses a single atomic UPDATE so there is no TOCTOU window between reading
-    /// current Queued tickets and updating them. Per-sibling
-    /// notifications are intentionally suppressed — each sibling will discover
-    /// its new phase on the next poll cycle via the standard poll loop.
-    ///
-    /// Returns the number of tickets moved.
+    /// Move all non-archived Queued tickets in the workspace to Planning — the circuit breaker's
+    /// drain when a ticket in the same workspace fails. Returns how many moved.
     pub(crate) async fn drain_queued_to_planning(
         &self,
         workspace_name: &str,
@@ -2017,10 +1694,9 @@ impl BoardStore {
         Ok(updated)
     }
 
-    /// Archive every non-archived done/cancelled ticket in the installation —
-    /// every ticket row, including those whose workspace is gone or was never
-    /// registered. The Telegram `/archive` command and the GUI bulk action both
-    /// come through here, so the two surfaces cannot diverge.
+    /// Archive every non-archived done/cancelled ticket in the installation — every ticket row,
+    /// including those whose workspace is gone or was never registered. The Telegram `/archive`
+    /// command and the GUI bulk action both come through here, so the two cannot diverge.
     pub async fn archive_all_done_and_cancelled(&self) -> Result<u64> {
         let now = db::now();
         let sql = format!(
@@ -2036,21 +1712,15 @@ impl BoardStore {
         Ok(updated)
     }
 
-    // ── Board display ordering (shared with the GUI) ─────────────────────
-    //
-    // The GUI board and the Telegram `/board` command must show tickets in
-    // exactly the same order. These helpers are the single source of truth —
-    // the GUI column rendering and the Telegram listing both use them.
+    // The GUI board and the Telegram `/board` command must show tickets in exactly the same order;
+    // these helpers are the single source of truth both use.
 
-    /// Partition tickets into the three kanban columns, in the same order the
-    /// GUI board displays them: completed ([`TicketPhase::is_unblocking`]),
-    /// pipeline ([`TicketPhase::is_pipeline_occupied`] plus
-    /// `Queued`), pending (everything else — the safe fallback
-    /// for unclassified phases). Archived tickets are excluded.
-    ///
-    /// Non-completed tickets sort by priority ASC (0 = highest) then
-    /// created_at ASC; completed tickets sort Done-first by exact done
-    /// timestamp DESC (created_at fallback), then Cancelled by created_at
+    /// Partition tickets into the three kanban columns in GUI board order: completed
+    /// ([`TicketPhase::is_unblocking`]), pipeline ([`TicketPhase::is_pipeline_occupied`] plus
+    /// `Queued`), pending (everything else — the safe fallback for unclassified phases). Archived
+    /// tickets are excluded.
+    /// Non-completed sort by priority ASC (0 = highest) then created_at ASC; completed sort
+    /// Done-first by exact done timestamp DESC (created_at fallback), then Cancelled by created_at
     /// DESC.
     #[must_use]
     fn partition_board_tickets(tickets: &[Ticket]) -> (Vec<&Ticket>, Vec<&Ticket>, Vec<&Ticket>) {
@@ -2067,17 +1737,14 @@ impl BoardStore {
             } else if ticket.phase.is_pipeline_occupied() || ticket.phase == TicketPhase::Queued {
                 pipeline.push(ticket);
             } else {
-                // Unknown future phases silently default to pending — the
-                // safe bucket for unclassified phases.
+                // Unknown future phases silently default to pending — the safe bucket.
                 pending.push(ticket);
             }
         }
 
-        // Sort: pending and pipeline by priority (ASC), then oldest-first (ASC);
-        // completed: Done tickets newest-done_first (DESC), then Cancelled
-        // newest-first (DESC) below them.
-        // Priority is an integer — 0 = highest, so ASC puts urgent tickets first.
-        // Ticket created_at is an ISO 8601 string, so lexical sort = chronological sort
+        // Pending and pipeline: priority ASC (0 = highest) then oldest-first;
+        // completed: Done newest-done-first (DESC), then Cancelled newest-first below them.
+        // created_at is an ISO 8601 string, so lexical sort is chronological.
         for column in [&mut pending, &mut pipeline] {
             column.sort_by(|a, b| {
                 a.priority
@@ -2088,8 +1755,8 @@ impl BoardStore {
         completed.sort_by(|a, b| {
             let (a_done, b_done) = (a.phase == TicketPhase::Done, b.phase == TicketPhase::Done);
             match (a_done, b_done) {
-                // Done first, newest completion on top (created_at fallback
-                // for Done tickets with no done_at, e.g. test-created ones).
+                // Done first, newest completion on top (created_at fallback for Done tickets with
+                // no done_at, e.g. test-created ones).
                 (true, true) => Self::board_done_sort_key(b).cmp(Self::board_done_sort_key(a)),
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
@@ -2100,10 +1767,9 @@ impl BoardStore {
         (pending, pipeline, completed)
     }
 
-    /// The four board sections in display order: In Progress (pipeline minus
-    /// Queued), Queued, Pending, Completed. Shared by the GUI
-    /// column rendering and the Telegram `/board` listing so the two surfaces
-    /// can never diverge. Empty sections are included (callers skip them).
+    /// The four board sections in display order: In Progress (pipeline minus Queued), Queued,
+    /// Pending, Completed — shared by the GUI columns and the Telegram `/board` listing so the two
+    /// cannot diverge. Empty sections are included (callers skip them).
     #[must_use]
     pub fn board_sections(tickets: &[Ticket]) -> [Vec<&Ticket>; 4] {
         let (pending, pipeline, completed) = Self::partition_board_tickets(tickets);
@@ -2120,9 +1786,8 @@ impl BoardStore {
         [in_progress, queued, pending, completed]
     }
 
-    /// Flatten [`Self::board_sections`] into a single display-order list —
-    /// the exact order the GUI board shows them. Used by the Telegram
-    /// `/board` command so its listing can never diverge from the GUI.
+    /// Flatten [`Self::board_sections`] into one display-order list — the exact order the GUI board
+    /// shows. The Telegram `/board` command uses it so its listing cannot diverge from the GUI.
     #[must_use]
     pub fn board_display_order(tickets: &[Ticket]) -> Vec<&Ticket> {
         Self::board_sections(tickets)
@@ -2131,35 +1796,19 @@ impl BoardStore {
             .collect()
     }
 
-    /// Completion ordering key for a completed-column ticket: its exact done
-    /// timestamp, falling back to creation time when `done_at` is absent.
+    /// Completion ordering key: the exact done timestamp, falling back to creation time when
+    /// `done_at` is absent.
     fn board_done_sort_key(ticket: &Ticket) -> &str {
         ticket.done_at.as_deref().unwrap_or(&ticket.created_at)
     }
 
-    // ── Ticket FTS search methods ─────────────────────────────────────────
-    //
     // The installation-wide archived search used by
-    // [`SearchArchivedTicketsTool`](crate::tools::search_archived_tickets), and
-    // [`search_by_fts`], which backs the GUI sidebar search. The board owns the
-    // FTS schema (`ngram` tokenizer and index name); the tool layer owns only
-    // the presentation.
+    // [`SearchArchivedTicketsTool`](crate::tools::search_archived_tickets), and [`search_by_fts`],
+    // which backs the GUI sidebar search. The board owns the FTS schema (`ngram` tokenizer and
+    // index name); the tool layer owns only the presentation.
 
-    /// Search archived tickets by FTS keyword match, installation-wide.
-    ///
-    /// Sanitizes the input query (strips non-alphanumeric characters) before
-    /// matching against the `ngram`-tokenized FTS index on `title`. Every
-    /// workspace's archived tickets are candidates.
-    ///
-    /// Returns up to `limit` ticket ids, highest score first. The ranked FTS
-    /// scan is wrapped in a subquery and the archive predicate and `ORDER BY`
-    /// are applied outside it: the engine drops the sort when the archive
-    /// predicate sits inside, and the unbounded candidate set means live
-    /// (non-archived) tickets can neither crowd out archived hits nor break the
-    /// ordering.
-    ///
-    /// On SQL error (e.g. corrupt FTS index), logs a warning and returns an
-    /// empty vec.
+    /// Search archived tickets by FTS keyword match, installation-wide: up to `limit` ticket ids,
+    /// highest score first, across every workspace's archived tickets.
     pub(crate) async fn search_archived_by_fts(
         &self,
         query: &str,
@@ -2197,28 +1846,16 @@ impl BoardStore {
         }
     }
 
-    /// Search tickets (both active and archived) by FTS keyword match across
-    /// every workspace.
-    ///
-    /// Sanitizes the input query (strips non-alphanumeric characters) before
-    /// matching against the `ngram`-tokenized FTS index on `title`.
-    ///
-    /// Returns full [`Ticket`] objects (without comments) ordered by FTS
-    /// relevance (`fts_score DESC`), up to `limit` results.
-    ///
-    /// A query error and a ticket row that fails to parse are both propagated
-    /// to the caller: the GUI sidebar renders the failure instead of silently
-    /// showing an empty (or incomplete) result as "No matching tickets". Each is
-    /// also logged, so a failed sidebar search leaves a trail outside the GUI.
+    /// Search tickets (active and archived) by FTS keyword match across every workspace: full
+    /// [`Ticket`] objects (without comments) by FTS relevance (`fts_score DESC`), up to `limit`.
     pub async fn search_by_fts(&self, query: &str, limit: usize) -> Result<Vec<Ticket>> {
         let sanitized = crate::db::sanitize_fts_query(query);
         if sanitized.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Use an explicit `FROM tickets t` alias so `fts_score(t.title, ?1)`
-        // resolves correctly — the `select_tickets` helper does not support
-        // table aliases in FTS scoring expressions.
+        // An explicit `FROM tickets t` alias lets `fts_score(t.title, ?1)` resolve — the
+        // `select_tickets` helper does not support table aliases in FTS scoring expressions.
         let sql = format!(
             "SELECT {TICKET_COLUMNS} \
              FROM tickets t \

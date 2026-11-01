@@ -1,19 +1,14 @@
-//! Plain Win32 window facts for the Windows backend: which top-level windows an
-//! application owns, every target's frame in physical pixels, the virtual-desktop
-//! rect, process names, and the two refusals actuation owes the caller (an
-//! elevated window, the secure desktop).
+//! Plain Win32 window facts for the Windows backend: which top-level windows an application
+//! owns, every target's frame in physical pixels, the virtual-desktop rect, process names, and the
+//! two refusals actuation owes the caller (an elevated window, the secure desktop).
 //!
-//! Runs on the apartment thread, like every other platform call: a target is
-//! resolved to an `HWND` here, used, and dropped — nothing stores a platform
-//! handle across jobs.
+//! Runs on the apartment thread, like every other platform call: a target is resolved to an
+//! `HWND` here, used, and dropped — nothing stores a platform handle across jobs.
 //!
-//! A window's identity is its own OS handle plus the pid that owned it when it was
-//! enumerated ([`window_key`]): the handle stays valid across moves, renames and
-//! re-enumeration, so a `TargetSpec::Window` either lands on that very window or
-//! fails with [`core::ERR_SURFACE_GONE`] — never on another window of the
-//! application, by title or by position in a listing. `TargetSpec::App` names an
-//! application rather than a window and is resolved per call: its own active
-//! window, else its frontmost one.
+//! A window's identity is its own OS handle plus the pid that owned it when enumerated
+//! ([`window_key`]): a `TargetSpec::Window` either lands on that very window or fails with
+//! [`core::ERR_SURFACE_GONE`] — never on another window of the application. `TargetSpec::App`
+//! names an application and is resolved per call: its own active window, else its frontmost.
 
 use super::super::core::{
     self, AppInfo, AppListing, SurfaceGeometry, TargetSpec, UnreadWindows, WindowInfo, WindowKey,
@@ -61,9 +56,7 @@ pub(super) struct TargetWindow {
     pub surface: SurfaceGeometry,
 }
 
-/// Ask for per-monitor-v2 DPI awareness once, eagerly, before any coordinate is
-/// read. A GUI run already has it (winit sets it when the dashboard starts) and
-/// the call then fails harmlessly, leaving the existing awareness in place.
+/// Ask for per-monitor-v2 DPI awareness once, eagerly, before any coordinate is computed.
 pub(super) fn ensure_dpi_aware() {
     static ONCE: Once = Once::new();
     // SAFETY: no pointer or handle crosses this boundary, and the only failure (an
@@ -73,20 +66,13 @@ pub(super) fn ensure_dpi_aware() {
     });
 }
 
-/// Whether an interactive desktop is attached at all: the channel question
-/// [`super::Backend::capture_available`] answers. It is the same desktop check
-/// actuation refuses on, so a secure, locked or disconnected desktop answers "no"
-/// here too; a single window that refuses capture is not this.
+/// Whether an interactive desktop is attached at all: the channel question.
 pub(super) fn interactive_desktop_available() -> bool {
     ensure_input_desktop().is_ok()
 }
 
-// ── Target resolution ───────────────────────────────────────────────────
-
-/// Resolve a target to its window. `Focused` follows the foreground window;
-/// `App` re-resolves the application's own window per call; `Window` lands on the
-/// exact window its key names or fails; `Screen` is a capture surface, not a
-/// window.
+/// Resolve a target to its window. `Focused` follows the foreground window; `App` its active or
+/// frontmost window.
 pub(super) fn resolve(target: &TargetSpec) -> anyhow::Result<TargetWindow> {
     match target {
         TargetSpec::Screen => Err(core::screen_act_error()),
@@ -114,9 +100,7 @@ pub(super) fn resolve(target: &TargetSpec) -> anyhow::Result<TargetWindow> {
     }
 }
 
-/// The refusal for an `a` id that names no window right now: the application quit, is
-/// running without a window, or could not be asked. The three are kept apart because
-/// only the first one means the surface is gone.
+/// The refusal for an `a` id that names no window right now: the application quit or closed.
 fn absent_app(app_pid: Option<u32>, app_name: &str) -> anyhow::Error {
     match app_pid.and_then(process_alive) {
         Some(true) => core::app_absent(app_name, core::AppAbsence::Windowless),
@@ -125,11 +109,7 @@ fn absent_app(app_pid: Option<u32>, app_name: &str) -> anyhow::Error {
     }
 }
 
-/// Whether the process `pid` still exists: `Some(false)` only when the system says the
-/// pid names no process or that the process has exited, `Some(true)` when it is still
-/// running, and `None` when this process may not query it (an elevated application) —
-/// an answer that is not a fact about the application, so its caller says so instead of
-/// claiming a quit.
+/// Whether the process `pid` still exists: `Some(false)` only when the system says so.
 pub(super) fn process_alive(pid: u32) -> Option<bool> {
     if pid == 0 {
         return Some(false);
@@ -140,8 +120,6 @@ pub(super) fn process_alive(pid: u32) -> Option<bool> {
     unsafe {
         match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
             Ok(process) => {
-                // A pid whose process object is still referenced opens fine: the exit
-                // code is what tells a live process from a finished one.
                 let alive = GetExitCodeProcess(process, &raw mut exit_code).is_ok()
                     && exit_code == STILL_ACTIVE.0.cast_unsigned();
                 let _ = CloseHandle(process);
@@ -157,10 +135,9 @@ pub(super) fn process_alive(pid: u32) -> Option<bool> {
 
 /// Resolve a stored window key to exactly the window it names, or refuse.
 ///
-/// The key carries the window's own handle and the pid that owned it, so a moved,
-/// resized or renamed window keeps resolving while a closed or replaced one does
-/// not. There is no fallback: a title match or another window of the application
-/// would be a different surface than the caller named.
+/// The key carries the window's own handle and the pid that owned it, so a moved, resized or
+/// renamed window keeps resolving while a closed or replaced one does not. There is no fallback: a
+/// title match or another window of the application would be a different surface.
 fn resolve_key(app_name: &str, key: &WindowKey) -> anyhow::Result<TargetWindow> {
     let Some((pid, hwnd)) = parse_key(key) else {
         return Err(core::surface_gone(app_name));
@@ -174,24 +151,20 @@ fn resolve_key(app_name: &str, key: &WindowKey) -> anyhow::Result<TargetWindow> 
     describe(hwnd)
 }
 
-/// The identity a [`WindowKey`] carries (`hwnd:<pid>:<handle>`), and the one place
-/// it is spelled. The handle alone is normally unique, but Windows may recycle one
-/// after its window closes: the pid is the guard, and a recycled handle re-creating
-/// the same pid+handle pair while a stale key is held is not addressable here.
+/// The identity a [`WindowKey`] carries (`hwnd:<pid>:<handle>`), and the one place it is spelled.
+/// Windows may recycle a handle after its window closes, so the pid is the guard.
 fn window_key(hwnd: HWND, pid: u32) -> WindowKey {
     WindowKey::new(format!("hwnd:{pid}:{}", hwnd.0 as usize))
 }
 
-/// Split a [`WindowKey`] back into its owning pid and handle. `None` when the text
-/// is not one this backend produced.
+/// Split a [`WindowKey`] back into its owning pid and handle. `None` when the text is not one.
 fn parse_key(key: &WindowKey) -> Option<(u32, HWND)> {
     let (pid, hwnd) = key.as_str().strip_prefix("hwnd:")?.split_once(':')?;
     let hwnd = hwnd.parse::<usize>().ok()?;
     Some((pid.parse().ok()?, HWND(hwnd as *mut std::ffi::c_void)))
 }
 
-/// Window geometry for a target: the window's own frame, or the virtual-desktop
-/// bounding rect (which can have a negative origin) for `Screen`.
+/// Window geometry for a target: the window's own frame, or the virtual-desktop rect.
 pub(super) fn surface_geometry(target: &TargetSpec) -> anyhow::Result<SurfaceGeometry> {
     match target {
         TargetSpec::Screen => screen_geometry(),
@@ -233,11 +206,9 @@ pub(super) fn foreground_app_name() -> Option<String> {
     Some(app_name(pid_of(hwnd), &title_of(hwnd)))
 }
 
-/// The window a point lies over, attributed to the process that owns it — what a
-/// coordinate click is checked against at the moment it is sent. `None` when no window is
-/// there at all (the desktop itself), and when the window found cannot be attributed to an
-/// application: a vanished window leaves pid 0, and a point over an application this process
-/// cannot name is reported as unchecked rather than guessed at.
+/// The window a point lies over, attributed to the process that owns it — what a coordinate click
+/// is checked against when it is sent. `None` when no window is there (the desktop itself) or the
+/// window found cannot be attributed to an application.
 pub(super) fn window_at_point(x: i32, y: i32) -> Option<core::WindowAtPoint> {
     let hwnd = top_level_at(x, y)?;
     let pid = pid_of(hwnd);
@@ -249,9 +220,7 @@ pub(super) fn window_at_point(x: i32, y: i32) -> Option<core::WindowAtPoint> {
         app_pid: Some(pid),
         app_name: app_name(pid, &title),
         title,
-        // The frame is how the window the caller addressed is told apart from this one,
-        // so it is read exactly as the caller's own resolution reads it. A frame that
-        // cannot be read leaves the window recognisable by pid alone.
+        /// The frame is how the window the caller addressed is told apart from this one.
         frame: surface_of(hwnd).ok(),
     })
 }
@@ -276,9 +245,8 @@ pub(super) fn foreground() -> Option<HWND> {
     (!hwnd.0.is_null()).then_some(hwnd)
 }
 
-/// Refuse input aimed at a window that is not in front: typing, a drag or a wheel at
-/// a point would land in whatever is. Windows may refuse the foreground change this
-/// follows (a background process), and then the input is not delivered at all.
+/// Refuse input aimed at a window that is not in front: typing, a drag or a wheel would land
+/// elsewhere.
 pub(super) fn ensure_foreground(hwnd: HWND) -> anyhow::Result<()> {
     // SAFETY: no arguments; the handle is only compared, never dereferenced.
     if unsafe { GetForegroundWindow() } == hwnd {
@@ -291,11 +259,10 @@ pub(super) fn ensure_foreground(hwnd: HWND) -> anyhow::Result<()> {
     )))
 }
 
-/// Bring a window to the foreground before input aimed at it. Best-effort: Windows
-/// may refuse foreground changes for a background process. Every pinned action —
-/// typing, a drag, a wheel at a point — then verifies with [`ensure_foreground`] and
-/// fails honestly. A coordinate click is not pinned: it raises, and is checked against the
-/// window actually under its point before anything is posted.
+/// Bring a window to the foreground before input aimed at it. Best-effort: Windows may refuse
+/// foreground changes for a background process. Every pinned action then verifies with
+/// [`ensure_foreground`]; a coordinate click raises and is checked against the window under its
+/// point.
 pub(super) fn activate(hwnd: HWND) {
     // SAFETY: no arguments; the handle is only compared, never dereferenced.
     if unsafe { GetForegroundWindow() } == hwnd {
@@ -306,8 +273,7 @@ pub(super) fn activate(hwnd: HWND) {
     unsafe {
         let _ = SetForegroundWindow(hwnd);
     }
-    // Windows applies some foreground changes asynchronously; give it a moment
-    // before the caller's check turns a late one into a refusal.
+    // Windows applies some foreground changes asynchronously; give it a moment.
     for _ in 0..FOREGROUND_RETRIES {
         // SAFETY: as above — a no-argument query whose result is only compared.
         if unsafe { GetForegroundWindow() } == hwnd {
@@ -317,12 +283,10 @@ pub(super) fn activate(hwnd: HWND) {
     }
 }
 
-// ── Actuation refusals ──────────────────────────────────────────────────
-
-/// The two platform refusals actuation owes the caller, checked before any input
-/// or accessibility action: the secure desktop (see [`ensure_input_desktop`]) and
-/// an elevated window. `hwnd` is the window the input actually lands on — `None`
-/// is the desktop itself, which no process owns and which cannot be elevated.
+/// The two platform refusals actuation owes the caller, checked before any input or
+/// accessibility action: the secure desktop ([`ensure_input_desktop`]) and an elevated window.
+/// `hwnd` is the window the input actually lands on — `None` is the desktop itself, which no
+/// process owns and which cannot be elevated.
 pub(super) fn ensure_actuation_allowed(hwnd: Option<HWND>) -> anyhow::Result<()> {
     ensure_input_desktop()?;
     let Some(hwnd) = hwnd else {
@@ -350,15 +314,11 @@ pub(super) fn ensure_actuation_allowed(hwnd: Option<HWND>) -> anyhow::Result<()>
     )))
 }
 
-/// Refuse an accessibility ACTION aimed at a window of mahbot itself.
-///
-/// UI Automation answers a call addressed to our own process in-process, and this
-/// backend has no path onto the interface thread the dashboard owns (iced's event
-/// loop exposes no way to run a closure on itself), so an element action issued
-/// from the accessibility thread can freeze the dashboard or abort the process —
-/// and a trap cannot be caught. The action is refused rather than risk the
-/// product. Listing, reading and capturing our own windows, and raw input that
-/// reaches them, are unaffected.
+/// Refuse an accessibility ACTION aimed at a window of mahbot itself. UI Automation answers a call
+/// addressed to our own process in-process, and this backend has no path onto the interface thread
+/// the dashboard owns, so an element action issued from the accessibility thread can freeze the
+/// dashboard or abort the process — and a trap cannot be caught. Listing, reading and capturing our
+/// own windows, and raw input reaching them, are unaffected.
 pub(super) fn ensure_not_own_window(hwnd: HWND) -> anyhow::Result<()> {
     if !is_own_process(pid_of(hwnd)) {
         return Ok(());
@@ -379,8 +339,7 @@ pub(super) fn ensure_not_own_window(hwnd: HWND) -> anyhow::Result<()> {
 
 /// Refuse while the secure desktop or the lock screen owns the input desktop.
 fn ensure_input_desktop() -> anyhow::Result<()> {
-    // The default desktop is not localized; when the secure desktop is up,
-    // opening the input desktop fails with access denied instead.
+    // The default desktop is not localized; when the secure desktop is up, it is the one to name.
     let desktop =
         // SAFETY: no out-pointer; the returned desktop handle is owned by this function
         // and closed below, and a failed open carries no handle at all.
@@ -417,8 +376,7 @@ fn ensure_input_desktop() -> anyhow::Result<()> {
 }
 
 /// What a session without an interactive desktop is, named once: the core gate
-/// ([`super::core::ERR_DESKTOP_UNAVAILABLE`]) and every Windows refusal spell it the
-/// same way.
+/// ([`super::core::ERR_DESKTOP_UNAVAILABLE`]) and every Windows refusal spell it the same way.
 pub(super) const SECURE_DESKTOP_REASON: &str = "the UAC secure desktop, the lock screen or a \
      non-interactive session owns the desktop";
 
@@ -438,8 +396,8 @@ fn own_process_is_elevated() -> bool {
     *OWN.get_or_init(|| unsafe { process_is_elevated(GetCurrentProcessId()) })
 }
 
-/// Whether a process's token is elevated. A failed query answers "no": the refusal
-/// must never fire on a guess, and the action itself then fails honestly.
+/// Whether a process's token is elevated. A failed query answers "no": the refusal then does not
+/// fire.
 fn process_is_elevated(pid: u32) -> bool {
     // SAFETY: every handle here is the OS's own return, checked or closed in this
     // function — `token` is only read after `OpenProcessToken` succeeded — and
@@ -470,8 +428,6 @@ fn process_is_elevated(pid: u32) -> bool {
     }
 }
 
-// ── Enumeration ─────────────────────────────────────────────────────────
-
 /// One enumerated top-level window.
 struct Enumerated {
     hwnd: HWND,
@@ -479,15 +435,13 @@ struct Enumerated {
     app_name: String,
     title: String,
     active: bool,
-    /// The frame, or why it could not be read: a window without one is left out of
-    /// a listing but is still reported there (see [`list_windows`]).
+    /// The frame, or why it could not be read: a window without one is left out of the listing.
     surface: anyhow::Result<SurfaceGeometry>,
 }
 
-/// The running applications, with the one in front named. The application in front is the
-/// foreground window's — the one source both listings read, so a listing of the
-/// applications and a listing of the windows cannot disagree about what is in front. A
-/// machine with no window in front names none.
+/// The running applications, with the one in front named. That is the foreground window's — the one
+/// source both listings read, so they cannot disagree. A machine with no window in front names
+/// none.
 pub(super) fn list_apps() -> AppListing {
     AppListing {
         apps: apps_of(&top_level_windows()),
@@ -495,8 +449,7 @@ pub(super) fn list_apps() -> AppListing {
     }
 }
 
-/// Every running application that owns at least one listed top-level window, in
-/// front-to-back order.
+/// Every running application that owns at least one listed top-level window, in a stable order.
 fn apps_of(windows: &[Enumerated]) -> Vec<AppInfo> {
     let mut apps: Vec<AppInfo> = Vec::new();
     for win in windows {
@@ -539,12 +492,11 @@ pub(super) fn list_windows(app: Option<&AppInfo>) -> WindowListing {
     // applications listing reads, so the two cannot disagree, and the filtered list need
     // not contain that window at all.
     listing.frontmost = foreground_app_name();
-    // In an all-applications listing only the foreground window is marked, because a
-    // background application's focused window cannot be read there; a single-application
-    // listing asks that application's own thread instead, so it marks its active window
-    // even when the application is not in front. The two sources are exclusive, so a
-    // single-application listing never marks two windows — and when neither can name one
-    // (see [`marked_window_of`]) it marks no window rather than guessing.
+    // In an all-applications listing only the foreground window is marked: a background
+    // application's focused window cannot be read there. A single-application listing asks that
+    // application's own thread instead, so it marks its active window even when it is not in front
+    // — the two sources are exclusive, so it never marks two, and it marks none rather than
+    // guessing.
     let focused_of_app = if app.is_some() {
         marked_window_of(&windows)
     } else {
@@ -568,8 +520,7 @@ pub(super) fn list_windows(app: Option<&AppInfo>) -> WindowListing {
                 continue;
             }
         };
-        // The enumeration is front to back, so the place among the windows actually
-        // listed is the place in that order.
+        // The enumeration is front to back, so the place among the windows is the rank.
         let rank = Some(listing.windows.len() + 1);
         listing.windows.push(WindowInfo {
             app_pid: Some(win.pid),
@@ -584,7 +535,6 @@ pub(super) fn list_windows(app: Option<&AppInfo>) -> WindowListing {
             rank,
         });
     }
-    // Every listed window's rank is attributed: the enumeration is front to back.
     listing.order = core::WindowOrder::All;
     listing.unread = lost
         .into_iter()
@@ -620,35 +570,31 @@ pub(super) fn window_info(target: &TargetSpec) -> anyhow::Result<WindowInfo> {
 }
 
 /// The window a single-application listing marks `[focused]`: the application's own active
-/// window (asked of its thread, which reads it even when the application is not in front),
-/// else the one of its windows that is the foreground window. A mark the listing cannot
-/// place is no mark: `None` when neither source names a window the listing shows, so the
-/// application is listed without one rather than marked by a guess.
+/// window (asked of its thread, which reads it even when the application is not in front), else
+/// the one of its windows that is the foreground window. `None` when neither names a listed
+/// window, so the application is listed without a mark rather than marked by a guess.
 fn marked_window_of(windows: &[Enumerated]) -> Option<HWND> {
     let first = windows.first()?;
     active_window_of_application(first.hwnd)
-        // An untitled or tool window is filtered out of the enumeration, and a mark on a
-        // window the caller cannot see would name nothing it can act on.
+        // An untitled or tool window is filtered out of the enumeration, and a mark on a filtered
+        // window is dropped with it.
         .filter(|hwnd| windows.iter().any(|win| win.hwnd == *hwnd))
         .or_else(|| windows.iter().find(|win| win.active).map(|win| win.hwnd))
 }
 
-/// The window an `a` id names: what [`TargetSpec::App`] resolves to. It is the window the
-/// listing marks whenever a mark could be placed ([`marked_window_of`]), and only when it
-/// could not is it the application's frontmost window — its first listed one. `None` only
-/// when the application has no listed window at all, which the caller refuses as an absent
-/// application.
+/// The window an `a` id names: what [`TargetSpec::App`] resolves to — the window the listing
+/// marks whenever a mark could be placed ([`marked_window_of`]), else the application's frontmost
+/// listed window. `None` only when it has no listed window at all.
 fn app_window(windows: &[Enumerated]) -> Option<HWND> {
     marked_window_of(windows).or_else(|| windows.first().map(|win| win.hwnd))
 }
 
-/// The window an application holds as active in its own input queue. This is the one
-/// way to name a background application's focused window: the foreground window belongs
-/// to whichever application is in front, so a listing that must say what another
-/// application has focused has to ask that application's thread.
+/// The window an application holds as active in its own input queue: the one way to name a
+/// background application's focused window, since the foreground window belongs to whichever
+/// application is in front.
 ///
-/// `None` when the thread does not answer — it has exited, or its window is on another
-/// desktop — which the listing states as a mark it cannot place rather than guessing.
+/// `None` when the thread does not answer — it exited, or its window is on another desktop —
+/// which the listing states as a mark it cannot place rather than guessing.
 fn active_window_of_application(hwnd: HWND) -> Option<HWND> {
     // SAFETY: no out-pointer beyond the structure below, which the call fills; the thread
     // id belongs to the window's own process and the call only reads its state.
@@ -666,8 +612,7 @@ fn active_window_of_application(hwnd: HWND) -> Option<HWND> {
     (!info.hwndActive.0.is_null()).then_some(info.hwndActive)
 }
 
-/// One application's top-level windows (by pid when known, else by name), in
-/// front-to-back order.
+/// One application's top-level windows (by pid when known, else by name), front to back.
 fn app_windows(pid: Option<u32>, app_name: &str) -> Vec<Enumerated> {
     top_level_windows()
         .into_iter()
@@ -681,13 +626,11 @@ fn app_windows(pid: Option<u32>, app_name: &str) -> Vec<Enumerated> {
         .collect()
 }
 
-/// All top-level application windows, front to back, plus the foreground window when
-/// the filter below would hide it (see the note there).
-///
-/// Visible and titled, which is what tells an application window apart from the
-/// helper windows every toolkit leaves lying around. Owned windows are kept: a
-/// modal dialog is exactly the surface an agent needs. Cloaked windows (another
-/// virtual desktop, a suspended UWP app) are dropped — they have no pixels.
+/// All top-level application windows, front to back, plus the foreground window when the filter
+/// would hide it. Visible and titled, which tells an application window from the helper windows
+/// every toolkit leaves around. Owned windows are kept (a modal dialog is exactly the surface an
+/// agent needs); cloaked windows — another virtual desktop, a suspended UWP app — are dropped, they
+/// have no pixels.
 fn top_level_windows() -> Vec<Enumerated> {
     let mut handles: Vec<HWND> = Vec::new();
     // SAFETY: `handles` is a live local that outlives this synchronous enumeration,
@@ -706,18 +649,14 @@ fn top_level_windows() -> Vec<Enumerated> {
         .filter(|hwnd| is_application_window(*hwnd))
         .map(|hwnd| enumerate(hwnd, foreground))
         .collect();
-    // The foreground window joins the list even when the filter above hides it (a tool
-    // palette, an untitled surface): `observe` pins the focused surface, and the
-    // listing should name the surface the agent is looking at.
+    // The foreground window joins the list even when the filter above hides it.
     if foreground_joins_listing(&windows, foreground) {
         windows.insert(0, enumerate(foreground, foreground));
     }
     windows
 }
 
-/// Whether the foreground window is a surface the filter above hid but the listing
-/// must still carry: it is what `observe` pins. Invisible and cloaked windows stay
-/// out — they can have no pixels.
+// Whether the foreground window is a surface the filter hid but the listing keeps.
 fn foreground_joins_listing(windows: &[Enumerated], foreground: HWND) -> bool {
     if foreground.0.is_null() || windows.iter().any(|win| win.hwnd == foreground) {
         return false;
@@ -740,12 +679,10 @@ fn enumerate(hwnd: HWND, foreground: HWND) -> Enumerated {
     }
 }
 
-/// An application's display name. UWP and WinUI apps are hosted by
-/// `ApplicationFrameHost.exe`, one process for several apps, so the window's own
-/// title is the app there — the exe stem would merge them into one. Consequence: a
-/// frame-hosted app whose title changes after enumeration makes its stored `a`
-/// target stale (a `w` target keeps the window's own handle and is unaffected), and
-/// re-enumerating is the fix — ordinary apps are named by their executable.
+/// An application's display name. UWP and WinUI apps are hosted by `ApplicationFrameHost.exe`,
+/// one process for several apps, so the window's own title is the app there — the exe stem would
+/// merge them into one. Consequence: a frame-hosted app whose title changes after enumeration
+/// makes its stored `a` target stale (a `w` target keeps the handle); re-enumerating is the fix.
 fn app_name(pid: u32, title: &str) -> String {
     match process_name(pid) {
         Some(stem) if stem.eq_ignore_ascii_case("ApplicationFrameHost") && !title.is_empty() => {
@@ -761,8 +698,8 @@ fn app_name(pid: u32, title: &str) -> String {
 // frame does not own.
 unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     // Always continue: a `FALSE` here would make `EnumWindows` report an error.
-    // SAFETY: `lparam` is that `&mut Vec<HWND>` from `top_level_windows`, still
-    // live and exclusively reachable here, so it is aligned and pushable.
+    // SAFETY: `lparam` is that `&mut Vec<HWND>` from `top_level_windows`, still live and
+    // exclusively reachable here, so it is aligned and pushable.
     let handles = unsafe { &mut *(lparam.0 as *mut Vec<HWND>) };
     handles.push(hwnd);
     BOOL(1)
@@ -775,8 +712,7 @@ fn is_application_window(hwnd: HWND) -> bool {
         if !IsWindowVisible(hwnd).as_bool() || GetWindowTextLengthW(hwnd) == 0 {
             return false;
         }
-        // Tool windows are palettes and floating bars; they are still reachable
-        // through the focused-window path when the owner actually uses one.
+        // Tool windows are palettes and floating bars; they are still reachable, so they are kept.
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
         if ex_style & WS_EX_TOOLWINDOW.0 != 0 {
             return false;
@@ -800,8 +736,8 @@ fn is_cloaked(hwnd: HWND) -> bool {
     queried.is_ok() && cloaked != 0
 }
 
-/// A window's surface in physical pixels: the visible frame without the invisible
-/// resize border (`DWMWA_EXTENDED_FRAME_BOUNDS`), falling back to `GetWindowRect`.
+/// A window's surface in physical pixels: the visible frame without the invisible resize border
+/// (`DWMWA_EXTENDED_FRAME_BOUNDS`), falling back to `GetWindowRect`.
 fn surface_of(hwnd: HWND) -> anyhow::Result<SurfaceGeometry> {
     let mut rect = RECT::default();
     // SAFETY: `rect` is a live `RECT` local and the byte count is `size_of` of that
@@ -820,8 +756,7 @@ fn surface_of(hwnd: HWND) -> anyhow::Result<SurfaceGeometry> {
     Ok(geometry(rect))
 }
 
-/// The window rect, invisible resize border included — the other size a capture
-/// item may come back in (see [`super::capture::align_to_surface`]).
+/// The window rect, invisible resize border included — the other size a capture may report.
 pub(super) fn window_rect(hwnd: HWND) -> anyhow::Result<SurfaceGeometry> {
     let mut rect = RECT::default();
     // SAFETY: `rect` is a live local of exactly the type the call fills.
@@ -843,14 +778,12 @@ fn geometry(rect: RECT) -> SurfaceGeometry {
     }
 }
 
-/// Everything the caller needs about one window, refusing a minimized one: its
-/// frame sits off-screen and its capture is black, so every action on it would be
-/// a lie.
+/// Everything the caller needs about one window, refusing a minimized one: its frame sits
+/// off-screen and its capture is black, so every action on it would be a lie.
 fn describe(hwnd: HWND) -> anyhow::Result<TargetWindow> {
     let pid = pid_of(hwnd);
     let title = title_of(hwnd);
-    // A handle that vanished since resolution answers FALSE, which reads as "not
-    // minimized".
+    // A handle that vanished since resolution answers FALSE, which reads as "not minimized".
     // SAFETY: one handle argument and no out-pointer.
     if unsafe { IsIconic(hwnd) }.as_bool() {
         return Err(core::minimized_window(&title));
@@ -874,31 +807,27 @@ fn pid_of(hwnd: HWND) -> u32 {
     pid
 }
 
-/// Whether `pid` is this very process. A window that vanished before the query
-/// reports pid 0, which does not count as ours.
+/// Whether `pid` is this very process. A window that vanished before the query answers "no".
 fn is_own_process(pid: u32) -> bool {
     // SAFETY: `GetCurrentProcessId` takes no arguments and has no failure mode.
     pid != 0 && pid == unsafe { GetCurrentProcessId() }
 }
 
-/// A window's title as a label: kept to the product's cap, the ellipsis marking the
-/// cut. Used wherever a title is shown or named.
+/// A window's title as a label: kept to the product's cap, the ellipsis marking the cut.
 fn title_of(hwnd: HWND) -> String {
     core::cap_label(&title_text(hwnd))
 }
 
-/// A window's title as read — bounded by a product-sized buffer, never by what the
-/// window reports, so a document-length title is not materialised. `observe` keeps
-/// it through [`core::Truncation::keep_name`], which is what counts a cut title in
-/// the observation header; a label is only marked.
+/// A window's title as read — bounded by a product-sized buffer, never by what the window
+/// reports, so a document-length title is not materialised. `observe` keeps it through
+/// [`core::Truncation::keep_name`], which counts a cut title in the observation header.
 pub(super) fn title_text(hwnd: HWND) -> String {
     // SAFETY: one handle argument, no out-pointer.
     let length = unsafe { GetWindowTextLengthW(hwnd) };
     if length <= 0 {
         return String::new();
     }
-    // The reported length decides how much is ASKED FOR, never how much is allocated;
-    // two UTF-16 units per character plus room for the ellipsis and the terminator.
+    // The reported length decides how much is ASKED FOR, never how much is allocated.
     let wanted = core::MAX_NAME_CHARS * 2 + 2;
     let mut buffer = vec![0u16; (length as usize).min(wanted) + 1];
     // SAFETY: `buffer` is alive here and the binding passes its own length as the cap,
@@ -907,8 +836,8 @@ pub(super) fn title_text(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buffer[..written.max(0) as usize])
 }
 
-/// An application's display name: its executable's file stem ("notepad"), which is
-/// what `windows { app: … }` matches and what the target lines show.
+/// An application's display name: its executable's file stem ("notepad"), which is what
+/// `windows { app: … }` matches and what the target lines show.
 fn process_name(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;

@@ -1,19 +1,12 @@
 //! The per-workspace file index: one scan-backed `SharedFilePicker` per
-//! workspace, shared by every caller.
+//! workspace, shared by every caller — the file-search tool, `read`, `edit`, the
+//! editor and the Git page, plus the lifecycle paths that reuse or release one
+//! (branch launch and stop, session deletion, transient-session purge, research-run
+//! cleanup). Indexes are created on demand or eagerly at start-up, registered
+//! before use, and `ensure_scanned` gates searches on scan readiness.
 //!
-//! The registry creates an index on demand (`get_or_init_engine`) and eagerly
-//! for the workspaces known at start-up (`init_all_engines`). Either path
-//! registers the index before use, scanning starts when it is registered, and
-//! `ensure_scanned` gates searches on scan readiness. It is the single source
-//! of the indexes the file-search tool, `read`, `edit`, the editor and the Git
-//! page use, and of the lifecycle paths that reuse or release one — branch
-//! launch and stop, session deletion and transient-session purge, research-run
-//! cleanup.
-//!
-//! Not a search engine and not the search tool: this module owns the indexes
-//! and their lifecycle. Its items keep their historical names
-//! (`SearchEngineEntry`, `get_or_init_engine`, `remove_engine`,
-//! `init_all_engines`).
+//! Not a search engine and not the search tool: this module owns the indexes and
+//! their lifecycle. Items keep their historical names (`get_or_init_engine` etc).
 
 use crate::util::UnwrapPoison;
 use fff_search::FilePicker;
@@ -25,17 +18,12 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio::sync::OnceCell;
 
-// ── Registry ─────────────────────────────────────────────────────────────
-
 /// Global search-engine registry, keyed by workspace name.
 static REGISTRY: OnceCell<RwLock<HashMap<String, Arc<SearchEngineEntry>>>> = OnceCell::const_new();
 
-/// Initialize the global registry. Must be called during bootstrap, before
-/// any background task that may search.
-///
-/// Idempotent: a second call (e.g. a test init path racing another test's
-/// bootstrap) is a no-op that preserves the existing registry — the map is
-/// never cleared, so there is nothing to re-create.
+/// Must be called during bootstrap, before any background task that may search.
+/// Idempotent: a second call (e.g. a test init racing another test's bootstrap) is
+/// a no-op that preserves the existing registry.
 pub fn init_global() {
     let _ = REGISTRY.set(RwLock::new(HashMap::new()));
 }
@@ -46,40 +34,26 @@ fn registry() -> &'static RwLock<HashMap<String, Arc<SearchEngineEntry>>> {
         .expect("search engine registry not initialized — call workspace_index::init_global()")
 }
 
-/// Whether the global search-engine registry has been initialized.
 #[must_use]
 pub(crate) fn registry_initialized() -> bool {
     REGISTRY.get().is_some()
 }
 
-// ── Entry ─────────────────────────────────────────────────────────────────
-
-/// Per-workspace shared search engine state.
-///
-/// Created once per workspace (by [`get_or_init_engine`]), shared across all
-/// agents searching that workspace. The caller should ensure the background
-/// scan is complete (via [`ensure_scanned`]) before using the engine for
-/// searches — this is handled by [`resolve_engine`].
+/// Created once per workspace and shared across all agents searching it. Callers
+/// must go through [`resolve_engine`], which waits for the scan first.
 #[derive(Debug)]
 pub(crate) struct SearchEngineEntry {
-    /// Shared file picker used for both `files` and `grep` modes.
+    /// Used for both `files` and `grep` modes.
     pub picker: SharedFilePicker,
 }
 
-// ── Initialization ────────────────────────────────────────────────────────
-
-/// Get or initialize the shared search engine for a workspace.
-///
-/// On first access, this creates the [`FilePicker`] and spawns a background
-/// filesystem scan via [`FilePicker::new_with_shared_state`].
-///
-/// Returns a cloneable handle. Multiple callers racing on first access are
-/// serialized by the registry write lock — only one engine is created.
+/// On first access, creates the [`FilePicker`] and spawns a background filesystem
+/// scan. Racing callers are serialised by the registry write lock — only one
+/// engine is created.
 pub(crate) fn get_or_init_engine(
     name: &str,
     path: &Path,
 ) -> Result<Arc<SearchEngineEntry>, String> {
-    // Fast path: read-lock check.
     {
         let reg = registry().read().unwrap_poison();
         if let Some(entry) = reg.get(name) {
@@ -87,11 +61,9 @@ pub(crate) fn get_or_init_engine(
         }
     }
 
-    // Slow path: serialise creation under the write lock so that two
-    // concurrent callers never create duplicate scans.
     let mut reg = registry().write().unwrap_poison();
 
-    // Double-check: another writer may have inserted while we waited.
+    // Another writer may have inserted while we waited for the lock.
     if let Some(existing) = reg.get(name) {
         return Ok(Arc::clone(existing));
     }
@@ -101,9 +73,7 @@ pub(crate) fn get_or_init_engine(
     Ok(entry)
 }
 
-/// Initialize the search engine for a workspace without touching the registry.
-///
-/// Creates the `FilePicker` and spawns the background scan.
+/// Without touching the registry: creates the `FilePicker` and starts the scan.
 fn init_engine_for_workspace(name: &str, path: &Path) -> Result<SearchEngineEntry, String> {
     if !path.exists() {
         return Err(format!(
@@ -123,20 +93,16 @@ fn init_engine_for_workspace(name: &str, path: &Path) -> Result<SearchEngineEntr
         enable_fs_root_scanning: false,
         enable_home_dir_scanning: false,
         cache_budget: None,
-        // Ranking by git recency is on by default, and it reorders matches by how
-        // recently each file was touched by a commit. The product's result order
-        // is fuzzy-match quality only (see the frecency note below), so it stays
-        // off and search results are ordered exactly as they were before.
+        // Ranking by git recency is on by default and reorders matches by commit
+        // recency; the product orders by fuzzy-match quality only, so it stays off.
         git_recency: GitRecencyConfig {
             enabled: false,
             ..GitRecencyConfig::default()
         },
     };
 
-    // The picker requires a frecency handle. Nothing in the product ever
-    // records file visits, so ranking stays fuzzy-match-quality only, and the
-    // disabled handle guarantees no frecency store can be opened per workspace
-    // (`init` is a no-op on it).
+    // The picker requires a frecency handle; nothing records file visits, and the
+    // noop handle guarantees no frecency store is opened per workspace.
     FilePicker::new_with_shared_state(picker.clone(), SharedFrecency::noop(), options)
         .map_err(|e| format!("Failed to create search engine: {e}"))?;
 
@@ -149,17 +115,9 @@ fn init_engine_for_workspace(name: &str, path: &Path) -> Result<SearchEngineEntr
     Ok(SearchEngineEntry { picker })
 }
 
-// ── Scan readiness ────────────────────────────────────────────────────────
-
-/// Wait for the background filesystem scan to finish.
-///
-/// Blocks for up to 30 seconds. Returns an error if the scan hasn't completed
-/// within the timeout, rather than returning incomplete or stale results.
-/// A completed scan may legitimately leave the index empty — the live
-/// watcher populates it as files appear — so it returns `Ok(())` regardless.
-///
-/// This is an async function because [`SharedFilePicker::wait_for_scan`] is a
-/// blocking call — we run it on the tokio blocking thread pool.
+/// Waits up to 30 s for the background scan; an error means incomplete or stale
+/// results would otherwise leak out. [`SharedFilePicker::wait_for_scan`] blocks,
+/// hence the blocking thread pool.
 async fn ensure_scanned(entry: &SearchEngineEntry) -> Result<(), String> {
     let picker = entry.picker.clone();
 
@@ -176,24 +134,16 @@ async fn ensure_scanned(entry: &SearchEngineEntry) -> Result<(), String> {
             .to_string());
     }
 
-    // A completed scan may legitimately leave the index empty — an empty
-    // workspace, or an ephemeral run folder the worker hasn't written yet.
-    // The live filesystem watcher populates the index incrementally as
-    // files appear, so we return empty results rather than erroring.
-    //
-    // Deliberate trade-off: this also drops the post-scan panic detector
-    // (a panicked walk clears the scanning flag but commits zero files);
-    // a genuinely-broken scan is rare and an empty result is accepted.
+    // A completed scan may legitimately leave the index empty (an empty workspace,
+    // an ephemeral run folder not written yet); the live watcher fills it as files
+    // appear. Trade-off: this drops the post-scan panic detector — a panicked walk
+    // clears the scanning flag but commits zero files — an accepted residual.
     Ok(())
 }
 
-/// Get or init the engine for a workspace and ensure the background scan has
-/// finished — the shared entry point used by the search tool and the editor's
-/// global-search path.
-///
-/// `scan_error_prefix` is prepended to scan-readiness errors only; the
-/// editor's run path passes `"Search engine not ready: "` while other callers
-/// pass `""` to keep the raw error.
+/// Get or init the engine and wait for the scan — the shared entry point of the
+/// search tool and the editor's global-search path. `scan_error_prefix` is
+/// prepended to scan-readiness errors only (the editor passes a label, others `""`).
 pub(crate) async fn resolve_engine(
     name: &str,
     path: &str,
@@ -206,21 +156,14 @@ pub(crate) async fn resolve_engine(
     Ok(entry)
 }
 
-// ── Lookup helpers for tools ───────────────────────────────────────────────
-
 #[must_use]
 pub(crate) fn get_engine_by_name(name: &str) -> Option<Arc<SearchEngineEntry>> {
     let reg = REGISTRY.get()?.read().ok()?;
     reg.get(name).cloned()
 }
 
-// ── Lifecycle ─────────────────────────────────────────────────────────────
-
-/// Remove a workspace's search engine from the registry.
-///
-/// Dropping the last [`Arc<SearchEngineEntry>`] will drop the underlying
-/// [`SharedFilePicker`], which triggers the background scan's cancellation
-/// flag and cleans up any associated threads.
+/// Dropping the last [`Arc<SearchEngineEntry>`] drops the [`SharedFilePicker`],
+/// which cancels the background scan and cleans up its threads.
 pub(crate) fn remove_engine(workspace_name: &str) {
     let mut reg = registry().write().unwrap_poison();
     if reg.remove(workspace_name).is_some() {
@@ -228,29 +171,20 @@ pub(crate) fn remove_engine(workspace_name: &str) {
     }
 }
 
-/// Release the engine of a path-named workspace no launch refers to any more.
-///
-/// A path-named workspace is one named by an absolute path — a synthetic
-/// workspace created on demand (the folder a custom role was launched into),
-/// never a managed name (`validate_name` allows only letters and underscores)
-/// and never a `dir-…` delegation key. Its engine is the only one whose lifetime
-/// is owned by the callers that create it, and it is keyed by the folder rather
-/// than by the launch: it is kept while a launch works there and released as
-/// soon as one launch leaves, is stopped, or has its session end (deleted, or
-/// purged when a one-off run expires) — a sibling still working in the same
-/// folder simply re-creates it. A managed workspace's engine is the
-/// workspace's own and is left alone.
+/// Release the engine of a path-named workspace — one named by an absolute path,
+/// a synthetic workspace created on demand, never a managed name (`validate_name`
+/// allows only letters and underscores) and never a `dir-…` delegation key. Its
+/// engine is keyed by the folder, not the launch: kept while any launch works
+/// there, released as soon as one leaves, stops, or its session ends, and a
+/// sibling still working there re-creates it. A managed workspace's engine is left alone.
 pub(crate) fn release_path_named_engine(workspace_name: &str) {
     if registry_initialized() && std::path::Path::new(workspace_name).is_absolute() {
         remove_engine(workspace_name);
     }
 }
 
-/// Initiate eager scanning for all managed workspaces.
-///
-/// Should be called once after bootstrap, in a background task. Errors for
-/// individual workspaces are logged but don't prevent other workspaces from
-/// being scanned.
+/// Eager scanning for all managed workspaces: called once after bootstrap, in a
+/// background task. One workspace's error does not stop the others.
 pub async fn init_all_engines() {
     let workspaces = match crate::workspace::store().list().await {
         Ok(wss) => wss,

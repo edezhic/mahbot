@@ -1,18 +1,15 @@
-//! Onboarding flow: the Phase-1 scripted provider-setup scenario (GUI Home
-//! chat) and the Phase-2 Assistant kickoff ("hi mah bot" auto-send).
+//! Onboarding flow: the Phase-1 scripted provider-setup scenario (GUI Home chat) and the Phase-2
+//! Assistant kickoff ("hi mah bot" auto-send).
 //!
-//! Phase 1 runs in the GUI Home chat while no LLM provider is configured
-//! (`provider_configured() == false`): a hard-coded scripted scenario guides
-//! the admin to enter an OpenRouter key or a custom endpoint+key, persisting
-//! it via the public config path so the live in-memory CONFIG updates. The
-//! scripted exchange is transient (never persisted to chat_history).
+//! Phase 1 runs in the GUI Home chat while no LLM provider is configured: a hard-coded scripted
+//! scenario guides the admin to enter an OpenRouter key or a custom endpoint+key, persisted through
+//! the public config path so the live in-memory CONFIG updates. That exchange is transient (never
+//! written to chat_history).
 //!
-//! Phase 2 fires once a provider is configured and the onboarding state is
-//! `Init` for an admin: the kickoff persists `OnboardingState::Finished`
-//! (closing the flow) and routes a single real "hi mah bot" user message
-//! through the normal pipeline. The Assistant drives onboarding now (the
-//! Support role is gone); the onboarding guide reaches the greeting session
-//! via the pending-guide bridge, not the onboarding state.
+//! Phase 2 fires once a provider is configured and the onboarding state is `Init` for an admin: the
+//! kickoff persists `OnboardingState::Finished` (closing the flow) and routes a single real "hi mah
+//! bot" user message through the normal pipeline. The Assistant drives onboarding now; the guide
+//! reaches the greeting session through the pending-guide bridge, not the onboarding state.
 
 use crate::ChannelMessage;
 use crate::config::{
@@ -20,22 +17,18 @@ use crate::config::{
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Process-local CAS guard ensuring only one `kickoff_onboarding` attempt is
-/// in flight per process; it is reset on a persist failure so a later kickoff
-/// attempt can retry. The persisted `Finished` state is the durable guard
-/// across restarts.
+/// Process-local CAS guard ensuring only one `kickoff_onboarding` attempt is in flight per process;
+/// reset on a persist failure so a later attempt can retry. The persisted `Finished` state is the
+/// durable guard across restarts.
 static KICKOFF_FIRED: AtomicBool = AtomicBool::new(false);
 
-/// Bridge over the greeting race: `kickoff_onboarding` persists `Finished`
-/// BEFORE the async pipeline builds the session that handles the greeting
-/// (the greeting crosses many channel hops; the persist is a single fast
-/// config_kv upsert), so `Session::build_context_messages` cannot rely on
-/// `onboarding_stage() != Finished` alone to inject the onboarding guide.
-/// The kickoff arms this flag; the first Assistant session built for the admin
-/// afterwards consumes it and gets the guide — in practice the greeting
-/// session, since nothing else builds one during the kickoff window. If the
-/// greeting send fails, the next admin Assistant session receives the guide
-/// instead (a reasonable fallback).
+/// Bridge over the greeting race: `kickoff_onboarding` persists `Finished` BEFORE the async
+/// pipeline builds the session that handles the greeting (the greeting crosses many channel hops;
+/// the persist is one fast `config_kv` upsert), so `build_context_messages` cannot rely on
+/// `onboarding_stage() != Finished` alone to inject the guide. The kickoff arms this flag; the
+/// first Assistant session built for the admin afterwards consumes it — in practice the greeting
+/// session. If the greeting send fails, the next admin Assistant session receives the guide
+/// instead.
 static GREETING_GUIDE_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Arm the pending-guide bridge (see [`GREETING_GUIDE_PENDING`]).
@@ -43,7 +36,7 @@ pub fn mark_greeting_guide_pending() {
     GREETING_GUIDE_PENDING.store(true, Ordering::SeqCst);
 }
 
-/// Consume the pending-guide bridge; returns true exactly once per kickoff.
+/// Consume the pending-guide bridge; true exactly once per kickoff.
 pub fn take_greeting_guide_pending() -> bool {
     GREETING_GUIDE_PENDING.swap(false, Ordering::SeqCst)
 }
@@ -59,12 +52,9 @@ pub enum ProviderInput {
     Invalid,
 }
 
-/// Parse the user's Phase-1 provider entry.
-///
-/// Rules:
-/// - OpenRouter key = a token containing `sk-or-v1-…`.
-/// - Custom endpoint = URL on line 1, optional key on line 2.
-/// - A bare URL alone (keyless custom endpoint) counts as configured.
+/// Parse the user's Phase-1 provider entry: an OpenRouter key (a token containing `sk-or-v1-…`), a
+/// custom endpoint (URL on line 1, optional key on line 2), or a bare URL alone (a keyless custom
+/// endpoint, which counts as configured).
 #[must_use]
 pub fn parse_provider_input(raw: &str) -> ProviderInput {
     let trimmed = raw.trim();
@@ -75,8 +65,8 @@ pub fn parse_provider_input(raw: &str) -> ProviderInput {
         .collect();
     if lines.len() >= 2 && is_http_url(lines[0]) {
         let key = lines[1].to_string();
-        // A default OpenRouter endpoint + a `sk-or-v1-` key is an OpenRouter key:
-        // the user meant "use OpenRouter", not a custom endpoint.
+        // A default OpenRouter endpoint + a `sk-or-v1-` key is an OpenRouter key: the user meant
+        // "use OpenRouter", not a custom endpoint.
         if crate::config::is_default_endpoint(lines[0]) && key.contains("sk-or-v1-") {
             return ProviderInput::OpenRouterKey(key);
         }
@@ -85,19 +75,18 @@ pub fn parse_provider_input(raw: &str) -> ProviderInput {
     if lines.len() == 1 && is_http_url(lines[0]) {
         return custom_endpoint(lines[0], None);
     }
-    // A line carrying a `sk-or-v1-` token is an OpenRouter key. Extract the key
-    // line rather than the whole input, so a reversed entry (key line, then URL)
-    // never persists a multi-line blob as the provider key.
+    // A line carrying a `sk-or-v1-` token is an OpenRouter key. Extract the line rather than the
+    // whole input, so a reversed entry (key first, then URL) never persists a multi-line blob as
+    // the key.
     if let Some(key_line) = lines.iter().find(|l| l.contains("sk-or-v1-")) {
         return ProviderInput::OpenRouterKey(key_line.to_string());
     }
     ProviderInput::Invalid
 }
 
-/// Shared validation tail for both URL branches: reject the default endpoint
-/// (a bare default URL, or a default URL with a non-OpenRouter key, can't
-/// configure the provider — persisting it would never become configured) and
-/// malformed URL lines; otherwise build the custom endpoint.
+/// Shared validation tail for both URL branches: reject the default endpoint (a bare default URL,
+/// or one with a non-OpenRouter key, can never become configured) and malformed URL lines;
+/// otherwise build the endpoint.
 fn custom_endpoint(url_line: &str, key: Option<String>) -> ProviderInput {
     if crate::config::is_default_endpoint(url_line) {
         return ProviderInput::Invalid;
@@ -111,24 +100,22 @@ fn custom_endpoint(url_line: &str, key: Option<String>) -> ProviderInput {
     }
 }
 
-// Deliberately case-insensitive, unlike the prefix-only `util::is_http_url`
-// (whose case-sensitive contract config validation relies on) — onboarding
-// accepts pasted endpoint URLs leniently regardless of scheme casing.
+// Deliberately case-insensitive, unlike the prefix-only `util::is_http_url` (whose case-sensitive
+// contract config validation relies on) — onboarding accepts pasted endpoint URLs leniently
+// regardless of scheme casing.
 fn is_http_url(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
-/// A URL cannot contain a literal space, so a candidate URL line must be a
-/// single whitespace-delimited token. A line with trailing junk (e.g. a key
-/// pasted on the same line as the URL) is malformed.
+/// A URL cannot contain a literal space, so a candidate line must be a single whitespace-delimited
+/// token. A line with trailing junk (a key pasted beside the URL) is malformed.
 fn is_clean_url_line(s: &str) -> bool {
     s.split_whitespace().count() == 1
 }
 
-/// Persist a parsed provider input via the public config path (updates the
-/// live in-memory CONFIG and the `config_kv` row). Returns an error for
-/// [`ProviderInput::Invalid`].
+/// Persist a parsed provider input via the public config path (updating the live CONFIG and the
+/// `config_kv` row). Errors for [`ProviderInput::Invalid`].
 pub async fn persist_provider_input(input: &ProviderInput) -> anyhow::Result<()> {
     match input {
         ProviderInput::OpenRouterKey(key) => {
@@ -139,10 +126,9 @@ pub async fn persist_provider_input(input: &ProviderInput) -> anyhow::Result<()>
                 crate::config::persist_settled_string_field(CONFIG_KEY_PROVIDER_ENDPOINT_KEY, k)
                     .await?;
             }
-            // Persist the endpoint LAST — it is the gating field for
-            // `provider_configured()`, so a failure here leaves the provider
-            // unconfigured and the script re-prompts instead of proceeding with a
-            // keyless endpoint the user did not intend.
+            // Persist the endpoint LAST — it is the gating field for `provider_configured()`, so a
+            // failure here leaves the provider unconfigured and the script re-prompts instead of
+            // proceeding with a keyless endpoint.
             crate::config::persist_settled_string_field(CONFIG_KEY_PROVIDER_ENDPOINT, url).await?;
         }
         ProviderInput::Invalid => anyhow::bail!("invalid provider input"),
@@ -171,17 +157,13 @@ pub fn invalid_message() -> &'static str {
     "That doesn't look right. Enter an OpenRouter key (starts with `sk-or-v1-`) or a custom endpoint URL (first line) + optional API key (second line)."
 }
 
-/// Phase-2 kickoff: if onboarding state is `Init` and a provider is
-/// configured, persist `OnboardingState::Finished` (closing the flow) and
-/// auto-send a single real "hi mah bot" user message through the normal GUI
-/// pipeline. No-op when the state is not `Init`, when no provider is
-/// configured, or when the user is not an admin.
-///
-/// Onboarding is strictly one-shot: the `== Init` gate plus the `KICKOFF_FIRED`
-/// CAS make re-trigger impossible, even after a provider reconnection or a
-/// second workspace — the state can only move `Init` → `Finished` and only this
-/// route moves it. A guest NEVER triggers onboarding (none is planned
-/// for them): the `is_admin` gate fails closed.
+/// Phase-2 kickoff: if the onboarding state is `Init` and a provider is configured, persist
+/// `OnboardingState::Finished` and auto-send a single real "hi mah bot" user message through the
+/// normal GUI pipeline. No-op when the state is not `Init`, no provider is configured, or the user
+/// is not an admin. Onboarding is strictly one-shot: the `== Init` gate plus the `KICKOFF_FIRED`
+/// CAS make a re-trigger impossible, even after a provider reconnection or a second workspace — the
+/// state only moves `Init` → `Finished`, and only this route moves it. A guest never triggers
+/// onboarding: the `is_admin` gate fails closed.
 pub async fn kickoff_onboarding(user_name: &str) -> anyhow::Result<()> {
     use crate::config::OnboardingState;
     if crate::config::CONFIG.onboarding_stage() != OnboardingState::Init {
@@ -197,8 +179,8 @@ pub async fn kickoff_onboarding(user_name: &str) -> anyhow::Result<()> {
     if !crate::users::is_admin(user_name).await {
         return Ok(());
     }
-    // Compare-and-set: only one kickoff attempt is in flight per process;
-    // the CAS is reset below on a persist failure so a later attempt retries.
+    // Compare-and-set: one kickoff attempt per process; reset below on a persist failure so a later
+    // attempt retries.
     if KICKOFF_FIRED.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
@@ -274,10 +256,9 @@ mod tests {
         };
 
         for (raw, expected) in [
-            // A token containing `sk-or-v1-` is an OpenRouter key, however it was
-            // pasted — alone, with the default endpoint above it, or with a
-            // custom URL below it (the reversed order the grammar does not
-            // document, whose whole blob must never become the provider key).
+            // A token containing `sk-or-v1-` is an OpenRouter key however it was pasted — alone,
+            // with the default endpoint above it, or with a custom URL below it (the reversed order
+            // the grammar does not document, whose whole blob must never become the provider key).
             (" sk-or-v1-abc123def456 ", key("sk-or-v1-abc123def456")),
             (
                 "https://openrouter.ai/api/v1\nsk-or-v1-abc123def456",
@@ -287,8 +268,8 @@ mod tests {
                 "sk-or-v1-abc123def456\nhttps://custom.example/v1",
                 key("sk-or-v1-abc123def456"),
             ),
-            // A custom endpoint is a URL on line 1 and an optional key on line 2;
-            // a bare URL alone is a keyless one.
+            // A custom endpoint is a URL on line 1 and an optional key on line 2; a bare URL is a
+            // keyless one.
             (
                 "https://ollama.local:11434/v1",
                 endpoint("https://ollama.local:11434/v1", None),
@@ -297,12 +278,12 @@ mod tests {
                 "http://localhost:8080/v1\nsk-local-123",
                 endpoint("http://localhost:8080/v1", Some("sk-local-123")),
             ),
-            // The default endpoint alone never configures the provider, and
-            // neither does it under a key that is not OpenRouter's.
+            // The default endpoint alone never configures the provider, and neither does it under a
+            // foreign key.
             ("https://openrouter.ai/api/v1", Read::Invalid),
             ("https://openrouter.ai/api/v1\nmy-random-key", Read::Invalid),
-            // A URL cannot contain a literal space: a key pasted onto its line is
-            // outside the documented grammar.
+            // A URL cannot contain a literal space: a key pasted onto its line is outside the
+            // documented grammar.
             ("https://custom.example/v1 sk-local-123", Read::Invalid),
             ("https://custom.example/v1 extra", Read::Invalid),
             ("just some chat text", Read::Invalid),

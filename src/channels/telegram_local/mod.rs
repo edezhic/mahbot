@@ -23,8 +23,7 @@
 //! start time before anything is done with its pid — an unprovable record is
 //! dropped and its pid left alone; a port is only ever used for a process proven
 //! that way, and a fresh one is chosen for each start. Two pollers on one bot
-//! token split its updates, so a surviving process is never joined by a second
-//! one.
+//! token split its updates, so a surviving process is never joined by a second one.
 //!
 //! ## What the transport uses
 //!
@@ -44,8 +43,7 @@
 //! local server that is installed and answering has no state word, because "the
 //! process answers" says nothing about Telegram and a bot nobody writes to is not
 //! a fault. A failure carries its reason. A switch waiting for the owner keeps its
-//! own cause in the journal, so it survives a restart and is not overwritten by a
-//! later probe.
+//! own cause in the journal, so it survives a restart and is not overwritten by a later probe.
 
 mod install;
 mod migrate;
@@ -58,7 +56,6 @@ use std::time::Duration;
 use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
 
-/// Which Bot API the bot is served by.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Mode {
     Cloud,
@@ -82,7 +79,6 @@ impl Mode {
         value.and_then(Self::parse).unwrap_or(Mode::Cloud)
     }
 
-    /// The stored spelling of a mode; the counterpart of [`Mode::parse`].
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Mode::Cloud => "cloud",
@@ -91,12 +87,10 @@ impl Mode {
     }
 }
 
-/// The mode the owner asked for, from the durable config row.
 fn configured_mode() -> Mode {
     Mode::from_value(CONFIG.telegram_local_server().as_deref())
 }
 
-/// The mode the transport serves right now.
 pub(crate) fn serving_mode() -> Mode {
     serving_from(configured_mode(), migrate::current().as_ref())
 }
@@ -132,17 +126,11 @@ fn serving_from(configured: Mode, switch: Option<&migrate::Journal>) -> Mode {
     }
 }
 
-/// What the interface shows about the feature.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Health {
-    /// Cloud mode: nothing local is involved.
     Cloud,
-    /// Installing or starting the server, before it answers.
     Starting,
-    /// The process answers: nothing to report.
     Running,
-    /// The local server is not serving the bot; [`Status::last_error`] names the
-    /// cause once a step has named it.
     Down,
 }
 
@@ -154,19 +142,14 @@ pub(crate) enum Health {
 /// supervisor last observed and is stored between reads.
 #[derive(Clone, Debug)]
 pub(crate) struct Status {
-    /// The mode the owner asked for.
     pub(crate) target: Mode,
-    /// The mode the transport uses right now.
     pub(crate) serving: Mode,
     pub(crate) health: Health,
-    /// The last failure, in words the owner can act on.
     pub(crate) last_error: Option<String>,
     pub(crate) port: Option<u16>,
-    /// A switch is in progress.
     pub(crate) migrating: bool,
     /// Why the switch is waiting for the owner, when it is.
     pub(crate) blocked: Option<String>,
-    /// The credentials are on file.
     pub(crate) credentials_set: bool,
 }
 
@@ -211,15 +194,9 @@ pub(crate) fn status() -> Status {
     snapshot.serving = serving_from(configured_mode(), switch.as_ref());
     snapshot.blocked = switch.as_ref().and_then(|switch| switch.blocked.clone());
     if let Some(reason) = snapshot.blocked.clone() {
-        // The journal's own cause outranks any later probe: a switch waiting for
-        // the owner is not an ordinary outage, and it stays readable after a
-        // restart and under a liveness tick.
         snapshot.last_error = Some(reason);
     }
     if snapshot.serving == Mode::Cloud {
-        // The bot is on the cloud: whatever a local server last reported is not
-        // what carries it, and reporting the local side's health would describe a
-        // transport the owner is not using.
         snapshot.health = Health::Cloud;
         snapshot.port = None;
     } else if snapshot.health == Health::Cloud {
@@ -230,7 +207,6 @@ pub(crate) fn status() -> Status {
     snapshot
 }
 
-/// Replace the state and let the interface redraw.
 fn set_status(update: impl FnOnce(&mut Status)) {
     {
         let mut guard = status_cell().lock().unwrap_poison();
@@ -248,15 +224,11 @@ pub(crate) fn local_endpoint() -> Option<String> {
     Some(format!("http://127.0.0.1:{port}"))
 }
 
-/// The server's own directory tree: the only place a local-mode hand-over may
-/// come from.
+/// The server's own directory tree: the only place a local-mode hand-over may come from.
 pub(crate) fn incoming_files_dir() -> Option<std::path::PathBuf> {
     server::download_root()
 }
 
-/// The `api_id`/`api_hash` pair as configured, normalised the way the server is
-/// launched with it — the one place that normalises, so the value that was
-/// validated is the value that is used.
 fn credentials() -> (String, String) {
     let api_id = CONFIG.telegram_api_id().unwrap_or_default();
     let api_hash = CONFIG.telegram_api_hash().unwrap_or_default();
@@ -308,8 +280,6 @@ fn parse_api_id(api_id: &str) -> Result<(), String> {
     }
 }
 
-/// `api_hash`'s shape, or what is wrong with it. Case is not checked: a hex value
-/// means the same in either case, and [`credentials`] is what normalises it.
 fn parse_api_hash(api_hash: &str) -> Result<(), String> {
     let api_hash = api_hash.trim();
     if api_hash.is_empty() {
@@ -326,29 +296,18 @@ fn parse_api_hash(api_hash: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// What the boot of the message pipeline should do about the listener.
 pub(crate) enum Boot {
-    /// Start the channel against the base the current mode names.
     Start,
-    /// A resumed switch already started it.
     Running,
-    /// The local mode has no server yet; the supervisor starts one and then the
-    /// listener. Nothing may talk to the cloud in the meantime.
     Waiting,
 }
 
-/// How often the process is checked: a tokenless request, cheap enough to run
-/// every minute.
 const LIVENESS_INTERVAL: Duration = Duration::from_mins(1);
 
-/// How often the local server is asked whether it takes the bot: `getMe` is the
-/// one question a refusal or a rejected pair answers.
 const REACHABILITY_INTERVAL: Duration = Duration::from_mins(5);
 
-/// How often the release stream is asked for a newer server.
 const UPDATE_INTERVAL: Duration = Duration::from_hours(1);
 
-/// How often the server's own disk use is trimmed.
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_hours(1);
 
 /// Restart delays after a failed start. A start that keeps failing settles at one
@@ -362,16 +321,10 @@ const RESTART_BACKOFF: [Duration; 4] = [
 ];
 const SETTLED_RETRY: Duration = Duration::from_hours(1);
 
-/// How often a switch waiting for the owner is reconsidered: often enough that a
-/// cause which is gone (an outage that ended, a pair that was replaced elsewhere)
-/// clears by itself, rarely enough that a cause which is not gone costs nothing.
 const BLOCKED_RETRY: Duration = Duration::from_hours(1);
 
-/// Whether the owner has already been told about the current failure episode.
 static FAILURE_NOTIFIED: AtomicBool = AtomicBool::new(false);
 
-/// A build that is installed and waiting for the supervisor to restart the server
-/// onto it. The download itself runs beside the loop ([`start_server_update`]).
 static UPDATE_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// One update check at a time: a download outlasting the interval must not be
@@ -414,7 +367,6 @@ pub(crate) async fn prepare_for_boot() -> Boot {
     }
 }
 
-/// Start (or confirm) the local server for the configured credentials.
 async fn ensure_local() -> Result<(), String> {
     if crate::config::CONFIG.telegram_bot_token().is_none() {
         return Err("Telegram has no bot token configured, so there is no bot to serve".into());
@@ -428,8 +380,6 @@ async fn ensure_local() -> Result<(), String> {
     Ok(())
 }
 
-/// Record the endpoint the transport may use: the server answers, so the state
-/// is healthy and the current failure episode, if any, is over.
 pub(super) fn publish_endpoint(port: u16) {
     set_status(|status| {
         status.port = Some(port);
@@ -439,13 +389,10 @@ pub(super) fn publish_endpoint(port: u16) {
     FAILURE_NOTIFIED.store(false, Ordering::SeqCst);
 }
 
-/// Forget the endpoint: the server it named is gone, and nothing may be built
-/// against it. In local mode that means no listener at all until one exists.
 pub(super) fn clear_endpoint() {
     set_status(|status| status.port = None);
 }
 
-/// Record a failure and tell the owner once per episode.
 fn report_failure(reason: &str) {
     set_status(|status| {
         status.health = Health::Down;
@@ -461,10 +408,6 @@ fn report_failure(reason: &str) {
     }
 }
 
-/// The Bot API's own words for a failed call, without the transport's wrapper.
-/// The wrapper is a credential-shaped `key: value` pair, which every log and
-/// tool scrubber masks into nonsense ("Unau*[REDACTED]"); the caller wants the
-/// cause, not that.
 fn api_cause(reason: &str) -> &str {
     reason
         .split_once(crate::channels::telegram::REJECTED_TOKEN_PREFIX)
@@ -507,9 +450,6 @@ pub(crate) fn credentials_rejected(reason: &str) -> bool {
         || reason.contains("api_hash")
 }
 
-/// Ask for a switch to `target`: the decision is recorded durably before
-/// anything runs, and the switch itself is resumed by the supervisor if it does
-/// not finish here.
 pub(crate) async fn request_switch(target: Mode) -> anyhow::Result<()> {
     if target == Mode::Local {
         if CONFIG.telegram_bot_token().is_none() {
@@ -521,8 +461,7 @@ pub(crate) async fn request_switch(target: Mode) -> anyhow::Result<()> {
     // Liveness is the supervisor's business: asking for the mode that is already
     // in force must not run the switch again — a second cutover would log the bot
     // out of the cloud a second time while it is being served locally. A finished
-    // switch whose chat message is still pending is settled too: its own notice is
-    // on its way.
+    // switch whose chat message is still pending is settled too: its own notice is on its way.
     let settled = configured_mode() == target && (!migrate::pending() || migrate::finishing());
     if settled {
         return Ok(());
@@ -535,8 +474,7 @@ pub(crate) async fn request_switch(target: Mode) -> anyhow::Result<()> {
 /// switch a crash interrupted.
 ///
 /// Its whole cost when everything is fine is one tokenless request a minute, and
-/// a `getMe` every five minutes to catch a server that answers but refuses the
-/// bot.
+/// a `getMe` every five minutes to catch a server that answers but refuses the bot.
 pub(crate) async fn run_supervisor() {
     let mut backoff = 0usize;
     // `None` means nothing is scheduled: the steady state wakes on the liveness
@@ -548,8 +486,6 @@ pub(crate) async fn run_supervisor() {
     let mut blocked_at = tokio::time::Instant::now();
 
     loop {
-        // A scheduled restart waits its own delay; everything else is the minute.
-        // Without this the ladder would be quantised to whole minutes.
         let wait = if configured_mode() == Mode::Local && !migrate::pending() {
             retry_at.map_or(LIVENESS_INTERVAL, |at| {
                 at.saturating_duration_since(tokio::time::Instant::now())
@@ -634,8 +570,6 @@ pub(crate) async fn run_supervisor() {
                 }
             }
         } else if !switching && server::read_record().is_some() {
-            // The cloud owns no local process; one left behind by a revert is
-            // stopped here rather than nobody's business.
             server::stop().await;
         }
 
@@ -684,8 +618,7 @@ async fn check_reachability() {
     // — and not while a switch is in flight, which owns the diagnosis: it knows
     // which side the bot is on, and a probe of the wrong side would overwrite its
     // cause. A switch waiting for the owner does not own it: the local server is
-    // what carries the bot then, and a failure of it is exactly what the owner must
-    // see.
+    // what carries the bot then, and a failure of it is exactly what the owner must see.
     if serving_mode() != Mode::Local
         || (migrate::pending() && !migrate::is_blocked() && !migrate::finishing())
     {
@@ -742,14 +675,10 @@ fn start_server_update() {
     });
 }
 
-/// Install a newer build when the release stream offers one, one-way.
 async fn install_newer_build() {
     let Some(current) =
         server::read_record().and_then(|record| record.version.as_deref().and_then(parse_version))
     else {
-        // Without a version to compare there is nothing to decide: downloading the
-        // newest build on every tick would be the alternative, and re-installing the
-        // same server repeatedly is not an update.
         tracing::debug!("telegram-bot-api: the running server reports no comparable version");
         return;
     };
@@ -790,7 +719,6 @@ async fn apply_server_update() {
     }
 }
 
-/// A release version out of the text the artifact reports (`Bot API 10.3`).
 fn parse_version(reported: &str) -> Option<semver::Version> {
     let numeric = reported
         .split_whitespace()
@@ -798,7 +726,6 @@ fn parse_version(reported: &str) -> Option<semver::Version> {
     crate::util::managed_bin::parse_short_version(numeric)
 }
 
-/// Stop the server on the way out.
 pub(crate) async fn stop_for_exit() {
     if configured_mode() == Mode::Local || server::read_record().is_some() {
         server::stop().await;
@@ -811,8 +738,6 @@ mod tests {
 
     #[test]
     fn a_malformed_pair_is_named_field_by_field() {
-        // Both empty: each field says what it is missing, and neither complaint
-        // stands in for the other.
         let (id, hash) = credential_problems("", "");
         assert!(
             id.as_deref()
@@ -844,8 +769,6 @@ mod tests {
                 .is_some_and(|problem| problem.contains("32 hexadecimal"))
         );
 
-        // The api_id's complaint is the one reported first, whichever field the
-        // other problem is in.
         assert!(
             validate_credentials("", "")
                 .unwrap_err()
@@ -867,8 +790,6 @@ mod tests {
 
     #[test]
     fn the_serving_mode_follows_the_side_the_bot_is_on() {
-        // A switch requested from one side to the other, with the leave recorded or
-        // not — the two facts a resumed switch reads.
         let switch =
             |from: &str, target: &str, cloud_logged_out: bool, local_left: bool| migrate::Journal {
                 from: from.into(),
@@ -878,11 +799,9 @@ mod tests {
                 ..Default::default()
             };
 
-        // No switch: the configured mode is what serves.
         assert_eq!(serving_from(Mode::Cloud, None), Mode::Cloud);
         assert_eq!(serving_from(Mode::Local, None), Mode::Local);
 
-        // Into the local server: the cloud keeps serving until the bot has left it.
         assert_eq!(
             serving_from(Mode::Local, Some(&switch("cloud", "local", false, false))),
             Mode::Cloud
@@ -904,8 +823,6 @@ mod tests {
             Mode::Cloud
         );
 
-        // A row nothing wrote names no side: the configured mode stands, rather than
-        // being read as a switch back to the cloud.
         let unreadable = migrate::Journal {
             target: "cloud".into(),
             ..Default::default()

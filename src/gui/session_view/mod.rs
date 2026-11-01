@@ -1,8 +1,6 @@
-//! Shared agent-session rendering layer — one view-model ("ledger") plus
-//! shared components used by both the Sessions page (full historical
-//! transcript) and the Running Agents page (live compact projection). The
-//! compact view is a projection of the same ledger, never a second data
-//! structure.
+//! Shared agent-session rendering layer — one view-model ("ledger") plus shared
+//! components for the Sessions page (full transcript) and the Running Agents page (a
+//! compact projection of the same ledger, never a second data structure).
 
 use iced::widget::markdown;
 
@@ -17,28 +15,21 @@ use super::media_markers;
 pub(crate) mod preview;
 mod render;
 
-// Shared components re-exported for the Sessions page (full view) and the
-// Running Agents page (compact projection).
+// Shared components re-exported for both pages.
 pub(crate) use render::{MAX_TOOL_TOOLTIP_WIDTH, ToolBlockView, tool_block, truncate_at_boundary};
 
-/// One entry of the flat session ledger: a regular message (system/user/
-/// assistant, optionally carrying a thinking block) or one assistant
-/// tool-call round (one assistant message's calls plus their
-/// tool_call_id-matched results).
+/// One entry of the flat session ledger: a regular message (optionally carrying a thinking
+/// block) or one assistant tool-call round with its `tool_call_id`-matched results.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SessionEntry {
     Message {
         role: crate::ChatRole,
-        /// Visible body text (thinking extracted). None = empty.
         content: Option<String>,
-        /// Thinking text: the decoded Reasoning when present, else a literal
-        /// [thinking] block extracted from the content.
+        /// The decoded Reasoning, else a literal [thinking] block from the content.
         thinking: Option<String>,
     },
     ToolRound {
-        /// Assistant text content that appeared alongside the calls.
         narration: Option<String>,
-        /// The assistant message's decoded long Reasoning block.
         reasoning: Option<String>,
         calls: Vec<ToolCallEntry>,
     },
@@ -47,16 +38,13 @@ pub(crate) enum SessionEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ToolCallEntry {
     pub tool_call_id: String,
-    /// Full unscrubbed args pairs (RunningTool flattening).
     pub tool: RunningTool,
-    /// tool_call_id-matched result content.
     pub result: Option<String>,
 }
 
-/// Split a decoded assistant message into (thinking, visible body).
-/// The decoded Reasoning wins; otherwise a literal `[thinking]...[/thinking]`
-/// pair is extracted from the content, panic-safely: the closer is searched
-/// only after the opener (historical slice-panic regression — see tests).
+/// Split a decoded assistant message into (thinking, visible body): the decoded Reasoning
+/// wins, else a literal `[thinking]…[/thinking]` pair is extracted panic-safely — the closer
+/// is searched only after the opener (historical slice-panic regression — see tests).
 fn split_thinking(
     content: Option<String>,
     reasoning: Option<String>,
@@ -81,26 +69,22 @@ fn split_thinking(
     (None, none_if_empty(&content))
 }
 
-/// [`build_ledger_with_sources`]'s entries alone, for callers that never need
-/// the stored-row mapping.
+/// [`build_ledger_with_sources`]'s entries alone, for callers that never need the row mapping.
 pub(crate) fn build_ledger(messages: &[ChatMessage]) -> Vec<SessionEntry> {
     build_ledger_with_sources(messages).0
 }
 
-/// Decode the native history messages into the flat session ledger, plus a
-/// parallel `sources` vec mapping each entry back to the message row that
-/// CREATED it: the assistant tool-call frame for a [`SessionEntry::ToolRound`],
-/// the message row itself for a [`SessionEntry::Message`].
+/// Decode the native history messages into the flat ledger plus a parallel `sources` vec
+/// mapping each entry back to the message row that CREATED it: the assistant tool-call frame
+/// for a [`SessionEntry::ToolRound`], the message row for a [`SessionEntry::Message`].
 ///
-/// Pure and deterministic: each assistant message becomes a regular message
-/// (with an optional thinking block) or a tool round, and each tool result
-/// attaches to the first unmatched call of the nearest preceding tool round;
-/// stray results render like a regular message — so `sources` is NOT the
-/// identity.
+/// Pure and deterministic: each assistant message becomes a regular message (with an
+/// optional thinking block) or a tool round, and each tool result attaches to the first
+/// unmatched call of the nearest preceding tool round; stray results render like a regular
+/// message — so `sources` is NOT the identity.
 ///
-/// Contract: `sources` is strictly increasing, and cutting stored rows from
-/// `sources[i]` on removes exactly the entries `i..` — the Sessions page's
-/// truncate relies on both.
+/// Contract: `sources` is strictly increasing, and cutting stored rows from `sources[i]` on
+/// removes exactly the entries `i..` — the Sessions page's truncate relies on both.
 pub(crate) fn build_ledger_with_sources(
     messages: &[ChatMessage],
 ) -> (Vec<SessionEntry>, Vec<usize>) {
@@ -128,8 +112,7 @@ pub(crate) fn build_ledger_with_sources(
                             .collect(),
                     });
                 } else {
-                    // No (or an empty) tool-call list: a regular assistant
-                    // message, possibly carrying a thinking block.
+                    // No (or an empty) tool-call list: a regular message.
                     let (thinking, body) =
                         split_thinking(content, plaintext_for_display(reasoning.as_ref()));
                     entries.push(SessionEntry::Message {
@@ -172,7 +155,6 @@ pub(crate) fn build_ledger_with_sources(
                 });
             }
         }
-        // A message produces at most one entry, so the delta is that entry's
         // source row.
         if entries.len() != before {
             sources.push(index);
@@ -181,20 +163,16 @@ pub(crate) fn build_ledger_with_sources(
     (entries, sources)
 }
 
-/// A transcript body parsed for display: its markdown items and the attachments
-/// it carries in body order (the viewer draws them as one block above the text
-/// and turns a file row's click into a reveal).
+/// A transcript body parsed for display: its markdown items and the attachments in body
+/// order (drawn as one block above the text, a file row's click revealing it).
 pub(crate) struct ParsedBody {
     pub items: Vec<markdown::Item>,
     pub attachments: Vec<media_markers::MediaAttachment>,
 }
 
-/// Per-entry markdown parse for bubble bodies: Message → its content,
-/// ToolRound → its narration. None = nothing to render.
-///
-/// `workspace` is the root the session's relative marker targets resolve
-/// against. Every body follows the same rule — the role it arrived under does
-/// not change what its markers become.
+/// Per-entry markdown parse for bubble bodies: Message → its content, ToolRound → its
+/// narration; `None` = nothing to render. `workspace` is the root relative marker targets
+/// resolve against — every body follows the same rule whatever role it arrived under.
 pub(crate) fn parse_entry_bodies(
     entries: &[SessionEntry],
     workspace: Option<&std::path::Path>,
@@ -212,11 +190,10 @@ pub(crate) fn parse_entry_bodies(
         .collect()
 }
 
-/// The reasoning promoted into a tool round's narration slot, if any: the
-/// assistant text content is empty (whitespace-only counts as empty) while a
-/// decoded Reasoning block is present. Render-only signal — the ledger itself
-/// is untouched, empty content stays empty in the history and in the model
-/// replay. Used by the Sessions page's narration body.
+/// The reasoning promoted into a tool round's narration slot, if any: the assistant text
+/// content is empty (whitespace-only counts) while a decoded Reasoning block is present.
+/// Render-only — the ledger is untouched, so empty content stays empty in the history and
+/// in the model replay.
 pub(crate) fn promoted_reasoning<'a>(
     narration: Option<&'a str>,
     reasoning: Option<&'a str>,
@@ -319,7 +296,8 @@ mod tests {
         promoted: Option<&'static str>,
     }
 
-    /// Reasoning is promoted only when the round has no visible narration and there is reasoning to promote.
+    /// Reasoning is promoted only when the round has no visible narration and there is
+    /// reasoning to promote.
     #[test]
     fn promoted_reasoning_cases() {
         let cases: &[PromotedCase] = &[

@@ -1,44 +1,38 @@
-//! The server process: where its pieces live, how it is started, probed,
-//! adopted, stopped and kept from piling up on disk.
+//! The server process: where its pieces live, how it is started, probed, adopted,
+//! stopped and kept from piling up on disk.
 //!
-//! One server per bot, always. A process that outlived the daemon — a crash, a
-//! killed terminal, an update handoff that exits without running destructors —
-//! is found through its record file. The record's process start identity is what
-//! proves it still names the process this product started: a pid alone is reused
-//! across a reboot, so acting on it without the start time would signal a
-//! stranger. A port proves even less — any process of this user can hold one — and
-//! there is no portable way to ask the kernel which process owns a listening
-//! socket, so that ownership is not proven: a port is only ever taken from a
-//! record whose process has been proven, and a fresh one is chosen immediately
-//! before each spawn, which keeps the window in which something else could take it
-//! down to the spawn itself. A process that
-//! proves itself and answers is adopted; one that proves itself and does not
-//! answer is stopped; one that cannot be proven is left alone and its record
-//! dropped. Starting a second poller on the same token splits the bot's updates,
-//! which is the one failure this module exists to prevent.
+//! One server per bot, always. A process that outlived the daemon (a crash, a
+//! killed terminal, an update handoff that skips destructors) is found through its
+//! record file, and the record's process start identity is what proves it still
+//! names the process this product started: a pid alone is reused across a reboot,
+//! so acting on it without the start time would signal a stranger. A port proves
+//! even less — any process of this user can hold one — and no portable call names
+//! the owner of a listening socket: a port is only ever taken from a record whose
+//! process has been proven, and a fresh one is chosen right before each spawn,
+//! keeping the window down to the spawn itself. A process that proves itself and
+//! answers is adopted; one that proves itself and does not answer is stopped; one
+//! that cannot be proven is left alone and its record dropped. A second poller on
+//! the same token splits the bot's updates — the one failure this module exists to prevent.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-/// How long a freshly started process may take to answer on its port.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long a stop waits for the process to go away before it is killed.
+/// How long a stop waits before the kill.
 const STOP_GRACE: Duration = Duration::from_secs(10);
 
-/// The cheapest possible health request: a connection and one HTTP line with a
-/// short bound. A path outside `/bot…` never creates a bot client, so probing
-/// costs the platform nothing and cannot log the bot in anywhere.
+/// A path outside `/bot…` never creates a bot client, so probing costs the platform
+/// nothing and cannot log the bot in anywhere.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The server's own log is bounded here rather than at its 2 GB default.
+/// Bounded here rather than at the server's 2 GB default.
 const LOG_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Files the server leaves in its own directories are its business, but they are
-/// swept by age so they cannot grow without bound. A day is far longer than any
-/// ingest takes.
+/// Files the server leaves in its own directories are swept by age so they cannot
+/// grow without bound; a day is far longer than any ingest takes.
 const STATE_FILE_RETENTION: Duration = Duration::from_hours(24);
 
 /// What a running server is, as the record file keeps it across restarts.
@@ -49,19 +43,16 @@ pub(super) struct Instance {
     /// The version the artifact reports for itself.
     #[serde(default)]
     pub(super) version: Option<String>,
-    /// A fingerprint of the credentials it was started with: a changed
-    /// `api_id`/`api_hash` must reach a restarted process, because the server
-    /// reads them once at launch and caches a failed login for half an hour.
+    /// A changed `api_id`/`api_hash` must reach a restarted process: the server reads
+    /// them once at launch and caches a failed login for half an hour.
     #[serde(default)]
     pub(super) credentials: String,
-    /// The platform's start time for the process, captured right after spawn.
-    /// A pid names whatever holds that number now; this is what says the process
-    /// is still the one this record was written for.
+    /// Captured right after spawn: a pid names whatever holds that number now, and
+    /// this says the process is still the one this record was written for.
     #[serde(default)]
     pub(super) start: u64,
 }
 
-/// The process this daemon started, when it started one.
 struct Owned {
     child: tokio::process::Child,
     pid: u32,
@@ -88,25 +79,22 @@ pub(super) fn root() -> Option<PathBuf> {
     )
 }
 
-/// The server's working directory: TDLib's own state, kept stable across binary
-/// updates so the bot's session survives one.
+/// TDLib's own state, kept stable across binary updates so the bot's session
+/// survives one.
 pub(super) fn state_dir() -> Option<PathBuf> {
     Some(root()?.join("state"))
 }
 
-/// Where the server keeps the payloads it downloads (`--files-dir`), one directory
-/// per bot token under it.
+/// `--files-dir`: one directory per bot token under it.
 fn files_dir() -> Option<PathBuf> {
     Some(root()?.join("files"))
 }
 
-/// Test hook: the directory a local hand-over must come from, in place of the
-/// server's own.
+/// Test hook: overrides the directory a local hand-over comes from.
 const FILES_DIR_ENV: &str = "MAHBOT_TGAPI_FILES_DIR";
 
-/// The only place a local hand-over may come from: the directory the server is
-/// given for its own files. Nothing else, so a malformed or misbehaving answer can
-/// neither copy nor delete anything that is not the server's.
+/// The only place a local hand-over may come from, so a malformed or misbehaving
+/// answer can neither copy nor delete anything that is not the server's.
 pub(super) fn download_root() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os(FILES_DIR_ENV) {
         return Some(PathBuf::from(dir));
@@ -114,15 +102,14 @@ pub(super) fn download_root() -> Option<PathBuf> {
     files_dir()
 }
 
-/// The directories the server leaves payloads in, swept by age so that a file an
-/// interrupted or refused transfer left behind cannot accumulate: downloads land
-/// under `--files-dir`, uploads in the temporary one (`--temp-dir`). The working
-/// directory beside them — its TDLib database — is never walked.
+/// Swept by age, so a file an interrupted or refused transfer left behind cannot
+/// accumulate: downloads land under `--files-dir`, uploads in `--temp-dir`. The
+/// working directory beside them (its TDLib database) is never walked.
 fn payload_dirs() -> Vec<PathBuf> {
     [files_dir(), temp_dir()].into_iter().flatten().collect()
 }
 
-/// The server's own temporary directory, likewise swept by age.
+/// Likewise swept by age.
 fn temp_dir() -> Option<PathBuf> {
     Some(root()?.join("tmp"))
 }
@@ -131,9 +118,8 @@ fn log_path() -> Option<PathBuf> {
     Some(root()?.join("server.log"))
 }
 
-/// The child's stderr: everything it prints before `--log` is even opened, which
-/// is where a launch failure says why. Truncated at every start, so it holds the
-/// last launch only and cannot grow — the server's own log has its own bound.
+/// Everything the child prints before `--log` is opened, which is where a launch
+/// failure says why. Truncated at every start, so it holds the last launch only.
 fn stderr_path() -> Option<PathBuf> {
     Some(root()?.join("server.stderr.log"))
 }
@@ -148,8 +134,8 @@ pub(super) fn read_record() -> Option<Instance> {
     serde_json::from_str(&body).ok()
 }
 
-/// Write the record atomically: a torn record is one no later start can read,
-/// which is the state that lets a second poller start beside a live one.
+/// Atomically: a torn record is one no later start can read, which is the state
+/// that lets a second poller start beside a live one.
 fn write_record(instance: &Instance) -> Result<(), String> {
     let Some(path) = record_path() else {
         return Err("the server's record path is unavailable".to_string());
@@ -173,7 +159,6 @@ fn clear_record() {
     }
 }
 
-/// A fingerprint of the credentials a process was started with.
 pub(super) fn credentials_fingerprint(api_id: &str, api_hash: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -183,9 +168,8 @@ pub(super) fn credentials_fingerprint(api_id: &str, api_hash: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Ask a port whether the server answers there. A connection and one HTTP
-/// request line: the answer says "something speaking HTTP is listening", which
-/// is all a liveness check needs.
+/// The answer says "something speaking HTTP is listening", which is all a liveness
+/// check needs.
 pub(super) async fn probe(port: u16) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let Ok(Ok(mut stream)) = tokio::time::timeout(
@@ -210,14 +194,10 @@ pub(super) async fn probe(port: u16) -> bool {
     ) && &head == b"HTTP/"
 }
 
-/// A fresh loopback port for the next spawn.
-///
-/// The listener only reserves the number and is dropped before the server binds it,
-/// so this proves the port was free at this moment — not that the server ends up
-/// owning it: no portable check names the owner of a listening socket, and the
-/// window in which something else could take it is the spawn itself. The server
-/// fails to start rather than silently serving on another port, and the record's
-/// process identity is what the rest of this module trusts.
+/// The listener reserves the number and is dropped before the server binds it, so
+/// this proves only that the port was free at that moment. The server fails to start
+/// rather than silently serving on another port, and the record's process identity
+/// is what the rest of this module trusts.
 fn pick_port() -> Result<u16, String> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
         .map_err(|e| format!("no loopback port could be reserved ({})", e.kind()))?;
@@ -229,18 +209,15 @@ fn pick_port() -> Result<u16, String> {
     Ok(port)
 }
 
-/// The version the installed artifact reports for itself: the Bot API version
-/// it implements, which is what makes a mismatch between what the product
-/// expects and what runs diagnosable. `None` when the binary cannot run at all.
+/// The Bot API version it implements, which makes a mismatch between what the
+/// product expects and what runs diagnosable. `None` when it cannot run at all.
 pub(super) async fn reported_version() -> Option<String> {
     reported_version_at(&super::install::binary_path()?).await
 }
 
-/// The version the binary at `path` reports, or `None` when it cannot run there.
-///
-/// Also the only proof that a copied file is a usable executable: a checksum-valid
-/// artifact can still fail on a missing library, and the answer it prints is the
-/// one thing that tells the two apart before it replaces a working copy.
+/// `None` when the binary cannot run there. Also the only proof that a copied file
+/// is a usable executable: a checksum-valid artifact can still fail on a missing
+/// library, and this answer tells the two apart before it replaces a working copy.
 pub(super) async fn reported_version_at(path: &std::path::Path) -> Option<String> {
     let mut command = tokio::process::Command::new(path);
     #[cfg(target_os = "windows")]
@@ -248,8 +225,6 @@ pub(super) async fn reported_version_at(path: &std::path::Path) -> Option<String
     command
         .arg("--version")
         .stdin(std::process::Stdio::null())
-        // The banner is printed through tdlib's plain log, which writes to
-        // stderr — capturing only stdout reads nothing at all.
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(10), command.output())
@@ -274,18 +249,13 @@ pub(super) async fn reported_version_at(path: &std::path::Path) -> Option<String
         .map(|line| (*line).to_string())
 }
 
-/// Make sure a process this daemon owns is running against `credentials`, and
-/// answer with its record.
-///
-/// The order is what keeps the cloud listener untouched while this happens: an
-/// absent binary is fetched, an orphan is adopted, and only then is a new
-/// process started — on a port nothing else holds, in a stable state directory,
-/// with the credentials passed in the environment so they never appear in the
-/// process list.
+/// The order keeps the cloud listener untouched: an absent binary is fetched, an
+/// orphan is adopted, and only then is a new process started — on a port nothing else
+/// holds, in a stable state directory, with the credentials passed in the environment
+/// so they never appear in the process list.
 pub(super) async fn ensure(credentials: &str) -> Result<Instance, String> {
-    // Serialized: the boot path and the supervisor can ask at the same time, and
-    // two answers to "is it running" are how a second process gets started beside
-    // the first.
+    // Serialized: the boot path and the supervisor can ask at once, and two answers
+    // to "is it running" are how a second process gets started beside the first.
     let _guard = ensure_lock().lock().await;
     if let Some(instance) = read_record()
         && instance.credentials == credentials
@@ -299,13 +269,12 @@ pub(super) async fn ensure(credentials: &str) -> Result<Instance, String> {
         return Ok(instance);
     }
 
-    // A process of ours that no longer answers, or one started with the previous
-    // credentials: gone before a second one can exist.
+    // Ours but not answering, or started with previous credentials: gone before a
+    // second one can exist.
     stop().await;
     if let Some(left) = read_record() {
-        // `stop` keeps the record only when the process outlived it. Starting
-        // beside one would put two pollers on the same bot token — the one outcome
-        // this module exists to prevent — so the start waits instead.
+        // Starting beside a live process would put two pollers on the bot token, so
+        // the start waits instead.
         return Err(format!(
             "the previous server process (pid {}) is still running, so a second one was not started",
             left.pid
@@ -319,9 +288,8 @@ pub(super) async fn ensure(credentials: &str) -> Result<Instance, String> {
         version
     } else {
         // A copy that checksums right but cannot run is not an installed server:
-        // reinstalling is the only repair, and without it the update check could
-        // never replace the copy either — it has no version to compare, which is
-        // exactly the "stranded on a version that cannot run" state.
+        // reinstalling is the only repair (the update check has no version to compare,
+        // so it could never replace the copy either).
         tracing::warn!("telegram-bot-api: the installed server cannot run; reinstalling");
         super::install::install(super::install::latest().await?).await?;
         reported_version()
@@ -331,9 +299,9 @@ pub(super) async fn ensure(credentials: &str) -> Result<Instance, String> {
 
     let port = pick_port()?;
     let (pid, start) = spawn(port).await?;
-    // Recorded before it is ready: an exit that skips destructors between the
-    // spawn and the ready answer would otherwise leave a process no later start
-    // could find, and the next one would start a second poller beside it.
+    // Recorded before it is ready: an exit that skips destructors between spawn and
+    // the ready answer would leave a process no later start could find, and the next
+    // one would start a second poller beside it.
     if let Err(reason) = write_record(&Instance {
         pid,
         port,
@@ -341,8 +309,8 @@ pub(super) async fn ensure(credentials: &str) -> Result<Instance, String> {
         credentials: credentials.to_string(),
         start,
     }) {
-        // Without the record the process could outlive this daemon un-found, and
-        // the next start would put a second poller beside it.
+        // Without the record the process could outlive this daemon un-found, and the
+        // next start would put a second poller beside it.
         stop().await;
         return Err(reason);
     }
@@ -350,8 +318,7 @@ pub(super) async fn ensure(credentials: &str) -> Result<Instance, String> {
     let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
     loop {
         // Both facts, in this order: the process must still be ours when its port
-        // answers, otherwise something else took the port and this is not a
-        // running server of ours.
+        // answers, else something else took the port.
         if probe(port).await && exit_status().await.is_none() {
             break;
         }
@@ -377,12 +344,10 @@ pub(super) async fn ensure(credentials: &str) -> Result<Instance, String> {
     })
 }
 
-/// Start the server process on `port` and answer with its process id and start
-/// time.
-///
-/// Its credentials come from the environment, so `api_hash` never appears in the
-/// process list; its three directories are created here, because a missing one
-/// must be reported as this side's failure rather than read out of its log.
+/// Answers with the process id and start time. Credentials come from the
+/// environment, so `api_hash` never appears in the process list; the three
+/// directories are created here, because a missing one must be reported as this
+/// side's failure rather than read out of its log.
 async fn spawn(port: u16) -> Result<(u32, u64), String> {
     let Some(state) = state_dir() else {
         return Err("the server's working directory is unavailable".to_string());
@@ -407,8 +372,8 @@ async fn spawn(port: u16) -> Result<(u32, u64), String> {
     if let Some(dir) = log.parent() {
         let _ = tokio::fs::create_dir_all(dir).await;
     }
-    // Startup failures land here, so the reason can be quoted back to the owner
-    // instead of leaving only "it did not start".
+    // Startup failures land here, so the reason can be quoted back instead of only
+    // "it did not start".
     let stderr = match stderr_path().and_then(|path| {
         std::fs::OpenOptions::new()
             .create(true)
@@ -432,8 +397,7 @@ async fn spawn(port: u16) -> Result<(u32, u64), String> {
     #[cfg(target_os = "windows")]
     command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     // A session of its own on unix, so a hangup aimed at the service's session cannot
-    // reach the helper either — the service itself is detached from the terminal it was
-    // started from (see `detach`), and anything that outlives it must not hang off it.
+    // reach the helper: anything that outlives the service must not hang off it.
     //
     // SAFETY: `setsid` is async-signal-safe and is the only thing run between the fork and
     // the exec; the child is freshly forked, so it is not a group leader.
@@ -447,9 +411,8 @@ async fn spawn(port: u16) -> Result<(u32, u64), String> {
         });
     }
     command
-        // Everything it writes stays under its own root, including whatever a
-        // relative path would resolve against: the product's working directory is
-        // not its business.
+        // Everything it writes stays under its own root, relative paths included: the
+        // product's working directory is not its business.
         .current_dir(&root)
         .arg("--local")
         .arg("--http-ip-address")
@@ -458,8 +421,8 @@ async fn spawn(port: u16) -> Result<(u32, u64), String> {
         .arg(port.to_string())
         .arg("--dir")
         .arg(&state)
-        // Its payloads go to a directory of their own, which is what the sweep
-        // ages out and what a local hand-over is confined to.
+        // Its payloads go to a directory of their own — what the sweep ages out and
+        // what a local hand-over is confined to.
         .arg("--files-dir")
         .arg(&files)
         .arg("--temp-dir")
@@ -468,13 +431,13 @@ async fn spawn(port: u16) -> Result<(u32, u64), String> {
         .arg(&log)
         .arg("--log-max-file-size")
         .arg(LOG_MAX_BYTES.to_string())
-        // Warnings and errors in the log file, so a death after startup can be
-        // quoted back instead of reported as "it stopped".
+        // Warnings and errors in the log file, so a death after startup can be quoted
+        // back instead of reported as "it stopped".
         .arg("--verbosity")
         .arg("1")
-        // Read once at launch and cached by the server for half an hour. The
-        // environment keeps them out of `ps` output (a same-user process can
-        // still read `/proc/<pid>/environ`, which `ps` cannot show).
+        // Read once at launch and cached for half an hour. The environment keeps them
+        // out of `ps` output (a same-user process can still read
+        // `/proc/<pid>/environ`).
         .env("TELEGRAM_API_ID", &api_id)
         .env("TELEGRAM_API_HASH", &api_hash)
         .stdin(std::process::Stdio::null())
@@ -488,11 +451,9 @@ async fn spawn(port: u16) -> Result<(u32, u64), String> {
         .id()
         .ok_or_else(|| "the server reported no process id".to_string())?;
     *owned().lock().await = Some(Owned { child, pid });
-    // Captured now, while the pid can only mean this process: it is the fact that
-    // later says the record still names the process this side started. A process
-    // that cannot be identified could never be proven ours again, and the next
-    // start would put a second poller beside it — so it is stopped while it is
-    // still ours to stop.
+    // Captured now, while the pid can only mean this process: a process that cannot
+    // be identified could never be proven ours again, and the next start would put a
+    // second poller beside it — so it is stopped while it is still ours to stop.
     let Some(start) = process_identity(pid) else {
         let child = owned().lock().await.take();
         if let Some(Owned { mut child, .. }) = child {
@@ -504,8 +465,8 @@ async fn spawn(port: u16) -> Result<(u32, u64), String> {
     Ok((pid, start))
 }
 
-/// The last lines the process wrote, when it died on its own — the only place
-/// the real reason is recorded.
+/// The last lines the process wrote when it died on its own — the only place the
+/// real reason is recorded.
 fn startup_failure(reason: &str) -> String {
     let tail = [stderr_path(), log_path()]
         .into_iter()
@@ -525,33 +486,25 @@ fn startup_failure(reason: &str) -> String {
     }
 }
 
-/// The child's exit status, when it has one.
-///
-/// `try_wait` reaps a child that has exited, which is what makes the status
-/// final — and what frees its pid for reuse, so nothing may signal that pid
-/// afterwards.
+/// `try_wait` reaps an exited child, which makes the status final and frees its pid
+/// for reuse — so nothing may signal that pid afterwards.
 async fn exit_status() -> Option<std::process::ExitStatus> {
     let mut guard = owned().lock().await;
     let owned = guard.as_mut()?;
     owned.child.try_wait().unwrap_or_default()
 }
 
-/// Whether the recorded process is the one this record was written for.
-///
-/// The pid alone proves nothing: it is reused across a reboot, and the port it
-/// names can be taken by anything. The start time recorded at spawn is what says
-/// "this is still the process we started", and a record without one proves
-/// nothing at all.
+/// The pid alone proves nothing: it is reused across a reboot, and its port can be
+/// taken by anything. Only the start time recorded at spawn says "this is still the
+/// process we started", and a record without one proves nothing.
 fn verify(instance: &Instance) -> bool {
     instance.start != 0 && process_identity(instance.pid) == Some(instance.start)
 }
 
-/// Whether the recorded process is still ours and answering on its port: one this
+/// Whether the recorded process is still ours and answering on its port — one this
 /// daemon started or one it adopted.
 pub(super) async fn alive(instance: &Instance) -> bool {
-    // The port, not only the process: a server that is alive but no longer answers
-    // is as useless to the bot as one that died, and only the probe tells them
-    // apart.
+    // Alive but not answering is as useless as dead, and only the probe tells them apart.
     verify(instance) && probe(instance.port).await
 }
 
@@ -562,8 +515,8 @@ pub(super) async fn adopt_or_reap() {
         return;
     };
     if !verify(&instance) {
-        // Whatever that pid names now, it is not this product's server: it must be
-        // neither signalled nor handed the bot's token.
+        // Whatever that pid names now, it is not this product's server: neither
+        // signalled nor handed the bot's token.
         tracing::debug!(
             pid = instance.pid,
             "telegram-bot-api: the record names no process this product started"
@@ -586,17 +539,16 @@ pub(super) async fn adopt_or_reap() {
 /// Stop the server: the one this daemon started, or the one it adopted.
 pub(super) async fn stop() {
     stop_process().await;
-    // The endpoint names a port nothing serves any more: a status that kept it
-    // would offer a listener a base for a server that is not installed.
+    // The endpoint names a port nothing serves any more: a listener would get a base
+    // for a server that is not installed.
     super::clear_endpoint();
 }
 
 /// Stop the process and settle the record; the published endpoint is the caller's.
 async fn stop_process() {
     if let Some(Owned { child, pid }) = owned().lock().await.take() {
-        // A child this process started: its pid cannot be reused until it is
-        // reaped, so this is the one path that may signal without asking the
-        // record.
+        // A child this process started: its pid cannot be reused until reaped, so this
+        // is the one path that may signal without asking the record.
         stop_child(child, pid).await;
         clear_record();
         return;
@@ -615,8 +567,7 @@ async fn stop_process() {
         return;
     }
     terminate_pid(instance.pid).await;
-    // The record is what a later start adopts or reaps: one that outlived its own
-    // process must not be left pointing at a port nobody answers on.
+    // A record that outlived its own process must not point at a port nobody answers on.
     if process_alive(instance.pid) {
         tracing::warn!(
             pid = instance.pid,
@@ -627,13 +578,12 @@ async fn stop_process() {
     }
 }
 
-/// Termination, graceful where the platform has a way to ask: Unix gets
-/// `SIGTERM`, which the server handles by closing its TDLib state properly.
-/// Windows has nothing gentler than `TerminateProcess` — `signal_terminate` is a
-/// hard kill there. The timeout and the unconditional kill are the fallback.
+/// Graceful where the platform allows: Unix gets `SIGTERM`, which the server handles
+/// by closing its TDLib state properly. Windows has nothing gentler than
+/// `TerminateProcess` — a hard kill. The timeout and unconditional kill are the fallback.
 async fn stop_child(mut child: tokio::process::Child, pid: u32) {
-    // Only a child that has not exited may be signalled: reading its status reaps
-    // it, and a reaped pid can already belong to an unrelated process.
+    // Only a child that has not exited may be signalled: reading its status reaps it,
+    // and a reaped pid can already belong to an unrelated process.
     if matches!(child.try_wait(), Ok(None)) {
         signal_terminate(pid);
     }
@@ -647,7 +597,7 @@ async fn stop_child(mut child: tokio::process::Child, pid: u32) {
     }
 }
 
-/// Stop a process this daemon did not start (an adopted or orphaned server).
+/// For a process this daemon did not start (adopted or orphaned).
 async fn terminate_pid(pid: u32) {
     if !process_alive(pid) {
         return;
@@ -657,14 +607,14 @@ async fn terminate_pid(pid: u32) {
         return;
     }
     signal_kill(pid);
-    // A start that follows this must not put a second poller beside one that is
-    // still shutting down, so the kill is waited out rather than assumed.
+    // A following start must not put a second poller beside one still shutting down,
+    // so the kill is waited out.
     if !wait_until_gone(pid, STOP_GRACE).await {
         tracing::warn!(pid, "telegram-bot-api: the server survived its kill");
     }
 }
 
-/// Wait up to `bound` for `pid` to stop existing; `true` when it is gone.
+/// `true` when `pid` is gone.
 async fn wait_until_gone(pid: u32, bound: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + bound;
     loop {
@@ -678,20 +628,17 @@ async fn wait_until_gone(pid: u32, bound: Duration) -> bool {
     }
 }
 
-/// The platform's start time for `pid`, the fact that tells one process apart
-/// from a later one holding the same number.
-///
-/// A pid is reused across a reboot and a port can be taken by anything; the start
-/// time is what says "this is still the process we started".
+/// The fact that tells one process apart from a later one holding the same number:
+/// a pid is reused across a reboot and a port can be taken by anything.
 fn process_identity(pid: u32) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        // `comm` (field 2) is a parenthesised name that may itself contain spaces
-        // and parentheses, so everything after the last `)` is positional.
+        // `comm` (field 2) is a parenthesised name that may contain spaces and
+        // parentheses, so everything after the last `)` is positional.
         let rest = stat.rsplit_once(')')?.1;
-        // The remainder starts at `state` (field 3), which makes `starttime`
-        // (field 22) the twentieth whitespace-separated item.
+        // The remainder starts at `state` (field 3), making `starttime` (field 22) the
+        // twentieth whitespace-separated item.
         rest.split_whitespace().nth(19)?.parse().ok()
     }
     #[cfg(target_os = "macos")]
@@ -756,8 +703,8 @@ fn process_alive(pid: u32) -> bool {
     }
     #[cfg(unix)]
     {
-        // `kill(pid, 0)` asks the platform whether the process exists without
-        // touching it; EPERM still means it exists.
+        // `kill(pid, 0)` asks whether the process exists without touching it; EPERM
+        // still means it exists.
         let alive = unsafe { libc::kill(i32::try_from(pid).unwrap_or(i32::MAX), 0) } == 0;
         alive || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
@@ -781,7 +728,6 @@ fn process_alive(pid: u32) -> bool {
     }
 }
 
-/// Ask the process to stop.
 fn signal_terminate(pid: u32) {
     #[cfg(unix)]
     if let Ok(pid) = i32::try_from(pid) {
@@ -791,7 +737,6 @@ fn signal_terminate(pid: u32) {
     signal_kill(pid);
 }
 
-/// Stop the process unconditionally.
 fn signal_kill(pid: u32) {
     #[cfg(unix)]
     if let Ok(pid) = i32::try_from(pid) {
@@ -813,9 +758,9 @@ fn signal_kill(pid: u32) {
     }
 }
 
-/// Remove everything the server owns — the binary, its state, the payloads it
-/// left and its record. Used when the owner goes back to the cloud: none of it
-/// means anything there, and the owner is told so before confirming.
+/// Removes the binary, its state, the payloads it left and its record — for when the
+/// owner goes back to the cloud, where none of it means anything. The owner is told
+/// so before confirming.
 pub(super) async fn remove_state() {
     stop().await;
     let Some(root) = root() else { return };
@@ -826,14 +771,10 @@ pub(super) async fn remove_state() {
     }
 }
 
-/// Keep the server's own disk use bounded: the payloads it leaves behind are
-/// dropped by age. Its log needs nothing here — `--log-max-file-size` is the
-/// server's own bound, and rewriting a log a live process holds open would
-/// corrupt it.
-///
-/// Only its download directory (`--files-dir`) and its temporary one
-/// (`--temp-dir`) are walked ([`payload_dirs`]): its TDLib database is never
-/// touched.
+/// Payloads it leaves behind are dropped by age. Its log needs nothing here —
+/// `--log-max-file-size` is the server's own bound, and rewriting a log a live
+/// process holds open would corrupt it. Only [`payload_dirs`] are walked: the TDLib
+/// database is never touched.
 pub(super) async fn sweep_state_files() {
     for dir in payload_dirs() {
         let mut pending = vec![dir];
@@ -868,9 +809,8 @@ pub(super) async fn sweep_state_files() {
 mod tests {
     use super::*;
 
-    /// The record is what a later start acts on, and only the process start time
-    /// tells its pid apart from whatever holds that number now — the difference
-    /// between signalling our server and signalling a stranger.
+    /// Only the process start time tells the pid apart from whatever holds that
+    /// number now — the difference between signalling our server and a stranger.
     #[test]
     fn a_record_proves_itself_only_with_the_start_time_of_its_process() {
         let pid = std::process::id();
@@ -884,23 +824,20 @@ mod tests {
         };
         assert!(verify(&record));
 
-        // A record written before the start time was kept proves nothing: a pid is
-        // reused across a reboot, so matching numbers say nothing about the process.
+        // A record without a start time proves nothing: matching pids say nothing.
         assert!(!verify(&Instance {
             start: 0,
             ..record.clone()
         }));
-        // A start time that belongs to another process is not this one.
         assert!(!verify(&Instance {
             start: start + 1,
             ..record
         }));
     }
 
-    /// The update path places a downloaded artifact only after it has run it: a
-    /// checksum-valid file that cannot start must be detected before it replaces a
-    /// working copy, because the update check would have no version to compare and
-    /// could never repair the copy it stranded.
+    /// A checksum-valid file that cannot start must be detected before it replaces a
+    /// working copy: the update check would have no version to compare and could never
+    /// repair the copy it stranded.
     #[tokio::test]
     async fn an_artifact_that_cannot_run_reports_no_version() {
         let dir = tempfile::tempdir().expect("tempdir");

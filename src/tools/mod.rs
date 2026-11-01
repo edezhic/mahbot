@@ -12,8 +12,7 @@ pub(crate) mod chrome_groups;
 pub mod chrome_release;
 pub(crate) mod chrome_tab_ledger;
 pub(crate) mod chrome_tabs;
-// Computer-use tool (GUI observe/act). Linux, macOS and Windows offer it; every
-// other platform reaches the stub backend, which is never advertised.
+// Computer-use tool (GUI observe/act); every other platform reaches the stub, never advertised.
 pub mod computer;
 pub(crate) mod custom;
 pub(crate) mod delegation;
@@ -47,65 +46,41 @@ pub(crate) mod video_gen;
 pub(crate) mod web_search;
 pub(crate) mod workspace;
 
-/// Maximum file size for edit and search tool operations and the dashboard editor
-/// (10 MB), and the read tool's cap for any read that is not a document container;
-/// a container it accepts up to `FILE_MAX_BYTES` (50 MB), the conversion bound.
-/// Guards against OOM when agents or the GUI attempt to read very large files.
-/// ReadTool/EditTool enforce it via `check_size_within()`; SearchTool and the Iced
-/// Editor use it directly.
+/// Maximum size for edit and search operations and the dashboard editor (10 MB), and the read
+/// tool's cap for any read that is not a document container (a container it accepts up to
+/// `FILE_MAX_BYTES`, 50 MB). Guards against OOM when agents or the GUI attempt very large files.
 pub(crate) const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
-/// Maximum size for a single reference image in bytes. The 2 MB figure is a
-/// client-side sanity budget, not a documented OpenRouter number; base64 adds
-/// ~33% overhead so we cap raw image data at 1.5 MB (1_500_000 bytes) to stay
-/// well under.
-/// Over-cap references are compressed by the loader (see `load_reference_image`).
-/// Note: the aggregate body budget (`MAX_REQUEST_BODY_BYTES`) re-encodes even
-/// under-cap references when the serialized request exceeds it, so literal
-/// pass-through holds up to ~1.499 MB per single reference (base64 of 1.5 MB
-/// already reaches the 2 MB budget once the data-URI prefix and JSON envelope
-/// are added).
+/// Maximum size for a single reference image in bytes. The 2 MB figure is a client-side sanity
+/// budget, not a documented OpenRouter number; base64 adds ~33% overhead, so raw image data is
+/// capped at 1.5 MB to stay well under. Over-cap references are compressed by the loader. Note: the
+/// aggregate body budget re-encodes even under-cap references when the serialized request exceeds
+/// it.
 const MAX_REFERENCE_IMAGE_BYTES: u64 = 1_500_000;
 
-/// Aggregate budget for the serialized generation request body. The per-image
-/// cap does not bound the total body when multiple references are present, so
-/// the final serialized body is checked against this budget and references are
-/// compressed further until it fits. The 2 MB figure is a client-side sanity
-/// budget mirroring the pre-existing ~2 MB provider body-limit premise (not a
-/// documented OpenRouter number).
+/// Aggregate budget for the serialized generation request body: the per-image cap does not bound
+/// the total, so references are compressed further until the body fits. A client-side sanity
+/// budget.
 const MAX_REQUEST_BODY_BYTES: usize = 2_000_000;
 
-/// The provider's documented maximum number of reference images in one
-/// generation request — the image API declares `input_references` with a
-/// maximum array length of 16. The live model catalog advertises more than
-/// this for some models (up to 20), so the ceiling also clamps the catalog's
-/// declared maximum: both for the reference count the tool sends and for the
-/// maximum rendered to the agent. It is also the cap when the catalog is
-/// unavailable; the aggregate body budget stays the backstop for what reaches
-/// the wire.
+/// The provider's documented maximum number of reference images in one request (`input_references`
+/// allows 16). The live model catalog advertises more for some models, so this also clamps the
+/// catalog's declared maximum, and it is the cap when the catalog is unavailable.
 pub(crate) const MAX_REFERENCE_IMAGES_PER_REQUEST: usize = 16;
 
-/// The effective reference-image maximum for a model whose catalog declares
-/// `catalog_max`: the declared maximum, never above the provider's documented
-/// ceiling ([`MAX_REFERENCE_IMAGES_PER_REQUEST`]).
+/// The effective reference-image maximum: the catalog's declared value, never above the ceiling.
 #[expect(clippy::cast_possible_wrap)] // small compile-time cap
 #[must_use]
 pub(crate) fn effective_reference_max(catalog_max: i64) -> i64 {
     catalog_max.min(MAX_REFERENCE_IMAGES_PER_REQUEST as i64)
 }
 
-/// Canonical list of argument aliases for file path parameters.
-///
-/// The aliases `"file"` and `"filename"` are remapped to `"path"` by
-/// [`normalize_tool_arguments`] — everywhere but the document and computer tools,
-/// which name their own arguments and refuse one their action does not take, so an
-/// alias left as written is refused under the spelling the caller used.
+/// Argument aliases for file path parameters: `"file"` and `"filename"` are remapped to `"path"` by
+/// [`normalize_tool_arguments`] — but not for the document and computer tools, which refuse a stray
+/// key.
 const PATH_ALIAS_KEYS: &[&str] = &["file", "filename"];
 
-/// Check that a file's size is within `limit` bytes, naming `label` in the
-/// error. The shared gate for the file-reading paths, whose limits differ: the
-/// read/edit cap above, and [`crate::util::FILE_MAX_BYTES`] for a converted
-/// document container.
+/// Check a file's size against `limit`, naming `label` in the error; the shared gate for reads.
 fn check_size_within(meta: &std::fs::Metadata, limit: u64, label: &str) -> anyhow::Result<()> {
     if meta.len() > limit {
         anyhow::bail!("{label}: {} bytes (limit: {limit} bytes)", meta.len());
@@ -113,10 +88,8 @@ fn check_size_within(meta: &std::fs::Metadata, limit: u64, label: &str) -> anyho
     Ok(())
 }
 
-// ── Generation request reference images ─────────────────────────────────
+// The OpenRouter `input_references` array (image_url entries) — the single source of that shape.
 
-/// Build the OpenRouter `input_references` array (image_url entries) for
-/// generation requests. Single source of truth for the reference request shape.
 fn reference_json(references: &[crate::util::ReferenceImage]) -> serde_json::Value {
     serde_json::json!(
         references
@@ -132,15 +105,9 @@ fn reference_json(references: &[crate::util::ReferenceImage]) -> serde_json::Val
 /// Key of the reference-image array in the generation request body.
 const INPUT_REFERENCES_KEY: &str = "input_references";
 
-/// Ensure the final serialized request body fits `max_body_bytes`, compressing
-/// references (largest first, falling through to the next-largest when a
-/// reference's ladder is exhausted) one step at a time until it does. The
-/// per-image cap does not bound the total body (N refs × cap), so this is the
-/// real guard against oversized generation requests.
-///
-/// The reference array is always (re)synced from the current reference state
-/// when references are present, so a caller cannot silently drop them; the
-/// loop rewrites it after each compression step.
+/// Ensure the final serialized body fits `max_body_bytes` by compressing references one step at a
+/// time, largest first and falling through to the next-largest when a ladder is exhausted: the
+/// per-image cap does not bound the total (N refs × cap). The array is re-synced after each step.
 pub(crate) fn fit_request_body_budget(
     body: &mut serde_json::Value,
     references: &mut [crate::util::ReferenceImage],
@@ -151,8 +118,8 @@ pub(crate) fn fit_request_body_budget(
     }
     loop {
         if serde_json::to_vec(body)?.len() <= max_body_bytes {
-            // The request body is final — drop the retained source bytes so
-            // they don't sit in memory through the generation fetch/poll.
+            // The body is final — drop the retained source bytes so they don't sit in memory
+            // through the fetch.
             for r in references {
                 r.release_source_bytes();
             }
@@ -187,8 +154,6 @@ pub(crate) fn fit_request_body_budget(
          limit {max_body_bytes} bytes). {advice}",
     );
 }
-
-// ── Re-exports ─────────────────────────────────────────────────────────
 
 pub(crate) use analyze::{AnalyzeDepth, AnalyzeTool, DispatchMode};
 pub(crate) use archive::ArchiveTool;
@@ -226,16 +191,12 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-// ── JSON helpers ─────────────────────────────────────────────────────────
-
 use crate::util::json::{
     get_bool, get_object, get_opt_bool, get_opt_i64, get_opt_str, get_opt_str_strict, get_opt_u64,
     get_str, get_str_array, get_usize, wrong_type,
 };
 
-/// The shared `message` argument of the dispatch tools (`analyze`, `send`):
-/// required, and non-empty once trimmed. One rule for both tools, so a holder
-/// gets the same refusal whichever one it calls.
+/// The shared `message` argument of `analyze` and `send`: required, non-empty once trimmed.
 pub(crate) fn get_dispatch_message(args: &serde_json::Value) -> anyhow::Result<&str> {
     let message = get_str(args, "message")?;
     anyhow::ensure!(
@@ -245,17 +206,13 @@ pub(crate) fn get_dispatch_message(args: &serde_json::Value) -> anyhow::Result<&
     Ok(message)
 }
 
-/// Record one argument the tool corrected before running: debug level, so a reshaped call
-/// stays explainable with the log filter opened and costs ordinary operation nothing. The
-/// note describes the reshaping only: never the payload, which may be text the owner typed.
+/// Record one corrected argument at debug level, so a reshaped call stays explainable and costs
+/// ordinary operation nothing. The note describes the reshaping only, never the payload text.
 pub(crate) fn log_normalization_note(tool: &str, note: &str) {
     tracing::debug!(tool, note, "tool arguments were normalized");
 }
 
-/// Append a bracketed note (`[exit status: 3]`, `[leftover process] …`) under
-/// `text` as its own paragraph: the text's trailing whitespace is trimmed so the
-/// note is never preceded by a blank gap, and a run that produced nothing is left
-/// as just the note.
+/// Append a bracketed note as its own paragraph, trimming the text's trailing whitespace first.
 pub(crate) fn with_note(text: &str, note: &str) -> String {
     let mut out = text.trim_end().to_string();
     if !out.is_empty() {
@@ -265,9 +222,8 @@ pub(crate) fn with_note(text: &str, note: &str) -> String {
     out
 }
 
-/// Refuse a choice-argument value the holder does not offer, naming what it
-/// does. A model can emit a value the declaration never listed, so the choice
-/// axes validate rather than merely unadvertise.
+/// Refuse a choice-argument value the holder does not offer, naming what it does. A model can emit
+/// a value the declaration never listed, so the choice axes validate rather than merely unadvertise.
 pub(crate) fn refuse_choice(argument: &str, value: &str, allowed: &[&str]) -> anyhow::Error {
     anyhow::anyhow!(
         "usage: `{argument}` must be one of {} — got \"{value}\"",
@@ -275,11 +231,8 @@ pub(crate) fn refuse_choice(argument: &str, value: &str, allowed: &[&str]) -> an
     )
 }
 
-/// Resolve a choice argument against the kinds a holder has, in interface
-/// order (narrowest first). An absent (or explicit null) value takes the
-/// narrowest kind; a named value must be one of them — anything else is
-/// refused, never silently narrowed. `held` must not be empty (it is the
-/// holder's declared set, and a holder always has at least one kind).
+/// Resolve a choice argument against the holder's kinds, in interface order (narrowest first). An
+/// absent or null value takes the narrowest; anything unnamed is refused, never silently narrowed.
 pub(crate) fn chosen_kind<T: Copy + PartialEq>(
     args: &serde_json::Value,
     argument: &str,
@@ -303,16 +256,9 @@ pub(crate) fn chosen_kind<T: Copy + PartialEq>(
     }
 }
 
-/// Build a JSON schema for tool parameters.
-///
-/// Wraps `properties` in the standard `{"type": "object", "properties": {...}}`
-/// envelope and conditionally adds `"required"` only when the slice is non-empty.
-///
-/// This eliminates repetitive boilerplate across tool implementations.
-/// Tools with non-standard top-level keys in their top-level schema
-/// (e.g., `oneOf` in WebSearchTool) should not use this directly;
-/// they may still use it internally as a building block (e.g.,
-/// ChromeTool's [`action_entry_schema`] calls it for each inner entry).
+/// Build a JSON schema for tool parameters: `properties` in the standard object envelope, with
+/// `"required"` added only for a non-empty slice. Tools with non-standard top-level keys should not
+/// use this directly, though they may use it for inner entries.
 #[must_use]
 pub(crate) fn tool_params_schema(
     properties: &serde_json::Value,
@@ -328,13 +274,8 @@ pub(crate) fn tool_params_schema(
     schema
 }
 
-/// Build a single action entry for a `oneOf` action list.
-///
-/// Wraps a `"{"name": inner}"` object in the standard `{"type":"object",
-/// "properties":{name: inner}, "required":[name], "additionalProperties":false,
-/// "description":description}` envelope used by the chrome and computer tools'
-/// nested action schemas. `inner` is built by [`tool_params_schema`], which adds
-/// `"required"` only when non-empty, and then hard-closes the action object.
+/// Build one `oneOf` action entry: the name wrapped in the object envelope with
+/// `"additionalProperties": false` that the chrome and computer action schemas use.
 #[must_use]
 pub(crate) fn action_entry_schema(
     name: &str,
@@ -356,30 +297,11 @@ pub(crate) fn action_entry_schema(
     })
 }
 
-// ── scrub ────────────────────────────────────────────────────────────
-
 use crate::util::scrub_credentials;
 
-/// Scrub credentials from tool output; delegates the scrubbing policy to the tool.
-///
-/// Call flow:
-///
-/// ```text
-/// agent::execute_tool
-///   └─ scrub_tool_output(tool, args, output)   (tools/mod.rs)
-///        ├─ tool.should_scrub_output(args)      (lib.rs, per-tool override)
-///        │    ├─ returns true  → scrub_credentials(output)  (util/mod.rs)
-///        │    └─ returns false → output as-is
-/// ```
-///
-/// Integration with tools that handle credentials themselves:
-/// The shell tool's `apply_profile_pipeline` (shell/mod.rs) scrubs stdout and stderr
-/// at pipeline entry, so `ShellTool::should_scrub_output` returns `false` to prevent
-/// this function from double-scrubbing. See the `ShellTool::should_scrub_output` doc
-/// comment for the rationale. Any tool that performs its own credential scrubbing
-/// internally must follow the same pattern — return `false` from `should_scrub_output`.
-/// So does a tool whose output is stored text returned as it is, like the read-only
-/// `mahbot_debug` query surface: the cell is the answer, not something to rewrite.
+/// Scrub credentials from tool output, delegating the policy to the tool through
+/// [`Tool::should_scrub_output`]. A tool that scrubs its own output (the shell pipeline) or returns
+/// stored text as it stands (`mahbot_debug` cells) must return `false` to avoid double-scrubbing.
 #[must_use]
 pub(crate) fn scrub_tool_output(
     tool: &dyn Tool,
@@ -393,33 +315,26 @@ pub(crate) fn scrub_tool_output(
     }
 }
 
-/// Prefix of a failed tool result — shared so the research wrap-up's
-/// success detection checks the same marker [`format_tool_failure_feedback`]
-/// produces (a successful result never starts with it).
+/// Prefix of a failed tool result — shared so the research wrap-up checks the marker this produces.
 pub(crate) const TOOL_FAILURE_MARKER: &str = "Tool call failed.";
 
-/// Byte cap for the argument preview in [`format_tool_failure_feedback`]: a byte
-/// bound, so a multi-byte argument cannot take the whole budget the reason beside
-/// it is measured against.
+/// Byte cap for the argument preview, so a multi-byte argument cannot eat the reason's budget.
 const TOOL_FAILURE_ARGS_PREVIEW_BYTES: usize = 1_000;
 
 /// What the caller wraps a tool's own fault text with before it reaches
 /// [`format_tool_failure_feedback`] — see [`tool_failure_reason`].
 const TOOL_FAILURE_REASON_PREFIX: &str = "Error executing ";
 
-/// The reason a tool's fault is reported with: the fault text in the wrapper
-/// [`Agent::execute_tool`](crate::agent::Agent) raises it with, so a tool bounding the
-/// text it composes and the wrapper that carries it agree on one shape.
+/// The wrapper a fault is reported in, so a tool and the wrapper carrying its text agree on one
+/// shape.
 #[must_use]
 pub(crate) fn tool_failure_reason(tool_name: &str, fault: &str) -> String {
     format!("{TOOL_FAILURE_REASON_PREFIX}{tool_name}: {fault}")
 }
 
-/// The room a fault may NOT take inside the result the model receives: the wrapper
-/// above plus everything [`format_tool_failure_feedback`] spends on the text itself —
-/// the marker, the labels, a tool name of `tool_name_len` bytes and the capped argument
-/// preview. A tool composing a fault text subtracts this from the budget a tool result
-/// is truncated to rather than re-stating the shape of either wrapper.
+/// The room a fault may NOT take inside the delivered result: the wrapper plus everything the
+/// formatter spends — the marker, the labels, a tool name of `tool_name_len` bytes, the capped
+/// preview.
 pub(crate) const fn tool_failure_envelope_bytes(tool_name_len: usize) -> usize {
     TOOL_FAILURE_REASON_PREFIX.len()
         + tool_name_len
@@ -436,11 +351,9 @@ pub(crate) fn format_tool_failure_feedback(
     tool_args: &serde_json::Value,
     reason: &str,
 ) -> String {
-    // The `reason` parameter is pre-scrubbed by the caller
-    // ([`failure_outcome`](crate::agent::Agent::failure_outcome)) and passed
-    // through as-is to avoid double-scrubbing. The `tool_args` are scrubbed
-    // here since they're formatted for display.
-    // Scrubbed before the cap: redaction can lengthen the text.
+    // `reason` arrives pre-scrubbed and is passed through; `tool_args` are scrubbed here because
+    // they are formatted for display. Scrubbing comes before the cap: redaction can lengthen the
+    // text.
     let args = scrub_credentials(&tool_args.to_string());
     let args_preview = crate::util::cut_bytes(&args, TOOL_FAILURE_ARGS_PREVIEW_BYTES);
     format!(
@@ -451,10 +364,8 @@ pub(crate) fn format_tool_failure_feedback(
     )
 }
 
-/// Build the canonical `internal` tool error for a mahbot-side fault the
-/// model cannot recover from (lost state, missing internal rows, all-worker
-/// failure): no argument change or retry can fix it — a user or engineer
-/// must investigate the mahbot service.
+/// The canonical `internal` error for a mahbot-side fault the model cannot recover from: no
+/// argument change or retry can fix it — a user or engineer must investigate the service.
 #[must_use]
 pub(crate) fn internal_fault(cause: &str) -> anyhow::Error {
     anyhow::anyhow!(
@@ -464,19 +375,14 @@ pub(crate) fn internal_fault(cause: &str) -> anyhow::Error {
     )
 }
 
-/// Run one durable round's own future and catch a panic in it: the panic is
-/// logged against `label` and handed back as its message, so each caller
-/// decides what a panicked round leaves behind — a dispatch routes it as the
-/// round's error envelope, the resume path as the round's failure. A round that
-/// panics never takes the instance with it: `panic = "unwind"` is load-bearing
-/// here.
+/// Run one durable round's future and catch a panic in it, logging it against `label` and returning
+/// its message so the caller decides what a panicked round leaves behind. A panicking round never
+/// takes the instance with it: `panic = "unwind"` is load-bearing here.
 pub(crate) async fn caught_round<T>(
     label: &str,
     round: impl std::future::Future<Output = T>,
 ) -> Result<T, String> {
-    // Boxed before it is caught: the round's own future is far larger than the
-    // threshold `clippy::large_futures` warns on, and this is once per durable
-    // round.
+    // Boxed before it is caught: the future is far larger than `clippy::large_futures` tolerates.
     let round = Box::pin(round);
     match std::panic::AssertUnwindSafe(round).catch_unwind().await {
         Ok(value) => Ok(value),
@@ -488,10 +394,8 @@ pub(crate) async fn caught_round<T>(
     }
 }
 
-/// Gives back a synthetic `dir-…` exec engine when it is dropped, so a round that
-/// unwinds releases it exactly as one that returns does. A managed
-/// workspace's own engine is never touched (see
-/// [`delegation::release_exec_engine`]).
+/// Gives back a synthetic `dir-…` exec engine on drop, so a round that unwinds releases it exactly
+/// as one that returns does. A managed workspace's own engine is never touched.
 struct ExecEngineGuard<'a>(&'a crate::Workspace);
 
 impl Drop for ExecEngineGuard<'_> {
@@ -500,12 +404,9 @@ impl Drop for ExecEngineGuard<'_> {
     }
 }
 
-/// Internal error-carrier for a tool call whose durable work was drain-cut by
-/// shutdown/drain. NEVER persisted — the emission-time frame already recorded
-/// the call durably, so the result is simply absent and the universal
-/// resume-completion step re-runs/resumes it. Carried as an `anyhow::Error`
-/// out of a sync dispatch (analyze, worker) so the caller's tool-execution
-/// layer can mark the outcome `suspended`.
+/// Carrier for a tool call whose durable work was drain-cut. NEVER persisted: the frame already
+/// recorded the call, so the result is simply absent and the resume step re-runs it. Carried as an
+/// `anyhow::Error` out of a sync dispatch so the caller can mark the outcome `suspended`.
 #[derive(Debug)]
 pub(crate) struct CallSuspended;
 
@@ -520,78 +421,54 @@ impl std::fmt::Display for CallSuspended {
 
 impl std::error::Error for CallSuspended {}
 
-// ── Sync durable-core glue ──────────────────────────────────────────────
-//
-// The two dispatch tools (`analyze`, `send`) share one durable lifecycle —
-// sync dispatch, async dispatch, boot resume, result envelopes — and ALL of
-// that glue lives on [`SyncDurableCore`] so there is exactly one
-// implementation: the sync tool paths and the boot-resume rounds both
-// delegate to it.
+// The job-scoped parameters every durable sync core takes. Beyond `(ws, task)` these are the values
+// the sync wrappers read from the task-locals and job row, so the core never touches
+// `CURRENT_TOOL_*` itself.
 
-/// The job-scoped parameters every durable sync core takes. Beyond
-/// `(ws, task)` these are the values the sync wrappers read from the
-/// task-locals / job row, so the core never touches `CURRENT_TOOL_*` itself.
 pub(crate) struct CoreJobArgs<'a> {
     pub job_id: &'a str,
     pub caller_role: crate::Role,
     pub user_name: &'a str,
     pub channel: &'a str,
-    /// The fresh-spawn row record — the resume discriminator: `Some` spawns
-    /// (writes the jobs row), `None` resumes (reuses the stored roster and
-    /// outcomes, never inserts a row).
+    /// The fresh-spawn row record — the resume discriminator: `Some` spawns, `None` resumes.
     pub spawn: Option<SpawnRecord<'a>>,
-    /// Caller session pin persisted on the jobs row at fresh spawn so the
-    /// live resume-completion step can find caller-owned launched jobs.
-    /// Always `None` on resume — the row already carries it.
+    /// Caller session pin persisted at fresh spawn so the resume-completion step can find
+    /// caller-owned launched jobs. Always `None` on resume — the row already carries it.
     pub caller_agent_id: Option<&'a str>,
-    /// Sync-call discriminator: a checkpoint DB error fails the tool call /
-    /// round so it is retried; async & boot-resume paths warn-and-continue
-    /// (the outcome is recomputable on the next resume).
+    /// A checkpoint DB error fails a sync call so it is retried; async and boot-resume warn and go
+    /// on.
     pub fail_on_checkpoint_error: bool,
 }
 
-/// The jobs-row fields a fresh dispatch writes. Read ONLY when the call
-/// actually spawns (see [`CoreJobArgs::spawn`]); a resume inserts no row and
-/// carries no record — so a resume can never hand the chosen directory's name
-/// to the delivery key.
+/// The jobs-row fields a fresh dispatch writes — read ONLY when the call actually spawns, so a
+/// resume can never hand the chosen directory's name to the delivery key.
 pub(crate) struct SpawnRecord<'a> {
     /// The CALLER's own workspace name: the durable delivery/routing key
     /// (`jobs.workspace_name`). Never the chosen directory.
     pub delivery_name: &'a str,
-    /// The chosen directory the round executes in, when the caller asked for one
-    /// — including one that happens to name the caller's own directory — so the
-    /// reply always names the directory really used and a restart resumes into
-    /// the same identity. Persisted as `jobs.exec_dir`.
+    /// The chosen directory the round executes in, when the caller asked for one (including its
+    /// own), so the reply names the directory really used and a restart resumes into the same
+    /// identity.
     pub exec_dir: Option<&'a str>,
-    /// The CALLER's custom-role launch, when the round was dispatched by a
-    /// custom role: persisted as `jobs.custom_launch` so a boot resume rebuilds
-    /// the envelope addressed to the custom branch (rather than the tool's
-    /// construction role). The WHOLE launch travels — a resumed turn opens its
-    /// branch from this snapshot, so the authorial prompt and the tool subset
-    /// are as load-bearing as the branch address. `None` for every built-in
-    /// caller.
+    /// The CALLER's custom-role launch, persisted as `jobs.custom_launch` so a boot resume rebuilds
+    /// the envelope addressed to the custom branch. The WHOLE launch travels: a resumed turn opens
+    /// its branch from it, so the prompt and tool subset are as load-bearing as the branch address.
     pub custom_launch: Option<&'a crate::Launch>,
 }
 
-/// The single outcome form of the durable sync cores (analyze, worker):
-/// `Terminal` wraps a produced result (Ok or Err — both terminalize with a
-/// durable envelope), `DrainCut` means the round was cut by drain/shutdown —
-/// the job stays status='launched' for resume (boot or live), nothing is
-/// routed or terminalized now, `Cancelled` means the round observed its
-/// cancel signal and stopped.
+/// The single outcome form of the durable sync cores: `Terminal` wraps a produced result,
+/// `DrainCut` means the round was cut by drain/shutdown — the job stays `launched` for resume and
+/// nothing is routed — and `Cancelled` means the round observed its cancel signal and stopped.
 pub(crate) enum SyncCoreOutcome {
     Terminal(Result<String, anyhow::Error>),
     DrainCut,
-    /// The round observed its cancel signal and stopped: nothing is produced and
-    /// nothing is routed. Its durable rows are the cancel path's to remove (see
-    /// [`SyncDurableCore::dispatch_durable`]).
+    /// The round observed its cancel signal: nothing is produced, and its rows are the cancel
+    /// path's.
     Cancelled,
 }
 
-/// The sync analyze/worker durable cores, normalized behind one interface so the
-/// sync dispatch, the resume-completion loop and the per-tool wrappers all
-/// reuse a single body. [`Worker`](Self::Worker)'s `jobs.kind` is
-/// [`crate::jobs::SpawnChild::Implement`]'s (`"implement"`).
+/// The sync analyze/worker durable cores, behind one interface so the sync dispatch, the
+/// resume-completion loop and the per-tool wrappers share one body.
 #[derive(Copy, Clone)]
 pub(crate) enum SyncDurableCore {
     Analyze,
@@ -616,15 +493,10 @@ impl SyncDurableCore {
         }
     }
 
-    /// Resolve a dangling tool call to the sync durable core that settles it.
-    /// The core is resolved from the tool plus its choice argument, never by
-    /// matching a name against a stored round kind: `analyze`'s sync form is the
-    /// quick round and `send`'s is the single-run worker, so a call that asked for
-    /// another kind (`deep`, `worker_branch`, `manager`, `role`, `guest`), an
-    /// unknown value, a non-string, or an unknown tool name — a retired tool's
-    /// included — resolves to `None` and is re-executed instead of binding an
-    /// unrelated job. A retired tool name is not resolvable either: history is
-    /// never rewritten, so a cut-mid-flight retired call is simply repeated.
+    /// Resolve a dangling tool call to the core that settles it, from the tool plus its choice
+    /// argument — never by matching a stored round kind. A call that asked for another kind, an
+    /// unknown value, a non-string or an unknown (or retired) tool name resolves to `None` and is
+    /// re-executed instead.
     #[must_use]
     pub(crate) fn from_call(name: &str, args: &serde_json::Value) -> Option<Self> {
         // A cancel call names an existing round instead of starting one: a
@@ -636,9 +508,8 @@ impl SyncDurableCore {
         {
             return None;
         }
-        // Each tool's sync form is its narrowest choice: the quick depth, the
-        // worker addressee. An absent (or explicit null) choice is that narrowest
-        // kind — how a call frame that predates the merge reconnects to its
+        // Each tool's sync form is its narrowest choice: the quick depth, the worker addressee. An
+        // absent or null choice is that kind — how a frame predating the merge reconnects to its
         // unfinished round.
         let (core, argument, own_choice) = match name {
             "analyze" => (
@@ -657,8 +528,7 @@ impl SyncDurableCore {
         Some(core)
     }
 
-    /// Run the durable core — both per-tool bodies return [`SyncCoreOutcome`]
-    /// directly.
+    /// Run the durable core — both per-tool bodies return [`SyncCoreOutcome`] directly.
     pub(crate) async fn run(
         self,
         ws: &crate::Workspace,
@@ -671,13 +541,10 @@ impl SyncDurableCore {
         }
     }
 
-    /// Abandon this dispatch's own row after the call has already failed: the
-    /// failure IS the call's result, so the model repeats the call and an
-    /// unfinished row left behind would only be bindable by a later, unrelated
-    /// call of the same core — settling a completed round's stored report as
-    /// that call's own result. Never an alias: the call is repeated, not
-    /// reconnected. A drain-cut is the only outcome that keeps the row (see
-    /// [`Self::run_sync_dispatch`]).
+    /// Abandon this dispatch's own row after the call already failed: the failure IS the result, so
+    /// the model repeats the call and a leftover row would only be bindable by a later, unrelated
+    /// call of the same core. Never an alias: the call is repeated, not reconnected. A drain-cut
+    /// keeps the row.
     async fn abandon_failed_dispatch(conn: &crate::db::Connection, job_id: &str, label: &str) {
         if let Err(e) = crate::jobs::terminalize_job(conn, job_id).await {
             tracing::warn!(
@@ -688,9 +555,7 @@ impl SyncDurableCore {
         }
     }
 
-    /// The round's cancel-signal guard for the core the cancel action can stop
-    /// ([Analyze](Self::Analyze) only), `None` for the rest — see
-    /// [`crate::round_cancel`].
+    /// The cancel-signal guard for the one core the cancel action can stop, `None` for the rest.
     fn cancel_guard(
         self,
         job_id: &str,
@@ -702,9 +567,8 @@ impl SyncDurableCore {
         }
     }
 
-    /// Whether the round's cancel signal has fired — the delivery path's last look
-    /// before the result is handed over, so a cancelled round's result is never
-    /// delivered.
+    /// Whether the cancel signal fired — the delivery path's last look before the result is handed
+    /// over.
     fn stopped_by_cancel(self, job_id: &str) -> bool {
         if !crate::round_cancel::is_cancelled(job_id) {
             return false;
@@ -713,12 +577,9 @@ impl SyncDurableCore {
         true
     }
 
-    /// Shared sync dispatch: read the task-locals the way the two wrappers do
-    /// today, generate a fresh job id, run the core as a fresh spawn
-    /// (`spawn: Some(..)` — the core writes the jobs row), then
-    /// terminalize-on-terminal / surface [`CallSuspended`] on drain-cut. Every
-    /// outcome but a drain-cut abandons the row with the call's own result, so a
-    /// row stays launched only while its call is dangling.
+    /// Shared sync dispatch: read the task-locals, generate a fresh job id, run the core as a fresh
+    /// spawn (it writes the jobs row), then terminalize or surface [`CallSuspended`] on a
+    /// drain-cut. Every outcome but a drain-cut abandons the row with the call's own result.
     pub(crate) async fn run_sync_dispatch(
         self,
         ws: &crate::Workspace,
@@ -732,9 +593,7 @@ impl SyncDurableCore {
         let channel = crate::agent::tool_channel();
         let conn = &crate::session::store().conn;
 
-        // This dispatch never binds to prior jobs: if the model re-issues a call
-        // after the resume-completion already settled and delivered, no launched
-        // job remains and this spawns fresh.
+        // Never binds to prior jobs: a call re-issued after a settled resume spawns fresh.
 
         let job_id = crate::generate_id();
         let custom = crate::agent::tool_custom_launch();
@@ -775,26 +634,19 @@ impl SyncDurableCore {
                 );
                 Err(anyhow::Error::new(crate::tools::CallSuspended))
             }
-            // Unreachable: only the async entry points register a cancel signal,
-            // and a sync dispatch's id is freshly generated — and whatever
-            // cancels a round removes that round's own rows, so there is nothing
-            // to clean up here.
+            // Unreachable: only the async entry points register a cancel signal, and whatever
+            // cancels a round removes its own rows, so there is nothing to clean up here.
             SyncCoreOutcome::Cancelled => Err(crate::tools::internal_fault(
                 "a sync round observed a cancel signal it never registered",
             )),
         }
     }
 
-    /// Shared sync resume: run the [`crate::jobs::resume_job_preamble_discrete`]
-    /// preamble, then the core as a resume (`spawn: None` — it reuses the
-    /// stored roster and outcomes and inserts no row), mapping the outcome to
-    /// [`crate::jobs::SyncResumeOutcome`].
-    ///
-    /// `sync_resume` selects checkpoint-error propagation: a live sync resume
-    /// (the caller's resume-completion step, agent/mod.rs) passes `true` — a
-    /// checkpoint DB error fails the round; the async boot-resume rounds pass
-    /// `false` — warn-and-continue, the outcomes are recomputable on the next
-    /// resume.
+    /// Shared sync resume: run the resume preamble, then the core as a resume (`spawn: None` — it
+    /// reuses the stored roster and outcomes and inserts no row), mapping the outcome to
+    /// [`crate::jobs::SyncResumeOutcome`]. `sync_resume` selects checkpoint-error propagation: a
+    /// live sync resume passes `true` (fail the round), the async boot-resume rounds `false` (warn
+    /// and go on).
     pub(crate) async fn resume_sync_core(
         self,
         ws: &crate::Workspace,
@@ -817,10 +669,9 @@ impl SyncDurableCore {
             crate::jobs::ResumePreamble::Gone => {
                 return Ok(crate::jobs::SyncResumeOutcome::Gone);
             }
-            // An unreadable row is a resume-core infra failure, not an abandon:
-            // fail the round so the caller-driven path never surfaces an
-            // "explicitly abandoned" note for a live job (the row stays
-            // launched and the next cycle retries).
+            // An unreadable row is an infra failure, not an abandon: fail the round so the
+            // caller-driven path never surfaces an "explicitly abandoned" note for a live job (the
+            // next cycle retries).
             crate::jobs::ResumePreamble::Unreadable(e) => {
                 return Err(e.context(format!("{label} resume: job row unreadable")));
             }
@@ -848,9 +699,8 @@ impl SyncDurableCore {
                 );
                 Ok(crate::jobs::SyncResumeOutcome::DrainCut)
             }
-            // A cancel landed while this resume ran: the round stopped and its
-            // rows are the cancel action's to remove — a quiet abort, exactly
-            // like an explicitly abandoned row.
+            // A cancel landed during this resume: the round stopped and its rows are the cancel
+            // action's.
             Ok(SyncCoreOutcome::Cancelled) => Ok(crate::jobs::SyncResumeOutcome::Gone),
             Err(e) => Err(e),
         }
@@ -865,16 +715,9 @@ impl SyncDurableCore {
         }
     }
 
-    /// Build the async result envelope delivered to the caller's agent channel
-    /// for this core's round results (success and failure paths).
-    ///
-    /// The analyze envelope keeps the caller-generated `job_id` as its first body
-    /// line so the delivered result is correlatable with the immediate ack
-    /// placeholder, and `exec_dir` names the directory the round really ran in
-    /// when the caller asked for one. The worker's envelope is the
-    /// `<worker-report>` — no job id, and the folder the worker worked in: the
-    /// chosen directory when one was given, else the delivery workspace's own
-    /// folder.
+    /// Build the async result envelope for this core's round results. The analyze envelope keeps
+    /// the caller-generated `job_id` as its first body line so the result is correlatable with the
+    /// ack placeholder; the worker's is the `<worker-report>` with the folder the worker worked in.
     #[must_use]
     pub(crate) fn build_async_message(
         self,
@@ -896,30 +739,13 @@ impl SyncDurableCore {
         }
     }
 
-    /// Durable async dispatch (SPAWN → run → CHECKPOINT → COMPLETE): run the
-    /// core as a fresh spawn (`spawn: Some(..)` — it writes the jobs row) and no
-    /// session pin, then terminalize into the
-    /// durable envelope under the caller-generated `job_id` (the id is created
-    /// in the tool's `execute()` BEFORE the spawn so the immediate ack and the
-    /// delivered envelope share one id). Returns `None` when the round was cut
-    /// by drain/shutdown — the job stays status='launched' for boot resume and
-    /// NOTHING is routed now — and also when the round observed a cancel: the
-    /// cancel action owns the round's rows (it sweeps them, and answers the caller
-    /// when it cannot), so nothing is completed, routed or removed here; the
-    /// round's own row write is gated in-tx against the cancel signal (see
-    /// `jobs::spawn_job`), so the two cannot both stand. On error the envelope
-    /// still routes (errors wrapped in the core's envelope tag) and the job is
-    /// terminalized.
-    ///
-    /// `delivery` is the caller's own workspace (the durable delivery key);
-    /// `place`, when present, is the directory the round executes in — the
-    /// sub-agents' root, context and search key, while delivery stays the
-    /// caller's.
-    ///
-    /// `custom`, when present, is the calling custom role's launch: the round's
-    /// envelopes and its jobs row carry `Role::Custom` and the launch so a boot
-    /// resume delivers back to the custom branch, never to the tool's own
-    /// construction role's address.
+    /// Durable async dispatch (SPAWN → run → CHECKPOINT → COMPLETE): run the core as a fresh spawn
+    /// with no session pin, then terminalize into the durable envelope under the caller-generated
+    /// `job_id`, which `execute()` creates BEFORE the spawn so ack and delivery share one id.
+    /// Returns `None` when the round was cut by drain/shutdown (the job stays `launched` for boot
+    /// resume; nothing is routed) or observed a cancel (the cancel action owns its rows).
+    /// `delivery` is the caller's own workspace, `place` the directory the round executes in,
+    /// `custom` the calling custom role's launch.
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn dispatch_durable(
         self,
@@ -956,11 +782,8 @@ impl SyncDurableCore {
             .await
         {
             Ok(SyncCoreOutcome::DrainCut) => {
-                // Drain-cut: the round's outcomes are already checkpointed — leave
-                // the job status='launched' for boot resume. No terminalization, no
-                // error envelope: a spurious envelope here would discard the
-                // checkpointed outcomes and contradict "jobs stay status='launched'
-                // for boot resume".
+                // Drain-cut: the outcomes are checkpointed — leave the job `launched` for boot
+                // resume. A spurious envelope here would discard them.
                 tracing::info!(
                     job = %job_id,
                     "{} round cut short by drain — job stays launched for boot resume",
@@ -969,13 +792,9 @@ impl SyncDurableCore {
                 return None;
             }
             Ok(SyncCoreOutcome::Cancelled) => {
-                // Cancelled: the cancel action already answered the caller and
-                // owns the round's rows — nothing is completed, routed or removed
-                // here, because there is nothing to remove: the row write itself is
-                // gated in-tx against the cancel signal (see `jobs::spawn_job`), and
-                // a sweep that failed was answered to the caller as a cancellation
-                // that did not happen. Unlike the drain-cut arm (which keeps the
-                // engine for the resume) the synthetic `dir-…` goes.
+                // Cancelled: the cancel action answered the caller and owns the rows, so nothing is
+                // completed, routed or removed — the row write itself is gated in-tx against the
+                // cancel signal. Unlike the drain-cut arm, the synthetic `dir-…` engine goes.
                 tracing::info!(
                     job = %job_id,
                     "{} round stopped by cancel — not completed, not routed",
@@ -989,10 +808,9 @@ impl SyncDurableCore {
             Ok(SyncCoreOutcome::Terminal(result)) => result,
             Err(e) => Err(e),
         };
-        // The round is over: drop the synthetic `dir-…` engine it may have
-        // created (a managed workspace's own engine is left alone). The
-        // drain-cut early return above deliberately skips this — that job
-        // resumes in the same directory.
+        // The round is over: drop the synthetic `dir-…` engine it may have created (a managed
+        // workspace's own is left alone). The drain-cut path above skips this — that job resumes in
+        // the same directory.
         if let Some(place) = place {
             crate::tools::delegation::release_exec_engine(place);
         }
@@ -1011,27 +829,13 @@ impl SyncDurableCore {
         )
     }
 
-    /// Boot-resume a durable round: resolve the execution workspace (the
-    /// recorded directory when the round had one, else the caller's own
-    /// workspace), run the core as a resume (`spawn: None` — it reuses the stored
-    /// roster and outcomes and inserts no row) through
-    /// [`Self::resume_sync_core`], then terminalize into a durable envelope and
-    /// route it to the ORIGINAL caller (role/user/channel persisted on the job
-    /// row at spawn), never the Manager. The delivery workspace stays the
-    /// caller's own (`delivery`) so the result lands in the conversation that
-    /// asked.
-    ///
-    /// A round that PANICS is caught here and reported through the same arm as
-    /// any other round that produced no outcome: the failure is delivered to the
-    /// conversation that was promised a result, and the row is terminalized. A
-    /// panicked round is over — leaving the row would make every boot retry a
-    /// round that dies the same way, silently.
-    ///
-    /// Aborts quietly on shutdown/drain: no routing, no terminalization — the
-    /// job row stays for the next boot (checkpointed outcomes are reused, so
-    /// already-completed LLM work is never lost or duplicated). A cancel landing
-    /// during the resume is the one stop that discards the round's own result
-    /// instead (the cancel action owns its rows).
+    /// Boot-resume a durable round: resolve the execution workspace (the recorded directory when
+    /// there is one, else the caller's own), run the core as a resume through
+    /// [`Self::resume_sync_core`], then terminalize into a durable envelope and route it to the
+    /// ORIGINAL caller (role/user/channel persisted at spawn), never the Manager; `delivery` stays
+    /// the caller's own. A panicking round is caught and reported through the same arm as a round
+    /// that produced no outcome. Drain aborts quietly (the row stays for the next boot); a cancel
+    /// discards the round's own result.
     pub(crate) async fn resume_durable_round(
         self,
         job_id: &str,
@@ -1042,32 +846,26 @@ impl SyncDurableCore {
         // A resume registers its cancel signal too: its rows exist, so
         // ownership is the row's and no caller pin is needed.
         let _cancel_guard = self.cancel_guard(job_id, None);
-        // A cancel can land between the boot scan that picked this round and the
-        // registration above — and it fires into nothing, because this round had
-        // not registered yet. Its mark reaches that registration
-        // ([`crate::round_cancel`]), so the signal is already fired here: return
-        // before running a round whose caller was answered as stopped.
+        // A cancel can land between the boot scan and the registration above; its mark reaches that
+        // registration, so the signal is already fired here — return without running the round.
         if self.stopped_by_cancel(job_id) {
             return;
         }
-        // The round's own future is caught: a panic in it is a round that
-        // produced no outcome, and it is reported as one (see the doc above)
-        // rather than left as a launched row nobody is told about.
+        // The round's own future is caught: a panic in it is a round that produced no outcome, and
+        // it is reported as one rather than left as a launched row nobody is told about.
         let resumed = caught_round(&format!("{label} resume"), async {
             match exec_dir {
                 None => self.resume_sync_core(delivery, job_id, false).await,
                 Some(dir) => match crate::tools::delegation::workspace_at_dir(dir).await {
                     Ok(exec) => {
-                        // Released however this ends: the round may unwind, and a
-                        // directory's engine registered for the process lifetime is
-                        // exactly what a panic must not leave behind. Whatever next
-                        // needs it re-creates it on demand.
+                        // Released however this ends: a directory's engine is registered for the
+                        // process lifetime, which a panic must not leave behind. Whatever needs it
+                        // next re-creates it on demand.
                         let _engine = ExecEngineGuard(&exec);
                         self.resume_sync_core(&exec, job_id, false).await
                     }
-                    // The recorded directory is gone: the round ends through
-                    // the resume-failure arm below with that plain message — never
-                    // left hanging.
+                    // The recorded directory is gone: the round ends through the resume-failure arm
+                    // below.
                     Err(e) => Err(e),
                 },
             }
@@ -1079,18 +877,13 @@ impl SyncDurableCore {
                 let custom = caller.custom_launch.as_deref().cloned();
                 (caller_role, caller, custom, result)
             }
-            // Drain-cut mid-resume / job row gone (explicitly abandoned, or
-            // removed by a cancel racing this resume): abort quietly — the core
-            // logs the reason; a gone job was already noted.
+            // Drain-cut mid-resume or job row gone: abort quietly — the core logs the reason.
             Ok(crate::jobs::SyncResumeOutcome::DrainCut | crate::jobs::SyncResumeOutcome::Gone) => {
                 return;
             }
-            // Resume infra failure (roster load / checkpoint), an unusable
-            // recorded directory, or a round that panicked: deliver an error
-            // envelope to the ORIGINAL caller, exactly like a round-level
-            // failure. The job row is still present (the core never
-            // terminalizes), so the caller identity can be re-loaded for the
-            // route.
+            // Resume infra failure, an unusable recorded directory, or a panicked round: deliver an
+            // error envelope to the ORIGINAL caller, like any round-level failure (the row is still
+            // there to re-load it from).
             Err(e) => {
                 let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
                     &crate::session::store().conn,
@@ -1126,10 +919,9 @@ impl SyncDurableCore {
                 return;
             }
         };
-        // Drain/shutdown fired after the round returned: abort quietly WITHOUT
-        // routing and WITHOUT deleting the row — the outcomes are checkpointed
-        // (next boot reuses them) and routing a partial result here would race
-        // the exit.
+        // Drain/shutdown fired after the round returned: abort quietly without routing or deleting
+        // the row — the outcomes are checkpointed, and routing a partial result here would race the
+        // exit.
         if crate::shutdown::aborting() {
             tracing::info!(
                 job = %job_id,
@@ -1156,50 +948,16 @@ impl SyncDurableCore {
         crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
     }
 
-    /// Async dispatch entry of [`crate::tools::analyze::AnalyzeTool`]'s quick
-    /// depth and [`crate::tools::send::SendTool`]'s worker addressee: read the
-    /// caller identity from
-    /// the `CURRENT_TOOL_*` task-locals, spawn the core's durable dispatch in the
-    /// background, catch its panics, and route the resulting envelope to the
-    /// caller's agent channel. The core is the single source of the envelope
-    /// kind, tag and builder — no call-site knobs can drift. The `job_id` is
-    /// generated by the caller (the tool's `execute()`) BEFORE this spawn so the
-    /// immediate ack placeholder and the delivered envelope reference one
-    /// identical id.
-    ///
-    /// Semantics, in order:
-    ///
-    /// 1. `tokio::spawn` + `catch_unwind` so a panic in the dispatch task can
-    ///    never leave the caller waiting forever on a result that can never
-    ///    arrive — the panic path rebuilds an error envelope here.
-    /// 2. The dispatch builds the success envelope itself (with pending_job_id
-    ///    set by the completion tx) — route it as-is so the persisted copy and
-    ///    the routed copy can never drift.
-    /// 3. `Ok(None)` = drain-cut or cancel: route NOTHING now. For a drain-cut
-    ///    the job stays status='launched' for boot resume (a spurious error
-    ///    envelope during the drain would discard the checkpointed outcome; the
-    ///    result envelope is delivered after boot resume); for a cancel the
-    ///    round is gone for good. This silent return is deliberately BEFORE the
-    ///    aborting() guard.
-    /// 4. `crate::shutdown::aborting()` guard: drain/shutdown fired between the
-    ///    dispatch and the route — the pending row (if any) survives for boot
-    ///    replay; skip routing rather than deliver into a consumer that has
-    ///    stopped pulling. (If the pending INSERT had failed, this also
-    ///    suppresses the insert-failure policy's best-effort route — the
-    ///    surviving launched job row is resumed at the next boot, so the result
-    ///    is deferred, never lost.)
-    /// 5. The round's cancel signal is registered BEFORE the spawn and consulted
-    ///    immediately before the route: a round the caller cancels is never
-    ///    delivered — the one case where a produced result is deliberately
-    ///    discarded.
-    /// 6. `crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope)`.
-    ///
-    /// Note: src/tools/research.rs deliberately does NOT share this scaffold —
-    /// it logs "ended without delivery" and omits the pre-route aborting() guard
-    /// (at-least-once rationale).
-    ///
-    /// `delivery` is the caller's own workspace (the durable delivery key);
-    /// `place`, when present, is the directory the round executes in.
+    /// Async dispatch entry of `analyze`'s quick depth and `send`'s worker addressee: read the
+    /// caller identity from the `CURRENT_TOOL_*` task-locals, spawn the core's durable dispatch in
+    /// the background, catch its panics, and route the resulting envelope to the caller's agent
+    /// channel. The `job_id` comes from `execute()` before this spawn, so ack and delivery share
+    /// one id. In order: `tokio::spawn` + `catch_unwind`, so a panic can never leave the caller
+    /// waiting (that path rebuilds an error envelope); the dispatch builds the success envelope
+    /// itself and it is routed as-is; `Ok(None)` (drain-cut or cancel) routes nothing; the
+    /// `aborting()` guard skips routing into a consumer that stopped pulling; the cancel signal is
+    /// consulted right before the route. `src/tools/research.rs` deliberately does not share this
+    /// scaffold (it omits the pre-route guard).
     pub(crate) fn spawn_dispatch(
         self,
         delivery: &crate::Workspace,
@@ -1210,15 +968,12 @@ impl SyncDurableCore {
     ) {
         let user_name = crate::agent::tool_user_name();
         let channel = crate::agent::tool_channel();
-        // Read synchronously before the spawn (task-local contract): the round's
-        // envelope and job row must carry the caller's branch when it is a
-        // custom role, and the default construction role otherwise — that
-        // derivation lives in `dispatch_durable`.
+        // Read synchronously before the spawn (task-local contract): the round's envelope and job
+        // row must carry the caller's branch for a custom role, the default construction role
+        // otherwise.
         let custom = crate::agent::tool_custom_launch();
-        // The dispatching session's agent id, read synchronously before the
-        // spawn (task-local contract) — the round's cancel-signal entry records
-        // it, so a cancel naming this id can prove ownership even in the window
-        // before the round's `jobs` row is written.
+        // The dispatching session's agent id, read synchronously: the cancel-signal entry records
+        // it, so a cancel naming this id can prove ownership before the `jobs` row exists.
         let caller = crate::agent::CURRENT_TOOL_AGENT_ID
             .try_with(Clone::clone)
             .unwrap_or(None);
@@ -1246,7 +1001,6 @@ impl SyncDurableCore {
             let envelope = match round {
                 Ok(Some(envelope)) => envelope,
                 Ok(None) => {
-                    // Drain-cut or cancel (see doc point 3): route nothing.
                     return;
                 }
                 Err(panic) => {
@@ -1290,13 +1044,9 @@ impl SyncDurableCore {
     }
 }
 
-/// Wrap a sub-agent/tool result in the async `<tag>` envelope delivered to
-/// the caller's agent channel. The `job_id` is embedded as the first body line
-/// so the delivered result is correlatable with the immediate ack placeholder;
-/// when the round ran in a chosen directory (`exec_dir`), a `Directory:` line
-/// follows it in the same shape so the caller is never in doubt which directory
-/// the round really ran in. Failures carry an explicit marker instead of an
-/// empty result. Shared with the deep analysis run.
+/// Wrap a sub-agent/tool result in the async `<tag>` envelope. The `job_id` is the first body line
+/// so the result is correlatable with the ack placeholder, and a `Directory:` line follows when the
+/// round ran in a chosen directory. Failures carry an explicit marker instead of an empty result.
 pub(crate) fn build_async_result_envelope(
     job_id: &str,
     result: &anyhow::Result<String>,
@@ -1332,11 +1082,9 @@ fn worker_report_text(result: &anyhow::Result<String>) -> String {
     }
 }
 
-/// Render a branch-report asset (`worker_report.md` / `worker_failure.md`): the
-/// same `<worker-report>` envelope for both, with the folder it happened in and —
-/// only when the turn ran on a named branch — its `branch` attribute. The single
-/// renderer for a worker's report, shared by a single-run dispatch and a worker
-/// branch's turn so the two shapes cannot drift.
+/// Render a branch-report asset (`worker_report.md` / `worker_failure.md`): one `<worker-report>`
+/// envelope for both, with the folder it happened in and, for a named branch, its `branch`
+/// attribute.
 pub(crate) fn build_worker_envelope(
     asset: &str,
     folder: &str,
@@ -1356,23 +1104,17 @@ pub(crate) fn build_worker_envelope(
     )
 }
 
-/// The `branch="id"` attribute a report envelope carries for a named branch,
-/// empty otherwise — the shape `custom_role_message.md`, `worker_report.md` and
-/// `worker_failure.md` all render through `{{branch_attr}}`.
+/// The `branch="id"` attribute a report envelope carries for a named branch, empty otherwise.
 pub(crate) fn branch_attr(identifier: Option<&str>) -> String {
     identifier.map_or_else(String::new, |id| {
         format!(" branch=\"{}\"", envelope_attr(id))
     })
 }
 
-/// An attribute value interpolated into an envelope (`<worker-report folder="…">`,
-/// `<manager-message workspace="…">`, `<custom-role-message role="…" workspace="…">`).
-///
-/// The value is usually a folder path the model itself chose, so ONLY the three
-/// characters that could end the attribute or forge an envelope are replaced:
-/// escaping `&` or `'` too would distort an ordinary name — an account called
-/// `o'brien` would become a folder the model is told to trust but that does not
-/// exist, and copying it back into a folder argument would not resolve.
+/// An attribute value interpolated into an envelope. The value is usually a folder path the model
+/// chose, so ONLY the three characters that could end the attribute or forge an envelope are
+/// replaced: escaping `&` or `'` too would distort an ordinary name (an `o'brien` would name a
+/// folder that does not exist).
 pub(crate) fn envelope_attr(value: &str) -> String {
     value
         .replace('"', "&quot;")
@@ -1389,31 +1131,18 @@ pub(crate) struct ToolOutput {
     /// Images produced by this call, injected by the agent loop as native
     /// image parts after the round's tool-result block.
     pub image_payloads: Vec<ImagePayload>,
-    /// Whether `text` is real content the model must keep, rather than a claim
-    /// ABOUT the images this call produced. The single flag behind both
-    /// decisions the agent loop makes from a result: with content, image
-    /// annotations are APPENDED and any `[IMAGE:path]` marker inside it is
-    /// literal text; without it, the annotations REPLACE `text` and such a
-    /// marker is a claim that may be turned into an injected image. `true` for
-    /// the read tool's converted-document answer (extracted text, or the note
-    /// standing in for what a document could not yield), for the computer
-    /// tool, whose result describes the surface and the action rather than the
-    /// image, and for the picture tool's batch report, which names every
-    /// generation — including the ones that produced nothing — beside the
-    /// pictures it made.
+    /// Whether `text` is real content the model must keep, rather than a claim ABOUT the images
+    /// this call produced: with content, image annotations are APPENDED and any `[IMAGE:path]`
+    /// marker is literal text; without it, the annotations REPLACE `text` and a marker may become
+    /// an injected image. `true` for the read tool's converted document, the computer tool and the
+    /// picture tool's batch report.
     pub text_is_content: bool,
 }
 
-/// Pair a textual result with the image payload of the tool's
-/// [`Tool::image_payload`] hook — the tail of the default
-/// [`Tool::execute_with_payloads`], shared with the read tool's override so the
-/// two can never drift.
-///
-/// The text is flagged as a claim about the image (not content) whether or not a
-/// payload comes back, which is what every tool routed here has always meant by
-/// its result: a media tool names the file it wrote, the read tool the file it
-/// read. Tools whose text is the result itself — the read tool's
-/// converted-document answer, the computer tool's surface and outcome — bypass
+/// Pair a textual result with the image payload of [`Tool::image_payload`] — the tail of the
+/// default `execute_with_payloads`, shared with the read tool's override so the two cannot drift.
+/// The text is flagged as a claim about the image whether or not a payload comes back: a media tool
+/// names the file it wrote, the read tool the file it read. Tools whose text IS the result bypass
 /// this helper.
 pub(crate) async fn with_image_payload<T: Tool + ?Sized>(
     tool: &T,
@@ -1438,42 +1167,34 @@ pub(crate) struct ToolExecutionOutcome {
     pub image_payloads: Vec<ImagePayload>,
     /// The tool's own [`ToolOutput::text_is_content`], carried through unchanged.
     pub text_is_content: bool,
-    /// `true` when the tool's durable work was drain-cut and its result is
-    /// intentionally absent (the call's frame is already durably persisted at
-    /// emission time; the result settles on the next resume-completion). Such
-    /// outcomes are SKIPPED by the tool-result commit — no row is written and
-    /// the call stays dangling.
+    /// `true` when the tool's durable work was drain-cut and its result is intentionally absent:
+    /// the commit skips such outcomes, so the call stays dangling until the resume-completion
+    /// settles it.
     pub suspended: bool,
-    /// `true` when a successful outcome should end the agent run gracefully
-    /// after the round's results commit (sleep tool); failed/unknown calls
-    /// never set it.
+    /// `true` when a successful outcome should end the run gracefully after the round's results
+    /// commit.
     pub ends_turn: bool,
 }
 
-/// Discriminates the tool that produced an [`ImagePayload`] so the agent loop can
-/// label the injected image with the actual opening phrase ("Read image file",
-/// "Generated image file", "Chrome screenshot") without knowing which tool
-/// produced it — the loop selects the annotation purely by dedup.
+/// Discriminates the tool that produced an [`ImagePayload`], so the loop labels the injected image
+/// with the right opening phrase without knowing which tool produced it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ImagePayloadSource {
     /// On-disk raster read by the read tool.
     Read,
-    /// Tool-produced image (e.g. image_gen, or a page rasterized or extracted
-    /// from a converted document), or one derived by the agent loop from a tool's
-    /// `[IMAGE:path]` marker.
+    /// Tool-produced image (image_gen, a rasterized page, an extracted document), or one derived
+    /// from a marker.
     Generated,
-    /// Screenshot captured by the chrome tool (injected as a native image for
-    /// the agent's own visual analysis).
+    /// Screenshot captured by the chrome tool, injected as a native image for the agent's own
+    /// analysis.
     Chrome,
-    /// Screen capture from the computer tool (injected as a native image for
-    /// the agent's own visual analysis).
+    /// Screen capture from the computer tool, injected as a native image for the agent's own
+    /// analysis.
     Computer,
 }
 
 impl ImagePayloadSource {
-    /// Opening phrase of the injected-image annotation, e.g. "Read image file"
-    /// for the read tool's on-disk raster, "Generated image file" for a
-    /// tool-produced image, "Chrome screenshot" for the chrome's capture.
+    /// Opening phrase of the injected-image annotation, e.g. "Read image file" for a raster read.
     #[must_use]
     pub(crate) fn opener(self) -> &'static str {
         match self {
@@ -1485,23 +1206,15 @@ impl ImagePayloadSource {
     }
 }
 
-/// Per-call image payload produced by a tool that reads an on-disk raster image
-/// (the Read tool), by a tool that generated or captured one (image_gen, chrome,
-/// computer), or derived by the agent loop from a real on-disk `[IMAGE:path]`
-/// marker in a successful tool output that supplied no payload of its own. The
-/// agent loop injects `[IMAGE:{data_uri}]` as a synthetic persisted User-role
-/// message after the round's tool results.
-///
-/// `width`/`height` are the post-EXIF/post-resize dimensions of the *encoded*
-/// JPEG the data-URI carries, and `format` is the uppercase source-format label
-/// (`"PNG" | "JPEG" | "WEBP"`). Together they let the agent loop build the
-/// definitive attached/already-attached annotation from the payload metadata
-/// rather than rewriting a hardcoded sentence in a tool-result string.
+/// Per-call image payload: read from disk, generated or captured by a tool, or derived by the loop
+/// from a real `[IMAGE:path]` marker in a successful output. The loop injects `[IMAGE:{data_uri}]`
+/// as a synthetic persisted User-role message after the round. `width`/`height` are the
+/// post-EXIF/post-resize dimensions of the encoded JPEG and `format` the uppercase source label
+/// (`PNG`/`JPEG`/`WEBP`).
 #[derive(Debug, Clone)]
 pub(crate) struct ImagePayload {
-    /// Canonical (resolved) path of the image — surfaced in the tool-result
-    /// annotation (`{opener} {path} ...`) and the debug log. The dedup
-    /// key used by the agent loop is `data_uri`, not `path`.
+    /// Canonical path of the image, surfaced in the annotation and the debug log. The dedup key is
+    /// `data_uri`.
     pub path: String,
     /// Bounded JPEG data-URI (`data:image/jpeg;base64,...`).
     pub data_uri: String,
@@ -1511,23 +1224,20 @@ pub(crate) struct ImagePayload {
     pub height: u32,
     /// Uppercase source-format label: `"PNG" | "JPEG" | "WEBP"`.
     pub format: String,
-    /// `Some` when the read resolved a typo'd path to a unique filename match;
-    /// preserved in the tool-result annotation so the model keeps the typo
-    /// context (mirrors the `[Recovered path: ...]` note shown for text reads).
+    /// `Some` when the read resolved a typo'd path to a unique filename match; kept in the
+    /// annotation.
     pub recovery_note: Option<String>,
-    /// An extra line the annotation carries, for a tool-specific fact that must
-    /// reach the assistant with the image itself (the computer tool names the
-    /// reduction a capture over the attachment cap reached the model as).
+    /// An extra line the annotation carries, for a tool-specific fact that must reach the assistant
+    /// with the image itself.
     pub note: Option<String>,
     /// Tool that produced the image, selecting the annotation opener
     /// ("Read image file", "Generated image file", "Chrome screenshot").
     pub source: ImagePayloadSource,
 }
 
-/// Prefix `body` with a read's typo-recovery note, when there is one — the one
-/// place the `[Recovered path: ...]` line is put in front of a read's answer, so
-/// a recovered text read, a recovered raster's annotation and a converted
-/// document's answer word it identically.
+/// Prefix `body` with a read's typo-recovery note — the one place `[Recovered path: ...]` is put in
+/// front of an answer, so a text read, a raster annotation and a document answer word it
+/// identically.
 #[must_use]
 pub(crate) fn with_recovery_note(note: Option<&str>, body: String) -> String {
     match note {
@@ -1537,23 +1247,20 @@ pub(crate) fn with_recovery_note(note: Option<&str>, body: String) -> String {
 }
 
 impl ImagePayload {
-    /// Tool-result annotation for a FRESH attachment (the image is injected as a
-    /// new synthetic user message).
+    /// Tool-result annotation for a FRESH attachment (injected as a new synthetic user message).
     #[must_use]
     pub(crate) fn attached_annotation(&self) -> String {
         self.annotation("Image content attached to the conversation as a native image.")
     }
 
-    /// Tool-result annotation for a DEDUPED repeat read (image already attached;
-    /// the read returns a reference rather than re-adding it).
+    /// Tool-result annotation for a DEDUPED repeat read: the image is already attached.
     #[must_use]
     pub(crate) fn already_attached_annotation(&self) -> String {
         self.annotation("Image content is already attached to the conversation as a native image.")
     }
 
-    /// Render the annotation shared by the fresh/already-attached variants:
-    /// `{opener} {path} ({w}x{h}, {format}). {sentence}`, then the tool's own
-    /// `note` on a new line, then the read's recovery note as a prefix.
+    /// Render the annotation shared by both variants: `{opener} {path} ({w}x{h}, {format}).
+    /// {sentence}`, then the tool's own `note`, with the read's recovery note as a prefix.
     #[must_use]
     fn annotation(&self, sentence: &str) -> String {
         let base = format!(
@@ -1572,17 +1279,9 @@ impl ImagePayload {
         with_recovery_note(self.recovery_note.as_deref(), base)
     }
 
-    /// Build an [`ImagePayload`] from a post-decode [`crate::util::CompressedImageMeta`]
-    /// (the bounded data URI + post-EXIF dims + source-format label) and the
-    /// caller's resolved path, recovery note, and producing tool.
-    ///
-    /// This is the infallible construction tail: the caller performs the
-    /// fallible decode separately
-    /// (`crate::util::local_image_to_compressed_data_uri_with_meta(...).await.ok()?`)
-    /// and passes the decoded meta in to build the payload.
-    ///
-    /// The annotation `note` (a tool-specific fact carried with the image) is left
-    /// `None` for the caller to set.
+    /// Build an [`ImagePayload`] from a post-decode [`crate::util::CompressedImageMeta`] and the
+    /// caller's resolved path, recovery note and producing tool: the infallible tail after the
+    /// fallible decode. The tool-specific `note` is left `None` for the caller to set.
     #[must_use]
     pub(crate) fn from_compressed_meta(
         path: &std::path::Path,
@@ -1603,10 +1302,8 @@ impl ImagePayload {
     }
 }
 
-/// Normalize a tool call name and arguments, repairing common agent mistakes.
-///
-/// Returns `(normalized_name, normalized_args)`. Stats and dispatch should use
-/// the normalized values so recovered calls are attributed to the real tool.
+/// Normalize a tool call name and arguments, repairing common agent mistakes. Stats and dispatch
+/// should use the result so recovered calls are attributed to the real tool.
 #[must_use]
 pub(crate) fn normalize_tool_call(
     name: &str,
@@ -1623,17 +1320,9 @@ pub(crate) fn normalize_tool_call(
     (normalized_name, args)
 }
 
-/// Map known tool-name aliases to their canonical names.
-///
-/// This is the single source of truth for tool-name normalization, shared by
-/// [`normalize_tool_call`] (full call normalization) and [`find_tool`] (direct
-/// lookup).  Adding a new alias here immediately affects both paths.
-///
-/// The `"glob"` alias is included because it resolves to `"search"` regardless
-/// of arguments; the parallel `mode:"files"` injection is handled separately
-/// in [`normalize_tool_call`] when args are available. `pub(crate)` so the
-/// research sanitizer can gate on the canonical name before paying for an
-/// argument clone.
+/// Map known tool-name aliases to their canonical names — the single source of truth, shared by
+/// [`normalize_tool_call`] and [`find_tool`]. The `"glob"` alias resolves to `"search"` regardless
+/// of arguments; the parallel `mode:"files"` injection happens in [`normalize_tool_call`].
 pub(crate) fn normalize_tool_name(name: &str) -> &str {
     match name {
         "bash" | "run_terminal_cmd" => "shell",
@@ -1651,13 +1340,9 @@ fn normalize_tool_arguments(name: &str, args: &mut serde_json::Value) {
         return;
     };
 
-    // Apply path-aliases (file/filename) for every tool call. Tools that do not
-    // take a "path" simply ignore the extra key — except the tools whose contract
-    // refuses every argument an action does not take (document, computer): there an
-    // alias is left as the caller wrote it, so a refusal names that spelling rather
-    // than a "path" the caller never passed. The `workspace` tool keeps the alias (its
-    // `add` takes the path); its `pause` / `resume` refuse a stray field, but by
-    // that tool's own address rule rather than by the key's name.
+    // Apply path aliases for every tool call; a tool that does not take a "path" ignores the extra
+    // key — except the document and computer tools, whose contract refuses every argument an action
+    // does not take, so an alias stays as written and the refusal names that spelling.
     if name != "document" && name != "computer" {
         for &alias in PATH_ALIAS_KEYS {
             remap_arg_key(obj, alias, "path");
@@ -1682,10 +1367,7 @@ fn normalize_tool_arguments(name: &str, args: &mut serde_json::Value) {
     }
 }
 
-/// Move `from` → `to` only when the canonical key is absent.
-///
-/// When both the alias (`from`) and canonical (`to`) keys are present the
-/// canonical value is used.
+/// Move `from` → `to` only when the canonical key is absent; the canonical value always wins.
 fn remap_arg_key(obj: &mut serde_json::Map<String, serde_json::Value>, from: &str, to: &str) {
     if !obj.contains_key(to)
         && let Some(v) = obj.remove(from)
@@ -1694,14 +1376,10 @@ fn remap_arg_key(obj: &mut serde_json::Map<String, serde_json::Value>, from: &st
     }
 }
 
-/// A tool's answer to one operation, with the flag a frontend that must treat a
-/// partly carried-out operation as a failure reads.
-///
-/// The agent path reads only [`text`](Self::text) (through [`Tool::execute`]);
-/// the command line reads `partial` too, because it must exit non-zero when
-/// part of what it asked for did not happen. `partial` is the tool's own honest
-/// report — the text names the part that did not succeed — and is never
-/// inferred from the wording.
+/// A tool's answer to one operation, with the flag a frontend that must treat a partly carried-out
+/// operation as a failure reads: the agent path reads only `text`, the command line reads `partial`
+/// too and exits non-zero. `partial` is the tool's own honest report, never inferred from the
+/// wording.
 pub(crate) struct ToolAnswer {
     pub text: String,
     pub partial: bool,
@@ -1725,11 +1403,7 @@ impl ToolAnswer {
     }
 }
 
-/// Look up a tool by name in a slice of boxed `dyn Tool` values.
-///
-/// Tool-name aliases are resolved via `normalize_tool_name` so that all
-/// callers benefit from the same alias mapping.  Prefer [`normalize_tool_call`]
-/// before dispatch when full argument normalization is also desired.
+/// Look up a tool by name, resolving aliases via [`normalize_tool_name`].
 #[must_use]
 pub(crate) fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     let normalized = normalize_tool_name(name);
@@ -1743,37 +1417,19 @@ pub(crate) fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'
 /// command-line call, which names its destination.
 pub(crate) const GENERATED_DIR: &str = "generated";
 
-/// The directory a produced file must land in: the destination a
-/// command-line caller chose ([`crate::agent::tool_output_dir`]), and the
-/// workspace's own `fallback` directory for every other caller.
+/// The directory a produced file must land in: the command line's destination, else the workspace's
+/// own.
 pub(crate) fn output_directory(ws: &Workspace, fallback: &str) -> PathBuf {
     crate::agent::tool_output_dir().unwrap_or_else(|| ws.as_path().join(fallback))
 }
 
-/// Canonicalize a local media path and confine it to the workspace's
-/// `uploads/` (received attachments) and `generated/` (tool outputs) dirs — the
-/// shared rule for video_edit's local inputs and the generation tools'
-/// reference images. `kind` names the input in the messages.
-///
-/// The confinement is the AGENTS' rule: a command-line caller is the machine's
-/// own owner, whose shell can already hand any local file to any program, so the
-/// command line adds no capability the owner does not have and this check is
-/// skipped for it. Everything else still happens — the file must exist, be a
-/// regular file and be canonicalized.
-///
-/// The regular-file rule holds for every caller, agent or not: what is given here
-/// is read by the tool (an upload, a duration probe, an image decode) with no
-/// timeout of its own, so a pipe with no writer would hold the daemon — and the
-/// operation's own flight guard — forever and a device would read without end.
-/// Nothing is opened to decide it: metadata is the whole check.
-///
-/// Callers must run it before any other filesystem access on the path: a path
-/// refused here is only canonicalized and stat'ed — never opened or sniffed.
-///
-/// Roots are canonicalized when they exist; a missing directory cannot contain
-/// a canonicalized (existing) file, so it is skipped — which fails closed when
-/// neither exists. A relative input resolves against the process CWD rather
-/// than the workspace, matching video_edit's local inputs.
+/// Canonicalize a local media path and confine it to the workspace's `uploads/` (attachments) and
+/// `generated/` (tool outputs) dirs — the shared rule for video_edit's local inputs and the
+/// generation tools' reference images. The confinement is the AGENTS' rule: the command line is the
+/// owner, whose shell already reaches any file, so it is skipped there. The file must exist, be
+/// regular and be canonicalized for every caller: what is given is read with no timeout, so a pipe
+/// would hold the daemon and its flight guard forever, and nothing is opened or sniffed to decide
+/// it. A relative input resolves against the process CWD, not the workspace.
 pub(crate) async fn resolve_local_media_path(
     input: &str,
     ws: &Workspace,
@@ -1822,24 +1478,13 @@ pub(crate) async fn resolve_local_media_path(
     Ok(canonical)
 }
 
-/// Save generated media bytes into the caller's output directory
-/// ([`output_directory`]: the workspace's `generated/` for every caller but a
-/// command-line call, which names its destination), naming the file
-/// `{prefix}_{timestamp}.{ext}` and reserving a free name so a file already
-/// there is never overwritten (see [`crate::util::write_unique_file`]).
-///
-/// Creates the directory if needed, writes the file, and returns the full
-/// `PathBuf` naming a COMPLETE file. The bytes are content-sniffed and stripped
-/// (`util::provenance`) on the way out, so the single written file is what the GUI
-/// preview, the Telegram delivery and the model-context payload all consume;
-/// non-image outputs pass through untouched.
-///
-/// # Security note
-/// This function deliberately bypasses path security (no `resolve_write_target`
-/// check): the output directory is either the tool-owned `generated/` of the
-/// caller's workspace or the destination a command-line caller named, which the
-/// command line itself has already resolved and vetted (`crate::cli`). Do not
-/// use this function for user-uploaded or arbitrary content.
+/// Save generated media bytes into the caller's output directory ([`output_directory`]), naming the
+/// file `{prefix}_{timestamp}.{ext}` and reserving a free name so nothing is overwritten; returns
+/// the path of a COMPLETE file. Bytes are content-sniffed and stripped (`util::provenance`) on the
+/// way out, so the one written file is what the GUI preview, the Telegram delivery and the model
+/// payload consume. Security: deliberately bypasses path security — the output directory is
+/// tool-owned or already vetted by the command line. Never use it for user-uploaded or arbitrary
+/// content.
 async fn save_generated_file(
     ws: &Workspace,
     bytes: &[u8],
@@ -1883,12 +1528,8 @@ async fn save_generated_file(
     Ok(output_path)
 }
 
-/// Format a video tool result: the `[VIDEO:path]` marker first (so the reply
-/// path and GUI keep working), then a "Video content:" description line when
-/// the shared video transcription succeeds. Fail-open: marker-only on any
-/// failure. The transcription's live tracking resolves via the tool-execution
-/// task-local (the owning agent's activity indicator); `None` is passed for
-/// workspace because the in-agent path never needs a non-agent call row.
+/// Format a video tool result: the `[VIDEO:path]` marker first, then a "Video content:" line when
+/// the shared transcription succeeds. Fail-open: marker-only on any failure.
 pub(crate) async fn format_video_result(marker: String, output_path: &std::path::Path) -> String {
     match crate::providers::transcribe_video_file(output_path, None).await {
         Some(text) => format!("{marker}\n\nVideo content: {text}"),
@@ -1896,20 +1537,15 @@ pub(crate) async fn format_video_result(marker: String, output_path: &std::path:
     }
 }
 
-// ── Async video jobs (video_gen / video_edit) ───────────────────────────
+// Wall-clock deadline for an async-video job (1 hour), shared by video_gen and video_edit.
 
-/// Wall-clock deadline for an async-video job (1 hour) — shared by the
-/// video_gen and video_edit tools.
 const VIDEO_JOB_TIMEOUT: Duration = Duration::from_hours(1);
 
 /// Polling interval between video job status checks (30 s).
 const VIDEO_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Kind-dependent labels for an OpenRouter async-video job.
-///
-/// Fields stay separate so every user-facing string is byte-identical with the
-/// pre-refactor tools (e.g. gen's download context is bare "Video download",
-/// not "Video generation download").
+/// Kind-dependent labels for an OpenRouter async-video job, kept separate so every user-facing
+/// string stays byte-identical with the pre-refactor tools.
 struct VideoJobLabels {
     /// "Video generation" / "Video edit" — submission/poll HTTP contexts,
     /// tracing, "failed" and timeout bails.
@@ -1933,19 +1569,16 @@ impl VideoJobLabels {
     };
 }
 
-/// Submit an OpenRouter async-video job (exactly one POST — no retry; each
-/// submission is a billable job and the endpoint has no idempotency key),
-/// poll for completion (1-hour wall-clock deadline), download the result, and
-/// validate it is a real MP4. Returns the video bytes; callers save the file
-/// and format the media marker.
+/// Submit an OpenRouter async-video job (exactly one POST — no retry: each submission is billable
+/// and the endpoint has no idempotency key), poll to the 1-hour deadline, download the result and
+/// validate it is a real MP4. Returns the bytes; callers save the file and format the media marker.
 #[expect(clippy::too_many_lines)]
 async fn fetch_async_video(
     api_base: &str,
     body: &serde_json::Value,
     labels: VideoJobLabels,
 ) -> anyhow::Result<Vec<u8>> {
-    // ── Step 1: Submit video job (exactly one POST — no retry) ─────────
-    // Each submission is a billable job; the endpoint has no idempotency key.
+    // Each submission is a billable job, so exactly one POST — the endpoint has no idempotency key.
     let submit_url = format!("{api_base}/videos");
     let submit_body: serde_json::Value = match crate::util::http::post_json_to_provider(
         &submit_url,
@@ -1985,7 +1618,6 @@ async fn fetch_async_video(
 
     tracing::info!(%job_id, "{} job submitted", labels.label);
 
-    // ── Step 2: Poll for completion (1-hour wall-clock deadline) ────────
     let deadline = Instant::now() + VIDEO_JOB_TIMEOUT;
     let mut result_url: Option<String> = None;
     let mut attempt: u32 = 0;
@@ -2017,7 +1649,6 @@ async fn fetch_async_video(
                 tracing::debug!(%job_id, attempt, error = %e, "Poll failed");
                 continue;
             }
-            // Deadline elapsed while the poll request was in flight.
             Err(_) => break,
         };
 
@@ -2029,18 +1660,14 @@ async fn fetch_async_video(
         tracing::debug!(%job_id, %status, attempt, "{} poll", labels.label);
 
         if status == "completed" {
-            // Download URL: OpenRouter provides unsigned_urls array or
-            // a content endpoint at /api/v1/videos/{jobId}/content?index=0
+            // OpenRouter provides an `unsigned_urls` array or a `/content?index=0` endpoint.
             result_url = poll_body
                 .get("unsigned_urls")
                 .and_then(|v| v.as_array())
                 .and_then(|arr| arr.first())
                 .and_then(|v| v.as_str())
                 .map(String::from)
-                .or_else(|| {
-                    // Fallback: use content endpoint
-                    Some(format!("{api_base}/videos/{job_id}/content?index=0"))
-                });
+                .or_else(|| Some(format!("{api_base}/videos/{job_id}/content?index=0")));
             break;
         }
 
@@ -2060,10 +1687,9 @@ async fn fetch_async_video(
         );
     };
 
-    // ── Step 3: Download the video ──────────────────────────────────────
-    // The result URL requires the bearer key despite the "unsigned" name.
-    // The per-request timeout is the remaining job window, so large files on
-    // slow connections are not cut short by the shared client's 2-minute cap.
+    // The result URL requires the bearer key despite the "unsigned" name. The per-request timeout
+    // is the remaining job window, so large files on slow connections are not cut short by the
+    // 2-minute client cap.
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         anyhow::bail!(
@@ -2088,8 +1714,6 @@ async fn fetch_async_video(
     Ok(video_bytes)
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2097,20 +1721,16 @@ mod tests {
     use crate::workspace::test_ws_named;
     use tempfile::TempDir;
 
-    // ── ToolSpec serde ───────────────────────────────────────────
-
     #[test]
     fn failure_feedback_bounds_the_argument_preview_it_shows() {
         let tool = "image_gen";
         let fault = "Image generation failed: no configured image model served the request.";
-        // A multi-byte argument far longer than the preview's own cap: the preview is
-        // cut, marked as cut, and the whole result stays inside the budget it is
-        // delivered in — which is what a tool composing a fault text counts on.
+        // A multi-byte argument far longer than the preview's cap: the preview is cut and marked,
+        // and the whole result stays inside the budget it is delivered in.
         let args = serde_json::json!({ "prompt": "生成".repeat(600) });
         let args_str = args.to_string();
         assert!(args_str.len() > TOOL_FAILURE_ARGS_PREVIEW_BYTES);
-        // The fault reaches the formatter in the caller's wrapper, as it does in
-        // production.
+        // The fault reaches the formatter in the caller's wrapper, as it does in production.
         let reason = tool_failure_reason(tool, fault);
         let feedback = format_tool_failure_feedback(tool, &args, &reason);
         let preview = feedback
@@ -2130,9 +1750,7 @@ mod tests {
             args_str.starts_with(preview.trim_end_matches('…')),
             "the preview is the head of the arguments"
         );
-        // The reserve covers the wrapper and the envelope alike, and leaves the fault
-        // text a byte or two of slack at most (a char-boundary cut never fills its cap
-        // exactly).
+        // The reserve covers wrapper and envelope, leaving the fault text a byte or two of slack.
         assert!(
             feedback.len() <= tool_failure_envelope_bytes(tool.len()) + fault.len(),
             "{} bytes for a fault text of {}",
@@ -2141,9 +1759,7 @@ mod tests {
         );
         assert_eq!(crate::util::truncate_tool_output(&feedback), feedback);
 
-        // Scrubbing happens before the cap: this credential straddles the preview's
-        // cut, so a cap applied first would leave its raw head in the shown text and
-        // no redaction marker at all.
+        // Scrubbing happens before the cap: this credential straddles the cut the cap would make.
         let secret = "abcdefghij".repeat(10);
         let secret_args = serde_json::json!({
             "prompt": "x".repeat(928),
@@ -2159,8 +1775,6 @@ mod tests {
             "the raw credential cannot survive: {secret_feedback}"
         );
     }
-
-    // ── ImagePayload source verb ──────────────────────────────────
 
     #[test]
     fn image_payload_generated_verb_annotation() {
@@ -2212,8 +1826,6 @@ mod tests {
         );
     }
 
-    // ── find_tool aliases ──────────────────────────────────────────
-
     #[test]
     fn find_tool_aliases() {
         let tools: Vec<Box<dyn Tool>> = vec![
@@ -2223,26 +1835,19 @@ mod tests {
             Box::new(EditTool::confined()),
         ];
 
-        // Each case: (alias, expected_tool_name or None).
         let cases: &[(&str, Option<&str>)] = &[
-            // Canonical names
             ("search", Some("search")),
             ("shell", Some("shell")),
             ("read", Some("read")),
             ("edit", Some("edit")),
-            // Shell aliases
             ("bash", Some("shell")),
             ("run_terminal_cmd", Some("shell")),
-            // Search aliases
             ("grep", Some("search")),
             ("rg", Some("search")),
             ("grep_search", Some("search")),
             ("glob", Some("search")),
-            // Read aliases
             ("read_file", Some("read")),
-            // Edit aliases
             ("str_replace", Some("edit")),
-            // Unknown tool
             ("unknown", None),
         ];
 
@@ -2265,22 +1870,14 @@ mod tests {
         kept: Option<&'static str>,
     }
 
-    /// Verify that [`normalize_tool_call`] repairs the names and arguments a
-    /// caller sent, and that it remaps every alias in [`PATH_ALIAS_KEYS`] to
-    /// `"path"` — sweeping the constant itself, so an alias added tomorrow is
-    /// exercised against the loop-based approach in [`normalize_tool_arguments`].
-    ///
-    /// The document and computer tools are the exemptions: each declares and
-    /// enforces its own argument names, so an alias is left as the caller wrote it
-    /// and refused by that name instead of being remapped into a `"path"` its
-    /// actions do not take. Remapped alias and ignored-or-refused extra key are
-    /// separate things: `workspace` takes the alias for its `add` while refusing a
-    /// stray field on `pause` / `resume` (`tools::workspace::a_misspelled_address_…`).
+    /// Verify [`normalize_tool_call`] repairs the names and arguments a caller sent and remaps
+    /// every alias in [`PATH_ALIAS_KEYS`] to `"path"` — sweeping the constant itself, so an alias
+    /// added tomorrow is exercised. The document and computer tools are the exemptions and refuse
+    /// the alias by its spelling.
     #[expect(clippy::too_many_lines)]
     #[test]
     fn normalize_tool_call_cases() {
         for case in [
-            // A tool's own aliases route the call and repair its arguments.
             NormalizeCallCase {
                 name: "a shell alias sends the command under its own key",
                 tool: "bash",
@@ -2383,26 +1980,23 @@ mod tests {
                     name, *tool_name,
                     "tool name should not change for {tool_name} with alias {alias}"
                 );
-                // The alias is remapped to "path" for every tool but the document and
-                // computer tools: tools that don't use "path" simply ignore the extra key.
+                // The alias is remapped to "path" for every tool but the document and computer
+                // tools.
                 assert_eq!(
                     args["path"], "src/main.rs",
                     "alias {alias} should be remapped to 'path' for tool {tool_name}"
                 );
-                // The alias key itself should have been removed since "path" was absent.
                 assert!(
                     !args.as_object().unwrap().contains_key(alias),
                     "alias key {alias} should be removed after normalization for {tool_name}"
                 );
-                // Shell-specific remaps must be unaffected.
                 if *tool_name == "shell" {
                     assert_eq!(args["command"], "ls");
                 }
             }
         }
-        // The document and computer tools' own contracts name their arguments: an
-        // alias stays as the caller wrote it, for the boundary to refuse that spelling
-        // by name.
+        // The document and computer tools name their arguments: an alias stays as the caller wrote
+        // it.
         for tool_name in ["document", "computer"] {
             let (_, args) = normalize_tool_call(tool_name, serde_json::json!({ "file": "a.pdf" }));
             assert_eq!(
@@ -2415,9 +2009,8 @@ mod tests {
             );
         }
 
-        // A dangling `send` frame resolves to the sync worker core: an absent or
-        // explicit-null address is the narrowest choice, the worker address is
-        // itself, and any other address is re-executed.
+        // A dangling `send` frame resolves to the sync worker core: an absent or null address is
+        // the narrowest choice, the worker address is itself, and any other address is re-executed.
         for (name, args) in [
             ("an absent address", serde_json::json!({"message": "m"})),
             (
@@ -2448,9 +2041,7 @@ mod tests {
     }
 
     #[test]
-    // ── media_marker coverage ────────────────────────────────────────
     fn all_media_tools_implement_media_marker() {
-        // Each media-generation tool must return Some from media_marker()
         let tools: [(&str, Box<dyn Tool>); 6] = [
             ("ImageGenTool", Box::new(ImageGenTool)),
             ("VideoGenTool", Box::new(VideoGenTool)),
@@ -2475,7 +2066,6 @@ mod tests {
                 "{name} should return Some from media_marker()"
             );
             let marker = marker.unwrap();
-            // Validate format: `[KIND:` where KIND is uppercase letters
             assert!(
                 marker.starts_with('['),
                 "{name} marker {marker:?} should start with '['"
@@ -2489,7 +2079,6 @@ mod tests {
                 !kind.is_empty() && kind.chars().all(char::is_uppercase),
                 "{name} marker kind {kind:?} should be non-empty uppercase letters"
             );
-            // Validate against the canonical MEDIA_MARKER_RE pattern
             let full_marker = format!("{marker}/some/path]");
             assert!(
                 crate::util::MEDIA_MARKER_RE.is_match(&full_marker),
@@ -2498,12 +2087,11 @@ mod tests {
         }
     }
 
-    // ── resolve_local_media_path tests ─────────────────────────────────────
+    // The command line's branch of the rule: the owner IS the machine's own user, so the file the
+    // caller named is taken wherever it is — while every other caller keeps the workspace
+    // confinement, and the regular-file rule holds for both so the branch cannot be widened into a
+    // hang.
 
-    /// The command line's own branch of the rule: the owner IS the machine's own
-    /// user, so the file the caller named is taken wherever it is — while every
-    /// other caller keeps the workspace confinement, and the regular-file rule
-    /// holds for both so the branch cannot be widened into a hang.
     #[tokio::test]
     async fn resolve_local_media_path_takes_any_file_for_a_command_line_call() {
         let tmp = TempDir::new().expect("tempdir");
@@ -2517,7 +2105,6 @@ mod tests {
         let outside = write("outside/picture.png");
         let inside = write("generated/clip.mp4");
 
-        // The agents' rule: the workspace's own media dirs, and nowhere else.
         assert!(
             resolve_local_media_path(&outside.to_string_lossy(), &ws, "clip")
                 .await
@@ -2530,7 +2117,6 @@ mod tests {
                 .is_ok()
         );
 
-        // The command line's: the very file the caller gave it.
         let taken = crate::agent::CURRENT_TOOL_COMMAND_LINE
             .scope(true, async {
                 resolve_local_media_path(&outside.to_string_lossy(), &ws, "clip").await
@@ -2545,9 +2131,8 @@ mod tests {
 
         #[cfg(unix)]
         {
-            // A pipe with no writer would hold the reading tool — and the
-            // operation's flight guard — forever, so it is refused for BOTH
-            // callers, the command line's branch included.
+            // A pipe with no writer would hold the reading tool — and the operation's flight guard
+            // — forever, so it is refused for BOTH callers, the command line's branch included.
             let fifo = tmp.path().join("generated/pipe.mp4");
             let path = std::ffi::CString::new(fifo.to_string_lossy().as_bytes())
                 .expect("a path without a NUL");
@@ -2568,9 +2153,9 @@ mod tests {
         }
     }
 
-    /// The rule video_edit's local inputs and the generation tools' reference
-    /// images share: only the workspace's `uploads/` and `generated/` dirs are
-    /// reachable, and anywhere else is refused with the reason.
+    /// The shared rule for video_edit's local inputs and the generation tools' reference images:
+    /// only the workspace's `uploads/` and `generated/` dirs are reachable, and anywhere else is
+    /// refused.
     #[tokio::test]
     async fn resolve_local_media_path_confines_to_uploads_and_generated() {
         let tmp = TempDir::new().expect("tempdir");
@@ -2582,8 +2167,6 @@ mod tests {
             path.to_string_lossy().to_string()
         };
 
-        // Both media dirs are accepted, including `generated/` when `uploads/`
-        // does not exist yet.
         assert!(
             resolve_local_media_path(&write("generated/image_1.png"), &ws, "image")
                 .await
@@ -2595,7 +2178,6 @@ mod tests {
                 .is_ok()
         );
 
-        // Anywhere else in the workspace is refused, naming both accepted dirs.
         let err = resolve_local_media_path(&write("config.toml"), &ws, "clip")
             .await
             .expect_err("a file outside uploads/generated must be refused");
@@ -2618,10 +2200,9 @@ mod tests {
         );
     }
 
-    // ── save_generated_file tests ──────────────────────────────────────────
+    // One [`save_generated_file`] call: the workspace it lands in and the name the produced file
+    // must carry.
 
-    /// One [`save_generated_file`] call: the workspace it lands in and the name
-    /// the produced file must carry.
     struct SaveGeneratedCase {
         name: &'static str,
         /// Nest the workspace root one level down, so its directory does not exist.
@@ -2700,8 +2281,6 @@ mod tests {
         }
     }
 
-    // ── Reference-image body budget ─────────────────────────────────
-
     enum BudgetScenario {
         AggregateLadder,
         FallsThroughToSmallerReference,
@@ -2741,8 +2320,6 @@ mod tests {
                         "prompt": "test",
                         "input_references": reference_json(&refs),
                     });
-                    // The per-image cap passes a 384×384 ref through unchanged (~590 KB
-                    // base64 body); a small budget forces the aggregate ladder.
                     assert!(
                         serde_json::to_vec(&body).unwrap().len() > BUDGET,
                         "[{}] the body starts past the budget",
@@ -2762,8 +2339,8 @@ mod tests {
                     );
                 }
                 BudgetScenario::FallsThroughToSmallerReference => {
-                    // When the largest reference's ladder is exhausted, the loop must
-                    // fall through to the next-largest instead of bailing.
+                    // When the largest reference's ladder is exhausted, the loop falls through to
+                    // the next-largest.
                     let tmp = TempDir::new().unwrap();
                     let big = tmp.path().join("big.png");
                     let small = tmp.path().join("small.png");
@@ -2785,8 +2362,7 @@ mod tests {
                     });
                     // Exhaust the big reference's ladder, then measure the raw body so
                     // the budget can be pinned to a window that only the small
-                    // reference can close — deterministically forcing the fall-through
-                    // path.
+                    // reference can close — deterministically forcing the fall-through path.
                     while refs[0].has_compression_left() {
                         refs[0].compress_more().unwrap();
                     }

@@ -1,9 +1,6 @@
-//! Role metadata consolidation — single source of truth for all static [`Role`] properties.
-//!
-//! This module is the canonical home for [`Role`]'s static methods, trait impls,
-//! and metadata lookups — including role descriptions, discovery prompts,
-//! tool assignments, and [`RoleInfo`]. Used by [`crate::agent`] and other modules
-//! that need role data.
+//! Role metadata consolidation — the single source of truth for all static [`Role`] properties:
+//! role descriptions, discovery prompts, tool assignments and [`RoleInfo`]. Used by
+//! [`crate::agent`] and anything else that needs role data.
 
 use std::sync::LazyLock;
 
@@ -11,93 +8,52 @@ use strum::IntoEnumIterator;
 
 use crate::Role;
 
-/// Role string for the workspace's project commands — `"diagnostics"`.
-///
-/// The value outlives the retired commands-only phase as a shared key: the
-/// shell spill-owner key of a run with no agent identity (`tools/shell/mod.rs`,
-/// via `cleanup_agent_spills`), the sentinel that collapses already-stored
-/// diagnostics comments to a summary in the GUI board (`gui/board.rs`), and the
-/// diagnostics-discovery agent id / stale-write log label (`workspace.rs`).
-///
-/// The literal is a key: it's compared against `comment.role` (`gui/board.rs`)
-/// and against agent ids (the shell spill collision guard in `tools/shell/mod.rs`),
-/// so a change must be coordinated across those sites.
+/// Role string for the workspace's project commands — `"diagnostics"`. The value outlives the
+/// commands-only phase as a shared key: the shell spill-owner key of a run with no agent identity
+/// (`cleanup_agent_spills`), the sentinel that collapses already-stored diagnostics comments to a
+/// summary in the GUI board, and the diagnostics-discovery agent id / stale-write log label. The
+/// literal is compared against `comment.role` and against agent ids, so a change must be
+/// coordinated across those sites.
 pub(crate) const DIAGNOSTICS_ROLE: &str = "diagnostics";
 
-/// Role string for system comments — `"system"`.
-///
-/// Two uses, both where a ticket has no agent author:
-///
-/// - the circuit-breaker trip comment `bounce_to_development` posts when the
-///   bounce budget is exhausted (`pipeline/mod.rs`);
-/// - the actor `attributed_actor` substitutes in the chronicle
-///   (`pipeline/chronicle.rs`) when `last_transition_actor` is absent or blank
-///   — legacy rows with no recorded actor included — so this value reaches a
-///   stored `ticket_chronicle.actor`, not only comments.
-///
-/// `gui/theme.rs` gives `"system"` the generic unknown-role badge colour on its
-/// own; it does not read this constant.
+/// Role string for system comments — `"system"`, used where a ticket has no agent author: the
+/// circuit-breaker trip comment `bounce_to_development` posts, and the actor `attributed_actor`
+/// substitutes in the chronicle when `last_transition_actor` is absent or blank — so this value
+/// reaches a stored `ticket_chronicle.actor`, not only comments. `gui/theme.rs` gives `"system"`
+/// the generic unknown-role badge colour on its own; it does not read this constant.
 pub(crate) const SYSTEM_ROLE: &str = "system";
 
-// ── RoleInfo ──────────────────────────────────────────────────────────────
+// All static metadata for a [`Role`] variant, looked up through a single match in [`role_info()`]
+// rather than the scattered matches this replaced. Prompt-loading accessors (`role_description`,
+// `role_description_for`, `discovery_prompt`, `summary_prompt`) read the embedded `.md` assets
+// directly; icon widgets live in `theme::role_icon()`.
+//
+// Adding a role: the [`Role`] enum in `lib.rs`, prompts at `src/prompt/role/{name}.md` and
+// `src/prompt/summarize/{name}.md` (plus `src/prompt/discovery/{name}.md` when `has_discovery`), an
+// arm here, the [`Role::tools()`] arm and the `theme::role_icon()` arm. [`Role::Custom`] is the one
+// exception: it has no compiled `role/custom.md` (its prompt is assembled at launch) and no static
+// tool set ([`Role::custom_role_tools`] derives it per record), so the guards below exempt it. The
+// compiler catches missing arms but not one returning an empty tool set or silently using
+// struct-update defaults — the tests here guard those: the [`RoleInfo`] sentinels (a black
+// `badge_fg`, an empty `display_label`), non-empty [`Role::tools()`], and real content in the role,
+// summary and discovery prompts.
 
-/// All static metadata for a [`Role`] variant.
-///
-/// Static role metadata lives here and is looked up through a single match in
-/// [`role_info()`], replacing the match statements that were previously
-/// scattered across the codebase for role metadata lookups. Exception:
-/// prompt-loading accessors (`role_description`, `role_description_for`,
-/// `discovery_prompt`, `summary_prompt`) read the embedded `.md` assets
-/// directly. Icon widgets live in `theme::role_icon()`.
-///
-/// Adding a new role requires updating the [`Role`] enum in `lib.rs`,
-/// creating prompt files at `src/prompt/role/{name}.md` and
-/// `src/prompt/summarize/{name}.md` (and optionally
-/// `src/prompt/discovery/{name}.md` if `has_discovery` is true),
-/// adding an arm in this match, the [`Role::tools()`] method,
-/// and the `theme::role_icon()` match.
-/// [`Role::Custom`] is the one exception: it has no compiled
-/// `role/custom.md` asset (its system prompt is assembled at launch from the
-/// administrator's own record) and no static tool set
-/// ([`Role::custom_role_tools`] derives it per record), so the tool-set and
-/// role-description guards below exempt it while every other guard applies.
-/// The compiler will catch missing arms in exhaustive matches, but it
-/// cannot catch an arm that returns an empty tool set or silently uses
-/// struct update defaults — the tests in this module guard against those:
-///
-/// * the [`RoleInfo`] sentinels carried by a struct update — a black `badge_fg`
-///   and an empty `display_label` (the base's `default_reasoning_effort` is a
-///   real value, so it cannot hide a missing one)
-/// * [`Role::tools()`] non-empty for every variant
-/// * `role_description()` contains real content (no placeholder)
-/// * `summary_prompt()` contains real content (no placeholder)
-/// * `discovery_prompt()` contains real content (no placeholder, for roles where `has_discovery` is true)
 pub struct RoleInfo {
     /// Whether this role has a discovery prompt for workspace exploration.
     pub has_discovery: bool,
-    /// Badge foreground color as an RGB tuple.
-    ///
-    /// Converted to an [`iced::Color`] badge in `gui/theme.rs`. The badge
-    /// background is always this color at 0.1 alpha.
+    /// Badge foreground colour as an RGB tuple, converted to an [`iced::Color`] badge in
+    /// `gui/theme.rs`. The badge background is always this colour at 0.1 alpha.
     pub badge_fg: (f32, f32, f32),
-    /// Default reasoning effort for this role.
-    ///
-    /// Authoritative: reasoning effort is baked into the binary and not
-    /// user-tunable, so this default is what request time always uses.
+    /// Default reasoning effort: authoritative, since effort is baked into the binary and not
+    /// user-tunable, so request time always uses this value.
     pub default_reasoning_effort: &'static str,
     /// Human-readable display label (e.g. `"QA"` for [`Role::Qa`]).
     pub display_label: &'static str,
 }
 
-// ── Single source of truth ────────────────────────────────────────────────
-
-/// Default values shared by most [`Role`] variants in [`role_info()`].
-///
-/// Used via struct update syntax (`..BASE_ROLE_INFO`) to keep each arm
-/// concise and make future field additions cheap. Arms that spell out every
-/// field (Discovery, Assistant) do so because clippy's
-/// `needless_update` fires when the base contributes nothing, so the update
-/// syntax is only valid when at least one field comes from the base.
+// Default values shared by most [`Role`] variants, used via `..BASE_ROLE_INFO` to keep each arm
+// concise and make future field additions cheap. Arms that spell out every field (Discovery,
+// Assistant) do so because clippy's `needless_update` fires when the base contributes nothing.
 const BASE_ROLE_INFO: RoleInfo = RoleInfo {
     has_discovery: true,
     badge_fg: (0.0, 0.0, 0.0),
@@ -177,9 +133,6 @@ pub const fn role_info(role: &Role) -> &'static RoleInfo {
     }
 }
 
-// ── Trait impls ─────────────────────────────────────────────────────────
-
-/// Valid role names, pre-computed once to avoid re-iteration in error paths.
 static ALL_ROLE_NAMES: LazyLock<String> = LazyLock::new(|| {
     Role::iter()
         .map(|r| r.as_str())
@@ -198,14 +151,9 @@ impl std::str::FromStr for Role {
     }
 }
 
-// ── Role metadata methods ──────────────────────────────────────────────
-
 impl Role {
-    /// Canonical role name as a `&'static str` (lowercase).
-    ///
-    /// Delegates to the [`strum::IntoStaticStr`] derive, which produces
-    /// string literals with a `'static` lifetime. This is the canonical
-    /// method for obtaining the role's string representation.
+    /// Canonical role name as a `&'static str` (lowercase), via the [`strum::IntoStaticStr`]
+    /// derive.
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         self.into()
@@ -217,17 +165,14 @@ impl Role {
         role_info(self).display_label
     }
 
-    /// Role description loaded from embedded prompt files.
+    /// Role description, loaded from the embedded prompt files.
     #[must_use]
     pub fn role_description(&self) -> String {
         crate::prompt::load_prompt(&format!("role/{}.md", self.as_str()))
     }
 
-    /// Role description for this role, widened for the admin's Assistant.
-    ///
-    /// Only the Assistant has a separate description when the triggering
-    /// account is the admin; every other role returns its canonical
-    /// [`Role::role_description`] regardless of `is_admin`.
+    /// Role description widened for the admin's Assistant: only the Assistant has a separate one
+    /// when the triggering account is the admin; every other role ignores `is_admin`.
     #[must_use]
     pub fn role_description_for(&self, is_admin: bool) -> String {
         if *self == Role::Assistant && is_admin {
@@ -241,9 +186,9 @@ impl Role {
         }
     }
 
-    /// The admin Assistant's note about the `say` tool, spliced into
-    /// `role/assistant_admin.md` where the tool exists: a platform without the
-    /// speech engine offers neither the tool nor the sentence.
+    /// The admin Assistant's note about the `say` tool, spliced into `role/assistant_admin.md`
+    /// where the tool exists: a platform without the speech engine offers neither the tool nor the
+    /// sentence.
     fn say_tool_note() -> String {
         if cfg!(target_os = "macos") {
             crate::prompt::load_prompt("role/assistant_admin_say.md")
@@ -252,12 +197,12 @@ impl Role {
         }
     }
 
-    /// Discovery prompt for this role, loaded from embedded prompt files.
+    /// Discovery prompt, loaded from the embedded prompt files.
     ///
     /// # Panics
-    /// Panics if the role does not have a discovery prompt (see
-    /// [`RoleInfo::has_discovery`]) — callers must check `has_discovery`
-    /// before calling this method or use a role that is known to have one.
+    ///
+    /// Panics if the role has no discovery prompt (see [`RoleInfo::has_discovery`]) — check it
+    /// first.
     #[must_use]
     pub fn discovery_prompt(&self) -> String {
         let info = role_info(self);
@@ -268,26 +213,22 @@ impl Role {
         }
     }
 
-    /// Conversation compaction prompt for this role, loaded from
-    /// `src/prompt/summarize/{role}.md`.
+    /// Conversation compaction prompt for this role, from `src/prompt/summarize/{role}.md`.
     #[must_use]
     pub fn summary_prompt(&self) -> String {
         crate::prompt::load_prompt(&format!("summarize/{}.md", self.as_str()))
     }
 
-    /// The roles that hold a long-lived, owner-facing session: the admin's and a
-    /// guest's Assistant, each project's Manager, and a custom role. Unlike the
-    /// pipeline roles, whose session ends with its phase, these are meant to be
-    /// continued — the roles granted `sleep`, and the ones whose over-limit
-    /// sessions compact in the pause after a reply rather than at the next
+    /// The roles that hold a long-lived, owner-facing session: the admin's and a guest's Assistant,
+    /// each project's Manager, and a custom role. Unlike the pipeline roles, whose session ends
+    /// with its phase, these are meant to be continued — the roles granted `sleep`, and the ones
+    /// whose over-limit sessions compact in the pause after a reply rather than at the next
     /// message.
     #[must_use]
     pub(crate) const fn is_long_lived_chat(self) -> bool {
         matches!(self, Role::Assistant | Role::Manager | Role::Custom)
     }
 }
-
-// ── Tool set factory ──────────────────────────────────────────────────────
 
 use crate::Tool;
 use crate::Workspace;
@@ -304,18 +245,16 @@ use crate::tools::{
     UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchTool, WorkspaceTool,
 };
 
-/// Tools in the admin Assistant's set that a custom role is never offered or
-/// built: the `computer` surface and the `say` voice are the administrator's
-/// Assistant's alone. A stored entry naming one stays on the record and builds
-/// nothing.
+/// Tools in the admin Assistant's set that a custom role is never offered or built: the `computer`
+/// surface and the `say` voice are the administrator's Assistant's alone. A stored entry naming one
+/// stays on the record and builds nothing.
 const CUSTOM_ROLE_WITHHELD_TOOLS: &[&str] = &["computer", "say"];
 
 impl Role {
-    /// Core read/search tools — plus the shell in `shell` mode when one is
-    /// requested — for the inspector roles (Analyst, QA, Reviewer, Discovery,
-    /// Maintainer). None of them may mutate the workspace, so none gets `edit`;
-    /// they differ only in the shell mode, and an Analyst in a guest's personal
-    /// workspace loses the shell entirely (see [`Self::analyst_shell_allowed`]).
+    /// Core read/search tools — plus the shell in `shell` mode when one is requested — for the
+    /// inspector roles (Analyst, QA, Reviewer, Discovery, Maintainer). None of them may mutate the
+    /// workspace, so none gets `edit`; they differ only in the shell mode, and a guest's Analyst
+    /// loses the shell entirely.
     fn inspector_core_tools(shell: Option<ShellMode>) -> Vec<Box<dyn Tool>> {
         let mut tools: Vec<Box<dyn Tool>> =
             vec![Box::new(ReadTool::general()), Box::new(SearchTool)];
@@ -325,18 +264,14 @@ impl Role {
         tools
     }
 
-    /// Whether an Analyst running in `ws` keeps its read-only shell.
-    ///
-    /// Analysts are built with no identity of their own (an empty user name and
-    /// `is_admin = false`), so the workspace they inherit from the summoning
-    /// session is the only carrier of who called — and it is re-read from
-    /// durable state on every construction, so the rule holds across restarts.
-    /// A guest's Assistant is pinned to `personal:<user>`, so its analysts
-    /// must lose the shell: that shell has no reading restriction and would be
-    /// a direct route into the admin's `shared` folder the per-user grants
-    /// exist to gate. Anything else — a managed workspace (the pipeline's own
-    /// analysts), or the admin's own personal workspace — keeps it; an
-    /// unrecognised `personal:` name falls to the stricter side.
+    /// Whether an Analyst running in `ws` keeps its read-only shell. Analysts are built with no
+    /// identity of their own (empty user name, `is_admin = false`), so the inherited workspace is
+    /// the only carrier of who called — and it is re-read from durable state on every construction,
+    /// so the rule holds across restarts. A guest's Assistant is pinned to `personal:<user>`, so
+    /// its analysts must lose the shell: that shell has no reading restriction and would be a
+    /// direct route into the admin's `shared` folder. Anything else (a managed workspace, the
+    /// admin's own personal workspace) keeps it; an unrecognised `personal:` name falls to the
+    /// stricter side.
     fn analyst_shell_allowed(ws: &Workspace) -> bool {
         match crate::users::personal_user_name(&ws.name) {
             Some(user) => crate::users::is_admin_name(user),
@@ -344,8 +279,6 @@ impl Role {
         }
     }
 
-    /// Core full-shell/read/edit/search tools for the build roles
-    /// (Engineer, Worker).
     fn full_core_tools() -> Vec<Box<dyn Tool>> {
         vec![
             Box::new(ShellTool::new(ShellMode::Full)),
@@ -355,30 +288,20 @@ impl Role {
         ]
     }
 
-    /// The Assistant's static core tool set: the admin's own set minus
-    /// `web_search` ([`Role::tools`] appends that afterwards), plus the
-    /// guest-only `archive`.
-    ///
-    /// `is_admin` widens the set exactly as it does for the Assistant: the
-    /// admin-only shell / send / computer / config
-    /// / pipeline / voice tools, whose access level and `analyze` flavour also
-    /// follow it. It narrows it in one place — `archive`, which exists only
-    /// because a guest has no shell.
-    ///
-    /// A custom role's derivation ([`Self::custom_role_tools`]) starts from this
-    /// same set minus [`CUSTOM_ROLE_WITHHELD_TOOLS`].
+    /// The Assistant's static core tool set: the admin's own minus `web_search` ([`Role::tools`]
+    /// appends that afterwards), plus the guest-only `archive`. `is_admin` widens it with the
+    /// admin-only shell, send, computer, config, pipeline and voice tools, and narrows it in one
+    /// place — `archive`, which exists only because a guest has no shell. A custom role's
+    /// derivation starts from this set minus [`CUSTOM_ROLE_WITHHELD_TOOLS`].
     fn assistant_core_tools(is_admin: bool) -> Vec<Box<dyn Tool>> {
-        // The optional `place` argument belongs to the admin's Assistant: a
-        // guest's round always runs in its own workspace, and a custom role's
-        // dispatch tools are rebuilt from its own grants
-        // ([`Role::custom_role_tools`]), never taken from this set.
+        // The optional `place` argument belongs to the admin's Assistant: a guest's round always
+        // runs in its own workspace, and a custom role's dispatch tools come from its own grants.
         let analyze = if is_admin {
             AnalyzeTool::admin(Role::Assistant)
         } else {
             AnalyzeTool::new(DispatchMode::Async, Role::Assistant)
         };
-        // The admin's Assistant reaches the machine; a guest's is
-        // confined to its own workspace (see `PathAccess`).
+        // The admin's Assistant reaches the machine; a guest's is confined to its own workspace.
         let file_access = if is_admin {
             PathAccess::Unrestricted
         } else {
@@ -392,74 +315,56 @@ impl Role {
             Box::new(EditTool::new(file_access)),
             Box::new(SearchTool),
             Box::new(SleepTool),
-            // Media tools serve every Assistant alike: the media
-            // models they use resolve per-user, so no access-level
-            // gate applies.
+            // Media tools serve every Assistant alike: the models they use resolve per-user.
             Box::new(ImageGenTool),
             Box::new(VideoGenTool),
             Box::new(VideoEditTool),
-            // Likewise, the rasterizing action serves every account: it reads the
-            // file — and every resource a drawing refers to — under the caller's
-            // own access, and writes into that caller's workspace.
+            // The rasterizer serves every account: it reads the file and its resources under the
+            // caller's own access and writes into that caller's workspace.
             Box::new(RasterizeTool::new(file_access)),
-            // Likewise, the document tool serves every account: an agent's
-            // own call keeps its outputs inside that agent's workspace, and
-            // its input paths follow the caller's access.
+            // Likewise the document tool: outputs stay in the agent's workspace, input paths follow
+            // the access.
             Box::new(DocumentTool::new(file_access)),
-            // Likewise, the video action serves every account: the composition
-            // is read and the output written under the caller's own access.
             Box::new(HyperframesTool::new(file_access)),
         ];
-        // A guest's Assistant has no shell, so moving a stale file out of the
-        // way needs a tool of its own; the admin's has a shell and gets none.
+        // A guest's Assistant has no shell, so moving a stale file aside needs a tool of its own.
         if !is_admin {
             t.push(Box::new(ArchiveTool));
         }
-        // The grant-gated forwarding tool: every Assistant can call
-        // admin-authored scripts; the grant (or admin rights) decides
-        // what each call may reach.
+        // The grant-gated forwarding tool: the grant (or admin rights) decides what each call may
+        // reach.
         t.push(Box::new(CustomTool));
-        // A guest's Assistant read access is workspace-bounded; the
-        // admin's reaches any path the shell could name. (An agent's own
-        // media call writes only into the workspace's generated/ tree in
-        // both cases.)
+        // A guest's read access is workspace-bounded; the admin's reaches any path the shell could
+        // name.
         t.push(Box::new(ReadTool::new(file_access)));
         if is_admin {
             t.push(Box::new(ShellTool::new(ShellMode::Full)));
-            // The worker and the branch surface, the Manager/custom-role
-            // addressees, and the one-way handover to a guest's own assistant
-            // (the one address no other holder has) — one tool, chosen per call.
+            // The worker and branch surface, the Manager/custom-role addressees, and the one-way
+            // handover to a guest's own assistant — one tool, chosen per call.
             t.push(Box::new(SendTool::admin(Role::Assistant)));
-            // The admin's session is a trusted local session, so the
-            // Assistant can also observe/act on the local GUI directly.
-            // No structural authorization gate beyond `is_admin`, matching
-            // the full shell widening; on macOS the three privacy grants
-            // belong to the terminal the daemon runs from and are requested
-            // per call (see `tools/computer/macos.rs`). A custom role is never
-            // offered it ([`CUSTOM_ROLE_WITHHELD_TOOLS`]).
+            // The admin's session is a trusted local one, so the Assistant may also observe/act on
+            // the local GUI. No authorization gate beyond `is_admin`, matching the full shell
+            // widening; on macOS the privacy grants belong to the terminal the daemon runs from and
+            // are requested per call. A custom role is never offered it.
             t.push(Box::new(ComputerTool));
-            // The admin config surface: the merged `mahbot_config`
-            // setup tool and the read-only DB query tool. The admin's
-            // Assistant is now the single user-facing role, so these
-            // migrated over from the removed Support role.
+            // The admin config surface: the merged `mahbot_config` setup tool and the read-only DB
+            // query tool.
             t.push(Box::new(MahbotConfigTool));
             t.push(Box::new(MahbotDebugTool));
-            // The admin's own project view: list / add / board / ticket /
-            // comment / pause / resume over the managed workspaces.
+            // The admin's own project view: list / add / board / ticket / comment / pause / resume.
             t.push(Box::new(WorkspaceTool));
-            // The voice: one short phrase spoken aloud on this machine, asked
-            // for by the admin's own Assistant. A custom role is never offered
-            // it ([`CUSTOM_ROLE_WITHHELD_TOOLS`]), and a platform without the
-            // speech engine has no tool to build at all.
+            // The voice: one short phrase spoken aloud, for the admin's own Assistant only — a
+            // custom role is never offered it, and a platform without the speech engine builds no
+            // tool at all.
             #[cfg(target_os = "macos")]
             t.push(Box::new(SayTool));
         }
         t
     }
 
-    /// The admin Assistant's own set as a custom role sees it: the same list
-    /// minus [`CUSTOM_ROLE_WITHHELD_TOOLS`]. Both the catalogue and the built
-    /// tool set start here, so neither can offer or build a withheld tool.
+    /// The admin Assistant's own set as a custom role sees it: the same list minus
+    /// [`CUSTOM_ROLE_WITHHELD_TOOLS`], so neither the catalogue nor the built set can offer a
+    /// withheld tool.
     fn custom_role_base_tools() -> Vec<Box<dyn Tool>> {
         Self::assistant_core_tools(true)
             .into_iter()
@@ -467,25 +372,15 @@ impl Role {
             .collect()
     }
 
-    /// Build the tool set for this role.
-    ///
-    /// Ticket tools are bound to `ws` at construction time — all their
-    /// operations are confined to that workspace, except that the archive
-    /// search spans the installation and `get_ticket` opens a prefixed ID
-    /// from any workspace.
-    ///
-    /// `is_admin` says whether the triggering account is the admin. It widens
-    /// the Assistant's toolset with `shell`, `send`,
-    /// `computer`, `mahbot_config`, `mahbot_debug`, `workspace` and (on macOS)
-    /// `say`, and removes the guest-only `archive`.
-    /// Every other role's toolset is byte-identical regardless of its value.
-    /// `computer` is offered on the platforms that have the capability
-    /// (Linux, macOS and Windows), `say` only where the speech engine lives
-    /// (macOS); [`Tool::is_advertised`] decides the rest.
-    ///
-    /// `chrome_sessions` is the run-scoped tracker shared with the agent's
-    /// `ChromeTool`: every session the run opens is handed to the run-end
-    /// release queue (see `crate::agent::RunEndCleanup`).
+    /// Build the tool set for this role. Ticket tools are bound to `ws` at construction — every
+    /// operation is confined to it, except that the archive search spans the installation and
+    /// `get_ticket` opens a prefixed ID from any workspace. `is_admin` widens the Assistant's set
+    /// with `shell`, `send`, `computer`, `mahbot_config`, `mahbot_debug`, `workspace` and (on
+    /// macOS) `say`, and removes the guest-only `archive`; every other role's set is byte-identical
+    /// whatever its value. `computer` is offered where the platform can serve it and `say` where
+    /// the speech engine lives — [`Tool::is_advertised`] decides the rest. `chrome_sessions` is the
+    /// run-scoped tracker shared with the agent's `ChromeTool`, so every session the run opens is
+    /// handed to the run-end release queue.
     #[must_use]
     pub(crate) fn tools(
         self,
@@ -513,9 +408,8 @@ impl Role {
                     Box::new(AddCommentTool::new(ws)),
                     Box::new(SearchArchivedTicketsTool),
                     Box::new(AnalyzeTool::new(DispatchMode::Async, Role::Manager)),
-                    // The Manager often has nothing to say until a ticket
-                    // advances or an async analysis lands — sleep
-                    // ends the turn instead of a premature/no-op reply.
+                    // The Manager often has nothing to say until a ticket advances or an async
+                    // analysis lands.
                     Box::new(SleepTool),
                 ]
             }
@@ -526,22 +420,17 @@ impl Role {
                 t
             }
             Role::Worker => Self::full_core_tools(),
-            // QA runs the build roles' unrestricted shell so it can start the
-            // product or its service and observe it while it runs. The mode is
-            // the only thing it shares with them: no `edit`, and the
-            // no-mutation rule lives in `prompt/role/qa.md`.
+            // QA runs the build roles' unrestricted shell so it can start the product and observe
+            // it. The mode is the only thing it shares with them: no `edit`, and the no-mutation
+            // rule lives in `role/qa.md`.
             Role::Qa => Self::inspector_core_tools(Some(ShellMode::Full)),
             Role::Reviewer | Role::Discovery => {
                 Self::inspector_core_tools(Some(ShellMode::ReadOnly))
             }
             Role::Sanitation => {
-                // Sanitation deliberately has NO search tools (local `search`
-                // or `web_search`): the role inspects and cleans specific
-                // filesystem artifacts and never needs to index the temp tree
-                // or hit the web — for the periodic temp cleaner a
-                // `search` over the whole temp folder would index junk and
-                // start filesystem watchers. Read + read-only shell cover
-                // inspection and temp-root mutation.
+                // Sanitation deliberately has NO search tools: it inspects and cleans specific
+                // filesystem artifacts, and a `search` over the temp tree would index junk and
+                // start watchers.
                 vec![
                     Box::new(ReadTool::general()),
                     Box::new(ShellTool::new(ShellMode::ReadOnly)),
@@ -557,18 +446,14 @@ impl Role {
                 t
             }
             Role::Assistant => Self::assistant_core_tools(is_admin),
-            // A custom role's tools come from its own record — the
-            // administrator's chosen subset of this static Assistant set minus
-            // [`CUSTOM_ROLE_WITHHELD_TOOLS`] ([`Role::custom_role_tools`],
-            // catalogued by [`Role::custom_role_tool_catalog`]) — so the static
-            // factory has none for it. The agent is built from the record at
-            // launch, never from here.
+            // A custom role's tools come from its own record — the chosen subset of the static
+            // Assistant set minus [`CUSTOM_ROLE_WITHHELD_TOOLS`] — so the static factory has none
+            // for it.
             Role::Custom => Vec::new(),
         };
 
-        // `Role::Custom` is excluded alongside the two above: it has no static
-        // tool set at all, and `web_search` is appended per record by
-        // [`Self::custom_role_tools`], never here.
+        // `Role::Custom` is excluded alongside the two above: it has no static set at all, and
+        // `web_search` is appended per record by [`Self::custom_role_tools`].
         if !matches!(self, Role::Manager | Role::Sanitation | Role::Custom) {
             Self::add_web_search_tool(&mut tools);
         }
@@ -576,41 +461,29 @@ impl Role {
         tools
     }
 
-    /// The tool set of a custom role: the subset of the admin Assistant's core
-    /// tools (at the admin's own strength, minus [`CUSTOM_ROLE_WITHHELD_TOOLS`])
-    /// named by the role's record, plus the configured `web_search` and the
-    /// granted dispatch tools with their kinds.
-    ///
-    /// Each stored entry is `"tool"` (its narrowest kind) or `"tool:kind1,kind2"`
-    /// (see [`crate::tools::grants`]). The two dispatch tools (`analyze`, `send`)
-    /// are never taken from the static admin set — they are rebuilt from the
-    /// grants so a role gets exactly its granted depths/addressees.
-    ///
-    /// The read is lenient ([`crate::tools::grants::parse_lossy`]): a stored
-    /// entry the grammar refuses drops itself alone, so it cannot cost the role
-    /// the rest of its tool set.
-    ///
-    /// A chosen tool the installation cannot serve right now (a platform-gated
-    /// or configuration-dependent tool) is simply absent from the built list —
-    /// the record keeps the choice, and the launch carries on with what it can
-    /// serve. A stored entry naming a withheld tool is the same: it stays on the
-    /// record and builds nothing. The caller applies `is_advertised()` to the
-    /// result (as [`crate::agent::role_tools_and_specs`] does for every role).
+    /// The tool set of a custom role: the subset of the admin Assistant's core tools (at the
+    /// admin's own strength, minus [`CUSTOM_ROLE_WITHHELD_TOOLS`]) named by the record, plus the
+    /// configured `web_search` and the granted dispatch tools with their kinds. Each entry is
+    /// `"tool"` (its narrowest kind) or `"tool:kind1,kind2"`. `analyze` and `send` are never taken
+    /// from the static set — they are rebuilt from the grants so a role gets exactly its granted
+    /// depths and addressees. The read is lenient: an entry the grammar refuses drops itself alone.
+    /// A tool the installation cannot serve right now is simply absent (the record keeps the
+    /// choice), as is an entry naming a withheld tool. The caller applies `is_advertised()` to the
+    /// result.
     #[must_use]
     pub(crate) fn custom_role_tools(entries: &[String]) -> Vec<Box<dyn Tool>> {
-        // One unparsable stored entry drops itself alone, never the record's
-        // whole tool set.
+        // One unparsable stored entry drops itself alone, never the record's whole tool set.
         let grants = crate::tools::grants::parse_lossy(entries);
         let granted: Vec<&str> = grants.iter().map(|grant| grant.tool.as_str()).collect();
         let mut tools: Vec<Box<dyn Tool>> = Self::custom_role_base_tools()
             .into_iter()
-            // The dispatch tools are rebuilt from their grants below, never taken
-            // from the static admin set (the grants carry the kinds).
+            // The dispatch tools are rebuilt from their grants below, never taken from the static
+            // admin set.
             .filter(|tool| crate::tools::grants::kinds_of(tool.name()).is_none())
             .filter(|tool| granted.contains(&tool.name()))
             .collect();
-        // `web_search` is not part of the static admin set, and its presence
-        // depends on the configured provider.
+        // `web_search` is not part of the static set, and its presence depends on the configured
+        // provider.
         if granted.contains(&"web_search") {
             Self::add_web_search_tool(&mut tools);
         }
@@ -640,12 +513,10 @@ impl Role {
         tools
     }
 
-    /// The catalog a custom role's tool subset is chosen from: the admin
-    /// Assistant's static core tool names minus [`CUSTOM_ROLE_WITHHELD_TOOLS`],
-    /// plus `"web_search"` — offered even before a provider is configured, so a
-    /// role keeps its choice across a provider change. This is the list the
-    /// settings picker shows and [`crate::custom_role::validate_tools_against`]
-    /// accepts.
+    /// The catalog a custom role's subset is chosen from: the admin Assistant's static core tool
+    /// names minus [`CUSTOM_ROLE_WITHHELD_TOOLS`], plus `"web_search"` — offered even before a
+    /// provider is configured, so a role keeps its choice across a provider change. This is what
+    /// the settings picker shows and [`crate::custom_role::validate_tools_against`] accepts.
     #[must_use]
     pub(crate) fn custom_role_tool_catalog() -> Vec<&'static str> {
         let mut names: Vec<&'static str> = Self::custom_role_base_tools()
@@ -658,16 +529,11 @@ impl Role {
         names
     }
 
-    /// Appends a web search tool for the configured providers.
-    ///
-    /// At most one web search tool is registered. An explicit provider choice
-    /// is honoured even when the other key is configured; with no choice, text
-    /// goes to DeepSeek and pictures to Exa when that key exists. A key missing
-    /// for the chosen capability means no tool is added.
-    /// The caller is responsible for skipping this for Manager (who is
-    /// expected to delegate web searches to analysts via [`AnalyzeTool`])
-    /// and Sanitation (whose toolset is deliberately search-free — see
-    /// [`Role::tools`]).
+    /// Append a web search tool for the configured providers; at most one is registered. An
+    /// explicit provider choice is honoured even when the other key is configured; with no choice,
+    /// text goes to DeepSeek and pictures to Exa when that key exists. A key missing for the chosen
+    /// capability adds no tool. The caller skips this for Manager (which delegates searches to
+    /// analysts) and Sanitation (search-free by design).
     fn add_web_search_tool(tools: &mut Vec<Box<dyn Tool>>) {
         let provider = CONFIG.web_search_provider();
         let tool = WebSearchTool::from_config(
@@ -685,16 +551,14 @@ impl Role {
 mod tests {
     use super::*;
 
-    /// Run-scoped chrome session tracker for toolset tests — the caller-visible
-    /// per-run tracker is never used here (these tests never open a browser).
+    /// Run-scoped chrome session tracker for toolset tests — these tests never open a browser.
     fn test_sessions() -> std::sync::Arc<crate::tools::chrome::ChromeRunSessions> {
         std::sync::Arc::new(crate::tools::chrome::ChromeRunSessions::default())
     }
 
-    /// Every [`RoleInfo`] field a struct update can silently leave at its
-    /// sentinel is set: a visible `badge_fg` (never the base `(0,0,0)`) and a
-    /// non-empty `display_label`. The label a role must not render as its own
-    /// snake_case name is pinned explicitly for QA.
+    /// Every [`RoleInfo`] field a struct update can silently leave at its sentinel is set: a
+    /// visible `badge_fg` (never the base `(0,0,0)`) and a non-empty `display_label`, pinned for
+    /// QA's spelling.
     #[test]
     fn role_info_sentinels_are_all_set() {
         for role in Role::iter() {
@@ -718,10 +582,9 @@ mod tests {
         );
     }
 
-    /// A custom role's tools are exactly the chosen subset of the admin
-    /// Assistant's own set minus computer use: a servable name builds, a name the
-    /// installation cannot serve is simply absent (the record keeps it), and
-    /// `sleep` is part of what a role may choose.
+    /// A custom role's tools are exactly the chosen subset of the admin set minus computer use: a
+    /// servable name builds, an unservable one is simply absent (the record keeps it), and `sleep`
+    /// is choosable.
     #[test]
     fn custom_role_tools_are_the_chosen_subset_of_the_admin_set() {
         let catalog = Role::custom_role_tool_catalog();
@@ -729,8 +592,8 @@ mod tests {
             catalog.contains(&"sleep"),
             "sleep must be selectable — it is how a role ends a quiet turn"
         );
-        // The catalogue loses exactly the withheld tools; every other tool of
-        // the admin's own set stays choosable.
+        // The catalogue loses exactly the withheld tools; every other tool of the admin's set
+        // stays.
         let mut expected: Vec<&str> = Role::assistant_core_tools(true)
             .iter()
             .map(|tool| tool.name())
@@ -751,8 +614,7 @@ mod tests {
             "nothing outside the catalog may be built: {built:?}"
         );
         for name in &catalog {
-            // `web_search` is offered before a provider is configured and is
-            // built only once one is — every other name always builds.
+            // `web_search` is offered before a provider is configured and builds only once one is.
             if *name == "web_search" {
                 continue;
             }
@@ -769,9 +631,8 @@ mod tests {
         assert_eq!(chosen_names, vec!["read", "sleep"]);
         assert!(Role::custom_role_tools(&[]).is_empty());
 
-        // Computer use stays with the administrator's Assistant: the catalogue
-        // never offers it, and a stored grant naming it keeps the record intact
-        // while building nothing.
+        // Computer use stays with the administrator's Assistant: the record keeps the grant,
+        // nothing builds.
         assert!(
             !catalog.contains(&"computer"),
             "computer use must not be offered to a custom role"
@@ -794,9 +655,8 @@ mod tests {
         );
     }
 
-    /// A granted dispatch tool is built with exactly the kinds its entry names,
-    /// declared and required: a kind the holder does not have is absent from its
-    /// interface, and a one-kind holder still states its choice.
+    /// A granted dispatch tool is built with exactly the kinds its entry names: a kind the holder
+    /// does not have is absent from its interface, and a one-kind holder still states its choice.
     #[test]
     fn granted_dispatch_tools_offer_exactly_the_granted_kinds() {
         let granted = |entries: &[&str]| {
@@ -877,15 +737,13 @@ mod tests {
 
     #[test]
     fn all_roles_have_tools() {
-        // Guards against an empty Vec in Role::tools() — the compiler catches
-        // missing arms in the match, but cannot catch an arm that returns
-        // vec![]. Every role needs at least one tool to function, and every
-        // advertised tool must build its spec: `spec()` loads
-        // `src/prompt/tool/{name}.md`, so a misnamed description asset panics
-        // here instead of at the first agent run.
+        // Guards against an empty Vec in `Role::tools()` — the compiler catches missing arms but
+        // not one returning `vec![]`. Every role needs a tool, and every advertised tool must build
+        // its spec: `spec()` loads `src/prompt/tool/{name}.md`, so a misnamed asset panics here
+        // instead of at the first agent run.
         for role in Role::iter() {
-            // A custom role's tool set is per-record, never static
-            // (`Role::custom_role_tools`); the static factory has none for it.
+            // A custom role's tool set is per-record, never static; the static factory has none for
+            // it.
             if role == Role::Custom {
                 continue;
             }
@@ -910,9 +768,8 @@ mod tests {
     #[test]
     #[serial_test::serial(config_persist)] // swaps the process-global CONFIG
     fn sanitation_toolset_is_read_and_shell_only() {
-        // Acceptance pin: the Sanitation role advertises NO
-        // search tools — even with web search configured — exactly read +
-        // read-only shell.
+        // Acceptance pin: the Sanitation role advertises NO search tools — even with web search
+        // configured.
         let snapshot = crate::config::CONFIG.snapshot();
         crate::config::CONFIG.swap(crate::config::ConfigData::STRUCT_FIELDS_DEFAULT);
         let _ = crate::config::CONFIG.set_string_field("web_search_provider", "exa");
@@ -933,11 +790,10 @@ mod tests {
     #[test]
     #[serial_test::serial(config_persist)] // swaps the process-global CONFIG
     fn qa_toolset_is_the_build_shell_without_edit() {
-        // Acceptance pin: QA verifies runtime behaviour by starting the product
-        // or its service, so it runs the engineer/worker shell (Full mode,
-        // background included) — but it must not change the workspace, so it
-        // gets no `edit`. The prohibition itself is prompt text
-        // (`prompt/role/qa.md`), not a tool restriction.
+        // Acceptance pin: QA verifies runtime behaviour by starting the product, so it runs the
+        // worker shell (Full mode, background included) — but it must not change the workspace, so
+        // it gets no `edit`. The prohibition itself is prompt text (`prompt/role/qa.md`), not a
+        // tool restriction.
         let snapshot = crate::config::CONFIG.snapshot();
         crate::config::CONFIG.swap(crate::config::ConfigData::STRUCT_FIELDS_DEFAULT);
         let ws = crate::workspace::test_ws("test");
@@ -971,10 +827,9 @@ mod tests {
 
     #[test]
     fn manager_has_quick_analyze_and_no_send() {
-        // Acceptance pin: the Manager's single delegation path is a `quick`
-        // `analyze` — a deep analysis and every `send` addressee belong to the
-        // admin's Assistant. The Manager's analyze declares no `depth` choice
-        // (it holds only `quick`) and no `place`.
+        // Acceptance pin: the Manager's single delegation path is a `quick` `analyze` — a deep
+        // analysis and every `send` addressee belong to the admin's Assistant. Its analyze declares
+        // no `depth` choice and no `place`.
         let tools =
             crate::Role::Manager.tools(&crate::workspace::test_ws("test"), false, test_sessions());
         let analyze = tools
@@ -998,10 +853,9 @@ mod tests {
 
     #[test]
     fn assistant_toolset_gates_admin_tools() {
-        // The Assistant toolset must differ by whether the triggering account
-        // is the admin: a guest's Assistant has no shell/send/computer, the
-        // admin's does. A guest gets the workspace-only
-        // read access; the admin's reaches the machine.
+        // The Assistant toolset must differ by whether the triggering account is the admin: a
+        // guest's has no shell/send/computer, the admin's does. A guest gets workspace-only read
+        // access; the admin's reaches the machine.
         let ws = crate::workspace::test_ws("test");
         let guest = crate::Role::Assistant.tools(&ws, false, test_sessions());
         let admin = crate::Role::Assistant.tools(&ws, true, test_sessions());
@@ -1017,8 +871,7 @@ mod tests {
                 "the admin's Assistant toolset must contain '{name}'"
             );
         }
-        // `archive` is the guest's alone: the admin's Assistant moves files with
-        // its shell, so a tool for it would be redundant.
+        // `archive` is the guest's alone: the admin's Assistant moves files with its shell.
         assert!(
             guest.iter().any(|t| t.name() == "archive"),
             "a guest's Assistant needs `archive`: it has no shell to move a file out of the way"
@@ -1027,10 +880,9 @@ mod tests {
             !admin.iter().any(|t| t.name() == "archive"),
             "the admin's Assistant must not advertise `archive` — its shell already moves files"
         );
-        // The read boundary is what the model is told — the tool's own
-        // description, not a restatement in its parameter schema: a guest
-        // (restricted) only reaches the personal workspace; the admin's names
-        // the machine and what stays closed.
+        // The read boundary is what the model is told — the tool's own description, not a
+        // restatement in its parameter schema: a guest only reaches the personal workspace; the
+        // admin's names the machine and what stays closed.
         let guest_read = guest.iter().find(|t| t.name() == "read");
         let guest_read_desc = guest_read.map(|t| t.description()).unwrap_or_default();
         assert!(
@@ -1050,8 +902,8 @@ mod tests {
              refuses, got: {admin_read_desc}"
         );
 
-        // The write boundary likewise: the admin's edit names the two refusals,
-        // a guest's edit states the workspace boundary.
+        // The write boundary likewise: the admin's edit names the two refusals, a guest's states
+        // the workspace boundary.
         let admin_edit_desc = admin
             .iter()
             .find(|t| t.name() == "edit")
@@ -1083,9 +935,8 @@ mod tests {
             );
         }
 
-        // The optional `place` delegation argument is the admin's alone: the
-        // admin's `analyze` and `send` advertise it, the guest's `analyze`
-        // (the guest has no `send`) does not.
+        // The optional `place` delegation argument is the admin's alone: the admin's `analyze` and
+        // `send` advertise it, the guest's `analyze` (a guest has no `send`) does not.
         let advertises_place = |tools: &[Box<dyn Tool>], name: &str| {
             tools.iter().find(|t| t.name() == name).is_some_and(|t| {
                 t.parameters_schema()["properties"]
@@ -1107,11 +958,9 @@ mod tests {
         );
     }
 
-    /// One row per specially-restricted tool: it reaches exactly the roles the
-    /// row's predicate names and no other, admin Assistant included in "no
-    /// other". The predicate is the whole rule — the custom-role catalogue is a
-    /// separate derivation, pinned by
-    /// `custom_role_tools_are_the_chosen_subset_of_the_admin_set`.
+    /// One row per specially-restricted tool: it reaches exactly the roles the row's predicate
+    /// names and no other, the admin's Assistant included. The predicate is the whole rule — the
+    /// custom-role catalogue is a separate derivation with its own pin.
     #[test]
     fn restricted_tools_reach_only_the_roles_that_may_hold_them() {
         fn admin_assistant(role: crate::Role, is_admin: bool) -> bool {
@@ -1137,8 +986,8 @@ mod tests {
             ("document", any_assistant),
             ("sleep", assistant_or_manager),
         ];
-        // `cfg!`, not `#[cfg]`: the macOS-only row must not leave `rules`
-        // unmutated on the other targets, where that is a denied lint.
+        // `cfg!`, not `#[cfg]`: the macOS-only row must not leave `rules` unmutated elsewhere,
+        // which is a denied lint.
         if cfg!(target_os = "macos") {
             rules.push(("say", admin_assistant));
         }
@@ -1168,10 +1017,9 @@ mod tests {
 
     #[test]
     fn analyst_shell_follows_the_summoning_session() {
-        // The pipeline's own analysts (managed workspaces) and the owner
-        // admin's Assistant keep the read-only shell; every other user's
-        // Assistant summons shell-less analysts, including an unresolvable
-        // personal name (fail closed).
+        // The pipeline's own analysts (managed workspaces) and the owner admin's Assistant keep the
+        // read-only shell; every other user's Assistant summons shell-less analysts, an
+        // unresolvable name included.
         for name in ["proj", "personal:admin"] {
             let ws = crate::workspace::test_ws_named("/tmp/proj", name);
             let has = Role::Analyst
@@ -1191,7 +1039,6 @@ mod tests {
                 !names.contains(&"shell"),
                 "analysts in {name} must not get a shell, got {names:?}"
             );
-            // Everything else about them is unchanged.
             for expected in ["read", "search", "chrome"] {
                 assert!(names.contains(&expected), "{name} keeps {expected}");
             }
@@ -1200,10 +1047,9 @@ mod tests {
 
     #[test]
     fn manager_addressee_only_in_the_admin_assistants_send() {
-        // Acceptance pin: the Manager and custom-role addressees belong to the
-        // admin's Assistant's `send` (and any custom role it grants them to).
-        // The choice declaration names exactly the addressees the holder has, so
-        // manager+role being offered pins this surface.
+        // Acceptance pin: the Manager and custom-role addressees belong to the admin's Assistant's
+        // `send` (and to any custom role it grants them to), so the choice declaration names
+        // exactly the holder's addressees.
         let ws = crate::workspace::test_ws("test");
         for role in Role::iter() {
             for is_admin in [false, true] {
@@ -1241,9 +1087,8 @@ mod tests {
 
     #[test]
     fn assistant_role_descriptions_are_populated() {
-        // Both Assistant descriptions (a guest's + the admin's) must be
-        // non-empty, free of unsubstituted template keys, and carry the
-        // automation-notification marker.
+        // Both Assistant descriptions (a guest's and the admin's) must be non-empty, free of
+        // unsubstituted template keys, and carry the automation-notification marker.
         for is_admin in [false, true] {
             let desc = crate::Role::Assistant.role_description_for(is_admin);
             assert!(
@@ -1265,9 +1110,8 @@ mod tests {
     fn all_roles_have_role_description() {
         // Guards against an empty or unsubstituted role description file.
         for role in Role::iter() {
-            // A custom role has no compiled `role/custom.md`: its system prompt
-            // is assembled at launch from the administrator's record, so only
-            // the built-in roles carry a description asset.
+            // A custom role has no compiled `role/custom.md`: only the built-in roles carry a
+            // description asset.
             if role == Role::Custom {
                 continue;
             }
@@ -1287,10 +1131,9 @@ mod tests {
 
     #[test]
     fn all_roles_have_summary_prompt() {
-        // Guards against an empty or unsubstituted summary prompt file, and
-        // against a role losing the no-tools / summary-only instruction the
-        // summarisation request depends on (its tool set is sent, so the
-        // model must be told not to use it).
+        // Guards against an empty or unsubstituted summary prompt, and against a role losing the
+        // no-tools / summary-only instruction the summarisation request depends on (its tool set is
+        // sent, so the model must be told not to use it).
         for role in Role::iter() {
             let prompt = role.summary_prompt();
             assert!(

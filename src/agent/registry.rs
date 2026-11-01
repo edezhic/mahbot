@@ -1,20 +1,13 @@
-//! Global registry of running agents with cancellation support.
-//!
-//! Also tracks in-flight non-agent (single-shot utility) LLM calls —
-//! consolidation, research-orchestration passes, joint-verdict synthesis.
-//! These register here on start and remove themselves on completion via a RAII
-//! guard. Calls originating inside an agent run (the agent loop, verdict
-//! extraction, summarization) never register; agents are tracked separately in
-//! [`AGENT_REGISTRY`], and in-agent utility LLM calls (e.g. media
-//! transcription) surface on the agent's card as an activity label via
-//! [`AgentRegistry::activity_started`]. The call tracking is purely
-//! observational — it carries no cancellation semantics and never affects
-//! call behavior, retries, or results.
-//!
-//! Every mutation that changes the live view (agent/call lifecycle, activity
-//! instrumentation) publishes
-//! [`RuntimeEvent::Registries`](crate::runtime_events::RuntimeEvent::Registries)
-//! so the GUI re-renders — see the per-method broadcast points below.
+//! Global registry of running agents with cancellation support. Also tracks in-flight non-agent
+//! (single-shot utility) LLM calls — consolidation, research-orchestration passes, joint-verdict
+//! synthesis — which register here on start and remove themselves through a RAII guard. Calls
+//! originating inside an agent run never register; agents are tracked separately in
+//! [`AGENT_REGISTRY`], and in-agent utility calls surface on the agent's card as an activity label
+//! ([`AgentRegistry::activity_started`]). The call tracking is purely observational — no
+//! cancellation semantics, no effect on behavior, retries or results. Every mutation that changes
+//! the live view publishes
+//! [`RuntimeEvent::Registries`](crate::runtime_events::RuntimeEvent::Registries) so the GUI
+//! re-renders.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -29,30 +22,26 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
-/// Monotonically increasing generation counter for registry entries.
-/// Used by [`deregister`](AgentRegistry::deregister) to detect stale entries
-/// — when a new agent is registered with the same `agent_id` (e.g. the Manager
-/// interrupt-and-resume pattern), the old entry's generation will not match
-/// the new entry, so `deregister` will not incorrectly remove the replacement.
+/// Monotonically increasing generation counter for registry entries, so
+/// [`deregister`](AgentRegistry::deregister) can detect stale entries: a new agent registered
+/// under the same `agent_id` (the Manager interrupt-and-resume pattern) leaves the old
+/// entry's generation unmatched, and the old entry cannot remove the replacement.
 static NEXT_ENTRY_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-/// Grouping key for the Running Agents live view: the DIRECT PARENT
-/// INVOCATION a running work item belongs to.
+/// Grouping key for the Running Agents live view: the DIRECT PARENT INVOCATION a running work
+/// item belongs to.
 ///
-/// - [`Ticket`](ParentKey::Ticket) — all agents working on the same ticket
-///   plus LLM calls belonging to the ticket's own work (e.g. the joint-verdict
-///   synthesis of a verification round).
-/// - [`AnalyzeRound`](ParentKey::AnalyzeRound) — the parallel analysts of one analyze
-///   round plus its consolidation LLM call (members share the round key).
-/// - [`Research`](ParentKey::Research) — all sub-agents and orchestrator LLM
-///   calls of one research run (members share the durable research job id).
-/// - [`Launch`](ParentKey::Launch) — one branch launch (a custom role's or a worker
-///   branch's), keyed by the launch's agent id (one launch is one conversation,
-///   so the id is the group key).
+/// - [`Ticket`](ParentKey::Ticket) — the agents on one ticket plus LLM calls belonging to its
+///   own work (the joint-verdict synthesis of a verification round).
+/// - [`AnalyzeRound`](ParentKey::AnalyzeRound) — the parallel analysts of one round plus its
+///   consolidation call (members share the round key).
+/// - [`Research`](ParentKey::Research) — sub-agents and orchestrator calls of one research
+///   run (members share the durable job id).
+/// - [`Launch`](ParentKey::Launch) — one branch launch, keyed by the launch's agent id (one
+///   launch is one conversation).
 ///
-/// `None` means the work item is a workspace singleton (manager / maintainer /
-/// discovery / direct chat) or — for non-agent calls — genuinely
-/// unattributable orchestrator work (workspace-scoped section).
+/// `None` means a workspace singleton (manager / maintainer / discovery / direct chat) or, for
+/// non-agent calls, genuinely unattributable orchestrator work.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 pub enum ParentKey {
     Ticket(String),
@@ -61,23 +50,15 @@ pub enum ParentKey {
     Launch(String),
 }
 
-/// One tool call in the GUI's session-ledger projection (`session_view`) —
-/// the payload of a ledger tool block, consumed by both the session ledger
-/// views and the Running Agents page (whose cards render ledger entries).
+/// One tool call in the GUI's session-ledger projection (`session_view`) — the payload of a
+/// ledger tool block, consumed by the session views and the Running Agents cards.
 ///
-/// `args` holds the tool's arguments as STRUCTURED key-value pairs with FULL,
-/// untruncated values, deliberately NOT credential-scrubbed: the Running
-/// Agents view shows exactly what the agent passed to the tool, including any
-/// secrets (the user wants complete visibility). This is a live-view-only
-/// divergence — durable logs (tool-call stats) and failure feedback remain
-/// scrubbed.
-///
-/// Pairs are derived from the JSON argument object at flattening/decode time
-/// (keys in the object's iteration order): string values are taken verbatim,
-/// nested objects/arrays/scalars are compact-JSON-stringified. Non-object
-/// arguments (bare strings/arrays/null) collapse to a single `("args", …)`
-/// pair. The row view truncates values at display time; the hover tooltip
-/// shows everything untruncated.
+/// `args` holds the arguments as STRUCTURED key-value pairs with FULL, untruncated values,
+/// deliberately NOT credential-scrubbed: the Running Agents view shows exactly what the agent
+/// passed, secrets included (the user wants complete visibility). A live-view-only
+/// divergence — durable logs and failure feedback remain scrubbed. Pairs come from the JSON
+/// argument object at decode time: strings verbatim, nested values compact-JSON-stringified,
+/// non-object arguments collapsed to a single `("args", …)` pair.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RunningTool {
     pub name: String,
@@ -85,9 +66,8 @@ pub(crate) struct RunningTool {
 }
 
 impl RunningTool {
-    /// Build a `RunningTool` from a decoded native-history tool call. This is
-    /// the flattening used by the GUI ledger projection (`session_view`):
-    /// full-unscrubbed argument pairs from the call's JSON arguments.
+    /// Build a `RunningTool` from a decoded native-history tool call: full-unscrubbed argument
+    /// pairs from the call's JSON arguments.
     pub(crate) fn from_tool_call(call: &crate::ToolCall) -> Self {
         Self {
             name: call.name.clone(),
@@ -102,55 +82,43 @@ pub struct AgentHandle {
     pub agent_id: String,
     pub role: String,
     pub ticket_id: Option<String>,
-    /// Filesystem path of the workspace (not the name) — intentionally
-    /// distinct from the workspace_name identifier. Not used for GUI display
-    /// (the GUI groups by `workspace_name`); the only reader is
-    /// [`cancel_by_role_and_workspace_path`](AgentRegistry::cancel_by_role_and_workspace_path),
-    /// which matches maintenance-disable cancellations against the path.
+    /// Filesystem path of the workspace (not the name) — distinct from `workspace_name`, and
+    /// not used for display: the only reader is
+    /// [`cancel_by_role_and_workspace_path`](AgentRegistry::cancel_by_role_and_workspace_path).
     pub workspace_path: String,
-    /// Workspace NAME — the identifier used by the board database and the
-    /// dashboard's workspace map. Displayed on Running Agents cards/group
-    /// headers and used for paused-state lookups.
+    /// Workspace NAME — the identifier the board database and the dashboard's workspace map
+    /// use. Displayed on cards and group headers, and used for paused-state lookups.
     pub workspace_name: String,
     /// Grouping key for the Running Agents view — see [`ParentKey`].
     pub parent_key: Option<ParentKey>,
-    /// Human-readable label for the DIRECT PARENT INVOCATION this agent
-    /// belongs to (ticket title / analyze question / research question) —
-    /// shown on the group header of the Running Agents view. `None` for
-    /// workspace singletons. Purely presentational; never affects pipeline
-    /// behavior.
+    /// Human-readable label for the DIRECT PARENT INVOCATION this agent belongs to (ticket
+    /// title / analyze question / research question), shown on the group header. `None` for
+    /// workspace singletons. Purely presentational.
     pub parent_label: Option<String>,
     pub started_at: DateTime<Utc>,
-    /// Registry generation for this agent run — used by the Running Agents
-    /// page to key expanded-state by (agent_id, generation) so a recycled
-    /// agent_id never inherits a stale expansion.
+    /// Registry generation for this run — the Running Agents page keys expanded state by
+    /// (agent_id, generation) so a recycled agent_id never inherits a stale expansion.
     pub generation: u64,
-    /// Live activity indicator for non-tool LLM phases inside this agent
-    /// (e.g. "extracting", "summarizing", "transcribing"), taken at `list()`
-    /// time. `None` between phases — the agent's card is the single tracker
-    /// for these calls (no separate registry rows are ever created for them).
+    /// Live activity indicator for non-tool LLM phases inside this agent (e.g. "extracting",
+    /// "transcribing"), taken at `list()` time. `None` between phases.
     pub activity: Option<String>,
-    /// Whether a workspace-pause freeze was signalled for this run
-    /// ([`AgentRegistry::cancel_by_workspace_pause`]), taken at `list()` time.
-    /// A frozen agent stops at its next LLM round boundary, so it is not
-    /// working: the Sessions page keeps its row in place instead of pinning it
-    /// to the top. Cleared on unpause (`clear_workspace_pause`).
+    /// Whether a workspace-pause freeze was signalled for this run, taken at `list()` time. A
+    /// frozen agent stops at its next LLM round boundary, so it is not working: the Sessions
+    /// page keeps its row in place instead of pinning it to the top.
     pub paused: bool,
 }
 
-/// Agent identity + registry generation propagated to tool execution via a
-/// task-local, so tool-internal LLM calls (e.g. media transcription in video
-/// tool results) can attribute themselves to the owning agent's card and
-/// telemetry. `None` outside an agent run (inbound enrichment, tests).
+/// Agent identity + registry generation propagated to tool execution via a task-local, so
+/// tool-internal LLM calls can attribute themselves to the owning agent's card and telemetry.
+/// `None` outside an agent run.
 #[derive(Clone, Debug)]
 pub(crate) struct AgentTracking {
     pub agent_id: String,
     pub generation: u64,
     pub role: String,
     pub workspace: String,
-    /// The ticket the run works on — empty when it has none. The log row's
-    /// ticket scope for a record that never travels through the agent's span
-    /// (see [`crate::logs::record_stray_event`]).
+    /// The ticket the run works on — empty when it has none. The log row's ticket scope for a
+    /// record that never travels through the agent's span.
     pub ticket: String,
 }
 
@@ -158,29 +126,21 @@ struct AgentEntry {
     generation: u64,
     handle: AgentHandle,
     cancel_token: CancellationToken,
-    /// The turn's urgent-message interrupt — see
-    /// [`AgentRegistry::interrupt`]. Fired, never removed: it dies with the
-    /// entry.
+    /// The turn's urgent-message interrupt (see [`AgentRegistry::interrupt`]). Fired, never
+    /// removed: it dies with the entry.
     interrupt_token: CancellationToken,
-    /// Whether a workspace-pause (strict freeze) cancellation was requested for
-    /// this agent. Set by [`AgentRegistry::cancel_by_workspace_pause`] when the
-    /// agent's workspace is paused — a FREEZE distinct from a code-driven
-    /// cancellation.
+    /// Whether a workspace-pause (strict freeze) cancellation was requested for this agent — a
+    /// FREEZE distinct from a code-driven cancellation.
     pause_stop: Arc<AtomicBool>,
-    /// Live activity label (e.g. "extracting", "transcribing") for the
-    /// non-tool LLM phase currently running inside this agent; `None` between
-    /// phases. Single slot: an agent runs sequentially, so at most one
-    /// activity can be live at a time. Snapshot into
+    /// Live activity label for the non-tool LLM phase currently running inside this agent;
+    /// `None` between phases. Single slot: an agent runs sequentially. Snapshot into
     /// [`AgentHandle::activity`] by `list()`.
     activity: Option<String>,
 }
 
-/// Flatten a tool's JSON arguments into structured key-value display pairs.
-///
-/// Object arguments become one pair per key (keys in the object's iteration
-/// order); anything else (bare strings, arrays, scalars, null) collapses to a
-/// single `("args", …)` pair. Values are full and unscrubbed — see
-/// [`RunningTool`].
+/// Flatten a tool's JSON arguments into structured key-value display pairs: object arguments
+/// become one pair per key (in iteration order), anything else collapses to a single
+/// `("args", …)` pair. Values are full and unscrubbed — see [`RunningTool`].
 fn tool_arg_pairs(args: &serde_json::Value) -> Vec<(String, String)> {
     match args {
         serde_json::Value::Object(map) => map
@@ -191,8 +151,8 @@ fn tool_arg_pairs(args: &serde_json::Value) -> Vec<(String, String)> {
     }
 }
 
-/// Render one JSON argument value as a display string: string values verbatim,
-/// everything else (nested objects/arrays/scalars) as compact JSON.
+/// Render one JSON argument value as a display string: strings verbatim, everything else as
+/// compact JSON.
 fn json_value_to_display_string(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
@@ -208,16 +168,10 @@ pub struct AgentRegistry {
 impl AgentRegistry {
     /// Register an agent entry and return the generation counter.
     ///
-    /// Used by [`crate::Agent::new`] where deregistration is handled by [`crate::Agent::drop`]
-    /// instead of a guard.
-    ///
-    /// `parent_label` is the human-readable label of the agent's DIRECT PARENT
-    /// INVOCATION (ticket title / analyze question / research question) for the
-    /// Running Agents group header — purely presentational.
-    ///
-    /// `interrupt_token` is the turn's urgent-message interrupt, stored so the
-    /// router can fire it by agent id without knowing the run (see
-    /// [`Self::interrupt`]).
+    /// Used by [`crate::Agent::new`], where deregistration is handled by [`crate::Agent::drop`]
+    /// instead of a guard. `parent_label` is the parent invocation's human-readable label, and
+    /// `interrupt_token` the turn's urgent-message interrupt, stored so the router can fire it
+    /// by agent id without knowing the run.
     #[expect(clippy::too_many_arguments)] // one positional arg per handle field; callers use literals
     pub fn register(
         &self,
@@ -246,8 +200,7 @@ impl AgentRegistry {
             paused: false,
         };
         let mut map = self.inner.lock().unwrap_poison();
-        // Replacing an old agent cancels the old token — the new agent is a
-        // re-dispatch/replacement.
+        // Replacing an old agent cancels the old token — the new agent is a replacement.
         if let Some(old) = map.remove(&agent_id) {
             old.cancel_token.cancel();
         }
@@ -266,13 +219,10 @@ impl AgentRegistry {
         generation
     }
 
-    /// Cut the turn an urgent user message interrupted: fire the interrupt of
-    /// the agent running under `agent_id`, if any. Not a cancellation: the token
-    /// is the turn's own (the agent's `interrupt_token`), so the run settles its
-    /// in-flight tool calls and finalizes its session. A turn that has already
-    /// concluded — or no run at all, which is also the instant before a
-    /// dispatched run registers itself — has nothing to cut, and the message is
-    /// answered by the next turn as usual.
+    /// Cut the turn an urgent user message interrupted: fire the interrupt of the agent
+    /// running under `agent_id`, if any. Not a cancellation — the token is the turn's own, so
+    /// the run settles its in-flight tool calls and finalizes its session. A concluded turn, or
+    /// no run at all, has nothing to cut.
     pub fn interrupt(&self, agent_id: &str) {
         let map = self.inner.lock().unwrap_poison();
         if let Some(entry) = map.get(agent_id) {
@@ -280,21 +230,13 @@ impl AgentRegistry {
         }
     }
 
-    /// Register a live activity label on a running agent's card (e.g.
-    /// "extracting" during a verdict extraction, "transcribing" during a
-    /// media-transcription LLM call inside a tool). Purely observational — no
-    /// cancellation semantics.
+    /// Register a live activity label on a running agent's card (e.g. "extracting",
+    /// "transcribing"). Purely observational — no cancellation semantics.
     ///
-    /// The returned guard clears the label on drop (RAII — guaranteed cleanup
-    /// on completion AND on failure, including early returns and task
-    /// cancellation). Generation-safety: the entry is only mutated when
-    /// `generation` matches the current entry — a stale guard from a
-    /// finished/restarted agent can never mutate a replacement agent's card.
-    ///
-    /// Single-slot semantics: an agent runs sequentially, so at most one
-    /// activity is live at a time; a second registration overwrites the label
-    /// and both guards clear on drop (the slot is `Option`-reset, not
-    /// reference-counted).
+    /// The returned guard clears the label on drop (guaranteed on completion, failure and task
+    /// cancellation). Generation-gated both ways: a stale guard can never mutate a replacement
+    /// agent's card. Single slot: a second registration overwrites the label, and both guards
+    /// clear on drop.
     pub(crate) fn activity_started(
         &self,
         agent_id: &str,
@@ -316,8 +258,8 @@ impl AgentRegistry {
         }
     }
 
-    /// Clear the entry's live activity label. No-op when the agent is gone or
-    /// the generation no longer matches (stale guard).
+    /// Clear the entry's live activity label. No-op when the agent is gone or the generation
+    /// no longer matches.
     fn activity_finished(&self, agent_id: &str, generation: u64) {
         let mut map = self.inner.lock().unwrap_poison();
         if let Some(entry) = map.get_mut(agent_id)
@@ -328,13 +270,10 @@ impl AgentRegistry {
         }
     }
 
-    /// Cancel a specific agent by agent_id. Removes it from the registry.
-    ///
-    /// Prefer [`cancel_by_ticket_id`](AgentRegistry::cancel_by_ticket_id) or
-    /// [`cancel_by_role_and_workspace_path`](AgentRegistry::cancel_by_role_and_workspace_path)
-    /// — those match on a stable predicate, whereas this method bypasses the
-    /// generation-based safety check that guards against stale `agent_id`
-    /// references.
+    /// Cancel a specific agent by agent_id, removing it from the registry. Prefer
+    /// [`cancel_by_ticket_id`](AgentRegistry::cancel_by_ticket_id) or
+    /// [`cancel_by_role_and_workspace_path`](AgentRegistry::cancel_by_role_and_workspace_path):
+    /// those match on a stable predicate, while this bypasses the generation safety check.
     fn cancel(&self, agent_id: &str) {
         let mut map = self.inner.lock().unwrap_poison();
         if let Some(entry) = map.remove(agent_id) {
@@ -345,14 +284,11 @@ impl AgentRegistry {
 
     /// Cancel all agents matching a predicate.
     ///
-    /// The lock is dropped **before** calling [`cancel`](AgentRegistry::cancel) on each matched
-    /// agent ID to avoid deadlock — `cancel` acquires the same lock internally.
-    ///
     /// # Lock-ordering invariant
     ///
-    /// The predicate is evaluated while the lock is held, then the lock is released
-    /// and cancellation proceeds without it. This is the only safe ordering — any
-    /// future `cancel_by_*` method MUST follow this pattern or risk deadlock.
+    /// The predicate is evaluated while the lock is held, then the lock is released and
+    /// cancellation proceeds without it — `cancel` acquires the same lock. Any future
+    /// `cancel_by_*` method MUST follow this pattern or risk deadlock.
     fn cancel_matching<F>(&self, predicate: F)
     where
         F: Fn(&AgentEntry) -> bool,
@@ -369,26 +305,20 @@ impl AgentRegistry {
         }
     }
 
-    /// Cancel all agents running for a specific `ticket_id`.
-    /// Used on ticket phase transitions — stops any agent currently working on it.
+    /// Cancel all agents running for a `ticket_id` — used on ticket phase transitions.
     pub fn cancel_by_ticket_id(&self, ticket_id: &str) {
         self.cancel_matching(|entry| entry.handle.ticket_id.as_deref() == Some(ticket_id));
     }
 
-    /// Cancel all agents running for a `workspace_name` as a workspace-pause
-    /// (strict freeze): sets the pause-stop flag on each matched agent WITHOUT
-    /// firing its cancel token, so the agent's current round finishes normally
-    /// and it stops cooperatively at the next LLM round boundary. Distinct from
-    /// [`Self::cancel_by_ticket_id`], a plain code-driven cancellation.
-    /// The pause flag lets the failure classifier treat a frozen run as a
-    /// FREEZE (leave the ticket in place for unpause), not a failure and not a
-    /// cancellation.
+    /// Cancel all agents running for a `workspace_name` as a workspace-pause (strict freeze):
+    /// sets the pause-stop flag on each matched agent WITHOUT firing its cancel token, so its
+    /// current round finishes and it stops cooperatively at the next LLM round boundary. The
+    /// flag lets the failure classifier treat a frozen run as a FREEZE (leave the ticket for
+    /// unpause), not a failure or a cancellation.
     ///
-    /// Scoped to TICKET-parented pipeline agents (engineer, the verification
-    /// round's reviewers and tester, analysts, sanitation) — the managers,
-    /// maintainers, and on-demand analyze/research sub-agents (all
-    /// `ticket_id = None`) are intentionally left running so a pause only halts
-    /// the ticket pipeline.
+    /// Scoped to TICKET-parented pipeline agents — managers, maintainers and on-demand
+    /// analyze/research sub-agents (`ticket_id = None`) keep running, so a pause only halts the
+    /// ticket pipeline.
     pub fn cancel_by_workspace_pause(&self, workspace_name: &str) {
         let mut changed = false;
         {
@@ -400,19 +330,16 @@ impl AgentRegistry {
                 }
             }
         }
-        // No cancel token fired: the pause is cooperative — each agent stops at
-        // the next LLM round boundary (see the llm_loop round-top check). The
-        // publish is what lets a live view show the freeze (the registry's
+        // No cancel token fired: the pause is cooperative — each agent stops at the next LLM
+        // round boundary. The publish is what lets a live view show the freeze (the registry's
         // membership did not change).
         if changed {
             publish(RuntimeEvent::Registries);
         }
     }
 
-    /// Clear the cooperative pause-stop flag for every agent in a workspace.
-    /// Called on unpause so an agent that was mid-round when the pause fired
-    /// (and had not yet reached the LLM round boundary) does not bail "frozen"
-    /// at a boundary after the workspace has resumed.
+    /// Clear the cooperative pause-stop flag for every agent in a workspace, so an agent that
+    /// was mid-round when the pause fired does not bail "frozen" after the resume.
     pub fn clear_workspace_pause(&self, workspace_name: &str) {
         let mut changed = false;
         {
@@ -428,24 +355,19 @@ impl AgentRegistry {
         }
     }
 
-    /// Cancel all agents running for a specific role within a specific workspace path.
-    /// Used when maintenance is disabled for a workspace — stops the in-flight maintainer agent.
+    /// Cancel all agents running for a specific role within a specific workspace path — used
+    /// when maintenance is disabled for a workspace.
     pub fn cancel_by_role_and_workspace_path(&self, role: &str, ws_path: &str) {
         self.cancel_matching(|entry| {
             entry.handle.role == role && entry.handle.workspace_path == ws_path
         });
     }
 
-    /// Cancel every agent belonging to a direct parent invocation (ticket /
-    /// analyze round / research run) as a group. Used by the manual-cancel paths
-    /// — the GUI's research stop (analysts, verifier, worker and the cleanup
-    /// agent share the run's [`ParentKey::Research`]) and the analyze tool's
-    /// cancel action (the round's analysts and verification analysts share its
-    /// [`ParentKey::AnalyzeRound`]).
+    /// Cancel every agent belonging to a direct parent invocation (ticket / analyze round /
+    /// research run) as a group — the GUI's research stop and the analyze tool's cancel action.
     ///
     /// Follows the lock-ordering invariant documented on
-    /// [`cancel_matching`](AgentRegistry::cancel_matching): the predicate runs
-    /// under the lock, cancellation outside it.
+    /// [`cancel_matching`](AgentRegistry::cancel_matching).
     pub fn cancel_by_parent_key(&self, parent: &ParentKey) {
         let parent = parent.clone();
         self.cancel_matching(move |entry| entry.handle.parent_key.as_ref() == Some(&parent));
@@ -467,12 +389,8 @@ impl AgentRegistry {
             .collect()
     }
 
-    /// The worker or custom-role agent working in `folder` right now, other
-    /// than `caller` (an agent id) — the roles that edit a folder's tree; a
-    /// worker branch is a [`crate::Role::Worker`] and counts like any other
-    /// worker.
-    ///
-    /// Path equality is component-based, so a managed workspace's stored
+    /// The worker or custom-role agent working in `folder` right now, other than `caller` —
+    /// the roles that edit a folder's tree. Path equality is component-based, so a stored
     /// trailing separator is not a different folder.
     #[must_use]
     pub fn worker_in_folder(&self, folder: &Path, caller: Option<&str>) -> Option<AgentHandle> {
@@ -504,8 +422,8 @@ impl AgentRegistry {
         }
     }
 
-    /// Remove a registry entry only if its generation still matches.
-    /// Used by [`crate::Agent::drop`] to safely deregister without stale-removal risk.
+    /// Remove a registry entry only if its generation still matches — [`crate::Agent::drop`]
+    /// deregisters through this.
     pub fn deregister(&self, agent_id: &str, generation: u64) {
         let mut map = self.inner.lock().unwrap_poison();
         if let Some(entry) = map.get(agent_id)
@@ -517,11 +435,8 @@ impl AgentRegistry {
     }
 }
 
-/// RAII guard: clears the agent's live activity label on drop.
-///
-/// Creation is generation-gated; removal is generation-gated the same way — a
-/// stale guard from a finished/restarted agent can never clear the
-/// replacement agent's card.
+/// RAII guard: clears the agent's live activity label on drop. Creation and removal are both
+/// generation-gated, so a stale guard can never clear the replacement agent's card.
 pub(crate) struct ActivityGuard {
     agent_id: String,
     generation: u64,
@@ -536,33 +451,27 @@ impl Drop for ActivityGuard {
 /// Global static registry.
 pub static AGENT_REGISTRY: LazyLock<AgentRegistry> = LazyLock::new(AgentRegistry::default);
 
-/// Monotonically increasing entry id — lets each guard remove exactly its own
-/// entry on drop, regardless of drop order.
+/// Monotonically increasing entry id — each guard removes exactly its own entry on drop,
+/// regardless of drop order.
 static NEXT_ENTRY_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Public snapshot of one in-flight call — serializable, no internals exposed.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct NonAgentCallHandle {
-    /// Call kind — the same purpose string the call's `ChatRequestMeta` uses
-    /// (e.g. `"consolidate"`, `"synthesis"`, `"gap_extract"`,
-    /// `"research_wrap_up"`, `"media_transcription"`).
+    /// Call kind — the same purpose string the call's `ChatRequestMeta` uses (e.g.
+    /// `"consolidate"`, `"synthesis"`, `"media_transcription"`).
     pub kind: &'static str,
     pub workspace: String,
     pub started_at: DateTime<Utc>,
-    /// Grouping key for the Running Agents view — the DIRECT PARENT
-    /// INVOCATION this call belongs to (ticket / analyze round / research run).
-    /// `None` means the call is genuinely unattributable (workspace-scoped
-    /// section with a visually distinct marker).
+    /// Grouping key for the Running Agents view. `None` means the call is genuinely
+    /// unattributable (workspace-scoped section with a distinct marker).
     pub parent_key: Option<ParentKey>,
-    /// Human-readable label for the DIRECT PARENT INVOCATION this call
-    /// belongs to (ticket title / analyze question / research question) —
-    /// shown on the group header of the Running Agents view. Purely
-    /// presentational; never affects call behavior.
+    /// Human-readable label for the DIRECT PARENT INVOCATION this call belongs to, shown on
+    /// the group header. Purely presentational.
     pub parent_label: Option<String>,
-    /// True when this entry is a whole-operation lifetime guard (the research
-    /// orchestrator holds one guard for the entire run) — such entries render
-    /// inside their research group as a run-lifetime indicator, not as a
-    /// transient LLM-call card.
+    /// True when this entry is a whole-operation lifetime guard (the research orchestrator
+    /// holds one for the entire run): it renders inside its group as a run-lifetime indicator,
+    /// not as a transient LLM-call card.
     pub run_lifetime: bool,
 }
 
@@ -572,18 +481,12 @@ pub(crate) struct NonAgentCallRegistry {
 }
 
 impl NonAgentCallRegistry {
-    /// Register an in-flight non-agent LLM call and return the RAII guard
-    /// that removes it on drop — cleanup is guaranteed on completion and on
-    /// failure (including early returns and task cancellation).
+    /// Register an in-flight non-agent LLM call and return the RAII guard that removes it on
+    /// drop — cleanup is guaranteed on completion, failure and task cancellation.
     ///
-    /// `parent` attaches the call to its DIRECT PARENT INVOCATION for the
-    /// Running Agents grouping (ticket / analyze round / research run); `None`
-    /// makes the call render in the workspace-scoped unattributable section.
-    /// `parent_label` is the human-readable label of that parent invocation
-    /// (ticket title / analyze question / research question) — purely
-    /// presentational. `run_lifetime` marks whole-operation lifetime guards
-    /// (research orchestrator) that render as a run-lifetime indicator, not a
-    /// transient call card.
+    /// `parent` attaches the call to its DIRECT PARENT INVOCATION for the grouping (`None`
+    /// renders in the unattributable section), `parent_label` is that invocation's label, and
+    /// `run_lifetime` marks whole-operation guards (research orchestrator).
     pub fn register(
         &'static self,
         kind: &'static str,
@@ -619,11 +522,9 @@ impl NonAgentCallRegistry {
             .collect()
     }
 
-    /// Remove every in-flight call belonging to a direct parent invocation
-    /// (ticket / analyze round / research run). Purely observational — the
-    /// RAII guards' drops become no-ops. Used by the manual-cancel paths so the
-    /// group disappears from Running Agents immediately instead of lingering
-    /// until its task returns (which can be minutes mid-LLM-call).
+    /// Remove every in-flight call belonging to a direct parent invocation. Purely
+    /// observational — the guards' drops become no-ops. Used by the manual-cancel paths so the
+    /// group disappears immediately instead of lingering until its task returns.
     pub fn remove_by_parent_key(&self, parent: &ParentKey) {
         let parent = parent.clone();
         let mut map = self.inner.lock().unwrap_poison();
@@ -634,10 +535,8 @@ impl NonAgentCallRegistry {
         }
     }
 
-    /// Remove a single in-flight call by id. Internal — the guard drop's sole
-    /// removal point, so a guard that already lost its entry to
-    /// [`Self::remove_by_parent_key`] is a no-op (and never re-broadcasts a
-    /// removal the bulk path already published).
+    /// Remove a single in-flight call by id — the guard drop's sole removal point, so a guard
+    /// whose entry already went with [`Self::remove_by_parent_key`] is a no-op.
     fn remove_one(&self, id: u64) {
         let removed = self.inner.lock().unwrap_poison().remove(&id).is_some();
         if removed {
@@ -663,15 +562,12 @@ impl Drop for NonAgentCallGuard {
 pub(crate) static NON_AGENT_CALLS: LazyLock<NonAgentCallRegistry> =
     LazyLock::new(NonAgentCallRegistry::default);
 
-/// Static human-readable label for a non-agent call kind — the single source
-/// of truth for every place a raw kind string would otherwise surface
-/// (Running Agents call rows, the footer zap tooltip).
+/// Static human-readable label for a non-agent call kind — the single source of truth for
+/// every place a raw kind string would otherwise surface.
 ///
-/// The mapping is deliberately EXHAUSTIVE over every kind the codebase
-/// registers today; unknown/future kinds fall back to a generic label so a
-/// raw snake_case name can never leak onto the page. The fallback is
-/// `"Other LLM work"` — the same wording used for the unattributed
-/// workspace-scoped section, so a future kind reads as generic pipeline work.
+/// The mapping is deliberately EXHAUSTIVE over every kind registered today; unknown kinds fall
+/// back to `"Other LLM work"`, the same wording as the unattributed section, so a raw
+/// snake_case name can never leak onto the page.
 #[must_use]
 pub(crate) fn call_kind_label(kind: &str) -> &'static str {
     match kind {
@@ -695,9 +591,8 @@ pub(crate) fn call_kind_label(kind: &str) -> &'static str {
 mod tests {
     use super::*;
 
-    /// Register a bare agent in the GLOBAL registry and return its generation
-    /// counter. Each test uses a unique agent_id (via [`crate::generate_suffix`]),
-    /// so concurrent tests never collide on shared state.
+    /// Register a bare agent in the GLOBAL registry and return its generation counter. Each
+    /// test uses a unique agent_id (via [`crate::generate_suffix`]).
     fn register_test_agent(agent_id: &str, ws_path: &str) -> u64 {
         let ws = crate::Workspace {
             name: agent_id.to_string(),
@@ -751,13 +646,10 @@ mod tests {
     fn stale_activity_guard_cannot_clear_replacement_agent() {
         let agent_id = format!("activity_stale_{}", crate::generate_suffix());
         let generation = register_test_agent(&agent_id, "/tmp/ws");
-        // An activity starts, then the agent is deregistered (finished/restarted).
         let stale_guard = AGENT_REGISTRY.activity_started(&agent_id, generation, "extracting");
         AGENT_REGISTRY.deregister(&agent_id, generation);
-        // Replacement registers with a NEW generation and starts its own activity.
         let new_gen = register_test_agent(&agent_id, "/tmp/ws");
         let fresh_guard = AGENT_REGISTRY.activity_started(&agent_id, new_gen, "transcribing");
-        // Stale guard drops — must NOT clear the replacement's activity.
         drop(stale_guard);
         let handles = AGENT_REGISTRY.list();
         let h = handles
@@ -818,8 +710,7 @@ mod tests {
 
     #[test]
     fn cancel_by_parent_key_cancels_matching_agents_only() {
-        // Two agents of runA + one agent of runB — a group cancel of runA must
-        // fire exactly the runA tokens and leave runB untouched.
+        // Two agents of runA + one of runB — a group cancel of runA fires exactly the runA tokens.
         let a1 = format!("cancel_parent_a1_{}", crate::generate_suffix());
         let a2 = format!("cancel_parent_a2_{}", crate::generate_suffix());
         let b1 = format!("cancel_parent_b1_{}", crate::generate_suffix());
@@ -847,8 +738,7 @@ mod tests {
 
         AGENT_REGISTRY.cancel_by_parent_key(&ParentKey::Research("runA".to_string()));
 
-        // runA agents are gone from the registry (cancel removes the entry);
-        // runB survives.
+        // runA agents are gone from the registry (cancel removes the entry); runB survives.
         assert!(
             !AGENT_REGISTRY.contains(&a1) && !AGENT_REGISTRY.contains(&a2),
             "runA agents cancelled (entry removed)"
@@ -900,19 +790,15 @@ mod tests {
             "a cut is not a cancellation of the agent"
         );
 
-        // A turn that has already concluded — or never registered — has nothing
-        // to cut, and saying so is not an error.
+        // A concluded or never-registered turn has nothing to cut, and saying so is not an error.
         AGENT_REGISTRY.deregister(&agent_id, generation);
         AGENT_REGISTRY.interrupt(&agent_id);
     }
 
     #[test]
     fn register_carries_parent_key_and_run_lifetime() {
-        // Unique test-only kinds: `NON_AGENT_CALLS` is a process-global shared
-        // by parallel tests (analyze consolidation and research orchestration
-        // register the literal "consolidate"/"research_orchestrator" kinds),
-        // so a non-unique kind would make this test flakily observe another
-        // test's live registration and fail its post-drop emptiness assertion.
+        // Unique test-only kinds: `NON_AGENT_CALLS` is a process-global shared by parallel
+        // tests, so a non-unique kind would let this test observe another test's live registration.
         let kind: &'static str = "registry_test_consolidate_kind";
         let guard = NON_AGENT_CALLS.register(
             kind,
@@ -921,8 +807,7 @@ mod tests {
             false,
             Some("Why is CI flaky?".to_string()),
         );
-        // The run-lifetime flag is a distinct registration mode (whole-run
-        // orchestrator guards); both must round-trip through the same path.
+        // The run-lifetime flag is a distinct registration mode; both round-trip the same path.
         let orchestrator: &'static str = "registry_test_orchestrator_kind";
         let orchestrator_guard = NON_AGENT_CALLS.register(
             orchestrator,
@@ -966,8 +851,7 @@ mod tests {
 
     #[test]
     fn remove_by_parent_key_removes_matching_calls_only() {
-        // Two calls of runA + one call of runB — removing runA must drop its
-        // calls from the live list and leave runB's call visible.
+        // Two calls of runA + one of runB — removing runA leaves runB's call visible.
         let run_a1 = NON_AGENT_CALLS.register(
             "consolidate",
             "ws1",
@@ -1005,8 +889,8 @@ mod tests {
                 .any(|h| h.parent_key == Some(ParentKey::Research("runB".to_string()))),
             "runB call still visible"
         );
-        // The guards' drops are now no-ops (their entries are already gone) —
-        // dropping them must not panic and must not disturb anything else.
+        // The guards' drops are now no-ops — they must not panic and must not disturb
+        // anything else.
         drop(run_a1);
         drop(run_a2);
         drop(run_b);

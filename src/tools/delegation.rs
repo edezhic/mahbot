@@ -1,23 +1,19 @@
-//! The optional `place` argument of the two dispatch tools (`analyze` and
-//! `send`): a holder that declares it — the admin Assistant, and a custom role
-//! whose grants rebuild the tool — can point a round at a chosen directory
-//! instead of its own workspace.
+//! The optional `place` argument of the two dispatch tools (`analyze` and `send`): a holder that
+//! declares it — the admin Assistant, and a custom role whose grants rebuild the tool — can point
+//! a round at a chosen directory instead of its own workspace.
 //!
-//! Resolution is exact and every refusal is explicit — a place that resolves
-//! to nothing usable never falls back to the caller's own workspace. A value is
-//! either a managed workspace named exactly (case-sensitively) or an absolute
-//! existing directory; an absolute path that IS a managed workspace is that
-//! workspace, with its identity and its stored context, never a bare directory.
+//! Resolution is exact and every refusal is explicit — a place that resolves to nothing usable
+//! never falls back to the caller's own workspace. A value is either a managed workspace named
+//! exactly (case-sensitively) or an absolute existing directory; an absolute path that IS a
+//! managed workspace is that workspace, with its identity and stored context.
 //!
-//! The resolved directory becomes the round's EXECUTION workspace (the
-//! sub-agents' root, context and search key) while the round's durable delivery
-//! key stays the caller's own workspace name (`jobs.workspace_name`), so the
-//! result always lands in the conversation that asked.
+//! The resolved directory becomes the round's EXECUTION workspace (the sub-agents' root, context
+//! and search key) while its durable delivery key stays the caller's own workspace name
+//! (`jobs.workspace_name`), so the result lands in the conversation that asked.
 //!
-//! A worker round additionally refuses a managed workspace, anything inside
-//! one, the filesystem root and the product's own data directory: a ticket-less
-//! worker must never write into a tree whose workspace pipeline owns it. These
-//! are guardrails, not a security boundary — the worker's shell is unchanged.
+//! A worker round additionally refuses a managed workspace, anything inside one, the filesystem
+//! root and the product's own data directory: a ticket-less worker must never write into a tree
+//! whose workspace pipeline owns it. Guardrails, not a security boundary — the shell is unchanged.
 
 use crate::Workspace;
 use anyhow::{Context as _, Result, bail};
@@ -25,30 +21,22 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
 
-/// Which delegation tool is resolving a place — the two differ in what they
-/// refuse.
+/// Which delegation tool is resolving a place — the two differ in what they refuse.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum DelegationKind {
-    /// The read-only analyst round: a managed workspace and a plain
-    /// directory are both legitimate places.
+    /// The read-only analyst round: a managed workspace and a plain directory.
     Analyze,
-    /// The worker round: refuses managed workspaces (and anything inside
-    /// them) and the product's own data directory.
+    /// The worker round: refuses managed workspaces (and anything inside one).
     Worker,
 }
 
-/// The managed workspace occupying exactly `dir` — "this path IS that
-/// workspace, with its identity and its stored context". `Path` equality is
-/// component-based, so it tolerates the trailing separator a managed
-/// workspace's `workspaces.path` carries.
+/// The managed workspace occupying exactly `dir` — "this path IS that workspace".
 fn managed_at(managed: &[Workspace], dir: &Path) -> Option<Workspace> {
     managed.iter().find(|ws| dir == ws.as_path()).cloned()
 }
 
-/// Resolve a `place` that must address a managed workspace — by its exact
-/// managed name or by its own folder. Any other folder (a personal
-/// workspace included) is refused: the Manager exists only for managed
-/// workspaces.
+/// Resolve a `place` that must address a managed workspace — by its exact name, or the directory
+/// that is it.
 pub(crate) async fn resolve_managed_workspace(raw: &str) -> Result<Workspace> {
     let raw = raw.trim();
     if !raw.is_empty() {
@@ -73,18 +61,13 @@ fn refuse_not_managed(raw: &str) -> anyhow::Error {
 }
 
 /// Resolve the optional `place` argument into the workspace the round runs in.
-///
-/// `Ok(None)` means no place — the round runs in the caller's own workspace
-/// exactly as before; an empty or whitespace-only value counts as no place.
-/// Everything else is decided here and now, before anything is dispatched.
 pub(crate) async fn resolve(kind: DelegationKind, args: &Value) -> Result<Option<Workspace>> {
     let raw = super::get_opt_str_strict(args, "place")?.map(str::trim);
     let Some(raw) = raw.filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
 
-    // A value that is not an absolute path can only be a managed workspace
-    // name: managed names are letters and underscores, never a path.
+    // A value that is not an absolute path can only be a managed workspace name.
     let expanded = crate::util::expand_tilde(raw);
     if !expanded.is_absolute() {
         let Some(ws) = crate::workspace::get_by_name(raw).await? else {
@@ -114,20 +97,14 @@ pub(crate) async fn resolve(kind: DelegationKind, args: &Value) -> Result<Option
         }
         return Ok(Some(dir_workspace(&dir)));
     }
-    // The analyst may be pointed at a managed workspace: it then carries
-    // that workspace's identity and stored context, never a bare directory.
+    // The analyst may be pointed at a managed workspace: it then carries that workspace's context.
     match exact {
         Some(ws) => Ok(Some(ws)),
         None => Ok(Some(dir_workspace(&dir))),
     }
 }
 
-/// The execution workspace for a directory recorded on a round that already
-/// started (`jobs.exec_dir`): the managed workspace at that path when one
-/// exists now, else a directory-scoped synthetic one. `Err` when the directory
-/// is gone or unusable — that failure ends the resumed round instead of leaving
-/// it hanging. A recorded directory is never re-refused: the refusals are the
-/// dispatch-time guardrail.
+/// The execution workspace for a directory recorded on a round that already resolved one.
 pub(crate) async fn workspace_at_dir(dir: &str) -> Result<Workspace> {
     let path = Path::new(dir);
     let (_, is_dir) = path_state(path);
@@ -141,10 +118,7 @@ pub(crate) async fn workspace_at_dir(dir: &str) -> Result<Workspace> {
     }
 }
 
-/// Every stored `workspaces` row — nothing else in the product looks a
-/// workspace up by its path, so the path-identity rules read the (small) table
-/// here. Unlike [`crate::users::managed_workspaces`], a legacy `personal:` row
-/// is not filtered out.
+/// Every stored `workspaces` row — nothing else in the product looks at these.
 async fn stored_workspaces() -> Result<Vec<Workspace>> {
     crate::workspace::store()
         .list()
@@ -152,8 +126,7 @@ async fn stored_workspaces() -> Result<Vec<Workspace>> {
         .context("list managed workspaces")
 }
 
-/// Canonicalize an existing directory place, refusing the filesystem root (it
-/// is not a project directory, and every path would count as inside it).
+/// Canonicalize an existing directory place, refusing the filesystem root.
 fn canonical_dir(raw: &str, expanded: &Path) -> Result<PathBuf> {
     let (exists, is_dir) = path_state(expanded);
     if !exists {
@@ -169,9 +142,7 @@ fn canonical_dir(raw: &str, expanded: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-/// A place path's metadata, off the async worker pool (`with_block_in_place`
-/// per the util's convention for fast blocking syscalls in async callers):
-/// whether it exists and whether it is a directory.
+/// A place path's metadata, off the async worker pool (`with_block_in_place`).
 fn path_state(path: &Path) -> (bool, bool) {
     crate::util::with_block_in_place(|| (path.exists(), path.is_dir()))
 }
@@ -196,16 +167,12 @@ fn refuse_root(raw: &str) -> anyhow::Error {
     )
 }
 
-/// The product's own data directory when `dir` lies inside it OUTSIDE the
-/// personal workspaces — a personal workspace directory is a legitimate
-/// place, the `userspaces` container itself is not.
+/// The product's own data directory when `dir` lies inside it OUTSIDE the personal workspaces —
+/// a personal workspace directory is a legitimate place, the `userspaces` container itself is not.
 ///
-/// The storage root is only the containment base: it is derived as the personal
-/// root's parent, so the fallback rule lives in exactly one place
-/// ([`crate::users::userspaces_root`]), and the refusal message still names it.
-/// It is spelled canonically like `dir` (macOS puts the temp root behind the
-/// `/var` → `/private/var` symlink), independently of whether the personal root
-/// itself exists yet.
+/// The storage root is only the containment base: it is derived as the personal root's parent, so
+/// the rule lives in one place ([`crate::users::userspaces_root`]). It is spelled canonically
+/// like `dir`, independently of whether the personal root itself exists yet.
 fn data_dir(dir: &Path) -> Option<PathBuf> {
     let personal = crate::stored_workspace_path(&crate::users::userspaces_root());
     let root = crate::stored_workspace_path(personal.parent()?);
@@ -215,18 +182,15 @@ fn data_dir(dir: &Path) -> Option<PathBuf> {
     crate::util::is_within(dir, &root).then_some(root)
 }
 
-/// Drop the search engine a delegated round created for its synthetic `dir-…`
-/// workspace: its lifetime is bounded by the run that served it, exactly like a
-/// research run root — a one-off directory must never keep a picker and a file
-/// watcher alive forever. A round in a managed workspace's folder uses that
-/// workspace's own engine and is left alone.
+/// Drop the search engine a delegated round created for its synthetic `dir-…` workspace: its
+/// lifetime is bounded by the run that served it, exactly like a research run root — a one-off
+/// directory must never keep a picker and a file watcher alive forever. A round in a managed
+/// workspace's folder uses that workspace's engine and is left alone.
 ///
-/// Accepted trade-off: two rounds placed in the same directory share one
-/// `dir-…` name, so releasing while another such round is still running only
-/// costs that round a picker re-scan on its next search — never a wrong result.
-/// A round cut by drain keeps its engine for the resume that reuses it; a cancel
-/// of that round releases it, even after the directory itself is gone — see
-/// [`release_placed_engine`].
+/// Accepted trade-off: two rounds placed in the same directory share one `dir-…` name, so
+/// releasing while another is still running only costs it a picker re-scan — never a wrong
+/// result. A round cut by drain keeps its engine for the resume that reuses it; a cancel of that
+/// round releases it ([`release_placed_engine`]).
 pub(crate) fn release_exec_engine(exec: &Workspace) {
     if !exec.name.starts_with(DIR_WORKSPACE_PREFIX)
         || !crate::workspace_index::registry_initialized()
@@ -236,34 +200,28 @@ pub(crate) fn release_exec_engine(exec: &Workspace) {
     crate::workspace_index::remove_engine(&exec.name);
 }
 
-/// Release the search engine a round placed in `dir` created, named by the
-/// directory alone: the synthetic name is a pure function of the canonical path,
-/// so this reaches the engine even when the directory is no longer there — which
-/// is exactly the state a cancel can leave (its rows are gone too, so the round's
-/// own exit never runs and nothing else will release it). A managed workspace's
-/// engine is not touched: the derivation only ever names a `dir-…` workspace, and
-/// a name nothing handed an engine releases nothing.
+/// Release the search engine a round placed in `dir` created, named by the directory alone: the
+/// synthetic name is a pure function of the canonical path, so this reaches the engine even when
+/// the directory is gone — the state a cancel leaves. A managed workspace's engine is not
+/// touched: the derivation only ever names a `dir-…` workspace.
 pub(crate) fn release_placed_engine(dir: &str) {
     let canonical = crate::stored_workspace_path(Path::new(dir));
     release_exec_engine(&dir_workspace(&canonical));
 }
 
-/// The name prefix of a directory-scoped synthetic workspace — impossible in a
-/// managed name (`validate_name` allows only letters and underscores), so it
-/// identifies one unambiguously.
+/// The name prefix of a directory-scoped synthetic workspace — impossible in a managed
+/// workspace name.
 const DIR_WORKSPACE_PREFIX: &str = "dir-";
 
-/// A directory-scoped execution workspace for a delegation round placed in a
-/// folder. The name is `dir-<basename>-<hash of the canonical path>`: the
-/// embedded `-` is impossible in a managed workspace name (`validate_name`
-/// allows only letters and underscores), so a name-keyed surface — the
-/// per-workspace search index above all — can never hand this directory a
-/// managed workspace's state, and the path hash keeps two directories apart.
-/// The derivation is deterministic, so a resumed round re-derives the same
-/// agent/session/search identity.
+/// A directory-scoped execution workspace for a delegation round placed in a folder:
+/// `dir-<basename>-<hash of the canonical path>`. The embedded `-` is impossible in a managed
+/// workspace name (`validate_name` allows only letters and underscores), so a name-keyed surface
+/// — the per-workspace search index above all — can never hand this directory a managed
+/// workspace's state, and the path hash keeps two directories apart. Deterministic, so a resumed
+/// round re-derives the same agent/session/search identity.
 ///
-/// The short key is only ever an in-memory execution identity, bounded by the
-/// round that created it — never a durable launch address.
+/// The short key is only ever an in-memory execution identity, bounded by the round that created
+/// it — never a durable launch address.
 fn dir_workspace(canonical: &Path) -> Workspace {
     let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
     let hash = crate::util::hex_string(&digest[..6]);
@@ -324,15 +282,12 @@ mod tests {
     use crate::util::test::{create_test_workspace, init_management_test_stores, test_root};
     use serde_json::json;
 
-    /// Canonicalize a real path the way [`resolve`] and `stored_workspace_path`
-    /// do — the macOS temp dir sits behind the `/var` → `/private/var` symlink,
-    /// so comparing raw `tempdir()` paths would never match.
+    /// Canonicalize a real path the way [`resolve`] and `stored_workspace_path` do.
     fn canon(path: &Path) -> PathBuf {
         crate::util::strip_verbatim_prefix(&std::fs::canonicalize(path).unwrap())
     }
 
-    /// Add a workspace the way production rows are stored: the canonical
-    /// path with the platform's trailing separator appended.
+    /// Add a workspace the way production rows are stored: the canonical directory, named.
     async fn add_managed_workspace(dir: &Path, name: &str) -> String {
         let stored = format!("{}{}", dir.display(), std::path::MAIN_SEPARATOR);
         create_test_workspace(&stored, name).await;
@@ -378,8 +333,7 @@ mod tests {
                 args: json!({"place": "   "}),
                 expected: PlaceExpect::NoPlace,
             },
-            // The root is refused by name, never resolved to a place no round can
-            // run in.
+            // The root is refused by name, never resolved to a place no round can use.
             PlaceValueCase {
                 name: "the filesystem root",
                 args: json!({"place": "/"}),

@@ -14,27 +14,16 @@ use super::{
     reset_phase_attempt, run_parallel_agents, warn, with_comment_and_transition,
 };
 
-/// Number of parallel analyst agents in the base cohort of an analysis round.
-/// Reviewers use a calibrated dynamic count (see
-/// [`crate::pipeline::verification::compute_reviewer_count`]); the verification
-/// stage runs its single functional tester alongside them.
 const BASE_ANALYST_COUNT: usize = 2;
 
-/// Number of blocker-verification analysts in an escalation cohort.
 const ESCALATION_ANALYST_COUNT: usize = 2;
 
-/// The stage's own name: the role the joint comment is authored under and the
-/// stage name the grouping pass reports (mirrors the verification stage's
-/// `STAGE`).
 pub(crate) const STAGE: &str = "Analysis";
 
-/// Load the ticket-analysis angle sections the base cohort's analysts share.
 fn load_ticket_analysis_angles() -> Vec<String> {
     load_prompt_sections("analyze/ticket_angles.md")
 }
 
-/// Build the base cohort's slots — the analysts that share the ticket-analysis
-/// angle sections. The tests pin the dispatch shape through this seam.
 pub(super) fn base_slots(ticket_id: &str, prompt: &str) -> Vec<AgentSlot> {
     build_agent_slots(
         ticket_id,
@@ -53,9 +42,8 @@ pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
     dispatch_backlog_analysts(ticket, ws, &job_id).await;
 }
 
-/// Build the base analysis slot roster and write it onto the phase job.
-/// Returns `None` when the roster could not be written: the round never starts
-/// on a half-written plan, and the poller re-drives the job.
+/// Build the base analysis slot roster onto the phase job. `None` when the roster could not be
+/// written: the round never starts on a half-written plan, and the poller re-drives the job.
 async fn ensure_analysis_slots(
     ticket: &Ticket,
     job_id: &str,
@@ -76,10 +64,9 @@ async fn ensure_analysis_slots(
     }
 }
 
-/// Append the escalation cohort to an existing phase job. Escalation slots are
-/// purely blocker-verification focused and inherit NO base angle. The starting
-/// idx derives from the max stored idx (not the roster length) so a resumed
-/// roster with prior rows never collides or over-indexes.
+/// Append the escalation cohort to the phase job: purely blocker-verification slots that inherit NO
+/// base angle. The starting idx derives from the max stored idx (not the roster length), so a
+/// resumed roster with prior rows never collides.
 async fn append_analysis_slots(
     ticket: &Ticket,
     job_id: &str,
@@ -103,18 +90,14 @@ async fn append_analysis_slots(
     Ok(slots)
 }
 
-/// One escalated deduplicated group selected for the blocker-verification
-/// round. `text` is the display string baked into the verifier instructions:
-/// "{heading}: {representative}" for a grouped entry, or just the issue text
-/// for a lone (ungrouped / fallback) blocker. The report renders `text`
-/// directly, so no prose-splitting is needed to recover structure on resume.
+/// One escalated deduplicated group for the blocker-verification round. `text` is the display
+/// string baked into the verifier instructions — "{heading}: {representative}" for a grouped entry,
+/// the issue text for a lone blocker — so the report renders it directly with no prose-splitting on
+/// resume.
 pub(crate) struct EscalationEntry {
     pub text: String,
 }
 
-/// A merged substance outcome for one aggregate blocker after the escalation
-/// round. The two verifiers are reduced deterministically and conservatively
-/// into a single grade; every aggregated blocker survives (enrichment-only).
 pub(crate) struct ResolvedBlocker {
     pub text: String,
     pub kind: crate::BlockerKind,
@@ -141,13 +124,10 @@ fn display_severity(severity: crate::BlockerSeverity) -> &'static str {
     }
 }
 
-/// Merge the escalation verifiers' substance verdicts into one per-blocker
-/// outcome. Deterministic and conservative: severity is the max across
-/// verifiers, kind is `main_path_blocker` if any verifier chose it, and
-/// impact/reasoning concatenate the non-empty per-verifier values separated by
-/// " — ". A verifier that produced no verdict for a blocker contributes
-/// nothing. Every aggregated blocker survives with an enriched grade (this is
-/// never a filter).
+/// Merge the escalation verifiers' substance verdicts into one per-blocker outcome: severity is the
+/// max across verifiers, kind is `main_path_blocker` if any verifier chose it, and impact/reasoning
+/// concatenate the non-empty values with " — ". A verifier with no verdict contributes nothing;
+/// every blocker survives enriched (never filtered).
 pub(crate) fn apply_blocker_verification(
     entries: &[EscalationEntry],
     verdicts: &[&crate::BlockerVerificationVerdict],
@@ -190,19 +170,16 @@ pub(crate) fn apply_blocker_verification(
         .collect()
 }
 
-/// Marker emitted by `format_blocker_list` before the numbered entries. The
-/// resume parser anchors on THIS line, not on the `analyze/blocker_verification.md`
-/// prompt's lead-in prose — co-located with the generator so edits to that
-/// prompt asset cannot silently break crash-resume recovery.
+/// Marker `format_blocker_list` emits before the numbered entries. The resume parser anchors on
+/// THIS line, not the prompt's lead-in prose, so edits to `analyze/blocker_verification.md` cannot
+/// silently break crash-resume.
 const BLOCKER_LIST_MARKER: &str = "Blocker list:";
 
-/// Legacy prompt lead-in phrase (`analyze/blocker_verification.md`) that
-/// preceded the `{{blockers}}` list in tasks baked before [`BLOCKER_LIST_MARKER`]
-/// existed. Kept as a resume fallback so an escalation task stored by the
-/// previous code version still recovers on a resume-across-deploy.
+/// Legacy prompt lead-in (`analyze/blocker_verification.md`) from tasks baked before
+/// [`BLOCKER_LIST_MARKER`] existed — a resume fallback so an escalation task stored by the previous
+/// version still recovers across a deploy.
 const LEGACY_BLOCKER_LIST_MARKER: &str = "matching index.";
 
-/// Number the blocker-verification entries for the escalation prompt template.
 fn format_blocker_list(entries: &[EscalationEntry]) -> String {
     let mut out = format!("{BLOCKER_LIST_MARKER}\n");
     for (i, e) in entries.iter().enumerate() {
@@ -212,8 +189,6 @@ fn format_blocker_list(entries: &[EscalationEntry]) -> String {
     out
 }
 
-/// Render the escalation round's substance outcome. Always reached with a
-/// non-empty blocker list (escalation only appends when blockers aggregate).
 fn format_blocker_verification_report(blockers: &[ResolvedBlocker]) -> String {
     let mut out = String::from("\n\n### Blocker verification\n");
     let _ = writeln!(
@@ -236,7 +211,6 @@ fn format_blocker_verification_report(blockers: &[ResolvedBlocker]) -> String {
     out
 }
 
-/// Append the escalation round's verdict to the joint comment.
 fn append_escalation_report(
     joint_comment: &mut String,
     entries: &[EscalationEntry],
@@ -272,8 +246,6 @@ fn append_escalation_report(
     }
 }
 
-/// Format the analyst grade-count summary that is logged (not posted to the
-/// ticket) when the analysis comment is composed.
 fn format_grade_summary(results: &[ParallelVerdict]) -> String {
     let mut clean = 0usize;
     let mut minor = 0usize;
@@ -319,13 +291,11 @@ fn format_grade_summary(results: &[ParallelVerdict]) -> String {
     format!("{total} analysts reviewed this ticket. {description}.")
 }
 
-/// Build the escalation entries (whole deduplicated groups) from the round's
-/// grouping outcome. A group escalates when ANY member (including its
-/// collapsed same-fact ids) carries `grade = blocker`; the entry uses the
-/// group's heading with the FIRST blocker-bearing member's text as its
-/// display. Ungrouped blockers fail open and escalate as lone entries. A
-/// `Fallback` outcome (no grouping) escalates every blocker item as a lone
-/// entry — the old deterministic escalation never depended on grouping.
+/// Build the escalation entries (whole deduplicated groups) from the round's grouping outcome. A
+/// group escalates when ANY member (collapsed same-fact ids included) carries `grade = blocker`,
+/// and the entry uses the group heading with the FIRST blocker-bearing member's text. Ungrouped
+/// blockers fail open as lone entries, and a `Fallback` outcome (no grouping) escalates every
+/// blocker as one.
 fn escalation_groups(
     round: &JointRound,
     outcome: &crate::consensus::RepairOutcome,
@@ -345,8 +315,6 @@ fn escalation_groups(
     };
     match outcome {
         crate::consensus::RepairOutcome::Repaired { output, .. } => {
-            // Whole deduplicated groups escalate; the entry uses the group
-            // heading with the first blocker member's text as its display.
             let mut entries = Vec::new();
             for group in &output.groups {
                 if let Some(id) = first_blocker(&group.members) {
@@ -422,8 +390,6 @@ fn parse_escalation_entries(task: &str) -> Vec<EscalationEntry> {
     entries
 }
 
-/// Split a trimmed line matching `^\d+\.\s+(.+)$` into the captured text after
-/// the leading run of digits, the `.`, and the mandatory whitespace.
 fn split_numbered(line: &str) -> Option<&str> {
     let after_digits = line.trim_start_matches(|c: char| c.is_ascii_digit());
     if after_digits.len() == line.len() {
@@ -554,14 +520,11 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace, job_id: &
         return;
     }
 
-    // Resume: an interrupted round lives on in the roster, split back into its
-    // cohorts by the rows' own labels.
     let Some(plan) = RoundPlan::from_roster(&roster) else {
-        // A roster that is not an analysis round (a wider build's base round, or
-        // a shape another version wrote) is never resumed as one: dropping the
-        // job makes the poller re-create it, so the round re-runs whole instead
-        // of being resumed at a guessed cohort boundary. The job is gone
-        // afterwards, so the roster's shape is logged here or not at all.
+        // A roster that is not an analysis round (a wider build's base round, or another
+        // version's shape) is never resumed as one: dropping the job makes the poller
+        // re-create it, so the round re-runs whole. The job is gone afterwards, so the
+        // roster's shape is logged here or not at all.
         warn!(
             ticket = %ticket.id,
             job = %job_id,
@@ -573,15 +536,12 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace, job_id: &
         return;
     };
     if plan.escalation.is_empty() {
-        // Base round not yet escalated: re-run the not-Done base slots with their
-        // stored tasks, then re-evaluate escalation on the resumed base verdicts.
         rearm_resumed_slots(&ticket.id, job_id, "analysis base", &[&plan.base]).await;
         run_analysis_round(&ticket, &ws, job_id, &plan.base, true).await;
     } else {
-        // Base round completed (it triggered the escalation). Reconstruct the
-        // base verdicts from stored outcomes — NOT a re-run — so the blocker list
-        // that the escalation slots were built for stays frozen; only the not-Done
-        // escalation slots resume.
+        // Base round completed (it triggered the escalation): reconstruct the base verdicts
+        // from stored outcomes — NOT a re-run — so the blocker list the escalation slots
+        // were built for stays frozen.
         let base_results: Vec<ParallelVerdict> = plan
             .base
             .iter()
@@ -591,24 +551,17 @@ async fn dispatch_backlog_analysts(ticket: Arc<Ticket>, ws: Workspace, job_id: &
     }
 }
 
-/// One analysis round's dispatch plan: the base analyst cohort and, when the
-/// base round aggregated blockers, the escalation cohort appended to it.
 struct RoundPlan {
     base: Vec<AgentSlot>,
     escalation: Vec<AgentSlot>,
 }
 
 impl RoundPlan {
-    /// Split a stored roster back into its cohorts by the rows' own roster
-    /// labels — never by slot position, so a base round written by a
-    /// differently-sized build cannot be cut at the wrong place and silently
-    /// lose a verdict.
-    ///
-    /// `None` for a roster this stage cannot read back as a round: it must carry
-    /// exactly [`BASE_ANALYST_COUNT`] base rows, either no escalation rows or
-    /// exactly [`ESCALATION_ANALYST_COUNT`] of them, and no row of any other
-    /// kind. Such a roster is never resumed at a guessed boundary — see
-    /// [`dispatch_backlog_analysts`].
+    /// Split a stored roster into cohorts by the rows' own roster labels — never by slot
+    /// position, so a base round written by a differently-sized build cannot be cut at the
+    /// wrong place and silently lose a verdict. `None` unless the roster carries exactly
+    /// [`BASE_ANALYST_COUNT`] base rows, either no escalation rows or exactly
+    /// [`ESCALATION_ANALYST_COUNT`] of them, and no row of any other kind.
     fn from_roster(roster: &[crate::jobs::AgentRow]) -> Option<Self> {
         let cohort = |kind: crate::jobs::AgentKind| -> Vec<AgentSlot> {
             roster
@@ -630,10 +583,9 @@ impl RoundPlan {
     }
 }
 
-/// Build the base-round grouping and finalize: the orphaned-escalation-slots
-/// arm of [`resume_escalation_round`] passes an empty escalation report, while
-/// the normal resume path passes the re-run base grouping and the baked-in
-/// escalation entries.
+/// Build the base-round grouping and finalize: the orphaned-escalation-slots arm of
+/// [`resume_escalation_round`] passes an empty escalation report, while the normal resume passes
+/// the re-run base grouping and the baked-in escalation entries.
 async fn finalize_analysis_round_with_grouping(
     ws: &Workspace,
     ticket: &Ticket,
@@ -646,7 +598,6 @@ async fn finalize_analysis_round_with_grouping(
         STAGE,
         base_results,
         Role::Analyst,
-        // Analysis always runs the grouping pass.
         false,
         ws,
         &ticket.id,
@@ -665,12 +616,10 @@ async fn finalize_analysis_round_with_grouping(
     .await;
 }
 
-/// Resume an escalation round whose base verdicts are already frozen, from the
-/// escalation cohort the plan read back from the roster. The already-Done
-/// escalation slots are reconstructed from stored outcomes and the not-Done
-/// ones re-run with their stored tasks; the escalation group list is re-derived
-/// from the task baked into the first escalation slot (it is never re-run
-/// through consolidation).
+/// Resume an escalation round whose base verdicts are frozen, from the escalation cohort the plan
+/// read back: already-Done slots are reconstructed from stored outcomes and the not-Done ones
+/// re-run with their stored tasks, while the escalation group list is re-derived from the task
+/// baked into the first escalation slot (never re-run through consolidation).
 async fn resume_escalation_round(
     ticket: &Arc<Ticket>,
     ws: &Workspace,
@@ -678,11 +627,8 @@ async fn resume_escalation_round(
     base_results: Vec<ParallelVerdict>,
     escalation_slots: Vec<AgentSlot>,
 ) {
-    // The plan only hands this path a non-empty escalation cohort.
     let entries = parse_escalation_entries(&escalation_slots[0].task);
     if entries.is_empty() {
-        // Orphaned escalation slots (no blocker list baked into their task) —
-        // the base round still advances fail-open.
         finalize_analysis_round_with_grouping(ws, ticket, &base_results, &[], &[], job_id).await;
         return;
     }
@@ -704,17 +650,13 @@ async fn resume_escalation_round(
         pause_freezing(ticket, job_id).await;
         return;
     }
-    // Re-run the base consolidation for the comment body; the escalation report
-    // uses the baked-in entries (not a re-run consolidation) — decision D.
     finalize_analysis_round_with_grouping(ws, ticket, &base_results, &extra, &entries, job_id)
         .await;
 }
 
-/// Run an analysis round: parallel analysts, optional blocker-verification
-/// escalation, then verdict finalization.
-///
-/// `resume` marks a slot-resume round: the not-Done base slots continue their
-/// sessions and the leader-stagger is skipped.
+/// Run an analysis round: parallel analysts, optional blocker-verification escalation, then verdict
+/// finalization. `resume` marks a slot-resume round: not-Done base slots continue their sessions
+/// and the leader-stagger is skipped.
 async fn run_analysis_round(
     ticket: &Arc<Ticket>,
     ws: &Workspace,
@@ -744,7 +686,6 @@ async fn run_analysis_round(
         STAGE,
         &base_results,
         Role::Analyst,
-        // Analysis always runs the grouping pass.
         false,
         ws,
         &ticket.id,
@@ -785,10 +726,6 @@ async fn run_analysis_round(
     .await;
 }
 
-/// Finalize an analysis round — hands the verdicts to
-/// [`process_analyst_verdicts`], which normally advances to Planning
-/// (fail-open) but resets the round (ticket stays in Analysis) when no
-/// analyst produced usable output; see its docs.
 async fn finalize_analysis_round(
     ticket: &Ticket,
     base_results: &[ParallelVerdict],
@@ -827,10 +764,9 @@ async fn finalize_analysis_round(
     }
 }
 
-/// Hard technical failure: no analyst produced usable output. Reset the
-/// attempt — the ticket stays in Analysis for a fresh round. No workspace
-/// pause (Analysis is not an implementation phase), no retry limit, no bounce
-/// budget.
+/// Hard technical failure: no analyst produced usable output. Reset the attempt — the ticket stays
+/// in Analysis for a fresh round, with no workspace pause (Analysis is not an implementation
+/// phase), no retry limit and no bounce budget.
 async fn reset_analysis_round(ticket: &Ticket, job_id: &str) {
     info!(
         ticket = %ticket.id,
@@ -839,11 +775,9 @@ async fn reset_analysis_round(ticket: &Ticket, job_id: &str) {
     reset_phase_attempt(ticket, TicketPhase::Analysis, job_id, "analysis failure").await;
 }
 
-/// Process the analyst verdicts and transition the ticket to Planning
-/// (fail-open — the ticket always advances, the Manager decides). The one
-/// hard-failure exception: when NO analyst produced usable output
-/// (`extracted_count == 0`), reset the attempt (stay in Analysis, fresh
-/// round, no workspace pause) instead of advancing with nothing.
+/// Process the analyst verdicts and transition the ticket to Planning (fail-open — the ticket
+/// always advances and the Manager decides). The one hard-failure exception: `extracted_count == 0`
+/// resets the attempt (stay in Analysis, fresh round, no pause) instead of advancing with nothing.
 async fn process_analyst_verdicts(
     ticket: &Ticket,
     base_results: &[ParallelVerdict],
@@ -892,7 +826,6 @@ async fn process_analyst_verdicts(
     ) {
         return;
     }
-    // Debug: the routine completion record for a backlog ticket that advanced.
     debug!(
         ticket = %ticket.id,
         nonempty_count = extracted_count,
@@ -904,11 +837,9 @@ async fn process_analyst_verdicts(
 mod tests {
     use super::*;
 
-    /// Pins the [`parse_escalation_entries`] dual-anchor contract: the stable
-    /// code-owned [`BLOCKER_LIST_MARKER`] (baked by the current
-    /// [`format_blocker_list`]) AND the legacy `matching index.` lead-in (tasks
-    /// baked by a previous code version) both recover the full per-entry text,
-    /// and a task with neither marker degrades to an empty list (fail-open).
+    /// Pins the [`parse_escalation_entries`] dual-anchor contract: the code-owned
+    /// [`BLOCKER_LIST_MARKER`] AND the legacy `matching index.` lead-in both recover the full
+    /// per-entry text, and a task with neither degrades to an empty list (fail-open).
     #[test]
     fn parse_escalation_entries_recover_marker_and_legacy_anchor() {
         let current = "report the outcome for each blocker using the matching index.\n\n\

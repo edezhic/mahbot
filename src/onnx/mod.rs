@@ -1,30 +1,20 @@
-//! Minimal in-repo ONNX inference runtime.
+//! Minimal in-repo ONNX inference runtime, replacing the removed `candle-onnx-mahbot` fork.
 //!
-//! This module replaces the vendored `candle-onnx-mahbot` fork (removed).
-//! It exists for exactly one consumer: the Supertonic 3 TTS
-//! pipeline ([`crate::audio::tts`]), which executes four pinned ONNX models
-//! (duration_predictor, text_encoder, vector_estimator, vocoder — all opset
-//! 19, a closed subset of 39 ops).  Nothing else in the codebase consumes
-//! ONNX today, so the runtime deliberately implements only what those models
-//! need:
+//! It exists for exactly one consumer: the Supertonic 3 TTS pipeline ([`crate::audio::tts`]), which
+//! executes four pinned ONNX models (duration_predictor, text_encoder, vector_estimator, vocoder —
+//! all opset 19, a closed subset of 39 ops). Nothing else consumes ONNX, so the runtime implements
+//! only what those models need: a hand-rolled protobuf wire-format reader for that subset (no
+//! prost, no build-time protoc, tensor payloads only as `raw_data`); the evaluator for those 39 ops
+//! (implicit dtype promotion, Pad `edge` mode, LayerNormalization with explicit epsilon, negative
+//! Slice steps, Concat majority-dtype promotion, Unsqueeze negative-axis handling, …); and
+//! load-time preparation that converts initializers and `Constant` tensor attributes to CPU tensors
+//! once, so repeated `simple_eval` calls (8 flow-matching steps × chunks) do not re-materialize the
+//! ~256 MB vector_estimator weights on every call.
 //!
-//! * **Proto layer** — a hand-rolled protobuf wire-format reader for the
-//!   ONNX subset (no prost, no build-time protoc).  Tensor payloads are
-//!   handled in `raw_data` form; the models contain no `external_data` /
-//!   typed-array payloads.
-//! * **Evaluator** — the 39 ops the four models use (implicit dtype
-//!   promotion, Pad `edge` mode, LayerNormalization with explicit epsilon,
-//!   negative Slice steps, Concat majority-dtype promotion, Unsqueeze
-//!   negative-axis handling, ...).
-//! * **Load-time preparation** — initializers and `Constant` tensor
-//!   attributes are converted to CPU tensors once at load, so repeated
-//!   `simple_eval` calls (8 flow-matching steps × chunks) do not re-materialize
-//!   the ~256 MB vector_estimator weights on every call.
+//! The ONNX wire format and dims are inherently i64/varint while candle dims are usize; the
+//! reader's single-letter locals and the op dispatcher's size are idiomatic for this domain — hence
+//! the module-level pedantic allows rather than per-function attributes.
 
-// The ONNX wire format and dims are inherently i64/varint while candle
-// dims are usize; the reader's single-letter locals and the op dispatcher's
-// size are idiomatic for this domain — allow the corresponding pedantic
-// lints at module level rather than scattering per-function attributes.
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -41,10 +31,8 @@ use std::path::Path;
 
 pub use eval::simple_eval;
 
-// ── Parsed model representation ───────────────────────────────────────
-
-/// A parsed ONNX model.  Initializers and `Constant` tensor attributes are
-/// pre-converted to CPU tensors at parse time.
+// A parsed ONNX model. Initializers and `Constant` tensor attributes are pre-converted to CPU
+// tensors at parse time.
 #[derive(Debug, Clone)]
 pub struct Model {
     pub graph: Graph,
@@ -56,9 +44,8 @@ impl Model {
         parse_model(buf)
     }
 
-    /// Name of the graph's first output (the pipeline's `extract_output`
-    /// helper resolves the tensor this way).  Falls back to `"output"` when
-    /// the graph declares no outputs.
+    /// Name of the graph's first output (the pipeline's `extract_output` resolves the tensor this
+    /// way). Falls back to `"output"` when the graph declares no outputs.
     #[must_use]
     pub fn output_name(&self) -> &str {
         self.graph
@@ -76,10 +63,8 @@ pub fn read_file<P: AsRef<Path>>(p: P) -> Result<Model> {
 
 #[derive(Debug, Clone)]
 pub struct Graph {
-    /// Graph nodes in topological order.
     pub nodes: Vec<Node>,
-    /// Pre-converted initializers (float dtypes normalized to F32), in graph
-    /// order.
+    /// Pre-converted initializers (float dtypes normalized to F32), in graph order.
     pub initializers: Vec<(String, Tensor)>,
     pub inputs: Vec<ValueInfo>,
     pub outputs: Vec<ValueInfo>,
@@ -88,7 +73,6 @@ pub struct Graph {
 #[derive(Debug, Clone)]
 pub struct Node {
     pub op_type: String,
-    /// May be empty (unnamed nodes).
     pub name: String,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
@@ -108,28 +92,24 @@ pub enum AttrKind {
     /// Raw UTF-8 string payload (e.g. Pad `mode`).
     Bytes(Vec<u8>),
     Ints(Vec<i64>),
-    /// `repeated float` attribute payload.  Decoded for completeness; no
-    /// consumer in the pinned TTS models uses it, so callers treat it as
-    /// unsupported.
+    /// `repeated float` attribute payload. Decoded for completeness; no consumer in the pinned
+    /// models uses it, so callers treat it as unsupported.
     FloatsUnused,
-    /// Tensor attribute (e.g. `Constant` value, `ConstantOfShape` value),
-    /// pre-converted to a CPU tensor at load time.
+    /// Tensor attribute (`Constant` value, `ConstantOfShape` value), pre-converted to a CPU tensor
+    /// at load time.
     Tensor(Tensor),
 }
 
 #[derive(Debug, Clone)]
 pub struct ValueInfo {
     pub name: String,
-    /// Declared element type mapped to a candle dtype; `None` when the type
-    /// is absent or uses an unmapped ONNX data type (validation skipped).
+    /// Declared element type mapped to a candle dtype; `None` when absent or unmapped (validation
+    /// skipped).
     pub elem_type: Option<DType>,
 }
 
-// ── Minimal protobuf wire-format reader ───────────────────────────────
-//
-// Only the ONNX message subset used by the four TTS models is decoded.
-// Field numbers follow onnx.proto3 (the OLD AttributeProto numbering:
-// ints=8, floats=7, strings=9, tensors=10, type=20).
+// Only the ONNX message subset used by the four TTS models is decoded. Field numbers follow
+// onnx.proto3 (the OLD AttributeProto numbering: ints=8, floats=7, strings=9, tensors=10, type=20).
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum WireType {
@@ -235,8 +215,8 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
-    /// Read a `repeated int64` field that may be encoded packed
-    /// (length-delimited varint list) or unpacked (repeated varint fields).
+    /// Read a `repeated int64` field, packed (length-delimited varint list) or unpacked (repeated
+    /// varint fields).
     fn read_varints(&mut self, wire: WireType) -> Result<Vec<i64>> {
         match wire {
             WireType::Varint => Ok(vec![self.read_varint()? as i64]),
@@ -328,9 +308,9 @@ fn parse_graph(buf: &[u8]) -> Result<Graph> {
                 let sub = r.read_len_delimited()?;
                 let raw = parse_tensor_proto(sub)?;
                 let mut tensor = raw_to_tensor(&raw)?;
-                // Normalize float initializers to F32: many ONNX exports store
-                // constants as F64, downstream ops expect F32.  The pinned TTS
-                // models contain no F64 tensors, so this is defensive only.
+                // Normalize float initializers to F32: many ONNX exports store constants as F64
+                // while downstream ops expect F32. The pinned models contain no F64 tensors, so
+                // this is defensive only.
                 if tensor.dtype().is_float() && tensor.dtype() != DType::F32 {
                     tensor = tensor.to_dtype(DType::F32)?;
                 }
@@ -414,9 +394,8 @@ fn parse_attribute(buf: &[u8]) -> Result<Attribute> {
                 let sub = r.read_len_delimited()?;
                 t = Some(parse_tensor_proto(sub)?);
             }
-            // Repeated scalar fields may be encoded packed (one length-
-            // delimited list) or unpacked (one field per element) — the four
-            // TTS models use the unpacked form.  Accumulate both.
+            // Repeated scalar fields may be packed (one length-delimited list) or unpacked (one
+            // field per element) — the four models use the unpacked form. Accumulate both.
             (7, _) => {
                 let vals = r.read_floats(wire)?;
                 floats.get_or_insert_with(Vec::new).extend(vals);
@@ -429,8 +408,8 @@ fn parse_attribute(buf: &[u8]) -> Result<Attribute> {
             _ => r.skip(wire)?,
         }
     }
-    // AttributeType discriminators (onnx.proto3): FLOAT=1, INT=2, STRING=3,
-    // TENSOR=4, FLOATS=6, INTS=7, STRINGS=8, TENSORS=9, ...
+    // AttributeType discriminators (onnx.proto3): FLOAT=1, INT=2, STRING=3, TENSOR=4, FLOATS=6,
+    // INTS=7, ...
     let kind = match type_disc {
         Some(1) => AttrKind::Float(f.unwrap_or(0.0)),
         Some(2) => AttrKind::Int(i.unwrap_or(0)),
@@ -507,7 +486,6 @@ fn parse_tensor_proto(buf: &[u8]) -> Result<RawTensor> {
                 }
             }
             (2, WireType::Varint) => data_type = r.read_varint()? as i32,
-            // Repeated scalar payloads may be packed or unpacked — accumulate.
             (4, _) => {
                 let vals = r.read_floats(wire)?;
                 floats.get_or_insert_with(Vec::new).extend(vals);
@@ -535,8 +513,7 @@ fn parse_tensor_proto(buf: &[u8]) -> Result<RawTensor> {
             _ => r.skip(wire)?,
         }
     }
-    // Typed arrays take precedence over raw_data; zero-element tensors may
-    // omit all payload fields.
+    // Typed arrays take precedence over raw_data; zero-element tensors may omit all payload fields.
     let data = if let Some(v) = floats {
         TensorPayload::Float(v)
     } else if let Some(v) = int32s {
@@ -579,9 +556,8 @@ fn parse_value_info(buf: &[u8]) -> Result<ValueInfo> {
     Ok(ValueInfo { name, elem_type })
 }
 
-/// Extract `TypeProto.Tensor.elem_type` (mapped to a candle dtype) from a
-/// `TypeProto` payload.  `None` when the type is absent, not a tensor type,
-/// or uses an unmapped ONNX data type.
+/// Extract `TypeProto.Tensor.elem_type` (mapped to a candle dtype) from a `TypeProto` payload.
+/// `None` when the type is absent, not a tensor type, or uses an unmapped ONNX data type.
 fn parse_type_elem_type(buf: &[u8]) -> Result<Option<DType>> {
     let mut r = Reader::new(buf);
     while !r.eof() {
@@ -621,13 +597,11 @@ pub(crate) fn dtype(dt: i32) -> Option<DType> {
     }
 }
 
-/// Convert a parsed tensor payload into a CPU candle tensor: INT32 payloads
-/// are widened to I64, typed arrays take precedence over `raw_data`,
-/// everything else uses `from_raw_buffer`.
+/// Convert a parsed tensor payload into a CPU candle tensor: INT32 payloads are widened to I64,
+/// typed arrays take precedence over `raw_data`, everything else uses `from_raw_buffer`.
 fn raw_to_tensor(t: &RawTensor) -> Result<Tensor> {
     let dev = &Device::Cpu;
     if t.data_type == 6 {
-        // INT32 → I64
         let data: Vec<i64> = match &t.data {
             TensorPayload::Int32(v) => v.iter().map(|&x| i64::from(x)).collect(),
             TensorPayload::Raw(b) => b
@@ -676,19 +650,16 @@ fn payload_kind(p: &TensorPayload) -> &'static str {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Round-trip a tiny wire-encoded attribute with the OLD field numbering
-    /// (ints=8, floats=7, strings=9, type=20) to guard the reader against the
-    /// protobuf-version trap called out in the fork-removal analysis.
+    /// Round-trip a tiny wire-encoded attribute with the OLD field numbering (ints=8, floats=7,
+    /// strings=9, type=20) to guard the reader against the protobuf-version trap called out in the
+    /// fork-removal analysis.
     #[test]
     fn test_parse_attribute_old_numbering() {
-        // name = "mode" (field 1), s = "constant" (field 4),
-        // type = STRING (field 20, varint 3).
+        // name = "mode" (field 1), s = "constant" (field 4), type = STRING (field 20, varint 3).
         let mut wire = Vec::new();
         wire.extend_from_slice(&[0x0a, 4, b'm', b'o', b'd', b'e']); // name
         wire.extend_from_slice(&[0x22, 8, b'c', b'o', b'n', b's', b't', b'a', b'n', b't']); // s
@@ -712,12 +683,12 @@ mod tests {
         }
     }
 
-    /// Verify the wire reader decodes a packed int64 tensor payload (the form
-    /// all four TTS model initializers use).
+    /// Verify the wire reader decodes a packed int64 tensor payload (the form all four TTS
+    /// initializers use).
     #[test]
     fn test_parse_tensor_proto_raw() {
-        // dims = [2] (field 1, packed varint), data_type = 7 (field 2),
-        // raw_data = 16 bytes (field 9).
+        // dims = [2] (field 1, packed varint), data_type = 7 (field 2), raw_data = 16 bytes (field
+        // 9).
         let mut wire = Vec::new();
         wire.extend_from_slice(&[0x0a, 1, 2]); // dims packed [2]
         wire.extend_from_slice(&[0x10, 7]); // data_type = INT64

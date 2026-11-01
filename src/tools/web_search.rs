@@ -1,15 +1,12 @@
-//! The `web_search` tool: one query against a chosen backend (DeepSeek or
-//! Exa), and the per-session expand-id cache that tool instance owns.
+//! The `web_search` tool: one query against a chosen backend (DeepSeek or Exa), and the
+//! per-session expand-id cache that tool instance owns.
 //!
-//! Not workspace file search (`tools::search`) and not link enrichment — this
-//! tool reaches the public web. The cache is deliberately session-scoped: a new
-//! tool instance starts empty, and an expand id is valid only in the session
-//! that earned it.
+//! Not workspace file search (`tools::search`) and not link enrichment — this tool reaches the
+//! public web. The cache is deliberately session-scoped: a new tool instance starts empty, and an
+//! expand id is valid only in the session that earned it.
 //!
-//! A search flagged `pictures` also lists pictures of the results' subjects —
-//! discovery only, never an attached image: the agent fetches what it wants to
-//! look at with its own tools. Only Exa supplies pictures, and that capability is
-//! resolved separately from the text backend.
+//! A search flagged `pictures` also lists pictures of the results' subjects — discovery only,
+//! never an attached image: the agent fetches what it wants.
 
 use crate::Tool;
 use async_trait::async_trait;
@@ -23,17 +20,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-// ── Backend selection ───────────────────────────────────────────────────────────
-
 /// Backend provider for web search.
 pub enum WebSearchBackend {
-    /// DeepSeek API (`api.deepseek.com/v1/tools/search`).
     DeepSeek { key: String },
-    /// Exa API (`api.exa.ai/search`).
     Exa { key: String },
 }
-
-// ── DeepSeek API types ──────────────────────────────────────────────────────────
 
 /// DeepSeek's stand-alone search endpoint (fixed, not owner-editable).
 const DEEPSEEK_SEARCH_ENDPOINT: &str = "https://api.deepseek.com/v1/tools/search";
@@ -41,9 +32,8 @@ const DEEPSEEK_SEARCH_ENDPOINT: &str = "https://api.deepseek.com/v1/tools/search
 /// Results asked of every backend.
 const RESULTS_PER_SEARCH: usize = 10;
 
-/// DeepSeek's documented query ceiling, in Unicode characters. A longer query is
-/// refused here rather than forwarded: the provider's rejection would reach the
-/// model as a failure it cannot act on. The other backend has no such limit.
+/// DeepSeek's documented query ceiling, in Unicode characters. A longer query is refused before
+/// a request is made.
 const DEEPSEEK_MAX_QUERY_CHARS: usize = 128;
 
 #[derive(Serialize)]
@@ -59,9 +49,7 @@ struct DeepSeekSearchResponse {
     results: Vec<DeepSeekResult>,
 }
 
-/// `snippet` is the one-line description shown under a link; the provider's
-/// longer `summary` is deliberately unused — the model expands a result when it
-/// wants more.
+/// `snippet` is the one-line description shown under a link; the provider's own wording.
 #[derive(Deserialize, Debug)]
 struct DeepSeekResult {
     title: Option<String>,
@@ -72,8 +60,7 @@ struct DeepSeekResult {
     content: Option<String>,
 }
 
-/// The DeepSeek search body. `need_content` is what makes a result's page text
-/// arrive with it: without it `expand` would always answer "no full text".
+/// The DeepSeek search body. `need_content` is what makes a result's page text available.
 fn deepseek_request_body(query: &str) -> DeepSeekSearchRequest<'_> {
     DeepSeekSearchRequest {
         query,
@@ -108,13 +95,7 @@ fn deepseek_query_limit(query: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Exa API types ───────────────────────────────────────────────────────────────
-
 /// Deserialize an absent-or-null field as the field's default.
-///
-/// Exa omits a list it did not produce in one response and sends `null` in
-/// another; a plain `#[serde(default)]` covers only the first, and a parse
-/// failure here would cost a flagged call its text results.
 fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -126,9 +107,7 @@ where
 #[derive(Serialize)]
 struct ExaContentsOptions {
     text: bool,
-    /// The picture route: `imageLinks` makes Exa attach the per-picture list,
-    /// and `richImageLinks` is the form that carries alt text. Requesting the
-    /// rich form alone returns nothing, so both counts go out together.
+    /// The picture route: `imageLinks` makes Exa attach the per-picture list.
     #[serde(skip_serializing_if = "Option::is_none")]
     extras: Option<ExaExtrasOptions>,
 }
@@ -141,20 +120,16 @@ struct ExaExtrasOptions {
     rich_image_links: usize,
 }
 
-/// Exa's everyday search mode: fast and cheap. `lite` rejects any request field
-/// outside its allowlist with a 400 — `contents.extras` included — so a picture
-/// search has to leave it for [`EXA_PICTURE_SEARCH_MODE`], and a new
-/// `ExaSearchBody` field must be checked against that allowlist. `lite` serves
-/// cached page text only — freshness cannot be requested.
+/// Exa's everyday search mode: fast and cheap. `lite` rejects any request field the mode does
+/// not carry.
 const EXA_SEARCH_MODE: &str = "lite";
 
-/// The mode a picture search uses: the documented default, and the only
-/// non-legacy mode that accepts `contents.extras` (`fast`/`instant` still do, but
-/// both are marked "use `lite` instead", and `lite` cannot serve pictures).
+/// The mode a picture search uses: the documented default, and the only one that carries
+/// `imageLinks`.
 const EXA_PICTURE_SEARCH_MODE: &str = "auto";
 
-/// Pictures requested per result. They are free within the search price, and a
-/// result keeps the first one that passes verification.
+/// Pictures requested per result. They are free within the search price, and a result keeps the
+/// first one that passes verification.
 const PICTURES_PER_RESULT: usize = 3;
 
 #[derive(Serialize)]
@@ -199,61 +174,44 @@ struct ExaSearchResponse {
     results: Vec<ExaResult>,
 }
 
-// ── Shared result formatting ────────────────────────────────────────────
-
 /// A normalized search result shared by DeepSeek and Exa.
 struct SearchRow {
     title: Option<String>,
     url: String,
     text: Option<String>,
-    /// The one-line description rendered under the link. DeepSeek supplies one
-    /// (its `snippet`); Exa's results carry none.
+    /// The one-line description rendered under the link. DeepSeek supplies one (its `snippet`);
+    /// Exa's results carry none.
     description: Option<String>,
 }
 
-/// One backend call's answer: the text rows, and what happened to the pictures
-/// the call asked for.
+/// One backend call's answer: the text rows, and what happened to the pictures.
 struct SearchAnswer {
     rows: Vec<SearchRow>,
     pictures: Pictures,
 }
 
-// ── Picture discovery ───────────────────────────────────────────────────────────
-
-/// A picture of a result's subject: offered by the backend, then verified by a
-/// probe of the image itself.
+/// A picture of a result's subject: offered by the backend, then verified by a fetch.
 struct Picture {
     /// The address, exactly as the backend returned it: the agent fetches it.
     url: String,
-    /// The alt text Exa reported, describing what it shows.
     description: String,
-    /// The page the picture was found on.
     page: String,
 }
 
 /// What a search that may ask for pictures learned about them.
-///
-/// Pictures are an Exa-only capability, so everything the text backend answers
-/// arrives [`Pictures::NotRequested`] unless a picture call had to be recovered
-/// as text, which reports [`Pictures::Unavailable`] instead.
 enum Pictures {
     /// The call did not ask for pictures; output is exactly what it always was.
     NotRequested,
-    /// The call asked and the picture part failed — the backend refused it, or
-    /// the request never completed. The text results stand, and the output says
-    /// the pictures were unavailable.
+    /// The call asked and the picture part failed — the backend refused it, or the fetch did.
     Unavailable,
-    /// Verified pictures, no more than the call's text results.
     Usable(Vec<Picture>),
 }
 
-/// Smallest size a subject picture may have. Below it, the image is a logo, an
-/// avatar or an interface glyph.
+/// Smallest size a subject picture may have. Below it the image is a logo, an icon or a sprite.
 const MIN_PICTURE_WIDTH: u32 = 200;
 const MIN_PICTURE_HEIGHT: u32 = 150;
 
-/// Address words for page furniture rather than the subject: logos, icons,
-/// sprites, avatars, tracking pixels, placeholders and social cards.
+/// Address words for page furniture rather than the subject: logos, icons, avatars.
 const FURNITURE_URL_TOKENS: &[&str] = &[
     "logo",
     "logos",
@@ -310,13 +268,12 @@ fn describes_furniture(text: &str) -> bool {
     tokens(text).any(|token| FURNITURE_TEXT_TOKENS.contains(&token.as_str()))
 }
 
-/// Whether a candidate can be the subject of its page, judged by the only facts
-/// a search response carries for free: its address and its alt/title text.
+/// Whether a candidate can be the subject of its page, judged by the only facts a search response
+/// carries for free: its address and its alt/title text.
 ///
-/// Every rule is a rejection. A list of logos is worse than no pictures at all,
-/// so anything ambiguous — a blank or non-web address, no descriptive text, a
-/// furniture word, a page that merely ends in an image name — is dropped here
-/// and, if it survives, verified against the image itself.
+/// Every rule is a rejection. A list of logos is worse than no pictures at all, so anything
+/// ambiguous — a blank or non-web address, no descriptive text, a furniture word, a page that merely
+/// ends in an image name — is dropped here and, if it survives, verified against the image itself.
 fn candidate_is_plausible(url: &str, description: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
         return false;
@@ -356,27 +313,22 @@ fn candidate_is_plausible(url: &str, description: &str) -> bool {
     !describes_furniture(description)
 }
 
-/// Whether an extension names an image this crate reads natively, through the
-/// same gate the `read` tool's content sniff uses, so the picture formats are
-/// not restated here.
+/// Whether an extension names an image this crate reads natively.
 fn is_picture_extension(extension: &str) -> bool {
     image::ImageFormat::from_extension(extension.trim())
         .is_some_and(|format| crate::util::image_format_native_label(format).is_some())
 }
 
-/// Byte cap of a verification fetch: enough header bytes for every format the
-/// `image` crate measures, including JPEGs with a large embedded thumbnail.
+/// Byte cap of a verification fetch: enough header bytes for every format the crate reads.
 const PICTURE_PROBE_BYTES: usize = 64 * 1024;
 
-/// Budget for a verification fetch: image CDNs can take several seconds to
-/// answer even a range request (5.2 s measured on one host), and dropping a real
-/// picture for its host's latency is worse than waiting — only a flagged call
-/// pays this.
+/// Budget for a verification fetch: image CDNs can take several seconds to answer even a range
+/// request (5.2 s measured on one host), and dropping a real picture for its host's latency is worse
+/// than waiting — only a flagged call pays this.
 const PICTURE_PROBE_TIMEOUT_SECS: u64 = 10;
 
-/// The probe client: it never follows a redirect — every hop would escape the
-/// address guard below — and its short timeout keeps a slow host from holding
-/// the search open.
+/// The probe client: it never follows a redirect — every hop would escape the address guard
+/// below — and its short timeout keeps a slow host from holding the search open.
 fn probe_http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -386,11 +338,10 @@ fn probe_http_client() -> &'static reqwest::Client {
     })
 }
 
-/// Whether a candidate address may be fetched at all: a plain web URL whose host
-/// resolves only to public addresses. Picture addresses come from indexed pages,
-/// and a page must not be able to point the daemon's fetch at an internal
-/// service — neither by naming one nor through a public name that resolves
-/// inward.
+/// Whether a candidate address may be fetched at all: a plain web URL whose host resolves only
+/// to public addresses. Picture addresses come from indexed pages, and a page must not be able to
+/// point the daemon's fetch at an internal service — neither by naming one nor through a public
+/// name that resolves inward.
 async fn probe_allowed(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
@@ -456,13 +407,11 @@ fn is_public_ip(address: std::net::IpAddr) -> bool {
     }
 }
 
-/// Redirect hops a probe follows, each checked by [`probe_allowed`] first — the
-/// client never follows one itself, so a hop cannot escape the guard.
+/// Redirect hops a probe follows, each checked by [`probe_allowed`] first — the client never follows
+/// one itself, so a hop cannot escape the guard.
 const PICTURE_PROBE_HOPS: usize = 3;
-
-/// The response for the first bytes of the picture at `url`, following up to
-/// [`PICTURE_PROBE_HOPS`] validated redirects: image CDNs commonly redirect to
-/// the host actually serving the bytes.
+/// The response for the first bytes of the picture at `url`, following up to [`PICTURE_PROBE_HOPS`]
+/// validated redirects: image CDNs commonly redirect to the host actually serving the bytes.
 async fn probe_response(url: &str) -> Option<reqwest::Response> {
     let client = probe_http_client();
     let mut target = reqwest::Url::parse(url).ok()?;
@@ -492,10 +441,8 @@ async fn probe_response(url: &str) -> Option<reqwest::Response> {
     None
 }
 
-/// Dimensions of the image at `url`, or `None` when it is not an image, does not
-/// answer in time, or is not a format this crate reads. Only the leading bytes
-/// are fetched: dimensions live in the header, and the picture itself is never
-/// downloaded (viewing is the agent's own tool call, not the search's).
+/// Dimensions of the image at `url`, or `None` when it is not an image, does not fit the
+/// limits, or cannot be fetched.
 async fn probe_picture_dimensions(url: &str) -> Option<(u32, u32)> {
     let mut response = probe_response(url).await?;
     let is_image = response
@@ -527,16 +474,13 @@ async fn probe_picture_dimensions(url: &str) -> Option<(u32, u32)> {
         .ok()
 }
 
-/// Confirm a picture really is an image at the size bar, keeping its address
-/// exactly as the backend returned it.
+/// Confirm a picture really is an image at the size bar, keeping its address.
 async fn verify_picture(picture: Picture) -> Option<Picture> {
     let (width, height) = probe_picture_dimensions(&picture.url).await?;
     (width >= MIN_PICTURE_WIDTH && height >= MIN_PICTURE_HEIGHT).then_some(picture)
 }
 
-/// Verify one group of candidates — one result's pictures — and keep the first
-/// that passes, so a rejected candidate (a social card that slipped past the
-/// token filter) does not cost the result its other, already-paid-for pictures.
+/// Verify one group of candidates — one result's pictures — and keep the first that passes.
 async fn first_verified(group: Vec<Picture>) -> Option<Picture> {
     for picture in group {
         if let Some(picture) = verify_picture(picture).await {
@@ -546,8 +490,7 @@ async fn first_verified(group: Vec<Picture>) -> Option<Picture> {
     None
 }
 
-/// Verify groups concurrently — at most one picture each — and keep the first
-/// `cap` in result order, deduped by address.
+/// Verify groups concurrently — at most one picture each — and keep the first that passes.
 async fn verified_pictures(groups: Vec<Vec<Picture>>, cap: usize) -> Vec<Picture> {
     let mut seen = HashSet::new();
     futures_util::future::join_all(groups.into_iter().map(first_verified))
@@ -559,8 +502,6 @@ async fn verified_pictures(groups: Vec<Vec<Picture>>, cap: usize) -> Vec<Picture
         .collect()
 }
 
-// ── Cache ────────────────────────────────────────────────────────────────────────
-
 /// A cached search result with full text content.
 #[derive(Debug, Clone)]
 pub(crate) struct CachedResult {
@@ -570,10 +511,6 @@ pub(crate) struct CachedResult {
 }
 
 /// In-memory cache shared between web search backends.
-///
-/// Holds search results that can later be expanded by ID.  Each agent
-/// session gets its own cache, so entries are freed automatically when
-/// the agent session ends.
 pub(crate) struct WebSearchCache {
     cache: RwLock<HashMap<u64, CachedResult>>,
     next_id: AtomicU64,
@@ -628,17 +565,7 @@ impl WebSearchCache {
     }
 }
 
-// ── Shared HTTP error handling ─────────────────────────────────────────
-
-/// Check a web search API response for HTTP errors and extract structured
-/// JSON error messages when available.
-///
-/// Both DeepSeek and Exa return structured JSON errors — this reads the
-/// response body, extracts the error detail (string `error` field or the
-/// nested-envelope cascade — see
-/// [`crate::util::extract_provider_error_detail`]), and bails with a
-/// descriptive message.  Returns the response on success (2xx) so the
-/// caller can continue processing it.
+/// Check a web search API response for HTTP errors and extract structured details from the body.
 pub(crate) async fn check_search_error(
     response: reqwest::Response,
 ) -> anyhow::Result<reqwest::Response> {
@@ -657,8 +584,7 @@ pub(crate) async fn check_search_error(
     anyhow::bail!("search failed with status {status}: {body}");
 }
 
-/// Extract a descriptive error message from a web-search error response body
-/// (string `error` field or the nested-envelope cascade).
+/// Extract a descriptive error message from a web-search error response body.
 #[must_use]
 fn search_error_detail(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
@@ -668,10 +594,6 @@ fn search_error_detail(body: &str) -> Option<String> {
 
 impl WebSearchCache {
     /// Parse and validate `web_search` tool arguments.
-    ///
-    /// Returns `(query, Option<expand_id>)` where `query` is the trimmed query
-    /// string (empty if expanding).  Exactly one of `expand_id` is `Some` or
-    /// `query` is non-empty.
     pub(crate) fn validate_execute_args<'a>(
         &self,
         args: &'a Value,
@@ -713,27 +635,16 @@ impl WebSearchCache {
                     );
                 }
 
-                // query is empty, expand_id is Some
                 Ok(("", Some(id)))
             }
         }
     }
 }
 
-// ── Tool ────────────────────────────────────────────────────────────────────────
-
 /// Web search tool: one text backend, plus the Exa key pictures go to.
-///
-/// Results are cached per-instance in-memory and can be expanded via the
-/// `expand` parameter to retrieve full text content. Each agent session gets its
-/// own tool instance, so caches are automatically freed when the agent session
-/// ends.
 pub struct WebSearchTool {
-    /// Every text search goes here.
     text: WebSearchBackend,
-    /// The Exa key a search asking for pictures goes to. Only Exa supplies
-    /// pictures, so `Some` also *is* this instance's picture capability: with
-    /// `None` the tool offers no `pictures` parameter and ignores one if sent.
+    /// The Exa key a search asking for pictures goes to. Only Exa supplies pictures.
     pictures: Option<String>,
     cache: WebSearchCache,
 }
@@ -749,11 +660,6 @@ impl WebSearchTool {
     }
 
     /// Resolve the stored choice into the two capabilities.
-    ///
-    /// An explicit choice is honoured even when the other key is configured;
-    /// with no explicit choice text goes to DeepSeek and pictures to the only
-    /// backend that can supply them. A key missing for the chosen capability
-    /// means no tool at all — there is no fallback between providers.
     #[must_use]
     pub(crate) fn from_config(
         provider: Option<&str>,
@@ -793,17 +699,8 @@ impl WebSearchTool {
         }
     }
 
-    /// A search, with the one recovery rule: a picture call whose picture part
-    /// failed still returns its text results and reports the pictures
-    /// unavailable rather than none.
-    ///
-    /// The flag is honoured only when this instance has a picture backend; on
-    /// one without, the call is a plain text search.
-    ///
-    /// That retry is the only place a call moves between backends — it is the
-    /// recovery of a request the picture backend refused, not a fallback: it
-    /// obeys the text backend's own limits, so a DeepSeek retry of an over-long
-    /// query fails with that refusal.
+    /// A search, with the one recovery rule: a picture call whose picture part failed still answers
+    /// with its text.
     async fn search(&self, query: &str, pictures: bool) -> anyhow::Result<SearchAnswer> {
         let Some(key) = self.pictures.as_deref().filter(|_| pictures) else {
             return self.text_answer(query).await;
@@ -819,8 +716,7 @@ impl WebSearchTool {
         }
     }
 
-    /// One DeepSeek search. The provider's own query ceiling is enforced first
-    /// so the model gets a refusal it can act on.
+    /// One DeepSeek search. The provider's own query ceiling is enforced first.
     async fn deepseek_answer(&self, key: &str, query: &str) -> anyhow::Result<SearchAnswer> {
         deepseek_query_limit(query)?;
 
@@ -840,8 +736,7 @@ impl WebSearchTool {
         })
     }
 
-    /// One Exa search: rows, plus one group of picture candidates per result
-    /// when the flag asked for pictures.
+    /// One Exa search: rows, plus one group of picture candidates per result.
     async fn exa_answer(
         &self,
         key: &str,
@@ -880,9 +775,7 @@ impl WebSearchTool {
         Ok(SearchAnswer { rows, pictures })
     }
 
-    /// Render rows as the agent-facing search output: no-results message,
-    /// header, then one entry per row (caching full text for `expand`), then the
-    /// picture section a flagged call asked for.
+    /// Render rows as the agent-facing search output: no-results message, then one line per result.
     async fn format_search_output(
         &self,
         query: &str,
@@ -914,8 +807,8 @@ impl WebSearchTool {
             }
         }
 
-        // A picture call scrubs its own text (see `should_scrub_output`) and then
-        // appends addresses verbatim.
+        // A picture call scrubs its own text (see `should_scrub_output`) and then appends the
+        // pictures.
         let mut output = if matches!(pictures, Pictures::NotRequested) {
             lines.join("\n")
         } else {
@@ -929,9 +822,7 @@ impl WebSearchTool {
     }
 }
 
-/// The picture section of a search answer, or `None` when the call did not ask
-/// for pictures. "No usable pictures" and "the picture part of the search
-/// failed" are different facts and are reported differently.
+/// The picture section of a search answer, or `None` when the call did not ask.
 fn picture_section(pictures: &Pictures) -> Option<String> {
     match pictures {
         Pictures::NotRequested => None,
@@ -981,8 +872,7 @@ fn exa_request_body(query: &str, pictures: bool) -> ExaSearchBody {
 }
 
 /// Every picture of one Exa result its alt text presents as the subject, best
-/// first: the first candidate verification accepts becomes that result's
-/// picture.
+/// first: the first candidate verification accepts becomes that result's picture.
 ///
 /// The same address can appear twice with different alt text, so an address the
 /// page labels as furniture anywhere is skipped even where another alt text

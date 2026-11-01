@@ -1,109 +1,19 @@
 //! Chrome sessions and tab records runs leave behind: the ended-run releases, the live run's own
 //! tab cap, and the per-agent tab record that cap counts from.
 //!
-//! chrome-use ≥1.5.101 preserves external Chrome tabs across daemon idle recycling, so the
-//! sessions an agent run opened must be closed explicitly — a run cannot do it in its own
-//! tail, which is skipped whenever its future is dropped. Every run end queues the names it
-//! recorded, from its run-end guard's `Drop` (`crate::agent::RunEndCleanup`), and the
-//! `chrome-run-releases` task closes them out of band.
+//! chrome-use ≥1.5.101 preserves external Chrome tabs across daemon idle recycling, and a run
+//! cannot close its own in its tail — that tail is skipped when its future is dropped — so every
+//! run end queues its names from `RunEndCleanup`'s `Drop` and the `chrome-run-releases` task closes
+//! them out of band through the browser extension ([`crate::tools::chrome_tabs::close_sessions`]),
+//! not chrome-use's endpoint-bound `session stop`.
 //!
-//! What closes them is the browser's own extension, not chrome-use's endpoint-bound
-//! `session stop`: one batched call into [`crate::tools::chrome_tabs::close_sessions`] per
-//! pass, over every due record's names and the reclaim set below, where the browser's own
-//! answers are the only proof (that module owns the reading).
+//! A record ends only when the browser says every name is gone, when the record's routes cannot
+//! close the rest ([`record_disposition`]), or when the cap evicts it — the record is lost, never a
+//! tab. Leftovers no record names are reclaimed by a sweep of live `AGENT_TAB_PREFIX` groups
+//! ([`reclaim_unfinished`]) that never runs on a timer and leaves [`ProtectedNamespaces`] alone.
 //!
-//! A record is not dropped on a retry: it ends only when the browser says every name is
-//! gone, or that the record's own routes cannot close the rest — the extension's ledger no
-//! longer holding them, or an answer that this run's close left them standing repeated
-//! [`MAX_LEFT_OPEN_ATTEMPTS`] times ([`record_disposition`], which reports both with the run
-//! they came from) — or when the queue cap evicts it, which loses the record and never the
-//! tabs ([`MAX_PENDING_RELEASES`]). A name the browser answered for and left open is reported
-//! once and retried (see [`RetryLeg::LeftOpen`]); once the browser has answered that way
-//! [`MAX_LEFT_OPEN_ATTEMPTS`] times the record is dropped with the leftover reported, and the
-//! still-open groups are left to the reclaim sweep, which re-examines them at
-//! [`STUCK_REVISIT`]. Anything else it did not answer for stays queued on a growing, capped
-//! backoff and no attempt cap. A settled session is then let go
-//! ([`crate::tools::chrome_tabs::forget_settled_sessions`]), and that let-go queue is the one
-//! piece of this path that lives in memory only — what it holds is chrome-use's own
-//! bookkeeping plus this module's scratch session. The scratch session is a
-//! `mahbot-chrome-ephemeral-*` name, which the product's session sweeps own for what the queue
-//! cannot settle; a settled run's session record is the one thing nothing else sweeps, and it is
-//! bookkeeping alone, never a tab. The shutdown flush reaches that queue
-//! ([`flush_pending_run_releases`]) without draining it: its budget is below one whole stop, so a
-//! name its cut-short stop could not settle dies with the process. While the process lives, an
-//! unconfirmed let-go of our own session is queued ([`queue_forget`]) and retried on the queue's
-//! own deadline, never left for the next start. What this path can never lose is a run's tab.
-//!
-//! The browser reads run in a chrome-use session this module BORROWS wherever the work has one
-//! ([`read_session`]): the sessions the records name are the run's own — the normal run-end case,
-//! where the run's session is the one whose tabs are being closed — so a pass with one to borrow
-//! mints no session of ours; a run whose session is still there gains nothing from the read, and
-//! one whose session chrome-use had already recycled gains the page that session works in, in its
-//! own group (see [`read_session`] for what removes it). Only a pass with no name
-//! to borrow at all falls back to this product's own session
-//! ([`crate::tools::chrome_tabs::OWN_SESSION`]), and every pass that used it lets it go
-//! ([`crate::tools::chrome_tabs::release_own_session`]) through the same connection-independent
-//! route the runs are closed by, so its scratch group cannot be stranded by an endpoint re-mint.
-//! That session is this module's one member of the `mahbot-chrome-ephemeral-*` family, which the
-//! product's session sweeps own for what its members could not close — including a scratch group
-//! whose pass died before its let-go. The one state that let-go can establish against us — the
-//! browser not confirming that group gone, a read that looks for it included — is surfaced once
-//! ([`OWN_SESSION_REASON`]) rather than accepted quietly, and the session is queued for a stop
-//! ([`queue_forget`]) so the group cannot sit in the owner's strip until the next start. The one
-//! page any of this can add is the one chrome-use opens when a read starts a session whose daemon
-//! had been recycled: in a borrowed session it lands in that session's own group, which the record
-//! holding the name closes at its own pass — unless that namespace is protected then, when the page
-//! waits in that run's group for a later pass — and for the fallback it is the scratch group the
-//! same pass lets go.
-//!
-//! [`MAX_PENDING_RELEASES`] is the one other way a record leaves the queue: its eviction
-//! closes nothing and needs no report of its own, because those tabs are then `agent-tab-*`
-//! groups no live run, no record and no resumable job claims — what the sweep owns from its
-//! next ask on, and reports itself if it cannot close them. The run the evicted record came
-//! from is remembered for a while ([`EVICTED_RUNS`]), so that report can still name it.
-//!
-//! Leftovers nobody recorded — a run lost to a crash, force quit, hard kill or self-update,
-//! and the residue of earlier runs and versions — are reclaimed unprompted by a sweep of the
-//! browser's live tab groups whose title starts with `crate::tools::chrome::AGENT_TAB_PREFIX`
-//! ([`crate::tools::chrome_tabs::agent_group_names`]), so the product does not depend on a
-//! run-end hook having fired. The sweep matches a live title exactly; which titles carry a
-//! session name is chrome-use's grouping rule, not this sweep's
-//! ([`crate::tools::chrome_tabs`]' honest limits). It asks at the start of the process only when
-//! the durable record file handed it something, and after that only while something is unfinished
-//! or an event arms one ([`schedule_reclaim_now`] — a run end or a queue-cap eviction — a parked
-//! verdict's revisit ([`schedule_reclaim_revisit`]), a record concluding with leftovers no route
-//! closed, [`reclaim_unfinished`]) — never on a timer, so an idle product asks the browser nothing
-//! and a start with nothing pending opens no page. Its reads borrow the sessions the records name
-//! ([`read_session`]), so the product's own scratch group appears only for a leftover no record
-//! names any more. [`ProtectedNamespaces`] is the set it leaves alone, and it does not
-//! re-interrogate what it has already concluded. The product's other scratch families are NOT
-//! this sweep's: a `mahbot-chrome-ephemeral-*` leftover and the link enricher's sessions are the
-//! product's own session sweeps' to close. That is because this sweep can only protect what it
-//! can attribute, and a live fetch whose daemon has been idle-recycled is one it cannot tell from
-//! a leftover: chrome-use keeps tabs across recycling, so a live fetch's session can be
-//! unregistered while its tabs and its work are live. That family is therefore swept at the
-//! moments nothing is in flight for it — product start — and closed per fetch, and a leftover of
-//! it whose session record is gone is a pre-existing, documented limit (see
-//! [`crate::tools::chrome_daemon`]'s own note on the
-//! dead-orphan case) rather than something this sweep may guess at.
-//!
-//! Reporting is truthful about its own reach: what this module can attribute to a session is
-//! reported once per `(message, reason)` and with the run wherever durable state still names one
-//! — or where the queue cap remembered it ([`EVICTED_RUNS`]). What is deliberately not in it is
-//! what is not a leftover — a namespace [`ProtectedNamespaces`] still keeps for a run, and the
-//! classes a route closing by exact group title cannot ATTRIBUTE (a rename off
-//! `crate::tools::chrome::AGENT_TAB_PREFIX`, tabs moved out of a session's group) — because
-//! reporting them would blame the owner's own tabs. A browser side with no ownership door is
-//! reported once as a fact about the host, with no run and no session names
-//! ([`NO_OWNERSHIP_DOOR_REASON`]).
-//!
-//! Two more of this path's members serve a run that is still going: [`evict_agent_tab`] closes the
-//! one tab the agent tool's per-agent cap picked when a new tab appeared — the live run asking for
-//! its own tab, counted from [`crate::tools::chrome_tab_ledger`], off the agent's path — and
-//! [`prune_tab_records`], run once per boot by [`release_queue`], drops the tab records no live
-//! run, no held release record and no resumable job claims, since nothing of theirs is left to
-//! count.
-//!
+//! Reports name a run wherever durable state or [`EVICTED_RUNS`] does, and never blame the owner's
+//! own tabs for what cannot be attributed ([`NO_OWNERSHIP_DOOR_REASON`]).
 
 use super::chrome_daemon::cli_path;
 use super::chrome_tabs::{self, RetryLeg, TabOutcome};
@@ -117,98 +27,56 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-/// First retry gap and its cap: the gap doubles per attempt. A record whose tabs are
-/// still there is retried on that ladder — a leftover must not cost a spawn every few
-/// seconds — until the browser either answers that they are gone or has answered
-/// [`MAX_LEFT_OPEN_ATTEMPTS`] times that this run's close left them standing (see
-/// [`record_disposition`]).
+/// Retry ladder for a leftover: doubles per attempt, capped at [`RELEASE_RETRY_CAP`].
 const RELEASE_RETRY_BASE: Duration = Duration::from_secs(5);
 const RELEASE_RETRY_CAP: Duration = Duration::from_mins(30);
-/// How many passes may get the browser's own answer that this run's close left the tabs
-/// standing before the close route concludes. An answer repeated that often, each after a full
-/// close attempt and fresh reads, is the strongest evidence any route here can produce that it
-/// is not going to close them — and a record must never be retried forever without reaching a
-/// conclusion (see [`record_disposition`] for what the conclusion costs).
+/// Answers that this run's close left the tabs standing, before the close route concludes.
 const MAX_LEFT_OPEN_ATTEMPTS: u32 = 3;
-/// How long a held release waits, and the only bound on a run that never comes back.
-/// A restart inside the window re-mints the whole hold from that boot (see
-/// [`restored_eligibility`]); which ends hold is [`holds_run_end`]'s rule.
+/// How long a held release waits, and the only bound on a run that never comes back: a restart
+/// inside the window re-mints the hold from its own boot ([`restored_eligibility`]).
 pub(crate) const RELEASE_HOLD_REDRIVEN_RUN: Duration = Duration::from_mins(30);
-/// Which run ends hold their session release back: a drain/shutdown cut and a workspace-pause
-/// freeze, held for [`RELEASE_HOLD_REDRIVEN_RUN`] — the ends after which the same run is
-/// normally rebuilt under its own durable id (the dispatches re-read a durable id, and a paused
-/// phase job waits for the unpause re-drive), so its resumed segment must still find the tabs it
-/// was working with. The hold is a property of the end alone — nothing checks that a run is
-/// actually re-driven — so a run nothing comes back for pays it as latency. `internal_cancel` is
-/// a cooperative end too, but deliberately not held: it may release while a replacement segment
-/// starts up on the same names, which is why every attempt re-checks per name. Every other end
-/// releases at once — including a run aborted at a round/research deadline or lost to a panic,
-/// which ends through its run-end guard's `Drop` with the record queued unheld.
-///
-/// The hold is a floor, not the whole protection: a namespace a non-terminalized job still
-/// names is left alone whatever the hold says (see [`ProtectedNamespaces`]).
+/// Which run ends hold their release back: a drain/shutdown cut and a workspace pause, after which
+/// the same run is normally rebuilt under its own durable id, so its resumed segment must still
+/// find its tabs. Nothing checks that a run is re-driven, so a run nothing comes back for pays the
+/// hold as latency; `internal_cancel` is deliberately not held, which is why every attempt
+/// re-checks per name. The hold is a floor: a namespace a non-terminalized job still names is left
+/// alone anyway.
 pub(crate) fn holds_run_end(classification: &str) -> bool {
     matches!(classification, "drain" | "shutdown" | "pause")
 }
 
-/// Floor on a restored record's eligibility: the runs the daemon re-drives at boot
-/// are constructed (and their namespaces registered as live) after the release
-/// task restores, so a restored record must not be attempted before they exist.
-/// A held record is not floored here — its hold is re-minted from boot instead
-/// (see [`restored_eligibility`]).
+/// Floor on a restored record's eligibility: the runs the daemon re-drives at boot register after
+/// the release task restores; a held record is re-minted to its whole hold instead.
 const RELEASE_BOOT_GRACE: Duration = Duration::from_mins(1);
-/// Durable record of the queue, at the storage root. A file rather than a DB row
-/// because the hand-off runs from a `Drop` (a dropped future is an interrupted
-/// run's only hook), where a DB write during a shutdown is not dependable — this
-/// is one small synchronous write.
+/// Durable record of the queue: a file, not a DB row, because the hand-off runs from a `Drop`.
 const RELEASE_FILE_NAME: &str = "chrome-run-releases.json";
-/// Hard cap on queued releases: a burst of runs ending while the browser side is
-/// down must not accumulate records without bound, so a record is evicted to make room
-/// (see [`evict_oldest`]). Eviction closes nothing and is logged, not reported: the evicted
-/// record's tabs stay plain `agent-tab-*` groups no live run, no record and no resumable job
-/// claims any more, so the reclaim sweep owns them from its next ask on and reports them itself
-/// if it cannot close them — with the run the record came from, remembered for a while
-/// ([`EVICTED_RUNS`]).
+/// Hard cap on queued releases: a burst of runs ending while the browser side is down must not
+/// accumulate without bound, so a record is evicted to make room ([`evict_oldest`]). Eviction
+/// closes nothing and loses a record, never a tab — the reclaim sweep owns those tabs from its next
+/// ask on and reports them itself, naming the run [`EVICTED_RUNS`] remembers.
 const MAX_PENDING_RELEASES: usize = 256;
-/// How long an evicted record's run is remembered for the sweep's report of its tabs.
-/// A leftover the sweep can close is closed on its next ask, so the attribution is only
-/// ever read for one that survived a sweep or two; an hour covers the browser side being
-/// brought back by hand without keeping the map alive for the whole process.
+/// How long an evicted record's run is remembered for the sweep's report (see [`EVICTED_RUNS`]).
 const EVICTED_RUN_TTL: Duration = Duration::from_hours(1);
-/// Last-chance release budget on the shutdown/self-update path: a degraded browser side
-/// cannot be waited out while the process is going down. It sits below what one close pass
-/// may legitimately need (see
-/// [`crate::chrome::SESSION_STOP_TIMEOUT`]), so a slow but working pass is cut off here and its
-/// record left for the next boot — whose pass owns the charging rules (see
-/// [`flush_pending_run_releases`]).
+/// Last-chance release budget on the shutdown/self-update path, below what one close pass may need
+/// ([`crate::chrome::SESSION_STOP_TIMEOUT`]), so a slow pass is cut off and left for the next boot.
 const SHUTDOWN_RELEASE_FLUSH_BUDGET: Duration = Duration::from_secs(10);
 
 /// One ended run's unreleased session names.
 #[derive(Clone)]
 struct PendingRunRelease {
-    /// Namespace of the run that opened them — the identity a live run of the
-    /// same agent id shares, which records are merged by.
+    /// The identity records are merged by: a live run of the same agent id shares it.
     namespace: String,
     names: Vec<String>,
     attempts: u32,
     next_attempt_at: Instant,
-    /// Whether [`holds_run_end`] held this record's eligibility back — see
-    /// [`restored_eligibility`] for what that does to it.
     held: bool,
-    /// The agent id the run ended under, carried so an issue report can name the run
-    /// it came from. Empty for a record restored from a file written before this field
-    /// existed.
+    /// The agent id the run ended under, so a report can name it.
     run: String,
-    /// Passes that asked the browser to remove this record's tabs and got the answer that this
-    /// run's close left them standing ([`crate::tools::chrome_tabs::RetryLeg::LeftOpen`]).
-    /// At [`MAX_LEFT_OPEN_ATTEMPTS`] the close route stops retrying and the leftovers are
-    /// reported (see [`record_disposition`]).
+    /// Passes the browser answered for and left standing, concluded at [`MAX_LEFT_OPEN_ATTEMPTS`].
     left_open: u32,
 }
 
-/// One queued record as persisted. `Instant` is process-relative, so the
-/// remaining eligibility is stored as an absolute epoch-seconds deadline and
-/// re-based onto the reading process's clock at restore.
+/// One queued record as persisted: `Instant` is process-relative, so deadlines are epoch seconds.
 #[derive(Serialize, Deserialize)]
 struct PersistedRunRelease {
     namespace: String,
@@ -218,22 +86,16 @@ struct PersistedRunRelease {
     /// Epoch seconds at which the record becomes eligible (`0` = now).
     #[serde(default)]
     next_attempt_at: u64,
-    /// Whether the record's eligibility is a hold ([`PendingRunRelease::held`]).
     #[serde(default)]
     held: bool,
-    /// The run the record belongs to ([`PendingRunRelease::run`]). `default` is
-    /// mandatory here: an old record file carries no `run`, and without it the whole
-    /// pending queue would stop parsing and be silently dropped.
+    /// `default` is mandatory on `run` and `left_open`: an old record file carries neither.
     #[serde(default)]
     run: String,
-    /// [`PendingRunRelease::left_open`], defaulted for the same reason as `run`.
     #[serde(default)]
     left_open: u32,
 }
 
-/// One run whose record the queue cap evicted. The record itself is gone — its tabs are the
-/// sweep's from then on — but the run it belonged to is what lets the sweep's report of a
-/// leftover it cannot close name the run instead of nobody (see [`evicted_run`]).
+/// A run whose record the cap evicted, so a report of its tabs can still name it.
 struct EvictedRun {
     namespace: String,
     run: String,
@@ -241,33 +103,25 @@ struct EvictedRun {
 }
 
 static PENDING_RELEASES: OnceLock<Mutex<VecDeque<PendingRunRelease>>> = OnceLock::new();
-/// The records the passes in flight have taken out of the queue, each tagged with the
-/// [`ReleasePass`] holding it. [`persist_pending_releases`] writes them too, so a persist
-/// from any path can never publish a file that loses a batch a pass is mid-way through
-/// when the process exits (self-update's `exit(0)`, a kill); each pass unparks exactly
-/// its own, because passes may overlap (the driver and the shutdown flush). The one way
-/// an entry outlives its pass is a panic inside a finish closure, and it is parked
-/// precisely so the file keeps it until the next boot restores it.
+/// The records passes in flight took out of the queue, tagged with their [`ReleasePass`] id.
+/// [`persist_pending_releases`] writes them too, so a persist can never publish a file that loses a
+/// batch a pass is mid-way through; each pass unparks exactly its own, since passes may overlap. An
+/// entry outlives its pass only through a panic inside a finish closure, and it stays parked so the
+/// next boot restores it.
 static PARKED_RELEASES: OnceLock<Mutex<Vec<(u64, PendingRunRelease)>>> = OnceLock::new();
 /// Source of [`ReleasePass`] ids, unique within one process.
 static NEXT_PASS_ID: AtomicU64 = AtomicU64::new(0);
 static RELEASE_WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
-/// Namespaces of the runs live RIGHT NOW, refcounted: a replacement run for the
-/// same agent id (self-update or daemon-restart resume) can overlap the run it
-/// replaces, so both may hold the same namespace at once.
+/// Namespaces of the runs live RIGHT NOW, refcounted: a replacement run may overlap its
+/// predecessor.
 static LIVE_RUN_NAMESPACES: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
-/// When the reclaim sweep last asked the browser and how many consecutive asks it could
-/// not get answered, which is what spaces its attempts out (see [`reclaim_due`]).
+/// When the sweep last asked, and how many asks went unanswered (see [`reclaim_due`]).
 static RECLAIM: OnceLock<Mutex<ReclaimSchedule>> = OnceLock::new();
-/// Namespaces the sweep has already concluded no route here closes, and when it did
-/// (see [`stuck`]). In-process only: a restart tries once more, which is what a fresh
-/// look at a possibly repaired browser is worth.
+/// Namespaces the sweep concluded no route here closes, and when ([`stuck`]); in-process only.
 static STUCK_NAMESPACES: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
-/// Sessions a pass closed but had no budget left to let go of, each with the number of
-/// passes that have failed to let it go (see [`forget_settled`]).
+/// Sessions a pass closed but had no budget to let go of, with their failed attempts.
 static PENDING_FORGET: OnceLock<Mutex<Vec<(String, u32)>>> = OnceLock::new();
-/// The runs whose records the queue cap evicted, so the sweep's own report of the tabs they
-/// left can still name them (see [`evicted_run`]).
+/// The runs whose records the cap evicted, so a report of their tabs can still name them.
 static EVICTED_RUNS: OnceLock<Mutex<VecDeque<EvictedRun>>> = OnceLock::new();
 
 fn pending_releases() -> &'static Mutex<VecDeque<PendingRunRelease>> {
@@ -290,10 +144,8 @@ fn evicted_runs() -> &'static Mutex<VecDeque<EvictedRun>> {
     EVICTED_RUNS.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
-/// Mark a run's session namespace as live. The release of an earlier run's record
-/// must never close a session whose run is live again: a resumed run re-attaches
-/// the very same names, so it owns them until its own release. Empty namespaces
-/// (the shared non-agent instance) are ignored — it never owns run-scoped sessions.
+/// Mark a run's namespace as live: an earlier record's release must never close a session a live
+/// run re-attached. Empty namespaces (the shared non-agent instance) are ignored.
 pub(crate) fn register_run_namespace(namespace: &str) {
     if namespace.is_empty() {
         return;
@@ -305,9 +157,7 @@ pub(crate) fn register_run_namespace(namespace: &str) {
         .or_insert(0) += 1;
 }
 
-/// Drop one registration of a run's namespace. Waking the release task here is
-/// what makes a record skipped as live releasable the moment that run's tracker is
-/// gone — a live skip is not re-armed, so there is no poll interval.
+/// Drop one registration and wake the release task, so a record skipped as live is retried at once.
 pub(crate) fn unregister_run_namespace(namespace: &str) {
     if namespace.is_empty() {
         return;
@@ -334,17 +184,13 @@ fn run_namespace_is_live(namespace: &str) -> bool {
             .contains_key(namespace)
 }
 
-/// Which of two eligibilities a merge keeps when the run already has a record
-/// queued. An eligibility is the pair (when the record may be attempted, whether it
-/// is a hold) and the two travel together, so the pair kept is always whole.
+/// Which of two eligibilities a merge keeps; the (deadline, hold) pair always travels whole.
 #[derive(Clone, Copy)]
 enum Eligibility {
-    /// The incoming pair wins: a run end is the most recent statement about the run,
-    /// so it replaces an earlier cut's hold with what it says now.
+    /// The incoming pair wins: a run end is the most recent statement about the run.
     RunEnd,
-    /// The later deadline wins: a pass putting records back must not undercut an
-    /// eligibility that arrived while it was in flight. A stale hold can win this way
-    /// and delay a release its run no longer needs, by at most the hold.
+    /// The later deadline wins, so a pass putting records back cannot undercut an eligibility that
+    /// arrived while it was in flight; a stale hold can win this way, by at most the hold.
     Retry,
 }
 
@@ -353,17 +199,15 @@ impl Eligibility {
     fn keep(self, queued: (Instant, bool), incoming: (Instant, bool)) -> (Instant, bool) {
         match self {
             Self::RunEnd => incoming,
-            // A retry keeps the queued pair unless the incoming one is later
-            // still — a tie must not shorten what is already queued.
+            // A retry keeps the queued pair unless the incoming one is later still — a tie must not
+            // shorten what is already queued.
             Self::Retry if incoming.0 > queued.0 => incoming,
             Self::Retry => queued,
         }
     }
 }
 
-/// Fold `incoming` into `entry`: the union of the names, the higher counts (attempts and
-/// left-open answers alike, so a re-queue cannot restart a count the browser has already run
-/// up) and the eligibility pair `keep` picks among the two.
+/// Fold `incoming` into `entry`: union of names, the higher counts, and the pair `keep` picks.
 fn absorb(entry: &mut PendingRunRelease, incoming: PendingRunRelease, keep: Eligibility) {
     (entry.next_attempt_at, entry.held) = keep.keep(
         (entry.next_attempt_at, entry.held),
@@ -374,9 +218,7 @@ fn absorb(entry: &mut PendingRunRelease, incoming: PendingRunRelease, keep: Elig
     if entry.run.is_empty() {
         entry.run = incoming.run;
     }
-    // A membership set built from the record's current names and grown as the incoming ones
-    // arrive: a record's names are gathered from every merge (a re-queued end, a restore, the
-    // queue's own fold), so the duplicate check must not be a linear scan per name.
+    // A membership set grown as the incoming names arrive, so no per-name linear scan.
     let mut seen: HashSet<String> = entry.names.iter().cloned().collect();
     for name in incoming.names {
         if seen.insert(name.clone()) {
@@ -390,20 +232,15 @@ fn within_hold(record: &PendingRunRelease, now: Instant) -> bool {
     record.held && record.next_attempt_at > now
 }
 
-/// Take out the record to evict to make room for one more: the oldest NOT inside a hold, or
-/// `None` when every record is inside one. Dropping such a record would lose the tabs of a run
-/// that may still come back to them, which is worse than a queue that grows until one of those
-/// holds elapses.
+/// The oldest record NOT inside a hold, or `None`: a held record's tabs may still be resumed.
 fn evict_oldest(queue: &mut VecDeque<PendingRunRelease>) -> Option<PendingRunRelease> {
     let now = Instant::now();
     let index = queue.iter().position(|record| !within_hold(record, now))?;
     queue.remove(index)
 }
 
-/// Remember the run an evicted record came from, so the sweep's own report of the leftover
-/// tabs can still name it. Bounded like the queue the record left: an entry older than
-/// [`EVICTED_RUN_TTL`] is dropped, and so is the oldest once the deque is as long as the
-/// queue's own cap.
+/// Remember the run an evicted record came from, so the sweep's report can name it. Bounded like
+/// the queue: entries past [`EVICTED_RUN_TTL`], and past the queue's own cap, go.
 fn remember_evicted_run(namespace: &str, run: &str) {
     let now = Instant::now();
     let mut runs = evicted_runs().lock().unwrap_poison();
@@ -418,8 +255,8 @@ fn remember_evicted_run(namespace: &str, run: &str) {
     }
 }
 
-/// The run an evicted record's namespace came from, when one was evicted inside the TTL —
-/// the newest such entry, since a namespace evicted twice belongs to the later run.
+/// The newest evicted run for `namespace` inside [`EVICTED_RUN_TTL`]: a namespace evicted twice
+/// belongs to the later run.
 fn evicted_run(namespace: &str) -> Option<String> {
     let now = Instant::now();
     evicted_runs()
@@ -434,14 +271,11 @@ fn evicted_run(namespace: &str) -> Option<String> {
         .map(|entry| entry.run.clone())
 }
 
-/// Put a record in the queue, merging into the record already queued for the same run instead
-/// of keeping two: the merge keeps the union of the names and the higher counts, so a re-queue
-/// cannot discard what an earlier end recorded. `eligibility` resolves which pair wins (see
-/// [`Eligibility`]).
+/// Queue a record, merging into the record already queued for the same run — the union of the names
+/// and the higher counts — instead of keeping two; `eligibility` resolves which pair wins.
 fn merge_record(entry: PendingRunRelease, eligibility: Eligibility) {
-    // The namespace is what a record is identified by — records are merged, and
-    // matched against the runs live right now, by it — so a record without one is
-    // never queued.
+    // A record without a namespace is never queued: records are merged, and matched against the
+    // live runs, by it.
     if entry.namespace.is_empty() || entry.names.is_empty() {
         return;
     }
@@ -459,11 +293,9 @@ fn merge_record(entry: PendingRunRelease, eligibility: Eligibility) {
     queue.push_back(entry);
     drop(queue);
     for record in evicted {
-        // Logged and not reported: the sweep owns these tabs from its next ask on and
-        // reports them itself (see [`MAX_PENDING_RELEASES`]) — with the run the record came
-        // from, which is what the memory below carries to it. The ask is armed here because
-        // an eviction need not come from a run end (a pass putting its records back, a
-        // restore): the sweep has to be what picks the group up either way.
+        // Logged, not reported: the sweep owns these tabs from its next ask on and reports them
+        // itself (see [`MAX_PENDING_RELEASES`]), with the run carried by the memory below. Armed
+        // here because an eviction need not come from a run end.
         remember_evicted_run(&record.namespace, &record.run);
         arm_reclaim_at(Instant::now() + STUCK_REVISIT);
         info!(
@@ -475,12 +307,11 @@ fn merge_record(entry: PendingRunRelease, eligibility: Eligibility) {
     }
 }
 
-/// Hand a run's ended-session record over for release. `held` is [`holds_run_end`]'s verdict for
-/// how the run ended; `run` is the agent id, carried so a report can name the run the leftover
-/// tabs came from. Sync and panic-free so it can run from a `Drop`, and durable: the write below
-/// is what makes the release survive this process. The names are snapshotted here (`ChromeTool`
-/// records a session before it dispatches, so the set is complete once the run is gone), and a
-/// later run of the same durable id re-attaches them, which the live-namespace guard covers.
+/// Hand a run's ended-session record over for release. `held` is [`holds_run_end`]'s verdict; `run`
+/// is the agent id, carried so a report can name the run. Sync and panic-free so it can run from a
+/// `Drop`, and durable: the write below is what makes the release outlive this process. The names
+/// are snapshotted here (`ChromeTool` records a session before dispatching), and a later run of the
+/// same durable id re-attaches them, which the live-namespace guard covers.
 pub(crate) fn queue_run_session_release(
     sessions: &super::chrome::ChromeRunSessions,
     held: bool,
@@ -497,8 +328,7 @@ pub(crate) fn queue_run_session_release(
     );
 }
 
-/// [`queue_run_session_release`] with the hold spelled out, for the tests that need one
-/// other than the constant's.
+/// [`queue_run_session_release`] with the hold spelled out, for the tests that need another.
 fn queue_run_session_release_after(
     sessions: &super::chrome::ChromeRunSessions,
     hold: Duration,
@@ -521,20 +351,16 @@ fn queue_run_session_release_after(
         Eligibility::RunEnd,
     );
     persist_pending_releases();
-    // The run end is the event that brings a crashed run's leftover to light: names nothing
-    // recorded are exactly what a crashed or force-quit run leaves, and a sweep asks the
-    // browser about them at no extra cost to the owner — the pass that closes this record's
-    // tabs has already opened the session the sweep's own read runs in. A run that queued
-    // nothing must not arm one ([`unregister_run_namespace`] deliberately does not).
+    // The run end is what brings a crashed run's leftover to light — a crash leaves exactly the
+    // names no record has — and the pass that closes this record has already opened the session the
+    // sweep reads in. A run that queued nothing must not arm one.
     schedule_reclaim_now();
     release_wake().notify_one();
 }
 
-/// Restore the records a previous process left queued, once at the start of
-/// [`run_session_release_queue`]: a release still pending when the release task stopped is
-/// retried after the restart instead of being lost, a held record survives the restart it waits
-/// for (with its attempt count, so the bound stays bounded across restarts), and an unreadable
-/// file is ignored rather than treated as a failure.
+/// Restore the records a previous process left queued, once, at the start of
+/// [`run_session_release_queue`]: a pending release is retried rather than lost, a held record
+/// survives the restart it waits for with its attempt count, and an unreadable file is ignored.
 fn restore_pending_releases() {
     let Some(path) = release_settings().store else {
         return;
@@ -555,9 +381,8 @@ fn restore_pending_releases() {
     };
     let mut restored = 0usize;
     for record in records {
-        // What [`merge_record`] would refuse is not restored — and must not count as restored
-        // either: it is not work this process owes the browser a read for (a corrupt file's
-        // nameless record would otherwise arm a sweep with nothing queued).
+        // What [`merge_record`] would refuse is neither restored nor counted: it is no work this
+        // process owes the browser a read for.
         if record.names.is_empty() || record.namespace.is_empty() {
             continue;
         }
@@ -571,9 +396,8 @@ fn restore_pending_releases() {
                 run: record.run,
                 left_open: record.left_open,
             },
-            // `Retry`, not `RunEnd`: a file with two entries for one namespace (only a
-            // pre-dedupe file can) keeps the later pair, i.e. the hold, rather than
-            // blindly letting the last line win.
+            // `Retry`, not `RunEnd`: a pre-dedupe file with two entries for one namespace keeps the
+            // later pair, i.e. the hold.
             Eligibility::Retry,
         );
         restored += 1;
@@ -583,18 +407,17 @@ fn restore_pending_releases() {
             restored,
             "agent-run chrome releases restored from the previous process"
         );
-        // Work a previous process left queued is exactly what the sweep is owed a read for —
-        // including the names no record carries, which a crash or a force quit leaves behind.
+        // Work a previous process left queued is exactly what the sweep is owed a read for,
+        // including the names no record carries.
         schedule_reclaim_now();
         release_wake().notify_one();
     }
 }
 
-/// Drop the per-agent tab records no live run, no held release record and no resumable job
-/// claims any more — their tabs are the reclaim sweep's business from here
-/// (see [`crate::tools::chrome_tab_ledger`]). One durable read, once per boot, and fail-closed:
-/// a durable read that could not be made prunes nothing, because deleting a record is not a step
-/// a missing answer may authorize (the tabs of such a run would start counting from zero).
+/// Drop the per-agent tab records no live run, no held release record and no resumable job claims
+/// any more ([`crate::tools::chrome_tab_ledger`]). One durable read per boot, and fail-closed: a
+/// read that could not be made prunes nothing, since deleting a record is not a step a missing
+/// answer may authorize.
 async fn prune_tab_records() {
     let Some(durable) = durable_resume_namespaces_checked().await else {
         return;
@@ -605,20 +428,18 @@ async fn prune_tab_records() {
 }
 
 /// Write the whole queue — plus what the passes in flight hold ([`PARKED_RELEASES`]) — to the
-/// record file (compact JSON, atomic tmp+rename): fail-open, a no-op with no storage root, and a
-/// record with no names is never written. Both locks are held across the write as well as the
-/// snapshot (parked before queue, the order [`ReleasePass::take`] parks in), because two
-/// persists sharing the one `.json.tmp` could publish a torn file the next boot ignores. A failed
-/// serialization or write leaves the previous file in place rather than publishing a payload that
-/// would read as a drained queue, and says so instead of swallowing the failure.
+/// record file (compact JSON, atomic tmp+rename), both locks held across the write because two
+/// persists sharing one `.json.tmp` could publish a torn file. Fail-open: no storage root, a failed
+/// write or a nameless record leaves the previous file in place, never an empty one that would read
+/// as a drained queue.
 fn persist_pending_releases() {
     let Some(path) = release_settings().store else {
         return;
     };
     let parked = parked_releases().lock().unwrap_poison();
     let queue = pending_releases().lock().unwrap_poison();
-    // Indexed by namespace rather than searched per record: the fold runs over the whole
-    // queue every pass, which is the one place the queue's size is paid for quadratically.
+    // Indexed by namespace rather than searched per record: the fold runs over the whole queue
+    // every pass, which is where the queue's size is paid for quadratically.
     let mut folded: Vec<PendingRunRelease> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for record in queue.iter().chain(parked.iter().map(|(_, record)| record)) {
@@ -645,8 +466,8 @@ fn persist_pending_releases() {
     let json = match serde_json::to_string(&records) {
         Ok(json) => json,
         Err(err) => {
-            // Never fall back to an empty payload: publishing one over the live file would
-            // read as a drained queue and erase everything still queued.
+            // Never fall back to an empty payload: one published over the live file would read as a
+            // drained queue.
             warn!(error = %err, "agent-run chrome release record not written: serialization failed");
             return;
         }
@@ -661,9 +482,8 @@ fn epoch_secs() -> u64 {
     crate::util::unix_millis() / 1000
 }
 
-/// Absolute epoch-seconds deadline for a record's remaining eligibility, which
-/// is what the file stores: an `Instant` is process-relative and dies with the
-/// process that minted it.
+/// Absolute epoch-seconds deadline for a record's remaining eligibility — what the file stores,
+/// since an `Instant` dies with the process that minted it.
 fn eligibility_deadline(next_attempt_at: Instant) -> u64 {
     epoch_secs().saturating_add(
         next_attempt_at
@@ -672,13 +492,9 @@ fn eligibility_deadline(next_attempt_at: Instant) -> u64 {
     )
 }
 
-/// A persisted record as this process's eligibility instant. A held record re-mints its whole
-/// hold from THIS boot ([`RELEASE_HOLD_REDRIVEN_RUN`]): the deadline the previous process
-/// minted says nothing about when the run it waits for will exist, and trusting it would
-/// downgrade a restart that outlasted the hold to the boot grace. Every other record is floored
-/// at the boot grace (with the shipped settings the stored deadline never wins, both being the
-/// same minute) and clamped to the ladder's cap, since a further-out deadline is corrupt input
-/// the add would panic on, taking the release task down for the whole boot.
+/// A persisted record as this process's eligibility instant. A held record re-mints its whole hold
+/// from THIS boot; every other is floored at the boot grace and clamped to the ladder's cap, since
+/// a further-out deadline would panic the add and take the release task down for the whole boot.
 fn restored_eligibility(deadline: u64, held: bool) -> Instant {
     if held {
         return Instant::now() + RELEASE_HOLD_REDRIVEN_RUN;
@@ -688,21 +504,20 @@ fn restored_eligibility(deadline: u64, held: bool) -> Instant {
     Instant::now() + release_settings().boot_grace.max(remaining)
 }
 
-/// Release-queue driver (spawned as `chrome-run-releases`), restoring what a
-/// previous process left queued before it takes its first pass.
+/// Release-queue driver (spawned as `chrome-run-releases`), restoring what a previous process left
+/// queued before it takes its first pass.
 pub async fn run_session_release_queue() {
     release_queue(crate::shutdown::shutdown_token()).await;
 }
 
-/// The loop itself against an explicit token, so a test can drive the real entry point without
-/// the process-wide one: wake on an enqueue, on a live run's tracker going away, or on the next
-/// deadline the schedule carries, whichever comes first. Unlike the other background loops it
-/// does not gate passes on `shutdown::aborting()` — every pass releases runs that have already
-/// ended, so there is nothing a drain needs to protect from it.
+/// The loop against an explicit token, so a test can drive the real entry point: wake on an
+/// enqueue, on a live run's tracker going away, or on the next deadline, whichever comes first. It
+/// does not gate passes on `shutdown::aborting()` — every pass releases runs that already ended, so
+/// there is nothing a drain protects from it.
 async fn release_queue(shutdown: CancellationToken) {
     restore_pending_releases();
-    // The restored records are in the queue above, so their namespaces count as protected here:
-    // the boot prune must not drop the tab record of a release still waiting on the browser.
+    // The restored records are in the queue above, so their namespaces count as protected here: the
+    // boot prune must not drop the tab record of a release still waiting on the browser.
     prune_tab_records().await;
     loop {
         tokio::select! {
@@ -714,9 +529,8 @@ async fn release_queue(shutdown: CancellationToken) {
     }
 }
 
-/// The driver's own wait: until the next deadline, or forever when there is none — the loop
-/// is then woken by an enqueue ([`queue_run_session_release`], [`schedule_reclaim_now`]), by a
-/// live run's tracker going away ([`unregister_run_namespace`]), or by shutdown.
+/// The driver's wait: until the next deadline, or forever when there is none — the loop is then
+/// woken by an enqueue, a live run's tracker going away, or shutdown.
 async fn wait_for_release_work() {
     match next_release_deadline() {
         Some(deadline) => {
@@ -727,12 +541,10 @@ async fn wait_for_release_work() {
 }
 
 /// When the release task must run again: the earliest queued retry not owned by a live run, the
-/// reclaim sweep's own scheduled ask ([`ReclaimSchedule::next_at`]) and the let-go queue's retry
-/// ([`forget_retry_at`]), whichever comes first; `None` when none exists, and the loop then waits
-/// on a wake alone. There is deliberately no standing interval behind it — each of the three is
-/// either an event's ask or a leftover's own retry, spaced by the same capped ladder, and the
-/// let-go queue's element is what makes a session nothing will stop (`~/.chrome-use` bookkeeping,
-/// or this module's own scratch session) be tried again rather than wait for the next start.
+/// sweep's scheduled ask ([`ReclaimSchedule::next_at`]) and the let-go queue's retry, whichever
+/// comes first; `None` when none exists, and the loop then waits on a wake alone. There is no
+/// standing interval — each is an event's ask or a leftover's own retry, spaced by the same capped
+/// ladder.
 fn next_release_deadline() -> Option<Instant> {
     let sweep = reclaim_schedule().lock().unwrap_poison().next_at;
     pending_releases()
@@ -748,11 +560,9 @@ fn next_release_deadline() -> Option<Instant> {
         .min()
 }
 
-/// Take the records a pass may attempt out of the queue: the ones whose hold or retry
-/// backoff elapsed, skipping any whose namespace a live run still owns — its tabs stay until
-/// the chain ends, the one delay a release does not bound (see [`register_run_namespace`]).
-/// A namespace durable state still names for a resumable job is left alone at close time
-/// instead — see [`ProtectedNamespaces`].
+/// Take the records a pass may attempt: those whose hold or backoff elapsed, skipping any whose
+/// namespace a live run still owns ([`register_run_namespace`]), and any durable state still names
+/// for a resumable job ([`ProtectedNamespaces`]).
 fn take_releasable() -> Vec<PendingRunRelease> {
     let now = Instant::now();
     let mut queue = pending_releases().lock().unwrap_poison();
@@ -761,10 +571,8 @@ fn take_releasable() -> Vec<PendingRunRelease> {
     while let Some(mut entry) = queue.pop_front() {
         let releasable = !run_namespace_is_live(&entry.namespace) && entry.next_attempt_at <= now;
         if releasable {
-            // A record is taken only when its eligibility elapsed; for a held record that
-            // means the hold has been spent, so it goes back ordinary — from here on it is
-            // just a rung of the retry ladder, and nothing may protect it (or its namespace)
-            // as if a run could still come back to it.
+            // A held record taken here has spent its hold, so it goes back ordinary: from now on it
+            // is a rung of the retry ladder and nothing protects it as if a run could return.
             entry.held = false;
             taken.push(entry);
         } else {
@@ -777,37 +585,28 @@ fn take_releasable() -> Vec<PendingRunRelease> {
 
 /// What one record's browser answers left.
 struct RecordDisposition {
-    /// Names still open that the browser did not settle (`Retry`) or the pass never
-    /// asked about (no binary to ask): the record stays queued for exactly these.
+    /// Names the browser did not settle (`Retry`) or the pass never asked about (no binary to ask):
+    /// the record stays queued for exactly these.
     retry: Vec<String>,
-    /// The retried names the browser ANSWERED for and did not remove (see
-    /// [`RetryLeg::LeftOpen`]): kept apart from the silent ones because their answer is what
-    /// the record counts and reports.
+    /// Retried names the browser ANSWERED for and did not remove ([`RetryLeg::LeftOpen`]) — kept
+    /// apart because their answer is what the record counts and reports.
     left_open: Vec<String>,
-    /// The names the record is done with: the browser answered as not the extension's to remove,
-    /// or answered this run's close and left them standing [`MAX_LEFT_OPEN_ATTEMPTS`] times.
-    /// Reported with the run, then dropped from the record — the reclaim sweep keeps examining
-    /// their group at [`STUCK_REVISIT`].
+    /// Names the record is done with: not the extension's to remove, or left standing
+    /// [`MAX_LEFT_OPEN_ATTEMPTS`] times. Reported with the run, then dropped — the reclaim sweep
+    /// keeps examining their group at [`STUCK_REVISIT`].
     unclosable: Vec<String>,
 }
 
-/// Decide one record's fate from the pass's browser answers: a name the browser settled as gone
-/// is dropped; one it says is not the extension's to remove is a leftover to report; one it
-/// answered for and left open is retried and reported; anything else — including every name of a
-/// pass whose reads settled nothing — stays queued.
-///
-/// What concludes those left-open names is this record's own count: at most
-/// [`MAX_LEFT_OPEN_ATTEMPTS`] of them, one per pass, never reset, and about this run's close
-/// however many of the record's names the browser answered that way. A name left open in the
-/// pass that reaches that count is a leftover too (reported under the same kind) instead of
-/// being retried forever; the early `chrome-tabs-left-open:` row still tells the owner as soon
-/// as the browser first answers that way.
+/// Decide one record's fate from the pass's answers: a name settled as gone is dropped, one that is
+/// not the extension's to remove is a leftover to report, one answered for and left open is retried
+/// and reported, and anything else stays queued. A record's own count concludes the left-open
+/// names: at most one such answer per pass, at [`MAX_LEFT_OPEN_ATTEMPTS`], never reset.
 fn record_disposition(
     entry: &mut PendingRunRelease,
     outcomes: &HashMap<String, TabOutcome>,
 ) -> RecordDisposition {
-    // One left-open answer per pass, however many of the record's names were answered that
-    // way: what is counted is the browser's repeated answer about this run's close.
+    // One left-open answer per pass, however many of the record's names were answered that way:
+    // what is counted is the browser's repeated answer about this run's close.
     if entry.names.iter().any(|name| {
         matches!(
             outcomes.get(name),
@@ -824,8 +623,8 @@ fn record_disposition(
         match outcomes.get(name) {
             Some(TabOutcome::Gone) => {}
             Some(TabOutcome::Unclosable) => unclosable.push(name.clone()),
-            // The browser has answered the same way [`MAX_LEFT_OPEN_ATTEMPTS`] times: this
-            // route is not going to close them, so they conclude like any other leftover.
+            // The browser has answered the same way [`MAX_LEFT_OPEN_ATTEMPTS`] times: this route is
+            // not going to close them, so they conclude like any other leftover.
             Some(TabOutcome::Retry(RetryLeg::LeftOpen)) if concluded => {
                 unclosable.push(name.clone());
             }
@@ -844,25 +643,21 @@ fn record_disposition(
 }
 
 /// The records one release pass took out of the queue, parked ([`PARKED_RELEASES`]) under the
-/// pass's id so the durable file still describes them: a record out of both the queue and the
-/// file would be stranded — the failure this whole mechanism exists to prevent.
-/// [`ReleasePass::reconcile`] accounts for them; `Drop` puts back whatever it did not.
+/// pass's id so the durable file still describes them: a record out of both would be stranded — the
+/// failure this mechanism exists to prevent. `Drop` puts back whatever it did not reconcile.
 struct ReleasePass {
-    /// This pass's identity in [`PARKED_RELEASES`], so it unparks its own records
-    /// and never those of a pass overlapping it.
+    /// This pass's identity in [`PARKED_RELEASES`]: it unparks its own records, never a peer's.
     id: u64,
     records: Vec<PendingRunRelease>,
-    /// Namespace of the record `finish` is holding right now, so a panic inside it
-    /// leaves exactly that record parked rather than dropping it everywhere.
+    /// Namespace `finish` holds right now, so a panic inside it leaves exactly that record parked.
     in_flight: Option<String>,
     reconciled: bool,
 }
 
 impl ReleasePass {
-    /// The records a pass may attempt now, or `None` when nothing is due. They are
-    /// parked for as long as the pass holds them out of the queue, so the file still
-    /// describes them; the parked lock is held across the pop as well, so a persist can
-    /// never look at a moment where they are in neither.
+    /// The records a pass may attempt, or `None` when nothing is due. They stay parked while the
+    /// pass holds them out of the queue, and the parked lock is held across the pop too, so a
+    /// persist never sees them in neither.
     fn take() -> Option<Self> {
         let mut parked = parked_releases().lock().unwrap_poison();
         let records = take_releasable();
@@ -879,19 +674,15 @@ impl ReleasePass {
         })
     }
 
-    /// Hand every record the pass took to `finish` (which either drops it or
-    /// re-queues it) with the pass's own browser answers, and disarm. Whatever a panic
-    /// did not reach — and the record a panicking `finish` was holding — is dealt with
-    /// by `Drop`.
+    /// Hand every record to `finish` with the pass's own answers, then disarm; whatever a panic
+    /// left — including the record a panicking `finish` held — is dealt with by `Drop`.
     fn reconcile(
         &mut self,
         outcomes: &HashMap<String, TabOutcome>,
         mut finish: impl FnMut(PendingRunRelease, RecordDisposition),
     ) {
-        // Popped one at a time, so a panic in `finish` still leaves exactly the
-        // records it never reached for the `Drop` guard. `finish` itself must not
-        // panic: the record it holds is already out of the queue, and only the fact
-        // that it is still parked keeps the file — and the next boot — describing it.
+        // Popped one at a time, so a panic in `finish` still leaves the records it never reached
+        // for the `Drop` guard. `finish` must not panic: only the parking keeps the record alive.
         while let Some(mut entry) = self.records.pop() {
             self.in_flight = Some(entry.namespace.clone());
             let disposition = record_disposition(&mut entry, outcomes);
@@ -902,10 +693,9 @@ impl ReleasePass {
         self.unpark(None);
     }
 
-    /// Stop parking this pass's records — the ones `finish` dropped are gone for
-    /// good and the ones it re-queued are back in the queue, which is what the file
-    /// carries. `keep` is the namespace a mid-panic `finish` was holding, the one
-    /// record that has to stay parked.
+    /// Stop parking this pass's records: the ones `finish` dropped are gone and the ones it
+    /// re-queued are back in the queue, which is what the file carries. `keep` is the namespace a
+    /// mid-panic `finish` held, the one record that must stay parked.
     fn unpark(&self, keep: Option<&str>) {
         parked_releases()
             .lock()
@@ -919,9 +709,9 @@ impl Drop for ReleasePass {
         if self.reconciled {
             return;
         }
-        // The pass never finished: every record it had not handed to `finish` is put
-        // back (`Retry` cannot shorten an eligibility that arrived meanwhile) and
-        // unparked — the queue describes it again, so the file does too.
+        // The pass never finished: every record not yet handed to `finish` is put back (`Retry`
+        // cannot shorten an eligibility that arrived meanwhile) and unparked, so the file carries
+        // it again.
         for entry in self.records.drain(..) {
             merge_record(entry, Eligibility::Retry);
         }
@@ -931,26 +721,24 @@ impl Drop for ReleasePass {
     }
 }
 
-/// One pass over the records whose hold/retry is due, plus the reclaim sweep. All the
-/// work is [`attempt_pass`]'s; this only collects the sweep's names, reads the durable
-/// resume set once, and reports what the pass could not close.
+/// One pass over the due records plus the reclaim sweep: [`attempt_pass`] does the work, this only
+/// collects the sweep's names, reads the durable resume set once and reports what stayed open.
 async fn release_due() {
     let cli = release_cli();
     let deadline = Instant::now() + release_settings().attempt_timeout;
     let pass = ReleasePass::take();
     let taken = pass.is_some();
     let sweep_due = reclaim_due();
-    // The one durable read of the pass, and only when something will use it: the sweep
-    // is due, or records are waiting on the browser. An idle wake (an enqueue that finds
-    // the namespace live, a retry that is not due yet) stays a no-op.
+    // The one durable read of the pass, and only when something will use it: an idle wake is a
+    // no-op.
     let durable = if taken || sweep_due {
         durable_resume_namespaces().await
     } else {
         Vec::new()
     };
     let mut protected = ProtectedNamespaces::snapshot(&durable);
-    // The session this pass runs its browser reads in, decided once for the sweep's read and the
-    // close alike: a name the work itself already has wherever one exists (see [`read_session`]).
+    // The session this pass runs its browser reads in, decided once for the sweep and the close
+    // alike.
     let session = read_session(pass.as_ref());
     let ask = reclaim_names(cli.as_deref(), &session, &protected, deadline, sweep_due).await;
     let issues = attempt_pass(
@@ -967,26 +755,10 @@ async fn release_due() {
 
 /// The session one pass runs its browser reads in: a name the work itself already has, so a pass
 /// with one opens no page of its own. The records the pass took come first — those are the tabs
-/// being closed — then the first name any record still queued or parked carries, which is the
-/// run's own session even when the run's tracker still holds its namespace (the run-end case: the
-/// record is queued the moment the run ends, and the namespace unregisters a moment later) or
-/// when its release is held or restored. A borrowed name is always one a record holds, so a page
-/// our read opens in its group (the session had been idle-recycled while its tabs survived) is
-/// removed by that record's own close: the name is one of its own — bar the case where that
-/// namespace is still protected when the close runs (its run holds it again, or a resumable job
-/// claims it), which leaves the page inside that run's group until a later pass takes it.
-/// [`chrome_tabs`](crate::tools::chrome_tabs)' Honest limits carry the whole of it, including the
-/// page a stop-then-read pass mints.
-///
-/// [`OWN_SESSION`] is what is left for a pass with no name to borrow at all — a sweep armed for a
-/// leftover no record names any more (a parked verdict's revisit, a queue-cap eviction). That is
-/// the one pass that shows the product's own scratch group, and the only reason it still exists.
-///
-/// The queue's names may belong to a live run, and are borrowed anyway: the read is one call on a
-/// session that run already has, serialized by chrome-use behind whatever it is doing, while
-/// minting a session of ours instead would be a page in the owner's browser (which is the whole
-/// footprint this choice exists to remove). Nothing of a live run's is closed by it — the live
-/// half of [`ProtectedNamespaces`] keeps its names out of the close.
+/// being closed — then the first name any queued or parked record carries, which is the run's own
+/// session. A page our read opens in that group is removed by the record's own close, unless the
+/// namespace is protected then. [`OWN_SESSION`] is what is left for a pass with no name to borrow:
+/// our own scratch group.
 fn read_session(pass: Option<&ReleasePass>) -> String {
     if let Some(name) = pass
         .and_then(|pass| pass.records.first())
@@ -1005,13 +777,11 @@ fn read_session(pass: Option<&ReleasePass>) -> String {
         .unwrap_or_else(|| crate::tools::chrome_tabs::OWN_SESSION.to_string())
 }
 
-/// Close the browser's tabs for `names` — except the ones a run may own again right now.
-/// `protected` is the pass's snapshot of every namespace that must be left alone, refreshed
-/// here with the live map and held records as they are immediately before the close: the
-/// reclaim sweep above spends a browser read (seconds) before this runs, and a run that
-/// registers its namespace in that window owns its tabs — the pass's own snapshot would miss
-/// it, and the close would take them from under the run. (`close_sessions` re-asks at each act
-/// it performs — see [`crate::tools::chrome_tabs::OwnedAgain`].)
+/// Close the browser's tabs for `names`, except the ones a run may own again right now. `protected`
+/// is refreshed here with the live map and the held records as they are immediately before the
+/// close: the sweep above spends a browser read (seconds), and a run that registers in that window
+/// owns its tabs. (`close_sessions` re-asks at each act — see
+/// [`crate::tools::chrome_tabs::OwnedAgain`].)
 async fn close_unprotected(
     cli: Option<&Path>,
     names: &[String],
@@ -1028,9 +798,8 @@ async fn close_unprotected(
         .filter(|name| !protected.contains(name))
         .cloned()
         .collect();
-    // What the close asks right before each act: the live map and the held records as they
-    // are at that moment. Only those two — the durable half is what the pass snapshotted
-    // once, and it cannot change inside one pass.
+    // What the close asks right before each act: the live map and the held records as they are
+    // then. The durable half is what the pass snapshotted once and cannot change inside one pass.
     let owned_again = ProtectedNamespaces::protects_live_or_held;
     chrome_tabs::close_sessions(cli, &unprotected, session, deadline, &owned_again)
         .await
@@ -1039,21 +808,10 @@ async fn close_unprotected(
 }
 
 /// Close one tab of a LIVE agent run because the run went over its per-agent tab cap, and say
-/// whether the browser confirmed the group is gone.
-///
-/// Only the single name handed in (`session`) is asked for, and [`chrome_tabs::close_sessions`]
-/// matches it exactly against the live tab-group titles, so no other run's tabs and no tab of the
-/// owner's can be touched. The namespace the caller names is exempt from the live-run guard: that
-/// guard exists to keep a FINISHED run's release off a live run's tabs, and this close is the live
-/// run itself asking for one of its own — without the exemption every eviction would be a no-op
-/// (`plan_removal` retries a name the live map protects).
-///
-/// `read_session` is where the close's own reads run: a session whose page is live right now (the
-/// tab that just appeared), so a name the browser has already lost mints no scratch group of its
-/// own while it is being closed.
-///
-/// Runs off the calling agent's path (the tool spawns it), so the same budget a release pass gets
-/// ([`ATTEMPT_TIMEOUT`], narrowed for a test) bounds the browser side, not the agent.
+/// whether the browser confirmed the group is gone. Only `session` is asked for and matched
+/// exactly, so no other run's tabs and none of the owner's can be touched; the caller's namespace
+/// is exempt from the live-run guard, or every eviction would be a no-op. Off the agent's path,
+/// bounded by [`ATTEMPT_TIMEOUT`].
 pub(crate) async fn evict_agent_tab(namespace: &str, session: &str, read_session: &str) -> bool {
     let Some(cli) = release_cli() else {
         return false;
@@ -1077,21 +835,18 @@ pub(crate) async fn evict_agent_tab(namespace: &str, session: &str, read_session
         .first()
         .is_some_and(|(_, outcome)| matches!(outcome, chrome_tabs::TabOutcome::Gone));
     if gone {
-        // The group is gone, but chrome-use's own session record still pins the tab it created,
-        // and the name must stay good for a new page: retire the record (a later call on the same
-        // name then starts a fresh session with its own scratch page instead of failing on a
-        // target the relay no longer holds). A stop that does not settle is asked once more: this
-        // runs off the agent's path, so the retry costs the agent nothing, while a name left pinned
-        // breaks the very `open` the cap's refusal tells the agent to use. Past that, the run's own
-        // release retires the record — the let-go queue cannot, because its driver never stops a
-        // live run's session.
+        // The group is gone, but chrome-use's session record still pins the tab it created, and the
+        // name must stay good for a new page: retire the record, or a later `open` on the name
+        // fails on a target the relay no longer holds. A stop that does not settle is asked once
+        // more — this runs off the agent's path, so the retry costs nothing. Past that, the run's
+        // own release retires the record; the let-go queue cannot stop a live run's session.
         for _ in 0..2 {
             let outcome = chrome_tabs::forget_settled_sessions(
                 &cli,
                 std::slice::from_ref(&name),
-                // The eviction's own deadline, not a fresh one: a stop is only spawned with the
-                // whole bound when the budget still holds it, so a verdict of `tried` keeps meaning
-                // the helper really answered and `deferred` that nothing was heard.
+                // The eviction's own deadline, not a fresh one: a stop is spawned with the whole
+                // bound only when the budget still holds it, so `tried` keeps meaning the helper
+                // answered.
                 deadline,
                 &|_: &str| false,
             )
@@ -1105,51 +860,27 @@ pub(crate) async fn evict_agent_tab(namespace: &str, session: &str, read_session
 }
 
 /// Let go of the sessions earlier passes closed but had no budget to forget, plus `just_settled`,
-/// and keep what still has to wait: chrome-use's own per-session bookkeeping, plus this module's
-/// own scratch session when its let-go could not be confirmed — whose stop is what closes its
-/// group — and never a run's tab.
+/// and keep what must wait: chrome-use's per-session bookkeeping, this module's own scratch session
+/// when its let-go was not confirmed, and never a run's tab.
 ///
-/// Which names wait is [`LetGoOutcome`]'s four classes: one whose stop the helper did not settle
-/// is charged one more failed attempt, one the pass could not give a whole bound — either no
-/// stop fitted or the one it spawned was cut short — keeps the rung it had, because it never
-/// heard a real answer, one a run owns again leaves the queue outright, because stopping that
-/// session is what would end the run, whose own end hands over its own release, and this module's
-/// own scratch session waits behind a call of ours still running in it, owing nothing until that
-/// call is done. The roster a pass
-/// carries is bounded both ways: a name past [`MAX_PENDING_FORGET`] is trimmed, and one that
-/// reaches [`MAX_FORGET_ATTEMPTS`] failed stops is dropped with one `info!` naming it and the
-/// count — except this module's own scratch session, which neither bound drops (see both
-/// constants). A name the queue keeps is retried by the attempt its own deadline arms
-/// ([`forget_retry_at`]), which is how a session nothing answers for is tried again without an
-/// event in between.
-///
-/// The wait it comes back on is the highest rung the queue holds ([`release_backoff`]) — one
-/// batch, retried at the rung of its most-charged member, so a burst is never hammered and a
-/// fresh name may wait a charged one's rung — floored at one whole stop when anything was
-/// deferred behind a call of ours ([`BUSY_FORGET_FLOOR`]), since nothing then is owed until the
-/// pass holding that call has spent its own let-go step. Deferring is deferred work, not a
-/// failure — the pass that deferred it spent its budget on a close, and the next pass tries the
-/// let-go with a fresh one.
-///
-/// The queue is never taken out of its slot: this pass reads it, runs the stops, and writes back
-/// what it did not let go — so a pass overlapping this one, or a pass whose future is dropped
-/// mid-stop (a shutdown cutting the flush), can never take names away with it. What the queue
-/// gains meanwhile is kept after the names this pass held. One interleaving is not covered: a name
-/// this pass itself let go is dropped from the queue even if a pass overlapping it kept that name
-/// — which follows this pass's own observation that the stop landed, so the session is settled and
-/// nothing is lost; the opposite order can leave a settled name queued for one redundant stop.
+/// [`LetGoOutcome`]'s classes decide: a stop not settled is charged another attempt, one given no
+/// whole bound keeps its rung, one a run owns again leaves the queue (its own end hands over its
+/// release), and [`chrome_tabs::OWN_SESSION`] waits for the call holding it and is dropped by
+/// neither bound. The wait is the highest rung held, floored at one whole stop when anything was
+/// deferred ([`BUSY_FORGET_FLOOR`]). The queue is never taken out of its slot, so an overlapping
+/// pass takes no names with it.
 async fn forget_settled(cli: &Path, just_settled: &[String], deadline: Instant) {
     let mut todo: Vec<(String, u32)> = pending_forget().lock().unwrap_poison().clone();
     // The names this pass takes out of the live queue, read BEFORE the cap below trims them: a
-    // queued name the cap drops must not be written back by the merge at the end, or the cap
-    // would be undone and the queue would churn instead of settling on the oldest names.
+    // queued name the cap drops must not be written back by the merge at the end, or the cap would
+    // be undone and the queue would churn instead of settling on the oldest names.
     let snapshot: HashSet<String> = todo.iter().map(|(name, _)| name.clone()).collect();
     // First-seen wins, so a name already waiting keeps the attempts it has run up.
     todo.extend(just_settled.iter().map(|name| (name.clone(), 0)));
     dedupe_and_bound_forgotten(&mut todo);
     if todo.is_empty() {
-        // Nothing to try. Only a queue that is still empty loses its retry — a pass that
-        // overlapped this one armed its own for whatever it queued.
+        // Nothing to try. Only a queue that is still empty loses its retry — a pass that overlapped
+        // this one armed its own for whatever it queued.
         let queue = pending_forget().lock().unwrap_poison();
         if queue.is_empty() {
             *forget_retry().lock().unwrap_poison() = None;
@@ -1157,21 +888,20 @@ async fn forget_settled(cli: &Path, just_settled: &[String], deadline: Instant) 
         return;
     }
     let names: Vec<String> = todo.iter().map(|(name, _)| name.clone()).collect();
-    // Asked at each act inside: the run that owns a session again is what the stop would
-    // end, and a let-go step must never race one.
+    // Asked at each act inside: the run that owns a session again is what the stop would end, and a
+    // let-go step must never race one.
     let owned_again = ProtectedNamespaces::protects_live_or_held;
     let left = chrome_tabs::forget_settled_sessions(cli, &names, deadline, &owned_again).await;
     let mut kept: Vec<(String, u32)> = Vec::new();
     for (name, attempts) in todo {
         if left.owned.contains(&name) {
-            // A name a run owns again leaves this queue instead of climbing it: its own end
-            // hands over its own release, so nothing here is waiting for us.
+            // A name a run owns again leaves this queue instead of climbing it: its own end hands
+            // over its own release, so nothing here is waiting for us.
             continue;
         }
         if left.deferred.contains(&name) || left.busy.contains(&name) {
-            // Nothing was asked of the helper — for a deferral its whole bound did not fit, for
-            // a busy name a call of ours held the session — so nothing is charged and the rung
-            // it has stays as it is.
+            // Nothing was asked of the helper — no whole bound fitted, or a call of ours held the
+            // session — so nothing is charged and the rung stays as it is.
             kept.push((name, attempts));
             continue;
         }
@@ -1180,7 +910,7 @@ async fn forget_settled(cli: &Path, just_settled: &[String], deadline: Instant) 
         }
         let attempts = attempts.saturating_add(1);
         // The one name the bound never drops is this module's own scratch session (see
-        // [`MAX_FORGET_ATTEMPTS`]); every other name here leaves the queue.
+        // [`MAX_FORGET_ATTEMPTS`]).
         if attempts >= MAX_FORGET_ATTEMPTS && name != chrome_tabs::OWN_SESSION {
             info!(
                 session = %name,
@@ -1193,16 +923,14 @@ async fn forget_settled(cli: &Path, just_settled: &[String], deadline: Instant) 
         }
         kept.push((name, attempts));
     }
-    // What is left drives its own retry: the attempt a name has run up is the rung the queue
-    // waits on ([`forget_retry_at`]), so a session the helper would not stop is tried again
-    // without a run end or a sweep arming one — and once nothing is left, nothing is scheduled.
+    // What is left drives its own retry ([`forget_retry_at`]): a session the helper would not stop
+    // is tried again without an event arming one, and once nothing is left nothing is scheduled.
     let deferred_behind_call = !left.busy.is_empty();
     let mut queue = pending_forget().lock().unwrap_poison();
-    // What the pass leaves in the queue: the names it held, minus what it let go (or found a run
-    // owning again), plus whatever a pass overlapping it queued while the stops ran — the
-    // snapshot above is what tells the two apart, so the cap's own dropped names are not added
-    // back here. The queue was never taken out, so nothing else may be removed. A rung already
-    // written by an overlapping pass is the high-water one: a count only ever climbs.
+    // What the pass leaves: the names it held, minus what it let go or found a run owning again,
+    // plus whatever an overlapping pass queued while the stops ran — the snapshot tells the two
+    // apart, so the cap's own dropped names are not added back. The queue was never taken out, so
+    // nothing else may be removed, and a count only ever climbs.
     let mut merged = kept;
     merged.extend(
         queue
@@ -1220,9 +948,8 @@ async fn forget_settled(cli: &Path, just_settled: &[String], deadline: Instant) 
     let most_attempts = queue.iter().map(|(_, attempts)| *attempts).max();
     let retry_at = most_attempts.map(|attempts| Instant::now() + release_backoff(attempts));
     *forget_retry().lock().unwrap_poison() = if deferred_behind_call {
-        // Nothing is owed until the call that held the session is done, and waking at the base
-        // gap would only bring the driver back to defer again while it runs: the wake waits for
-        // the covering pass's own let-go step (see [`BUSY_FORGET_FLOOR`]).
+        // Nothing is owed until the call holding the session is done, and waking at the base gap
+        // would only bring the driver back to defer again (see [`BUSY_FORGET_FLOOR`]).
         let floor = Instant::now() + BUSY_FORGET_FLOOR;
         Some(retry_at.map_or(floor, |at| at.max(floor)))
     } else {
@@ -1230,13 +957,11 @@ async fn forget_settled(cli: &Path, just_settled: &[String], deadline: Instant) 
     };
 }
 
-/// Put `name` in the let-go queue for the driver's next attempt, keeping the place (and the
-/// attempts) a name already has — and arm the queue's own retry deadline here
-/// ([`forget_retry_at`]), so a name queued by a pass whose tail runs out before the let-go step
-/// (or by the process's last pass) still has an attempt behind it rather than waiting for an
-/// unrelated event. One case that deadline cannot cover: while no chrome-use binary resolves,
-/// [`forget_retry_at`] answers `None` and no pass runs the queue at all — the attempt then waits
-/// for the next event, which is the only thing a pass with no binary could do anyway.
+/// Put `name` in the let-go queue for the driver's next attempt, keeping the place and attempts a
+/// name already has, and arm the queue's own retry deadline so a name queued by a pass whose tail
+/// runs out still has an attempt behind it. While no chrome-use binary resolves no pass runs the
+/// queue at all, so such a name waits for the next event — all a pass with no binary could do
+/// anyway.
 fn queue_forget(name: &str) {
     let mut queue = pending_forget().lock().unwrap_poison();
     if queue.iter().any(|(queued, _)| queued == name) {
@@ -1247,8 +972,8 @@ fn queue_forget(name: &str) {
     *forget_retry().lock().unwrap_poison() = Some(Instant::now() + release_backoff(0));
 }
 
-/// When the let-go queue must be tried again. `None` while the queue is empty — a queue whose
-/// work is done schedules nothing.
+/// When the let-go queue must be tried again; `None` while it is empty — a queue whose work is done
+/// schedules nothing.
 static FORGET_RETRY: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 
 fn forget_retry() -> &'static Mutex<Option<Instant>> {
@@ -1256,49 +981,32 @@ fn forget_retry() -> &'static Mutex<Option<Instant>> {
 }
 
 /// The queue's own retry deadline, as [`next_release_deadline`] reads it: `None` while no
-/// chrome-use binary is resolvable, because no pass can run the queue then. A deadline left
-/// over from before the binary went away (a managed self-update swap, a removed install) would
-/// otherwise be read as due for the rest of the process, and the driver would come back from
-/// its sleep into a pass that can do nothing — a spin, not a retry. The stored deadline stays
-/// where it is: a binary that resolves again finds the queue still at its own rung, and it is run
-/// by whatever comes next — a run end, a record's own retry, the shutdown flush, whose budget is
-/// below one whole stop but reaches the queue all the same. Nothing wakes the driver for this
-/// alone.
+/// chrome-use binary is resolvable, because no pass can run the queue then. A deadline left over
+/// from before the binary went away (a self-update swap, a removed install) would otherwise read as
+/// due for the rest of the process and spin the driver. The stored deadline stays where it is, and
+/// nothing wakes the driver for this alone.
 fn forget_retry_at() -> Option<Instant> {
     release_cli()?;
     *forget_retry().lock().unwrap_poison()
 }
 
-/// Cap on the sessions waiting to be let go: a burst the helper will not stop must not grow
-/// the queue without bound, so past the cap the oldest names go — chrome-use's own bookkeeping
-/// under `~/.chrome-use`, never a run's tab and never this module's own scratch session (see
-/// both constants). A full queue clears over one or more passes: a pass asks as many stops as
-/// its budget holds, and each of those is a session daemon being shut down, so the queue is what
-/// keeps a burst from growing while it waits its turn.
+/// Cap on the sessions waiting to be let go: a burst the helper will not stop must not grow the
+/// queue without bound, so past the cap the oldest names go — chrome-use's own `~/.chrome-use`
+/// bookkeeping, never a run's tab and never this module's own scratch session. Each stop is a
+/// session daemon being shut down, so the queue is what keeps a burst waiting its turn.
 const MAX_PENDING_FORGET: usize = 64;
 /// Floor on the wake the queue arms when a pass found a call of ours still running in a name's
-/// session ([`crate::tools::chrome_tabs::LetGoOutcome::busy`]). The pass holding that call spends
-/// its own let-go step on the name right after, a step whose dominant cost is one whole
-/// `session stop`, so the queue comes back at that stop's bound instead of at the base gap, which
-/// would only bring the driver back to defer again while the step runs.
+/// session ([`crate::tools::chrome_tabs::LetGoOutcome::busy`]): the pass holding it spends one
+/// whole `session stop` right after, so waking at the base gap would only defer again.
 const BUSY_FORGET_FLOOR: Duration = crate::chrome::SESSION_STOP_TIMEOUT;
-/// How many attempts may fail to let one session go before it leaves the queue with one
-/// `info!` naming it. That trace is not the report the Issues view is owed — the scratch
-/// session's own row is filed once by [`crate::tools::chrome_tabs`]'s caller, and what this
-/// queue's attempts own is chrome-use's bookkeeping rather than a run's tab — and the attempt
-/// bound, not the trace, is what stops the retry.
-///
-/// This module's own scratch session ([`chrome_tabs::OWN_SESSION`]) is the one name the bound
-/// never drops: what IT can leave behind is a group in the owner's tab strip rather than helper
-/// bookkeeping, and a name that then waits for the next process start is exactly what the queue
-/// exists to avoid. It stays at the bound's rung and later, retried by the queue's own deadline
-/// for as long as the helper cannot settle it.
+/// How many attempts may fail to let one session go before it leaves the queue with one `info!`.
+/// That trace is not a row the Issues view is owed — the scratch session's own row is filed by
+/// `chrome_tabs`'s caller. [`chrome_tabs::OWN_SESSION`] is the one name the bound never drops: what
+/// it leaves is a group in the owner's strip, so the queue's own deadline retries it.
 const MAX_FORGET_ATTEMPTS: u32 = 5;
 
-/// Keep `names` in first-seen order without repeats, bounded by [`MAX_PENDING_FORGET`]:
-/// what a pass carries is what it will try to stop, so a queue nothing drains must not
-/// grow into one that a pass can never work through. What the cap drops is chrome-use's
-/// own per-session bookkeeping — never a run's tab.
+/// Keep `names` in first-seen order without repeats, bounded by [`MAX_PENDING_FORGET`]: what the
+/// cap drops is chrome-use's per-session bookkeeping — never a run's tab.
 fn dedupe_and_bound_forgotten(names: &mut Vec<(String, u32)>) {
     let mut seen: HashSet<String> = HashSet::with_capacity(names.len());
     names.retain(|(name, _)| seen.insert(name.clone()));
@@ -1308,8 +1016,8 @@ fn dedupe_and_bound_forgotten(names: &mut Vec<(String, u32)>) {
     }
     let mut dropped = 0usize;
     names.retain(|(name, _)| {
-        // The product's own scratch session is never the name the cap drops — see
-        // [`MAX_FORGET_ATTEMPTS`] — so one more bookkeeping name goes in its place.
+        // The product's own scratch session is never the name the cap drops — one more goes
+        // instead.
         if dropped == excess || name == chrome_tabs::OWN_SESSION {
             return true;
         }
@@ -1327,8 +1035,8 @@ fn pending_forget() -> &'static Mutex<Vec<(String, u32)>> {
     PENDING_FORGET.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// The names one pass is about: the reclaim set first, then every name the records it took
-/// still carry, each once.
+/// The names one pass is about: the reclaim set first, then every name its records still carry,
+/// once.
 fn pass_names(ask: &ReclaimAsk, pass: Option<&ReleasePass>) -> Vec<String> {
     let mut names = ask.names.clone();
     if let Some(pass) = pass {
@@ -1342,8 +1050,7 @@ fn pass_names(ask: &ReclaimAsk, pass: Option<&ReleasePass>) -> Vec<String> {
     names
 }
 
-/// Every name the pass's records carry, in first-seen order — the set the driver's
-/// pass and the shutdown flush both work from.
+/// Every name the pass's records carry, in first-seen order.
 fn record_names(pass: &ReleasePass) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -1357,19 +1064,11 @@ fn record_names(pass: &ReleasePass) -> Vec<String> {
     names
 }
 
-/// What the reclaim sweep's own names came to: how many it closed, and the reports the rest owe.
-/// A reclaimed group belongs to no record any more (the cap's eviction kept the run, not the
-/// record), so its namespace comes from the group's own session name and its run is whatever
-/// [`evicted_run`] has, empty when nothing does.
-///
-/// A name the browser did not settle — Unclosable, or left open as the browser's own — is
-/// remembered as stuck so the next sweeps skip it until its verdict is worth re-checking, and
-/// its revisit stays armed ([`park_stuck`]); a name the browser never answered keeps an ask
-/// armed too ([`reclaim_unfinished`]); either kind expires with its window.
-///
-/// The retry ladder is reset here from the sweep's own answers: a pass whose names were all
-/// answered for leaves it at the floor, a pass with a Silent outcome keeps the rung
-/// [`reclaim_unfinished`] just charged.
+/// What the reclaim sweep's names came to: how many it closed, and the reports the rest owe. A
+/// reclaimed group belongs to no record, so its namespace comes from the group's own session name
+/// and its run from [`evicted_run`]. A name the browser did not settle is remembered as stuck with
+/// its revisit armed, and an ask that answered nothing keeps one armed too. All answered leaves the
+/// ladder at its floor.
 fn reclaim_issues(
     reclaim: &[String],
     answered: bool,
@@ -1388,28 +1087,23 @@ fn reclaim_issues(
                 reclaimed += 1;
                 stuck_namespaces().lock().unwrap_poison().remove(&namespace);
             }
-            // No route here can close these tabs: a leftover, reported and done with — and
-            // not interrogated in full again until the verdict is worth re-checking.
+            // No route here closes these tabs: reported once, then skipped for a while.
             TabOutcome::Unclosable => {
                 issues.push(reclaimed_issue(name, &namespace, IssueKind::Unclosable));
                 park_stuck(&namespace);
             }
-            // The browser answered and left its own tabs: a contradiction, not a verdict —
-            // a later sweep retries them, and the report keeps them from ageing out unseen.
+            // The browser answered and left its own tabs: a contradiction, retried later, reported
+            // now.
             TabOutcome::Retry(RetryLeg::LeftOpen) => {
                 issues.push(reclaimed_issue(name, &namespace, IssueKind::LeftOpen));
                 park_stuck(&namespace);
             }
-            // Nothing was established about that group, so it is not abandoned: the pass
-            // keeps an ask armed for it below, rather than letting it vanish with this pass.
+            // Nothing was established about that group, so the ask stays armed for it.
             TabOutcome::Retry(RetryLeg::Silent) => silent = true,
         }
     }
-    // One ask, one rung: the sweep's failure is the pass, not how many of its names the
-    // browser left unanswered, so the ladder is charged once however many came back Silent.
-    // An ask the browser answered whose names all settled (or were parked) is clean and
-    // leaves the ladder at its floor; a failed read resets nothing here — it charged the
-    // ladder itself.
+    // One ask, one rung: the sweep's failure is the pass, not how many names went unanswered. All
+    // settled leaves the ladder at its floor; a failed read charged it itself.
     if silent {
         reclaim_unfinished();
     } else if answered {
@@ -1418,10 +1112,8 @@ fn reclaim_issues(
     (reclaimed, issues)
 }
 
-/// Remember that nothing else here is worth asking about `namespace` for a while: the entry
-/// expires on its own after [`STUCK_REVISIT`], whether or not any group is ever read again
-/// (see [`stuck`]). This leftover's revisit is also what the sweep leaves scheduled behind
-/// it ([`schedule_reclaim_revisit`]), so a browser that recovers is looked at again.
+/// Remember that nothing here is worth asking about `namespace` for a while: the entry expires
+/// after [`STUCK_REVISIT`], and its revisit stays armed so a recovered browser is looked at again.
 fn park_stuck(namespace: &str) {
     stuck_namespaces()
         .lock()
@@ -1430,9 +1122,7 @@ fn park_stuck(namespace: &str) {
     schedule_reclaim_revisit();
 }
 
-/// One report about a reclaimed group — the same row a record's own name would produce,
-/// except that the namespace comes from the name and the run is only known when the cap
-/// evicted the record that carried it (see [`reclaim_issues`]).
+/// One report about a reclaimed group: namespace from the name, run from [`evicted_run`].
 fn reclaimed_issue(name: &str, namespace: &str, kind: IssueKind) -> Issue {
     Issue {
         kind,
@@ -1443,21 +1133,11 @@ fn reclaimed_issue(name: &str, namespace: &str, kind: IssueKind) -> Issue {
 }
 
 /// Let go of this product's own browser-read session ([`chrome_tabs::OWN_SESSION`]) if a pass of
-/// ours actually used it — a pass that borrowed a name the work itself has has nothing of ours
-/// open — and surface the one state that
-/// is ours: `false` from [`chrome_tabs::release_own_session`] means this pass made the reads and
-/// the browser did not confirm the scratch group gone — a read may itself have failed, so the
-/// group may or may not be there — and the row says exactly that. Reported once, through the
-/// same `(message, reason)` de-dupe as every other row; the normal path (nothing owed, or the
-/// group confirmed gone) says nothing, and a host where no call of ours was ever answered gets
-/// no row either ([`chrome_tabs::own_scratch_group_possible`]).
-///
-/// An unconfirmed let-go is handed on rather than left for the next start: the session goes into
-/// the let-go queue ([`queue_forget`]), and the let-go step that runs a few lines later in this
-/// same pass is the ONE place the graceful `session stop` is asked for — the route that closes
-/// the tabs a session created even when the extension's ledger no longer reaches them. A pass
-/// that runs out of budget before that step leaves the name queued with its retry armed, and the
-/// product's session sweeps stay the backstop.
+/// ours used it, and surface the one state that is ours: `false` from
+/// [`chrome_tabs::release_own_session`] means the browser did not confirm the scratch group gone —
+/// a read may itself have failed — and the row says that. An unconfirmed let-go is queued for the
+/// graceful `session stop` the let-go step runs a few lines later, the route that closes the tabs
+/// the extension's ledger no longer reaches.
 async fn let_go_own_session(cli: &Path, deadline: Instant) {
     if chrome_tabs::release_own_session(cli, deadline).await {
         return;
@@ -1483,10 +1163,9 @@ async fn let_go_own_session(cli: &Path, deadline: Instant) {
     .await;
 }
 
-/// One row for a host whose browser answers settle nothing this route can act on — filed at most
-/// once, and only after such an answer actually happened in this process: such an answer settles
-/// no name, which must not stay a `debug!` that ages out. The latch is one atomic load, so an
-/// ordinary pass pays nothing for it.
+/// One row for a host whose browser answers settle nothing this route acts on — filed at most once,
+/// only after such an answer happened, since it settles no name and must not stay a `debug!` that
+/// ages out.
 async fn report_unreadable_answers() {
     if !chrome_tabs::saw_unreadable_answer() {
         return;
@@ -1509,9 +1188,8 @@ async fn report_unreadable_answers() {
 }
 
 /// Drop the tab record of a release that concluded with every name confirmed gone — unless the run
-/// came alive again while the pass ran, whose fresh record must outlive this pass's conclusion. A
-/// release with unclosable leftovers never reaches this: its tabs may still stand, so its entry
-/// stays.
+/// came alive again while the pass ran. A release with unclosable leftovers keeps its entry: its
+/// tabs may stand.
 fn conclude_released_record(namespace: &str) {
     if ProtectedNamespaces::protects_live_or_held(namespace) {
         return;
@@ -1519,15 +1197,11 @@ fn conclude_released_record(namespace: &str) {
     crate::tools::chrome_tab_ledger::forget_namespace(namespace);
 }
 
-/// One pass over the records a [`ReleasePass`] took, plus the names the reclaim sweep
-/// found: every name the pass is about goes to the browser in one batched call, the
-/// browser's own answers decide each record's fate, and the reports the Issues view is
-/// owed come back. [`ReleasePass`] puts back whatever the pass could not finish.
-///
-/// This product's own browser-read session, if the pass used it, is let go right after the
-/// close — before the let-go step below, which can spend what is left of the budget on children
-/// of its own — so the scratch group it opened cannot outlive a pass that ran out of budget in
-/// its tail.
+/// One pass over the records a [`ReleasePass`] took plus the names the reclaim sweep found: every
+/// name goes to the browser in one batched call, its answers decide each record's fate, and the
+/// reports the Issues view is owed come back. [`ReleasePass`] puts back what the pass could not
+/// finish. This product's own browser-read session, if used, is let go right after the close —
+/// before the let-go step, which can spend what is left of the budget on children of its own.
 async fn attempt_pass(
     cli: Option<&Path>,
     mut pass: Option<ReleasePass>,
@@ -1538,10 +1212,8 @@ async fn attempt_pass(
 ) -> Vec<Issue> {
     let names = pass_names(ask, pass.as_ref());
     if names.is_empty() {
-        // Nothing due and nothing to reclaim: the only work left is letting go of the
-        // session the reclaim's own read ran in, and of the sessions an earlier pass closed
-        // but had no budget to forget. The ask that found nothing to reclaim was still an
-        // ask the browser answered, so it leaves the ladder at its floor.
+        // Nothing due and nothing to reclaim: only the let-go steps, and the answered ask resets
+        // the ladder.
         if ask.answered {
             reset_reclaim_failures();
         }
@@ -1549,28 +1221,23 @@ async fn attempt_pass(
             let_go_own_session(cli, deadline).await;
             forget_settled(cli, &[], deadline).await;
         }
-        // A read of THIS pass may have been the unreadable one (the ask that found nothing to
-        // reclaim): the row belongs to the pass that met it, not to whenever one runs next.
+        // A read of THIS pass may have been the unreadable one: the row belongs to the pass that
+        // met it.
         report_unreadable_answers().await;
         return Vec::new();
     }
 
     let outcomes = close_unprotected(cli, &names, session, protected, deadline).await;
 
-    // Every browser read of this pass is behind us, and the let-go step below can spend what
-    // is left of the budget on children of its own — so this product's own session, if the pass
-    // borrowed no name and used it, is let go HERE, where it is still affordable. It is asked
-    // for only when a call of ours is outstanding, so a pass that borrowed a session spawns
-    // nothing for it.
+    // Every browser read is behind us, so our own session is let go HERE, where it is affordable.
     if let Some(cli) = cli {
         let_go_own_session(cli, deadline).await;
     }
 
-    // Let go of the settled sessions' chrome-use records and daemons — the close leaves
-    // both behind — but never a name a run owns again by the time the browser answered.
-    // This is the pass's THIRD read of the live map, and the one moment the close's own
-    // fresh read cannot cover: a run re-dispatched while the close was running registers
-    // its namespace now, and its tabs must not be let go under it.
+    // Let go of the settled sessions' chrome-use records and daemons — the close leaves both behind
+    // — but never a name a run owns again by the time the browser answered. This is the pass's
+    // THIRD read of the live map: a run re-dispatched while the close ran registers now, and its
+    // tabs must not be let go under it.
     if let Some(cli) = cli {
         let live_now = ProtectedNamespaces::live_and_held();
         let settled: Vec<String> = names
@@ -1616,9 +1283,8 @@ async fn attempt_pass(
                     name,
                 });
             }
-            // The record ends here, so those tabs are now `agent-tab-*` groups no record, live
-            // run or resumable job claims: arm the sweep so the still-open group is examined
-            // there — and parked like any other leftover once the sweep answers.
+            // The record ends here: those tabs are `agent-tab-*` groups nothing claims, so arm the
+            // sweep.
             if unclosable > 0 {
                 arm_reclaim_at(Instant::now() + STUCK_REVISIT);
             }
@@ -1643,9 +1309,8 @@ async fn attempt_pass(
                 }
                 return;
             }
-            // Charged on every pass that leaves names open — no bound, so the record is
-            // retried for as long as the browser has not answered — and spaced by the
-            // capped ladder so a browser side that stays degraded is not hammered.
+            // Charged on every pass that leaves names open — no bound, so retried while unanswered
+            // — and spaced.
             entry.attempts = entry.attempts.saturating_add(1);
             entry.next_attempt_at = Instant::now() + release_backoff(entry.attempts);
             debug!(
@@ -1659,38 +1324,24 @@ async fn attempt_pass(
         });
         persist_pending_releases();
     }
-    // A read of THIS pass may have been the unreadable one, so the host row is filed here rather
-    // than waiting for whichever pass runs next.
+    // A read of THIS pass may have been the unreadable one, so the host row is filed here.
     report_unreadable_answers().await;
     issues
 }
 
-/// Last-chance pass for the shutdown and self-update paths: spends at most `budget`
-/// closing every record whose hold/retry has elapsed (same live-run guard, same
-/// browser-driven close; the whole sequence gets what is left of the budget), then
-/// returns. It runs no reclaim sweep and files no leftover row of its own — the next boot's
-/// normal pass owns both — though it can owe the one row for this module's own scratch
-/// session ([`OWN_SESSION_MESSAGE`]), which is let go here, and it reaches the let-go queue
-/// here too (best-effort: this budget is below one whole stop, so only a stop the
-/// helper settles inside it lets a name go), before the process goes down; a name it could not
-/// let go goes down with the process — the product's
-/// own scratch family is what the next start's session sweep reaches, and a settled run's
-/// session name is left as its chrome-use record alone, which nothing in this product sweeps.
-/// A held record waits for a run the restart may re-drive, and the record is durable either
-/// way, so whatever is left is picked up next boot. What is uncharged here is the retry
-/// ladder's attempt count: the flush is the last chance before the process goes down, not a
-/// step on that ladder, so a record it re-queues keeps the count it had. What IS charged is a
-/// left-open answer the browser did give: it is counted here ([`record_disposition`]) so a
-/// repeated one still reaches its conclusion, and the record is kept for the next boot to
-/// report.
+/// Last-chance pass for the shutdown and self-update paths: spends at most `budget` closing every
+/// record whose hold/retry elapsed, then returns. It runs no reclaim sweep and files no leftover
+/// row — the next boot owns both — though it can owe the row for this module's own scratch session,
+/// and reaches the let-go queue too (best-effort: the budget is below one whole stop). A held
+/// record waits for a run the restart may re-drive, and the retry ladder's count is not charged; a
+/// left-open answer the browser gave is, so a repeated one still concludes, and the record is kept
+/// for the next boot to report.
 async fn flush_pending_run_releases(budget: Duration) {
     let deadline = Instant::now() + budget;
     let cli = release_cli();
     let Some(mut pass) = ReleasePass::take() else {
-        // No record is due, but the let-go queue may still hold a name — a session let go of
-        // but not stopped, this module's own scratch session among them — and this is its last
-        // chance before the process goes down. Within this budget's stop bound, which is why
-        // the stop is attempted best-effort ([`forget_settled_sessions`]).
+        // No record is due, but the let-go queue may still hold a name: its last chance before
+        // exit.
         if let Some(cli) = cli.as_deref() {
             forget_settled(cli, &[], deadline).await;
         }
@@ -1703,22 +1354,17 @@ async fn flush_pending_run_releases(budget: Duration) {
     let outcomes =
         close_unprotected(cli.as_deref(), &names, &session, &mut protected, deadline).await;
     if let Some(cli) = cli.as_deref() {
-        // This product's own session, if the pass used it, goes before the process does; the
-        // name's family is only left alone if this flush itself settles it.
+        // This product's own session, if the pass used it, goes before the process does.
         let_go_own_session(cli, deadline).await;
-        // And the let-go queue is reached here rather than left to the next start: an
-        // unconfirmed let-go just queued that scratch session, and only a graceful stop closes
-        // the group it may have left. The flush's own budget is below one whole stop, so the
-        // stop is best-effort — a name it could not settle stays in the queue, which the
-        // process is about to drop (see this function's own doc for what that leaves).
+        // The let-go queue is reached here too: only a graceful stop closes the group an
+        // unconfirmed let-go may have left, and the budget is below one whole stop, so the stop is
+        // best-effort.
         forget_settled(cli, &[], deadline).await;
     }
     let mut released = 0usize;
     let mut still_open = 0usize;
     pass.reconcile(&outcomes, |mut entry, disposition| {
-        // Only a `Gone` answer is settled; an `Unclosable` or unanswered name is left in
-        // the record — off the retry ladder and untouched, keeping the attempt count it had —
-        // for the next boot's pass to report or retry.
+        // Only a `Gone` answer is settled; anything else stays in the record for the next boot.
         let keep: Vec<String> = disposition
             .retry
             .into_iter()
@@ -1739,22 +1385,18 @@ async fn flush_pending_run_releases(budget: Duration) {
     );
 }
 
-/// The chrome half of a shutdown: release what ended runs left queued, and close nothing
-/// else — a session ends by its own lifetime or an explicit `session stop`
-/// (see [`crate::chrome::cli_sessions`]). Both shutdown paths (GUI exit, self-update) call
-/// this.
+/// The chrome half of a shutdown, called by both shutdown paths: release what ended runs left
+/// queued, and close nothing else — a session ends by its own lifetime or an explicit `session
+/// stop`.
 pub async fn flush_ended_run_chrome_releases() {
     flush_pending_run_releases(SHUTDOWN_RELEASE_FLUSH_BUDGET).await;
 }
 
-/// Names of the live agent tab groups the sweep owns this pass: every group the browser
-/// titles under [`AGENT_TAB_PREFIX`] whose namespace no run may still own — and none whose
-/// namespace already got a verdict ([`stuck`]). `due` is the caller's own read of
-/// [`reclaim_due`], taken before the pass so the same answer can gate letting the door
-/// session go afterwards. Only the session names a queue or parked record still holds are left
-/// to that record, matched exactly ([`claimed_names`]): its own pass retries them on its own
-/// ladder, while a name the record dropped — one it settled unclosable — is the sweep's again,
-/// so a browser that recovers still gets that group closed.
+/// Names of the live agent tab groups the sweep owns this pass: every group titled under
+/// [`AGENT_TAB_PREFIX`] whose namespace no run may still own and none that already got a verdict
+/// ([`stuck`]). `due` is the caller's own read of [`reclaim_due`], taken before the pass. Only the
+/// names a queue or parked record still holds are left to that record ([`claimed_names`]); a name
+/// the record dropped is the sweep's again, so a recovered browser still gets its group closed.
 async fn reclaim_names(
     cli: Option<&Path>,
     session: &str,
@@ -1765,21 +1407,16 @@ async fn reclaim_names(
     if !due {
         return ReclaimAsk::unanswered();
     }
-    // Every due sweep, before the browser is read: a verdict expires with its window even
-    // when nothing reads it again (see [`stuck`]) — and even when the binary is not
-    // resolvable, so a verdict cannot outlive its window on a host without chrome-use.
+    // Every due sweep, before the browser is read: a verdict expires with its window even when
+    // unread.
     prune_stuck();
     let Some(cli) = cli else {
-        // Nothing to ask the browser with right now (a managed self-update swap window, a
-        // host without chrome-use): the ask that was owed goes up the ladder rather than
-        // being left standing at once, so a binary that is not resolvable yet — an install
-        // in flight, the swap window — does not cost the process its ask.
+        // No binary right now: the owed ask goes up the ladder rather than standing at once.
         reclaim_unfinished();
         return ReclaimAsk::unanswered();
     };
-    // The names the queue's records still hold, built directly rather than through the
-    // live/held pair: it is what keeps a second driver off the names a record's own pass
-    // retries, while a name a record dropped is examined here.
+    // Built directly rather than through the live/held pair: it keeps a second driver off record
+    // names.
     let claimed = claimed_names();
     match chrome_tabs::agent_group_names(cli, session, deadline).await {
         Ok(names) => {
@@ -1802,10 +1439,8 @@ async fn reclaim_names(
                 reason = %reason.text(),
                 "agent-run chrome reclaim could not read the live tab groups"
             );
-            // Nothing on this pass, and on a host with no ownership door the sweep cannot
-            // enumerate the browser's groups at all: that host-level gap is what the Issues
-            // view is owed rather than a debug line that ages out. Told through the same
-            // de-dupe as every other report, so a sweep that keeps failing costs one row.
+            // No ownership door: the sweep cannot enumerate groups, and the Issues view is owed
+            // that.
             if chrome_tabs::ownership_door_missing(cli, session, deadline).await {
                 report_once(
                     NO_DOOR_MESSAGE,
@@ -1825,10 +1460,8 @@ async fn reclaim_names(
     }
 }
 
-/// What one reclaim ask came to: the names the browser answered with, and whether the browser
-/// answered at all. `answered: false` is a read that failed or a binary that was not resolvable
-/// — the asking legs charge the ladder for those themselves, and nothing may be read as a clean
-/// ask from one.
+/// What one reclaim ask came to; `answered: false` is a failed read or no binary, never a clean
+/// ask.
 struct ReclaimAsk {
     names: Vec<String>,
     answered: bool,
@@ -1844,17 +1477,11 @@ impl ReclaimAsk {
     }
 }
 
-/// When the reclaim sweep may ask the browser again, and how many consecutive asks it could
-/// not get answered. `next_at` is the ask the schedule carries: `Some` exactly while something
-/// is unfinished or an event armed one, `None` after a clean ask that left no leftover behind —
-/// nothing here re-arms on an interval (see [`schedule_reclaim_now`] and [`reclaim_unfinished`]).
-/// `failures` is the ladder rung a failed ask is spaced by, kept across asks so a browser side
-/// that stays down is not re-shovelled.
-///
-/// The schedule starts with NOTHING armed: a process with no queued record and no leftover it
-/// knows about has no reason to read the browser at all, and a start that finds nothing pending
-/// must not open a page (`restore_pending_releases` arms the ask when there IS something).
-/// Nothing here is timed, so the derived default is the whole constructor.
+/// When the reclaim sweep may ask the browser again, and how many consecutive asks it could not get
+/// answered. `next_at` is `Some` exactly while something is unfinished or an event armed one;
+/// `failures` is the ladder rung a failed ask is spaced by, kept so a downed browser is not
+/// re-shovelled. The schedule starts with NOTHING armed: a start that finds nothing pending must
+/// not open a page, and nothing here is timed.
 #[derive(Default)]
 struct ReclaimSchedule {
     next_at: Option<Instant>,
@@ -1865,17 +1492,14 @@ fn reclaim_schedule() -> &'static Mutex<ReclaimSchedule> {
     RECLAIM.get_or_init(|| Mutex::new(ReclaimSchedule::default()))
 }
 
-/// Arm an ask at `at`, keeping whichever ask is already sooner: an event that arrives while a
-/// leftover's revisit is parked must not push that revisit back, and a revisit parked while
-/// an event's ask is armed must not push that ask back either.
+/// Arm an ask at `at`, keeping whichever ask is already sooner.
 fn arm_reclaim_at(at: Instant) {
     let mut schedule = reclaim_schedule().lock().unwrap_poison();
     schedule.next_at = Some(schedule.next_at.map_or(at, |old| old.min(at)));
 }
 
-/// The ask the leftovers the sweep could not close still owe: the earliest `at +
-/// [`STUCK_REVISIT`]` over the stuck verdicts still INSIDE their window. Strictly in the
-/// future by construction, so deriving an ask from it can never arm one in the past.
+/// The ask the stuck verdicts still inside their window owe; strictly in the future by
+/// construction.
 fn next_reclaim_revisit() -> Option<Instant> {
     stuck_namespaces()
         .lock()
@@ -1886,35 +1510,26 @@ fn next_reclaim_revisit() -> Option<Instant> {
         .min()
 }
 
-/// Arm an ask now: a run end queued names, which is the event that brings a crashed run's
-/// leftover to light. The ladder's failure count is left alone, so this asks once now and a
-/// failure still spaces the next ask out as it did.
+/// Arm an ask now: a run end queued names, leaving the failure count to space the next ask.
 fn schedule_reclaim_now() {
     arm_reclaim_at(Instant::now());
 }
 
-/// Arm a revisit [`STUCK_REVISIT`] away: a leftover the sweep could not close is owed another
-/// look rather than left with nothing scheduled behind it.
+/// Arm a revisit [`STUCK_REVISIT`] away: a leftover the sweep could not close is owed another look.
 fn schedule_reclaim_revisit() {
     arm_reclaim_at(Instant::now() + STUCK_REVISIT);
 }
 
-/// How long a namespace the sweep already concluded nothing can close — or that the browser
-/// keeps answering for, leaving its own tabs open — is left alone before the full close is tried
-/// again. A verdict is remembered so a stuck leftover cannot cost a `session stop` per name plus
-/// two browser reads on every sweep, while a browser that recovered still gets another chance:
-/// the entry expires with that window ([`prune_stuck`]), and the window is also the revisit a
-/// successful sweep leaves armed ([`next_reclaim_revisit`]).
+/// How long a namespace the sweep concluded nothing can close is left alone before the full close
+/// is tried again: a verdict saves a stop per name plus two reads on every sweep, and still
+/// expires.
 const STUCK_REVISIT: Duration = Duration::from_mins(30);
 
 fn stuck_namespaces() -> &'static Mutex<HashMap<String, Instant>> {
     STUCK_NAMESPACES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Whether the sweep may skip `namespace` this pass: a verdict was reached for it less than
-/// [`STUCK_REVISIT`] ago. The entry expires for real after that window ([`prune_stuck`] drops
-/// the expired ones, and a read drops its own), so a namespace nothing reads again does not keep
-/// its verdict for the whole process.
+/// Whether the sweep may skip `namespace`: a verdict was reached less than [`STUCK_REVISIT`] ago.
 fn stuck(namespace: &str) -> bool {
     let mut stuck = stuck_namespaces().lock().unwrap_poison();
     match stuck.get(namespace) {
@@ -1927,9 +1542,7 @@ fn stuck(namespace: &str) -> bool {
     }
 }
 
-/// Drop the verdicts whose [`STUCK_REVISIT`] window has passed — the sweep calls this before
-/// it reads the browser, so a namespace only ever read through [`stuck`] still loses its
-/// verdict in time.
+/// Drop the verdicts whose [`STUCK_REVISIT`] window passed, so one never read again still expires.
 fn prune_stuck() {
     let now = Instant::now();
     stuck_namespaces()
@@ -1938,17 +1551,14 @@ fn prune_stuck() {
         .retain(|_, concluded| now.saturating_duration_since(*concluded) < STUCK_REVISIT);
 }
 
-/// Whether the sweep may ask the browser this pass: only once the ask the schedule carries is
-/// due. Nothing arms one by itself — a start with nothing pending opens no page — so an ask
-/// exists only while something is unfinished or an event armed one ([`restore_pending_releases`],
-/// [`schedule_reclaim_now`], a parked verdict's revisit); [`reclaim_answered`] and
-/// [`reclaim_unfinished`] are what an ask leaves behind.
+/// Whether the sweep may ask the browser this pass: only once the ask the schedule carries is due.
+/// Nothing arms one by itself, so it exists only while something is unfinished or an event armed
+/// one.
 fn reclaim_due() -> bool {
     let mut schedule = reclaim_schedule().lock().unwrap_poison();
     match schedule.next_at {
-        // The pass that takes an ask is the one that runs it: clearing it here is what lets an
-        // ask armed while that pass runs (a run end, a parked verdict) stay a new one for the
-        // next wake instead of being consumed by the pass already in flight.
+        // The pass that takes an ask runs it: clearing it here keeps one armed meanwhile for the
+        // next wake.
         Some(at) if at <= Instant::now() => {
             schedule.next_at = None;
             true
@@ -1957,11 +1567,8 @@ fn reclaim_due() -> bool {
     }
 }
 
-/// A clean ask: the browser answered, so nothing stays scheduled except what the sweep's
-/// own leftovers still owe — the earliest revisit of a parked verdict ([`next_reclaim_revisit`]).
-/// Deriving the ask from the verdicts is what lets an already-parked revisit survive an ask
-/// that answered cleanly in between, and what makes a revisit firing a hair inside its window
-/// re-arm instead of vanishing; an ask armed while this pass ran is kept.
+/// A clean ask: only what the sweep's own leftovers owe stays scheduled — the earliest parked
+/// revisit. Deriving it from the verdicts lets a revisit survive a clean ask in between.
 fn reclaim_answered() {
     let revisit = next_reclaim_revisit();
     let mut schedule = reclaim_schedule().lock().unwrap_poison();
@@ -1970,16 +1577,14 @@ fn reclaim_answered() {
     }
 }
 
-/// Leave the ladder at its floor: the sweep's last ask was answered and nothing of its own is
-/// unfinished, so the next failure starts from the first rung again.
+/// Leave the ladder at its floor: the last ask was answered and nothing of the sweep's is
+/// unfinished.
 fn reset_reclaim_failures() {
     reclaim_schedule().lock().unwrap_poison().failures = 0;
 }
 
-/// An ask that could not be run or was left unfinished: charge the ladder and space the next
-/// ask by it, capped at [`RELEASE_RETRY_CAP`]. The failure count is kept across asks, so a
-/// browser side that stays down is not re-shovelled, and the arming keeps an ask already
-/// parked sooner.
+/// Charge the ladder and space the next ask by it, capped at [`RELEASE_RETRY_CAP`], keeping a
+/// sooner ask.
 fn reclaim_unfinished() {
     let failures = {
         let mut schedule = reclaim_schedule().lock().unwrap_poison();
@@ -1989,30 +1594,20 @@ fn reclaim_unfinished() {
     arm_reclaim_at(Instant::now() + release_backoff(failures));
 }
 
-/// Namespaces durable state says a run may still be rebuilt under: the roster agent ids of
-/// every job that has not been terminalized, minus the slots that already finished
-/// ([`crate::jobs::resumable_roster_agent_ids`]). A cut round resumes IN PLACE from its stored
-/// roster, so the slots it still has to run come back under the very ids — and the very chrome
-/// namespaces — they were working with, which is what protects a run whose end was deferred past
-/// the hold; a slot that finished is never re-dispatched, so its namespace is nothing to keep.
-/// Nothing else durable does this job: a parallel round's agent ids carry a random suffix, so its
-/// roster rows are the only place they exist before the run does, and a stage round's
-/// deterministic id ([`crate::jobs::session_pin_id`]) is named by the row its stage job writes for
-/// as long as that job can still resume — the row a settled ticket keeps as its session pin is
-/// continuity for the SESSION, not a promise the run comes back, and is deliberately not read
-/// here.
-///
-/// Fail-open: a store that is not up yields no protection beyond the in-memory registry and the
-/// held records, and a read that fails is a `debug!` — the sweep then runs on what it does know.
+/// Namespaces durable state says a run may still be rebuilt under: the roster agent ids of every
+/// job not yet terminalized, minus the slots that already finished. A cut round resumes IN PLACE
+/// from its stored roster, so its remaining slots come back under the very chrome namespaces they
+/// had. Nothing else durable does this: a parallel round's ids carry a random suffix, and a session
+/// pin is continuity for the SESSION, not a promise the run comes back. Fail-open: no store or a
+/// failed read is a `debug!`.
 async fn durable_resume_namespaces() -> Vec<String> {
     durable_resume_namespaces_checked()
         .await
         .unwrap_or_default()
 }
 
-/// The same read as [`durable_resume_namespaces`], but `None` when no answer could be made: a
-/// caller that DELETES durable state must not read a failed read as "nothing claims this" (see
-/// [`prune_tab_records`]).
+/// [`durable_resume_namespaces`], but `None` when no answer could be made: a caller that DELETES
+/// durable state must not read a failed read as "nothing claims this" ([`prune_tab_records`]).
 async fn durable_resume_namespaces_checked() -> Option<Vec<String>> {
     let store = crate::session::SESSIONS.get()?;
     match crate::jobs::resumable_roster_agent_ids(&store.conn).await {
@@ -2032,12 +1627,8 @@ async fn durable_resume_namespaces_checked() -> Option<Vec<String>> {
     }
 }
 
-/// The session names every record in the queue or in a pass right now still holds — held or
-/// not — matched EXACTLY (record names ARE the physical session names,
-/// `agent-tab-<12hex>-<tab>`). This is what keeps a second driver off the names a record's
-/// own pass retries: a name the record still carries is left to that pass, while one it
-/// dropped (a name it settled unclosable) belongs to the sweep again, so its group is still
-/// examined there.
+/// The session names every record queued or in a pass still holds — matched EXACTLY, because record
+/// names ARE the physical session names. A name the record still carries is left to its own pass.
 fn claimed_names() -> HashSet<String> {
     let parked = parked_releases().lock().unwrap_poison();
     let queue = pending_releases().lock().unwrap_poison();
@@ -2049,33 +1640,21 @@ fn claimed_names() -> HashSet<String> {
 }
 
 /// The namespaces a close must leave alone, snapshotted once per pass: every run live right now,
-/// every queued record still inside its hold (a run rebuilt under its own durable id), and
-/// whatever `durable` adds — the ids of a not-yet-terminalized job's slots that have not finished,
-/// i.e. the ones a round resuming in place would re-dispatch. Both the record's own release and the
-/// reclaim sweep pass that set: a record names a run that has ENDED, but a job row that outlives
-/// the end still says the round may come back, so its tabs must survive the hold. The live half
-/// is re-read before the close ([`close_unprotected`]), at every act it performs
-/// ([`crate::tools::chrome_tabs::OwnedAgain`]) and once more for the let-go step. The durable
-/// half is bounded by the stale-job purge ([`crate::jobs::purge_stale_jobs`]): a phase job idle
-/// for [`crate::jobs::PURGE_CUTOFF_HOURS`] is deleted, a frozen one is purge-immune and keeps its
-/// tabs (a paused round comes back), and only an abandoned non-phase job can outlive that — the
-/// boot scan re-drives those, which is the safe direction to err in.
-///
-/// Every member is a namespace and matched as a prefix, so a live run protects every name under
-/// it; the names a queue or parked record still holds are NOT this set (the sweep excludes those
-/// by exact name, [`claimed_names`]).
+/// every queued record still inside its hold, and `durable` — the ids of a not-yet-terminalized
+/// job's unfinished slots. The live half is re-read before the close and at every act; the durable
+/// half is bounded by the stale-job purge, where a frozen job is purge-immune. Members are
+/// namespaces, matched as a prefix.
 struct ProtectedNamespaces {
     namespaces: Vec<String>,
 }
 
 impl ProtectedNamespaces {
-    /// Every namespace a close must leave alone this pass: the live map, the held records
-    /// and `durable`.
+    /// Every namespace a close must leave alone this pass: the live map, the held records,
+    /// `durable`.
     fn snapshot(durable: &[String]) -> Self {
         let now = Instant::now();
-        // Each lock is taken and released on its own: `take_releasable` holds the queue
-        // lock while it reads the live map, so the two must never be nested in the
-        // opposite order.
+        // Each lock is taken alone: `take_releasable` holds the queue lock while reading the live
+        // map.
         let live: Vec<String> = live_run_namespaces()
             .lock()
             .unwrap_poison()
@@ -2095,17 +1674,13 @@ impl ProtectedNamespaces {
         protected
     }
 
-    /// The live map and the held records only — the set a step that must not race a run
-    /// re-reads in one go.
+    /// The live map and the held records only — the set a step that must not race a run re-reads in
+    /// one go.
     fn live_and_held() -> Self {
         Self::snapshot(&[])
     }
 
-    /// Whether the LIVE map or a HELD record protects `name` right now, under its own
-    /// locks and building nothing: this is the question a close asks at each act it
-    /// performs ([`crate::tools::chrome_tabs::OwnedAgain`]), so it must see the map as it
-    /// is at that moment — seconds after the pass's own snapshot — and cost nothing worth
-    /// avoiding.
+    /// Whether the LIVE map or a HELD record protects `name` now — what a close asks at each act.
     fn protects_live_or_held(name: &str) -> bool {
         let live = live_run_namespaces().lock().unwrap_poison();
         if live
@@ -2128,9 +1703,8 @@ impl ProtectedNamespaces {
         self.namespaces.extend(Self::live_and_held().namespaces);
     }
 
-    /// Whether `name` belongs to a namespace some run may still own — asked both about a session
-    /// name and (by the boot prune) about a namespace itself, which is its own prefix. Namespaces
-    /// are matched as prefixes (they all end in `-`), never re-derived from the agent id.
+    /// Whether `name` belongs to a namespace some run may still own — also asked of a namespace
+    /// itself.
     fn contains(&self, name: &str) -> bool {
         self.namespaces
             .iter()
@@ -2138,55 +1712,37 @@ impl ProtectedNamespaces {
     }
 }
 
-/// Whether a session `name` belongs to the namespace `prefix`: matched as a prefix,
-/// never re-derived from the agent id, and an empty prefix matches nothing.
+/// Whether `name` belongs to `prefix`; an empty prefix matches nothing.
 fn names_a_namespace(prefix: &str, name: &str) -> bool {
     !prefix.is_empty() && name.starts_with(prefix)
 }
 
-/// The `target` every row of the chrome-tabs issue family carries: this module's leftover and
-/// reclaim reports, and the agent tool's own un-settled group report.
+/// The `target` every row of the chrome-tabs issue family carries.
 pub(crate) const ISSUE_TARGET: &str = "chrome-tabs";
-/// The one durable message every leftover report carries — stable, because the Issues
-/// view dedupes on the `(message, reason)` pair.
+/// The one durable message every leftover report carries; stable, because the Issues view dedupes.
 const LEFTOVER_MESSAGE: &str = "agent-run browser tabs could not be closed automatically";
-/// The report for a close the browser answered for and did not make (see
-/// [`RetryLeg::LeftOpen`]).
+/// The report for a close the browser answered for and did not make (see [`RetryLeg::LeftOpen`]).
 const LEFT_OPEN_MESSAGE: &str =
     "agent-run browser tabs were left open: the browser answered for them and did not close them";
-/// The report for a host whose browser side has no ownership door at all (see the chrome_tabs
-/// module doc's Honest limits): a fact about the host, not a leftover of any run. What is missing
-/// is the browser-side listing every read here runs on — so the sweep cannot enumerate agent-run
-/// groups, and what a record names is left to chrome-use's own `session stop`. What that route
-/// cannot settle is left unnamed rather than written off as one run's, since the host cannot
-/// establish which tabs are whose. No run, no session and no tab is ever named, and the message
-/// must not claim a close failed (there may have been nothing to close).
+/// The report for a host whose browser side has no ownership door (see chrome_tabs' Honest limits):
+/// a fact about the host, not a leftover of any run. The listing every read runs on is missing, so
+/// a record's names are left to chrome-use's own `session stop`; nothing is named and no close is
+/// claimed to have failed.
 const NO_DOOR_MESSAGE: &str = "the browser side here cannot list agent-run tab groups, so \
                                leftovers no record names cannot be closed";
-/// The report for this module's own scratch group a let-go could not confirm gone: the one
-/// visible tab this product can leave in the owner's strip, so it must be surfaced rather than
-/// accepted quietly — but the reads that look for the group can themselves fail, so the row says
-/// only that the release was not CONFIRMED, never that a group was seen. Not a run's leftover: it
-/// is the one name neither queue bound drops, so a helper that will not settle it is retried on
-/// the queue's own capped deadline for as long as this process lives, and the product's session
-/// sweeps own the `mahbot-chrome-ephemeral-*` family across a restart.
+/// The report for this module's own scratch group a let-go could not confirm gone: the one visible
+/// tab this product can leave in the owner's strip, so it is surfaced rather than accepted quietly
+/// — but the reads that look for the group can fail, so the row says only that the release was not
+/// CONFIRMED. It is the one name neither queue bound drops, so it is retried on the queue's own
+/// capped deadline while the process lives, and the session sweeps own its family across a restart.
 const OWN_SESSION_MESSAGE: &str =
     "the product's own browser-read session could not be confirmed released";
-/// Why that report is filed; stable, because the Issues view dedupes on the `(message, reason)`
-/// pair and this is a property of the module's own session rather than of any run.
+/// Why that report is filed: a property of the module's own session, not of any run.
 const OWN_SESSION_REASON: &str = "chrome-tabs:own-session";
-/// Why a tab left behind is reported as unclosable: either its ledger lost it (the extension was
-/// updated, re-installed or restarted since it was created) or it was never this session's, or the
-/// browser answered this run's close and left it standing — the record's own conclusion
-/// ([`MAX_LEFT_OPEN_ATTEMPTS`] passes). Naming every one keeps the report true whichever it was,
-/// and it is only said about an answer that repeated ([`crate::tools::chrome_tabs`]'s own
-/// confirmation), never about one read. The record drops these names; the reclaim sweep keeps
-/// examining their group at [`STUCK_REVISIT`].
-///
-/// Every one of these rows states what the product could NOT do and that something of ours keeps
-/// after those tabs — the record's next pass, or the sweep's own revisit — never what the browser
-/// holds right now: a later pass that does close the tabs makes the rows old, not untrue, and the
-/// Issues view is an append-only record of what was answered.
+/// Why a tab is reported as unclosable: its ledger lost it, it was never this session's, or the
+/// browser answered this run's close and left it standing ([`MAX_LEFT_OPEN_ATTEMPTS`] passes) —
+/// only ever said of a repeated answer. Every row states what the product could NOT do, never what
+/// the browser holds now.
 const UNCLOSABLE_DETAIL: &str = "the product could not close these tabs and keeps retrying \
                                  them: the browser extension answered that it does not hold \
                                  them as its own (it lost its ledger — updated, re-installed or \
@@ -2194,46 +1750,33 @@ const UNCLOSABLE_DETAIL: &str = "the product could not close these tabs and keep
                                  the browser answered this run's close attempts and left the \
                                  tabs standing — the removal refused as not its own to make, or \
                                  answered while they still stood";
-/// The one detail a left-open report carries: the browser's answer that left the tabs standing,
-/// as the past fact it is (see [`UNCLOSABLE_DETAIL`] for why). Both shapes the leg covers are
-/// named, because either can be the answer the record's own count concluded on.
+/// The one detail a left-open report carries: the browser's answer that left the tabs standing.
 const LEFT_OPEN_DETAIL: &str = "the browser extension answered this run's close and the tabs \
                                 were left standing: it refused the removal as not its own to \
                                 make, or answered it while the tabs still stood";
-/// The reason a host whose browser side has no ownership door is reported under: it is a
-/// property of the host, not of any one run, so it carries no namespace.
+/// The reason a host with no ownership door is reported under: a property of the host, so no
+/// namespace.
 const NO_OWNERSHIP_DOOR_REASON: &str = "chrome-tabs:no-ownership-door";
-/// The report for a host whose browser answers this route cannot decide from (see
-/// [`chrome_tabs::saw_unreadable_answer`]): unlike a missing door, the door is there and an answer
-/// came back, but nothing in it settles a name — a field a read parser refuses to guess at,
-/// because a dropped tab would read as one that is gone, bytes with no envelope at all, or an
-/// envelope carrying neither a success verdict nor a reason for failing. The row must claim
-/// neither a close that failed nor a host no route can ever close, and must not say what became
-/// of the names the answer covered — another read settles what it can — because it is a fact about
-/// the host rather than about one name, and like [`NO_DOOR_MESSAGE`] it names no run and no
-/// session.
+/// The report for a host whose browser answers this route cannot decide from
+/// ([`chrome_tabs::saw_unreadable_answer`]): the door is there and an answer came back, but nothing
+/// in it settles a name. It claims neither a failed close nor a host no route can settle, and names
+/// nothing.
 const UNREADABLE_MESSAGE: &str = "the browser's answers gave this cleanup no decision it could act on, so no name was concluded from them";
-/// Why that report is filed; stable, because the Issues view dedupes on the `(message, reason)`
-/// pair, and the fact is about the host rather than about any one run or name.
+/// Why that report is filed: a fact about the host rather than about any one run or name.
 const UNREADABLE_REASON: &str = "chrome-tabs:unreadable-answer";
-/// Cap on the joined `session` field of a report, so one wide leftover group cannot bloat
-/// the row.
+/// Cap on the joined `session` field of a report, so one wide leftover group cannot bloat the row.
 const SESSION_NAMES_MAX_CHARS: usize = 300;
-/// Reasons already reported in THIS process, so a leftover the sweep keeps re-reading does
-/// not cost a store read on every pass. The durable dedupe (`record_issue_once`) stays the
-/// authority — including across restarts.
+/// Reasons already reported in THIS process, so a re-read leftover costs no store read.
 static REPORTED_REASONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 fn reported_reasons() -> &'static Mutex<HashSet<String>> {
     REPORTED_REASONS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// Which fact one report carries — the two are told apart in the Issues view because the first
-/// ends its record's retries while the second is retried on.
+/// Which fact one report carries: the first ends its record's retries, the second keeps retrying.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum IssueKind {
-    /// The record's routes are done with these tabs: reported with the run, while the reclaim
-    /// sweep keeps examining their group.
+    /// The record's routes are done with these tabs: reported with the run, examined by the sweep.
     Unclosable,
     /// The browser answered and left the tabs: the record keeps retrying them.
     LeftOpen,
@@ -2248,8 +1791,7 @@ impl IssueKind {
         }
     }
 
-    /// The reason prefix this kind's rows are deduped on. One reason per namespace, so a
-    /// repeated pass over the same run is a duplicate, not news.
+    /// One reason per namespace, so a repeated pass over the same run is a duplicate, not news.
     fn reason_prefix(self) -> &'static str {
         match self {
             Self::Unclosable => "chrome-tabs:",
@@ -2257,8 +1799,7 @@ impl IssueKind {
         }
     }
 
-    /// What the report says about the sessions it carries: one sentence per kind, because
-    /// every name of a group ran into the same fact.
+    /// One sentence per kind: every name of a group ran into the same fact.
     fn detail(self) -> &'static str {
         match self {
             Self::Unclosable => UNCLOSABLE_DETAIL,
@@ -2267,8 +1808,8 @@ impl IssueKind {
     }
 }
 
-/// One report the Issues view is owed: the run namespace it belongs to (which the rows are
-/// deduped on), the run that produced it, and one leaked session name.
+/// One report the Issues view is owed: the namespace rows are deduped on, the run, and one leaked
+/// name.
 struct Issue {
     kind: IssueKind,
     namespace: String,
@@ -2276,8 +1817,8 @@ struct Issue {
     name: String,
 }
 
-/// One namespace's issues, the shape the Issues view is written in: one row per
-/// `(kind, namespace)`, carrying every name that namespace ran into.
+/// One namespace's issues, the shape the Issues view is written in: one row per `(kind,
+/// namespace)`.
 struct IssueGroup {
     kind: IssueKind,
     namespace: String,
@@ -2286,9 +1827,8 @@ struct IssueGroup {
     names: Vec<String>,
 }
 
-/// Report every fact the Issues view is owed, one row per `(kind, namespace)` and at most
-/// once per `(message, reason)` — across this process and, by
-/// [`crate::logs::record_issue_once`], across restarts.
+/// Report every fact the Issues view is owed: one row per `(kind, namespace)`, once per `(message,
+/// reason)`.
 async fn report_issues(issues: Vec<Issue>) {
     let mut groups: Vec<IssueGroup> = Vec::new();
     for issue in issues {
@@ -2322,21 +1862,15 @@ async fn report_issues(issues: Vec<Issue>) {
     }
 }
 
-/// Tell the Issues view one fact, once: the in-process set is what a sweep that keeps
-/// re-reading the same leftover is spared, and it is only marked after the write landed —
-/// a write that failed must not suppress the report for the rest of the process. Every row
-/// goes under [`ISSUE_TARGET`].
-///
-/// The write is fail-open by design ([`crate::logs::record_issue_once`] reports the failure
-/// and writes nothing): a fact lost to a down store is not lost for good — whatever produced
-/// it is still true of the browser, so the pass that reads it again reports it again — and
-/// the process never stops closing tabs because its log store is broken.
+/// Tell the Issues view one fact, once: the in-process set spares a re-reading sweep, and a reason
+/// is marked only after the write landed. Fail-open — a fact lost to a down store is reported again
+/// by the next pass that reads it, and the process never stops closing tabs over a broken log
+/// store.
 async fn report_once(message: &str, reason: &str, fields: serde_json::Value) {
     if reported_reasons().lock().unwrap_poison().contains(reason) {
         return;
     }
-    // The seam captures the same `(message, reason, fields)` the real writer takes, and a
-    // test with no seam installed goes through the real writer.
+    // The seam captures the same `(message, reason, fields)` the real writer takes.
     #[cfg(test)]
     if let Some(sink) = release_settings().issues {
         sink.lock()
@@ -2353,8 +1887,7 @@ async fn report_once(message: &str, reason: &str, fields: serde_json::Value) {
     }
 }
 
-/// Remember that `reason` has been reported: the next pass over the same leftover is then
-/// spared the store read.
+/// Remember that `reason` has been reported, sparing the next pass the store read.
 fn mark_reported(reason: &str) {
     reported_reasons()
         .lock()
@@ -2362,30 +1895,24 @@ fn mark_reported(reason: &str) {
         .insert(reason.to_string());
 }
 
-/// Test seam: when set, issue reports land here instead of the Issues store, so a
-/// test can assert a leftover report without a logs store.
+/// Test seam: when set, issue reports land here instead of the Issues store.
 #[cfg(test)]
 type CapturedIssues = std::sync::Arc<Mutex<Vec<(String, String, serde_json::Value)>>>;
 
-/// The whole budget of one close attempt — a release pass, or one cap eviction: the two phases of
-/// browser reads ([`READ_PHASE_RESERVE`] each — the planning reads that decide what the close is
-/// about, and the confirmation's own deciding reads) and one `session stop`
-/// ([`crate::chrome::SESSION_STOP_TIMEOUT`]) in between. The removal call and its verification
-/// reads have no reserve of their own — they spend what the planning share left over — so on a
-/// slow pass they are what pushes the confirmation's stop out: the names that stop would have
-/// covered then stay retries, settled by no read of that pass, and a later pass whose budget holds
-/// a whole stop concludes them (see `chrome_tabs`' own reserve).
+/// The whole budget of one close attempt — a release pass or one cap eviction: two phases of
+/// browser reads ([`READ_PHASE_RESERVE`] each) and one `session stop` between. The removal call and
+/// its verification reads have no reserve, so on a slow pass those names stay retries, settled by a
+/// later pass.
 ///
 /// [`READ_PHASE_RESERVE`]: crate::tools::chrome_tabs::READ_PHASE_RESERVE
 const ATTEMPT_TIMEOUT: Duration = crate::tools::chrome_tabs::READ_PHASE_RESERVE
     .saturating_mul(2)
     .saturating_add(crate::chrome::SESSION_STOP_TIMEOUT);
 
-/// Every knob of the release path — one accessor so the test seam swaps the whole set
-/// at once. A release build compiles no seam state (the `cli` and `issues` stubs below
-/// are `#[cfg(test)]`) and always reads the constants above plus the storage root; the
-/// real binary is resolved on demand by [`release_cli`], so a `Drop`-driven enqueue, a
-/// persist or a restore never probes for it.
+/// Every knob of the release path — one accessor so a test seam swaps the whole set at once. A
+/// release build compiles no seam state and always reads the constants above plus the storage root;
+/// the binary is resolved on demand by [`release_cli`], so a `Drop`-driven enqueue, a persist or a
+/// restore never probes for it.
 #[derive(Clone, Debug)]
 struct ReleaseSettings {
     /// One pass's whole budget ([`ATTEMPT_TIMEOUT`]).
@@ -2393,11 +1920,9 @@ struct ReleaseSettings {
     retry_base: Duration,
     /// Floor on a restored record's eligibility ([`RELEASE_BOOT_GRACE`]).
     boot_grace: Duration,
-    /// The durable record file (`None` = nothing to write it to; see
-    /// [`RELEASE_FILE_NAME`]).
+    /// The durable record file (`None` = nothing to write it to; see [`RELEASE_FILE_NAME`]).
     store: Option<PathBuf>,
-    /// Stub binary the release tests spawn in place of the real `chrome-use`
-    /// (see [`release_cli`]).
+    /// Stub binary the release tests spawn in place of the real `chrome-use`.
     #[cfg(test)]
     cli: Option<PathBuf>,
     /// The sink [`report_once`] writes to under test (see [`CapturedIssues`]).
@@ -2424,11 +1949,9 @@ fn release_settings() -> ReleaseSettings {
     }
 }
 
-/// The `chrome-use` binary a release pass spawns (`None` = not available right now),
-/// resolved once per pass from the [`cli_path`] probe behind it (a cached lock plus an
-/// executable check, not a filesystem search). An installed test seam decides on its own —
-/// including "there is none" — so a test can put the release path in the window a
-/// managed self-update swap creates.
+/// The `chrome-use` binary a release pass spawns, resolved once per pass from the [`cli_path`]
+/// probe. An installed test seam decides on its own, so a test can put the path in a self-update
+/// swap window.
 fn release_cli() -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(settings) = test_release_settings() {
@@ -2445,16 +1968,13 @@ fn test_release_settings() -> Option<ReleaseSettings> {
     RELEASE_SETTINGS.lock().unwrap_poison().clone()
 }
 
-/// Install release seams (a stub `chrome-use` plus shortened timings, so the
-/// release path is exercised against a slow or failing browser side without a
-/// browser and without real waits), returning the previous value so an RAII
-/// guard can restore it on drop — including during a panic.
+/// Install release seams (a stub `chrome-use` plus shortened timings), returning the previous
+/// value.
 #[cfg(test)]
 fn swap_release_settings(settings: ReleaseSettings) -> Option<ReleaseSettings> {
     RELEASE_SETTINGS.lock().unwrap_poison().replace(settings)
 }
 
-/// Restore a previously swapped-out release settings.
 #[cfg(test)]
 fn restore_release_settings(previous: Option<ReleaseSettings>) {
     *RELEASE_SETTINGS.lock().unwrap_poison() = previous;
@@ -2468,8 +1988,7 @@ fn release_backoff(attempts: u32) -> Duration {
         .min(RELEASE_RETRY_CAP)
 }
 
-/// Test-only: one entry per queued record — its names, its attempt count and how
-/// long it still has to wait before it may be attempted.
+/// Test-only: one entry per queued record — names, attempt count, and how long it must still wait.
 #[cfg(test)]
 fn pending_releases_snapshot() -> Vec<(Vec<String>, u32, Duration)> {
     let now = Instant::now();
@@ -2487,8 +2006,7 @@ fn pending_releases_snapshot() -> Vec<(Vec<String>, u32, Duration)> {
         .collect()
 }
 
-/// Test-only: the queued records as `(names, attempts)`, the shape most assertions
-/// pin (a record's remaining eligibility gets its own assertion).
+/// Test-only: the queued records as `(names, attempts)`, the shape most assertions pin.
 #[cfg(test)]
 pub(crate) fn pending_names_and_attempts() -> Vec<(Vec<String>, u32)> {
     pending_releases_snapshot()
@@ -2497,8 +2015,7 @@ pub(crate) fn pending_names_and_attempts() -> Vec<(Vec<String>, u32)> {
         .collect()
 }
 
-/// Test-only: how long each queued record still has to wait before it may be
-/// attempted.
+/// Test-only: how long each queued record must still wait.
 #[cfg(test)]
 pub(crate) fn pending_release_delays() -> Vec<Duration> {
     pending_releases_snapshot()
@@ -2507,13 +2024,11 @@ pub(crate) fn pending_release_delays() -> Vec<Duration> {
         .collect()
 }
 
-/// Test-only: empty everything the release path holds in memory — the queue, the
-/// passes' parking, the sweep's schedule and verdicts, the evicted runs it remembers,
-/// the reasons already reported and the sessions waiting to be let go.
+/// Test-only: empty everything the release path holds in memory — queues, schedule, verdicts,
+/// latches.
 #[cfg(test)]
 pub(crate) fn clear_pending_releases() {
-    // Parked first, the order [`ReleasePass::take`] and [`persist_pending_releases`]
-    // acquire the two in, so no lock cycle can form against a live pass.
+    // Parked first, the order [`ReleasePass::take`] acquires them in, so no lock cycle can form.
     parked_releases().lock().unwrap_poison().clear();
     pending_releases().lock().unwrap_poison().clear();
     reported_reasons().lock().unwrap_poison().clear();
@@ -2522,21 +2037,19 @@ pub(crate) fn clear_pending_releases() {
     pending_forget().lock().unwrap_poison().clear();
     *forget_retry().lock().unwrap_poison() = None;
     evicted_runs().lock().unwrap_poison().clear();
-    // The chrome_tabs process latches this module's passes set, so a test that met an
-    // unreadable answer cannot make the next one report the host row for it.
+    // The chrome_tabs process latch is cleared too, so a met unreadable answer cannot report again.
     crate::tools::chrome_tabs::reset_unreadable_answer();
 }
 
-/// Test-only: the sessions waiting for the next pass to let them go, with the passes that
-/// have failed to let each one go. Read only by the unix-gated release tests.
+/// Test-only: the sessions waiting to be let go, with their failed attempts; read by the unix
+/// tests.
 #[cfg(all(test, unix))]
 fn pending_forget_snapshot() -> Vec<(String, u32)> {
     pending_forget().lock().unwrap_poison().clone()
 }
 
-/// Keeps the release path from writing the durable record file while it lives — for a
-/// test that drives a real run end without a store of its own (a `ReleaseGuard` has
-/// one), so it cannot leave records in the shared test storage root.
+/// Keeps the release path from writing the record file while it lives, so no test leaves records
+/// behind.
 #[cfg(test)]
 pub(crate) struct NoReleaseStore(Option<ReleaseSettings>);
 
@@ -2566,23 +2079,17 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    // -----------------------------------------------------------------------
     // Ended-run session releases
-    // -----------------------------------------------------------------------
-
-    /// Re-arm the attempt bound of the settings a [`ReleaseGuard`] installed — for
-    /// a test whose short bound has served its purpose and whose later, successful
-    /// pass must not race a cold or loaded stub spawn. The shipped budget
-    /// ([`ATTEMPT_TIMEOUT`]) is the value that can reach every step of a pass, the
-    /// confirmation's stop included.
+    /// Re-arm the attempt bound of the settings a [`ReleaseGuard`] installed, so a later pass does
+    /// not race a cold stub spawn.
     fn widen_attempt_bound(attempt_timeout: Duration) {
         let mut settings = release_settings();
         settings.attempt_timeout = attempt_timeout;
         swap_release_settings(settings);
     }
 
-    /// Re-arm the retry gap, to a value no test waits out: a release that still lands
-    /// promptly can then only be explained by a wake.
+    /// Re-arm the retry gap, to a value no test waits out: a release that still lands promptly can
+    /// then only be explained by a wake.
     fn widen_retry_base(retry_base: Duration) {
         let mut settings = release_settings();
         settings.retry_base = retry_base;
@@ -2601,8 +2108,8 @@ mod tests {
         names
     }
 
-    /// The `left_open` count of each queued record — the browser's repeated answer that a
-    /// close left the tabs standing (see [`MAX_LEFT_OPEN_ATTEMPTS`]), which
+    /// The `left_open` count of each queued record — the browser's repeated answer that a close
+    /// left the tabs standing (see [`MAX_LEFT_OPEN_ATTEMPTS`]), which
     /// [`pending_names_and_attempts`] leaves out.
     fn pending_left_open() -> Vec<u32> {
         pending_releases()
@@ -2613,16 +2120,15 @@ mod tests {
             .collect()
     }
 
-    /// The browser state the stub answers from, one line per tab and per group:
-    /// `tab <id> <groupId> <owned>` and `group <id> <title>`. `owned` decides whether the
-    /// extension holds that tab (a closeable one) or not (an unclosable one).
+    /// The browser state the stub answers from, one line per tab and per group: `tab <id> <groupId>
+    /// <owned>` and `group <id> <title>`.
     fn write_browser_state(path: &Path, names: &[String], owned: bool) {
         let each: Vec<(&str, bool)> = names.iter().map(|name| (name.as_str(), owned)).collect();
         write_browser_state_each(path, &each);
     }
 
-    /// As [`write_browser_state`], one ownership flag per group: the shape a record's close
-    /// sees when one of its names is a leftover no route can close while another is closeable.
+    /// As [`write_browser_state`], one ownership flag per group: the shape a record's close sees
+    /// when one of its names is a leftover no route can close while another is closeable.
     fn write_browser_state_each(path: &Path, owned: &[(&str, bool)]) {
         let index = |i: usize| i64::try_from(i).expect("a small test index");
         let mut lines: Vec<String> = owned
@@ -2646,24 +2152,14 @@ mod tests {
         fs::write(path, lines.join("\n")).expect("write browser state");
     }
 
-    /// The stub `chrome-use` itself: it answers the extension protocol from `state`,
-    /// records every invocation's argv to `log`, and takes its behaviour from `mode` —
-    /// `refuse` (a structured error for every call, none of which ever carries the
-    /// extension's own refusal sentence), `remove-sentence` (every read answers normally,
-    /// and the `tabs.remove` leg fails with the extension's own refusal sentence, relayed
-    /// exactly as the extension sends it), `remove-transient` (the same, with a `tabs.remove`
-    /// leg whose failure never reached the browser), `silent` (never answers), `keep`
-    /// (answers, and leaves its tabs open anyway), `amnesia-once` (one empty ledger read),
-    /// `garbled-answer` (one read answers in a shape no parser can use), `stop-refused` (every
-    /// read answers normally and `session stop` reports a tab it could not close, the shape a
-    /// session whose browser the extension no longer reaches has), `no-extension` (a host
-    /// with no extension in the driving profile), `disabled-extension` (one installed but
-    /// disabled), `ledger-unreadable` (a CRAFTED shape, impossible on a real host: `extension
-    /// status` reads as no extension while `tabGroups.query` still answers from the state file
-    /// and both ownership reads fail — it exists to reach the door-less fallback with live group
-    /// names in play, and its `session stop` refuses exactly one name, the one carrying
-    /// `refuse`). An exit code alone is
-    /// deliberately NOT a success mode — the close gates on the browser's own answer.
+    /// The stub `chrome-use` itself: answers the extension protocol from `state`, records argv to
+    /// `log`, and takes its behaviour from `mode`: `refuse` (structured error, never the
+    /// extension's own refusal sentence), `remove-sentence` (`tabs.remove` fails with that
+    /// sentence), `remove-transient` (the same, never reaching the browser), `silent`, `keep`
+    /// (answers and leaves its tabs open), `amnesia-once`, `garbled-answer`, `stop-refused`,
+    /// `no-extension`, `disabled-extension`, and `ledger-unreadable` (a crafted shape whose status
+    /// reads as no extension while the group query still answers, reaching the door-less fallback;
+    /// its `session stop` refuses one name).
     #[expect(clippy::too_many_lines)] // one shell script, one stub: the modes are read against each other
     fn stub_script(log: &Path, mode: &Path, state: &Path, mark: &Path) -> String {
         r#"#!/bin/sh
@@ -2784,31 +2280,27 @@ exit 0
         .replace("__MARK__", &mark.display().to_string())
     }
 
-    /// A stub `chrome-use`, the [`ReleaseSettings`] pointing at it, a private record
-    /// file and a browser-state file. Restores the previous settings and drains the
-    /// queue on drop, including during a panic.
+    /// A stub `chrome-use`, the [`ReleaseSettings`] pointing at it, a private record file and a
+    /// browser-state file.
     struct ReleaseGuard {
         state: PathBuf,
         mode: PathBuf,
         log: PathBuf,
         issues: CapturedIssues,
         previous: Option<ReleaseSettings>,
-        // Holds the stub binary, the record file and the state file for the guard's
-        // lifetime.
+        // Holds the stub binary, the record file and the state file for the guard's lifetime.
         dir: tempfile::TempDir,
     }
 
     impl ReleaseGuard {
-        // Install the stub settings with no boot grace (every restored record is
-        // eligible at once) and warm the spawn path once.
+        // Install the stub settings with no boot grace (every restored record is eligible at once)
+        // and warm the spawn path once.
         async fn install(attempt_timeout: Duration) -> Self {
             Self::install_with(attempt_timeout, Duration::ZERO).await
         }
 
-        // `boot_grace` is the floor a restored record's eligibility gets — a test
-        // injects a short one instead of waiting a real minute. The record file and
-        // state file live in the guard's own temp dir, so the real
-        // `~/.mahbot/chrome-run-releases.json` is never touched.
+        // `boot_grace` is the floor a restored record's eligibility gets — a test injects a short
+        // one instead of waiting a real minute.
         async fn install_with(attempt_timeout: Duration, boot_grace: Duration) -> Self {
             let dir = tempfile::tempdir().expect("release stub dir");
             let cli = dir.path().join("chrome-use");
@@ -2837,9 +2329,9 @@ exit 0
                 previous,
                 dir,
             };
-            // Warm-up call; the log is reset so it cannot be mistaken for a real
-            // close pass, and the session it read in is let go exactly as a pass would —
-            // otherwise the next pass would find a read outstanding that it never made.
+            // Warm-up call; the log is reset so it cannot be mistaken for a real close pass, and
+            // the session it read in is let go exactly as a pass would — otherwise the next pass
+            // would find a read outstanding that it never made.
             let _ = chrome_tabs::close_sessions(
                 &cli,
                 &["warmup".to_string()],
@@ -2866,14 +2358,14 @@ exit 0
             write_browser_state(&self.state, names, owned);
         }
 
-        // Write the browser state with one ownership flag per group — the shape a close sees
-        // when one of a record's names is unclosable and another is closeable.
+        // Write the browser state with one ownership flag per group — the shape a close sees when
+        // one of a record's names is unclosable and another is closeable.
         fn write_state_each(&self, owned: &[(&str, bool)]) {
             write_browser_state_each(&self.state, owned);
         }
 
-        // The titles of the tab groups the stub's browser still holds (`group <id> <title>`
-        // lines), so a test can assert what an eviction left open.
+        // The titles of the tab groups the stub's browser still holds (`group <id> <title>` lines),
+        // so a test can assert what an eviction left open.
         fn group_titles(&self) -> Vec<String> {
             fs::read_to_string(&self.state)
                 .unwrap_or_default()
@@ -2883,8 +2375,8 @@ exit 0
                 .collect()
         }
 
-        // Put the release path in the window a managed self-update swap creates:
-        // chrome-use resolves to nothing.
+        // Put the release path in the window a managed self-update swap creates: chrome-use
+        // resolves to nothing.
         #[expect(
             clippy::unused_self,
             reason = "called as a guard method so every seam installs the same way"
@@ -2895,9 +2387,7 @@ exit 0
             swap_release_settings(settings);
         }
 
-        // Arm the sweep as an event would — the schedule no longer arms a boot ask. The
-        // shipped product arms one from an event ([`schedule_reclaim_now`]); a test does it
-        // to ask without one.
+        // Arm the sweep as an event would — the schedule no longer arms a boot ask.
         #[expect(
             clippy::unused_self,
             reason = "called as a guard method so every seam installs the same way"
@@ -2920,8 +2410,8 @@ exit 0
             self.log_lines().iter().any(|line| line.contains(needle))
         }
 
-        // The tab ids the release path asked `tabs.remove` for, in the order asked — what
-        // the close demanded of the browser, not what the browser answered.
+        // The tab ids the release path asked `tabs.remove` for, in the order asked — what the close
+        // demanded of the browser, not what the browser answered.
         fn removed_tab_ids(&self) -> Vec<i64> {
             self.log_lines()
                 .iter()
@@ -2943,10 +2433,7 @@ exit 0
         }
 
         // Whether the only things the release path asked the browser were reads: no record was
-        // attempted, nothing was closed, and no record's session was stopped. The sweep's read
-        // borrows the work's own session where one exists, so a line naming a session other than
-        // [`OWN_SESSION`] is not itself a close — a `tabs.remove` is, wherever it runs, and so is
-        // a `session stop` of any name but the door's own.
+        // attempted, nothing was closed, and no record's session was stopped.
         fn only_swept(&self) -> bool {
             self.log_lines().iter().all(|line| {
                 !line.contains("tabs.remove")
@@ -2980,10 +2467,8 @@ exit 0
         }
     }
 
-    /// Seed one ended run's record through the production tracker (dropped, as a
-    /// real run's tracker is at run end) and hand it over, eligible at once. The
-    /// names given are logical: the record carries them under the tracker's
-    /// namespace, which [`run_session_names`] resolves for assertions.
+    /// Seed one ended run's record through the production tracker (dropped, as a real run's tracker
+    /// is at run end) and hand it over, eligible at once.
     fn queue_names(agent_id: &str, names: &[&str]) {
         queue_names_with_hold(agent_id, names, Duration::ZERO);
     }
@@ -2998,10 +2483,8 @@ exit 0
         queue_run_session_release_after(&sessions, hold, agent_id);
     }
 
-    /// Physical names as a run records them: the tracker's namespace plus each logical
-    /// name — the shape the durable record file carries. `for_run` derives the namespace
-    /// from the agent id alone, so this is exactly what [`queue_names_with_hold`]
-    /// recorded for that id.
+    /// Physical names as a run records them: the tracker's namespace plus each logical name — the
+    /// shape the durable record file carries.
     fn run_session_names(agent_id: &str, logical: &[&str]) -> Vec<String> {
         let ns = ChromeRunSessions::for_run(agent_id).namespace().to_string();
         logical.iter().map(|name| format!("{ns}{name}")).collect()
@@ -3020,8 +2503,8 @@ exit 0
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn the_browsers_own_answers_settle_each_release_record() {
-        // An ended run's record is dropped once the browser's own answer says every one
-        // of its names is gone, and the close went through the browser's extension.
+        // An ended run's record is dropped once the browser's own answer says every one of its
+        // names is gone, and the close went through the browser's extension.
         {
             let case = "a verified release empties the record";
             let guard = ReleaseGuard::install(ATTEMPT_TIMEOUT).await;
@@ -3062,8 +2545,8 @@ exit 0
                 guard.log_lines()
             );
         }
-        // A record whose groups the browser no longer holds is dropped — no `tabs.remove`
-        // is even needed for it.
+        // A record whose groups the browser no longer holds is dropped — no `tabs.remove` is even
+        // needed for it.
         {
             let case = "a record the browser reports gone is dropped";
             let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
@@ -3077,9 +2560,9 @@ exit 0
             );
             assert!(!guard.invoked("extension call tabs.remove"), "case {case}");
         }
-        // The `refuse` stub answers a structured error to EVERY call, so the browser never
-        // settles the record: it stays queued past five attempts and is never dropped from the
-        // durable file — there is no attempt cap on a record the browser did not answer for.
+        // The `refuse` stub answers a structured error to EVERY call, so the browser never settles
+        // the record: it stays queued past five attempts and is never dropped from the durable file
+        // — there is no attempt cap on a record the browser did not answer for.
         {
             let case = "a record the browser never settles stays queued past five attempts";
             let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
@@ -3117,9 +2600,9 @@ exit 0
                 "case {case}: the record file still describes it — nothing drops an unanswered record from the queue"
             );
         }
-        // A record the browser reports as not the extension's to remove is reported on the
-        // Issues view once and dropped: the queue never re-asks those names, and the
-        // reclaim pass keeps re-reading the browser for such a group anyway.
+        // A record the browser reports as not the extension's to remove is reported on the Issues
+        // view once and dropped: the queue never re-asks those names, and the reclaim pass keeps
+        // re-reading the browser for such a group anyway.
         {
             let case = "a record the browser reports as not ours is reported once and dropped";
             // The shipped pass budget: the planning reads, a stop's full bound and the
@@ -3165,11 +2648,9 @@ exit 0
             release_due().await;
             assert_eq!(guard.issues().len(), 1, "case {case}: and never again");
         }
-        // An empty ledger is one browser answer, not a verdict on its own: the extension's
-        // storage read is not reported to us, so a swallowed one hands back exactly what a
-        // lost ledger does. The verdict is only reached after the session's own route was
-        // tried and the browser was read again — here that second read finds the tab, so the
-        // record survives and the next pass closes it normally.
+        // An empty ledger is one browser answer, not a verdict on its own: the extension's storage
+        // read is not reported to us, so a swallowed one hands back exactly what a lost ledger
+        // does.
         {
             let case = "a transient empty ledger does not write a run off";
             // The shipped pass budget, so the pass reaches the confirmation's second read rather
@@ -3200,8 +2681,8 @@ exit 0
             );
             assert!(guard.invoked("extension call tabs.remove"), "case {case}");
         }
-        // A browser that answers and leaves its own tabs open is a contradiction between two of
-        // its own answers, not a verdict from one pass: the record keeps retrying, and the
+        // A browser that answers and leaves its own tabs open is a contradiction between two of its
+        // own answers, not a verdict from one pass: the record keeps retrying, and the
         // answered-and-left-open name is told durably — once, with the run it came from — rather
         // than ageing out as a `debug!` line nobody ever sees.
         {
@@ -3260,8 +2741,8 @@ exit 0
         // The extension's own ownership-refusal sentence, relayed under `tabs.remove`, is the only
         // failing leg that counts as the browser answering about the tabs — so it reaches the very
         // conclusion a kept tab does: after [`MAX_LEFT_OPEN_ATTEMPTS`] passes the record stops
-        // retrying, and the leftover is reported with the run it came from (the reclaim sweep
-        // keeps examining its group).
+        // retrying, and the leftover is reported with the run it came from (the reclaim sweep keeps
+        // examining its group).
         {
             let case = "a remove the extension refuses concludes after the cap";
             let guard = ReleaseGuard::install(ATTEMPT_TIMEOUT).await;
@@ -3315,8 +2796,8 @@ exit 0
             );
         }
         // A `tabs.remove` leg that failed before the browser answered — here a relay that is not
-        // connected — is NOT the browser answering for the tabs: it never increments `left_open`, so
-        // no pass count ever concludes the record, and neither a left-open nor a leftover row is
+        // connected — is NOT the browser answering for the tabs: it never increments `left_open`,
+        // so no pass count ever concludes the record, and neither a left-open nor a leftover row is
         // filed for it.
         {
             let case = "a transient remove failure is never counted as an answer";
@@ -3365,13 +2846,9 @@ exit 0
     #[serial_test::serial(chrome_release)]
     async fn every_leftover_is_reported_to_the_issues_view_once() {
         // A host with no browser extension at all has no ownership door, so nothing here can
-        // enumerate the browser's groups and a leftover no record names is out of reach: the
-        // Issues view is told once, with what to do about it, instead of a `debug!` line that
-        // ages out of the log store. The record path is told too — with the absence that decides
-        // it (`chromeExtension`, not the host manifest the product writes itself), and it keeps
-        // retrying the helper's own stop rather than writing the tabs off.
-        // Nothing is filed for the product's own scratch group: the pass's reads run in the
-        // record's own session, not the product's own, so that group is never in play here.
+        // enumerate the browser's groups and a leftover no record names is out of reach: the Issues
+        // view is told once, with what to do about it, instead of a `debug!` line that ages out of
+        // the log store.
         {
             let case = "a host without the ownership door is reported once";
             // The shipped pass budget: the fallback close is a `session stop` by name, and the
@@ -3441,8 +2918,6 @@ exit 0
         }
         // The one visible tab this product can leave in the owner's strip — its own scratch group,
         // when a let-go could not confirm it gone — is surfaced once rather than accepted quietly.
-        // The reads that look for the group can themselves fail, so the row claims only that the
-        // release is not CONFIRMED, and a host where no call of ours was ever answered gets none.
         {
             let case = "a scratch group the let go could not confirm is surfaced once";
             let guard = ReleaseGuard::install(ATTEMPT_TIMEOUT).await;
@@ -3452,8 +2927,8 @@ exit 0
             // leaves the group standing and the let-go unfinished.
             guard.set_mode("stop-refused");
             guard.write_state(&[OWN_SESSION.to_string()], false);
-            // No record queued: the pass has nothing to borrow, so its reads run in the product's own
-            // session — the shape a parked leftover's revisit takes.
+            // No record queued: the pass has nothing to borrow, so its reads run in the product's
+            // own session — the shape a parked leftover's revisit takes.
             guard.arm_sweep();
 
             release_due().await;
@@ -3483,9 +2958,9 @@ exit 0
                  stop — the one route left that closes its group was answered with a refusal"
             );
         }
-        // A host whose browser answers settle nothing this route can act on is a fact about the HOST,
-        // filed once: every automatic close there is a retry with no conclusion, so it must not stay
-        // a `debug!` that ages out (see [`UNREADABLE_MESSAGE`]). The record itself keeps trying.
+        // A host whose browser answers settle nothing this route can act on is a fact about the
+        // HOST, filed once: every automatic close there is a retry with no conclusion, so it must
+        // not stay a `debug!` that ages out (see [`UNREADABLE_MESSAGE`]).
         {
             let case = "a host whose answers are unreadable is reported once";
             let guard = ReleaseGuard::install(ATTEMPT_TIMEOUT).await;
@@ -3523,8 +2998,7 @@ exit 0
         }
         // The same host-level fact, for the host shape that is easiest to mistake for a working
         // one: the extension IS installed (and new enough for the door), but Chrome reports it
-        // disabled, so nothing answers an `extension call`. That still establishes no ownership
-        // door — the row is filed once, and the fallback close is still attempted.
+        // disabled, so nothing answers an `extension call`.
         {
             let case = "a host with a disabled extension is reported once";
             let guard = ReleaseGuard::install(ATTEMPT_TIMEOUT).await;
@@ -3565,9 +3039,9 @@ exit 0
                 guard.log_lines()
             );
         }
-        // A group the sweep claims but the browser will not close is reported with the group's
-        // own namespace, even though no record names it: the record path reports its left-open
-        // names, and a reclaimed one must not be the only kind that ages out.
+        // A group the sweep claims but the browser will not close is reported with the group's own
+        // namespace, even though no record names it: the record path reports its left-open names,
+        // and a reclaimed one must not be the only kind that ages out.
         {
             let case = "a reclaimed group the browser leaves open is reported";
             let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
@@ -3596,8 +3070,8 @@ exit 0
                 "case {case}: no record was evicted for a group nothing recorded, so no run can be named"
             );
 
-            // The verdict is remembered: the next sweep skips the group it already answered
-            // for, and the report stays one.
+            // The verdict is remembered: the next sweep skips the group it already answered for,
+            // and the report stays one.
             guard.arm_sweep();
             release_due().await;
             assert_eq!(guard.issues().len(), 1, "case {case}: and never again");
@@ -3607,9 +3081,7 @@ exit 0
     /// The fallback's mapping over an index slice, with more than one affected name and two
     /// DIFFERENT outcomes to place: the name whose stop the helper refuses must stay queued, the
     /// other must settle `Gone`, and the name with no live group must settle on the group read and
-    /// never be asked for a stop. A positional mix-up (results written by slot instead of by
-    /// index) moves a result onto another name's place, which is what the queued set catches —
-    /// and the affected names are not the leading ones precisely so it can.
+    /// never be asked for a stop.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn the_fallback_maps_each_live_name_back_to_its_own_slot() {
@@ -3619,8 +3091,8 @@ exit 0
             "run-ledger-unreadable",
             &["agent-tab-missing", "agent-tab-refuse", "agent-tab-live"],
         );
-        // The first name has no live group (settled by the one group read); the other two do,
-        // and the ownership reads that would map their ids back to names both fail.
+        // The first name has no live group (settled by the one group read); the other two do, and
+        // the ownership reads that would map their ids back to names both fail.
         guard.write_state(&names[1..], true);
         queue_names(
             "run-ledger-unreadable",
@@ -3652,13 +3124,10 @@ exit 0
         );
     }
 
-    /// The sweep claims a live agent group nothing accounts for, and leaves alone every
-    /// group a run may still come back to: one whose namespace is live right now, a held
-    /// record's, an unheld record's own names, and one the roster of a job that has not
-    /// been terminalized still names — a cut round resumes in place under the very same
-    /// ids, and reads its tabs back by name. A slot of that same roster that already
-    /// finished is claimed with the orphan: a resume reconstructs it instead of
-    /// re-dispatching it, so nothing will work under its id again.
+    /// The sweep claims a live agent group nothing accounts for, and leaves alone every group a run
+    /// may still come back to: one whose namespace is live right now, a held record's, an unheld
+    /// record's own names, and one the roster of a job that has not been terminalized still names —
+    /// a cut round resumes in place under the very same ids, and reads its tabs back by name.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn the_reclaim_spares_every_group_a_run_may_come_back_to() {
@@ -3764,9 +3233,9 @@ exit 0
         )
         .await;
 
-        // Undo the seeded protection BEFORE asserting: the shared test store must not keep
-        // naming a run that may come back, or every later test in this process reads a
-        // resume set this one left behind — including when an assertion below fails.
+        // Undo the seeded protection BEFORE asserting: the shared test store must not keep naming a
+        // run that may come back, or every later test in this process reads a resume set this one
+        // left behind — including when an assertion below fails.
         drop(live);
         store
             .conn
@@ -3796,14 +3265,14 @@ exit 0
         );
     }
 
-    /// A stuck leftover is not interrogated again every sweep, and its verdict is
-    /// dropped once expired so the group is examined again.
+    /// A stuck leftover is not interrogated again every sweep, and its verdict is dropped once
+    /// expired so the group is examined again.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn a_stuck_verdict_expires_and_is_examined_again() {
-        // A leftover the browser has already answered twice can never be closed is not
-        // interrogated in full on every sweep — the verdict is remembered, so a stuck group
-        // cannot cost a `session stop` per name on each pass — while the report stays one.
+        // A leftover the browser has already answered twice can never be closed is not interrogated
+        // in full on every sweep — the verdict is remembered, so a stuck group cannot cost a
+        // `session stop` per name on each pass — while the report stays one.
         {
             let case = "a stuck leftover is not interrogated again every sweep";
             // The shipped pass budget: the planning reads, a stop's full bound and the
@@ -3846,8 +3315,8 @@ exit 0
             );
         }
         // A verdict is not forever: once its [`STUCK_REVISIT`] window has passed the prune drops
-        // it, and the next armed sweep examines the group in full again — the stop route
-        // included — instead of skipping it for the rest of the process.
+        // it, and the next armed sweep examines the group in full again — the stop route included —
+        // instead of skipping it for the rest of the process.
         {
             let case = "an expired stuck verdict is dropped and its group examined again";
             let guard = ReleaseGuard::install(ATTEMPT_TIMEOUT).await;
@@ -3887,10 +3356,10 @@ exit 0
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn the_let_go_queue_retires_each_scratch_session() {
-        // The session a pass with no name to borrow reads in ([`OWN_SESSION`]) is let go by the pass
-        // that made the reads, through the same door a run's tabs are closed by — so a re-minted
-        // relay endpoint cannot orphan its scratch group — and a pass that read nothing leaves it
-        // alone. A pass with real work borrows a record's own session instead of opening this one.
+        // The session a pass with no name to borrow reads in ([`OWN_SESSION`]) is let go by the
+        // pass that made the reads, through the same door a run's tabs are closed by — so a
+        // re-minted relay endpoint cannot orphan its scratch group — and a pass that read nothing
+        // leaves it alone.
         {
             let case = "the pass lets go of the session its reads ran in";
             let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
@@ -3934,8 +3403,7 @@ exit 0
         // this module's ledger route — asking for an id the extension does not hold is refused
         // whole — so the let-go hands the name to the queue, and the pass's let-go step is the ONE
         // place a graceful `session stop` is asked for: it is the verb that closes the tabs a
-        // session created. One stop per pass, never the `--force` form (which drops the record and
-        // leaves the group exactly where it is), and the failure it hears is charged.
+        // session created.
         {
             let case = "a scratch group the ledger cannot close goes to its session stop";
             let guard = ReleaseGuard::install(ATTEMPT_TIMEOUT).await;
@@ -4004,9 +3472,7 @@ exit 0
         }
         // A scratch group the ledger route cannot close, whose own stop then lands, ends the whole
         // debt: that stop settled the session — its record and the group — so the reads it covered
-        // are no longer owed. Without the marker being advanced there, the next pass would start the
-        // session again and mint a fresh blank group for no new reason, which is the one page this
-        // whole choice of session exists to keep out of the owner's browser.
+        // are no longer owed.
         {
             let case = "a settled scratch session is not started again by the next pass";
             let guard = ReleaseGuard::install(ATTEMPT_TIMEOUT).await;
@@ -4048,8 +3514,6 @@ exit 0
         }
         // Two passes over the let-go queue can overlap — the driver and the shutdown flush — and
         // neither may lose the other's names: the queue is read and written back, never taken out.
-        // (A pass whose future is dropped mid-stop is the same shape from the queue's side: it
-        // writes nothing back, and its names were never removed from it.)
         {
             let case = "overlapping let go passes keep each others names";
             let budget = Duration::from_millis(300);
@@ -4129,9 +3593,8 @@ exit 0
             );
         }
         // A settled session the pass had no budget to let go is not lost: it waits — with the rung
-        // it had, since the pass never asked the helper anything — and the next pass tries it again.
-        // The record itself is dropped as soon as the browser says the tabs are gone, so nothing else
-        // would ever come back for that name.
+        // it had, since the pass never asked the helper anything — and the next pass tries it
+        // again.
         {
             let case = "a settled session left over is let go by a later pass";
             let guard = ReleaseGuard::install(ATTEMPT_TIMEOUT).await;
@@ -4178,9 +3641,9 @@ exit 0
             );
         }
         // A stop the pass could only cut short is best-effort: the helper is asked (it often
-        // answers well inside the bound) and a name it took leaves the queue, but a name it did
-        // not take keeps the rung it had — a pass that could not hear a whole answer must not walk
-        // a session toward [`MAX_FORGET_ATTEMPTS`] and drop it while its group may stand.
+        // answers well inside the bound) and a name it took leaves the queue, but a name it did not
+        // take keeps the rung it had — a pass that could not hear a whole answer must not walk a
+        // session toward [`MAX_FORGET_ATTEMPTS`] and drop it while its group may stand.
         {
             let case = "a stop cut to the pass is not charged an attempt";
             let guard = ReleaseGuard::install(ATTEMPT_TIMEOUT).await;
@@ -4216,9 +3679,7 @@ exit 0
     async fn the_let_go_queue_keeps_to_its_own_rules() {
         // The shutdown flush is the let-go queue's last chance before the process goes down, and it
         // has to reach the queue even when no record is due — the unconfirmed let-go of this
-        // module's own scratch session is queued precisely when its own pass is ending. Its budget is
-        // below one whole stop, so only a helper that answers inside it lets a name go here; one that
-        // does not leaves the name where the process leaves everything the queue holds in memory.
+        // module's own scratch session is queued precisely when its own pass is ending.
         {
             let case = "the shutdown flush reaches the let go queue";
             let guard = ReleaseGuard::install(ATTEMPT_TIMEOUT).await;
@@ -4243,9 +3704,9 @@ exit 0
         }
         // A let-go that never lands is bounded rather than retried forever: after
         // [`MAX_FORGET_ATTEMPTS`] passes whose stop the helper did not settle, a run's session name
-        // leaves the queue with one `info!` naming it — a log trace, not an Issues row (chrome-use's
-        // own record under `~/.chrome-use` is all that is left behind by it, never a tab). A pass
-        // that does let go of its name drops it without reaching the bound.
+        // leaves the queue with one `info!` naming it — a log trace, not an Issues row
+        // (chrome-use's own record under `~/.chrome-use` is all that is left behind by it, never a
+        // tab).
         {
             let case = "the let go queue gives up after its attempt bound";
             let guard = ReleaseGuard::install(ATTEMPT_TIMEOUT).await;
@@ -4272,10 +3733,10 @@ exit 0
             );
         }
         // The product's own scratch session is the one name the attempt bound never drops: what it
-        // can leave behind is a group in the owner's tab strip rather than chrome-use's bookkeeping,
-        // so once a stop has failed [`MAX_FORGET_ATTEMPTS`] times it stays in the queue at the
-        // bound's rung and the queue's own deadline keeps retrying it — the alternative would be the
-        // group waiting for the next process start.
+        // can leave behind is a group in the owner's tab strip rather than chrome-use's
+        // bookkeeping, so once a stop has failed [`MAX_FORGET_ATTEMPTS`] times it stays in the
+        // queue at the bound's rung and the queue's own deadline keeps retrying it — the
+        // alternative would be the group waiting for the next process start.
         {
             let case = "the scratch session is retried past the attempt bound";
             let guard = ReleaseGuard::install(ATTEMPT_TIMEOUT).await;
@@ -4299,8 +3760,8 @@ exit 0
         // A name the pass could not ask a stop of because a call of ours was still running in its
         // session is deferred as busy, not failed: the helper is not asked, nothing is charged, and
         // the queue's own wake is floored at one whole stop — nothing is owed until that call is
-        // done, and the pass holding it covers the name at its own let-go step, so waking at the base
-        // gap would only bring the driver back to defer again.
+        // done, and the pass holding it covers the name at its own let-go step, so waking at the
+        // base gap would only bring the driver back to defer again.
         {
             let case = "a let go behind a call of ours waits the stop bound";
             let _guard = ReleaseGuard::install(ATTEMPT_TIMEOUT).await;
@@ -4367,8 +3828,7 @@ exit 0
         // A let-go retry left behind by an earlier pass must not keep the driver awake while no
         // chrome-use binary is resolvable: nothing can run the queue then, so a deadline already in
         // the past would be read as due by every loop turn, with a pass that can do nothing — a
-        // spin, not a retry. The stored deadline is kept, so a binary that resolves again puts the
-        // queue back on the ladder.
+        // spin, not a retry.
         {
             let case = "a let go retry cannot wake a driver with no binary";
             let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
@@ -4389,11 +3849,10 @@ exit 0
         }
     }
 
-    /// The sweep's own gate: the ask is not on a timer — a pass woken by an enqueue does not
-    /// ask the browser again once the last ask is done with, so a quiet queue cannot cost a
-    /// chrome-use child per wake; an event arms the next ask, and only then does the sweep
-    /// read the browser again. A record that settles unclosable is what arms the revisit that
-    /// examines the group it left behind.
+    /// The sweep's own gate: the ask is not on a timer — a pass woken by an enqueue does not ask
+    /// the browser again once the last ask is done with, so a quiet queue cannot cost a chrome-use
+    /// child per wake; an event arms the next ask, and only then does the sweep read the browser
+    /// again.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn the_sweep_is_armed_by_events_and_revisits() {
@@ -4430,9 +3889,9 @@ exit 0
                 "case {case}: an event — a run end queuing names — is what arms the next ask"
             );
         }
-        // A record whose leftover no route here can close is not abandoned with it: once the
-        // record is dropped and the leftover reported, the sweep is armed to look at the group
-        // again at its own slower cadence, not at once.
+        // A record whose leftover no route here can close is not abandoned with it: once the record
+        // is dropped and the leftover reported, the sweep is armed to look at the group again at
+        // its own slower cadence, not at once.
         {
             let case = "a record settled unclosable arms the sweep";
             let guard = ReleaseGuard::install(ATTEMPT_TIMEOUT).await;
@@ -4467,8 +3926,7 @@ exit 0
     async fn silent_sweeps_climb_one_rung_per_pass() {
         // A sweep whose read succeeds but whose close leg comes back Silent is unfinished, and the
         // ladder has to see that: repeated Silent passes climb the capped backoff instead of
-        // re-arming at the first rung every few seconds. The count is reset only where the sweep's
-        // answers are known ([`reclaim_issues`]), so a Silent pass keeps the rung it charged.
+        // re-arming at the first rung every few seconds.
         {
             let case = "repeated silent sweeps climb the ladder";
             let guard = ReleaseGuard::install(ATTEMPT_TIMEOUT).await;
@@ -4538,9 +3996,9 @@ exit 0
             );
         }
         // The one thing a sweep that found a leftover it could not close leaves behind is that
-        // leftover's revisit: nothing is periodic, so a pass right after asks nothing while the
-        // ask the driver waits on is still parked, and the armed ask is what asks the browser
-        // again once it comes due — no new event needed.
+        // leftover's revisit: nothing is periodic, so a pass right after asks nothing while the ask
+        // the driver waits on is still parked, and the armed ask is what asks the browser again
+        // once it comes due — no new event needed.
         {
             let case = "a leftover the sweep could not settle keeps an ask armed";
             let guard = ReleaseGuard::install(ATTEMPT_TIMEOUT).await;
@@ -4592,18 +4050,17 @@ exit 0
         }
     }
 
-    /// The sweep leaves a record's own work alone by exact name, so a record that settled one
-    /// name unclosable and left another retrying keeps only the retrying name — and the name
-    /// it dropped is examined by the sweep at the revisit, so a browser that recovered still
-    /// gets that group closed. This is the regression a namespace-prefix exclusion caused: the
-    /// reclaimed group shares the surviving record's namespace, but is no longer its name.
+    /// The sweep leaves a record's own work alone by exact name, so a record that settled one name
+    /// unclosable and left another retrying keeps only the retrying name — and the name it dropped
+    /// is examined by the sweep at the revisit, so a browser that recovered still gets that group
+    /// closed.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn a_name_a_record_dropped_is_still_swept() {
         let guard = ReleaseGuard::install(ATTEMPT_TIMEOUT).await;
-        // Two names of one run: the first holds a tab the extension does not own (unclosable
-        // by this route), the second a closeable one whose remove leg never reaches the
-        // browser (a silent retry), so the record ends the pass holding only the second name.
+        // Two names of one run: the first holds a tab the extension does not own (unclosable by
+        // this route), the second a closeable one whose remove leg never reaches the browser (a
+        // silent retry), so the record ends the pass holding only the second name.
         let names = run_session_names("run-mixed", &["agent-tab-m-stuck", "agent-tab-m-keep"]);
         guard.write_state_each(&[(&names[0], false), (&names[1], true)]);
         guard.set_mode("remove-transient");
@@ -4617,8 +4074,8 @@ exit 0
             "the record drops the unclosable name and keeps retrying the other"
         );
 
-        // The browser recovered: the abandoned group's tab is closeable again, so the sweep is
-        // the route that closes it. Drive the revisit the record's own conclusion armed.
+        // The browser recovered: the abandoned group's tab is closeable again, so the sweep is the
+        // route that closes it.
         guard.write_state(std::slice::from_ref(&names[0]), true);
         guard.set_mode("ok");
         guard.clear_log();
@@ -4641,10 +4098,10 @@ exit 0
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn the_cap_evicts_only_an_unheld_record() {
-        // The queue cap is kept and the record an overflow drops is the oldest unheld one: it
-        // is logged, its run is remembered so the sweep's report of the tabs can still name it,
-        // and the tabs themselves are left to the reclaim sweep, which owns an `agent-tab-*`
-        // group no live run, no record and no resumable job claims.
+        // The queue cap is kept and the record an overflow drops is the oldest unheld one: it is
+        // logged, its run is remembered so the sweep's report of the tabs can still name it, and
+        // the tabs themselves are left to the reclaim sweep, which owns an `agent-tab-*` group no
+        // live run, no record and no resumable job claims.
         {
             let case = "an overflow eviction drops the oldest unheld record";
             let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
@@ -4691,9 +4148,9 @@ exit 0
             );
             clear_pending_releases();
         }
-        // The run an eviction remembered is what the sweep's own report names: the evicted
-        // record cannot name its tabs any more, so a leftover it could not close would
-        // otherwise be reported with no run at all.
+        // The run an eviction remembered is what the sweep's own report names: the evicted record
+        // cannot name its tabs any more, so a leftover it could not close would otherwise be
+        // reported with no run at all.
         {
             let case = "an evicted records run is named by the sweeps report";
             let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
@@ -4773,11 +4230,10 @@ exit 0
             );
             clear_pending_releases();
         }
-        // The cap never takes a record that is still inside its hold: one that is not always
-        // goes first, and with every record inside a hold nothing is evicted at all — dropping
-        // one would lose the tabs of a run that may still come back to them, which is worse
-        // than a queue that grows until one of those holds elapses. A hold that HAS elapsed is
-        // evictable again, like any other record.
+        // The cap never takes a record that is still inside its hold: one that is not always goes
+        // first, and with every record inside a hold nothing is evicted at all — dropping one would
+        // lose the tabs of a run that may still come back to them, which is worse than a queue that
+        // grows until one of those holds elapses.
         {
             let case = "eviction prefers an unheld record over a held one";
             let record = |held: bool, until: Instant| PendingRunRelease {
@@ -4807,8 +4263,8 @@ exit 0
                 "case {case}: a hold that has elapsed is evictable again"
             );
         }
-        // A full queue of held records grows instead of losing one: the cap is what bounds a
-        // burst of ends, and it never outweighs the tabs of a run that may still come back.
+        // A full queue of held records grows instead of losing one: the cap is what bounds a burst
+        // of ends, and it never outweighs the tabs of a run that may still come back.
         {
             let case = "the queue cap never evicts a held record";
             clear_pending_releases();
@@ -4835,13 +4291,12 @@ exit 0
         }
     }
 
-    /// An attempt that never reached the browser counts as one failure and keeps
-    /// the record queued.
+    /// An attempt that never reached the browser counts as one failure and keeps the record queued.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn an_attempt_that_could_not_reach_the_browser_keeps_the_record_queued() {
-        // A close pass that outlives its attempt bound is one failed attempt: the name
-        // stays queued, and the shorter bound is cut off without waiting the stub out.
+        // A close pass that outlives its attempt bound is one failed attempt: the name stays
+        // queued, and the shorter bound is cut off without waiting the stub out.
         {
             let case = "a timed out release counts as one failed attempt";
             let guard = ReleaseGuard::install(Duration::from_secs(1)).await;
@@ -4860,8 +4315,8 @@ exit 0
                 "case {case}: a timed-out attempt is one failed attempt, and the name stays queued"
             );
 
-            // The short bound has served its purpose; the success that follows must
-            // not race a cold or loaded stub spawn.
+            // The short bound has served its purpose; the success that follows must not race a cold
+            // or loaded stub spawn.
             guard.set_mode("ok");
             widen_attempt_bound(ATTEMPT_TIMEOUT);
             release_due().await;
@@ -4870,9 +4325,9 @@ exit 0
                 "case {case}: dropped on the next pass, when the browser answers"
             );
         }
-        // With no chrome-use to run, a due release is skipped rather than failed — the
-        // record stays queued and nothing is spawned — but it is still charged the ladder
-        // so the driver cannot spin on it.
+        // With no chrome-use to run, a due release is skipped rather than failed — the record stays
+        // queued and nothing is spawned — but it is still charged the ladder so the driver cannot
+        // spin on it.
         {
             let case = "a release with no chrome use binary keeps the record queued";
             let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
@@ -4893,10 +4348,9 @@ exit 0
         }
     }
 
-    /// Two passes may overlap (the driver and the shutdown flush): neither may erase
-    /// the other's records from the file — the reason the queue and the file are two
-    /// different views of a pass's records — and unparking is per pass. The put-back a
-    /// dropped pass does is `an_aborted_pass_puts_its_records_back`'s subject.
+    /// Two passes may overlap (the driver and the shutdown flush): neither may erase the other's
+    /// records from the file — the reason the queue and the file are two different views of a
+    /// pass's records — and unparking is per pass.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn overlapping_passes_keep_each_others_records_in_the_file() {
@@ -4921,9 +4375,9 @@ exit 0
             "both passes' records are in the file"
         );
 
-        // The first pass ends (as the shutdown flush does while the driver's pass is
-        // still in flight): its record goes back to the queue, and the second pass's
-        // record is untouched by its unpark.
+        // The first pass ends (as the shutdown flush does while the driver's pass is still in
+        // flight): its record goes back to the queue, and the second pass's record is untouched by
+        // its unpark.
         drop(first);
         assert_eq!(
             record_file_names(&guard.store_path()),
@@ -4945,9 +4399,8 @@ exit 0
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn a_persisted_record_is_restored_and_released() {
-        // A record queued by one process is retried by the next: the write at
-        // enqueue/after-a-pass is all the durable state, and restoring it brings
-        // back the names AND the attempt count.
+        // A record queued by one process is retried by the next: the write at enqueue/after-a-pass
+        // is all the durable state, and restoring it brings back the names AND the attempt count.
         {
             let case = "a queued release survives the process that queued it";
             let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
@@ -4963,8 +4416,7 @@ exit 0
                 "case {case}: one unanswered pass, re-queued"
             );
 
-            // Everything the process held in memory is gone; the file is what a
-            // restart has left.
+            // Everything the process held in memory is gone; the file is what a restart has left.
             clear_pending_releases();
             assert!(pending_releases_snapshot().is_empty(), "case {case}");
 
@@ -4978,9 +4430,9 @@ exit 0
                 "case {case}: names and attempt count restored from the record file"
             );
         }
-        // A record file that cannot be read — or that carries an absurd deadline — is
-        // never fatal: an unreadable one restores nothing, and a parseable one whose
-        // deadline is absurd is restored with it clamped rather than trusted.
+        // A record file that cannot be read — or that carries an absurd deadline — is never fatal:
+        // an unreadable one restores nothing, and a parseable one whose deadline is absurd is
+        // restored with it clamped rather than trusted.
         {
             let case = "a corrupt record file is ignored";
             let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
@@ -4994,8 +4446,8 @@ exit 0
                 "case {case}: a corrupt file restores nothing and fails nothing"
             );
 
-            // Parseable but absurd input: unlike the invalid file above it IS restored,
-            // with its deadline clamped rather than trusted (the add would panic on it).
+            // Parseable but absurd input: unlike the invalid file above it IS restored, with its
+            // deadline clamped rather than trusted (the add would panic on it).
             fs::write(
                 guard.store_path(),
                 r#"[{"namespace":"agent-tab-absurd-","names":["agent-tab-absurd-default"],"next_attempt_at":18446744073709551615}]"#,
@@ -5037,10 +4489,9 @@ exit 0
                 "case {case}: and none of them arms a read: a start with no work opens no page"
             );
         }
-        // The record file is this queue's own state, not input to be judged: a record
-        // naming sessions outside the family this queue opens is restored with those
-        // names untouched, and the browser's answer settles them like any other. An entry
-        // with no names is still not queued.
+        // The record file is this queue's own state, not input to be judged: a record naming
+        // sessions outside the family this queue opens is restored with those names untouched, and
+        // the browser's answer settles them like any other.
         {
             let case = "a restored record releases its names exactly as written";
             let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
@@ -5077,9 +4528,9 @@ exit 0
             );
             clear_pending_releases();
         }
-        // A restored record waits out the boot grace before anything may be
-        // attempted — the runs the daemon re-drives at boot are built after this
-        // restore, so the live-namespace guard cannot protect them yet.
+        // A restored record waits out the boot grace before anything may be attempted — the runs
+        // the daemon re-drives at boot are built after this restore, so the live-namespace guard
+        // cannot protect them yet.
         {
             let case = "a restored release waits out the boot grace";
             let grace = Duration::from_millis(800);
@@ -5111,9 +4562,9 @@ exit 0
                 "case {case}"
             );
         }
-        // A held record is skipped untried until its hold elapses (the unheld end is
-        // covered above), and the run-end merge rule lets a later, unheld end of the
-        // same namespace release it without waiting that hold out.
+        // A held record is skipped untried until its hold elapses (the unheld end is covered
+        // above), and the run-end merge rule lets a later, unheld end of the same namespace release
+        // it without waiting that hold out.
         {
             let case = "a held redriven run release waits out its hold";
             let hold = Duration::from_millis(800);
@@ -5140,8 +4591,8 @@ exit 0
             );
             guard.clear_log();
 
-            // Same namespace, queued held first, then re-queued unheld: the shorter
-            // eligibility must win, so the re-queue is not blocked by the hold set.
+            // Same namespace, queued held first, then re-queued unheld: the shorter eligibility
+            // must win, so the re-queue is not blocked by the hold set.
             queue_names_with_hold("run-shrunk", &["agent-tab-s-default"], hold * 4);
             queue_names("run-shrunk", &["agent-tab-s-default"]);
             release_due().await;
@@ -5153,14 +4604,14 @@ exit 0
     }
 
     /// A hold is spent once the record is taken for an attempt: from then on the record is an
-    /// ordinary one of the retry ladder, so the retry that re-arms it must not leave it
-    /// permanently un-evictable or keep its namespace protected as if a run could come back.
+    /// ordinary one of the retry ladder, so the retry that re-arms it must not leave it permanently
+    /// un-evictable or keep its namespace protected as if a run could come back.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn a_spent_hold_stops_protecting_its_record() {
         let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
-        // A retry gap longer than this test, so only a hold left standing could keep the
-        // re-armed record inside one and the assertions below meaningful.
+        // A retry gap longer than this test, so only a hold left standing could keep the re-armed
+        // record inside one and the assertions below meaningful.
         widen_retry_base(Duration::from_secs(600));
         let names = run_session_names("run-spent-hold", &["agent-tab-sh-default"]);
         guard.write_state(&names, true);
@@ -5197,10 +4648,10 @@ exit 0
         evict_oldest(&mut queue).is_some()
     }
 
-    /// A record whose run is live again is skipped untried — that run owns the
-    /// sessions — and becomes releasable the moment it is gone; a run resumed while a
-    /// pass is in flight has already re-attached the very same names, so the close set
-    /// is re-checked per name right before the browser is asked.
+    /// A record whose run is live again is skipped untried — that run owns the sessions — and
+    /// becomes releasable the moment it is gone; a run resumed while a pass is in flight has
+    /// already re-attached the very same names, so the close set is re-checked per name right
+    /// before the browser is asked.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn a_live_run_keeps_its_own_sessions() {
@@ -5235,11 +4686,11 @@ exit 0
                 "case {case}"
             );
         }
-        // A run resumed while a pass is in flight has already re-attached the very same
-        // names, so the close set is re-checked per name right before the browser is asked:
-        // a name a live run owns again is left out of the close and its record keeps it
-        // rather than closing the session out from under the run — unless the browser holds
-        // no group of that title any more, which is settled gone whoever owns it.
+        // A run resumed while a pass is in flight has already re-attached the very same names, so
+        // the close set is re-checked per name right before the browser is asked: a name a live run
+        // owns again is left out of the close and its record keeps it rather than closing the
+        // session out from under the run — unless the browser holds no group of that title any
+        // more, which is settled gone whoever owns it.
         {
             let case = "a run that comes back mid pass keeps its sessions";
             let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
@@ -5248,8 +4699,8 @@ exit 0
             // The record a pass would have taken just before the run came back.
             queue_names("run-midpass", &["agent-tab-m-default"]);
             let pass = ReleasePass::take().expect("the record is due before the run comes back");
-            // The same durable id is re-dispatched inside the pass window and re-attaches
-            // the very same names.
+            // The same durable id is re-dispatched inside the pass window and re-attaches the very
+            // same names.
             let live = ChromeRunSessions::for_run("run-midpass");
 
             let cli = release_cli();
@@ -5278,16 +4729,15 @@ exit 0
         }
     }
 
-    /// The production entry point ([`run_session_release_queue`], driven here through
-    /// its loop with a local token): a queued record is closed, and a record whose
-    /// run is live again waits — not on a poll interval, on the wake that run's own
-    /// tracker sends when it goes away.
+    /// The production entry point ([`run_session_release_queue`], driven here through its loop with
+    /// a local token): a queued record is closed, and a record whose run is live again waits — not
+    /// on a poll interval, on the wake that run's own tracker sends when it goes away.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn the_driver_releases_a_queued_record_and_waits_for_a_live_run_to_go() {
         let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
-        // A retry gap far longer than this test: a release that still lands promptly
-        // can only be explained by the wake.
+        // A retry gap far longer than this test: a release that still lands promptly can only be
+        // explained by the wake.
         widen_retry_base(Duration::from_secs(600));
         let live = ChromeRunSessions::for_run("run-driver");
         let names = run_session_names("run-driver", &["agent-tab-driver-default"]);
@@ -5316,9 +4766,7 @@ exit 0
         assert_eq!(pending_releases_snapshot().len(), 1);
 
         drop(live);
-        // The record settles on the tracker's own wake, not on a poll interval. Wait on
-        // the durable file — the queue empties as soon as a pass parks the record, so
-        // neither the queue nor the log says whether that pass finished.
+        // The record settles on the tracker's own wake, not on a poll interval.
         tokio::time::timeout(Duration::from_secs(5), async {
             while !record_file_names(&guard.store_path()).is_empty() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -5342,13 +4790,13 @@ exit 0
             .expect("the driver task does not panic");
     }
 
-    /// One record per run: a second end of the same (agent-id-derived) namespace
-    /// adds only the names it recorded and consumes no attempt.
+    /// One record per run: a second end of the same (agent-id-derived) namespace adds only the
+    /// names it recorded and consumes no attempt.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn a_requeue_of_the_same_run_does_not_double_count() {
-        // The merge path persists too, so the record file needs the guard's
-        // private dir (and the queue is drained for the next test).
+        // The merge path persists too, so the record file needs the guard's private dir (and the
+        // queue is drained for the next test).
         let _guard = ReleaseGuard::install(Duration::from_secs(10)).await;
         clear_pending_releases();
         let first = ChromeRunSessions::for_run("run-merge");
@@ -5369,11 +4817,9 @@ exit 0
         clear_pending_releases();
     }
 
-    /// The shutdown flush spends its budget on the records whose hold (or retry
-    /// backoff) elapsed and leaves the held ones alone: a held record waits for a
-    /// run the restart may re-drive, and being durable it is picked up next boot.
-    /// A silent browser side is cut off at the budget and the record is left for that
-    /// next boot.
+    /// The shutdown flush spends its budget on the records whose hold (or retry backoff) elapsed
+    /// and leaves the held ones alone: a held record waits for a run the restart may re-drive, and
+    /// being durable it is picked up next boot.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn the_shutdown_flush_releases_the_queue_within_its_budget() {
@@ -5417,9 +4863,9 @@ exit 0
         );
     }
 
-    /// A run end that arrives while a pass holds the record must not be lost by the file:
-    /// queue and parked copies are folded, so the later (held) pair survives a process
-    /// death in that window instead of the stale unheld snapshot the pass took.
+    /// A run end that arrives while a pass holds the record must not be lost by the file: queue and
+    /// parked copies are folded, so the later (held) pair survives a process death in that window
+    /// instead of the stale unheld snapshot the pass took.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn a_hold_queued_while_a_pass_holds_the_record_survives_in_the_file() {
@@ -5427,8 +4873,8 @@ exit 0
         queue_names("run-fold", &["agent-tab-f-default"]);
         let pass = ReleasePass::take().expect("a due record is taken");
 
-        // The same run is cut off while the pass holds it: the queue now says the release
-        // must be held, the pass's parked snapshot still says otherwise.
+        // The same run is cut off while the pass holds it: the queue now says the release must be
+        // held, the pass's parked snapshot still says otherwise.
         queue_names_with_hold(
             "run-fold",
             &["agent-tab-f-default"],
@@ -5453,9 +4899,9 @@ exit 0
         drop(pass);
     }
 
-    /// A `finish` that panics hands nothing back, yet the record it was holding is
-    /// still parked and persisted, so the next boot restores it instead of leaving
-    /// those sessions stranded everywhere.
+    /// A `finish` that panics hands nothing back, yet the record it was holding is still parked and
+    /// persisted, so the next boot restores it instead of leaving those sessions stranded
+    /// everywhere.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn a_panicking_finish_leaves_its_record_for_the_next_boot() {
@@ -5482,9 +4928,9 @@ exit 0
         );
     }
 
-    /// A pass dropped mid-attempt (shutdown token, panic) puts back what it took
-    /// and counts no attempt: a record left out of the queue would also be left
-    /// out of the next persist, stranding its sessions.
+    /// A pass dropped mid-attempt (shutdown token, panic) puts back what it took and counts no
+    /// attempt: a record left out of the queue would also be left out of the next persist,
+    /// stranding its sessions.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn an_aborted_pass_puts_its_records_back() {
@@ -5508,16 +4954,14 @@ exit 0
         );
     }
 
-    /// A held record re-mints its hold from the boot that restores it — the run
-    /// it waits for is re-dispatched after the restart, so the deadline the
-    /// previous process minted says nothing.
+    /// A held record re-mints its hold from the boot that restores it — the run it waits for is
+    /// re-dispatched after the restart, so the deadline the previous process minted says nothing.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn a_restored_held_record_holds_from_boot() {
         let guard = ReleaseGuard::install_with(Duration::from_secs(10), Duration::ZERO).await;
 
-        // The file a previous process left: its own namespace, and the physical
-        // names under it. It predates the `run` field, so it carries none.
+        // The file a previous process left: its own namespace, and the physical names under it.
         let namespace = ChromeRunSessions::for_run("run-resume")
             .namespace()
             .to_string();
@@ -5544,10 +4988,6 @@ exit 0
             delays[0]
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Per-agent tab cap: eviction, and the boot prune of the run record
-    // -----------------------------------------------------------------------
 
     /// The cap's eviction closes exactly the named tab of the live run it is asked for, leaves
     /// another live run's tab standing, and retires the settled session's chrome-use record.
@@ -5632,8 +5072,8 @@ exit 0
 
     /// The tool's cap wiring end to end, minus only the browser dispatch the tool itself would
     /// make: the sixth appearance names the least recently addressed tab on the record, the close
-    /// the tool spawns off its own path really takes that group out of the browser (the stub
-    /// stands in for chrome-use), and the confirmed close comes back to the record as a closed tab.
+    /// the tool spawns off its own path really takes that group out of the browser (the stub stands
+    /// in for chrome-use), and the confirmed close comes back to the record as a closed tab.
     #[tokio::test]
     #[serial_test::serial(chrome_release, chrome_tabs)]
     async fn the_tools_sixth_appearance_closes_the_least_recently_addressed_tab() {

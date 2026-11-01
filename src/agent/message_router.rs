@@ -1,45 +1,10 @@
-//! Agent-ID-based message router — replaces per-role queue with per-agent
-//! channels for true instance-level parallelism.
+//! Agent-ID-based message router: every agent instance gets its own
+//! [`mpsc::UnboundedSender`] in a global [`HashMap`] keyed by unique agent ID, so
+//! jobs reach their consumer directly and no agent ever blocks another.
 //!
-//! Every agent instance gets its own [`mpsc::UnboundedSender`] stored in a
-//! global [`HashMap`] keyed by unique agent ID. Jobs are routed directly to
-//! the correct consumer — no agent ever blocks another.
-//!
-//! # Producer paths
-//!
-//! Jobs reach [`route`] from several producer paths — user chat messages via
-//! [`route_user_message`], ticket transitions, sub-agent results, boot-time
-//! pending-job replay, and dead-session recovery — and the router stays
-//! agnostic to the job's origin.
-//!
-//! # Agent ID formats
-//!
-//! Agent IDs are stable deterministic strings built by
-//! `crate::session::resolve_agent_id` and friends. The [`Role`] is embedded
-//! directly in [`AgentJob`] so the router never needs to parse the agent ID.
-//!
-//! # Response delivery
-//!
-//! - [`Role::Manager`] responses relay to the admin's Assistant via
-//!   the durable `<manager-message>` envelope ([`route_manager_notify`]) —
-//!   there is no direct user delivery. When the Manager answers a custom-role
-//!   caller, the reply instead returns into that branch
-//!   ([`route_manager_reply_to_custom`]).
-//! - [`Role::Custom`] responses relay to the admin's Assistant the same way,
-//!   via the durable `<custom-role-message>` envelope
-//!   ([`route_custom_role_notify`] / [`route_custom_role_failure`]) — a custom
-//!   role delivers nothing to the owner's channels.
-//! - [`Role::Worker`] responses on a branch job deliver the durable
-//!   `<worker-report>` envelope into the conversation that asked
-//!   ([`route_worker_branch_report`] / [`route_worker_branch_failure`]) — the
-//!   asking custom role's branch when it carried one, else the admin's
-//!   Assistant.
-//! - A guest's Assistant is handed a one-way `<owner-assistant-message>` from the
-//!   owner's Assistant ([`route_guest_message`]); it runs as that guest like any
-//!   other incoming message, so its answer reaches the guest's own channels and
-//!   nothing goes back to the sender.
-//! - Other roles deliver to the triggering user's channel bindings (with an
-//!   unregistered-user fallback).
+//! Producers are user chat, ticket transitions, sub-agent results, boot-time replay
+//! and dead-session recovery; the router stays agnostic to the job's origin.
+//! [`AgentJob`] carries the [`Role`] so the router never parses agent IDs.
 
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
@@ -57,186 +22,118 @@ use crate::users::UserRecord;
 use crate::util::UnwrapPoison;
 use crate::{Channel, ChatEvent, Role, SendMessage};
 
-// ── Job definition ─────────────────────────────────────────────────────────
-
-/// Emoji sent to the user when an agent completes without producing a
-/// response (LLM errors, retry exhaustion, context overflow, etc.).
-/// Language-agnostic — pure emoji, no text.
-///
-/// Not sent when the agent was cancelled (deliberate stop) or during global
-/// shutdown.
-///
-/// Known limitations:
-/// - Emoji rendering varies across terminals and clients.
+/// Emoji sent when an agent finishes with no response (LLM error, retry exhaustion,
+/// context overflow) — never when cancelled or shutting down. Language-agnostic.
 const AGENT_FAILURE_EMOJI: &str = "🤖⚠️🔄";
 
-/// Semantic category of a queue job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageKind {
-    /// User-typed message (chat or inline-button callback).
-    /// For Manager: the ticket_chronicle timeline drains before the agent runs.
-    /// For other roles: no ticket timeline drain.
+    /// User-typed message (chat or inline-button callback); for Manager the
+    /// ticket_chronicle timeline drains before the agent runs, for no other role.
     UserMessage,
-    /// System notification from a ticket transition.
-    /// Only enqueued for the Manager role.
+    /// Ticket transition notification; only enqueued for the Manager role.
     TicketNotify,
-    /// Result from an async AnalyzeTool sub-agent, injected back into the caller's
-    /// agent session. A round its caller cancels produces none.
+    /// An async AnalyzeTool sub-agent's result, injected back into the caller's session;
+    /// a round its caller cancels produces none.
     AnalyzeToolResult,
-    /// Result from an async single-run worker dispatch (`send` `worker`), injected
-    /// back into the caller's agent session. Also the kind a worker branch's
-    /// report is delivered under (single run or branch).
+    /// An async single-run worker dispatch's result (`send` `worker`), injected back into
+    /// the caller's session; also the kind a worker branch reports under.
     ImplementResult,
-    /// Result from an async deep analysis run (the `deep` depth of `analyze`),
-    /// injected back into the calling agent's session. Exactly one envelope per
-    /// run.
+    /// An async deep analysis run's result (`analyze` at `deep` depth) — one envelope per run.
     ResearchResult,
-    /// Comment added to a ticket while an agent is working on it.
-    /// Delivered mid-work via the agent's inbox (not a consumer loop).
+    /// Ticket comment added mid-work: through the agent's inbox, never a consumer loop.
     TicketComment,
-    /// Recovery retry for a dead session — routes without appending a new
-    /// user message to the session history.  Emoji error feedback is
-    /// suppressed for this kind (the emoji fires once on the original
-    /// failure, not on silent retries).
+    /// Dead-session recovery retry: routes without appending a user message, and suppresses
+    /// the emoji, which fires once on the original failure.
     RecoveryRetry,
-    /// Message sent by an assistant agent into a workspace Manager's session,
-    /// wrapped in an `<assistant-message>` envelope. Manager-bound and durable
-    /// (persisted to `pending_jobs` before routing, same class as Manager-bound
-    /// `UserMessage`); the Manager's chronicle/CDC drain applies. Deliberately
-    /// distinct from `UserMessage` so the failure-emoji gate (`== UserMessage`)
-    /// structurally excludes it.
+    /// An assistant's message into a workspace Manager's session (`<assistant-message>`
+    /// envelope), durable so the Manager's chronicle/CDC drain applies. Not
+    /// `UserMessage`: the failure-emoji gate must structurally exclude it.
     AgentMessage,
-    /// Durable auto-delivery copy of a Manager's response, routed into the
-    /// single admin's Assistant session (`<manager-message>`
-    /// envelope; the job's workspace is the admin's personal one, the source
-    /// workspace rides in `originating_workspace` and in the envelope's
-    /// `workspace` attribute, so its file references stay authorized).
-    /// Appended to the session like other result kinds; never
-    /// broadcast/persisted to chat_history. Deliberately distinct from
-    /// `UserMessage` so the failure-emoji gate (`== UserMessage`) structurally
-    /// excludes it. The serde alias keeps pre-unification `ManagerReply`
-    /// pending rows deserializable at boot replay.
+    /// Durable auto-delivery of a Manager's answer into the admin's Assistant
+    /// (`<manager-message>`): the job's workspace is the admin's personal one, while
+    /// `originating_workspace` and the envelope's `workspace` attribute name the source,
+    /// keeping its file references authorized. The serde alias keeps pre-unification
+    /// `ManagerReply` rows replayable at boot.
     #[serde(alias = "ManagerReply")]
     ManagerNotify,
-    /// A custom-role branch's finished answer or its failure, routed into the
-    /// asking conversation (`<custom-role-message>` envelope). Into the admin's
-    /// Assistant session when the branch was the asker (the job's workspace is
-    /// the admin's personal one, the folder the launch ran in travels in
-    /// `originating_workspace`), or into the asking custom role's branch.
-    /// Durable — produced through `stamp_and_route`. Deliberately distinct from
-    /// `UserMessage` so the failure-emoji gate (`== UserMessage`) structurally
-    /// excludes it. (A worker branch's report is the sibling shape under
-    /// [`MessageKind::ImplementResult`], which carries no extra file-delivery
-    /// root.)
+    /// A custom-role branch's answer or failure, routed into the asking conversation
+    /// (`<custom-role-message>`): the admin's Assistant when that branch was the asker,
+    /// else the asking custom role's branch. Durable through `stamp_and_route`; not
+    /// `UserMessage`, so the failure-emoji gate excludes it.
     CustomRoleNotify,
     /// A one-way handover from the owner's Assistant into a guest's own Assistant
-    /// conversation (`<owner-assistant-message>` envelope): the job runs AS that
-    /// guest, in their personal workspace, and the answer it produces reaches the
-    /// guest's own channels. Nothing returns to the sender — hence no reply
-    /// target — and `originating_workspace` stays unset, so the guest's workspace
-    /// is the only root its RELATIVE media markers resolve in (an absolute one is
-    /// not confined by the media layer, the same as any other message). Durable —
-    /// produced through [`hand_over`]. Deliberately distinct from `UserMessage` so
-    /// the failure-emoji gate (`== UserMessage`) structurally excludes it: the
-    /// guest never sees an unexplained failure mark from a message they did not
-    /// send.
+    /// (`<owner-assistant-message>`): the job runs AS that guest in their personal
+    /// workspace and answers into the guest's channels, nothing returns to the sender.
+    /// `originating_workspace` stays unset, so the guest's workspace is the only root its
+    /// RELATIVE media markers resolve in.
     GuestMessage,
 }
 
-/// A single unit of work for an agent consumer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentJob {
-    /// The message content to process.
     pub content: String,
-    /// Workspace name — resolved to a [`crate::Workspace`] inside the consumer.
     pub workspace_name: String,
     /// Sender identity — used for per-user response delivery.
     pub user_name: String,
-    /// Channel origin (gui, telegram, voice, cli).
     pub channel: String,
-    /// The semantic job kind.
     pub kind: MessageKind,
-    /// The agent's [`Role`] — embedded directly so the router never needs
-    /// to parse agent ID strings.
+    /// The agent's [`Role`], embedded so the router never parses agent IDs.
     pub role: Role,
-    /// Original reply target from the incoming message (e.g., Telegram chat_id).
-    /// Used by [`deliver_unregistered_user_response`] when there is no
-    /// [`UserRecord`](crate::users::UserRecord) in the users DB.
-    /// `None` for non-user-facing jobs (ticket notifications, broadcast-only).
+    /// Original reply target (e.g. Telegram chat_id), used by
+    /// [`deliver_unregistered_user_response`] when the users DB has no record.
     pub reply_target: Option<String>,
-    /// Durable pending_jobs row id (set when the job was persisted /
-    /// replayed from a pending row). The consumer deletes the row only after
-    /// `run_agent` returns — the at-least-once delivery boundary.
+    /// Durable pending_jobs row id. The consumer deletes the row only after `run_agent`
+    /// returns — the at-least-once delivery boundary.
     #[serde(default)]
     pub pending_job_id: Option<String>,
-    /// For relayed jobs ([`MessageKind::ManagerNotify`]) this names the
-    /// workspace the relayed content originated in, so a project-workspace
-    /// media marker in that content (`[FILE:...]`, `[IMAGE:...]`, `[AUDIO:...]`,
-    /// `[VIDEO:...]`) resolves and delivers from where it was produced, not just
-    /// because the relaying Assistant sits in the admin's personal workspace.
+    /// For relayed jobs, the workspace the relayed content originated in, so its media
+    /// markers resolve and deliver from where they were produced.
     #[serde(default)]
     pub originating_workspace: Option<String>,
-    /// The branch launch this job runs, when it runs one ([`Role::Custom`] or
-    /// [`Role::Worker`]): the definition taken at launch plus the resolved branch
-    /// address. `#[serde(default)]` keeps already-persisted `pending_jobs`
-    /// envelopes (which predate the field) decodable at boot replay.
+    /// The branch launch this job runs ([`Role::Custom`] or [`Role::Worker`]);
+    /// `#[serde(default)]` keeps persisted envelopes decodable at boot replay.
     #[serde(default)]
     pub custom_role: Option<crate::Launch>,
-    /// The conversation a forwarded reply must return to, when the job's caller
-    /// was a custom role: the Manager's answer goes back into that branch
-    /// instead of the admin's Assistant (see [`route_manager_reply_to_custom`]).
-    /// A worker branch carries its asker on the launch instead
-    /// ([`crate::Launch::reply_to`]) — one carrier per fact. `None` for every
-    /// other job.
+    /// The conversation a forwarded reply must return to when the caller was a custom
+    /// role (see [`route_manager_reply_to_custom`]); a worker branch carries its asker on
+    /// the launch instead ([`crate::Launch::reply_to`]) — one carrier per fact.
     #[serde(default)]
     pub reply_to_custom: Option<Asker>,
-    /// True when the user's message was marked urgent: it must not wait behind
-    /// the running turn. Only a surface a user types into sets it
-    /// ([`route_user_message`]) — every other producer, and every already-stored
-    /// envelope, leaves it `false`.
+    /// The user marked the message urgent: it must not wait behind the running turn.
+    /// Only a surface a user types into sets it ([`route_user_message`]).
     #[serde(default)]
     pub urgent: bool,
 }
 
-/// The conversation that asked for a forwarded reply — the asking branch's
-/// launch and the folder its turn ran in, so an answer returns there instead
-/// of the admin's Assistant. Carried durably by the launch
-/// (`crate::Launch::reply_to`) and on the routed job
-/// (`AgentJob::reply_to_custom`) that must deliver into it; a Manager's
-/// answer, a worker branch's report and its failure notice all travel this way.
+/// The conversation that asked for a forwarded reply — the asking branch's launch and
+/// the folder its turn ran in, so an answer returns there instead of the admin's
+/// Assistant. Carried by `crate::Launch::reply_to` and `AgentJob::reply_to_custom`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Asker {
-    /// The asking branch's launch — its authorial definition and its resolved
-    /// branch address, so the reply re-enters that same conversation.
+    /// The asking branch's launch, so the reply re-enters that conversation.
     pub launch: crate::Launch,
-    /// The folder the asking turn runs in — the branch's own folder, so the
-    /// answer re-enters the same conversation in the same place.
+    /// The folder the asking turn runs in.
     pub workspace: String,
 }
-
-// ── Global router ─────────────────────────────────────────────────────────
 
 /// Global router table: maps agent ID → that agent's consumer.
 static ROUTER: OnceLock<RwLock<HashMap<String, Consumer>>> = OnceLock::new();
 
-/// How long an announced urgent message has to reach the queue before the turn
-/// cut for it answers what it already has. Generous, because the message's
-/// attachments are still being understood while the turn holds (that is the
-/// whole point of cutting on staging); bounded, because a hand-over that never
-/// arrives must not stall the agent's queue.
+/// How long an announced urgent message has to reach the queue before the turn cut for
+/// it answers what it already has: generous, because its attachments are still being
+/// understood while the turn holds; bounded, so a hand-over that never arrives cannot
+/// stall the queue.
 const URGENT_ARRIVAL_SECS: u64 = 600;
 
-/// One agent's consumer: its job queue, plus what reaches it out of band — the
-/// announcement that an urgent message is on its way.
+/// One agent's consumer: its job queue, plus urgent announcements on their way.
 struct Consumer {
     jobs: mpsc::UnboundedSender<AgentJob>,
     urgent: Arc<UrgentArrivals>,
 }
 
-/// Urgent messages announced for one agent and not yet handed to its queue: when
-/// each was announced, and the token that ends the wait it started. The consumer
-/// cuts its running turn on the announcement — staging is where the cut is taken
-/// — and holds the next turn until the message itself arrives.
+/// Urgent messages announced for one agent and not yet handed to its queue, with the
+/// token that ends each wait: the consumer cuts its running turn and holds the next.
 #[derive(Default)]
 struct UrgentArrivals {
     announced: std::sync::Mutex<Vec<(tokio::time::Instant, CancellationToken)>>,
@@ -244,33 +141,28 @@ struct UrgentArrivals {
 }
 
 impl UrgentArrivals {
-    /// An urgent message for this agent is on its way: it is not in the queue
-    /// yet, so the consumer cuts what runs now and waits for it.
+    /// An urgent message for this agent is on its way: cut the running turn and wait.
     fn announce(&self) -> UrgentAnnouncement {
         let token = CancellationToken::new();
         self.announced
             .lock()
             .unwrap_poison()
             .push((tokio::time::Instant::now(), token.clone()));
-        // `notify_waiters`, not `notify_one`: only a consumer that is watching —
-        // one with a turn running — is cut. One that is between turns finds the
-        // announcement and waits for the message before it starts any turn.
+        // `notify_waiters`, not `notify_one`: only a consumer that is watching — one with
+        // a turn running — is cut.
         self.changed.notify_waiters();
         UrgentAnnouncement(token)
     }
 
-    /// The announcements outstanding now: the messages a turn cut at this instant
-    /// waits for. Taking them means one is never waited for twice; anything
-    /// announced later is a later arrival with a turn of its own.
+    /// The announcements outstanding now — what a turn cut at this instant waits for.
+    /// Taking them means one is never waited for twice.
     fn take(&self) -> Vec<(tokio::time::Instant, CancellationToken)> {
         std::mem::take(&mut *self.announced.lock().unwrap_poison())
     }
 }
 
-/// An urgent message announced for an agent, owned by the task staging it.
-/// Dropping it ends the wait it started — when the message was handed to the
-/// queue, or because that task died before it could be: a hand-over that never
-/// arrives must not hold the agent's queue.
+/// An urgent message announced for an agent, owned by the task staging it: dropping
+/// it ends the wait it started — after the hand-over, or because that task died.
 #[must_use]
 pub struct UrgentAnnouncement(CancellationToken);
 
@@ -280,11 +172,8 @@ impl Drop for UrgentAnnouncement {
     }
 }
 
-/// Initialise the global router table.
-///
-/// Must be called after the Tokio runtime is active (i.e., during startup).
-/// No consumer loops are spawned here — they are created lazily on first
-/// [`route`] to each agent ID.
+/// Initialise the global router table once the Tokio runtime is active; consumers are
+/// spawned lazily on first [`route`].
 pub fn init_global() -> anyhow::Result<()> {
     ROUTER
         .set(RwLock::new(HashMap::new()))
@@ -292,16 +181,9 @@ pub fn init_global() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Cut the turn `agent_id` is running right now, because a user's urgent message
-/// is on its way to it: the message's hand-over is not waited for, so the cut
-/// lands before anything about that message — its attachments included — is
-/// understood. The turn the message creates then answers it together with
-/// everything that was already waiting, itself last (see [`route_user_message`]).
-///
-/// The returned guard is held by the staging task until the message is handed to
-/// the queue: dropping it — then, or because that task died first — ends the wait
-/// the announcement started. `None` when the agent has no consumer at all: no
-/// turn was cut, and the message is answered by the next turn as usual.
+/// Cut the turn `agent_id` runs right now because a user's urgent message is on its way:
+/// the cut lands before anything about that message is understood (see
+/// [`route_user_message`]). `None` when the agent has no consumer at all.
 #[must_use]
 pub fn announce_urgent(agent_id: &str) -> Option<UrgentAnnouncement> {
     let table = ROUTER.get()?.read().unwrap_poison();
@@ -310,23 +192,10 @@ pub fn announce_urgent(agent_id: &str) -> Option<UrgentAnnouncement> {
         .map(|consumer| consumer.urgent.announce())
 }
 
-/// Route a job to the consumer for the given agent ID.
-///
-/// # Fast path
-///
-/// Locks the router for reading only, looks up the agent ID, and — when a
-/// consumer exists — sends the job through the sender borrowed from the read
-/// guard, holding the guard until the block ends. If the sender exists, we
-/// are done.
-///
-/// # Slow path
-///
-/// The agent ID is not yet registered: drop the read lock, acquire a write
-/// lock, create a new channel, spawn a [`consumer_loop`], store the sender,
-/// and forward the job.  A double-check pattern prevents races when two
-/// tasks simultaneously encounter a missing entry.
+/// Route a job to the consumer for `agent_id`. Fast path: a read lock, a lookup and a
+/// send. Slow path (agent not yet registered): write lock, new channel, spawn a
+/// [`consumer_loop`], store the sender, forward the job — double-checked against races.
 pub fn route(agent_id: &str, job: AgentJob) {
-    // ── Fast path: read-only lookup ───────────────────────────────────
     {
         let map = ROUTER
             .get()
@@ -340,14 +209,12 @@ pub fn route(agent_id: &str, job: AgentJob) {
         }
     }
 
-    // ── Slow path: create new consumer ────────────────────────────────
     let map = ROUTER
         .get()
         .expect("ROUTER not initialised — call init_global() first");
     let mut guard = map.write().unwrap_poison();
 
-    // Double-check: another task might have created the entry while we
-    // waited for the write lock.
+    // Double-check: another task may have registered the agent meanwhile.
     if let Some(consumer) = guard.get(agent_id) {
         if consumer.jobs.send(job).is_err() {
             error!(agent_id = %agent_id, "Router: consumer dropped (double-check) — failed to route job");
@@ -362,9 +229,8 @@ pub fn route(agent_id: &str, job: AgentJob) {
     let agent_id_for_cleanup = agent_id_for_consumer.clone();
 
     tokio::spawn(async move {
-        // Wrap consumer_loop in catch_unwind so a panic doesn't leave a dead
-        // sender in the router table, causing permanent message loss for this
-        // agent ID.
+        // catch_unwind so a panic does not leave a dead sender in the router table and
+        // lose this agent ID's messages for good.
         #[expect(clippy::large_futures)] // one consumer per agent, spawned once
         let result = std::panic::AssertUnwindSafe(consumer_loop(
             agent_id_for_consumer,
@@ -401,13 +267,8 @@ pub fn route(agent_id: &str, job: AgentJob) {
     guard.insert(agent_id.to_string(), Consumer { jobs: tx, urgent });
 }
 
-/// The `MessageKind::UserMessage` envelope every producer of an owner-side
-/// incoming message builds: a routed incoming message ([`route_user_message`]),
-/// the command line's handover ([`deliver_command_line_message`]), and a notice
-/// the product addresses to the owner's assistant
-/// ([`assistant_notice_job`], shared by both of its delivery paths). The routing
-/// fields such a message never carries are the shape's own defaults — including
-/// `urgent`, which only the user's own typed message can be.
+/// The `MessageKind::UserMessage` envelope every owner-side producer builds; fields such a
+/// message never carries stay at their defaults, `urgent` included.
 fn user_message_job(
     content: String,
     workspace_name: String,
@@ -432,9 +293,8 @@ fn user_message_job(
     }
 }
 
-/// The agent a user message for `role` in `workspace_name` is routed to — the ID
-/// [`route_user_message`] computes, for a caller that must reach the agent before
-/// the message does ([`announce_urgent`]).
+/// The agent ID [`route_user_message`] computes, for a caller that must reach the agent
+/// before the message does ([`announce_urgent`]).
 #[must_use]
 pub fn user_message_agent_id(user_name: &str, role: Role, workspace_name: &str) -> String {
     // The same normalization `route_user_message` applies, so the two can never
@@ -443,23 +303,15 @@ pub fn user_message_agent_id(user_name: &str, role: Role, workspace_name: &str) 
     crate::session::resolve_agent_id(user_name, role.as_str(), workspace_name)
 }
 
-/// Route a user message to the agent for the given role in a workspace.
+/// Route a user message to the agent for `role` in a workspace, resolving the agent ID
+/// exactly as [`user_message_agent_id`] does; broadcast, persistence and enrichment stay
+/// at the call sites. `urgent` (see `crate::channels::take_urgent`) cuts the running turn
+/// and brings everything already waiting with it instead of queueing behind it.
 ///
-/// Resolves the agent ID the same way [`user_message_agent_id`] does and enqueues
-/// a [`MessageKind::UserMessage`] job. Surrounding per-site pipelines (broadcast,
-/// persistence, enrichment) remain at the call sites.
-///
-/// `urgent` says the user marked the message urgent (see
-/// `crate::channels::take_urgent`): it cuts the agent's running turn and brings
-/// everything already waiting with it, instead of queueing behind it.
-///
-/// # Durability (at-least-once)
-///
-/// Manager-bound messages are persisted to `pending_jobs` BEFORE routing —
-/// a crash between persist and delivery replays the row at next boot (dedup
-/// prevents duplicate append). Non-Manager messages are covered by the
-/// dead-session poller (not durable). During the graceful drain the message
-/// is persisted but NOT routed — the row is reclaimed by boot replay.
+/// At-least-once: Manager-bound messages are persisted to `pending_jobs` BEFORE routing,
+/// so a crash between the two replays the row at boot (dedup prevents a double append);
+/// non-Manager ones are covered only by the dead-session poller. During the graceful
+/// drain the message is persisted but NOT routed — boot replay reclaims the row.
 pub async fn route_user_message(
     content: String,
     workspace_name: String,
@@ -469,11 +321,9 @@ pub async fn route_user_message(
     reply_target: Option<String>,
     urgent: bool,
 ) {
-    // Invariant: the routed user identity is never an empty string. A real
-    // admin account is always seeded. Normalize defensively so no path can create
-    // a malformed identity (bare "_ws_role" key) or persist/reply under an
-    // empty user — once, so the agent ID key and the delivery payload always
-    // name the same person.
+    // Invariant: the routed user identity is never empty — an admin account is always
+    // seeded. Normalized once here so the agent ID key and the delivery payload always
+    // name the same person, never a bare "_ws_role" key.
     let user_name =
         crate::session::normalize_user_name(&user_name, "route_user_message").to_string();
     let agent_id = crate::session::resolve_agent_id(&user_name, role.as_str(), &workspace_name);
@@ -488,9 +338,6 @@ pub async fn route_user_message(
     );
     job.urgent = urgent;
 
-    // DURABLE kinds = UserMessage (manager-bound), AgentMessage, ManagerNotify,
-    // CustomRoleNotify, GuestMessage, AnalyzeToolResult, ResearchResult,
-    // ImplementResult.
     if job.role == Role::Manager {
         stamp_and_route(job, &agent_id, "manager message").await;
         return;
@@ -498,10 +345,8 @@ pub async fn route_user_message(
     route(&agent_id, job);
 }
 
-/// Persist `job` to `pending_jobs` and stamp the row id onto it — the
-/// at-least-once boundary every durable producer shares. An `Err` is a failed
-/// write, not a dropped message: the caller still routes the job and logs the
-/// cause against its own context.
+// Persist `job` to `pending_jobs` and stamp the row id onto it — the at-least-once
+// boundary. An `Err` is a failed write, not a dropped message.
 async fn persist_and_stamp(job: &mut AgentJob) -> anyhow::Result<()> {
     let id = crate::generate_id();
     persist_pending(job, id.clone()).await?;
@@ -509,38 +354,23 @@ async fn persist_and_stamp(job: &mut AgentJob) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Who answers for a durable handover: the one thing that decides what a failed
-/// `pending_jobs` write means. The choice belongs to the PRODUCER, never to the
-/// message — the same envelope can be a handover whose caller is answered and
-/// then gone (the command line) or one whose producer's own turn is durable
-/// already (an agent's tool call).
+// Who answers for a durable handover: what a failed `pending_jobs` write means is
+// the PRODUCER's choice, never the message's.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum AnsweredFor {
-    /// A handover whose failure nobody is told about: an agent, whose own turn is
-    /// durable already, or a background sweep with no answerable caller at all
-    /// (the automation sweep). The failed write is logged and the envelope is routed
-    /// best-effort instead (at-most-once): dropping the handover would be worse
-    /// than delivering it unrecorded.
+    // Nobody is told about this handover's failure — an agent, whose own turn is durable
+    // already, or a background sweep: the failed write is logged and the envelope routed.
     Agent,
-    /// The command line. The failure is returned, with NOTHING routed: its
-    /// caller is answered and gone the moment it returns, so it must never be
-    /// told a handover succeeded that a restart could lose.
+    /// The command line: the failure is returned with NOTHING routed, since its caller is
+    /// answered and gone the moment it returns.
     CommandLine,
 }
 
-/// Hand one durable envelope over, under `answered_for`'s contract — the ONE
-/// handover body: persist the envelope to `pending_jobs`, then route it unless
-/// a drain began after the write (the row is left to boot replay, which
-/// reclaims it; the drain must not be raced with a live route). `Err` is the
-/// failed write, and only a [`CommandLine`](AnsweredFor::CommandLine) handover
-/// ever returns it — every other producer's failure is logged here and the
-/// envelope is routed best-effort (at-most-once) instead.
-///
-/// A row persisted during the drain/shutdown is never routed: boot replay
-/// reclaims it. A best-effort route — the failed write, or one that slipped in
-/// as the drain began — may land in a consumer that has already stopped
-/// pulling, so the message can still be lost at exit; that window is the price
-/// of never dropping a handover whose write failed on the normal path.
+// Hand one durable envelope over under `answered_for`'s contract — the ONE handover body:
+// persist to `pending_jobs`, then route unless a drain began after the write (the row is
+// left to boot replay; the drain must not be raced with a live route). Only a
+// [`CommandLine`](AnsweredFor::CommandLine) handover returns `Err`; any other failure is
+// logged and routed best-effort — the price of never dropping a failed write.
 pub(crate) async fn hand_over(
     mut job: AgentJob,
     target: &str,
@@ -573,9 +403,8 @@ pub(crate) async fn hand_over(
     Ok(())
 }
 
-/// [`hand_over`] under [`AnsweredFor::Agent`]: the durable producer whose own
-/// turn is already durable. A failed write is logged and the envelope is
-/// routed best-effort rather than dropped — see [`hand_over`].
+/// [`hand_over`] under [`AnsweredFor::Agent`]: a failed write is logged and the envelope
+/// routed best-effort rather than dropped.
 pub(crate) async fn stamp_and_route(job: AgentJob, target: &str, producer: &str) {
     let _ = hand_over(job, target, producer, AnsweredFor::Agent).await;
 }
@@ -607,15 +436,10 @@ fn agent_message_job(
     }
 }
 
-/// Route a message from an assistant agent into the workspace Manager's
-/// session (`MessageKind::AgentMessage`). For a non-custom caller there is no
-/// addressed reply leg — the Manager's response auto-delivers to the admin's
-/// Assistant via [`route_manager_notify`]. A Manager-bound request from a custom
-/// role DOES have one: `asker` carries the asking branch, and the answer
-/// re-enters it via [`route_manager_reply_to_custom`].
-///
-/// `answered_for` carries the handover's contract ([`hand_over`]): what a failed
-/// `pending_jobs` write means depends on who answers for the call.
+/// Route an assistant agent's message into the workspace Manager's session
+/// ([`MessageKind::AgentMessage`]). A custom role's `asker` carries the asking branch,
+/// answered through [`route_manager_reply_to_custom`]; a non-custom caller's answer
+/// auto-delivers via [`route_manager_notify`].
 pub(crate) async fn route_agent_message_to_manager(
     content: String,
     workspace_name: String,
@@ -628,15 +452,10 @@ pub(crate) async fn route_agent_message_to_manager(
     hand_over(job, &target, "agent message", answered_for).await
 }
 
-/// Hand one message from the owner's Assistant to a guest account's own Assistant
-/// (`MessageKind::GuestMessage`, durable) — one-way: nothing is addressed back to
-/// the sender.
-///
-/// The producer (`tools::send`) has already wrapped the text in
-/// `<owner-assistant-message>`. The job runs AS the guest — their account is the
-/// identity and their personal workspace the folder, so the consumer's pinning and
-/// delivery give it the guest's own toolset, conversation and channels, never the
-/// owner's. `answered_for` carries the handover's contract ([`hand_over`]).
+/// Hand one message from the owner's Assistant to a guest's own Assistant
+/// ([`MessageKind::GuestMessage`], durable) — one-way, nothing addressed back to the
+/// sender. The job runs AS the guest, so pinning and delivery give it the guest's own
+/// toolset, conversation and channels; `tools::send` wrapped the text already.
 pub(crate) async fn route_guest_message(
     content: String,
     guest_name: &str,
@@ -664,37 +483,17 @@ pub(crate) async fn route_guest_message(
     hand_over(job, &target, "guest message", answered_for).await
 }
 
-/// Hand one message from the COMMAND LINE to the owner's own assistant.
-///
-/// The message is an ordinary incoming message from the owner and nothing in
-/// its text marks it as scripted: it is broadcast to the GUI, persisted to
-/// `chat_history`, and mirrored to his bound Telegram as one of his own —
-/// exactly as a message typed into the dashboard is
-/// ([`crate::channels::broadcast_and_persist_incoming_message`]) — and it reaches
-/// the assistant's conversation through the same durable envelope every other
-/// handover uses, so the assistant answers the way it normally does. It is
-/// attributed to [`crate::cli::CHANNEL`] for the product's own record — a message
-/// a shell sent can be told apart from one the owner typed (`gui`) or spoke
-/// (`voice`), and the product's own logs record the handover as a command-line
-/// operation — never in the message itself, which carries no trace of its
-/// origin.
-///
-/// The durable handover comes FIRST and the history copy second — deliberately
-/// the opposite of the other incoming-message producers, which broadcast first
-/// so the transcript shows the message while the agent is still working. Here
-/// the caller is answered only once the handover is durable, so the conversation
-/// must not show a message the caller was told did not get through.
-///
-/// `Err` is a call carrying no owner, or a failed `pending_jobs` write — either
-/// way the handover is REFUSED and nothing is routed: see
-/// [`AnsweredFor::CommandLine`].
+/// Hand one message from the COMMAND LINE to the owner's own assistant as an ordinary
+/// incoming message — broadcast to the GUI, persisted to `chat_history`, mirrored to his
+/// bound Telegram — attributed to [`crate::cli::CHANNEL`], never in the message itself, so
+/// a shell-sent message can be told from a typed (`gui`) or spoken (`voice`) one. The
+/// durable handover comes FIRST and the history copy second, the opposite of the other
+/// producers: the conversation must not show a message the caller was told did not get
+/// through. `Err` (no owner, or a failed write) REFUSES the handover.
 pub(crate) async fn deliver_command_line_message(content: String) -> anyhow::Result<()> {
-    // The owner the CALL carries, never a second copy of the constant: the command
-    // line scopes the identity it acts with
-    // ([`crate::cli::instance`]), and every other handover this tool makes is
-    // attributed the same way. Checked rather than defaulted, as the Manager arm
-    // does: an empty identity would attribute the message to nobody and address
-    // it to a `personal:` workspace that does not exist.
+    // The owner the CALL carries, never a second copy of the constant: the command line
+    // scopes the identity it acts with ([`crate::cli::instance`]). Checked rather than
+    // defaulted — an empty identity would address a `personal:` workspace that does not exist.
     let user_name = crate::agent::tool_user_name();
     anyhow::ensure!(
         !user_name.is_empty(),
@@ -737,12 +536,8 @@ pub(crate) async fn deliver_command_line_message(content: String) -> anyhow::Res
     Ok(())
 }
 
-/// Persist an envelope to `pending_jobs`. The target agent id is derived
-/// from the envelope by [`crate::jobs::pending_job_params`].
-/// Used by the durable producers: manager-bound messages routed here,
-/// analyze/research results via [`crate::jobs::complete_job_with_envelope`],
-/// and assistant notices ([`deliver_assistant_notice`]) from the automation sweep
-/// (`automations::fire_automation`) and the custom-tool grant path.
+// Persist an envelope to `pending_jobs`; the target agent id is derived from it by
+// [`crate::jobs::pending_job_params`]. Used by every durable producer.
 pub(crate) async fn persist_pending(job: &AgentJob, id: String) -> anyhow::Result<()> {
     let now = db::now();
     crate::session::store()
@@ -755,19 +550,10 @@ pub(crate) async fn persist_pending(job: &AgentJob, id: String) -> anyhow::Resul
     Ok(())
 }
 
-/// Deliver a durable notice into an Assistant session: build the
-/// [`MessageKind::UserMessage`] envelope, persist it to `pending_jobs` BEFORE
-/// routing (a crash after persisting replays it at boot), then route it to
-/// `agent_id`.
-///
-/// The same delivery path for both kinds of notice — a fired automation and a custom-tool grant
-/// change both arrive through it. `agent_id` is the resolved Assistant session
-/// key; automation delivery passes the id stored on the automation rather than
-/// re-deriving it (re-derivation would double-escape colliding user names). The
-/// text is delivered as composed — notice text is not credential-scrubbed.
-///
-/// An `Err` is a failed persistence: the notice was still routed, best-effort
-/// (at-most-once), and the caller logs the cause against its own context.
+/// Deliver a durable notice into an Assistant session: persist to `pending_jobs` BEFORE
+/// routing (a crash after persisting replays it at boot), then route. `agent_id` is the
+/// resolved session key — automation delivery passes the stored id, since re-deriving it would
+/// double-escape colliding user names. An `Err` is a failed persistence.
 pub(crate) async fn deliver_assistant_notice(
     agent_id: &str,
     user_name: &str,
@@ -779,10 +565,8 @@ pub(crate) async fn deliver_assistant_notice(
     durable
 }
 
-/// The envelope a notice addressed to an Assistant carries: the owner's personal
-/// workspace, the Assistant role, and the history tag an owner-side message
-/// carries. Both delivery paths build it here so the fields that must match an
-/// incoming message are spelled once.
+// The envelope a notice addressed to an Assistant carries; both delivery paths
+// build it here so the fields match an incoming message's.
 fn assistant_notice_job(content: String, user_name: &str) -> AgentJob {
     user_message_job(
         content,
@@ -797,31 +581,16 @@ fn assistant_notice_job(content: String, user_name: &str) -> AgentJob {
     )
 }
 
-/// Post a notice addressed to an Assistant straight into its ordinary queue,
-/// with no `pending_jobs` row.
-///
-/// This is the at-most-once sibling of [`deliver_assistant_notice`]: a durable
-/// row is replayed at boot, so a producer that owns its own bookkeeping must
-/// never also persist the envelope. It records nothing itself, so a caller that
-/// wants a repeat rather than a loss settles its own record only after this
-/// returns — the update notice does exactly that — while a caller that must
-/// never ask twice settles it before, as the nightly memory inventory does.
+/// Post a notice into an Assistant's ordinary queue with no `pending_jobs` row — the
+/// at-most-once sibling of [`deliver_assistant_notice`], for a producer that owns its own
+/// bookkeeping: settle the record after this returns if a repeat is affordable, else before.
 pub(crate) fn post_assistant_notice(agent_id: &str, user_name: &str, content: String) {
     route(agent_id, assistant_notice_job(content, user_name));
 }
 
-/// Register an agent in the router table without spawning a consumer loop.
-///
-/// Returns a receiver that the caller (typically the agent's `llm_loop`)
-/// drains manually via `try_recv()`. The sender is stored in the router
-/// table so that [`try_route`] can deliver messages (e.g., ticket comments)
-/// to this agent mid-work.
-///
-/// Call [`unregister_agent`] when the agent's work finishes to remove the
-/// entry — for caller-registered paths (those passing a receiver into
-/// [`crate::agent::run_agent`]), the exit guard inside `run_agent` does this
-/// on every path including panic; the persistent consumer path cleans up in
-/// [`route`]'s wrapper instead.
+/// Register an agent without a consumer loop and hand back the receiver (`llm_loop` drains
+/// it with `try_recv()`); the stored sender lets [`try_route`] deliver mid-work messages.
+/// Pair it with [`unregister_agent`] — `run_agent`'s exit guard calls it on every path.
 pub fn register_agent(agent_id: &str) -> mpsc::UnboundedReceiver<AgentJob> {
     let (tx, rx) = mpsc::unbounded_channel::<AgentJob>();
     let map = ROUTER
@@ -838,25 +607,16 @@ pub fn register_agent(agent_id: &str) -> mpsc::UnboundedReceiver<AgentJob> {
     rx
 }
 
-/// Unregister an agent from the router table.
-///
-/// After this call, [`try_route`] returns `false` for this agent ID.
-/// Must be called when the agent's work loop finishes to remove the
-/// router entry. Safe to call even if the agent was never registered.
+/// Unregister an agent from the router table: [`try_route`] then returns `false` for
+/// it. Safe when the agent was never registered.
 pub fn unregister_agent(agent_id: &str) {
     let Some(map) = ROUTER.get() else { return };
     let mut guard = map.write().unwrap_poison();
     guard.remove(agent_id);
 }
-/// Try to route a job to a previously registered agent.
-///
-/// Returns `true` if the agent was found and the job was delivered.
-/// Returns `false` if the agent is not registered — the caller can
-/// fall back to persisting the job in the DB for the next dispatch.
-///
-/// This does NOT spawn a consumer loop — it only sends to already-
-/// registered agents. This is the fast path for mid-work message
-/// delivery (e.g., ticket comments to running pipeline agents).
+/// Try to route a job to a previously registered agent: `true` when delivered, `false`
+/// when not (the caller may then persist the job for the next dispatch). Never spawns a
+/// consumer — the fast path for mid-work delivery.
 pub fn try_route(agent_id: &str, job: AgentJob) -> bool {
     let Some(map) = ROUTER.get() else {
         return false;
@@ -867,15 +627,9 @@ pub fn try_route(agent_id: &str, job: AgentJob) -> bool {
         .is_some_and(|consumer| consumer.jobs.send(job).is_ok())
 }
 
-/// The turn a queue forms: everything already waiting up to and including the
-/// first urgent message — answered together, the urgent one last — or, when
-/// nothing is urgent, the one job at the front.
-///
-/// The first urgent message in queue order closes the batch: it is the one whose
-/// hand-in took the cut, and everything behind it — a second urgent message
-/// included — is left for the next turn. Nothing is ever answered after an
-/// urgent message that was already waiting when it arrived, and queue order
-/// always holds.
+// The turn a queue forms: everything already waiting up to and including the first urgent
+// message, answered together with the urgent one last — else the one job at the front.
+// Everything behind that urgent message, a second urgent included, is the next turn's.
 fn take_turn_batch(waiting: &mut std::collections::VecDeque<AgentJob>) -> Vec<AgentJob> {
     match waiting.iter().position(|job| job.urgent) {
         Some(at) => waiting.drain(..=at).collect(),
@@ -883,16 +637,11 @@ fn take_turn_batch(waiting: &mut std::collections::VecDeque<AgentJob>) -> Vec<Ag
     }
 }
 
-/// Hold the turn about to start for the urgent messages announced before it: the
-/// cut was taken at staging, so those messages are still on their way and must be
-/// answered together with everything already waiting, last. Whatever reaches the
-/// queue meanwhile joins that turn.
-///
-/// The wait for an announcement ends when its message is handed over — or when
-/// the task staging it is gone — and is bounded from the instant it was
-/// announced, so a hand-over that never arrives lets the turn answer what it
-/// already has instead of parking the agent's queue. A shutdown or a drain ends
-/// it at once. Returns `false` when the consumer must stop.
+// Hold the turn about to start for the urgent messages announced before it: their cut was
+// taken at staging, so they are still on their way and must be answered last, with everything
+// already waiting. The wait ends when the message is handed over or its staging task is gone,
+// and is bounded from the announcement; a shutdown or drain ends it at once. `false` means the
+// consumer must stop.
 async fn hold_for_urgent(
     waiting: &mut std::collections::VecDeque<AgentJob>,
     urgent: &UrgentArrivals,
@@ -901,9 +650,8 @@ async fn hold_for_urgent(
     agent_id: &str,
     hold: std::time::Duration,
 ) -> bool {
-    // Only what was announced before this turn started is waited for: a message
-    // announced later is a later arrival, and either lands in this turn's queue
-    // or cuts the turn that starts once the wait is over.
+    // Only what was announced before this turn started is waited for: a later
+    // announcement either lands in this turn's queue or cuts the turn after the wait.
     let awaiting = urgent.take();
     let Some(deadline) = awaiting
         .iter()
@@ -957,19 +705,9 @@ async fn hold_for_urgent(
     true
 }
 
-// ── Consumer loop ─────────────────────────────────────────────────────────
-
-/// The consumer task that processes agent jobs for a single agent instance.
-///
-/// One turn at a time, in queue order; an urgent message cuts the running turn
-/// and is answered by the next one together with everything that was already
-/// waiting (see [`AgentJob::urgent`]).
-///
-/// Shutdown-aware loop: checks for global shutdown between jobs.
-///
-/// Cleanup (removing this consumer's entry from the router table) is handled
-/// by the outer wrapper in [`route()`], which runs on both normal exit and
-/// (via `catch_unwind`) panic exit.
+/// The consumer task for one agent: one turn at a time in queue order, an urgent message
+/// cutting the running turn and answered by the next one (see [`AgentJob::urgent`]). The
+/// wrapper in [`route`] removes the router entry on exit and on panic.
 #[expect(clippy::too_many_lines)]
 async fn consumer_loop(
     agent_id: String,
@@ -994,7 +732,6 @@ async fn consumer_loop(
             break;
         }
 
-        // ── Take this turn's batch ────────────────────────────────────────
         // Nothing is waiting: block for the next job.
         if waiting.is_empty() {
             let job = tokio::select! {
@@ -1009,17 +746,13 @@ async fn consumer_loop(
             };
             waiting.push_back(job);
         }
-        // Everything else the queue already holds is waiting too: gathered now,
-        // so an urgent message among them starts ONE turn together with them
-        // instead of interrupting a turn that started a moment earlier.
+        // Everything else the queue already holds is gathered now, so an urgent message
+        // among them starts ONE turn with them instead of interrupting a turn already begun.
         while let Ok(job) = rx.try_recv() {
             waiting.push_back(job);
         }
-        // An announced urgent message is still being staged (its attachments may
-        // still be understood): the cut was taken the moment it was announced, and
-        // this turn waits for the message itself so it is answered together with
-        // everything already waiting, last. A shutdown or drain that began during
-        // that wait ends this loop here, as the top-of-loop guards would.
+        // An announced urgent message is still being staged: wait for the message itself
+        // and answer it last. A shutdown or drain ends this loop here, as the guards would.
         if !hold_for_urgent(
             &mut waiting,
             &urgent,
@@ -1034,22 +767,17 @@ async fn consumer_loop(
             info!(agent_id = %agent_id, "Message router: draining — no new jobs pulled");
             break;
         }
-        // The batch ends with the first urgent message it holds — that one is
-        // taken last, after everything that was already waiting, and everything
-        // behind it is a later arrival that gets its own turn. A batch with no
-        // urgent message is the one job at the front.
+        // The batch ends with the first urgent message it holds — taken last, after
+        // everything already waiting; what is behind it is a later arrival with its own turn.
         let batch = take_turn_batch(&mut waiting);
 
-        // Execution-time normalization every job of the batch goes through: the
-        // role derived from its launch, the pinned-role rule, and the
-        // custom-role guard. A refused job is confirmed and dropped so it cannot
-        // take the rest of the batch with it.
+        // Execution-time normalization every job of the batch goes through (role, the
+        // pinned-role rule, the custom-role guard); a refused job is confirmed and dropped,
+        // so it cannot take the rest of the batch with it.
         let mut validated: Vec<AgentJob> = Vec::with_capacity(batch.len());
         for mut item in batch {
-            // TicketComment jobs should NEVER reach the consumer loop — they are
-            // delivered directly via try_route() to agents that drain them in
-            // llm_loop. If one arrives here, someone used route() instead of
-            // try_route(), or the agent's receiver was dropped.
+            // TicketComment jobs NEVER reach the consumer loop — `try_route()` delivers them
+            // to agents draining in `llm_loop`. One arriving here means a misuse of `route()`.
             if item.kind == MessageKind::TicketComment {
                 warn!(
                     agent_id = %agent_id,
@@ -1059,15 +787,12 @@ async fn consumer_loop(
                 continue;
             }
 
-            // A launch and the role are one fact: derive the role from the launch
-            // FIRST, so a job built without the derivation cannot smuggle a launch
-            // past the pinning rule below or the custom-role guard that follows.
+            // A launch and the role are one fact: derive the role from the launch FIRST, so
+            // a job built without the derivation cannot smuggle a launch past the guards.
             item.role = item.role.for_launch(item.custom_role.as_ref());
 
-            // Execution-time invariant: pinned roles (Assistant)
-            // never run outside the user's personal workspace, no matter what the
-            // producer stored. Empty-user envelopes for pinned roles are refused
-            // outright.
+            // Execution-time invariant: pinned roles (Assistant) never run outside the user's
+            // personal workspace, whatever the producer stored; empty-user envelopes are refused.
             let Some(pinned_ws) = crate::users::enforce_personal_pinning(
                 item.role,
                 &item.workspace_name,
@@ -1084,14 +809,10 @@ async fn consumer_loop(
             };
             item.workspace_name = pinned_ws;
 
-            // A custom-role job is meaningless without its launch — the record's
-            // prompt, tool subset and branch address all travel in it — and a
-            // branch whose record has since been deleted must never be resumed
-            // with a definition that no longer exists (a round the role dispatched
-            // may still complete after the delete). Both are refused here, in the
-            // one funnel every producer goes through, and the durable pending row
-            // is reclaimed so boot replay does not resurrect them. The cost is one
-            // primary-key lookup per custom-role turn.
+            // A custom-role job is meaningless without its launch, and a branch whose record
+            // was since deleted must never resume with a definition that no longer exists (a
+            // round it dispatched may still complete after the delete). Both are refused in
+            // this one funnel, the durable row reclaimed so boot replay cannot resurrect them.
             if item.role == Role::Custom {
                 let refusal = match item.custom_role.as_ref() {
                     None => Some("the job carries no custom-role launch"),
@@ -1099,9 +820,8 @@ async fn consumer_loop(
                         Ok(Some(_)) => None,
                         Ok(None) => Some("the custom role no longer exists"),
                         Err(e) => {
-                            // A transient read failure is not a verdict about the
-                            // role: run the turn and let the error surface wherever
-                            // the turn itself needs the store.
+                            // A transient read failure is not a verdict about the role:
+                            // run the turn and let the error surface where it needs the store.
                             warn!(
                                 agent_id = %agent_id,
                                 role = %launch.name,
@@ -1124,10 +844,8 @@ async fn consumer_loop(
             }
             validated.push(item);
         }
-        // The turn's identity — its surface, user, channel and reply target —
-        // is the last item's: the urgent message is what the turn answers, and
-        // everything waiting rides in front of it. The items before it are its
-        // messages, in queue order.
+        // The turn's identity — surface, user, channel, reply target — is the last item's:
+        // the urgent message is what the turn answers, the items before it its messages.
         let Some(job) = validated.pop() else {
             continue;
         };
@@ -1142,7 +860,6 @@ async fn consumer_loop(
             "Message router: processing job",
         );
 
-        // ── Resolve workspace by name ─────────────────────────────────
         let ws = match crate::users::resolve_workspace(&job.workspace_name).await {
             Ok(Some(ws)) => ws,
             Ok(None) => {
@@ -1168,12 +885,9 @@ async fn consumer_loop(
             }
         };
 
-        // ── Roots anchoring outbound media markers ─────────────────────
-        // The job's own workspace, plus the workspace the relayed content
-        // originated in when it differs (a Manager→Assistant relay names it in
-        // `originating_workspace`): a relative `[IMAGE:]`/`[AUDIO:]`/`[VIDEO:]`
-        // target resolves against them, and `[FILE:]` is confined to them. A
-        // failed lookup only narrows the roots.
+        // The job's own workspace, plus the one relayed content originated in when it differs:
+        // relative `[IMAGE:]`/`[AUDIO:]`/`[VIDEO:]` targets resolve against them and `[FILE:]`
+        // is confined to them. A failed lookup only narrows the roots.
         let mut file_roots = vec![std::path::PathBuf::from(&ws.path)];
         if let Some(origin) = job.originating_workspace.as_deref()
             && origin != job.workspace_name
@@ -1192,17 +906,10 @@ async fn consumer_loop(
             }
         }
 
-        // ── Role is embedded directly in the job ────────────────────────
-        // No agent-ID string parsing needed — every caller knows the role.
         let role = job.role;
 
-        // ── Resolve users for response delivery ───────────────────────
-        // Non-Manager roles deliver to the specific triggering user. The
-        // Manager has no direct user delivery: its responses relay to the
-        // admin's Assistant via the ManagerNotify envelope below. A custom role
-        // delivers nothing to the owner's channels either — its answer goes to
-        // the admin's Assistant via the CustomRoleNotify envelope. A worker branch
-        // likewise: its report goes into the conversation that asked.
+        // Non-Manager roles deliver to the triggering user. Manager, Custom and Worker branch
+        // answers relay to the admin's Assistant (or the asking branch) through their envelopes.
         let users: Vec<UserRecord> = if matches!(role, Role::Manager | Role::Custom | Role::Worker)
         {
             Vec::new()
@@ -1213,18 +920,15 @@ async fn consumer_loop(
             }
         };
 
-        // ── Typing indicators ─────────────────────────────────────────
         let typing_tasks = setup_telegram_typing(&users).await;
         broadcast_typing(&users, &job.workspace_name, true);
 
-        // ── Chronicle timeline drain (Manager only) ────────────────────────
         // Each item the turn answers becomes its own message, in queue order; the
         // job that ended the batch (the urgent one) is last.
         let message = match (role, job.kind) {
             (Role::Manager, MessageKind::UserMessage | MessageKind::AgentMessage) => {
-                // Flush the CDC drainer so a transition committed moments ago is
-                // materialized into the chronicle before the manager reads it
-                // (delayed, not lost, if skipped — the next drain delivers it).
+                // Flush the CDC drainer so a transition committed moments ago is materialized
+                // before the manager reads it (delayed, not lost, if skipped).
                 if let Err(e) =
                     crate::db::cdc::drain_once(&crate::pipeline::board::store().conn).await
                 {
@@ -1242,20 +946,14 @@ async fn consumer_loop(
         let mut messages: Vec<String> = queued.iter().map(|item| item.content.clone()).collect();
         messages.push(message);
 
-        // ── Run the agent ─────────────────────────────────────────────
-        // The admin gets the Assistant's widened toolset and role prompt;
-        // everyone else runs the guest Assistant.
-        // Manager and custom-role jobs resolve no users, so `is_admin` is false
-        // for both — and nothing reads it for either: a custom role's strength
-        // comes from its own tool subset (`Role::custom_role_tools`), not from
-        // this flag.
+        // The admin gets the Assistant's widened toolset and role prompt; everyone else runs
+        // the guest Assistant. Manager and custom-role jobs resolve no users, so `is_admin` is
+        // false for both and nothing reads it — a custom role's strength is its tool subset.
         let is_admin = users
             .first()
             .is_some_and(|user| crate::users::is_admin_name(&user.name));
-        // The Running Agents grouping for this job: a branch launch is one
-        // conversation keyed by its own agent id, with the display label naming
-        // the role and (when named) its branch. Everything else stays
-        // ungrouped, exactly as before.
+        // The Running Agents grouping: a branch launch is one conversation keyed by its own
+        // agent id, labelled with its role and branch; everything else stays ungrouped.
         let (parent_key, parent_label) = match &job.custom_role {
             Some(launch) => (
                 Some(crate::agent::registry::ParentKey::Launch(
@@ -1265,15 +963,10 @@ async fn consumer_loop(
             ),
             None => (None, None),
         };
-        // ── Run the turn, watching the queue ──────────────────────────
-        // The turn answers every message of the batch. While it runs, two things
-        // cut it: an urgent message announced for this agent — staging is where
-        // that cut is taken, so it never waits for the message's own attachments
-        // to be understood — and an urgent message handed straight to the queue.
-        // Everything that reaches the queue while the turn runs is the next turn's
-        // items, in queue order, so the urgent one is answered last, together with
-        // everything already waiting. No interruption is attempted while the
-        // product is stopping or draining.
+        // The turn answers every message of the batch. Two things cut it: an announcement
+        // (taken at staging, so it never waits for that message's own attachments) and an
+        // urgent job handed straight to the queue — neither while stopping or draining. What
+        // reaches the queue meanwhile is the next turn's, so the urgent one is answered last.
         let message_refs: Vec<&str> = messages.iter().map(String::as_str).collect();
         let mut queue_open = true;
         let mut turn = std::pin::pin!(crate::agent::run_agent(
@@ -1292,9 +985,8 @@ async fn consumer_loop(
             parent_label,
             job.custom_role.clone(),
         ));
-        // `interrupt` is a no-op when the run has already concluded — or has not
-        // registered itself yet — and that message is then answered by the next
-        // turn as usual.
+        // `interrupt` is a no-op when the run has already concluded or has not registered
+        // itself yet; that message is then answered by the next turn as usual.
         let (mut agent, response) = loop {
             tokio::select! {
                 done = &mut turn => break done,
@@ -1314,7 +1006,6 @@ async fn consumer_loop(
             }
         };
 
-        // ── Stop typing ───────────────────────────────────────────────
         for (cancel, handle) in typing_tasks {
             cancel.cancel();
             stop_typing(handle).await;
@@ -1322,14 +1013,9 @@ async fn consumer_loop(
         broadcast_typing(&users, &job.workspace_name, false);
 
         let Some(response) = response else {
-            // A custom role's failure produces no answer: deliver the durable
-            // failure notice to the admin's Assistant — never the emoji, never
-            // anything to the owner. A worker branch's failure delivers the same
-            // kind of notice into the asking conversation. Guarded exactly like
-            // the emoji branch: a deliberately stopped or drained launch stays
-            // silent. These arms are mutually exclusive with the emoji: neither a
-            // custom role nor a worker branch may EVER emit the generic failure
-            // emoji into the owner's channel.
+            // A custom role's failure produces no answer: deliver the durable failure notice to
+            // the admin's Assistant — never the emoji, never anything to the owner. A worker
+            // branch's failure goes into the asking conversation, guarded the same way.
             if role == Role::Custom {
                 if !agent.is_cancelled() && !crate::shutdown::aborting() {
                     let name = job
@@ -1348,19 +1034,9 @@ async fn consumer_loop(
                     route_worker_branch_failure(launch, &ws.path).await;
                 }
             }
-            // Send emoji error only for UserMessage jobs where the agent truly
-            // failed (not cancelled or shutdown). Internal job kinds
-            // (TicketNotify, AnalyzeToolResult, ResearchResult, ManagerNotify,
-            // CustomRoleNotify, GuestMessage) get no feedback.
-            //
-            // We check both the agent-specific token AND the
-            // global shutdown token because during SIGTERM/SIGINT the global
-            // token fires first — work() catches it and returns None, but the
-            // agent-specific token may not have been cancelled yet.
-            //
-            // Drained agents must NOT emit the failure emoji: their round was
-            // cut short by the graceful-drain window (or shutdown), not a
-            // failure.
+            // The emoji only for a UserMessage job whose agent truly failed; internal kinds get
+            // no feedback. Both the agent token AND the global shutdown token are checked, since
+            // during SIGTERM/SIGINT the global one fires first. A drained agent must NOT emit it.
             else if job.kind == MessageKind::UserMessage
                 && !agent.is_cancelled()
                 && !crate::shutdown::aborting()
@@ -1373,28 +1049,18 @@ async fn consumer_loop(
             continue;
         };
 
-        // Sleep-ended turn: the Assistant deliberately went silent waiting for
-        // new input — deliver nothing (no empty bubble, no failure emoji), but
-        // still confirm the at-least-once pending-jobs boundary.
+        // Sleep-ended turn: the Assistant deliberately went silent — deliver nothing (no
+        // empty bubble, no emoji), but still confirm the at-least-once pending-jobs boundary.
         if agent.sleep_ended {
             confirm_turn_delivery(&queued).await;
             confirm_pending_delivery(&job).await;
             continue;
         }
 
-        // ── Response delivery ─────────────────────────────────────────
-        // Manager: the sole delivery path is the durable <manager-message>
-        // envelope into the admin's personal Assistant — unless the Manager was
-        // answering a custom-role caller, in which case the answer delivers
-        // back into that branch.
-        // A custom role: the durable <custom-role-message> envelope into the
-        // admin's personal Assistant (the folder the launch ran in travels in
-        // the envelope's `workspace` attribute).
-        // A worker branch: the durable <worker-report> envelope into the asking
-        // conversation — the asking custom role's branch, or the admin's
-        // Assistant when the assistant asked.
-        // Other roles: broadcast to all of the triggering user's channel
-        // bindings (or use fallback for unregistered users).
+        // Manager: a durable `<manager-message>` into the admin's Assistant, or back into the
+        // asking branch. Custom role: `<custom-role-message>`. Worker branch: `<worker-report>`
+        // into the asking conversation. Other roles: broadcast to the user's channel bindings,
+        // with the unregistered-user fallback.
         match role {
             Role::Manager => match job.reply_to_custom.clone() {
                 Some(reply) => {
@@ -1408,10 +1074,9 @@ async fn consumer_loop(
                 let identifier = launch.and_then(|c| c.identifier.as_deref());
                 route_custom_role_notify(&response, name, &job.workspace_name, identifier).await;
             }
-            // A Worker job reaches the consumer loop only as a worker branch (a
-            // plain worker sub-agent is run by the dispatching tool, never
-            // routed), so the launch is always there — reporting the absence
-            // rather than dropping the report silently.
+            // A Worker job reaches the consumer loop only as a worker branch (a plain worker
+            // sub-agent is run by the dispatching tool, never routed), so the launch is always
+            // there — reporting its absence rather than dropping the report silently.
             Role::Worker => {
                 if let Some(launch) = worker_branch_launch(&job) {
                     route_worker_branch_report(&response, launch, &ws.path).await;
@@ -1434,37 +1099,26 @@ async fn consumer_loop(
         confirm_turn_delivery(&queued).await;
         confirm_pending_delivery(&job).await;
 
-        // A long-lived chat role's session over a summary trigger compacts here,
-        // after this reply is delivered and its pending row confirmed (a crash
-        // during the compaction can then not replay a delivered job), in the pause
-        // before the user's next message.
+        // A long-lived chat role's session over a summary trigger compacts here, after this
+        // reply is delivered and its pending row confirmed (a crash during the compaction then
+        // cannot replay a delivered job), in the pause before the user's next message.
         agent.maybe_summarize_after_delivery().await;
     }
 }
 
-/// The launch of a worker-branch job, when the job is one: `Some` only when the
-/// job carries a launch whose role is [`Role::Worker`]. A plain worker sub-agent
-/// never reaches the consumer loop, so this is the branch discriminator.
+/// The launch of a worker-branch job: `Some` only when the job carries a launch whose role
+/// is [`Role::Worker`]. A plain worker sub-agent never reaches the consumer loop.
 fn worker_branch_launch(job: &AgentJob) -> Option<&crate::Launch> {
     job.custom_role
         .as_ref()
         .filter(|launch| launch.role == Role::Worker)
 }
 
-/// Consumer-confirmed delivery: delete the durable pending_jobs row after the
-/// agent ran (at-least-once boundary — the row is created before routing and
-/// reclaimed only here or by boot replay). Also invoked on the
-/// pin-refusal path (a pinned-role envelope with an empty user), the
-/// custom-role refusal path, and an unrunnable branch launch
-/// ([`report_unrunnable_branch`]): the consumer accept-and-discards the
-/// job, and the row is reclaimed here so boot replay does not resurrect it. One
-/// sync retry on failure, then log-and-continue: residual duplicate
-/// re-delivery at next boot is bounded and accepted. Never called on
-/// workspace-not-found for a built-in role (the consumer skips the job) — a
-/// pending row for a deleted workspace re-routes and consumer-skips at every
-/// boot until the workspace returns; bounded and accepted (purge reclaims only
-/// `jobs`, never `pending_jobs` — the at-least-once guarantee keeps unconfirmed
-/// rows alive).
+// Consumer-confirmed delivery: delete the durable pending_jobs row after the agent ran
+// (at-least-once — created before routing, reclaimed only here or by boot replay), also on the
+// refusal paths. One sync retry, then log-and-continue: duplicate re-delivery at next boot is
+// bounded and accepted. Never called on workspace-not-found for a built-in role, so such a row
+// re-routes and skips at every boot until the workspace returns; accepted.
 async fn confirm_pending_delivery(job: &AgentJob) {
     let Some(id) = job.pending_job_id.as_deref() else {
         return;
@@ -1490,27 +1144,19 @@ async fn confirm_pending_delivery(job: &AgentJob) {
     }
 }
 
-/// Confirm the turn's earlier items too: each carries its own durable pending
-/// row (the same at-least-once boundary as the job that ended the batch), so a
-/// turn answering several messages reclaims them all. The last item is confirmed
-/// by the caller as before.
+/// Confirm the turn's earlier items too: each carries its own durable pending row (the same
+/// at-least-once boundary), so a turn answering several messages reclaims them all.
 async fn confirm_turn_delivery(queued: &[AgentJob]) {
     for item in queued {
         confirm_pending_delivery(item).await;
     }
 }
 
-/// Report a branch job that cannot run because the folder its launch names
-/// is gone — the rule being that an unrunnable launch is reported to the admin's
-/// Assistant (or the asking branch), naming the branch and the folder it ran in,
-/// never to the owner directly and never to a guest. The durable pending row is
-/// reclaimed with the notice, because the reported failure IS the delivery.
-///
-/// Only the positively-gone case reports: a transient store failure on the
-/// lookup above is not a verdict about the folder, so it keeps the plain skip
-/// (the pending row survives and re-routes). No-op for a built-in role, whose
-/// pending row is deliberately kept so it re-routes when the workspace returns
-/// (see [`confirm_pending_delivery`]).
+// Report a branch job whose launch names a folder that is gone: reported to the admin's
+// Assistant (or the asking branch), naming branch and folder, never to the owner or a guest
+// — and the pending row is reclaimed with the notice, because the failure IS the delivery.
+// Only the positively-gone case reports: a transient store failure keeps the plain skip, and
+// a built-in role's row is deliberately kept so it re-routes when the workspace returns.
 async fn report_unrunnable_branch(job: &AgentJob) {
     let Some(launch) = job.custom_role.as_ref() else {
         return;
@@ -1528,10 +1174,7 @@ async fn report_unrunnable_branch(job: &AgentJob) {
     confirm_pending_delivery(job).await;
 }
 
-// ── Typing helpers ────────────────────────────────────────────────────────
-
-/// Set up Telegram typing indicators for the given users. Returns a list of
-/// (CancellationToken, JoinHandle) pairs — one per unique Telegram chat.
+/// Set up Telegram typing indicators for the given users — one per unique Telegram chat.
 async fn setup_telegram_typing(
     users: &[UserRecord],
 ) -> Vec<(CancellationToken, tokio::task::JoinHandle<()>)> {
@@ -1583,8 +1226,6 @@ fn broadcast_typing(users: &[UserRecord], workspace: &str, is_typing: bool) {
     }
 }
 
-// ── Response delivery ─────────────────────────────────────────────────────
-
 /// Outcome of attempting to deliver a response on a single channel.
 enum DeliverOutcome {
     Sent,
@@ -1594,10 +1235,8 @@ enum DeliverOutcome {
     Failed(anyhow::Error),
 }
 
-/// Resolve the recipient and send `response` on `channel`.
-///
-/// Returns the outcome so each delivery function applies its own per-variant
-/// logging — resolve-miss handling (silent skip vs warn+abort) and error
+/// Resolve the recipient and send `response` on `channel`, returning the outcome so each
+/// delivery function applies its own per-variant logging: resolve-miss handling and error
 /// wording differ between manager / single-user / unregistered delivery.
 async fn deliver_on_channel(
     channel: &dyn Channel,
@@ -1623,14 +1262,10 @@ async fn deliver_on_channel(
     }
 }
 
-/// The one spelling of the admin-pinning rule every relay-to-the-owner route
-/// shares: a job addressed to the single admin's Assistant, in that admin's own
-/// personal workspace, on the `gui` channel, with no reply target and no branch.
-/// The admin is a constant identity rather than a lookup, so no account-store
-/// hiccup can drop an envelope, and the consumer re-validates the pinning
-/// invariant ([`crate::users::enforce_personal_pinning`]), so no site re-pins.
-/// `originating_workspace` is the folder the relayed content was produced in,
-/// when the kind grants its file references that root (see [`MessageKind`]).
+// The one spelling of the admin-pinning rule every relay-to-the-owner route shares: a job
+// for the single admin's Assistant, in that admin's personal workspace, on `gui`, with no
+// reply target and no branch. The admin is a constant identity, so no account-store hiccup can
+// drop an envelope; the consumer re-validates the invariant.
 fn admin_assistant_job(
     content: String,
     kind: MessageKind,
@@ -1653,8 +1288,7 @@ fn admin_assistant_job(
 }
 
 /// The content of a `<manager-message>` envelope for `response` produced in
-/// `source_workspace`, or `None` for an empty response (a sleep-ended or failed
-/// turn delivers nothing).
+/// `source_workspace`, or `None` for an empty response.
 fn manager_message_content(response: &str, source_workspace: &str) -> Option<String> {
     if response.is_empty() {
         return None;
@@ -1671,13 +1305,10 @@ fn manager_message_content(response: &str, source_workspace: &str) -> Option<Str
     ))
 }
 
-/// Auto-delivery hook: EVERY Manager response is additionally routed as a
-/// durable `<manager-message>` envelope into the admin's Assistant session —
-/// the only manager→assistant delivery path. `source_workspace` is the folder
-/// the response was produced in; it rides in the job's `originating_workspace`
-/// and in the envelope's `workspace` attribute, so a `[FILE:...]`/`[IMAGE:]`
-/// marker in the response stays authorized. Empty responses deliver nothing
-/// (sleep-ended/failed turns never reach the delivery branch at all).
+/// Auto-delivery hook: EVERY Manager response is additionally routed as a durable
+/// `<manager-message>` envelope into the admin's Assistant session. `source_workspace` rides in
+/// the job's `originating_workspace` and in the envelope's `workspace` attribute, so a marker in
+/// the response stays authorized. Empty responses deliver nothing.
 async fn route_manager_notify(response: &str, source_workspace: &str) {
     let Some(content) = manager_message_content(response, source_workspace) else {
         return;
@@ -1687,9 +1318,8 @@ async fn route_manager_notify(response: &str, source_workspace: &str) {
     stamp_and_route(job, &target, "manager notify envelope").await;
 }
 
-/// A job delivered into the conversation that asked for it instead of the
-/// admin's Assistant: the destination comes from `asker`, the envelope from
-/// `kind`.
+/// A job delivered into the conversation that asked for it instead of the admin's
+/// Assistant: the destination comes from `asker`, the envelope from `kind`.
 fn branch_job(content: String, asker: &Asker, kind: MessageKind) -> AgentJob {
     AgentJob {
         content,
@@ -1707,11 +1337,10 @@ fn branch_job(content: String, asker: &Asker, kind: MessageKind) -> AgentJob {
     }
 }
 
-/// Deliver a Manager's answer back into the custom-role branch that asked for
-/// it — the mirror image of the analyze and worker result envelopes:
-/// the job carries the branch address (via its launch) and the folder the
-/// asking turn ran in, and is tagged `<manager-message>` because that is the
-/// shape `send`'s `manager` addressee promises its caller.
+/// Deliver a Manager's answer back into the custom-role branch that asked for it — the
+/// mirror image of the analyze and worker result envelopes: the job carries the branch
+/// address and the folder the asking turn ran in, tagged `<manager-message>` because that is
+/// the shape `send`'s `manager` addressee promises its caller.
 async fn route_manager_reply_to_custom(response: &str, source_workspace: &str, asker: &Asker) {
     let Some(content) = manager_message_content(response, source_workspace) else {
         return;
@@ -1721,12 +1350,10 @@ async fn route_manager_reply_to_custom(response: &str, source_workspace: &str, a
     stamp_and_route(job, &target, "manager reply envelope").await;
 }
 
-/// Deliver a finished custom role's answer into the admin Assistant's session
-/// (the durable `<custom-role-message>` envelope, `MessageKind::CustomRoleNotify`).
-/// `source_workspace` is the folder the launch ran in and travels in
-/// `originating_workspace`, so a file/media reference in the answer is
-/// validated against the folder it was produced in. `identifier` names the
-/// branch when the launch ran on a named one. An empty answer delivers nothing.
+/// Deliver a finished custom role's answer into the admin Assistant's session (the durable
+/// `<custom-role-message>` envelope). `source_workspace` travels in `originating_workspace`,
+/// so a file/media reference in the answer is validated against the folder it was produced
+/// in; `identifier` names the branch when the launch ran on one. An empty answer delivers nothing.
 async fn route_custom_role_notify(
     response: &str,
     role_name: &str,
@@ -1760,9 +1387,8 @@ async fn route_custom_role_notify(
     stamp_and_route(job, &target, "custom role notify envelope").await;
 }
 
-/// Deliver the notice that a custom role's launch failed, naming the role, its
-/// branch when it ran on a named one, and the folder it ran in. Nothing goes to
-/// the owner directly.
+/// Deliver the notice that a custom role's launch failed, naming the role, its branch when
+/// it ran on one, and the folder it ran in. Nothing goes to the owner directly.
 async fn route_custom_role_failure(
     role_name: &str,
     source_workspace: &str,
@@ -1791,13 +1417,10 @@ async fn route_custom_role_failure(
     stamp_and_route(job, &target, "custom role failure envelope").await;
 }
 
-/// Deliver a worker branch's finished turn into the conversation that asked for
-/// it: the asking custom role's branch when the launch carries an asker
-/// ([`crate::Launch::reply_to`]), else the admin Assistant's session. Both shapes
-/// carry the `<worker-report>` envelope, naming the folder the turn ran in (its
-/// resolved PATH, not the branch's durable address) and its branch. An empty
-/// answer delivers nothing, and the report gains no file-delivery power the
-/// worker's single-run report does not have.
+/// Deliver a worker branch's finished turn into the conversation that asked for it: the asking
+/// custom role's branch when the launch carries an asker, else the admin Assistant's session.
+/// Both carry the `<worker-report>` envelope, naming the folder the turn ran in (its resolved
+/// PATH, not the branch's durable address) and its branch; an empty answer delivers nothing.
 async fn route_worker_branch_report(response: &str, launch: &crate::Launch, folder: &str) {
     if response.is_empty() {
         return;
@@ -1811,11 +1434,10 @@ async fn route_worker_branch_report(response: &str, launch: &crate::Launch, fold
     route_worker_branch_envelope(content, launch.reply_to.as_deref()).await;
 }
 
-/// Deliver the notice that a worker branch's turn produced no answer, into the
-/// same destination as its report — the failure counterpart of
-/// [`route_worker_branch_report`]. `folder` is the same resolved path the report
-/// names; [`report_unrunnable_branch`] passes the branch's durable address
-/// because no workspace was resolved to run in.
+/// Deliver the notice that a worker branch's turn produced no answer, into the same
+/// destination as its report. `folder` is the same resolved path the report names;
+/// [`report_unrunnable_branch`] passes the branch's durable address, since no workspace was
+/// resolved to run in.
 async fn route_worker_branch_failure(launch: &crate::Launch, folder: &str) {
     let content = crate::tools::build_worker_envelope(
         "worker_failure.md",
@@ -1826,12 +1448,10 @@ async fn route_worker_branch_failure(launch: &crate::Launch, folder: &str) {
     route_worker_branch_envelope(content, launch.reply_to.as_deref()).await;
 }
 
-/// Route a worker branch's envelope: into the asking custom role's branch when
-/// the caller carried one (mirroring [`route_manager_reply_to_custom`]), else
-/// into the admin's Assistant session (mirroring [`route_custom_role_notify`]).
-/// Neither arm sets `originating_workspace`: a worker report must carry exactly
-/// the file-delivery roots the single-run worker's report carries — its own
-/// delivery workspace alone.
+/// Route a worker branch's envelope: into the asking custom role's branch when the caller
+/// carried one (mirroring [`route_manager_reply_to_custom`]), else into the admin's Assistant
+/// session. Neither arm sets `originating_workspace`: a worker report must carry exactly the
+/// file-delivery roots the single-run worker's report carries — its own workspace alone.
 async fn route_worker_branch_envelope(content: String, asker: Option<&Asker>) {
     let job = match asker {
         Some(asker) => branch_job(content, asker, MessageKind::ImplementResult),
@@ -1841,12 +1461,10 @@ async fn route_worker_branch_envelope(content: String, asker: Option<&Asker>) {
     stamp_and_route(job, &target, "worker branch report envelope").await;
 }
 
-/// Transport-deliver `response` to every channel binding of `users`
-/// (broadcast + chat_history persistence happen at the call sites). Logs both
-/// diagnostics per reachable binding: an unresolvable recipient (warn — the
-/// response is persisted but not transport-delivered) and a transport failure
-/// (error). `workspace` names the workspace in the no-channels diagnostic
-/// (which also names the affected users).
+/// Transport-deliver `response` to every channel binding of `users` (broadcast and
+/// chat_history persistence happen at the call sites). Logs an unresolvable recipient (warn —
+/// persisted but not transport-delivered) and a transport failure (error) per binding.
+/// `workspace` names the workspace in the no-channels diagnostic.
 async fn deliver_response_over_channels(
     response: &str,
     users: &[UserRecord],
@@ -1907,21 +1525,10 @@ async fn deliver_response_over_channels(
     }
 }
 
-/// Deliver a response to a single registered user, broadcasting it to ALL of
-/// the user's channel bindings.
-///
-/// `user` is the resolved [`UserRecord`] for the job's sender — guaranteed
-/// non-empty by the consumer loop before calling this function.
-///
-/// Broadcast+persist is performed exactly once per response, tagged with the
-/// originating channel and a fresh `broadcast_id` on the row; transport delivery
-/// is delegated to [`deliver_response_over_channels`], which iterates all
-/// registered channels and every binding, using each binding's own reply_target.
-/// A user registered on multiple channels sees the reply on all of them,
-/// regardless of the channel the request came in on.
-///
-/// `job.reply_target` is not used to scope transport delivery for registered
-/// users — each binding supplies its own reply_target on its own channel.
+/// Deliver a response to a single registered user, broadcasting it to ALL of the user's
+/// channel bindings through [`deliver_response_over_channels`], which walks every registered
+/// channel with that binding's own reply_target, so a user bound on several channels sees the
+/// reply on all of them. `job.reply_target` does not scope delivery for registered users.
 async fn deliver_single_user_response(
     response: &str,
     user: &UserRecord,
@@ -1929,8 +1536,7 @@ async fn deliver_single_user_response(
     role: &Role,
     file_roots: &[std::path::PathBuf],
 ) {
-    // Broadcast + persist (tagged with the originating channel and a fresh
-    // dispatch tag on the row).
+    // Broadcast + persist, tagged with the originating channel and a fresh dispatch tag.
     let channel = job.channel.as_str();
     broadcast_and_persist_agent_response(
         &user.name,
@@ -1952,23 +1558,15 @@ async fn deliver_single_user_response(
     .await;
 }
 
-/// Deliver a response to an unregistered user (no [`UserRecord`] in the users DB).
+/// Deliver a response to an unregistered user (no [`UserRecord`] in the users DB), falling
+/// back to the originating channel with `job.reply_target` (or `job.user_name`) as the reply
+/// target, so the original message's target (e.g. a Telegram chat_id) is preserved. Also used
+/// by the binary for inline confirmations via raw `reply_target` passthrough.
 ///
-/// Falls back to the originating channel using `job.reply_target` (when
-/// available) or `job.user_name` as the reply target. Works for any user
-/// regardless of registration status and preserves the original message's
-/// reply target (e.g. Telegram chat_id).
-///
-/// Also used directly by the binary for inline confirmations (e.g. Telegram
-/// session-clear replies) via raw `reply_target` passthrough.
-///
-/// The response is always broadcast + persisted first (so it appears in the
-/// GUI chat history even if the channel transport delivery fails).
-///
-/// `file_roots` anchors and confines outbound media markers exactly as in
-/// [`deliver_single_user_response`]; an empty slice names no workspace, so a
-/// relative marker cannot be delivered and no `[FILE:...]` is authorized —
-/// which is what the inline-confirmation caller passes.
+/// Broadcast + persisted first, so it reaches the GUI chat history even if the transport
+/// fails. `file_roots` anchors and confines media markers as in
+/// [`deliver_single_user_response`]; an empty slice names no workspace, so no relative marker
+/// and no `[FILE:...]` is authorized — what the inline-confirmation caller passes.
 pub async fn deliver_unregistered_user_response(
     response: &str,
     job: &AgentJob,
@@ -1982,8 +1580,8 @@ pub async fn deliver_unregistered_user_response(
     let user_name =
         crate::session::normalize_user_name(&job.user_name, "deliver_unregistered_user_response");
 
-    // Broadcast + persist (works with just strings, no UserRecord needed),
-    // tagged with the originating channel and a fresh dispatch tag on the row.
+    // Broadcast + persist (strings only, no UserRecord needed), tagged with the originating
+    // channel and a fresh dispatch tag on the row.
     broadcast_and_persist_agent_response(
         user_name,
         ch,
@@ -1994,13 +1592,11 @@ pub async fn deliver_unregistered_user_response(
     )
     .await;
 
-    // Try to send via the originating channel.
     let Some(chan) = crate::channel_registry().get(ch) else {
         return;
     };
 
-    // Use reply_target from the original message when available (e.g. Telegram
-    // chat_id), falling back to user_name.
+    // reply_target from the original message when available (e.g. Telegram chat_id).
     let reply_target = job.reply_target.as_deref().unwrap_or(user_name);
     match deliver_on_channel(chan.as_ref(), user_name, reply_target, response, file_roots).await {
         DeliverOutcome::Unresolvable => warn!(
@@ -2019,8 +1615,7 @@ pub async fn deliver_unregistered_user_response(
     }
 }
 
-/// Resolve a single user by name, returning their full record if available.
-/// Uses a targeted database query instead of loading all users.
+/// Resolve a single user by name with a targeted query instead of loading all users.
 async fn resolve_single_user(user_name: &str) -> Option<UserRecord> {
     let store = crate::users::USER_STORE.get()?;
     match store.find_by_name(user_name).await {
@@ -2029,8 +1624,6 @@ async fn resolve_single_user(user_name: &str) -> Option<UserRecord> {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2038,11 +1631,7 @@ mod tests {
     use crate::channels::GuiChannel;
     use std::sync::Arc;
 
-    // ── Consumer loop lifecycle tests ─────────────────────────────────
-
-    /// The turn a queue forms ends with the first urgent message it holds: an
-    /// urgent one never overtakes what was already waiting and never brings a
-    /// later arrival with it.
+    /// An urgent message never overtakes what already waited, nor pulls a later arrival.
     #[test]
     fn a_turn_ends_with_its_urgent_message_and_leaves_later_arrivals() {
         let job = |content: &str, urgent: bool| {
@@ -2055,14 +1644,11 @@ mod tests {
             batch.iter().map(|job| job.content.clone()).collect()
         };
 
-        // Nothing urgent: the one job at the front, everything behind it queued.
         let mut waiting: std::collections::VecDeque<_> =
             [job("one", false), job("two", false)].into();
         assert_eq!(contents(&take_turn_batch(&mut waiting)), ["one"]);
         assert_eq!(waiting.len(), 1, "the rest keeps its turn");
 
-        // An urgent message behind two waiting ones takes them with it, itself
-        // last; a later arrival stays queued.
         let mut waiting: std::collections::VecDeque<_> = [
             job("one", false),
             job("two", false),
@@ -2074,13 +1660,10 @@ mod tests {
         assert_eq!(contents(&batch), ["one", "two", "urgent"]);
         assert_eq!(waiting.len(), 1, "a later arrival is not pulled forward");
 
-        // An urgent message at the front is a turn of its own.
         let mut waiting: std::collections::VecDeque<_> = [job("urgent", true)].into();
         assert_eq!(contents(&take_turn_batch(&mut waiting)), ["urgent"]);
         assert!(waiting.is_empty());
 
-        // Two urgent messages are two turns, in arrival order: the first closes
-        // its batch, the second closes the next one.
         let mut waiting: std::collections::VecDeque<_> = [
             job("urgent-a", true),
             job("urgent-b", true),
@@ -2092,8 +1675,6 @@ mod tests {
         assert_eq!(contents(&take_turn_batch(&mut waiting)), ["later"]);
     }
 
-    /// An announcement is outstanding exactly until it is taken by the turn that
-    /// waits for it: it is never waited for twice.
     #[test]
     fn an_announcement_is_waited_for_once() {
         let arrivals = UrgentArrivals::default();
@@ -2113,8 +1694,6 @@ mod tests {
         drop(second);
     }
 
-    /// The turn waits for an announced urgent message and takes it last,
-    /// together with whatever reached the queue while it held.
     #[tokio::test]
     #[serial_test::serial(drain)] // the hold observes the process-global drain flag
     async fn a_pending_announcement_holds_the_turn_for_its_message() {
@@ -2125,7 +1704,6 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             let _ = tx.send(job_with_content("ordinary", false));
             let _ = tx.send(job_with_content("urgent", true));
-            // The hand-over completed: the wait ends with it.
             drop(announcement);
         });
 
@@ -2146,8 +1724,8 @@ mod tests {
         assert_eq!(contents, ["ordinary", "urgent"]);
     }
 
-    /// A hand-over that never arrives is given up after its window instead of
-    /// parking the queue, and a staging task that is gone ends the wait at once.
+    /// A hand-over that never arrives is given up after its window; a staging task that is
+    /// gone ends the wait at once.
     #[tokio::test]
     #[serial_test::serial(drain)] // the hold observes the process-global drain flag
     async fn an_announcement_that_never_arrives_is_given_up() {
@@ -2170,8 +1748,7 @@ mod tests {
             "the wait gave the announcement up"
         );
 
-        // The staging task is gone before handing the message over: nothing is
-        // coming, so the turn is not held at all.
+        // The staging task is gone before the hand-over: nothing is coming.
         let gone = urgent.announce();
         drop(gone);
         let started = std::time::Instant::now();
@@ -2197,8 +1774,6 @@ mod tests {
         assert!(urgent.take().is_empty(), "and nothing is left outstanding");
     }
 
-    /// A drain ends the hold at once instead of parking the queue for a message
-    /// the consumer will not run.
     #[tokio::test]
     #[serial_test::serial(drain)]
     async fn a_drain_ends_the_urgent_hold() {
@@ -2226,8 +1801,7 @@ mod tests {
         assert!(!kept, "a drain stops the consumer, so nothing holds it");
     }
 
-    /// An announcement lands on the addressed agent's consumer only — and on
-    /// no agent at all when that agent has no consumer (nothing was running).
+    /// An announcement lands on the addressed agent's consumer only.
     #[tokio::test]
     async fn announce_urgent_reaches_the_addressed_consumer() {
         let _ = init_global();
@@ -2260,8 +1834,7 @@ mod tests {
             "another agent's consumer is untouched"
         );
 
-        // No consumer: the message is answered by the next turn that is started
-        // for that agent, and the announcement is not an error.
+        // No consumer: the next turn started for that agent answers it; not an error.
         assert!(
             announce_urgent(&format!(
                 "_test_announce_absent_{}",
@@ -2275,7 +1848,6 @@ mod tests {
         unregister_agent(&other);
     }
 
-    /// A minimal job carrying `content` and the urgent mark.
     fn job_with_content(content: &str, urgent: bool) -> AgentJob {
         AgentJob {
             content: content.to_string(),
@@ -2284,7 +1856,6 @@ mod tests {
         }
     }
 
-    /// Shortcut to construct a minimal [`AgentJob`] for lifecycle tests.
     fn make_job(role: Role, workspace: &str, user: &str, channel: &str) -> AgentJob {
         AgentJob {
             content: String::new(),
@@ -2314,30 +1885,21 @@ mod tests {
         assert!(guard.contains_key(id));
         drop(guard);
 
-        // Cleanup
         let map = ROUTER.get().unwrap();
         let mut guard = map.write().unwrap_poison();
         guard.remove(id);
     }
 
-    /// Verify that the consumer loop exits gracefully when the channel's
-    /// last sender is dropped (causing `rx.recv()` to return `None`), AND
-    /// that the consumer's cleanup wrapper removes the entry from the router
-    /// table.
-    ///
-    /// We call [`route()`] which spawns the consumer and stores the sender.
-    /// We then remove the sender and drop it to close the channel, but
-    /// re-insert a dummy sender so the cleanup wrapper (which runs after the
-    /// consumer exits) removes an actual entry from the map.
+    /// The consumer exits when the channel's last sender is dropped, and its cleanup
+    /// wrapper removes the router entry: a dummy sender is re-inserted after the drop so
+    /// the removal proves the wrapper ran.
     #[tokio::test]
     async fn test_consumer_loop_exits_gracefully_on_sender_drop() {
         let _ = init_global();
         let id = "_test_ua_on_close";
 
-        // Route a job — creates the consumer and stores the sender.
         route(id, make_job(Role::Assistant, "", "", ""));
 
-        // Verify consumer is registered.
         assert!(
             ROUTER
                 .get()
@@ -2358,8 +1920,7 @@ mod tests {
             .expect("sender should exist");
         drop(dropped_tx);
 
-        // Re-insert a dummy sender so the consumer's cleanup wrapper has an
-        // entry to remove (proving it actually runs after the consumer exits).
+        // A dummy sender for the cleanup wrapper to remove once the consumer exits.
         let (dummy_tx, _) = mpsc::unbounded_channel::<AgentJob>();
         ROUTER.get().unwrap().write().unwrap_poison().insert(
             id.to_string(),
@@ -2369,8 +1930,7 @@ mod tests {
             },
         );
 
-        // Poll until the consumer loop exits and its cleanup wrapper removes
-        // the dummy entry.
+        // Poll until the consumer exits and the wrapper removes the dummy entry.
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
         let mut cleaned_up = false;
         while tokio::time::Instant::now() < deadline {
@@ -2393,9 +1953,6 @@ mod tests {
         );
     }
 
-    // ── Workspace resolution tests ─────────────────────────────────────
-
-    /// Resolving a workspace that exists in the DB returns it.
     #[tokio::test]
     // Shares the process-global stores with the provider-group tests (uniform exclusion).
     #[serial_test::serial(provider)]
@@ -2410,8 +1967,6 @@ mod tests {
         assert_eq!(resolved.unwrap().name, "test_resolve_ws");
     }
 
-    /// Resolving a personal workspace constructs it on the fly when
-    /// it is NOT in the DB.
     #[tokio::test]
     #[serial_test::serial(provider)]
     async fn test_resolve_workspace_personal() {
@@ -2423,13 +1978,10 @@ mod tests {
 
         assert_eq!(ws.name, "personal:liliana");
         assert_eq!(ws.status, crate::WorkspaceStatus::Ready);
-        // Path should point to the userspace directory.
         let expected_path = crate::users::personal_workspace_path("liliana");
         assert_eq!(ws.path, expected_path);
     }
 
-    /// Resolving a workspace that genuinely does not exist (and is not
-    /// a personal workspace) returns `Ok(None)`.
     #[tokio::test]
     #[serial_test::serial(provider)]
     async fn test_resolve_workspace_not_found() {
@@ -2443,10 +1995,9 @@ mod tests {
         );
     }
 
-    /// A path that is a managed workspace's own folder resolves to that
-    /// workspace — not to a separate path-named area over the same tree — so a
-    /// launch addressed by path still runs with the workspace's notes, its pause
-    /// state and its search engine.
+    /// A path that is a managed workspace's own folder resolves to that workspace, not to a
+    /// path-named area over the same tree, so a launch by path keeps its notes, pause state
+    /// and search engine.
     #[tokio::test]
     #[serial_test::serial(provider)]
     async fn test_resolve_workspace_path_of_managed_workspace() {
@@ -2469,11 +2020,8 @@ mod tests {
         assert_eq!(resolved.name, "path_resolved_ws");
     }
 
-    // ── Helpers ──────────────────────────────────────────────────────────
-
-    /// A channel name unique to the message_router delivery tests, so the
-    /// spy registration never collides with a real "telegram" channel that a
-    /// parallel test (e.g. telegram_tests) may have already registered.
+    /// Unique to these delivery tests, so the spy never collides with a real "telegram"
+    /// channel a parallel test (e.g. telegram_tests) may have registered.
     const TEST_SPY_CHANNEL: &str = "__test_spy_channel";
 
     /// Set up DB stores + channel registry for response-delivery tests.
@@ -2484,13 +2032,9 @@ mod tests {
         crate::channel_registry().register(Arc::new(gui_channel));
     }
 
-    // ── Response delivery tests ──────────────────────────────────────────
-    //
-    // The broadcast outcome is asserted through the spy channel below: the
-    // real transports are no-ops or hard to observe at this level, so a
-    // delivery path that only "completes without panic" proves nothing.
+    // The broadcast outcome is asserted through the spy channel below: the real transports
+    // are no-ops at this level, so a path that only "completes without panic" proves nothing.
 
-    /// `resolve_single_user` returns a [`UserRecord`] when the user exists.
     #[tokio::test]
     #[serial_test::serial(provider)]
     async fn test_resolve_single_user_found() {
@@ -2502,7 +2046,6 @@ mod tests {
         assert_eq!(user.as_ref().unwrap().name, "admin");
     }
 
-    /// `resolve_single_user` returns `None` for a non-existent user.
     #[tokio::test]
     #[serial_test::serial(provider)]
     async fn test_resolve_single_user_not_found() {
@@ -2512,11 +2055,8 @@ mod tests {
         assert!(user.is_none(), "non-existent user should return None");
     }
 
-    /// `deliver_single_user_response` broadcasts the reply to ALL of the user's
-    /// channel bindings. Admin is bound to both "gui" and a registered spy
-    /// channel; the job originates on "gui" but the reply reaches every
-    /// registered channel the user is bound to. The spy captures at least one
-    /// send.
+    /// The reply reaches every channel the user is bound to, whatever channel the job
+    /// originated on.
     #[tokio::test]
     #[serial_test::serial(provider)]
     async fn test_deliver_single_user_broadcasts_to_all_bindings() {
@@ -2569,9 +2109,6 @@ mod tests {
         );
     }
 
-    // ── Job builder tests ───────────────────────────────────────────────
-
-    /// `agent_message_job` threads the normalized identity + durable kind.
     #[test]
     fn agent_message_job_threading() {
         let job = agent_message_job("hello".to_string(), "proj_ws".to_string(), "alice", None);
@@ -2586,12 +2123,10 @@ mod tests {
         assert_eq!(job.user_name, "admin");
     }
 
-    /// Auto-delivery round trip: a Manager response persists one durable
-    /// `<manager-message>` envelope for the admin, addressed to the admin's
-    /// personal Assistant session, carrying the FULL untruncated response, with
-    /// the source workspace in `originating_workspace` and in the envelope
-    /// attribute. Empty responses persist nothing. Cleans up the row it created
-    /// so other tests' boot-replay paths never see it.
+    /// A Manager response persists one durable `<manager-message>` envelope for the admin's
+    /// personal Assistant, carrying the FULL untruncated response with the source workspace
+    /// in `originating_workspace` and in the envelope attribute. Empty responses persist
+    /// nothing. Cleans up the row it created so boot replay never sees it.
     #[tokio::test]
     #[serial_test::serial(provider)]
     async fn manager_notify_delivers_to_admin_assistant() {
@@ -2616,10 +2151,8 @@ mod tests {
         let pending = crate::jobs::list_pending_jobs(conn)
             .await
             .expect("list pending");
-        // Scoped to the rows this test created: the shared global store is
-        // written by parallel tests too (see `src/session/mod.rs`), so a bare
-        // count for the target session would include rows that are not this
-        // test's.
+        // Scoped to the rows this test created: the global store is written by parallel
+        // tests too, so a bare count for the target session would include other tests' rows.
         let matching: Vec<_> = pending
             .iter()
             .filter(|r| r.target_agent_id == target && !before.contains(&r.id))
@@ -2670,9 +2203,6 @@ mod tests {
         }
     }
 
-    // ── register_agent / unregister_agent / try_route tests ────────────
-
-    /// `register_agent` creates a router entry that `try_route` can find.
     #[tokio::test]
     async fn test_register_agent_try_route_found() {
         let _ = init_global();
@@ -2688,7 +2218,6 @@ mod tests {
         unregister_agent(agent_id);
     }
 
-    /// `try_route` returns `false` when the agent is not registered.
     #[tokio::test]
     async fn test_try_route_agent_not_found() {
         let _ = init_global();
@@ -2701,14 +2230,11 @@ mod tests {
         );
     }
 
-    /// `try_route` returns `false` when the receiver has been dropped
-    /// (sender channel is closed).
     #[tokio::test]
     async fn test_try_route_receiver_dropped() {
         let _ = init_global();
         let agent_id = "_test_try_route_dropped";
 
-        // Register, create the receiver but immediately drop it.
         let rx = register_agent(agent_id);
         drop(rx);
 
@@ -2721,7 +2247,6 @@ mod tests {
         unregister_agent(agent_id);
     }
 
-    /// `unregister_agent` removes the entry so `try_route` returns `false`.
     #[tokio::test]
     async fn test_unregister_agent_removes_entry() {
         let _ = init_global();
@@ -2737,12 +2262,10 @@ mod tests {
         );
     }
 
-    /// A custom role's answer is an internal envelope addressed to the admin's
-    /// personal Assistant — never the owner's channels and never Telegram —
-    /// persisted as one durable `<custom-role-message>` row naming the folder the
-    /// launch ran in, so a `[FILE:]`/`[IMAGE:]` marker in the answer can be
-    /// relayed out of it. An empty answer delivers nothing. Cleans up the row it
-    /// created so other tests' boot-replay paths never see it.
+    /// A custom role's answer is an internal envelope for the admin's personal Assistant —
+    /// never the owner's channels — persisted as one durable `<custom-role-message>` row
+    /// naming the folder the launch ran in, so a marker in it can be relayed out. Cleans up
+    /// the row it created.
     #[tokio::test]
     #[serial_test::serial(provider)]
     async fn custom_role_notify_targets_the_admin_assistant() {
@@ -2804,12 +2327,9 @@ mod tests {
         }
     }
 
-    /// A worker branch's report has the same shape as the single-run worker's: the
-    /// `<worker-report>` envelope names the folder PATH the turn ran in (the
-    /// resolved workspace path, never the branch's durable address) and its
-    /// `branch` when the branch was named, and the delivered job carries NO
-    /// `originating_workspace` — so it gains no `[FILE:...]` root the single run
-    /// lacks. An empty answer delivers nothing.
+    /// The `<worker-report>` envelope names the folder PATH the turn ran in (never the
+    /// branch's durable address) and its `branch` when named, and the delivered job carries
+    /// NO `originating_workspace` — no `[FILE:...]` root the single run lacks.
     #[tokio::test]
     #[serial_test::serial(provider)]
     async fn worker_branch_report_matches_the_single_run_shape() {
@@ -2864,9 +2384,8 @@ mod tests {
             delivered.originating_workspace
         );
 
-        // A folder whose name carries a quote or an angle bracket cannot deform
-        // the envelope: the three characters that could end the attribute are
-        // escaped.
+        // A folder name carrying a quote or angle bracket cannot deform the envelope: the
+        // three characters that could end the attribute are escaped.
         route_worker_branch_report("did the thing", &launch, "/data/we\"ird<dir>").await;
         let hostile = assistant_rx
             .try_recv()
@@ -2893,9 +2412,8 @@ mod tests {
             ordinary.content
         );
 
-        // An asking custom role's branch: same shape, no extra root either. The
-        // asker travels on the LAUNCH (its single carrier), which is what the
-        // report reads.
+        // An asking custom role's branch: same shape, no extra root. The asker travels on
+        // the LAUNCH, its single carrier, which is what the report reads.
         let asking = crate::Launch {
             reply_to: Some(Box::new(Asker {
                 launch: launch.clone(),
@@ -2934,9 +2452,8 @@ mod tests {
         }
     }
 
-    /// A user with no row still gets the reply: it is sent through the
-    /// originating channel (the `reply_target` path) and persisted under the
-    /// seeded user, so an unregistered sender is never silently dropped.
+    /// A user with no row still gets the reply: sent through the originating channel and
+    /// persisted under the seeded user, so an unregistered sender is never silently dropped.
     #[tokio::test]
     #[serial_test::serial(provider)]
     async fn test_deliver_unregistered_user_response() {

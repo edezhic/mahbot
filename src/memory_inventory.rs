@@ -1,33 +1,15 @@
-//! The nightly memory inventory.
+//! Nightly memory inventory: once a night, per account, ask the admin Assistant to trim a
+//! personal memory file that has outgrown the workspace file limit.
 //!
-//! Every account's Assistant keeps its own [`MEMORY_FILE`] beside the rest of
-//! its personal folder, and a context render keeps only the first
-//! [`MAX_WORKSPACE_FILE_CHARS`] of it. Once a night, inside the 03:00–03:59
-//! local window, every account whose file is longer than that is sent one
-//! ordinary message asking it to inventory and clean up what it keeps — its
-//! memory, and the notes and working material it accumulated itself. Nothing
-//! here edits a file: the work belongs to the Assistant, with the tools it
-//! already has.
-//!
-//! At most one message per account per local day, recorded in
-//! `users.memory_inventory_day` BEFORE the message is handed over, so a restart
-//! cannot ask twice. A night lost to a shutdown, a sleeping machine or a crash
-//! in that gap is not caught up on, and a file still over the limit is asked
-//! about again on a later night.
-//!
-//! The window gates the tick, not the work a tick already started: a pass that
-//! began before 04:00 still asks every account it found over the limit, the same
-//! rule the product's other nightly work follows.
-//!
-//! [`MEMORY_FILE`]: crate::prompt::MEMORY_FILE
-//! [`MAX_WORKSPACE_FILE_CHARS`]: crate::prompt::MAX_WORKSPACE_FILE_CHARS
+//! At most one asking per account per local day (the day is recorded BEFORE the ask, so a crash
+//! cannot ask twice), and accounts are asked one at a time — each queued turn is awaited before the
+//! next account, so the passes never run side by side.
 
 use std::time::Duration;
 
 use chrono::Timelike;
 use tracing::{debug, info, warn};
 
-/// The local hour the inventory window opens (03:00–03:59).
 const INVENTORY_HOUR: u32 = 3;
 
 /// Wake interval — the same half-hour tick the product's other nightly work
@@ -35,21 +17,17 @@ const INVENTORY_HOUR: u32 = 3;
 /// inside it and a tick outside it does nothing.
 const TICK: Duration = Duration::from_mins(30);
 
-/// How long the hand-over is given to appear in the registry before the pass
-/// stops waiting for it.
+/// How long a turn may take to appear before an idle assistant counts as finished.
 const TURN_START_WAIT: Duration = Duration::from_secs(30);
 
-/// How long one assistant's turn is given once it is running, before the next
-/// account is asked anyway.
+/// Hard bound on one queued turn: past it the pass moves to the next account rather than wait.
 const TURN_WAIT: Duration = Duration::from_mins(10);
 
-/// How often [`wait_for_turn`] looks at the registry.
 const TURN_POLL: Duration = Duration::from_secs(5);
 
-/// The product-authored message asking for an inventory.
+/// Prompt asset holding the notice posted to the assistant.
 const NOTICE_ASSET: &str = "memory_inventory_notice.md";
 
-/// Run the nightly memory inventory loop.
 pub async fn run_memory_inventory_loop() {
     loop {
         if !crate::shutdown::sleep_or_shutdown_or_drain(TICK).await {
@@ -62,8 +40,6 @@ pub async fn run_memory_inventory_loop() {
     }
 }
 
-/// Measure every account's memory file and ask the assistants whose file no
-/// longer fits into their context.
 async fn inventory_pass() {
     let Some(store) = crate::users::USER_STORE.get() else {
         warn!("Memory inventory: USER_STORE not initialized — skipping this night");
@@ -102,8 +78,6 @@ async fn inventory_pass() {
             continue;
         }
 
-        // Record the day BEFORE the hand-over: a crash in between loses one
-        // night, while the opposite order could ask the same assistant twice.
         if let Err(e) = store.set_memory_inventory_day(&user, &today).await {
             warn!(user = %user, error = %e, "Memory inventory: failed to record the day — not asking");
             continue;
@@ -136,12 +110,6 @@ async fn read_memory(user: &str) -> Option<String> {
 /// Wait until the assistant's queued turn is over, so the next account is asked
 /// after it rather than beside it. `false` means the product is shutting down or
 /// draining and the pass must stop.
-///
-/// The registry entry is created when the turn's `Agent` is built and dropped
-/// when the turn ends, including the summary the session writes after delivery.
-/// Two consecutive empty polls are what counts as idle — one can land in the
-/// gap between two turns of the same consumer — and a notice that starts no turn
-/// at all is given [`TURN_START_WAIT`] before the pass stops waiting for it.
 async fn wait_for_turn(agent_id: &str) -> bool {
     let started = tokio::time::Instant::now();
     let mut running = false;

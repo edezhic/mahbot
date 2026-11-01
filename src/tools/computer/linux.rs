@@ -1,90 +1,74 @@
-//! Linux [`Backend`] for the Computer tool: AT-SPI2 accessibility (async D-Bus,
-//! observe/act), XTEST input synthesis via enigo, X11 stills via x11rb and
-//! Wayland stills via the Screenshot portal over zbus. All Rust-only: no
-//! system capture packages beyond the session's own daemons.
+//! Linux [`Backend`] for the Computer tool: AT-SPI2 accessibility (async D-Bus, observe/act), XTEST
+//! input synthesis via enigo, X11 stills via x11rb and Wayland stills via the Screenshot portal
+//! over zbus. All Rust-only: no system capture packages beyond the session's own daemons.
 //!
 //! # Which server this is
 //!
 //! [`wayland`] (from [`crate::util::display_server`]) decides stills and coordinate input: a
 //! Wayland session gets stills through the portal and no coordinate input, whether or not
-//! `WAYLAND_DISPLAY` is set. XWayland counts as Wayland, since an X connection there is not
-//! the session's server.
+//! `WAYLAND_DISPLAY` is set. XWayland counts as Wayland, since an X connection there is not the
+//! session's server.
 //!
 //! # Nothing left held, and nothing left behind
 //!
-//! Input synthesis is fire-and-forget: a gesture that stops partway reports what may still
-//! be held or half-applied rather than failing as if nothing happened, and the buttons a
-//! call pressed are let go on the way out — an error return or an unwind included, though a
-//! call abandoned inside a request of the server releases nothing until that request
-//! returns. The Screenshot portal's request is closed on every path, the timeout included;
-//! the image file it hands over is read and left where the portal put it, because only a
-//! file this tool created is ever deleted.
+//! Input synthesis is fire-and-forget: a gesture that stops partway reports what may still be held
+//! or half-applied rather than failing as if nothing happened, and the buttons a call pressed are
+//! let go on the way out — an error return or an unwind included, though a call abandoned inside a
+//! request of the server releases nothing until that request returns. The Screenshot portal's
+//! request is closed on every path, the timeout included; the image file it hands over is read and
+//! left where the portal put it, because only a file this tool created is ever deleted.
 //!
 //! # A locked session is refused
 //!
-//! Input into a locked session is synthesized and reported as delivered, and a still of
-//! it is a still of the lock screen, so the session's own lock state is asked first:
-//! systemd-logind's `LockedHint`, the one lock signal the system publishes for every
-//! desktop. A session that does not answer is not refused; the X screen saver's own state
-//! is deliberately not read, since a screen it blanked after an idle period with no
-//! locker is the ordinary session input still reaches.
+//! Input into a locked session is synthesized and reported as delivered, and a still of it is a
+//! still of the lock screen, so the session's own lock state is asked first: systemd-logind's
+//! `LockedHint`, the one lock signal the system publishes for every desktop. A session that does
+//! not answer is not refused; the X screen saver's state is deliberately not read, since a screen
+//! it blanked after an idle period with no locker is the ordinary session input still reaches.
 //!
-//! Surface geometry is PIXELS on Linux: X11 has no stable logical-point space and
-//! mixed-DPI makes physical↔logical translation unreliable — this is precisely
-//! why the tool is accessibility-first here.
+//! Surface geometry is PIXELS on Linux: X11 has no stable logical-point space and mixed-DPI makes
+//! physical↔logical translation unreliable — precisely why the tool is accessibility-first here.
 //!
-//! A window's identity is its AT-SPI object reference (`unique bus name|object
-//! path`): a stored key resolves to that very window or fails, never to another
-//! window of the same application.
+//! A window's identity is its AT-SPI object reference (`unique bus name|object path`): a stored key
+//! resolves to that very window or fails, never to another window of the same application.
+//! A window still must show the window's current visible pixels, occluders included, which reading
+//! its own drawable would not — so a window still is a crop of the screen capture. AT-SPI extents
+//! live in the accessibility coordinate space, which need not be the capture's pixels: the crop is
+//! taken only after the two are reconciled by `core::a11y_scale`; on X11, whose extents are the
+//! root's own pixels, an unreconcilable pair falls back to 1:1, and on Wayland the still is
+//! refused.
 //!
-//! A window still must show the window's current visible pixels, occluders
-//! included, which reading the window's own drawable would not — so a window
-//! still is a crop of the screen capture. AT-SPI extents live in the accessibility
-//! coordinate space, which need not be the capture's pixels: the crop is taken
-//! only after the two are reconciled by `core::a11y_scale`; on X11, whose extents
-//! are the root's own pixels, an unreconcilable pair falls back to 1:1, and on
-//! Wayland the still is refused instead.
+//! Mahbot's own window publishes no AT-SPI surface, so it never appears in an enumeration, has no
+//! element tree and no window still; screen-target input, key chords and typing still reach it.
 //!
-//! Mahbot's own window publishes no AT-SPI surface, so it never appears in an
-//! enumeration, has no element tree and no window still; screen-target input, key
-//! chords and typing still reach it. Nothing here needs to know which process owns
-//! a window.
+//! What this platform cannot answer, the answers say instead of implying otherwise: AT-SPI carries
+//! no application identity, so `apps` names a frontmost application only from the active state of
+//! the applications' windows (and names none when no window reports one), a listing gives no
+//! front-to-back order (the stack lives in the window manager), and a coordinate click cannot be
+//! checked against the window under its point — it is sent, and the answer says the point could not
+//! be checked. Focus is the exception: the toolkit publishes no "what has focus" call, so the
+//! element holding it is found by a bounded search of the addressed window's subtree — a few
+//! hundred nodes at most, since this probe runs after every action — and one that search cannot
+//! reach is reported as an element the platform cannot name.
 //!
-//! That last fact is what this platform cannot answer, and the answers say so instead of
-//! implying otherwise: AT-SPI carries no application identity, so `apps` names a
-//! frontmost application only from the active state of the applications' windows (and
-//! names none when no window reports one), a listing gives no front-to-back order (the
-//! stack lives in the window manager, unreachable from these windows), and a coordinate
-//! click cannot be checked against the window under its point — it is sent, and its
-//! answer states that the point could not be checked.
+//! A read never presents a ceiling as completeness: a tree that stopped at one records it in the
+//! observation's header, an application whose windows cannot be read is named as unread rather than
+//! appearing to have none, and a node whose own accessibility proxy cannot be read is skipped with
+//! its subtree — an accepted limit of the AT-SPI walk.
 //!
-//! Focus is the exception: the toolkit publishes no "what has focus" call, so the element
-//! that holds it is found by a bounded search of the addressed window's subtree — a few
-//! hundred nodes at most, since this probe runs after every action — and an element that
-//! search cannot reach is reported as one the platform cannot name.
-//!
-//! A read never presents a ceiling as completeness: a tree that stopped at one
-//! records it in the observation's header, and an application whose windows cannot
-//! be read is named as unread instead of appearing to have none. A node whose own
-//! accessibility proxy cannot be read is skipped with its subtree — an accepted
-//! limit of the AT-SPI walk.
-//!
-//! Every accessibility exchange is bounded: the connection is this backend's own,
-//! opened with the product's method timeout ([`core::EXCHANGE_DEADLINE`]), so a target
-//! that never answers costs one attribute or one child instead of the call. One
-//! aggregate budget per call ([`core::Budget`]) bounds resolution — which walks every
-//! application — and the walk alike, and each application gets a share of a listing so
-//! a hung one cannot spend it. A connection the accessibility service closed is rebuilt
-//! by the next call, so a restarted at-spi takes effect instead of leaving the
+//! Every accessibility exchange is bounded: the connection is this backend's own, opened with the
+//! product's method timeout ([`core::EXCHANGE_DEADLINE`]), so a target that never answers costs one
+//! attribute or one child instead of the call. One aggregate budget per call ([`core::Budget`])
+//! bounds resolution — which walks every application — and the walk alike, and each application
+//! gets a share of a listing so a hung one cannot spend it. A connection the accessibility service
+//! closed is rebuilt by the next call, so a restarted at-spi takes effect instead of leaving the
 //! capability dead for the life of the process.
 //!
-//! Nor is anything sized by what the machine reports: a name or a value is cut at
-//! the product's cap as it is read, and every still buffer is charged to the call's
-//! allowance. The accounting and its reasoning live in [`core`].
+//! Nor is anything sized by what the machine reports: a name or a value is cut at the product's cap
+//! as it is read, and every still buffer is charged to the call's allowance. The accounting and its
+//! reasoning live in [`core`].
 
 #![cfg(target_os = "linux")]
-// A handful of pedantic cast lints are inherent to the C ABI-style integer
-// geometry the atspi/X11 crates expose (i32 screen coords, u32 pixel dims).
 #![allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
@@ -126,36 +110,35 @@ pub(crate) static LINUX_BACKEND: LinuxBackend = LinuxBackend {
 };
 
 pub(crate) struct LinuxBackend {
-    /// The a11y bus connection, cloned out per call (never held across a call
-    /// body). `None` until one is established; a connection the service closed is
-    /// dropped and rebuilt by the next call, and a failed attempt caches nothing.
-    /// [`zbus::Connection`] carries the per-exchange deadline as its method timeout.
+    /// The a11y bus connection, cloned out per call (never held across a call body). `None` until
+    /// one is established; a connection the service closed is dropped and rebuilt by the next call,
+    /// and a failed attempt caches nothing. [`zbus::Connection`] carries the per-exchange deadline
+    /// as its method timeout.
     connection: tokio::sync::Mutex<Option<zbus::Connection>>,
 }
 
-/// Nodes one focus probe may visit: AT-SPI publishes no "what has focus" call, so the
-/// element is found by walking — and this probe runs after every action, so the search
-/// may cost a moment, not a walk of the whole window.
+/// Nodes one focus probe may visit: AT-SPI publishes no "what has focus" call, so the element is
+/// found by walking — and this probe runs after every action, so the search may cost a moment, not
+/// a walk of the whole window.
 const FOCUS_WALK_NODES: usize = 200;
-/// Cap on text read into a node's `value`: one character past what the renderer
-/// shows. The tree dump is a map of the surface, not a copy of its text, so one
-/// character more than the renderer displays is enough to know the value was cut —
-/// and the renderer's own count states that cut in the header.
+/// Cap on text read into a node's `value`: one character past what the renderer shows. The tree
+/// dump is a map of the surface, not a copy of its text, so one character more than the renderer
+/// displays is enough to know the value was cut — and the renderer's own count states that cut in
+/// the header.
 const VALUE_READ_CHARS: i32 = core::RENDER_VALUE_CHARS as i32 + 1;
 const INTERP_STEPS: usize = 12;
 
-/// What a refused or timed-out a11y connection ends in — the one message both
-/// states share; the next call retries, so a restarted at-spi is picked up.
+/// What a refused or timed-out a11y connection ends in — the one message both states share; the
+/// next call retries, so a restarted at-spi is picked up.
 const CONN_DEGRADED_MSG: &str =
     "AT-SPI2 accessibility bus unavailable — is at-spi2 installed and the session bus running?";
 
-/// The registry's well-known name, which the registry root is addressed by.
 const A11Y_REGISTRY: &str = "org.a11y.atspi.Registry";
 
-/// Fail a call whose connection died under it. Every attribute and child read
-/// degrades to `None`/empty on a failure, so a bus that went away mid-read would
-/// otherwise be reported as a window with almost nothing in it — the honest answer is
-/// that the call never saw the target, and the next call re-establishes the link.
+/// Fail a call whose connection died under it. Every attribute and child read degrades to
+/// `None`/empty on a failure, so a bus that went away mid-read would otherwise be reported as a
+/// window with almost nothing in it — the honest answer is that the call never saw the target, and
+/// the next call re-establishes the link.
 fn ensure_link(conn: &zbus::Connection) -> Result<(), anyhow::Error> {
     if conn.is_closed() {
         return Err(core::taxonomy_error(
@@ -182,11 +165,10 @@ const KNOWN_KEYS: &str = "return, enter, tab, space, delete/backspace, forwardde
      comma, period, slash, semicolon, quote, backslash, backtick, leftbracket, rightbracket, a-z, 0-9";
 
 impl LinuxBackend {
-    /// The a11y bus connection, established on first use and rebuilt whenever the
-    /// held one is closed (a killed `at-spi-bus-launcher` closes the socket — that
-    /// is the evidence the service is gone). Establishment is bounded here because
-    /// the session-bus round trip and the a11y handshake are not method calls, so
-    /// the connection's own timeout does not cover them.
+    /// The a11y bus connection, established on first use and rebuilt whenever the held one is
+    /// closed (a killed `at-spi-bus-launcher` closes the socket — that is the evidence the service
+    /// is gone). Establishment is bounded here because the session-bus round trip and the a11y
+    /// handshake are not method calls, so the connection's own timeout does not cover them.
     async fn conn(&self) -> Result<zbus::Connection, anyhow::Error> {
         let mut held = self.connection.lock().await;
         if let Some(conn) = held.as_ref() {
@@ -221,9 +203,6 @@ impl LinuxBackend {
         }
     }
 
-    /// The target's surface, resolved under the caller's budget, and named once it is
-    /// resolved so a failure refers to the window rather than to the target as the model
-    /// wrote it. A `Screen` target costs no accessibility exchange at all.
     async fn surface_geometry_with(
         &self,
         target: &TargetSpec,
@@ -232,8 +211,8 @@ impl LinuxBackend {
         match target {
             TargetSpec::Screen => {
                 if wayland() {
-                    // Zoom sizes itself from the last Screen capture so it never
-                    // triggers a second portal dialog.
+                    // Zoom sizes itself from the last Screen capture so it never triggers a second
+                    // portal dialog.
                     match *SCREEN_DIMS.lock().unwrap_poison() {
                         Some((w, h)) => Ok(SurfaceGeometry {
                             x: 0.0,
@@ -265,10 +244,6 @@ impl LinuxBackend {
         }
     }
 
-    /// Screen-channel still: X11 full capture or the single portal attempt,
-    /// caching dims for zoom. Window stills crop out of this in `capture`, through
-    /// [`window_still`] (which reconciles the accessibility and pixel spaces).
-    /// Every buffer either route holds is charged to the call's `budget`.
     async fn capture_screen_channel(
         &self,
         budget: &CaptureBudget,
@@ -290,12 +265,10 @@ impl LinuxBackend {
     }
 }
 
-// ── Accessibility bus ────────────────────────────────────────────────────
-
-/// Open the a11y bus with the product's per-exchange deadline as the connection's own
-/// method timeout. Every proxy here is built on this raw connection rather than on the
-/// crate's convenience wrapper, because the timeout has to belong to the connection: only
-/// then does a target that stops answering cost one exchange.
+/// Open the a11y bus with the product's per-exchange deadline as the connection's own method
+/// timeout. Every proxy here is built on this raw connection rather than on the crate's convenience
+/// wrapper, because the timeout has to belong to the connection: only then does a target that stops
+/// answering cost one exchange.
 async fn open_a11y_bus() -> anyhow::Result<zbus::Connection> {
     let session = zbus::Connection::session()
         .await
@@ -317,8 +290,8 @@ async fn open_a11y_bus() -> anyhow::Result<zbus::Connection> {
         .context("connect to the a11y bus")
 }
 
-/// The registry root, built as atspi builds it: the registry's properties are
-/// incompletely implemented, so they are never cached.
+/// The registry root, built as atspi builds it: the registry's properties are incompletely
+/// implemented, so they are never cached.
 async fn registry_root(conn: &zbus::Connection) -> anyhow::Result<AccessibleProxy<'_>> {
     AccessibleProxy::builder(conn)
         .destination(A11Y_REGISTRY)
@@ -329,18 +302,17 @@ async fn registry_root(conn: &zbus::Connection) -> anyhow::Result<AccessibleProx
         .map_err(|e| dbus_err(e, "access registry root"))
 }
 
-// ── Session lock state ───────────────────────────────────────────────────
 /// systemd-logind, whose per-session `LockedHint` is the desktop-agnostic lock signal.
 const LOGIND_DEST: &str = "org.freedesktop.login1";
 const LOGIND_PATH: &str = "/org/freedesktop/login1";
 
-/// How long the logind question may take, asked before every call that needs the
-/// desktop: a system bus that stops answering costs this and not the call's own budget.
+/// How long the logind question may take, asked before every call that needs the desktop: a system
+/// bus that stops answering costs this and not the call's own budget.
 const STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The system bus, kept across calls the way the accessibility connection is: the probe
-/// runs before every call that needs the desktop, so it must not pay a connect each time.
-/// A bus that went away is reopened, and nothing is cached when the connect fails.
+/// The system bus, kept across calls the way the accessibility connection is: the probe runs before
+/// every call that needs the desktop, so it must not pay a connect each time. A bus that went away
+/// is reopened, and nothing is cached when the connect fails.
 static SYSTEM_BUS: tokio::sync::Mutex<Option<zbus::Connection>> =
     tokio::sync::Mutex::const_new(None);
 
@@ -357,8 +329,8 @@ async fn system_bus() -> Option<zbus::Connection> {
     Some(conn)
 }
 
-/// `LockedHint` of this process's logind session, read under [`STATE_PROBE_TIMEOUT`]:
-/// logind is optional, so the answer is only ever what the session itself published.
+/// `LockedHint` of this process's logind session, read under [`STATE_PROBE_TIMEOUT`]: logind is
+/// optional, so the answer is only ever what the session itself published.
 async fn locked_reason() -> Option<String> {
     let locked = tokio::time::timeout(STATE_PROBE_TIMEOUT, async {
         let conn = system_bus().await?;
@@ -370,8 +342,8 @@ async fn locked_reason() -> Option<String> {
         )
         .await
         .ok()?;
-        // "self" is logind resolving the caller by pid, so a process that belongs to no
-        // session of its own (a user service) is answered with an error — "cannot tell".
+        // "self" is logind resolving the caller by pid, so a process that belongs to no session of
+        // its own (a user service) is answered with an error — "cannot tell".
         let (session,): (zbus::zvariant::OwnedObjectPath,) =
             manager.call("GetSession", &("self",)).await.ok()?;
         let proxy = zbus::Proxy::new(
@@ -390,11 +362,6 @@ async fn locked_reason() -> Option<String> {
     locked.then(|| "the session's lock screen is active".to_string())
 }
 
-// ── Pure helpers ─────────────────────────────────────────────────────────
-
-/// AT-SPI `Role` → the lowercase string the core matches on. Most CamelCase enum
-/// names lowercase to the expected role; a few are remapped to the conventional
-/// AT-SPI role-name spelling so reflected roles read naturally.
 fn role_name(role: Role) -> String {
     match role {
         Role::Button => "pushbutton".to_string(),
@@ -417,9 +384,8 @@ fn is_window_role(role: Role) -> bool {
     matches!(role, Role::Window | Role::Frame | Role::Dialog)
 }
 
-/// Union bounding rect of monitor rects `(x, y, w, h)` in pixels. Origins may be
-/// negative (a left/upper monitor); the result keeps them so normalized ↔ pixel
-/// mapping stays exact.
+/// Union bounding rect of monitor rects `(x, y, w, h)` in pixels. Origins may be negative (a
+/// left/upper monitor); the result keeps them so normalized ↔ pixel mapping stays exact.
 fn surface_from_rects(rects: &[(i32, i32, i32, i32)]) -> SurfaceGeometry {
     if rects.is_empty() {
         return SurfaceGeometry {
@@ -447,34 +413,29 @@ fn surface_from_rects(rects: &[(i32, i32, i32, i32)]) -> SurfaceGeometry {
     }
 }
 
-/// What a D-Bus / atspi error string names. One classifier for both mappings:
-/// [`dbus_err`] (reads, and actions that certainly did nothing) and
-/// [`action_dbus_outcome`] (the action call itself) must agree on which failures
-/// are transient, or the same bus failure would be a refusal in one and a silent
-/// success in the other.
+/// What a D-Bus / atspi error string names. One classifier for both mappings: [`dbus_err`] (reads,
+/// and actions that certainly did nothing) and [`action_dbus_outcome`] (the action call itself)
+/// must agree on which failures are transient, or the same bus failure would be a refusal in one
+/// and a silent success in the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BusFault {
     /// Access denied / not authorized.
     Denied,
-    /// The app or object is gone, or has no such method.
     Gone,
     /// The reply never arrived. Nothing says whether the call was performed.
     Transient,
-    /// Anything else: passed through as a plain error.
     Other,
 }
 
-/// The single classification of an atspi/zbus error string, so the read mapping
-/// and the action mapping below can never disagree about what is transient. A
-/// timed-out call belongs with the dropped replies: the answer was never
-/// received, which says nothing about whether it was performed.
+/// The single classification of an atspi/zbus error string, so the read and action mappings can
+/// never disagree about what is transient; a timed-out call belongs with the dropped replies, since
+/// the answer was never received and that says nothing about whether it was performed.
 ///
-/// The spellings are the ones the library really produces: a client-side method
-/// timeout is `Error::InputOutput(TimedOut, "timed out")`, displayed as
-/// `I/O error: timed out`; the bus's own error name for the same condition is
-/// `org.freedesktop.DBus.Error.TimedOut`; and a connection the bus dropped under us
-/// reads `I/O error: socket closed` (or `… connection reset by peer`). A dropped
-/// connection says nothing about whether the request reached its owner either.
+/// The spellings are the ones the library really produces: a client-side method timeout is
+/// `Error::InputOutput(TimedOut, "timed out")`, shown as `I/O error: timed out`; the bus's own
+/// error name is `org.freedesktop.DBus.Error.TimedOut`; and a connection dropped under us reads
+/// `I/O error: socket closed` (or `… connection reset by peer`), which says nothing about whether
+/// the request reached its owner either.
 fn classify_bus_fault(msg: &str) -> BusFault {
     let lower = msg.to_ascii_lowercase();
     if lower.contains("accessdenied")
@@ -501,17 +462,14 @@ fn classify_bus_fault(msg: &str) -> BusFault {
     }
 }
 
-/// Read error mapping: access denied → permission-denied, a gone app/object/method
-/// → stale-element, a dropped reply → degraded, else plain. Reads only — an
-/// action call maps through [`action_dbus_outcome`], because a dropped reply there
-/// may have carried the action through.
+/// Read error mapping: access denied → permission-denied, a gone app/object/method → stale-element,
+/// a dropped reply → degraded, else plain. Reads only — an action call maps through
+/// [`action_dbus_outcome`], because a dropped reply there may have carried the action through.
 fn dbus_err(err: impl std::fmt::Display, ctx: &str) -> anyhow::Error {
     let msg = err.to_string();
     bus_error(classify_bus_fault(&msg), &msg, ctx)
 }
 
-/// Build the failure for one bus fault. Split out so a caller that has already
-/// classified the fault renders the same message without re-stringifying the error.
 fn bus_error(fault: BusFault, msg: &str, ctx: &str) -> anyhow::Error {
     match fault {
         BusFault::Denied => {
@@ -529,10 +487,10 @@ fn bus_error(fault: BusFault, msg: &str, ctx: &str) -> anyhow::Error {
     }
 }
 
-/// Outcome of the ACTION call itself — never of the reads that precede it, which
-/// stay [`dbus_err`] failures because nothing was performed yet. A transient bus
-/// failure there may have carried the action through, so it is reported as
-/// [`Impact::Unconfirmed`], naming the call that may have landed.
+/// Outcome of the ACTION call itself — never of the reads that precede it, which stay [`dbus_err`]
+/// failures because nothing was performed yet. A transient bus failure there may have carried the
+/// action through, so it is reported as [`Impact::Unconfirmed`], naming the call that may have
+/// landed.
 fn action_dbus_outcome(err: impl std::fmt::Display, ctx: &str) -> anyhow::Result<Impact> {
     let msg = err.to_string();
     match classify_bus_fault(&msg) {
@@ -543,8 +501,8 @@ fn action_dbus_outcome(err: impl std::fmt::Display, ctx: &str) -> anyhow::Result
     }
 }
 
-/// Identity of a window: its AT-SPI object reference, stable for as long as that
-/// window lives and never positional (`core::WindowKey`).
+/// Identity of a window: its AT-SPI object reference, stable for as long as that window lives and
+/// never positional (`core::WindowKey`).
 fn window_key(object_ref: &ObjectRefOwned) -> WindowKey {
     WindowKey::new(format!(
         "{}|{}",
@@ -552,8 +510,6 @@ fn window_key(object_ref: &ObjectRefOwned) -> WindowKey {
         object_ref.path_as_str()
     ))
 }
-
-// ── Registry / tree enumeration ──────────────────────────────────────────
 
 struct WindowHandle {
     object_ref: ObjectRefOwned,
@@ -564,8 +520,8 @@ struct WindowHandle {
     focused: bool,
 }
 
-/// Root accessible's children = applications that expose accessibility. Apps
-/// that don't simply don't appear — an accepted AX-first limitation.
+/// Root accessible's children = applications that expose accessibility. Apps that don't simply
+/// don't appear — an accepted AX-first limitation.
 async fn enumerate_apps(
     conn: &zbus::Connection,
     budget: &core::Budget,
@@ -585,7 +541,6 @@ async fn enumerate_apps(
         if name.is_empty() {
             continue;
         }
-        // atspi 0.30 has no Application::get_pid, so the pid stays unknown.
         out.push((app_ref, AppInfo { pid: None, name }));
     }
     // A listing that lost the bus mid-way would show as "no applications".
@@ -605,10 +560,10 @@ async fn app_info_of(
     Ok(AppInfo { pid: None, name })
 }
 
-/// The two names a call addresses a window by: the application the target carries
-/// (else the one resolution found) and the window's live title. Both are read BEFORE
-/// the walk, because a walk that spends its budget has to name what it abandoned, and
-/// the title is an exchange it can no longer afford then.
+/// The two names a call addresses a window by: the application the target carries (else the one
+/// resolution found) and the window's live title. Both are read BEFORE the walk, because a walk
+/// that spends its budget has to name what it abandoned, and the title is an exchange it can no
+/// longer afford then.
 async fn surface_identity(
     target: &TargetSpec,
     window: &AccessibleProxy<'_>,
@@ -620,12 +575,12 @@ async fn surface_identity(
     (app_name, window.name().await.ok())
 }
 
-/// The application object an `a` id names, found by name (this desktop exposes no
-/// pid) among the applications that publish an accessibility tree.
+/// The application object an `a` id names, found by name (this desktop exposes no pid) among the
+/// applications that publish an accessibility tree.
 ///
-/// Not appearing there is not the same as having quit: a running application that
-/// publishes nothing looks identical from here, so the refusal says the surface is
-/// gone without claiming which — and keeps the id, since nothing confirmed its death.
+/// Not appearing there is not the same as having quit: a running application that publishes nothing
+/// looks identical from here, so the refusal says the surface is gone without claiming which — and
+/// keeps the id, since nothing confirmed its death.
 async fn resolve_app_object(
     conn: &zbus::Connection,
     app_name: &str,
@@ -646,11 +601,10 @@ async fn resolve_app_object(
         .ok_or_else(|| core::app_absent(app_name, core::AppAbsence::Unreachable))
 }
 
-/// Whether the element advertises more children than [`core::MAX_CHILDREN`]. Read
-/// before the list itself: AT-SPI answers `GetChildren` in one exchange, so a target
-/// that claims a near-2^31 child list (a spreadsheet's cell list is the classic case)
-/// is refused here instead of being paid for. A count the target cannot produce is
-/// not a claim, and the caller proceeds to the list.
+/// Whether the element advertises more children than [`core::MAX_CHILDREN`]. Read before the list
+/// itself: AT-SPI answers `GetChildren` in one exchange, so a target that claims a near-2^31 child
+/// list (a spreadsheet's cell list is the classic case) is refused here instead of being paid for.
+/// A count the target cannot produce is not a claim, and the caller proceeds to the list.
 async fn claims_too_many_children(accessible: &AccessibleProxy<'_>) -> bool {
     accessible
         .child_count()
@@ -658,19 +612,16 @@ async fn claims_too_many_children(accessible: &AccessibleProxy<'_>) -> bool {
         .is_ok_and(|count| count > core::MAX_CHILDREN as i32)
 }
 
-/// The app's window-role children (Window/Frame/Dialog): identity key, global
-/// screen extents, title and active/focused state.
+/// The app's window-role children (Window/Frame/Dialog): identity key, global screen extents, title
+/// and active/focused state.
 ///
-/// A failure to read the application or its children is an `Err`, never an empty
-/// list: "this app has no windows" and "this app's windows could not be read" are
-/// different answers, and a listing must be able to say which one it has. A child
-/// whose own proxy, role or extents cannot be read is skipped — that is one
-/// window's detail, not a failed read of the application.
+/// A failure to read the application or its children is an `Err`, never an empty list: "this app
+/// has no windows" and "its windows could not be read" are different answers. A child whose own
+/// proxy, role or extents cannot be read is skipped — one window's detail, not a failed read.
 ///
-/// One application's part of a listing pays a few exchanges per window, so it checks
-/// its budget — the call's, or the share of it this application was given — before every
-/// read it makes, including the reads inside one window: an application that stalls is
-/// caught at the check after its stall, having overspent by that one read at most.
+/// An application's part of a listing pays a few exchanges per window, so it checks its budget —
+/// the call's, or the share it was given — before every read, those inside one window included: a
+/// stall is caught at the next check, having overspent by that one read at most.
 async fn app_window_handles(
     app_ref: &ObjectRefOwned,
     conn: &zbus::Connection,
@@ -728,9 +679,8 @@ async fn app_window_handles(
     Ok(out)
 }
 
-/// An element's global screen extents, checked per exchange so one stalled read cannot
-/// outlive the caller's budget. `None` is a surface that reports no usable extents;
-/// `Err` is the budget spent.
+/// An element's global screen extents, checked per exchange so one stalled read cannot outlive the
+/// caller's budget. `None` is a surface that reports no usable extents; `Err` is the budget spent.
 async fn window_screen_extents(
     accessible: &AccessibleProxy<'_>,
     budget: &core::Budget,
@@ -759,19 +709,16 @@ async fn window_screen_extents(
 /// window-shaped call makes before it can show, capture or map coordinates, each charged to
 /// `budget`.
 struct ResolvedSurface {
-    /// The window object the reads were made against.
     object_ref: ObjectRefOwned,
-    /// The pid of the application resolution landed on, as far as this desktop tells it:
-    /// the target's own pid when it carried one, else whatever named the window.
     app_pid: Option<u32>,
     app_name: String,
     title: Option<String>,
     surface: SurfaceGeometry,
 }
 
-/// The one place a window target becomes a named, measurable surface. Each step is checked
-/// against `budget`, so a target that stops answering costs the read in flight and ends the
-/// call there instead of at the next whole step.
+/// The one place a window target becomes a named, measurable surface. Each step is checked against
+/// `budget`, so a target that stops answering costs the read in flight and ends the call there
+/// instead of at the next whole step.
 async fn resolve_surface(
     conn: &zbus::Connection,
     target: &TargetSpec,
@@ -799,9 +746,9 @@ async fn resolve_surface(
     })
 }
 
-/// Refuse a minimized (Iconified) window before its frame is used: it keeps the
-/// extents it had before it was minimized, so a crop of them, or a point mapped
-/// through them, is about a different part of the screen.
+/// Refuse a minimized (Iconified) window before its frame is used: it keeps the extents it had
+/// before it was minimized, so a crop of them, or a point mapped through them, is about a different
+/// part of the screen.
 async fn refuse_minimized(proxy: &AccessibleProxy<'_>) -> Result<(), anyhow::Error> {
     if proxy
         .get_state()
@@ -817,9 +764,9 @@ async fn refuse_minimized(proxy: &AccessibleProxy<'_>) -> Result<(), anyhow::Err
 
 /// Resolve a stored window key to exactly the window it names.
 ///
-/// The key is the AT-SPI object reference (`unique name|object path`), so this
-/// either lands on that window or fails with [`core::ERR_SURFACE_GONE`]: it never
-/// falls back to another window of the app, and never to coordinates.
+/// The key is the AT-SPI object reference (`unique name|object path`), so this either lands on that
+/// window or fails with [`core::ERR_SURFACE_GONE`]: it never falls back to another window of the
+/// app, and never to coordinates.
 async fn resolve_window_by_key(
     conn: &zbus::Connection,
     app_name: &str,
@@ -840,10 +787,9 @@ async fn resolve_window_by_key(
     Ok(object_ref)
 }
 
-/// The failure for a stored window key. Only the bus's own "that object is gone"
-/// answer is `surface-gone`: a call that timed out is a live window that stopped
-/// answering, and saying it vanished would send the model re-enumerating a window that
-/// is still there.
+/// The failure for a stored window key. Only the bus's own "that object is gone" answer is
+/// `surface-gone`: a call that timed out is a live window that stopped answering, and saying it
+/// vanished would send the model re-enumerating a window that is still there.
 fn window_gone_or_silent(err: impl std::fmt::Display, app_name: &str) -> anyhow::Error {
     let msg = err.to_string();
     match classify_bus_fault(&msg) {
@@ -856,8 +802,8 @@ fn window_gone_or_silent(err: impl std::fmt::Display, app_name: &str) -> anyhow:
     }
 }
 
-/// Parse a [`WindowKey`] back into an owned object reference. `None` when the
-/// text is not one this backend produced.
+/// Parse a [`WindowKey`] back into an owned object reference. `None` when the text is not one this
+/// backend produced.
 fn object_ref_from_key(key: &WindowKey) -> Option<ObjectRefOwned> {
     let (name, path) = key.as_str().split_once('|')?;
     let name = zbus::names::UniqueName::try_from(name).ok()?;
@@ -865,8 +811,8 @@ fn object_ref_from_key(key: &WindowKey) -> Option<ObjectRefOwned> {
     Some(ObjectRef::new_owned(name.to_owned(), path.to_owned()))
 }
 
-/// The app's own window: the one reporting active/focused state, else its first.
-/// Per-call by design — a `TargetSpec::App` names an application, not a window.
+/// The app's own window: the one reporting active/focused state, else its first. Per-call by design
+/// — a `TargetSpec::App` names an application, not a window.
 async fn app_current_window(
     conn: &zbus::Connection,
     app_ref: &ObjectRefOwned,
@@ -883,12 +829,11 @@ async fn app_current_window(
         .ok_or_else(|| core::app_absent(app_name, core::AppAbsence::Windowless))
 }
 
-/// The one window reporting active/focused across every application. An application
-/// whose windows cannot be read is skipped, as it always has been: a targetless read
-/// must not be broken by an unrelated application, and the `windows` listing is where
-/// such a failure is disclosed. A share that runs out is not one of those details —
-/// that application was skipped because it stopped answering — so a search that finds
-/// no window reports it instead of claiming none has focus.
+/// The one window reporting active/focused across every application. An application whose windows
+/// cannot be read is skipped, as it always has been: a targetless read must not be broken by an
+/// unrelated application, and the `windows` listing is where such a failure is disclosed. A share
+/// that runs out is not one of those details — that application was skipped because it stopped
+/// answering — so a search that finds no window reports it instead of claiming none has focus.
 async fn resolve_focused_window(
     conn: &zbus::Connection,
     budget: &core::Budget,
@@ -898,7 +843,6 @@ async fn resolve_focused_window(
     let mut skipped = None;
     for (app_ref, app_info) in &apps {
         budget.check()?;
-        // One application's share: a hung one costs its own part, and the search goes on.
         let slice = budget.slice(core::APP_SLICE, core::windows_label(&app_info.name));
         match app_window_handles(app_ref, conn, &app_info.name, &slice).await {
             Ok(handles) => {
@@ -908,8 +852,8 @@ async fn resolve_focused_window(
                     }
                 }
             }
-            // Its share ran out: remembered, because it may be the window the caller is
-            // after. Any other failure is one application's detail.
+            // Its share ran out: remembered, because it may be the window the caller is after. Any
+            // other failure is one application's detail.
             Err(_) => {
                 if slice.expired() {
                     skipped = Some(slice);
@@ -930,9 +874,9 @@ async fn resolve_focused_window(
             ));
         }
     }
-    // Nothing reported focus. A call whose budget ran out says so; otherwise an
-    // application that stopped answering is named — where "no focused window found" would
-    // read as an ordinary negative answer — and the negative result is stated with it.
+    // Nothing reported focus. A call whose budget ran out says so; otherwise an application that
+    // stopped answering is named — where "no focused window found" would read as an ordinary
+    // negative answer — and the negative result is stated with it.
     budget.check()?;
     if let Some(slice) = skipped {
         return Err(core::taxonomy_error(
@@ -946,9 +890,9 @@ async fn resolve_focused_window(
     ))
 }
 
-/// Resolve a non-`Screen` target to its window object + owning app, under the call's
-/// budget: resolution walks every application, so a hung unrelated one must not hold
-/// work aimed at a healthy window.
+/// Resolve a non-`Screen` target to its window object + owning app, under the call's budget:
+/// resolution walks every application, so a hung unrelated one must not hold work aimed at a
+/// healthy window.
 async fn resolve_window(
     conn: &zbus::Connection,
     target: &TargetSpec,
@@ -981,20 +925,17 @@ async fn resolve_window(
     }
 }
 
-// ── Window stills ────────────────────────────────────────────────────────
 //
-// A window still must show the window's current visible pixels, occluders
-// included, which reading the window's own drawable would not — so a window still
-// is a crop of the screen capture. AT-SPI extents and captured pixels are
-// different coordinate spaces whenever the desktop scale is not 1, so the crop is
-// taken only after the whole screen is read from the accessibility stack and
-// reconciled with the capture (`core::a11y_scale`) — an unreconcilable pair
-// refuses instead of cropping a guess.
+// A window still must show the window's current visible pixels, occluders included, which reading
+// the window's own drawable would not — so a window still is a crop of the screen capture. AT-SPI
+// extents and captured pixels are different coordinate spaces whenever the desktop scale is not 1,
+// so the crop is taken only after the whole screen is read from the accessibility stack and
+// reconciled with the capture (`core::a11y_scale`) — an unreconcilable pair refuses instead of
+// cropping a guess.
 
-/// The whole screen in the accessibility coordinate space (the registry root's own
-/// `Component` extents). A failed exchange means the stack did not report it (`Ok(None)`);
-/// a spent budget is an error, because a target that stopped answering must not be reported
-/// as nothing being reported.
+/// The whole screen in the accessibility coordinate space (the registry root's own `Component`
+/// extents). A failed exchange means the stack did not report it (`Ok(None)`); a spent budget is an
+/// error, because a target that stopped answering must not be reported as nothing being reported.
 async fn a11y_screen_extents(
     conn: &zbus::Connection,
     budget: &core::Budget,
@@ -1006,11 +947,10 @@ async fn a11y_screen_extents(
     window_screen_extents(&root, budget).await
 }
 
-/// The pixel space stills and coordinate mapping use: the X11 virtual desktop, or
-/// the last portal capture's size on Wayland. `None` when it cannot be established.
+/// The pixel space stills and coordinate mapping use: the X11 virtual desktop, or the last portal
+/// capture's size on Wayland. `None` when it cannot be established.
 fn pixel_space() -> Option<(u32, u32)> {
     if wayland() {
-        // Copied out of the cache, so no lock is held past this call.
         *SCREEN_DIMS.lock().unwrap_poison()
     } else {
         with_block_in_place(x11_screen_geometry)
@@ -1019,9 +959,9 @@ fn pixel_space() -> Option<(u32, u32)> {
     }
 }
 
-/// What to do instead when an accessibility space cannot be mapped into pixels: the
-/// one tail every refusal in [`a11y_pixel_scale`] ends with. A capture is named only
-/// when stills are known to work; ref actions need no pixels either way.
+/// What to do instead when an accessibility space cannot be mapped into pixels: the one tail every
+/// refusal in [`a11y_pixel_scale`] ends with. A capture is named only when stills are known to
+/// work; ref actions need no pixels either way.
 fn a11y_unmapped_guidance() -> &'static str {
     if super::capture_known_available() {
         "capture target: \"screen\" first — its still and zoom always work — and prefer ref \
@@ -1031,19 +971,17 @@ fn a11y_unmapped_guidance() -> &'static str {
     }
 }
 
-/// The scale between accessibility extents and the pixel space `pixels` describes —
-/// the one owner of that reconciliation, so a crop and a coordinate map can never
-/// disagree about whether their spaces match.
+/// The scale between accessibility extents and the pixel space `pixels` describes — the one owner
+/// of that reconciliation, so a crop and a coordinate map can never disagree about whether their
+/// spaces match.
 ///
-/// One message per cause: an unknown pixel space is not a mismatch, an
-/// accessibility screen that was never read was never compared at all (a spent budget is
-/// its own, honest error), and only a pair that was compared and disagreed is a
-/// reconciliation failure. On X11 the
-/// accessibility screen extents are the X11 root's own pixels, and a root covering
-/// one output of a larger desktop is a sub-rect rather than a scale — refusing
-/// there would lose a 1:1 crop that is right, so X11 falls back to it. Wayland's
-/// per-output scaling leaves no such guarantee, so an unreconcilable space there
-/// is refused instead of guessed.
+/// One message per cause: an unknown pixel space is not a mismatch, an accessibility screen never
+/// read was never compared (a spent budget is its own, honest error), and only a pair compared and
+/// disagreed is a reconciliation failure. On X11 the accessibility extents are the root's own
+/// pixels, and a root covering one output of a larger desktop is a sub-rect rather than a scale —
+/// refusing there would lose a 1:1 crop that is right, so X11 falls back to it. Wayland's
+/// per-output scaling leaves no such guarantee, so an unreconcilable space there is refused rather
+/// than guessed.
 async fn a11y_pixel_scale(
     conn: &zbus::Connection,
     pixels: Option<(u32, u32)>,
@@ -1060,9 +998,9 @@ async fn a11y_pixel_scale(
         ));
     };
     let Some(extents) = a11y_screen_extents(conn, budget).await? else {
-        // Nothing was compared, so this is not a mismatch: the accessibility stack
-        // did not report the screen at all. X11 still answers in the root's own
-        // pixels, so 1:1 remains the right mapping there.
+        // Nothing was compared, so this is not a mismatch: the accessibility stack did not report
+        // the screen at all. X11 still answers in the root's own pixels, so 1:1 remains the right
+        // mapping there.
         if !wayland() {
             return Ok(1.0);
         }
@@ -1089,17 +1027,14 @@ async fn a11y_pixel_scale(
     }
 }
 
-/// One window still: the window's AT-SPI extents mapped into the captured pixels
-/// by the scale both spaces share, then cropped. `cap_geo` is the geometry the
-/// backend maps coordinates with (the X11 virtual desktop, the portal image on
-/// Wayland), so `cap` and `cap_geo` always describe the same pixels.
+/// One window still: the window's AT-SPI extents mapped into the captured pixels by the scale both
+/// spaces share, then cropped. `cap_geo` is the geometry the backend maps coordinates with (the X11
+/// virtual desktop, the portal image on Wayland), so `cap` and `cap_geo` describe the same pixels.
 ///
-/// The extents are taken to be screen-relative, which is what `CoordType::Screen`
-/// asks for; a toolkit that answers with window-relative extents cannot be told
-/// apart from the accessibility data, so its crop is the wrong part of the screen.
-/// The crop is a buffer of its own, so it is charged to the call's `budget`; `lookup`
-/// bounds the accessibility screen read the scale comes from — the only accessibility
-/// exchange in here.
+/// The extents are screen-relative, which is what `CoordType::Screen` asks for; window-relative
+/// extents cannot be told apart from the accessibility data, so such a crop is the wrong part of
+/// the screen. The crop is a buffer of its own, charged to the call's `budget`; `lookup` bounds the
+/// accessibility screen read the scale comes from — the only accessibility exchange in here.
 async fn window_still(
     conn: &zbus::Connection,
     win: &SurfaceGeometry,
@@ -1109,9 +1044,9 @@ async fn window_still(
     lookup: &core::Budget,
 ) -> Result<Capture, anyhow::Error> {
     let scale = a11y_pixel_scale(conn, Some((cap.width, cap.height)), lookup).await?;
-    // The crop is clamped to the captured screen, so a window that hangs off it
-    // yields its visible part — the same result as before the reconciliation
-    // existed. A window entirely outside it is an honest failure.
+    // The crop is clamped to the captured screen, so a window that hangs off it yields its visible
+    // part — the same result as before the reconciliation existed. A window entirely outside it is
+    // an honest failure.
     core::crop_rgba(
         cap,
         core::window_capture_rect(&core::scale_geometry(*win, scale), cap_geo)?,
@@ -1120,14 +1055,11 @@ async fn window_still(
     )
 }
 
-// ── Accessibility tree walk ──────────────────────────────────────────────
-
-/// One node and its subtree, `Ok(None)` when the node is not emitted (it could not
-/// be opened, or the node ceiling was reached). `Err` is the aggregate budget
-/// running out: a refused or timed-out attribute or child only loses that detail
-/// and the walk continues, but a target that has spent the whole budget ends the
-/// call — thousands of bounded exchanges can still add up to more than the tool may
-/// hold.
+/// One node and its subtree, `Ok(None)` when the node is not emitted (it could not be opened, or
+/// the node ceiling was reached). `Err` is the aggregate budget running out: a refused or timed-out
+/// attribute or child only loses that detail and the walk continues, but a target that has spent
+/// the whole budget ends the call — thousands of bounded exchanges can still add up to more than
+/// the tool may hold.
 #[async_recursion]
 async fn walk_node(
     object_ref: &ObjectRefOwned,
@@ -1150,21 +1082,18 @@ async fn walk_node(
     handles.push(object_ref.clone());
 
     let role = role_name(accessible.get_role().await.unwrap_or(Role::Unknown));
-    // A name is what a ref falls back to matching on and a title can be a document,
-    // so it is capped at the read's own limit and a cut is stated in the header.
     let name = accessible
         .name()
         .await
         .ok()
         .map(|name| truncation.keep_name(&name));
     let proxies = accessible.proxies().await.ok();
-    // A node's own reads are several exchanges; a target that stalls across them must
-    // not be allowed to spend the budget of the whole walk here.
+    // A node's own reads are several exchanges; a target that stalls across them must not be
+    // allowed to spend the budget of the whole walk here.
     budget.check()?;
 
-    // Read one character past what the renderer shows ([`VALUE_READ_CHARS`]), so the
-    // value never needs the shared read cap and the renderer's own count states the
-    // display cut in the header.
+    // Read one character past what the renderer shows ([`VALUE_READ_CHARS`]), so the value never
+    // needs the shared read cap and the renderer's own count states the display cut in the header.
     let value = tree_value(proxies.as_ref(), &role).await;
     let frame = tree_frame(proxies.as_ref()).await;
     let actions = tree_actions(proxies.as_ref()).await;
@@ -1176,8 +1105,8 @@ async fn walk_node(
 
     let mut children = Vec::new();
     if depth >= core::MAX_TREE_DEPTH {
-        // The node's subtree is not read. Only a node that has one is a cut, so a leaf
-        // at the ceiling is not reported as a truncation.
+        // The node's subtree is not read. Only a node that has one is a cut, so a leaf at the
+        // ceiling is not reported as a truncation.
         if node_has_children(&accessible).await {
             truncation.cut_depth(core::MAX_TREE_DEPTH);
         }
@@ -1209,11 +1138,10 @@ async fn walk_node(
     }))
 }
 
-/// Whether a node has any children, at the depth ceiling where only the yes/no is
-/// wanted. A count beyond the child ceiling answers it without paying for the list,
-/// and a count the target cannot be trusted with (or cannot produce) falls back to the
-/// list itself — this decides whether a subtree is recorded as cut, so it must not turn
-/// a wrong count into a hidden one.
+/// Whether a node has any children, at the depth ceiling where only the yes/no is wanted. A count
+/// beyond the child ceiling answers it without paying for the list, and a count the target cannot
+/// be trusted with (or cannot produce) falls back to the list itself — this decides whether a
+/// subtree is recorded as cut, so it must not turn a wrong count into a hidden one.
 async fn node_has_children(accessible: &AccessibleProxy<'_>) -> bool {
     if claims_too_many_children(accessible).await {
         return true;
@@ -1224,10 +1152,10 @@ async fn node_has_children(accessible: &AccessibleProxy<'_>) -> bool {
         .is_ok_and(|children| !children.is_empty())
 }
 
-/// A node's children, or `None` when its advertised count exceeds the child ceiling
-/// — a spreadsheet's cell list advertises near 2^31, and one exchange would then pay
-/// for all of it. A reply that is longer than the ceiling anyway is cut to it. Both
-/// cases are recorded, each as what it is.
+/// A node's children, or `None` when its advertised count exceeds the child ceiling — a
+/// spreadsheet's cell list advertises near 2^31, and one exchange would then pay for all of it. A
+/// reply that is longer than the ceiling anyway is cut to it. Both cases are recorded, each as what
+/// it is.
 async fn walkable_children(
     accessible: &AccessibleProxy<'_>,
     truncation: &mut Truncation,
@@ -1263,9 +1191,8 @@ async fn build_tree(
     )
     .await?
     else {
-        // The root is the one node whose absence is not a detail: without it nothing
-        // was read at all, and an empty tree would present that as a window with no
-        // content.
+        // The root is the one node whose absence is not a detail: without it nothing was read at
+        // all, and an empty tree would present that as a window with no content.
         return Err(core::taxonomy_error(
             core::ERR_DEGRADED,
             format!(
@@ -1275,19 +1202,17 @@ async fn build_tree(
             ),
         ));
     };
-    // A walk that lost the bus mid-way degrades per node, so what it kept would read as
-    // a thin window; say the read is incomplete instead.
+    // A walk that lost the bus mid-way degrades per node, so what it kept would read as a thin
+    // window; say the read is incomplete instead.
     ensure_link(conn)?;
     Ok((node, handles, truncation))
 }
 
-/// The focused element in a window's subtree, by the one state AT-SPI publishes.
-///
-/// A depth-first walk over the same children the tree walk reads, bounded twice: at
-/// most [`FOCUS_WALK_NODES`] nodes and [`core::MAX_TREE_DEPTH`] levels, with the call's
-/// budget checked before each node. A cap or a spent budget answers `None` — this probe
-/// is an extra the answer can do without, so it never guesses instead — and so does a
-/// proxy that stops answering on the way down.
+/// The focused element in a window's subtree, by the one state AT-SPI publishes. A depth-first walk
+/// over the same children the tree walk reads, bounded twice: at most [`FOCUS_WALK_NODES`] nodes
+/// and [`core::MAX_TREE_DEPTH`] levels, with the call's budget checked before each node. A cap or a
+/// spent budget answers `None` — this probe is an extra the answer can do without, so it never
+/// guesses instead — and so does a proxy that stops answering on the way down.
 async fn focused_node(
     root: &ObjectRefOwned,
     conn: &zbus::Connection,
@@ -1304,8 +1229,6 @@ async fn focused_node(
         let state = accessible.get_state().await.ok()?;
         if state.contains(AtspiState::Focused) {
             let kind = role_name(accessible.get_role().await.unwrap_or(Role::Unknown));
-            // The name is exactly what an observation prints for the same element, so
-            // the answer can be read against the tree it came from.
             let name = accessible
                 .name()
                 .await
@@ -1338,8 +1261,8 @@ async fn tree_value(proxies: Option<&Proxies<'_>>, role: &str) -> Option<String>
     if count <= 0 {
         return None;
     }
-    // A text longer than the cap is read up to it and shown cut, never dropped: an
-    // absent value would read as "this field is empty".
+    // A text longer than the cap is read up to it and shown cut, never dropped: an absent value
+    // would read as "this field is empty".
     text.get_text(0, count.min(VALUE_READ_CHARS)).await.ok()
 }
 
@@ -1347,7 +1270,6 @@ async fn tree_frame(proxies: Option<&Proxies<'_>>) -> Option<(f64, f64, f64, f64
     let proxies = proxies?;
     let comp = proxies.component().await.ok()?;
     let (x, y, w, h) = comp.get_extents(CoordType::Window).await.ok()?;
-    // Drop zero-size (hidden/unmapped) nodes like the AX backend does.
     if w <= 0 || h <= 0 {
         return None;
     }
@@ -1369,8 +1291,6 @@ async fn tree_actions(proxies: Option<&Proxies<'_>>) -> Vec<String> {
         .filter_map(|a| (!a.name.is_empty()).then(|| a.name.to_lowercase()))
         .collect()
 }
-
-// ── Element actions ──────────────────────────────────────────────────────
 
 async fn press_element(proxies: &Proxies<'_>) -> Result<Impact, anyhow::Error> {
     let action = proxies
@@ -1410,7 +1330,6 @@ async fn press_element(proxies: &Proxies<'_>) -> Result<Impact, anyhow::Error> {
     };
     let ok = match action.do_action(idx as i32).await {
         Ok(ok) => ok,
-        // The one actuating call: a bus failure here may have performed it.
         Err(e) => return action_dbus_outcome(e, "perform action"),
     };
     if ok {
@@ -1434,7 +1353,6 @@ async fn set_element_value(
     if let Ok(editable) = proxies.editable_text().await {
         let ok = match editable.set_text_contents(text).await {
             Ok(ok) => ok,
-            // The one actuating call: a bus failure here may have set the text.
             Err(e) => return action_dbus_outcome(e, "set text contents"),
         };
         return if ok {
@@ -1457,15 +1375,12 @@ async fn set_element_value(
     ))
 }
 
-// ── Raw input (enigo / XTEST) ────────────────────────────────────────────
-
 /// Bring a window to the front and prove it got there.
 ///
-/// XTEST input goes to whatever holds the focus, so input aimed at a window that
-/// did not come forward must fail BEFORE anything is synthesized: reporting
-/// success while the keystrokes went to another window is the failure this
-/// prevents. `grab_focus` is a request to the window manager, so its reply is not
-/// the authority — the window's own active/focused state is, re-read briefly.
+/// XTEST input goes to whatever holds the focus, so input aimed at a window that did not come
+/// forward must fail BEFORE anything is synthesized: reporting success while the keystrokes went to
+/// another window is the failure this prevents. `grab_focus` is a request to the window manager, so
+/// its reply is not the authority — the window's own active/focused state is, re-read briefly.
 async fn raise_window(
     conn: &zbus::Connection,
     window_ref: &ObjectRefOwned,
@@ -1519,9 +1434,6 @@ fn char_key(c: char) -> Option<Key> {
     }
 }
 
-/// Key-chord name → enigo [`Key`]. Single printable chars (letters, digits,
-/// punctuation) map to `Key::Unicode`, which the X keymap synthesizes; named
-/// keys map to their dedicated variant.
 fn enigo_key(name: &str) -> Result<Key, String> {
     if let Ok(c) = name.parse::<char>()
         && let Some(key) = char_key(c)
@@ -1578,12 +1490,9 @@ fn enigo_key(name: &str) -> Result<Key, String> {
     Ok(key)
 }
 
-// ── Input synthesis ──────────────────────────────────────────────────────
-
-/// One call's synthesis session: the `Enigo` it drives and the mouse buttons it has
-/// pressed and not yet released. A button is recorded before it is pressed — a press that
-/// errors may still have reached the server — and released by [`Drop`]; enigo's own drop
-/// releases the keys it pressed.
+/// One call's synthesis session: the `Enigo` it drives and the mouse buttons it has pressed and not
+/// yet released. A button is recorded before it is pressed — a press that errors may still have
+/// reached the server — and released by [`Drop`]; enigo's own drop releases the keys it pressed.
 struct InputSession {
     enigo: Enigo,
     buttons: Vec<Button>,
@@ -1599,8 +1508,8 @@ impl InputSession {
         })
     }
 
-    /// Press `button`, recorded BEFORE the attempt: a press that errors may still have
-    /// reached the server, so it must be released either way.
+    /// Press `button`, recorded BEFORE the attempt: a press that errors may still have reached the
+    /// server, so it must be released either way.
     fn press_button(&mut self, button: Button) -> Result<(), enigo::InputError> {
         self.buttons.push(button);
         self.enigo.button(button, Direction::Press)
@@ -1617,9 +1526,6 @@ impl InputSession {
 }
 
 impl Drop for InputSession {
-    /// Let go of every button this call left pressed. Failures are dropped with the
-    /// session — there is nothing left to report them to, and the result the call
-    /// returned already named what may be held.
     fn drop(&mut self) {
         for button in self.buttons.drain(..) {
             let _ = self.enigo.button(button, Direction::Release);
@@ -1627,9 +1533,9 @@ impl Drop for InputSession {
     }
 }
 
-/// Press `mods` in order. `Err` carries the index of the modifier whose press failed
-/// and that failure: it and every modifier before it may be down, so a caller that
-/// stops here must say so rather than report that nothing was delivered.
+/// Press `mods` in order. `Err` carries the index of the modifier whose press failed and that
+/// failure: it and every modifier before it may be down, so a caller that stops here must say so
+/// rather than report that nothing was delivered.
 fn press_modifiers(
     session: &mut InputSession,
     mods: &[Modifier],
@@ -1652,8 +1558,8 @@ fn release_modifiers(session: &mut InputSession, mods: &[Modifier]) -> Result<()
     Ok(())
 }
 
-/// Release `mods` and, when that fails, name what a held modifier costs and who can
-/// clear it: the chord and every character typed after it would be modified.
+/// Release `mods` and, when that fails, name what a held modifier costs and who can clear it: the
+/// chord and every character typed after it would be modified.
 fn release_note(session: &mut InputSession, mods: &[Modifier]) -> Option<String> {
     if mods.is_empty() || release_modifiers(session, mods).is_ok() {
         return None;
@@ -1674,7 +1580,6 @@ fn release_note(session: &mut InputSession, mods: &[Modifier]) -> Option<String>
     ))
 }
 
-/// Append a release state to a detail that already reports what landed.
 fn with_held(detail: String, held: Option<String>) -> String {
     match held {
         Some(held) => format!("{detail}; {held}"),
@@ -1682,8 +1587,8 @@ fn with_held(detail: String, held: Option<String>) -> String {
     }
 }
 
-/// The result of an actuation whose own input is delivered: done, unless letting go
-/// of the modifiers failed, which the result then has to say.
+/// The result of an actuation whose own input is delivered: done, unless letting go of the
+/// modifiers failed, which the result then has to say.
 fn done_after_release(session: &mut InputSession, mods: &[Modifier]) -> Impact {
     match release_note(session, mods) {
         None => Impact::Done,
@@ -1691,9 +1596,9 @@ fn done_after_release(session: &mut InputSession, mods: &[Modifier]) -> Impact {
     }
 }
 
-/// The failure of an actuation that stopped before its own input was delivered. It
-/// says only what is known: the input did not go through, and a modifier a failed
-/// press left down has to be released before trying again.
+/// The failure of an actuation that stopped before its own input was delivered. It says only what
+/// is known: the input did not go through, and a modifier a failed press left down has to be
+/// released before trying again.
 fn press_failed(
     session: &mut InputSession,
     mods: &[Modifier],
@@ -1707,8 +1612,8 @@ fn press_failed(
 }
 
 fn scroll_params(direction: ScrollDirection, amount: u32) -> (i32, Axis) {
-    // The tool bounds the amount before it gets here; the conversion is still total so
-    // no magnitude can wrap the direction.
+    // The tool bounds the amount before it gets here; the conversion is still total so no magnitude
+    // can wrap the direction.
     let a = i32::try_from(amount).unwrap_or(i32::MAX);
     match direction {
         ScrollDirection::Down => (a, Axis::Vertical),
@@ -1718,21 +1623,20 @@ fn scroll_params(direction: ScrollDirection, amount: u32) -> (i32, Axis) {
     }
 }
 
-/// The geometry a point action is posted through. Only the shapes that place a point ask
-/// for one: a call that resolved none is refused before any event is sent.
+/// The geometry a point action is posted through. Only the shapes that place a point ask for one: a
+/// call that resolved none is refused before any event is sent.
 fn input_geometry(geo: Option<&SurfaceGeometry>) -> Result<SurfaceGeometry, anyhow::Error> {
     geo.copied()
         .ok_or_else(|| anyhow!("raw input needs surface geometry for this action"))
 }
 
-/// Normalized surface point → absolute X11 pixel point.
 fn pixel_point(point: (f64, f64), geometry: &SurfaceGeometry) -> Result<(i32, i32), anyhow::Error> {
     let (x, y) = core::normalized_to_surface(point.0, point.1, geometry)?;
     Ok((x.round() as i32, y.round() as i32))
 }
 
-// Owned because it is handed to `map_err` at most call sites: borrowing would push
-// a closure into each of them.
+// Owned because it is handed to `map_err` at most call sites: borrowing would push a closure into
+// each of them.
 #[expect(clippy::needless_pass_by_value)]
 fn input_err(e: enigo::InputError) -> anyhow::Error {
     anyhow!("input synthesis failed: {e}")
@@ -1741,9 +1645,9 @@ fn input_err(e: enigo::InputError) -> anyhow::Error {
 fn key_chord(session: &mut InputSession, chord: &str) -> Result<Impact, anyhow::Error> {
     let (mods, key) = core::parse_key_chord(chord)?;
     let key = enigo_key(&key).map_err(anyhow::Error::msg)?;
-    // Nothing of the chord is in the system before the modifiers are down, so a
-    // failed modifier press is only a half-pressed chord: it and the ones before it
-    // may be down, but no key of it has been delivered.
+    // Nothing of the chord is in the system before the modifiers are down, so a failed modifier
+    // press is only a half-pressed chord: it and the ones before it may be down, but no key of it
+    // has been delivered.
     if let Err((failed, e)) = press_modifiers(session, &mods) {
         return Err(press_failed(
             session,
@@ -1752,9 +1656,9 @@ fn key_chord(session: &mut InputSession, chord: &str) -> Result<Impact, anyhow::
             &e,
         ));
     }
-    // XTEST writes the key press before the release can fail, so a press that errors
-    // may already have fired the chord: press and release are driven apart, and a
-    // press failure is repaired by releasing the key again.
+    // XTEST writes the key press before the release can fail, so a press that errors may already
+    // have fired the chord: press and release are driven apart, and a press failure is repaired by
+    // releasing the key again.
     if let Err(e) = session.enigo.key(key, Direction::Press) {
         let released = session.enigo.key(key, Direction::Release).is_ok();
         let key_state = if released {
@@ -1779,9 +1683,9 @@ fn key_chord(session: &mut InputSession, chord: &str) -> Result<Impact, anyhow::
     Ok(done_after_release(session, &mods))
 }
 
-/// What a drag that stopped after the button went down leaves behind. `released`
-/// says whether the button was let go again, so the result never claims a clean
-/// machine when one may still be mid-gesture.
+/// What a drag that stopped after the button went down leaves behind. `released` says whether the
+/// button was let go again, so the result never claims a clean machine when one may still be
+/// mid-gesture.
 fn drag_incomplete(fx: i32, fy: i32, released: bool) -> Impact {
     let at = format!("the button went down at ({fx}, {fy})");
     Impact::Unconfirmed(if released {
@@ -1797,8 +1701,8 @@ fn drag_incomplete(fx: i32, fy: i32, released: bool) -> Impact {
     })
 }
 
-/// Let a button go again after a press that errored — the press may have been
-/// written before the call failed — and say how that ended.
+/// Let a button go again after a press that errored — the press may have been written before the
+/// call failed — and say how that ended.
 fn release_after_failed_press(session: &mut InputSession, button: Button) -> &'static str {
     if session.release_button(button).is_ok() {
         "was released again"
@@ -1807,12 +1711,11 @@ fn release_after_failed_press(session: &mut InputSession, button: Button) -> &'s
     }
 }
 
-/// A coordinate click: the pointer moves first, then the modifiers, then each
-/// press/release pair (twice for a double click). XTEST synthesizes into whatever is
-/// under the pointer, and this platform cannot attribute that window to an application,
-/// so the answer states that the point was not checked. Every step after the move is
-/// answered for: a failure names what may have landed or may still be held, because a
-/// second click is a second actuation.
+/// A coordinate click: the pointer moves first, then the modifiers, then each press/release pair
+/// (twice for a double click). XTEST synthesizes into whatever is under the pointer, and this
+/// platform cannot attribute that window to an application, so the answer states that the point was
+/// not checked. Every step after the move is answered for: a failure names what may have landed or
+/// may still be held, because a second click is a second actuation.
 fn click(
     session: &mut InputSession,
     x: i32,
@@ -1865,9 +1768,9 @@ fn click(
     Ok(done_after_release(session, modifiers))
 }
 
-/// Type `text` one character at a time. Enigo writes a character's key press before
-/// its release can fail, so each half is driven apart: a press that errors may
-/// already have typed the character, and a release that errors leaves its key down.
+/// Type `text` one character at a time. Enigo writes a character's key press before its release can
+/// fail, so each half is driven apart: a press that errors may already have typed the character,
+/// and a release that errors leaves its key down.
 fn type_text(session: &mut InputSession, text: &str) -> Impact {
     let total = text.chars().count();
     for (typed, ch) in text.chars().enumerate() {
@@ -1894,9 +1797,6 @@ fn type_text(session: &mut InputSession, text: &str) -> Impact {
     Impact::Done
 }
 
-/// One wheel tick is a press/release pair of a scroll button, and the ticks are
-/// driven apart for the same reason: a failure names how many landed and whether a
-/// wheel button is left down.
 fn scroll(session: &mut InputSession, length: i32, axis: Axis) -> Impact {
     let button = match (length.is_positive(), axis) {
         (true, Axis::Vertical) => Button::ScrollDown,
@@ -1924,9 +1824,9 @@ fn scroll(session: &mut InputSession, length: i32, axis: Axis) -> Impact {
     Impact::Done
 }
 
-/// Deliver one input, and answer with what it left behind together with the placement the
-/// delivery itself made: the point posted and the geometry that mapped it come from the
-/// same read here, so an answer can never quote a second, parallel mapping.
+/// Deliver one input, and answer with what it left behind together with the placement the delivery
+/// itself made: the point posted and the geometry that mapped it come from the same read here, so
+/// an answer can never quote a second, parallel mapping.
 fn raw_input_blocking(
     input: RawInput,
     geo: Option<&SurfaceGeometry>,
@@ -1982,7 +1882,6 @@ fn raw_input_blocking(
             let geometry = input_geometry(geo)?;
             let (fx, fy) = pixel_point(from, &geometry)?;
             let (tx, ty) = pixel_point(to, &geometry)?;
-            // Both ends of the gesture as posted, from the pixels the drag actually uses.
             let start = core::surface_local((f64::from(fx), f64::from(fy)), &geometry);
             let end = core::surface_local((f64::from(tx), f64::from(ty)), &geometry);
             let placement = core::Placement {
@@ -1991,14 +1890,14 @@ fn raw_input_blocking(
                 to: Some(end),
             };
             let placed = |impact: Impact| core::Actuation::at(impact, placement);
-            // The button goes down where the gesture starts: pressing at the
-            // pointer's previous position would grab whatever window that was.
+            // The button goes down where the gesture starts: pressing at the pointer's previous
+            // position would grab whatever window that was.
             session
                 .enigo
                 .move_mouse(fx, fy, Coordinate::Abs)
                 .map_err(input_err)?;
-            // As in a click, the press may have reached the server before the call
-            // failed: the button can be down and the target may have seen a click.
+            // As in a click, the press may have reached the server before the call failed: the
+            // button can be down and the target may have seen a click.
             if let Err(e) = session.press_button(Button::Left) {
                 let state = release_after_failed_press(&mut session, Button::Left);
                 return Ok(placed(Impact::Unconfirmed(format!(
@@ -2006,8 +1905,8 @@ fn raw_input_blocking(
                      so the target may have taken it as a click"
                 ))));
             }
-            // Past the button-down the drag is under way: a failure must let the
-            // button go again rather than leave the machine mid-gesture.
+            // Past the button-down the drag is under way: a failure must let the button go again
+            // rather than leave the machine mid-gesture.
             for i in 1..=INTERP_STEPS {
                 let t = i as f64 / INTERP_STEPS as f64;
                 let x = (fx as f64 + (tx - fx) as f64 * t).round() as i32;
@@ -2019,8 +1918,8 @@ fn raw_input_blocking(
                 std::thread::sleep(Duration::from_millis(2));
             }
             if let Err(e) = session.release_button(Button::Left) {
-                // Every step ran and the pointer reached `to`: only the release
-                // failed, which is what must not read as an unfinished gesture.
+                // Every step ran and the pointer reached `to`: only the release failed, which is
+                // what must not read as an unfinished gesture.
                 return Ok(placed(Impact::Unconfirmed(format!(
                     "the drag ran to its end but the button's release failed ({e}) — the button \
                      may still be held down"
@@ -2031,15 +1930,11 @@ fn raw_input_blocking(
     }
 }
 
-// ── X11 stills (x11rb) ───────────────────────────────────────────────────
-// Blocking throughout; every entry runs inside `with_block_in_place`.
-// Per-CRTC `GetImage` tiles composited over the RandR union (negative origins
-// kept); screen→drawable mapping is `coord − union_min` — the root pixmap
-// spans the bounding box, so capture offsets are union-relative while the
-// geometry keeps the screen-space origin for coordinate mapping.
+// every entry runs inside `with_block_in_place`. Per-CRTC `GetImage` tiles composited over the
+// RandR union (negative origins kept); screen→drawable mapping is `coord − union_min` — the root
+// pixmap spans the bounding box, so capture offsets are union-relative while the geometry keeps the
+// screen-space origin for coordinate mapping.
 
-/// Monitor rects `(x, y, w, h)` from the RandR CRTC union. Any RandR failure
-/// or zero-area result falls back to the root window geometry.
 fn x11_monitor_rects(conn: &RustConnection, root: xproto::Window) -> Vec<(i32, i32, i32, i32)> {
     let resources = randr::get_screen_resources_current(conn, root)
         .ok()
@@ -2081,7 +1976,6 @@ fn x11_monitor_rects(conn: &RustConnection, root: xproto::Window) -> Vec<(i32, i
         .unwrap_or_default()
 }
 
-/// Virtual-desktop union over the RandR CRTC rects.
 fn x11_screen_geometry() -> Result<SurfaceGeometry, anyhow::Error> {
     let (conn, screen) = x11rb::connect(None)
         .map_err(|e| core::taxonomy_error(core::ERR_DEGRADED, format!("no X11 display: {e}")))?;
@@ -2095,14 +1989,11 @@ fn x11_screen_geometry() -> Result<SurfaceGeometry, anyhow::Error> {
     Ok(geo)
 }
 
-/// Full virtual-desktop still: per-CRTC `GetImage` tiles (row-tiled to the
-/// server's max request size) composited over the RandR union via
-/// `core::blit_rgba`. The X11 root pixmap spans the RandR bounding box with
-/// drawable origin == union min (a pixmap has no negative indices), so
-/// screen→drawable mapping is always `coord - union_min`: one global
-/// coordinate system, no mixed spaces.
-///
-/// The composite and every tile are charged to the call's `budget`, so a display
+/// Full virtual-desktop still: per-CRTC `GetImage` tiles (row-tiled to the server's max request
+/// size) composited over the RandR union via `core::blit_rgba`. The X11 root pixmap spans the RandR
+/// bounding box with drawable origin == union min (a pixmap has no negative indices), so
+/// screen→drawable mapping is always `coord - union_min`: one global coordinate system, no mixed
+/// spaces. The composite and every tile are charged to the call's `budget`, so a display
 /// arrangement the server reports as enormous is refused before it is allocated.
 fn x11_capture_screen(budget: &CaptureBudget) -> Result<(Capture, SurfaceGeometry), anyhow::Error> {
     let (conn, screen) = x11rb::connect(None)
@@ -2140,9 +2031,8 @@ fn x11_capture_screen(budget: &CaptureBudget) -> Result<(Capture, SurfaceGeometr
         let mut y = 0i32;
         while y < rh {
             let tile_h = rows_per_tile.min((rh - y) as u32);
-            // Range-checked by the union guard above: every origin/dim passed
-            // is within `[0, union]`, so the `as i16/u16/usize` casts below
-            // cannot silently wrap.
+            // Range-checked by the union guard above: every origin/dim passed is within `[0,
+            // union]`, so the `as i16/u16/usize` casts below cannot silently wrap.
             let tile_reply = xproto::get_image(
                 &conn,
                 xproto::ImageFormat::Z_PIXMAP,
@@ -2183,13 +2073,9 @@ fn x11_capture_screen(budget: &CaptureBudget) -> Result<(Capture, SurfaceGeometr
     Ok((composite, geo))
 }
 
-// ── Wayland stills (Screenshot portal over zbus) ──────────────────────────
-// One Screenshot attempt with short timeouts; deny/timeout/missing portal
-// degrades to accessibility-only — no retries, no prompt spam.
+// with short timeouts; deny/timeout/missing portal degrades to accessibility-only — no retries, no
+// prompt spam.
 
-/// Last known screen pixels, stored on every successful `Screen` capture so
-/// zoom can size itself without triggering a second portal dialog, and so AT-SPI
-/// extents can be reconciled with pixels ([`pixel_space`]).
 static SCREEN_DIMS: Mutex<Option<(u32, u32)>> = Mutex::new(None);
 
 static PORTAL_TOKEN_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -2198,19 +2084,17 @@ const PORTAL_BUS: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const PORTAL_IFACE: &str = "org.freedesktop.portal.Screenshot";
 
-/// Every portal call is a `Request` object; its `Close` is how a call gives one back.
 const REQUEST_IFACE: &str = "org.freedesktop.portal.Request";
 
-/// Ceiling on the encoded file the Screenshot portal hands over. The portal chooses
-/// the image, so this is a FILE limit, separate from what the decode will honour
-/// (the shared raster envelope, itself capped by what the call has left): a PNG of
-/// any surface this tool can hold is far below it, and a larger file is refused
-/// unread.
+/// Ceiling on the encoded file the Screenshot portal hands over. The portal chooses the image, so
+/// this is a FILE limit, separate from what the decode will honour (the shared raster envelope,
+/// itself capped by what the call has left): a PNG of any surface this tool can hold is far below
+/// it, and a larger file is refused unread.
 const PORTAL_FILE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
-/// The session bus has a portal owner. Never pops a dialog — safe as a probe.
-/// Uses an untyped proxy: the generated `DBus` proxy trait is crate-private in
-/// zbus, so `NameHasOwner` is called by hand.
+/// The session bus has a portal owner. Never pops a dialog — safe as a probe. Uses an untyped
+/// proxy: the generated `DBus` proxy trait is crate-private in zbus, so `NameHasOwner` is called by
+/// hand.
 async fn portal_available() -> bool {
     tokio::time::timeout(Duration::from_secs(3), async {
         let conn = zbus::Connection::session().await.ok()?;
@@ -2231,11 +2115,11 @@ async fn portal_available() -> bool {
     .unwrap_or(false)
 }
 
-/// Single Screenshot-portal attempt: subscribe for the `Response` signal first (a fast
-/// compositor can't beat the subscription), then call and wait. The request path is
-/// predicted from the token and the caller's bus name before the call, so a `Screenshot`
-/// call that times out — leaving no reply to read it from — still has one to close, and
-/// [`PortalRequest`] closes it however the attempt ends.
+/// Single Screenshot-portal attempt: subscribe for the `Response` signal first (a fast compositor
+/// can't beat the subscription), then call and wait. The request path is predicted from the token
+/// and the caller's bus name before the call, so a `Screenshot` call that times out — leaving no
+/// reply to read it from — still has one to close, and [`PortalRequest`] closes it however the
+/// attempt ends.
 async fn portal_screenshot(budget: &CaptureBudget) -> Result<Capture, anyhow::Error> {
     let conn = zbus::Connection::session().await.map_err(|e| {
         core::taxonomy_error(
@@ -2257,20 +2141,19 @@ async fn portal_screenshot(budget: &CaptureBudget) -> Result<Capture, anyhow::Er
     outcome
 }
 
-/// One `Screenshot` request, closed however the call ends: explicitly on every path the
-/// call returns on, and from its own drop on the ones it cannot — an unwind out of the
-/// response handling, or a future dropped mid-call. The drop closes on a task of its own
-/// because a bus round trip cannot be awaited there; the portal also drops a request when
-/// the caller's connection goes away, so a missed task is not a leak.
+/// One `Screenshot` request, closed however the call ends: explicitly on every path the call
+/// returns on, and from its own drop on the ones it cannot — an unwind out of the response
+/// handling, or a future dropped mid-call. The drop closes on a task of its own because a bus round
+/// trip cannot be awaited there; the portal also drops a request when the caller's connection goes
+/// away, so a missed task is not a leak.
 struct PortalRequest {
     conn: zbus::Connection,
     path: Option<zbus::zvariant::OwnedObjectPath>,
 }
 
 impl PortalRequest {
-    /// The request this call is about to open, at the path the portal will publish it
-    /// at — `None` when the caller's own bus name is not known, in which case only a
-    /// reply can name it.
+    /// The request this call is about to open, at the path the portal will publish it at — `None`
+    /// when the caller's own bus name is not known, in which case only a reply can name it.
     fn new(conn: &zbus::Connection, token: &str) -> Self {
         Self {
             conn: conn.clone(),
@@ -2278,8 +2161,6 @@ impl PortalRequest {
         }
     }
 
-    /// Take the path the portal actually published, which is authoritative over the
-    /// predicted one.
     fn adopt(&mut self, path: zbus::zvariant::OwnedObjectPath) {
         self.path = Some(path);
     }
@@ -2304,9 +2185,9 @@ impl Drop for PortalRequest {
     }
 }
 
-/// Where the portal publishes this request's `Response`, from the caller's unique bus
-/// name (':' stripped, '.' as '_') and the token this tool chose: the one handle that
-/// exists before the call replies.
+/// Where the portal publishes this request's `Response`, from the caller's unique bus name (':'
+/// stripped, '.' as '_') and the token this tool chose: the one handle that exists before the call
+/// replies.
 fn request_path(conn: &zbus::Connection, token: &str) -> Option<zbus::zvariant::OwnedObjectPath> {
     let sender = conn
         .unique_name()?
@@ -2318,8 +2199,8 @@ fn request_path(conn: &zbus::Connection, token: &str) -> Option<zbus::zvariant::
         .ok()
 }
 
-/// Close the request, best-effort and bounded: the call's own answer is already
-/// decided by the time this runs, and a portal that ignores `Close` must not hold it.
+/// Close the request, best-effort and bounded: the call's own answer is already decided by the time
+/// this runs, and a portal that ignores `Close` must not hold it.
 async fn close_request(conn: &zbus::Connection, path: &zbus::zvariant::ObjectPath<'_>) {
     let _ = tokio::time::timeout(Duration::from_secs(3), async {
         let proxy = zbus::Proxy::new(conn, PORTAL_BUS, path, REQUEST_IFACE)
@@ -2330,9 +2211,6 @@ async fn close_request(conn: &zbus::Connection, path: &zbus::zvariant::ObjectPat
     .await;
 }
 
-/// The `Screenshot` call and its response. The request's own path is adopted as soon as
-/// the portal replies, so the caller can close the request whatever the wait afterwards
-/// does with it.
 async fn screenshot_request(
     conn: &zbus::Connection,
     token: &str,
@@ -2421,9 +2299,8 @@ async fn screenshot_request(
         })?
 }
 
-/// The portal's image file, read through a bounded reader: at most
-/// [`PORTAL_FILE_MAX_BYTES`] are taken, so a file that grew past it after it was
-/// opened is refused instead of loaded whole.
+/// The portal's image file, read through a bounded reader: at most [`PORTAL_FILE_MAX_BYTES`] are
+/// taken, so a file that grew past it after it was opened is refused instead of loaded whole.
 async fn read_portal_file(path: &std::path::Path) -> Result<Vec<u8>, anyhow::Error> {
     let unreadable = |e: std::io::Error| {
         core::taxonomy_error(
@@ -2450,12 +2327,11 @@ async fn read_portal_file(path: &std::path::Path) -> Result<Vec<u8>, anyhow::Err
     Ok(bytes)
 }
 
-/// `Response` signal body → pixels. Response 1 is an in-dialog deny/dismiss:
-/// opt-in consent, no auto-retry. Nothing here is sized by the compositor: the file
-/// is read under this product's own ceiling, the decode is bounded by what is left of
-/// the call's allowance, and the RGBA this path keeps is a claimed buffer — so
-/// neither a compositor nor a crafted PNG can drive an allocation this call cannot
-/// survive.
+/// `Response` signal body → pixels. Response 1 is an in-dialog deny/dismiss: opt-in consent, no
+/// auto-retry. Nothing here is sized by the compositor: the file is read under this product's own
+/// ceiling, the decode is bounded by what is left of the call's allowance, and the RGBA this path
+/// keeps is a claimed buffer — so neither a compositor nor a crafted PNG can drive an allocation
+/// this call cannot survive.
 async fn portal_response(
     code: u32,
     results: HashMap<String, zbus::zvariant::OwnedValue>,
@@ -2474,9 +2350,9 @@ async fn portal_response(
             })?;
             let path = core::portal_uri_to_path(&uri)?;
             let bytes = read_portal_file(&path).await?;
-            // Two ceilings on the decode: the shared raster envelope, and what is left of
-            // this call's allowance (`remaining` counts RGBA pixels, four bytes each).
-            // The refusal states the one that was applied.
+            // Two ceilings on the decode: the shared raster envelope, and what is left of this
+            // call's allowance (`remaining` counts RGBA pixels, four bytes each). The refusal
+            // states the one that was applied.
             let mut limits = crate::util::media_target::raster_decode_limits();
             let decode_cap = crate::util::media_target::RASTER_DECODE_MAX_ALLOC_BYTES
                 .min(budget.remaining().saturating_mul(4));
@@ -2500,10 +2376,10 @@ async fn portal_response(
                 img.width() as usize,
                 img.height() as usize,
             )?;
-            // The RGBA this path keeps is a claimed buffer: charging it BEFORE the
-            // conversion is made refuses an image this call cannot hold instead of
-            // converting it. The decode above is transient and bounded by the same
-            // allowance, so this path peaks at that decode plus the claimed RGBA.
+            // The RGBA this path keeps is a claimed buffer: charging it BEFORE the conversion is
+            // made refuses an image this call cannot hold instead of converting it. The decode
+            // above is transient and bounded by the same allowance, so this path peaks at that
+            // decode plus the claimed RGBA.
             let claim = budget.charge("the portal screenshot", w, h)?;
             Ok(Capture::adopt(claim, w, h, img.into_rgba8().into_raw()))
         }
@@ -2521,8 +2397,6 @@ async fn portal_response(
     }
 }
 
-// ── Backend impl ─────────────────────────────────────────────────────────
-
 #[async_trait::async_trait]
 impl Backend for LinuxBackend {
     fn is_supported(&self) -> bool {
@@ -2534,7 +2408,6 @@ impl Backend for LinuxBackend {
         gui && bus
     }
 
-    /// The session's own lock state — see [`locked_reason`].
     async fn desktop_unavailable(&self) -> Option<String> {
         locked_reason().await
     }
@@ -2563,10 +2436,10 @@ impl Backend for LinuxBackend {
         }
     }
 
-    /// Applications with their ids, and the one in front. AT-SPI gives an application no
-    /// "is active" state, so the frontmost is read from the active state of the
-    /// applications' windows, under the listing's budget; it is `None` only when that scan
-    /// found no active window, including when the budget ran out first.
+    /// Applications with their ids, and the one in front. AT-SPI gives an application no "is
+    /// active" state, so the frontmost is read from the active state of the applications' windows,
+    /// under the listing's budget; it is `None` only when that scan found no active window,
+    /// including when the budget ran out first.
     async fn list_apps(&self) -> Result<AppListing, anyhow::Error> {
         let conn = self.conn().await?;
         let budget = core::Budget::new(
@@ -2577,8 +2450,8 @@ impl Backend for LinuxBackend {
         let found = enumerate_apps(&conn, &budget).await?;
         let mut frontmost = None;
         for (app_ref, app_info) in &found {
-            // A spent budget ends the scan with what it already found: the rest of the
-            // applications are the listing's answer, not the frontmost question's.
+            // A spent budget ends the scan with what it already found: the rest of the applications
+            // are the listing's answer, not the frontmost question's.
             if budget.check().is_err() {
                 break;
             }
@@ -2588,8 +2461,6 @@ impl Backend for LinuxBackend {
             else {
                 continue;
             };
-            // The active window names the application in front, exactly as a listing of
-            // windows reads it.
             if handles.iter().any(|w| w.active) {
                 frontmost = Some(app_info.name.clone());
                 break;
@@ -2612,9 +2483,8 @@ impl Backend for LinuxBackend {
             ),
         );
         for (app_ref, app_info) in enumerate_apps(&conn, &budget).await? {
-            // The caller's filter comes first: an application it did not ask about is
-            // never reported as "not reached" — only the ones this listing owes an
-            // answer for are.
+            // The caller's filter comes first: an application it did not ask about is never
+            // reported as "not reached" — only the ones this listing owes an answer for are.
             if let Some(filter) = app {
                 let name_ok = filter.name.eq_ignore_ascii_case(&app_info.name);
                 let pid_ok = filter.pid.is_some() && filter.pid == app_info.pid;
@@ -2622,8 +2492,8 @@ impl Backend for LinuxBackend {
                     continue;
                 }
             }
-            // A listing that runs out of time keeps what it read and names the
-            // applications it did not reach, instead of discarding healthy windows.
+            // A listing that runs out of time keeps what it read and names the applications it did
+            // not reach, instead of discarding healthy windows.
             if let Err(e) = budget.check() {
                 listing.unread.push(UnreadWindows {
                     app_name: app_info.name.clone(),
@@ -2631,16 +2501,16 @@ impl Backend for LinuxBackend {
                 });
                 continue;
             }
-            // One unreadable application must not hide the others — and must not
-            // be presented as an application without windows.
+            // One unreadable application must not hide the others — and must not be presented as an
+            // application without windows.
             let slice = budget.slice(core::APP_SLICE, core::windows_label(&app_info.name));
             match app_window_handles(&app_ref, &conn, &app_info.name, &slice).await {
                 Ok(handles) => {
                     for w in handles {
-                        // The active window is the one in front, so its application is the
-                        // one the listing can name — AT-SPI has no application-level state
-                        // to ask instead. Neither carries a place in an order: the stack
-                        // lives in the window manager, unreachable from here.
+                        // The active window is the one in front, so its application is the one the
+                        // listing can name — AT-SPI has no application-level state to ask instead.
+                        // Neither carries a place in an order: the stack lives in the window
+                        // manager, unreachable from here.
                         if w.active {
                             listing.frontmost = Some(app_info.name.clone());
                         }
@@ -2650,16 +2520,14 @@ impl Backend for LinuxBackend {
                             title: w.title,
                             key: w.key,
                             surface: w.surface,
-                            // A background application's focused window is not the one
-                            // input reaches, so a general listing marks only the
-                            // frontmost application's; a listing of one application
-                            // marks its own.
+                            // A background application's focused window is not the one input
+                            // reaches, so a general listing marks only the frontmost application's;
+                            // a listing of one application marks its own.
                             focused: w.focused && (app.is_some() || w.active),
                             rank: None,
                         });
                     }
                 }
-                // A spent share is one skipped application, said on the line naming it.
                 Err(e) => listing.unread.push(UnreadWindows {
                     app_name: app_info.name.clone(),
                     reason: core::unread_reason(&e, &slice),
@@ -2697,14 +2565,12 @@ impl Backend for LinuxBackend {
             return Err(core::screen_observe_error());
         }
         let conn = self.conn().await?;
-        // One clock for the whole observation, resolution included, so the budget the
-        // model is told about is the one the call actually pays.
         let mut budget = core::Budget::new(core::OBSERVE_BUDGET, "observation", target.describe());
         let window = resolve_surface(&conn, target, &mut budget).await?;
         let (root, _handles, mut truncation) =
             build_tree(&window.object_ref, &conn, &budget).await?;
-        // The header shows the window's title, so it is capped like a tree name and a
-        // cut is counted in the same ceiling.
+        // The header shows the window's title, so it is capped like a tree name and a cut is
+        // counted in the same ceiling.
         let window_title = window.title.map(|title| truncation.keep_name(&title));
         Ok(Observation {
             app_name: window.app_name,
@@ -2725,8 +2591,6 @@ impl Backend for LinuxBackend {
         if matches!(target, TargetSpec::Screen) {
             return Err(core::screen_act_error());
         }
-        // One clock for the whole call, resolution included: the action observes the
-        // surface it addresses and then performs one exchange on it.
         let mut budget = core::Budget::new(core::ACT_BUDGET, "element action", target.describe());
         let (window_ref, app) = resolve_window(&conn, target, &budget).await?;
         let proxy = window_ref
@@ -2736,8 +2600,8 @@ impl Backend for LinuxBackend {
         let (app_name, title) = surface_identity(target, &proxy, &app).await;
         core::name_surface(&mut budget, &app_name, title.as_deref());
         let (root, handles, _truncation) = build_tree(&window_ref, &conn, &budget).await?;
-        // The ref is acted on only if it is still what the caller saw: same kind, same
-        // name, same place on the surface. Nothing is sent otherwise.
+        // The ref is acted on only if it is still what the caller saw: same kind, same name, same
+        // place on the surface. Nothing is sent otherwise.
         let (matched, confirmed) = core::resolve_locator_confirmed(&root, locator)?;
         if handles.is_empty() {
             return Err(core::taxonomy_error(
@@ -2777,10 +2641,10 @@ impl Backend for LinuxBackend {
                  accessibility actions where the app exposes them",
             ));
         }
-        // Input that lands where the focus is: aimed at one window, it must reach
-        // that window or not go at all. A coordinate click and a point-less wheel
-        // are deliberately unpinned global input. One budget covers the whole
-        // resolution, so raising a window and mapping its frame cannot stack two.
+        // Input that lands where the focus is: aimed at one window, it must reach that window or
+        // not go at all. A coordinate click and a point-less wheel are deliberately unpinned global
+        // input. One budget covers the whole resolution, so raising a window and mapping its frame
+        // cannot stack two.
         let mut budget = core::Budget::new(core::LIST_BUDGET, "surface lookup", target.describe());
         if core::pinned_input(target, &input) {
             let conn = self.conn().await?;
@@ -2793,11 +2657,10 @@ impl Backend for LinuxBackend {
             | RawInput::Drag { .. } => Some(self.surface_geometry_with(target, &mut budget).await?),
             _ => None,
         };
-        // This platform cannot attribute a window to an application, so a click's point
-        // is never checked against what lies under it: the answer says exactly that rather
-        // than implying a check that did not happen. A click that names the screen is its
-        // own case: the screen's points belong to no window at all. No other input carries
-        // either note.
+        // This platform cannot attribute a window to an application, so a click's point is never
+        // checked against what lies under it: the answer says exactly that rather than implying a
+        // check that did not happen. A click that names the screen is its own case: the screen's
+        // points belong to no window at all. No other input carries either note.
         let note = match &input {
             RawInput::Click { .. } if matches!(target, TargetSpec::Screen) => {
                 Some(core::SCREEN_POINT_NOTE.to_string())
@@ -2805,8 +2668,6 @@ impl Backend for LinuxBackend {
             RawInput::Click { .. } => Some(core::UNCHECKED_POINT_NOTE.to_string()),
             _ => None,
         };
-        // The delivery path answers with the placement it made, from the same geometry it
-        // posted through, so nothing here maps a point a second time.
         let mut actuation = with_block_in_place(|| raw_input_blocking(input, geo.as_ref()))?;
         if let Some(note) = note {
             actuation.impact = core::impact_note(actuation.impact, note);
@@ -2829,13 +2690,12 @@ impl Backend for LinuxBackend {
         })
     }
 
-    /// The element that holds the addressed window's focus, found by a bounded search:
-    /// AT-SPI has no "give me the focused element" call, so the one state it publishes
-    /// is what the search looks for. `None` when the window cannot be resolved or the
-    /// search cannot read the state — the answer then says the focus could not be read,
-    /// which is what a probe running after every action may report.
+    /// The element that holds the addressed window's focus, found by a bounded search: AT-SPI has
+    /// no "give me the focused element" call, so the one state it publishes is what the search
+    /// looks for. `None` when the window cannot be resolved or the search cannot read the state —
+    /// the answer then says the focus could not be read, which is what a probe running after every
+    /// action may report.
     async fn focused_element(&self, target: Option<&TargetSpec>) -> Option<FocusedElement> {
-        // The screen has no focus of its own.
         if matches!(target, Some(TargetSpec::Screen)) {
             return None;
         }
@@ -2849,10 +2709,10 @@ impl Backend for LinuxBackend {
         focused_node(&window, &conn, &budget).await
     }
 
-    /// Window stills show current visible pixels (occluders visible; use
-    /// observe for the exact tree). Both capture routes crop the same way:
-    /// through [`window_still`], which reconciles the accessibility and pixel
-    /// spaces before cropping. Every buffer is charged to the call's `budget`.
+    /// Window stills show current visible pixels (occluders visible; use observe for the exact
+    /// tree). Both capture routes crop the same way: through [`window_still`], which reconciles the
+    /// accessibility and pixel spaces before cropping. Every buffer is charged to the call's
+    /// `budget`.
     async fn capture(
         &self,
         target: &TargetSpec,
@@ -2862,15 +2722,15 @@ impl Backend for LinuxBackend {
             TargetSpec::Screen => Ok(self.capture_screen_channel(budget).await?.0),
             other => {
                 let conn = self.conn().await?;
-                // The window is resolved before any capture work: a hung target is
-                // answered here rather than after a whole screen was read for nothing.
+                // The window is resolved before any capture work: a hung target is answered here
+                // rather than after a whole screen was read for nothing.
                 let mut lookup =
                     core::Budget::new(core::LIST_BUDGET, "surface lookup", other.describe());
                 let window = resolve_surface(&conn, other, &mut lookup).await?;
                 let (screen_cap, screen_geo) = self.capture_screen_channel(budget).await?;
-                // On Wayland that capture may have sat behind a person's consent dialog, which
-                // is not the target failing to answer: the scale read gets its clock from here,
-                // on the surface the call already resolved.
+                // On Wayland that capture may have sat behind a person's consent dialog, which is
+                // not the target failing to answer: the scale read gets its clock from here, on the
+                // surface the call already resolved.
                 let lookup = core::Budget::new(
                     core::LIST_BUDGET,
                     "surface lookup",
@@ -2890,8 +2750,6 @@ impl Backend for LinuxBackend {
     }
 }
 
-// ── Tests (pure logic only; no D-Bus / X11 / portal) ─────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2905,7 +2763,6 @@ mod tests {
         assert_eq!(role_name(Role::CheckBox), "checkbox");
         assert_eq!(role_name(Role::PageTab), "tab");
         assert_eq!(role_name(Role::Entry), "textfield");
-        // Unknown / unmapped enum variant → Debug name lowercased.
         assert_eq!(role_name(Role::Unknown), "unknown");
         assert_eq!(role_name(Role::Canvas), "canvas");
     }

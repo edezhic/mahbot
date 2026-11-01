@@ -1,34 +1,28 @@
-//! The durable single-worker round body (`run_implement_with_job`): the worker
-//! sub-agent a `send` `worker` call dispatches. The worker has full
-//! shell/read/edit/search access and mutates the workspace.
+//! The durable single-worker round body (`run_implement_with_job`): the worker sub-agent a
+//! `send` `worker` call dispatches, with full shell/read/edit/search access.
 //!
-//! The round itself is dispatched by [`crate::tools::SyncDurableCore::Worker`]
-//! (sync for the Engineer, async for the admin Assistant and custom roles) —
-//! this module owns the round body only; the tool half lives in
-//! [`crate::tools::send`]. The jobs-row kind stays `implement` — the `Worker`
-//! core's own kind ([`crate::jobs::SpawnChild::Implement`]).
+//! [`crate::tools::SyncDurableCore::Worker`] dispatches the round (sync for the Engineer,
+//! async for the admin Assistant and custom roles); this module owns the round body only,
+//! the tool half living in [`crate::tools::send`]. The jobs-row kind stays `implement`.
 
 use crate::agent::run_agent;
 use crate::session::analyze_agent_id;
 use crate::{Role, Workspace};
 use anyhow::anyhow;
 
-/// Write a fresh round's durable rows — the jobs row and the single-worker
-/// roster, in ONE tx — and return the worker's agent id. The row fields come
-/// from the call's own [`CoreJobArgs`](crate::tools::CoreJobArgs) (the same
-/// bundle every durable sync core takes), whose spawn record must be present.
-/// The fresh-spawn half of [`run_implement_with_job`], shared with the command
-/// line's handover ([`hand_over_worker_round`]), which must have these rows down
-/// BEFORE it answers its caller.
+/// Write a fresh round's durable rows — the jobs row and the single-worker roster, in ONE
+/// tx — and return the worker's agent id, taken from the call's own
+/// [`CoreJobArgs`](crate::tools::CoreJobArgs).
+/// The fresh-spawn half of [`run_implement_with_job`], shared with the command line's
+/// handover ([`hand_over_worker_round`]), which needs these rows down BEFORE it answers.
 async fn spawn_implement_rows(
     exec: &Workspace,
     task: &str,
     args: &crate::tools::CoreJobArgs<'_>,
 ) -> anyhow::Result<String> {
-    // The helper's own precondition, a fault rather than a caller-facing refusal:
-    // rows are written for a FRESH dispatch only, and a fresh dispatch is exactly
-    // the call whose spawn record is present (a resume inserts no row — see
-    // [`CoreJobArgs::spawn`](crate::tools::CoreJobArgs::spawn)).
+    // The helper's own precondition, a fault rather than a caller-facing refusal: rows are
+    // written for a FRESH dispatch only, the call whose spawn record is present (a resume
+    // inserts no row — see [`CoreJobArgs::spawn`](crate::tools::CoreJobArgs::spawn)).
     let Some(record) = args.spawn.as_ref() else {
         return Err(super::internal_fault(
             "a fresh worker dispatch carries no spawn record",
@@ -36,8 +30,7 @@ async fn spawn_implement_rows(
     };
     let worker_agent_id =
         analyze_agent_id(&exec.name, Role::Worker.as_str()) + &crate::generate_suffix();
-    // Single-worker roster: one tx puts the job + the worker row down before
-    // any session write (caller identity + task persisted on the rows).
+    // Single-worker roster: one tx puts the job + the worker row down before any session write.
     let agents = vec![crate::jobs::NewAgent {
         agent_id: worker_agent_id.clone(),
         kind: crate::jobs::AgentKind::Worker,
@@ -55,11 +48,9 @@ async fn spawn_implement_rows(
         &agents,
         &crate::jobs::SpawnChild::Implement,
         args.caller_agent_id,
-        // The round's execution directory (the caller's place, when one was
-        // asked for) so a restart resumes into the same directory.
+        // The round's execution directory, so a restart resumes into the same one.
         record.exec_dir,
-        // The calling custom role's launch, when there is one, so a
-        // resume rebuilds an envelope addressed to its branch.
+        // The calling custom role's launch, so a resume rebuilds an envelope to its branch.
         record.custom_launch,
     )
     .await?;
@@ -68,21 +59,15 @@ async fn spawn_implement_rows(
 
 /// The COMMAND LINE's handover of a worker round.
 ///
-/// [`crate::tools::SyncDurableCore::spawn_dispatch`] answers its caller as soon
-/// as the round is started, which is right for an agent whose own turn is
-/// durable: the jobs row lands moments later and a restart resumes the round
-/// from it. The command line is answered and gone the moment it returns, so the
-/// round's durable rows are written FIRST (awaited) and the round then runs as a
-/// RESUME of its own rows — exactly the round a crash between the two would have
-/// started at the next boot, so a restart neither loses the handover nor repeats
-/// it.
-///
-/// The round's job row carries the command line's own user and channel. There is
-/// no agent session and no custom-role launch behind a shell caller (the
-/// caller-role branch cannot be reached), so neither is threaded through.
-///
-/// `Err` is a failed row write: nothing was dispatched and nothing is running,
-/// so the caller may be told the handover did not happen.
+/// [`crate::tools::SyncDurableCore::spawn_dispatch`] answers its caller as soon as the round
+/// starts, which is right for an agent whose own turn is durable. The command line is
+/// answered and gone the moment it returns, so the round's durable rows are written FIRST
+/// (awaited) and the round then runs as a RESUME of its own rows — exactly the round a crash
+/// between the two would have started at the next boot, so a restart neither loses the
+/// handover nor repeats it. The job row carries the command line's own user and channel;
+/// there is no agent session and no custom-role launch behind a shell caller, so neither is
+/// threaded through. `Err` is a failed row write: nothing was dispatched, and the caller may
+/// be told the handover did not happen.
 pub(crate) async fn hand_over_worker_round(
     delivery: &Workspace,
     place: Option<&Workspace>,
@@ -90,9 +75,8 @@ pub(crate) async fn hand_over_worker_round(
     caller_role: Role,
     job_id: &str,
 ) -> anyhow::Result<()> {
-    // Read the caller's identity synchronously BEFORE the spawn (task-local
-    // contract): the round's job row must carry the command line's own user and
-    // channel.
+    // Read the caller's identity synchronously BEFORE the spawn (task-local contract): the
+    // job row must carry the command line's own user and channel.
     let user_name = crate::agent::tool_user_name();
     let channel = crate::agent::tool_channel();
 
@@ -107,17 +91,15 @@ pub(crate) async fn hand_over_worker_round(
             exec_dir: place.map(|ws| ws.path.as_str()),
             custom_launch: None,
         }),
-        // The command line has no agent session behind it: no caller session pin,
-        // and the row write is not a caller's retry (nothing is running yet).
+        // No agent session behind the command line: no caller session pin, and the row write
+        // is not a caller's retry (nothing is running yet).
         caller_agent_id: None,
         fail_on_checkpoint_error: false,
     };
     spawn_implement_rows(exec, task, &args).await?;
 
-    // The rows are down: run the round as a RESUME of its own rows, so a restart
-    // that lands between the two starts the very round this call promised. The
-    // resume path reports its own outcome — a failure or a panic included — to
-    // the conversation the report was promised to.
+    // The rows are down: run the round as a RESUME of them, so a restart landing between the
+    // two starts the very round this call promised.
     let (delivery, job_id) = (delivery.clone(), job_id.to_string());
     let exec_dir = place.map(|ws| ws.path.clone());
     tokio::spawn(async move {
@@ -128,9 +110,9 @@ pub(crate) async fn hand_over_worker_round(
     Ok(())
 }
 
-/// Spawn the implement job + single-worker roster (one tx), then run the worker.
-/// A resume (`spawn: None`) reuses the stored roster (never regenerate ids —
-/// the PK would conflict AND the new id would not match the stored roster row).
+/// Spawn the implement job + single-worker roster (one tx), then run the worker. A resume
+/// (`spawn: None`) reuses the stored roster — ids are never regenerated, or the PK would
+/// conflict and the new id would not match the stored row.
 pub(crate) async fn run_implement_with_job(
     ws: &Workspace,
     task: &str,
@@ -138,35 +120,29 @@ pub(crate) async fn run_implement_with_job(
 ) -> anyhow::Result<crate::tools::SyncCoreOutcome> {
     let resume = args.spawn.is_none();
     let (worker_agent_id, pre_done) = match &args.spawn {
-        // Resume: reuse the stored roster (never regenerate ids — the PK would
-        // conflict AND the new id would not match the stored roster row).
         None => {
             let rows = crate::jobs::list_agents_for_job(&crate::session::store().conn, args.job_id)
                 .await?;
             let row = rows.first().ok_or_else(|| {
                 super::internal_fault("worker round resume found no roster row for the stored job")
             })?;
-            // Only a completed (done) worker's outcome is reconstructable — a
-            // failed/launched worker is re-run with its stored task on resume.
+            // Only a completed worker's outcome is reconstructable — a failed or launched
+            // one is re-run with its stored task.
             let pre_done = (row.status == crate::jobs::RowStatus::Done.as_str())
                 .then(|| row.outcome.clone())
                 .flatten();
             (row.agent_id.clone(), pre_done)
         }
-        // Fresh dispatch: spawn the job + single-worker roster (one tx).
         Some(_) => (spawn_implement_rows(ws, task, &args).await?, None),
     };
 
-    // A completed worker's stored outcome IS the final response — deliver it
-    // without re-running (the LLM work is never lost or duplicated).
+    // A completed worker's stored outcome IS the final response: deliver it without re-running.
     if let Some(outcome) = pre_done {
         return Ok(crate::tools::SyncCoreOutcome::Terminal(Ok(outcome)));
     }
 
-    // Fresh (or resume-without-outcome) run: run the single worker. On resume the
-    // worker reuses its persisted session so an interrupted attempt continues
-    // rather than redoing the whole task (an empty message when the session
-    // already holds the task).
+    // Fresh (or resume-without-outcome) run. On resume the worker reuses its persisted
+    // session, so an interrupted attempt continues rather than redoing the task.
     let parent_key = crate::agent::CURRENT_TOOL_PARENT_KEY
         .try_with(std::clone::Clone::clone)
         .unwrap_or(None);
@@ -192,8 +168,8 @@ pub(crate) async fn run_implement_with_job(
     )
     .await;
 
-    // CHECKPOINT: persist the worker's terminal outcome so a drain-cut / crash
-    // resume can reconstruct it without re-running a completed worker.
+    // CHECKPOINT: persist the worker's terminal outcome so a drain-cut or crash resume can
+    // reconstruct it without re-running a completed worker.
     let (status, outcome) = match &response {
         Some(r) => (crate::jobs::RowStatus::Done, r.clone()),
         None => (
@@ -391,11 +367,10 @@ mod tests {
         assert_place_round_write(&delivery, &place, "implement_own_dir_job").await;
     }
 
-    /// (h) Mirror the analyze durability lifecycle for implement: with drain
-    /// active the sync dispatch surfaces [`CallSuspended`] and leaves the
-    /// caller-owned job launched; a Done-worker resume then reconstructs
-    /// "WORKER_RESPONSE", settles it as the tool result contiguous after the
-    /// frame, and terminalizes the job.
+    /// (h) Mirror the analyze durability lifecycle: with drain active the sync dispatch
+    /// surfaces [`CallSuspended`] and leaves the caller-owned job launched; a Done-worker
+    /// resume then reconstructs "WORKER_RESPONSE", settles it as the tool result contiguous
+    /// after the frame, and terminalizes the job.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn sync_implement_draincut_and_completion_resumes_durable_job() {
@@ -405,7 +380,6 @@ mod tests {
         let conn = &crate::session::store().conn;
         crate::util::test::seed_session_row(conn, pin, "user", "implement this").await;
 
-        // (e) drain → CallSuspended; the durable job stays launched, caller-owned.
         crate::shutdown::drain_begin();
         let res = crate::agent::CURRENT_TOOL_AGENT_ID
             .scope(Some(pin.to_string()), async {
@@ -437,8 +411,8 @@ mod tests {
         );
         let job_id = jobs[0].get::<String>(0).unwrap();
 
-        // Simulate the worker checkpointing Done just before the drain cut: the
-        // drain observed the round mid-flight, the durable outcome is intact.
+        // The worker checkpointed Done just before the drain cut: the drain observed the round
+        // mid-flight, the durable outcome is intact.
         let roster = crate::jobs::list_agents_for_job(conn, &job_id)
             .await
             .unwrap();
@@ -453,7 +427,6 @@ mod tests {
         .await
         .unwrap();
 
-        // (f) completion: seed the caller frame and resume + settle.
         let frame = crate::providers::reasoning::assistant_replay_payload(
             Some(""),
             &[crate::ToolCall {
@@ -490,7 +463,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Job terminalized; tool row WORKER_RESPONSE contiguous after the frame.
         let jobs = conn
             .query(
                 "SELECT id FROM jobs WHERE id = ?1",

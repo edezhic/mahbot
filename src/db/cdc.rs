@@ -1,44 +1,33 @@
 //! General CDC (change-data-capture) subscription engine over the Turso CDC log.
 //!
-//! [`drain_once`] drains the engine-managed `turso_cdc` table (created by
-//! enabling `PRAGMA capture_data_changes_conn('full,turso_cdc')`), decodes the
-//! business key for each changed row, and broadcasts a [`ChangeEvent`] to
-//! subscribers of that table. It prunes consumed `turso_cdc` rows bottom-up so
-//! the log stays bounded and the WAL `NewRowid` `change_id` stays monotonic for
-//! new rows.
+//! [`drain_once`] drains the engine-managed `turso_cdc` table (created by enabling `PRAGMA
+//! capture_data_changes_conn('full,turso_cdc')`), decodes the business key for each changed row,
+//! and broadcasts a [`ChangeEvent`] to subscribers of that table. It prunes consumed `turso_cdc`
+//! rows bottom-up so the log stays bounded and the WAL `NewRowid` `change_id` stays monotonic for
+//! new rows. This module writes no domain/timeline tables: its only write is that pruning (which
+//! the engine self-excludes from capture).
 //!
-//! This module writes no domain/timeline tables. The only write it performs is
-//! pruning `turso_cdc` (which the engine self-excludes from capture) — the
-//! "no domain writes" contract. Decoding is deliberately a Rust-side positional
-//! read over the `before`/`after` full-record blobs, using a cached
-//! `PRAGMA table_info` column/PK map.
+//! Decoding is deliberately a Rust-side positional read over the `before`/`after` full-record
+//! blobs, using a cached `PRAGMA table_info` column/PK map. The drainer invokes any registered
+//! synchronous ticket materializer ([`register_ticket_materializer`]) before broadcasting to
+//! channel subscribers, so a non-lossy subscriber (e.g. the chronicle) observes every tickets
+//! transition even when a broadcast receiver lags. The event DTOs are `pub` because [`ChangeEvent`]
+//! is part of the public GUI message surface; the module itself is `pub(crate)`, so they are not
+//! nameable outside the crate. The bin never touches `cdc` directly: warm-up goes through the
+//! `gui::init_*_tx()` wrappers.
 //!
-//! The drainer invokes any registered synchronous ticket materializer
-//! ([`register_ticket_materializer`]) before broadcasting to broadcast-channel
-//! subscribers, so a non-lossy subscriber (e.g. the chronicle) observes every
-//! tickets transition even when a broadcast receiver lags.
+//! Pinned-engine caveat:
 //!
-//! The event DTOs ([`ChangeEvent`] and friends) are `pub` because
-//! [`ChangeEvent`] is part of the public GUI message surface
-//! (`gui::board::BoardMessage::TicketChanged`); the module itself is
-//! `pub(crate)`, so they are not nameable from outside the crate. The bin
-//! never touches `cdc` directly: warm-up goes through the `gui::init_*_tx()`
-//! wrappers.
-//!
-//! ## Pinned-engine caveat
-//!
-//! - CDC is per-connection and mutually exclusive with MVCC (mahbot is WAL, so
-//!   it does not apply). Per-connection is what makes the store's change record
-//!   complete with capture enabled on the writing connection alone: no change
-//!   may be committed on any other connection (the reader connections are
-//!   read-only for their whole life — see [`Connection`]).
-//! - The pragma's `full` capture mode guarantees `before`/`after` are populated
-//!   for every `change_type` (`1`=INSERT, `0`=UPDATE, `-1`=DELETE, `2`=COMMIT),
-//!   so business keys are recoverable for all three mutations.
-//! - In WAL mode `change_id` is a plain `NewRowid` (not a global monotonic
-//!   cursor); the drainer therefore reads + prunes strictly in `change_id`
-//!   order and re-drains surviving rows on restart (at-least-once + idempotent
-//!   consumers).
+//! - CDC is per-connection and mutually exclusive with MVCC (mahbot is WAL, so that does not
+//!   apply). Per-connection is what makes the change record complete with capture enabled on the
+//!   writing connection alone: no change may be committed on any other connection (the readers are
+//!   read-only for their whole life).
+//! - `full` capture guarantees `before`/`after` are populated for every `change_type`
+//!   (`1`=INSERT, `0`=UPDATE, `-1`=DELETE, `2`=COMMIT), so business keys are recoverable for all
+//!   three mutations.
+//! - In WAL mode `change_id` is a plain `NewRowid` (not a global monotonic cursor); the drainer
+//!   therefore reads and prunes strictly in `change_id` order and re-drains surviving rows on
+//!   restart (at-least-once, idempotent consumers).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -54,20 +43,19 @@ use crate::util::UnwrapPoison;
 /// Capacity of each per-table change-event broadcast channel.
 const CHANNEL_CAPACITY: usize = 1024;
 
-/// Maximum number of `turso_cdc` rows processed per drain batch (bounds the
-/// per-cycle read for a large transaction; the prune keeps the table small).
+/// Maximum `turso_cdc` rows processed per drain batch (bounds the per-cycle read for a large
+/// transaction; the prune keeps the table small).
 const DRAIN_BATCH: i64 = 1000;
 
-/// Fixed poll interval for the CDC drainer. A constant cadence keeps GUI reaction
-/// latency bounded regardless of idle/busy state; the cost of an empty poll is
-/// one cheap cached-prepare read.
+/// Fixed poll interval for the drainer: a constant cadence keeps GUI reaction latency bounded
+/// whatever the idle/busy state, and an empty poll costs one cheap cached-prepare read.
 const DRAIN_POLL: Duration = Duration::from_millis(100);
 
 /// The engine-managed CDC table name (created when capture is enabled).
 pub(crate) const CDC_TABLE: &str = "turso_cdc";
 
-/// Tables that must never be broadcast (self-feed prevention). Writes to these on
-/// the CDC-enabled connection would otherwise re-enter the drainer.
+/// Tables that must never be broadcast (self-feed prevention): writes to these on the CDC-enabled
+/// connection would otherwise re-enter the drainer.
 const EXCLUDED_TABLES: &[&str] = &[CDC_TABLE, "turso_cdc_version", "ticket_chronicle"];
 
 /// Which mutation produced a CDC change row.
@@ -138,8 +126,7 @@ impl RowRecord {
         })
     }
 
-    /// Look up a column by name. Returns `None` when the column is absent or its
-    /// value is SQL NULL.
+    /// Look up a column by name: `None` when the column is absent or its value is SQL NULL.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&CdcValue> {
         self.columns
@@ -153,13 +140,11 @@ impl RowRecord {
 #[derive(Debug, Clone)]
 pub struct ChangeEvent {
     pub table: String,
-    /// The drainer's ordering key (WAL `NewRowid`). **Not** used as a GUI
-    /// watermark: it is a plain `NewRowid` that restarts after `turso_cdc` is
-    /// fully pruned, so it is only informational today.
+    /// The drainer's ordering key (WAL `NewRowid`). **Not** a GUI watermark: it restarts after
+    /// `turso_cdc` is fully pruned, so it is only informational today.
     pub change_id: i64,
-    /// The original unix-second commit time of the change. Informational today;
-    /// the chronicle subscriber prefers the after-record `updated_at` (microsecond
-    /// precision) as the transition timestamp.
+    /// The original unix-second commit time. Informational today; the chronicle subscriber prefers
+    /// the after-record `updated_at` (microsecond precision) as the transition timestamp.
     pub change_time: i64,
     pub change_type: ChangeType,
     pub pk: Pk,
@@ -184,10 +169,9 @@ impl ChangeEvent {
     }
 }
 
-/// Cached `PRAGMA table_info` shape for a table. The PK columns in mahbot are
-/// leading and never dropped, so the map is stable in practice; it is re-queried
-/// when the table's column count drifts (a DDL change) rather than trusted
-/// blindly.
+/// Cached `PRAGMA table_info` shape for a table. The PK columns are leading and never dropped, so
+/// the map is stable in practice; it is re-queried when the table's column count drifts (a DDL
+/// change) rather than trusted blindly.
 #[derive(Debug, Clone)]
 struct TableInfo {
     columns: Vec<String>,
@@ -196,8 +180,8 @@ struct TableInfo {
 }
 
 impl TableInfo {
-    /// Upkeep: the drain's own bookkeeping read, so it runs on the writing
-    /// connection with the rest of the drain (see [`drain_once`]).
+    /// Upkeep: the drain's own bookkeeping read, so it runs on the writing connection with the rest
+    /// of the drain.
     async fn query(conn: &Connection, table: &str) -> anyhow::Result<Self> {
         let rows = conn
             .upkeep()
@@ -223,22 +207,17 @@ impl TableInfo {
 /// Cache of per-table [`TableInfo`], keyed by table name.
 static TABLE_INFO: OnceLock<Mutex<HashMap<String, TableInfo>>> = OnceLock::new();
 
-/// Registry of generic per-table broadcast senders.
-///
-/// The drainer derives `subscribed_tables` from this map's keys and
-/// [`broadcast_event`] sends via it, so every consumed non-tickets table MUST
-/// have an entry here. The "workspaces" / "users" / "user_channels" tables have
-/// dedicated sender slots (for the GUI subscription helper) initialised through
-/// [`init_table_sender`], which keeps the slot and this map on the SAME channel —
-/// if they ever diverged, the drainer would prune rows without broadcasting (it
-/// derives `subscribed_tables` from [`TABLES`] keys and sends via the map).
-/// "tickets" is special-cased in [`broadcast_event`] and does not
-/// use this map.
+/// Registry of generic per-table broadcast senders. The drainer derives `subscribed_tables` from
+/// this map's keys and [`broadcast_event`] sends via it, so every consumed non-tickets table MUST
+/// have an entry. The `workspaces`/`users`/`user_channels` tables have dedicated sender slots
+/// initialised through [`init_table_sender`], which keeps the slot and this map on the SAME channel
+/// — if they diverged, the drainer would prune rows without broadcasting. `tickets` is
+/// special-cased in [`broadcast_event`].
 static TABLES: OnceLock<Mutex<HashMap<String, tokio::sync::broadcast::Sender<ChangeEvent>>>> =
     OnceLock::new();
 
-/// The tickets-table broadcast sender (the only table the GUI + chronicle
-/// consume today). Created on first access.
+/// The tickets-table broadcast sender (the only table the GUI and chronicle consume today), created
+/// on first access.
 static TICKET_SENDER: OnceLock<tokio::sync::broadcast::Sender<ChangeEvent>> = OnceLock::new();
 
 /// The shared tickets-table broadcast sender.
@@ -257,20 +236,17 @@ pub(crate) fn ticket_sender_lock() -> &'static OnceLock<tokio::sync::broadcast::
     &TICKET_SENDER
 }
 
-// Dedicated per-table sender slots for the GUI subscription helper. Each is
-// kept on the SAME channel as its [`TABLES`] registry entry (see
-// [`init_table_sender`] for the invariant).
+// Dedicated per-table sender slots for the GUI subscription helper, each kept on the SAME channel
+// as its [`TABLES`] entry (see [`init_table_sender`] for the invariant).
 static WORKSPACE_SENDER: OnceLock<tokio::sync::broadcast::Sender<ChangeEvent>> = OnceLock::new();
 static USER_SENDER: OnceLock<tokio::sync::broadcast::Sender<ChangeEvent>> = OnceLock::new();
 static USER_CHANNEL_SENDER: OnceLock<tokio::sync::broadcast::Sender<ChangeEvent>> = OnceLock::new();
 
-/// Initialise the dedicated sender slot for `table` and register the SAME
-/// channel in [`TABLES`] so the drainer's `subscribed_tables` (derived from the
-/// [`TABLES`] keys) and [`broadcast_event`] (which sends via [`TABLES`]) see a
-/// subscriber. Both the dedicated slot and the registry MUST be the same channel:
-/// if they ever diverged, the drainer would prune rows without broadcasting. The
-/// slot is first-writer-wins (idempotent); the registry entry is (re)written to
-/// the slot's channel so the two can never drift.
+/// Initialise the dedicated sender slot for `table` and register the SAME channel in [`TABLES`], so
+/// the drainer's `subscribed_tables` and [`broadcast_event`] see a subscriber. The two MUST be the
+/// same channel: if they diverged the drainer would prune rows without broadcasting. The slot is
+/// first-writer-wins (idempotent); the registry entry is (re)written to the slot's channel so the
+/// two cannot drift.
 fn init_table_sender(
     table: &'static str,
     slot: &'static OnceLock<tokio::sync::broadcast::Sender<ChangeEvent>>,
@@ -285,21 +261,20 @@ fn init_table_sender(
         .insert(table.to_string(), tx);
 }
 
-/// Warm the workspaces CDC sender before the iced application runs (same
-/// immediately-ending-stream rationale as the board sender) so the GUI's
-/// workspaces subscription always has a source. Called from `main`.
+/// Warm the workspaces CDC sender before the iced application runs (same immediately-ending-stream
+/// rationale as the board sender), so the GUI's subscription always has a source. Called from
+/// `main`.
 pub(crate) fn init_workspace_tx() {
     init_table_sender("workspaces", &WORKSPACE_SENDER);
 }
 
-/// Warm the users CDC sender before the iced application runs (same
-/// immediately-ending-stream rationale as the board sender). Called from `main`.
+/// Warm the users CDC sender before the iced application runs (same rationale as the board sender).
 pub(crate) fn init_users_tx() {
     init_table_sender("users", &USER_SENDER);
 }
 
-/// Warm the user_channels CDC sender before the iced application runs (same
-/// immediately-ending-stream rationale as the board sender). Called from `main`.
+/// Warm the user_channels CDC sender before the iced application runs (same rationale as the board
+/// sender).
 pub(crate) fn init_user_channels_tx() {
     init_table_sender("user_channels", &USER_CHANNEL_SENDER);
 }
@@ -325,11 +300,10 @@ pub(crate) fn user_channels_sender_lock()
     &USER_CHANNEL_SENDER
 }
 
-/// A synchronous subscriber invoked by the drainer for each tickets change
-/// before broadcasting to the GUI. This is the chronicle's non-lossy materializer
-/// (a broadcast channel would drop events on a lagging receiver, losing
-/// transitions from the source-of-truth table). db::cdc itself performs no
-/// domain/timeline write — the materializer's code owns its own writes.
+/// A synchronous subscriber the drainer invokes for each tickets change before broadcasting to the
+/// GUI: the chronicle's non-lossy materializer (a broadcast channel drops events on a lagging
+/// receiver, losing transitions from the source-of-truth table). `cdc` itself performs no domain
+/// write — the materializer owns its own.
 type TicketMaterializer = Arc<
     dyn for<'a> Fn(&'a ChangeEvent) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>
         + Send
@@ -337,8 +311,8 @@ type TicketMaterializer = Arc<
 >;
 static TICKET_MATERIALIZER: OnceLock<TicketMaterializer> = OnceLock::new();
 
-/// Register the synchronous tickets materializer (once, idempotent). Must run
-/// before the drainer's first drain (typically right after store init).
+/// Register the synchronous tickets materializer (once, idempotent). Must run before the drainer's
+/// first drain (typically right after store init).
 pub(crate) fn register_ticket_materializer(
     f: impl for<'a> Fn(&'a ChangeEvent) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>
     + Send
@@ -348,11 +322,9 @@ pub(crate) fn register_ticket_materializer(
     let _ = TICKET_MATERIALIZER.set(Arc::new(f));
 }
 
-/// Test-only generic subscription entry point: returns a receiver for `table`'s
-/// broadcast channel, creating the sender (and a [`TABLES`] registry entry) on
-/// first call. Production subscribers use `ticket_sender()` or the dedicated
-/// `*_sender_lock()` accessors instead; "tickets" is special-cased here the same
-/// way [`broadcast_event`] special-cases it.
+/// Test-only generic subscription entry point: a receiver for `table`'s channel, creating the
+/// sender (and a [`TABLES`] entry) on first call. Production uses `ticket_sender()` or the
+/// dedicated accessors; "tickets" is special-cased here as [`broadcast_event`] does.
 #[cfg(test)]
 pub(crate) fn subscribe(table: &str) -> tokio::sync::broadcast::Receiver<ChangeEvent> {
     if table == "tickets" {
@@ -370,9 +342,9 @@ pub(crate) fn subscribe(table: &str) -> tokio::sync::broadcast::Receiver<ChangeE
         .subscribe()
 }
 
-/// Enable CDC on `conn`: capture mode `full` into [`CDC_TABLE`]. Idempotent (the
-/// engine uses `CREATE TABLE IF NOT EXISTS` + `INSERT OR IGNORE`). Must run AFTER
-/// migrations / boot hooks so those writes are not captured.
+/// Enable CDC on `conn`: capture mode `full` into [`CDC_TABLE`]. Idempotent (the engine uses
+/// `CREATE TABLE IF NOT EXISTS` + `INSERT OR IGNORE`). Must run AFTER migrations and boot hooks so
+/// those writes are not captured.
 pub(crate) async fn enable_capture(conn: &Connection) -> anyhow::Result<()> {
     conn.execute(
         &format!("PRAGMA capture_data_changes_conn('full,{CDC_TABLE}');"),
@@ -382,12 +354,9 @@ pub(crate) async fn enable_capture(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Spawn the background drain loop (once per process), pumping [`drain_once`]
-/// at a fixed cadence (`DRAIN_POLL`).
-///
-/// The connection is the boot connection (the one every domain store shares via
-/// the `DOMAIN_CONN` cell), established during the boot open before this runs
-/// and process-stable after that — so no runtime re-pointing is needed.
+/// Spawn the background drain loop (once per process), pumping [`drain_once`] at a fixed cadence.
+/// The connection is the boot connection every domain store shares via `DOMAIN_CONN`, established
+/// before this runs and process-stable after — so no runtime re-pointing is needed.
 pub(crate) fn spawn_drainer(conn: Connection) {
     static STARTED: OnceLock<()> = OnceLock::new();
     if STARTED.get().is_some() {
@@ -404,30 +373,19 @@ pub(crate) fn spawn_drainer(conn: Connection) {
     });
 }
 
-/// Drains a batch of `turso_cdc` rows: decode + broadcast subscribed-table
-/// changes, then prune the consumed rows bottom-up. Public so tests can drive a
-/// single deterministic drain. Rows that fail to decode (e.g. an engine-managed
-/// shadow table) are logged and skipped — the batch still prunes, so a bad row
-/// never stalls the drainer.
-///
-/// A row whose tickets materializer errors is left for the next drain (its
-/// `change_id` is not pruned), so a transient DB failure during the chronicle
-/// write is retried rather than permanently dropping the transition.
-///
-/// Read and prune both run on the writing connection (the read through
-/// [`Connection::upkeep`]): this drain is the bookkeeping half of the store's
-/// own change recording, whose other half — the capture itself — lives on that
-/// connection too, and it reads the store's own record of changes rather than
-/// domain state. Kept off a reader connection it also stays a single
-/// read-then-prune sequence on one connection, instead of reading a snapshot a
-/// reader may lag behind.
-///
-/// Concurrent invocations are serialized by [`DRAIN_LOCK`]: the drainer is
-/// called both from the background loop and from synchronous flushes
-/// (`notify_ticket`, the Manager path), and without serialization two drains
-/// could interleave their prune with another drain's full-table prune, letting a
-/// freshly-captured row whose `change_id` restarted low (after `turso_cdc` was
-/// fully pruned) be deleted before it was ever processed.
+/// Drain a batch of `turso_cdc` rows: decode and broadcast subscribed-table changes, then prune the
+/// consumed rows bottom-up. Public so tests can drive one deterministic drain. A row that fails to
+/// decode (an engine-managed shadow table) is logged and skipped — the batch still prunes, so a bad
+/// row never stalls the drainer. A row whose tickets materializer errors is left for the next drain
+/// (its `change_id` is not pruned), so a transient DB failure during the chronicle write is retried
+/// rather than losing the transition. Read and prune both run on the writing connection (the read
+/// through [`Connection::upkeep`]): this drain is the bookkeeping half of the store's own change
+/// recording, it reads that record rather than domain state, and it stays one read-then-prune
+/// sequence instead of reading a snapshot a reader may lag behind. Concurrent invocations are
+/// serialized by [`DRAIN_LOCK`]: the drainer runs both from the background loop and from
+/// synchronous flushes (`notify_ticket`, the Manager path), and without serialization two drains
+/// could interleave their prunes, letting a freshly-captured row whose `change_id` restarted low be
+/// deleted before it was ever processed.
 static DRAIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub(crate) async fn drain_once(conn: &Connection) -> anyhow::Result<()> {
@@ -435,8 +393,8 @@ pub(crate) async fn drain_once(conn: &Connection) -> anyhow::Result<()> {
     let rows = conn
         .upkeep()
         .query_cached(
-            // prepare_cached caches by SQL text, so the same formatted string
-            // still hits the engine's per-connection statement cache.
+            // prepare_cached caches by SQL text, so the same formatted string still hits the
+            // statement cache.
             &format!(
                 "SELECT change_id, change_time, change_type, \
                  table_name, id, before, after \
@@ -450,8 +408,8 @@ pub(crate) async fn drain_once(conn: &Connection) -> anyhow::Result<()> {
     }
     // Cache table_info per batch for multi-row transactions.
     let mut infos: HashMap<String, TableInfo> = HashMap::new();
-    // Set of non-ticket tables that have at least one broadcast subscriber, so
-    // decode can be skipped (and the row pruned) for tables nobody consumes.
+    // Tables with at least one broadcast subscriber, so decode can be skipped (and the row pruned)
+    // for tables nobody consumes.
     let subscribed_tables: std::collections::HashSet<String> = {
         let mut s = std::collections::HashSet::new();
         if let Some(map) = TABLES.get().and_then(|m| m.lock().ok()) {
@@ -459,19 +417,17 @@ pub(crate) async fn drain_once(conn: &Connection) -> anyhow::Result<()> {
         }
         s
     };
-    // Highest change_id whose row was fully delivered (decode + broadcast + a
-    // successful materializer) — the prune bound. Rows before this are safe to
-    // drop; rows at/after a materializer failure are left for the next drain so
-    // a transient DB error is retried rather than permanently dropping the
-    // transition (the at-least-once contract).
+    // Highest change_id whose row was fully delivered — the prune bound. Rows at/after a
+    // materializer failure are left for the next drain, so a transient DB error is retried rather
+    // than dropping the transition.
     let mut prune_up_to: i64 = -1;
     for row in &rows {
         let Some(change_id) = row.get_value(0).ok().and_then(|v| v.as_integer().copied()) else {
             continue;
         };
         let Some(table) = row.get_value(3).ok().and_then(|v| v.as_text().cloned()) else {
-            // No table name — cannot determine the row; drop it so a malformed
-            // row never stalls the drainer.
+            // No table name — cannot determine the row; drop it so a malformed row never stalls the
+            // drainer.
             prune_up_to = change_id;
             continue;
         };
@@ -496,9 +452,8 @@ pub(crate) async fn drain_once(conn: &Connection) -> anyhow::Result<()> {
         }
         match decode_row(conn, &mut infos, row, &table, change_type).await {
             Ok(event) => {
-                // Non-lossy materializer (e.g. the chronicle) runs before the
-                // broadcast so a re-delivered transition is materialized even if
-                // a lagging receiver drops the broadcast copy.
+                // The non-lossy materializer runs before the broadcast, so a re-delivered
+                // transition is materialized even if a lagging receiver drops the broadcast copy.
                 if event.table == "tickets"
                     && let Some(m) = TICKET_MATERIALIZER.get().cloned()
                     && let Err(e) = m(&event).await
@@ -510,8 +465,8 @@ pub(crate) async fn drain_once(conn: &Connection) -> anyhow::Result<()> {
                         error = %e,
                         "ticket materializer failed",
                     );
-                    // Leave this row (and later ones) for the next drain so the
-                    // transition is retried, not permanently dropped.
+                    // Leave this row (and later ones) for the next drain so the transition is
+                    // retried.
                     break;
                 }
                 broadcast_event(&event);
@@ -573,8 +528,8 @@ async fn decode_row(
 /// Publish an event to its table's subscriber channel(s).
 fn broadcast_event(event: &ChangeEvent) {
     if event.table == "tickets" {
-        // Best-effort: a lagging receiver gets `Lagged` → the GUI forces a
-        // full refresh rather than silently dropping the delta.
+        // Best-effort: a lagging receiver gets `Lagged` → the GUI forces a full refresh rather than
+        // dropping the delta.
         let _ = ticket_sender().send(event.clone());
         return;
     }
@@ -589,12 +544,10 @@ fn broadcast_event(event: &ChangeEvent) {
     }
 }
 
-/// Resolve the business key from the record (before for DELETE, after for
-/// INSERT/UPDATE), falling back to the rowid when the record is absent. A single
-/// INTEGER PRIMARY KEY rowid alias also carries its value in the record, so the
-/// record path covers both rowid-alias and TEXT-PK tables. Composite-PK tables
-/// (none in mahbot today) fall back to the raw rowid — a known latent gap, since
-/// no current subscriber reads one.
+/// Resolve the business key from the record (before for DELETE, after for INSERT/UPDATE), falling
+/// back to the rowid when the record is absent — an INTEGER PRIMARY KEY rowid alias also carries
+/// its value in the record, to the raw rowid: a known latent gap, since no current subscriber reads
+/// one.
 fn resolve_pk(
     info: &TableInfo,
     rowid: i64,
@@ -621,14 +574,12 @@ fn resolve_pk(
     Pk::Integer(rowid)
 }
 
-/// Build (and cache) the column/PK map for `table`, re-querying when the
-/// schema's column count drifts.
-///
-/// Upkeep, like [`TableInfo::query`]: both reads are the drain's own bookkeeping
-/// and so run on the writing connection with the rest of the drain.
+/// Build (and cache) the column/PK map for `table`, re-querying when the schema's column count
+/// drifts. Upkeep, like [`TableInfo::query`], so both run on the writing connection with the rest
+/// of the drain.
 async fn cached_table_info(conn: &Connection, table: &str) -> anyhow::Result<TableInfo> {
-    // Fast path: a cached map whose schema is unchanged. The clone is released
-    // from the mutex guard before the await below, so the future stays `Send`.
+    // Fast path: a cached map whose schema is unchanged. The clone leaves the mutex guard before
+    // the await below, so the future stays `Send`.
     let cached = TABLE_INFO
         .get()
         .and_then(|m| m.lock().ok())
@@ -651,8 +602,7 @@ async fn cached_table_info(conn: &Connection, table: &str) -> anyhow::Result<Tab
     Ok(info)
 }
 
-/// Convert a Turso record value to our owned [`CdcValue`] via the public
-/// `ValueRef` accessors (avoiding the private `Numeric` module).
+/// Convert a Turso record value to our owned [`CdcValue`] via the public `ValueRef` accessors.
 fn value_ref_to_cdc(v: &ValueRef<'_>) -> CdcValue {
     if matches!(v, ValueRef::Null) {
         return CdcValue::Null;
@@ -698,7 +648,6 @@ mod tests {
         assert_eq!(event.table, "t");
         assert_eq!(event.change_type, ChangeType::Insert);
         assert_eq!(event.pk, Pk::Text("mahbot-t".into()));
-        // The decoded after record exposes the row by column name.
         let after = event.after.as_ref().expect("after record");
         assert_eq!(after.get("phase"), Some(&CdcValue::Text("backlog".into())));
 

@@ -1,45 +1,29 @@
 //! Text-to-Speech using Supertone's Supertonic 3 model.
 //!
-//! # Overview
-//!
-//! This is the speech engine behind the `say` tool
-//! ([`crate::tools::SayTool`]): one short phrase the admin's Assistant asks to
-//! have spoken, rendered and played on the machine the product runs on.
-//! Synthesis runs **asynchronously** and **non-blocking** — [`say_phrase`]
-//! returns as soon as the phrase is handed to the engine, and playback happens
-//! in the background.
+//! The speech engine behind the `say` tool ([`crate::tools::SayTool`]): one short
+//! phrase the admin's Assistant asks to have spoken, rendered and played on the
+//! machine the product runs on. Synthesis runs **asynchronously** and
+//! **non-blocking** — [`say_phrase`] returns as soon as the phrase is handed to the
+//! engine, and playback happens in the background.
 //!
 //! Nothing is spoken by itself: an assistant reply, an automation or a confirmation
-//! reaches the engine only through a `say` call. A phrase is then spoken when:
-//!
-//! 1. Speech output is enabled in config ([`is_config_enabled`]).
-//! 2. The Supertonic 3 model files are cached and loaded.
-//! 3. An audio output device could be opened.
-//! 4. Someone is at the computer ([`crate::user_activity`]) — a phrase is not
-//!    spoken to an empty room.
-//!
-//! A newer phrase replaces the one still being spoken ([`cancel_playback`]).
+//! reaches the engine only through a `say` call. A phrase is then spoken when speech
+//! output is enabled ([`is_config_enabled`]), the Supertonic 3 files are cached and
+//! loaded, an output device could be opened, and someone is at the computer
+//! ([`crate::user_activity`]) — a phrase is not spoken to an empty room. A newer
+//! phrase replaces the one still being spoken ([`cancel_playback`]).
 //!
 //! # Pipeline (Supertonic 3)
 //!
-//! The synthesis pipeline has 4 ONNX model stages:
-//!
-//! 1. **Duration Predictor** – predicts token durations from token IDs.
-//! 2. **Text Encoder** – encodes text features from token IDs.
-//! 3. **Vector Estimator** – 8-step flow matching from noise to latent vector.
-//! 4. **Vocoder** – converts latent vectors to PCM audio.
+//! Four ONNX stages: a **Duration Predictor** (token durations from token IDs), a
+//! **Text Encoder**, a **Vector Estimator** (8-step flow matching from noise to
+//! latent vector) and a **Vocoder** (latent vectors to PCM audio).
 //!
 //! # State machine
 //!
-//! The loading state uses [`crate::util::model_state::ModelState`]:
-//!
-//! | Value | Name     | Meaning                                      |
-//! |-------|----------|----------------------------------------------|
-//! | 0     | UNINIT   | TTS not loaded yet; [`init_global()`] must   |
-//! |       |          | be called before the module can function.     |
-//! | 1     | LOADING  | Downloading model files (retry loop).         |
-//! | 2     | READY    | All models loaded and ready for synthesis.    |
-//! | 3     | FAILED   | Download or load failed terminally.           |
+//! Loading runs through [`crate::util::model_state::ModelState`]: `UNINIT` ([`init_global()`]
+//! must be called), `LOADING` (downloading, retry loop), `READY`, and `FAILED`
+//! (terminal download or load failure).
 
 use crate::audio::{
     MAX_DOWNLOAD_RETRIES, ensure_downloaded, extract_output, models_subdir, run_download_retry_loop,
@@ -61,8 +45,6 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
-// ── Constants ────────────────────────────────────────────────────────
-
 const MODEL_DIR_NAME: &str = "supertonic3";
 const MODEL_REPO: &str = "Supertone/supertonic-3";
 // Pinned to the "Initial Supertonic 3 release" commit (verified on HuggingFace).
@@ -73,29 +55,21 @@ const MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 const DEFAULT_TOTAL_STEPS: usize = 8;
 const SPEED_FACTOR: f32 = 1.05;
 const MAX_CHUNK_LENGTH: usize = 300;
-/// The seed every phrase the product speaks is rendered with: fixed, so the
-/// same text and voice always give the same waveform — the file the command
-/// line writes and the phrase the app speaks are then the same audio.
+/// The seed every phrase is rendered with: fixed, so the same text and voice always give
+/// the same waveform — the file the command line writes and the app speaks are one audio.
 const PLAYBACK_SEED: u64 = 42;
-/// The pause between two spoken parts, in milliseconds: playback waits it out
-/// between parts, and a reading rendered to a file carries the same pause
-/// written into its audio.
+/// The pause between two spoken parts, in milliseconds: playback waits it out, and a
+/// reading rendered to a file carries the same pause written into its audio.
 const TTS_CHUNK_SILENCE_MS: u64 = 300;
 // Timeout per-chunk receive: guards against hung synthesis (ONNX deadlock).
 const SYNTHESIS_CHUNK_TIMEOUT: Duration = Duration::from_mins(5);
 
-/// Reverb tail in milliseconds — how long after TTS playback ends to keep
-/// the [`PLAYBACK_ACTIVE`] flag asserted, suppressing wake word detection
-/// while room acoustics and output buffer drain complete.
+/// Reverb tail in milliseconds — how long after playback ends to keep [`PLAYBACK_ACTIVE`]
+/// asserted, suppressing wake word detection while acoustics and output buffers drain.
 const PLAYBACK_REVERB_TAIL_MS: u64 = 300;
 
-// ── SHA256 integrity hashes ──────────────────────────────────────────
-//
-// Expected SHA256 hex digests for each model/config file.  When non-empty,
-// the hash is verified on every access (both cache reuse and fresh download).
-//
-// To update: download a new version of the model files and compute their
-// SHA256 digests, then replace the values below.
+// Expected SHA256 hex digests per model/config file: when non-empty, the hash is verified
+// on every access (cache reuse and fresh download alike).
 
 pub(crate) const DP_MODEL_SHA256: &str =
     "c3eb91414d5ff8a7a239b7fe9e34e7e2bf8a8140d8375ffb14718b1c639325db";
@@ -123,7 +97,6 @@ const UNICODE_INDEXER_NAME: &str = "unicode_indexer.json";
 pub(crate) const DEFAULT_VOICE_NAME: &str = "M1.json";
 
 /// The six `onnx/` model+config files as `(filename, expected sha256)`.
-/// Single source of truth for the download, cache-check, and test sites below.
 const ONNX_TTS_FILES: &[(&str, &str)] = &[
     (DP_ONNX_NAME, DP_MODEL_SHA256),
     (TEXT_ENC_ONNX_NAME, TEXT_ENC_MODEL_SHA256),
@@ -133,29 +106,22 @@ const ONNX_TTS_FILES: &[(&str, &str)] = &[
     (UNICODE_INDEXER_NAME, UNICODE_INDEXER_SHA256),
 ];
 
-/// All 10 available voice styles from HuggingFace.
-/// F1-F5 are female voices, M1-M5 are male voices.
+/// All 10 voice styles: F1-F5 female, M1-M5 male.
 pub(crate) const ALL_VOICE_STYLE_NAMES: &[&str] = &[
     "F1.json", "F2.json", "F3.json", "F4.json", "F5.json", "M1.json", "M2.json", "M3.json",
     "M4.json", "M5.json",
 ];
 
-/// The speech model's own language tags: the 31 languages upstream publishes
-/// plus `na`, its language-agnostic fallback. A language the product spells is
-/// always one of these — the speech-output setting's own value is put in the
-/// tag as it stands, and the command line's `--language` is read against this list.
+/// The speech model's own language tags: the 31 languages upstream publishes plus `na`, its
+/// language-agnostic fallback. The setting's value is put in the tag as it stands.
 pub(crate) const TTS_LANGUAGES: &[&str] = &[
     "en", "ko", "ja", "ar", "bg", "cs", "da", "de", "el", "es", "et", "fi", "fr", "hi", "hr", "hu",
     "id", "it", "lt", "lv", "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "tr", "uk", "vi", "na",
 ];
 
-// ── State machine ─────────────────────────────────────────────────────
-
-/// Atomic model-loading state (Uninit → Loading → Ready / Failed).
-///
-/// Shared wrapper: [`crate::util::model_state::ModelState`] with the shared
-/// [`crate::util::model_state::ModelLoadGuard`] for panic safety; retry paths
-/// below ([`spawn_download`], [`retry_download`]) are unchanged.
+/// Atomic model-loading state (Uninit → Loading → Ready / Failed), shared
+/// [`crate::util::model_state::ModelState`] plus its [`crate::util::model_state::ModelLoadGuard`]
+/// for panic safety.
 static STATE: AtomicModelState = AtomicModelState::new(ModelState::Uninit);
 static GLOBAL_TTS: OnceLock<RwLock<Option<Arc<TtsEngine>>>> = OnceLock::new();
 static CANCEL_TX: OnceLock<broadcast::Sender<()>> = OnceLock::new();
@@ -163,36 +129,31 @@ static CANCEL_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 /// Reference-counted signal that TTS audio is currently playing.
 ///
-/// Incremented when the first chunk begins playback in `speak_async()`,
-/// and decremented after the last chunk finishes plus the reverb tail delay
-/// ([`PLAYBACK_REVERB_TAIL_MS`]).  Using a counter (rather than a boolean)
-/// correctly handles overlapping `speak()` calls: if a new phrase starts
-/// before the previous one's reverb tail expires, the count stays above zero
-/// and wake word detection remains suppressed.
-///
-/// Read by the voice pipeline to suppress wake word detection during TTS
-/// output, preventing false triggers from the system hearing its own speech.
+/// Incremented when the first chunk begins playback and decremented after the last chunk
+/// plus the reverb tail ([`PLAYBACK_REVERB_TAIL_MS`]). A counter rather than a boolean, so
+/// overlapping calls keep the count above zero and the voice pipeline keeps suppressing wake
+/// word detection instead of hearing the system's own speech.
 static PLAYBACK_ACTIVE: AtomicUsize = AtomicUsize::new(0);
-
-// ── Download progress events (GUI subscription) ───────────────────────
 
 /// Events emitted during TTS model download for GUI progress reporting.
 #[derive(Debug, Clone)]
 pub enum TtsDownloadEvent {
-    /// A file download has started.
-    FileStarted { name: String, total_bytes: u64 },
-    /// Download progress for a file.
+    FileStarted {
+        name: String,
+        total_bytes: u64,
+    },
     FileProgress {
         name: String,
         bytes_downloaded: u64,
         total_bytes: u64,
     },
-    /// A file download has completed successfully.
-    FileCompleted { name: String },
-    /// All files have been downloaded and verified.
+    FileCompleted {
+        name: String,
+    },
     Complete,
-    /// Download failed with an error.
-    Failed { error: String },
+    Failed {
+        error: String,
+    },
 }
 
 /// Broadcast channel for TTS download progress events (GUI subscription).
@@ -200,29 +161,20 @@ pub static DOWNLOAD_EVENTS: OnceLock<broadcast::Sender<TtsDownloadEvent>> = Once
 
 /// Wrapper around rodio's audio output.
 ///
-/// rodio 0.22 splits output into a `MixerDeviceSink` (owns the cpal stream)
-/// and a `Mixer` handle (a cheap `Arc` clone). Playback creates its players
-/// from the mixer via `Player::connect_new(&mixer)`; the wake-word cues
-/// ([`crate::audio::cue`]) append their source to the same mixer. The sink is
-/// created lazily by `open_audio_output()` and never touched again. Both
-/// members are `Send + Sync` — the cpal `Stream` inside `MixerDeviceSink`
-/// dropped its `NotSendSyncAcrossAllPlatforms` phantom marker in cpal 0.17, so
-/// the wrapper auto-derives both traits and the historical `unsafe impl
-/// Send`/`Sync` are no longer needed (a future rodio/cpal bump that
-/// re-introduces a non-`Send` type would fail to compile at the
-/// `static AUDIO_OUTPUT` below — the correct loud failure).
+/// rodio 0.22 splits output into a `MixerDeviceSink` (owns the cpal stream) and a cheap
+/// `Arc`-cloned `Mixer`; playback and the wake-word cues ([`crate::audio::cue`]) both create
+/// players from that mixer. Both members are `Send + Sync` since cpal 0.17 dropped its
+/// `NotSendSyncAcrossAllPlatforms` marker, so the wrapper auto-derives both traits and a
+/// future bump that re-introduces a non-`Send` type fails to compile at the `static`.
 struct AudioOutputWrapper {
     _sink: MixerDeviceSink,
     mixer: rodio::mixer::Mixer,
 }
 
 static AUDIO_OUTPUT: OnceLock<AudioOutputWrapper> = OnceLock::new();
-/// Serializes lazy device-opens in [`ensure_audio_output()`] so a best-effort
-/// (and relatively costly) `open_default_sink` call is never raced by
-/// concurrent players attempting to open the device at once.
+/// Serializes lazy device-opens in [`ensure_audio_output()`] so a costly `open_default_sink`
+/// call is never raced by concurrent players.
 static AUDIO_OUTPUT_OPEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-// ── TTS JSON config ───────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -246,8 +198,6 @@ struct AeConfig {
     base_chunk_size: usize,
 }
 
-// ── TTS engine ───────────────────────────────────────────────────────
-
 struct TtsEngine {
     dp_model: crate::onnx::Model,
     text_enc_model: crate::onnx::Model,
@@ -261,16 +211,9 @@ struct TtsEngine {
     device: Device,
 }
 
-/// A single style entry from the HuggingFace voice style JSON.
-///
-/// Actual format from HuggingFace repo:
-/// ```json
-/// {
-///   "data": [[[ ... ]]],   // 3D array: [batch, rows, cols]
-///   "dims": [1, 8, 16],    // shape description (ignored by serde)
-///   "type": "float32"       // data type (ignored by serde)
-/// }
-/// ```
+/// A single style entry from the HuggingFace voice style JSON:
+/// `{"data": [[[ ... ]]], "dims": [1, 8, 16], "type": "float32"}` — `data` is a 3D
+/// `[batch, rows, cols]` array; the other two are ignored by serde.
 #[derive(Debug, Deserialize)]
 struct StyleEntry {
     data: Vec<Vec<Vec<f32>>>,
@@ -284,14 +227,8 @@ struct VoiceStyleFile {
     style_ttl: StyleEntry,
 }
 
-// ── Public API ───────────────────────────────────────────────────────
-
-/// Returns `true` if TTS is enabled in config (regardless of model state).
-/// Use this to avoid unnecessary download/loading when TTS is disabled.
-///
-/// TTS is opt-in (disabled by default) — the user must explicitly set
-/// `tts_enabled` to `"true"` in config to activate it. This matches the
-/// convention used by the voice assistant ([`crate::audio::voice`]).
+/// Returns `true` if TTS is enabled in config (regardless of model state), so a caller can
+/// avoid an unnecessary download. TTS is opt-in: `tts_enabled` must be set to `"true"`.
 #[must_use]
 pub fn is_config_enabled() -> bool {
     let enabled = CONFIG.tts_enabled();
@@ -303,61 +240,47 @@ pub fn models_ready() -> bool {
     STATE.is_ready()
 }
 
-/// Returns `true` if the audio output device was successfully initialized.
-///
-/// This checks whether `DeviceSinkBuilder::open_default_sink()` succeeded —
-/// through [`ensure_audio_output()`] or its silent counterpart
-/// [`ensure_audio_output_silent()`] used by the wake-word cues. Models may be
-/// loaded ([`models_ready()`]) but audio output may still be unavailable (e.g.,
-/// headless system, no speakers, CoreAudio initialization failure).
-///
-/// The device is opened lazily on demand ([`ensure_audio_output()`]); this
-/// passive check reflects whether that open has succeeded. Runtime device
-/// disconnection after initialization is not reflected.
+/// Returns `true` if the audio output device was successfully initialized, through
+/// [`ensure_audio_output()`] or its silent counterpart. Models may be loaded while output is
+/// unavailable (headless system, no speakers, CoreAudio failure). A device disconnected after
+/// initialization is not reflected.
 #[must_use]
 pub fn audio_output_ready() -> bool {
     AUDIO_OUTPUT.get().is_some()
 }
 
-/// Open the OS audio output device on demand (idempotent, best-effort).
-/// Returns whether output is ready.
+/// Open the OS audio output device on demand (idempotent, best-effort); returns whether
+/// output is ready.
 ///
-/// Nothing opens the device at init: the speech-enabled boot and the Settings
-/// enable toggle open it, a phrase that finds it closed kicks an open through
-/// [`say_phrase`], and the wake-word cues open it independently via
-/// [`ensure_audio_output_silent()`] (when the microphone starts, and before a
-/// cue).
-///
-/// On failure this warns and leaves [`AUDIO_OUTPUT`] unset (playback disabled),
-/// matching the previous [`init_global()`] behavior. A later call retries a
-/// previously-failed open.
+/// Nothing opens the device at init: the speech-enabled boot and the Settings toggle open it,
+/// a phrase that finds it closed kicks an open through [`say_phrase`], and the wake-word cues
+/// open it through [`ensure_audio_output_silent()`]. On failure this warns and leaves
+/// [`AUDIO_OUTPUT`] unset; a later call retries.
 #[must_use]
 pub fn ensure_audio_output() -> bool {
     open_audio_output(true)
 }
 
-/// [`ensure_audio_output`] for the wake-word cues ([`crate::audio::cue`]).
-/// Identical, except that a failed open is not warned about: a host without
-/// audio output must stay silent, logs and GUI Issues view included.
+/// [`ensure_audio_output`] for the wake-word cues ([`crate::audio::cue`]), except that a
+/// failed open is not warned about: a host without audio output stays silent.
 #[must_use]
 pub(crate) fn ensure_audio_output_silent() -> bool {
     open_audio_output(false)
 }
 
-/// Mixer of the shared output device, for playback that is not a spoken phrase
-/// (the wake-word cues). `None` until the device has been opened.
+/// Mixer of the shared output device, for playback that is not a spoken phrase. `None` until
+/// the device has been opened.
 pub(crate) fn playback_mixer() -> Option<rodio::mixer::Mixer> {
     AUDIO_OUTPUT.get().map(|output| output.mixer.clone())
 }
 
 /// Shared body of [`ensure_audio_output`] and [`ensure_audio_output_silent`];
-/// `warn_on_failure` picks the log level a failed device open is reported at.
+/// `warn_on_failure` picks the log level.
 fn open_audio_output(warn_on_failure: bool) -> bool {
     if AUDIO_OUTPUT.get().is_some() {
         return true;
     }
-    // Serialize concurrent opens and re-check inside the guard: another thread
-    // may have won the race and populated AUDIO_OUTPUT already.
+    // Re-check inside the guard: another thread may have won the race already.
     let _guard = AUDIO_OUTPUT_OPEN_LOCK.lock().unwrap_poison();
     if AUDIO_OUTPUT.get().is_some() {
         return true;
@@ -383,22 +306,16 @@ fn open_audio_output(warn_on_failure: bool) -> bool {
     AUDIO_OUTPUT.get().is_some()
 }
 
-/// Returns `true` if model download has permanently failed
-/// (retries exhausted or model directory unresolvable).
+/// Returns `true` if model download has permanently failed (retries exhausted or model
+/// directory unresolvable).
 #[must_use]
 pub fn download_failed() -> bool {
     STATE.load(Ordering::Acquire) == ModelState::Failed
 }
 
-/// Retry model download after a previous failure.
-///
-/// Atomically transitions [`STATE`] from [`ModelState::Failed`] → [`ModelState::Uninit`]
-/// and calls [`spawn_download()`]. If the state is not [`ModelState::Failed`],
-/// this is a no-op and returns `false`.
-///
-/// This is the GUI-facing counterpart of [`spawn_download()`] which only
-/// transitions from [`ModelState::Uninit`] — the two functions together handle
-/// the initial download and retry-after-failure paths.
+/// Retry model download after a previous failure: atomically [`ModelState::Failed`] →
+/// [`ModelState::Uninit`] and [`spawn_download()`]. A no-op returning `false` in any other
+/// state. The GUI-facing counterpart of [`spawn_download()`], which only starts from Uninit.
 #[must_use]
 pub fn retry_download() -> bool {
     if !STATE.transition(ModelState::Failed, ModelState::Uninit) {
@@ -414,39 +331,27 @@ pub(crate) fn test_set_state(state: u8) {
     STATE.store(ModelState::from_u8(state), Ordering::Release);
 }
 
-// ── The `say` tool's entry point ─────────────────────────────────────
-
 /// What became of one [`say_phrase`] call.
 pub(crate) enum SayOutcome {
-    /// The phrase was handed to the engine; playback runs in the background.
     Speaking,
-    /// Speech output is switched off for this user — nothing was spoken.
     SpeechOff,
-    /// The engine is not up, so nothing was spoken; its bring-up was kicked.
     NotReady(NotReady),
-    /// The user is not at the computer, so nothing was spoken.
     Absent,
 }
 
 /// Why the engine could not speak a phrase right now.
 pub(crate) enum NotReady {
-    /// The model set is not loaded yet — loading or fetching runs on the side.
     ModelsMissing,
-    /// The last model fetch failed; a retry has just been started.
     DownloadFailed,
-    /// No audio output device could be opened.
     NoAudioDevice,
 }
 
-/// Speak one short phrase for the admin's Assistant, and return at once: the
-/// phrase is rendered and played in the background, never waited for here.
+/// Speak one short phrase for the admin's Assistant, and return at once: the phrase is
+/// rendered and played in the background. This is the product's whole speech output.
 ///
-/// This is the product's whole speech output — nothing reaches [`speak`]
-/// otherwise. Whatever is missing is brought up the way the Settings toggle
-/// brings it up, on the side and never waited for: a model set that is not
-/// loaded starts the same download ([`spawn_or_retry_download`], which retries a
-/// failed one), and a device that is not open is opened on the blocking pool
-/// (retried by every later call), because enumerating output devices can stall.
+/// Whatever is missing is brought up on the side and never waited for: a model set that is
+/// not loaded starts the same download ([`spawn_or_retry_download`]), and a device that is
+/// not open is opened on the blocking pool, because enumerating output devices can stall.
 pub(crate) fn say_phrase(text: &str) -> SayOutcome {
     if !is_config_enabled() {
         return SayOutcome::SpeechOff;
@@ -462,14 +367,13 @@ pub(crate) fn say_phrase(text: &str) -> SayOutcome {
         });
     }
     if !audio_output_ready() {
-        // Detached on purpose: the open outlives this answer, and a blocking task
-        // cannot be cancelled.
+        // Detached on purpose: the open outlives this answer, and a blocking task cannot be
+        // cancelled.
         drop(tokio::task::spawn_blocking(ensure_audio_output));
         return SayOutcome::NotReady(NotReady::NoAudioDevice);
     }
-    // Last, so the answers above keep precedence: what cannot be produced at all
-    // is reported as such, and absence only stops speech that would otherwise be
-    // produced.
+    // Last, so the answers above keep precedence: absence only stops speech that would
+    // otherwise be produced.
     if crate::user_activity::is_absent() {
         return SayOutcome::Absent;
     }
@@ -477,33 +381,25 @@ pub(crate) fn say_phrase(text: &str) -> SayOutcome {
     SayOutcome::Speaking
 }
 
-/// Hand `text` to the engine: spawns a background task that synthesizes the
-/// audio, plays it through the shared output device, then returns. Called only
-/// by [`say_phrase`], which has established that speech is enabled, the models
-/// are loaded and the output device is open.
+/// Hand `text` to the engine: spawn a background task that synthesizes the audio, plays it
+/// through the shared output device, then returns.
 fn speak(text: &str) {
     if text.trim().is_empty() {
         return;
     }
-    // Cancel any previous playback before starting new synthesis.
-    // The subscription below happens BEFORE the spawn so that this cancel
-    // signal reaches the old task before the new task subscribes.
+    // Cancel any previous playback before starting new synthesis, and subscribe to the
+    // cancellation channel BEFORE the spawn so the cancel reaches the old task.
     cancel_playback();
 
-    // Subscribe to cancellation channel BEFORE spawning the task to avoid a
-    // race where cancel_playback() between spawn and subscription is lost.
+    // Subscribed before the spawn: a `cancel_playback()` in between is not lost.
     let cancel_rx = CANCEL_TX.get().map(broadcast::Sender::subscribe);
     tokio::spawn(speak_async(text.to_string(), cancel_rx));
 }
 
-/// Cancel any currently-playing TTS audio.
+/// Cancel any currently-playing TTS audio by signalling the playback task.
 ///
-/// Sends a cancellation signal to the playback task. If a synthesis/playback
-/// cycle is in progress, the audio playback will be interrupted early.
-///
-/// **Note:** If ONNX synthesis is actively running inside a blocking thread,
-/// cancellation may take up to a single chunk synthesis cycle (~3–5s) to
-/// take effect, as the cancellation flag is only checked between chunks.
+/// If ONNX synthesis is actively running inside a blocking thread, cancellation may take up
+/// to a single chunk cycle (~3–5s), as the flag is only checked between chunks.
 fn cancel_playback() {
     if let Some(tx) = CANCEL_TX.get() {
         let _ = tx.send(());
@@ -513,12 +409,9 @@ fn cancel_playback() {
     }
 }
 
-/// Returns `true` if TTS audio is currently playing through the speakers.
-///
-/// The flag remains asserted for [`PLAYBACK_REVERB_TAIL_MS`] milliseconds
-/// after the last audio chunk finishes, to account for room acoustics and
-/// output buffer drain.  Used by the voice pipeline to suppress wake word
-/// detection during TTS output.
+/// Returns `true` if TTS audio is currently playing, and for
+/// [`PLAYBACK_REVERB_TAIL_MS`] after the last chunk while acoustics and output buffers
+/// drain. Used by the voice pipeline to suppress wake word detection.
 #[must_use]
 pub fn is_playback_active() -> bool {
     PLAYBACK_ACTIVE.load(Ordering::Acquire) > 0
@@ -544,24 +437,20 @@ pub fn init_global() -> Result<()> {
         .set(dl_tx)
         .map_err(|_| anyhow!("DOWNLOAD_EVENTS already initialized"))?;
 
-    // The OS audio output device is intentionally NOT opened here: it is opened
-    // lazily on demand via [`ensure_audio_output()`] once something actually
-    // needs it — a spoken phrase ([`say_phrase`]), the speech-enabled boot and
-    // the Settings enable toggle, or the wake-word cues ([`crate::audio::cue`]),
-    // which share the same device.
+    // The OS audio output device is intentionally NOT opened here: it is opened lazily by
+    // [`ensure_audio_output()`] once something needs it.
     Ok(())
 }
 
-/// The ONNX model files in `dir`, in the order the set is fetched: the six files
-/// every reading needs, whatever voice it is spoken with.
+/// The ONNX model files in `dir`, in the order the set is fetched.
 fn onnx_paths(dir: &Path) -> impl Iterator<Item = PathBuf> {
     ONNX_TTS_FILES
         .iter()
         .map(|(name, _)| dir.join(ONNX_DIR).join(name))
 }
 
-/// Essential TTS model file paths for a given model directory, used to
-/// verify that the model is fully cached on disk.
+/// Essential TTS model file paths for a model directory, used to verify the model is fully
+/// cached on disk.
 fn essential_tts_paths(dir: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<_> = onnx_paths(dir).collect();
     // Also check that at least the default voice style exists
@@ -569,13 +458,11 @@ fn essential_tts_paths(dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
-/// Try to load TTS models from cache at startup.
-/// Returns `true` if loaded, `false` if not (download will happen async).
+/// Try to load TTS models from cache at startup; `false` means the download happens async.
 pub fn try_load_cached() -> bool {
-    // Fast path: models already loaded.
-    // Also accept LOADING/FAILED states — loading from disk is safe regardless
-    // of the async download state, and is the primary recovery mechanism when
-    // the download task is orphaned (STATE stuck in LOADING).
+    // Fast path: models already loaded. LOADING/FAILED are accepted too — loading from disk
+    // is safe regardless of the async download state, and is the recovery mechanism when the
+    // download task is orphaned (STATE stuck in LOADING).
     if STATE.load(Ordering::Acquire) == ModelState::Ready {
         return true;
     }
@@ -608,12 +495,9 @@ pub fn spawn_download() {
     }
 }
 
-/// Spawn model download, retrying after a previous failure if needed.
-///
-/// Unlike [`spawn_download()`] which only transitions from [`ModelState::Uninit`],
-/// this also handles [`ModelState::Failed`] by resetting to [`ModelState::Uninit`] first,
-/// making it suitable for the GUI toggle which may be activated after a
-/// permanent download failure.
+/// Spawn model download, retrying after a previous failure if needed: unlike
+/// [`spawn_download()`] this also resets [`ModelState::Failed`] to Uninit first, which is what
+/// the GUI toggle needs after a permanent failure.
 pub fn spawn_or_retry_download() {
     if STATE.transition(ModelState::Uninit, ModelState::Loading) {
         tokio::spawn(download_retry_loop());
@@ -624,8 +508,6 @@ pub fn spawn_or_retry_download() {
     }
 }
 
-// ── Internal helpers ─────────────────────────────────────────────────
-
 fn set_engine_ready(engine: TtsEngine) {
     if let Some(global) = GLOBAL_TTS.get() {
         *global.write().unwrap_poison() = Some(Arc::new(engine));
@@ -633,9 +515,8 @@ fn set_engine_ready(engine: TtsEngine) {
     STATE.store(ModelState::Ready, Ordering::Release);
 }
 
-/// Clone the engine [`Arc`] cheaply, then drop the read lock.
-/// Use this before [`tokio::task::spawn_blocking`] to avoid holding
-/// the `RwLock` across a long CPU-bound operation.
+/// Clone the engine [`Arc`] cheaply, then drop the read lock — before
+/// [`tokio::task::spawn_blocking`], so the `RwLock` is not held across a long CPU-bound operation.
 fn get_engine_clone() -> Option<Arc<TtsEngine>> {
     GLOBAL_TTS.get()?.read().unwrap_poison().clone()
 }
@@ -658,11 +539,9 @@ fn load_voice_style(dir: &Path, voice_name: &str) -> Result<(Tensor, Tensor)> {
     Ok((style_dp, style_ttl))
 }
 
-/// A voice style, loaded: the pair of tensors a reading is spoken with.
-///
-/// [`ensure_ready_once`] loads it — that load is how it knows a request can be
-/// served from the cache — and hands it to [`render_speech_wav`], so one reading
-/// parses the style file once instead of proving it and then loading it again.
+/// A voice style, loaded: the pair of tensors a reading is spoken with. [`ensure_ready_once`]
+/// loads it — that load is how it knows the request can be served from the cache — and hands
+/// it to [`render_speech_wav`], so one reading parses the style file once.
 pub(crate) struct Voice {
     dp: Tensor,
     ttl: Tensor,
@@ -675,8 +554,8 @@ impl Voice {
     }
 }
 
-/// Flatten the first batch slice of a 3D `[batch, rows, cols]` style tensor
-/// and wrap it into a candle `Tensor` with the batch dimension restored.
+/// Flatten the first batch slice of a 3D `[batch, rows, cols]` style tensor into a candle
+/// `Tensor` with the batch dimension restored.
 fn style_tensor(data: &[Vec<Vec<f32>>], label: &str, device: &Device) -> Result<Tensor> {
     anyhow::ensure!(!data.is_empty(), "Voice style has empty {label}");
     anyhow::ensure!(!data[0].is_empty(), "Voice style has empty {label}[0]");
@@ -735,51 +614,40 @@ fn load_engine(dir: &Path) -> Result<TtsEngine> {
     })
 }
 
-/// Prepare the speech engine for one rendering: the model set, loaded from the
-/// cache when it is complete and fetched EXACTLY once when it is not. The voice
-/// that was loaded comes back with it, for the render to speak with.
+/// Prepare the speech engine for one rendering: the model set, loaded from the cache when it
+/// is complete and fetched EXACTLY once when it is not, plus the voice that was loaded.
 ///
-/// No download retry loop: the daemon retries for as long as it is up, while a
-/// command line has one answer to give. `voice_style` names the voice style file
-/// the rendering will use — one file out of the set the product ships, fetched
-/// with the rest when it is missing. `announce_fetch` runs once, when the FIRST
-/// fetch that actually starts begins, with the model directory it goes into; a
-/// set already on disk needs nothing from the network, so it is not called.
-///
-/// A set is complete for this call when the ONNX files are on disk AND that ONE
-/// style file loads — [`try_load_cached`] asks for the default style instead,
-/// because the app speaks in one voice only, and a caller who asked for another
-/// voice must not pay for the whole set again on every run.
+/// No download retry loop: the daemon retries while it is up, a command line has one answer
+/// to give. `voice_style` names the style file the rendering will use, fetched with the rest
+/// when missing. `announce_fetch` runs once, when the FIRST fetch that actually starts
+/// begins. A set is complete when the ONNX files are on disk AND that ONE style file loads —
+/// [`try_load_cached`] asks for the default style instead, so a caller who asked for another
+/// voice does not pay for the whole set again on every run.
 ///
 /// This prepares the engine for ONE operation and expects nothing to be up yet:
-/// [`init_global`] is called under the guard that asks whether the global is
-/// already there, because it refuses a second initialisation.
+/// [`init_global`] refuses a second initialisation.
 pub(crate) async fn ensure_ready_once(
     voice_style: &str,
     announce_fetch: impl FnOnce(&Path),
 ) -> Result<Voice> {
     let dir = models_subdir(MODEL_DIR_NAME).context("Cannot resolve the speech model directory")?;
 
-    // The download events and the cancel channel have to exist before the
-    // engine can be parked in them.
+    // The download events and the cancel channel have to exist before the engine can be
+    // parked in them.
     if GLOBAL_TTS.get().is_none() {
         init_global().context("Cannot initialize the speech engine")?;
     }
 
-    // The notice is bound to the first fetch that actually starts: the set is
-    // verified file by file, and a set already on disk fetches nothing and says
-    // nothing.
+    // The notice is bound to the first fetch that actually starts: a set already on disk
+    // fetches nothing and says nothing.
     let mut announce_fetch = Some(announce_fetch);
     let mut fetch_starting = || {
         if let Some(say) = announce_fetch.take() {
             say(&dir);
         }
     };
-    // A set on disk is loaded from disk and verified against nothing: what the
-    // reading needs is the ONNX files and the ONE voice asked for, so a set
-    // fetched for another voice serves this one too, a caller repeating his own
-    // command repeats no work, and a style file that is there but unusable is
-    // not taken for a set either.
+    // A set on disk is loaded and verified against nothing: the reading needs the ONNX files
+    // and the ONE voice asked for, so a set fetched for another voice serves this one too.
     if onnx_paths(&dir).all(|path| path.exists())
         && let Ok(voice) = Voice::load(&dir, voice_style)
     {
@@ -788,9 +656,8 @@ pub(crate) async fn ensure_ready_once(
                 set_engine_ready(engine);
                 return Ok(voice);
             }
-            // Present is not the same as usable — a file left truncated by an
-            // interrupted fetch is not a set — so this falls through to the
-            // verified fetch below, which replaces what does not verify.
+            // Present is not usable — a file left truncated by an interrupted fetch is not a
+            // set — so this falls through to the verified fetch below.
             Err(e) => warn!("The cached speech models did not load, verifying them: {e}"),
         }
     }
@@ -800,8 +667,6 @@ pub(crate) async fn ensure_ready_once(
     set_engine_ready(engine);
     Voice::load(&dir, voice_style)
 }
-
-// ── Download retry loop ──────────────────────────────────────────────
 
 /// Emit a download event through the global broadcast channel.
 fn emit_download_event(event: TtsDownloadEvent) {
@@ -841,9 +706,8 @@ struct TtsFile {
     sha256: &'static str,
 }
 
-/// The files the speech model set is made of: the ONNX models and config, plus
-/// the voice styles named in `styles`. The daemon's own acquisition asks for all
-/// of them; a caller that needs one voice asks for that one.
+/// The files the speech model set is made of: the ONNX models and config, plus the voice
+/// styles named in `styles`.
 fn model_files(dir: &Path, styles: &[&str]) -> Vec<TtsFile> {
     let base = format!("{HF_BASE}/{MODEL_REPO}/resolve/{MODEL_REVISION}");
 
@@ -869,8 +733,7 @@ fn voice_style_file(dir: &Path, name: &str) -> TtsFile {
     TtsFile {
         url: format!("{HF_BASE}/{MODEL_REPO}/resolve/{MODEL_REVISION}/{VOICE_STYLES_DIR}/{name}"),
         path: dir.join(VOICE_STYLES_DIR).join(name),
-        // Only M1.json has a verified SHA256; the rest have empty hashes
-        // (minimum-size check only) until they are verified against downloads.
+        // Only M1.json has a verified SHA256; the rest have empty hashes (minimum-size check only).
         sha256: if name == DEFAULT_VOICE_NAME {
             VOICE_STYLE_SHA256
         } else {
@@ -879,9 +742,8 @@ fn voice_style_file(dir: &Path, name: &str) -> TtsFile {
     }
 }
 
-/// Fetch the model set, calling `fetch_starting` before the first file that
-/// actually has to be fetched — a file already on disk is verified and skipped,
-/// so a set that needs nothing from the network does not call it.
+/// Fetch the model set, calling `fetch_starting` before the first file that actually has to
+/// be fetched — a file already on disk is verified and skipped.
 async fn ensure_models_downloaded(
     dir: &Path,
     styles: &[&str],
@@ -909,9 +771,8 @@ async fn ensure_models_downloaded(
     Ok(())
 }
 
-/// Ensure a single file exists and is uncorrupted, or download it. `fetch_starting`
-/// is called once, just before the download that actually streams, so a caller
-/// can bind a notice to a fetch that really begins.
+/// Ensure a single file exists and is uncorrupted, or download it. `fetch_starting` is called
+/// once, just before the download that actually streams.
 async fn ensure_file(f: &TtsFile, fetch_starting: &mut impl FnMut()) -> Result<()> {
     let file_name = f
         .path
@@ -962,8 +823,6 @@ async fn ensure_file(f: &TtsFile, fetch_starting: &mut impl FnMut()) -> Result<(
     Ok(())
 }
 
-// ── Text preprocessing ───────────────────────────────────────────────
-
 /// Compiled regex patterns used by [`strip_markdown`].
 static RE_CODE_BLOCK: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"```[\s\S]*?```").expect("RE_CODE_BLOCK"));
@@ -990,8 +849,8 @@ static RE_HR: LazyLock<regex::Regex> =
 fn preprocess_text(text: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
 
-    // Media markers are display/plumbing artifacts, never speech — every kind
-    // goes, so neither a path nor a base64 data URI is spoken.
+    // Media markers are display/plumbing artifacts, never speech — neither a path nor a
+    // base64 data URI is spoken.
     let text = crate::util::MEDIA_MARKER_RE.replace_all(text, " ");
     let mut s: String = text.as_ref().nfkd().collect();
     s = strip_markdown(&s);
@@ -1013,35 +872,25 @@ fn preprocess_text(text: &str) -> String {
 fn strip_markdown(text: &str) -> String {
     let mut s = text.to_string();
 
-    // Remove code blocks (triple backtick or indented)
     s = RE_CODE_BLOCK.replace_all(&s, " ").to_string();
 
-    // Remove inline code
     s = RE_INLINE_CODE.replace_all(&s, " ").to_string();
 
-    // Remove image markup: ![alt](url)
     s = RE_IMAGE.replace_all(&s, " ").to_string();
 
-    // Replace links with their text: [text](url) → text
     s = RE_LINK.replace_all(&s, "$1").to_string();
 
-    // Remove bold/italic markers: **text** or *text*
     s = RE_BOLD_ITALIC.replace_all(&s, " ").to_string();
 
-    // Remove strikethrough: ~~text~~
     s = RE_STRIKETHROUGH.replace_all(&s, " ").to_string();
 
-    // Remove headers markers: # text, ## text, etc.
     s = RE_HEADER.replace_all(&s, "").to_string();
 
-    // Remove list markers: - text, * text, 1. text
     s = RE_LIST_DASH.replace_all(&s, "").to_string();
     s = RE_LIST_NUM.replace_all(&s, "").to_string();
 
-    // Remove horizontal rules (multiline: ^/$ match line boundaries)
     s = RE_HR.replace_all(&s, " ").to_string();
 
-    // Clean up excessive whitespace left by replacements
     s
 }
 
@@ -1131,16 +980,12 @@ fn has_ending_punctuation(text: &str) -> bool {
     })
 }
 
-// ── Character encoding ───────────────────────────────────────────────
-
 /// Encode a text string into token IDs using the engine's unicode indexer.
 fn encode_text(engine: &TtsEngine, text: &str) -> (Vec<i64>, usize) {
     encode_text_with_indexer(&engine.unicode_indexer, text)
 }
 
-/// Core encoding logic that works with any unicode indexer slice.
-///
-/// This is extracted for testability — see `test_encode_text_with_indexer`.
+/// Core encoding logic that works with any unicode indexer slice; extracted for testability.
 fn encode_text_with_indexer(unicode_indexer: &[i32], text: &str) -> (Vec<i64>, usize) {
     let unk_id = unicode_indexer.first().copied().unwrap_or(0);
     #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -1162,8 +1007,6 @@ fn encode_text_with_indexer(unicode_indexer: &[i32], text: &str) -> (Vec<i64>, u
     (ids, len)
 }
 
-// ── ONNX helpers ─────────────────────────────────────────────────────
-
 fn build_inputs(inputs: Vec<(&str, Tensor)>) -> HashMap<String, Tensor> {
     let mut map = HashMap::new();
     for (name, tensor) in inputs {
@@ -1171,8 +1014,6 @@ fn build_inputs(inputs: Vec<(&str, Tensor)>) -> HashMap<String, Tensor> {
     }
     map
 }
-
-// ── Synthesis pipeline ───────────────────────────────────────────────
 
 /// Synthesize audio for a single text chunk. Returns PCM f32 samples.
 #[expect(
@@ -1189,13 +1030,11 @@ fn synthesize_internal(
 ) -> Result<Vec<f32>> {
     let dev = &engine.device;
 
-    // 1. Encode text
     let (token_ids, seq_len) = encode_text(engine, text);
     if seq_len == 0 {
         anyhow::bail!("Empty token sequence");
     }
 
-    // 2. Duration predictor inputs
     let text_ids = Tensor::from_slice(&token_ids, (1, seq_len), dev)?;
     let text_mask = Tensor::from_slice(&vec![1.0f32; seq_len], (1, 1, seq_len), dev)?;
 
@@ -1216,7 +1055,6 @@ fn synthesize_internal(
         .collect();
     let total_dur: f32 = durations.iter().sum();
 
-    // 3. Text encoder
     let te_out = simple_eval(
         &engine.text_enc_model,
         build_inputs(vec![
@@ -1228,13 +1066,11 @@ fn synthesize_internal(
     .context("Text encoder failed")?;
     let text_emb = extract_output(te_out, &engine.text_enc_model, "te")?;
 
-    // 4. Latent dimensions
     let wav_len = (total_dur * engine.sample_rate as f32).ceil() as usize;
     let chunk_size = engine.base_chunk_size * engine.chunk_compress_factor;
     let latent_len = wav_len.div_ceil(chunk_size);
     let latent_dim = engine.latent_dim * engine.chunk_compress_factor;
 
-    // 5. Sample noise (Box-Muller transform, seeded xorshift for determinism)
     let mut rng = seed;
     let noise: Vec<f32> = {
         let n = latent_dim * latent_len;
@@ -1266,10 +1102,8 @@ fn synthesize_internal(
     };
     let mut xt = Tensor::from_slice(&noise, (1, latent_dim, latent_len), dev)?;
 
-    // Latent mask
     let latent_mask = Tensor::from_slice(&vec![1.0f32; latent_len], (1, 1, latent_len), dev)?;
 
-    // 6. Flow matching
     let total_steps = Tensor::new(DEFAULT_TOTAL_STEPS as f32, dev)?.reshape((1,))?;
     for step in 0..DEFAULT_TOTAL_STEPS {
         let step_f = Tensor::new(step as f32, dev)?.reshape((1,))?;
@@ -1286,49 +1120,38 @@ fn synthesize_internal(
             ]),
         )
         .with_context(|| format!("Vector estimator step {step} failed"))?;
-        // The Supertonic 3 vector estimator uses x₀-prediction (its output is
-        // `denoised_latent`, not a velocity field).  At each flow-matching step
-        // the model predicts the clean latent directly — we replace xt, not
-        // accumulate a velocity-field integral.
+        // The Supertonic 3 vector estimator uses x₀-prediction: at each flow-matching step it
+        // predicts the clean latent directly, so we replace xt rather than accumulate a
+        // velocity-field integral.
         let denoised_latent = extract_output(ve_out, &engine.vector_est_model, "ve")?;
         xt = denoised_latent;
     }
 
-    // 7. Vocoder
     let voc_out = simple_eval(&engine.vocoder_model, build_inputs(vec![("latent", xt)]))
         .context("Vocoder failed")?;
     let wav_t = extract_output(voc_out, &engine.vocoder_model, "voc")?;
 
-    // Squeeze batch dim
     let wav_data = if wav_t.dims().len() >= 2 {
         wav_t.squeeze(0)?.to_vec1::<f32>()?
     } else {
         wav_t.to_vec1::<f32>()?
     };
 
-    // Clamp samples to valid [-1.0, 1.0] range for audio playback.
-    // The vocoder may produce values slightly outside this range due to
-    // floating-point accumulation in the flow-matching / neural vocoder.
+    // Clamp to [-1.0, 1.0]: the vocoder can overshoot through floating-point accumulation.
     let wav_data: Vec<f32> = wav_data.into_iter().map(|s| s.clamp(-1.0, 1.0)).collect();
 
     Ok(wav_data)
 }
 
-/// Synthesize with chunking for long texts, streaming each chunk through
-/// a bounded channel as it becomes available.
-///
-/// The reading is split into parts ([`reading_parts`]) and each part is spoken
+/// Synthesize with chunking for long texts, streaming each chunk through a bounded channel
+/// as it becomes available. The reading is split into parts ([`reading_parts`]), each spoken
 /// under the language tag `lang` (the model requires `<en>...</en>` wrapping).
-/// Each part's PCM samples are sent via the provided sender. The function
-/// returns `Ok(())` when all parts have been sent, or an error on cancellation
-/// or if the receiver was dropped.
 ///
 /// # Error propagation (intentional asymmetry)
 ///
-/// A part that fails to render is skipped with a `warn!` — one bad sentence
-/// should not abort the whole response, so the user hears the rest — except
-/// when it is the only part: there is then no audio at all, and the error is
-/// returned instead. Cancellation and a dropped receiver are always fatal.
+/// A part that fails to render is skipped with a `warn!` — one bad sentence should not abort
+/// the whole response — except when it is the only part: there is then no audio at all, and
+/// the error is returned. Cancellation and a dropped receiver are always fatal.
 #[expect(clippy::too_many_arguments)]
 fn synthesize_chunked_streaming(
     engine: &TtsEngine,
@@ -1365,9 +1188,8 @@ fn synthesize_chunked_streaming(
     Ok(())
 }
 
-/// The parts of one reading, in the order the product speaks them: one part when
-/// the text fits [`MAX_CHUNK_LENGTH`], else the sentence-boundary split
-/// ([`split_at_sentence_boundaries`]).
+/// The parts of one reading, in the order the product speaks them: one part when the text
+/// fits [`MAX_CHUNK_LENGTH`], else the sentence-boundary split.
 fn reading_parts(text: &str) -> Vec<String> {
     if text.len() <= MAX_CHUNK_LENGTH {
         vec![text.to_string()]
@@ -1394,11 +1216,9 @@ fn synthesize_part(
     )
 }
 
-/// Wrap text in a language tag for the Supertonic 3 model.
-///
-/// The language is the caller's — the speech-output setting's value (defaults
-/// to `"na"`, the model's language-agnostic fallback) or the command line's
-/// `--language` — and is one of [`TTS_LANGUAGES`].
+/// Wrap text in a language tag for the Supertonic 3 model. The language is the caller's — the
+/// speech-output setting's value (defaults to `"na"`) or the command line's `--language` — and
+/// is one of [`TTS_LANGUAGES`].
 fn wrap_lang_tag(text: &str, lang: &str) -> String {
     format!("<{lang}>{text}</{lang}>")
 }
@@ -1444,13 +1264,8 @@ fn split_at_sentence_boundaries(text: &str, max_len: usize) -> Vec<String> {
     chunks
 }
 
-// ── WAV generation ───────────────────────────────────────────────────
-
-/// Render PCM float samples to an in-memory WAV file (16-bit mono PCM).
-///
-/// Returns the complete WAV file bytes, including RIFF header and sample data.
-/// Rodio can play directly from a `Cursor<Vec<u8>>`, eliminating ephemeral
-/// file I/O. Shared with `audio::voice` (transcription temp files).
+/// Render PCM float samples to an in-memory WAV file (16-bit mono PCM), header and data
+/// included. Rodio plays directly from a `Cursor<Vec<u8>>`, so no ephemeral file I/O.
 pub(crate) fn render_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
     let channels: u16 = 1;
     let bps: u16 = 16;
@@ -1486,17 +1301,13 @@ pub(crate) fn render_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-// ── Speech file rendering ────────────────────────────────────────────
-
-/// Render `text` to the spoken file's bytes: the product's own reading path —
-/// the same preparation, the same split at sentence boundaries, the same
-/// per-part rendering under the same language tag, and the same pause between
-/// the parts, written into the audio rather than waited out — assembled into one
-/// uncompressed WAV at the engine's own sample rate.
+/// Render `text` to the spoken file's bytes: the product's own reading path — the same
+/// preparation, split, per-part rendering and language tag, with the pause between parts
+/// written into the audio rather than waited out — assembled into one uncompressed WAV at the
+/// engine's own sample rate.
 ///
-/// The voice comes from [`ensure_ready_once`], loaded for this reading already.
-/// Unlike playback, a part that fails to render fails the whole reading: a
-/// file delivered with a part missing would be a lie about what the text says.
+/// Unlike playback, a part that fails to render fails the whole reading: a file delivered with
+/// a part missing would be a lie about what the text says.
 pub(crate) async fn render_speech_wav(text: &str, voice: Voice, lang: &str) -> Result<Vec<u8>> {
     let processed = preprocess_text(text);
 
@@ -1509,8 +1320,7 @@ pub(crate) async fn render_speech_wav(text: &str, voice: Voice, lang: &str) -> R
             dp: style_dp,
             ttl: style_ttl,
         } = voice;
-        // The pause playback waits out between parts, in samples: the same
-        // duration, written into the audio instead.
+        // The pause playback waits out between parts, in samples.
         let gap = usize::try_from(u64::from(sample_rate) * TTS_CHUNK_SILENCE_MS / 1000)
             .unwrap_or_default();
         let mut pcm: Vec<f32> = Vec::new();
@@ -1528,8 +1338,6 @@ pub(crate) async fn render_speech_wav(text: &str, voice: Voice, lang: &str) -> R
     .context("the speech synthesis task panicked")?
 }
 
-// ── Async speak ──────────────────────────────────────────────────────
-
 #[expect(clippy::too_many_lines)]
 async fn speak_async(text: String, mut cancel_rx: Option<broadcast::Receiver<()>>) {
     // Check cancellation before starting expensive work
@@ -1543,12 +1351,12 @@ async fn speak_async(text: String, mut cancel_rx: Option<broadcast::Receiver<()>
     // Process text (lightweight, no blocking I/O)
     let processed = preprocess_text(&text);
 
-    // The speech-output language, read once: the synthesis itself runs on a
-    // blocking thread that must not touch the config.
+    // The speech-output language, read once: the synthesis runs on a blocking thread that
+    // must not touch the config.
     let lang = CONFIG.tts_language();
 
-    // Clone the engine Arc outside the blocking task so the RwLock is
-    // not held across CPU-bound synthesis (which can take seconds).
+    // The engine Arc is cloned outside the blocking task so the `RwLock` is not held across
+    // CPU-bound synthesis.
     let Some(engine) = get_engine_clone() else {
         return;
     };
@@ -1566,28 +1374,24 @@ async fn speak_async(text: String, mut cancel_rx: Option<broadcast::Receiver<()>
         }
     };
 
-    // Check audio output availability BEFORE starting the expensive
-    // CPU-bound synthesis. On headless systems this avoids wasting
-    // ~3-5s of synthesis work per chunk before the channel close is
-    // detected.
+    // Check output availability BEFORE the expensive synthesis: on headless systems this
+    // avoids ~3-5s of work per chunk before the channel close is detected.
     let Some(audio_output) = AUDIO_OUTPUT.get() else {
         return;
     };
 
-    // Create bounded channel for streaming chunks.
-    // Capacity 4 provides natural backpressure — if synthesis outpaces
-    // playback, the synthesizer blocks on send after 4 queued chunks.
+    // Bounded channel: capacity 4 gives natural backpressure — a synthesizer that outpaces
+    // playback blocks on send after 4 queued chunks.
     let (tx, mut rx) = mpsc::channel::<Vec<f32>>(4);
 
-    // Reset cancellation flag for this synthesis, then clone the Arc
-    // so it can be passed into the spawn_blocking closure.
+    // Reset the cancellation flag for this synthesis, then clone the Arc for the
+    // spawn_blocking closure.
     let cancel_flag = CANCEL_FLAG.get().map(|f| {
         f.store(false, Ordering::Release);
         Arc::clone(f)
     });
 
-    // CPU-bound synthesis: run on blocking threadpool, streaming each
-    // chunk through the channel as it becomes available.
+    // CPU-bound synthesis on the blocking threadpool, streaming each chunk through the channel.
     let synthesize_handle = tokio::task::spawn_blocking(move || {
         synthesize_chunked_streaming(
             &engine,
@@ -1601,9 +1405,8 @@ async fn speak_async(text: String, mut cancel_rx: Option<broadcast::Receiver<()>
         )
     });
 
-    // Spawn a lightweight logging task that observes the synthesis result.
-    // This restores error observability lost when we stopped awaiting the
-    // blocking task directly — synthesis errors and panics are now logged.
+    // A logging task observes the synthesis result: errors and panics are logged even though
+    // the blocking task is never awaited.
     tokio::spawn(async move {
         match synthesize_handle.await {
             Ok(Ok(())) => {} // Success — normal completion
@@ -1615,9 +1418,8 @@ async fn speak_async(text: String, mut cancel_rx: Option<broadcast::Receiver<()>
     // Receive chunks and play them as they arrive.
     let mut current_player: Option<Player> = None;
 
-    // Stream chunks with a per-chunk timeout to guard against hung
-    // synthesis. On timeout the loop breaks, which drops the receiver
-    // and causes the blocking sender to unblock with a channel error.
+    // A per-chunk timeout guards against hung synthesis. On timeout the loop breaks, which
+    // drops the receiver and unblocks the sender with a channel error.
     loop {
         let chunk_samples = match tokio::time::timeout(SYNTHESIS_CHUNK_TIMEOUT, rx.recv()).await {
             Ok(Some(samples)) => samples,
@@ -1638,20 +1440,19 @@ async fn speak_async(text: String, mut cancel_rx: Option<broadcast::Receiver<()>
             info!("TTS playback cancelled mid-stream");
             if let Some(ref player) = current_player {
                 player.stop();
-                // Wait briefly for the audio thread to finish flushing
-                // so we don't leave a truncated burst in the output buffer.
+                // Wait briefly for the audio thread to flush, so no truncated burst is left
+                // in the output buffer.
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             break;
         }
 
-        // Wait for previous chunk to finish playing, then add inter-chunk
-        // silence between consecutive chunks.
+        // Wait for the previous chunk, then add the inter-chunk silence.
         if let Some(ref player) = current_player {
             let completed = wait_for_player(player, cancel_rx.as_mut()).await;
             if !completed {
-                // Cancelled while waiting — player.stop() was already called
-                // inside wait_for_player. Flush output buffer and stop.
+                // Cancelled while waiting — player.stop() was already called inside
+                // wait_for_player.
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 break;
             }
@@ -1668,8 +1469,7 @@ async fn speak_async(text: String, mut cancel_rx: Option<broadcast::Receiver<()>
             }
         };
 
-        // Decode the WAV bytes as an in-memory source (hound-backed WAV decode
-        // under the Apache-2.0 license posture — no Symphonia path).
+        // Decode the WAV bytes as an in-memory source (hound-backed, no Symphonia path).
         let cursor = Cursor::new(wav_bytes);
         let source = match rodio::Decoder::new(cursor) {
             Ok(s) => s,
@@ -1679,15 +1479,13 @@ async fn speak_async(text: String, mut cancel_rx: Option<broadcast::Receiver<()>
             }
         };
 
-        // Create a fresh player for this chunk and begin playback immediately.
-        // Each chunk gets its own player (connected to the shared mixer) so we
-        // can cancel per-chunk playback. `Player::connect_new` is infallible —
-        // the fallible device-open work lives in `open_audio_output()`.
+        // A fresh player per chunk (connected to the shared mixer) so playback can be
+        // cancelled per chunk. `Player::connect_new` is infallible.
         let player = Player::connect_new(&audio_output.mixer);
 
         if current_player.is_none() {
-            // Only increment on the first chunk — the single fetch_sub(1)
-            // after the reverb tail (below) restores the counter to zero.
+            // Only on the first chunk — the single fetch_sub(1) after the reverb tail
+            // restores the counter to zero.
             PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
             debug!("TTS playback started — wake word detection suppressed");
         }
@@ -1700,21 +1498,18 @@ async fn speak_async(text: String, mut cancel_rx: Option<broadcast::Receiver<()>
         let _ = wait_for_player(player, cancel_rx.as_mut()).await;
     }
 
-    // Reverb tail: keep the playback count > 0 briefly after playback ends
-    // to prevent wake word false triggers from room acoustics and output
-    // buffer drain.  Using a counter (not a boolean) ensures that a new
-    // speak_async() call that starts during this window keeps the count >= 1.
+    // Reverb tail: keep the playback count > 0 briefly after playback ends, so room acoustics
+    // and buffer drain cannot trigger the wake word. A counter, not a boolean, so a call that
+    // starts during this window keeps the count >= 1.
     if current_player.is_some() {
         tokio::time::sleep(Duration::from_millis(PLAYBACK_REVERB_TAIL_MS)).await;
         PLAYBACK_ACTIVE.fetch_sub(1, Ordering::Release);
     }
 }
 
-/// Wait for a rodio player to finish playback, polling for completion
-/// with optional cancellation support.
-///
-/// Returns `true` if playback completed normally, `false` if cancelled
-/// or if the player didn't drain within [`PLAYER_WAIT_TIMEOUT`].
+/// Wait for a rodio player to finish playback, polling with optional cancellation support.
+/// Returns `true` if it completed normally, `false` if cancelled or if the player did not
+/// drain within [`PLAYER_WAIT_TIMEOUT`].
 async fn wait_for_player(player: &Player, cancel_rx: Option<&mut broadcast::Receiver<()>>) -> bool {
     /// Maximum time to wait for the player to drain before giving up.
     const PLAYER_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1752,8 +1547,6 @@ async fn wait_for_player(player: &Player, cancel_rx: Option<&mut broadcast::Rece
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1761,17 +1554,14 @@ mod tests {
     #[test]
     fn test_has_ending_punctuation() {
         let cases: &[(&str, &str, bool)] = &[
-            // Sentence-ending punctuation detected
             ("period", "Yes.", true),
             ("exclamation", "No!", true),
             ("question", "Maybe?", true),
-            // Commas, semicolons, colons are NOT terminal punctuation for TTS
-            // (they don't indicate the end of a sentence)
+            // Commas, semicolons and colons are NOT terminal punctuation for TTS.
             ("comma", "comma,", false),
             ("semicolon", "semicolon;", false),
             ("colon", "colon:", false),
-            // Closing brackets, quotes, guillemets, and CJK closing marks
-            // are NOT terminal punctuation for TTS (they don't end a sentence)
+            // Closing brackets, quotes, guillemets and CJK closing marks do NOT end a sentence.
             ("paren", "paren)", false),
             ("bracket", "bracket]", false),
             ("brace", "brace}", false),
@@ -1782,12 +1572,9 @@ mod tests {
             ("cjk_right_black_square_bracket", "cjk】", false),
             ("cjk_right_angle_bracket", "cjk〉", false),
             ("cjk_right_double_angle", "cjk》", false),
-            // Quotes are NOT terminal punctuation
             ("single_quote", "single'", false),
             ("double_quote", "double\"", false),
-            // No punctuation
             ("no_punctuation", "Maybe", false),
-            // Fullwidth variants should also be terminal
             ("cjk_fullwidth_period", "CJK\u{3002}", true),
             ("cjk_fullwidth_bang", "CJK\u{FF01}", true),
             ("cjk_fullwidth_question", "CJK\u{FF1F}", true),
@@ -1799,7 +1586,6 @@ mod tests {
 
     #[test]
     fn test_preprocess_text() {
-        // Basic case: trailing period added
         let r = preprocess_text("Hello world");
         assert_eq!(
             r, "Hello world.",
@@ -1807,15 +1593,13 @@ mod tests {
         );
 
         // Markdown stripped, emoji removed, symbols normalized, abbreviations expanded.
-        // **Hi** is completely removed by bold stripping (correct — bold syntax carries no
-        // semantic text content for TTS purposes).
+        // **Hi** is removed entirely — bold syntax carries no text content for TTS.
         let r2 = preprocess_text("**Hi** @user, e.g., hello 😊");
         assert_eq!(
             r2, "at user, for example, hello.",
             "should strip markdown, expand abbrevs, remove emoji, add period"
         );
 
-        // Already well-formed: no change
         let r3 = preprocess_text("Hello, world.");
         assert_eq!(r3, "Hello, world.", "should not double-add period");
     }
@@ -1824,7 +1608,6 @@ mod tests {
     fn test_split_at_sentence_boundaries() {
         let cases: &[(&str, &str, usize, &[&str])] = &[
             ("single_char_sentences", "A. B. C.", 3, &["A.", "B.", "C."]),
-            // Single short sentence: no splitting
             (
                 "single_short_sentence",
                 "Hello world.",
@@ -1842,10 +1625,9 @@ mod tests {
     #[test]
     fn test_render_wav_decodes_via_hound() {
         use rodio::Source;
-        // The rodio 0.22 upgrade switched WAV decode from the symphonia-based
-        // `wav` feature to hound (Apache-2.0 license posture). Verify the
-        // hound-backed `Decoder::new` still decodes render_wav's PCM16 mono
-        // output with the right rate/channel count and sample values.
+        // The rodio 0.22 upgrade switched WAV decode from symphonia to hound (Apache-2.0
+        // posture): verify it still decodes render_wav's PCM16 mono output with the right
+        // rate, channel count and sample values.
         let sample_rate = 16000u32;
         let samples = vec![0.0f32, 0.5, -0.5, 1.0, -1.0];
         let wav_bytes = render_wav(&samples, sample_rate).expect("render_wav should succeed");
@@ -1874,43 +1656,31 @@ mod tests {
 
     #[test]
     fn test_encode_text_with_indexer() {
-        // Synthetic unicode indexer: maps ASCII chars 0-127 to sequential IDs.
-        // indexer[i] = i for i in 0..128, with UNK positioned at index 0.
-        // This means:
-        //   - 'H' (72)  → ID 72
-        //   - 'w' (119) → ID 119
-        //   - '😊' (U+1F60A = 128522) → out of range → UNK (ID 0)
-        //
-        // We specifically set space (32) to -1 so it falls through to UNK,
-        // simulating a real indexer where space is not a valid token.
+        // Synthetic unicode indexer: ASCII 0-127 map to sequential IDs, UNK sits at index 0.
+        // Space (32) is set to -1 so it falls through to UNK, as in a real indexer where space
+        // is not a valid token.
         let mut indexer: Vec<i32> = (0..128i32).collect();
-        // ID 0 is the UNK token
         indexer[0] = 0;
-        // Space (code 32) → UNK (not a valid token in the model)
         indexer[32] = -1;
 
         let (ids, len) = encode_text_with_indexer(&indexer, "H w");
         assert_eq!(len, 3, "three characters encoded");
         assert_eq!(ids, vec![72, 0, 119], "space should map to UNK (ID 0)");
 
-        // Test with empty indexer (edge case)
         let (ids2, len2) = encode_text_with_indexer(&[], "hello");
         assert_eq!(len2, 5, "five chars encoded with empty indexer");
         assert_eq!(ids2, vec![0; 5], "all map to UNK (default 0)");
 
-        // Test with single-entry indexer (no UNK differentiation)
         let (ids3, len3) = encode_text_with_indexer(&[42], "abc");
         assert_eq!(len3, 3);
         assert_eq!(ids3, vec![42; 3], "all chars map to UNK (first entry = 42)");
 
-        // Test with negative UNK sentinel
         let (ids4, len4) = encode_text_with_indexer(&[-1], "x");
         assert_eq!(len4, 1);
         assert_eq!(ids4, vec![-1i64], "UNK sentinel preserved");
 
-        // The empty-token guard in [`synthesize_internal`] checks
-        // `seq_len == 0` after [`encode_text`]: an empty string encodes to no
-        // tokens, anything else produces tokens even when it is whitespace.
+        // The empty-token guard in [`synthesize_internal`] checks `seq_len == 0` after
+        // [`encode_text`]: whitespace produces tokens, an empty string does not.
         let (ids, len) = encode_text_with_indexer(&vec![0i32; 128], "");
         assert_eq!(
             len, 0,
@@ -1923,14 +1693,12 @@ mod tests {
         assert_eq!(len3, 1, "whitespace input produces a token");
     }
 
-    // ── say_phrase ───────────────────────────────────────────────────
+    // say_phrase
     //
-    // What the tool's one entry point into the engine answers while speech is
-    // off and while the model set is not loaded. Neither case reaches the audio
-    // device, and neither starts a download (a Loading set is left as it is).
+    // What the tool's one entry point answers while speech is off and while the model set is
+    // not loaded. Neither case reaches the audio device, and neither starts a download.
 
-    /// Run `say_phrase` under a known config and state, restoring both
-    /// afterwards.
+    /// Run `say_phrase` under a known config and state, restoring both afterwards.
     fn say_under(config: &str, state: ModelState) -> SayOutcome {
         let snapshot = CONFIG.snapshot();
         let prev_state = STATE.load(Ordering::Acquire);
@@ -1956,10 +1724,9 @@ mod tests {
         }
     }
 
-    /// Not-ready is an answer like the others, and it names what is missing: a
-    /// model set still loading is never waited for inside the call. (A failed
-    /// fetch and an unstarted set both kick the download, which a test must not
-    /// do, so only the state that is already loading is pinned here.)
+    /// Not-ready is an answer like the others: a set still loading is never waited for inside
+    /// the call. Only the loading state is pinned here — a failed or unstarted set would kick
+    /// a download, which a test must not do.
     #[test]
     #[serial_test::serial(tts)]
     fn say_reports_a_model_set_that_is_not_loaded() {
@@ -1972,39 +1739,33 @@ mod tests {
         );
     }
 
-    // ── Playback-active flag tests ──────────────────────────────────────
-
-    /// The counter's whole life: it starts at zero, one increment per
-    /// `speak_async()` call (not per chunk), one decrement after the reverb
-    /// tail, and overlapping calls keep it active until the last tail expires.
+    /// The counter's whole life: zero at rest, one increment per `speak_async()` call (not per
+    /// chunk), one decrement after the reverb tail, and overlapping calls keeping it active
+    /// until the last tail expires.
     #[test]
     #[serial_test::serial(tts)]
     fn test_playback_counter_lifecycle() {
-        // The playback-active flag must start as `false` (no TTS playing).
         assert!(!is_playback_active(), "default state must be inactive");
         assert_eq!(
             PLAYBACK_ACTIVE.load(Ordering::Acquire),
             0,
             "internal counter must start at 0"
         );
-        // Reverb tail must be 200-400ms.
         assert!(
             (200..=400).contains(&PLAYBACK_REVERB_TAIL_MS),
             "PLAYBACK_REVERB_TAIL_MS={PLAYBACK_REVERB_TAIL_MS} must be between 200 and 400",
         );
 
-        // Single-chunk response: one increment when the first chunk starts
-        // playing, one decrement after the reverb tail.
+        // Single-chunk response: one increment when the chunk starts playing, one decrement
+        // after the reverb tail.
         PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
         assert!(is_playback_active(), "active during playback");
         PLAYBACK_ACTIVE.fetch_sub(1, Ordering::Release);
         assert!(!is_playback_active(), "inactive after reverb tail");
         assert_eq!(PLAYBACK_ACTIVE.load(Ordering::Acquire), 0);
 
-        // Multi-chunk response: the increment happens ONCE per speak_async()
-        // call when the first chunk plays, not once per chunk. Previously the
-        // increment ran on every chunk, causing a permanent counter leak on
-        // multi-chunk responses (N>=2).
+        // Multi-chunk: the increment happens ONCE per call, not once per chunk. Incrementing
+        // per chunk leaked the counter on responses of two or more chunks.
         PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
         // Further chunks arrive with `current_sink.is_some()`: no fetch_add.
         assert_eq!(PLAYBACK_ACTIVE.load(Ordering::Acquire), 1);
@@ -2016,8 +1777,7 @@ mod tests {
         );
         assert!(!is_playback_active(), "inactive after all chunks done");
 
-        // Overlapping calls: B starts during A's reverb tail, so A's expiry
-        // does not make the flag inactive.
+        // Overlapping calls: B starts during A's reverb tail, so A's expiry leaves it active.
         PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
         assert!(is_playback_active());
         PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);
@@ -2027,8 +1787,7 @@ mod tests {
         PLAYBACK_ACTIVE.fetch_sub(1, Ordering::Release);
         assert!(!is_playback_active());
 
-        // 100 iterations of overlapping call pairs: the counter always returns
-        // to 0 regardless of interleaving.
+        // 100 overlapping call pairs: the counter always returns to 0.
         for _ in 0..100 {
             assert_eq!(PLAYBACK_ACTIVE.load(Ordering::Acquire), 0);
             PLAYBACK_ACTIVE.fetch_add(1, Ordering::Relaxed);

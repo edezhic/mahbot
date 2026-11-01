@@ -21,13 +21,11 @@ pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
     dispatch_engineer(ticket, ws, &job_id).await;
 }
 
-/// Build the engineer's work prompt: comments that arrived after the
-/// engineer's last comment are bounce feedback to address, otherwise fall
-/// back to the plain implement prompt.
+/// Build the engineer's work prompt: comments that arrived after the engineer's last comment
+/// are bounce feedback to address, otherwise the plain implement prompt.
 ///
-/// On a first InDevelopment dispatch there is no prior engineer comment, so
-/// there is no post-round feedback — pre-existing comments are baseline
-/// context already injected via the `<current-ticket>` block.
+/// On a first dispatch there is no prior engineer comment, so pre-existing comments are
+/// baseline context already injected via the `<current-ticket>` block.
 fn engineer_work_message(ticket: &Ticket) -> String {
     let feedback: Vec<&str> = ticket
         .comments
@@ -61,8 +59,7 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) {
     run_stage_agent(&ticket, &ws, job_id, &message, StageRunKind::Engineer).await;
 }
 
-/// Extract a concise structured summary of the engineer's work for the ticket
-/// comment.
+/// Extract a concise structured summary of the engineer's work for the ticket comment.
 async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
     let ticket_id = agent.ticket.as_ref().map_or("?", |t| t.id.as_str());
     let policy = crate::retry::RetryPolicy::comment();
@@ -135,8 +132,7 @@ fn engineer_failure_notice(shutdown: bool, error: Option<&str>) -> String {
     }
 }
 
-/// Notify the Manager that a workspace was paused because of an engineer hard
-/// failure.
+/// Notify the Manager that a workspace was paused because of an engineer hard failure.
 fn notify_engineer_pause(ticket_id: &str, ws: &Workspace, failure_details: &str, paused: bool) {
     let content = substitute(
         &load_prompt("pipeline/engineer_pause_notification.md"),
@@ -171,8 +167,7 @@ pub(crate) async fn finalize_engineer_stage(
         return;
     }
 
-    // Success path: engineer produced output — transition to Verification.
-    // The puller creates the Verification phase job on the next tick.
+    // Success: transition to Verification; the puller creates its phase job next tick.
     if let Some(text) = response {
         let comment_text = engineer_comment_text(agent, text).await;
         comment_and_transition_or_bail(
@@ -205,17 +200,14 @@ async fn handle_engineer_failure(
     ws: &Workspace,
     paused: bool,
 ) {
-    // A workspace-pause (strict freeze) is NOT a failure — leave the job in
-    // place for the unpause re-drive. Uses the immutable bail-time snapshot
-    // captured on the agent, so it survives a workspace-unpause race.
+    // A workspace-pause (strict freeze) is NOT a failure — leave the job for the unpause
+    // re-drive. Uses the immutable bail-time snapshot, so it survives an unpause race.
     if paused {
         pause_freezing(ticket, job_id).await;
         return;
     }
 
-    // A code-driven (internal) cancellation — re-dispatch, register
-    // replacement, phase transition/supersede, or the GUI cancel (whose
-    // authoritative Cancelled transition is handled by the GUI, not here) —
+    // A code-driven cancellation — re-dispatch, replacement, supersede, or the GUI cancel —
     // leaves the ticket for the replacement run.
     if agent.is_cancelled() && !crate::shutdown::aborting() {
         info!(ticket = %ticket.id, "Engineer run interrupted by a code-driven cancellation — leaving the ticket for the replacement run");
@@ -238,9 +230,8 @@ async fn handle_engineer_failure(
     );
     let conn = &crate::session::store().conn;
 
-    // Hard failure: pause is already committed. The ticket itself gets no
-    // comment — ticket history carries stage conclusions only; the Manager
-    // notice below reports the pause and the cause.
+    // Hard failure: the pause is already committed. The ticket itself gets no comment —
+    // ticket history carries stage conclusions only.
     let workspace_paused = ws.paused || pause_occurred;
     notify_engineer_pause(&ticket.id, ws, &failure_notice, workspace_paused);
     info!(

@@ -1,52 +1,39 @@
-//! Compaction spill-dump: recovery artifact of the conversation messages a
+//! Compaction spill-dump: the recovery artifact of the conversation messages a
 //! summarization compaction deletes.
 //!
-//! When [`crate::session::Session::apply_summary`] rebuilds history it keeps
-//! only a fresh system prompt, the summary, and the latest retention window
-//! (see [`crate::session::select_retention_window`]) — everything else is
-//! dropped from the session permanently. This module writes the dropped
-//! messages to a readable `.md` dump and returns its path so the persisted
-//! summary message can point the agent at it.
+//! [`crate::session::Session::apply_summary`] rebuilds history keeping only a fresh system
+//! prompt, the summary and the latest retention window
+//! ([`crate::session::select_retention_window`]); everything else is dropped permanently. This
+//! module writes the dropped messages to a readable `.md` dump and returns its path so the
+//! persisted summary can point the agent at it.
 //!
-//! Lifecycle: the dump is NOT registered for owner-delete-at-run-end cleanup
-//! (unlike the `spill_*` shell spill files), and the daemon builds no startup
-//! purge. For every role except the Assistant the dump lives under the pinned
-//! temp root, so the periodic temp cleaner sweeps it once it is older than
-//! 24 hours (see [`crate::temp`]); the Assistant's dump lives in its personal
-//! workspace, outside the cleaner's scope. A compaction whose persist fails
-//! orphans its dump; that is accepted — orphan dumps are dead weight, not a
-//! correctness problem, and deleting a dump that a concurrently-retried
-//! persist might reference would be worse.
+//! Lifecycle: the dump is NOT registered for owner-delete-at-run-end cleanup (unlike the
+//! `spill_*` shell files) and no startup purge exists. For every role but the Assistant it
+//! lives under the pinned temp root, so the periodic temp cleaner sweeps it once it is a day
+//! old ([`crate::temp`]); the Assistant's lives in its personal workspace, outside the
+//! cleaner's scope. A compaction whose persist fails orphans its dump — accepted, since
+//! deleting a dump a concurrently-retried persist might reference would be worse.
 //!
-//! Cross-references: media-marker handling in [`crate::util`] (data-URI
-//! stripping) and the read tool's `MAX_FILE_SIZE_BYTES` cap (the reason data
-//! URIs are stripped).
+//! Media-marker handling in [`crate::util`] (data-URI stripping) exists for the read tool's
+//! `MAX_FILE_SIZE_BYTES` cap.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::{ChatMessage, ChatRole, Role};
 
-/// Directory name (inside the role-appropriate dump root) holding compaction
-/// dumps. For the Assistant this is a hidden dir in the user's personal
-/// workspace; for every other role a plain dir under the pinned agent temp
-/// root. `personal_changes::is_skipped` prunes it at any depth, so neither the
-/// session-start picture nor the change report shows it, and ripgrep defaults
-/// keep it out of search results.
+/// Directory name (inside the role-appropriate root) holding compaction dumps. For the
+/// Assistant it is a hidden dir in the personal workspace, elsewhere a plain dir under the agent
+/// temp root. `personal_changes::is_skipped` prunes it at any depth, so neither the
+/// session-start picture nor the change report shows it, and ripgrep keeps it out of search.
 const DUMP_DIR_NAME: &str = ".compaction";
 
-/// Dump the messages this compaction deletes to a `.md` file.
+/// Dump the messages this compaction deletes to a `.md` file. The caller's persist removes them
+/// from the session, so this dump is their only copy; lifecycle is in the module header.
 ///
-/// The messages it contains are removed from the session by the caller's
-/// persist, so this dump is the only copy of them. Lifecycle (retention,
-/// cleanup, orphaned dumps) is described in the module header.
-///
-/// Fail-open: any filesystem failure logs a warning and returns `None` — a
-/// dump failure never blocks compaction.
-///
-/// Returns `Some(path)` on success; `None` when there is nothing to dump
-/// (deletion set empty), the dump root cannot be resolved/created, or the
-/// write fails.
+/// Fail-open: any filesystem failure logs a warning and returns `None` — a dump failure never
+/// blocks compaction. `None` also when there is nothing to dump, the root cannot be
+/// resolved/created, or the write fails.
 pub(crate) async fn dump_deleted_messages(
     agent_id: &str,
     old_history: &[ChatMessage],
@@ -73,20 +60,14 @@ pub(crate) async fn dump_deleted_messages(
     Some(path)
 }
 
-/// Compute the messages `old_history` contributes to the dump: everything
-/// except the retained window and System-role messages.
+/// The messages `old_history` contributes to the dump: everything except the retained window
+/// and System-role messages.
 ///
-/// Multiset matching, not set matching: `old_history` is walked in order and
-/// each non-System message consumes the FIRST not-yet-consumed equal message
-/// in `retained_window` (equality on role + content). Two identical user
-/// messages are both deleted only if the window really contains two —
-/// positional or set semantics would silently drop one of them. System-role
-/// messages are skipped entirely: the regenerated context prefix and the
-/// superseded previous summary are not conversation content, and the fresh
-/// system prompt is never part of the retained window anyway.
-///
-/// The returned items borrow `old_history` so the render can stay
-/// allocation-free per message.
+/// Multiset matching, not set matching: each non-System message consumes the FIRST
+/// not-yet-consumed equal message (role + content) in `retained_window`, so two identical user
+/// messages are both deleted only if the window really holds two. System-role messages are
+/// skipped: the regenerated context prefix and the superseded summary are not conversation
+/// content. The items borrow `old_history`, so the render stays allocation-free per message.
 fn deleted_conversation_messages<'a>(
     old_history: &'a [ChatMessage],
     retained_window: &[ChatMessage],
@@ -95,8 +76,7 @@ fn deleted_conversation_messages<'a>(
     let mut deleted = Vec::new();
     for msg in old_history {
         if msg.role == ChatRole::System {
-            // Regenerated context prefix / superseded summary — not
-            // conversation content, never dumped.
+            // Regenerated context prefix / superseded summary — never dumped.
             continue;
         }
         if let Some(slot) = retained_window
@@ -112,10 +92,9 @@ fn deleted_conversation_messages<'a>(
     deleted
 }
 
-/// Render the deleted messages as a plain readable transcript. The whole
-/// output runs through [`crate::util::scrub_credentials`] — the same
-/// scrubbing tool output gets — because any agent with a read tool can open a
-/// dump, just as it can read tool output.
+/// Render the deleted messages as a plain readable transcript, the whole output through
+/// [`crate::util::scrub_credentials`] — the same scrubbing tool output gets, since any agent with
+/// a read tool can open a dump.
 fn render_dump(messages: &[&ChatMessage]) -> String {
     let mut out = String::new();
     for msg in messages {
@@ -126,8 +105,7 @@ fn render_dump(messages: &[&ChatMessage]) -> String {
                 tool_calls,
                 ..
             }) => {
-                // Reasoning is deliberately skipped: scratch space, not
-                // conversation content.
+                // Reasoning is scratch space, not conversation content.
                 if let Some(content) = content.filter(|c| !c.is_empty()) {
                     let _ = writeln!(out, "{}", crate::util::strip_data_uris(&content));
                 }
@@ -160,22 +138,15 @@ fn render_dump(messages: &[&ChatMessage]) -> String {
     crate::util::scrub_credentials(out.trim_end())
 }
 
-/// Resolve the directory holding compaction dumps for this role.
+/// - [`Role::Assistant`]: `<personal_workspace>/{[`DUMP_DIR_NAME`]}` — the one location both
+///   audiences' read tools can open (the admin's reaches the machine, a guest's only its
+///   workspace, and the general read's temp allowlist is not the guest's). `user_name` is
+///   validated via [`crate::users::is_valid_personal_user_name`].
+/// - Every other role has the general read tool and the pinned temp root is inside its
+///   allowlist, so the dump goes to `<agent_temp_dir>/compaction` — deliberately NOT the
+///   `spill_*` shape and NOT in `SPILL_OWNERS`, since a dump outlives its run.
 ///
-/// - [`Role::Assistant`]: pinned to the user's personal workspace —
-///   `<personal_workspace>/{[`DUMP_DIR_NAME`]}` — because that is the one
-///   location both audiences' read tools can open: the admin's reaches the
-///   machine, a guest's only reaches its workspace, and the general read's
-///   temp allowlist is not the guest's. `user_name` is validated via
-///   [`crate::users::is_valid_personal_user_name`]; `None` when invalid.
-/// - Every other role has the general read tool, and the whole pinned temp
-///   root is already inside its allowlist, so the dump goes to
-///   `<agent_temp_dir>/compaction`. It deliberately does NOT use the
-///   `spill_*` filename shape and is NOT registered in `SPILL_OWNERS` — a dump
-///   outlives the run that wrote it.
-///
-/// Fail-open: `None` when validation fails or the directory cannot be
-/// created.
+/// Fail-open: `None` when validation fails or the directory cannot be created.
 async fn dump_dir(role: &Role, user_name: &str) -> Option<PathBuf> {
     let dir = if matches!(role, Role::Assistant) {
         if !crate::users::is_valid_personal_user_name(user_name) {
@@ -189,14 +160,11 @@ async fn dump_dir(role: &Role, user_name: &str) -> Option<PathBuf> {
     Some(dir)
 }
 
-/// Pick the next dump path: `compaction-{sanitized_agent_id}-{seq:03}-{unix_millis}.md`.
+/// `compaction-{sanitized_agent_id}-{seq:03}-{unix_millis}.md`.
 ///
-/// `seq` is per-session monotonic, derived by counting existing files whose
-/// name starts with `compaction-{sanitized}-` (start at 1). The unix-millis
-/// suffix keeps names unique even if an earlier dump was already reclaimed
-/// (a plain counter would then reuse a name whose file is gone — harmless,
-/// but a fresh name avoids any ambiguity). Fail-open: `None` on `read_dir`
-/// failure.
+/// `seq` is per-session monotonic, derived by counting existing files with the same prefix (from
+/// 1). The unix-millis suffix keeps names unique even after an earlier dump was reclaimed. `None`
+/// on `read_dir` failure.
 async fn next_dump_path(dir: &Path, agent_id: &str) -> Option<PathBuf> {
     let sanitized: String = agent_id
         .chars()
@@ -224,10 +192,9 @@ mod tests {
     use super::*;
     use crate::ChatRole;
 
-    /// The dump carries the complement of the retention window as a MULTISET:
-    /// the older turns only, never the system prompt, and one of two identical
-    /// user messages still counts as deleted while the window holds only the
-    /// other — set semantics would wrongly call it retained.
+    /// The dump carries the complement of the retention window as a MULTISET: older turns only,
+    /// never the system prompt, and one of two identical user messages still counts as deleted
+    /// while the window holds only the other.
     #[test]
     fn deleted_set_is_the_window_complement_counted_as_a_multiset() {
         let history = vec![

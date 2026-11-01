@@ -1,10 +1,8 @@
-//! Git diff parsing — parse unified diff output into structured data.
+//! Git diff parsing — unified diff output into structured data.
 //!
-//! Handles `git diff HEAD --no-color --find-renames` or `git show -m` output.
-//! Untracked / new file content is assembled into synthetic DiffFile entries.
-//!
-//! For git subprocess wrappers that produce diff output or manage
-//! repository state, see [`crate::git::commands`].
+//! Handles `git diff HEAD --no-color --find-renames` or `git show -m`; untracked / new file
+//! content is assembled into synthetic entries. The git subprocess wrappers live in
+//! [`crate::git::commands`].
 
 use tracing::warn;
 
@@ -13,15 +11,15 @@ use crate::util::unquote_c_style;
 /// Status of a file in the diff — what kind of change it represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffFileStatus {
-    /// File exists on both sides (modified or unchanged).
+    /// Exists on both sides (modified or unchanged).
     Modified,
     /// New file added to git (from `--- /dev/null`).
     Added,
     /// File deleted from git (from `+++ /dev/null`).
     Deleted,
-    /// File renamed (from `rename from`/`rename to`).
+    /// Renamed (from `rename from`/`rename to`).
     Renamed,
-    /// Untracked/new file (assembled via `make_untracked_diff_file` from raw content).
+    /// Untracked/new file, assembled from raw content by `make_untracked_diff_file`.
     Untracked,
 }
 
@@ -30,9 +28,9 @@ pub enum DiffFileStatus {
 pub enum DiffContent {
     /// File has parseable text hunks.
     Parseable,
-    /// File is binary (detected by git).
+    /// Binary (detected by git).
     Binary,
-    /// File is too large to diff (size in bytes).
+    /// Too large to diff (size in bytes).
     TooLarge(u64),
 }
 
@@ -40,17 +38,16 @@ pub enum DiffContent {
 #[derive(Debug, Clone)]
 pub struct DiffFile {
     pub path: String,
-    /// Previous path when git detects a rename. None otherwise.
+    /// Previous path when git detects a rename.
     pub old_path: Option<String>,
     pub hunks: Vec<DiffHunk>,
     /// Change status (Added, Deleted, Renamed, Untracked, or Modified).
     pub status: DiffFileStatus,
-    /// Content state — parseable hunks, binary, or too-large placeholder.
+    /// Parseable hunks, binary, or too-large placeholder.
     pub content: DiffContent,
 }
 
 impl DiffFile {
-    /// Create a new `DiffFile` with the given path, hunks, and status.
     /// Defaults: `old_path: None`, `content: DiffContent::Parseable`.
     #[must_use]
     pub fn new(path: String, hunks: Vec<DiffHunk>, status: DiffFileStatus) -> Self {
@@ -74,9 +71,7 @@ impl DiffFile {
             content,
         }
     }
-    /// Whether this file has parseable hunk content.
-    /// Binary files and files that are too large to diff have no parseable
-    /// content lines — they are represented as file headers only.
+    /// Binary and too-large files have no parseable content lines — headers only.
     #[must_use]
     pub(crate) fn has_parseable_content(&self) -> bool {
         matches!(self.content, DiffContent::Parseable)
@@ -86,7 +81,7 @@ impl DiffFile {
 /// One hunk within a file diff.
 #[derive(Debug, Clone)]
 pub struct DiffHunk {
-    /// The hunk header line, e.g. "@@ -10,7 +10,9 @@ fn main() {"
+    /// The hunk header line, e.g. "@@ -10,7 +10,9 @@ fn main() {
     pub header: String,
     pub lines: Vec<DiffLine>,
 }
@@ -147,7 +142,7 @@ impl DiffParser {
         }
     }
 
-    /// Handle a `diff --git` line: flush previous file, reset counters, and create a new file entry.
+    /// `diff --git`: flush the previous file, reset counters, create a new entry.
     fn handle_diff_git_header(&mut self, line: &str) {
         self.flush();
         self.old_counter = 0;
@@ -158,9 +153,8 @@ impl DiffParser {
         }
     }
 
-    /// Handle a `rename from` line: parse the old path and, if successful, set the
-    /// file status to `Renamed`. The status remains `Modified` (the default) when
-    /// the rename line is malformed.
+    /// `rename from`: parse the old path and set the status to `Renamed`; a malformed line
+    /// leaves it `Modified` (the default).
     fn handle_rename_from(&mut self, line: &str) {
         let Some(f) = self.current_file.as_mut() else {
             return;
@@ -184,8 +178,8 @@ impl DiffParser {
         f.old_path = Some(old_path);
     }
 
-    /// Handle a hunk header line (`@@ -old,count +new,count @@`): flush previous hunk,
-    /// parse the header, and set up a new hunk with fresh line counters.
+    /// Hunk header (`@@ -old,count +new,count @@`): flush the previous hunk, parse the header
+    /// and start a new hunk with fresh counters.
     fn handle_hunk_header(&mut self, line: &str) {
         self.flush_hunk();
         let (old_start, new_start) = parse_hunk_header(line);
@@ -197,13 +191,10 @@ impl DiffParser {
         });
     }
 
-    /// Handle a content line within a hunk: classify as Added/Removed/Context, track
-    /// line numbers, and push to the hunk.
-    ///
-    /// Non-content lines are filtered by the caller before reaching this function.
-    /// Unknown lines are silently skipped — the caller continues normally.
+    /// A content line within a hunk: classify as Added/Removed/Context, track line numbers,
+    /// push to the hunk. Non-content lines are filtered by the caller.
     fn handle_diff_content_line(&mut self, line: &str) {
-        // If no hunk is active, this line falls outside any diff hunk — skip.
+        // No active hunk: this line falls outside any diff hunk — skip.
         let Some(hunk) = self.current_hunk.as_mut() else {
             return;
         };
@@ -260,8 +251,8 @@ impl DiffParser {
             || line.starts_with("\\ ")
         // e.g. "\ No newline at end of file"
         {
-            // rename to is safe to skip because diff --git already captures the b-path,
-            // and rename from already set the status.
+            // Safe to skip: `diff --git` already captured the b-path, and `rename from`
+            // already set the status.
         } else if line.starts_with("--- ") || line.starts_with("+++ ") {
             if let Some(ref mut f) = self.current_file {
                 if line.starts_with("--- /dev/null") {
@@ -295,7 +286,7 @@ pub fn parse_git_diff(diff_output: &str) -> Vec<DiffFile> {
     parser.files
 }
 
-/// Create a [`DiffFile`] for an untracked file (showing all lines as added).
+/// A [`DiffFile`] for an untracked file (all lines added).
 #[must_use]
 pub fn make_untracked_diff_file(path: &str, content: &str) -> DiffFile {
     let lines: Vec<DiffLine> = content
@@ -319,36 +310,20 @@ pub fn make_untracked_diff_file(path: &str, content: &str) -> DiffFile {
 
 /// Parse the `b/` path from a `diff --git a/… b/…` line.
 ///
-/// Git's `core.quotepath` (on by default) C-quotes paths containing trigger
-/// characters (`"`, `\`, control chars <0x20, bytes ≥0x80). Spaces (0x20)
-/// do NOT trigger quoting.
+/// Git's `core.quotepath` (on by default) C-quotes paths with trigger characters (`"`, `\`,
+/// control chars <0x20, bytes ≥0x80); spaces (0x20) do NOT trigger quoting. Two formats exist:
 ///
-/// Two quoting formats exist:
+/// - **Fully-quoted** (both sides trigger chars): each side gets its own quote pair,
+///   `diff --git "a/file\"name.rs" "b/file\"name.rs"` — the `b/` prefix is INSIDE the
+///   quotes, so a naive `find(" b/")` fails.
+/// - **Asymmetrical** (possible for renames where only one path has trigger chars):
+///   `diff --git "a/file\"x.rs" b/normal.rs` or `diff --git a/normal.rs "b/file\"x.rs"`.
 ///
-/// - **Fully-quoted**: both sides have trigger chars. Git's `quote_two_c_style()`
-///   wraps each side in its own double-quote pair:
-///   `diff --git "a/file\"name.rs" "b/file\"name.rs"`.
-///   The `b/` prefix is INSIDE the quotes — a naive `find(" b/")` fails.
-///
-/// - **Asymmetrical** (possible for renames where only one path has trigger
-///   chars): `diff --git "a/file\"x.rs" b/normal.rs` or
-///   `diff --git a/normal.rs "b/file\"x.rs"`.
-///
-/// Returns `None` if the line is malformed, if escape sequences are invalid,
-/// or if the expected `b/` prefix is missing.
-///
-/// # What this function does NOT handle
-///
-/// - `---`/`+++` lines: these are only checked for `/dev/null` to detect
-///   added/deleted files. They are NOT path-extraction sites even though git
-///   may C-quote them. Extracting paths from them would be a bug.
-///
-/// - `rename to` lines: the `b/` path from `diff --git` is authoritative.
-///   `rename to` does not need separate extraction.
-///
-/// - Combined diff format (`diff --combined` / `diff --cc`): these produce
-///   different header formats. Our `git show -m` invocation never produces
-///   these, and they are not handled by this parser.
+/// Returns `None` if the line is malformed, an escape sequence is invalid, or the `b/` prefix
+/// is missing. Deliberately not handled: `---`/`+++` lines (only checked for `/dev/null` to
+/// detect added/deleted files — extracting paths from them would be a bug), `rename to` (the
+/// `diff --git` b-path is authoritative), and combined diff (`diff --combined`/`--cc`), which
+/// `git show -m` never produces.
 fn parse_diff_git_line(line: &str) -> Option<String> {
     let rest = line.strip_prefix("diff --git ")?;
     let b_part = find_b_part(rest)?;
@@ -357,25 +332,21 @@ fn parse_diff_git_line(line: &str) -> Option<String> {
 
 /// Locate the b-part (second token) in the remainder of a `diff --git` line.
 ///
-/// The a-part may be double-quoted and contain escaped quotes/spaces, so a
-/// simple split on the first space is unreliable. For unquoted a-parts,
-/// spaces in paths do NOT trigger C-style quoting (per git's `quote_c_style`),
-/// and the b-part may itself be quoted. We search for the boundary marker
-/// (` b/` for unquoted b-part, ` "b/` for quoted b-part).
+/// The a-part may be double-quoted and contain escaped quotes/spaces, so splitting on the first
+/// space is unreliable; the b-part may itself be quoted. Search for the boundary marker (` b/`
+/// for an unquoted b-part, ` "b/` for a quoted one).
 fn find_b_part(rest: &str) -> Option<&str> {
     let bytes = rest.as_bytes();
 
     if bytes.first() == Some(&b'"') {
-        // Quoted a-part: scan for the closing unescaped quote,
-        // then skip whitespace to reach the b-part.
+        // Quoted a-part: scan for the closing unescaped quote, then skip whitespace to reach
+        // the b-part.
         let mut i: usize = 1;
         while i < bytes.len() {
             if bytes[i] == b'\\' {
-                // Skip past the escape sequence. Git's C-quoting uses single-char
-                // escapes (\t, \n, \\, \") or multi-byte octal escapes (\377, \342,
-                // etc.); skipping 2 bytes (backslash + next byte) is sufficient
-                // because remaining octal digits are plain bytes that can't match
-                // `\` or `"`.
+                // Git's C-quoting uses single-char escapes (\t, \n, \\, \") or multi-byte
+                // octal escapes; skipping 2 bytes (backslash + next byte) suffices, because the
+                // remaining octal digits cannot match `\` or `"`.
                 i += 2;
             } else if bytes[i] == b'"' {
                 i += 1; // skip closing quote
@@ -392,9 +363,8 @@ fn find_b_part(rest: &str) -> Option<&str> {
         }
         Some(&rest[i..])
     } else {
-        // Unquoted a-part. Paths may contain spaces (which don't trigger
-        // C-style quoting). The b-part can be either quoted (`"b/…"`) or
-        // unquoted (`b/…`). Try the quoted separator first.
+        // Unquoted a-part, whose path may contain spaces (they don't trigger C-style
+        // quoting). The b-part can be quoted (`"b/…"`) or not; try the quoted separator first.
         if let Some(idx) = rest.find(" \"b/") {
             Some(&rest[idx + 1..])
         } else {
@@ -403,17 +373,14 @@ fn find_b_part(rest: &str) -> Option<&str> {
     }
 }
 
-/// Extract the unescaped path from the b-part token.
-///
-/// The b-part is either `b/path` (unquoted, no trigger chars) or
-/// `"b/path\"with\"escapes"` (quoted, the `b/` prefix is inside the quotes).
+/// Extract the unescaped path from the b-part token: `b/path`, or `"b/path\"with\"escapes"`
+/// with the prefix inside the quotes.
 fn extract_b_path(b_part: &str) -> Option<String> {
     let path = unquote_c_style(b_part)?;
     Some(path.strip_prefix("b/")?.to_string())
 }
 
-/// Parse a single range token like `-10,7` or `+10` from a hunk header.
-/// Returns the starting line number, or `None` if the token is malformed.
+/// Parse a range token like `-10,7` or `+10` from a hunk header; `None` when malformed.
 fn parse_range_token(part: &str, prefix: char) -> Option<usize> {
     let remainder = part.strip_prefix(prefix)?;
     remainder.split(',').next()?.parse::<usize>().ok()
@@ -425,20 +392,10 @@ fn parse_range_token(part: &str, prefix: char) -> Option<usize> {
 ///
 /// # Correctness
 ///
-/// The parser must guard against two types of tokens that look like range
-/// prefixes but carry different meaning in trailing context:
-///
-/// - **`->`** (arrow in Rust function signatures): after the closing `@@`,
-///   a token like `->` starts with `-` but is not a range token. The parser
-///   stops at the first token starting with `@` (the closing delimiter), so
-///   trailing-context tokens are never inspected.
-/// - **`a + b`** (expressions in context): the `+b` token starts with `+`
-///   but appears after the closing `@@` delimiter — again stopped by the
-///   `@` break.
-///
-/// The `@` break alone is sufficient — [`parse_range_token`] simply returns
-/// `None` for any non-numeric remainder (its `parse::<usize>()` call fails),
-/// so spurious `-` or `+` tokens like `->` are harmlessly skipped.
+/// Trailing-context tokens can look like range prefixes: `->` in a Rust signature starts with
+/// `-`, and `a + b` yields a `+b` token. Both appear after the closing `@@`, where the parser
+/// stops on the first `@`, so they are never inspected — and [`parse_range_token`] returns
+/// `None` for any non-numeric remainder anyway.
 fn parse_hunk_header(header: &str) -> (usize, usize) {
     // Example inputs:
     //   @@ -10,7 +10,9 @@ fn main() {
@@ -452,8 +409,8 @@ fn parse_hunk_header(header: &str) -> (usize, usize) {
     let mut new_start = 1;
 
     for part in after_open.split_whitespace() {
-        // Stop when we hit the closing @@ delimiter — any remaining
-        // tokens are context and must not influence line numbers.
+        // Stop at the closing @@ delimiter — remaining tokens are context and must not
+        // influence line numbers.
         if part.starts_with('@') {
             break;
         }
@@ -476,10 +433,9 @@ fn parse_hunk_header(header: &str) -> (usize, usize) {
 mod tests {
     use super::*;
 
-    /// One hunk-shape decision per case — a modified file's context/removed/added
-    /// lines, a new file (all added, numbered from 1), a deleted file (all
-    /// removed), a binary file (a header with no parseable content), and the
-    /// synthetic untracked file [`make_untracked_diff_file`] assembles.
+    /// One hunk-shape decision per case — a modified file's context/removed/added lines, a new
+    /// file (all added, numbered from 1), a deleted file (all removed), a binary file (a header
+    /// with no parseable content), and the synthetic untracked file.
     #[expect(clippy::too_many_lines)] // the table is the whole point: one row per hunk shape
     #[test]
     fn file_status_and_line_kinds_follow_the_diff() {
@@ -631,20 +587,17 @@ Binary files a/image.png and b/image.png differ
         }
     }
 
-    // ── parse_diff_git_line tests ─────────────────────────────────────
-
     #[test]
     fn test_parse_diff_git_line() {
-        // Cases: (diff_line, expected_b_path).
-        // None-returning cases are not covered — all existing tests
-        // exercise only Some-returning paths.
+        // Cases: (diff_line, expected_b_path). None-returning cases are not covered — all
+        // existing tests exercise only Some-returning paths.
         let cases: &[(&str, Option<&str>)] = &[
-            // ── unquoted path ──
+            // Unquoted path.
             (
                 "diff --git a/src/main.rs b/src/main.rs",
                 Some("src/main.rs"),
             ),
-            // ── fully quoted (both sides have trigger chars) ──
+            // Fully quoted: both sides have trigger chars.
             (
                 r#"diff --git "a/file\"name.rs" "b/file\"name.rs""#,
                 Some("file\"name.rs"),
@@ -662,7 +615,7 @@ Binary files a/image.png and b/image.png differ
                 r#"diff --git "a/file\t\"quote\"\\n.rs" "b/file\t\"quote\"\\n.rs""#,
                 Some("file\t\"quote\"\\n.rs"),
             ),
-            // ── asymmetrical (only one side quoted) ──
+            // Asymmetrical: only one side quoted.
             (
                 r#"diff --git "a/file\"x.rs" b/normal.rs"#,
                 Some("normal.rs"),
@@ -671,11 +624,9 @@ Binary files a/image.png and b/image.png differ
                 r#"diff --git a/normal.rs "b/file\"x.rs""#,
                 Some("file\"x.rs"),
             ),
-            // ── multi-byte octal escape (git's `\377` = byte 0xFF) ──
-            // Tests that `find_b_part`'s 2-byte escape skip (`i += 2`)
-            // correctly handles 4-byte octal escapes (`\377` = backslash +
-            // 3 octal digits): `\3` is skipped, remaining `77` are processed
-            // as ordinary non-delimiter bytes.
+            // Multi-byte octal escape (git's `\377` = byte 0xFF): `find_b_part`'s 2-byte skip
+            // (`i += 2`) handles 4-byte octal escapes — `\3` is skipped, the remaining `77`
+            // process as ordinary non-delimiter bytes.
             (
                 r#"diff --git "a/file\377name.rs" "b/file\377name.rs""#,
                 Some("file\u{FFFD}name.rs"), // 0xFF → replacement character
@@ -762,8 +713,8 @@ rename to new name.rs
 
     #[test]
     fn test_rename_from_malformed_c_style_escape() {
-        // Malformed C-style escape (\x is unrecognized) causes unquote_c_style to
-        // return None, so the file should retain the default Modified status.
+        // Malformed C-style escape (\x is unrecognized) makes unquote_c_style return None, so
+        // the file keeps the default Modified status.
         let diff = r#"diff --git "a/old.rs" "b/new.rs"
 similarity index 100%
 rename from "old\xname.rs"
@@ -778,10 +729,9 @@ rename to "new.rs"
 
     #[test]
     fn test_no_newline_annotation_skipped_and_counters_correct() {
-        // Files without trailing newlines produce a `\ No newline at end of file`
-        // annotation after the last content line. This line is metadata and must
-        // NOT increment line counters — otherwise highlight lookups would be
-        // off-by-one for all subsequent hunks.
+        // A trailing `\ No newline at end of file` annotation is metadata and must NOT
+        // increment line counters — otherwise highlight lookups would be off-by-one for all
+        // subsequent hunks.
         let diff = r"diff --git a/foo.rs b/foo.rs
 index abc123..def456 100644
 --- a/foo.rs
@@ -808,33 +758,29 @@ index abc123..def456 100644
         assert_eq!(output[0].hunks[1].lines[1].old_line_number, Some(11));
     }
 
-    // ── parse_hunk_header unit tests ──────────────────────────────────
+    // parse_hunk_header unit tests
 
     #[test]
     fn test_parse_hunk_header_cases() {
         // Cases: (name, hunk_header, expected_old, expected_new).
-        // Each name corresponds to the original standalone test for traceability.
         let cases: &[(&str, &str, usize, usize)] = &[
-            // Rust function signatures contain `->` which must not corrupt old_start.
-            // (The -> token appears after the closing @@ delimiter and is never
-            // reached by the parser loop — it breaks on @@ first.)
+            // Rust signatures contain `->`, which must not corrupt old_start — it sits after
+            // the closing @@ and the parser breaks on @@ first.
             (
                 "hunk_context_with_arrow",
                 "@@ -10,7 +10,9 @@ fn process() -> Result<()>",
                 10,
                 10,
             ),
-            // Expressions like `a + b` in context must not corrupt new_start.
-            // (Any `->` token is after the closing @@ delimiter — the parser
-            // breaks on @@ first, so spurious tokens are not inspected.)
+            // `a + b` in context must not corrupt new_start, for the same reason.
             (
                 "hunk_context_with_plus",
                 "@@ -5,3 +5,4 @@ fn add(a: i32, b: i32) -> i32 { let x = a + b; }",
                 5,
                 5,
             ),
-            // A context that produces `@@` as a whitespace-delimited token
-            // must not cause the parser to consume tokens after the real delimiter.
+            // A context producing `@@` as a whitespace-delimited token must not make the parser
+            // consume tokens after the real delimiter.
             ("hunk_at_at_in_context", "@@ -1,3 +1,3 @@ @@ -this", 1, 1),
             // Standard hunk header with plain context.
             (
@@ -845,16 +791,13 @@ index abc123..def456 100644
             ),
             // No context string after the closing @@.
             ("hunk_no_context", "@@ -0,0 +1,5 @@", 0, 1),
-            // Single-line hunk without comma-count on old range: `@@ -old_start +new_start @@`.
+            // Single-line hunk without a comma count on the old range.
             ("hunk_no_count_first", "@@ -1 +1 @@ fn single_line()", 1, 1),
-            // Single-line hunk without comma-count — different values.
+            // Single-line hunk, different values.
             ("hunk_no_count_second", "@@ -5 +3 @@ fn another()", 5, 3),
-            // Context like `if x < -1` produces a `-1` token — must be skipped.
-            // The remainder after stripping `-` is `"1"`, which is all digits,
-            // so digit validation alone would not reject it. Only the @-break
-            // (stopping at the closing @@ delimiter) protects against this.
-            // We test a constructed header where `-1` appears after the real
-            // range tokens — it must be skipped via the @-break.
+            // Context like `if x < -1` produces a `-1` token whose remainder `"1"` is all digits,
+            // so digit validation alone would not reject it — only the @-break protects against
+            // this. The header is constructed so `-1` follows the real range tokens.
             (
                 "hunk_negative_number_in_context",
                 "@@ -3,2 +3,2 @@ fn check() { if x < -1 { } }",

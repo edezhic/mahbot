@@ -1,29 +1,18 @@
 //! The Chrome for Testing headless shell HyperFrames renders in.
 //!
-//! The vendor renders by seeking a timeline in a real browser, and the product
-//! gives it one of its own rather than whatever the host happens to have: the
-//! `chrome-headless-shell` build Google publishes for this platform, downloaded
-//! once into the product's configuration directory and reused from then on. A
-//! usable copy means no network at all.
+//! The vendor renders by seeking a timeline in a real browser, and the product gives it one of
+//! its own: the `chrome-headless-shell` build Google publishes for this platform, downloaded once
+//! into the product's configuration directory and reused from then on.
 //!
-//! Google publishes no checksum for these archives, so nothing about the download
-//! is verified by digest. The proof is the binary itself: it is extracted into a
-//! scratch directory inside the cache and run with `--version` before it is
-//! placed, and a build that answers is moved to its final name with one
-//! `rename`, so a half-extracted tree can never appear under a version another run
-//! would pick up. A cached copy is proved the same way whenever it is picked up, so
-//! a damaged one is passed over for the next that answers instead of failing every
-//! render — and a build that proves is reused as it stands: the newest build Google
-//! publishes is fetched only when a download is needed, and there is no version of its
-//! own to satisfy, because the conditional trust is the proof, not a number.
-//! A build that does not run here — it answered wrongly, or its own exit status was a
-//! failure — is remembered by its version, so it costs one download rather than one per render
-//! and is not kept in the cache either. A build the product could not finish checking — it never
-//! started, or its own ceiling or memory watchdog ended the probe — is not the build's verdict:
-//! the tree just unpacked is placed the same way without a record against it, and a cached copy
-//! is left in place, the older copies are still tried, the reason is reported if none of them
-//! proves, and the same copy is tried again next time rather than being written down as one that
-//! cannot run here. Either way no second download is spent on the same archive.
+//! Google publishes no checksum for these archives, so nothing is verified by digest. The proof is
+//! the binary itself: it is extracted into a scratch directory inside the cache and run with
+//! `--version` before it is placed, and a build that answers is moved to its final name with one
+//! `rename`, so a half-extracted tree can never appear under a version another run would pick up.
+//! A cached copy is proved the same way whenever it is picked up, so a damaged one is passed over
+//! for the next that answers. A build that does not run here is remembered by its version, so it
+//! costs one download rather than one per render; a build the product could not finish checking
+//! (it never started, or its own ceiling or memory watchdog ended the probe) is not the build's
+//! verdict — the tree is placed without a record against it and the same copy is tried again.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,73 +21,65 @@ use std::time::Duration;
 use crate::tools::shell::ProgramOutcome;
 use crate::util::http::{DownloadSizeCheck, build_download_client, download_verified};
 
-/// The channel Google calls "last known good", and the file that lists each
-/// channel's version with the browse downloads beside it.
+/// The channel Google calls "last known good", and the file listing each channel's version.
 const LAST_KNOWN_GOOD: &str = "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json";
 
-/// How long the extracted binary may take to answer `--version`.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Holds the one download in flight (see [`ensure_shell`]).
 static INSTALLING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Held shared for the whole of every render and exclusively while the cache is
-/// changed, so the build a render launches from is never removed under it — on any
-/// platform, not only where the filesystem refuses the removal.
+/// Held shared for the whole of every render and exclusively while the cache is changed, so the
+/// build a render launches from is never removed under it — on any platform, not only where the
+/// filesystem refuses the removal.
 static IN_USE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
-/// The file that records a build this machine could not run: the same archive would
-/// be downloaded again for the same answer, so the next call reads it instead. It is
-/// keyed by the build's version — a newer Stable is a different binary and is tried
-/// normally — and a build that proves overwrites it.
-///
-/// Bookkeeping, not a build tree: it is written and read under [`IN_USE`]'s *shared*
-/// guard, which is what guards the trees themselves against a swap or a removal.
+/// The file recording a build this machine could not run: the same archive would be downloaded
+/// again for the same answer, so the next call reads it instead. Keyed by the build's version — a
+/// newer Stable is a different binary and is tried normally — and a build that proves overwrites
+/// it. Bookkeeping, not a build tree: written and read under [`IN_USE`]'s *shared* guard, which is
+/// what guards the trees against a swap or a removal.
 const UNPROVEN: &str = ".unproven";
 
-/// What a build that does not run on this machine is answered with, wherever it is
-/// met: a fresh download that failed its proof, or a cached copy that did.
+/// What a build that does not run on this machine is answered with: a fresh download that failed
+/// its proof, or a cached copy that did.
 const DOES_NOT_RUN: &str = "the browser build does not run on this machine";
 
-/// The shell one render uses, and the read guard that keeps the cache from removing it
-/// while the render launches from it.
+/// The shell one render uses, and the read guard that keeps the cache from removing it while the
+/// render launches from it.
 pub(super) struct Shell {
     pub(super) binary: PathBuf,
     _held: tokio::sync::RwLockReadGuard<'static, ()>,
 }
 
-/// Why the renderer has no browser to launch: there is none to have, or the product
-/// could not finish proving the one it has.
+/// Why the renderer has no browser to launch: there is none to have, or the product could not
+/// finish proving the one it has.
 #[derive(Debug)]
 pub(super) enum Unavailable {
-    /// Nothing can be launched: no cached build runs here and no download produced one.
-    /// The sentence names the failing step and carries no URL.
+    /// No cached build runs here and no download produced one. The sentence names the failing
+    /// step and carries no URL.
     Missing(String),
-    /// The build is there, but the product's own check of it was stopped — never the
-    /// build's verdict, whether the copy it checked was cached or just downloaded. The
-    /// reason is reported when no older copy proves, nothing is recorded against the build,
-    /// and the same copy is tried again next time.
+    /// The build is there, but the product's own check of it was stopped — never the build's
+    /// verdict. The reason is reported when no older copy proves, nothing is recorded against the
+    /// build, and the same copy is tried again next time.
     Unchecked(String),
 }
 
-/// Why a build did not prove.
 enum Unproven {
-    /// The product itself ended the check: a verdict about the machine, so it is worth
-    /// another attempt and nothing is remembered.
+    /// The product itself ended the check: a verdict about the machine, so it is worth another
+    /// attempt and nothing is remembered.
     Stopped(String),
-    /// The build does not run on this machine: the same archive would answer the same
-    /// way, so it is remembered by its version and reported instead of downloaded.
+    /// The build does not run on this machine: the same archive would answer the same way, so it
+    /// is remembered by its version and reported instead of downloaded.
     DoesNotRun,
 }
 
-/// A Chrome for Testing version as the vendor spells it: four numeric components.
-/// `semver` cannot read one — Chrome carries a fourth — so ordering is its own.
+/// A Chrome for Testing version as the vendor spells it: four numeric components. `semver`
+/// cannot read one, so ordering is its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ChromeVersion([u64; 4]);
 
 impl ChromeVersion {
-    /// The version a cache directory's name or the listing names, `None` for
-    /// anything else.
+    /// The version a cache directory's name or the listing names, `None` for anything else.
     fn parse(text: &str) -> Option<Self> {
         let mut parts = text.trim().split('.');
         let mut numbers = [0_u64; 4];
@@ -111,16 +92,14 @@ impl ChromeVersion {
         Some(Self(numbers))
     }
 
-    /// The spelling the cache directory is named by.
     fn spelling(self) -> String {
         format!("{}.{}.{}.{}", self.0[0], self.0[1], self.0[2], self.0[3])
     }
 }
 
-/// The archive platform tag for a host, `None` on a platform Google publishes
-/// nothing for. Windows on ARM takes the ordinary x64 build: there is no
-/// `win-arm64`, and the x64 binary runs under Windows 11's own emulation — the
-/// same substitution chrome-use's installer makes.
+/// The archive platform tag for a host, `None` on a platform Google publishes nothing for.
+/// Windows on ARM takes the ordinary x64 build: there is no `win-arm64`, and the x64 binary runs
+/// under Windows 11's own emulation — the same substitution chrome-use's installer makes.
 #[must_use]
 fn platform_for(os: &str, arch: &str) -> Option<&'static str> {
     Some(match (os, arch) {
@@ -133,15 +112,13 @@ fn platform_for(os: &str, arch: &str) -> Option<&'static str> {
     })
 }
 
-/// The archive platform tag for THIS build, or `None` when Google publishes no
-/// build for it.
+/// The archive platform tag for THIS build, or `None` when Google publishes no build for it.
 #[must_use]
 fn platform() -> Option<&'static str> {
     let (os, arch) = crate::util::managed_bin::host_os_arch().ok()?;
     platform_for(os, arch)
 }
 
-/// The binary's file name on this platform.
 const fn binary_name() -> &'static str {
     if cfg!(target_os = "windows") {
         "chrome-headless-shell.exe"
@@ -150,8 +127,6 @@ const fn binary_name() -> &'static str {
     }
 }
 
-/// The cache root: one directory per version inside the product's configuration
-/// directory.
 fn root() -> Result<PathBuf, String> {
     let root = crate::config::default_config_dir()
         .map(|dir| dir.join("chrome-headless-shell"))
@@ -165,9 +140,8 @@ fn root() -> Result<PathBuf, String> {
     Ok(root)
 }
 
-/// Every cached copy of this platform's shell, newest first. A directory whose
-/// name is not a version, and a version directory with no executable inside, are
-/// not copies at all.
+/// Every cached copy of this platform's shell, newest first. A directory whose name is not a
+/// version, and a version directory with no executable inside, are not copies at all.
 fn cached(root: &Path, platform: &str) -> Vec<(ChromeVersion, PathBuf)> {
     let folder = format!("chrome-headless-shell-{platform}");
     let mut copies = Vec::new();
@@ -187,13 +161,11 @@ fn cached(root: &Path, platform: &str) -> Vec<(ChromeVersion, PathBuf)> {
     copies
 }
 
-/// The newest cached copy that proves by running, `None` when none does. A failure that
-/// says the build does not run is remembered by its version ([`UNPROVEN`]), so the next
-/// call does not spawn it again and [`drop_unproven`] removes the tree. A failure that is
-/// the product's own stop is neither passed over as a verdict nor remembered: the copy is
-/// left in place, the older copies are still tried — no download is involved either way —
-/// and the first such reason is the answer if none of them proves: the machine, not the
-/// build, failed to answer.
+/// The newest cached copy that proves by running, `None` when none does. A failure saying the
+/// build does not run is remembered by its version ([`UNPROVEN`]), so the next call does not spawn
+/// it again and [`drop_unproven`] removes the tree. A failure that is the product's own stop is
+/// neither a verdict nor remembered: the copy is left in place, the older copies are still tried,
+/// and the first such reason is the answer if none proves.
 async fn usable(root: &Path, platform: &str) -> Result<Option<PathBuf>, Unavailable> {
     let mut stopped = None;
     for (version, binary) in cached(root, platform) {
@@ -214,9 +186,8 @@ async fn usable(root: &Path, platform: &str) -> Result<Option<PathBuf>, Unavaila
     }
 }
 
-/// [`usable`] with the guard that keeps the build in place: the guard is taken before
-/// the proof, so the cache cannot remove the build between the proof and the render
-/// that launches it.
+/// [`usable`] with the guard that keeps the build in place: the guard is taken before the proof,
+/// so the cache cannot remove the build between the proof and the render that launches it.
 async fn shell_in_use(root: &Path, platform: &str) -> Result<Option<Shell>, Unavailable> {
     let held = IN_USE.read().await;
     Ok(usable(root, platform).await?.map(|binary| Shell {
@@ -225,12 +196,11 @@ async fn shell_in_use(root: &Path, platform: &str) -> Result<Option<Shell>, Unav
     }))
 }
 
-/// Remove every cached build but the one just placed, and every tree of ours a swap left
-/// behind under any name: one build belongs in the cache — the one this product will use —
-/// plus the record beside it. A rename-aside tree (`<version>.old`) and a build no longer
-/// offered are reclaimed like any other download of ours; a scratch tree is left to
-/// [`super::reclaim_scratch`], which knows a download in flight from an abandoned one. The
-/// caller holds [`IN_USE`] exclusively, so no render is launching from any of them.
+/// Remove every cached build but the one just placed, and every tree of ours a swap left behind
+/// under any name: one build belongs in the cache plus the record beside it. A rename-aside tree
+/// (`<version>.old`) and a build no longer offered are reclaimed like any other download; a
+/// scratch tree is left to [`super::reclaim_scratch`], which knows a download in flight from an
+/// abandoned one. The caller holds [`IN_USE`] exclusively, so no render is launching from them.
 fn prune(root: &Path, keep: ChromeVersion) {
     let kept = keep.spelling();
     for entry in fs::read_dir(root).into_iter().flatten().flatten() {
@@ -241,9 +211,8 @@ fn prune(root: &Path, keep: ChromeVersion) {
     }
 }
 
-/// The build recorded as one that does not run here, and the sentence recorded with
-/// it: the file's one reader, so the writer and the removal cannot disagree about its
-/// shape.
+/// The build recorded as one that does not run here, and the sentence recorded with it: the
+/// file's one reader, so the writer and the removal cannot disagree about its shape.
 fn unproven_record(root: &Path) -> Option<(ChromeVersion, String)> {
     let body = fs::read_to_string(root.join(UNPROVEN)).ok()?;
     let (failed, reason) = body.split_once('\n')?;
@@ -253,15 +222,14 @@ fn unproven_record(root: &Path) -> Option<(ChromeVersion, String)> {
     ))
 }
 
-/// The sentence recorded for a build that did not run here, when the build on offer is
-/// that very one.
+/// The sentence recorded for a build that did not run here, when the build on offer is that very
+/// one.
 fn recorded_unproven(root: &Path, version: ChromeVersion) -> Option<String> {
     unproven_record(root)
         .filter(|(recorded, _)| *recorded == version)
         .map(|(_, reason)| reason)
 }
 
-/// Remember that a build did not run here, so the next call does not download it again.
 fn record_unproven(root: &Path, version: ChromeVersion, reason: &str) {
     let _ = fs::write(
         root.join(UNPROVEN),
@@ -269,36 +237,32 @@ fn record_unproven(root: &Path, version: ChromeVersion, reason: &str) {
     );
 }
 
-/// Remove the cached tree of the build recorded as one this machine does not run: a
-/// copy that cannot be used is neither kept nor spawned again. The caller holds
-/// [`IN_USE`] exclusively, so no render is launching from it.
+/// Remove the cached tree of a build this machine does not run: a copy that cannot be used is
+/// neither kept nor spawned again. The caller holds [`IN_USE`] exclusively.
 fn drop_unproven(root: &Path) {
     if let Some((version, _)) = unproven_record(root) {
         let _ = fs::remove_dir_all(root.join(version.spelling()));
     }
 }
 
-/// The shell a render is handed — its binary and the guard that keeps the cache from
-/// removing it — downloading a build first when the cache holds none that runs. A build
-/// this machine already could not run is reported rather than fetched again
-/// ([`UNPROVEN`]), and a cached build whose check the product itself stopped is never
-/// answered with a fresh download: the reason is reported when no other cached copy proves.
+/// The shell a render is handed — its binary and the guard that keeps the cache from removing it —
+/// downloading a build first when the cache holds none that runs. A build this machine already
+/// could not run is reported rather than fetched again ([`UNPROVEN`]), and a cached build whose
+/// check the product itself stopped is never answered with a fresh download.
 ///
-/// The download is behind [`INSTALLING`], so two first renders never fetch the
-/// same archive beside each other — and neither replaces the directory the other
-/// is about to launch from: the loser of that race re-checks the cache before it
-/// downloads anything.
+/// The download is behind [`INSTALLING`], so two first renders never fetch the same archive beside
+/// each other — and neither replaces the directory the other is about to launch from: the loser of
+/// that race re-checks the cache before it downloads anything.
 pub(super) async fn ensure_shell() -> Result<Shell, Unavailable> {
     let platform = platform()
         .ok_or_else(|| Unavailable::Missing("this platform is not supported".to_string()))?;
     let root = root().map_err(Unavailable::Missing)?;
-    // A download killed before it placed anything is ours to clear, whether or not this
-    // call downloads.
+    // A download killed before it placed anything is ours to clear, whether or not this call
+    // downloads.
     super::reclaim_scratch(&root);
-    // A tree a swap set aside and a build recorded as one that does not run here are not
-    // kept either, and both are removed under the guard that keeps a render from launching
-    // out of them. A render holding the cache right now leaves the removal to the next
-    // call.
+    // A tree a swap set aside and a build recorded as one that does not run here are not kept
+    // either, and both are removed under the guard that keeps a render from launching out of
+    // them. A render holding the cache right now leaves the removal to the next call.
     if let Ok(_swap) = IN_USE.try_write() {
         super::reclaim_aside(&root);
         drop_unproven(&root);
@@ -315,24 +279,22 @@ pub(super) async fn ensure_shell() -> Result<Shell, Unavailable> {
     let (version, url) = stable_build(&client, platform)
         .await
         .map_err(Unavailable::Missing)?;
-    // A build this machine already could not run is not downloaded again: the same
-    // archive would give the same answer.
+    // A build this machine already could not run is not downloaded again: the same archive would
+    // give the same answer.
     if let Some(reason) = recorded_unproven(&root, version) {
         return Err(Unavailable::Missing(reason));
     }
     let binary = install_build(&client, &root, platform, version, &url).await?;
-    // The build was proved before it was placed, so it is not proved again: it is
-    // handed straight to the render, with the guard that keeps the cache from
-    // removing it while that render runs.
+    // The build was proved before it was placed, so it is not proved again: it is handed straight
+    // to the render, with the guard that keeps the cache from removing it while that render runs.
     Ok(Shell {
         binary,
         _held: IN_USE.read().await,
     })
 }
 
-/// The Stable channel's version and this platform's archive URL, from the
-/// listing Google publishes. Every failure names the failing step and carries no
-/// URL.
+/// The Stable channel's version and this platform's archive URL, from the listing Google
+/// publishes. Every failure names the failing step and carries no URL.
 async fn stable_build(
     client: &reqwest::Client,
     platform: &str,
@@ -382,12 +344,11 @@ async fn stable_build(
     Ok((version, url.to_string()))
 }
 
-/// Download and place one build: the archive into scratch space inside the cache,
-/// the extracted tree proved by running it, then one rename into
-/// `root/<version>/` — the swap the shared managed-binary helper performs when a
-/// tree is already there. The build this one replaces is removed once the new one
-/// is in place, and the placed binary's path is answered so it is not proved twice.
-/// A proof the product itself stopped is handled by [`refused`].
+/// Download and place one build: the archive into scratch space inside the cache, the extracted
+/// tree proved by running it, then one rename into `root/<version>/` — the swap the shared
+/// managed-binary helper performs when a tree is already there. The build this one replaces is
+/// removed once the new one is in place, and the placed binary's path is answered so it is not
+/// proved twice. A proof the product itself stopped is handled by [`refused`].
 async fn install_build(
     client: &reqwest::Client,
     root: &Path,
@@ -395,12 +356,12 @@ async fn install_build(
     version: ChromeVersion,
     url: &str,
 ) -> Result<PathBuf, Unavailable> {
-    // The scratch space lives inside the cache so the final rename stays on one
-    // filesystem; it is removed when this function returns either way.
+    // The scratch space lives inside the cache so the final rename stays on one filesystem; it is
+    // removed when this function returns either way.
     let work = super::scratch(root).map_err(Unavailable::Missing)?;
     let archive = work.path().join("chrome-headless-shell.zip");
-    // Google publishes no digest for these archives, so nothing is checked here:
-    // the proof is the binary answering below.
+    // Google publishes no digest for these archives, so nothing is checked here: the proof is the
+    // binary answering below.
     download_verified(
         client,
         url,
@@ -434,26 +395,24 @@ async fn install_build(
             "the browser archive carries no binary".to_string(),
         ));
     }
-    // An archive does not always carry the mode bits; the product's own copy is
-    // always meant to be runnable.
+    // An archive does not always carry the mode bits; the product's own copy is always meant to
+    // be runnable.
     crate::util::managed_bin::set_executable(&binary).map_err(Unavailable::Missing)?;
     if let Err(unproven) = prove_it_runs(&binary, work.path()).await {
         return Err(refused(root, version, &folder, &extracted, unproven).await);
     }
 
-    // The whole extracted tree is the copy: `<version>/<folder>/<binary>`. Nothing a
-    // render reads is touched before this point, and the cache is changed under the
-    // exclusive guard, so no render is launching from what is replaced.
+    // The whole extracted tree is the copy: `<version>/<folder>/<binary>`. Nothing a render reads
+    // is touched before this point, and the cache is changed under the exclusive guard.
     let placed = place(root, version, &folder, &extracted).await?;
-    // A build that proved replaces whatever an earlier one was remembered for.
     let _ = fs::remove_file(root.join(UNPROVEN));
     Ok(placed)
 }
 
-/// What a refused proof does with the tree it ran, and with the record beside the cache: a build
-/// that does not run here is remembered and its tree dropped, while a build the product itself
-/// stopped keeps its tree with the reason for this attempt only — the next call proves that copy
-/// instead of downloading the archive again, and nothing is written down against it.
+/// What a refused proof does with the tree it ran and the record beside the cache: a build that
+/// does not run here is remembered and its tree dropped, while a build the product itself stopped
+/// keeps its tree with the reason for this attempt only — the next call proves that copy instead of
+/// downloading the archive again.
 async fn refused(
     root: &Path,
     version: ChromeVersion,
@@ -467,7 +426,6 @@ async fn refused(
             Unavailable::Missing(DOES_NOT_RUN.to_string())
         }
         Unproven::Stopped(reason) => {
-            // A tree that cannot be placed costs this attempt its cache entry, not its reason.
             let _ = place(root, version, folder, tree).await;
             Unavailable::Unchecked(reason)
         }
@@ -490,9 +448,9 @@ async fn place(
     Ok(placed.join(folder).join(binary_name()))
 }
 
-/// The extracted build's own answer: it must exit clean and name itself. This is
-/// the only proof a download without a digest can give, and the same check is
-/// repeated whenever a cached copy is picked up (see [`usable`]).
+/// The extracted build's own answer: it must exit clean and name itself. This is the only proof a
+/// download without a digest can give, and the same check repeats whenever a cached copy is picked
+/// up (see [`usable`]).
 async fn prove_it_runs(binary: &Path, cwd: &Path) -> Result<(), Unproven> {
     let args = vec!["--version".to_string()];
     let outcome = crate::tools::shell::run_internal_program_outcome(
@@ -506,12 +464,10 @@ async fn prove_it_runs(binary: &Path, cwd: &Path) -> Result<(), Unproven> {
     proof_verdict(&outcome)
 }
 
-/// What one probe's outcome says about the build it ran. A build that answered with its own
-/// name runs here; one that exited badly or answered something else does not run here
-/// ([`Unproven::DoesNotRun`]), and the same archive would give the same answer next time. A stop
-/// is the product's own verdict, never the build's — it never started the build, its ceiling or
-/// its memory watchdog ended the probe — so the reason is kept for this attempt only and nothing
-/// is written down against the build.
+/// What one probe's outcome says about the build it ran. A build that answered with its own name
+/// runs here; one that exited badly or answered something else does not run here
+/// ([`Unproven::DoesNotRun`]), and the same archive would give the same answer next time. A stop is
+/// the product's own verdict, never the build's, so the reason is kept for this attempt only.
 fn proof_verdict(outcome: &ProgramOutcome) -> Result<(), Unproven> {
     if outcome.stopped() {
         return Err(Unproven::Stopped(outcome.detail.clone()));
@@ -540,8 +496,7 @@ mod tests {
         assert_eq!(platform_for("windows", "x86_64"), Some("win64"));
         // Windows on ARM takes the x64 build: Google publishes no `win-arm64`.
         assert_eq!(platform_for("windows", "aarch64"), Some("win64"));
-        // Nothing is published for these, and another processor's build is never
-        // substituted.
+        // Nothing is published for these, and another processor's build is never substituted.
         assert_eq!(platform_for("linux", "armv7l"), None);
         assert_eq!(platform_for("windows", "arm64ec"), None);
         assert_eq!(platform_for("freebsd", "x86_64"), None);

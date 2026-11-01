@@ -1,70 +1,44 @@
 //! Pre-processing for media markers in chat content.
 //!
-//! A body is split into the two blocks a bubble draws — its attachments and
-//! its text — because the markdown parser cannot keep them apart: iced's
-//! parser drains every accumulated inline span into an `Image` item's `alt`
-//! (`TagEnd::Image` in `iced_widget`'s markdown), so a picture drawn *inside*
-//! a paragraph swallows the text beside it. Extracting at render time means
-//! already-stored chat history and transcripts render correctly too; nothing
-//! about the stored content changes.
+//! A body is split into the two blocks a bubble draws — its attachments and its text — because
+//! iced's markdown parser drains every accumulated inline span into an `Image` item's `alt`, so a
+//! picture drawn *inside* a paragraph swallows the text beside it. Extracting at render time means
+//! already-stored history and transcripts render correctly too; nothing about the stored content
+//! changes, and the text that reaches `markdown::parse()` never carries a picture.
 //!
-//! The text that reaches `markdown::parse()` therefore never carries a
-//! picture, and the stored body is never rewritten. What each marker draws:
-//!
-//! - `[IMAGE:generated/poster.png]` → the picture: a `data:` URI or a local
-//!   file draws; a remote, undecodable, missing or oversized target shows its
-//!   `🖼️` label instead (never raw base64 text, never a blank)
-//! - `![alt](url)` → the same picture; inside code — a fenced or indented
-//!   block, an inline span — the source stays visible as written
-//! - `[AUDIO:recordings/take.ogg]` → 🎵 filename,
-//!   `[VIDEO:generated/clip.mp4]` → 🎬 Video: filename,
-//!   `[FILE:generated/report.pdf]` → 📄 filename, whose click reveals the file
-//!   in the OS file manager
-//! - `[Audio transcription of ...]: text` → 🔊 emoji + transcribed text
-//! - `[Video transcription of ...]: text` → 🎬 emoji + transcribed text
-//! - `[Saved image: path]` → stripped (the image renders separately from its
-//!   data-URI marker, so the upload annotation is pure display noise)
-//! - `[Saved video: path]` → `🎬 Video: filename` (there is no separate video
-//!   renderer, so the clip path must stay visible rather than be hidden)
+//! What each marker draws: `[IMAGE:…]` and `![alt](url)` the picture (a `data:` URI or a local
+//! file draws; a remote, undecodable, missing or oversized target shows its `🖼️` label instead —
+//! never raw base64, never a blank), and inside code the source stays visible as written;
+//! `[AUDIO:…]`/`[VIDEO:…]`/`[FILE:…]` an emoji plus the file name, whose click reveals the file in
+//! the OS file manager; `[Audio transcription of …]`/`[Video transcription of …]` an emoji plus
+//! the transcribed text; `[Saved image: …]` nothing (the image renders from its data-URI marker);
+//! `[Saved video: …]` the clip name (there is no separate video renderer).
 //!
 //! # When a marker is an attachment
 //!
-//! One rule decides it, in every message — a system message, a user's, a tool
-//! result and an agent's reply — and for every kind: a marker becomes an
-//! attachment if and only if its target is a reference — a path, an address, or
-//! an inline payload, as [`media_target::resolve_marker_target`] (the authority
-//! Telegram delivery uses too) classifies it. An address counts in any scheme
-//! casing: [`referenced_target`] canonicalises it first, because the resolver
-//! reads a scheme exactly as written. Prose that merely mentions the syntax — a
-//! bare word, `<path in your workspace>` — stays text as the author wrote it,
-//! and so do a malformed address and one of a scheme the product has no way to
-//! show: none of them is a reference, so none carries a notice.
-//!
-//! A reference stays one when its file is gone: the row draws and a click
-//! behaves like any missing file. (A bare word is a reference only while a
-//! workspace file of that name is — the resolver's existence probe, shared with
-//! delivery, not a display decision.) Only a reference that cannot be attached
-//! *as that kind* — an inline payload claiming to be audio, video or a file, an
-//! address for a file — becomes a [`media_target::marker_refusal`] notice.
+//! One rule decides it, in every message and for every kind: a marker becomes an attachment if
+//! and only if its target is a reference — a path, an address or an inline payload, as
+//! [`media_target::resolve_marker_target`] (the authority Telegram delivery uses too) classifies
+//! it. An address counts in any scheme casing: [`referenced_target`] canonicalises it first,
+//! because the resolver reads a scheme as written. Prose that merely mentions the syntax — a bare
+//! word, `<path in your workspace>` — stays text, and so do a malformed address and one of a
+//! scheme the product cannot show. A reference stays one when its file is gone: the row draws and
+//! a click behaves like any missing file (a bare word is a reference only while a workspace file
+//! of that name is — the resolver's existence probe, not a display decision). Only a reference
+//! that cannot be attached *as that kind* becomes a [`media_target::marker_refusal`] notice.
 //!
 //! # Canonical marker pattern
 //!
-//! The `[KIND:path]` format is defined by the `MediaMarkerKind` enum in
-//! `src/util/mod.rs`, from which [`MEDIA_MARKER_RE`] is generated — **the
-//! single source of truth** for all marker kinds (`IMAGE`, `AUDIO`, `VIDEO`,
-//! `FILE`, and any future additions), in any casing. This module uses the
-//! shared [`MEDIA_MARKER_RE`] and [`parse_media_marker`] helper to stay in sync —
-//! adding a new marker kind there automatically propagates to this module,
-//! `enrichment.rs`, `agent.rs`, and `compatible.rs` without needing per-kind
-//! regexes anywhere.
+//! `[KIND:path]` is defined by the `MediaMarkerKind` enum in `src/util/mod.rs`, from which
+//! [`MEDIA_MARKER_RE`] is generated — **the single source of truth** for every marker kind, in
+//! any casing. This module uses the shared regex and [`parse_media_marker`] so a new kind
+//! propagates here and to `enrichment.rs`, `agent.rs` and `compatible.rs` without per-kind regexes.
 //!
 //! # Clickable file markers
 //!
-//! A file attachment is a label row, not a link: it carries no colour and no
-//! underline, and only a click reveals its target. The click travels as a
-//! `mahbot-file:` URI ([`file_link_target`] takes it apart,
-//! [`reveal_file_marker`] opens it), so both surfaces link a row the same way
-//! they link a URL.
+//! A file attachment is a label row, not a link: no colour, no underline, only a click reveals its
+//! target. The click travels as a `mahbot-file:` URI ([`file_link_target`] takes it apart,
+//! [`reveal_file_marker`] opens it), so both surfaces link a row the way they link a URL.
 
 use iced::widget::{Column, image, markdown, text};
 use iced::{ContentFit, Element, Length};
@@ -91,27 +65,22 @@ use ::image as image_crate;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MediaAttachment {
     /// The picture to draw (a `data:` URI, a local path — absolute once a
-    /// workspace resolves it — or a remote address, which only ever shows its
-    /// label); `None` for a named file (audio, video, document) and for a
-    /// picture whose payload the content no longer carries.
+    /// workspace resolves it — or a remote address, which only ever shows its label); `None` for
+    /// a named file (audio, video, document) and for a picture whose payload is gone.
     pub image: Option<String>,
-    /// How a plain-text rendition names it — `🖼️ image`, `🖼️ poster.png`,
-    /// `🎵 song.mp3`, `🎬 Video: clip.mp4`, `📄 report.pdf`.
+    /// How a plain-text rendition names it — `🖼️ image`, `🎵 song.mp3`, `🎬 Video: clip.mp4`.
     pub label: String,
-    /// What a `[FILE:…]` click reveals; `None` for anything else.
     pub reveal: Option<String>,
 }
 
-/// A rendered body: the text to parse and the attachments it carried.
 pub(crate) struct Preprocessed {
     pub text: String,
     pub attachments: Vec<MediaAttachment>,
 }
 
 impl Preprocessed {
-    /// The body as plain text: one line per attachment (its label), then the
-    /// text — the order it is drawn in. Used by the Sessions collapse
-    /// measurement so the preview agrees with the expanded transcript.
+    /// The body as plain text: one line per attachment (its label), then the text — the order it
+    /// is drawn in. Used by the Sessions collapse measurement.
     #[must_use]
     pub fn display_text(&self) -> String {
         let mut out = self
@@ -130,22 +99,14 @@ impl Preprocessed {
     }
 }
 
-/// Pre-process a content string, splitting it into the text to parse and the
-/// attachments the text no longer carries.
-///
-/// One ordered pass over the body: the attachments come out in the order it
-/// carried them, whichever source — a `[KIND:…]` marker or a markdown picture
-/// — wrote each one.
-///
-/// `workspace` is the root the message's relative marker targets name a file
-/// in; `None` when the surface knows no workspace, leaving each target to the
-/// module's rule as it was written.
+/// Pre-process a content string into the text to parse and the attachments the text no longer
+/// carries. One ordered pass, so the attachments come out in body order, whichever source wrote
+/// each one. `workspace` is the root relative marker targets name a file in; `None` leaves each
+/// target to the module's rule as written.
 pub(crate) fn preprocess(content: &str, workspace: Option<&Path>) -> Preprocessed {
-    // Order matters: the transcription annotations contain the words "Audio"
-    // and "Video", which overlap with the raw `[AUDIO:...]`/`[VIDEO:...]`
-    // patterns.  Handle them first.
+    // Order matters: the transcription annotations contain the words "Audio" and "Video",
+    // which overlap the raw `[AUDIO:...]`/`[VIDEO:...]` patterns. Handle them first.
     let s = replace_saved_annotations(&replace_transcription(content));
-    // Fast path: nothing to extract, so the body reaches the parser as it is.
     if !MEDIA_MARKER_RE.is_match(&s) && !s.contains("![") {
         return Preprocessed {
             text: s,
@@ -158,14 +119,10 @@ pub(crate) fn preprocess(content: &str, workspace: Option<&Path>) -> Preprocesse
     apply_edits(&s, edits)
 }
 
-/// Parse a chat body for display: extract its markers into attachments, escape
-/// the HTML-classified regions so angle-bracket text renders literally, turn
-/// soft breaks into hard ones, and parse what is left.
-///
-/// Both chat surfaces — Home and the Sessions transcript — run exactly this
-/// pipeline. The order is load-bearing: markers are extracted before the escape
-/// and the break pass, so a payload or a target is never rewritten as HTML or
-/// re-wrapped as prose.
+/// Parse a chat body for display: extract its markers into attachments, escape the
+/// HTML-classified regions so angle-bracket text renders literally, turn soft breaks into hard
+/// ones, and parse what is left. Both chat surfaces run exactly this pipeline, and the order is
+/// load-bearing: markers are extracted before the escape and the break pass.
 pub(crate) fn parse_body(
     content: &str,
     workspace: Option<&Path>,
@@ -179,14 +136,9 @@ pub(crate) fn parse_body(
     )
 }
 
-/// `[Audio transcription of {filename}]: {text}` → 🔊, `[Video transcription
-/// of {filename}]: {text}` → 🎬 — the emoji matches the annotation kind. The
-/// audio form is a legacy annotation from before the icon-combo switch (only
-/// rows already persisted in chat history / sessions carry it; new messages
-/// store the icon combo `🔊✍️` + transcription directly); the video form is
-/// produced by `enrich_message` for inbound VIDEO markers.
-/// Only the annotation header is replaced — the (often multi-line) description
-/// and any following message content are left untouched.
+/// `[Audio transcription of {filename}]: {text}` → 🔊, `[Video transcription of …]` → 🎬. The
+/// audio form is a legacy annotation (only persisted rows carry it); the video form comes from
+/// `enrich_message`. Only the annotation header is replaced.
 fn replace_transcription(s: &str) -> String {
     static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"\[(Audio|Video) transcription of [^\]]+\]:\s*")
@@ -201,10 +153,8 @@ fn replace_transcription(s: &str) -> String {
     .to_string()
 }
 
-/// The display form of one marker under the module's one rule: the replacement
-/// it becomes, or `None` when its target is prose and stays as the author wrote
-/// it. [`referenced_target`] settles how the target reads; the resolver then
-/// says whether it is a reference at all.
+/// The display form of one marker under the module's one rule: the replacement it becomes, or
+/// `None` when its target is prose and stays as written.
 fn render_marker(kind: MediaMarkerKind, target: &str, roots: &[PathBuf]) -> Option<Replacement> {
     let target = referenced_target(target)?;
     match media_target::resolve_marker_target(&target, roots) {
@@ -231,14 +181,10 @@ fn render_marker(kind: MediaMarkerKind, target: &str, roots: &[PathBuf]) -> Opti
     }
 }
 
-/// The target as this layer classifies it, or `None` when it names no
-/// reference.
-///
-/// The resolver reads a scheme exactly as written, so the address reading is
-/// settled here: a scheme-written target is the address it spells, in any
-/// casing, and never a path, while one that is not a well-formed http(s)
-/// address names nothing. An empty target names nothing too — joined to a root
-/// it would be that root directory.
+/// The target as this layer classifies it, or `None` when it names no reference. The resolver
+/// reads a scheme exactly as written, so the address reading is settled here: a scheme-written
+/// target is the address it spells, never a path, while one that is not a well-formed http(s)
+/// address names nothing — and an empty target names nothing either.
 fn referenced_target(target: &str) -> Option<Cow<'_, str>> {
     let target = target.trim();
     if target.is_empty() {
@@ -256,10 +202,9 @@ fn referenced_target(target: &str) -> Option<Cow<'_, str>> {
     media_target::is_valid_remote_url(&canonical).then_some(canonical)
 }
 
-/// The scheme `target` is written with — `HTTPS://example.com/x.png` → `HTTPS`.
-/// A `://` further into the target belongs to it, not to a scheme, and only an
-/// RFC-valid scheme passes, so a `data:` payload whose body holds one (a
-/// hand-written SVG, say) is never read as an address.
+/// The scheme `target` is written with — `HTTPS://example.com/x.png` → `HTTPS`. A `://` further
+/// into the target belongs to it, and only an RFC-valid scheme passes, so a `data:` payload
+/// holding one is never read as an address.
 fn scheme_of(target: &str) -> Option<&str> {
     let (scheme, _) = target.split_once("://")?;
     let mut chars = scheme.chars();
@@ -268,10 +213,8 @@ fn scheme_of(target: &str) -> Option<&str> {
     .then_some(scheme)
 }
 
-/// The attachment a marker that names a reference becomes. `resolved` is what
-/// the thing is reached by when that differs from the written target (a local
-/// target's absolute path); the label always keeps naming the target as the
-/// message spelled it.
+/// The attachment a marker naming a reference becomes. `resolved` is what the thing is reached by
+/// when that differs from the written target (a local target's absolute path).
 fn delivered_marker(
     kind: MediaMarkerKind,
     target: &str,
@@ -293,10 +236,8 @@ fn delivered_marker(
     }
 }
 
-/// The attachment a picture becomes: `image` is what the renderer draws, while
-/// the label names it by file name — by the written target when that differs
-/// from what is drawn — or generically, because an inline payload has no name
-/// and a stripped one has no bytes left to draw.
+/// The attachment a picture becomes: `image` is what the renderer draws, while the label names it
+/// by file name — or generically, because an inline payload has no name.
 fn picture_attachment(image: &str, label_target: Option<&str>) -> MediaAttachment {
     let stripped = image.starts_with(crate::util::DATA_URI_OMITTED_PREFIX);
     MediaAttachment {
@@ -310,8 +251,8 @@ fn picture_attachment(image: &str, label_target: Option<&str>) -> MediaAttachmen
     }
 }
 
-/// The label a delivered `AUDIO`/`VIDEO` marker shows: neither has an inline
-/// player, so the file is named rather than played.
+/// The label a delivered `AUDIO`/`VIDEO` marker shows: neither has an inline player, so the file
+/// is named rather than played.
 fn media_label(kind: MediaMarkerKind, target: &str) -> String {
     match kind {
         MediaMarkerKind::Audio => format!("🎵 {}", file_name_or_path(target)),
@@ -319,23 +260,15 @@ fn media_label(kind: MediaMarkerKind, target: &str) -> String {
     }
 }
 
-/// Handle the `[Saved <kind>: path]` upload annotations produced by the channel
-/// enrichment layer. These are **not** `[KIND:path]` markers (so the canonical
-/// [`MEDIA_MARKER_RE`] leaves them untouched), and they are model-facing only —
-/// the GUI strips/rewrites them for display.
+/// Handle the `[Saved <kind>: path]` upload annotations produced by the channel enrichment layer.
+/// They are **not** `[KIND:path]` markers and are model-facing only.
 ///
-/// - `[Saved image: path]` → stripped entirely. The image already renders
-///   separately from its accompanying `[IMAGE:data:…]` marker, so the upload
-///   annotation (with the blank-line separator enrichment inserts before it) is
-///   pure display noise.
-/// - `[Saved video: path]` → `🎬 Video: filename`. Video enrichment replaces the
-///   `[VIDEO:path]` marker in place with the `[Saved video: ...]` annotation and
-///   has **no** separate video renderer, so blanket-stripping it would hide the
-///   clip. Rewriting it to the same placeholder the raw `[VIDEO:path]` marker
-///   produces keeps the clip path visible.
+/// `[Saved image: path]` is stripped entirely: the image already renders from its `[IMAGE:data:…]`
+/// marker. `[Saved video: path]` becomes `🎬 Video: filename`: there is **no** separate video
+/// renderer, so stripping it would hide the clip.
 fn replace_saved_annotations(s: &str) -> String {
-    // `\n*` eats the blank-line separator enrichment inserts before the
-    // trailing image annotation so no stray whitespace remains in the display.
+    // `\n*` eats the blank-line separator enrichment inserts before the trailing image annotation
+    // so no stray whitespace remains.
     static SAVED_IMAGE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"\n*\[Saved image: [^\]]*\]")
             .expect("saved image annotation regex must compile")
@@ -354,40 +287,29 @@ fn replace_saved_annotations(s: &str) -> String {
         .to_string()
 }
 
-// ── Extraction ─────────────────────────────────────────────────
-
-/// One rewrite of the body, in body order.
 struct Edit {
     range: Range<usize>,
     replacement: Replacement,
 }
 
-/// What one edit becomes.
 enum Replacement {
-    /// Text the body keeps in place of the range (a refusal notice).
     Text(String),
-    /// The attachment the range becomes: it leaves the text and is drawn in the
-    /// body's attachment group instead.
+    /// The attachment the range becomes: it leaves the text and is drawn in the body's
+    /// attachment group instead.
     Attachment(MediaAttachment),
 }
 
-/// One `into_offset_iter` pass over the body with iced's parser options — the
-/// parser the markdown view runs — collecting what both edit sources need: the
-/// byte ranges of its code, where marker syntax is source rather than content,
-/// and the edits its markdown pictures become, in body order.
+/// One `into_offset_iter` pass over the body with iced's parser options — the parser the
+/// markdown view runs — collecting the byte ranges of its code (where marker syntax is source) and
+/// the edits its markdown pictures become.
 ///
-/// An agent writes `![alt](url)` directly, and the parser would draw it as an
-/// `Image` item that swallows the text collected before it, so it leaves the
-/// text here too. A picture needs no code check: this same scan is the render's,
-/// so it reports an `Image` only where one draws — never inside an inline span
-/// or a fenced/indented block, where the source must stay visible.
+/// An agent writes `![alt](url)` directly, and the parser would draw it as an `Image` item that
+/// swallows the text collected before it, so it leaves the text here too. A picture needs no code
+/// check: this same scan is the render's.
 fn scan(text: &str) -> (Vec<Range<usize>>, Vec<Edit>) {
     let mut code = Vec::new();
     let mut pictures = Vec::new();
-    // Where the open code block began, held until its matching end reports the
-    // end.
     let mut block: Option<usize> = None;
-    // The open picture: where it started and what it names.
     let mut picture: Option<(usize, String)> = None;
     for (event, range) in
         pulldown_cmark::Parser::new_ext(text, iced_markdown_options()).into_offset_iter()
@@ -409,11 +331,9 @@ fn scan(text: &str) -> (Vec<Range<usize>>, Vec<Edit>) {
                 let Some((start, dest)) = picture.take() else {
                     continue;
                 };
-                // A `<>`-quoted destination arrives without its brackets.
                 let dest = dest.trim();
-                // A picture with no destination can never draw and would still
-                // reach the parser as an `Image` item, so its source goes
-                // without an attachment.
+                // A picture with no destination can never draw and would still reach the
+                // parser as an `Image` item, so its source goes without an attachment.
                 let replacement = if dest.is_empty() {
                     Replacement::Text(String::new())
                 } else {
@@ -430,13 +350,11 @@ fn scan(text: &str) -> (Vec<Range<usize>>, Vec<Edit>) {
     (code, pictures)
 }
 
-/// The edits the body's `[KIND:…]` markers become, in body order, through the
-/// canonical [`MEDIA_MARKER_RE`].
+/// The edits the body's `[KIND:…]` markers become, in body order, through the canonical
+/// [`MEDIA_MARKER_RE`].
 ///
-/// A reference becomes an attachment and contributes nothing to the text; a
-/// refusal notice and a marker left as written keep their place in it. A target
-/// that is prose stays as written, and a marker inside code is source, so it
-/// stays as written too.
+/// A reference becomes an attachment and contributes nothing to the text; a refusal notice and a
+/// marker left as written keep their place. A marker inside code is source, so it stays too.
 fn marker_edits(text: &str, workspace: Option<&Path>, code: &[Range<usize>]) -> Vec<Edit> {
     let roots: Vec<PathBuf> = workspace.map(Path::to_path_buf).into_iter().collect();
     let mut edits = Vec::new();
@@ -457,9 +375,8 @@ fn marker_edits(text: &str, workspace: Option<&Path>, code: &[Range<usize>]) -> 
     edits
 }
 
-/// Apply the edits, sorted by where they begin, and collect the attachments in
-/// walk order — one pass, so a body mixing marker kinds and markdown pictures
-/// keeps its order.
+/// Apply the edits, sorted by where they begin, and collect the attachments in walk order — one
+/// pass, so a body mixing marker kinds and markdown pictures keeps its order.
 fn apply_edits(text: &str, edits: Vec<Edit>) -> Preprocessed {
     let mut out = String::with_capacity(text.len());
     let mut attachments = Vec::new();
@@ -467,7 +384,6 @@ fn apply_edits(text: &str, edits: Vec<Edit>) -> Preprocessed {
     let mut edits = edits.into_iter().peekable();
     while let Some(edit) = edits.next() {
         if edit.range.start < cursor {
-            // Inside a range an earlier edit already rewrote.
             continue;
         }
         match edit.replacement {
@@ -492,12 +408,11 @@ fn apply_edits(text: &str, edits: Vec<Edit>) -> Preprocessed {
     }
 }
 
-/// The range an attachment's removal actually takes out: the picture itself, or
-/// — when the picture is all its line holds, a bullet aside — the whole line
-/// including its newline. A lone picture's two surrounding line breaks are one
-/// line break of the body, and a bullet left behind would dangle over nothing.
-/// A line another edit already rewrote (`cursor`) or is about to rewrite
-/// (`next_start`) keeps its own text: dropping it would take that edit with it.
+/// The range an attachment's removal actually takes out: the picture itself, or — when the picture
+/// is all its line holds, a bullet aside — the whole line including its newline. A lone picture's
+/// two surrounding line breaks are one line break of the body, and a bullet left behind would
+/// dangle. A line another edit already rewrote (`cursor`) or is about to (`next_start`) keeps its
+/// own text.
 fn removal_range(
     text: &str,
     range: &Range<usize>,
@@ -524,12 +439,10 @@ fn removal_range(
     }
 }
 
-/// Join the text around a removal: the whitespace run `out` ends with and the
-/// one the text continues with are replaced by what they amount to — a blank
-/// line for a paragraph gap, one newline for a line break, a single space
-/// inside a sentence, nothing at the end of the body. A removal never sits in
-/// code, so the run it touches is prose. Returns the cursor, past the run the
-/// text continues with.
+/// Join the text around a removal: the whitespace run `out` ends with and the one the text
+/// continues with are replaced by what they amount to — a blank line for a paragraph gap, one
+/// newline for a line break, a single space inside a sentence, nothing at the end of the body.
+/// Returns the cursor, past the run the text continues with.
 fn join_after_removal(out: &mut String, text: &str, cursor: usize) -> usize {
     let mut newlines = 0;
     let mut opened = false;
@@ -557,8 +470,8 @@ fn join_after_removal(out: &mut String, text: &str, cursor: usize) -> usize {
     cursor + run
 }
 
-/// Whether a line is only a list marker (`-`, `*`, `+`, `1.`, `1)`) and
-/// whitespace — the remains of a bullet whose whole content was extracted.
+/// Whether a line is only a list marker (`-`, `*`, `+`, `1.`, `1)`) and whitespace — the remains
+/// of a bullet whose whole content was extracted.
 fn only_list_marker(line: &str) -> bool {
     let trimmed = line.trim();
     if matches!(trimmed, "-" | "*" | "+") {
@@ -569,23 +482,18 @@ fn only_list_marker(line: &str) -> bool {
     })
 }
 
-// ── Raster image rendering (bounded, downscaled) ─────────────────
-
 /// Maximum longest side (px) of the rendered image the GUI keeps per image — a
-/// `MAX_IMAGE_LONGEST_SIDE_PX² · 4` = 16 MiB RGBA tile. A larger — but still
-/// valid — raster is decoded under the shared generous raster budget and
-/// DOWNSCALED to this cap so a tall chrome screenshot renders (not a
-/// placeholder); only a genuinely corrupt / missing / non-image / header-bomb
-/// target degrades to the "🖼️ …" placeholder.
+/// `MAX_IMAGE_LONGEST_SIDE_PX² · 4` = 16 MiB RGBA tile. A larger but valid raster is decoded under
+/// the shared generous budget and DOWNSCALED to this cap, so a tall chrome screenshot renders; only
+/// a corrupt, missing, non-image or header-bomb target degrades to the placeholder.
 const MAX_IMAGE_LONGEST_SIDE_PX: u32 = 2048;
 
-/// Shrink a decoded raster to the display cap `MAX_IMAGE_LONGEST_SIDE_PX`.
 fn downscale_raster(width: u32, height: u32, rgba: Vec<u8>) -> Option<(u32, u32, Vec<u8>)> {
     if width <= MAX_IMAGE_LONGEST_SIDE_PX && height <= MAX_IMAGE_LONGEST_SIDE_PX {
         return Some((width, height, rgba));
     }
-    // `thumbnail` computes the aspect-preserving target dims internally (no
-    // manual float casts) and only shrinks when the image exceeds the box.
+    // `thumbnail` computes the aspect-preserving target dims internally and only shrinks when the
+    // image exceeds the box.
     let img = image_crate::DynamicImage::ImageRgba8(image_crate::RgbaImage::from_raw(
         width, height, rgba,
     )?);
@@ -595,16 +503,12 @@ fn downscale_raster(width: u32, height: u32, rgba: Vec<u8>) -> Option<(u32, u32,
     Some((resized.width(), resized.height(), resized.into_raw()))
 }
 
-/// Decode `bytes` as a native raster and downscale it to the display cap,
-/// returning `(width, height, RGBA8 pixels)` on success and `None` on any
-/// failure — every `None` renders as the "🖼️ …" placeholder.
+/// Decode `bytes` as a native raster and downscale it to the display cap, answering `(width,
+/// height, RGBA8 pixels)` or `None` on any failure — every `None` renders as the placeholder.
 ///
-/// The decode step reuses the shared [`media_target::raster_decode_limits`]
-/// budget (generous dimension + alloc caps, so a legitimate tall screenshot
-/// still decodes) and then shrinks the result to the renderable cap so the
-/// persistent handle stays small and the renderer upload happens once. The
-/// transient decode is bounded by that budget; only a header-bomb target fails
-/// outright.
+/// The decode reuses the shared [`media_target::raster_decode_limits`] budget (generous dimension
+/// and alloc caps, so a legitimate tall screenshot still decodes) and then shrinks the result to
+/// the renderable cap, so the persistent handle stays small and the renderer upload happens once.
 #[must_use]
 fn render_raster(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let (width, height, rgba) =
@@ -612,12 +516,10 @@ fn render_raster(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     downscale_raster(width, height, rgba)
 }
 
-/// Decode and validate the image encoded in a `data:…` URI, returning
-/// `(width, height, RGBA8 pixels)` on success and `None` on any failure — every
-/// `None` renders as the "🖼️ image" placeholder. Vets the URI through the same
-/// declared-subtype==actual-bytes gate the provider's image gate uses (a
-/// `data:image/png` holding JPEG bytes is mismatched and rejected), then uses
-/// the shared raster decode + downscale pipeline.
+/// Decode and validate the image in a `data:…` URI, answering `(width, height, RGBA8 pixels)` or
+/// `None` on any failure. Vets the URI through the same declared-subtype==actual-bytes gate the
+/// provider's image gate uses (a `data:image/png` holding JPEG bytes is rejected), then uses the
+/// shared raster decode and downscale.
 #[must_use]
 fn decode_data_uri_image(uri: &str) -> Option<(u32, u32, Vec<u8>)> {
     let (width, height, rgba) =
@@ -625,12 +527,8 @@ fn decode_data_uri_image(uri: &str) -> Option<(u32, u32, Vec<u8>)> {
     downscale_raster(width, height, rgba)
 }
 
-// ── Process-lifetime image caches ───────────────────────────────
-
-/// A bounded least-recently-used cache: `get` bumps recency so a recently-viewed
-/// entry survives eviction, `insert` evicts the oldest once the capacity cap is
-/// hit. Keys are looked up by [`Borrow`] so callers can use an unowned key (e.g.
-/// a `&str` media marker).
+/// A bounded least-recently-used cache: `get` bumps recency, `insert` evicts the oldest once the
+/// capacity is hit. Keys are looked up by [`Borrow`], so callers can use an unowned key.
 pub(super) struct BoundedLruCache<K, V> {
     entries: HashMap<K, V>,
     /// LRU order of `entries` keys; back = most recently used.
@@ -657,7 +555,6 @@ where
     {
         let hit = self.entries.get(key);
         if hit.is_some() {
-            // Bump recency so recently-viewed images survive eviction.
             if let Some(pos) = self.lru.iter().position(|k| k.borrow() == key) {
                 let key = self.lru.remove(pos).expect("position found by iteration");
                 self.lru.push_back(key);
@@ -667,10 +564,9 @@ where
     }
 
     pub(super) fn insert(&mut self, key: K, value: V) {
-        // Remove any existing occurrence so a re-insert replaces the value and
-        // moves the key to the most-recent position exactly once. Two concurrent
-        // check→decode→insert passes for the same key must not duplicate it in
-        // `lru`, or eviction could drop a live entry ahead of a stale copy.
+        // Remove any existing occurrence so a re-insert replaces the value and moves the key to
+        // the most-recent position exactly once — a duplicate in `lru` would let eviction drop a
+        // live entry.
         if let Some(pos) = self.lru.iter().position(|k| k == &key) {
             self.lru.remove(pos);
         }
@@ -686,21 +582,15 @@ where
     }
 }
 
-/// Maximum decoded-image outcomes retained per process-lifetime cache (data-URI
-/// and local-path). Each `Decoded` entry holds up to
-/// `MAX_IMAGE_LONGEST_SIDE_PX² · 4` (16 MiB) of RGBA under the display budget,
-/// so this bound (32) caps worst-case retained pixels at ~512 MiB per cache.
+/// Maximum decoded-image outcomes retained per process-lifetime cache. Each `Decoded` entry holds
+/// up to 16 MiB of RGBA, so this caps worst-case retained pixels at ~512 MiB per cache.
 const MAX_CACHED_IMAGES: usize = 32;
 
-/// Outcome of one cached image decode attempt.
 #[derive(Debug)]
 pub(super) enum CachedImage {
-    /// Successfully decoded; the stable handle is reused across frames, which
-    /// keeps the wgpu texture Id stable too (re-building a handle in `view()`
-    /// would decode every frame).
+    /// Successfully decoded; the stable handle is reused across frames, which keeps the wgpu
+    /// texture Id stable too.
     Decoded(image::Handle),
-    /// Failed validation — cached so a corrupt payload isn't re-decoded on
-    /// every frame; renders as the caller's placeholder.
     Failed,
 }
 
@@ -722,20 +612,15 @@ impl CachedImage {
     }
 }
 
-/// Process-lifetime cache of data-URI decode outcomes, keyed by the full
-/// data-URI string. Evicts the least-recently-used entry past
-/// [`MAX_CACHED_IMAGES`].
+/// Process-lifetime cache of data-URI decode outcomes, keyed by the full data-URI string.
 static DATA_URI_IMAGE_CACHE: LazyLock<Mutex<BoundedLruCache<String, CachedImage>>> =
     LazyLock::new(|| Mutex::new(BoundedLruCache::with_capacity(MAX_CACHED_IMAGES)));
 
-/// Return the cached outcome for `key`, decoding and caching it on a miss.
+/// The cached outcome for `key`, decoding and caching it on a miss.
 ///
-/// The cached entry is inspected under the lock and returned through
-/// [`CachedImage::handle`] — a cached [`CachedImage::Failed`] is a hit that
-/// yields `None`, never a miss (falling through would re-decode a corrupt
-/// payload on every frame). The decode itself runs with the lock released, so a
-/// raster decode never blocks a concurrent frame, and the owned key is cloned
-/// only when the outcome is inserted — a cache hit copies nothing.
+/// The entry is inspected under the lock and returned through [`CachedImage::handle`] — a cached
+/// [`CachedImage::Failed`] is a hit that yields `None`, never a miss (falling through would
+/// re-decode a corrupt payload on every frame). The decode runs with the lock released.
 #[must_use]
 pub(super) fn cached_image<K, Q>(
     cache: &Mutex<BoundedLruCache<K, CachedImage>>,
@@ -755,33 +640,24 @@ where
     handle
 }
 
-/// Return a stable, cached iced handle for the image in a `data:…` URI, or
-/// `None` when the payload is missing, over-cap, or undecodable — the caller
-/// renders the "🖼️ image" placeholder in that case (never raw base64 text,
-/// never a silent blank).
-///
-/// Over-cap payloads are refused by `media_target::data_uri_base64_payload`
-/// from length alone BEFORE the cache is consulted, so an oversized data URI is
-/// never retained as a cache key.
+/// A stable, cached iced handle for the image in a `data:…` URI, or `None` when the payload is
+/// missing, over-cap or undecodable — the caller renders the placeholder. An over-cap payload is
+/// refused from length alone BEFORE the cache is consulted, so it is never retained as a key.
 #[must_use]
 fn data_uri_image_handle(uri: &str) -> Option<image::Handle> {
     media_target::data_uri_base64_payload(uri)?;
     cached_image(&DATA_URI_IMAGE_CACHE, uri, || decode_data_uri_image(uri))
 }
 
-// ── Local-path image rendering (bounded, cached) ─────────────────
-
-/// Process-lifetime cache of local-image decode outcomes, keyed by (canonical
-/// path, mtime) — a modified file is a new entry. Evicts the least-recently-used
-/// entry past [`MAX_CACHED_IMAGES`].
+/// Process-lifetime cache of local-image decode outcomes, keyed by (canonical path, mtime) — a
+/// modified file is a new entry. Evicts the least-recently-used entry past [`MAX_CACHED_IMAGES`].
 static LOCAL_IMAGE_CACHE: LazyLock<Mutex<BoundedLruCache<(PathBuf, SystemTime), CachedImage>>> =
     LazyLock::new(|| Mutex::new(BoundedLruCache::with_capacity(MAX_CACHED_IMAGES)));
 
-/// Return a stable, cached iced handle for a local image file, or `None` when
-/// the file is missing, relative, over-cap, or undecodable — the caller renders
-/// the "🖼️ {filename}" placeholder (never a blank). The raster is decoded under
-/// the shared generous budget and downscaled to the display cap ([`render_raster`]),
-/// then cached at most once per (canonical path, mtime).
+/// A stable, cached iced handle for a local image file, or `None` when the file is missing,
+/// relative, over-cap or undecodable — the caller renders the `🖼️ {filename}` placeholder. The
+/// raster is decoded under the shared generous budget, downscaled to the display cap
+/// ([`render_raster`]), then cached at most once per (canonical path, mtime).
 #[must_use]
 fn local_path_image_handle(path: &str) -> Option<image::Handle> {
     let p = Path::new(path);
@@ -789,8 +665,8 @@ fn local_path_image_handle(path: &str) -> Option<image::Handle> {
         return None;
     }
     let meta = std::fs::metadata(p).ok()?;
-    // Shared 50 MiB cap: a huge file is refused from metadata alone (never
-    // opened), so the render thread is not asked to read it.
+    // Shared 50 MiB cap: a huge file is refused from metadata alone (never opened), so the render
+    // thread is not asked to read it.
     if !meta.is_file() || meta.len() > crate::util::INBOUND_IMAGE_MAX_INPUT_BYTES {
         return None;
     }
@@ -803,23 +679,18 @@ fn local_path_image_handle(path: &str) -> Option<image::Handle> {
     })
 }
 
-// ── Clickable file markers ──────────────────────────────────────
-
-/// The link value a file attachment row's click carries.
 const FILE_LINK_PREFIX: &str = "mahbot-file:";
 
-/// The target a file row's click carries, or `None` for any other link.
 pub(crate) fn file_link_target(uri: &str) -> Option<&str> {
     uri.strip_prefix(FILE_LINK_PREFIX)
 }
 
-/// The link a file attachment row carries: the resolved target it reveals.
 fn file_link_uri(target: &str) -> String {
     format!("{FILE_LINK_PREFIX}{target}")
 }
 
-/// Resolve a hand-over's target: an absolute one as it is, a relative one
-/// against the conversation's workspace.
+/// Resolve a hand-over's target: an absolute one as it is, a relative one against the
+/// conversation's workspace.
 fn resolve_file_marker_target(target: &str, workspace: Option<&Path>) -> Result<PathBuf, String> {
     let raw = Path::new(target);
     if raw.is_absolute() {
@@ -830,10 +701,9 @@ fn resolve_file_marker_target(target: &str, workspace: Option<&Path>) -> Result<
         .ok_or_else(|| format!("Cannot open '{target}': the conversation's workspace is unknown."))
 }
 
-/// Reveal a marker's target in the platform file manager. Only an existing
-/// regular file is handed over: the launchers report success and failure
-/// unreliably, so a target that is gone, is not a file, or names no path at all
-/// is reported instead of opening something.
+/// Reveal a marker's target in the platform file manager. Only an existing regular file is handed
+/// over: the launchers report success and failure unreliably, so a target that is gone, is not a
+/// file, or names no path is reported instead of opening something.
 pub(crate) fn reveal_file_marker(target: &str, workspace: Option<&Path>) -> Result<(), String> {
     let path = resolve_file_marker_target(target, workspace)?;
     if !path.exists() {
@@ -845,12 +715,9 @@ pub(crate) fn reveal_file_marker(target: &str, workspace: Option<&Path>) -> Resu
     super::reveal_in_file_manager(&path)
 }
 
-// ── Attachment group ────────────────────────────────────────────
-
-/// The drawn body of one message: its attachment group above its whole text, in
-/// the stored order — never interleaved, neither ever dropped. `fallback` draws
-/// what to show when the body carries neither (content the preprocessing
-/// strips, an empty body).
+/// The drawn body of one message: its attachment group above its whole text, in the stored order —
+/// never interleaved, neither ever dropped. `fallback` draws what to show when the body carries
+/// neither.
 #[expect(
     clippy::large_types_passed_by_value,
     reason = "mirrors `markdown::view`, which hands the settings over by value"
@@ -876,9 +743,8 @@ pub(crate) fn body<'a, Message: 'a>(
     }
 }
 
-/// The attachment group of a rendered body: its pictures and its named files,
-/// one block above the text, in the order the content carried them — drawn at
-/// the text's own size. `None` when the body carries no attachment.
+/// The attachment group of a rendered body: its pictures and named files, one block above the
+/// text, in the order the content carried them. `None` when the body carries no attachment.
 fn attachment_group<'a, Message: 'a>(
     attachments: &'a [MediaAttachment],
     text_size: f32,
@@ -890,11 +756,9 @@ fn attachment_group<'a, Message: 'a>(
     let rows: Vec<Element<'a, Message>> = attachments
         .iter()
         .map(|attachment| match &attachment.image {
-            // A picture the content names: drawn from the cached bounded
-            // decode, or named by its label when there is nothing to draw
-            // (missing / corrupt / over-cap file, undrawable address, or a
-            // payload the content no longer carries) — never a broken image,
-            // never raw base64.
+            // A picture the content names: drawn from the cached bounded decode, or named by its
+            // label when there is nothing to draw (missing, corrupt or over-cap file, undrawable
+            // address, a payload the content no longer carries) — never a broken image.
             Some(url) => picture_row(url, &attachment.label, text_size),
             None => label_row(attachment, text_size, on_link_click.clone()),
         })
@@ -902,7 +766,6 @@ fn attachment_group<'a, Message: 'a>(
     Some(Column::with_children(rows).spacing(theme::SPACE_6).into())
 }
 
-/// The picture `url` draws, or `label` when there is no handle for it.
 fn picture_row<'a, Message: 'a>(
     url: &'a str,
     label: &'a str,
@@ -922,9 +785,8 @@ fn picture_row<'a, Message: 'a>(
     }
 }
 
-/// A named attachment's row. A revealable one is the same plain label as any
-/// other — no colour, no underline, no button chrome: only a click reveals the
-/// file, exactly as a `[FILE:…]` marker always behaved.
+/// A named attachment's row. A revealable one is the same plain label as any other — no colour,
+/// no underline, no button chrome: only a click reveals the file.
 fn label_row<'a, Message: 'a>(
     attachment: &'a MediaAttachment,
     text_size: f32,
@@ -942,14 +804,11 @@ fn label_row<'a, Message: 'a>(
     }
 }
 
-/// A selectable label, in the body's own text colour.
 fn label_text<'a, Message: 'a>(label: &'a str, text_size: f32) -> Element<'a, Message> {
     widgets::selectable_text(label, theme::TEXT_PRIMARY)
         .size(text_size)
         .into()
 }
-
-// ── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1482,18 +1341,16 @@ mod tests {
         let uri = data_uri(&tiny_png(3, 2));
         let first = data_uri_image_handle(&uri).expect("valid data URI decodes");
         let second = data_uri_image_handle(&uri).expect("cached hit still decodes");
-        // iced Handle::from_rgba assigns a unique Id per construction; a stable
-        // cache must return the same Id so the wgpu worker doesn't re-decode and
-        // re-upload on every frame.
+        // iced Handle::from_rgba assigns a unique Id per construction; a stable cache must return
+        // the same Id so the wgpu worker doesn't re-decode and re-upload on every frame.
         assert_eq!(first.id(), second.id());
     }
 
     #[test]
     fn data_uri_image_handle_caches_failures_and_skips_oversized() {
         let huge = "A".repeat(media_target::MAX_DATA_URI_ENCODED_BYTES + 1);
-        // (case, uri, cached as a failure) — a decode failure is cached so a
-        // corrupt payload is not re-decoded every frame, while an over-cap
-        // payload is refused by the length check before the cache is consulted.
+        // (case, uri, cached as a failure) — a decode failure is cached so a corrupt payload is
+        // not re-decoded every frame, while an over-cap payload is refused before the cache.
         let cases: &[(&str, String, bool)] = &[
             (
                 "decode failure cached",
@@ -1526,7 +1383,6 @@ mod tests {
         }
     }
 
-    /// A concurrent same-key re-insert leaves no duplicate for eviction to trip on.
     #[test]
     fn bounded_cache_duplicate_insert_keeps_eviction_exact() {
         let mut cache = BoundedLruCache::with_capacity(2);
@@ -1536,7 +1392,6 @@ mod tests {
         assert_eq!(cache.lru.len(), 2, "duplicate key must not survive in lru");
         assert_eq!(cache.entries.len(), 2);
         assert_eq!(cache.get(&2), Some(&"b"));
-        // capacity 2, lru now [1, 2] (back = most recently used). Inserting 3 evicts 1.
         cache.insert(3, "c");
         assert_eq!(cache.lru.len(), 2, "eviction must stay exact");
         assert_eq!(cache.get(&1), None, "oldest (1) must be evicted");

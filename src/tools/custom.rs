@@ -1,38 +1,28 @@
 //! `custom` — one native tool forwarding calls to admin-authored scripts in the
 //! `shared/` folder of the admin's personal workspace.
 //!
-//! A tool is a file in that folder: one file per tool, flat (subfolders are
-//! never walked), the file's name without its extension being the tool's name.
-//! The file's leading comment block (`//` lines or a block comment) is the only
-//! place a tool is defined — `@description …` plus one
-//! `@param <name> <type> <required|optional> …` per argument. There is no
-//! registry and no publishing step, and a malformed or missing header is never
-//! repaired or guessed: the file is simply not described and any call to it
-//! fails.
+//! A tool is a file in that folder: one file per tool, flat (subfolders are never
+//! walked), the file's name without extension being the tool's name. The file's leading
+//! comment block is the only place a tool is defined — `@description …` plus one
+//! `@param <name> <type> <required|optional> …` per argument. There is no registry: a
+//! malformed header is never repaired, the file is simply not described and any call to
+//! it fails.
 //!
-//! The scripts are the product's single-file `bun` scripts, run like the
-//! Assistant's own — never through a shell, so nothing in the call can be
-//! reinterpreted as shell syntax. The Assistant reaches its own scripts through
-//! the shell's `PATH` (where a user-installed bun can outrank the managed one);
-//! a custom tool always runs the managed binary. A script receives the caller's
-//! arguments as one argv entry: a JSON object of the declared parameters the
-//! caller supplied, under the names it used. The payload is nested so the
-//! product's own argument normalization can never rewrite it. It runs in place,
-//! from the calling session's workspace root — and the Assistant is pinned to
-//! its own personal workspace, so a custom call always runs in the caller's
-//! `userspaces/<user>` directory.
+//! Scripts are single-file `bun` scripts, run like the Assistant's own — never through a
+//! shell, so nothing in the call can be reinterpreted as shell syntax — and always with
+//! the managed binary. A script receives the caller's arguments as one argv entry: a JSON
+//! object of the declared parameters under the names it used, nested so the product's own
+//! argument normalization cannot rewrite it. It runs from the calling session's workspace
+//! root, so a custom call always runs in `userspaces/<user>`.
 //!
-//! Output that outgrows the inline budget is not cut: the run's complete output
-//! is kept in the caller's own `generated/` folder — inside the workspace, so
-//! even a confined guest's `read` may open it — and deleted when the run ends
-//! ([`crate::tools::shell`]'s complete-output file).
+//! Output that outgrows the inline budget is kept whole in the caller's own `generated/`
+//! folder (inside the workspace, so even a confined guest's `read` may open it) and
+//! deleted when the run ends.
 //!
-//! Availability is per user: the admin may call anything, a guest only
-//! what is granted to them (`users.granted_tools`). The `<custom-tools>`
-//! context block is the model-facing catalogue and follows the same split; it
-//! is fixed when a session is built, so a grant change on a guest whose session
-//! already exists is announced into that session ([`notify_grant_change`]),
-//! carrying the granted tool's own entry so the tool is usable from the notice.
+//! Availability is per user: the admin may call anything, a guest only what is granted to
+//! them (`users.granted_tools`). The `<custom-tools>` context block follows the same split
+//! and is fixed when a session is built, so a grant change on an existing session is
+//! announced into it ([`notify_grant_change`]) carrying the tool's own entry.
 
 use crate::Workspace;
 use crate::prompt::{load_prompt, substitute};
@@ -46,17 +36,13 @@ use std::path::{Path, PathBuf};
 /// Folder holding the catalogue, inside the admin's personal workspace.
 const SHARED_DIR: &str = "shared";
 
-/// Extensions the managed `bun` runtime executes as a single-file script. Any
-/// other extension is not a tool — not described and not callable — so a stray
-/// file (a note, a module a script imports) never becomes one.
+/// Extensions the managed `bun` runtime executes as a single-file script. Any other
+/// extension is not a tool, so a stray file never becomes one.
 const RUNNABLE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
 
-/// How much of a tool file is read to parse its header. The header is the
-/// file's leading comment block, so this is orders of magnitude more than any
+/// How much of a tool file is read to parse its header: orders of magnitude more than any
 /// real one, and it bounds the read of an arbitrarily large script.
 const MAX_HEADER_BYTES: u64 = 16 * 1024;
-
-// ── Header grammar ───────────────────────────────────────────────────────
 
 /// The four argument types the shallow validation knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,8 +95,8 @@ pub(crate) struct Param {
     pub(crate) description: String,
 }
 
-/// A usable custom tool: its parsed header plus the file that defines it. The
-/// name is reached through [`ToolListing::name`], so it stays module-private.
+/// A usable custom tool: its parsed header plus the file that defines it (the name is
+/// reached through [`ToolListing::name`], so it stays module-private).
 #[derive(Debug, Clone)]
 pub(crate) struct CustomToolEntry {
     name: String,
@@ -119,15 +105,13 @@ pub(crate) struct CustomToolEntry {
     path: PathBuf,
 }
 
-/// One tool as a listing shows it: the header parsed from the file that defines
-/// it, or the fact that no file under its name has a usable one.
+/// One tool as a listing shows it: the header parsed from the file that defines it, or the fact that
+/// no file under its name has a usable one.
 #[derive(Debug, Clone)]
 pub(crate) enum ToolListing {
-    /// At least one file under the name parses; the first one in path order
-    /// defines the tool.
+    /// At least one file under the name parses; the first one in path order defines the tool.
     Usable(CustomToolEntry),
-    /// Every file under the name is unusable — an unreadable file counts as
-    /// unusable. Shown as a name with no description and no arguments.
+    /// Every file under the name is unusable. Shown as a name with no description or arguments.
     Broken(String),
 }
 
@@ -140,8 +124,8 @@ impl ToolListing {
     }
 }
 
-/// Split `line` into its first `n` whitespace-separated words plus the rest of
-/// the line (`""` when nothing follows them).
+/// Split `line` into its first `n` whitespace-separated words plus the rest of the line
+/// (`""` when nothing follows them).
 fn split_words(line: &str, n: usize) -> (Vec<&str>, &str) {
     let mut words = Vec::with_capacity(n);
     let mut rest = line;
@@ -181,14 +165,12 @@ fn comment_body(line: &str) -> Option<&str> {
     Some(rest.trim_start_matches('*').trim())
 }
 
-/// Parse a script's leading comment block into `(description, params)`.
-/// `None` when the header is missing or malformed.
+/// Parse a script's leading comment block into `(description, params)`, or `None` when the
+/// header is missing or malformed.
 ///
-/// An unknown `@`-directive is malformed rather than ignored: the header *is*
-/// the tool's interface, so a misspelled `@param` (`@parm`) that was silently
-/// skipped would drop a declared argument, and the caller's value for it would
-/// come back as an ignored argument — a quietly wrong tool. The author instead
-/// sees the call fail loudly and fixes the header.
+/// An unknown `@`-directive is malformed rather than ignored: the header *is* the tool's
+/// interface, so a misspelled `@param` skipped silently would drop a declared argument and
+/// the caller's value for it would come back as an ignored one — a quietly wrong tool.
 fn parse_header(source: &str) -> Option<(String, Vec<Param>)> {
     let mut description: Option<String> = None;
     let mut params: Vec<Param> = Vec::new();
@@ -246,15 +228,11 @@ fn parse_header(source: &str) -> Option<(String, Vec<Param>)> {
     Some((description?, params))
 }
 
-/// Whether `name` is a usable tool name: a plain file name, so no call can name
-/// a path, traverse out of the folder, or address a dot-file. Discovery, the
-/// call path and the grant action share this one predicate, so no surface can
-/// hold or advertise a name another would refuse.
+/// Whether `name` is a usable tool name: a plain file name, so no call can name a path
+/// or a dot-file. Discovery, the call path and the grant action share this one predicate.
 pub(crate) fn is_tool_name(name: &str) -> bool {
     !name.is_empty() && !name.starts_with('.') && !name.contains(['/', '\\'])
 }
-
-// ── Discovery ────────────────────────────────────────────────────────────
 
 /// The catalogue folder: `<admin's personal workspace>/shared`.
 fn shared_dir() -> PathBuf {
@@ -282,10 +260,9 @@ fn read_header_source(path: &Path) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Candidate tool files: regular files directly in the folder whose extension
-/// the managed runtime executes, ordered by path. A folder that does not exist
-/// holds no tools — the admin has simply not written one yet. Any other failure
-/// to read it is a real failure, not an empty folder.
+/// Candidate tool files: regular files directly in the folder whose extension the managed
+/// runtime executes, ordered by path. A missing folder holds no tools; any other read
+/// failure is a real failure.
 fn candidate_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -300,15 +277,14 @@ fn candidate_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         .map(|e| e.path())
         .filter(|p| is_runnable(p))
         .collect();
-    // Sort by path so a same-stem collision (`weather.ts` vs `weather.js`)
-    // resolves the same way on every read: the first *usable* file wins, so a
-    // malformed `.js` leaves the tool to a later `.ts` rather than erasing it.
+    // Sort by path so a same-stem collision resolves the same way on every read: the first
+    // *usable* file wins, so a malformed `.js` leaves the tool to a later `.ts`.
     files.sort();
     Ok(files)
 }
 
-/// The tool name a candidate file defines, when it is a usable name: a name the
-/// call path would refuse is not a tool at all — not even a broken one.
+/// The tool name a candidate file defines, when it is a usable name: a name the call path would
+/// refuse is not a tool at all — not even a broken one.
 fn tool_name_of(path: &Path) -> Option<String> {
     let name = path.file_stem().and_then(|s| s.to_str())?;
     if !is_tool_name(name) {
@@ -317,8 +293,8 @@ fn tool_name_of(path: &Path) -> Option<String> {
     Some(name.to_string())
 }
 
-/// The listing for `name` parsed from the file at `path`: `None` when the file
-/// cannot be read or its header cannot be parsed.
+/// The listing for `name` parsed from the file at `path`: `None` when the file cannot be
+/// read or its header cannot be parsed.
 fn usable_listing(path: PathBuf, name: String) -> Option<ToolListing> {
     let source = read_header_source(&path).ok()?;
     let (description, params) = parse_header(&source)?;
@@ -330,17 +306,15 @@ fn usable_listing(path: PathBuf, name: String) -> Option<ToolListing> {
     }))
 }
 
-/// Every tool name in the folder, in name order (byte-wise — the same
-/// deterministic ordering the product's other file-defined descriptions use),
-/// broken ones included.
+/// Every tool name in the folder, in byte-wise name order, broken ones included.
 fn load_listings(dir: &Path) -> std::io::Result<Vec<ToolListing>> {
     let mut listings: Vec<ToolListing> = Vec::new();
     for path in candidate_files(dir)? {
         let Some(name) = tool_name_of(&path) else {
             continue;
         };
-        // A name already given a header keeps it: only a still-broken name can
-        // be upgraded, so a later broken sibling never downgrades a good file.
+        // A name already given a header keeps it: only a still-broken name can be upgraded, so a
+        // later broken sibling never downgrades a good file.
         let listed = listings.iter().position(|l| l.name() == name);
         if listed.is_some_and(|index| matches!(listings[index], ToolListing::Usable(_))) {
             continue;
@@ -362,10 +336,8 @@ fn load_listings(dir: &Path) -> std::io::Result<Vec<ToolListing>> {
     Ok(listings)
 }
 
-/// The catalogue block's source: the usable subset of [`load_listings`], which
-/// owns the discovery rules (a runnable extension, one file per name, a header
-/// that parses). A folder that cannot be read describes no tools: the prompt
-/// form has nowhere to report the failure.
+/// The catalogue block's source: the usable subset of [`load_listings`], which owns the
+/// discovery rules. A folder that cannot be read describes no tools.
 fn load_catalogue(dir: &Path) -> Vec<CustomToolEntry> {
     load_listings(dir)
         .unwrap_or_default()
@@ -377,12 +349,11 @@ fn load_catalogue(dir: &Path) -> Vec<CustomToolEntry> {
         .collect()
 }
 
-/// A listing read: every tool in the folder, broken ones included. Run off the
-/// async runtime — it reads the folder.
+/// A listing read: every tool in the folder, broken ones included. Run off the async
+/// runtime — it reads the folder.
 ///
-/// A folder that cannot be read is an error here (unlike [`load_catalogue`], the
-/// model-facing read): a caller then keeps the list it last loaded rather than
-/// showing the folder as empty.
+/// A folder that cannot be read is an error here (unlike [`load_catalogue`]): a caller then
+/// keeps the list it last loaded rather than showing the folder as empty.
 pub(crate) async fn list_tool_listings() -> Result<Vec<ToolListing>, String> {
     tokio::task::spawn_blocking(|| load_listings(&shared_dir()))
         .await
@@ -397,16 +368,12 @@ async fn catalogue() -> Vec<CustomToolEntry> {
         .unwrap_or_default()
 }
 
-// ── Catalogue block ──────────────────────────────────────────────────────
-
-/// One tool's entry: its description, then its parameters narrated in prose
-/// (name, basic type, required-ness). The admin-authored text is
-/// credential-scrubbed on the way into the prompt, like the product's other
-/// user-provided text that enters one.
+/// One tool's entry: its description, then its parameters in prose (name, basic type,
+/// required-ness). The admin-authored text is credential-scrubbed on the way into the
+/// prompt, like the product's other user-provided text.
 ///
-/// The `<custom-tools>` block and a grant notice both render a tool through
-/// this, so the entry an Assistant reads in the notice is the entry its list
-/// shows, character for character.
+/// The `<custom-tools>` block and a grant notice both render a tool through this, so the
+/// entry an Assistant reads in the notice is the one its list shows.
 fn render_line(tool: &CustomToolEntry) -> String {
     let mut out = String::new();
     let _ = write!(
@@ -476,10 +443,8 @@ pub(crate) async fn context_block(user_name: &str, is_admin: bool) -> String {
     block_for(&catalogue, &granted, is_admin)
 }
 
-/// Render the block for a loaded catalogue: every tool for the admin, only the
-/// granted ones for a guest — the same split the call itself enforces. A grant
-/// that matches no usable file contributes nothing, and an empty listing falls
-/// back to the matching brief form.
+/// Render the block for a loaded catalogue: every tool for the admin, only the granted
+/// ones for a guest. A grant matching no usable file contributes nothing.
 fn block_for(catalogue: &[CustomToolEntry], granted: &[String], is_admin: bool) -> String {
     let tools: Vec<&CustomToolEntry> = catalogue
         .iter()
@@ -498,22 +463,16 @@ fn block_for(catalogue: &[CustomToolEntry], granted: &[String], is_admin: bool) 
     )
 }
 
-/// Wake `user_name`'s Assistant with a notice that one of its custom-tool
-/// grants changed: a tool was granted to, or revoked from, the account. The
-/// admin-side `grant_tool` / `revoke_tool` action is otherwise invisible to the
-/// account it applies to — the `<custom-tools>` block is fixed when the session
-/// is built.
+/// Wake `user_name`'s Assistant with a notice that one of its custom-tool grants changed.
+/// The admin-side grant/revoke action is otherwise invisible to the account it applies to
+/// — the `<custom-tools>` block is fixed when the session is built.
 ///
-/// A grant notice also carries the granted tool's own entry, rendered by the
-/// same [`render_line`] the block lists — the account's list cannot name a tool
-/// granted after the session was built, so the notice is where the tool becomes
-/// usable. A removal says only that the tool is gone: its interface is of no
-/// use to an account that may no longer call it.
+/// A grant notice carries the granted tool's own entry, rendered by the same
+/// [`render_line`]: the account's list cannot name a tool granted after the session was
+/// built, so the notice is where it becomes usable. A removal says only that the tool is gone.
 ///
-/// Nothing is announced to the admin's own Assistant (it holds every tool, so
-/// a grant on that account changes nothing for it) nor to an account whose
-/// Assistant has no session yet — its first session is built with the current
-/// list, so there is nothing to correct.
+/// Nothing is announced to the admin's own Assistant (it holds every tool) nor to an
+/// account with no session yet — its first session is built with the current list.
 pub(crate) async fn notify_grant_change(user_name: &str, tool: &str, granted: bool) {
     if crate::users::is_admin_name(user_name) {
         return;
@@ -523,19 +482,16 @@ pub(crate) async fn notify_grant_change(user_name: &str, tool: &str, granted: bo
         crate::Role::Assistant.as_str(),
         &crate::users::personal_workspace_name(user_name),
     );
-    // An emptied session (a cleared or truncated one) behaves like a first one
-    // — its next turn rebuilds the whole system prompt — so it has nothing to
-    // correct either.
+    // An emptied session behaves like a first one — its next turn rebuilds the whole system
+    // prompt — so it has nothing to correct either.
     if !crate::session::store().has_content(&agent_id).await {
         return;
     }
     let content = if granted {
-        // The catalogue's tool of that exact name, never the account's grants:
-        // by now the grant is recorded and the account's own list is stale. A
-        // name with no readable definition behind it — no such tool, or an
-        // unreadable file — contributes nothing, and the notice then reads
-        // exactly as it always has. The entry is frozen into the durable
-        // envelope here, so a replay shows the same text.
+        // The catalogue's tool of that exact name, never the account's grants: by now the grant is
+        // recorded and the account's list is stale. A name with no readable definition behind it
+        // contributes nothing. The entry is frozen into the durable envelope, so a replay shows
+        // the same text.
         let entry = catalogue()
             .await
             .iter()
@@ -563,17 +519,14 @@ pub(crate) async fn notify_grant_change(user_name: &str, tool: &str, granted: bo
     }
 }
 
-// ── Call path ────────────────────────────────────────────────────────────
-
 /// A resolved custom-tool call: the script to run and the arguments it receives.
 pub(crate) struct ResolvedCall {
     /// The tool's file.
     pub path: PathBuf,
     /// The declared arguments the caller supplied, coerced to their types.
     pub args: Map<String, Value>,
-    /// The supplied argument names the tool does not declare. The call path
-    /// reports them back with the run's output; a strict caller has none,
-    /// because it refuses them instead.
+    /// The supplied argument names the tool does not declare. The call path reports them back
+    /// with the run's output; a strict caller refuses them instead.
     pub ignored: Vec<String>,
 }
 
@@ -586,16 +539,14 @@ impl ResolvedCall {
 
 /// Why a custom-tool call could not be resolved.
 ///
-/// The call path renders these as its `forbidden:` / `not-found:` / `usage:`
-/// refusals; an automation's arming and firing paths turn them into their own
-/// wording, which is why the reason is a value rather than a formatted error.
+/// The call path renders these as its `forbidden:` / `not-found:` / `usage:` refusals; an
+/// automation's paths turn them into their own wording, which is why the reason is a value.
 pub(crate) enum CallRefusal {
     /// The name is not a callable tool name at all (a path, a dot-file, empty).
     Name { name: String },
     /// The caller may not call this name: not the admin and not granted it.
     Unavailable { name: String },
-    /// No usable tool of that name: no such file, or a header the catalogue
-    /// refuses.
+    /// No usable tool of that name: no such file, or a header the catalogue refuses.
     NotUsable { name: String },
     /// The arguments do not fit the tool's declared interface.
     Arguments(anyhow::Error),
@@ -626,9 +577,8 @@ impl CallRefusal {
 
 /// Refuse a name that is not a callable tool name at all (see [`is_tool_name`]).
 ///
-/// A caller that must settle the name before anything else about the call — the
-/// normal call path, which reads the argument object next — calls this itself,
-/// as [`resolve_tool_call`] does first for every path.
+/// The normal call path, which reads the argument object next, calls this itself, as
+/// [`resolve_tool_call`] does first for every path.
 fn check_name(name: &str) -> Result<(), CallRefusal> {
     if is_tool_name(name) {
         Ok(())
@@ -639,13 +589,12 @@ fn check_name(name: &str) -> Result<(), CallRefusal> {
     }
 }
 
-/// Resolve `name` for `caller` and validate `supplied` against the tool's
-/// declared interface, returning the script to run and the arguments it gets.
+/// Resolve `name` for `caller` and validate `supplied` against the tool's declared
+/// interface, returning the script to run and the arguments it gets.
 ///
-/// Availability is settled before the catalogue is read — exactly as a normal
-/// call already does it — so no path that resolves a tool can be used to learn
-/// what exists. `strict` additionally refuses arguments the tool does not
-/// declare; the default (a normal call) ignores them and reports them back.
+/// Availability is settled before the catalogue is read, so no path that resolves a tool can
+/// be used to learn what exists. `strict` additionally refuses arguments the tool does not
+/// declare; the default ignores them and reports them back.
 pub(crate) async fn resolve_tool_call(
     caller: &str,
     name: &str,
@@ -653,9 +602,8 @@ pub(crate) async fn resolve_tool_call(
     strict: bool,
 ) -> Result<ResolvedCall, CallRefusal> {
     check_name(name)?;
-    // The admin may call anything; a guest only what is granted to them. The
-    // refusal comes before the catalogue is read so it cannot probe which tools
-    // exist — nor leak anything about their declared parameters.
+    // The admin may call anything; a guest only what is granted. The refusal comes before the
+    // catalogue is read so it cannot probe which tools exist or leak their parameters.
     if !crate::users::is_admin(caller).await
         && !crate::users::granted_tools(caller)
             .await
@@ -740,15 +688,13 @@ fn checked(param: &Param, value: &Value) -> anyhow::Result<Value> {
     }
 }
 
-/// The whole of the argument contract: the declared parameters are checked
-/// shallowly — string, integer, boolean and list-of-strings values, required
-/// ones present — and anything deeper is the script's own job.
+/// The whole of the argument contract: the declared parameters are checked shallowly —
+/// string, integer, boolean and list-of-strings values, required ones present — and
+/// anything deeper is the script's own job.
 ///
-/// Returns the payload the script receives: only the declared parameters the
-/// caller supplied, under the names it used. An explicit `null` counts as
-/// omitted — the usual way a model says "no value for this one" — so it is
-/// neither forwarded nor a type mismatch. The unrecognised names come from
-/// [`ignored_arguments`], which the caller reports back alongside this.
+/// Returns the payload the script receives: only the declared parameters the caller
+/// supplied, under the names it used. An explicit `null` counts as omitted, so it is
+/// neither forwarded nor a type mismatch.
 fn check_arguments(
     tool: &CustomToolEntry,
     supplied: &Map<String, Value>,
@@ -774,8 +720,7 @@ fn check_arguments(
     Ok(payload)
 }
 
-/// The supplied argument names the tool does not declare: ignored and reported
-/// back to the caller, never fatal.
+/// The supplied argument names the tool does not declare: ignored and reported back.
 fn ignored_arguments(tool: &CustomToolEntry, supplied: &Map<String, Value>) -> Vec<String> {
     let mut ignored: Vec<String> = supplied
         .keys()
@@ -786,9 +731,8 @@ fn ignored_arguments(tool: &CustomToolEntry, supplied: &Map<String, Value>) -> V
     ignored
 }
 
-/// The single native tool that forwards a call to one admin-authored script.
-/// Available to every Assistant (the admin's and a guest's alike); the grant
-/// decides what each call may reach.
+/// The single native tool that forwards a call to one admin-authored script. Available to
+/// every Assistant; the grant decides what each call may reach.
 pub(crate) struct CustomTool;
 
 #[async_trait]
@@ -814,9 +758,8 @@ impl Tool for CustomTool {
     }
 
     async fn execute(&self, ws: &Workspace, args: Value) -> Result<String> {
-        // The caller is resolved from the live call and fails closed: an
-        // unresolvable identity is refused outright, never treated as the
-        // admin.
+        // The caller is resolved from the live call and fails closed: an unresolvable identity is
+        // refused outright, never treated as the admin.
         let caller = crate::agent::tool_user_name();
         if caller.trim().is_empty() {
             anyhow::bail!(
@@ -826,13 +769,12 @@ impl Tool for CustomTool {
         }
 
         let name = super::get_str(&args, "tool")?;
-        // The call's identity is settled before its arguments, as it was before
-        // the resolver below was extracted: a bad name outranks a malformed
+        // The call's identity is settled before its arguments: a bad name outranks a malformed
         // `args`.
         check_name(name).map_err(CallRefusal::into_error)?;
         let supplied = super::get_object(&args, "args")?;
-        // A normal call is not strict: an argument the tool does not declare is
-        // ignored and reported back with the run rather than refused.
+        // A normal call is not strict: an argument the tool does not declare is ignored and
+        // reported back with the run rather than refused.
         let call = resolve_tool_call(&caller, name, &supplied, false)
             .await
             .map_err(CallRefusal::into_error)?;
@@ -871,12 +813,11 @@ fn report_ignored(text: &str, ignored: &[String]) -> String {
     )
 }
 
-/// A failure the caller sees, carrying the note when there is something
-/// unrecognised to report. An empty note leaves the error exactly as it was.
+/// A failure the caller sees, carrying the note when there is something unrecognised to
+/// report. An empty note leaves the error exactly as it was.
 ///
-/// The note is appended to the message because every producer on this path is
-/// message-only, while anyhow's `.context` would render it before the reason it
-/// annotates.
+/// The note is appended to the message because every producer on this path is message-only,
+/// while anyhow's `.context` would render it before the reason it annotates.
 fn report_ignored_failure(e: anyhow::Error, ignored: &[String]) -> anyhow::Error {
     if ignored.is_empty() {
         return e;
@@ -889,10 +830,9 @@ mod tests {
     use super::*;
     use crate::util::test::ProbeFile;
 
-    /// The folder the discovery tests share: a tool that parses, a same-stem
-    /// pair that both parse, a name whose first file by path is broken and whose
-    /// second parses, a name every file of which is broken, and the files that
-    /// must never count as tools at all.
+    /// The folder the discovery tests share: a tool that parses, a same-stem pair that both
+    /// parse, a name whose first file is broken and whose second parses, a name every file of
+    /// which is broken, and files that must never count as tools.
     fn discovery_fixture() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().expect("tempdir");
         let write = |name: &str, body: &str| {
@@ -935,10 +875,8 @@ mod tests {
         assert!(weather.path.ends_with("weather.js"));
     }
 
-    /// The block's listing split is what keeps a guest from being told about
-    /// tools it cannot call: the whole catalogue for the admin, the
-    /// granted subset otherwise, and the matching brief form when nothing is
-    /// left.
+    /// The block's listing split keeps a guest from being told about tools it cannot call: the
+    /// whole catalogue for the admin, the granted subset otherwise.
     #[test]
     fn block_lists_the_whole_catalogue_or_the_granted_subset() {
         let entry = |name: &str| CustomToolEntry {
@@ -972,10 +910,9 @@ mod tests {
         );
     }
 
-    /// The access gate and the argument contract, end to end: an unresolvable
-    /// identity is refused (never treated as the admin), grants are checked
-    /// before the catalogue is read, only plain file names are accepted, and the
-    /// unrecognised-argument note rides a refusal as well as a run.
+    /// The access gate and the argument contract, end to end: an unresolvable identity is
+    /// refused, grants are checked before the catalogue is read, only plain file names are
+    /// accepted, and the unrecognised-argument note rides a refusal as well as a run.
     #[tokio::test]
     async fn call_gate_and_argument_contract() {
         crate::util::test::init_management_test_stores().await;
@@ -993,9 +930,8 @@ mod tests {
             .to_string();
         assert!(err.starts_with("forbidden:"), "got: {err}");
 
-        // An ungranted caller is refused before the tool's existence is
-        // consulted, so the refusal is not an existence oracle. The name is
-        // unique to this test: every test in the process shares one users
+        // An ungranted caller is refused before the tool's existence is consulted, so the refusal
+        // is not an existence oracle. The name is unique to this test: every test shares one users
         // store, so a common name could carry another test's grants.
         let err = as_user("custom_gate_guest", json!({ "tool": "ghost" }))
             .await
@@ -1020,9 +956,8 @@ mod tests {
             assert!(err.starts_with("forbidden:"), "{bad:?} got: {err}");
         }
 
-        // Author a usable tool in the admin's own folder (the test root's), then
-        // refuse a call to it: the declared interface decides what counts as
-        // unrecognised, and the note rides the refusal.
+        // Author a usable tool in the admin's own folder, then refuse a call to it: the declared
+        // interface decides what counts as unrecognised, and the note rides the refusal.
         let dir = shared_dir();
         std::fs::create_dir_all(&dir).expect("create the shared folder");
         let probe = ProbeFile(dir.join("probe.ts"));
@@ -1072,8 +1007,7 @@ mod tests {
         assert_eq!(resolved.args["city"], json!("Minsk"));
 
         // A guest without the grant is refused whatever the name resolves to —
-        // here to nothing at all — so no path that arms an automation can probe the
-        // catalogue.
+        // here to nothing at all — so no path that arms an automation can probe the catalogue.
         let unavailable = resolve_tool_call("strict_probe_guest", "ghost", supplied, true).await;
         assert!(
             matches!(unavailable, Err(CallRefusal::Unavailable { .. })),
@@ -1159,7 +1093,7 @@ mod tests {
         std::fs::write(
             &probe.0,
             "// @description Reports the notice probe.\n\
-             // @param city string required the city to look up\n",
+            // @param city string required the city to look up\n",
         )
         .expect("write the probe tool");
         let entry = load_catalogue(&dir)

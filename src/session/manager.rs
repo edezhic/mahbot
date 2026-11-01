@@ -1,18 +1,13 @@
-//! `Session` — single source of truth for conversation persistence.
+//! `Session` — the single source of truth for conversation persistence, owning the in-memory
+//! history of the current turn.
 //!
-//! Owns the in-memory history Vec for the current turn. The orchestrator
-//! calls [`init`](Session::init) to load/build history, then passes `&mut Session` to the agent loop.
+//! A turn: `Session::default()`; [`init`](Session::init) loads the persisted history and the token
+//! length; the turn's messages land via [`append_turn_message`](Session::append_turn_message) after
+//! the universal resume-completion step; the agent loop pushes and persists during tool rounds; and
+//! [`finalize`](Session::finalize) persists the final assistant response.
 //!
-//! ## Usage
-//! 1. `Session::default()` at turn start
-//! 2. `session.init(agent_id)` — loads history and the token length, stores
-//!    history internally; the turn message is appended separately via
-//!    `append_turn_message` after the universal resume-completion step
-//! 3. Agent loop calls `session.push_assistant()`, `session.persist_messages()`,
-//!    `session.push_messages_unpersisted()`, etc. during tool rounds
-//! 4. `session.finalize(agent_id)` on success — persists the final assistant response
-//!    and reports a [`FinalizeOutcome`]; an empty unpersisted tail is a no-op
-//!    (everything already durable) and is surfaced to the caller to log
+//! An empty unpersisted tail at finalize is a no-op (everything is already durable) and is surfaced
+//! to the caller to log.
 
 use std::fmt::Write;
 use std::sync::Arc;
@@ -34,86 +29,67 @@ use crate::{ChatMessage, ChatRole, Role, Workspace};
 
 use super::TranscriptSnapshot;
 
-/// Coordinates session persistence and prompt building across a single
-/// agent turn.
+/// Coordinates session persistence and prompt building across a single agent turn.
 #[derive(Default)]
 pub(crate) struct Session {
-    /// In-memory history for the current turn (includes system prompt,
-    /// conversation, and the latest user message).
+    /// In-memory history for the current turn: system prompt, conversation and the latest message.
     history: Vec<ChatMessage>,
-    /// Number of leading `history` entries already persisted to the store;
-    /// `history[..persisted_len]` mirrors the DB contents contiguously and
-    /// `history[persisted_len..]` is exactly the unpersisted tail (failed
-    /// appends, tool traffic awaiting commit, the final answer). Every
-    /// successful persist advances this prefix over the span it wrote.
+    /// Leading `history` entries already persisted: `history[..persisted_len]` mirrors the DB
+    /// contiguously and the rest is exactly the unpersisted tail (failed appends, tool traffic
+    /// awaiting commit, the final answer). Every successful persist advances this prefix over the
+    /// span it wrote.
     persisted_len: usize,
-    /// Real provider-reported session length (input + output tokens of the
-    /// most recent successful agent LLM call), loaded at [`init`](Self::init)
-    /// and updated after every successful agent-purpose LLM call. `None` for
-    /// sessions that never recorded a value (new sessions, pre-migration
-    /// sessions — approved no-backfill semantics) and for sessions whose value
-    /// the last compaction cleared ([`Session::apply_summary`]).
+    /// Real provider-reported session length (input + output tokens of the most recent successful
+    /// agent call), loaded at [`init`](Self::init) and updated after every agent call. `None` for
+    /// sessions that never recorded a value (approved no-backfill semantics) and for sessions whose
+    /// value the last compaction cleared.
     token_length: Option<u64>,
-    /// Shared lock-free holder this session publishes live transcript
-    /// snapshots into. `None` when the session is not attached to a running
-    /// agent (tests, detached sessions). Set by
+    /// Shared lock-free holder this session publishes live transcript snapshots into; `None` when
+    /// the session is not attached to a running agent (tests, detached sessions). Set by
     /// [`attach_transcript`](Self::attach_transcript) from `Agent::new`.
     transcript: Option<Arc<ArcSwap<TranscriptSnapshot>>>,
-    /// The launch this session runs under — a custom role's authorial
-    /// definition taken at launch plus the resolved branch address, or a worker
-    /// branch's address. `Some` for a branch session; `None` for every built-in
-    /// role. Set by `Agent::new` from the run's launch.
+    /// The launch this session runs under: a custom role's authorial definition plus resolved
+    /// branch address, or a worker branch's address. `Some` for a branch session, `None` for
+    /// built-in roles.
     pub(crate) launch: Option<crate::Launch>,
 }
 
-/// Outcome of a [`Session::finalize`] call.
-///
-/// The finalize guard is deliberately logging-free: whether an empty
-/// unpersisted tail is expected (graceful drain cut right after the last
-/// tool-group commit) or anomalous (LLM failure with no output, iteration
-/// limit) depends on shutdown state this module does not track. The caller
-/// inspects the outcome and logs with full agent/role/workspace/ticket
-/// attribution.
+/// Outcome of a [`Session::finalize`] call. The guard is deliberately logging-free: whether an
+/// empty unpersisted tail is expected (a drain cut after the last commit) or anomalous depends on
+/// shutdown state this module does not track, so the caller logs with full attribution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FinalizeOutcome {
-    /// The unpersisted tail (final assistant answer / delivered comments)
-    /// was flushed to the store and the persisted prefix advanced.
+    /// The unpersisted tail was flushed and the persisted prefix advanced.
     Flushed,
-    /// Nothing was unpersisted — the turn ended with an empty tail. All
-    /// committed state is already durable; the caller decides whether the
-    /// no-op is expected (drain) or a genuine anomaly.
+    /// Nothing was unpersisted — everything committed is already durable; the caller decides
+    /// whether the no-op is expected (drain) or a genuine anomaly.
     NoUnpersistedTail,
 }
 
 /// Outcome of [`Session::rewrite_last_user_message`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RewriteOutcome {
-    /// The most recent User-role message was durably rewritten and the
-    /// in-memory history entry swapped.
+    /// The message was durably rewritten and the in-memory entry swapped.
     Rewritten,
-    /// The most recent User-role message is in the unpersisted tail
-    /// (index >= `persisted_len`): the positional store UPDATE would target a
-    /// different row, so the rewrite is skipped (conservative no-op — the
-    /// caller keeps the original error path).
+    /// The most recent User-role message is in the unpersisted tail, where a positional UPDATE
+    /// would hit a different row — a conservative no-op that leaves the caller its original error
+    /// path.
     UnpersistedTailNoop,
 }
 
-/// The unresolved tool calls of the session's LAST tool-call frame plus the
-/// frame-level context the sleep-delivery guard needs on the resume path:
-/// whether the frame carried non-empty raw text (which is never delivered
-/// in a tool round) and how many calls the round bundled.
+/// The unresolved tool calls of the session's LAST tool-call frame plus the frame-level context the
+/// sleep-delivery guard needs on resume: whether the frame carried non-empty raw text (never
+/// delivered in a tool round) and how many calls the round bundled.
 pub(crate) struct PendingToolFrame {
     pub calls: Vec<crate::ToolCall>,
     pub has_text: bool,
     pub call_count: usize,
 }
 
-/// Render the fixed system block a custom role's prompt opens with: this
-/// launch's folder and the system. Nothing else — the role itself is defined by
-/// the administrator's authorial text ([`crate::Launch::prompt`]),
-/// which follows as the second system part. Rendered from
-/// `context/custom_role.md`; a launch in a different folder re-renders this
-/// block (see [`Session::append_turn_message`]).
+/// Render the fixed system block a custom role's prompt opens with: this launch's folder and the
+/// system. Nothing else — the role itself is the administrator's authorial text
+/// ([`crate::Launch::prompt`]), which follows as the second system part. A launch in a different
+/// folder re-renders it (see [`Session::append_turn_message`]).
 fn custom_role_block(ws: &Workspace) -> String {
     substitute(
         &load_prompt("context/custom_role.md"),
@@ -125,48 +101,36 @@ fn custom_role_block(ws: &Workspace) -> String {
 }
 
 impl Session {
-    // ── Session lifecycle ──────────────────────────────────────────────
+    // Begin a turn: load the persisted history and the real session length, record the persisted
+    // prefix and publish the initial transcript snapshot. The turn's user message — and the
+    // first-turn system prompt caching that goes with it — comes separately via
+    // [`append_turn_message`](Self::append_turn_message), after the orchestrator's
+    // resume-completion step has settled any dangling tool calls.
 
-    /// Begin a turn. Loads the persisted history and the real
-    /// provider-reported session length (last successful agent LLM call's
-    /// input + output tokens), records the persisted prefix, and publishes the
-    /// initial transcript snapshot. The turn's user message — and the
-    /// first-turn system-prompt caching that goes with it — is handled
-    /// separately via
-    /// [`append_turn_message`](Self::append_turn_message); the orchestrator
-    /// runs the universal resume-completion step between the two so any
-    /// dangling tool calls are settled BEFORE the new message lands.
     pub(crate) async fn init(&mut self, agent_id: &str) -> Result<()> {
         self.history = crate::session::store().load(agent_id).await;
 
-        // Load the real provider-reported session length (last successful
-        // agent LLM call's input + output tokens) so `maybe_summarize` and
-        // the Running Agents card see it from the start of the turn. `None`
-        // for sessions that never recorded a value — treated as below the
-        // summarization threshold.
+        // Load the real session length so `maybe_summarize` and the Running Agents card see it from
+        // the start of the turn; `None` (never recorded) is treated as below the summarization
+        // threshold.
         self.token_length = crate::session::store().get_token_length(agent_id).await;
 
-        // All loaded history above is persisted — record the prefix so
-        // finalize only appends genuinely new assistant output.
+        // All loaded history above is persisted — record the prefix so finalize appends only new
+        // output.
         self.persisted_len = self.history.len();
 
-        // Publish the initial live snapshot so the Running Agents card reflects
-        // the loaded/unpersisted transcript and the persisted token length from
-        // the very start of the turn.
+        // Publish the initial snapshot so the Running Agents card shows the loaded state from the
+        // start.
         self.publish_transcript();
 
         Ok(())
     }
 
-    /// Append a turn's messages and session context into the loaded session.
-    /// A turn answers one message, or several when an urgent message cut the
-    /// previous turn and brought everything already waiting with it: each lands
-    /// as its own user message, in arrival order, and the model reads them as
-    /// consecutive messages.
-    ///
-    /// The per-turn blocks — the personal-workspace report, the model-change
-    /// line, the activity line — ride the FIRST message only, so a turn carrying
-    /// several never repeats them.
+    /// Append a turn's messages and session context into the loaded session. A turn answers one
+    /// message, or several when an urgent message cut the previous turn: each lands as its own user
+    /// message in arrival order. The per-turn blocks — personal-workspace report, model-change
+    /// line, activity line — ride the FIRST message only, so a turn carrying several never repeats
+    /// them.
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn append_turn_messages(
         &mut self,
@@ -203,20 +167,12 @@ impl Session {
         Ok(())
     }
 
-    /// Append this turn's user message and session context into the loaded
-    /// session. Moves the message-append half of [`init`](Self::init) here so
-    /// the orchestrator can run the universal resume-completion step in between
-    /// (see `Agent::work`): the session loads WITHOUT the new message, the
-    /// dangling tool calls are settled directly after their frame, and only then
-    /// does the user message land. An empty `msg` is a no-op (RecoveryRetry
-    /// re-triggers against the existing history without adding a turn).
-    ///
-    /// `turn_first` says whether this message is its turn's first — the per-turn
-    /// blocks ride only that one (see [`Self::append_turn_messages`]).
-    ///
-    /// `round_ts` pins the timestamp of the appended user message (one value
-    /// per round for byte-identical first messages across parallel members);
-    /// `None` stamps now.
+    /// Append this turn's user message and session context. The append half of [`init`](Self::init)
+    /// lives here so the orchestrator can run the resume-completion step in between: the session
+    /// loads WITHOUT the new message, the dangling tool calls are settled after their frame, and
+    /// only then does the message land. An empty `msg` is a no-op. `turn_first` says whether this
+    /// message is its turn's first (the per-turn blocks ride only that one); `round_ts` pins its
+    /// timestamp, so parallel members write byte-identical first messages, and `None` stamps now.
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn append_turn_message(
         &mut self,
@@ -234,18 +190,13 @@ impl Session {
         if !msg.is_empty() {
             let is_new = self.history.is_empty();
 
-            // The one composition point for both branches below: the activity line
-            // at the very head, then the personal-workspace report, then a later
-            // Assistant turn's machine change-info (a first turn's system prompt
-            // holds the models instead, so the snapshot write below stays on its
-            // first-turn path). The session-start `<workspace-structure>` block
-            // cannot stand in for the report: it is a shape — folder names with
-            // counts, never a path — so it cannot say what the user just touched,
-            // and a session truncated from the Sessions page takes this path with
-            // its baseline intact.
-            //
-            // Every block here is per-turn, not per-message: on a turn carrying
-            // several messages they ride the first one only.
+            // The one composition point for both branches below: the activity line at the very
+            // head, then the personal-workspace report, then a later Assistant turn's machine
+            // change-info (a first turn's system prompt holds the models instead). The
+            // session-start `<workspace-structure>` block cannot stand in for the report: it is a
+            // shape — folder names with counts, never a path — so it cannot say what the user just
+            // touched. Every block here is per-turn: on a turn carrying several messages they ride
+            // the first one only.
             let (content, new_snapshot) =
                 if turn_first && !is_new && matches!(role, Role::Assistant) {
                     Self::prepend_model_change(agent_id, msg, user_name).await
@@ -276,11 +227,10 @@ impl Session {
                 )
                 .await;
 
-                // Batch-write all messages + session context atomically. A launch
-                // session's leading context block is `msgs` minus the one turn
-                // message, and its length is recorded in the SAME transaction so
-                // a later folder change rebuilds the block from what was WRITTEN,
-                // not from a re-render of live workspace state.
+                // Batch-write all messages and session context atomically. A launch session's
+                // leading context block is `msgs` minus the one turn message, and its length is
+                // recorded in the SAME transaction so a later folder change rebuilds the block from
+                // what was WRITTEN, not from live workspace state.
                 let meta =
                     super::BatchMetadata::context(channel, user_name, &ws.name, role.as_str())
                         .block_len(self.launch.as_ref().map(|_| msgs.len() - 1));
@@ -293,36 +243,30 @@ impl Session {
                     Self::persist_active_models_snapshot(agent_id, &snapshot).await;
                 }
             } else {
-                // A launch's folder is named on EVERY use, so the session's
-                // cached opening context block must follow the folder the branch
-                // now works in — a custom role's OR a worker branch's (the block
-                // is the session's leading system run). The conversation after
-                // the block is never touched. The recorded folder is read BEFORE
-                // the append below rewrites it: it is what tells the change from
-                // a repeat use of the same folder.
+                // A launch's folder is named on EVERY use, so the cached opening context block must
+                // follow the folder the branch now works in — a custom role's or a worker branch's
+                // (the block is the session's leading system run); the conversation after it is
+                // never touched. The recorded folder is read BEFORE the append below rewrites it:
+                // it is what tells a change from a repeat use of the same folder.
                 if self.launch.is_some()
                     && let Some(previous) = crate::session::store()
                         .session_workspace_name(agent_id)
                         .await
                     && previous != ws.name
                 {
-                    // Refreshed for EVERY folder change, including one whose
-                    // previous folder no longer resolves: the block's length was
-                    // recorded when it was written, so nothing about the folder it
-                    // was built for is needed to replace it.
+                    // Refreshed for EVERY folder change, including one whose previous folder no
+                    // longer resolves: the block's length was recorded when it was written, so
+                    // nothing about the old folder is needed.
                     self.refresh_context_block(agent_id, ws, role, ticket, is_admin, user_name)
                         .await?;
-                    // The launch landed in a different folder than the one
-                    // recorded for the branch, so the engine the branch held for
-                    // that folder is now unreferenced — release it (the new
-                    // folder's engine is created on demand and kept for as long
-                    // as the branch works there).
+                    // The launch landed in a different folder than the one recorded, so the engine
+                    // the branch held for that folder is now unreferenced — release it (the new
+                    // folder's engine is created on demand).
                     crate::workspace_index::release_path_named_engine(&previous);
                 }
-                // Caching: system prompt is NOT rebuilt on every subsequent
-                // turn (see doc comment above). The session DB caches the full
-                // first-turn message set. The rebuild paths are the folder
-                // change just above and `apply_summary` below.
+                // Caching: the system prompt is NOT rebuilt on every turn; the session DB caches
+                // the full first-turn message set. The rebuild paths are the folder change above
+                // and `apply_summary` below.
                 let user_msg = crate::session::user_msg_with_ts(&content, round_ts);
                 // Append the user message and update session context atomically.
                 crate::session::store()
@@ -332,20 +276,19 @@ impl Session {
                         super::BatchMetadata::context(channel, user_name, &ws.name, role.as_str()),
                     )
                     .await?;
-                // Refresh the change-detection baseline only after the message
-                // (carrying the change-info) is persisted — otherwise a failed
-                // append would lose the change-info while advancing the
-                // baseline, so a retry could never communicate the switch.
-                // Residual window: an append that succeeds while the baseline
-                // write fails leaves a stale baseline, so the next message
-                // re-fires the same change-info — benign and self-healing.
+                // Refresh the change-detection baseline only after the message carrying the
+                // change-info is persisted — otherwise a failed append would lose the change-info
+                // while advancing the baseline, so a retry could never communicate the switch.
+                // Residual window: a successful append with a failed baseline write leaves a stale
+                // baseline, so the next message re-fires the same change-info — benign and
+                // self-healing.
                 if let Some(snapshot) = new_snapshot {
                     Self::persist_active_models_snapshot(agent_id, &snapshot).await;
                 }
                 self.history.push(user_msg);
             }
-            // The activity state the message just written carries — recorded only once the
-            // append landed, so a failed write cannot silently swallow the change.
+            // Recorded only once the append landed, so a failed write cannot silently swallow the
+            // change.
             if let Some(location) = activity
                 && let Err(e) = crate::session::store()
                     .set_user_activity(agent_id, location.as_str())
@@ -357,14 +300,11 @@ impl Session {
                     "Failed to record the user-activity reference"
                 );
             }
-            // A branch session records its kind and address — a custom role's
-            // name and the identifier it continues, or a worker branch's `None`
-            // role name and its branch name — on EVERY appending turn, so the
-            // dead-session poller can resume the branch as the same kind without
-            // parsing the agent ID. It sits outside the `is_new` branch so a
-            // single failed first-turn write cannot leave the branch permanently
-            // without a recorded role. Log-and-continue like the snapshot writes
-            // above.
+            // A branch session records its kind and address — a custom role's name and the
+            // identifier it continues, or a worker branch's `None` role name and its branch name —
+            // on EVERY appending turn, so the dead-session poller can resume the branch as the same
+            // kind without parsing the agent ID. Outside the `is_new` branch, so one failed
+            // first-turn write cannot leave the branch permanently unrecorded.
             if let Some(launch) = &self.launch
                 && let Err(e) = crate::session::store()
                     .set_branch(
@@ -381,29 +321,20 @@ impl Session {
                     "Failed to record branch session metadata"
                 );
             }
-            // The appended message is durably written above — advance the
-            // persisted prefix and refresh the live transcript.
+            // The message is durably written above — advance the persisted prefix and refresh the
+            // transcript.
             self.persisted_len = self.history.len();
             self.publish_transcript();
         }
         Ok(())
     }
 
-    /// Rebuild a launch session's opening context block for the folder the branch
-    /// now works in — a branch's folder is named on every use, so its cached block
-    /// must follow it (parity with a custom role's branch).
-    ///
-    /// The block is the session's leading system run: the first turn writes it
-    /// there, every compaction rebuilds it, and its length is recorded in the
-    /// same transaction whenever it is written
-    /// (`session_metadata.context_block_len`). This method measures the cached
-    /// block by that recorded length — never by re-rendering the previous
-    /// folder, whose length follows that folder's live state (skills on disk, the
-    /// workspace context, automations) and could drift after the block was cached. A
-    /// session that predates the record (no released build can be in that state)
-    /// is measured from the history itself, so no path needs the previous folder
-    /// to resolve and no folder change can leave the model reading a stale one.
-    /// The conversation after the block is never touched.
+    /// Rebuild a launch session's opening context block for the folder the branch now works in: the
+    /// block is the session's leading system run and its length is recorded in the same transaction
+    /// whenever it is written. It is measured by that recorded length — never by re-rendering the
+    /// previous folder, whose length follows live state (skills on disk, workspace context,
+    /// automations) and could drift. A session predating the record is measured from the history
+    /// itself.
     async fn refresh_context_block(
         &mut self,
         agent_id: &str,
@@ -417,16 +348,15 @@ impl Session {
             .context_block_len(agent_id)
             .await
             .unwrap_or_else(|| {
-                // A branch session recorded before the column existed: its block
-                // is the leading run of system messages, counted from the history
-                // rather than from a folder lookup.
+                // Recorded before the column existed: the block is the leading run of system
+                // messages.
                 self.history
                     .iter()
                     .take_while(|message| message.role == ChatRole::System)
                     .count()
             })
-            // The recorded length is written with the block it describes, so it
-            // always fits; clamped anyway, so the slice below cannot panic.
+            // Written with the block it describes, so it always fits; clamped so the slice cannot
+            // panic.
             .min(self.history.len());
         let (fresh, _) = Self::build_context_messages(
             ws,
@@ -450,19 +380,16 @@ impl Session {
         Ok(())
     }
 
-    // ── Live transcript snapshot ─────────────────────────────────────
+    // Attach the shared lock-free holder this session publishes live transcript snapshots into.
+    // Called by `Agent::new` after registering the holder in the global accessor; must run before
+    // the first mutation.
 
-    /// Attach the shared lock-free holder this session publishes live
-    /// transcript snapshots into. Called by `Agent::new` after registering the
-    /// holder in the global accessor; must run before the first mutation.
     pub(crate) fn attach_transcript(&mut self, holder: Arc<ArcSwap<TranscriptSnapshot>>) {
         self.transcript = Some(holder);
     }
 
-    /// Publish a fresh read-only snapshot of the current history + token count
-    /// into the holder. Copy-on-write: clones the history Vec (the one
-    /// per-publish cost) and stores the new snapshot. No-op when no holder is
-    /// attached (detached sessions / tests).
+    /// Publish a fresh read-only snapshot of the current history and token count. Copy-on-write:
+    /// one history clone per publish. No-op when no holder is attached (detached sessions, tests).
     fn publish_transcript(&self) {
         if let Some(holder) = &self.transcript {
             let snapshot = TranscriptSnapshot {
@@ -470,51 +397,43 @@ impl Session {
                 token_count: self.token_length,
             };
             holder.store(Arc::new(snapshot));
-            // Live transcript content changed → the Running Agents cards /
-            // footer need a re-render.
+            // Live transcript content changed → the Running Agents cards and footer need a
+            // re-render.
             crate::runtime_events::publish(RuntimeEvent::Registries);
         }
     }
 
-    // ── History access (for agent loop) ────────────────────────────────
-
-    /// Read-only access to the in-memory history (for LLM calls).
+    // Read-only access to the in-memory history (for LLM calls).
     #[must_use]
     pub(crate) fn history(&self) -> &[ChatMessage] {
         &self.history
     }
 
-    /// Real provider-reported session length (see the field doc), loaded at
-    /// [`init`](Self::init). `None` when no successful usage-bearing agent
-    /// call ever recorded a value, or the last compaction cleared it.
+    /// Real provider-reported session length (see the field doc). `None` when no usage-bearing
+    /// agent call ever recorded a value, or the last compaction cleared it.
     #[must_use]
     pub(crate) fn token_length(&self) -> Option<u64> {
         self.token_length
     }
 
-    /// Update the in-memory session length after a successful agent LLM call.
-    /// The durable store write is the caller's responsibility
+    /// Update the in-memory length after a successful agent call. The durable write is the caller's
     /// ([`crate::Agent::record_session_usage`]).
     pub(crate) fn set_token_length(&mut self, token_length: Option<u64>) {
         self.token_length = token_length;
         self.publish_transcript();
     }
 
-    /// Append an assistant message (final response or intermediate tool-call).
-    /// Operates on in-memory history only, not the session store.
+    /// Append an assistant message (final response or intermediate tool-call) to in-memory history
+    /// only.
     pub(crate) fn push_assistant(&mut self, content: String) {
         self.history.push(ChatMessage::assistant(content));
         self.publish_transcript();
     }
 
-    /// Persist any unpersisted history tail plus `messages` in one
-    /// transaction, then deliver `messages` to in-memory history and advance
-    /// `persisted_len` over the whole persisted span. On failure nothing is
-    /// delivered — the caller aborts or delivers unpersisted via
-    /// [`Session::push_messages_unpersisted`].
-    ///
-    /// `messages` must not already be part of the unpersisted tail — they
-    /// would be written twice.
+    /// Persist any unpersisted tail plus `messages` in one transaction, then deliver `messages` to
+    /// memory and advance `persisted_len` over the whole persisted span. On failure nothing is
+    /// delivered (the caller aborts or delivers unpersisted). `messages` must not already be in the
+    /// unpersisted tail.
     pub(crate) async fn persist_messages(
         &mut self,
         agent_id: &str,
@@ -534,13 +453,10 @@ impl Session {
         Ok(())
     }
 
-    /// The tool calls of the session's LAST tool-call frame whose results are
-    /// not yet present — the universal resume-completion input.
-    ///
-    /// Walks back to the last assistant tool-call frame, then forward over the
-    /// immediately-following Tool-role entries, collecting the `tool_call_id`s
-    /// they resolved. Returns the frame's calls whose ids are missing: `None`
-    /// when nothing is missing, or when there is no (undecodable) frame.
+    /// The calls of the session's LAST tool-call frame whose results are missing — the universal
+    /// resume-completion input. Walks back to the last assistant tool-call frame, then forward over
+    /// the Tool-role entries it resolved. `None` when nothing is missing or no (decodable) frame
+    /// exists.
     pub(crate) fn pending_tool_frame(&self) -> Option<PendingToolFrame> {
         let frame_idx = self.history.iter().rposition(super::is_tool_call_frame)?;
         let Some(super::DecodedNativeHistoryMessage::Assistant {
@@ -582,11 +498,10 @@ impl Session {
         }
     }
 
-    /// Test-only thin wrapper: run the store's self-transactional settle and
-    /// mirror the rewrite into the in-memory history. Production invokes
-    /// [`SessionStore::settle_tool_results_tx`](super::SessionStore::settle_tool_results_tx)
-    /// directly inside the agent's atomic settle+terminalize transaction and
-    /// mirrors via [`Self::mirror_settled`] only after the commit.
+    /// Test-only thin wrapper: the store's self-transactional settle, mirrored into memory.
+    /// Production calls
+    /// [`SessionStore::settle_tool_results_tx`](super::SessionStore::settle_tool_results_tx) inside
+    /// the agent's atomic settle+terminalize transaction and mirrors only after the commit.
     #[cfg(test)]
     pub(crate) async fn settle_tool_results(
         &mut self,
@@ -601,9 +516,8 @@ impl Session {
         Ok(())
     }
 
-    /// Mirror a store settle's returned sequence into the in-memory history:
-    /// truncate after the tool-call frame and replay the final sequence
-    /// verbatim (role via the strum parse path, content as-is).
+    /// Mirror a store settle's returned sequence into memory: truncate after the tool-call frame
+    /// and replay the final sequence verbatim.
     pub(crate) fn mirror_settled(&mut self, settled: Vec<super::SettledRow>) -> Result<()> {
         let Some(frame_idx) = self.history.iter().rposition(super::is_tool_call_frame) else {
             debug_assert!(
@@ -627,28 +541,25 @@ impl Session {
         Ok(())
     }
 
-    /// Deliver `messages` to in-memory history without persisting them
-    /// (store append failed). They remain in the unpersisted tail; the next
+    /// Deliver `messages` to memory without persisting them (store append failed); the next
     /// successful persist flushes them in order.
     pub(crate) fn push_messages_unpersisted(&mut self, messages: &[ChatMessage]) {
         self.history.extend_from_slice(messages);
         self.publish_transcript();
     }
 
-    /// Durable rewrite of the most recent User-role message: persist the new
-    /// content to the store FIRST, then swap the in-memory history entry.
+    /// Durable rewrite of the most recent User-role message: persist the new content to the store
+    /// FIRST, then swap the in-memory history entry.
     ///
-    /// Ordering invariant: the store write happens before the in-memory swap,
-    /// so a persist failure leaves the in-memory history untouched and the
-    /// caller can fall back to the original error path without a half-stripped
-    /// continuation or a swallowed error.
+    /// Ordering invariant: the store write happens before the in-memory swap, so a persist failure
+    /// leaves the in-memory history untouched and the caller can fall back to the original error
+    /// path without a half-stripped continuation or a swallowed error.
     ///
-    /// The store UPDATE targets the last `user`-role row, which corresponds to
-    /// the most recent User-role message **only while that message is within
-    /// the persisted prefix** (`index < persisted_len`) — `history[..persisted_len]`
-    /// mirrors the DB contiguously. A message in the unpersisted tail returns
-    /// [`RewriteOutcome::UnpersistedTailNoop`] instead of corrupting an earlier
-    /// row. The target message is re-derived here (authoritative), not taken
+    /// The store UPDATE targets the last `user`-role row, which corresponds to the most recent
+    /// User-role message **only while that message is within the persisted prefix**
+    /// (`index < persisted_len`) — `history[..persisted_len]` mirrors the DB contiguously. A message
+    /// in the unpersisted tail returns [`RewriteOutcome::UnpersistedTailNoop`] instead of
+    /// corrupting an earlier row. The target message is re-derived here (authoritative), not taken
     /// from the caller.
     pub(crate) async fn rewrite_last_user_message(
         &mut self,
@@ -670,30 +581,16 @@ impl Session {
         Ok(RewriteOutcome::Rewritten)
     }
 
-    // ── Summarization — apply summary produced by Agent ─────────────────
-
-    /// Replace the in-memory and persisted history with a compacted version
-    /// containing a fresh system prompt (via `build_context_messages`), the
-    /// given `summary_text`, and the latest [`super::RETENTION_PER_SIDE`]
-    /// user messages + assistant answers from the pre-compaction history
-    /// (tool traffic excluded — see `select_retention_window`), plus every
-    /// message from `turn_start` on.
-    ///
-    /// Before persisting, the messages this compaction deletes are dumped to
-    /// a file via [`super::compaction_dump`] and the dump path is appended to
-    /// the summary message, so the agent can re-read dropped content with the
-    /// read tool. A dump failure is fail-open (no path line).
-    ///
-    /// The LLM call to produce the summary text is the responsibility of
-    /// [`crate::Agent::summarize`] — this method
-    /// handles only the history rebuild, dump, and persistence.
-    ///
-    /// KV-cache preservation: called by Agent after producing a summary
-    /// with byte-identical parameters (model, reasoning_effort, tools,
-    /// provider routing) so the provider can reuse the cached prefix.
-    ///
-    /// On persist failure, the full in-memory history is preserved — the
-    /// next turn reloads from DB and retries (self-healing).
+    /// Replace the in-memory and persisted history with a compacted version: a fresh system prompt
+    /// (via `build_context_messages`), the `summary_text`, the latest [`super::RETENTION_PER_SIDE`]
+    /// user messages and assistant answers from the pre-compaction history (tool traffic excluded),
+    /// plus every message from `turn_start` on. Before persisting, the messages this compaction
+    /// deletes are dumped via [`super::compaction_dump`] and the path is appended to the summary
+    /// message so the agent can re-read the dropped content; a dump failure is fail-open. Producing
+    /// the summary text is [`crate::Agent::summarize`]'s job. KV-cache preservation: the Agent calls
+    /// this with byte-identical parameters (model, reasoning effort, tools, routing) so the provider
+    /// reuses the cached prefix. On a persist failure the full in-memory history is kept and the
+    /// next turn reloads from the DB.
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn apply_summary(
         &mut self,
@@ -706,7 +603,7 @@ impl Session {
         user_name: &str,
         turn_start: usize,
     ) {
-        // Build fresh system prompt (may have changed since session start).
+        // Build the fresh system prompt (it may have changed since session start).
         let (mut compacted, snapshot) = Self::build_context_messages(
             ws,
             role,
@@ -716,21 +613,17 @@ impl Session {
             self.launch.as_ref(),
         )
         .await;
-        // The leading context block this compaction writes is exactly `compacted`
-        // before the summary message and the retained window are appended; a
-        // launch session records its length in the same transaction.
+        // The leading context block is exactly `compacted` here; a launch session records its
+        // length.
         let context_block_len = compacted.len();
 
-        // Append conversation summary, then the retained latest turns in
-        // chronological order. The newest user message is already among them (the
-        // in-flight one on a pre-turn compaction, the answered one on a
-        // post-delivery one) — no separate re-append here.
+        // Append the summary, then the retained latest turns in chronological order. The newest
+        // user message is already among them — no separate re-append here.
         let prefix = load_prompt("context/summary_prefix.md");
         let retained = crate::session::select_retention_window(&self.history, turn_start);
-        // Dump what this compaction deletes BEFORE persisting, so the path
-        // rides inside the persisted summary message; a persist failure then
-        // orphans the dump (accepted: an orphan is dead weight — its lifecycle
-        // is in `compaction_dump`). A dump failure fails open.
+        // Dump what this compaction deletes BEFORE persisting, so the path rides in the persisted
+        // summary; a persist failure orphans the dump (accepted: its lifecycle is in
+        // `compaction_dump`).
         let dump_path = super::compaction_dump::dump_deleted_messages(
             agent_id,
             &self.history,
@@ -751,9 +644,8 @@ impl Session {
         compacted.push(ChatMessage::system(summary));
         compacted.extend(retained);
 
-        // Persist compacted history (system prompt + summary + retained window).
-        // On success, update in-memory history to match. On failure, keep the
-        // full in-memory history — next turn reloads from DB and retries.
+        // Persist the compacted history; only on success does the in-memory history follow. On
+        // failure the full in-memory history stays — the next turn reloads from the DB and retries.
         if let Err(e) = crate::session::store()
             .replace_messages(
                 agent_id,
@@ -773,20 +665,16 @@ impl Session {
         }
         self.history = compacted;
         self.persisted_len = self.history.len();
-        // The store cleared the length in the same transaction; until this
-        // session's next reply the product shows no token count for it.
+        // The store cleared the length in the same transaction; the product shows no count until
+        // the reply.
         self.token_length = None;
         self.publish_transcript();
-        // Refresh the change-detection baseline when the block was
-        // (re)rendered: it is the newest authoritative state — a stale
-        // snapshot would fire a spurious change-info on the first turn
-        // after every compaction. Sections that did not re-render
-        // (catalog down) keep their old baseline so a mid-session switch
-        // of that model can still surface as a change line. When no block
-        // rendered at all the baseline is left untouched for the same
-        // reason — the block itself is dropped from the system prompt
-        // until the next compaction or /new (accepted fail-open gap: the
-        // block is only re-rendered through this path).
+        // Refresh the change-detection baseline when the block was (re)rendered: it is the newest
+        // authoritative state, and a stale snapshot would fire a spurious change-info on the first
+        // turn after every compaction. Sections that did not re-render (catalog down) keep their
+        // old baseline so a mid-session switch of that model still surfaces as a change line. When
+        // no block rendered at all the baseline is left untouched for the same reason (accepted
+        // fail-open gap: the block is only re-rendered here).
         let block_rendered = snapshot.image.is_some() || snapshot.video.is_some();
         if matches!(role, Role::Assistant) && block_rendered {
             let merged = Self::merge_active_models_snapshot(agent_id, &snapshot).await;
@@ -794,16 +682,12 @@ impl Session {
         }
     }
 
-    // ── Lifecycle ────────────────────────────────────────────────────
+    // Flush any unpersisted history tail to the store and advance the persisted prefix — the final
+    // assistant answer, or just delivered comments on aborted turns. No-op on an empty tail (a
+    // drain cut after the last tool-group commit, or a turn with no output), so a retained answer
+    // is never duplicated; the no-op is surfaced as [`FinalizeOutcome::NoUnpersistedTail`] for the
+    // caller to log with attribution. Skipped by the agent-level cancel path.
 
-    /// Flush any unpersisted history tail to the session store and advance
-    /// the persisted prefix — the final assistant answer, or just delivered
-    /// comments on aborted turns. No-op on an empty tail (e.g. a drain cut
-    /// right after the last tool-group commit, or a turn with no output), so
-    /// a retained assistant answer is never duplicated. The no-op is surfaced
-    /// via [`FinalizeOutcome::NoUnpersistedTail`] for the caller to log with
-    /// attribution. Skipped by the agent-level cancel path (see
-    /// `finalize_session`).
     pub(crate) async fn finalize(&mut self, agent_id: &str) -> Result<FinalizeOutcome> {
         debug_assert!(self.persisted_len <= self.history.len());
         if self.persisted_len == self.history.len() {
@@ -813,52 +697,23 @@ impl Session {
         Ok(FinalizeOutcome::Flushed)
     }
 
-    // ── Internals ────────────────────────────────────────────────────
-
-    /// Build fresh system prompt + ticket context for the current turn.
-    /// Returns the system-level messages plus the model snapshot rendered in
-    /// the `<active-models-opts>` block (Assistant only; `Default` when no
-    /// block was injected). Messages appear in this order:
+    /// Build fresh system prompt + ticket context for the current turn: the system-level messages
+    /// plus the model snapshot rendered in the `<active-models-opts>` block (`Default` when none was
+    /// injected).
     ///
-    /// ```text
-    /// role_description       — from src/prompt/role/{role}.md (always)
-    /// onboarding_guide       — the admin's Assistant only, while onboarding
-    ///                          state is Init (or via the greeting kickoff's
-    ///                          pending-guide bridge)
-    /// active_models_opts     — Assistant only, when the catalogs are available
-    /// workspace boilerplate  — src/prompt/context/workspace.md, with the
-    ///                          per-role frame from context/workspace_frame.md
-    ///                          (or context/workspace_frame_admin.md for the
-    ///                          admin's Assistant); substituted (always). Its
-    ///                          `<workspace-context>` file material includes
-    ///                          `MEMORY.md` only for the account's own
-    ///                          Assistant ([`carries_personal_memory`])
-    /// skills                 — if any skills exist in the workspace
-    /// automations            — Assistant only, when the user has active automations
-    /// personal_files         — Assistant only, when the personal folder shows
-    ///                          something of the user's
-    /// workspaces             — the admin's Assistant only, when managed workspaces exist
-    /// custom_tools           — Assistant only, always (the catalogue, or the
-    ///                          brief "nothing available" form)
-    /// custom_roles           — the admin's Assistant only, when roles are defined
-    /// board_context          — Manager role only, when active tickets exist
-    /// ticket_block           — when a ticket is assigned to this session
-    /// ```
+    /// Message order, which the cached prefix depends on: role description, onboarding guide (the
+    /// admin's Assistant while onboarding), active-models opts (Assistant), workspace boilerplate
+    /// (with the per-role frame; `<workspace-context>` carries `MEMORY.md` only for the account's own
+    /// Assistant), skills, automations, personal files, workspaces, custom tools, custom roles, board
+    /// context (Manager), ticket block.
     ///
-    /// # Caching contract
-    /// This function is called directly by
-    /// [`Session::apply_summary`] when rebuilding context after compaction.
-    /// [`Self::build_turn_messages`] wraps it to add the per-turn user message.
-    /// The Assistant block is re-emitted on compaction, so long sessions never
-    /// lose the capability info.
+    /// Caching contract: called directly by [`Session::apply_summary`] when rebuilding context after
+    /// compaction, and wrapped by [`Self::build_turn_messages`] to add the per-turn user message. The
+    /// Assistant block is re-emitted on compaction, so long sessions never lose the capability info.
     ///
-    /// # Custom roles
-    /// A custom role ([`Role::Custom`]) receives exactly two system parts and
-    /// nothing else: the fixed [`custom_role_block`] first and the launch's
-    /// authorial text (taken at session start) second. Everything the built-in
-    /// roles receive — workspace boilerplate, skills, notes, automations/board/ticket
-    /// context, personal files, custom tools, custom-role listing, active models
-    /// — is deliberately absent, because the administrator's own words are the
+    /// Custom roles: a [`Role::Custom`] session receives exactly two system parts and nothing else —
+    /// the fixed [`custom_role_block`] first and the launch's authorial text second. Every
+    /// built-in-role block is deliberately absent, because the administrator's own words are the
     /// whole definition.
     async fn build_context_messages(
         ws: &Workspace,
@@ -868,14 +723,11 @@ impl Session {
         user_name: &str,
         launch: Option<&crate::Launch>,
     ) -> (Vec<ChatMessage>, ModelSnapshot) {
-        // A `Role::Custom` session ALWAYS opens with the two-part custom prompt —
-        // the fixed workspace block plus the authorial text. A launch that
-        // arrives without one (a mis-routed envelope, an old row, a bug) renders
-        // the fixed block with an empty authorial part instead of falling
-        // through to the built-in path, which would `load_prompt("role/custom.md")`
-        // and panic (there is no such asset). The message router already refuses
-        // a launch-less custom-role job, so this is only the last line of
-        // defence.
+        // A `Role::Custom` session ALWAYS opens with the two-part custom prompt. A launch without
+        // one (a mis-routed envelope, an old row, a bug) renders the fixed block with an empty
+        // authorial part instead of falling through to the built-in path, which would
+        // `load_prompt("role/custom.md")` and panic (there is no such asset). The message router
+        // already refuses a launch-less custom-role job.
         if role == &Role::Custom {
             return (
                 vec![
@@ -903,10 +755,9 @@ impl Session {
             // Auto-discovered workspace context block.
             ctx.push_str(&crate::prompt::wrap_workspace_context(&workspace_context));
 
-            // User-curated manual notes block (survives rediscover).
-            // NOTE: changes to ws.notes do not affect in-flight agent sessions
-            // until summarization compacts the history — identical to all other
-            // system prompt changes (documented caching contract).
+            // User-curated manual notes block (survives rediscover). NOTE: changes to `ws.notes` do
+            // not reach an in-flight session until a compaction rebuilds the prompt — the
+            // documented caching contract.
             if !ws.notes.trim().is_empty() {
                 let notes = truncate_workspace_notes(&ws.notes);
                 let _ = write!(ctx, "\n<user-notes>\n{notes}\n</user-notes>\n");
@@ -938,17 +789,12 @@ impl Session {
         let mut msgs = Vec::with_capacity(7);
         msgs.push(ChatMessage::system(&role_description));
 
-        // Onboarding guide (the admin's Assistant only, while onboarding is
-        // live). One-shot / no-re-onboarding contract: the guide disappears
-        // once state is `Finished`. The greeting kickoff persists `Finished`
-        // BEFORE the pipeline builds the greeting's session (many async hops
-        // vs a single fast config_kv upsert), so the state check alone would
-        // deterministically miss the guide — the kickoff also arms a
-        // process-local pending flag that the admin Assistant
-        // build consumes here (see `GREETING_GUIDE_PENDING`). After that
-        // single consumption nothing re-arms it and the state can only move
-        // `Init` → `Finished`. Audience is global state and admin-only:
-        // guests receive no onboarding and none is planned.
+        // Onboarding guide (the admin's Assistant only, while onboarding is live): it disappears
+        // once the state is `Finished`. The greeting kickoff persists `Finished` BEFORE the
+        // pipeline builds the greeting's session (many async hops against one config_kv upsert), so
+        // the state check alone would miss the guide — the kickoff also arms a process-local flag
+        // that this build consumes once. After that the state can only move `Init` → `Finished`.
+        // Guests receive no onboarding.
         if matches!(role, Role::Assistant) && is_admin {
             let live = crate::config::CONFIG.onboarding_stage()
                 != crate::config::OnboardingState::Finished;
@@ -1007,23 +853,13 @@ impl Session {
         (msgs, snapshot)
     }
 
-    /// Build fresh system prompt + ticket context + user message for the
-    /// current turn.
-    /// Returns messages: [role_description, onboarding_guide?, active_models_opts?,
-    /// workspace_boilerplate, skills?, automations?, personal_files?, workspaces?,
-    /// custom_tools, custom_roles?, board_context?, ticket_block?, user_msg]
-    /// plus the rendered active-models snapshot (Assistant only; `Default` when
-    /// no block injected).
-    ///
-    /// # Caching contract
-    /// The output of this function is intended to be persisted to the session
-    /// DB on the **first** turn (via `batch_append_with_context` in
-    /// [`Self::append_turn_message`]) and loaded from there on subsequent turns.
-    /// This function is NOT called every turn — only on new sessions.
-    ///
-    /// System prompts are cached; user messages carry the timestamp block —
-    /// round-pinned for parallel-round first messages, fresh for everything
-    /// else (see [`crate::session::render_timestamp`]).
+    /// Build the fresh system prompt, ticket context and user message for the current turn: the
+    /// system messages above plus the user message, and the rendered active-models snapshot
+    /// (Assistant only). Caching contract: the output is persisted on the FIRST turn (via
+    /// `batch_append_with_context` in [`Self::append_turn_message`]) and loaded from the DB
+    /// afterwards — this is only called for new sessions. System prompts are cached; user messages
+    /// carry the timestamp block, round-pinned for parallel-round first messages and fresh
+    /// otherwise.
     #[expect(clippy::too_many_arguments)]
     async fn build_turn_messages(
         msg: &str,
@@ -1041,16 +877,12 @@ impl Session {
         (msgs, snapshot)
     }
 
-    // ── Active-models snapshot (Assistant mid-session change detection) ──
-
-    /// Persist the `<active-models-opts>` baseline after the system prompt
-    /// (re)build. Only the model ids actually rendered in the block are
-    /// recorded (fail-open: a section absent from the block means no baseline
-    /// for that model, so a later switch of it never fires a change-info).
-    /// An empty snapshot clears any baseline — used at first turn when no
-    /// block rendered (nothing to compare against). At compaction the caller
-    /// merges in the preserved baseline for sections that did not re-render
-    /// and only calls this when the block (re)rendered.
+    // Persist the `<active-models-opts>` baseline after the system prompt (re)build. Only the model
+    // ids actually rendered are recorded (fail-open: a section absent from the block gets no
+    // baseline, so a later switch of it never fires a change-info). An empty snapshot clears any
+    // baseline — at first turn nothing rendered, so there is nothing to compare against. At
+    // compaction the caller merges in the preserved baseline for sections that did not re-render
+    // and only calls this when it did.
     async fn persist_active_models_snapshot(agent_id: &str, snapshot: &ModelSnapshot) {
         let json =
             (snapshot.image.is_some() || snapshot.video.is_some()).then(|| snapshot.to_json());
@@ -1062,9 +894,8 @@ impl Session {
         }
     }
 
-    /// Extend a freshly rendered snapshot with the preserved baseline for
-    /// sections that did not render (catalog down), so a mid-session switch
-    /// of that model can still surface as a change line.
+    /// Extend a freshly rendered snapshot with the preserved baseline for sections that did not
+    /// render, so a mid-session switch of that model can still surface as a change line.
     async fn merge_active_models_snapshot(
         agent_id: &str,
         rendered: &ModelSnapshot,
@@ -1085,12 +916,10 @@ impl Session {
         }
     }
 
-    /// Detect a mid-session image/video model change against the persisted
-    /// baseline, driven by `user_name`'s per-user model picks. When one
-    /// occurred, returns the message with a change-info block prepended plus
-    /// the new snapshot to persist (the caller persists it only after the
-    /// message is stored); otherwise the message is returned unchanged with no
-    /// snapshot.
+    /// Detect a mid-session image/video model change against the persisted baseline, driven by the
+    /// user's per-user model picks. On a change, returns the message with a change-info block
+    /// prepended plus the snapshot to persist (the caller persists it only after the message is
+    /// stored); otherwise the message unchanged and no snapshot.
     async fn prepend_model_change(
         agent_id: &str,
         msg: &str,
@@ -1105,11 +934,9 @@ impl Session {
         };
         let current = ModelSnapshot::from_user(user_name).await;
 
-        // Advance only the changed model(s) from the persisted baseline — a
-        // model whose section never rendered (partial-block fail-open session)
-        // must not enter the baseline through an unrelated change, or a later
-        // switch of it would fire a change-info for an id never shown to the
-        // LLM.
+        // Advance only the changed model(s): a model whose section never rendered must not enter
+        // the baseline through an unrelated change, or a later switch of it would fire for an id
+        // never shown.
         let mut advanced = previous.clone();
         let mut changed = Vec::new();
         if let (Some(old), Some(new)) = (previous.image.as_deref(), current.image.as_deref())
@@ -1128,10 +955,8 @@ impl Session {
             return (msg.to_string(), None);
         }
 
-        // Both catalog fetches run concurrently under join_all (each
-        // timeout-bounded internally), so a dual image+video switch adds two
-        // concurrent fetches — one bounded wall-clock duration, not two
-        // sequential ones.
+        // Both catalog fetches run concurrently (each internally timeout-bounded), so a dual switch
+        // costs one bounded wall-clock duration, not two sequential ones.
         let blocks = join_all(
             changed
                 .into_iter()
@@ -1139,15 +964,15 @@ impl Session {
         )
         .await;
 
-        // The change-info is the newest authoritative state for the changed
-        // model(s) — the caller refreshes the baseline once the message is
-        // persisted, so the next message does not re-fire the same change.
+        // The change-info is the newest authoritative state for the changed model(s): the caller
+        // refreshes the baseline once the message is persisted, so the next message does not
+        // re-fire it.
         (format!("{}\n\n{msg}", blocks.join("\n")), Some(advanced))
     }
 
-    /// Build a change-info block for one model: "old → new" plus the new
-    /// model's capabilities from the catalog (or its static edit nuances when
-    /// the catalog is unavailable); a change-only line when neither renders.
+    /// Build a change-info block for one model: "old → new" plus the new model's capabilities from
+    /// the catalog (or its static edit nuances when the catalog is unavailable); a change-only line
+    /// otherwise.
     async fn model_change_block(kind: ModelKind, old: &str, new: &str) -> String {
         match crate::tools::active_models::render_section(kind, new).await {
             Some(section) => format!(
@@ -1166,11 +991,9 @@ impl Session {
     }
 }
 
-/// Build a board-state context block for the Manager role.
-///
-/// Fetches all tickets for the workspace, filters out unblocking phases,
-/// and formats them in the same style as the `list_tickets` tool.
-/// Returns `None` for non-Manager roles, or when there are no active tickets.
+/// Build a board-state context block for the Manager role: active tickets for the workspace, in the
+/// same style as the `list_tickets` tool. `None` for other roles or when there are no active
+/// tickets.
 async fn build_board_context(ws: &Workspace, role: &Role) -> Option<String> {
     if !matches!(role, Role::Manager) {
         return None;
@@ -1196,18 +1019,14 @@ async fn build_board_context(ws: &Workspace, role: &Role) -> Option<String> {
     Some(output)
 }
 
-// ── Assistant context blocks (automations + files + workspaces + tools + roles) ──
-
 /// Upper char bound for a workspace's collapsed discovery-summary line.
 const MAX_WORKSPACE_SUMMARY_CHARS: usize = 1000;
 
-/// Fetch the data for the Assistant's context blocks. Fail-open per store:
-/// an uninitialized store (`AUTOMATIONS.get()` / `WORKSPACES.get()` /
-/// `CUSTOM_ROLES.get()` returning `None`) or a read error yields empty data, so
-/// the corresponding block is omitted — same contract as `build_board_context`.
-/// The automation fetch, the workspace fetch, the personal-folder picture walk and
-/// the custom-role listing (the admin's Assistant only) run concurrently, and the
-/// per-workspace general-context reads are batched via `join_all`.
+/// Fetch the data for the Assistant's context blocks. Fail-open per store: an uninitialized store
+/// or a read error yields empty data, so the block is omitted — the same contract as
+/// `build_board_context`. The automation fetch, the workspace fetch, the personal-folder walk and
+/// the custom-role listing run concurrently, and the per-workspace context reads are batched via
+/// `join_all`.
 async fn fetch_assistant_context(
     user_name: &str,
     is_admin: bool,
@@ -1271,21 +1090,18 @@ async fn fetch_assistant_context(
     )
 }
 
-/// Whether the file-derived workspace context for this session carries the
-/// account's personal memory (`MEMORY.md`): only the Assistant of the account
-/// whose personal workspace it is. No other role — in a personal folder or a
-/// managed workspace — and no other account's Assistant receives it; a
-/// `MEMORY.md` sitting in a managed workspace is nobody's continuity record.
+/// Whether the file-derived workspace context carries the account's personal memory (`MEMORY.md`):
+/// only the Assistant of the account whose personal workspace it is. No other role receives it, and
+/// a `MEMORY.md` in a managed workspace is nobody's continuity record.
 fn carries_personal_memory(ws: &Workspace, role: Role, user_name: &str) -> bool {
     matches!(role, Role::Assistant)
         && crate::users::is_valid_personal_user_name(user_name)
         && crate::users::personal_user_name(&ws.name) == Some(user_name)
 }
 
-/// The workspace-frame asset for a role: the admin's Assistant is not confined
-/// to the workspace, so it gets the frame that says so (and names what stays
-/// closed); a guest's Assistant and every pipeline role keep the workspace
-/// frame. `context/workspace.md` carries the rest of the boilerplate either way.
+/// The workspace-frame asset for a role: the admin's Assistant is not confined to the workspace, so
+/// it gets the frame that says so (and names what stays closed); every other role keeps the
+/// workspace frame. `context/workspace.md` carries the rest of the boilerplate either way.
 fn workspace_frame_key(role: Role, is_admin: bool) -> &'static str {
     if matches!(role, Role::Assistant) && is_admin {
         "context/workspace_frame_admin.md"
@@ -1294,17 +1110,12 @@ fn workspace_frame_key(role: Role, is_admin: bool) -> &'static str {
     }
 }
 
-/// Compose the Assistant-only system-prompt blocks from pre-fetched data.
-/// Pure and fail-open: each block is omitted entirely when its content is
-/// empty, the personal-folder picture is supplied pre-rendered (`None` when the
-/// folder shows nothing of the user's or cannot be walked), and the workspace
-/// list and the custom-role listing appear only for the admin's Assistant.
-/// Order: automations → personal files → workspaces → custom tools → custom roles —
-/// the custom-tool block being the one an Assistant always gets, because
-/// [`crate::tools::custom::context_block`] renders the brief "nothing
-/// available" form rather than nothing, while the custom-role block is omitted
-/// entirely when no roles exist. The caller gates on `role == Assistant`
-/// (before fetching).
+/// Compose the Assistant-only system-prompt blocks from pre-fetched data. Pure and fail-open: a
+/// block is omitted when its content is empty, and the workspace list and custom-role listing are
+/// the admin's Assistant's only. Order: automations → personal files → workspaces → custom tools →
+/// custom roles. The custom-tool block always renders (the catalogue has a brief "nothing
+/// available" form); the custom-role block is omitted when no roles exist. The caller gates on
+/// `role == Assistant` before fetching.
 fn assistant_context_blocks(
     is_admin: bool,
     automations: &[Automation],
@@ -1344,8 +1155,8 @@ fn assistant_context_blocks(
     blocks
 }
 
-/// Render one line per automation — same shape as the `list_automations` tool output,
-/// plus the interval for periodic automations. `None` when there are no automations.
+/// Render one line per automation — the `list_automations` shape plus the interval for periodic
+/// ones. `None` when there are no automations.
 fn render_automation_lines(automations: &[Automation]) -> Option<String> {
     if automations.is_empty() {
         return None;
@@ -1370,11 +1181,9 @@ fn render_automation_lines(automations: &[Automation]) -> Option<String> {
     Some(out.trim_end().to_string())
 }
 
-/// Render one entry per managed workspace — name, status (strum Display),
-/// path, plus a one-line collapsed discovery summary when one exists. A
-/// workspace without a summary (Pending/Failed, discovery not run) is still
-/// listed, just without the summary line. Personal rows are filtered upstream
-/// in [`fetch_assistant_context`]. `None` when nothing remains.
+/// Render one entry per managed workspace — name, status, path, plus a one-line collapsed discovery
+/// summary when one exists. A workspace without a summary is still listed. Personal rows are
+/// filtered upstream in [`fetch_assistant_context`]. `None` when nothing remains.
 fn render_workspace_lines(workspaces: &[(Workspace, Option<String>)]) -> Option<String> {
     let mut out = String::new();
     for (ws, summary) in workspaces {
@@ -1393,15 +1202,13 @@ fn render_workspace_lines(workspaces: &[(Workspace, Option<String>)]) -> Option<
     (!out.is_empty()).then(|| out.trim_end().to_string())
 }
 
-/// Upper char bound for a role's collapsed prompt opening. Only the opening is
-/// quoted — the role's full prompt is its own, read at launch time.
+/// Upper char bound for a role's collapsed prompt opening: only the opening is quoted, the full
+/// prompt being read at launch time.
 const MAX_ROLE_EXCERPT_CHARS: usize = 500;
 
-/// Render one entry per custom role: name, behaviour token (the stored one the
-/// role's own listing and creation use) and the administrator's chosen tool set
-/// on the first line, the opening of the role's authored prompt on the second.
-/// `None` when no roles are defined — unlike the custom-tool catalogue, this
-/// block is omitted rather than rendered empty.
+/// Render one entry per custom role: name, behaviour token and the administrator's chosen tool set
+/// on the first line, the opening of the authored prompt on the second. `None` when no roles are
+/// defined — unlike the custom-tool catalogue, this block is omitted rather than rendered empty.
 fn render_custom_role_lines(roles: &[CustomRole]) -> Option<String> {
     if roles.is_empty() {
         return None;
@@ -1424,12 +1231,10 @@ fn render_custom_role_lines(roles: &[CustomRole]) -> Option<String> {
     Some(out.trim_end().to_string())
 }
 
-/// The opening of a role's authored prompt: whitespace (line breaks, headings)
-/// collapsed to single spaces, credential-scrubbed like the other admin-authored
-/// text that enters a prompt, then cut to [`MAX_ROLE_EXCERPT_CHARS`] on a char
-/// boundary (a role's text may be Russian) with an ellipsis when shortened. The
-/// text is the administrator's own — never a model-written summary, never the
-/// rendered launch prompt.
+/// The opening of a role's authored prompt: whitespace collapsed to single spaces,
+/// credential-scrubbed like the other admin-authored text that enters a prompt, then cut to
+/// [`MAX_ROLE_EXCERPT_CHARS`] on a char boundary (a role's text may be Russian) with an ellipsis.
+/// Never a model-written summary, never the rendered launch prompt.
 fn role_prompt_excerpt(prompt: &str) -> String {
     let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     crate::util::truncate(
@@ -1438,14 +1243,11 @@ fn role_prompt_excerpt(prompt: &str) -> String {
     )
 }
 
-/// The session-start `<workspace-structure>` picture for the user's personal folder:
-/// the folder's immediate child folders with the number of files beneath each
-/// plus the files sitting directly in the folder — the same file material the
-/// change report watches (see [`crate::session::personal_changes`]), rendered
-/// without a single path. `None` when the name cannot address a folder, the
-/// folder does not exist yet, it shows nothing of the user's, or it cannot be
-/// walked (fail-open, like the other blocks). The walk runs on the blocking pool
-/// so a large folder never stalls the executor.
+/// The session-start `<workspace-structure>` picture for the user's personal folder: its immediate
+/// child folders with the number of files beneath each plus the files sitting directly in it — the
+/// material the change report watches (see [`crate::session::personal_changes`]), rendered without
+/// a single path. `None` when the name cannot address a folder, the folder does not exist, it shows
+/// nothing of the user's, or it cannot be walked (fail-open). The walk runs on the blocking pool.
 async fn fetch_personal_files(user_name: &str) -> Option<String> {
     if !crate::users::is_valid_personal_user_name(user_name) {
         return None;
@@ -1469,9 +1271,9 @@ async fn lookup_workspace_context(ws: &Workspace, role: &Role) -> Option<String>
 mod tests {
     use super::*;
 
-    /// The persisted automation lines the assistant sees: one statement of the
-    /// timing per call, the tool trigger's arguments verbatim (scrubbing was
-    /// deliberately removed), and the custom-role branch address.
+    /// The persisted automation lines the assistant sees: one statement of the timing per call, the
+    /// tool trigger's arguments verbatim (scrubbing was deliberately removed), and the custom-role
+    /// branch address.
     #[test]
     fn automation_lines_show_trigger_and_interval() {
         let one_shot = Automation {
@@ -1533,8 +1335,8 @@ mod tests {
         assert!(lines.contains("every 3600 seconds"));
         assert!(lines.contains("trigger: weather "));
         assert!(lines.contains("\"city\":\"Minsk\""));
-        // Scrubbing was deliberately removed: a credential-shaped argument
-        // reaches the persisted prompt verbatim.
+        // Scrubbing was deliberately removed: a credential-shaped argument reaches the prompt
+        // verbatim.
         assert!(lines.contains("\"api_key\":\"supersecretvalue123\""));
         assert!(lines.contains("next fire:"));
         assert!(
@@ -1547,22 +1349,19 @@ mod tests {
         assert!(render_automation_lines(&[]).is_none());
     }
 
-    /// Mid-session change detection: switching image AND video models against
-    /// a persisted baseline fires one change-info per model (change-only
-    /// lines — both shared catalog caches are seeded fail-open, so the change
-    /// path performs no network I/O), returns the new snapshot for the caller
-    /// to persist after the message append, and does not re-fire once the
-    /// baseline is advanced. A missing baseline is a no-op.
+    /// Mid-session change detection: switching image AND video models against a persisted baseline
+    /// fires one change-info per model (change-only lines — both catalog caches are seeded
+    /// fail-open, so no network I/O), returns the new snapshot for the caller to persist after the
+    /// message append, and does not re-fire once the baseline is advanced. A missing baseline is a
+    /// no-op.
     #[tokio::test]
     #[serial_test::serial(active_models)]
     async fn prepend_model_change_detects_switch_and_refreshes_baseline() {
         let user = "test_assistant_change_user";
         crate::util::test::init_test_stores().await;
-        // Empty-catalog seeds: both catalog lookups return a fresh (empty)
-        // catalog with no network fetch, so render_section finds no model and
-        // the change path exercises the change-only fallback hermetically.
-        // Unlike a None seed (1-min negative-cache Backoff residue), the
-        // caches stay Fresh — no cross-test coupling.
+        // Empty-catalog seeds: both lookups return a fresh empty catalog with no network fetch, so
+        // the change path exercises the change-only fallback hermetically. Unlike a `None` seed
+        // (negative-cache residue), the caches stay Fresh — no cross-test coupling.
         crate::tools::media_catalog::image::seed_cache(Some(std::sync::Arc::new(
             crate::tools::media_catalog::image::ImageCatalog::default(),
         )));
@@ -1605,8 +1404,8 @@ mod tests {
         assert!(out.ends_with("\n\nhello"));
         let new_snapshot = new_snapshot.expect("snapshot returned for persistence");
 
-        // Baseline refreshed (as the caller does after a successful append) →
-        // the same switches do not re-fire.
+        // Baseline refreshed (as the caller does after a successful append) → the same switches do
+        // not re-fire.
         crate::session::store()
             .set_active_models(agent_id, Some(&new_snapshot.to_json()))
             .await
@@ -1623,9 +1422,9 @@ mod tests {
         assert!(snapshot.is_none());
     }
 
-    /// Partial-block session (one catalog down at start): switching the model
-    /// whose section DID render must not mint a baseline for the never-rendered
-    /// model — a later switch of it stays silent.
+    /// Partial-block session (one catalog down at start): switching the model whose section DID
+    /// render must not mint a baseline for the never-rendered model — a later switch of it stays
+    /// silent.
     #[tokio::test]
     #[serial_test::serial(active_models)]
     async fn prepend_model_change_preserves_absent_sections() {
@@ -1639,8 +1438,7 @@ mod tests {
         )));
         let agent_id = "test_assistant_partial";
 
-        // Session started with only the video section rendered (image catalog
-        // was down at session start) — the image id is NOT in the baseline.
+        // Only the video section rendered at session start — the image id is NOT in the baseline.
         crate::users::store()
             .set_video_model(user, "video-a")
             .await
@@ -1654,9 +1452,7 @@ mod tests {
             .await
             .expect("baseline persisted");
 
-        // Switch the video model → change-info for video; the returned
-        // snapshot advances only video, leaving the absent image baseline
-        // untouched.
+        // Switch the video model → change-info for video; the snapshot advances only video.
         crate::users::store()
             .set_video_model(user, "video-b")
             .await
@@ -1683,9 +1479,9 @@ mod tests {
         assert!(snapshot.is_none());
     }
 
-    /// Compaction merge: a rendered snapshot is extended with the preserved
-    /// baseline for sections that did not re-render (catalog down), so a
-    /// mid-session switch of that model can still surface as a change line.
+    /// Compaction merge: a rendered snapshot is extended with the preserved baseline for sections
+    /// that did not re-render, so a mid-session switch of that model can still surface as a change
+    /// line.
     #[tokio::test]
     async fn merge_active_models_snapshot_preserves_unrendered_sections() {
         crate::util::test::init_test_stores().await;
@@ -1718,8 +1514,6 @@ mod tests {
                 .await;
         assert_eq!(merged, rendered);
     }
-
-    // ── rewrite_last_user_message (input-image-rejection strip durability) ─
 
     #[tokio::test]
     async fn rewrite_last_user_message_persists_then_swaps() {
@@ -1771,9 +1565,8 @@ mod tests {
             .await
             .unwrap();
 
-        // The most recent user message lives in the UNPERSISTED tail
-        // (index 1 >= persisted_len 1): a positional UPDATE would rewrite the
-        // persisted row instead — conservative no-op.
+        // The most recent user message lives in the UNPERSISTED tail (index 1 >= persisted_len 1):
+        // a positional UPDATE would rewrite the persisted row instead — conservative no-op.
         let mut session = Session {
             history: vec![
                 ChatMessage::user("[IMAGE:/tmp/a.png] persisted"),
@@ -1793,7 +1586,7 @@ mod tests {
             "in-memory history untouched"
         );
 
-        // Durable row untouched.
+        // The durable row is untouched.
         let msgs = crate::session::store().load(agent_id).await;
         assert_eq!(msgs[0].content, "[IMAGE:/tmp/a.png] persisted");
     }
@@ -1802,10 +1595,9 @@ mod tests {
     async fn rewrite_last_user_message_persist_failure_leaves_history_untouched() {
         crate::util::test::init_test_stores().await;
         let agent_id = "test_rewrite_persist_fail";
-        // Seed a DIFFERENT agent's row so the sessions table is non-empty:
-        // the positional UPDATE for `agent_id` targets only that agent's last
-        // `user` row — none exists, so the store reports 0 rows affected and
-        // errors.
+        // Seed a DIFFERENT agent's row so the table is non-empty: the positional UPDATE for
+        // `agent_id` targets only that agent's last `user` row — none exists, so the store reports
+        // 0 rows and errors.
         crate::session::store()
             .batch_append(
                 "other_agent",
@@ -1837,9 +1629,8 @@ mod tests {
         );
     }
 
-    // ── Tool-call frame persist / settle ─────────────────────────────
+    // Helper: the assistant frame JSON for an analyze tool call.
 
-    /// Helper: the assistant frame JSON for an analyze tool call.
     fn analyze_frame(call_id: &str) -> String {
         crate::providers::reasoning::assistant_replay_payload(
             Some(""),
@@ -1858,7 +1649,6 @@ mod tests {
     /// all of them; one result present → only the missing one remains.
     #[test]
     fn pending_tool_frame_none_and_dangling_and_partial() {
-        // No frame → None.
         assert!(Session::default().pending_tool_frame().is_none());
 
         // Frame with two calls, no results → both dangling.
@@ -1910,10 +1700,9 @@ mod tests {
         assert!(session.pending_tool_frame().is_none());
     }
 
-    /// (b) `settle_tool_results` inserts the settled result directly after the
-    /// session's dangling tool-call frame, bumps `message_count` by the result
-    /// count, and mirrors the insert in-memory with `persisted_len` ==
-    /// `history.len()`.
+    /// (b) `settle_tool_results` inserts the settled result directly after the dangling frame,
+    /// bumps `message_count` by the result count, and mirrors the insert in memory with
+    /// `persisted_len` == `history.len()`.
     #[tokio::test]
     async fn settle_tool_results_inserts_result_after_frame() {
         crate::util::test::init_test_stores().await;
@@ -1983,7 +1772,7 @@ mod tests {
             .unwrap();
         assert_eq!(count_after - count_before, 1);
 
-        // In-memory history mirrors the insert; persisted prefix covers it.
+        // In-memory history mirrors the insert; the persisted prefix covers it.
         let roles: Vec<crate::ChatRole> = session.history().iter().map(|m| m.role).collect();
         assert_eq!(
             roles,
@@ -2000,12 +1789,10 @@ mod tests {
         assert_eq!(session.persisted_len, session.history().len());
     }
 
-    /// (b2) `settle_tool_results` preserves the frame's tool-call ORDER when a
-    /// partial result set is settled: a frame with calls `call_a`/`call_b`,
-    /// only `call_b`'s row already committed, settles `call_a` — the final DB
-    /// order is frame, tool(call_a), tool(call_b) (the recovered result keeps
-    /// the frame call order; the captured sibling stays in the frame's tool
-    /// block, not displaced by "new results first").
+    /// (b2) `settle_tool_results` preserves the frame's tool-call ORDER when a partial result set
+    /// is settled: with `call_b`'s row already committed, settling `call_a` leaves the DB order
+    /// frame, tool(call_a), tool(call_b) — the recovered result keeps the frame's order and the
+    /// captured sibling stays put.
     #[tokio::test]
     async fn settle_tool_results_preserves_frame_call_order() {
         crate::util::test::init_test_stores().await;
@@ -2051,9 +1838,8 @@ mod tests {
             .await
             .unwrap();
 
-        // DB rows by id: user, assistant(frame), tool(call_a), tool(call_b) —
-        // the recovered result keeps the frame's call order, and the captured
-        // sibling verbatim.
+        // DB rows by id: user, assistant(frame), tool(call_a), tool(call_b) — the frame's call
+        // order, and the captured sibling verbatim.
         let conn = &crate::session::store().conn;
         let rows = conn
             .query(
@@ -2081,14 +1867,12 @@ mod tests {
         assert_eq!(b_payload.content, "result b", "captured sibling verbatim");
     }
 
-    /// Pure gating of the Assistant context blocks: a guest's Assistant gets
-    /// the automations, workspace-structure and custom-tool blocks (the workspace list and
-    /// the custom-role listing are the admin's only); the admin's Assistant gets
-    /// the first three in automations → personal files → workspaces order plus the
-    /// custom-tool block last; empty data omits the conditional blocks, while
-    /// the custom-tool block is always present (its "nothing available" form is
-    /// rendered upstream) and the custom-role block is omitted when no roles
-    /// exist. (Role gating lives at the call site.)
+    /// Pure gating of the Assistant context blocks: a guest's Assistant gets automations,
+    /// workspace-structure and custom tools (the workspace list and custom-role listing are the
+    /// admin's only); the admin's gets automations → personal files → workspaces plus the
+    /// custom-tool block last; empty data omits the conditional blocks while the custom-tool block
+    /// is always present and the custom-role block is omitted when no roles exist. Role gating
+    /// lives at the call site.
     #[test]
     fn assistant_blocks_gating() {
         let automation = Automation {
@@ -2112,8 +1896,7 @@ mod tests {
         let files = Some("- album/ — 2 files\n2 files directly in the folder");
         let custom = "<custom-tools>\n- weather\n</custom-tools>";
 
-        // Guest's Assistant: automations + personal files + custom tools, no
-        // workspace list.
+        // Guest's Assistant: automations + personal files + custom tools, no workspace list.
         let blocks = assistant_context_blocks(
             false,
             std::slice::from_ref(&automation),
@@ -2128,8 +1911,8 @@ mod tests {
         assert!(!blocks[1].contains("<managed-workspaces>"));
         assert_eq!(blocks[2], custom);
 
-        // The admin's Assistant: the workspace list joins them, and the
-        // custom-tool block stays last.
+        // The admin's Assistant: the workspace list joins them, and the custom-tool block stays
+        // last.
         let blocks = assistant_context_blocks(
             true,
             std::slice::from_ref(&automation),
@@ -2151,9 +1934,9 @@ mod tests {
         );
     }
 
-    /// Path-safety guard: blank or synthetic user names (path separators,
-    /// dot segments) never resolve to a workspace — the block is omitted
-    /// instead of picturing the userspaces root or another user's folders.
+    /// Path-safety guard: blank or synthetic user names (path separators, dot segments) never
+    /// resolve to a workspace — the block is omitted instead of picturing the userspaces root or
+    /// another user's folders.
     #[tokio::test]
     async fn personal_files_fetch_rejects_synthetic_names() {
         for name in ["", "  ", ".", "..", "a/b", "a\\b"] {
@@ -2161,9 +1944,8 @@ mod tests {
         }
     }
 
-    /// Through the real session-start path: the block is built from the
-    /// `userspaces/<name>` folder the Assistant is pinned to, and a folder with
-    /// nothing of the user's yields no block at all.
+    /// Through the real session-start path: the block is built from the `userspaces/<name>` folder
+    /// the Assistant is pinned to, and a folder with nothing of the user's yields no block at all.
     #[tokio::test]
     async fn personal_files_fetch_pictures_the_users_own_folder() {
         let folder = crate::users::personal_workspace_path("manager_picture_user");
@@ -2181,9 +1963,8 @@ mod tests {
         assert!(fetch_personal_files("manager_picture_user").await.is_none());
     }
 
-    /// A custom role's system prompt is exactly two parts — the fixed
-    /// folder/system block and the administrator's authorial text verbatim —
-    /// and nothing else, in that order, whatever folder the launch runs in.
+    /// A custom role's system prompt is exactly two parts — the fixed folder/system block and the
+    /// administrator's authorial text verbatim — in that order, whatever folder the launch runs in.
     #[tokio::test]
     async fn custom_role_prompt_is_the_fixed_block_plus_the_authorial_text() {
         let ws = crate::workspace::test_ws_named("/data/proj", "/data/proj");
@@ -2212,15 +1993,12 @@ mod tests {
         assert_eq!(messages[1].content, launch.prompt);
     }
 
-    /// A worker branch's folder is named on every use, so its cached opening
-    /// context block follows the folder it now works in: the turn in folder B
-    /// rebuilds the leading block from B, and the conversation rows after the
-    /// block are left untouched.
-    ///
-    /// The block is measured by the length RECORDED when it was written, not by a
-    /// fresh render of the previous folder: folder A's skills appear on disk
-    /// after the block was cached, so re-rendering A here would slice the
-    /// conversation one message too far and drop its first row.
+    /// A worker branch's folder is named on every use, so its cached opening context block follows
+    /// the folder it now works in: the turn in folder B rebuilds the leading block from B and
+    /// leaves the conversation rows untouched. The block is measured by the length RECORDED when it
+    /// was written, not by a fresh render of the previous folder: A's skills appear on disk after
+    /// the block was cached, so re-rendering A would slice the conversation one message too far and
+    /// drop its first row.
     #[tokio::test]
     async fn worker_branch_context_block_follows_the_folder() {
         // A branch turn: appends one message as the launch's own role.
@@ -2257,9 +2035,8 @@ mod tests {
         }
 
         crate::util::test::init_test_stores().await;
-        // The recorded folder is the session's own address; a real canonical
-        // path (name == path) keeps the recorded name comparable with the folder
-        // the next turn names.
+        // The recorded folder is the session's own address; a real canonical path (name == path)
+        // keeps the recorded name comparable with the folder the next turn names.
         let dir_a = tempfile::TempDir::new().unwrap();
         let dir_b = tempfile::TempDir::new().unwrap();
         let path_a = dir_a
@@ -2296,11 +2073,10 @@ mod tests {
         // Two turns in A: the leading block plus pre-existing conversation rows.
         turn(&mut session, &agent_id, "first", &ws_a).await;
         turn(&mut session, &agent_id, "second", &ws_a).await;
-        // A's live context grows AFTER the block was cached: a skill appears in
-        // the folder, so a fresh render of A now counts one message more than the
-        // block that was really written. The switch below must use the recorded
-        // length — a re-render of the previous folder would slice the
-        // conversation one row too far and drop its first row.
+        // A's live context grows AFTER the block was cached: a skill appears in the folder, so a
+        // fresh render of A now counts one message more than the block really written. The switch
+        // below must use the recorded length — a re-render would slice the conversation one row too
+        // far and drop its first row.
         let skill = dir_a.path().join("skills").join("demo");
         std::fs::create_dir_all(&skill).unwrap();
         std::fs::write(skill.join("SKILL.md"), "# Instructions\nDo something.").unwrap();
@@ -2310,8 +2086,8 @@ mod tests {
             "the previous folder's fresh render must differ from the cached block"
         );
 
-        // A turn in B rebuilds the block; A's path must be gone from the leading
-        // rows, and the earlier conversation rows must survive after the block.
+        // A turn in B rebuilds the block: A's path is gone from the leading rows, and the earlier
+        // conversation rows survive after the block.
         turn(&mut session, &agent_id, "third", &ws_b).await;
 
         let msgs = crate::session::store().load(&agent_id).await;
@@ -2335,11 +2111,10 @@ mod tests {
         );
     }
 
-    /// The personal memory (`MEMORY.md`) is the owning account's
-    /// Assistant-only continuity record: another role in that folder gets none
-    /// of it, another account's Assistant gets none of it, a `MEMORY.md` in a
-    /// managed workspace reaches nobody, and a non-agent model call carries
-    /// none either. Everything else in the context block still renders.
+    /// The personal memory (`MEMORY.md`) is the owning account's Assistant-only continuity record:
+    /// another role in that folder gets none of it, another account's Assistant gets none of it, a
+    /// `MEMORY.md` in a managed workspace reaches nobody, and a non-agent model call carries none
+    /// either.
     #[tokio::test]
     #[serial_test::serial(active_models)] // seeds the process-global catalog caches
     async fn personal_memory_reaches_only_the_owning_assistant() {
@@ -2376,8 +2151,8 @@ mod tests {
         assert!(assistant.contains("--- MEMORY.md ---"));
         assert!(assistant.contains(MEMORY));
 
-        // Every other role in the same folder renders the context without it,
-        // and the rest of the workspace material still renders.
+        // Every other role in the same folder renders without it; the rest of the material still
+        // renders.
         for role in [
             crate::Role::Manager,
             crate::Role::Engineer,
@@ -2404,8 +2179,8 @@ mod tests {
         let stranger = context(&personal, crate::Role::Assistant, "memory_gate_other").await;
         assert!(!stranger.contains(MEMORY));
 
-        // A managed workspace's MEMORY.md is nobody's continuity record, while
-        // its other context files still reach the prompt.
+        // A managed workspace's `MEMORY.md` is nobody's continuity record, while its other context
+        // files still reach the prompt.
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("MEMORY.md"), MEMORY).unwrap();
         std::fs::write(dir.path().join("README.md"), SHARED).unwrap();

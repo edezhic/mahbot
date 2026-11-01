@@ -1,16 +1,12 @@
-//! Which display server a Linux session is talking to, for the parts of the product that
-//! can answer on only one of them.
-//!
-//! It is decided from the display server, not from an environment variable: an X
-//! connection that advertises `XWAYLAND` is XWayland, i.e. a Wayland session, and one
-//! without it is a real X server; `WAYLAND_DISPLAY` decides only a session with no X
-//! connection at all.
+//! Which display server a Linux session talks to. Decided by probing, not by an
+//! environment variable: an X connection advertising `XWAYLAND` is a Wayland
+//! session, one without it is a real X server, and `WAYLAND_DISPLAY` decides
+//! only a session with no X connection at all.
 
 use std::sync::OnceLock;
 
 use crate::util::with_block_in_place;
 
-/// The display server this process is talking to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DisplayServer {
     X11,
@@ -19,9 +15,8 @@ pub(crate) enum DisplayServer {
 
 static DISPLAY_SERVER: OnceLock<DisplayServer> = OnceLock::new();
 
-/// Which server this session is. The answer is kept for the life of the process — a
-/// session does not change server under it — while a probe that could not reach the
-/// server is retried by the next caller.
+/// Cached for the life of the process — a session does not change server under
+/// it — but a probe that could not reach the server is retried by the next caller.
 pub(crate) fn display_server() -> Option<DisplayServer> {
     if let Some(known) = DISPLAY_SERVER.get() {
         return Some(*known);
@@ -31,8 +26,7 @@ pub(crate) fn display_server() -> Option<DisplayServer> {
     Some(probed)
 }
 
-/// Whether this is a Wayland session — the branch every still, coordinate map and input-idle
-/// reading takes.
+/// The branch every still, coordinate map and input-idle reading takes.
 pub(crate) fn wayland() -> bool {
     display_server() == Some(DisplayServer::Wayland)
 }

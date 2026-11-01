@@ -7,15 +7,12 @@ use crate::Tool;
 use async_trait::async_trait;
 use serde_json::json;
 
-/// Tool for generating videos via OpenRouter's async videos API.
-///
-/// Submits a video generation job, polls for completion, downloads the
-/// resulting video file, and returns its path so the agent can send it via
-/// `[VIDEO:path]` in its reply.
+/// Tool for generating videos via OpenRouter's async videos API: submit, poll, download, and
+/// return the path so the agent can send it via `[VIDEO:path]` in its reply.
 pub struct VideoGenTool;
 
-/// Insert an optional value into the request body under `key`, skipping
-/// parameters the caller did not supply.
+/// Insert an optional value into the request body under `key`, skipping parameters the caller
+/// did not supply.
 fn set_opt<T: Into<serde_json::Value>>(body: &mut serde_json::Value, key: &str, value: Option<T>) {
     if let Some(v) = value {
         body[key] = v.into();
@@ -33,9 +30,8 @@ impl Tool for VideoGenTool {
     }
 
     fn preserve_full_output(&self) -> bool {
-        // Result is the marker plus an LLM transcription capped at
-        // 2048 tokens/3-min timeout that can exceed the 5 KB budget —
-        // the Assistant needs the full description to reason about its output.
+        // The result is the marker plus an LLM transcription capped at 2048 tokens/3-min that can
+        // exceed the 5 KB budget: the Assistant needs the full description.
         true
     }
 
@@ -99,12 +95,11 @@ impl Tool for VideoGenTool {
         let generate_audio = super::get_opt_bool(&args, "generate_audio")?;
         let seed = super::get_opt_i64(&args, "seed")?;
 
-        // Build the API base URL (strip /chat/completions if present).
-        // Video generation always targets OpenRouter — a custom
-        // chat endpoint never serves video models.
+        // Build the API base URL (strip /chat/completions if present). Video generation always
+        // targets OpenRouter — a custom chat endpoint never serves video models.
         let api_base = crate::providers::ensure_base_url(crate::config::DEFAULT_PROVIDER_ENDPOINT);
 
-        // ── Build the video generation request body ─────────────────────
+        // Build the video generation request body
         let mut body = json!({
             "model": model,
             "prompt": prompt,
@@ -117,9 +112,8 @@ impl Tool for VideoGenTool {
         set_opt(&mut body, "generate_audio", generate_audio);
         set_opt(&mut body, "seed", seed);
 
-        // Reference-load failures are hard errors — never silently degrade
-        // to text-to-video. `get_str_array` rejects malformed values
-        // (bare string or non-string elements) instead of dropping them.
+        // Reference-load failures are hard errors — never silently degrade to text-to-video.
+        // `get_str_array` rejects malformed values instead of dropping them.
         let images: Vec<String> = super::get_str_array(&args, "images")?;
 
         if images.len() > 1 {
@@ -139,19 +133,15 @@ impl Tool for VideoGenTool {
             body[super::INPUT_REFERENCES_KEY] = super::reference_json(&references);
         }
 
-        // Aggregate body budget: a single reference at the per-image cap
-        // already approaches the ~2 MB client-side body budget (not a
-        // documented OpenRouter number) once base64 + JSON overhead is added,
-        // so verify the serialized body before submitting.
+        // Aggregate body budget: one reference at the per-image cap already approaches the
+        // ~2 MB client-side body budget once base64 + JSON overhead is added.
         super::fit_request_body_budget(&mut body, &mut references, super::MAX_REQUEST_BODY_BYTES)?;
 
         let video_bytes =
             super::fetch_async_video(&api_base, &body, super::VideoJobLabels::GENERATION).await?;
 
-        // Save to the caller's output directory and format the media marker. The
-        // marker stays first; the transcription is appended for the Assistant to
-        // reason about its own output (fail-open: marker-only on transcription
-        // failure).
+        // Save to the caller's output directory and format the media marker. The marker stays
+        // first; the transcription is appended (fail-open: marker-only on failure).
         let output_path = super::save_generated_file(ws, &video_bytes, "video", "mp4").await?;
         let marker = self.format_media_result(&output_path);
         Ok(super::format_video_result(marker, &output_path).await)

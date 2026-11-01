@@ -326,7 +326,7 @@ struct NativeMessage {
     reasoning_details: Option<serde_json::Value>,
 }
 
-// ── Message content types for API serialization ──
+// Message content types for API serialization
 
 /// Parse `[IMAGE:…]` markers from content, returning cleaned text and extracted
 /// native image payloads.
@@ -530,8 +530,7 @@ impl OpenAiCompatibleProvider {
                     (Some(s), _, _) => Some(MessageContent::Text(s.clone())),
                     (None, true, true) => Some(MessageContent::Null),
                     // Backstop: a tool-call-less assistant turn must always
-                    // carry string content — an omitted field 400s on some
-                    // providers.
+                    // carry string content — an omitted field 400s on some providers.
                     (None, _, false) => Some(MessageContent::Text(String::new())),
                     // Tool-call frames keep today's wire shape (null with
                     // reasoning, omitted without).
@@ -576,8 +575,7 @@ fn parse_tool_call_arguments(name: &str, arguments: &str) -> serde_json::Value {
 /// Shared helper to build a [`ProviderToolCall`] from parsed API tool-call data.
 ///
 /// Delegates argument parsing to [`parse_tool_call_arguments`], which handles
-/// JSON parsing with repair fallback, and generates a fallback ID when none is
-/// provided.
+/// JSON parsing with repair fallback, and generates a fallback ID when none is provided.
 #[must_use]
 fn make_provider_tool_call(id: Option<String>, name: String, arguments: &str) -> ProviderToolCall {
     let arguments = parse_tool_call_arguments(&name, arguments);
@@ -781,7 +779,7 @@ impl OpenAiCompatibleProvider {
     }
 }
 
-// ── Model-family reasoning translation for custom endpoints ──
+// Model-family reasoning translation for custom endpoints
 
 /// Reasoning-field outcome for a chat-completions request after
 /// model-family translation.
@@ -851,8 +849,7 @@ fn translate_for_custom_endpoint(model: &str, effort: &str) -> ReasoningFields {
                 // be sent so reasoning is actually enabled/raised. Note:
                 // Tencent silently raises low→high whenever tools are present
                 // (i.e. on all mahbot agent calls), so the one-step-below-max
-                // intent is defeated on the hot path — harmless, still below
-                // max.
+                // intent is defeated on the hot path — harmless, still below max.
                 // gemini 3.7 Flash: xhigh→high, high→medium.
                 (ReasoningFamily::Hy3 | ReasoningFamily::Gemini, "xhigh") => "high",
                 (ReasoningFamily::Hy3, "high") => "low",
@@ -1036,7 +1033,7 @@ impl Provider for OpenAiCompatibleProvider {
         let model = request.model;
         let idle_timeout = crate::retry::DEFAULT_IDLE_TIMEOUT;
 
-        // ── Send — bounded by the idle timeout (TTFB) ──
+        // Send — bounded by the idle timeout (TTFB)
         // A pre-header server stall must not consume an unbounded amount of
         // the retry budget on attempt 1 (burst-shaped recovery needs later
         // attempts), so the header wait is capped by `idle_timeout`.
@@ -1061,14 +1058,14 @@ impl Provider for OpenAiCompatibleProvider {
             Ok(Ok(Ok(resp))) => resp,
         };
 
-        // ── Response metadata (telemetry) ──
+        // Response metadata (telemetry)
         let content_length = response.content_length();
 
         if !response.status().is_success() {
             return Err(scoped_http_error(self, response, idle_timeout).await);
         }
 
-        // ── Read body with idle timeout ──
+        // Read body with idle timeout
         let (body_bytes, read_failure) = match read_body_idle(response, idle_timeout).await {
             BodyReadOutcome::Complete(bytes) => (bytes, None),
             BodyReadOutcome::Failed {
@@ -1132,8 +1129,7 @@ fn scoped_metadata_error(
 /// Build a [`ScopedCallError`] from an HTTP error response (non-2xx).
 ///
 /// Reads the error body with idle-timeout semantics so a stalled error-body
-/// read cannot hang the call, and classifies via the provider error
-/// classifier.
+/// read cannot hang the call, and classifies via the provider error classifier.
 async fn scoped_http_error(
     provider: &OpenAiCompatibleProvider,
     response: reqwest::Response,
@@ -1394,8 +1390,7 @@ mod tests {
                 "low",
                 Omit,
             ),
-            // Older minimax m2.x still matches the family (documented
-            // over-capture).
+            // Older minimax m2.x still matches the family (documented over-capture).
             (
                 "minimax m2.1 (older sibling, family match)",
                 "minimax/minimax-m2.1",
@@ -1738,9 +1733,7 @@ mod tests {
         );
     }
 
-    // ────────────────────────────────────────────────────────────────────
     // Native tool calling tests
-    // ────────────────────────────────────────────────────────────────────
 
     #[test]
     #[expect(clippy::type_complexity)]
@@ -2132,9 +2125,7 @@ mod tests {
         assert!(usage.cost.is_none());
     }
 
-    // ─────────────────────────────────────────────────────────────────────
     // reasoning_content pass-through tests
-    // ─────────────────────────────────────────────────────────────────────
 
     /// What an assistant turn replays: its reasoning (`reasoning_content` as sent,
     /// or synthesized from the details blocks for a tool call), a content field that

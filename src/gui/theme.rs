@@ -12,8 +12,6 @@ use crate::pipeline::board::TicketPhase;
 use iced_fonts::lucide;
 use std::sync::atomic::AtomicBool;
 
-// ── Flexoki dark palette ─────────────────────────────────────────
-
 pub const BG_BASE: Color = Color::from_rgb(0.063, 0.059, 0.059); // #100f0f
 pub const BG_SURFACE: Color = Color::from_rgb(0.110, 0.106, 0.102); // #1c1b1a
 pub const BG_ELEVATED: Color = Color::from_rgb(0.157, 0.153, 0.149); // #282726
@@ -30,13 +28,9 @@ pub const ACCENT: Color = Color::from_rgb(0.227, 0.663, 0.624); // #3aa99f
 pub const ACCENT_LIGHT: Color = Color::from_rgb(0.357, 0.749, 0.710); // #5bbfb5
 pub const ACCENT_DIM: Color = Color::from_rgba(0.227, 0.663, 0.624, 0.3);
 
-// ── Find match highlight colors (Flexoki amber) ──────────────────
-//
-// Non-current matches: amber/gold at low alpha (background tint).
-// Current match: same amber at higher alpha for prominence.
-// Both are visually distinct from ACCENT_DIM (teal) used for selection.
-//
-// Flexoki amber: #D0A215 = rgb(0.816, 0.635, 0.082)
+// Find match highlights (Flexoki amber #D0A215): the current match at higher alpha for
+// prominence, the others at low alpha as a background tint. Both are distinct from the
+// ACCENT_DIM teal used for selection.
 pub const FIND_MATCH_DIM: Color = Color::from_rgba(0.816, 0.635, 0.082, 0.25);
 pub const FIND_MATCH_CURRENT: Color = Color::from_rgba(0.816, 0.635, 0.082, 0.45);
 
@@ -46,13 +40,9 @@ pub const BRACKET_MATCH: Color = Color::from_rgba(0.357, 0.749, 0.710, 0.35);
 pub const HOVER: Color = Color::from_rgba(0.808, 0.804, 0.765, 0.05);
 pub const HOVER_STRONG: Color = Color::from_rgba(0.808, 0.804, 0.765, 0.08);
 
-// ── Status colors ─────────────────────────────────────────────────
-
 pub const STATUS_SUCCESS: Color = Color::from_rgb(0.0, 0.902, 0.541); // #00e68a
 pub const STATUS_WARNING: Color = Color::from_rgb(1.0, 0.667, 0.0); // #ffaa00
 pub const STATUS_ERROR: Color = Color::from_rgb(1.0, 0.267, 0.4); // #ff4466
-
-// ── Diff widget tints (derived from STATUS_* palette) ─────────────
 
 pub const DIFF_ADDED_TINT: Color =
     Color::from_rgba(STATUS_SUCCESS.r, STATUS_SUCCESS.g, STATUS_SUCCESS.b, 0.10);
@@ -60,8 +50,6 @@ pub const DIFF_REMOVED_TINT: Color =
     Color::from_rgba(STATUS_ERROR.r, STATUS_ERROR.g, STATUS_ERROR.b, 0.10);
 pub const DIFF_FILE_HEADER_BG: Color =
     Color::from_rgba(STATUS_WARNING.r, STATUS_WARNING.g, STATUS_WARNING.b, 0.06);
-
-// ── Log level colors ──────────────────────────────────────────────
 
 #[must_use]
 pub fn log_level_color(level: &str) -> (Color, Color) {
@@ -81,30 +69,20 @@ pub fn log_level_color(level: &str) -> (Color, Color) {
     }
 }
 
-// ── Role badge colors ────────────────────────────────────────────
+// Role badge colors
 
-/// Translucent pill background for a badge foreground color: the foreground
-/// at 0.1 alpha. Single source of the badge-background math — the second
-/// member of every [`role_badge_color_for`] / [`role_badge_color`] tuple is
-/// `badge_bg(fg)` (including the unknown-role fallback), as is the background
-/// member of [`workspace_status_color`]. Consumers (role pill, logs span,
-/// workspace status pill) use that member directly, so rendering cannot
-/// drift from this alpha.
+/// Role badge colors from [`crate::agent::role::role_info()`] — the single source of truth, so
+/// a role the palette does not name cannot silently fall through to black.
 const fn badge_bg(fg: Color) -> Color {
     Color::from_rgba(fg.r, fg.g, fg.b, 0.1)
 }
 
-/// Returns the badge (foreground, background) color for a given [`crate::Role`].
+/// The badge (foreground, background) color for a role name.
 ///
-/// Reads from [`crate::agent::role::role_info()`] and converts the RGB tuple to
-/// [`iced::Color`] — this avoids duplicating color data in an exhaustive match.
-/// Adding a new [`crate::Role`] variant requires updating the `role_info()`
-/// match (`badge_fg` field); the compiler will not catch a missing field here
-/// (it defaults from `BASE_ROLE_INFO`), but the `role_info_sentinels_are_all_set` test in
-/// `role.rs` guards against silent black fallthrough.
-///
-/// The background member is always the foreground at 0.1 alpha ([`badge_bg`]);
-/// consumers that render the pill background use it directly.
+/// Accepts canonical names, derivative names carrying a trailing `_<digits>` suffix (stripped by
+/// [`crate::channels::reply::strip_agent_role_suffix`], the same rule the reply author label
+/// uses) and the joint-comment stage roles, including the retired stages' labels historical
+/// comments still carry. Unknown strings — LLM API roles included — fall back to a muted grey.
 #[must_use]
 #[allow(clippy::trivially_copy_pass_by_ref)]
 pub const fn role_badge_color_for(role: &crate::Role) -> (Color, Color) {
@@ -116,50 +94,34 @@ pub const fn role_badge_color_for(role: &crate::Role) -> (Color, Color) {
 
 /// Returns the badge (foreground, background) color for a role name string.
 ///
-/// Accepts canonical names (e.g. `"analyst"`), derivative names carrying a
-/// trailing `_<digits>` suffix (e.g. `"analyst_1"`, `"analyst_2"`; a bare
-/// trailing `_` strips too) and the joint-comment stage roles
-/// ("Analysis"/"Verification", plus the retired stages' "Review"/"QA" labels
-/// historical comments still carry — the comment role is the stage name, per
-/// the joint-verdict pipeline). The suffix is stripped by
-/// [`crate::channels::reply::strip_agent_role_suffix`], the same rule the reply
-/// author label uses, so a derivative name renders and labels as its base
-/// role. Unknown strings (including LLM API roles like `"user"`, `"assistant"`,
-/// `"system"`, `"tool"`) fall back to a muted grey.
+/// Accepts canonical names, derivative names with a trailing `_<digits>` suffix, and the
+/// joint-comment stage roles ("Analysis"/"Verification", plus the retired stages' labels that
+/// historical comments carry). The suffix is stripped by
+/// [`crate::channels::reply::strip_agent_role_suffix`], so a derivative name renders as its base
+/// role; unknown strings — LLM API roles included — fall back to a muted grey.
 ///
-/// The background member is always the foreground at 0.1 alpha ([`badge_bg`]) —
-/// including the fallback, so consuming the second member directly (role pill,
-/// logs span) renders the same alpha-scaled background for unknown roles as
-/// for canonical ones.
-///
-/// Delegates to [`role_badge_color_for`] after resolving the string, which
-/// reads colors from [`crate::agent::role::role_info()`] as the single source of truth.
+/// The background member is always the foreground at 0.1 alpha ([`badge_bg`]), the fallback
+/// included, so consumers can use the second member directly.
 #[must_use]
 pub fn role_badge_color(role: &str) -> (Color, Color) {
-    // Stage-name comment roles, resolved through the shared inverse mapping so
-    // the badge cannot drift from verdict::stage_role.
+    // Stage-name comment roles, resolved through the shared inverse mapping so the badge cannot
+    // drift from verdict::stage_role.
     if let Some(r) = crate::pipeline::verdict::stage_role(role) {
         return role_badge_color_for(&r);
     }
 
-    // One path for canonical and derivative names: the shared suffix rule
-    // returns its input unchanged when there is no numeric suffix.
+    // One path for canonical and derivative names: the shared suffix rule returns its input
+    // unchanged when there is no numeric suffix.
     if let Ok(r) = crate::channels::reply::strip_agent_role_suffix(role).parse::<crate::Role>() {
         return role_badge_color_for(&r);
     }
 
-    // The background member must stay `badge_bg(fg)` (not an independent
-    // constant): consumers render it directly, so this preserves the
-    // pre-consolidation rendering for unknown roles.
+    // The background member must stay `badge_bg(fg)`: consumers render it directly.
     (TEXT_MUTED, badge_bg(TEXT_MUTED))
 }
 
-// ── Role icon mapping (shared between sidebar and workspaces) ──────
-
-/// Returns the Lucide icon widget for a given agent role.
-///
-/// Callers apply `.size()`, `.color()`, and `.into()` to style the icon
-/// for their specific context.
+/// Returns the Lucide icon widget for a given agent role; callers apply `.size()`, `.color()`
+/// and `.into()` to style it.
 #[must_use]
 #[allow(clippy::trivially_copy_pass_by_ref)]
 pub fn role_icon(role: &crate::Role) -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
@@ -178,36 +140,25 @@ pub fn role_icon(role: &crate::Role) -> iced::widget::Text<'static, iced::Theme,
     }
 }
 
-/// Returns the Lucide icon widget for the workspace GENERAL context
-/// (the discovery-produced summary for non-role LLM calls, shown in the
-/// Settings → Workspaces row).
+/// Returns the Lucide icon widget for the workspace GENERAL context (the discovery-produced
+/// summary for non-role LLM calls).
 #[must_use]
 pub fn general_context_icon() -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
     lucide::book_open_text()
 }
 
-/// Returns the Lucide icon widget for the diagnostics pipeline role
-/// (a plain `"diagnostics"` string, not a [`crate::Role`] variant).
+/// Returns the Lucide icon widget for the diagnostics pipeline role.
 #[must_use]
 pub fn diagnostics_icon() -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
     lucide::stethoscope()
 }
 
-/// Returns the chat-style role icon and its badge foreground color for a
-/// ticket-comment author label, or `None` when the label must render as
-/// plain muted text.
-///
-/// Only the exact author values the pipeline writes today resolve to an
-/// icon: the joint-verdict stage names (resolved via the shared
-/// [`crate::pipeline::verdict::stage_role`] inverse mapping, which also carries
-/// the retired stages' labels that historical comments keep), the canonical
-/// agent names "engineer"/"manager"/"sanitation"/"assistant", and "diagnostics"
-/// (stethoscope, [`TEXT_PRIMARY`] tint). Legacy or unexpected values (e.g. old
-/// suffixed labels like "analyst_1", "system", "user:{name}") intentionally
-/// return `None`.
-///
-/// Delegates to [`role_badge_color_for`] for the foreground color, and to
-/// [`role_icon`] for the glyph.
+/// The chat-style role icon and its badge foreground color for a ticket-comment author label, or
+/// `None` when the label must render as plain muted text.
+/// Only the exact author values the pipeline writes today resolve: the joint-verdict stage names
+/// (via [`crate::pipeline::verdict::stage_role`], which also carries the retired stages' labels),
+/// the canonical agent names and "diagnostics". Legacy or unexpected values intentionally return
+/// `None`.
 #[must_use]
 pub fn comment_author_icon(
     author: &str,
@@ -233,8 +184,7 @@ pub fn comment_author_icon(
     }
 }
 
-/// Dashboard default font (JetBrains Mono). Registered via `.default_font()`
-/// in `main.rs`; fonts embedded via `.font()` calls there.
+/// Dashboard default font (JetBrains Mono), registered via `.default_font()` in `main.rs`.
 pub const JETBRAINS_MONO: iced::Font = iced::Font {
     family: iced::font::Family::Name("JetBrains Mono"),
     weight: iced::font::Weight::Normal,
@@ -242,14 +192,12 @@ pub const JETBRAINS_MONO: iced::Font = iced::Font {
     style: iced::font::Style::Normal,
 };
 
-/// Bold weight variant of JetBrains Mono (the dashboard default font).
 pub const FONT_BOLD: iced::Font = iced::Font {
     family: iced::font::Family::Name("JetBrains Mono"),
     weight: iced::font::Weight::Bold,
     ..iced::Font::DEFAULT
 };
 
-/// Regular weight variant of JetBrains Mono.
 pub const FONT_REGULAR: iced::Font = JETBRAINS_MONO;
 
 /// Italic variant of JetBrains Mono (narration text).
@@ -259,12 +207,9 @@ pub const FONT_ITALIC: iced::Font = iced::Font {
     ..iced::Font::DEFAULT
 };
 
-// ── Typography scale (px) ────────────────────────────────────────
-// f32 is the only type iced 0.14 accepts for both `Into<Pixels>`
-// (.size/.spacing) and `Into<Padding>` (.padding), so the whole scale is f32.
-// Deliberately shared beyond body text: lucide/role icons and the
-// editor/diff buffer font (font_metrics) sit on the same rungs, so a
-// change here moves those too.
+// f32 is the only type iced 0.14 accepts for both `Into<Pixels>` and `Into<Padding>`, so the
+// whole scale is f32. Deliberately shared beyond body text: icons and the editor/diff buffer font
+// sit on the same rungs, so a change here moves those too.
 pub const TEXT_10: f32 = 10.0;
 pub const TEXT_11: f32 = 11.0;
 pub const TEXT_12: f32 = 12.0;
@@ -273,12 +218,9 @@ pub const TEXT_14: f32 = 14.0;
 pub const TEXT_16: f32 = 16.0;
 pub const TEXT_24: f32 = 24.0;
 
-/// Glyph scale of the chat input panel. Every icon the panel draws — the
-/// action toolbar (send, attach, voice), the recording dot, the reply
-/// preview's dismiss control and the attachment chips — takes its size through
-/// [`composer_icon`], so one knob enlarges them all by the same factor and
-/// they keep their relative sizes. Text, padding, spacing and alignment stay
-/// on the shared rungs; only the panel's glyphs move.
+/// Glyph scale of the chat input panel: every icon it draws takes its size through
+/// [`composer_icon`], so one knob enlarges them all by the same factor. Text, padding, spacing
+/// and alignment stay on the shared rungs.
 pub const COMPOSER_ICON_SCALE: f32 = 1.25;
 
 /// `size` at [`COMPOSER_ICON_SCALE`] — the composer's copy of a `TEXT_*` rung.
@@ -287,7 +229,6 @@ pub const fn composer_icon(size: f32) -> f32 {
     size * COMPOSER_ICON_SCALE
 }
 
-// ── De-facto 2px spacing grid (px) ───────────────────────────────
 pub const SPACE_1: f32 = 1.0;
 pub const SPACE_2: f32 = 2.0;
 pub const SPACE_3: f32 = 3.0;
@@ -315,16 +256,12 @@ pub const PAD_24: f32 = 24.0;
 /// Page-level base-container padding (the de-facto 24px inset shared by every page).
 pub const PAGE_PADDING: f32 = PAD_24;
 
-/// Body text size (px) of the transcript markdown renderer
-/// (`markdown_settings`). The sessions-page collapse measurement measures
-/// body elements at this size (narration at [`NARRATION_TEXT_SIZE`]), so a
-/// theme font-size change cannot silently drift the measured wrap count away
-/// from the actual render.
+/// Body text size (px) of the transcript markdown renderer. The sessions-page collapse
+/// measurement measures body elements at this size, so a font-size change cannot silently drift
+/// the measured wrap count from the actual render.
 pub const MARKDOWN_TEXT_SIZE: f32 = TEXT_13;
 
-/// Narration text size (px) — the italic narration line on Running Agents
-/// cards and the narration body on the Sessions transcript. The
-/// sessions-page collapse measurement measures narration at this size.
+/// Narration text size (px) — the italic line on Running Agents cards and on the transcript.
 pub const NARRATION_TEXT_SIZE: f32 = TEXT_14;
 
 /// Markdown rendering settings consistent with the Flexoki dark theme.
@@ -333,16 +270,14 @@ pub fn markdown_settings() -> iced::widget::markdown::Settings {
     markdown_settings_with(FONT_REGULAR, MARKDOWN_TEXT_SIZE)
 }
 
-/// Markdown rendering settings for narration bodies: italic face at
-/// [`NARRATION_TEXT_SIZE`].
+/// Markdown rendering settings for narration bodies: italic face at [`NARRATION_TEXT_SIZE`].
 #[must_use]
 pub fn narration_markdown_settings() -> iced::widget::markdown::Settings {
     markdown_settings_with(FONT_ITALIC, NARRATION_TEXT_SIZE)
 }
 
-/// Markdown rendering settings with an explicit body face and text size.
-/// Fenced code blocks always stay in the regular face (never italic) while
-/// the body and inline code take the passed `font`.
+/// Markdown rendering settings with an explicit body face and size. Fenced code blocks always
+/// stay in the regular face while body and inline code take `font`.
 #[must_use]
 fn markdown_settings_with(font: iced::Font, text_size: f32) -> iced::widget::markdown::Settings {
     let style = iced::widget::markdown::Style {
@@ -360,12 +295,10 @@ fn markdown_settings_with(font: iced::Font, text_size: f32) -> iced::widget::mar
     iced::widget::markdown::Settings::with_text_size(text_size, style)
 }
 
-// ── Ticket phase colors ───────────────────────────────────────────
 // All TicketPhase variants exhaustively matched — no catch-all.
 
-/// Returns a `(foreground, background)` tuple — the badge-pill convention
-/// shared with `widgets::badge_pill`. The first member is the readable text
-/// color and the second the darker pill background.
+/// Returns a `(foreground, background)` tuple — the badge-pill convention shared with
+/// `widgets::badge_pill`.
 #[must_use]
 pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
     use TicketPhase::{
@@ -422,20 +355,11 @@ pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
     }
 }
 
-// ── Ticket priority chip colors (Flexoki muted palette) ──────────
-//
-// Priority uses the same muted-tone approach as phase badges:
-// lighter, readable text on darker backgrounds (a dark theme).
-//
-// P0 (urgent):     red     — failed-like
-// P1 (high):       orange  — in-development-like
-// P2 (medium):     yellow  — in-diagnostics-like
-// P3 (low):        green   — qa-passed-like
-// P4+ (lowest):    green   — done-like
+// Priority uses the same muted-tone approach as phase badges: lighter readable text on darker
+// backgrounds. P0 red (failed-like), P1 orange, P2 yellow, P3/P4+ green (passed/done-like).
 
-/// Returns a `(foreground, background)` tuple — the badge-pill convention
-/// shared with `widgets::badge_pill`. The first member is the readable text
-/// color and the second the darker pill background.
+/// Returns a `(foreground, background)` tuple — the badge-pill convention shared with
+/// `widgets::badge_pill`.
 #[must_use]
 pub fn ticket_priority_color(priority: i64) -> (Color, Color) {
     match priority {
@@ -465,11 +389,9 @@ pub fn ticket_priority_color(priority: i64) -> (Color, Color) {
 /// One-shot guard to log timestamp parse failure only once.
 static TIMESTAMP_PARSE_WARNED: AtomicBool = AtomicBool::new(false);
 
-/// Format an ISO 8601 timestamp string into a human-readable absolute form in
-/// the machine's local timezone. Output style: "Jun 5, 21:54" — no
-/// microseconds, no raw timezone suffixes. Storage stays UTC; only the
-/// displayed wall-clock is converted from the parsed instant to local.
-/// If parsing fails, returns the first 16 characters as a fallback.
+/// Format an ISO 8601 timestamp into a human-readable absolute form in local time ("Jun 5,
+/// 21:54"). Storage stays UTC; only the displayed wall-clock is converted. On parse failure the
+/// first 16 characters are returned.
 #[must_use]
 pub fn format_timestamp(ts: &str) -> String {
     if let Ok(dt) = crate::db::parse_utc_timestamp(ts) {
@@ -484,11 +406,8 @@ pub fn format_timestamp(ts: &str) -> String {
     }
 }
 
-/// Render the local-time HH:MM:SS portion of an ISO 8601 timestamp, or the
-/// full string when shorter than 20 chars. Char-boundary safe (mirrors
-/// `format_timestamp`'s hardening). On parse failure the raw `ts[11..19]`
-/// slice (or the whole string when short) is kept unchanged, so malformed
-/// inputs degrade to their stored (UTC) wall-clock rather than being dropped.
+/// The local-time HH:MM:SS portion of an ISO 8601 timestamp. Char-boundary safe; on parse
+/// failure the raw slice is kept, so malformed inputs degrade to their stored wall-clock.
 pub fn format_hhmmss(ts: &str) -> String {
     if let Ok(dt) = crate::db::parse_utc_timestamp(ts) {
         dt.with_timezone(&chrono::Local)
@@ -501,12 +420,9 @@ pub fn format_hhmmss(ts: &str) -> String {
     }
 }
 
-/// Render a relative timestamp label for a chat message, computed against
-/// the supplied local `now`. Today's messages render as local HH:MM,
-/// yesterday as "yesterday", and older messages as "X days ago" (calendar-day
-/// difference). Future timestamps / clock skew (negative day difference) are
-/// treated as today and render as HH:MM; invalid timestamps render as an
-/// empty string.
+/// A relative timestamp label for a chat message against the supplied local `now`: today as
+/// HH:MM, yesterday as "yesterday", older as "X days ago". Clock skew is treated as today and an
+/// invalid timestamp renders as an empty string.
 #[must_use]
 pub fn format_relative_time(ts: &str, now: chrono::DateTime<chrono::Local>) -> String {
     let Ok(dt) = crate::db::parse_utc_timestamp(ts) else {
@@ -523,19 +439,15 @@ pub fn format_relative_time(ts: &str, now: chrono::DateTime<chrono::Local>) -> S
     }
 }
 
-/// Compact session-length format: raw below 1,000 ("500"), one decimal in the
-/// k-range ("12.3k" for 12300), one decimal at/above one million ("1.2M") —
-/// sessions routinely exceed 200K tokens with context windows up to 1M.
-/// Values that would round up past a unit boundary are rendered in the next
-/// unit (999_999 → "1.0M", never "1000.0k"). Shared by the Running Agents
-/// card and the Sessions page session cards.
+/// Compact session-length format: raw below 1,000, one decimal in the k-range, one decimal
+/// at/above one million. Values that would round up past a unit boundary render in the next unit
+/// (999_999 → "1.0M").
 #[expect(clippy::cast_precision_loss)] // token counts are far below f64's 2^53 exact range
 pub(crate) fn format_compact_tokens(tokens: u64) -> String {
     if tokens < 1_000 {
         tokens.to_string()
     } else if tokens < 999_950 {
-        // k-range stops below values that would round to "1000.0k"
-        // (999_950 / 1000 = 999.95).
+        // k-range stops below values that would round to "1000.0k".
         format!("{:.1}k", tokens as f64 / 1_000.0)
     } else if tokens < 999_950_000 {
         format!("{:.1}M", tokens as f64 / 1_000_000.0)
@@ -543,8 +455,6 @@ pub(crate) fn format_compact_tokens(tokens: u64) -> String {
         format!("{:.1}G", tokens as f64 / 1_000_000_000.0)
     }
 }
-
-// ── Workspace status colors ───────────────────────────────────────
 
 #[must_use]
 pub fn workspace_status_color(status: WorkspaceStatus) -> (Color, Color) {
@@ -568,61 +478,40 @@ pub fn workspace_status_color(status: WorkspaceStatus) -> (Color, Color) {
     }
 }
 
-// ── Animation timing constants ────────────────────────────────────
-
 /// Log entry fade‑in duration (ms).
 pub const ANIM_LOG_FADE_MS: u64 = 100;
 
-// ── Shared scrollbar helpers ─────────────────────────────────────
-
-/// Returns a [`scrollable::Scrollbar`] with thin 6px dimensions for
-/// both the rail and scroller widths. Used across all scrollable
-/// widgets in the dashboard for a consistent appearance.
+/// A [`scrollable::Scrollbar`] with thin 6px dimensions, used by every scrollable widget for a
+/// consistent appearance.
 #[must_use]
 pub fn thin_scrollbar() -> scrollable::Scrollbar {
     scrollable::Scrollbar::new().width(6).scroller_width(6)
 }
 
-/// Returns a vertical [`scrollable::Direction`] with the thin scrollbar.
-///
-/// Convenience wrapper around [`thin_scrollbar`] — prefer this over
-/// spelling out `scrollable::Direction::Vertical(theme::thin_scrollbar())`
-/// at every call site.
+/// A vertical [`scrollable::Direction`] with the thin scrollbar — prefer this over spelling out
+/// `scrollable::Direction::Vertical(theme::thin_scrollbar())` at every call site.
 #[must_use]
 pub fn vertical_scrollbar() -> scrollable::Direction {
     scrollable::Direction::Vertical(thin_scrollbar())
 }
 
-/// Returns a vertical [`scrollable::Direction`] that scrolls without drawing a
-/// scrollbar — for a container too narrow to spend its edge on a rail, where the
-/// bar would be painted over the content itself.
+/// A vertical [`scrollable::Direction`] that scrolls without drawing a scrollbar — for a
+/// container too narrow to spend its edge on a rail.
 #[must_use]
 pub fn hidden_vertical_scrollbar() -> scrollable::Direction {
     scrollable::Direction::Vertical(scrollable::Scrollbar::hidden())
 }
 
-/// Returns a horizontal [`scrollable::Direction`] with the thin scrollbar,
-/// embedded (zero spacing) so the rail occupies layout space at the bottom of
-/// the scrollable — iced reserves it only while the content overflows, so a
-/// strip that fits carries no rail band under it.
-///
-/// Convenience wrapper around [`thin_scrollbar`] — prefer this over
-/// spelling out `scrollable::Direction::Horizontal(...)` at every call site.
+/// A horizontal [`scrollable::Direction`] with the thin scrollbar, embedded (zero spacing) so
+/// the rail occupies layout space: iced reserves it only while the content overflows.
 #[must_use]
 pub fn horizontal_scrollbar() -> scrollable::Direction {
     scrollable::Direction::Horizontal(thin_scrollbar().spacing(0.0))
 }
 
-/// Standard scrollbar style for the dark Flexoki theme.
-///
-/// Uses [`TEXT_PRIMARY`] as the scroller base color, varying opacity:
-/// * Active: 0.4
-/// * Hovered: 0.6
-/// * Dragged: 0.8
-///
-/// The rail background is transparent, both rail and scroller borders
-/// are rounded (2px radius). Other fields (`container`, `gap`,
-/// `auto_scroll`) are inherited from [`scrollable::default`].
+/// Standard scrollbar style for the dark Flexoki theme: [`TEXT_PRIMARY`] as the scroller base,
+/// at 0.4 active, 0.6 hovered and 0.8 dragged. The rail is transparent and both borders are
+/// rounded at 2px.
 #[must_use]
 pub fn scrollbar_style(theme: &iced::Theme, status: scrollable::Status) -> scrollable::Style {
     let base = scrollable::default(theme, status);
@@ -649,10 +538,7 @@ pub fn scrollbar_style(theme: &iced::Theme, status: scrollable::Status) -> scrol
     }
 }
 
-// ── Button theme helpers ──────────────────────────────────────────
-
-/// Transparent button with no background. Useful for icon-only buttons
-/// embedded in bars, toolbars, and tab close buttons.
+/// Transparent button with no background, for icon-only buttons embedded in bars and toolbars.
 #[must_use]
 pub fn button_transparent(
     _: &iced::Theme,
@@ -664,9 +550,8 @@ pub fn button_transparent(
     }
 }
 
-/// Transparent-background button style with a hover/press highlight. Shared
-/// factory for the composer's icon controls and dropdown menu items — the two
-/// differ only in highlight colors and corner radius.
+/// Transparent-background button style with a hover/press highlight — the shared factory for the
+/// composer's icon controls and dropdown menu items.
 #[must_use = "button style factory returns a style closure"]
 fn transparent_button_style(
     hover: Color,
@@ -696,9 +581,8 @@ fn transparent_button_style(
     }
 }
 
-/// Icon-only button with a subtle hover/press background (the composer's icon
-/// controls and its send button). Pass `disabled: true` to suppress the
-/// highlight (used for the greyed send button on empty input).
+/// Icon-only button with a subtle hover/press background. `disabled: true` suppresses the
+/// highlight.
 #[must_use = "button style factory returns a style closure"]
 pub fn icon_button_style(
     disabled: bool,
@@ -706,16 +590,14 @@ pub fn icon_button_style(
     transparent_button_style(HOVER_STRONG, ACCENT_DIM, 6.0, disabled)
 }
 
-/// Label color for editor/shell tab bars: [`ACCENT`] on the active tab,
-/// [`TEXT_SECONDARY`] on the inactive ones — readable at a glance while the
-/// active tab still stands out by hue and by its [`BG_ELEVATED`] background.
+/// Label color for editor/shell tab bars: [`ACCENT`] on the active tab, [`TEXT_SECONDARY`] on
+/// the others.
 #[must_use]
 pub fn tab_label_color(is_active: bool) -> Color {
     if is_active { ACCENT } else { TEXT_SECONDARY }
 }
 
-/// Tab-button style for editor/shell tab bars: active tabs use [`BG_ELEVATED`],
-/// hovered [`HOVER`], otherwise [`BG_SURFACE`], with a zero-radius border.
+/// Tab-button style: active tabs use [`BG_ELEVATED`], hovered [`HOVER`], otherwise [`BG_SURFACE`].
 pub fn tab_button_style(
     is_active: bool,
 ) -> impl Fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style {
@@ -795,8 +677,7 @@ pub fn button_secondary(
     }
 }
 
-/// Shared text-button factory: hover/pressed background plus an enabled
-/// text color that differs between the normal and danger variants.
+/// Shared text-button factory: hover/pressed background plus the enabled text color.
 fn button_text_style(
     status: iced::widget::button::Status,
     enabled_color: Color,
@@ -822,8 +703,7 @@ fn button_text_style(
     }
 }
 
-/// Text-only danger button (Cancel in modals, delete triggers). Like [`button_text`]
-/// but with red text. No colored background, subtle hover highlight, red text only.
+/// Text-only danger button (Cancel in modals, delete triggers).
 #[must_use]
 pub fn button_text_danger(
     _theme: &iced::Theme,
@@ -857,11 +737,8 @@ pub fn pick_list_style(_theme: &iced::Theme, _status: pick_list::Status) -> pick
     }
 }
 
-/// Flexoki-dark themed style for the expanded menu of [`fn@pick_list`] widgets,
-/// matching the ContextMenu overlay look (BG_ELEVATED fill, radius-4
-/// hairline border, TEXT_SECONDARY items highlighted to TEXT_PRIMARY on hover,
-/// no shadow). The menu's internal overflow scrollbar is styled by iced's
-/// default scrollable catalog and is not reachable through this API.
+/// Flexoki-dark style for the expanded menu of a [`fn@pick_list`], matching the ContextMenu
+/// overlay look. The menu's internal overflow scrollbar is styled by iced's default catalog.
 #[must_use]
 pub fn pick_list_menu_style(_theme: &iced::Theme) -> iced::overlay::menu::Style {
     iced::overlay::menu::Style {
@@ -937,11 +814,8 @@ pub fn checkbox_style(_theme: &iced::Theme, status: checkbox::Status) -> checkbo
     }
 }
 
-// ── Container styles ─────────────────────────────────────────────
-
-/// Shared container style factory: background fill plus border parameters.
-/// Public wrappers below delegate here so the variants stay in one place.
-/// Callers with a one-off combination may use this directly.
+/// Shared container style factory: background fill plus border parameters. The wrappers below
+/// delegate here so the variants stay in one place.
 pub(crate) fn container_style(
     bg: Color,
     radius: f32,
@@ -959,22 +833,15 @@ pub(crate) fn container_style(
     }
 }
 
-/// Style for tooltip containers: elevated background with subtle rounded
-/// corners and a hairline border, matching the `dialog_container_style`
-/// convention used for modal dialogs.
-///
-/// Applying this via `.style(theme::tooltip_style)` gives every tooltip a
-/// dark/neutral fill that stays readable regardless of what content is
-/// underneath it.
+/// Style for tooltip containers: elevated background with subtle rounded corners and a hairline
+/// border, so a tooltip stays readable whatever is underneath it.
 #[must_use]
 pub fn tooltip_style(_theme: &iced::Theme) -> container::Style {
     container_style(BG_ELEVATED, 6.0, 1.0, BORDER_STRONG)
 }
 
-/// Style for a control drawn over arbitrary content (the composer's
-/// picture-tile remove cross): a dark translucent scrim under the glyph, dark
-/// enough to keep a light glyph legible on a bright picture and still distinct
-/// on a dark one.
+/// Style for a control drawn over arbitrary content (the picture-tile remove cross): a dark
+/// translucent scrim under the glyph, legible on a bright picture and distinct on a dark one.
 #[must_use]
 pub fn scrim_style(_theme: &iced::Theme) -> container::Style {
     container_style(
@@ -985,12 +852,8 @@ pub fn scrim_style(_theme: &iced::Theme) -> container::Style {
     )
 }
 
-/// Style for chat message bubbles and the typing indicator.
-///
-/// Shared padding/radius/border across all bubbles.  Background is
-/// parameterized (user vs agent messages); `text_color` is optional —
-/// message bubbles set it to `TEXT_PRIMARY`, while the typing indicator
-/// leaves it inherited (the inner `text()` widget sets its own color).
+/// Style for chat message bubbles and the typing indicator: shared padding/radius/border, with
+/// the background parameterized and `text_color` optional.
 pub fn bubble_style(
     bg: Color,
     text_color: Option<Color>,
@@ -1007,52 +870,43 @@ pub fn bubble_style(
     }
 }
 
-/// Style for bar containers (find/replace bar, go-to-line bar).
-/// Flat elevated background with zero-radius border.
+/// Style for bar containers (find/replace, go-to-line): flat elevated background, no radius.
 #[must_use]
 pub fn container_bar(_theme: &iced::Theme) -> container::Style {
     container_style(BG_ELEVATED, 0.0, 0.0, Color::TRANSPARENT)
 }
 
-/// Style for surface cards: surface background with a 1px border and
-/// 4px rounded corners. Used for ticket detail sections, comment cards,
-/// log entries, and session transcript messages.
+/// Style for surface cards: 1px border, 4px corners — ticket sections, comment cards, log rows.
 #[must_use]
 pub fn surface_card_style(_theme: &iced::Theme) -> container::Style {
     container_style(BG_SURFACE, 4.0, 1.0, BORDER)
 }
 
-/// Style for elevated cards: elevated background with a 1px border and
-/// 4px rounded corners. Used for ticket board cards and session round cards.
+/// Style for elevated cards: 1px border, 4px corners — board cards and session round cards.
 #[must_use]
 pub fn elevated_card_style(_theme: &iced::Theme) -> container::Style {
     container_style(BG_ELEVATED, 4.0, 1.0, BORDER)
 }
 
-/// Style for modal dialog containers: elevated background, 8px rounded
-/// corners, and a strong border.
+/// Style for modal dialog containers: elevated background, 8px corners, a strong border.
 #[must_use]
 pub fn dialog_container_style(_theme: &iced::Theme) -> container::Style {
     container_style(BG_ELEVATED, 8.0, 1.0, BORDER_STRONG)
 }
 
-/// Style for the base page background: just the BG_BASE fill with no border.
-/// Used as the outermost container on most pages (home, sessions, logs).
+/// Style for the base page background: the BG_BASE fill with no border.
 #[must_use]
 pub fn base_container_style(_theme: &iced::Theme) -> container::Style {
     container_style(BG_BASE, 0.0, 0.0, Color::TRANSPARENT)
 }
 
-/// Style for surface-only containers: surface background with no border.
-/// Used for sidebar panels, tab bars, and filter bars.
+/// Style for surface-only containers with no border — sidebar panels, tab bars, filter bars.
 #[must_use]
 pub fn surface_container_style(_theme: &iced::Theme) -> container::Style {
     container_style(BG_SURFACE, 0.0, 0.0, Color::TRANSPARENT)
 }
 
-/// Style for badge pills: a rounded container with the given background and
-/// no border (canonical 4px radius). Used for log level tags, tool badges and
-/// workspace status pills.
+/// Style for badge pills: a rounded container with the given background and no border.
 pub fn pill_style(bg: Color) -> impl Fn(&iced::Theme) -> container::Style {
     move |_theme: &iced::Theme| container_style(bg, 4.0, 0.0, Color::TRANSPARENT)
 }
@@ -1103,10 +957,8 @@ mod tests {
     /// Compact counts stay raw below 1k and carry one decimal at every k/M/G edge.
     #[test]
     fn compact_token_format_edges() {
-        // Raw below 1,000; one decimal in the k-range; one decimal at/above
-        // 1M (sessions routinely exceed 200K with context windows up to 1M).
-        // Values rounding up past a unit boundary render in the next unit.
-        // (case label, token count, expected label)
+        // Raw below 1,000; one decimal in the k-range and at/above 1M. Values rounding up past
+        // a unit boundary render in the next unit.
         let cases: &[(&str, u64, &str)] = &[
             ("zero", 0, "0"),
             ("hundreds", 500, "500"),
@@ -1131,7 +983,8 @@ mod tests {
         }
     }
 
-    /// Locks every pre-consolidation style value so parameterization cannot silently change rendering.
+    /// Locks every pre-consolidation style value so parameterization cannot silently change
+    /// rendering.
     #[expect(clippy::too_many_lines)] // exhaustive style-lock fixture
     #[test]
     fn style_factory_values_unchanged() {
@@ -1314,9 +1167,8 @@ mod tests {
 
     #[test]
     fn joint_comment_stage_roles_get_their_role_colors() {
-        // The joint-verdict pipeline writes comments with the STAGE NAME as the
-        // comment role ("Analysis"/"Verification"/"Review"/"QA") — they must
-        // render with the corresponding role color, not the muted-grey fallback.
+        // The pipeline writes comments with the STAGE NAME as the comment role, and they must
+        // render with the role color rather than the muted-grey fallback.
         assert_eq!(
             role_badge_color("Analysis"),
             role_badge_color_for(&crate::Role::Analyst)
@@ -1335,7 +1187,8 @@ mod tests {
         );
     }
 
-    /// The badge tuple's background member must always be the foreground at 0.1 alpha ([`badge_bg`]).
+    /// The badge tuple's background member must always be the foreground at 0.1 alpha
+    /// ([`badge_bg`]).
     #[test]
     fn badge_background_is_alpha_scaled_foreground() {
         for role in Role::iter() {

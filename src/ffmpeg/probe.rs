@@ -1,19 +1,17 @@
 //! The one `ffprobe` document the product reads.
 //!
-//! Kept free of process handling and of the module's error type, so every rule
-//! here is a pure function of the JSON `ffprobe` prints — which is what the tests
-//! feed it, verbatim from the tool.
+//! Kept free of process handling and of the module's error type, so every rule here is a pure
+//! function of the JSON `ffprobe` prints — which is what the tests feed it, verbatim.
 
 use std::time::Duration;
 
 use super::ClipInfo;
 
-/// The facts [`ClipInfo`] needs from one `-print_format json` document, or `None`
-/// when it describes no usable stream and no duration.
+/// The facts [`ClipInfo`] needs from one `-print_format json` document, or `None` when it
+/// describes no usable stream and no duration.
 ///
-/// A corrupt or foreign file makes `ffprobe` print an empty object — sometimes
-/// with a zero exit status — so an empty answer is what "cannot be decoded" looks
-/// like here; the exit status carries no more.
+/// A corrupt or foreign file makes `ffprobe` print an empty object — sometimes with a zero exit
+/// status — so an empty answer is what "cannot be decoded" looks like here.
 pub(super) fn parse(json: &[u8]) -> Option<ClipInfo> {
     let document: serde_json::Value = serde_json::from_slice(json).ok()?;
     let no_streams = Vec::new();
@@ -25,8 +23,7 @@ pub(super) fn parse(json: &[u8]) -> Option<ClipInfo> {
     for stream in streams {
         match stream["codec_type"].as_str() {
             Some("audio") => has_audio = true,
-            // Cover art rides in a video stream of its own; it is not the file's
-            // video, and a track with a cover must not read as a video file.
+            // Cover art rides in a video stream of its own; it is not the file's video.
             Some("video") if stream["disposition"]["attached_pic"].as_u64() != Some(1) => {
                 if dimensions.is_none()
                     && let (Some(width), Some(height)) =
@@ -59,16 +56,14 @@ fn side(value: &serde_json::Value) -> Option<u32> {
     u32::try_from(value.as_u64()?).ok().filter(|side| *side > 0)
 }
 
-/// A JSON duration in seconds. `ffprobe` prints it as a string, and as the literal
-/// `N/A` where a container does not carry one.
+/// A JSON duration in seconds. `ffprobe` prints it as a string, and as the literal `N/A`.
 fn seconds(value: Option<&str>) -> Option<f64> {
     let seconds: f64 = value?.parse().ok()?;
     (seconds.is_finite() && seconds >= 0.0).then_some(seconds)
 }
 
-/// The rotation a container asks of its video stream, in degrees. The display
-/// matrix's own number is what current builds print; older ones only carry the
-/// `rotate` tag.
+/// The rotation a container asks of its video stream, in degrees. The display matrix wins over
+/// the older `rotate` tag.
 fn rotation(stream: &serde_json::Value) -> i64 {
     let from_matrix = stream["side_data_list"]
         .as_array()
@@ -101,8 +96,7 @@ fn upright(width: u32, height: u32, rotation: i64) -> (u32, u32) {
 mod tests {
     use super::*;
 
-    /// The shape `ffprobe` prints for an ordinary phone clip: one video stream and
-    /// one audio stream, the duration on the container.
+    /// The shape `ffprobe` prints for an ordinary phone clip: one video stream and one audio.
     const CLIP: &str = r#"{
         "streams": [
             {"index": 0, "codec_type": "video", "width": 1280, "height": 720,
@@ -120,8 +114,7 @@ mod tests {
         assert_eq!(info.dimensions, Some((1280, 720)));
         assert!(info.has_audio);
 
-        // An audio file with embedded artwork: the picture rides in a video stream
-        // of its own and must not read as the file's video.
+        // An audio file with embedded artwork: the picture rides in a video stream.
         let cover = r#"{
             "streams": [
                 {"codec_type": "audio", "duration": "2.000000",
@@ -165,15 +158,13 @@ mod tests {
 
     #[test]
     fn what_ffprobe_cannot_name_is_undecodable() {
-        // A corrupt or foreign file: `ffprobe` prints an empty object, sometimes
-        // with a zero exit status.
+        // A corrupt or foreign file: `ffprobe` prints an empty object, sometimes with a zero
+        // status.
         assert_eq!(parse(b"{\n\n}"), None);
         assert_eq!(parse(b""), None);
         assert_eq!(parse(b"not json at all"), None);
-        // No audio, no video, nothing to work with.
         assert_eq!(parse(br#"{"format": {"duration": "2.0"}}"#), None);
-        // A duration a `Duration` cannot hold: crafted media must not take the
-        // parse down with it.
+        // A duration a `Duration` cannot hold: crafted media must not take the parse down.
         let absurd = br#"{"streams": [{"codec_type": "video", "width": 2, "height": 2}],
                           "format": {"duration": "1e30"}}"#;
         assert_eq!(parse(absurd), None, "a duration no Duration holds");
@@ -181,8 +172,7 @@ mod tests {
 
     #[test]
     fn the_duration_falls_back_to_the_longest_stream() {
-        // A container that declares no duration of its own — the audio is all it
-        // can be timed by. `N/A` is what `ffprobe` prints where nothing exists.
+        // A container that declares no duration of its own — the audio is all it has.
         let document = br#"{
             "streams": [
                 {"codec_type": "audio", "duration": "3.500000"},

@@ -1,7 +1,5 @@
 //! Git subprocess wrappers — run git commands and parse porcelain/numstat output.
-//!
-//! Provides `run_git_*` async functions that operate on a repository path
-//! and return results. For diff output parsing, see [`crate::git::diff_parse`].
+//! Diff output parsing lives in [`crate::git::diff_parse`].
 
 use anyhow::Context;
 use std::collections::HashMap;
@@ -20,44 +18,31 @@ use crate::util::unquote_c_style;
 /// Result of a successful `git commit` — the full hash and line stats.
 #[derive(Debug, Clone)]
 pub struct CommitInfo {
-    /// Full 40-character commit SHA from `git rev-parse HEAD`.
+    /// Full 40-character SHA from `git rev-parse HEAD`.
     pub hash: String,
-    /// Total lines added across all changed files.
     pub lines_added: i64,
-    /// Total lines removed across all changed files.
     pub lines_removed: i64,
 }
 
 impl CommitInfo {
-    /// Return the first 7 characters of the commit hash, or the full hash
-    /// if it's shorter than 7 characters.
+    /// First 7 characters of the hash, or the whole hash if it is shorter.
     #[must_use]
     pub fn short_hash(&self) -> &str {
         self.hash.get(..7).unwrap_or(&self.hash)
     }
 }
 
-/// Maximum size (1 MiB) for reading untracked files in [`run_git_worktree_snapshot`]
-/// and the diff page's untracked-file display.
-///
-/// Larger untracked files are surfaced via [`DiffStats::huge_binary_file_count`]
-/// in the footer rather than line-counted; the diff page still shows a
-/// placeholder instead of reading them.
+/// Maximum size (1 MiB) for reading untracked files. Larger ones are surfaced via
+/// [`DiffStats::huge_binary_file_count`] and shown as a placeholder, never line-counted.
 pub(crate) const MAX_UNTRACKED_SIZE: u64 = 1024 * 1024;
 
-/// Cap on the total number of untracked files classified (line-counted or
-/// oversized/binary-detected) per [`run_git_worktree_snapshot`] refresh.
-/// Files beyond the cap are counted in [`DiffStats::omitted_file_count`].
+/// Cap on untracked files classified per snapshot refresh; the rest land in
+/// [`DiffStats::omitted_file_count`].
 const MAX_UNTRACKED_FILES_COUNTED: usize = 500;
-/// Cap on the total bytes read from untracked files per
-/// [`run_git_worktree_snapshot`] refresh.
+/// Cap on bytes read from untracked files per snapshot refresh.
 const MAX_UNTRACKED_BYTES_READ: u64 = 10 * 1024 * 1024;
 
 /// Classification of an untracked file read for diff display / line counting.
-///
-/// Ordering is load-bearing: size is checked from metadata before reading,
-/// then null-byte detection, then UTF-8 validity. Unreadable paths are skipped
-/// entirely — only `TooLarge` and `Binary` produce GUI placeholders.
 pub(crate) enum UntrackedFileRead {
     Text(String),
     TooLarge(u64),
@@ -65,10 +50,9 @@ pub(crate) enum UntrackedFileRead {
     Skip,
 }
 
-/// Classify an in-memory untracked-file buffer whose size already passed the
-/// [`MAX_UNTRACKED_SIZE`] gate. Returns `None` for binary (a null byte, or
-/// invalid UTF-8 without a null byte), or the UTF-8 text otherwise. The binary
-/// rule lives here so the snapshot and the diff window cannot disagree about it.
+/// Classify an in-memory buffer whose size already passed the [`MAX_UNTRACKED_SIZE`]
+/// gate; `None` means binary (a null byte, or invalid UTF-8). The rule lives here so the
+/// snapshot and the diff window cannot disagree about it.
 fn classify_untracked_content(content: Vec<u8>) -> Option<String> {
     if content.contains(&0) {
         return None;
@@ -76,9 +60,8 @@ fn classify_untracked_content(content: Vec<u8>) -> Option<String> {
     String::from_utf8(content).ok()
 }
 
-/// Read and classify an untracked file whose metadata the caller already holds.
-/// [`read_untracked_file`] fetches it; the snapshot passes the one it already
-/// read for its byte budget, so neither stats twice.
+/// Read and classify an untracked file whose metadata the caller already holds, so
+/// neither this nor the snapshot's byte budget stats the file twice.
 async fn read_untracked_file_with_meta(path: &Path, meta: &std::fs::Metadata) -> UntrackedFileRead {
     if !meta.is_file() {
         return UntrackedFileRead::Skip;
@@ -94,10 +77,8 @@ async fn read_untracked_file_with_meta(path: &Path, meta: &std::fs::Metadata) ->
     classify_untracked_content(content).map_or(UntrackedFileRead::Binary, UntrackedFileRead::Text)
 }
 
-/// Read and classify one untracked file for the diff window: fetch its
-/// metadata, then delegate to [`read_untracked_file_with_meta`] — the shared
-/// regular-file, size-gate, read and classification core that the snapshot's
-/// line counting also uses.
+/// Read and classify one untracked file for the diff window: fetch its metadata, then
+/// delegate to the shared [`read_untracked_file_with_meta`] core.
 pub(crate) async fn read_untracked_file(path: &Path) -> UntrackedFileRead {
     let Ok(meta) = tokio::fs::metadata(path).await else {
         return UntrackedFileRead::Skip;
@@ -105,28 +86,22 @@ pub(crate) async fn read_untracked_file(path: &Path) -> UntrackedFileRead {
     read_untracked_file_with_meta(path, &meta).await
 }
 
-/// Whether to discard changes in a single file or an entire directory tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscardTarget {
     File,
-    /// Recursively discard all changes within a directory (and its subdirectories).
+    /// Recursively, including subdirectories.
     Directory,
 }
 
-/// Check if a directory contains a `.git` entry (file for worktrees, directory otherwise).
+/// Whether the directory holds a `.git` entry (a file for worktrees, a directory otherwise).
 #[must_use]
 pub fn is_git_repo(path: &Path) -> bool {
     path.join(".git").exists()
 }
 
-/// Run `git show -m <hash> --no-color --find-renames --format=` — the diff a
-/// historical commit introduced.
-///
-/// `-m` splits merge commits into per-parent diffs, producing standard unified
-/// diff blocks that `parse_git_diff` can handle. This may produce duplicate file
-/// paths in the tree sidebar (one `diff --git` block per parent), which is
-/// expected — each parent comparison is a different diff. `--format=`
-/// suppresses the commit log header.
+/// Run `git show -m <hash> --no-color --find-renames --format=` — the diff a historical
+/// commit introduced. `-m` splits merges into per-parent diffs, so the same path may
+/// appear once per parent in the tree; that is expected. `--format=` drops the log header.
 pub(crate) async fn run_git_show_diff(repo_path: &Path, hash: &str) -> anyhow::Result<String> {
     run_git_command(
         repo_path,
@@ -142,11 +117,9 @@ pub(crate) async fn run_git_show_diff(repo_path: &Path, hash: &str) -> anyhow::R
     .await
 }
 
-/// Run `git diff <base> --no-color --find-renames` against the working tree.
-///
-/// `base` is `HEAD`, or this repository's empty tree on an unborn HEAD (see
-/// [`run_git_empty_tree`]). `--find-renames` is explicit so rename detection
-/// matches [`run_git_worktree_numstat`] regardless of repository config.
+/// Run `git diff <base> --no-color --find-renames` against the working tree, where `base` is `HEAD`
+/// or this repository's empty tree on an unborn HEAD. `--find-renames` is explicit so rename
+/// detection matches [`run_git_worktree_numstat`] regardless of repository config.
 pub(crate) async fn run_git_worktree_diff(
     repo_path: &Path,
     unborn_head: bool,
@@ -159,27 +132,7 @@ pub(crate) async fn run_git_worktree_diff(
     run_git_command(repo_path, &["diff", &base, "--no-color", "--find-renames"]).await
 }
 
-/// Run `git status --porcelain --untracked-files=normal` and return the output.
-///
-/// The untracked mode is pinned because it is otherwise the owner's
-/// `status.showUntrackedFiles` (global config is still read; only
-/// `safe.directory` is injected). With it set to `no`, this reader — the
-/// sanitation clean-tree check and its file listing, and the reviewed-base dirty
-/// guard — would call a tree whose only changes are untracked files clean, and
-/// sanitation would move the ticket to Done without committing its new files.
-/// `normal` is git's own mode when `-u` is absent, so a default configuration
-/// sees no change, and it keeps the dirty checks cheap. Git's promise that the
-/// porcelain format is unchanged across Git versions and regardless of user
-/// configuration is about the format, not about which files are selected, so the
-/// flag is not redundant.
-///
-/// The plain, newline-delimited form is deliberate: the same output feeds the
-/// sanitation file listing and [`has_unstaged_changes`], whose byte-level
-/// worktree column test must keep counting an entry whose path does not parse.
-/// Under `-z` the whole status is one NUL-delimited stream — a single "line" to
-/// that test, which would then read only the first record and could report a
-/// dirty tree as clean. Quoting and the ` -> ` delimiter the parsers handle are
-/// the price of that gate.
+/// Run `git status --porcelain --untracked-files=normal`.
 pub async fn run_git_status(repo_path: &Path) -> anyhow::Result<String> {
     run_git_command(
         repo_path,
@@ -188,16 +141,11 @@ pub async fn run_git_status(repo_path: &Path) -> anyhow::Result<String> {
     .await
 }
 
-/// Run `git status --porcelain --untracked-files=all`.
-///
-/// `-uall` lists individual files inside untracked directories instead of the
-/// collapsed `dir/` entry, so one status reading names every untracked file the
-/// footer counts and the diff window displays. Paths are repo-root-relative.
-///
-/// This is the snapshot's one unbounded read: git walks every untracked
-/// directory, and every returned path is kept. The complete file set is the
-/// contract — a collapsed directory cannot be expanded without losing files —
-/// while the per-file content reads are capped by the `MAX_UNTRACKED_*` limits.
+/// Run `git status --porcelain --untracked-files=all`: `-uall` names individual files inside
+/// untracked directories (repo-root-relative) rather than collapsing them to `dir/`, so one reading
+/// names every file the footer counts and the diff window shows. It is the snapshot's one unbounded
+/// read — a collapsed entry cannot be expanded later — while content reads stay capped by
+/// `MAX_UNTRACKED_*`.
 async fn run_git_status_all(repo_path: &Path) -> anyhow::Result<String> {
     run_git_command(
         repo_path,
@@ -206,14 +154,9 @@ async fn run_git_status_all(repo_path: &Path) -> anyhow::Result<String> {
     .await
 }
 
-/// Run `git show HEAD:<path>` (when `commit_ref` is `None`)
-/// or `git show <commit_ref>:<path>` (when `Some`) and return the file content.
-///
-/// Returns `None` if the file does not exist at that ref (new/untracked files,
-/// or root-commit `~1` which has no parent), or if any git error occurs.
-///
-/// **`~1` parent refs**: The caller constructs the parent hash. To get the parent
-/// version, pass `commit_ref = Some(&format!("{hash}~1"))`.
+/// Run `git show HEAD:<path>` or, when `commit_ref` is `Some`, `git show <ref>:<path>`.
+/// `None` means the file is absent at that ref (new/untracked, or `~1` of a root commit)
+/// or git failed. Callers build the parent ref themselves: `format!("{hash}~1")`.
 pub async fn run_git_show(
     repo_path: &Path,
     file_path: &str,
@@ -227,20 +170,12 @@ pub async fn run_git_show(
     run_git_command(repo_path, &["show", &show_arg]).await.ok()
 }
 
-/// Resolve the repository top-level directory (the `.git`-containing ancestor).
-///
-/// `repo_path` may be the repo root or a subdirectory of it. Walks upward to
-/// the first ancestor that contains a `.git` entry — a directory for normal
-/// repos, or a *file* for linked worktrees/submodules, hence [`is_git_repo`]
-/// (which uses `exists()`, not `is_dir()`).
-///
-/// Deliberately does NOT use `git rev-parse --show-toplevel`: repo discovery
-/// itself runs the dubious-ownership check this exists to satisfy, so it would
-/// recurse into the same failure (circular). Canonicalizes the resolved path
-/// where possible so the value matches git's own realpath-normalized discovery,
-/// and drops the Windows verbatim prefix for the same reason — the value is
-/// handed to git ([`inject_safe_directory`]) and must be spelled the way git
-/// spells it, not the way `std::fs::canonicalize` does on Windows.
+/// Resolve the repository top-level (the `.git`-containing ancestor of `repo_path`, which may
+/// itself be a subdirectory). [`is_git_repo`] uses `exists()` because `.git` is a directory for
+/// normal repos and a *file* for linked worktrees/submodules. Deliberately not `git rev-parse
+/// --show-toplevel`: discovery runs the dubious-ownership check this exists to satisfy, so it would
+/// recurse into the same failure. The result is canonicalized and has the Windows verbatim prefix
+/// dropped, because git receives it and must see its own spelling.
 pub(crate) fn resolve_git_top_level(repo_path: &Path) -> Option<PathBuf> {
     let dir = repo_path.ancestors().find(|dir| is_git_repo(dir))?;
     Some(crate::util::strip_verbatim_prefix(
@@ -248,14 +183,10 @@ pub(crate) fn resolve_git_top_level(repo_path: &Path) -> Option<PathBuf> {
     ))
 }
 
-/// Inject the repo top-level into git's per-process config as `safe.directory`.
-///
-/// Uses the process-scoped `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/
-/// `GIT_CONFIG_VALUE_0` env form — never writes the user's global gitconfig and
-/// never uses `*` (which would fully opt out of the CVE ownership guard). The
-/// value is scoped to the single resolved repo top-level. On git < 2.38 the env
-/// form is silently ignored by git, which is acceptable for the supported
-/// target as long as the repo is owned by the running user.
+/// Inject the repo top-level into git's per-process config as `safe.directory` via the
+/// `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` env form: it never writes the user's
+/// global gitconfig and never uses `*` (which would opt out of the CVE ownership guard). Git < 2.38
+/// silently ignores the env form — acceptable while the repo is owned by the running user.
 fn inject_safe_directory(cmd: &mut std::process::Command, repo_path: &Path) {
     let Some(top_level) = resolve_git_top_level(repo_path) else {
         return;
@@ -265,28 +196,18 @@ fn inject_safe_directory(cmd: &mut std::process::Command, repo_path: &Path) {
     cmd.env("GIT_CONFIG_VALUE_0", top_level.as_path());
 }
 
-/// Create a [`std::process::Command`] for `git` with the product's own internal
-/// environment — the shared setup of every git subprocess in this module.
+/// Create a `git` [`std::process::Command`] with the product's internal environment — the
+/// shared setup of every git subprocess here. The environment is cleared and re-populated
+/// with the reduced set of [`internal_env_pairs`] to prevent credential leakage (CWE-200),
+/// plus `LC_ALL=C` for consistent locale behavior. [`git_command`] wraps this for async
+/// callers; [`tracked_paths`] runs it directly mid directory-walk.
 ///
-/// The subprocess environment is cleared and re-populated with the reduced
-/// variable set the product uses for its own work (see [`internal_env_pairs`])
-/// to prevent credential leakage (CWE-200). `LC_ALL=C` is set for consistent
-/// locale behavior across all git invocations. [`git_command`] wraps this for
-/// async callers; [`tracked_paths`] runs it directly because it answers in the
-/// middle of a blocking directory walk.
-///
-/// `repo_root` is the workspace/`current_dir` path for repo-bound invocations;
-/// when present, the resolved repo top-level is injected as `safe.directory`
-/// (see [`inject_safe_directory`]) so git works on repos owned by a different
-/// UID. Pass `None` for repo-agnostic invocations (e.g. [`git_is_installed`]),
-/// which must not receive a repo-path value.
-///
-/// Callers should add further configuration (args, current_dir, stdio, etc.)
-/// and then spawn or execute the command.
+/// `repo_root` is the workspace/`current_dir` for repo-bound invocations, and its resolved
+/// top-level is injected as `safe.directory` (see [`inject_safe_directory`]) so git works on
+/// repos owned by another UID. Pass `None` for repo-agnostic calls (e.g. [`git_is_installed`]).
 fn git_std_command(repo_root: Option<&Path>) -> std::process::Command {
-    // `program_command` applies the pairs it names `git` under. No directory is
-    // passed: the internal list is absolute, so the `current_dir` callers set
-    // afterwards cannot change which program it resolves to.
+    // `program_command` applies the pairs it names `git` under. No directory is passed:
+    // the internal list is absolute, so a later `current_dir` cannot change the program.
     let mut cmd = program_command("git", &internal_env_pairs(), None);
     cmd.env("LC_ALL", "C");
     if let Some(path) = repo_root {
@@ -295,29 +216,25 @@ fn git_std_command(repo_root: Option<&Path>) -> std::process::Command {
     cmd
 }
 
-/// Create a [`tokio::process::Command`] for `git` — the async form of
-/// [`git_std_command`], and the only entry point for production async git
+/// Async form of [`git_std_command`] and the only entry point for production async git
 /// subprocess creation in this module.
 fn git_command(repo_root: Option<&Path>) -> tokio::process::Command {
     git_std_command(repo_root).into()
 }
 
-/// Every UTF-8 path `repo`'s index holds, repository-relative and `/`-separated as
-/// git spells them — git's own answer to "is this path tracked?", which no ignore
-/// rule overrides. An entry whose name is not UTF-8 is left out, as a walked path
-/// that is not UTF-8 never reaches the snapshot either.
+/// Every UTF-8 path `repo`'s index holds, repository-relative and `/`-separated — git's own answer
+/// to "is this path tracked?", which no ignore rule overrides. Non-UTF-8 entries are left out, as
+/// such a walked path never reaches the snapshot either.
 ///
-/// `None` when git cannot answer: not installed, not a repository, an unreadable
-/// index, or a failed run. A caller reads that as "git cannot say", never as an
-/// error — the paths the rules would hide then stay visible. Synchronous on purpose
-/// — its only caller asks the question in the middle of a directory walk on the
-/// blocking pool — and `GIT_OPTIONAL_LOCKS=0` keeps the read from taking the index
-/// lock, so the inspected repository is left untouched.
+/// `None` when git cannot answer (not installed, not a repo, unreadable index, failed run); callers
+/// read that as "git cannot say", so paths the rules would hide stay visible. Synchronous on
+/// purpose — its only caller asks mid directory-walk — and `GIT_OPTIONAL_LOCKS=0` keeps the read
+/// from locking the index.
 pub(crate) fn tracked_paths(repo: &Path) -> Option<Vec<String>> {
     let mut cmd = git_std_command(Some(repo));
     cmd.current_dir(repo)
-        // `core.fsmonitor` would run a command this repository's own config
-        // names; a passive read of the index never needs that.
+        // `core.fsmonitor` would run a command this repository's own config names; a
+        // passive read of the index never needs that.
         .args(["-c", "core.fsmonitor=false", "ls-files", "-z", "--cached"])
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
@@ -337,23 +254,8 @@ pub(crate) fn tracked_paths(repo: &Path) -> Option<Vec<String>> {
     )
 }
 
-/// Run a git command without any interpretation of the exit code.
-///
-/// Returns the raw [`std::process::Output`] so each caller can interpret the
-/// exit status as appropriate; [`run_git_command_env`] is the checked-output
-/// sibling.
-///
-/// **The product's own internal environment**: The subprocess environment is
-/// cleared and re-populated with the reduced variable set the product uses for
-/// its own work (see [`internal_env_pairs`] for details). This prevents leaking
-/// API keys and other secrets into child processes (CWE-200), but it also means
-/// variables like `SSH_AUTH_SOCK` and `GIT_SSH_COMMAND` are **not**
-/// inherited. That is git's own containment and nothing else's: an agent's
-/// shell command is handed the owner's environment (see
-/// [`crate::shell_env`]), while this internal work keeps the reduced one. Use
-/// SSH config (`~/.ssh/config`) for SSH-based git remotes rather than
-/// environment variables. ([`run_git_network`] is the one exception: it
-/// restores `SSH_AUTH_SOCK` so SSH-agent remotes still work.)
+/// Run a git command without interpreting the exit code: the raw [`std::process::Output`], so each
+/// caller decides; [`run_git_command_env`] is the checked-output sibling.
 pub(crate) async fn run_git_output(
     repo_path: &Path,
     args: &[&str],
@@ -361,8 +263,8 @@ pub(crate) async fn run_git_output(
     run_git_output_env(repo_path, &[], args).await
 }
 
-/// [`run_git_output`] with extra environment variables — used to point git at a
-/// throwaway index file instead of the repository's own.
+/// [`run_git_output`] with extra environment variables — used to point git at a throwaway
+/// index file instead of the repository's own.
 async fn run_git_output_env(
     repo_path: &Path,
     env: &[(&str, &OsStr)],
@@ -373,24 +275,20 @@ async fn run_git_output_env(
         cmd.env(name, value);
     }
     cmd.args(args).current_dir(repo_path);
-    // Tokio's `output()` inherits stdin (unlike std's, which nulls it), and no
-    // git command here reads stdin; `hash-object --stdin` needs EOF, not a
-    // terminal. Null it so a command can never wait on the parent's input.
+    // Tokio's `output()` inherits stdin (std's nulls it) and no git command here reads
+    // stdin; `hash-object --stdin` needs EOF, not a terminal, so it can never wait on us.
     cmd.stdin(Stdio::null());
     cmd.output()
         .await
         .with_context(|| format!("Failed to run git {}", args.join(" ")))
 }
 
-/// Run a git command and return stdout as string on success.
-///
-/// Returns an error if git exits with a non-zero status.
+/// Run a git command and return stdout as a string, erroring on a non-zero exit status.
 pub async fn run_git_command(repo_path: &Path, args: &[&str]) -> anyhow::Result<String> {
     run_git_command_env(repo_path, &[], args).await
 }
 
-/// [`run_git_command`] with extra environment variables set — used to point git
-/// at a throwaway index file instead of the repository's own.
+/// [`run_git_command`] with extra environment variables set (a throwaway index, say).
 async fn run_git_command_env(
     repo_path: &Path,
     env: &[(&str, &OsStr)],
@@ -406,9 +304,8 @@ async fn run_git_command_env(
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Run a git command and return its trimmed stdout.
-///
-/// Shared by the helpers that return a single scalar (hash, branch, message).
+/// Run a git command and return its trimmed stdout — shared by the helpers that return a
+/// single scalar (hash, branch, message).
 async fn run_git_trimmed(repo_path: &Path, args: &[&str]) -> anyhow::Result<String> {
     Ok(run_git_command(repo_path, args).await?.trim().to_string())
 }
@@ -425,19 +322,13 @@ async fn run_git_trimmed_env(
         .to_string())
 }
 
-/// Check if `git status --porcelain` output contains any unstaged changes.
+/// Whether `git status --porcelain` output holds any unstaged change: a line whose worktree column
+/// (byte 1) is non-space — an unstaged modification, deletion or `??` untracked. Fully-staged
+/// entries are ignored.
 ///
-/// Looks for any line where the worktree status column (second character) is
-/// non-space — an unstaged modification, deletion, or untracked file (`??` has
-/// `?` there). Fully-staged-only entries (`M `, `A `) are ignored.
-///
-/// The test is byte-level, not a record parse, on purpose: an entry whose path no
-/// parser accepts still counts as a change, so a dirty tree is never mistaken for
-/// a clean one. `!!` ignored lines would count too; the callers' invocation simply
-/// never asks git for ignored files.
-///
-/// This is a pure parsing function with no I/O — callers run `git status`
-/// themselves and pass the captured stdout here.
+/// Byte-level rather than a record parse: an entry whose path no parser accepts still counts, so a
+/// dirty tree is never mistaken for a clean one (`!!` lines would count too; no caller asks for
+/// them). Pure parsing — callers run `git status` and pass the stdout.
 #[must_use]
 pub fn has_unstaged_changes(porcelain: &str) -> bool {
     porcelain.lines().any(|line| {
@@ -445,69 +336,43 @@ pub fn has_unstaged_changes(porcelain: &str) -> bool {
         if line.is_empty() {
             return false;
         }
-        // Check the worktree status column (byte index 1).
-        // For `??` (untracked) lines, both columns are `?` — the second is non-space.
-        // For ` M`, `MM`, ` D`, etc., the second column is non-space.
-        // For `M `, `A `, etc., the second column is space (fully staged).
+        // Worktree column (byte 1): non-space for `??`, ` M`, `MM`, ` D`; space for `M `.
         line.as_bytes().get(1).is_some_and(|&b| b != b' ')
     })
 }
 
-/// Stage all changes in the working tree via `git add -A`.
-///
-/// This stages tracked modifications, untracked files, and file deletions.
-/// Unlike [`run_git_commit`], this does NOT commit — it only stages changes
-/// into the index.
-///
-/// Returns the stdout of the git command on success.
+/// Stage all changes — tracked modifications, untracked files, deletions — via `git add -A`.
+/// Staging only: unlike [`run_git_commit`], nothing is committed.
 pub async fn run_git_add_all(repo_path: &Path) -> anyhow::Result<String> {
     run_git_command(repo_path, &["add", "-A"]).await
 }
 
-/// Run `git rev-parse HEAD` and return the trimmed commit hash.
-///
-/// Errors when HEAD cannot be resolved (e.g. a repository with no commits
-/// yet). Callers that need unknown-as-`None` semantics should use `.ok()`.
+/// Run `git rev-parse HEAD` and return the trimmed commit hash. Errors when HEAD cannot be
+/// resolved (no commits yet); use `.ok()` where unknown must read as `None`.
 pub async fn run_git_head(repo_path: &Path) -> anyhow::Result<String> {
     run_git_trimmed(repo_path, &["rev-parse", "HEAD"]).await
 }
 
-/// Run `git write-tree` and return the trimmed index tree hash.
-///
-/// The tree hash identifies the exact staged content (index). Errors when the
-/// index cannot be written (e.g. unmerged entries). Callers that need
-/// unknown-as-`None` semantics should use `.ok()`.
+/// Run `git write-tree` and return the trimmed index tree hash — the exact staged content.
+/// Errors when the index cannot be written (unmerged entries); `.ok()` for `None` semantics.
 pub async fn run_git_write_tree(repo_path: &Path) -> anyhow::Result<String> {
     run_git_trimmed(repo_path, &["write-tree"]).await
 }
 
-/// The current content identity of the working tree: `(HEAD, tree)`, where the
-/// tree is the one a `git add -A` would stage (tracked modifications, untracked
-/// files, deletions, `.gitignore` honoured).
-///
-/// Read-only: the entries go into a throwaway index seeded from the
-/// repository's own, so the repository's index and working tree are left exactly
-/// as they were found — a caller may take this reading without changing what an
-/// agent's `git status`/`git diff` reports or the state a later step inherits.
-/// The blobs a tree needs land in the object store, as they do for any
-/// `git add`, and stay unreferenced until something stages that content.
-/// The value it returns is what [`run_git_write_tree`] reports after a real
-/// `git add -A` of the same content.
+/// The current content identity of the working tree: `(HEAD, tree)`, where the tree is what
+/// a `git add -A` would stage (tracked modifications, untracked files, deletions,
+/// `.gitignore` honoured).
 pub async fn run_git_worktree_identity(repo_path: &Path) -> anyhow::Result<(String, String)> {
     let dir = tempfile::tempdir().context("Failed to create a throwaway git index")?;
     let index = dir.path().join("index");
-    // Seed from the repository's own index: without the seed, a path that is
-    // tracked but matched by `.gitignore` is dropped (ignore rules govern making
-    // new index entries), so the tree would differ from the real `git add -A`
-    // this reading has to agree with. A split index needs nothing extra: its
-    // shared file is named after its own content and looked up through the
-    // repository, not relative to the index that links to it.
+    // Seed from the repository's own index: unseeded, a tracked path matched by `.gitignore` is
+    // dropped (ignore rules govern new index entries), so the tree would disagree with the real
+    // `git add -A`. A split index needs nothing extra — its shared file is looked up through
+    // the repository.
     //
-    // A repository with no index yet is normal — git creates the throwaway one
-    // from nothing. A failed copy is warned, because the tree would then be
-    // built unseeded and could disagree with the real `git add -A`. A repository
-    // git cannot resolve at all is not reported here: the `add -A` below fails
-    // on the same condition and the caller reports the round's missing identity.
+    // No index yet is normal: git creates the throwaway one from nothing. A failed copy is
+    // warned, since the tree would be built unseeded. A repo git cannot resolve is not reported
+    // here — `add -A` fails on the same condition.
     if let Ok(path) = run_git_trimmed(repo_path, &["rev-parse", "--git-path", "index"]).await {
         let path = PathBuf::from(path);
         let path = if path.is_absolute() {
@@ -528,19 +393,16 @@ pub async fn run_git_worktree_identity(repo_path: &Path) -> anyhow::Result<(Stri
     Ok((run_git_head(repo_path).await?, tree))
 }
 
-/// Stage all changes and commit with the given message.
-/// Runs `git add -A` followed by `git commit -m "<msg>"`,
-/// then captures the full SHA via `git rev-parse HEAD` and
-/// line stats via `git diff --numstat`.
+/// Stage all changes and commit: `git add -A`, `git commit -m <message>`, then the SHA via
+/// `git rev-parse HEAD` and line stats via `git diff --numstat`.
 pub async fn run_git_commit(repo_path: &Path, message: &str) -> anyhow::Result<CommitInfo> {
-    // Stage all changes (tracked, untracked, removed) in the worktree.
     run_git_add_all(repo_path).await?;
 
     run_git_command(repo_path, &["commit", "-m", message])
         .await
         .context("Failed to commit changes")?;
 
-    // Capture the full 40-char SHA — reliable source, not abbreviated.
+    // The full 40-char SHA from `rev-parse`, not an abbreviation.
     let hash = match run_git_head(repo_path).await {
         Ok(hash) => hash,
         Err(e) => {
@@ -556,13 +418,12 @@ pub async fn run_git_commit(repo_path: &Path, message: &str) -> anyhow::Result<C
         }
     };
 
-    // Capture line stats via --numstat. Try HEAD~1..HEAD first.
+    // Line stats from `--numstat`, trying HEAD~1..HEAD first.
     let (lines_added, lines_removed) =
         if let Ok(stats) = parse_numstat(repo_path, &["HEAD~1..HEAD"]).await {
             stats
         } else if let Ok(base) = run_git_empty_tree(repo_path).await {
-            // HEAD~1 doesn't exist (first commit) — diff against this
-            // repository's own empty tree.
+            // HEAD~1 does not exist (first commit) — diff against this repository's empty tree.
             parse_numstat(repo_path, &[&base, "HEAD"])
                 .await
                 .unwrap_or((0, 0))
@@ -576,51 +437,40 @@ pub async fn run_git_commit(repo_path: &Path, message: &str) -> anyhow::Result<C
     })
 }
 
-/// Broadcast for pipeline auto-commit notifications. The pipeline sends the
-/// repo path after a successful auto-commit (sanitation → Done); the GUI
-/// subscription consumes it and refreshes the footer promptly, since a commit
-/// is a ref-only change the file watcher never reports. Lives here (not in the
-/// GUI) so the pipeline can signal without depending on the GUI layer.
+/// Broadcast for pipeline auto-commit notifications: the pipeline sends the repo path after a
+/// successful auto-commit (sanitation → Done) and the GUI subscription refreshes the footer,
+/// since a commit is a ref-only change the file watcher never reports. It lives here so the
+/// pipeline can signal without depending on the GUI layer.
 pub(crate) static GIT_COMMIT_TX: OnceLock<tokio::sync::broadcast::Sender<PathBuf>> =
     OnceLock::new();
 
-/// Initialise the git-commit broadcast. Called from [`crate::gui::init_git_commit_tx`]
-/// in `main` before the iced application runs.
+/// Initialise the git-commit broadcast; called from [`crate::gui::init_git_commit_tx`] in
+/// `main` before the iced application runs.
 pub(crate) fn init_git_commit_tx() {
     let _ = GIT_COMMIT_TX.set(tokio::sync::broadcast::channel(64).0);
 }
 
-/// Notify the GUI that a pipeline auto-commit completed on `repo_path`, so the
-/// git footer refreshes promptly instead of waiting for the periodic timer.
+/// Notify the GUI that a pipeline auto-commit completed on `repo_path`, so the git footer
+/// refreshes promptly instead of waiting for the periodic timer.
 pub(crate) fn notify_git_commit(repo_path: &Path) {
     if let Some(tx) = GIT_COMMIT_TX.get() {
         let _ = tx.send(repo_path.to_path_buf());
     }
 }
 
-/// A single entry from `git diff --numstat` or `git show --numstat` output.
-///
-/// `additions` and `deletions` are `None` for binary files (where git outputs `-`
-/// instead of a line count). Regular files always have `Some` values.
+/// A single entry from `git diff --numstat` / `git show --numstat` output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NumstatEntry {
-    /// Lines added, or `None` if the file is binary.
+    /// `None` if the file is binary.
     pub additions: Option<i64>,
-    /// Lines deleted, or `None` if the file is binary.
+    /// `None` if the file is binary.
     pub deletions: Option<i64>,
     /// File path as printed by git.
     pub path: String,
 }
 
-/// Parse the output of `git diff --numstat` or `git show --numstat`.
-///
-/// Returns a vector of [`NumstatEntry`] values for each file.
-/// Binary files (displayed as `-\t-\t<path>`) have `additions` and `deletions`
-/// set to `None` so callers can distinguish them from regular entries with zero
-/// changes. Lines that don't match the expected 3-field format are silently skipped.
-///
-/// This is a pure parsing function with no I/O — callers run git themselves
-/// and pass the captured stdout here.
+/// Parse `git diff --numstat` / `git show --numstat` output. Malformed lines are skipped.
+/// Pure parsing, no I/O — callers run git and pass the captured stdout here.
 #[must_use]
 pub fn parse_numstat_lines(stdout: &str) -> Vec<NumstatEntry> {
     let mut result = Vec::new();
@@ -639,10 +489,8 @@ pub fn parse_numstat_lines(stdout: &str) -> Vec<NumstatEntry> {
         let deletions_str = parts[1];
         let path = parts[2].to_string();
 
-        // Binary files are displayed as "-\t-\t<path>"
-        // If either field is "-", treat the file as binary (both fields None).
-        // This is defensive: git always outputs "-\t-" for both fields on binary
-        // files, but we handle the mixed case conservatively.
+        // Binary files print "-\t-\t<path>": if either field is "-", treat both as None.
+        // Git always prints both, but the mixed case is handled conservatively.
         if additions_str == "-" || deletions_str == "-" {
             result.push(NumstatEntry {
                 additions: None,
@@ -663,8 +511,8 @@ pub fn parse_numstat_lines(stdout: &str) -> Vec<NumstatEntry> {
     result
 }
 
-/// Run `git diff --numstat <range...>` and return the per-file entries.
-/// Callers pass only the range (e.g. `&["HEAD"]` or `&["<empty-tree>", "HEAD"]`).
+/// Run `git diff --numstat <range...>` and return the per-file entries. Callers pass only the
+/// range (e.g. `&["HEAD"]` or `&["<empty-tree>", "HEAD"]`).
 async fn run_git_diff_numstat(
     repo_path: &Path,
     range: &[&str],
@@ -675,10 +523,8 @@ async fn run_git_diff_numstat(
     Ok(parse_numstat_lines(&stdout))
 }
 
-/// Run `git diff --numstat <range...>` and sum the line stats across all files.
-///
-/// Returns `Ok((lines_added, lines_removed))` on success (even if the diff
-/// is empty). Returns the git error message on failure.
+/// Run `git diff --numstat <range...>` and sum the line stats across all files, returning
+/// `Ok((added, removed))` even for an empty diff; a git failure comes back as the error.
 async fn parse_numstat(repo_path: &Path, range: &[&str]) -> anyhow::Result<(i64, i64)> {
     let entries = run_git_diff_numstat(repo_path, range).await?;
 
@@ -686,7 +532,7 @@ async fn parse_numstat(repo_path: &Path, range: &[&str]) -> anyhow::Result<(i64,
     let mut lines_removed: i64 = 0;
 
     for entry in entries {
-        // Binary files have None values — they contribute 0 lines.
+        // Binary files are None — they contribute 0 lines.
         if let Some(added) = entry.additions {
             lines_added += added;
         }
@@ -698,29 +544,24 @@ async fn parse_numstat(repo_path: &Path, range: &[&str]) -> anyhow::Result<(i64,
     Ok((lines_added, lines_removed))
 }
 
-/// Check if git is installed.
+/// Whether git is installed.
 pub async fn git_is_installed() -> bool {
     let mut cmd = git_command(None);
     cmd.arg("--version");
     cmd.output().await.is_ok_and(|o| o.status.success())
 }
 
-/// Check if a git repo has any commits (spawn/git failures count as `false`).
+/// Whether the repo has any commits (spawn/git failures count as `false`).
 async fn git_has_commits(repo_path: &Path) -> bool {
     run_git_head(repo_path).await.is_ok()
 }
 
-/// Print this repository's empty tree hash.
-///
-/// `git hash-object -t tree --stdin` reads EOF (the subprocess wrapper closes
-/// stdin) and prints the empty tree's hash, so the value follows the
-/// repository's object format (SHA-1 or SHA-256) instead of hardcoding SHA-1's
-/// `4b825d…`. Used as the base for an unborn HEAD.
+/// This repository's empty tree hash.
 async fn run_git_empty_tree(repo_path: &Path) -> anyhow::Result<String> {
     run_git_trimmed(repo_path, &["hash-object", "-t", "tree", "--stdin"]).await
 }
 
-/// Get the current branch name (e.g. `main`, `feature/xyz`).
+/// The current branch name (e.g. `main`, `feature/xyz`).
 pub async fn run_git_current_branch(repo_path: &Path) -> anyhow::Result<String> {
     run_git_trimmed(repo_path, &["rev-parse", "--abbrev-ref", "HEAD"]).await
 }
@@ -728,13 +569,11 @@ pub async fn run_git_current_branch(repo_path: &Path) -> anyhow::Result<String> 
 /// What the branch and its upstream each carry without the other.
 #[derive(Debug, Clone, Copy)]
 struct UpstreamCounts {
-    /// Commits the upstream has that `HEAD` does not: what a pull would take.
     behind: usize,
-    /// Commits `HEAD` has that the upstream does not: what a push to it owes.
     ahead: usize,
 }
 
-/// Measure the branch against `upstream`.
+/// Measure the branch against `upstream` (`--left-right` puts upstream first).
 async fn ahead_behind(repo_path: &Path, upstream: &str) -> anyhow::Result<UpstreamCounts> {
     let counts = run_git_trimmed(
         repo_path,
@@ -758,37 +597,33 @@ async fn ahead_behind(repo_path: &Path, upstream: &str) -> anyhow::Result<Upstre
 /// Where the sync control pushes the checked-out branch, and what it carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitPushTarget {
-    /// The remote that accepts pushes and receives the branch.
     pub remote: String,
-    /// Commits a press carries: what `remote` lacks of the branch as the update
-    /// step leaves it, or every commit the branch carries when it is published or
-    /// when `remote` could not be asked.
+    /// Commits a press carries: what `remote` lacks of the branch as the update step
+    /// leaves it, or every commit the branch carries when it is published or `remote`
+    /// could not be asked.
     pub commits: usize,
-    /// Whether `remote` has a branch of this name: `Some(true)` it does not, so
-    /// the push publishes it and the update step is skipped; `Some(false)` it
-    /// does; `None` when `remote` could not be asked, so neither is claimed.
+    /// Whether `remote` lacks a branch of this name: `Some(true)` publishes it (the
+    /// update step is skipped), `Some(false)` it exists, `None` when `remote` could not
+    /// be asked — then neither is claimed.
     pub publish: Option<bool>,
 }
 
 /// Where the checked-out branch can be pushed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitPushDestination {
-    /// A remote accepts pushes: the one a plain `git push` reaches, the branch's
-    /// tracked remote, or the only push-capable remote.
+    /// A remote accepts pushes: the one a plain `git push` reaches, the branch's tracked
+    /// remote, or the only push-capable remote.
     Target(GitPushTarget),
-    /// No remote accepts pushes, or several do: nothing is guessed, and the
-    /// control says why instead of staying hidden.
-    Nowhere {
-        /// Why no destination was chosen.
-        reason: String,
-    },
+    /// No remote accepts pushes, or several do: nothing is guessed and the control says
+    /// why instead of staying hidden.
+    Nowhere { reason: String },
 }
 
 /// The checked-out branch's remote state, as the footer's sync control shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitRemoteState {
-    /// The branch this state describes: the footer caches it across refreshes,
-    /// and a branch switched since then makes it stale rather than wrong.
+    /// The branch this state describes: the footer caches it across refreshes, so a branch
+    /// switched since then makes the state stale rather than wrong.
     pub branch: String,
     /// Commits the branch would pull from its own update source.
     pub behind: usize,
@@ -797,9 +632,8 @@ pub struct GitRemoteState {
 }
 
 impl GitRemoteState {
-    /// Whether the sync control has anything to offer: commits to pull, commits
-    /// to push, or a branch no reachable remote can take (which the control says
-    /// plainly rather than hiding).
+    /// Whether the sync control has anything to offer: commits to pull, commits to push, or
+    /// a branch no reachable remote can take (which the control says plainly, not by hiding).
     #[must_use]
     pub fn has_sync_work(&self) -> bool {
         match &self.push {
@@ -810,11 +644,6 @@ impl GitRemoteState {
 }
 
 /// Resolve the checked-out branch's remote state for the footer's sync control.
-///
-/// `behind` is measured against the branch's own upstream (what a pull would
-/// take), while the push destination is a separate question: a branch may track a
-/// fetch-only remote, or nothing at all, and still be pushable. `None` when
-/// `HEAD` names no branch — the control concerns the checked-out branch.
 pub async fn run_git_remote_state(repo_path: &Path) -> anyhow::Result<Option<GitRemoteState>> {
     let Some(lane) = resolve_push_lane(repo_path).await? else {
         return Ok(None);
@@ -826,39 +655,35 @@ pub async fn run_git_remote_state(repo_path: &Path) -> anyhow::Result<Option<Git
     }))
 }
 
-/// The remotes git resolves for a branch: the one it tracks for updates and the
-/// one a plain `git push` sends to.
+/// The remotes git resolves for a branch: the one it tracks for updates and the one a plain
+/// `git push` sends to.
 struct BranchRemotes {
-    /// The remote the branch tracks, even when its remote-tracking ref is gone;
-    /// `None` when it tracks nothing.
+    /// The tracked remote, even when its remote-tracking ref is gone; `None` if it tracks nothing.
     upstream: Option<String>,
-    /// The remote-tracking ref the upstream names, when that ref exists — the
-    /// exact local measure of what a pull would take and of what a push to the
-    /// upstream still owes.
+    /// The remote-tracking ref the upstream names, when it exists — the exact local measure
+    /// of what a pull would take and of what a push to the upstream still owes.
     upstream_ref: Option<String>,
-    /// The remote a plain `git push` sends to, which honours
-    /// `branch.<name>.pushRemote` and `remote.pushDefault`.
+    /// The remote a plain `git push` sends to — honours `branch.<name>.pushRemote` and
+    /// `remote.pushDefault`.
     push: Option<String>,
 }
 
-/// The checked-out branch's push lane: the branch, git's own view of its
-/// remotes, and where a push of it would go.
+/// The checked-out branch's push lane: the branch, git's own view of its remotes, and where
+/// a push of it would go.
 struct PushLane {
     branch: String,
     remotes: BranchRemotes,
-    /// The branch's distance from its upstream ref, when it has one.
+    /// Distance from the upstream ref, when the branch has one.
     upstream_counts: Option<UpstreamCounts>,
     destination: GitPushDestination,
 }
 
-/// Resolve where the checked-out branch can be pushed; `None` when `HEAD` names
-/// no branch (detached or unborn).
+/// Resolve where the checked-out branch can be pushed; `None` when `HEAD` names no branch
+/// (detached or unborn).
 ///
-/// Where a push goes is decided by which remote accepts pushes, not by what the
-/// branch tracks: a tracked remote that is fetch-only is the branch's update
-/// source, never a push destination. The remote git itself would push to comes
-/// first, so the destination the control names is the one a plain `git push`
-/// reaches.
+/// Which remote accepts pushes decides this, not what the branch tracks: a fetch-only
+/// tracked remote is the update source, never a push destination. The remote git itself
+/// would push to comes first, so the control names the one a plain `git push` reaches.
 async fn resolve_push_lane(repo_path: &Path) -> anyhow::Result<Option<PushLane>> {
     let Some(branch) = checked_out_branch(repo_path).await else {
         return Ok(None);
@@ -873,18 +698,17 @@ async fn resolve_push_lane(repo_path: &Path) -> anyhow::Result<Option<PushLane>>
         Some(upstream) => Some(ahead_behind(repo_path, upstream).await?),
         None => None,
     };
-    // A press fast-forwards the branch from its own update source before pushing,
-    // so the count belongs to the tip it carries then: the upstream it can
-    // fast-forward to, or the branch itself when the update cannot move it there
-    // (no upstream ref, already level, or diverged).
+    // A press fast-forwards the branch from its own update source before pushing, so the
+    // count belongs to the tip it carries then: the upstream it can fast-forward to, or the
+    // branch itself when the update cannot move it there (no upstream ref, level, diverged).
     let push_tip = match (&own.upstream_ref, upstream_counts) {
         (Some(upstream), Some(counts)) if counts.behind > 0 && counts.ahead == 0 => {
             upstream.as_str()
         }
         _ => "HEAD",
     };
-    // Prefer the remote git itself would push to, then the tracked one, then the
-    // only push-capable remote; a fetch-only remote is never chosen.
+    // Prefer the remote git itself would push to, then the tracked one, then the only
+    // push-capable remote; a fetch-only remote is never chosen.
     let accepts = |name: Option<&str>| {
         name.filter(|name| pushable.iter().any(|remote| remote == name))
             .map(str::to_string)
@@ -897,8 +721,8 @@ async fn resolve_push_lane(repo_path: &Path) -> anyhow::Result<Option<PushLane>>
         });
     let destination = match destination_remote.as_deref() {
         Some(remote) => {
-            // The upstream ref the fetch keeps current is exact, so a push to
-            // the branch's own upstream needs no network round trip.
+            // The upstream ref the fetch keeps current is exact: a push to the branch's own
+            // upstream needs no network round trip.
             let tracked_destination = own.upstream.as_deref() == Some(remote);
             let position = match upstream_counts {
                 Some(counts) if tracked_destination => DestinationPosition {
@@ -928,8 +752,7 @@ async fn resolve_push_lane(repo_path: &Path) -> anyhow::Result<Option<PushLane>>
     }))
 }
 
-/// The branch `HEAD` names, if it names one (a detached or unborn `HEAD` does
-/// not: `rev-parse --abbrev-ref` prints `HEAD`, or fails).
+/// The branch `HEAD` names, if any — a detached or unborn `HEAD` prints `HEAD` or fails.
 async fn checked_out_branch(repo_path: &Path) -> Option<String> {
     run_git_current_branch(repo_path)
         .await
@@ -937,38 +760,30 @@ async fn checked_out_branch(repo_path: &Path) -> Option<String> {
         .filter(|branch| branch != "HEAD")
 }
 
-/// What the destination answered for a branch: what it would take, and whether it
-/// already carries it at all.
+/// What the destination answered for a branch: what it would take, and whether it carries
+/// it at all.
 struct DestinationPosition {
-    /// Whether the destination has no branch of this name: `None` when it could
-    /// not be asked.
+    /// Whether the destination has no branch of this name; `None` when it could not be asked.
     publish: Option<bool>,
     /// Commits a press carries.
     commits: usize,
 }
 
-/// Ask `remote` what it carries for `branch`, and measure the push against it.
-///
-/// The destination is asked directly (`ls-remote`) rather than trusting the
-/// local `refs/remotes/<remote>/<branch>`: a narrowed `remote.<remote>.fetch`
-/// refspec never creates that ref, and the refresh's fetch follows the branch's
-/// own upstream, so that ref is stale in exactly the cases the control exists
-/// for. The destination's tip may not be in this repository at all, so its copy
-/// of the branch is fetched — into the remote-tracking ref, so the count holds
-/// whatever refspecs are configured — when the tip's commit is unknown.
-///
-/// A destination that cannot be reached, or whose objects cannot be fetched, does
-/// not fail the state and does not claim a publish: the branch is reported with
-/// the commits it carries, so it stays visible, and a press reports git's own
-/// reason.
+/// The destination is asked directly (`ls-remote`) rather than trusting the local
+/// `refs/remotes/<remote>/<branch>`: a narrowed `remote.<remote>.fetch` refspec never creates that
+/// ref and the refresh's fetch follows the branch's own upstream, so the ref is stale exactly where
+/// the control matters. An unknown tip's copy of the branch is fetched into the remote-tracking
+/// ref, so the count holds whatever refspecs are configured. A destination that cannot be reached,
+/// or whose objects cannot be fetched, does not fail the state and claims no publish: the branch is
+/// reported with the commits it carries, and a press reports git's own reason.
 async fn destination_position(
     repo_path: &Path,
     remote: &str,
     branch: &str,
     push_tip: &str,
 ) -> anyhow::Result<DestinationPosition> {
-    // The full ref, not the short name: `ls-remote` also matches a short name
-    // against the tail of other refs (`main` finds `feature/main` too).
+    // The full ref, not the short name: `ls-remote` matches a short name against the tail of
+    // other refs too (`main` finds `feature/main`).
     let wanted = format!("refs/heads/{branch}");
     let listing = match run_git_network(
         repo_path,
@@ -988,8 +803,8 @@ async fn destination_position(
         (refname.trim() == wanted).then(|| tip.trim().to_string())
     });
     let Some(tip) = tip else {
-        // The destination has no such branch: the push publishes it, so the count
-        // is everything the branch carries (nothing is pulled first).
+        // The destination has no such branch: the push publishes it, so the count is
+        // everything the branch carries (nothing is pulled first).
         return Ok(DestinationPosition {
             publish: Some(true),
             commits: count_commits(repo_path, "HEAD").await?,
@@ -1004,10 +819,9 @@ async fn destination_position(
     })
 }
 
-/// The position to report when the destination's copy of the branch is unknown —
-/// it could not be reached, or its tip could not be fetched: every commit the
-/// branch carries, so a pushable branch is never hidden behind a zero, and no
-/// publish claim that the destination was never asked about.
+/// The position to report when the destination's copy of the branch is unknown — unreachable,
+/// or its tip could not be fetched: every commit the branch carries, so a pushable branch is
+/// never hidden behind a zero, and no publish claim for a destination never asked.
 async fn unreported_position(repo_path: &Path) -> anyhow::Result<DestinationPosition> {
     Ok(DestinationPosition {
         publish: None,
@@ -1015,9 +829,8 @@ async fn unreported_position(repo_path: &Path) -> anyhow::Result<DestinationPosi
     })
 }
 
-/// Fetch `remote`'s copy of `branch` into its remote-tracking ref. `false` when
-/// another fetch is already running or this one failed — the caller then reports
-/// what the local refs say.
+/// Fetch `remote`'s copy of `branch` into its remote-tracking ref. `false` when another fetch
+/// is already running or this one failed — the caller then reports what the local refs say.
 async fn fetch_destination(repo_path: &Path, remote: &str, branch: &str) -> bool {
     if FETCH_IN_FLIGHT.swap(true, Ordering::AcqRel) {
         tracing::debug!(%remote, %branch, "skipping the destination fetch: another fetch is running");
@@ -1026,8 +839,8 @@ async fn fetch_destination(repo_path: &Path, remote: &str, branch: &str) -> bool
     let _guard = FetchInFlightGuard;
     let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
     match run_git_network(
-        // `--no-write-fetch-head` keeps the fetch from clobbering a concurrent
-        // pull's merge source; `--no-tags` keeps a probe from following tags.
+        // `--no-write-fetch-head` keeps this probe from clobbering a concurrent pull's merge
+        // source; `--no-tags` keeps it from following tags.
         repo_path,
         &[
             "fetch",
@@ -1049,12 +862,7 @@ async fn fetch_destination(repo_path: &Path, remote: &str, branch: &str) -> bool
     }
 }
 
-/// Remotes configured in `repo_path` and whether a push can reach each, in
-/// `git remote -v` order.
-///
-/// A remote is push-capable only when every push URL it lists is usable — git
-/// prints one `(push)` line per push URL, and a fetch-only remote disables
-/// pushing by giving it a dummy push URL.
+/// Remotes configured in `repo_path` and whether a push can reach each, in `git remote -v` order.
 async fn remotes(repo_path: &Path) -> anyhow::Result<Vec<(String, bool)>> {
     let output = run_git_command(repo_path, &["remote", "-v"]).await?;
     let mut remotes: Vec<(String, bool)> = Vec::new();
@@ -1075,14 +883,6 @@ async fn remotes(repo_path: &Path) -> anyhow::Result<Vec<(String, bool)>> {
 }
 
 /// Whether a push URL can actually receive a push.
-///
-/// Git has no "read-only remote" flag: the convention is a dummy push URL
-/// (`remote.<name>.pushurl = no-push`, `DISABLED`, …), which makes a remote
-/// fetch-only by sending pushes nowhere. Such a URL is a bare word naming no
-/// filesystem path — the convention's own caveat is "as long as you don't have
-/// a folder of the same name", so the existence probe mirrors exactly that.
-/// Everything else is a real transport (a `scheme://` URL, including `git+ssh://`
-/// and custom `git-remote-*` helpers, an scp-like `host:path`, or a path).
 fn push_destination_accepts_pushes(repo_path: &Path, url: &str) -> bool {
     let url = url.trim();
     if url.is_empty() {
@@ -1094,14 +894,8 @@ fn push_destination_accepts_pushes(repo_path: &Path, url: &str) -> bool {
     repo_path.join(url).exists()
 }
 
-/// The remotes git resolves for `branch`: the one it tracks for updates, that
-/// upstream's remote-tracking ref when it exists, and the one a plain
-/// `git push` sends to.
-///
-/// Git is asked for its own resolution (`%(upstream…)`, `%(push…)`) rather than
-/// re-reading the branch's config, so a local `.` upstream, a defaulted remote
-/// and a configured `pushRemote`/`pushDefault` are all handled by the same truth
-/// the push itself uses.
+/// The remotes git resolves for `branch`: the one it tracks for updates, that upstream's
+/// remote-tracking ref when it exists, and the one a plain `git push` sends to.
 async fn branch_remotes(repo_path: &Path, branch: &str) -> anyhow::Result<BranchRemotes> {
     let listing = run_git_command(
         repo_path,
@@ -1116,9 +910,8 @@ async fn branch_remotes(repo_path: &Path, branch: &str) -> anyhow::Result<Branch
     let upstream_ref = fields.next().unwrap_or_default();
     let upstream = fields.next().unwrap_or_default();
     let push = fields.next().unwrap_or_default();
-    // `%(upstream)` names what the config points at, not proof the ref exists: a
-    // pruned or never-fetched tracking ref leaves the name behind while
-    // `@{upstream}` stays unresolvable.
+    // `%(upstream)` names what the config points at, not proof the ref exists: a pruned or
+    // never-fetched tracking ref leaves the name behind while `@{upstream}` stays unresolvable.
     let upstream_ref = if !upstream_ref.is_empty() && rev_exists(repo_path, upstream_ref).await? {
         Some(upstream_ref.to_string())
     } else {
@@ -1144,10 +937,6 @@ async fn count_commits(repo_path: &Path, rev: &str) -> anyhow::Result<usize> {
 }
 
 /// Whether `rev` resolves to a commit in this repository.
-/// Whether `rev` resolves to a commit in this repository.
-///
-/// `--verify` alone accepts any well-formed object id as a revision without the
-/// object existing, so the peeled `^{commit}` form is what actually proves it.
 async fn rev_exists(repo_path: &Path, rev: &str) -> anyhow::Result<bool> {
     Ok(run_git_output(
         repo_path,
@@ -1163,18 +952,16 @@ async fn rev_exists(repo_path: &Path, rev: &str) -> anyhow::Result<bool> {
     .success())
 }
 
-/// Hard timeout for a single network round trip — a `git fetch`, or the
-/// destination probe that asks a remote what it carries. An unreachable/slow
-/// remote must not hang the remote sync indefinitely.
+/// Hard timeout for a single network round trip — a `git fetch`, a push, or the destination
+/// probe. An unreachable/slow remote must not hang the remote sync indefinitely.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Single-flight guard for network fetches ([`run_git_fetch`] and the
-/// destination probe): at most one fetch runs at a time so concurrent fetches
-/// cannot overlap/contend on the same ref locks.
+/// Single-flight guard for network fetches ([`run_git_fetch`] and the destination probe): at
+/// most one runs at a time so concurrent fetches cannot contend on the same ref locks.
 static FETCH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
-/// RAII guard that clears [`FETCH_IN_FLIGHT`] when the fetch task finishes
-/// (including on error/timeout/cancellation).
+/// RAII guard that clears [`FETCH_IN_FLIGHT`] when the fetch task finishes (including on
+/// error, timeout or cancellation).
 struct FetchInFlightGuard;
 impl Drop for FetchInFlightGuard {
     fn drop(&mut self) {
@@ -1182,18 +969,11 @@ impl Drop for FetchInFlightGuard {
     }
 }
 
-/// Run `git fetch` so remote refs are refreshed before the branch's remote state
-/// is computed (a fetch-free comparison only sees the last-fetched remote state).
-///
-/// The subprocess hardening (including restoring `SSH_AUTH_SOCK` for SSH-agent
-/// remotes) lives in [`run_git_network`]; the fetch is time-boxed by
-/// [`FETCH_TIMEOUT`] and single-flight guarded.
-///
-/// Callers most often discard the report and only log a failure (the subsequent
-/// remote-state read still works against local refs).
+/// Run `git fetch` so remote refs are refreshed before the branch's remote state is computed
+/// (a fetch-free comparison only sees the last-fetched state).
 pub async fn run_git_fetch(repo_path: &Path) -> anyhow::Result<String> {
-    // Single-flight: if a fetch is already running, skip this one rather than
-    // queueing it (it would only contend on the same ref locks).
+    // Single-flight: skip rather than queue, since a queued fetch would only contend on the
+    // same ref locks.
     if FETCH_IN_FLIGHT.swap(true, Ordering::AcqRel) {
         return Ok(String::new());
     }
@@ -1205,17 +985,17 @@ pub async fn run_git_fetch(repo_path: &Path) -> anyhow::Result<String> {
 
 /// What a [`run_git_network`] step printed, both streams trimmed.
 struct GitNetworkOutput {
-    /// git's progress and report lines — a push reports its ref updates and
-    /// "Everything up-to-date" here.
+    /// git's progress and report lines — a push reports its ref updates and "Everything
+    /// up-to-date" here.
     stderr: String,
     /// The command's own answer, e.g. `ls-remote`'s ref list.
     stdout: String,
 }
 
 impl GitNetworkOutput {
-    /// The human report, stderr first: a push prints its ref report before its
-    /// trailing upstream notice on stdout, so reading stdout alone would show a
-    /// real push as nothing to do.
+    /// The human report, stderr first: a push prints its ref report before its trailing
+    /// upstream notice on stdout, so reading stdout alone would show a real push as nothing
+    /// to do.
     fn report(self) -> String {
         [self.stderr, self.stdout]
             .into_iter()
@@ -1227,20 +1007,13 @@ impl GitNetworkOutput {
 
 /// Run a network git command (fetch/pull/push/ls-remote) with a hard timeout.
 ///
-/// The subprocess environment is the product's own internal one (see
-/// [`git_command`]), then `GIT_TERMINAL_PROMPT=0` prevents git/credential
-/// helpers from popping an interactive (osxkeychain) prompt for a
-/// credential-less remote, and `SSH_AUTH_SOCK` is restored (if present) so
-/// SSH-agent remotes still work — the reduced base drops it.
-///
-/// On timeout the direct `git` child is killed and reaped; a remote helper it
-/// spawned (e.g. `git-remote-https`) is not signalled directly but terminates
-/// when its communication pipe closes, so it cannot hold the command open past
-/// the timeout. A non-zero exit reports git's own stderr, so a refused push
-/// carries git's reason.
-///
-/// The two streams stay apart: a command's answer (`ls-remote`) is parsed from
-/// stdout, while [`GitNetworkOutput::report`] joins both for the human report.
+/// The environment is the product's internal one (see [`git_command`]) plus
+/// `GIT_TERMINAL_PROMPT=0`, so git/credential helpers never pop an interactive (osxkeychain) prompt
+/// for a credential-less remote, and `SSH_AUTH_SOCK` restored so SSH-agent remotes work. On timeout
+/// the `git` child is killed and reaped, and a remote helper it spawned (`git-remote-https`)
+/// terminates when its pipe closes, so nothing holds the command open. A non-zero exit reports
+/// git's own stderr, so a refused push carries git's reason; the streams stay apart — a command's
+/// answer is parsed from stdout while [`GitNetworkOutput::report`] joins both.
 async fn run_git_network(
     repo_path: &Path,
     args: &[&str],
@@ -1256,8 +1029,8 @@ async fn run_git_network(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    // Kill the child if this task is cancelled (e.g. on shutdown) so a running
-    // network operation cannot outlive the runtime and orphan.
+    // Kill the child if this task is cancelled (e.g. on shutdown) so a running network
+    // operation cannot outlive the runtime and orphan.
     cmd.kill_on_drop(true);
 
     let mut child = cmd
@@ -1268,10 +1041,9 @@ async fn run_git_network(
     let mut stdout_buf = Vec::new();
     let mut stderr_buf = Vec::new();
 
-    // Wait for the child while draining its pipes concurrently, all inside the
-    // timeout — a slow/unreachable remote (or a subprocess that outlives git
-    // holding the pipes) cannot hang the caller. On timeout, kill and reap so
-    // the process does not linger as a zombie.
+    // Drain the pipes while waiting for the child, all inside the timeout — a slow or
+    // unreachable remote (or a subprocess holding the pipes) cannot hang the caller. On
+    // timeout, kill and reap so no zombie lingers.
     let wait = child.wait();
     let read_stdout = async {
         if let Some(out) = &mut stdout {
@@ -1315,29 +1087,22 @@ async fn run_git_network(
 }
 
 /// Aggregate working-tree diff statistics for the GUI footer.
-///
-/// `added`/`removed` are the exact line counts used by the footer (+X / -Y)
-/// and by reviewer churn calibration, summed from every file in
-/// [`GitWorktreeSnapshot::changes`]. `huge_binary_file_count` counts oversized
-/// (> [`MAX_UNTRACKED_SIZE`]) and binary *untracked* files. It is a separate
-/// indicator and is deliberately NOT folded into `added`/`removed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiffStats {
     /// Total lines added (tracked diff + line-counted untracked text files).
     pub added: i64,
     /// Total lines removed (tracked diff only).
     pub removed: i64,
-    /// Count of oversized/binary untracked files surfaced as a separate
-    /// "N files" indicator, not line counts.
+    /// Oversized/binary untracked files, surfaced as a separate "N files" indicator.
     pub huge_binary_file_count: usize,
-    /// Untracked files the bounded worktree read left out (both surfaces
-    /// render [`Self::omitted_note`] for this).
+    /// Untracked files the bounded worktree read left out; both surfaces render
+    /// [`Self::omitted_note`] for this.
     pub omitted_file_count: usize,
 }
 
 impl DiffStats {
-    /// The one description of what the bounded untracked read left out; both the
-    /// footer and the diff window render this exact note.
+    /// The one description of what the bounded untracked read left out; the footer and the
+    /// diff window both render this exact note.
     pub(crate) fn omitted_note(&self) -> Option<String> {
         (self.omitted_file_count > 0).then(|| {
             format!(
@@ -1364,8 +1129,8 @@ pub enum UntrackedKind {
 /// One file in the settled uncommitted change set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeChange {
-    /// Path relative to the repository root (git reports root-relative paths,
-    /// even from a subdirectory workspace).
+    /// Relative to the repository root (git reports root-relative paths even from a
+    /// subdirectory workspace).
     pub path: String,
     /// Rename/copy source, when git detected one.
     pub old_path: Option<String>,
@@ -1380,17 +1145,15 @@ pub struct WorktreeChange {
 /// Git file status for coloring the file tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitFileStatus {
-    /// File has uncommitted modifications (M in porcelain output).
+    /// Modified (`M`).
     Modified,
-    /// File is untracked (?? in porcelain output) or newly added (A).
+    /// Untracked (`??`) or newly added (`A`).
     Added,
 }
 
-/// Run `git diff --numstat -z --find-renames <base>` and parse it into the
-/// tracked part of the change manifest.
-///
-/// `-z` keeps paths NUL-delimited and unquoted, so the returned paths are the
-/// raw repo-root-relative names.
+/// Run `git diff --numstat -z --find-renames <base>` and parse it into the tracked part of
+/// the change manifest. `-z` keeps paths NUL-delimited and unquoted, so the returned paths are
+/// the raw repo-root-relative names.
 async fn run_git_worktree_numstat(
     repo_path: &Path,
     base: &str,
@@ -1404,10 +1167,6 @@ async fn run_git_worktree_numstat(
 }
 
 /// Parse `git diff --numstat -z` output.
-///
-/// A normal record is `added\tremoved\t<path>\0`; a rename/copy record leaves
-/// the path field empty and follows it with `<old>\0<new>\0`. `-` (binary) counts
-/// as 0 lines. The trailing empty field after the final NUL is ignored.
 fn parse_numstat_z(stdout: &str) -> Vec<WorktreeChange> {
     let mut fields = stdout.split('\0');
     let mut result = Vec::new();
@@ -1440,36 +1199,29 @@ fn parse_numstat_z(stdout: &str) -> Vec<WorktreeChange> {
     result
 }
 
-/// Working-tree snapshot: aggregate diff stats, per-file porcelain statuses,
-/// and the settled change set, from one `git status --porcelain
-/// --untracked-files=all` reading plus one numstat pass.
-///
-/// The statuses are the same map the editor's file-tree coloring uses (once
-/// forwarded by `GitState`); `changes` is what both the footer line counter and
-/// the diff window draw from; and the stats drive the footer (+N / -M) and
-/// reviewer churn calibration.
+/// Working-tree snapshot: aggregate diff stats, per-file porcelain statuses, and the settled
+/// change set, from one `git status --porcelain --untracked-files=all` reading plus one
+/// numstat pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitWorktreeSnapshot {
     /// Aggregate line stats, summed from [`Self::changes`].
     pub stats: DiffStats,
-    /// Per-file porcelain status, keyed by the path exactly as git reports it
-    /// (repo-root-relative).
+    /// Per-file porcelain status, keyed by the repo-root-relative path as git reports it.
     pub file_statuses: HashMap<String, GitFileStatus>,
-    /// The repo has no commits (unborn HEAD): tracked changes are measured
-    /// against the empty tree but `unborn_head` still tells churn consumers
-    /// there is no valid baseline. Consumers that predate the unborn-HEAD
-    /// tolerance and must keep their old error semantics (reviewer churn)
-    /// check this instead of treating the snapshot as a valid diff baseline.
+    /// The repo has no commits (unborn HEAD): tracked changes are measured against the empty
+    /// tree, but `unborn_head` still tells churn consumers there is no valid baseline — ones
+    /// that must keep their old error semantics (reviewer churn) check this rather than
+    /// treating the snapshot as a valid diff baseline.
     pub unborn_head: bool,
-    /// Every uncommitted file: tracked entries in numstat order, then untracked
-    /// files in status order.
+    /// Every uncommitted file: tracked entries in numstat order, then untracked files in
+    /// status order.
     pub changes: Vec<WorktreeChange>,
     /// Repository top level; untracked status paths resolve against this.
     pub repo_root: PathBuf,
 }
 
-/// A manifest entry for an untracked file. `added` is its line count (0 for
-/// content with no lines); an untracked file never removes lines.
+/// A manifest entry for an untracked file: `added` is its line count (0 for content with no
+/// lines), and such a file never removes lines.
 fn untracked_change(path: &str, kind: UntrackedKind, added: i64) -> WorktreeChange {
     WorktreeChange {
         path: path.to_owned(),
@@ -1480,15 +1232,15 @@ fn untracked_change(path: &str, kind: UntrackedKind, added: i64) -> WorktreeChan
     }
 }
 
-/// Classify each `??` status path into a [`WorktreeChange`], returning the
-/// changes and how many files the per-refresh caps left out.
+/// Classify each `??` status path into a [`WorktreeChange`], returning the changes and how
+/// many files the per-refresh caps left out.
 ///
-/// `repo_root` resolves the root-relative status paths. Only regular files are
-/// classified; collapsed nested repositories (`dir/`) are already excluded by
-/// [`parse_untracked_from_porcelain`], so they never inflate the omitted tally.
-/// The metadata read here gates the byte budget *before* the content read; the
-/// read and its binary/text verdict are shared with the diff window through
-/// [`read_untracked_file_with_meta`], so the two cannot drift on what a file is.
+/// `repo_root` resolves the root-relative status paths. Only regular files are classified;
+/// collapsed nested repositories (`dir/`) are already excluded by
+/// [`parse_untracked_from_porcelain`], so they never inflate the omitted tally. The metadata
+/// read gates the byte budget *before* the content read, and the read and its binary/text
+/// verdict are shared with the diff window through [`read_untracked_file_with_meta`], so the
+/// two cannot drift on what a file is.
 async fn classify_untracked_changes(
     repo_root: &Path,
     untracked: &[String],
@@ -1544,21 +1296,8 @@ async fn classify_untracked_changes(
     (changes, omitted)
 }
 
-/// Capture the working-tree snapshot for a repository path.
-///
-/// A `git status --porcelain --untracked-files=all` failure is fatal: broken or
-/// missing git never yields a snapshot, so callers keep their last-known-good
-/// state (or default churn).
-///
-/// Tracked changes come from one numstat pass against `HEAD`; a missing HEAD
-/// (unborn repo) measures them against this repository's empty tree instead.
-/// Untracked files (`??` entries) are classified here — line-counted text,
-/// binary, or oversized — from `repo_root`, because git reports status paths
-/// relative to the repository root even when the workspace is a subdirectory.
-/// Status enumeration itself is unbounded (the complete file set is the
-/// point); the per-file content reads are bounded by the `MAX_UNTRACKED_*`
-/// caps, and files those caps leave out are reported through
-/// `omitted_file_count`.
+/// A `git status --porcelain --untracked-files=all` failure is fatal: broken or missing git never
+/// yields a snapshot, so callers keep their last-known-good state (or default churn).
 pub async fn run_git_worktree_snapshot(repo_path: &Path) -> anyhow::Result<GitWorktreeSnapshot> {
     let repo_root =
         resolve_git_top_level(repo_path).context("Failed to resolve the repository top-level")?;
@@ -1568,10 +1307,9 @@ pub async fn run_git_worktree_snapshot(repo_path: &Path) -> anyhow::Result<GitWo
 
     let (tracked, unborn_head) = match run_git_worktree_numstat(&repo_root, "HEAD").await {
         Ok(entries) => (entries, false),
-        // `git_has_commits` distinguishes an unborn HEAD (a freshly
-        // `git init`ed repo with no commits) from other numstat failures — an
-        // unborn repo still yields the full change set, measured against the
-        // empty tree.
+        // `git_has_commits` separates an unborn HEAD (a fresh `git init` with no commits) from
+        // other numstat failures — an unborn repo still yields the full change set, measured
+        // against the empty tree.
         Err(_) if !git_has_commits(&repo_root).await => {
             let base = run_git_empty_tree(&repo_root).await?;
             (
@@ -1626,18 +1364,8 @@ pub struct GitSyncReport {
     pub not_pushed: Option<String>,
 }
 
-/// Sync the checked-out branch: update it from its own update source, then push
-/// it wherever a push can actually go.
-///
-/// The destination is resolved here rather than taken from the footer's cached
-/// state, so a branch switched since the last refresh is pushed where *it* can
-/// go, not where the previous branch could. The branch is updated from its own
-/// tracking ref first — unless it has none, or the push publishes a new branch,
-/// which the destination has no copy of to update from. A branch that tracks
-/// nothing records its upstream on the remote that received the push; an existing
-/// tracking — of a fetch-only remote, say — is left alone, because it is the
-/// branch's update source, not a push destination. Returns what git reported,
-/// from both streams.
+/// Sync the checked-out branch: update it from its own update source, then push it wherever a
+/// push can actually go.
 pub async fn run_git_sync(repo_path: &Path) -> anyhow::Result<GitSyncReport> {
     let lane = resolve_push_lane(repo_path)
         .await?
@@ -1655,12 +1383,11 @@ pub async fn run_git_sync(repo_path: &Path) -> anyhow::Result<GitSyncReport> {
     let (not_pushed, push) = match &lane.destination {
         GitPushDestination::Nowhere { reason } => (Some(reason.clone()), None),
         GitPushDestination::Target(target) => {
-            // A plain `git push` reaches the branch's own push destination — the
-            // one the control names whenever it accepts pushes — so it keeps
-            // honouring the configured push remote, push refspecs and
-            // `push.default`. Everywhere else the destination is named
-            // explicitly, and a branch that tracks nothing records its upstream
-            // on the remote that received the push.
+            // A plain `git push` reaches the branch's own push destination — the one the
+            // control names whenever it accepts pushes — so it keeps honouring the configured
+            // push remote, push refspecs and `push.default`. Everywhere else the destination
+            // is named explicitly, and a branch that tracks nothing records its upstream on
+            // the remote that received the push.
             let record_upstream = lane.remotes.upstream.is_none();
             let plain =
                 !record_upstream && lane.remotes.push.as_deref() == Some(target.remote.as_str());
@@ -1693,44 +1420,22 @@ pub async fn run_git_sync(repo_path: &Path) -> anyhow::Result<GitSyncReport> {
     })
 }
 
-/// Discard all changes to a path — restores tracked files from HEAD, unstages
-/// staged new files, and removes untracked files. Uses a 3-step git command
-/// sequence to handle ALL file states:
+/// Discard all changes to a path — `checkout HEAD --`, `reset HEAD --`, then `clean -f[d] --` —
+/// covering Modified, Deleted, Renamed, Added and untracked files in one sequence. Errors from
+/// all three steps are absorbed (an untracked path fails checkout with "did not match", a
+/// restored one makes reset a no-op); success is judged afterwards by
+/// `git status --porcelain --untracked-files=normal -- <path>`, empty meaning the discard
+/// worked and any remaining output reported as the failure it is. That untracked mode is
+/// pinned for the same reason [`run_git_status`] pins it — the owner's
+/// `status.showUntrackedFiles` must not decide this answer — so a leftover `git clean`
+/// deliberately keeps (a nested repository needs `-ff`) cannot pass as a silent success.
 ///
-/// 1. `git checkout HEAD -- <path>`
-///    — restores tracked files from HEAD (handles Modified, Deleted, Renamed).
-///    For files staged in the index (Added) that don't exist in HEAD, checkout
-///    removes them from both index and working tree. Untracked files fail with
-///    "did not match" — absorbed below.
-///
-/// 2. `git reset HEAD -- <path>`
-///    — unstages staged new (Added) files so that `git clean` can remove them.
-///    For files already restored by checkout this is a no-op. Errors
-///    (e.g. untracked files not in index) are absorbed.
-///
-/// 3. `git clean -f[d] -- <path>`
-///    — removes untracked files. `-f` for files, `-fd` for directories (recurses
-///    into subdirectories). Errors (file already tracked, already removed by
-///    checkout) are absorbed.
-///
-/// `path` is repo-root-relative (as git reports it), which is exactly what the
-/// diff window lists. Every pathspec uses `:(top,literal)`: `top` resolves it
-/// against the repository root whatever the caller's working directory — a
-/// subdirectory workspace would otherwise rewrite or delete a same-named path
-/// beneath itself — and `literal` keeps glob characters in file names from
-/// matching other files.
-///
-/// All errors from all three steps are absorbed. After the sequence, the working
-/// tree is verified via
-/// `git status --porcelain --untracked-files=normal -- <path>`: if the output is
-/// empty the operation succeeded; otherwise the remaining changes are reported.
-/// The untracked mode is pinned for the same reason [`run_git_status`] pins it —
-/// the owner's `status.showUntrackedFiles` must not decide this answer — so a
-/// leftover `git clean` deliberately keeps (a nested repository needs `-ff`) is
-/// reported as the failure it is instead of a silent success.
-///
-/// Note: `git reset HEAD` also exits with non-zero status when the path is
-/// outside the repository — callers should validate paths before calling this.
+/// `path` is repo-root-relative, as the diff window lists it. Every pathspec uses
+/// `:(top,literal)`: `top` resolves it against the repository root whatever the caller's
+/// working directory — a subdirectory workspace would otherwise rewrite or delete a same-named
+/// path beneath itself — and `literal` keeps glob characters in file names from matching other
+/// files. `git reset HEAD` also exits non-zero for a path outside the repository, so callers
+/// validate paths first.
 pub async fn run_git_discard(
     repo_path: &Path,
     path: &str,
@@ -1762,10 +1467,7 @@ pub async fn run_git_discard(
     }
 }
 
-/// Get the last commit's subject via `git log -1 --format=%s`.
-///
-/// If `commit_hash` is `Some`, get the message for that specific commit
-/// instead of HEAD.
+/// Get the last commit's subject via `git log -1 --format=%s`, for `commit_hash` if given.
 pub async fn run_git_commit_message(
     repo_path: &Path,
     commit_hash: Option<&str>,
@@ -1777,18 +1479,8 @@ pub async fn run_git_commit_message(
     run_git_trimmed(repo_path, &args).await
 }
 
-/// List new or untracked files in the working tree.
-///
-/// Runs [`run_git_status`], so it reads the same pinned untracked mode as every
-/// other reader here, and selects the entries a sanitation pass has to inspect:
-/// untracked (`??`) files and files staged as new (`A`). An untracked directory
-/// arrives as its single collapsed `dir/` entry: this list goes into the
-/// sanitation prompt uncapped, so the per-file `-uall` form would let one
-/// un-ignored build directory blow the prompt budget, while the collapsed entry
-/// already names the directory and keeps the tree dirty. An entry whose quoted
-/// path does not decode is skipped rather than reported as raw text (see
-/// [`PorcelainRecord`]) — the wrong-path alternative, at the theoretical cost of
-/// an empty list letting the sanitation commit proceed uninspected.
+/// List new or untracked files in the working tree: untracked (`??`) and staged-as-new (`A`)
+/// entries, the ones a sanitation pass has to inspect.
 pub(crate) async fn list_new_or_untracked_files(repo_path: &Path) -> anyhow::Result<Vec<String>> {
     let porcelain = run_git_status(repo_path).await?;
     Ok(parse_new_files_from_porcelain(&porcelain))
@@ -1796,35 +1488,21 @@ pub(crate) async fn list_new_or_untracked_files(repo_path: &Path) -> anyhow::Res
 
 /// One parsed `git status --porcelain` record: both status columns and the path.
 ///
-/// The record is `<XY><space><path>`, `X` the index status and `Y` the worktree
-/// status. Git C-quotes a path that needs it, quoting each side of a rename or
-/// copy pair independently, so the path comes back unquoted; a rename or copy
-/// yields its **destination** — the name that exists in the working tree — for
-/// either column, never the `old -> new` text. A record too short to hold a path,
-/// or one whose quoted path has escapes that do not decode, yields `None` and is
-/// skipped rather than reported as its raw text. A field not wrapped in quotes on
-/// both ends is taken literally — git always wraps a quoted path on both ends, so
-/// the only such field is an unquoted path (the status map reads it the same way).
+/// `<XY><space><path>`, `X` the index status and `Y` the worktree. Git C-quotes a path that
+/// needs it, quoting each side of a rename or copy pair independently, so the path comes back
+/// unquoted; a rename or copy yields its **destination** — the name that exists in the working
+/// tree — for either column, never the `old -> new` text. A record too short to hold a path, or
+/// one whose escapes do not decode, yields `None` and is skipped rather than reported as its
+/// raw text; a field not wrapped in quotes on both ends (git always wraps a quoted path) is
+/// taken literally.
 ///
-/// This is the record parser of the two path listings. The status map parses its
-/// own records because it classifies rather than lists, sharing only
-/// [`split_rename_paths`]. Where the views legitimately differ:
-///
-/// - A trailing-slash entry is a directory, not a file. The
-///   `--untracked-files=normal` reading of [`list_new_or_untracked_files`]
-///   collapses an untracked directory to one `dir/` entry, so
-///   [`parse_new_files_from_porcelain`] keeps it; the snapshot's
-///   `--untracked-files=all` reading lists a directory's contents and grows a
-///   trailing slash only for a collapsed nested repository, so
-///   [`parse_untracked_from_porcelain`] drops it; the map strips the slash to key
-///   a tree row.
-/// - A deleted entry (`D` in either column) is stored by no view: the map skips
-///   it, neither listing selects it — except `AD`, whose `A` column the new-files
-///   list selects and the map still skips — and a deletion registers only in the
-///   byte-level [`has_unstaged_changes`], which reads columns rather than records
-///   (so ` D` counts and `D ` does not).
-/// - ` A`, the intent-to-add state of `git add -N`, is `Added` in the map and
-///   excluded by both listings, which select on the index column.
+/// The status map parses its own records because it classifies rather than lists, sharing only
+/// [`split_rename_paths`]. The views differ deliberately: a trailing-slash entry is a directory
+/// — kept by the `-unormal` reading of [`parse_new_files_from_porcelain`], dropped by the
+/// `-uall` snapshot, and stripped to key a tree row by the map; a deleted entry (`D`) is stored
+/// by no view and registers only in the byte-level [`has_unstaged_changes`]; and ` A`
+/// (intent-to-add) is `Added` in the map but excluded by both listings, which select on the
+/// index column.
 struct PorcelainRecord {
     /// Index (staged) status column.
     index: char,
@@ -1834,10 +1512,8 @@ struct PorcelainRecord {
     path: String,
 }
 
-/// Parse one `git status --porcelain` record — see [`PorcelainRecord`].
-///
-/// The two status columns must be followed by their separator space; anything
-/// else is not a record.
+/// Parse one `git status --porcelain` record — see [`PorcelainRecord`]. The two status columns
+/// must be followed by their separator space; anything else is not a record.
 fn parse_porcelain_record(line: &str) -> Option<PorcelainRecord> {
     let mut chars = line.chars();
     let index = chars.next()?;
@@ -1874,16 +1550,14 @@ fn parse_porcelain_paths(
         .collect()
 }
 
-/// The destination path of a rename or copy record, from its `<old> -> <new>`
-/// field.
+/// The destination path of a rename or copy record, from its `<old> -> <new>` field.
 ///
 /// The delimiter is the first ` -> ` outside a quoted span: git quotes each side
-/// independently, so neither "the field starts quoted" nor "the last ` -> ` wins"
-/// identifies it — a quoted source with a plain destination, a plain source with a
-/// quoted destination, and a quoted destination containing the delimiter all split
-/// here. The source is only scanned, never returned: the recorded path is the one
-/// that exists in the working tree. `None` when there is no delimiter or the
-/// destination is not a path, and the caller skips the record.
+/// independently, so neither "the field starts quoted" nor "the last ` -> ` wins" identifies
+/// it — a quoted source with a plain destination, a plain source with a quoted destination,
+/// and a quoted destination containing the delimiter all split here. The source is only
+/// scanned, never returned: the recorded path is the one in the working tree. `None` when
+/// there is no delimiter or the destination is not a path, and the caller skips the record.
 fn split_rename_paths(field: &str) -> Option<String> {
     let mut quoted = false;
     let mut escaped = false;
@@ -1901,14 +1575,10 @@ fn split_rename_paths(field: &str) -> Option<String> {
     None
 }
 
-/// New/added file paths from a `git status --porcelain` reading.
-///
-/// Selects `??` (untracked) records and index-column `A` ones: `A ` (staged,
-/// clean), `AM` (staged, then modified), and `AD` (added, then deleted). Excludes
-/// ` A` — the intent-to-add state of `git add -N` — which is a real status but
-/// carries a space in the index column, so nothing is staged.
-///
-/// To list only truly untracked files, use [`parse_untracked_from_porcelain`].
+/// New/added file paths from a `git status --porcelain` reading: `??` and index-column `A`
+/// records (`A `, `AM`, `AD`). Excludes ` A`, the intent-to-add state of `git add -N`, which
+/// carries a space in the index column — nothing is staged. For only truly untracked files use
+/// [`parse_untracked_from_porcelain`].
 #[must_use]
 fn parse_new_files_from_porcelain(porcelain: &str) -> Vec<String> {
     parse_porcelain_paths(porcelain, |record| {
@@ -1916,12 +1586,10 @@ fn parse_new_files_from_porcelain(porcelain: &str) -> Vec<String> {
     })
 }
 
-/// Untracked file paths from the snapshot's `--untracked-files=all` reading.
-///
-/// Selects `??` records only, so staged-as-new files the tracked half of the
-/// snapshot already covers are not listed twice. A trailing-slash entry is a
-/// collapsed nested repository rather than a file and is dropped — see
-/// [`PorcelainRecord`].
+/// Untracked file paths from the snapshot's `--untracked-files=all` reading: `??` records only,
+/// so staged-as-new files the tracked half already covers are not listed twice. A
+/// trailing-slash entry is a collapsed nested repository rather than a file and is dropped —
+/// see [`PorcelainRecord`].
 #[must_use]
 fn parse_untracked_from_porcelain(porcelain: &str) -> Vec<String> {
     parse_porcelain_paths(porcelain, |record| {
@@ -1934,23 +1602,16 @@ fn parse_untracked_from_porcelain(porcelain: &str) -> Vec<String> {
 
 /// Parse `git status --porcelain` output into a map of file path → `GitFileStatus`.
 ///
-/// The porcelain format uses a two-column status (index + worktree). If either
-/// column is `M` the file is [`GitFileStatus::Modified`]; otherwise staged-new
-/// (`A`) and untracked (`??`) entries both map to [`GitFileStatus::Added`] — so
-/// the unmerged `AA`, `AU` and `UA` store `Added` through their `A` column. If a
-/// file appears both modified and added, `Modified` wins. A rename in either
-/// column keys its destination as [`GitFileStatus::Modified`] (see
-/// [`split_rename_paths`]); a copy is skipped, as is a rename field that does not
-/// split. A deleted entry (`D` in either column — `D `, ` D`, `AD`, `DU`, `DD`)
-/// is skipped, the deletion taking precedence over an `A` column. Everything else
-/// (`UU`, typechange) stores nothing. Handles git's C-style quoting for paths
-/// with special characters, and a path that does not unquote is skipped.
+/// If either column is `M` the file is [`GitFileStatus::Modified`]; otherwise staged-new (`A`)
+/// and untracked (`??`) map to [`GitFileStatus::Added`], so the unmerged `AA`, `AU` and `UA`
+/// store `Added` through their `A` column. Modified wins over added. A rename in either column
+/// keys its destination as `Modified` (see [`split_rename_paths`]); a copy is skipped, as is a
+/// rename field that does not split. A deleted entry (`D` in either column — `D `, ` D`, `AD`,
+/// `DU`, `DD`) is skipped, the deletion taking precedence over an `A` column. Everything else
+/// (`UU`, typechange) stores nothing, and a path that does not unquote is skipped.
 ///
-/// Keys are the paths as emitted by `git status --porcelain` —
-/// repo-root-relative, with a trailing slash stripped so they match a tree row.
-/// When the workspace is the repository root, this is the same key space as the
-/// editor's file tree.
-///
+/// Keys are repo-root-relative as git emits them, with a trailing slash stripped so they match
+/// a tree row — the same key space as the editor's file tree when the workspace is the root.
 /// The differences from the path listings are stated on [`PorcelainRecord`].
 #[must_use]
 pub(crate) fn parse_git_status_porcelain(output: &str) -> HashMap<String, GitFileStatus> {
@@ -1975,12 +1636,10 @@ pub(crate) fn parse_git_status_porcelain(output: &str) -> HashMap<String, GitFil
             continue;
         }
 
-        // Rename entries: "R  old_path -> new_path". Git quotes each side
-        // separately, so the split cannot assume a shared quoting style. The
-        // worktree column is treated the same way as a robustness rule: ` R`
-        // ("renamed in work tree") is documented but not observed in practice, and
-        // if it ever appears, dropping the row would be worse than keying its
-        // destination. The destination is the path in the tree either way.
+        // "R  old_path -> new_path". Git quotes each side separately, so the split cannot
+        // assume a shared quoting style. The worktree column is handled the same way as a
+        // robustness rule: ` R` ("renamed in work tree") is documented but not observed, and
+        // dropping the row would be worse than keying its destination.
         if ix == 'R' || wt == 'R' {
             let Some(new_path) = split_rename_paths(trimmed[2..].trim_start()) else {
                 continue;
@@ -2012,12 +1671,11 @@ pub(crate) fn parse_git_status_porcelain(output: &str) -> HashMap<String, GitFil
         let Some(path) = unquote_c_style(path) else {
             continue;
         };
-        // Strip trailing slash — git appends '/' for untracked directories
-        // (e.g., `?? new_dir/`), but tree node full_path has no trailing slash.
+        // Git appends '/' for untracked directories (`?? new_dir/`); a tree full_path has none.
         let path = path.strip_suffix('/').unwrap_or(&path).to_string();
 
-        // For entries with multiple lines referencing the same file (e.g., staged +
-        // unstaged), keep the most "interesting" status: Modified > Added.
+        // Staged + unstaged lines for one file keep the most interesting status:
+        // Modified > Added.
         let entry = map.entry(path).or_insert(status);
         if status == GitFileStatus::Modified && *entry == GitFileStatus::Added {
             *entry = GitFileStatus::Modified;
@@ -2032,9 +1690,9 @@ mod tests {
     use super::*;
     use crate::util::test::init_temp_repo;
 
-    /// The worktree identity is a pure reading (the repository's own index and
-    /// status are left as found) that agrees with a real `git add -A` — the value
-    /// the reviewed-base skip check compares an index tree against.
+    /// The worktree identity is a pure reading (the repository's own index and status are left
+    /// as found) that agrees with a real `git add -A` — what the reviewed-base skip check
+    /// compares an index tree against.
     #[tokio::test]
     async fn worktree_identity_is_read_only_and_matches_a_real_add() {
         let (_dir, repo_path) = init_temp_repo();
@@ -2065,9 +1723,9 @@ mod tests {
         assert_eq!(head, run_git_head(&repo_path).await.unwrap());
     }
 
-    /// Both cases the seed exists for: a split index (whose shared file git
-    /// resolves through the repository, not next to the copy) and a tracked file
-    /// matched by `.gitignore`, which an unseeded throwaway index drops.
+    /// Both cases the seed exists for: a split index (whose shared file git resolves through
+    /// the repository, not next to the copy) and a tracked file matched by `.gitignore`, which
+    /// an unseeded throwaway index drops.
     #[tokio::test]
     async fn worktree_identity_seeds_a_split_index_and_ignored_tracked_paths() {
         let (_dir, repo_path) = init_temp_repo();
@@ -2090,13 +1748,10 @@ mod tests {
         );
     }
 
-    // ── safe.directory resolver (CVE-2022-24765 ancestor walk) ───
-
-    /// One rule at every entry point it is asked from: the walk resolves the
-    /// `.git`-containing ancestor, whether it is asked from the repository root,
-    /// from a subdirectory below it, or from a directory whose `.git` is a
-    /// *file* (linked worktree / submodule marker — the walk uses `exists()`,
-    /// not `is_dir()`) — and reports no repository outside one.
+    /// One rule at every entry point: the walk resolves the `.git`-containing ancestor whether
+    /// asked from the repository root, from a subdirectory below it, or from a directory whose
+    /// `.git` is a *file* (linked worktree / submodule marker — the walk uses `exists()`, not
+    /// `is_dir()`) — and reports no repository outside one.
     #[test]
     fn resolve_git_top_level_cases() {
         let (_dir, repo_path) = init_temp_repo();
@@ -2129,13 +1784,10 @@ mod tests {
         }
     }
 
-    // ── Safe.directory injection (dubious-ownership fix) ──────────
-
-    /// Build a git command with a hermetic config environment: `safe.directory`
-    /// must come only from the injected `GIT_CONFIG_*` env, never from the
-    /// developer's global/system gitconfig (which may already list the repo or
-    /// use `*`). `GIT_TEST_ASSUME_DIFFERENT_OWNER=1` simulates a repo owned by a
-    /// different UID without requiring `chown`/root.
+    /// Build a git command with a hermetic config environment: `safe.directory` must come only
+    /// from the injected `GIT_CONFIG_*` env, never from the developer's global/system gitconfig
+    /// (which may already list the repo or use `*`). `GIT_TEST_ASSUME_DIFFERENT_OWNER=1`
+    /// simulates a repo owned by a different UID without needing `chown`/root.
     fn hermetic_git_command(repo_root: Option<&Path>) -> tokio::process::Command {
         let mut cmd = git_command(repo_root);
         cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
@@ -2144,9 +1796,8 @@ mod tests {
         cmd
     }
 
-    /// Simulates a repo owned by a different UID via git's
-    /// `GIT_TEST_ASSUME_DIFFERENT_OWNER` hook: the injected top-level
-    /// `safe.directory` must make git operable.
+    /// Simulates a repo owned by a different UID via git's `GIT_TEST_ASSUME_DIFFERENT_OWNER`
+    /// hook: the injected top-level `safe.directory` must make git operable.
     #[tokio::test]
     async fn test_safe_directory_injection_bypasses_dubious_ownership() {
         let (_dir, repo_path) = init_temp_repo();
@@ -2174,9 +1825,8 @@ mod tests {
         );
     }
 
-    /// The injected value must be the repo *top-level* even when the invocation
-    /// runs from a subdirectory workspace — git's own discovery normalizes to
-    /// the top-level, so a subdir value would not match.
+    /// The injected value must be the repo *top-level* even from a subdirectory workspace —
+    /// git's own discovery normalizes to the top-level, so a subdir value would not match.
     #[tokio::test]
     async fn test_safe_directory_injects_top_level_for_subdir_workspace() {
         let (_dir, repo_path) = init_temp_repo();
@@ -2192,8 +1842,6 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-
-    // ── Integration tests for run_git_* functions ────────────────
 
     #[tokio::test]
     async fn test_run_git_head_and_write_tree_fingerprint() {
@@ -2230,9 +1878,8 @@ mod tests {
         assert!(head.is_none(), "commit-less repo must not resolve HEAD");
     }
 
-    /// `git_has_commits` and `run_git_commit_message` both resolve against the
-    /// same HEAD: no commit → neither answers; one commit → both do; a named
-    /// hash reads that commit's message.
+    /// `git_has_commits` and `run_git_commit_message` both resolve against the same HEAD: no
+    /// commit → neither answers; one commit → both do; a named hash reads that commit's subject.
     #[tokio::test]
     async fn test_git_has_commits_and_commit_message_read_through_head() {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -2322,8 +1969,8 @@ mod tests {
         );
     }
 
-    /// A mode-only tracked change has no hunks and `0\t0` numstat; it is still
-    /// one listed change, with no line counts.
+    /// A mode-only tracked change has no hunks and `0\t0` numstat; it is still one listed
+    /// change, with no line counts.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_run_git_worktree_snapshot_lists_mode_only_change_without_counts() {
@@ -2405,8 +2052,8 @@ mod tests {
         );
     }
 
-    /// Both ways an untracked file becomes "huge": a NUL byte (binary) and a
-    /// file over [`MAX_UNTRACKED_SIZE`]. Neither is line-counted, and both feed
+    /// Both ways an untracked file becomes "huge": a NUL byte (binary) and a file over
+    /// [`MAX_UNTRACKED_SIZE`]. Neither is line-counted, and both feed
     /// `huge_binary_file_count`, which the churn measurement reads.
     #[tokio::test]
     async fn test_run_git_worktree_snapshot_marks_binary_and_oversized_untracked_files_huge() {
@@ -2448,8 +2095,8 @@ mod tests {
         );
     }
 
-    /// A subdirectory workspace still reads the whole repository and reports
-    /// repo-root-relative paths.
+    /// A subdirectory workspace still reads the whole repository and reports repo-root-relative
+    /// paths.
     #[tokio::test]
     async fn test_run_git_worktree_snapshot_resolves_root_relative_paths_from_subdir() {
         let (_dir, repo_path) = init_temp_repo();
@@ -2479,9 +2126,8 @@ mod tests {
     async fn test_run_git_worktree_snapshot_bounded_file_count_cap() {
         let (_dir, repo_path) = init_temp_repo();
 
-        // An untracked directory with more files than the per-refresh cap —
-        // only the first `MAX_UNTRACKED_FILES_COUNTED` files are counted, the
-        // rest are reported as omitted.
+        // An untracked directory with more files than the per-refresh cap — only the first
+        // `MAX_UNTRACKED_FILES_COUNTED` are counted, the rest are reported as omitted.
         std::fs::create_dir_all(repo_path.join("big_dir")).expect("create directory");
         for i in 0..(MAX_UNTRACKED_FILES_COUNTED + 50) {
             std::fs::write(
@@ -2546,8 +2192,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_git_worktree_snapshot_unborn_head() {
-        // A freshly `git init`ed repo with no commits has no HEAD; numstat
-        // against the empty tree still carries staged and untracked files.
+        // A freshly `git init`ed repo has no HEAD; numstat against the empty tree still
+        // carries staged and untracked files.
         let dir = tempfile::tempdir().expect("create temp dir");
         let repo_path = dir.path().to_path_buf();
         let status = std::process::Command::new("git")
@@ -2614,10 +2260,8 @@ mod tests {
         assert_eq!(entries[2].old_path.as_deref(), Some("old.txt"));
         assert_eq!((entries[2].added, entries[2].removed), (2, 0));
     }
-    // ── Push destination resolution and sync ─────────────────────
-
-    /// Create a bare repository under `root` and register it as remote `name`
-    /// of `repo_path`; returns the bare repo's path.
+    /// Create a bare repository under `root` and register it as remote `name` of `repo_path`;
+    /// returns the bare repo's path.
     fn add_bare_remote(root: &Path, repo_path: &Path, name: &str) -> std::path::PathBuf {
         let bare = root.join(format!("{name}.git"));
         let status = std::process::Command::new("git")
@@ -2681,9 +2325,9 @@ mod tests {
             .expect("a branch is checked out")
     }
 
-    /// An upstream-less branch on a repo with one pushable remote publishes to
-    /// it: the push carries every commit, records the upstream, and the report
-    /// is a real push (never reported as nothing to do).
+    /// An upstream-less branch on a repo with one pushable remote publishes to it: the push
+    /// carries every commit, records the upstream, and the report is a real push (never
+    /// reported as nothing to do).
     #[tokio::test]
     async fn publish_untracked_branch_to_single_pushable_remote() {
         let (_dir, repo_path) = init_temp_repo();
@@ -2745,9 +2389,8 @@ mod tests {
         );
     }
 
-    /// The count is what a press pushes: an update-and-push fast-forwards from the
-    /// branch's own update source first, and the commits the fast-forward brings
-    /// go to the destination too.
+    /// The count is what a press pushes: an update-and-push fast-forwards from the branch's own
+    /// update source first, and the commits the fast-forward brings go to the destination too.
     #[tokio::test]
     async fn update_and_push_counts_the_commits_a_press_pushes() {
         let (_dir, repo_path) = init_temp_repo();
@@ -2757,8 +2400,8 @@ mod tests {
         git_ok(&repo_path, &["push", "-u", "upstream", &branch]);
         let origin = add_bare_remote(remotes.path(), &repo_path, "origin");
         git_ok(&repo_path, &["push", "origin", &branch]);
-        // The update source moves on, so a press fast-forwards the branch and then
-        // pushes what it carries.
+        // The update source moves on, so a press fast-forwards the branch and then pushes what
+        // it carries.
         git_ok(&repo_path, &["switch", "-c", "upstream-side"]);
         commit_file(&repo_path, "moved.txt", "upstream moved on");
         commit_file(&repo_path, "moved-again.txt", "upstream moved on again");
@@ -2791,8 +2434,8 @@ mod tests {
         );
     }
 
-    /// The destination's copy is fetched when its tip is unknown here, so the count
-    /// is exact even though no local ref has seen that tip.
+    /// The destination's copy is fetched when its tip is unknown here, so the count is exact
+    /// even though no local ref has seen that tip.
     #[tokio::test]
     async fn destination_advanced_elsewhere_is_fetched_before_counting() {
         let (_dir, repo_path) = init_temp_repo();
@@ -2800,8 +2443,8 @@ mod tests {
         let origin = add_bare_remote(remotes.path(), &repo_path, "origin");
         let branch = run_git_current_branch(&repo_path).await.expect("branch");
         git_ok(&repo_path, &["push", "origin", &branch]);
-        // Another clone moves the destination on, so its tip is not in this
-        // repository's object store.
+        // Another clone moves the destination on, so its tip is not in this repository's
+        // object store.
         let elsewhere = remotes.path().join("elsewhere");
         git_ok(
             remotes.path(),
@@ -2844,9 +2487,9 @@ mod tests {
         );
     }
 
-    /// The destination is asked directly: a branch it already carries is never
-    /// announced as a publish just because this repository has no local ref for
-    /// it (a narrowed `remote.<name>.fetch` refspec never creates one).
+    /// The destination is asked directly: a branch it already carries is never announced as a
+    /// publish just because this repository has no local ref for it (a narrowed
+    /// `remote.<name>.fetch` refspec never creates one).
     #[tokio::test]
     async fn destination_branch_is_detected_without_a_local_ref() {
         let (_dir, repo_path) = init_temp_repo();
@@ -2915,8 +2558,8 @@ mod tests {
         );
     }
 
-    /// A publish skips the update step: the destination has no such branch to
-    /// update from, so the branch's commits go out as they are.
+    /// A publish skips the update step: the destination has no such branch to update from, so
+    /// the branch's commits go out as they are.
     #[tokio::test]
     async fn publish_skips_the_update_step() {
         let (_dir, repo_path) = init_temp_repo();
@@ -2963,8 +2606,8 @@ mod tests {
         );
     }
 
-    /// A branch tracking a push-capable remote keeps that remote as its
-    /// destination, and has nothing to offer once in sync.
+    /// A branch tracking a push-capable remote keeps that remote as its destination, and has
+    /// nothing to offer once in sync.
     #[tokio::test]
     async fn tracked_push_capable_remote_stays_the_destination() {
         let (_dir, repo_path) = init_temp_repo();
@@ -3000,9 +2643,9 @@ mod tests {
         );
     }
 
-    /// An unreachable destination does not hide the branch and does not claim a
-    /// publish: the branch is reported with the commits it carries, its reachability
-    /// is not asserted, and a press reports git's own reason.
+    /// An unreachable destination does not hide the branch and does not claim a publish: the
+    /// branch is reported with the commits it carries, its reachability is not asserted, and a
+    /// press reports git's own reason.
     #[tokio::test]
     async fn unreachable_destination_still_offers_a_push() {
         let (_dir, repo_path) = init_temp_repo();
@@ -3024,8 +2667,8 @@ mod tests {
         assert!(state.has_sync_work());
     }
 
-    /// The destination the control names is the one a plain `git push` reaches:
-    /// a configured `branch.<name>.pushRemote` wins over the tracked remote.
+    /// The destination the control names is the one a plain `git push` reaches: a configured
+    /// `branch.<name>.pushRemote` wins over the tracked remote.
     #[tokio::test]
     async fn configured_push_remote_is_the_named_destination() {
         let (_dir, repo_path) = init_temp_repo();
@@ -3063,8 +2706,8 @@ mod tests {
         );
     }
 
-    /// A push remote whose push destination is disabled is never used: the push
-    /// goes to the tracked remote that accepts pushes.
+    /// A push remote whose push destination is disabled is never used: the push goes to the
+    /// tracked remote that accepts pushes.
     #[tokio::test]
     async fn fetch_only_push_remote_falls_back_to_the_tracked_remote() {
         let (_dir, repo_path) = init_temp_repo();
@@ -3073,8 +2716,8 @@ mod tests {
         let upstream = add_bare_remote(remotes.path(), &repo_path, "upstream");
         let branch = run_git_current_branch(&repo_path).await.expect("branch");
         git_ok(&repo_path, &["push", "-u", "origin", &branch]);
-        // Git's own way of making a remote fetch-only, this time as the branch's
-        // configured push remote.
+        // Git's own way of making a remote fetch-only, this time as the branch's configured
+        // push remote.
         git_ok(
             &repo_path,
             &["remote", "set-url", "--push", "upstream", "no-push"],
@@ -3110,8 +2753,8 @@ mod tests {
         );
     }
 
-    /// A branch tracking a fetch-only upstream still pushes to the push-capable
-    /// remote and keeps its fetch-only tracking.
+    /// A branch tracking a fetch-only upstream still pushes to the push-capable remote and
+    /// keeps its fetch-only tracking.
     #[tokio::test]
     async fn fetch_only_upstream_stays_tracked_while_pushing_to_origin() {
         let (_dir, repo_path) = init_temp_repo();
@@ -3154,9 +2797,9 @@ mod tests {
         );
     }
 
-    /// A branch whose tracking ref is gone (deleted remote branch, pruned or
-    /// narrowed fetch) still resolves: the destination is asked directly, and the
-    /// press republishes without overwriting the branch's tracking config.
+    /// A branch whose tracking ref is gone (deleted remote branch, pruned or narrowed fetch)
+    /// still resolves: the destination is asked directly, and the press republishes without
+    /// overwriting the branch's tracking config.
     #[tokio::test]
     async fn missing_tracking_ref_still_resolves_and_publishes() {
         let (_dir, repo_path) = init_temp_repo();
@@ -3191,8 +2834,8 @@ mod tests {
         );
     }
 
-    /// A branch that tracks a fetch-only upstream is still updated from it when
-    /// no remote can take a push: the update step is not a guess.
+    /// A branch that tracks a fetch-only upstream is still updated from it when no remote can
+    /// take a push: the update step is not a guess.
     #[tokio::test]
     async fn behind_branch_still_fast_forwards_when_nowhere_to_push() {
         let (_dir, repo_path) = init_temp_repo();
@@ -3204,8 +2847,8 @@ mod tests {
         add_bare_remote(remotes.path(), &repo_path, "origin");
         add_bare_remote(remotes.path(), &repo_path, "backup");
 
-        // Advance the upstream from a side branch, so the checked-out branch is
-        // behind its own update source; only then make the remote fetch-only.
+        // Advance the upstream from a side branch, so the checked-out branch is behind its own
+        // update source; only then make the remote fetch-only.
         git_ok(&repo_path, &["switch", "-c", "upstream-side"]);
         commit_file(&repo_path, "remote.txt", "upstream moved on");
         git_ok(&repo_path, &["push", "upstream", &format!("HEAD:{branch}")]);
@@ -3257,8 +2900,8 @@ mod tests {
         assert!(report.output.is_empty(), "nothing ran: {}", report.output);
     }
 
-    /// Two pushable remotes are ambiguous — neither is picked, nothing is
-    /// pushed, and the control still says why.
+    /// Two pushable remotes are ambiguous — neither is picked, nothing is pushed, and the
+    /// control still says why.
     #[tokio::test]
     async fn several_pushable_remotes_are_not_guessed() {
         let (_dir, repo_path) = init_temp_repo();
@@ -3289,8 +2932,8 @@ mod tests {
         }
     }
 
-    /// Dummy push URLs (git's fetch-only convention) are unusable; every real
-    /// transport and existing local path is usable.
+    /// Dummy push URLs (git's fetch-only convention) are unusable; every real transport and an
+    /// existing local path are usable.
     #[test]
     fn push_destination_accepts_pushes_distinguishes_dummy_urls() {
         let (_dir, repo_path) = init_temp_repo();
@@ -3333,8 +2976,8 @@ mod tests {
         let branch = run_git_current_branch(&repo_path).await.expect("branch");
         git_ok(&repo_path, &["push", "origin", &branch]);
 
-        // A commit only the remote gets, then a different one locally — the
-        // branches diverge and a plain push is refused.
+        // A commit only the remote gets, then a different one locally — the branches diverge
+        // and a plain push is refused.
         git_ok(&repo_path, &["switch", "-c", "remote-only"]);
         commit_file(&repo_path, "remote.txt", "remote only");
         git_ok(&repo_path, &["push", "origin", &format!("HEAD:{branch}")]);
@@ -3351,10 +2994,8 @@ mod tests {
         );
     }
 
-    // ── porcelain listings — new/untracked file paths ─────────────
-
-    /// Shared porcelain test input with a mix of untracked (`??`), staged-as-new
-    /// (`A `), modified, and C-quoted special-character paths.
+    /// Shared porcelain test input with a mix of untracked (`??`), staged-as-new (`A `),
+    /// modified, and C-quoted special-character paths.
     const PORCELAIN_INPUT: &str = "\
 ?? new_file.rs
 M  modified.rs
@@ -3370,16 +3011,12 @@ A  \"staged\\\"file.js\"
 ?? \"file\\\\backslash.rs\"
 ";
 
-    /// The two listings over one mixed reading, and the entries both must
-    /// refuse. `parse_new_files_from_porcelain` takes untracked and
-    /// staged-as-new records; `parse_untracked_from_porcelain` takes `??` only,
-    /// so a staged file is not listed twice. Both unquote C-quoted paths and
-    /// both report nothing for a reading with no new file — where a record is
-    /// too short, does not unquote, or names a collapsed nested repository
-    /// rather than a file.
-    ///
-    /// The byte-level unstaged check still counts an entry no parser accepts —
-    /// see `has_unstaged_changes_cases`.
+    /// The two listings over one mixed reading, and the entries both must refuse.
+    /// `parse_new_files_from_porcelain` takes untracked and staged-as-new records;
+    /// `parse_untracked_from_porcelain` takes `??` only, so a staged file is not listed twice.
+    /// Both unquote C-quoted paths and both report nothing for a record that is too short,
+    /// does not unquote, or names a collapsed nested repository. The byte-level unstaged check
+    /// still counts an entry no parser accepts — see `has_unstaged_changes_cases`.
     #[test]
     fn porcelain_listings_classify_and_skip_unusable_entries() {
         assert_eq!(
@@ -3410,8 +3047,8 @@ A  \"staged\\\"file.js\"
             "`??` records only, so staged-as-new files are not listed twice"
         );
 
-        // Readings that list nothing: only modified/deleted records, and lines
-        // too short to carry a path.
+        // Readings that list nothing: only modified/deleted records, and lines too short to
+        // carry a path.
         for porcelain in [
             "M  modified.rs\n M working_tree_only.txt\nD  deleted.rs\n A working_tree_new.txt\n",
             "A",
@@ -3434,15 +3071,13 @@ A  \"staged\\\"file.js\"
         assert_eq!(parse_untracked_from_porcelain(unusable), ["good.rs"]);
         assert_eq!(parse_new_files_from_porcelain(unusable), ["good.rs"]);
 
-        // A collapsed nested repository is one `dir/` entry, not a file, and
-        // must not reach the manifest (or be counted as an omitted file).
+        // A collapsed nested repository is one `dir/` entry, not a file, and must not reach the
+        // manifest (or be counted as an omitted file).
         assert_eq!(
             parse_untracked_from_porcelain("?? nested/\n?? real.rs\n"),
             ["real.rs"]
         );
     }
-
-    // ── parse_git_status_porcelain — per-file status map ─────────
 
     #[expect(clippy::too_many_lines)]
     #[test]
@@ -3452,9 +3087,8 @@ A  \"staged\\\"file.js\"
             name: &'static str,
             /// Raw git status --porcelain output.
             input: &'static str,
-            /// Expected entries: (path, Some(status)) asserts the file has that
-            /// status; (path, None) asserts the file is absent from the map.
-            /// An empty slice asserts the entire map is empty.
+            /// `(path, None)` asserts absence from the map; an empty slice asserts the whole
+            /// map is empty.
             expected: &'static [(&'static str, Option<GitFileStatus>)],
         }
         let cases: &[Case] = &[
@@ -3638,9 +3272,8 @@ A  \"staged\\\"file.js\"
         }
     }
 
-    /// A rename into a name that itself contains the ` -> ` delimiter: git quotes
-    /// only the destination, so splitting at the quoted side's own delimiter
-    /// would key a bogus path.
+    /// A rename into a name that itself contains the ` -> ` delimiter: git quotes only the
+    /// destination, so splitting at the quoted side's own delimiter would key a bogus path.
     #[cfg(unix)]
     #[tokio::test]
     async fn git_status_rename_into_a_name_with_the_delimiter_keys_its_destination() {
@@ -3665,8 +3298,6 @@ A  \"staged\\\"file.js\"
             "got {map:?}"
         );
     }
-
-    // ── parse_numstat_lines — numstat line parsing ──
 
     /// numstat line parsing: normal, binary, malformed-skip, and empty inputs.
     #[test]
@@ -3726,18 +3357,14 @@ A  \"staged\\\"file.js\"
         }
     }
 
-    // ── run_git_discard — discard modifications ──
-
     /// Discard changes to a modified tracked file — restores it to HEAD.
     #[tokio::test]
     async fn test_run_git_discard_modified_file() {
         let (_dir, repo_path) = init_temp_repo();
 
-        // Modify the tracked file.
         std::fs::write(repo_path.join("test.txt"), b"modified content\n")
             .expect("write modified file");
 
-        // Confirm file is dirty.
         let status = run_git_command(&repo_path, &["status", "--porcelain", "test.txt"])
             .await
             .expect("status before discard");
@@ -3746,12 +3373,10 @@ A  \"staged\\\"file.js\"
             "file should be dirty before discard"
         );
 
-        // Discard the modification.
         run_git_discard(&repo_path, "test.txt", DiscardTarget::File)
             .await
             .expect("run_git_discard should succeed");
 
-        // File should be clean now.
         let status = run_git_command(&repo_path, &["status", "--porcelain", "test.txt"])
             .await
             .expect("status after discard");
@@ -3760,7 +3385,6 @@ A  \"staged\\\"file.js\"
             "file should be clean after discard"
         );
 
-        // Content should match the committed version.
         let content = std::fs::read_to_string(repo_path.join("test.txt")).expect("read file");
         assert_eq!(
             content, "line1\nline2\nline3\n",
@@ -3768,8 +3392,8 @@ A  \"staged\\\"file.js\"
         );
     }
 
-    /// Untracked content is removed by a discard, in both target shapes: a new
-    /// file, and a directory that goes recursively.
+    /// Untracked content is removed by a discard, in both target shapes: a new file, and a
+    /// directory that goes recursively.
     #[tokio::test]
     async fn test_run_git_discard_untracked_file_and_directory() {
         let (_dir, repo_path) = init_temp_repo();
@@ -3797,8 +3421,8 @@ A  \"staged\\\"file.js\"
         );
     }
 
-    /// Diff-window paths are repo-root-relative. Discarding from a subdirectory
-    /// workspace must target the root file, never a same-named file beneath it.
+    /// Diff-window paths are repo-root-relative. Discarding from a subdirectory workspace must
+    /// target the root file, never a same-named file beneath it.
     #[tokio::test]
     async fn test_run_git_discard_from_subdirectory_targets_the_root_path() {
         let (_dir, repo_path) = init_temp_repo();
@@ -3823,17 +3447,17 @@ A  \"staged\\\"file.js\"
         );
     }
 
-    /// The untracked mode is pinned on the status readers and the discard
-    /// verification, so the owner's `status.showUntrackedFiles` cannot decide
-    /// what the pipeline sees: with it off, untracked files stay visible to both
-    /// readings and a leftover discard must still be reported as a failure.
+    /// The untracked mode is pinned on the status readers and the discard verification, so the
+    /// owner's `status.showUntrackedFiles` cannot decide what the pipeline sees: with it off,
+    /// untracked files stay visible to both readings and a leftover discard is still reported
+    /// as a failure.
     #[tokio::test]
     async fn status_readers_pin_the_untracked_mode() {
         let (_dir, repo_path) = init_temp_repo();
         std::fs::create_dir(repo_path.join("sub")).unwrap();
         std::fs::write(repo_path.join("sub/file.txt"), b"new\n").unwrap();
-        // A nested repository, which `git clean -fd` deliberately keeps (it needs
-        // `-ff`), so the discard below leaves an untracked entry behind.
+        // A nested repository, which `git clean -fd` deliberately keeps (it needs `-ff`), so
+        // the discard below leaves an untracked entry behind.
         let nested = repo_path.join("nested");
         std::fs::create_dir(&nested).unwrap();
         run_git_command(&nested, &["init", "-q"]).await.unwrap();
@@ -3862,10 +3486,8 @@ A  \"staged\\\"file.js\"
         );
     }
 
-    // ── has_unstaged_changes ─────────────────────────────────────────
-
-    /// Empty, fully-staged, unstaged, dual-status, untracked, mixed,
-    /// trailing-newline, and unparseable-path porcelain inputs.
+    /// Empty, fully-staged, unstaged, dual-status, untracked, mixed, trailing-newline, and
+    /// unparseable-path porcelain inputs.
     #[test]
     fn has_unstaged_changes_cases() {
         let cases: &[(&str, &str, bool)] = &[
@@ -3897,8 +3519,8 @@ A  \"staged\\\"file.js\"
             ),
             ("trailing_newline_unstaged", " M file.rs\n", true),
             ("trailing_newline_staged", "M  file.rs\n", false),
-            // A path no parser accepts must still count: this gate runs on
-            // bytes, not records, so a malformed entry can never read as clean.
+            // A path no parser accepts must still count: this gate runs on bytes, not records,
+            // so a malformed entry can never read as clean.
             ("unparseable_quoted_path", " M \"broken\\q.rs\"\n", true),
             (
                 "unparseable_path_after_staged",

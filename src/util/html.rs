@@ -1,18 +1,11 @@
-//! Shared HTML escaping/unescaping utilities.
-//!
-//! Provides `escape_html` for full-string escaping, `push_escaped`
-//! for use in character-at-a-time hot loops (e.g. Markdown-to-HTML converters),
-//! and `decode_html_entities` for the reverse transformation.
+//! Shared HTML escaping/unescaping utilities. `push_escaped` is the
+//! character-at-a-time form for hot loops such as Markdown converters.
 
 /// HTML entity pairs: (character, encoded_entity).
 ///
-/// **Ordering invariant:** `&amp;` must come before `&#39;` before named
-/// entities (`&lt;`, `&gt;`, `&quot;`). This ensures double-encoded input
-/// like `&amp;#39;` decodes correctly: first `&amp;` → `&`, yielding `&#39;`,
-/// then `&#39;` → `'`. Similarly `&amp;lt;` → `&lt;` → `<`.
-///
-/// When adding new entities, append them **after** the existing entries to
-/// preserve the current decode ordering.
+/// **Ordering invariant:** `&amp;` must come before `&#39;` before the named
+/// entities, else double-encoded input (`&amp;#39;`, `&amp;lt;`) decodes wrong.
+/// Append new entities **after** the existing entries.
 const HTML_ENTITIES: &[(char, &str)] = &[
     ('&', "&amp;"),
     ('\'', "&#39;"),
@@ -21,10 +14,7 @@ const HTML_ENTITIES: &[(char, &str)] = &[
     ('"', "&quot;"),
 ];
 
-/// Escape HTML-special characters as their corresponding entities.
-///
-/// Handles `&`, `<`, `>`, `"`, and `'` → `&amp;`, `&lt;`, `&gt;`,
-/// `&quot;`, `&#39;` respectively.
+/// Escape `&`, `<`, `>`, `"` and `'` as their entities.
 #[must_use]
 pub fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -34,11 +24,7 @@ pub fn escape_html(s: &str) -> String {
     out
 }
 
-/// Push a single character to the output buffer, escaping HTML-special
-/// characters as their corresponding entities.
-///
-/// Entity mappings are sourced from [`HTML_ENTITIES`]; any character not
-/// in the map is pushed unchanged.
+/// Push one character, escaped per [`HTML_ENTITIES`]; others pass through.
 #[inline]
 pub(crate) fn push_escaped(ch: char, out: &mut String) {
     for &(c, entity) in HTML_ENTITIES {
@@ -50,18 +36,9 @@ pub(crate) fn push_escaped(ch: char, out: &mut String) {
     out.push(ch);
 }
 
-/// Decode the 5 standard HTML entities back to their literal characters.
-///
-/// # Decode order
-///
-/// Entities are decoded in [`HTML_ENTITIES`] order (`&amp;` → `&#39;` →
-/// named entities), which correctly handles double-encoded input such as
-/// `&amp;#39;` (→ `&#39;` → `'`) and `&amp;lt;` (→ `&lt;` → `<`).
-///
-/// # Fast path
-///
-/// Returns `s.to_string()` immediately when no `&` is present, avoiding
-/// allocations in the common case of plain text.
+/// Decode the five entities back to characters, in [`HTML_ENTITIES`] order so
+/// double-encoded input (`&amp;#39;`) comes out right. A string with no `&` is
+/// returned as-is, skipping the work.
 #[must_use]
 pub(crate) fn decode_html_entities(s: &str) -> String {
     if !s.contains('&') {
@@ -80,9 +57,6 @@ pub(crate) fn decode_html_entities(s: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Every special character is written as its entity, and `&` is escaped
-    /// before anything else so an already-encoded document is not
-    /// double-decoded: `&amp;` becomes `&amp;amp;`, not `&`.
     #[test]
     fn escape_html_writes_every_special_character_as_its_entity() {
         let cases: [(&str, &str); 2] = [
@@ -100,9 +74,6 @@ mod tests {
         }
     }
 
-    /// All five entities decode, in the order that makes double-encoded input
-    /// come out right: `&amp;#39;` decodes `&amp;` first, yielding `&#39;`,
-    /// which the next pass turns into `'`.
     #[test]
     fn decode_html_entities_walks_the_table_in_order() {
         let cases: [(&str, &str); 2] = [
@@ -116,8 +87,6 @@ mod tests {
             assert_eq!(decode_html_entities(input), expected, "input: {input:?}");
         }
     }
-
-    // --- Round-trip: decode(encode(c)) == c for all entities ---
 
     #[test]
     fn round_trip_all_entities() {

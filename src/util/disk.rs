@@ -1,16 +1,15 @@
 //! Disk free-space readings.
 //!
-//! One reading, spelled per platform: `statvfs` on unix, `GetDiskFreeSpaceExW`
-//! on Windows, `None` elsewhere. Both report the space available to the calling
-//! user, not the volume's raw free blocks — a per-user quota is what actually
-//! bounds writes into the user's temp directory, so a reading that ignored it
-//! would let callers walk into the quota wall while the disk still looked roomy.
+//! One reading, spelled per platform: `statvfs` on unix, `GetDiskFreeSpaceExW` on Windows, `None`
+//! elsewhere. Both report the space available to the calling user, not the volume's raw free blocks
+//! — a per-user quota is what actually bounds writes into the user's temp directory, so a reading
+//! that ignored it would let callers walk into the quota wall while the disk still looked roomy.
 
 use std::path::Path;
 
-/// `(free, capacity)` bytes on the volume holding `path`; `None` when the
-/// reading is unavailable (a failed `statvfs`, or an unusable path). `free` is
-/// `f_bavail` — the space available to an unprivileged process, not `f_bfree`.
+/// `(free, capacity)` bytes on the volume holding `path`; `None` when the reading is unavailable (a
+/// failed `statvfs`, or an unusable path). `free` is `f_bavail` — the space available to an
+/// unprivileged process, not `f_bfree`.
 #[cfg(unix)]
 #[must_use]
 pub(crate) fn free_and_capacity(path: &Path) -> Option<(u64, u64)> {
@@ -30,20 +29,19 @@ pub(crate) fn free_and_capacity(path: &Path) -> Option<(u64, u64)> {
     ))
 }
 
-/// `blocks` blocks of `frsize` bytes as a byte count. The block counts are the
-/// platform's own width — `u64` on Linux, narrower on macOS — so they are widened
-/// through `Into` instead of being spelled per target.
+/// `blocks` blocks of `frsize` bytes as a byte count. The block counts are the platform's own width
+/// — `u64` on Linux, narrower on macOS — so they are widened through `Into` instead of being
+/// spelled per target.
 #[cfg(unix)]
 fn block_bytes(blocks: impl Into<u64>, frsize: u64) -> u64 {
     blocks.into().saturating_mul(frsize)
 }
 
-/// Whether a wide path needs a trailing separator before it reaches the
-/// free-space query: true for a UNC-shaped path that lacks one. The API reads a
-/// UNC directory only when it is spelled with a trailing separator, and a UNC
-/// storage root is reachable on a roaming-profile machine. The verbatim
-/// (`\\?\C:\…`) and device (`\\.\…`) forms share the leading double backslash
-/// but are not UNC names, so the third character decides.
+/// Whether a wide path needs a trailing separator before it reaches the free-space query: true for
+/// a UNC-shaped path that lacks one. The API reads a UNC directory only when it is spelled with a
+/// trailing separator, and a UNC storage root is reachable on a roaming-profile machine. The
+/// verbatim (`\\?\C:\…`) and device (`\\.\…`) forms share the leading double backslash but are not
+/// UNC names, so the third character decides.
 #[cfg(any(windows, test))]
 #[must_use]
 fn needs_unc_separator(wide: &[u16]) -> bool {
@@ -54,11 +52,10 @@ fn needs_unc_separator(wide: &[u16]) -> bool {
         && !wide.ends_with(&[u16::from(b'/')])
 }
 
-/// `(free, capacity)` bytes on the volume holding `path`; `None` when the
-/// reading is unavailable (a failed `GetDiskFreeSpaceExW`, or a path with an
-/// interior NUL, which would silently name a different volume). `free` is
-/// `lpFreeBytesAvailableToCaller` — the space available to the calling user, so
-/// a per-user quota is honoured — and `capacity` is `lpTotalNumberOfBytes`.
+/// `(free, capacity)` bytes on the volume holding `path`; `None` when the reading is unavailable (a
+/// failed `GetDiskFreeSpaceExW`, or a path with an interior NUL, which would silently name a
+/// different volume). `free` is `lpFreeBytesAvailableToCaller` — the space available to the calling
+/// user, so a per-user quota is honoured — and `capacity` is `lpTotalNumberOfBytes`.
 #[cfg(windows)]
 #[must_use]
 pub(crate) fn free_and_capacity(path: &Path) -> Option<(u64, u64)> {
@@ -71,9 +68,8 @@ pub(crate) fn free_and_capacity(path: &Path) -> Option<(u64, u64)> {
     wide.push(0);
     let mut free = 0_u64;
     let mut capacity = 0_u64;
-    // SAFETY: `wide` is NUL-terminated and outlives the call; each out-parameter
-    // is a valid `u64` for the documented write, and the third is explicitly
-    // null, which the API accepts.
+    // SAFETY: `wide` is NUL-terminated and outlives the call; each out-parameter is a valid `u64`
+    // for the documented write, and the third is explicitly null, which the API accepts.
     let ok = unsafe {
         GetDiskFreeSpaceExW(
             wide.as_ptr(),
@@ -85,7 +81,6 @@ pub(crate) fn free_and_capacity(path: &Path) -> Option<(u64, u64)> {
     (ok != 0).then_some((free, capacity))
 }
 
-/// No free-space query on a platform that is neither unix nor Windows.
 #[cfg(not(any(unix, windows)))]
 #[must_use]
 pub(crate) fn free_and_capacity(_path: &Path) -> Option<(u64, u64)> {
@@ -108,11 +103,9 @@ mod tests {
         // Already spelled with one — appending a second would break the read.
         assert!(!needs_unc_separator(&wide(r"\\srv\share\")));
         assert!(!needs_unc_separator(&wide(r"\\srv/share/")));
-        // The verbatim and device forms share the double backslash but are not
-        // UNC names.
+        // The verbatim and device forms share the double backslash but are not UNC names.
         assert!(!needs_unc_separator(&wide(r"\\?\C:\ws")));
         assert!(!needs_unc_separator(&wide(r"\\.\C:")));
-        // An ordinary local path is passed through untouched.
         assert!(!needs_unc_separator(&wide(r"C:\ws")));
     }
 }

@@ -59,8 +59,7 @@ impl Tool for EditTool {
     }
 
     /// The prompt asset with this write's own path policy rendered in: the
-    /// skeleton is shared, so the two statements cannot drift from each other's
-    /// structure.
+    /// skeleton is shared, so the two statements cannot drift from each other's structure.
     fn description(&self) -> String {
         let path_policy = crate::prompt::load_prompt(match self.access {
             PathAccess::Unrestricted => "tool/edit_paths_admin.md",
@@ -155,7 +154,7 @@ impl EditTool {
         new_string: &str,
         multiple: bool,
     ) -> Result<String> {
-        // ── No-op guard: reject edits where old and new are identical ──
+        // No-op guard: reject edits where old and new are identical
         // Raw string comparison (no line-ending or whitespace normalization) so
         // we fail fast before touching the file.  Accepts the trade-off that a
         // whitespace-normalization edit (where old == new but the file bytes
@@ -169,13 +168,13 @@ impl EditTool {
             anyhow::bail!("old_string equals new_string — no change needed");
         }
 
-        // ── 1. Path pre-validation ───────────────────────────────
+        // 1. Path pre-validation
         let resolved_target =
             super::path::resolve_write_target(ws.as_path(), path, false, self.access).await?;
 
         let use_ws_matching = is_ws_insensitive_extension(path);
 
-        // ── 2. Size guard: reject oversized files before read_to_string ──
+        // 2. Size guard: reject oversized files before read_to_string
         match tokio::fs::metadata(&resolved_target).await {
             Ok(meta) => {
                 super::check_size_within(&meta, super::MAX_FILE_SIZE_BYTES, "File too large")?;
@@ -183,7 +182,7 @@ impl EditTool {
             Err(e) => anyhow::bail!("Cannot access file {path}: {e}"),
         }
 
-        // ── 3. Read → match → splice → write ─────────────────────
+        // 3. Read → match → splice → write
         let content = match tokio::fs::read_to_string(&resolved_target).await {
             Ok(c) => c,
             Err(e) => {
@@ -236,11 +235,10 @@ impl EditTool {
     }
 }
 
-// ── Match planning ──────────────────────────────────────────────────
+// Match planning
 
 /// One planned replacement: the byte span of a match in the file's raw content,
-/// and the text to write there with its line endings already adapted to the
-/// file.
+/// and the text to write there with its line endings already adapted to the file.
 struct Edit {
     span: std::ops::Range<usize>,
     replacement: String,
@@ -296,8 +294,7 @@ struct Plan {
 ///    types that have it and to single mode.
 ///
 /// In `multiple` mode every match found is replaced; otherwise a match count
-/// other than one is an error — not found, or ambiguous when several places
-/// match.
+/// other than one is an error — not found, or ambiguous when several places match.
 fn plan_edits(
     path: &str,
     content: &str,
@@ -427,7 +424,7 @@ fn line_ending_spans(content: &str, old_string: &str) -> Vec<std::ops::Range<usi
         .collect()
 }
 
-// ── Line endings ────────────────────────────────────────────────────
+// Line endings
 
 /// The line endings this tool recognises. A lone `\r` is content, not an
 /// ending, so it is never recognised here and never rewritten.
@@ -522,7 +519,7 @@ impl LfView {
     }
 }
 
-// ── Search index maintenance ────────────────────────────────────────
+// Search index maintenance
 
 /// Synchronously update the search engine's file index after a write.
 ///
@@ -571,7 +568,7 @@ fn update_search_index_after_write(ws: &Workspace, file_path: &std::path::Path) 
     }
 }
 
-// ── Whitespace-insensitive matching ─────────────────────────────────
+// Whitespace-insensitive matching
 
 /// File extensions for languages where whitespace between tokens has no
 /// semantic meaning, making whitespace-insensitive editing safe.
@@ -801,7 +798,7 @@ mod tests {
         // TempDir::drop auto-cleans — panic-safe
     }
 
-    // ── Extension check tests ────────────────────────────────────────
+    // Extension check tests
 
     #[test]
     fn ws_insensitive_extensions() {
@@ -854,7 +851,7 @@ mod tests {
         }
     }
 
-    // ── Whitespace-insensitive matching tests ────────────────────────
+    // Whitespace-insensitive matching tests
 
     /// (content, old_string, expected_span) that should produce a match.
     const MATCH_CASES: &[(&str, &str, &str)] = &[
@@ -1438,7 +1435,7 @@ mod tests {
         .await;
     }
 
-    // ── WS-insensitive ambiguity tests ────────────────────────────
+    // WS-insensitive ambiguity tests
 
     #[tokio::test]
     async fn ws_ambiguous_rejects_multiple_matches() {
@@ -1507,7 +1504,7 @@ mod tests {
         .await;
     }
 
-    // ── Line-ending handling ──────────────────────────────────────
+    // Line-ending handling
 
     /// The raw bytes of `name` in `dir`. Every reading surface hides a CRLF's
     /// carriage return, so a line-ending claim can only be checked on bytes.

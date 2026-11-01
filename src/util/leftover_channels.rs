@@ -1,46 +1,31 @@
-//! Bounded retention of the output channels a process that outlived its command
-//! still holds.
+//! Bounded retention of the output channels a process that outlived its command still
+//! holds: the chrome-use CLI's helper is deliberately left running, and the shell tool's
+//! leftover survives only when the stop it makes at detection did not take.
 //!
-//! A command that exits while a process it started still holds the command's
-//! output channel can leave that channel alive: the chrome-use CLI's helper is
-//! deliberately left running, and the shell tool's leftover survives only when the
-//! stop it makes at the moment of detection did not take (see [`crate::tools::shell`]).
-//! Closing such a read end would fault the leftover on its next write (SIGPIPE on
-//! unix, a broken pipe on Windows) and kill the very process the caller was told
-//! about, so the channel is kept open.
+//! Closing such a read end would fault the leftover on its next write (SIGPIPE on unix, a
+//! broken pipe on Windows) and kill the very process the caller was told about, so the
+//! channel is kept open. Holding one costs a reader task and a descriptor, so the set is
+//! capped: past [`MAX_RETAINED_CHANNELS`] the OLDEST is released (its reader aborted), the
+//! newest is kept — it is what the caller was just told about. The "left running"
+//! guarantee therefore holds only while the channel is RETAINED; the cap's bound on
+//! descriptors is real, the leftover's survival past it is not promised.
 //!
-//! A reader is retained only when the call that started it ENDS, so the set holds
-//! only channels that outlived their call — the cap can never abort the reader of
-//! a call still in flight. Holding a channel costs a reader task and a file
-//! descriptor, so the number held at once is bounded: past
-//! [`MAX_RETAINED_CHANNELS`] the OLDEST is released (its reader aborted), which
-//! closes that read end — a leftover whose next write hits the closed pipe can
-//! then be terminated by the platform (SIGPIPE on unix, a broken pipe on Windows).
-//! The newest is the one kept: it is what the caller was just told about.
-//!
-//! So the "left running" guarantee is what the product provides while it RETAINS
-//! the channel: releasing it (past the cap, or when the product stops draining)
-//! ends that. The cap's bound on descriptors is real; the leftover's survival is
-//! not promised past it.
-//!
-//! The two readers that can outlive their command both retain through here: the
-//! shell's capture readers and the chrome-use CLI's output pipes.
+//! A reader is retained only when the call that started it ENDS, so the cap can never abort
+//! the reader of a call still in flight.
 
 use std::collections::VecDeque;
 use std::sync::{LazyLock, Mutex};
 
 use crate::util::UnwrapPoison;
 
-/// How many leftover output channels the product keeps open at once.
 pub(crate) const MAX_RETAINED_CHANNELS: usize = 16;
 
 /// The retained reader tasks, oldest first.
 static RETAINED: LazyLock<Mutex<VecDeque<tokio::task::JoinHandle<()>>>> =
     LazyLock::new(|| Mutex::new(VecDeque::new()));
 
-/// Keep a reader task draining after the call that started it has returned.
-/// Readers whose channel already reached EOF are dropped first (they hold
-/// nothing), then the oldest channel past [`MAX_RETAINED_CHANNELS`] is released.
+/// Keep a reader task draining after the call that started it returned. Finished readers
+/// are dropped first (they hold nothing), then the oldest past [`MAX_RETAINED_CHANNELS`].
 pub(crate) fn retain_channel(task: tokio::task::JoinHandle<()>) {
     // A finished reader holds nothing; pushing it would let it displace — and
     // abort — an oldest still-live channel.

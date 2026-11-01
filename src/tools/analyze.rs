@@ -1,31 +1,22 @@
-//! AnalyzeTool — dispatches a batch of parallel analysts to research a question,
-//! at one of two depths.
+//! AnalyzeTool — dispatches a batch of parallel analysts at `quick` (one round)
+//! or `deep` (the multi-round investigation, [`super::research`]).
 //!
-//! Dispatch-only: every dispatch call raises analysts (read-only research),
-//! never mutation-capable agents. The cancel action dispatches nothing (it
-//! deletes the named round's own rows — see below). `quick` runs the single
-//! round of parallel analysts; `deep` runs the multi-round deep investigation
-//! ([`super::research`]) to one consolidated, source-cited report. A holder that
-//! has both declares the `depth` choice; a holder with one fixed depth does not.
+//! Dispatch-only: analysts are read-only research agents, never mutation-capable.
+//! The cancel action dispatches nothing — it deletes the named round's own rows.
+//! A holder with both depths declares the `depth` choice; one with a fixed depth
+//! does not. Holders: the Engineer, Manager and Maintainer run `quick` (sync for
+//! the Engineer/Maintainer, async for the Manager); a guest Assistant runs `quick`
+//! async; the admin Assistant runs both depths async and alone accepts an optional
+//! `place` (a managed workspace name or an absolute path) for `quick`, moving the
+//! round's execution root for that call only — `deep` ignores it. Argument
+//! mechanics and refusals live in [`super::delegation`].
 //!
-//! Holders: the Engineer, Manager and Maintainer run `quick` (sync for the
-//! Engineer/Maintainer, async for the Manager); a guest Assistant runs `quick`
-//! async; the admin Assistant runs both depths async and additionally accepts an
-//! optional `place` argument (a managed workspace name, or an absolute
-//! directory path) for `quick` that moves the round's execution root for that
-//! call only. `deep` ignores `place`.
-//! Argument mechanics and refusals live in [`super::delegation`].
-//!
-//! Analyst batches run two decorrelated analysts (distinct research angles)
-//! that report structured claim-level findings; consolidation runs the shared
-//! LLM grouping pass ([`crate::consensus`]) — semantic grouping + contradiction
-//! judgment with code-computed agreement brackets. Disputed groups (those with
-//! a genuine contradiction) get an optional annotation-only verification round
-//! of fresh analysts, appended as a `## Verification` section. Fail-open is
-//! preserved throughout: findings are never silently lost — with one deliberate
-//! exception, a round the caller cancels: its analysts stop, its partial
-//! findings are never turned into a result, and its result is never delivered
-//! (see [`crate::analyze_cancel`]).
+//! Two decorrelated analysts per round report structured claim-level findings; the
+//! shared [`crate::consensus`] pass groups them and computes agreement brackets in
+//! code. Disputed groups get an optional annotation-only verification round,
+//! appended as `## Verification`. Fail-open throughout — findings are never
+//! silently lost — except a round the caller cancels: its partial findings never
+//! become a result and it is never delivered (see [`crate::analyze_cancel`]).
 
 use crate::agent::{run_agent, run_default_agent};
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
@@ -38,17 +29,11 @@ use serde_json::json;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-// ── Constants (module-local defaults) ────────────────────────────────────
-
-/// Number of decorrelated parallel analysts spawned per analyze round (durable and
-/// sync pipelines share the same batch width).
+/// Decorrelated parallel analysts per round (durable and sync share the width).
 const PARALLEL_ANALYST_COUNT: usize = 2;
 
-/// Controls sub-agent dispatch behaviour.
-///
-/// [`Sync`](DispatchMode::Sync) blocks the caller until the sub-agent completes.
-/// [`Async`](DispatchMode::Async) dispatches the sub-agent in a background task
-/// and injects the result via the caller's agent queue.
+/// [`Sync`](DispatchMode::Sync) blocks the caller until the sub-agent completes;
+/// [`Async`](DispatchMode::Async) injects its result via the caller's agent queue.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DispatchMode {
     Sync,
@@ -56,17 +41,14 @@ pub enum DispatchMode {
 }
 
 impl DispatchMode {
-    /// Returns `true` when this dispatch mode is [`Async`](DispatchMode::Async).
     #[must_use]
     pub const fn is_async(self) -> bool {
         matches!(self, Self::Async)
     }
 }
 
-/// How deep an `analyze` call goes: `quick` is one round of parallel analysts;
-/// `deep` is the multi-round deep investigation, whose report arrives hours
-/// later. The order of [`Self::ALL`] is the interface order — the narrowest
-/// kind is first.
+/// `quick` is one round of parallel analysts; `deep` the multi-round investigation
+/// whose report arrives hours later. [`Self::ALL`] is in interface order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AnalyzeDepth {
     Quick,
@@ -74,16 +56,12 @@ pub enum AnalyzeDepth {
 }
 
 impl AnalyzeDepth {
-    /// The argument naming the choice.
     pub const ARG: &'static str = "depth";
 
-    /// Every depth, in interface order (narrowest first).
     pub const ALL: [Self; 2] = [Self::Quick, Self::Deep];
 
-    /// The wire spellings of [`Self::ALL`], in the same order.
     pub const STRS: &'static [&'static str] = &[Self::Quick.as_str(), Self::Deep.as_str()];
 
-    /// The wire spelling of this depth.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -92,44 +70,34 @@ impl AnalyzeDepth {
         }
     }
 
-    /// Parse a wire spelling.
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|depth| depth.as_str() == value)
     }
 }
 
-/// The cancel action's argument spellings — the interface's second axis,
-/// declared only where an asynchronous quick round can be dispatched
-/// ([`AnalyzeTool::cancels`]).
+/// The cancel action's argument spellings, declared only where an asynchronous
+/// quick round can be dispatched ([`AnalyzeTool::cancels`]).
 pub(crate) const ACTION_ARG: &str = "action";
-/// The round the cancel action addresses — the id the dispatch acknowledgement
-/// carried.
+/// The round the cancel action addresses — the id its acknowledgement carried.
 pub(crate) const JOB_ID_ARG: &str = "job_id";
-/// The `action` value that selects the cancel action.
 const ACTION_CANCEL: &str = "cancel";
 
 pub struct AnalyzeTool {
-    /// Controls how the sub-agents are dispatched.
-    /// - [`DispatchMode::Sync`] — blocks the caller until the sub-agents complete.
-    /// - [`DispatchMode::Async`] — dispatches in a background task, result
-    ///   delivered via the caller's agent queue.
     dispatch_mode: DispatchMode,
-    /// The role of the calling agent. Used to route async results to the
-    /// correct agent channel (Manager → manager_{ws}, Assistant → direct_{...}).
+    /// Routes async results to the correct agent channel (Manager → manager_{ws},
+    /// Assistant → direct_{...}).
     pub caller_role: Role,
-    /// The depths this holder may call, in interface order. A single depth is
-    /// never declared as a choice argument.
+    /// The depths this holder may call, in interface order. A single depth is never
+    /// declared as a choice argument.
     kinds: Vec<AnalyzeDepth>,
-    /// Whether the optional `place` argument is accepted — the admin Assistant
-    /// and any custom role holding `quick`. Every other holder keeps the
-    /// argument-less interface.
+    /// Whether the optional `place` argument is accepted — the admin Assistant and any
+    /// custom role holding `quick`; every other holder keeps the argument-less interface.
     accepts_place: bool,
 }
 
 impl AnalyzeTool {
-    /// The quick-only, no-`place` variant: Engineer, Manager, Maintainer and a
-    /// guest Assistant.
+    /// The quick-only, no-`place` variant: Engineer, Manager, Maintainer, guest Assistant.
     #[must_use]
     pub fn new(dispatch_mode: DispatchMode, caller_role: Role) -> Self {
         Self {
@@ -140,11 +108,8 @@ impl AnalyzeTool {
         }
     }
 
-    /// The admin Assistant's variant: both depths and the optional `place`
-    /// argument (honoured for `quick` only).
-    ///
-    /// Always the async dispatch — a place can only be honoured by a durable
-    /// background round, which records the directory it runs in for resume.
+    /// Both depths plus the optional `place` (honoured for `quick` only), always async:
+    /// only a durable background round can honour a place, recording its directory for resume.
     #[must_use]
     pub fn admin(caller_role: Role) -> Self {
         Self {
@@ -155,9 +120,8 @@ impl AnalyzeTool {
         }
     }
 
-    /// A custom role's variant: exactly the granted depths, always async, with
-    /// `place` offered iff `quick` is held (deep ignores it). Never empty — a
-    /// grant entry that named no kind takes the narrowest kind (`quick`).
+    /// A custom role's exactly-granted depths, always async, with `place` iff `quick` is
+    /// held. Never empty — a kindless grant takes the narrowest kind (`quick`).
     #[must_use]
     pub fn granted(kinds: &[AnalyzeDepth]) -> Self {
         let kinds = if kinds.is_empty() {
@@ -174,11 +138,9 @@ impl AnalyzeTool {
         }
     }
 
-    /// Whether this holder is offered the cancel action. Only a holder that can
-    /// dispatch an asynchronous `quick` round can — the Manager, the Assistant
-    /// and a custom role granted `quick`. A sync holder (Engineer, Maintainer)
-    /// and a `deep`-only holder dispatch work this action deliberately does not
-    /// stop, so it is not offered to them.
+    /// Only a holder that can dispatch an asynchronous `quick` round is offered the
+    /// cancel action: the Manager, the Assistant and a custom role granted `quick`. A
+    /// sync or `deep`-only holder dispatches work this action deliberately does not stop.
     #[must_use]
     fn cancels(&self) -> bool {
         self.dispatch_mode.is_async() && self.kinds.contains(&AnalyzeDepth::Quick)
@@ -191,11 +153,10 @@ impl Tool for AnalyzeTool {
         "analyze"
     }
 
-    /// Compose the description from shared fragments: the base text, the quick
-    /// note when `quick` is held, the depth note for what this holder can call,
-    /// the optional-`place` note, the async note, and — only where the cancel
-    /// action is offered — the cancel note. The deep note always carries the
-    /// long-running warning and the scope-confirmation requirement.
+    /// Compose from shared fragments: base text, the quick note, the depth note, the
+    /// `place` note, the async note and — only where cancel is offered — the cancel
+    /// note. The deep note always carries the long-running warning and the
+    /// scope-confirmation requirement.
     fn description(&self) -> String {
         let mut parts = vec![load_prompt("tool/analyze.md")];
         if self.kinds.contains(&AnalyzeDepth::Quick) {
@@ -239,9 +200,8 @@ impl Tool for AnalyzeTool {
             dispatch.push(AnalyzeDepth::ARG);
         }
         if self.accepts_place {
-            // The interface declares the per-choice requirement — `deep` never
-            // takes the folder — so only a holder that has the `depth` argument
-            // is told about it. How the folder is spelled lives in the note.
+            // Declared per choice — `deep` never takes the folder — so only a
+            // holder with the `depth` argument is told about it.
             let mut description = "Optional folder this round works in.".to_string();
             if self.kinds.contains(&AnalyzeDepth::Deep) {
                 description.push_str(" `deep` ignores it.");
@@ -254,12 +214,9 @@ impl Tool for AnalyzeTool {
         if !self.cancels() {
             return super::tool_params_schema(&properties, &dispatch);
         }
-        // The cancel action is a second axis, not a second tool: it is declared
-        // beside the dispatch arguments and validated on the call. A cancel call
-        // carries no dispatch argument, so the requirement is a disjunction —
-        // `message` (+ `depth`) to dispatch, `action` + `job_id` to cancel —
-        // which the flat `required` envelope cannot express (built like
-        // `web_search`'s two-branch schema).
+        // A second axis, not a second tool: declared beside the dispatch arguments
+        // and validated on the call. A cancel carries no dispatch argument, so the
+        // requirement is a disjunction the flat `required` envelope cannot express.
         properties[ACTION_ARG] = json!({
             "type": "string",
             "enum": [ACTION_CANCEL],
@@ -277,31 +234,23 @@ impl Tool for AnalyzeTool {
         schema
     }
 
-    /// A dispatch itself spends nothing the workspace can observe — the analysts
-    /// are read-only (see `Role::tools()` for when even the read-only shell is
-    /// withheld), and this classification is coupled to it: if Analyst ever gains
-    /// side-effecting tools, this must be reconsidered. A cancel call does delete
-    /// the round's rows, but it can only name a round whose acknowledgement an
-    /// EARLIER tool round returned, so it never acts on a round dispatched beside
-    /// it — staying read-only keeps several dispatches of one tool round running
-    /// in parallel.
+    /// Analysts are read-only (see `Role::tools()` for when even the read-only shell is
+    /// withheld), and this classification is coupled to that: side-effecting Analyst tools would
+    /// force a reconsideration. A cancel deletes rows, but only of a round acknowledged in an
+    /// EARLIER tool round, so it never acts on a round dispatched beside it.
     fn side_effects(&self) -> bool {
         false
     }
 
-    /// The consolidated analysis (grouped claims + optional verification
-    /// section) must reach the calling agent in full — sandwich-truncating it
-    /// would silently drop findings and verification verdicts. The analyze
-    /// output is bounded by the analyst round itself, never by the shared
-    /// tool-output budget.
+    /// Sandwich-truncating it would silently drop findings and verification verdicts; it is
+    /// bounded by the analyst round, never by the output budget.
     fn preserve_full_output(&self) -> bool {
         true
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
-        // The cancel action is read before anything else: it takes neither the
-        // message, nor the depth, nor the place, so a cancel is never refused
-        // for a dispatch argument it does not carry.
+        // Read first: a cancel takes no message, depth or place, so it is never
+        // refused for a dispatch argument it does not carry.
         if self.cancels() {
             match super::get_opt_str_strict(&args, ACTION_ARG)? {
                 None => {}
@@ -311,11 +260,10 @@ impl Tool for AnalyzeTool {
                         !job_id.is_empty(),
                         "usage: `{JOB_ID_ARG}` must name the round to cancel"
                     );
-                    // Ownership is the calling SESSION: the round's own delivery
-                    // address is compared against it, and the user is not part of
-                    // it — a workspace-scoped Manager session is driven by
-                    // pipeline ticket notifications, whose turns carry no user at
-                    // all (`tool_identity` would refuse exactly those turns).
+                    // Ownership is the calling SESSION, not the user: the round's
+                    // delivery address is compared against it. A workspace-scoped
+                    // Manager session is driven by pipeline notifications, whose
+                    // turns carry no user (`tool_identity` would refuse them).
                     let caller = crate::agent::tool_agent_id()?;
                     let outcome = crate::analyze_cancel::cancel_round(job_id, &caller).await?;
                     return Ok(crate::analyze_cancel::answer(&outcome, job_id));
@@ -336,10 +284,9 @@ impl Tool for AnalyzeTool {
 
         match depth {
             AnalyzeDepth::Quick => {
-                // The optional `place` only affects a quick round, and only a
-                // durable background round can honour it — resolved here, where
-                // it is used. A refused place dispatches nothing and never falls
-                // back to the caller's own workspace.
+                // Only a quick round takes `place`, and only a durable background
+                // round can honour it. A refused place dispatches nothing and never
+                // falls back to the caller's own workspace.
                 let place = if self.accepts_place {
                     super::delegation::resolve(super::delegation::DelegationKind::Analyze, &args)
                         .await?
@@ -360,9 +307,8 @@ impl Tool for AnalyzeTool {
                          as an <analyze-tool-result> message unless you cancel the round first."
                     ));
                 }
-                // Sync path — blocks the caller until the analysts complete.
-                // (a place is impossible here: `admin()`/`granted()` are
-                // async-only.)
+                // Sync path — a place is impossible here: `admin()`/`granted()`
+                // are async-only.
                 super::SyncDurableCore::Analyze
                     .run_sync_dispatch(ws, message, self.caller_role)
                     .await
@@ -383,8 +329,7 @@ struct AnalyzeSlot {
 }
 
 /// Spawn the analyze job + roster (one tx), run the analysts, checkpoint per-agent
-/// outcomes, consolidate. `pre_done` carries slots already completed (resume)
-/// with their stored raw-response outcomes.
+/// outcomes, consolidate. `pre_done` are slots already completed by an earlier resume.
 #[expect(clippy::too_many_lines)]
 pub(crate) async fn run_analyze_with_job(
     ws: &Workspace,
@@ -410,8 +355,7 @@ pub(crate) async fn run_analyze_with_job(
 
     let (slots, pre_done) = match &spawn {
         // Resume: reuse the stored roster (agent ids + final tasks) — never
-        // regenerate ids (the PK would conflict AND the new ids would not match
-        // the stored roster rows).
+        // regenerate ids, or the PK conflicts and the rows stop matching.
         None => {
             let rows =
                 crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id).await?;
@@ -422,8 +366,7 @@ pub(crate) async fn run_analyze_with_job(
                     task: r.task.clone(),
                 })
                 .collect();
-            // Done slots are reconstructed from their stored outcomes; the rest
-            // re-run with their stored tasks.
+            // Done slots from their stored outcomes; the rest re-run their tasks.
             let pre_done: Vec<(String, String)> = rows
                 .iter()
                 .filter(|r| r.status == crate::jobs::RowStatus::Done.as_str())
@@ -431,9 +374,8 @@ pub(crate) async fn run_analyze_with_job(
                 .collect();
             (slots, pre_done)
         }
-        // Fresh dispatch: build the roster and spawn the job BEFORE any analyst
-        // session write (caller identity persisted on the job row so a later
-        // resume delivers to the ORIGINAL caller).
+        // Fresh dispatch: roster and job BEFORE any analyst session write, with the
+        // caller identity persisted so a later resume reaches the ORIGINAL caller.
         Some(spawn) => {
             let suffix = crate::generate_suffix();
             let angles = load_analyst_angles();
@@ -460,18 +402,15 @@ pub(crate) async fn run_analyze_with_job(
                 &agents,
                 &crate::jobs::SpawnChild::Analyze,
                 caller_agent_id,
-                // The round's execution directory (the caller's place, when one
-                // was asked for) so a restart resumes into the same directory.
+                // The round's execution directory, so a restart resumes there.
                 spawn.exec_dir,
-                // The calling custom role's launch, when there is one, so a
-                // resume rebuilds an envelope addressed to its branch.
+                // The custom role's launch, so a resume rebuilds its branch envelope.
                 spawn.custom_launch,
             )
             .await?;
-            // The cancel can have landed while the roster was built, or between
-            // that and this INSERT's commit. The gate inside `spawn_job`'s tx
-            // refuses the row in that case, so this only turns the stop into the
-            // round's outcome — a cancelled round is never resumed either way.
+            // A cancel can land while the roster is built or before this INSERT
+            // commits. `spawn_job`'s gate refuses the row then, so this only turns the
+            // stop into the round's outcome — a cancelled round is never resumed.
             if crate::round_cancel::is_cancelled(job_id) {
                 return Ok(crate::tools::SyncCoreOutcome::Cancelled);
             }
@@ -484,26 +423,23 @@ pub(crate) async fn run_analyze_with_job(
         .iter()
         .filter(|s| !pre_done.iter().any(|(id, _)| id == &s.agent_id))
         .collect();
-    // Round key = the durable job_id — stable across resume so a resumed
-    // round's analysts and consolidation call group under the same key.
+    // Round key = the durable job_id, stable across resume so a resumed round's
+    // analysts and consolidation call group together.
     let fresh_runs = run_analyze_slots(ws, &fresh_slots, deadline, resume, job_id, message).await;
 
-    // The cancel landed while the analysts ran: they were cancelled as a group,
-    // so their runs already carry the stopped outcome — the partial findings are
-    // never turned into a result, with no checkpoint write, extraction or
-    // consolidation.
+    // Cancelled as a group while the analysts ran, so their runs already carry the
+    // stopped outcome: no checkpoint write, extraction or consolidation, and the
+    // partial findings never become a result.
     if crate::round_cancel::is_cancelled(job_id) {
         return Ok(crate::tools::SyncCoreOutcome::Cancelled);
     }
 
-    // Assemble runs in slot order.
     let mut runs: Vec<AnalyzeRun> = Vec::with_capacity(slots.len());
     let mut fresh_iter = fresh_runs.into_iter();
     for slot in &slots {
         if let Some((_, raw)) = pre_done.iter().find(|(id, _)| id == &slot.agent_id) {
-            // Done slot — reconstruct the run from the stored response. The
-            // fresh agent pre-loads the analyst's persisted session so
-            // extract_findings keeps KV-cache compatibility.
+            // Done slot from the stored response; the fresh agent pre-loads the
+            // persisted session so extract_findings keeps KV-cache compatibility.
             let mut agent = crate::Agent::new(
                 slot.agent_id.clone(),
                 crate::Role::Analyst,
@@ -543,9 +479,8 @@ pub(crate) async fn run_analyze_with_job(
         )
         .await
         {
-            // Sync calls fail the tool call on a checkpoint DB error so the
-            // model retries; async/boot-resume warn-and-continue (the outcomes
-            // are recomputable on the next resume).
+            // Sync fails the tool call on a checkpoint DB error so the model retries;
+            // async/boot-resume warn and continue (outcomes are recomputable).
             if fail_on_checkpoint_error {
                 return Err(e.context("failed to checkpoint analyze outcome"));
             }
@@ -553,9 +488,8 @@ pub(crate) async fn run_analyze_with_job(
         }
     }
 
-    // Drain/shutdown cut the round mid-flight: skip the consolidate LLM call
-    // (no new LLM work during the drain) — the checkpointed outcomes are
-    // reused by the next boot's resume; the caller leaves the job launched.
+    // Drain cut the round mid-flight: skip the consolidate LLM call (no new LLM work
+    // during the drain) — the checkpointed outcomes are reused by the next resume.
     if crate::shutdown::aborting() {
         return Ok(crate::tools::SyncCoreOutcome::DrainCut);
     }
@@ -571,12 +505,9 @@ pub(crate) async fn run_analyze_with_job(
     )
 }
 
-/// Run the given analyst slots concurrently (deadline-bounded).
-///
-/// `round_key` is the analyze round's grouping key (the durable `job_id` on the
-/// durable path, a fresh suffix on the sync path) — every analyst of the round
-/// registers with `AnalyzeRound(round_key)` so the Running Agents view groups them
-/// with the round's consolidation call.
+/// Run the slots concurrently, deadline-bounded. `round_key` (the durable `job_id`, or
+/// a fresh suffix on the sync path) registers every analyst with `AnalyzeRound` so the
+/// Running Agents view groups them with the round's consolidation call.
 async fn run_analyze_slots(
     ws: &Workspace,
     slots: &[&AnalyzeSlot],
@@ -594,12 +525,11 @@ async fn run_analyze_slots(
             let round_key = round_key.to_string();
             let question = question.to_string();
             move |round| async move {
-                // Session-non-emptiness discriminator: a resumed slot whose
-                // session already contains the task continues with an empty
-                // message (no duplicate task-prompt append); a missing/empty
-                // session dispatches fresh with the stored task.
+                // Session non-emptiness discriminator: a resumed slot whose session
+                // already holds the task continues with an empty message (no duplicate
+                // task prompt); a missing/empty session dispatches with the stored task.
                 let has_session = resume && crate::session::store().has_content(&agent_id).await;
-                // Dynamic-resume path (resume + conditional message) — not a default dispatch.
+                // Dynamic resume (resume + conditional message), not a default dispatch.
                 run_agent(
                     agent_id,
                     crate::Role::Analyst,
@@ -640,19 +570,15 @@ async fn run_analyze_slots(
         .collect()
 }
 
-/// Boot-resume a durable analyze round — thin wrapper over
-/// [`crate::tools::SyncDurableCore::resume_durable_round`]. `exec_dir` is the
-/// recorded place directory the round ran in, when it had one.
+/// Boot-resume a durable round via
+/// [`crate::tools::SyncDurableCore::resume_durable_round`].
 pub(crate) async fn resume_analyze_round(job_id: &str, ws: &Workspace, exec_dir: Option<&str>) {
     crate::tools::SyncDurableCore::Analyze
         .resume_durable_round(job_id, ws, exec_dir)
         .await;
 }
 
-// ── Structured claim-level findings ──────────────────────────────────────
-
-/// A single claim with source and confidence, extracted from an analyst's
-/// response. Shared with the deep investigation (`research.rs`).
+/// A claim with source and confidence, shared with the deep investigation.
 #[expect(clippy::struct_field_names)] // field name matches the JSON schema key
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Claim {
@@ -669,20 +595,18 @@ pub(crate) struct AnalystFindings {
     pub unanswered: Vec<String>,
 }
 
-/// Per-analyst outcome after findings extraction. Three mutually-exclusive
-/// states mirroring `pipeline::ParallelVerdict` — the type system guarantees
-/// "no response" and "parse failure" cannot be confused.
+/// Per-analyst outcome after extraction — three mutually-exclusive states mirroring
+/// `pipeline::ParallelVerdict`, so "no response" and "parse failure" cannot be confused.
 enum AnalystOutcome {
-    /// Agent failed to produce a response (crashed, cancelled, empty output).
-    /// Carries the collapsed failure reason (scrubbed).
+    /// No response (crashed, cancelled, empty output); carries the scrubbed reason.
     NoResponse(String),
     /// Agent responded and structured extraction succeeded.
     Findings {
         raw: String,
         findings: AnalystFindings,
     },
-    /// Agent responded but structured extraction failed after retries; the
-    /// raw response is preserved for the fail-open dump.
+    /// Responded, but extraction failed after retries; the raw response is kept for
+    /// the fail-open dump.
     ParseFailed { raw: String, failure: String },
 }
 
@@ -694,23 +618,19 @@ pub(crate) enum RoundMember<T> {
     TimedOut,
     /// Member task panicked — surfaced, never silent.
     Panicked,
-    /// Member task was cancelled externally (e.g. runtime shutdown), not by
-    /// the round deadline — distinct from [`RoundMember::TimedOut`] so the
-    /// surfaced reason stays accurate.
+    /// Cancelled externally (e.g. shutdown), not by the round deadline — kept distinct
+    /// from [`RoundMember::TimedOut`] so the surfaced reason stays accurate.
     Cancelled,
 }
 
-/// Await all round tasks with a single overall deadline. Members still
-/// pending at the deadline are aborted and reported [`RoundMember::TimedOut`]
-/// (warn-logged); panicked members are reported [`RoundMember::Panicked`] with
-/// their panic message logged. Completed members keep their results, so a
-/// stuck analyst never blocks the others' delivery.
+/// Await all round tasks under one overall deadline. Pending members are aborted as
+/// [`RoundMember::TimedOut`] (warn-logged), panicked ones as [`RoundMember::Panicked`]
+/// with their message logged; completed members keep their results, so a stuck analyst
+/// never blocks the others' delivery.
 ///
-/// Note: members are `tokio::spawn`ed (panic isolation), so if this future is
-/// dropped mid-await the member tasks run detached to self-termination rather
-/// than being cancelled — reachable only during process shutdown (tools run
-/// to completion on agent cancel), where the runtime ends anyway; the
-/// deadline covers the live-await path.
+/// Members are `tokio::spawn`ed for panic isolation, so dropping this future mid-await
+/// leaves them detached to self-termination. Reachable only during shutdown (tools run
+/// to completion on agent cancel), where the runtime ends anyway.
 pub(crate) async fn await_round_members<T: Send + 'static>(
     handles: Vec<tokio::task::JoinHandle<T>>,
     deadline: std::time::Instant,
@@ -770,9 +690,8 @@ pub(crate) async fn await_round_members<T: Send + 'static>(
             out[i] = Some(member);
         }
         // After the drain every slot is filled; a `TimedOut` slot is exactly a
-        // member that was still running at the deadline (aborted), while
-        // members that finished just before it resolve to their real outcome
-        // (biased select prefers the ready handle) — an accurate count.
+        // member still running at the deadline. Biased select prefers a ready
+        // handle, so members finishing just before it keep their real outcome.
         let aborted = out
             .iter()
             .filter(|m| matches!(m, Some(RoundMember::TimedOut)))
@@ -783,28 +702,24 @@ pub(crate) async fn await_round_members<T: Send + 'static>(
             "round consolidation deadline expired — aborting stuck members"
         );
     }
-    // Every loop-exit path (pending empty, deadline-drain, Ok(None)) fills
-    // every slot exactly once — the invariant is enforced by construction.
+    // Every exit path fills every slot exactly once — by construction.
     out.into_iter()
         .map(|m| m.expect("every round member resolves exactly once"))
         .collect()
 }
 
-/// Default bound on a parallel round's consolidation wait. Hours-scale: only
-/// pathological stalls (a stuck analyst never completing) hit it; normal
-/// analyst work finishes in minutes.
+/// Default bound on a round's consolidation wait. Hours-scale: normal analyst work
+/// finishes in minutes, so only a pathological stall hits it.
 const DEFAULT_ROUND_TIMEOUT_SECS: u64 = 3 * 60 * 60;
 
-/// Round consolidation bound for [`await_round_members`]. Overridable via env
-/// for tuning.
+/// Round consolidation bound for [`await_round_members`]; env-overridable for tuning.
 pub(crate) fn round_timeout() -> Duration {
     crate::util::env_duration_secs("MAHBOT_ROUND_TIMEOUT_SECS", DEFAULT_ROUND_TIMEOUT_SECS)
 }
 
-/// One analyst's outcome in a parallel round. `Completed` always carries the
-/// analyst's text; every way of producing none — stuck past the round deadline,
-/// panicked, cancelled, or finished without a response — is spelled
-/// [`Self::Failed`] with its reason surfaced, never silent.
+/// One analyst's outcome in a parallel round. `Completed` always carries text; every
+/// way of producing none (deadline, panic, cancel, empty response) is [`Self::Failed`]
+/// with its reason surfaced, never silent.
 #[expect(clippy::large_enum_variant)] // Agent is inherently large; the enum is transient
 enum AnalyzeRun {
     Completed { agent: Agent, response: String },
@@ -812,9 +727,8 @@ enum AnalyzeRun {
 }
 
 impl AnalyzeRun {
-    /// Settle one finished slot. A member that finished without text is a
-    /// [`Self::Failed`] carrying the agent's own recorded reason, so the real
-    /// error chain (not a bare literal) reaches the caller.
+    /// A member that finished without text is a [`Self::Failed`] carrying the agent's
+    /// own recorded reason, so the real error chain reaches the caller.
     fn settle(agent: Agent, response: Option<String>) -> Self {
         match response.filter(|text| !text.trim().is_empty()) {
             Some(response) => Self::Completed { agent, response },
@@ -825,18 +739,15 @@ impl AnalyzeRun {
     }
 }
 
-/// Verdict of a single targeted claim verification, dispatched via
-/// [`dispatch_claim_verifiers`] (the deep investigation and the analyze
-/// dispute-verification round).
+/// Verdict of one targeted claim verification, via [`dispatch_claim_verifiers`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VerificationVerdict {
     pub verdict: String,
     pub evidence: String,
 }
 
-/// Verification outcome of one targeted claim. On the deep research path it is
-/// merged into the run summary (the telemetry fields feed its query ledger);
-/// on the analyze path it feeds the annotation-only `## Verification` section.
+/// One targeted claim's outcome: merged into the deep-research run summary (its
+/// telemetry fields feed the query ledger) or rendered in the analyze verification section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct VerificationResult {
     pub claim: String,
@@ -848,9 +759,8 @@ pub(crate) struct VerificationResult {
 }
 
 impl VerificationResult {
-    /// Fail-open verifier outcome: the claim could not be verified (deadline,
-    /// panic, no/empty response, extraction failure, budget exhaustion).
-    /// Canonical home of the "unresolved" verdict string.
+    /// Fail-open: the claim could not be verified (deadline, panic, no/empty response,
+    /// extraction failure, budget exhaustion). Canonical "unresolved" verdict string.
     pub(crate) fn unresolved(
         claim: &str,
         evidence: impl Into<String>,
@@ -869,8 +779,7 @@ impl VerificationResult {
     }
 }
 
-/// Reject verification verdicts outside the accepted vocabulary — fail-closed
-/// inside the extraction retry loop.
+/// Reject verdicts outside the accepted vocabulary — fail-closed inside the retry loop.
 fn validate_verification_verdict(v: &VerificationVerdict) -> Result<(), String> {
     if matches!(
         v.verdict.as_str(),
@@ -885,22 +794,18 @@ fn validate_verification_verdict(v: &VerificationVerdict) -> Result<(), String> 
     }
 }
 
-/// Cap on verification analysts spawned by a verification gate (exactly one
-/// pass, bounded). The research tool caps at this; the analyze round needs at
-/// most 2 (see [`verification_units`]) so the cap is never reached there.
-/// Bounds the shared dispatch — never a per-run analyst budget.
+/// Cap on verification analysts per gate (one bounded pass): the research tool caps
+/// here, the analyze round needs at most 2 ([`verification_units`]). Bounds the shared
+/// dispatch, never a per-run analyst budget.
 pub(crate) const VERIFY_MAX_ANALYSTS: usize = 4;
 
-/// Load the decorrelation angles asset — the research angles dealt out across
-/// the parallel analyst cohort ([`crate::prompt::deal_sections`]).
+/// The decorrelation angles asset, dealt out across the analyst cohort.
 pub(crate) fn load_analyst_angles() -> Vec<String> {
     load_prompt_sections("analyze/angles.md")
 }
 
-/// Compose an analyst's roster slot: the analyze with the slot's share of the
-/// decorrelation angles appended ([`crate::prompt::deal_sections`]).
-/// KV-cache discipline: vary ONLY the user message (the research
-/// angle) — never per-analyst model/effort/tools.
+/// An analyst's roster slot: the analyze plus its share of the decorrelation angles.
+/// KV-cache discipline: vary ONLY the user message — never model/effort/tools.
 fn analyst_slot(
     ws: &Workspace,
     angles: &[String],
@@ -920,13 +825,10 @@ fn analyst_slot(
     }
 }
 
-/// Consolidate analyst runs: 0 valid → error, 1 valid → raw passthrough,
-/// ≥2 valid → extract findings and run the shared grouping pass (≥2 with
-/// parseable claims group; a single parseable source skips grouping). A failed
-/// member is the single spelling of "no response" (see [`AnalyzeRun::settle`]),
-/// with its reason surfaced in the error. `Ok(None)` is a round that was
-/// cancelled before this phase's first model call: no text was produced and the
-/// caller receives nothing.
+/// 0 valid → error, 1 valid → raw passthrough, ≥2 valid → extract findings and run the
+/// shared grouping pass (a single parseable source skips grouping). A failed member is
+/// the single spelling of "no response". `Ok(None)` is a round cancelled before this
+/// phase's first model call: no text produced, nothing delivered.
 async fn consolidate_analyst_runs(
     ws: &Workspace,
     analyze: &str,
@@ -934,22 +836,17 @@ async fn consolidate_analyst_runs(
     deadline: std::time::Instant,
     round_key: &str,
 ) -> Result<Option<String>> {
-    // The cancel may have landed while the analysts ran: nothing new is started
-    // for a cancelled round, so the extraction model calls never happen and the
-    // partial findings are never turned into a result.
+    // Cancelled while the analysts ran: nothing new starts, so no extraction call and
+    // the partial findings never become a result.
     if crate::round_cancel::is_cancelled(round_key) {
         return Ok(None);
     }
-    // Drain-watch coverage for this phase: extraction runs while the analyst
-    // Agents are still registered (their registry entries keep the drain-watch
-    // from firing); the grouping pass runs with zero live agents and is
-    // covered by the guard INSIDE the shared consensus core
-    // (`run_grouping_repair`) — the single tracker for the consolidation call.
-    // `consolidate_findings` re-checks the drain flag before the grouping call,
-    // closing the sync-only window between extraction end and the core guard's
-    // registration (documented accepted-residual-window contract, jobs.rs). No
-    // phase guard here: it would duplicate the core's row and register a
-    // phantom row on 0/1-valid-response rounds where no grouping call runs.
+    // Drain-watch coverage: extraction runs while the analyst Agents are registered, which keeps
+    // the drain-watch from firing; the grouping pass runs with zero live agents and is covered by
+    // the guard inside the shared consensus core (`run_grouping_repair`). `consolidate_findings`
+    // re-checks the drain flag before grouping, closing the sync-only window in between. No phase
+    // guard here: it would duplicate the core's row and register a phantom one on 0/1-valid
+    // rounds where no grouping call runs.
     let valid_count = runs
         .iter()
         .filter(|r| matches!(r, AnalyzeRun::Completed { .. }))
@@ -984,13 +881,11 @@ async fn consolidate_analyst_runs(
     }
 }
 
-/// Extract structured claim-level findings from each valid analyst response
-/// while the agent is still alive (see [`Agent::extract_verdict`] for the
-/// KV-cache rationale). Fail-open: parse failures keep the raw response and
-/// are never silently dropped. The extraction wait shares the round-wide
-/// `deadline` — a stuck extraction is reported as no-response, not awaited
-/// forever — and `round_key` is the round whose cancel signal abandons each
-/// extraction instead of asking again.
+/// Extract structured findings from each valid response while the agent is still alive
+/// (see [`Agent::extract_verdict`] for the KV-cache rationale). Fail-open: a parse
+/// failure keeps the raw response. The wait shares the round-wide `deadline` — a stuck
+/// extraction is reported as no-response — and `round_key`'s cancel signal abandons
+/// each extraction.
 async fn extract_findings(
     runs: Vec<AnalyzeRun>,
     deadline: std::time::Instant,
@@ -1009,13 +904,10 @@ async fn extract_findings(
                         return AnalystOutcome::NoResponse(crate::util::scrub_credentials(&reason));
                     }
                 };
-                // Nothing new starts for a round the caller has cancelled: the
-                // extraction loop re-asks on a parse failure, so the whole call
-                // chain is abandoned at the signal instead of asking again. The
-                // caller has already been told the round was stopped, and the
-                // outcome here is discarded by the phase gate either way. The
-                // signal is polled first (`biased`), so it wins over an
-                // extraction that is ready to return.
+                // Nothing new starts for a cancelled round; the extraction loop re-asks
+                // on a parse failure, so the whole chain is abandoned at the signal. The
+                // outcome is discarded by the phase gate either way. `biased` polls the
+                // signal first, so it wins over an extraction ready to return.
                 let extracted = tokio::select! {
                     biased;
                     () = crate::round_cancel::cancelled(&round_key) => {
@@ -1055,10 +947,9 @@ async fn extract_findings(
         .collect()
 }
 
-/// Per-agent claim texts keyed by the ORIGINAL outcome index. A failed agent's
-/// slot stays empty so the id space matches the input material. Per-agent
-/// duplicates are NOT deduped: two identical claims from one agent are two
-/// distinct ids, and the model places each exactly once.
+/// Claim texts keyed by the ORIGINAL outcome index; a failed agent's slot stays empty
+/// so the id space matches the input. Per-agent duplicates are NOT deduped: two
+/// identical claims from one agent are two distinct ids.
 #[must_use]
 fn claims_per_agent(outcomes: &[AnalystOutcome]) -> Vec<Vec<String>> {
     outcomes
@@ -1072,13 +963,10 @@ fn claims_per_agent(outcomes: &[AnalystOutcome]) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// Render the fail-open analyst deliverable: the flat numbered claim list
-/// plus the raw analyst dumps, headed by an explicit `marker` naming why
-/// consolidation produced no groups. The marker is head-placed so it stays
-/// prominently visible in the delivered output. Every no-groups path with at
-/// least one valid claim list goes through this helper; the
-/// total-extraction-failure path (`n_valid == 0`) is a deliberate exception
-/// that renders extraction failures in place of the flat claim list.
+/// The fail-open deliverable: the numbered claim list plus raw analyst dumps, headed by
+/// a `marker` naming why consolidation produced no groups (head-placed so it stays
+/// visible). The total-extraction-failure path (`n_valid == 0`) is the deliberate
+/// exception, rendering failures in place of the claim list.
 #[must_use]
 fn render_unconsolidated_fallback(
     marker: &str,
@@ -1090,17 +978,13 @@ fn render_unconsolidated_fallback(
     format!("## Analyst Reports\n\n({marker})\n\n{flat}\n\n{raw_dump}")
 }
 
-/// Consolidate extracted outcomes: build the per-agent claim lists and run the
-/// shared repair-mode grouping pass (semantic grouping + contradiction
-/// judgment, frozen groups + deterministic remainder). ≥2 valid responses go
-/// through grouping; the output contract is summary + groups + optional
-/// ungrouped list, with brackets computed from distinct cited agent ids.
-/// Partial success (≥1 frozen group) is delivered as-is; only an exhaustion
-/// with zero groups ever frozen keeps the fail-open flat claim list plus raw
-/// analyst dumps with an explicit marker — never a fabricated consensus.
-/// `Ok(None)` is a round cancelled before this phase's first model call or one
-/// that was cancelled while it ran: no model call is started and the caller
-/// receives nothing.
+/// Build the per-agent claim lists and run the shared repair-mode grouping pass
+/// (semantic grouping + contradiction judgment). ≥2 valid responses group; the contract
+/// is summary + groups + optional ungrouped list, brackets computed from distinct cited
+/// agent ids. Partial success (≥1 frozen group) is delivered as-is; only an exhaustion
+/// with zero frozen groups keeps the flat claim list with an explicit marker — never a
+/// fabricated consensus. `Ok(None)` is a round cancelled before this phase's first
+/// model call or while it ran.
 async fn consolidate_findings(
     ws: &Workspace,
     analyze: &str,
@@ -1108,18 +992,17 @@ async fn consolidate_findings(
     round_key: &str,
     deadline: std::time::Instant,
 ) -> Result<Option<String>> {
-    // A round cancelled while its analysts ran produces no text at all — not
-    // even the fail-open claim list below, which would render a partial result
-    // for a round whose caller was already answered that it was stopped.
+    // A round cancelled while its analysts ran produces no text at all — not even the
+    // fail-open claim list, which would render a partial result for a caller already
+    // told the round was stopped.
     if crate::round_cancel::is_cancelled(round_key) {
         return Ok(None);
     }
     let items_by_agent = claims_per_agent(&outcomes);
     let n_valid = items_by_agent.iter().filter(|l| !l.is_empty()).count();
     if n_valid == 0 {
-        // No valid response produced parseable claims — fail open with raw
-        // reports and the per-analyst reasons (nothing silently lost). The
-        // marker distinguishes extraction failures from zero-claim reports.
+        // No parseable claims: fail open with raw reports and the per-analyst reasons.
+        // The marker distinguishes extraction failures from zero-claim reports.
         let has_parse_failures = outcomes
             .iter()
             .any(|o| matches!(o, AnalystOutcome::ParseFailed { .. }));
@@ -1135,10 +1018,8 @@ async fn consolidate_findings(
         )));
     }
     if n_valid == 1 {
-        // Only one analyst produced parseable claims — a grouping pass over a
-        // single source cannot produce agreement brackets or contradictions,
-        // so skip the provider call and deliver the flat claim list + raw
-        // dumps with an explicit marker.
+        // A single parseable source cannot produce agreement brackets or
+        // contradictions, so skip the provider call and deliver the flat claim list.
         tracing::info!("Single-analyst consolidation — skipping grouping pass");
         return Ok(Some(render_unconsolidated_fallback(
             "only one analyst produced parseable claims — grouping skipped",
@@ -1146,8 +1027,7 @@ async fn consolidate_findings(
             &outcomes,
         )));
     }
-    // User material: global flat ids across ALL agents (each claim exactly one
-    // id, in (agent, claim) order) — the schema's `id` field matches.
+    // Global flat ids across ALL agents, one per claim, in (agent, claim) order.
     let material = crate::consensus::numbered_items_material(&items_by_agent);
     let user =
         format!("# Original Question\n\n{analyze}\n\n# Agent Claims (id-numbered)\n\n{material}");
@@ -1173,11 +1053,9 @@ async fn consolidate_findings(
     let parent = Some(crate::agent::registry::ParentKey::AnalyzeRound(
         round_key.to_string(),
     ));
-    // Drain fired in the extraction-end → grouping-start gap (the analyst
-    // agents have dropped, the consensus core's guard is not yet registered):
-    // never start a new LLM call once the drain begins — deliver the fail-open
-    // raw claim list instead (the same deliverable as a Fallback, without the
-    // doomed call). The extraction itself is covered by the live analyst cards.
+    // Drain fired in the extraction-end → grouping-start gap (analyst agents dropped,
+    // consensus guard not yet registered): never start an LLM call once the drain begins
+    // — deliver the fail-open claim list instead, without the doomed call.
     if crate::shutdown::aborting() {
         tracing::warn!(
             "Analyst consolidation skipped — shutdown/drain in progress; delivering raw claim list"
@@ -1188,12 +1066,9 @@ async fn consolidate_findings(
             &outcomes,
         )));
     }
-    // The same stop at the phase's own model calls: a cancel that lands after
-    // the entry gate abandons the pass instead of letting it start another
-    // repair round (or write its fail-open fallback and Warn for a round the
-    // caller was already told was stopped). The signal is polled first and
-    // without the random branch choice (`biased`), so a fired signal always wins
-    // over a pass that is ready to continue.
+    // The same stop at the phase's own model calls: a cancel landing after the entry
+    // gate abandons the pass rather than starting another repair round. `biased` polls
+    // the signal without the random branch choice, so a fired signal always wins.
     let outcome = tokio::select! {
         biased;
         () = crate::round_cancel::cancelled(round_key) => return Ok(None),
@@ -1208,9 +1083,8 @@ async fn consolidate_findings(
     };
     match outcome {
         crate::consensus::RepairOutcome::Repaired { output, references } => {
-            // Annotation-only verification of disputed groups: fresh analysts
-            // re-check the contested findings, appended after the grouped
-            // analysis. The main grouped analysis is never re-run or re-rendered.
+            // Annotation-only verification of disputed groups: fresh analysts re-check
+            // the contested findings. The grouped analysis is never re-run.
             let verification = verify_disputed_groups(
                 ws, analyze, &output, &table, &outcomes, round_key, deadline,
             )
@@ -1235,16 +1109,12 @@ async fn consolidate_findings(
     }
 }
 
-/// Render the analyze output contract: summary + groups (heading, contradiction
-/// flag, members citing item ids) + ungrouped remainder + DISPUTED
-/// cross-references from remainder items to frozen groups. Brackets [n/N]
-/// come from distinct cited agent ids; DISPUTED appears only when the group's
-/// contradiction flag is true. Self-reported caveats of a cited claim render
-/// as member metadata, never as contradictions.
-///
-/// `verification` is the annotation-only `## Verification` section (empty when
-/// no disputed group was verified) — inserted after the grouped analysis so the
-/// main grouped analysis is never disturbed.
+/// The output contract: summary + groups (heading, contradiction flag, members citing
+/// item ids) + ungrouped remainder + DISPUTED cross-references from remainder items to
+/// frozen groups. Brackets [n/N] come from distinct cited agent ids; DISPUTED appears
+/// only when the contradiction flag is true. A cited claim's self-reported caveats are
+/// member metadata, never contradictions. `verification` is appended after the grouped
+/// analysis so that is never disturbed.
 #[must_use]
 fn render_analyze_groups(
     output: &crate::consensus::GroupingOutput,
@@ -1298,10 +1168,9 @@ fn render_analyze_groups(
     out
 }
 
-/// Look up a cited member's self-reported caveats (the claim's own
-/// `contradictions` field — analyst self-report, NOT a group contradiction).
-/// The claim is resolved via the item table's (agent, per-agent index) — no
-/// text equality.
+/// A cited member's self-reported caveats (the claim's own `contradictions` field —
+/// analyst self-report, NOT a group contradiction), resolved via the item table's
+/// (agent, per-agent index), never text equality.
 fn member_caveat(
     member: &crate::consensus::GroupingMember,
     table: &crate::consensus::ItemTable<'_>,
@@ -1319,8 +1188,7 @@ fn member_caveat(
     }
 }
 
-/// Render the flat numbered claim list (the grouping-pass input) for the
-/// fail-open deliverable.
+/// The flat numbered claim list — the grouping-pass input of the fail-open deliverable.
 #[must_use]
 fn render_flat_claim_list(items_by_agent: &[Vec<String>]) -> String {
     let mut out = String::new();
@@ -1333,8 +1201,7 @@ fn render_flat_claim_list(items_by_agent: &[Vec<String>]) -> String {
     out
 }
 
-/// Normalize a claim for deterministic comparisons (QueryLedger, unanswered
-/// dedup). Shared with the deep investigation.
+/// Normalize a claim for deterministic comparisons (QueryLedger, dedup).
 pub(crate) fn normalize_claim(s: &str) -> String {
     s.split_whitespace()
         .collect::<Vec<_>>()
@@ -1342,8 +1209,7 @@ pub(crate) fn normalize_claim(s: &str) -> String {
         .to_lowercase()
 }
 
-/// Max of two confidence tiers ("low" < "medium" < "high"). Shared with the
-/// deep investigation's cross-round claim merge (`research.rs`).
+/// Max of two confidence tiers ("low" < "medium" < "high").
 pub(crate) fn max_confidence(a: &str, b: &str) -> String {
     let rank = |c: &str| match c {
         "high" => 2,
@@ -1357,9 +1223,7 @@ pub(crate) fn max_confidence(a: &str, b: &str) -> String {
     }
 }
 
-/// One claim targeted for verification by a verification gate (deep research
-/// tool's, or the analyze dispute-verification round), plus the material fed
-/// into the fresh analyst's task.
+/// One claim targeted for verification, plus the material fed to the fresh analyst.
 pub(crate) struct VerificationTarget {
     pub(crate) claim: String,
     pub(crate) sources: String,
@@ -1376,10 +1240,9 @@ impl VerificationTarget {
     }
 }
 
-/// Extract search/web_search query strings + tool-call counts from session
-/// history messages (for the query ledger and the run summary). Shared with
-/// the deep investigation (`research.rs`), which also feeds it the persisted
-/// history of deadline-aborted analysts (wrap-up stage).
+/// Search/web_search query strings and tool-call counts from session-history messages,
+/// for the query ledger and run summary. The deep investigation also feeds it the
+/// persisted history of deadline-aborted analysts.
 pub(crate) fn extract_query_telemetry_from_history(
     history: &[ChatMessage],
 ) -> (usize, usize, Vec<String>) {
@@ -1403,28 +1266,22 @@ pub(crate) fn extract_query_telemetry_from_history(
     (tool_calls, searches, queries)
 }
 
-/// Extract search/web_search query strings + tool-call counts from an
-/// agent's session history (for the query ledger and the run summary).
-/// Shared with the deep investigation (`research.rs`).
+/// Query strings and tool-call counts from an agent's session history.
 pub(crate) fn extract_query_telemetry(agent: &Agent) -> (usize, usize, Vec<String>) {
     extract_query_telemetry_from_history(agent.session.history())
 }
 
-/// Dispatch one fresh Analyst per verification target (bounded by
-/// [`VERIFY_MAX_ANALYSTS`]) in parallel. `id_prefix` seeds the per-target
-/// agent IDs; `task_extra` is appended to every task (e.g. the query
-/// ledger). The wait shares the round-wide `deadline`. Shared with the deep
-/// research tool's verification gate.
+/// Dispatch one fresh Analyst per target in parallel, bounded by
+/// [`VERIFY_MAX_ANALYSTS`]. `id_prefix` seeds the agent IDs, `task_extra` is appended to
+/// every task (e.g. the query ledger) and the wait shares the round-wide `deadline`.
 ///
-/// `parent_key` names the parent invocation the verifiers group under
-/// (research verifiers pass [`ParentKey::Research`]; analyze verifiers pass
-/// [`ParentKey::AnalyzeRound`]) — the running-agents view and research-cancel
-/// sweep use it, so it must be supplied by the caller, never hardcoded.
+/// `parent_key` names the parent invocation the verifiers group under — the
+/// running-agents view and research-cancel sweep use it, so the caller must supply it,
+/// never hardcode it.
 ///
-/// Returns the results PLUS the dispatched agent IDs (the deep research
-/// sanitizer needs them at dispatch time — successful writers never appear in
-/// wrap-up snapshots; the ids ride the return value so the shared helper
-/// keeps no write-only out-parameter).
+/// Returns the results PLUS the dispatched agent IDs: the deep-research sanitizer needs
+/// them at dispatch time, since successful writers never appear in wrap-up snapshots,
+/// and riding the return value keeps this helper free of a write-only out-parameter.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_claim_verifiers(
     ws: &Workspace,
@@ -1497,13 +1354,10 @@ pub(crate) async fn dispatch_claim_verifiers(
     (results, dispatched)
 }
 
-/// Run one claim verifier: a fresh Analyst researches the claim and returns
-/// its structured verdict. Any failure yields "unresolved" — fail-open.
-///
-/// `question` is the run's question — threaded as the run group's header
-/// label (purely presentational). `parent_key` is supplied by the dispatcher
-/// so the verifier groups under the correct parent invocation (research run /
-/// analyze round).
+/// One verifier: a fresh Analyst researches the claim and returns its structured
+/// verdict. Any failure yields "unresolved" — fail-open. `question` is threaded as the
+/// run group's header label (purely presentational); `parent_key` is supplied by the
+/// dispatcher so the verifier groups under the correct parent invocation.
 #[expect(clippy::too_many_arguments)]
 async fn run_claim_verifier(
     ws: &Workspace,
@@ -1526,10 +1380,9 @@ async fn run_claim_verifier(
         Some(question.to_string()),
     )
     .await;
-    // The telemetry fields ride every VerificationResult regardless of caller:
-    // the deep-research path consumes them for its run-summary/query ledger,
-    // while the analyze path only renders claim/verdict/evidence in the
-    // annotation section (the extra scan is cheap and keeps one shared shape).
+    // The telemetry fields ride every VerificationResult: deep research consumes them
+    // for its run summary and query ledger, while analyze renders only
+    // claim/verdict/evidence — one shared shape for a cheap extra scan.
     let (tool_calls, searches, queries) = extract_query_telemetry(&agent);
     let Some(raw) = response else {
         return VerificationResult::unresolved(
@@ -1558,8 +1411,8 @@ async fn run_claim_verifier(
         .await
     {
         Ok(v) => VerificationResult {
-            // Key by the target claim (not the verifier's possibly-rephrased
-            // restatement) so report reconciliation matches exactly.
+            // Keyed by the target claim, not the verifier's rephrasing, so report
+            // reconciliation matches exactly.
             claim: target_claim.to_string(),
             verdict: v.verdict,
             evidence: v.evidence,
@@ -1583,15 +1436,10 @@ pub(crate) fn escape_fences(s: &str) -> String {
     s.replace("```", "\\`\\`\\`")
 }
 
-// ── Analyze dispute-verification round ──────────────────────────────────
-
-/// Split the disputed groups into verification units.
-///
-/// Exactly one disputed group → a single unit (→ 1 verifier). More than one →
-/// two roughly-equal parts **by group count**, the FIRST part taking the extra
-/// group when the count is odd (→ 2 verifiers). Each unit is verified by
-/// exactly one fresh analyst, so the verification cost is bounded by the rule
-/// above — no per-run analyst budget.
+/// Exactly one disputed group → one unit (1 verifier). More → two roughly-equal parts
+/// by group count, the FIRST taking the extra group on an odd count (2 verifiers). Each
+/// unit gets exactly one fresh analyst, so verification cost is bounded here — no
+/// per-run analyst budget.
 fn verification_units<'a>(
     disputed: &[&'a crate::consensus::GroupingGroup],
 ) -> Vec<Vec<&'a crate::consensus::GroupingGroup>> {
@@ -1604,14 +1452,10 @@ fn verification_units<'a>(
     vec![first.to_vec(), second.to_vec()]
 }
 
-/// Synthesize ONE verifiable proposition for a verification unit (a disputed
-/// group, or — for a split unit — several groups treated as a single unit).
-///
-/// The claim is a single statement built from the group's heading + its member
-/// claims; member sources and self-reported contradictions are aggregated into
-/// the [`VerificationTarget`] fields so the verifier sees both the assertion
-/// and the evidence pointing both ways. A group with no resolvable member
-/// claims degrades to its bare heading (never silent).
+/// ONE verifiable proposition for a unit: the group's heading plus its member claims,
+/// with sources and self-reported contradictions aggregated into the
+/// [`VerificationTarget`] fields so the verifier sees the assertion and the evidence both
+/// ways. A group with no resolvable members degrades to its bare heading.
 fn synthesize_verification_target(
     unit: &[&crate::consensus::GroupingGroup],
     table: &crate::consensus::ItemTable<'_>,
@@ -1650,11 +1494,9 @@ fn synthesize_verification_target(
     )
 }
 
-/// Render the annotation-only `## Verification` section from verifier results.
-/// Empty when no verifier produced a verdict. Each verdict line carries the
-/// synthesized claim, the verdict, and the supporting evidence. Composite
-/// (multi-group) claims AND multi-line evidence render their newlines as
-/// semicolons so the bullet stays on one line.
+/// The `## Verification` section; empty when no verifier produced a verdict. Newlines in
+/// composite claims AND multi-line evidence render as semicolons so each bullet stays on
+/// one line.
 fn render_verification_section(results: &[VerificationResult]) -> String {
     if results.is_empty() {
         return String::new();
@@ -1672,10 +1514,9 @@ fn render_verification_section(results: &[VerificationResult]) -> String {
     out
 }
 
-/// (Deadline agreement) Verification runs only while ≤ half of the round
-/// window has elapsed; past that, it is skipped entirely (nothing appended)
-/// rather than forced all-unresolved. The round window is
-/// [`round_timeout`] — the same bound the analyst round shares.
+/// Verification runs only while ≤ half the round window ([`round_timeout`], the bound the
+/// analyst round shares) has elapsed; past that it is skipped entirely, not forced
+/// all-unresolved.
 fn verification_window_open(deadline: std::time::Instant) -> bool {
     let Some(anchor) = deadline.checked_sub(round_timeout() / 2) else {
         return false;
@@ -1683,15 +1524,10 @@ fn verification_window_open(deadline: std::time::Instant) -> bool {
     std::time::Instant::now() <= anchor
 }
 
-/// Annotation-only verification of disputed consensus groups.
-///
-/// Detects groups flagged `contradiction:true` (those rendered `[n/N ·
-/// DISPUTED]`), and — only when at least one exists — dispatches fresh
-/// verification analysts (1 for a single disputed group, 2 over two split
-/// parts for more) to re-check them. Results are appended as a
-/// `## Verification` section; the main grouped analysis is never modified and
-/// grouping is never re-run. No per-run analyst budget is introduced, and the
-/// round is best-effort (never checkpointed).
+/// Dispatch fresh verifiers over groups flagged `contradiction:true` (rendered
+/// `[n/N · DISPUTED]`), 1 for a single disputed group and 2 over split parts for more.
+/// Results are appended as `## Verification`; the grouped analysis is never modified and
+/// grouping never re-run. Best-effort, never checkpointed.
 async fn verify_disputed_groups(
     ws: &Workspace,
     analyze: &str,
@@ -1701,10 +1537,9 @@ async fn verify_disputed_groups(
     round_key: &str,
     deadline: std::time::Instant,
 ) -> String {
-    // A cancelled round starts nothing new AND raises no complaint about itself:
-    // this gate is the phase's first statement, so neither skip warning below can
-    // fire for a round whose result is discarded. Logged at info, like the
-    // consolidation phase's gate.
+    // This gate is the phase's first statement, so a cancelled round raises no complaint
+    // about itself and neither skip warning can fire. Logged at info, like the
+    // consolidation gate.
     if crate::round_cancel::is_cancelled(round_key) {
         tracing::info!(
             round = %round_key,
@@ -1715,7 +1550,6 @@ async fn verify_disputed_groups(
     let disputed: Vec<&crate::consensus::GroupingGroup> =
         output.groups.iter().filter(|g| g.contradiction).collect();
     if disputed.is_empty() {
-        // No contested finding — the fast single-round path is preserved.
         return String::new();
     }
     if !verification_window_open(deadline) {
@@ -1759,9 +1593,8 @@ async fn verify_disputed_groups(
     render_verification_section(&results)
 }
 
-/// Render the fail-open raw dump: the raw response of every valid analyst
-/// (extraction success or failure) in `### Report from Analyst N` sections.
-/// No-response analysts render with their reason so nothing is silently lost.
+/// The raw response of every valid analyst in `### Report from Analyst N` sections; a
+/// no-response analyst renders with its reason.
 fn render_raw_analyst_dump(outcomes: &[AnalystOutcome]) -> String {
     let sections: Vec<String> = outcomes
         .iter()
@@ -1779,8 +1612,7 @@ fn render_raw_analyst_dump(outcomes: &[AnalystOutcome]) -> String {
     sections.join("\n\n")
 }
 
-/// Render extraction-failure reasons for the fail-open marker (which analysts
-/// produced no parseable findings and why).
+/// Extraction-failure reasons for the fail-open marker.
 #[must_use]
 fn render_extraction_failures(outcomes: &[AnalystOutcome]) -> String {
     let mut out = String::new();
@@ -1811,10 +1643,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
-    // ── Consolidation edge-case tests (no LLM provider needed) ──
-
-    /// Build a bare analyst run for pipeline tests: a real `Agent` (no stores
-    /// touched) settled from an optional raw response.
+    /// A bare analyst run: a real `Agent` (no stores touched) settled from a raw response.
     fn test_analyst_run(ws: &Workspace, response: Option<&str>) -> AnalyzeRun {
         let agent = Agent::new(
             format!("analyze_test_{}", crate::generate_suffix()),
@@ -1859,8 +1688,7 @@ mod tests {
         Failed(&'static str),
     }
 
-    /// A delivered round: the members, and the text — or the failure reasons —
-    /// the caller must receive.
+    /// A delivered round: the members, and the text or failure reasons the caller gets.
     struct ConsolidateRunsCase {
         name: &'static str,
         members: &'static [RoundMemberSpec],
@@ -1946,10 +1774,9 @@ mod tests {
         }
     }
 
-    /// Guards the bounded-round wait: a member stuck past the deadline is
-    /// aborted (its task dropped, cancelling the work) while a completed member
-    /// keeps its value, and a panicking member is surfaced as `Panicked`
-    /// instead of being silently dropped or taking the round down.
+    /// A member stuck past the deadline is aborted (its task dropped, cancelling the
+    /// work), a completed member keeps its value, and a panicking one is surfaced as
+    /// `Panicked` rather than taken down silently.
     #[tokio::test]
     async fn await_round_members_cases() {
         struct AbortDetector(std::sync::Arc<std::sync::atomic::AtomicBool>);
@@ -1959,8 +1786,7 @@ mod tests {
             }
         }
 
-        // A stuck member is aborted at the deadline; the completed one keeps
-        // its result.
+        // A stuck member aborts at the deadline; the completed one keeps its result.
         let aborted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = aborted.clone();
         let stuck = tokio::spawn(async move {
@@ -1980,7 +1806,7 @@ mod tests {
             matches!(members[1], RoundMember::Done(42)),
             "a completed member keeps its result: {members:?}"
         );
-        // Aborting the task drops its locals — the detector fires.
+        // Aborting drops the task's locals, so the detector fires.
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             aborted.load(std::sync::atomic::Ordering::SeqCst),
@@ -1997,10 +1823,8 @@ mod tests {
         );
     }
 
-    // ── Analyze grouping renderer ────────────────────────────────────────────
-
-    /// One [`render_analyze_groups`] scenario: the analyst outcomes, the
-    /// grouping output to render, and the strings the section must (not) carry.
+    /// One [`render_analyze_groups`] scenario: outcomes, grouping output, and the strings
+    /// the section must (not) carry.
     struct RenderGroupsCase {
         name: &'static str,
         outcomes: Vec<AnalystOutcome>,
@@ -2164,10 +1988,7 @@ mod tests {
         }
     }
 
-    // ── consolidation fail-open ────────────────────────────────────────
-
-    /// Helper: run consolidation over the given extracted outcomes with the
-    /// given fake provider outcomes scripted.
+    /// Run consolidation over the given outcomes with the provider outcomes scripted.
     async fn consolidate_with_script(
         outcomes: Vec<AnalystOutcome>,
         fake: FakeProvider,
@@ -2201,8 +2022,8 @@ mod tests {
         ]
     }
 
-    /// One scripted consolidation scenario: the analyst inputs, the scripted
-    /// provider, and the strings the delivered text must (not) carry.
+    /// One consolidation scenario: the inputs, the scripted provider, and the strings the
+    /// delivered text must (not) carry.
     struct ConsolidationCase {
         name: &'static str,
         input: ConsolidationInput,
@@ -2237,8 +2058,8 @@ mod tests {
             .err(FailureClass::Transport, "error reading response body")
             .err(FailureClass::Transport, "error reading response body")
             .err(FailureClass::Transport, "error reading response body");
-        // The grouping pass parses a strict id-based GroupingOutput; a faithful
-        // model groups the two agreed claims and leaves nothing ungrouped.
+        // The grouping pass parses a strict id-based GroupingOutput: a faithful model
+        // groups the two agreed claims and leaves nothing ungrouped.
         let one_group = r#"{"summary":"alpha is true.","groups":[{"heading":"Alpha","contradiction":false,"members":[{"id":0},{"id":1}]}],"ungrouped":[]}"#;
         let runs_ws = test_ws("/tmp/test_ws");
 
@@ -2355,9 +2176,8 @@ mod tests {
                     },
                     AnalystOutcome::NoResponse("analyst produced no response".into()),
                 ]),
-                // ids: 0 = a0 "alpha is true", 1 = a0 "beta is true",
-                // 2 = a1 "alpha is true". Round 2 leaves the id-1 item
-                // ungrouped → zero-progress stop.
+                // ids: 0 = a0 "alpha is true", 1 = a0 "beta is true", 2 = a1 "alpha is
+                // true". Round 2 leaves the id-1 item ungrouped → zero-progress stop.
                 fake: FakeProvider::new()
                     .ok(
                         r#"{"summary":"alpha agreed, beta solo.","groups":[{"heading":"Alpha","contradiction":false,"members":[{"id":0},{"id":2}]}],"ungrouped":[{"id":1}]}"#,
@@ -2406,8 +2226,8 @@ mod tests {
                 .unwrap_or_else(|err| panic!("[{}] consolidation errored: {err}", case.name))
                 .expect("a live round delivers its consolidated text");
             assert_contains_not_contains(case.name, &text, case.contains, case.not_contains);
-            // The analyze tool's format_output returns the output verbatim — no
-            // head/tail sandwich — so a marker and all findings reach the caller.
+            // The tool's format_output returns the output verbatim — no head/tail
+            // sandwich — so a marker and all findings reach the caller.
             let tool = AnalyzeTool::new(DispatchMode::Sync, Role::Engineer);
             assert_eq!(
                 tool.format_output(&text),
@@ -2510,26 +2330,21 @@ mod tests {
         contains: &'static [&'static str],
     }
 
-    /// Boot resume of a crashed async analyze must REUSE the existing job + roster
-    /// (never re-spawn — the jobs.id PK would conflict AND freshly generated
-    /// analyst ids would not match the stored roster rows, so outcomes would
-    /// be lost): a single done slot reconstructs from its stored outcome (raw
-    /// passthrough — no provider needed), and the round terminalizes into an
-    /// envelope delivered to the ORIGINAL caller. A place round whose recorded
-    /// directory is gone must END with a plain failure instead — the job
-    /// terminalizes and the caller receives the reason, never left launched and
-    /// silent forever.
+    /// Boot resume must REUSE the existing job + roster (never re-spawn: the PK would conflict
+    /// and fresh analyst ids would not match the stored rows, losing outcomes): a done slot
+    /// reconstructs from its stored outcome, and the round terminalizes into an envelope
+    /// delivered to the ORIGINAL caller. A place round whose directory is gone must END with a
+    /// plain failure — never left launched and silent forever.
     ///
-    /// Serialized with the drain-flag writers: `resume_analyze_round` consults the
-    /// process-global drain flag and aborts early while it is set.
+    /// Serialized with the drain-flag writers: `resume_analyze_round` reads the process-global
+    /// drain flag and aborts early while it is set.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn resume_round_cases() {
         crate::util::test::init_management_test_stores().await;
         for case in [
-            // Pre-create the job row exactly as a crashed dispatch leaves it
-            // (caller identity persisted on the job row; one done slot with a
-            // stored outcome).
+            // The job row as a crashed dispatch leaves it: caller identity persisted,
+            // one done slot with a stored outcome.
             ResumeRoundCase {
                 name: "a crashed round is resumed over its own roster",
                 job_id: "analyze_job_resume_1",
@@ -2586,8 +2401,8 @@ mod tests {
                 .unwrap();
             }
 
-            // Resume: must NOT hit the jobs.id PK conflict, must reuse the stored
-            // roster slot, then terminalize into a durable envelope.
+            // Resume must not hit the PK conflict, must reuse the stored roster slot,
+            // then terminalize into a durable envelope.
             resume_analyze_round(case.job_id, &ws, case.place).await;
 
             let job_rows = conn
@@ -2618,8 +2433,8 @@ mod tests {
             );
             let envelope: crate::agent::message_router::AgentJob =
                 serde_json::from_str(&pending[0].get::<String>(0).unwrap()).unwrap();
-            // Delivered to the ORIGINAL caller (Assistant, not Manager), keyed to
-            // that caller's own workspace — never to the place.
+            // Delivered to the ORIGINAL caller (Assistant, not Manager), keyed to that
+            // caller's workspace — never to the place.
             assert_eq!(
                 envelope.role,
                 crate::Role::Assistant,
@@ -2643,11 +2458,9 @@ mod tests {
         }
     }
 
-    /// A provider that parks every chat call until the test opens the gate, so
-    /// the round's durable state can be observed while it is still running.
-    /// The Assistant consumer the delivered envelope routes into is parked
-    /// indefinitely: it would otherwise reclaim (delete) the pending row before
-    /// the test can read it.
+    /// A provider parking every chat call until the test opens the gate, so durable state
+    /// can be observed mid-round. The Assistant consumer the envelope routes into is parked
+    /// indefinitely: it would otherwise reclaim (delete) the pending row.
     struct GatedProvider {
         calls: std::sync::Mutex<Vec<String>>,
         open: tokio::sync::watch::Receiver<bool>,
@@ -2683,11 +2496,9 @@ mod tests {
         }
     }
 
-    /// End-to-end for an ANALYST place round: the analysts run in the place
-    /// directory's synthetic workspace while the durable job and the delivered
-    /// envelope stay keyed to the caller's own workspace, and `jobs.exec_dir`
-    /// records the directory really used (so a restart resumes into it). The
-    /// gated provider parks the round until the durable row has been observed.
+    /// An ANALYST place round: analysts run in the place directory's synthetic workspace
+    /// while the job and the delivered envelope stay keyed to the caller's workspace, and
+    /// `jobs.exec_dir` records the directory really used so a restart resumes into it.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
     async fn place_round_records_exec_dir_and_delivers_to_the_caller() {
@@ -2702,8 +2513,8 @@ mod tests {
         let _provider_guard = install_fake_provider(provider.clone());
 
         let dir = tempfile::tempdir().unwrap();
-        // The spelling a resolved place stores (see `stored_workspace_path`):
-        // canonical, without the platform's verbatim prefix.
+        // The spelling a resolved place stores: canonical, without the platform's
+        // verbatim prefix.
         let place_path =
             crate::util::strip_verbatim_prefix(&std::fs::canonicalize(dir.path()).unwrap())
                 .to_str()
@@ -2711,8 +2522,8 @@ mod tests {
                 .to_string();
         let caller = test_ws("/tmp/test_ws_analyze_place");
 
-        // The admin Assistant's tool path: a place-bearing analyze call (the
-        // caller identity the tool reads from its task-locals).
+        // The admin Assistant's tool path: a place-bearing call with the caller identity
+        // from its task-locals.
         let ack = crate::agent::CURRENT_TOOL_USER_NAME
             .scope("admin".to_string(), async {
                 crate::agent::CURRENT_TOOL_CHANNEL
@@ -2735,8 +2546,8 @@ mod tests {
             .expect("the ack names the job id")
             .to_string();
 
-        // The round parks on the gated provider: the job row exists and records
-        // the place directory while the durable delivery key stays the caller's.
+        // Parked on the gated provider: the job row records the place directory while the
+        // delivery key stays the caller's.
         let conn = &crate::session::store().conn;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let (workspace_name, exec_dir) = loop {
@@ -2806,9 +2617,8 @@ mod tests {
             envelope.content
         );
 
-        // The analysts really saw the place directory: its path is in their
-        // system prompt, and their sessions are keyed to its synthetic
-        // workspace — never the caller's.
+        // The analysts really saw the place: its path is in their system prompt and
+        // their sessions are keyed to its synthetic workspace, never the caller's.
         let calls = provider.calls.lock().unwrap_poison().join("\n");
         assert!(
             calls.contains(&place_path),
@@ -2843,10 +2653,9 @@ mod tests {
         );
     }
 
-    /// A `place` is inert for every holder but the admin's Assistant: the
-    /// guest's tool keeps today's interface (no new error, even for a value the
-    /// admin's tool refuses) and still runs the round in the caller's own
-    /// workspace, even when the value names a real directory.
+    /// A `place` is inert for every holder but the admin's Assistant: the guest's tool
+    /// keeps today's interface (no new error, even for a value the admin's tool refuses)
+    /// and still runs in the caller's own workspace.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
     async fn a_place_is_inert_for_a_guest_assistant() {
@@ -2864,8 +2673,7 @@ mod tests {
                 .to_string();
 
         let tool = AnalyzeTool::new(DispatchMode::Async, Role::Assistant);
-        // A value the admin's tool refuses (a bogus name) must not become a new
-        // error for the guest.
+        // A value the admin's tool refuses must not become a new error for the guest.
         for place in ["not_a_managed_workspace", place_path.as_str()] {
             let ack = tool
                 .execute(&caller, json!({ "message": "q", "place": place }))
@@ -2912,9 +2720,8 @@ mod tests {
         );
     }
 
-    /// Run a dispatch tool the way the agent loop does — with the caller
-    /// identity the tool reads from its task-locals (the same scoping the send
-    /// harness uses).
+    /// Dispatch a tool as the agent loop does, with the caller identity it reads from
+    /// its task-locals.
     async fn dispatch_analyze(
         tool: &AnalyzeTool,
         ws: &Workspace,
@@ -2929,8 +2736,8 @@ mod tests {
             .await
     }
 
-    /// The `(kind, exec_dir)` a durable round's job row records, within a
-    /// bounded wait — the spawned dispatch writes the row asynchronously.
+    /// The `(kind, exec_dir)` a durable round's job row records, within a bounded wait —
+    /// the spawned dispatch writes it asynchronously.
     async fn round_row(job_id: &str) -> (String, Option<String>) {
         let conn = &crate::session::store().conn;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2956,11 +2763,9 @@ mod tests {
         }
     }
 
-    /// Ruling 1: a folder name may never refuse a `deep` call. The `place` the
-    /// admin's Assistant may name for `quick` is completely inert for `deep` —
-    /// never a refusal, never a different execution root — and a deep-only
-    /// holder, which is not offered `place` at all, is not tripped by one
-    /// either: the round keeps the caller's own workspace.
+    /// A folder name may never refuse a `deep` call: `place` is completely inert for
+    /// `deep` — never a refusal, never a different execution root — and a deep-only holder
+    /// is not offered `place` at all, so the round keeps the caller's workspace.
     #[tokio::test]
     #[serial_test::serial(provider, channel_registry, drain)] // serializes the process-global fake provider + channel registry + shutdown drain flag
     async fn a_place_never_touches_a_deep_round() {
@@ -2978,12 +2783,12 @@ mod tests {
             home.path().to_str().unwrap(),
             &crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
         );
-        // The deep report lands in the asking Assistant's session; register the
-        // consumer exactly as the running service's bootstrap leaves it.
+        // Register the deep report's consumer exactly as the running service's bootstrap
+        // leaves it.
         let assistant = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
         let _assistant_rx = crate::agent::message_router::register_agent(&assistant);
 
-        // A `place` the `quick` depth refuses: it is not a directory at all.
+        // A `place` the `quick` depth refuses: not a directory at all.
         let bogus = "/definitely/not/a/directory/xyz";
         let admin = AnalyzeTool::admin(Role::Assistant);
         let err = dispatch_analyze(
@@ -2995,8 +2800,7 @@ mod tests {
         .expect_err("a quick round refuses a place that is not a directory");
         assert!(err.to_string().contains("does not exist"), "{err}");
 
-        // The same argument is completely inert for `deep`: the round is
-        // dispatched, so the value never turns into a refusal.
+        // Completely inert for `deep`: the round is dispatched, never refused.
         let ack = dispatch_analyze(
             &admin,
             &caller,
@@ -3017,14 +2821,12 @@ mod tests {
             exec_dir, None,
             "a deep round ignores the place: no exec_dir is recorded"
         );
-        // The deep investigation is long-running and its completion is never
-        // required: the round this test started is stopped the way the Running
-        // Agents view stops one, so it never outlives the test.
+        // Completion is never required: the round is stopped the way the Running Agents
+        // view stops one, so it never outlives the test.
         crate::research_cancel::cancel_research_run(&job_id).await;
 
-        // A deep-only granted holder is not offered `place` at all; a caller
-        // passing one still succeeds and the round keeps the caller's own
-        // workspace as its execution root.
+        // A deep-only granted holder is not offered `place`; passing one still succeeds
+        // and the round keeps the caller's workspace.
         let deep_only = AnalyzeTool::granted(&[AnalyzeDepth::Deep]);
         assert!(
             deep_only.parameters_schema()["properties"]
@@ -3055,19 +2857,15 @@ mod tests {
         crate::research_cancel::cancel_research_run(&job_id).await;
     }
 
-    // ── Analyze cancel action ─────────────────────────────────────────────
-
-    // The cancel tests' caller: a guest Assistant's async quick variant under
-    // its own user/workspace identity. The message router and the shared test
-    // store are process-global, so this identity is deliberately one no other
-    // test routes to — a restart's replay of the store cannot leak another
-    // test's message into this caller's receiver.
+    // The cancel tests' caller: a guest Assistant's async quick variant under its own
+    // user/workspace identity. The router and test store are process-global, so this is
+    // an identity no other test routes to — a restart's replay cannot leak another test's
+    // message into this receiver.
     const CANCEL_TEST_USER: &str = "cancel_test_user";
     const CANCEL_TEST_WS: &str = "cancel_test_ws";
 
-    // The sibling-round test's own identity: its delivered result stays in the
-    // shared store's `pending_jobs` for the rest of the process, so it must not
-    // be one the other cancel tests' replay assertions observe.
+    // The sibling-round identity: its delivered result stays in the shared store's
+    // `pending_jobs`, so no other cancel test's replay assertions may observe it.
     const CANCEL_SIBLING_USER: &str = "cancel_sibling_user";
     const CANCEL_SIBLING_WS: &str = "cancel_sibling_ws";
 
@@ -3080,9 +2878,8 @@ mod tests {
         )
     }
 
-    /// The agent address of [`CANCEL_TEST_USER`]'s Assistant session — the id
-    /// these tests register as a consumer and the one a round's `jobs` row
-    /// derives to.
+    /// [`CANCEL_TEST_USER`]'s Assistant agent address — registered as a consumer, and the
+    /// one a round's `jobs` row derives to.
     fn cancel_test_caller_id() -> String {
         crate::session::resolve_agent_id(CANCEL_TEST_USER, Role::Assistant.as_str(), CANCEL_TEST_WS)
     }
@@ -3101,11 +2898,9 @@ mod tests {
             .is_empty()
     }
 
-    /// Run the cancel tests' tool the way the agent loop does — with the caller
-    /// identity the tool reads from its task-locals, including the calling agent
-    /// id the cancel action proves ownership with. The caller's workspace is the
-    /// one the round's address derives from, so the session that dispatched the
-    /// round is the one cancelling it.
+    /// Run the cancel tests' tool as the agent loop does, including the calling agent id
+    /// the cancel action proves ownership with. The caller's workspace is the one the
+    /// round's address derives from, so the dispatching session is the cancelling one.
     async fn run_as_caller(
         tool: &AnalyzeTool,
         ws: &Workspace,
@@ -3163,14 +2958,11 @@ mod tests {
         }
     }
 
-    /// A cancel stops a parked quick round: its `jobs` row and its queued result
-    /// go, the fired signal stays observable while the round unwinds, the
-    /// cancelled round delivers nothing to the caller, the analysts' own session
+    /// A cancel stops a parked quick round: its `jobs` row and queued result go, the fired signal
+    /// stays observable while the round unwinds, nothing is delivered, the analysts' session
     /// records survive, and a start does not re-arm the round.
     ///
-    /// `current_thread` on purpose: the WARN/ERROR capture below is
-    /// thread-scoped, and a single-threaded runtime keeps the awaited cancel on
-    /// the thread the capture was installed for.
+    /// `current_thread` on purpose: the WARN/ERROR capture is thread-scoped.
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(provider, drain, recover_from_restart)]
     async fn cancel_stops_a_running_round_and_delivers_nothing() {
@@ -3198,8 +2990,8 @@ mod tests {
             .to_string();
         assert!(ack.contains(&job_id), "{ack}");
 
-        // The round parks on the gated provider: the jobs row and its analyst
-        // roster are written while nothing has been delivered.
+        // Parked on the gated provider: the jobs row and analyst roster are written while
+        // nothing has been delivered.
         let (kind, _exec_dir) = round_row(&job_id).await;
         assert_eq!(kind, "analyze", "a quick round is an analyze job");
         let conn = &crate::session::store().conn;
@@ -3215,9 +3007,8 @@ mod tests {
             .collect();
         assert!(!roster.is_empty(), "the round has an analyst roster");
 
-        // A synthetic call card belonging to the round, exactly as the round's
-        // consolidation call registers one: the cancel must remove it so the
-        // cancelled round stops being shown as running work.
+        // A synthetic call card belonging to the round, as its consolidation call registers
+        // one: the cancel must remove it so the round stops showing as running work.
         let _call_card = crate::agent::registry::NON_AGENT_CALLS.register(
             "consolidate",
             CANCEL_TEST_WS,
@@ -3244,14 +3035,11 @@ mod tests {
         };
         assert!(answer.contains("Cancelled the analysis round"), "{answer}");
         assert!(answer.contains(&job_id), "{answer}");
-        // The cancel leaves no complaint about itself behind: nothing it emits
-        // is a WARN or an ERROR (its own record is the INFO line plus the tool
-        // call in the caller's session). `tracing::Level` orders by VERBOSITY
-        // (ERROR < WARN < INFO < …), so "above WARN" means quieter than a
-        // warning. The test runs on a single-threaded runtime so the capture
-        // installed for this thread sees every event the awaited cancel emits.
-        // The capture must have seen the path's own INFO record — an empty
-        // capture could only make the assertion below pass vacuously.
+        // The cancel leaves no complaint behind: nothing it emits is a WARN or ERROR (its
+        // own record is the INFO line plus the tool call in the caller's session).
+        // `tracing::Level` orders by VERBOSITY, so "above WARN" means quieter than a
+        // warning. The capture must have seen the path's own INFO record — an empty capture
+        // could only make the assertion pass vacuously.
         assert!(
             recorder.levels().contains(&tracing::Level::INFO),
             "the capture must observe the cancel's own record: {:?}",
@@ -3266,8 +3054,8 @@ mod tests {
             recorder.levels()
         );
 
-        // The stop is already durable while the round is still parked: the rows
-        // are gone and the fired signal is still observable on the live entry.
+        // The stop is durable while the round is still parked: the rows are gone and the
+        // fired signal is observable on the live entry.
         assert!(
             !cancel_row_exists("jobs", &job_id).await,
             "the cancelled round's jobs row must be gone"
@@ -3291,9 +3079,8 @@ mod tests {
             "the cancelled round must stop being shown as running work"
         );
 
-        // The round really is still running (its entry is registered until its
-        // invocation exits), so its stop is still in force and a second cancel
-        // of the same id is answered as stopped again.
+        // The round is still running (its entry is registered until its invocation exits),
+        // so a second cancel of the same id is answered as stopped again.
         let answer = run_as_cancel_test_caller(
             &tool,
             &caller,
@@ -3303,8 +3090,7 @@ mod tests {
         .expect("the repeat cancel is answered");
         assert!(answer.contains("Cancelled the analysis round"), "{answer}");
 
-        // Let the parked round unwind, then assert nothing it might still do
-        // resurrects its rows or reaches the caller.
+        // Let the parked round unwind: nothing may resurrect its rows or reach the caller.
         gate_tx.send(true).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while crate::round_cancel::is_registered(&job_id) {
@@ -3342,8 +3128,7 @@ mod tests {
             );
         }
 
-        // A start replays pending_jobs and re-arms resumable jobs: this round is
-        // neither, and the replay delivers nothing for it.
+        // A start replays pending_jobs and re-arms resumable jobs: this round is neither.
         let resumable = crate::jobs::recover_from_restart().await.unwrap();
         assert!(
             !resumable.iter().any(|job| matches!(
@@ -3358,10 +3143,9 @@ mod tests {
         );
     }
 
-    /// A cancel discards an analyze result already produced but not yet
-    /// delivered: its queued row goes, nothing reaches the caller, the discard
-    /// survives a start's replay, and a second cancel of the same id answers
-    /// exactly like an id that never existed.
+    /// A cancel discards an already-produced result before delivery: its queued row goes,
+    /// nothing reaches the caller, the discard survives a start's replay, and a second
+    /// cancel answers exactly like an id that never existed.
     #[tokio::test]
     #[serial_test::serial(provider, drain, recover_from_restart)]
     async fn cancel_discards_a_produced_result_and_survives_a_restart() {
@@ -3373,8 +3157,7 @@ mod tests {
         let tool = AnalyzeTool::new(DispatchMode::Async, Role::Assistant);
         let job_id = "analyze_cancel_discard_job";
 
-        // A produced result with no round row left: the delivery is all that
-        // remains, and it waits in `pending_jobs`.
+        // A produced result with no round row left: the delivery is all that remains.
         crate::jobs::complete_durable_job(
             job_id,
             format!("<analyze-tool-result>\n\nJob: {job_id}\n\nfindings"),
@@ -3413,8 +3196,7 @@ mod tests {
             "a discarded result must not be delivered"
         );
 
-        // A start replays pending_jobs — the discarded row must not come back
-        // and the replay must deliver nothing for it.
+        // A start replays pending_jobs — the discarded row must not come back.
         crate::jobs::recover_from_restart().await.unwrap();
         assert!(
             !cancel_row_exists("pending_jobs", job_id).await,
@@ -3425,8 +3207,7 @@ mod tests {
             "the pending replay of a discarded result delivers nothing"
         );
 
-        // The row is gone for good: a second cancel answers like an id that
-        // never existed.
+        // Gone for good: a second cancel answers like an id that never existed.
         let answer = run_as_cancel_test_caller(
             &tool,
             &caller,
@@ -3440,12 +3221,10 @@ mod tests {
         );
     }
 
-    /// A cancelled round leaves no resumable row: a dispatch that observes the
-    /// cancel at its entry returns before writing anything, delivers nothing, and
-    /// releases the synthetic place's engine it would have held. (The write that
-    /// WOULD have happened — a cancel landing inside the dispatch's own row
-    /// transaction — is the gate `jobs::spawn_job` covers, pinned beside it in
-    /// `spawn_job_refuses_a_cancelled_rounds_row`.)
+    /// A cancelled round leaves no resumable row: a dispatch that observes the cancel at its
+    /// entry returns before writing anything, delivers nothing and releases the synthetic
+    /// place's engine. The write inside the dispatch's own row transaction is the gate
+    /// `jobs::spawn_job` covers, pinned in `spawn_job_refuses_a_cancelled_rounds_row`.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
     async fn a_cancelled_dispatch_leaves_no_resumable_row() {
@@ -3453,8 +3232,8 @@ mod tests {
         let ws = test_ws("/tmp/test_ws_analyze_cancel_dispatch");
         let job_id = "analyze_cancel_dispatch_job";
 
-        // The synthetic `dir-…` delegation place: the cancelled dispatch must
-        // release the picker/watcher it created for it.
+        // The cancelled dispatch must release the picker/watcher it created for the
+        // synthetic `dir-…` place.
         let place_dir = std::env::temp_dir().join("mahbot_analyze_cancel_place");
         std::fs::create_dir_all(&place_dir).unwrap();
         let place =
@@ -3492,10 +3271,9 @@ mod tests {
         );
     }
 
-    /// A cancel that lands between the boot scan which picked a round and the
-    /// resume's own cancel-signal registration still stops that round: the mark
-    /// the cancel left reaches the registration, so the resume runs nothing and
-    /// a caller answered as stopped is never delivered to.
+    /// A cancel landing between the boot scan and the resume's cancel-signal registration
+    /// still stops the round: the mark reaches the registration, so the resume runs nothing
+    /// and a caller answered as stopped is never delivered to.
     #[tokio::test]
     #[serial_test::serial(drain, recover_from_restart)] // the resume consults the drain flag
     async fn a_cancel_before_a_resume_registers_still_stops_that_resume() {
@@ -3504,9 +3282,8 @@ mod tests {
         let job_id = "analyze_cancel_before_resume_job";
         let agent_id = format!("analyze_{}_rs_0_analyst", ws.name);
         let conn = &crate::session::store().conn;
-        // A round a crashed dispatch left launched, with its stored outcome
-        // (reconstructed by its roster slot — no provider needed): without the
-        // cancel, this resume runs and delivers that outcome.
+        // A round a crashed dispatch left launched, with its stored outcome: without the
+        // cancel, this resume runs and delivers it.
         crate::jobs::spawn_job(
             conn,
             job_id,
@@ -3538,9 +3315,8 @@ mod tests {
         .await
         .unwrap();
 
-        // The cancel fires while nothing is registered for the round, and its
-        // row removal has not landed yet: the boot scan has already listed this
-        // row, so the resume below is the one that must observe the cancel.
+        // The cancel fires while nothing is registered and its row removal has not landed:
+        // the boot scan already listed this row, so the resume must observe the cancel.
         assert!(!crate::round_cancel::is_registered(job_id));
         crate::round_cancel::cancel(job_id);
         resume_analyze_round(job_id, &ws, None).await;
@@ -3560,8 +3336,7 @@ mod tests {
             "a round cancelled before its resume must deliver nothing"
         );
 
-        // The cancel action then removes the round's own rows, as it always
-        // does, so the next start cannot re-arm it.
+        // The action then removes the round's own rows, so the next start cannot re-arm it.
         crate::jobs::delete_round_rows(conn, job_id).await.unwrap();
         assert!(
             !cancel_row_exists("jobs", job_id).await,
@@ -3569,8 +3344,8 @@ mod tests {
         );
     }
 
-    /// Seed one launched analyze round row exactly as a dispatch writes it — the
-    /// address shapes the ownership cases below need.
+    /// Seed one launched round row exactly as a dispatch writes it — the address shapes
+    /// the ownership cases need.
     async fn seed_round_row(
         ws: &Workspace,
         job_id: &str,
@@ -3596,20 +3371,18 @@ mod tests {
         .unwrap();
     }
 
-    /// Ownership is the calling SESSION, resolved through the crate's ONE
-    /// delivery-address derivation ([`crate::jobs::target_agent_id`]) — so the two
-    /// addresses that are NOT (user, role, workspace) are both covered: the
-    /// workspace's shared Manager session, cancelling in a pipeline-driven turn
-    /// that carries NO user at all, and a custom-role branch, whose address comes
-    /// from the launch its row carries.
+    /// Ownership is the calling SESSION, via the crate's ONE delivery-address derivation
+    /// ([`crate::jobs::target_agent_id`]), covering both addresses that are NOT
+    /// (user, role, workspace): the workspace's shared Manager session, cancelling in a pipeline
+    /// turn with NO user, and a custom-role branch, whose address comes from its row's launch.
     #[tokio::test]
     #[serial_test::serial(drain, recover_from_restart)]
     async fn the_dispatchers_session_cancels_its_round_whatever_its_address_shape() {
         crate::util::test::init_management_test_stores().await;
         let ws = test_ws("/tmp/test_ws_analyze_cancel_addresses");
 
-        // A Manager round, cancelled by the workspace's manager session in a turn
-        // with no user (pipeline ticket notifications).
+        // A Manager round cancelled by the workspace's manager session, in a turn with no
+        // user (pipeline ticket notifications).
         let manager_job = "analyze_cancel_manager_job";
         seed_round_row(&ws, manager_job, "asking-user", Role::Manager, None).await;
         let manager_tool = AnalyzeTool::new(DispatchMode::Async, Role::Manager);
@@ -3657,12 +3430,9 @@ mod tests {
         );
     }
 
-    /// A placed round holds its synthetic `dir-…` search engine for the resume
-    /// that reuses it — a round cut by drain has already returned, so its own
-    /// exit released nothing. A cancel means there is no resume, so the cancel
-    /// action releases the engine from the directory its row records — even once
-    /// that directory itself is gone, since the engine is NAMED by it and the
-    /// round's rows are swept.
+    /// A placed round holds its synthetic `dir-…` search engine for a resume that reuses it.
+    /// A cancel means no resume, so the cancel releases it from the directory its row
+    /// records — even once that directory is gone, since the engine is NAMED by it.
     #[tokio::test]
     #[serial_test::serial(drain, recover_from_restart)]
     async fn a_cancel_releases_a_placed_rounds_workspace_index() {
@@ -3677,7 +3447,7 @@ mod tests {
                 .to_str()
                 .unwrap()
                 .to_string();
-        // The engine the round left behind, exactly as a drain-cut leaves it.
+        // The engine a drain-cut round leaves behind.
         let place = crate::tools::delegation::workspace_at_dir(&place_path)
             .await
             .unwrap();
@@ -3704,10 +3474,8 @@ mod tests {
         )
         .await
         .unwrap();
-        // The directory is gone by the time the cancel lands — exactly the state
-        // a drain-cut round leaves: it has already returned, its rows are swept,
-        // and the engine's name is a derivation of the recorded path, not a
-        // lookup that needs the directory to exist.
+        // The directory is gone by now — the state a drain-cut round leaves: its rows are
+        // swept and the engine's name derives from the recorded path, which need not exist.
         dir.close().unwrap();
         assert!(
             !std::path::Path::new(&place_path).exists(),
@@ -3729,16 +3497,14 @@ mod tests {
         assert!(!cancel_row_exists("jobs", job_id).await);
     }
 
-    /// A cancel landing AFTER a phase's entry gate stops that phase's own model
-    /// calls instead of letting the retry loop re-ask: both the findings
-    /// extraction and the consolidation pass are abandoned at the fired signal,
-    /// so no attempt starts after the caller was answered.
+    /// A cancel landing AFTER a phase's entry gate stops that phase's own model calls
+    /// instead of letting the retry loop re-ask: both extraction and consolidation are
+    /// abandoned at the fired signal.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
     async fn a_cancelled_round_asks_no_further_model_call() {
-        // Parks the canceller deterministically at the phase's in-flight call
-        // instead of sleeping blindly: waits (bounded) until the provider has
-        // recorded `expected` calls.
+        // Parks the canceller at the phase's in-flight call instead of sleeping blindly:
+        // bounded wait until the provider has recorded `expected` calls.
         async fn wait_for_calls(provider: &GatedProvider, expected: usize) {
             let mut waited = 0;
             while provider.calls.lock().unwrap_poison().len() < expected {
@@ -3748,9 +3514,8 @@ mod tests {
             }
         }
 
-        /// The phase is already over: a retry loop that ignored the signal would
-        /// re-ask right away, so watching the count across a settle window
-        /// catches it wherever in the window it lands.
+        /// The phase is already over: a retry loop ignoring the signal would re-ask right
+        /// away, so watching the count across a settle window catches it anywhere.
         async fn assert_no_further_calls(provider: &GatedProvider, expected: usize) {
             for _ in 0..20 {
                 assert_eq!(
@@ -3765,9 +3530,8 @@ mod tests {
         crate::util::test::init_management_test_stores().await;
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
-        // Every call parks until the gate opens, then answers with a text that
-        // never parses: were the phase not abandoned at the cancel, the retry
-        // loop would re-ask within the test window.
+        // Every call parks until the gate opens, then answers with unparseable text: were
+        // the phase not abandoned at the cancel, the retry loop would re-ask.
         let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
         let provider = Arc::new(GatedProvider {
             calls: std::sync::Mutex::new(Vec::new()),
@@ -3778,8 +3542,8 @@ mod tests {
         let round = "analyze_cancel_no_further_call";
         let _cancel_guard = crate::round_cancel::register(round, None);
 
-        // Part 1 — findings extraction: the two extraction calls are in flight
-        // when the cancel lands, so neither may re-ask once the gate opens.
+        // Part 1 — extraction: both calls are in flight when the cancel lands, so neither
+        // may re-ask once the gate opens.
         let runs = vec![
             test_analyst_run(&ws, Some("report one")),
             test_analyst_run(&ws, Some("report two")),
@@ -3795,9 +3559,8 @@ mod tests {
             async {
                 wait_for_calls(&provider, 2).await;
                 crate::round_cancel::cancel(round);
-                // Unblock the parked calls too: were the phase not abandoned at
-                // the signal, the retry loop would re-ask and the count below
-                // would grow.
+                // Unblock the parked calls too: a retry loop that ignored the signal would
+                // re-ask and the count below would grow.
                 gate_tx.send(true).unwrap();
             },
         );
@@ -3809,10 +3572,9 @@ mod tests {
         );
         assert_no_further_calls(&provider, 2).await;
 
-        // Part 2 — consolidation: the grouping call is in flight when the cancel
-        // lands, so no repair round may start. A fresh round key is registered —
-        // the already-fired signal would be caught by the entry gate before any
-        // call — and the gate is re-armed so that grouping call parks.
+        // Part 2 — consolidation: the grouping call is in flight when the cancel lands, so
+        // no repair round may start. A fresh round key is registered (the entry gate would
+        // catch the already-fired signal) and the gate re-armed so grouping parks.
         let round2 = "analyze_cancel_no_further_call_consolidate";
         let _cancel_guard2 = crate::round_cancel::register(round2, None);
         gate_tx.send(false).unwrap();
@@ -3827,8 +3589,8 @@ mod tests {
             async {
                 wait_for_calls(&provider, 3).await;
                 crate::round_cancel::cancel(round2);
-                // Same as Part 1: the phase must stop at the signal, not after
-                // the unblocked call returns.
+                // As in Part 1: the phase must stop at the signal, not after the
+                // unblocked call returns.
                 gate_tx.send(true).unwrap();
             },
         );
@@ -3841,9 +3603,9 @@ mod tests {
         assert_no_further_calls(&provider, 3).await;
     }
 
-    /// Cancelling one round leaves the caller's other in-flight rounds alone: a
-    /// second round of the same session keeps its produced result, its signal is
-    /// never fired, and that result is still delivered by a start's replay.
+    /// Cancelling one round leaves the caller's other in-flight rounds alone: a second round
+    /// of the same session keeps its produced result, its signal is never fired, and a
+    /// start's replay still delivers it.
     #[tokio::test]
     #[serial_test::serial(provider, drain, recover_from_restart)]
     async fn a_cancel_leaves_the_callers_other_rounds_delivering() {
@@ -3899,8 +3661,7 @@ mod tests {
         .expect("the cancel is answered");
         assert!(answer.contains("Cancelled the analysis round"), "{answer}");
 
-        // The sibling round is untouched: its result still waits and its signal
-        // was never fired.
+        // The sibling round is untouched: its result still waits and its signal never fired.
         assert!(
             !crate::round_cancel::is_cancelled(sibling),
             "cancelling one round must not fire another round's signal"
@@ -3920,20 +3681,16 @@ mod tests {
             delivered.iter().any(|content| content.contains(sibling)),
             "the sibling round's result is still delivered: {delivered:?}"
         );
-        // The delivered row is not reclaimed by the replay: clear it so it
-        // cannot reach another test's assertions.
+        // Clear the delivered row so it cannot reach another test's assertions.
         crate::jobs::delete_pending_job(conn, sibling)
             .await
             .unwrap();
     }
 
-    /// The cancel action refuses everything that is not the caller's own live
-    /// quick round — an unknown id, a `deep` investigation the caller owns, a
-    /// deep investigation's queued report, a worker round's queued report, and
-    /// another session's analyze round — and leaves each completely alone: no
-    /// signal is fired and every refused row survives. The caller's own live
-    /// quick row is stopped and deleted, after which the same id answers as
-    /// nothing of the caller's.
+    /// The action refuses everything that is not the caller's own live quick round — an unknown
+    /// id, a `deep` investigation the caller owns, a deep investigation's queued report, a worker
+    /// round's queued report, another session's round — and leaves each alone. The caller's own
+    /// quick row is stopped and deleted, after which the same id answers as nothing of its own.
     #[tokio::test]
     #[serial_test::serial(provider, drain, recover_from_restart)]
     async fn a_cancel_refuses_everything_that_is_not_the_callers_live_quick_round() {
@@ -3966,8 +3723,8 @@ mod tests {
             "a refused cancel must not fire a signal"
         );
 
-        // A `deep` investigation is a research-kind row — out of the action's
-        // scope even when the caller's own identity owns it.
+        // A `deep` investigation is a research-kind row — out of scope even when the
+        // caller owns it.
         crate::jobs::spawn_job(
             conn,
             "deep_cancel_round",
@@ -4045,10 +3802,8 @@ mod tests {
             "another session's round is left in place"
         );
 
-        // Reports queued for THIS caller: only the round's own kind
-        // distinguishes them from a quick round's result, and a deep
-        // investigation's report and a worker round's report are not this
-        // action's to destroy.
+        // Reports queued for THIS caller: only the round's kind tells them from a quick round's
+        // result, and neither a deep report nor a worker report is this action's to destroy.
         for (job_id, kind) in [
             (
                 "cancel_refuses_deep_report",
@@ -4093,11 +3848,10 @@ mod tests {
             );
         }
 
-        // The caller's own live quick round: a live round holds its
-        // cancel-signal entry for the duration of its invocation, so register
-        // one the way a dispatch would. The first cancel stops it, fires its
-        // signal and deletes the row; once the invocation exits (the guard
-        // drops) the same id answers like one that never existed.
+        // The caller's own live quick round: a live round holds its cancel-signal entry for
+        // the duration of its invocation, so register one as a dispatch would. The first
+        // cancel stops it, fires its signal and deletes the row; once the invocation exits
+        // (the guard drops) the same id answers like one that never existed.
         crate::jobs::spawn_job(
             conn,
             "mine_cancel_round",
@@ -4149,9 +3903,8 @@ mod tests {
             "{answer}"
         );
 
-        // Leave nothing behind for a sibling test's `recover_from_restart`
-        // replay: every queued report and every launched row this test created
-        // goes.
+        // Leave nothing for a sibling test's `recover_from_restart` replay: every queued
+        // report and launched row this test created goes.
         for report in ["cancel_refuses_deep_report", "cancel_refuses_worker_report"] {
             crate::jobs::delete_pending_job(conn, report).await.unwrap();
         }
@@ -4160,10 +3913,9 @@ mod tests {
         }
     }
 
-    /// Nothing new is started for a cancelled round: an analyst that registers
-    /// AFTER the round's cancel signal fired is pre-cancelled at registration.
-    /// The late-register race is reachable for an analyze round because its
-    /// verification analysts are dispatched after the analysts it started with.
+    /// Nothing new starts for a cancelled round: an analyst registering AFTER the signal
+    /// fired is pre-cancelled at registration. Reachable because a round's verification
+    /// analysts are dispatched after the ones it started with.
     #[tokio::test]
     async fn a_late_registering_analyst_of_a_cancelled_round_is_pre_cancelled() {
         crate::util::test::init_management_test_stores().await;
@@ -4197,8 +3949,8 @@ mod tests {
             "an analyst the cancelled round dispatches afterwards must be pre-cancelled"
         );
 
-        // The entry belongs to the round's own invocation: once that invocation
-        // exits, a fresh round is not affected by the gone round's signal.
+        // The entry belongs to the round's own invocation: once it exits, a fresh round is
+        // unaffected by the gone round's signal.
         drop(round);
         assert!(
             !analyst("analyze_late_register_fresh").is_cancelled(),
@@ -4206,10 +3958,9 @@ mod tests {
         );
     }
 
-    /// A dangling cancel frame is re-executed, never bound to an unrelated
-    /// analyze job: the core resolution refuses any `analyze` call carrying an
-    /// `action`, while the plain dispatch form still resolves to the quick
-    /// round.
+    /// A dangling cancel frame is re-executed, never bound to an unrelated job: the core
+    /// resolution refuses an `analyze` call carrying an `action`, while the plain form
+    /// still resolves to the quick round.
     #[test]
     fn a_cancel_frame_is_never_resolved_to_a_dispatch() {
         assert!(
@@ -4229,10 +3980,9 @@ mod tests {
         );
     }
 
-    /// The cancel action is offered exactly where a quick async round can be
-    /// dispatched: its `action`/`job_id` properties and the cancel note appear
-    /// on the admin Assistant, the async Manager and a quick-granted holder, and
-    /// nowhere else.
+    /// Offered exactly where a quick async round can be dispatched: `action`/`job_id` and
+    /// the cancel note appear on the admin Assistant, the async Manager and a quick-granted
+    /// holder, and nowhere else.
     #[test]
     fn the_cancel_action_is_offered_only_where_a_quick_round_can_be_dispatched() {
         let note = load_prompt("tool/analyze_cancel.md");
@@ -4260,9 +4010,9 @@ mod tests {
                 description.contains(&note),
                 "the cancel note must be declared where the action is: {description}"
             );
-            // A cancel call carries no dispatch argument, so the requirement is
-            // per-branch: `message` (+ `depth`) to dispatch, `action` + `job_id`
-            // to cancel — never a flat `required` list that would demand both.
+            // A cancel carries no dispatch argument, so the requirement is per-branch:
+            // `message` (+ `depth`) to dispatch, `action` + `job_id` to cancel — never a
+            // flat `required` list demanding both.
             let branches = schema["oneOf"]
                 .as_array()
                 .expect("a cancelling holder's schema states the two call forms");
@@ -4315,11 +4065,9 @@ mod tests {
         }
     }
 
-    /// The same class `send`'s sweep guards, for the depth choice: a holder is
-    /// never told about a depth it does not have (its own note may name the one
-    /// it holds), the `depth` argument exists only where a choice is declared,
-    /// and `place` exists only where it means something. Swept over every holder,
-    /// so a third depth joins the sweep by existing.
+    /// The depth choice's sweep: a holder is never told about a depth it does not have, the
+    /// `depth` argument exists only where a choice is declared, and `place` only where it
+    /// means something. Swept over every holder, so a third depth joins by existing.
     #[test]
     fn no_holder_reads_a_depth_it_does_not_have() {
         for mask in 1u32..(1 << AnalyzeDepth::ALL.len()) {
@@ -4354,9 +4102,8 @@ mod tests {
         }
     }
 
-    /// Seed a caller-owned analyze job with a single roster slot. `outcome`
-    /// `Some` marks the slot Done with that stored outcome (reconstructable);
-    /// `None` leaves it launched.
+    /// Seed a caller-owned job with one roster slot. `outcome` `Some` marks it Done with that
+    /// stored outcome (reconstructable); `None` leaves it launched.
     async fn seed_analyze_job(ws: &Workspace, job_id: &str, pin: &str, outcome: Option<&str>) {
         let conn = &crate::session::store().conn;
         let analyst_id = format!("{job_id}_analyst");
@@ -4394,9 +4141,8 @@ mod tests {
         }
     }
 
-    /// (k-extra) `find_owned_launched_jobs` returns only the caller's
-    /// launched analyze/implement jobs — a research-kind and a ticket-phase-kind
-    /// job owned by the same pin are ignored — newest first.
+    /// `find_owned_launched_jobs` returns only the caller's launched analyze/implement jobs —
+    /// a research-kind and a ticket-phase-kind job on the same pin are ignored — newest first.
     #[tokio::test]
     async fn find_owned_launched_jobs_ignores_other_kinds() {
         crate::util::test::init_management_test_stores().await;
@@ -4462,8 +4208,8 @@ mod tests {
 
         seed_analyze_job(&ws, "analyze_newer", pin, None).await;
         seed_analyze_job(&ws, "analyze_older", pin, None).await;
-        // Backdate `analyze_older` so the newest-first assertion is
-        // deterministic at `created_at` second precision.
+        // Backdated so the newest-first assertion is deterministic at `created_at` second
+        // precision.
         conn.execute(
             "UPDATE jobs SET created_at = ?1 WHERE id = ?2",
             crate::db::params!["2023-01-02T00:00:00+00:00", "analyze_older"],
@@ -4481,8 +4227,6 @@ mod tests {
             "only analyze jobs returned, newest first"
         );
     }
-
-    // ── Analyze dispute-verification round helpers ────────────────────────
 
     /// Build a disputed consensus group over the given flat item ids.
     fn disputed_group(heading: &str, members: &[usize]) -> crate::consensus::GroupingGroup {
@@ -4549,8 +4293,8 @@ mod tests {
 
     #[test]
     fn synthesize_verification_target_merges_heading_claims_sources_contradictions() {
-        // Two disputed groups, each with member claims carrying a source and a
-        // self-reported contradiction (member caveat).
+        // Two disputed groups whose member claims each carry a source and a self-reported
+        // contradiction (member caveat).
         let mut f1 = findings(vec![("alpha is true", "url1", "high")]);
         f1.claims[0].contradictions = vec!["src says alpha may be false".into()];
         let f2 = findings(vec![("alpha is false", "url2", "high")]);
@@ -4602,9 +4346,8 @@ mod tests {
             target.contradictions
         );
 
-        // No results render nothing; every verdict is one bullet; multi-line
-        // claim/evidence text is collapsed to semicolons; and fenced untrusted
-        // text is escaped.
+        // No results render nothing; every verdict is one bullet; multi-line claim/evidence
+        // is collapsed to semicolons; fenced untrusted text is escaped.
         assert!(
             render_verification_section(&[]).is_empty(),
             "an empty set renders nothing"
@@ -4651,11 +4394,8 @@ mod tests {
         );
     }
 
-    // ── Emission-time durability: drain-cut + resume-completion ───────────
-
-    /// (e) With drain active, a sync analyze dispatch surfaces the
-    /// [`CallSuspended`] carrier and leaves the caller-owned job `launched` —
-    /// never terminalized.
+    /// (e) With drain active, a sync analyze dispatch surfaces [`CallSuspended`] and leaves
+    /// the caller-owned job `launched` — never terminalized.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn sync_analyze_draincut_returns_call_suspended_error() {
@@ -4696,13 +4436,10 @@ mod tests {
         );
     }
 
-    /// (f) The resume-completion path resumes a durable analyze job whose
-    /// roster is all-Done: the Done slot is reconstructed (zero LLM calls),
-    /// the consolidated result settles contiguously after the frame, and the
-    /// job is terminalized.
-    // Joins the `provider` serial group: the seam swaps the process-global
-    // provider, so the test must not interleave with the other provider-group
-    // tests (same exclusion the pipeline/retry tests rely on).
+    /// (f) The resume-completion path resumes an all-Done roster: the Done slot is
+    /// reconstructed (zero LLM calls), the result settles contiguously after the frame, and
+    /// the job is terminalized.
+    // Joins the `provider` serial group: the seam swaps the process-global provider.
     #[tokio::test]
     #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn resume_hook_completion_resumes_durable_analyze() {

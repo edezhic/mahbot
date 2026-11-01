@@ -1,27 +1,20 @@
-//! Image & video model-catalog clients.
-//!
-//! Both fetch through the single-flight, endpoint-keyed, TTL-cached machinery in
-//! [`crate::util::catalog_cache`], whose module docs carry the caching and
-//! fail-open contract. Media always targets OpenRouter, never a custom chat
-//! endpoint, so both clients read the default endpoint.
-//!
-//! They live in separate submodules because each declares the same helper names
-//! (`CATALOG`, `parse_catalog`, `get_catalog`, `seed_cache`).
+//! Image & video model-catalog clients, both through the single-flight, TTL-cached
+//! machinery in [`crate::util::catalog_cache`] (whose docs carry the caching and
+//! fail-open contract). Media always targets OpenRouter, never a custom chat
+//! endpoint, so both read the default endpoint. Separate submodules because each
+//! declares the same helper names (`CATALOG`, `parse_catalog`, `get_catalog`, `seed_cache`).
 
 /// Client for the OpenRouter image-models catalog (`GET {base}/images/models`).
 ///
-/// Each entry declares its generation parameters (`supported_parameters`:
-/// names, enums, ranges) and its output modalities
-/// (`architecture.output_modalities`). Every image-gen capability and parameter
-/// decision is driven by this data — never by model-name branches. Models are
-/// keyed by `id`.
+/// Every image-gen capability and parameter decision is driven by the declared
+/// data (`supported_parameters`, `architecture.output_modalities`) — never by
+/// model-name branches. Models are keyed by `id`.
 pub mod image {
     use crate::util::catalog_cache::{Catalog, parse_envelope};
     use serde_json::Value;
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    /// Declared constraint for one image-generation parameter.
     #[derive(Debug, Clone)]
     pub(crate) enum ParameterConstraint {
         Enum(Vec<String>),
@@ -29,40 +22,34 @@ pub mod image {
             max: i64,
         },
         Boolean,
-        /// Unknown constraint shape — tolerated so a catalog evolution never breaks parsing.
+        /// Tolerated so a catalog evolution never breaks parsing.
         Unknown,
     }
 
-    /// Whether a model declares image output in `architecture.output_modalities`.
+    /// From `architecture.output_modalities`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub(crate) enum ImageOutput {
-        /// `image` is among the declared output modalities.
         Declared,
-        /// Modalities are declared but exclude `image` (explicitly text-only).
+        /// Declared but excluding `image` (explicitly text-only).
         TextOnly,
-        /// Modalities are missing or empty — treated as capable (fail-open on shape drift).
+        /// Missing or empty modalities — treated as capable (fail-open on shape drift).
         #[default]
         Unknown,
     }
 
-    /// Parsed per-model image-generation capabilities.
     #[derive(Debug, Clone, Default)]
     pub(crate) struct ImageModelInfo {
-        /// Parameter names declared by the catalog (keys of `supported_parameters`).
         pub(crate) supported_parameters: HashMap<String, ParameterConstraint>,
-        /// Declared output modalities, mapped to image-generation support.
         pub(crate) image_output: ImageOutput,
     }
 
     impl ImageModelInfo {
-        /// Whether the catalog declares `param` for this model.
         #[must_use]
         pub(crate) fn declares(&self, param: &str) -> bool {
             self.supported_parameters.contains_key(param)
         }
 
-        /// The declared values of enum `param`; `None` when the catalog does not
-        /// declare `param` or declares it with another constraint shape.
+        /// `None` when `param` is undeclared or has another constraint shape.
         #[must_use]
         pub(crate) fn enum_values(&self, param: &str) -> Option<&[String]> {
             match self.supported_parameters.get(param) {
@@ -71,14 +58,12 @@ pub mod image {
             }
         }
 
-        /// Whether `param` is a declared enum that includes `value`.
         #[must_use]
         pub(crate) fn enum_contains(&self, param: &str, value: &str) -> bool {
             self.enum_values(param)
                 .is_some_and(|values| values.iter().any(|v| v == value))
         }
 
-        /// The declared `param` range max (e.g. `input_references` cap).
         #[must_use]
         pub(crate) fn range_max(&self, param: &str) -> Option<i64> {
             match self.supported_parameters.get(param) {
@@ -88,7 +73,6 @@ pub mod image {
         }
     }
 
-    /// The full parsed catalog: model id → capabilities.
     #[derive(Debug, Default)]
     pub(crate) struct ImageCatalog {
         models: HashMap<String, ImageModelInfo>,
@@ -101,16 +85,16 @@ pub mod image {
         }
     }
 
-    /// Parse a catalog response body; per-entry tolerance in [`parse_model`],
-    /// envelope error contract in [`crate::util::catalog_cache::parse_envelope`].
+    /// Per-entry tolerance in [`parse_model`], envelope errors from
+    /// [`crate::util::catalog_cache::parse_envelope`].
     pub(crate) fn parse_catalog(body: &Value) -> anyhow::Result<ImageCatalog> {
         Ok(ImageCatalog {
             models: parse_envelope(body, "Image models catalog", parse_model)?,
         })
     }
 
-    /// Parse one catalog entry; tolerates unknown model entries (skipped), missing
-    /// fields, and unknown parameter shapes.
+    /// Tolerates missing fields and unknown parameter shapes; entries without an
+    /// `id` are skipped.
     fn parse_model(entry: &Value) -> Option<(String, ImageModelInfo)> {
         let id = entry.get("id").and_then(Value::as_str)?.to_string();
         let image_output = match entry["architecture"]["output_modalities"].as_array() {
@@ -152,8 +136,6 @@ pub mod image {
         }
     }
 
-    // ── Cached fetch ───────────────────────────────────────────────────
-
     static CATALOG: Catalog<ImageCatalog> =
         Catalog::new("/images/models", "Image models catalog", parse_catalog);
 
@@ -162,21 +144,20 @@ pub mod image {
         CATALOG.get(crate::config::DEFAULT_PROVIDER_ENDPOINT).await
     }
 
-    /// Test-only: seed the shared cache (no network).
+    /// Test-only, no network.
     #[cfg(test)]
     pub(crate) fn seed_cache(catalog: Option<Arc<ImageCatalog>>) {
         let endpoint = crate::providers::ensure_base_url(crate::config::DEFAULT_PROVIDER_ENDPOINT);
         CATALOG.seed(&endpoint, catalog);
     }
 
-    /// The remediation the account's own-model paths append to a capability verdict:
-    /// it speaks to the account's pick. A walk candidate's skip line leaves it out —
-    /// the model the account chose is not the one the walk passed over.
+    /// Appended by the account's own-model paths only: a walk candidate's skip line
+    /// leaves it out, since the model the account chose is not the one passed over.
     const IMAGE_MODEL_REMEDIATION: &str =
         " Set an image-capable model in Settings → Provider → Models settings and retry.";
 
-    /// Reject a catalog-listed model that explicitly declares text-only output.
-    /// (Shape drift — missing/empty modalities — is tolerated as capable.)
+    /// Reject a catalog-listed model that explicitly declares text-only output. (Shape drift —
+    /// missing/empty modalities — is tolerated as capable.)
     fn reject_text_only(model: &str, info: &ImageModelInfo) -> anyhow::Result<()> {
         if info.image_output == ImageOutput::TextOnly {
             anyhow::bail!(
@@ -187,19 +168,14 @@ pub mod image {
         Ok(())
     }
 
-    /// Shared image-model capability resolver — the single validation entry
-    /// point for all three consumers (GUI model picker, Telegram model setter,
-    /// and the generation-time image-gen check).
+    /// The single validation entry point for the GUI model picker, the Telegram
+    /// model setter and the generation-time image-gen check.
     ///
-    /// Resolution order: a hit against the cached catalog yields the capability
-    /// verdict immediately (no network). A membership miss forces one atomic
-    /// catalog refresh ([`Catalog::refresh_for_miss`], cooldown-bounded) and
-    /// re-checks, so a model added to OpenRouter after the cached snapshot was
-    /// taken is accepted instead of being rejected until that snapshot expires.
-    /// Outcomes:
-    /// - `Ok(Some(info))` — present and not text-only; `info` feeds request building;
-    /// - `Ok(None)` — catalog unavailable (fetch failed/negative backoff) → fail-open;
-    /// - `Err` — confirmed absent from a freshly fetched catalog, or text-only.
+    /// A cached hit answers with no network. A membership miss forces one
+    /// cooldown-bounded refresh ([`Catalog::refresh_for_miss`]) and re-checks, so a
+    /// model added to OpenRouter after the snapshot was taken is accepted rather
+    /// than rejected until the snapshot expires. `Ok(None)` means the catalog is
+    /// unavailable (fail-open); `Err` means confirmed absent or text-only.
     pub(crate) async fn resolve_image_model(
         endpoint: &str,
         model: &str,
@@ -224,8 +200,8 @@ pub mod image {
         if let Some(info) = snapshot.find(model) {
             return reject_text_only(model, info).map(|()| Some(info.clone()));
         }
-        // Membership miss: one forced refresh + re-check. Only absence from a
-        // freshly fetched catalog rejects; a failed refresh degrades to fail-open.
+        // Only absence from a freshly fetched catalog rejects; a failed refresh
+        // degrades to fail-open.
         let Some(snapshot) = catalog.refresh_for_miss(&base).await else {
             return Ok(None);
         };
@@ -238,14 +214,12 @@ pub mod image {
         }
     }
 
-    /// Write-time validation that `model` can generate images, using the catalog
-    /// when available (a catalog outage passes — see [`resolve_image_model`]).
-    ///
-    /// Used by the Telegram model commands and the GUI model picker.
+    /// Write-time validation for the Telegram model commands and the GUI model
+    /// picker; a catalog outage passes.
     ///
     /// # Errors
     ///
-    /// - Catalog available and the model is absent from it or text-only.
+    /// The catalog is available and the model is absent from it or text-only.
     pub async fn validate_image_model(model: &str) -> anyhow::Result<()> {
         resolve_image_model(crate::config::DEFAULT_PROVIDER_ENDPOINT, model)
             .await
@@ -260,8 +234,6 @@ pub mod image {
         use std::collections::VecDeque;
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicUsize, Ordering};
-
-        // ── Resolver tests: scripted fetch on a local Catalog (hermetic) ──
 
         static SCRIPT: Mutex<VecDeque<anyhow::Result<serde_json::Value>>> =
             Mutex::new(VecDeque::new());
@@ -426,19 +398,16 @@ pub mod image {
 }
 
 /// Client for the OpenRouter video-models catalog (`GET {base}/videos/models`).
-///
-/// The response shape is flat per-model fields with high null variability
-/// (aleph-2 declares no resolutions/durations/sizes), so it gets its own
-/// tolerant parser. Models are looked up by `id`, never `canonical_slug` (they
-/// differ for every live model).
+/// Flat per-model fields with high null variability (aleph-2 declares no
+/// resolutions/durations/sizes), hence its own tolerant parser.
 pub(crate) mod video {
     use crate::util::catalog_cache::{Catalog, parse_envelope};
     use serde_json::Value;
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    /// Parsed per-model video-generation capabilities. Every field is optional —
-    /// the live catalog declares none of them for some models (aleph-2).
+    /// Every field is optional — the live catalog declares none of them for some
+    /// models (aleph-2).
     #[derive(Debug, Clone, Default)]
     pub(crate) struct VideoModelInfo {
         pub(crate) resolutions: Option<Vec<String>>,
@@ -450,7 +419,6 @@ pub(crate) mod video {
         pub(crate) seed: Option<bool>,
     }
 
-    /// The full parsed catalog: model id → capabilities.
     #[derive(Debug, Default)]
     pub(crate) struct VideoCatalog {
         models: HashMap<String, VideoModelInfo>,
@@ -463,18 +431,18 @@ pub(crate) mod video {
         }
     }
 
-    /// Parse a catalog response body; per-entry tolerance in [`parse_model`],
-    /// envelope error contract in [`crate::util::catalog_cache::parse_envelope`].
+    /// Per-entry tolerance in [`parse_model`], envelope errors from
+    /// [`crate::util::catalog_cache::parse_envelope`].
     pub(crate) fn parse_catalog(body: &Value) -> anyhow::Result<VideoCatalog> {
         Ok(VideoCatalog {
             models: parse_envelope(body, "Video models catalog", parse_model)?,
         })
     }
 
-    /// Parse one catalog entry; tolerates per-model nulls and unknown fields.
+    /// Tolerates per-model nulls and unknown fields.
     fn parse_model(entry: &Value) -> Option<(String, VideoModelInfo)> {
-        // Lookup key is always `id`, never `canonical_slug` — they differ for
-        // every live model.
+        // Lookup key is always `id`, never `canonical_slug` — they differ for every
+        // live model.
         let id = entry.get("id").and_then(Value::as_str)?.to_string();
         let info = VideoModelInfo {
             resolutions: parse_str_array(entry.get("supported_resolutions")),
@@ -488,7 +456,7 @@ pub(crate) mod video {
         Some((id, info))
     }
 
-    /// Parse a string-array field; `null`/missing stays `None`.
+    /// `null`/missing stays `None`.
     fn parse_str_array(v: Option<&Value>) -> Option<Vec<String>> {
         v.and_then(Value::as_array).map(|arr| {
             arr.iter()
@@ -498,23 +466,21 @@ pub(crate) mod video {
         })
     }
 
-    /// Parse an integer-array field; `null`/missing stays `None`.
+    /// `null`/missing stays `None`.
     fn parse_i64_array(v: Option<&Value>) -> Option<Vec<i64>> {
         v.and_then(Value::as_array)
             .map(|arr| arr.iter().filter_map(Value::as_i64).collect())
     }
 
-    // ── Cached fetch ───────────────────────────────────────────────────
-
     static CATALOG: Catalog<VideoCatalog> =
         Catalog::new("/videos/models", "Video models catalog", parse_catalog);
 
-    /// The cached catalog; `None` when it is unavailable — callers fail open.
+    /// `None` when unavailable — callers fail open.
     pub(crate) async fn get_catalog() -> Option<Arc<VideoCatalog>> {
         CATALOG.get(crate::config::DEFAULT_PROVIDER_ENDPOINT).await
     }
 
-    /// Test-only: seed the shared cache (no network).
+    /// Test-only, no network.
     #[cfg(test)]
     pub(crate) fn seed_cache(catalog: Option<Arc<VideoCatalog>>) {
         let endpoint = crate::providers::ensure_base_url(crate::config::DEFAULT_PROVIDER_ENDPOINT);

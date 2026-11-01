@@ -1,16 +1,14 @@
 //! Diff dashboard page — view git diff against HEAD with syntax highlighting.
 //!
-//! Shows staged + unstaged changes and untracked files from the worktree
-//! snapshot both the footer and this window draw from, with per-file tree-sitter
-//! syntax highlighting. Files are parsed in their entirety for correct
-//! multi-line token coloring; working-tree diffs read the old version from HEAD
-//! and the new version from disk, while commit views read both sides via git
+//! Shows staged + unstaged changes and untracked files from the worktree snapshot both the footer
+//! and this window draw from, with per-file tree-sitter syntax highlighting. Files are parsed in
+//! their entirety for correct multi-line token coloring; working-tree diffs read the old version
+//! from HEAD and the new version from disk, while commit views read both sides via git
 //! (`run_git_show`).
 //!
-//! The page layout splits into an auto-sizing directory tree sidebar (left)
-//! and a scrollable diff panel (right, filling the remaining width). Click a
-//! file in the tree to filter the diff to just that file; click again to show
-//! all files.
+//! The page layout splits into an auto-sizing directory tree sidebar (left) and a scrollable diff
+//! panel (right, filling the remaining width). Click a file in the tree to filter the diff to just
+//! that file; click again to show all files.
 //!
 //! Auto-refreshes every 5 seconds when a workspace is selected.
 use super::diff_widget::{self, DiffBufferWidget, DiffFileBuffer};
@@ -43,26 +41,23 @@ const MAX_HUNKS: usize = 1000;
 
 /// Returns `true` if `file` matches the optional `selected_file` path.
 ///
-/// When `selected_file` is `None`, every file matches (no filter is active).
-/// When `selected_file` is `Some(path)`, only the file whose `.path` equals
-/// `path` matches.
+/// When `selected_file` is `None`, every file matches (no filter is active). When `selected_file`
+/// is `Some(path)`, only the file whose `.path` equals `path` matches.
 ///
 /// # Behavioural invariant
 ///
-/// This filter must be applied identically in `compute_truncation_index`,
-/// `build_diff_content`, and `diff_widget::build_file_buffers` so that
-/// truncation boundaries and rendered content agree.  This function is the
-/// single point of truth.
+/// This filter must be applied identically in `compute_truncation_index`, `build_diff_content`, and
+/// `diff_widget::build_file_buffers` so that truncation boundaries and rendered content agree. This
+/// function is the single point of truth.
 pub(super) fn file_matches_selection(file: &DiffFile, selected_file: Option<&str>) -> bool {
     selected_file.is_none_or(|sel| file.path == sel)
 }
 
 /// Compute the index of the first [`DiffFile`] to exclude due to truncation limits.
 ///
-/// Iterates over `diff_files`, applying the same `selected_file` filter and
-/// binary/too-large skipping as the rendering functions. Returns `Some(idx)`
-/// where `idx` is the first file that would exceed either `max_hunks` or
-/// `max_lines`, or `None` if all files fit within the limits.
+/// Iterates over `diff_files`, applying the same `selected_file` filter and binary/too-large
+/// skipping as the rendering functions. Returns `Some(idx)` where `idx` is the first file that
+/// would exceed either `max_hunks` or `max_lines`, or `None` if all files fit within the limits.
 ///
 /// When `limits` is `None`, always returns `None` (no truncation).
 ///
@@ -87,7 +82,6 @@ pub(super) fn compute_truncation_index(
             continue;
         }
 
-        // Binary and too-large files consume no hunk/line capacity.
         if !file.has_parseable_content() {
             continue;
         }
@@ -111,12 +105,10 @@ const RENAME_COLOR: Color = theme::ACCENT_LIGHT;
 
 #[derive(Debug, Clone)]
 pub enum DiffMessage {
-    /// The workspace the dashboard resolved for the current selection, as the
-    /// filesystem path every git operation of this view runs against. The diff
-    /// view never resolves a workspace by name; the dashboard sends
-    /// [`DiffMessage::WorkspaceUnresolved`] instead while nothing resolves.
+    /// The workspace the dashboard resolved for the current selection, as the filesystem path every
+    /// git operation of this view runs against. The diff view never resolves a workspace by name;
+    /// the dashboard sends [`DiffMessage::WorkspaceUnresolved`] instead while nothing resolves.
     WorkspaceSelected(String),
-    /// Nothing is resolved: drop the workspace this view was showing.
     WorkspaceUnresolved,
     DiffLoaded(u64, Result<LoadedDiff, String>),
     Tick,
@@ -125,71 +117,44 @@ pub enum DiffMessage {
     CommitMessageChanged(super::editor_widget::EditorAction),
     CommitClicked,
     CommitResult(Result<CommitInfo, String>),
-    /// Emitted on successful manual commit — signals the parent to close the modal.
     CloseModal,
     Toast(super::ToastMessage),
-    // ── Tree keyboard navigation ──────────────────────────────────
     /// Ctrl+B toggled tree keyboard focus on/off.
     TreeFocusToggled,
-    /// Arrow Up in tree keyboard navigation.
     TreeNavUp,
-    /// Arrow Down in tree keyboard navigation.
     TreeNavDown,
-    /// Enter key in tree navigation — open file or expand directory.
     TreeNavEnter,
-    /// Arrow Left in tree navigation — collapse directory or go to parent.
     TreeNavLeft,
-    /// Arrow Right in tree navigation — expand directory or go to first child.
     TreeNavRight,
-    /// Scroll position changed in the tree panel. First element is the
-    /// absolute vertical scroll offset, second is the visible viewport height.
     TreeScrolled(f32, f32),
-    /// Navigate to a specific commit diff view (`commit_hash`) of the workspace
-    /// this view already resolves, keeping that workspace across the navigation.
     NavigateToCommit(String),
-    /// Show `commit_hash` of the workspace at `path` — a project other than the
-    /// one the dashboard picked for the working-tree view. Points the view and
-    /// navigates in one step: there is no separate workspace push to deliver
-    /// for that project.
     CommitInWorkspace {
-        /// Filesystem path of the project the commit belongs to.
         path: String,
-        /// Commit hash to display.
         hash: String,
     },
-    /// Return from historical commit view to working tree diff.
     BackToWorkingTree,
-    /// Commit message fetched for a historical commit (commit_hash, message).
     CommitMessageFetched(String, Option<String>),
-    /// Clear commit state (ref + message) without triggering any diff load.
-    /// Used when the modal is closed to prevent stale accessor returns.
     ClearCommitState,
-    /// Discard changes for a file or directory (path, target).
     DiscardPath(String, DiscardTarget),
-    /// Result of a discard operation.
     DiscardResult(Result<(), String>),
 }
 
-/// Everything one diff load produced: the files to display and, for the
-/// working tree, the note describing what the bounded read left out.
+/// Everything one diff load produced: the files to display and, for the working tree, the note
+/// describing what the bounded read left out.
 #[derive(Debug, Clone)]
 pub struct LoadedDiff {
     pub files: Vec<DiffFile>,
     pub omitted_note: Option<String>,
 }
 
-/// A single changed file, enhanced with highlight data and line counts.
 #[derive(Debug, Clone)]
 pub struct DiffFile {
     dfile: crate::git::diff_parse::DiffFile,
-    /// Per-line highlight spans for removed lines (from old version).
     pub old_highlights: Option<FileHighlights>,
-    /// Per-line highlight spans for added/context lines (from new version).
     pub new_highlights: Option<FileHighlights>,
-    /// Added lines for display. Worktree entries carry the manifest's count;
-    /// only commit views derive it from the hunks.
+    /// Added lines for display. Worktree entries carry the manifest's count; only commit views
+    /// derive it from the hunks.
     pub add_count: usize,
-    /// Removed lines for display; same source as [`Self::add_count`].
     pub remove_count: usize,
 }
 
@@ -202,8 +167,6 @@ impl std::ops::Deref for DiffFile {
 }
 
 impl DiffFile {
-    /// Construct a `DiffFile` from a parsed diff file, computing
-    /// `add_count` and `remove_count` from its hunks.
     #[must_use]
     pub fn from_parsed(
         dfile: crate::git::diff_parse::DiffFile,
@@ -214,9 +177,6 @@ impl DiffFile {
         Self::with_counts(dfile, old_highlights, new_highlights, counts)
     }
 
-    /// Construct with explicit per-file counts. The worktree manifest supplies
-    /// them so the tree's numbers sum to the footer's totals exactly, including
-    /// entries whose patch is absent (unmerged/`AD`).
     fn with_counts(
         dfile: crate::git::diff_parse::DiffFile,
         old_highlights: Option<FileHighlights>,
@@ -233,7 +193,6 @@ impl DiffFile {
     }
 }
 
-/// What the diff tree counter slot shows for a file row.
 enum CountsSlot {
     Binary,
     Stats { added: i64, removed: i64 },
@@ -252,7 +211,6 @@ fn counts_slot(file: Option<&DiffFile>) -> CountsSlot {
     }
 }
 
-/// Wrap content in the standard diff status-pane chrome (padding + fill + style).
 fn diff_pane_container<'a>(
     content: impl Into<Element<'a, DiffMessage>>,
 ) -> Element<'a, DiffMessage> {
@@ -266,37 +224,24 @@ fn diff_pane_container<'a>(
 
 pub struct DiffState {
     error: Option<String>,
-    /// The filesystem path of the workspace the dashboard resolved for the
-    /// current selection; `None` while nothing is resolved.
     resolved_workspace_path: Option<PathBuf>,
     generation: u64,
     diff_files: Vec<DiffFile>,
     diff_loading: bool,
-    /// Whether at least one diff fetch has completed successfully
-    /// (prevents "Loading diff…" flicker on auto-poll Ticks).
     diff_has_loaded: bool,
     status_message: Option<String>,
     /// What the bounded worktree read left out, when it left out anything.
     omitted_note: Option<String>,
-    /// Directory tree nodes (built from diff_files).
     file_tree: FileTree,
-    /// Currently selected file (full path), or None to show all.
     selected_file: Option<String>,
-    /// Per-file pre-computed cosmic_text buffer data. Built in `update()` when
-    /// diff data or file selection changes; consumed by `view()`.
     file_buffers: Vec<DiffFileBuffer>,
-    /// Commit message typed by the user.
     commit_message: super::common::SingleLineEditorState,
-    /// Whether a commit is in-flight.
     committing: bool,
-    /// Current commit being viewed, if any.
-    /// `None` means we're viewing the working-tree diff (`git diff HEAD`).
     current_commit_ref: Option<String>,
-    /// Commit message of the commit being viewed (fetched during NavigateToCommit).
     current_commit_message: Option<String>,
-    /// When true, the next successful [`DiffMessage::DiffLoaded`] recursively
-    /// expands all directory nodes in the file tree (nested folders included).
-    /// Cleared after expansion. Not set on periodic auto-refresh ticks.
+    /// When true, the next successful [`DiffMessage::DiffLoaded`] recursively expands all directory
+    /// nodes in the file tree (nested folders included). Cleared after expansion. Not set on
+    /// periodic auto-refresh ticks.
     tree_auto_expand_pending: bool,
 }
 
@@ -323,18 +268,16 @@ impl DiffState {
         }
     }
 
-    /// Whether this state is viewing a historical commit (vs working tree).
     #[must_use]
     pub fn is_viewing_commit(&self) -> bool {
         self.current_commit_ref.is_some()
     }
 
-    /// Reset all diff view state fields that could render stale data during
-    /// the async loading window after a context switch.
+    /// Reset all diff view state fields that could render stale data during the async loading
+    /// window after a context switch.
     ///
-    /// Handlers that also need to update `resolved_workspace_path`,
-    /// `diff_loading`, `diff_has_loaded`, or `generation` should call this
-    /// first, then set those fields.
+    /// Handlers that also need to update `resolved_workspace_path`, `diff_loading`,
+    /// `diff_has_loaded`, or `generation` should call this first, then set those fields.
     fn clear_diff_state(&mut self) {
         self.error = None;
         self.status_message = None;
@@ -351,13 +294,11 @@ impl DiffState {
         self.tree_auto_expand_pending = true;
     }
 
-    /// The commit message of the commit currently being viewed, if any.
     #[must_use]
     pub fn commit_message(&self) -> Option<&str> {
         self.current_commit_message.as_deref()
     }
 
-    /// The short hash (7 chars) of the commit currently being viewed, if any.
     #[must_use]
     pub fn commit_short_hash(&self) -> Option<&str> {
         self.current_commit_ref
@@ -370,16 +311,13 @@ impl DiffState {
         if self.resolved_workspace_path.is_some() {
             subs.push(iced::time::every(Duration::from_secs(5)).map(|_| DiffMessage::Tick));
         }
-        // Keyboard: Ctrl+B toggles tree focus; arrow/Enter messages are ignored
-        // by update handlers unless the tree is currently focused. This closure
-        // must stay non-capturing because iced validates that in release builds.
-        //
-        // NOTE: Escape-dismiss of tree focus is deliberately NOT wired here.
-        // `DiffMessage::Escape` was removed as dead code (the Dashboard never
-        // forwards Escape to the diff modal, and this subscription maps only
-        // Ctrl+B plus the arrow/Enter nav keys). If Escape-dismiss is ever
-        // desired, wire it into this subscription first — do not re-add the
-        // variant without the key mapping.
+        // Keyboard: Ctrl+B toggles tree focus; arrow/Enter messages are ignored by update handlers
+        // unless the tree is currently focused. This closure must stay non-capturing because iced
+        // validates that in release builds. NOTE: Escape-dismiss of tree focus is deliberately NOT
+        // wired here. `DiffMessage::Escape` was removed as dead code (the Dashboard never forwards
+        // Escape to the diff modal, and this subscription maps only Ctrl+B plus the arrow/Enter nav
+        // keys). If Escape-dismiss is ever desired, wire it into this subscription first — do not
+        // re-add the variant without the key mapping.
         subs.push(keyboard::listen().filter_map(|event| {
             use keyboard::Key;
             let (key, modifiers, physical_key) = super::parse_key_press(event)?;
@@ -405,9 +343,9 @@ impl DiffState {
     /// Start loading a diff. Returns a [`Task`] that will produce a [`DiffMessage::DiffLoaded`]
     /// when complete. Guards against stale results via the generation counter.
     ///
-    /// Sets `diff_loading = true` and increments the generation counter.
-    /// Callers are responsible for setting `diff_has_loaded` as appropriate before calling this
-    /// (it should be `false` on context switches, left unchanged on auto-refresh ticks).
+    /// Sets `diff_loading = true` and increments the generation counter. Callers are responsible
+    /// for setting `diff_has_loaded` as appropriate before calling this (it should be `false` on
+    /// context switches, left unchanged on auto-refresh ticks).
     fn spawn_diff_load(&mut self, commit_ref: Option<String>) -> Task<DiffMessage> {
         self.diff_loading = true;
         self.generation = self.generation.wrapping_add(1);
@@ -418,26 +356,22 @@ impl DiffState {
         })
     }
 
-    /// Show `hash` as the commit this view displays, against the workspace it
-    /// already resolves: loads the commit's diff and fetches its message.
+    /// Show `hash` as the commit this view displays, against the workspace it already resolves:
+    /// loads the commit's diff and fetches its message.
     ///
-    /// The callers own the resolved path — [`DiffMessage::NavigateToCommit`]
-    /// keeps the one this view has, [`DiffMessage::CommitInWorkspace`] points
-    /// it at another project first.
+    /// The callers own the resolved path — [`DiffMessage::NavigateToCommit`] keeps the one this
+    /// view has, [`DiffMessage::CommitInWorkspace`] points it at another project first.
     fn show_commit(&mut self, hash: String) -> Task<DiffMessage> {
         self.clear_diff_state();
-        // clear_diff_state() resets all viewing state (file tree, buffers,
-        // error, etc.) including current_commit_ref. We re-establish
-        // current_commit_ref below; the rest stays cleared for the new
-        // commit's diff to load into.
-        // Set commit ref before spawning task
-        // (prevents Tick race: subscription checks .is_some() to skip).
+        // clear_diff_state() resets all viewing state (file tree, buffers, error, etc.) including
+        // current_commit_ref. We re-establish current_commit_ref below; the rest stays cleared for
+        // the new commit's diff to load into. Set commit ref before spawning task (prevents Tick
+        // race: subscription checks .is_some() to skip).
         self.current_commit_ref = Some(hash.clone());
         self.diff_has_loaded = false;
 
-        // Load the diff and fetch the commit message in parallel — both
-        // against the workspace this view resolves, which it keeps across the
-        // navigation.
+        // Load the diff and fetch the commit message in parallel — both against the workspace this
+        // view resolves, which it keeps across the navigation.
         let msg_path = self.resolved_workspace_path.clone();
         let msg_hash = hash.clone();
         let msg_hash_for_git = hash.clone();
@@ -468,8 +402,8 @@ impl DiffState {
                 self.resolved_workspace_path = None;
                 self.diff_has_loaded = false;
                 self.diff_loading = false;
-                // Invalidate a load still in flight, so its result cannot land
-                // over the workspace that was just cleared.
+                // Invalidate a load still in flight, so its result cannot land over the workspace
+                // that was just cleared.
                 self.generation = self.generation.wrapping_add(1);
                 Task::none()
             }
@@ -502,7 +436,6 @@ impl DiffState {
                             );
                             self.tree_auto_expand_pending = false;
                         }
-                        // Preserve file selection across refreshes if the file still exists.
                         if let Some(ref sel) = self.selected_file {
                             if !files.iter().any(|f| f.path == *sel) {
                                 self.selected_file = None;
@@ -525,7 +458,6 @@ impl DiffState {
             }
             DiffMessage::Tick => {
                 if self.current_commit_ref.is_some() {
-                    // Commit diffs are immutable — no auto-refresh needed.
                     return Task::none();
                 }
                 if self.resolved_workspace_path.is_some() && !self.diff_loading && !self.committing
@@ -537,8 +469,8 @@ impl DiffState {
             }
             DiffMessage::NavigateToCommit(hash) => self.show_commit(hash),
             DiffMessage::CommitInWorkspace { path, hash } => {
-                // `show_commit` clears the viewing state but not the resolved
-                // path, which is what this arm is here to point.
+                // `show_commit` clears the viewing state but not the resolved path, which is what
+                // this arm is here to point.
                 self.resolved_workspace_path = Some(PathBuf::from(path));
                 self.show_commit(hash)
             }
@@ -546,8 +478,6 @@ impl DiffState {
                 if self.resolved_workspace_path.is_none() {
                     return Task::none();
                 }
-                // clear_diff_state() sets current_commit_ref to None.
-                // Iced's update() is single-threaded, so Tick can't race.
                 self.clear_diff_state();
                 self.diff_has_loaded = false;
                 self.spawn_diff_load(None)
@@ -573,16 +503,14 @@ impl DiffState {
                         .collapse_dir_and_keep_focus::<DiffMessage>(&path);
                 }
                 self.file_tree.expanded_dirs.insert(path.clone());
-                // Expand: rebuild visible tree, keep focus on the directory (don't advance).
                 self.file_tree.rebuild_visible();
                 self.file_tree.focus_path(&path);
                 Task::none()
             }
             DiffMessage::SelectFile(path) => {
-                // Clicking a file tree row transfers keyboard focus to the tree
-                // so that arrow keys navigate the tree instead of the editor.
+                // Clicking a file tree row transfers keyboard focus to the tree so that arrow keys
+                // navigate the tree instead of the editor.
                 self.file_tree.tree_focused = true;
-                // Remember the clicked file's position for Ctrl+B re-focus.
                 self.file_tree.focus_path(&path);
                 if self.selected_file.as_deref() == Some(&path) {
                     self.selected_file = None;
@@ -633,7 +561,6 @@ impl DiffState {
                             (0, r) => format!("Committed {} (\u{2212}{r})", info.short_hash()),
                             (a, r) => format!("Committed {} (+{a}/\u{2212}{r})", info.short_hash()),
                         };
-                        // Immediately refresh the diff.
                         if self.resolved_workspace_path.is_some() {
                             return Task::batch([
                                 Task::done(DiffMessage::CloseModal),
@@ -663,11 +590,9 @@ impl DiffState {
                 if self.current_commit_ref.is_some() {
                     return Task::none();
                 }
-                // Nothing resolved → nothing to discard into.
                 let Some(ws_path) = self.resolved_workspace_path.clone() else {
                     return Task::none();
                 };
-                // Mark as loading so the user sees the diff update.
                 self.diff_loading = true;
                 Task::perform(
                     async move {
@@ -679,31 +604,27 @@ impl DiffState {
                 )
             }
 
-            DiffMessage::DiscardResult(result) => {
-                match result {
-                    Ok(()) => {
-                        // Refresh the diff immediately.
-                        if self.resolved_workspace_path.is_some() {
-                            return Task::batch([
-                                Task::done(DiffMessage::Toast(super::ToastMessage::SuccessMsg(
-                                    "Changes discarded.".to_string(),
-                                ))),
-                                self.spawn_diff_load(None),
-                            ]);
-                        }
-                        self.diff_loading = false;
-                        Task::done(DiffMessage::Toast(super::ToastMessage::SuccessMsg(
-                            "Changes discarded.".to_string(),
-                        )))
+            DiffMessage::DiscardResult(result) => match result {
+                Ok(()) => {
+                    if self.resolved_workspace_path.is_some() {
+                        return Task::batch([
+                            Task::done(DiffMessage::Toast(super::ToastMessage::SuccessMsg(
+                                "Changes discarded.".to_string(),
+                            ))),
+                            self.spawn_diff_load(None),
+                        ]);
                     }
-                    Err(e) => {
-                        self.diff_loading = false;
-                        Task::done(DiffMessage::Toast(super::ToastMessage::Error(e)))
-                    }
+                    self.diff_loading = false;
+                    Task::done(DiffMessage::Toast(super::ToastMessage::SuccessMsg(
+                        "Changes discarded.".to_string(),
+                    )))
                 }
-            }
+                Err(e) => {
+                    self.diff_loading = false;
+                    Task::done(DiffMessage::Toast(super::ToastMessage::Error(e)))
+                }
+            },
 
-            // ── Tree keyboard navigation ─────────────────────────────
             DiffMessage::TreeFocusToggled => {
                 self.file_tree.tree_focused = !self.file_tree.tree_focused;
                 if self.file_tree.tree_focused && self.file_tree.visible_tree_nodes.is_empty() {
@@ -734,20 +655,17 @@ impl DiffState {
                     return Task::none();
                 };
                 if self.file_tree.focused_is_expanded_dir() {
-                    // Collapse and keep focus on the collapsed directory.
                     self.file_tree.expanded_dirs.remove(&path);
                     return self
                         .file_tree
                         .collapse_dir_and_keep_focus::<DiffMessage>(&path);
                 }
                 if is_dir {
-                    // Expand directory and move focus to the first child.
                     self.file_tree.expanded_dirs.insert(path.clone());
                     return self
                         .file_tree
                         .expand_dir_and_focus_first_child::<DiffMessage>(&path);
                 }
-                // Open file.
                 Task::done(DiffMessage::SelectFile(path))
             }
 
@@ -757,14 +675,12 @@ impl DiffState {
                 };
 
                 if self.file_tree.focused_is_expanded_dir() {
-                    // Collapse expanded directory and keep focus on it.
                     self.file_tree.expanded_dirs.remove(&path);
                     return self
                         .file_tree
                         .collapse_dir_and_keep_focus::<DiffMessage>(&path);
                 }
 
-                // ArrowLeft on collapsed directory or file — navigate to parent.
                 self.file_tree.focus_parent::<DiffMessage>()
             }
 
@@ -774,19 +690,16 @@ impl DiffState {
                 };
 
                 if !is_dir {
-                    // ArrowRight on a file does nothing.
                     return Task::none();
                 }
 
                 if !self.file_tree.expanded_dirs.contains(&path) {
-                    // Expand directory and move focus to the first child.
                     self.file_tree.expanded_dirs.insert(path.clone());
                     return self
                         .file_tree
                         .expand_dir_and_focus_first_child::<DiffMessage>(&path);
                 }
 
-                // Already expanded directory — move focus to first child (if any).
                 self.file_tree.focus_next_row::<DiffMessage>(idx)
             }
         }
@@ -797,9 +710,7 @@ impl DiffState {
         let show_commit_bar =
             self.current_commit_ref.is_none() && has_changes && self.error.is_none();
 
-        // Build the header row: commit controls or commit-view banner.
         let header = if let Some(short_hash) = self.commit_short_hash() {
-            // Historical commit view — show banner with Back button.
             let back_btn = button("Back to working tree")
                 .on_press(DiffMessage::BackToWorkingTree)
                 .style(theme::button_secondary);
@@ -850,7 +761,6 @@ impl DiffState {
             .width(Length::Fill)
             .padding([theme::PAD_8, theme::PAD_12])
         } else {
-            // Empty spacer to maintain layout consistency.
             container(Space::new().width(Length::Fill).height(0))
         };
 
@@ -874,8 +784,6 @@ impl DiffState {
         content.push(status).into()
     }
 
-    /// The pane below the header: an error, a status line, loading, or the
-    /// split view.
     fn status_pane(&self) -> Element<'_, DiffMessage> {
         if let Some(ref err) = self.error {
             widgets::error_banner(err)
@@ -884,9 +792,8 @@ impl DiffState {
         } else if self.diff_loading && !self.diff_has_loaded {
             diff_pane_container(widgets::loading_text())
         } else if self.resolved_workspace_path.is_none() {
-            // Defensive: the modal is gated on a resolution, so this is not
-            // reached in production; it keeps an unresolved view from claiming
-            // a clean working tree.
+            // Defensive: the modal is gated on a resolution, so this is not reached in production;
+            // it keeps an unresolved view from claiming a clean working tree.
             diff_pane_container(
                 text("Select a workspace to view its diff.")
                     .size(theme::TEXT_13)
@@ -913,8 +820,8 @@ impl DiffState {
             .style(theme::base_container_style)
             .into()
         } else if self.diff_files.is_empty() {
-            // Every uncommitted file was left out by the read cap; the note
-            // strip above says so, and this must not claim a clean tree.
+            // Every uncommitted file was left out by the read cap; the note strip above says so,
+            // and this must not claim a clean tree.
             diff_pane_container(
                 text("Nothing to display.")
                     .size(theme::TEXT_13)
@@ -925,7 +832,6 @@ impl DiffState {
         }
     }
 
-    /// Build the two-panel layout: tree sidebar (left) + diff content (right).
     fn build_split_view(&self) -> Element<'_, DiffMessage> {
         let tree_panel = self.build_tree_panel();
         let diff_panel = self.build_diff_content();
@@ -937,7 +843,6 @@ impl DiffState {
             .into()
     }
 
-    /// Build the directory tree sidebar.
     fn build_tree_panel(&self) -> Element<'_, DiffMessage> {
         let nodes = &self.file_tree.nodes;
         let count = nodes.len();
@@ -946,11 +851,10 @@ impl DiffState {
             .enumerate()
             .map(|(i, n)| self.render_tree_node(n, 0, 0, i == count - 1))
             .collect();
-        // Natural width of every rendered row, in render order, for the
-        // auto-sizing tree panel. Replicates the exact row composition:
-        // guide (depth*2 box-drawing chars at 14px) + lucide icon
-        // (TREE_ICON_SIZE for dirs and files) + 4px gap + name at 14px, plus
-        // the ± change counts at 10px with a 6px trailing gap on file rows.
+        // Natural width of every rendered row, in render order, for the auto-sizing tree panel.
+        // Replicates the exact row composition: guide (depth*2 box-drawing chars at 14px) + lucide
+        // icon (TREE_ICON_SIZE for dirs and files) + 4px gap + name at 14px, plus the ± change
+        // counts at 10px with a 6px trailing gap on file rows.
         let row_widths = widgets::collect_tree_row_widths(
             &self.file_tree.nodes,
             &self.file_tree.expanded_dirs,
@@ -966,9 +870,8 @@ impl DiffState {
                         None,
                     )
                 } else {
-                    // File rows always render a counts slot (empty when the
-                    // file has no changes or is not in the diff list) plus a
-                    // 6px trailing gap.
+                    // File rows always render a counts slot (empty when the file has no changes or
+                    // is not in the diff list) plus a 6px trailing gap.
                     let (add_label, rem_label) = match counts_slot(
                         self.diff_files.iter().find(|f| f.path == node.full_path),
                     ) {
@@ -1003,7 +906,6 @@ impl DiffState {
         })
     }
 
-    /// Recursively render a tree node and its children.
     fn render_tree_node<'a>(
         &'a self,
         node: &'a widgets::TreeNode,
@@ -1090,7 +992,6 @@ impl DiffState {
 
         let guide = widgets::tree_guide_prefix(ancestor_mask, depth, is_last);
 
-        // File status icon
         let (icon, icon_color) = if let Some(f) = file {
             if f.status == DiffFileStatus::Renamed {
                 (lucide::arrow_right(), RENAME_COLOR)
@@ -1107,7 +1008,6 @@ impl DiffState {
             (lucide::file_text(), FILE_HEADER_COLOR)
         };
 
-        // Line count labels
         let counts: Element<'_, DiffMessage> = match counts_slot(file) {
             CountsSlot::Binary => text("binary")
                 .size(theme::TEXT_10)
@@ -1160,8 +1060,6 @@ impl DiffState {
         )
     }
 
-    /// Return the diff content panel: file headers, binary/too-large placeholders,
-    /// truncation warnings, and per-file [`DiffBufferWidget`]s interleaved.
     #[expect(clippy::too_many_lines)]
     fn build_diff_content(&self) -> Element<'_, DiffMessage> {
         if self.diff_files.is_empty() {
@@ -1178,7 +1076,6 @@ impl DiffState {
         let mut buffer_idx = 0usize;
 
         for (idx, file) in self.diff_files.iter().enumerate() {
-            // File selection filter
             if !file_matches_selection(file, self.selected_file.as_deref()) {
                 continue;
             }
@@ -1191,7 +1088,6 @@ impl DiffState {
                 }
             }
 
-            // File header
             let (header_label, header_icon) = if file.status == DiffFileStatus::Renamed {
                 (
                     format!(
@@ -1223,8 +1119,8 @@ impl DiffState {
                 )
             };
 
-            // The tinted band spans the wrapper's content width, so it sits at
-            // the uniform 8px inset from the panel edge instead of touching it.
+            // The tinted band spans the wrapper's content width, so it sits at the uniform 8px
+            // inset from the panel edge instead of touching it.
             rows.push(
                 container(
                     row![
@@ -1245,7 +1141,6 @@ impl DiffState {
                 .into(),
             );
 
-            // Binary / too-large placeholders
             match file.content {
                 DiffContent::Binary => {
                     rows.push(
@@ -1274,7 +1169,6 @@ impl DiffState {
                 DiffContent::Parseable => {}
             }
 
-            // Find the matching buffer by index
             if let Some(buf) = self.file_buffers.get(buffer_idx) {
                 buffer_idx += 1;
 
@@ -1301,8 +1195,6 @@ impl DiffState {
         ))
     }
 
-    /// Rebuild per-file cosmic_text buffer data. Called from `update()` when
-    /// `diff_files` or `selected_file` changes.
     fn rebuild_file_buffers(&mut self) {
         if self.diff_files.is_empty() {
             self.file_buffers.clear();
@@ -1316,11 +1208,6 @@ impl DiffState {
     }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────
-
-/// Load the diff, compute per-file highlights, and return the files plus the
-/// worktree-omission note. `ws_path` is the path the dashboard resolved for the
-/// selected workspace; every git call and disk read uses the resolved repo root.
 async fn load_diff(
     ws_path: Option<PathBuf>,
     commit_ref: Option<String>,
@@ -1336,8 +1223,6 @@ async fn load_diff(
         return Err("This workspace is not a git repository.".to_string());
     };
 
-    // Historical commits don't have untracked files: a commit view is the pure
-    // patch from `git show`.
     if let Some(hash) = commit_ref.as_deref() {
         let files = load_commit_diff(&root, hash).await?;
         return Ok(LoadedDiff {
@@ -1348,7 +1233,6 @@ async fn load_diff(
     load_worktree_diff(&root).await
 }
 
-/// Load a historical commit's diff and highlights.
 async fn load_commit_diff(root: &Path, hash: &str) -> Result<Vec<DiffFile>, String> {
     let diff_output = run_git_show_diff(root, hash)
         .await
@@ -1366,13 +1250,10 @@ async fn load_commit_diff(root: &Path, hash: &str) -> Result<Vec<DiffFile>, Stri
     Ok(files)
 }
 
-/// Load the working-tree diff from the snapshot manifest: same files, same
-/// order, and same line totals as the footer.
 async fn load_worktree_diff(repo_path: &Path) -> Result<LoadedDiff, String> {
     let snapshot = run_git_worktree_snapshot(repo_path)
         .await
         .map_err(|e| format!("Failed to read the working tree: {e}"))?;
-    // Every manifest path is relative to the root the snapshot resolved.
     let root = snapshot.repo_root.as_path();
     let omitted_note = snapshot.stats.omitted_note();
     if snapshot.changes.is_empty() {
@@ -1399,8 +1280,6 @@ async fn load_worktree_diff(repo_path: &Path) -> Result<LoadedDiff, String> {
         let mut dfile = if let Some(kind) = change.untracked {
             untracked_diff_file(root, &change.path, kind).await
         } else {
-            // The patch omits some tracked entries (unmerged/AD); the manifest
-            // still lists them.
             parsed.remove(&change.path).unwrap_or_else(|| {
                 crate::git::diff_parse::DiffFile::new(
                     change.path.clone(),
@@ -1409,8 +1288,8 @@ async fn load_worktree_diff(repo_path: &Path) -> Result<LoadedDiff, String> {
                 )
             })
         };
-        // The manifest is the rename authority, so the entry keeps the old path
-        // the patch would have carried and is rendered as one renamed file.
+        // The manifest is the rename authority, so the entry keeps the old path the patch would
+        // have carried and is rendered as one renamed file.
         if let Some(old_path) = &change.old_path {
             dfile.old_path = Some(old_path.clone());
             dfile.status = DiffFileStatus::Renamed;
@@ -1439,7 +1318,6 @@ async fn load_worktree_diff(repo_path: &Path) -> Result<LoadedDiff, String> {
     })
 }
 
-/// Build the displayed file for an untracked manifest entry from its kind.
 async fn untracked_diff_file(
     root: &Path,
     path: &str,
@@ -1454,8 +1332,8 @@ async fn untracked_diff_file(
             crate::git::diff_parse::DiffFile::placeholder(path.to_owned(), DiffContent::Binary)
         }
         UntrackedKind::Text => {
-            // The snapshot already confirmed this file is text; this read only
-            // fetches the content the manifest does not retain.
+            // The snapshot already confirmed this file is text; this read only fetches the content
+            // the manifest does not retain.
             match read_untracked_file(&root.join(path)).await {
                 UntrackedFileRead::Text(text) => make_untracked_diff_file(path, &text),
                 UntrackedFileRead::TooLarge(size) => crate::git::diff_parse::DiffFile::placeholder(
@@ -1466,7 +1344,6 @@ async fn untracked_diff_file(
                     path.to_owned(),
                     DiffContent::Binary,
                 ),
-                // Unreadable / non-file paths have no content to show.
                 UntrackedFileRead::Skip => crate::git::diff_parse::DiffFile::new(
                     path.to_owned(),
                     Vec::new(),
@@ -1477,7 +1354,6 @@ async fn untracked_diff_file(
     }
 }
 
-/// Count added and removed lines in a diff file.
 fn count_lines(dfile: &crate::git::diff_parse::DiffFile) -> (usize, usize) {
     let mut add = 0;
     let mut remove = 0;
@@ -1493,7 +1369,6 @@ fn count_lines(dfile: &crate::git::diff_parse::DiffFile) -> (usize, usize) {
     (add, remove)
 }
 
-/// Compute highlight spans for both old and new versions of a file.
 async fn compute_highlights(
     dfile: &crate::git::diff_parse::DiffFile,
     repo_root: &Path,
@@ -1504,9 +1379,9 @@ async fn compute_highlights(
         return (None, None);
     };
 
-    // Build parsers for this file (created in the async task, not on UI thread).
-    // Run old and new highlight computation concurrently to overlap I/O
-    // (git subprocess for old version, git/disk read for new version).
+    // Build parsers for this file (created in the async task, not on UI thread). Run old and new
+    // highlight computation concurrently to overlap I/O (git subprocess for old version, git/disk
+    // read for new version).
     let (old_hl, new_hl) = tokio::join!(
         compute_old_highlights(dfile, repo_root, lang, commit_ref),
         compute_new_highlights(dfile, repo_root, lang, commit_ref),
@@ -1521,7 +1396,6 @@ async fn compute_old_highlights(
     lang: HighlightLanguage,
     commit_ref: Option<&str>,
 ) -> Option<FileHighlights> {
-    // For new and untracked files, there is no old version.
     if matches!(
         dfile.status,
         DiffFileStatus::Added | DiffFileStatus::Untracked
@@ -1530,8 +1404,6 @@ async fn compute_old_highlights(
     }
 
     let old_path = dfile.old_path.as_deref().unwrap_or(&dfile.path);
-    // For historical commits, read the parent version (~1).
-    // For working-tree diffs, read HEAD.
     let show_ref = commit_ref.map(|hash| format!("{hash}~1"));
     let content = run_git_show(repo_root, old_path, show_ref.as_deref()).await?;
 
@@ -1544,17 +1416,15 @@ async fn compute_new_highlights(
     lang: HighlightLanguage,
     commit_ref: Option<&str>,
 ) -> Option<FileHighlights> {
-    // Deleted files have no new version on disk.
     if dfile.status == DiffFileStatus::Deleted {
         return None;
     }
 
     let content = if let Some(hash) = commit_ref {
-        // Historical commit: read file content from git, NOT from disk.
-        // The working-tree path may not match the commit version.
+        // Historical commit: read file content from git, NOT from disk. The working-tree path may
+        // not match the commit version.
         run_git_show(repo_root, &dfile.path, Some(hash)).await?
     } else {
-        // Working-tree diff: read from disk (existing behavior).
         let full_path = repo_root.join(&dfile.path);
         tokio::fs::read_to_string(&full_path).await.ok()?
     };
@@ -1562,8 +1432,8 @@ async fn compute_new_highlights(
     parse_highlights(&content, lang)
 }
 
-/// Wrap a tree-row button in the "Discard changes" context menu; commit views
-/// return the button unchanged (discarding only applies to the working tree).
+/// Wrap a tree-row button in the "Discard changes" context menu; commit views return the button
+/// unchanged (discarding only applies to the working tree).
 fn discard_menu_button(
     btn: Element<'_, DiffMessage>,
     full_path: String,
@@ -1583,7 +1453,6 @@ fn discard_menu_button(
     .into()
 }
 
-/// Build a directory tree from the list of diff files.
 fn build_tree(files: &[DiffFile]) -> Vec<widgets::TreeNode> {
     let mut roots: HashMap<String, widgets::TreeNode> = HashMap::new();
 
@@ -1594,7 +1463,6 @@ fn build_tree(files: &[DiffFile]) -> Vec<widgets::TreeNode> {
             continue;
         }
 
-        // Ensure root-level directory exists.
         let root_name = components[0].to_string();
         let root_full = root_name.clone();
         let root_node = roots
@@ -1609,10 +1477,7 @@ fn build_tree(files: &[DiffFile]) -> Vec<widgets::TreeNode> {
             });
 
         if components.len() == 1 {
-            // This is a root-level file — convert or keep as file node.
             if root_node.is_dir {
-                // A directory with the same name exists; this shouldn't happen
-                // in a git repo, but handle gracefully.
                 root_node.children.push(widgets::TreeNode {
                     name: components[0].to_string(),
                     full_path: path.clone(),
@@ -1622,12 +1487,10 @@ fn build_tree(files: &[DiffFile]) -> Vec<widgets::TreeNode> {
                     ignored: false,
                 });
             } else {
-                // Already a file node — just ensure path is correct.
                 root_node.full_path.clone_from(path);
                 root_node.is_dir = false;
             }
         } else {
-            // Multi-component path — ensure intermediate directories exist.
             root_node.is_dir = true;
             let mut current = root_node;
             for (i, comp) in components.iter().enumerate().skip(1) {
@@ -1652,10 +1515,9 @@ fn build_tree(files: &[DiffFile]) -> Vec<widgets::TreeNode> {
                         });
                     }
                 }
-                // Move current to the child we just found/created.
                 if let Some(idx) = current.children.iter().position(|c| c.name == *comp) {
-                    // Safe: we just checked/added this child.
-                    // Need to split the borrow — use index after the loop.
+                    // Safe: we just checked/added this child. Need to split the borrow — use index
+                    // after the loop.
                     current = &mut current.children[idx];
                 } else {
                     break;
@@ -1669,7 +1531,6 @@ fn build_tree(files: &[DiffFile]) -> Vec<widgets::TreeNode> {
     sorted
 }
 
-/// Collect `full_path` of every directory node in the tree (recursive).
 fn collect_dir_paths(nodes: &[widgets::TreeNode], paths: &mut HashSet<String>) {
     for node in nodes {
         if node.is_dir {
@@ -1678,8 +1539,6 @@ fn collect_dir_paths(nodes: &[widgets::TreeNode], paths: &mut HashSet<String>) {
         }
     }
 }
-
-// ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1741,8 +1600,6 @@ mod tests {
             );
         }
     }
-
-    // ── Tree keyboard navigation focus state tests ──────────────────
 
     fn make_diff_with_tree() -> DiffState {
         let mut state = DiffState::new();
@@ -1855,7 +1712,6 @@ mod tests {
         TreeFocused(bool),
     }
 
-    /// Drive `state` through `steps`, asserting what each check finds.
     fn run_nav(state: &mut DiffState, steps: &[Nav], name: &str) {
         for &step in steps {
             match step {
@@ -1961,10 +1817,6 @@ mod tests {
         }
     }
 
-    // ── Discard changes tests ──────────────────────────────────────
-
-    /// Mark `state` as showing the workspace the dashboard resolved — the diff
-    /// view tracks it by its path alone.
     fn mark_workspace_resolved(state: &mut DiffState) {
         state.resolved_workspace_path = Some("/tmp/test-ws".into());
     }
@@ -1980,8 +1832,8 @@ mod tests {
         let cases: &[Case] = &[
             Case {
                 name: "discard_path_noop_in_commit_view",
-                // Must not mark loading in commit-view — DiscardPath is a no-op
-                // when viewing a historical commit (you can't discard history).
+                // Must not mark loading in commit-view — DiscardPath is a no-op when viewing a
+                // historical commit (you can't discard history).
                 setup: |s| {
                     s.current_commit_ref = Some("abc1234".to_owned());
                 },
@@ -1990,8 +1842,6 @@ mod tests {
             },
             Case {
                 name: "discard_path_noop_without_workspace",
-                // Without a resolved workspace there's nothing to discard into,
-                // so DiscardPath is a no-op.
                 setup: |s| {
                     s.resolved_workspace_path = None;
                 },
@@ -2006,8 +1856,6 @@ mod tests {
             },
             Case {
                 name: "discard_result_success_no_workspace_resets_loading",
-                // Without a resolved workspace the success path falls through
-                // to the no-refresh branch and resets loading.
                 setup: |s| {
                     s.resolved_workspace_path = None;
                     s.diff_loading = true;
@@ -2017,9 +1865,6 @@ mod tests {
             },
             Case {
                 name: "discard_result_success_with_workspace_keeps_loading_for_refresh",
-                // When there IS a resolved workspace, a successful discard
-                // triggers an immediate diff refresh — diff_loading stays true
-                // throughout so the UI shows a loading indicator.
                 setup: |s| {
                     mark_workspace_resolved(s);
                     s.diff_loading = true;
@@ -2047,8 +1892,6 @@ mod tests {
         for case in cases {
             let name = case.name;
             let mut state = make_diff_with_tree();
-            // All cases build from scratch with make_diff_with_tree, which
-            // starts with diff_loading = false.
             assert!(!state.diff_loading, "case {name}: expected clean state");
             (case.setup)(&mut state);
             let _ = state.update(case.msg.clone());
@@ -2083,7 +1926,6 @@ mod tests {
         &'a [&'a str],
         bool,
     );
-    /// First-load auto-expansion of nested directories, and which handlers leave it alone.
     #[test]
     fn test_tree_auto_expand_state() {
         const NESTED: &[&str] = &["src/gui/diff.rs", "src/lib.rs"];
@@ -2125,8 +1967,6 @@ mod tests {
             assert_eq!(flag, pending, "case {name}: pending");
         }
     }
-
-    // ── compute_truncation_index tests ─────────────────────────────
 
     fn make_file_with_hunks(path: &str, num_hunks: usize, lines_per_hunk: usize) -> DiffFile {
         let hunks = (0..num_hunks)
@@ -2291,13 +2131,10 @@ mod tests {
         }
     }
 
-    // ── Stale-data regression tests ───────────────────────────────────
     //
-    // Verify that context-switching message handlers clear all state
-    // synchronously (before the async load task runs), preventing stale data
-    // from rendering during the loading transition.
+    // Verify that context-switching message handlers clear all state synchronously (before the
+    // async load task runs), preventing stale data from rendering during the loading transition.
 
-    /// Shared helper: verify every field [`DiffState::clear_diff_state`] manages was reset.
     fn assert_clear_diff_state(state: &DiffState) {
         assert!(state.diff_files.is_empty(), "diff_files");
         assert!(state.error.is_none(), "error");
@@ -2315,8 +2152,6 @@ mod tests {
         );
     }
 
-    /// Shared helper: verify that a context switch has reset all fields that
-    /// could render stale data during the async loading window.
     fn assert_diff_state_reset(state: &DiffState) {
         assert_clear_diff_state(state);
         assert!(
@@ -2329,8 +2164,8 @@ mod tests {
         );
     }
 
-    /// Create a `DiffState` populated with old/stale data to verify that each
-    /// context-switching handler resets it before the async load runs.
+    /// Create a `DiffState` populated with old/stale data to verify that each context-switching
+    /// handler resets it before the async load runs.
     fn make_state_with_stale_data() -> DiffState {
         let mut state = make_diff_with_tree();
         assert!(!state.diff_files.is_empty());
@@ -2358,20 +2193,15 @@ mod tests {
 
     #[test]
     fn test_context_switches_clear_stale_diff_files() {
-        // Navigating to a commit clears stale working-tree diff state; the
-        // workspace itself is kept, so set one first.
         let mut state = make_state_with_stale_data();
         mark_workspace_resolved(&mut state);
         let _task = state.update(DiffMessage::NavigateToCommit("abc123".into()));
         assert_diff_state_reset(&state);
 
-        // Selecting a workspace clears stale diff state.
         let mut state = make_state_with_stale_data();
         let _task = state.update(DiffMessage::WorkspaceSelected("/p/new-ws".into()));
         assert_diff_state_reset(&state);
 
-        // Returning to the working tree clears stale commit-view state; the
-        // handler early-returns without a resolved workspace, so set one.
         let mut state = make_state_with_stale_data();
         mark_workspace_resolved(&mut state);
         let _task = state.update(DiffMessage::BackToWorkingTree);
@@ -2384,8 +2214,6 @@ mod tests {
         mark_workspace_resolved(&mut state);
         let stale_generation = state.generation;
         let _task = state.update(DiffMessage::WorkspaceUnresolved);
-        // The clear calls clear_diff_state(), drops the resolved workspace and
-        // invalidates any load still in flight.
         assert_clear_diff_state(&state);
         assert!(
             state.resolved_workspace_path.is_none(),
@@ -2397,11 +2225,9 @@ mod tests {
         );
     }
 
-    // ── load_diff — the modal draws the snapshot manifest ───────────
-
-    /// The diff window's file set and line totals must be exactly the
-    /// snapshot's change manifest: modified + staged + untracked (including
-    /// files inside a new folder), binary placeholders, and empty files.
+    /// The diff window's file set and line totals must be exactly the snapshot's change manifest:
+    /// modified + staged + untracked (including files inside a new folder), binary placeholders,
+    /// and empty files.
     #[tokio::test]
     async fn load_diff_working_tree_matches_snapshot_manifest() {
         let (_dir, repo_path) = crate::util::test::init_temp_repo();
@@ -2445,7 +2271,6 @@ mod tests {
             (1, 0),
             "a file inside a newly created folder opens its own diff"
         );
-        // No-line content is listed, but contributes no counts.
         for path in ["binary.bin", "empty.txt"] {
             let file = find(path);
             assert_eq!((file.add_count, file.remove_count), (0, 0), "{path}");
@@ -2465,8 +2290,6 @@ mod tests {
         assert!(loaded.omitted_note.is_none());
     }
 
-    /// A rename is one file on both surfaces: the manifest and the modal agree
-    /// on the new path and on the line totals.
     #[tokio::test]
     async fn load_diff_rename_matches_the_footer_totals() {
         let (_dir, repo_path) = crate::util::test::init_temp_repo();
@@ -2497,8 +2320,8 @@ mod tests {
         assert_eq!((file.add_count, file.remove_count), (1, 0));
     }
 
-    /// Git C-quotes non-ASCII path names in the patch; the decoded name must
-    /// match the raw manifest path so the file opens its own diff.
+    /// Git C-quotes non-ASCII path names in the patch; the decoded name must match the raw manifest
+    /// path so the file opens its own diff.
     #[tokio::test]
     async fn load_diff_non_ascii_path_keeps_its_patch() {
         let (_dir, repo_path) = crate::util::test::init_temp_repo();
@@ -2522,8 +2345,6 @@ mod tests {
         );
     }
 
-    /// A workspace that is a subdirectory of a repo still shows the
-    /// repo-root-relative path, and the content read resolves against the root.
     #[tokio::test]
     async fn load_diff_subdirectory_workspace_reads_root_relative_path() {
         let (_dir, repo_path) = crate::util::test::init_temp_repo();

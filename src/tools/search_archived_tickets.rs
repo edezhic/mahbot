@@ -1,10 +1,7 @@
-//! Search archived tickets by text in their titles.
-//!
-//! Available only to the Manager role. Searches the whole installation's
-//! `is_archived = 1` subset of the tickets table — every workspace. Returns at
-//! most [`RESULT_LIMIT`] matches as `[workspace] [phase] id: title` lines,
-//! best-scoring first. The Manager then uses
-//! [`crate::tools::ticket::GetTicketTool`] on the returned IDs for full details.
+//! Search archived tickets by text in their titles, across the whole installation (the
+//! `is_archived = 1` subset, every workspace), for the Manager only. Returns at most
+//! [`RESULT_LIMIT`] matches as `[workspace] [phase] id: title` lines, best-scoring first;
+//! [`crate::tools::ticket::GetTicketTool`] then takes those IDs for full details.
 
 use crate::Workspace;
 use crate::tools::Tool;
@@ -60,12 +57,9 @@ impl Tool for SearchArchivedTicketsTool {
 }
 
 impl SearchArchivedTicketsTool {
-    /// Format the results in rank order, each line naming the workspace the hit
-    /// was filed in.
-    ///
-    /// Fetches id/title/phase/workspace via
-    /// [`crate::pipeline::board::BoardStore::get_tickets_by_ids`]. At N ≤ 10 a
-    /// linear scan suffices.
+    /// Format the results in rank order, each line naming the workspace the hit was filed in.
+    /// At N ≤ 10 the id/title/phase/workspace lookup
+    /// ([`crate::pipeline::board::BoardStore::get_tickets_by_ids`]) is a linear scan.
     async fn format_results(
         board: &crate::pipeline::board::BoardStore,
         top_ids: &[String],
@@ -98,13 +92,11 @@ mod tests {
     use crate::pipeline::board::{BoardStore, TicketPhase};
     use crate::util::test::make_ticket;
 
-    /// Archive search must rank by relevance and must never let live tickets
-    /// consume the limit: the archive predicate is applied outside the ranked
-    /// scope, and that scope is unbounded. The fixtures pin both halves — the
-    /// archived titles are seeded weakest-first, so results in insertion (scan)
-    /// order cannot match, and the live titles outrank every archived one, so a
-    /// limit applied before the archive filter would return nothing. The GUI's
-    /// `search_by_fts` is the known-good reference ranking.
+    /// Archive search ranks by relevance and never lets live tickets consume the limit: the
+    /// archive predicate is applied outside the ranked scope, and that scope is unbounded. The
+    /// fixtures pin both halves — archived titles seeded weakest-first, so insertion order cannot
+    /// match, and live titles outranking every archived one, so a limit applied before the filter
+    /// would return nothing. The GUI's `search_by_fts` is the known-good reference ranking.
     #[tokio::test]
     async fn archived_search_ranks_by_score_and_is_not_crowded_out_by_live_tickets() {
         let (store, _tmp) = open_test_store!(BoardStore, "board");

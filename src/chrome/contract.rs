@@ -1,11 +1,10 @@
-//! One place for the chrome-use response envelope parsing, shared by the
-//! interactive `chrome` tool and the `mahbot chrome` CLI.
+//! One place for the chrome-use response envelope parsing, shared by the interactive
+//! `chrome` tool and the `mahbot chrome` CLI.
 //!
-//! chrome-use answers `--json` commands with either the classic `success` key
-//! or the newer `ok` key. [`ChromeResponse`] is the single structural parser
-//! every frontend shares — [`ChromeResponse::verdict`] applies the shared
-//! failure-precedence logic so the two paths cannot drift. The `mahbot
-//! chrome` stdout output contract ([`SCHEMA_VERSION`], [`OutKind`],
+//! chrome-use answers `--json` commands with either the classic `success` key or the newer `ok`
+//! key, so [`ChromeResponse`] is the single structural parser every frontend shares, and
+//! [`ChromeResponse::verdict`] applies the shared failure precedence so the two paths cannot
+//! drift. The `mahbot chrome` stdout contract ([`SCHEMA_VERSION`], [`OutKind`],
 //! [`OutEnvelope`]) lives here too.
 
 use regex::Regex;
@@ -13,50 +12,40 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::LazyLock;
 
-/// Response from chrome-use `--json` commands — the ONE structural envelope
-/// parser every chrome frontend shares.
-///
-/// There is no schema-version marker in chrome-use, and the envelope even
-/// varies within one binary (`session list` answers `ok:true`, everything
-/// else `success:true`), so tolerance is structural: every field is
-/// [`Option`], unknown keys are captured in [`extra`](Self::extra).
+/// Response from chrome-use `--json` commands — the ONE structural envelope parser every
+/// chrome frontend shares. There is no schema-version marker in chrome-use and the envelope
+/// even varies within one binary (`session list` answers `ok:true`, everything else
+/// `success:true`), so tolerance is structural: every field is [`Option`].
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct ChromeResponse {
     /// Classic `success` envelope key — absent on newer `ok`-keyed envelopes.
     #[serde(default)]
     pub(crate) success: Option<bool>,
-    /// Latest chrome-use envelopes replace `success` with `ok` on some commands
-    /// (e.g. `session list --json`).
+    /// Latest chrome-use envelopes replace `success` with `ok` on some commands.
     #[serde(default)]
     pub(crate) ok: Option<bool>,
     pub(crate) data: Option<Value>,
     pub(crate) error: Option<String>,
     /// Stable error-envelope code (v1.5.78+) — present on structured errors.
     pub(crate) code: Option<String>,
-    /// `retryable` flag on structured error envelopes (v1.5.101 emits it on
-    /// every `{success:false,…}`) — the interactive tool surfaces it to the
-    /// agent as a retry hint.
+    /// `retryable` flag on structured error envelopes, surfaced to the agent as a retry hint.
     #[serde(default)]
     pub(crate) retryable: Option<bool>,
-    /// Any other top-level envelope keys, captured so chrome-use's degraded-
-    /// success `warning` field is visible wherever it puts it
-    /// ([`chrome_use_warning`]).
+    /// Any other top-level keys, so chrome-use's degraded-success `warning` field is visible
+    /// wherever it puts it ([`chrome_use_warning`]).
     #[serde(flatten)]
     pub(crate) extra: serde_json::Map<String, Value>,
 }
 
 impl ChromeResponse {
-    /// Success gate accepting both the classic `success: true` envelope and
-    /// the latest `ok: true` one — delegates to the shared [`envelope_success`]
-    /// predicate (failure precedence).
+    /// Success gate accepting both the classic `success: true` and the `ok: true` envelope.
     pub(crate) fn is_success(&self) -> bool {
         envelope_success(self.success, self.ok)
     }
 
-    /// Tri-state verdict of a chrome-use JSON envelope: `Some(true)` when
-    /// either `success` or `ok` reports success, `Some(false)` when either
-    /// reports failure, `None` when the payload carries no verdict key
-    /// (callers own their default: strict / tolerance-first / error-first).
+    /// Tri-state verdict: `Some(true)` when either key reports success, `Some(false)` when
+    /// either reports failure, `None` when the payload carries no verdict key (callers own their
+    /// default: strict / tolerance-first / error-first).
     pub(crate) fn verdict(&self) -> Option<bool> {
         if self.success.is_none() && self.ok.is_none() {
             return None;
@@ -64,24 +53,18 @@ impl ChromeResponse {
         Some(self.is_success())
     }
 
-    /// The single `Value`-path parse entry: unknown keys are captured in
-    /// `extra` and any non-object / unparseable payload yields a default
-    /// response (all fields [`None`]).
+    /// The single `Value`-path parse entry: unknown keys are captured in `extra` and any
+    /// non-object or unparseable payload yields a default response.
     #[must_use]
     pub(crate) fn from_value(v: &Value) -> Self {
         serde_json::from_value(v.clone()).unwrap_or_default()
     }
 }
 
-/// chrome-use's `warning` field — the degraded-success signal for `type`
-/// (the page rewrote or filtered the typed text) and `press` (the key reached
-/// an element with no key listeners, or provably went nowhere). It rides
-/// inside `data` (the command's own warning) or at the envelope top level
-/// (the flattened `extra` map — chrome-use's `Response` struct carries a
-/// top-level `warning` for browser-replacement and settle notes, which also
-/// mean the typed input may not be where we think). chrome-use emits it ONLY
-/// on a degraded exit-0 success — never on a clean one — so its presence
-/// means "the action may not have taken effect".
+/// chrome-use's `warning` field — the degraded-success signal for `type` (the page rewrote or
+/// filtered the text) and `press` (the key reached nothing). It rides inside `data` or at the
+/// envelope top level (the flattened `extra` map), and chrome-use emits it ONLY on a degraded
+/// exit-0 success, so its presence means "the action may not have taken effect".
 pub(crate) fn chrome_use_warning(resp: &ChromeResponse) -> Option<Value> {
     let sources: [Option<&serde_json::Map<String, Value>>; 2] = [
         Some(&resp.extra),
@@ -93,34 +76,27 @@ pub(crate) fn chrome_use_warning(resp: &ChromeResponse) -> Option<Value> {
         .find_map(|map| map.get("warning").cloned())
 }
 
-/// A warning's text as it is shown to a caller: a plain string unquoted, any other
-/// value as its JSON. The raw [`Value`] stays with whoever puts it in an envelope.
+/// A warning's text as it is shown to a caller: a plain string unquoted, any other value as its
+/// JSON.
 pub(crate) fn warning_text(warning: &Value) -> String {
     warning
         .as_str()
         .map_or_else(|| warning.to_string(), str::to_string)
 }
 
-/// Stable fragments of chrome-use's browser-replacement note — the warning it
-/// attaches to a command it ran in a browser it launched ITSELF after the
-/// session's previous browser went away ("This session's previous browser is
-/// gone (<reason>) and a fresh one was launched for this command"). Matched as
-/// fragments rather than as one whole sentence: the parenthesized reason is
-/// chrome-use's own diagnosis ("its browser connection was dead", "its browser
-/// process had exited", …) and drifts with it.
+/// Stable fragments of chrome-use's browser-replacement note, attached to a command it ran in a
+/// browser it launched ITSELF. Matched as fragments rather than one whole sentence: the
+/// parenthesized reason is chrome-use's own diagnosis and drifts with it.
 const SELF_LAUNCHED_BROWSER_PHRASES: [&str; 2] =
     ["previous browser is gone", "a fresh one was launched"];
 
-/// The browser-replacement note on a chrome-use envelope: `Some(text)` with the
-/// tool's own warning text when this command ran in a browser chrome-use
-/// launched itself instead of the owner's real one, `None` otherwise.
+/// The browser-replacement note on a chrome-use envelope: `Some(text)` when this command ran in
+/// a browser chrome-use launched itself instead of the owner's real one.
 ///
-/// Deliberately distinct from the degraded-success warnings the same
-/// [`chrome_use_warning`] field carries (`type` read-back mismatch, `press`
-/// key-listener notes): those mean the action may not have taken effect in the
-/// browser the model was driving, this one means the browser was not the
-/// owner's at all, so callers must report it as a plain failure rather than a
-/// success with a note (see [`self_launched_browser_error`]).
+/// Deliberately distinct from the degraded-success warnings the same field carries: those mean
+/// the action may not have taken effect in the browser the model was driving, this one means the
+/// browser was not the owner's at all, so callers must report it as a plain failure
+/// ([`self_launched_browser_error`]).
 #[must_use]
 pub(crate) fn self_launched_browser_note(resp: &ChromeResponse) -> Option<String> {
     let warning = chrome_use_warning(resp)?;
@@ -134,19 +110,17 @@ pub(crate) fn self_launched_browser_note(resp: &ChromeResponse) -> Option<String
         .then_some(text)
 }
 
-/// Opening sentence of [`self_launched_browser_error`] — a const so a caller that must recognize
-/// that failure ([`is_self_launched_browser_error`]) never re-spells the sentence itself.
+/// Opening sentence of [`self_launched_browser_error`], so a caller that must recognize that
+/// failure never re-spells it.
 const SELF_LAUNCHED_BROWSER_PREFIX: &str =
     "chrome-use launched a browser of its own for this command";
 
-/// The failure a call whose envelope carried [`self_launched_browser_note`] gets:
-/// the tool's own note, what it means, and — per audience, since both frontends
-/// share the diagnosis — what to do next.
+/// The failure a call whose envelope carried [`self_launched_browser_note`] gets: the tool's own
+/// note, what it means, and — per audience — what to do next.
 ///
-/// This is NOT the daemon-down path: the daemon and the relay may be perfectly
-/// healthy, and what was lost is the connection to the owner's real browser — so
-/// the call must never be reported as a quiet success, and the daemon must not be
-/// marked unhealthy for it (a daemon restart cannot bring a gone browser back).
+/// This is NOT the daemon-down path: the daemon and relay may be perfectly healthy, and what was
+/// lost is the connection to the owner's real browser, so the call must never be reported as a
+/// quiet success and the daemon must not be marked unhealthy for it.
 #[must_use]
 fn self_launched_browser_diagnosis(note: &str) -> String {
     format!(
@@ -157,9 +131,8 @@ fn self_launched_browser_diagnosis(note: &str) -> String {
     )
 }
 
-/// The tool's copy of [`self_launched_browser_diagnosis`], for the agent driving
-/// it: retry, then hand the diagnosis over as it came — repairing the extension or
-/// the relay is the owner's side, not an agent's job.
+/// The tool's copy of the diagnosis, for the agent: retry, then hand the diagnosis over as it
+/// came — repairing the extension or the relay is the owner's side.
 #[must_use]
 pub(crate) fn self_launched_browser_error(note: &str) -> String {
     format!(
@@ -169,9 +142,8 @@ pub(crate) fn self_launched_browser_error(note: &str) -> String {
     )
 }
 
-/// The `mahbot chrome` CLI's copy of [`self_launched_browser_diagnosis`], for the
-/// person reading the command's failure: it keeps the repair path the tool's copy
-/// deliberately leaves out.
+/// The CLI's copy of the diagnosis, for the person reading the failure: it keeps the repair path
+/// the tool's copy deliberately leaves out.
 #[must_use]
 pub(crate) fn self_launched_browser_cli_error(note: &str) -> String {
     format!(
@@ -181,19 +153,15 @@ pub(crate) fn self_launched_browser_cli_error(note: &str) -> String {
     )
 }
 
-/// Whether `message` is the failure [`self_launched_browser_error`] built: the call ran in a
-/// browser chrome-use launched itself, so no page of the owner's exists for it.
+/// Whether `message` is the failure [`self_launched_browser_error`] built.
 #[must_use]
 pub(crate) fn is_self_launched_browser_error(message: &str) -> bool {
     message.starts_with(SELF_LAUNCHED_BROWSER_PREFIX)
 }
 
-/// The failure text for output the product had to cut off, either at the bytes
-/// it collects ([`crate::chrome::spawn::PIPE_READ_CAP`]) or when the collection
-/// window ended while bytes were still arriving: the envelope cannot be parsed
-/// because the PRODUCT cut it off, which is a different fact from chrome-use
-/// answering something malformed. Shared by both frontends so the two surfaces
-/// cannot drift.
+/// The failure text for output the product had to cut off, either at the bytes it collects
+/// ([`crate::chrome::spawn::PIPE_READ_CAP`]) or when the collection window ended mid-stream:
+/// that is a different fact from chrome-use answering something malformed.
 #[must_use]
 pub(crate) fn truncated_output_error() -> String {
     format!(
@@ -206,14 +174,12 @@ pub(crate) fn truncated_output_error() -> String {
     )
 }
 
-/// Parse the FIRST JSON value chrome-use wrote, ignoring anything after it — the
-/// ONE reading of a chrome-use answer, used by every path that reads one (the
-/// interactive tool's dispatch, the `mahbot chrome` CLI's step classification, the
-/// session-list sweep, and the daemon's own readiness/session probes).
+/// Parse the FIRST JSON value chrome-use wrote, ignoring anything after it — the ONE reading of
+/// a chrome-use answer.
 ///
-/// A process the command left behind can write into the inherited output channel
-/// after chrome-use's own answer, and those trailing bytes must not turn a
-/// finished command's answer into malformed output.
+/// A process the command left behind can write into the inherited output channel after
+/// chrome-use's own answer, and those trailing bytes must not turn a finished command's answer
+/// into malformed output.
 pub(crate) fn parse_first<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Option<T> {
     serde_json::Deserializer::from_slice(bytes)
         .into_iter::<T>()
@@ -221,16 +187,13 @@ pub(crate) fn parse_first<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Optio
         .ok()
 }
 
-/// The note a caller appends to a chrome-use result whose child exited while a
-/// process it left behind still held the call's output channel
-/// ([`crate::chrome::spawn::CliOutput::leftover_pipes`]) — on a FAILING result
-/// too, where the failure stays the failure and this is a separate fact.
+/// The note a caller appends to a chrome-use result whose child exited while a process it left
+/// behind still held the call's output channel
+/// ([`crate::chrome::spawn::CliOutput::leftover_pipes`]) — on a FAILING result too, where the
+/// failure stays the failure.
 ///
-/// What still runs is chrome-use's OWN helper, the daemon it starts for the
-/// session (`session` names that session, so the product's own stop verb can
-/// address it); chrome-use stops it on its own idle timeout, so a caller that
-/// leaves it alone loses nothing. Shared by both frontends so the two surfaces
-/// cannot drift.
+/// What still runs is chrome-use's OWN helper, the daemon it starts for the session, which
+/// chrome-use stops on its own idle timeout — so a caller that leaves it alone loses nothing.
 #[must_use]
 pub(crate) fn chrome_leftover_pipe_note(session: &str) -> String {
     format!(
@@ -242,52 +205,31 @@ pub(crate) fn chrome_leftover_pipe_note(session: &str) -> String {
     )
 }
 
-/// The `session stop` command that addresses chrome-use session `session`'s
-/// leftover helper — the recipe [`chrome_leftover_pipe_note`] embeds and the
-/// durable record written into the log store (shown on Logs → Issues) carries as
-/// its `detail`. Extracted so the agent's note and the durable record are the
-/// same text and cannot drift.
+/// The `session stop` command that addresses chrome-use session `session`'s leftover helper —
+/// the recipe [`chrome_leftover_pipe_note`] embeds and the durable record carries as `detail`.
 ///
-/// The name is rendered bare, and that is safe because the set the recipe can
-/// carry — `[A-Za-z0-9_-]`, the alphabet both producers, and chrome-use's own
-/// `validation::is_valid_session_name`, restrict themselves to — holds only
-/// characters that are inert in a shell, and the names are prefix-anchored. The
-/// tool's `sanitize_filename_component` emits that set (a '.' becomes '_'), and
-/// the CLI's `validate_session_name` accepts no more than chrome-use will stop
-/// (see [`crate::chrome::cli`] for why a '.' is refused). So the recipe cannot be
-/// turned into a different command by a name. Quoting is deliberately not used
-/// here — the recipe is run by the agent's shell, which may be `cmd.exe`, where
-/// the product's unix single-quote form would become part of the argument (and
-/// silently address the wrong session).
-///
-/// `--force` is part of the recipe because the interactive tool's sessions live
-/// under the protected `agent-tab-*` prefix (the same flag the CLI's own stop
-/// guard asks for); for a `mahbot-chrome-*` session, which the CLI mints for
-/// itself, the flag is simply unused.
+/// The name is rendered bare, and that is safe: both producers and chrome-use's own
+/// `validation::is_valid_session_name` restrict it to `[A-Za-z0-9_-]`, characters that are inert
+/// in a shell, and the names are prefix-anchored — so the recipe cannot be turned into a
+/// different command by a name. Quoting is deliberately not used: the recipe is run by the
+/// agent's shell, which may be `cmd.exe`, where the unix single-quote form would become part of
+/// the argument. `--force` is part of it because the interactive tool's sessions live under the
+/// protected `agent-tab-*` prefix.
 #[must_use]
 pub(crate) fn chrome_session_stop_command(session: &str) -> String {
     format!("mahbot chrome session stop {session} --force")
 }
 
-/// Core envelope-success predicate with failure precedence: an explicit
-/// `false` on either key loses over a contradicting success key (conservative
-/// — the error text surfaces), and a payload with neither key is not a
-/// success. Backs [`ChromeResponse::is_success`] and
-/// [`ChromeResponse::verdict`].
+/// Core envelope-success predicate with failure precedence: an explicit `false` on either key
+/// loses over a contradicting success key, and a payload with neither key is not a success.
 fn envelope_success(success: Option<bool>, ok: Option<bool>) -> bool {
     !(success == Some(false) || ok == Some(false)) && (success == Some(true) || ok == Some(true))
 }
 
-/// Extract textual content from a chrome-use snapshot response `data` field.
-///
-/// chrome-use can return the snapshot as:
-/// - A plain string (via `snapshot -c`)
-/// - An object with a `text` field (via `get_text`)
-/// - An object with a `result` field (via `eval`)
-/// - An object with a `content` field (via `get_text`)
-/// - An object with `origin`, `refs`, and `snapshot` fields (via `snapshot --json`)
-///
-/// Returns `None` if none of these shapes match (the caller falls back).
+/// Extract textual content from a chrome-use snapshot response `data` field: a plain string
+/// (`snapshot -c`), an object with `text` (`get_text`), `result` (`eval`) or `content`
+/// (`get_text`), or the `origin`/`refs`/`snapshot` shape of `snapshot --json`. `None` when none
+/// of these match (the caller falls back).
 pub(crate) fn extract_snapshot_text(data: &serde_json::Value) -> Option<String> {
     data.as_str().map(String::from).or_else(|| {
         ["text", "result", "content", "snapshot"]
@@ -296,10 +238,8 @@ pub(crate) fn extract_snapshot_text(data: &serde_json::Value) -> Option<String> 
     })
 }
 
-/// Unwrap the actual JS result from an eval response. chrome-use wraps
-/// `eval` output as `data = {origin, result}` — an object carrying BOTH keys
-/// is treated as that wrapper; every other shape (a bare value, a plain
-/// string, a page result that merely has a `result` field) passes through.
+/// Unwrap the actual JS result from an eval response: `data = {origin, result}` with BOTH keys
+/// is that wrapper, every other shape passes through.
 pub(crate) fn eval_result(resp: &ChromeResponse) -> Option<&Value> {
     resp.data
         .as_ref()
@@ -309,12 +249,10 @@ pub(crate) fn eval_result(resp: &ChromeResponse) -> Option<&Value> {
         })
 }
 
-/// The ONE error-page probe eval, shared by the CLI `open` action and the
-/// interactive tool: always a JSON verdict string (robust against textified
-/// delivery) reporting whether the tab committed to a Chrome error page and,
-/// best-effort, the net error token Chrome renders in the error page's
-/// `div.error-code` (empty until the neterror script renders it, and on
-/// template/locale drift — callers must keep the generic fallback).
+/// The ONE error-page probe eval, shared by the CLI `open` action and the interactive tool:
+/// always a JSON verdict string, reporting whether the tab committed to a Chrome error page and,
+/// best-effort, the net error token from `div.error-code` — empty until the neterror script
+/// renders it, so callers must keep the generic fallback.
 pub(crate) const ERROR_PAGE_PROBE_JS: &str = "JSON.stringify({err: location.protocol === 'chrome-error:', code: (document.querySelector('.error-code') || {}).textContent || ''})";
 
 /// Parsed [`ERROR_PAGE_PROBE_JS`] verdict.
@@ -322,14 +260,12 @@ pub(crate) const ERROR_PAGE_PROBE_JS: &str = "JSON.stringify({err: location.prot
 pub(crate) struct ErrorPageProbe {
     /// The tab conclusively sits on a Chrome error page.
     pub(crate) is_error_page: bool,
-    /// The net error token (`ERR_*` / `DNS_*`) read from `div.error-code`,
-    /// when one rendered and is recognizable.
+    /// The net error token (`ERR_*` / `DNS_*`) read from `div.error-code`, when recognizable.
     pub(crate) code: Option<String>,
 }
 
-/// Parse an error-page probe response. `None` = inconclusive (callers treat
-/// the probe as passed, never as a network failure). The verdict arrives as
-/// the eval's JSON string — possibly textified — or an already-parsed object.
+/// Parse an error-page probe response. `None` = inconclusive (callers treat the probe as passed,
+/// never as a network failure).
 pub(crate) fn parse_error_page_probe(resp: &ChromeResponse) -> Option<ErrorPageProbe> {
     let data = eval_result(resp)?;
     let verdict = if let Some(text) = extract_snapshot_text(data) {
@@ -358,16 +294,14 @@ pub(crate) fn parse_error_page_probe(resp: &ChromeResponse) -> Option<ErrorPageP
     })
 }
 
-/// Extract a non-negative element count from a count-eval response — the eval
-/// result arrives as a JSON number or its text form.
+/// Extract a non-negative element count from a count-eval response.
 pub(crate) fn eval_count(resp: &ChromeResponse) -> Option<u64> {
     let data = eval_result(resp)?;
     data.as_u64()
         .or_else(|| data.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
 }
 
-/// Trim `rows` to `limit` (mahbot-side) while reporting the honest `total`.
-/// Returns `(trimmed, total, returned)`.
+/// Trim `rows` to `limit` while reporting the honest `total`. Returns `(trimmed, total, returned)`.
 fn trim_extract_rows(rows: Vec<Value>, limit: Option<usize>) -> (Vec<Value>, usize, usize) {
     let total = rows.len();
     let returned = limit.map_or(total, |l| l.min(total));
@@ -375,13 +309,9 @@ fn trim_extract_rows(rows: Vec<Value>, limit: Option<usize>) -> (Vec<Value>, usi
     (trimmed, total, returned)
 }
 
-/// Rows from a chrome-use `extract --json` response `data` field.
-///
-/// chrome-use 1.5.101 answers rows-mode extract with
-/// `data = {extracted: [...], count, origin, meta}` (a `diagnostic` string is
-/// added on 0-match — unreachable through the count-gated frontends).
-/// Tolerance: a plain array passes through; a bare object is a single-object
-/// (schemaless) extract and becomes a one-element row list.
+/// Rows from a chrome-use `extract --json` response `data` field:
+/// `data = {extracted: [...], count, origin, meta}`. Tolerance: a plain array passes through, a
+/// bare object is a single-object extract and becomes a one-element list.
 fn extract_rows(data: &Value) -> Vec<Value> {
     match data {
         Value::Object(o) => match o.get("extracted") {
@@ -395,10 +325,8 @@ fn extract_rows(data: &Value) -> Vec<Value> {
     }
 }
 
-/// The ONE extract output contract for both frontends: read the rows from a
-/// chrome-use extract response `data` value and shape the payload — `data`
-/// carries the (possibly `limit`-trimmed) rows, `total` the honest full
-/// count, and `returned` appears only when a `limit` was applied.
+/// The ONE extract output contract for both frontends: `data` carries the (possibly trimmed)
+/// rows, `total` the honest full count, and `returned` appears only when a `limit` was applied.
 #[must_use]
 pub(crate) fn extract_output(data: &Value, limit: Option<usize>) -> Value {
     let (trimmed, total, returned) = trim_extract_rows(extract_rows(data), limit);
@@ -409,25 +337,21 @@ pub(crate) fn extract_output(data: &Value, limit: Option<usize>) -> Value {
     payload
 }
 
-/// A parsed `expect` verdict from a chrome-use `expect --json` response
-/// `data` object. `pass` is the authoritative tri-state anchor: `None` from
+/// A parsed `expect` verdict. `pass` is the authoritative tri-state anchor: `None` from
 /// [`expect_outcome`] means the payload was not an expect verdict at all.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ExpectOutcome {
     pub(crate) pass: bool,
-    /// The observed value chrome-use evaluated (element presence object,
-    /// count, text, URL string, …) — `None` when absent.
+    /// The observed value chrome-use evaluated — `None` when absent.
     pub(crate) actual: Option<Value>,
-    /// chrome-use sets `timedOut: true` when the condition never held within
-    /// the deadline. mahbot never passes --no-wait, so a false verdict always
-    /// arrives folded into `timedOut` in practice; a bare `pass:false` is
-    /// defensive against a future chrome-use grammar change.
+    /// chrome-use sets `timedOut: true` when the condition never held within the deadline. mahbot
+    /// never passes --no-wait, so a false verdict arrives folded into `timedOut`; a bare
+    /// `pass:false` is defensive against a future grammar change.
     pub(crate) timed_out: bool,
 }
 
-/// Parse the `expect` verdict out of a chrome-use response `data` value.
-/// Returns `None` when the payload carries no boolean `pass` key (not an
-/// expect verdict — the caller classifies it as a generic error).
+/// Parse the `expect` verdict out of a response `data` value. `None` when the payload carries no
+/// boolean `pass` key.
 #[must_use]
 pub(crate) fn expect_outcome(data: &Value) -> Option<ExpectOutcome> {
     let obj = data.as_object()?;
@@ -445,9 +369,8 @@ pub(crate) fn expect_outcome(data: &Value) -> Option<ExpectOutcome> {
 /// `mahbot chrome` stdout envelope schema version.
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 
-/// Failure/success classification of one CLI step — drives the emitted
-/// `kind` and the exit code (site problems are rc 1 and schedulable;
-/// environment problems are rc 2 and need a human).
+/// Failure/success classification of one CLI step — drives the emitted `kind` and the exit code
+/// (site problems are rc 1 and schedulable; environment problems are rc 2 and need a human).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutKind {
     Ok,
@@ -478,9 +401,8 @@ impl OutKind {
         }
     }
 
-    /// Process exit code for this kind: site/data problems are rc 1 and
-    /// retryable; environment problems are rc 2 (fix the environment, don't
-    /// blind-retry); usage is rc 3.
+    /// Process exit code for this kind: site/data problems rc 1 and retryable, environment
+    /// problems rc 2, usage rc 3.
     #[must_use]
     pub(crate) const fn exit_code(self) -> i32 {
         match self {
@@ -492,35 +414,26 @@ impl OutKind {
     }
 }
 
-// ── Failure signatures & classification ────────────────────────────────
-// These live here (not in chrome_daemon) so the failure-interpretation layer
-// stays dependency-free: chrome_daemon imports them back, and both frontends
-// classify through this module without any frontend-to-frontend coupling.
+// Failure signatures live here (not in chrome_daemon) so the interpretation layer stays
+// dependency-free: chrome_daemon imports them back, and both frontends classify through this
+// module without any frontend-to-frontend coupling.
 
-/// Per-session wedge signature: the session's CDP attach is unresponsive and
-/// every command on that named session times out while the daemon and relay
-/// may be perfectly healthy. The chrome_daemon watchdog reaches these texts
-/// through [`is_daemon_unavailable_error`] (they are DaemonWedge signals and
-/// MUST keep triggering its auto-recovery); the CLI uses this matcher
-/// directly to attach the wedge-specific remediation hint (the OutKind is
-/// Environment for both, so classification is unchanged).
+/// Per-session wedge signature: the session's CDP attach is unresponsive and every command on
+/// that named session times out while the daemon and relay may be healthy. These texts are
+/// DaemonWedge signals and MUST keep triggering the watchdog's auto-recovery; the CLI uses this
+/// matcher directly to attach the wedge-specific hint.
 pub(crate) fn is_session_unresponsive_error(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     lower.contains("session unresponsive")
         || lower.contains("cdp session is unresponsive after attaching")
 }
 
-/// Detect the daemon-unavailable signature chrome-use produces when its
-/// background daemon is dead or wedged: the CLI hangs in its own 5-retry loop
-/// (EAGAIN / "Resource temporarily unavailable") and eventually reports
-/// "daemon may be busy or unresponsive". Also covers the 1.5.8x-era texts
-/// (stuck-daemon auto-stop, disappeared daemon endpoint, failed auto-launch)
-/// and — via the [`is_session_unresponsive_error`] delegation — the
-/// session-wedge texts, which are DaemonWedge signals for the watchdog's
-/// auto-recovery.
+/// Detect the daemon-unavailable signature chrome-use produces when its background daemon is dead
+/// or wedged: the CLI hangs in its own 5-retry loop and eventually reports "daemon may be busy or
+/// unresponsive". Also covers the 1.5.8x-era texts and — via [`is_session_unresponsive_error`] —
+/// the session-wedge texts.
 pub(crate) fn is_daemon_unavailable_error(msg: &str) -> bool {
-    // The session-wedge texts are also DaemonWedge signals — the watchdog's
-    // auto-recovery cause folds them in (see [`is_session_unresponsive_error`]).
+    // The session-wedge texts are also DaemonWedge signals for the watchdog's auto-recovery.
     if is_session_unresponsive_error(msg) {
         return true;
     }
@@ -531,14 +444,12 @@ pub(crate) fn is_daemon_unavailable_error(msg: &str) -> bool {
         || lower.contains("daemon may be busy or unresponsive")
         || lower.contains("daemon failed to start")
         || lower.contains("auto-launch failed")
-        // Colon form only — "failed to connect to <host>" is a page-level
-        // navigation failure, not a daemon socket problem.
+        // Colon form only — "failed to connect to <host>" is a page-level navigation failure.
         || lower.contains("failed to connect:")
 }
 
-/// Relay-side failure signature — the daemon is alive but cannot drive Chrome
-/// through the extension relay. Distinct from a daemon wedge (restart clears a
-/// wedge; a relay drop needs the extension to republish, then self-heals).
+/// Relay-side failure signature — the daemon is alive but cannot drive Chrome through the
+/// extension relay. A wedge clears on restart; a relay drop needs the extension to republish.
 pub(crate) fn is_relay_unavailable_error(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     lower.contains("relay isn't connected")
@@ -548,22 +459,18 @@ pub(crate) fn is_relay_unavailable_error(msg: &str) -> bool {
         || lower.contains("could not drive your chrome")
 }
 
-/// Stable error-envelope `code` values (v1.5.78+) that are unambiguously
-/// daemon-side. The coarse `connection_failed` code is shared with page-level
-/// navigation failures (the CLI classifies any "connection" text as such), so
-/// the message-text matcher stays the source of truth for those.
+/// Stable error-envelope `code` values that are unambiguously daemon-side. The coarse
+/// `connection_failed` code is shared with page-level navigation failures, so the message-text
+/// matcher stays the source of truth for those.
 pub(crate) fn is_daemon_unavailable_code(code: Option<&str>) -> bool {
     matches!(code, Some("browser_not_launched"))
 }
 
 /// Structural failures of a call that never left the product for the owner's browser: the relay
-/// signature, the daemon signature (which already folds in the session-wedge texts, see
-/// [`is_daemon_unavailable_error`]), "browser not launched", "requires ab-connect" and "only works
-/// over the extension relay". Everything the browser may have run before the failure is NOT here —
-/// a call cut off at a clock, a stale or closed target, a stream that died mid-call
-/// ("event stream closed") — [`unreached_browser_error`] is that wider "holds no page" class, and a
-/// tab that became unreachable has its own predicate. An extension ownership refusal relayed in
-/// the same error field is not one of these either — that IS the browser's own answer, about a tab.
+/// signature, the daemon signature (which folds in the session-wedge texts), "browser not
+/// launched", "requires ab-connect" and "only works over the extension relay". Everything the
+/// browser may have run before the failure is NOT here — [`unreached_browser_error`] is that
+/// wider class.
 pub(crate) fn never_dispatched_error(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     is_relay_unavailable_error(msg)
@@ -573,10 +480,8 @@ pub(crate) fn never_dispatched_error(msg: &str) -> bool {
         || lower.contains("only works over the extension relay")
 }
 
-/// Structural failures that provably never reached the browser — the mirror of the vendor's own
-/// structural error classes: [`never_dispatched_error`] plus "event stream closed", "command timed
-/// out", "stale target" and "target closed". A caller uses this to keep such a failure from being
-/// read as the browser answering about the work it was asked to do.
+/// Structural failures that provably never reached the browser — [`never_dispatched_error`] plus
+/// "event stream closed", "command timed out", "stale target" and "target closed".
 pub(crate) fn unreached_browser_error(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     never_dispatched_error(msg)
@@ -586,18 +491,12 @@ pub(crate) fn unreached_browser_error(msg: &str) -> bool {
         || lower.contains("target closed")
 }
 
-/// Error signatures of a leftover tab the daemon can no longer re-drive: its
-/// binding went stale (relay blip, kill during an outage) while the extension
-/// keeps the attach. The extension never re-attaches `about:` URLs, so nothing
-/// re-drives that tab — its session has to move to another name, while the tab
-/// itself is the session's and the product closes it (at run end, or when the
-/// session is stopped/recovered), never the reader by hand. An orphan the
-/// extension fully dropped (service-worker restart) never produces these. Real
-/// chrome calls hitting this state fail fast with the same guidance without
-/// marking the daemon unhealthy — see [`unreachable_tab_message`]. The "or the
-/// relay lost it" variant is a permanent orphan (the relay dropped the attach);
-/// "navigated across processes" is a recoverable OAuth/SSO retarget and must
-/// stay OUT.
+/// Error signatures of a leftover tab the daemon can no longer re-drive: its binding went stale
+/// while the extension keeps the attach, and the extension never re-attaches `about:` URLs. Its
+/// session has to move to another name, while the tab itself is the session's and the product
+/// closes it. An orphan the extension fully dropped never produces these. The "relay lost it"
+/// variant is a permanent orphan; "navigated across processes" is a recoverable OAuth/SSO
+/// retarget and must stay OUT.
 pub(crate) fn is_unreachable_tab_error(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     lower.contains("can no longer be resolved")
@@ -609,12 +508,9 @@ pub(crate) fn is_unreachable_tab_error(msg: &str) -> bool {
         || lower.contains("the relay lost it")
 }
 
-/// Actionable error for a real call that hit an orphaned tab: the daemon and
-/// relay are up, only the session's tab is unreachable (the extension never
-/// re-attaches about:blank tabs). Fail fast without marking the daemon
-/// unhealthy — recovery cannot fix a Chrome-side orphan — and without asking
-/// anyone to close it: the tab belongs to the session, which the product closes
-/// itself (at run end, and when a wedged session is recovered).
+/// Actionable error for a real call that hit an orphaned tab: the daemon and relay are up, only
+/// the session's tab is unreachable. Fail fast without marking the daemon unhealthy — recovery
+/// cannot fix a Chrome-side orphan — and without asking anyone to close it.
 pub(crate) fn unreachable_tab_message(error: &str) -> String {
     format!(
         "{error}. The chrome-use extension lost its debugger attach to this tab and never \
@@ -625,10 +521,8 @@ pub(crate) fn unreachable_tab_message(error: &str) -> String {
     )
 }
 
-/// Classify a chrome-use step failure into an [`OutKind`]. Environment
-/// signatures win because rc 2 must not be masked by a page-level wrapper
-/// text: a relay/daemon/Chrome-launch problem is a CLI environment failure
-/// even when the CLI wraps the message in a "page failed" envelope.
+/// Classify a chrome-use step failure into an [`OutKind`]. Environment signatures win because
+/// rc 2 must not be masked by a page-level wrapper text.
 pub(crate) fn classify_call_failure(code: Option<&str>, error: &str) -> OutKind {
     if is_daemon_unavailable_error(error)
         || is_daemon_unavailable_code(code)
@@ -639,15 +533,10 @@ pub(crate) fn classify_call_failure(code: Option<&str>, error: &str) -> OutKind 
     if error.contains("net::ERR_") || code == Some("connection_failed") {
         return OutKind::Network;
     }
-    // chrome-use's internal action timeout (AGENT_BROWSER_DEFAULT_TIMEOUT).
-    // Chrome-side deadlines equal the declared budget, and the mahbot-side
-    // kill rides KILL_SLACK above them, so chrome-use's honest phrased
-    // timeouts normally surface first; the classifier still catches them for
-    // every verb. Matched
-    // by its specific phrasings ("Wait timed out after Nms", "waitFor timed
-    // out: …") rather than a bare "timed out" substring, so an unrecognized
-    // connect-timeout message still classifies as Error — same exit code (1),
-    // honest kind label.
+    // chrome-use's internal action timeout. Chrome-side deadlines equal the declared budget and
+    // the mahbot-side kill rides KILL_SLACK above them, so chrome-use's phrased timeouts normally
+    // surface first. Matched by its specific phrasings rather than a bare "timed out" substring,
+    // so an unrecognized connect-timeout still classifies as Error.
     let lower = error.to_ascii_lowercase();
     if code == Some("timeout")
         || lower.contains("timed out after")
@@ -661,11 +550,8 @@ pub(crate) fn classify_call_failure(code: Option<&str>, error: &str) -> OutKind 
     OutKind::Error
 }
 
-/// Canonical net error token extracted from chrome-side text. Both forms
-/// chrome-use surfaces — the `net::ERR_*` prefix form on CDP `errorText` and
-/// the bare `ERR_*`/`DNS_*` form Chrome renders in the error page's
-/// `div.error-code` — canonicalize to the bare token (e.g.
-/// `ERR_NAME_NOT_RESOLVED`, `DNS_PROBE_FINISHED_NXDOMAIN`).
+/// Canonical net error token extracted from chrome-side text: the `net::ERR_*` prefix form on CDP
+/// `errorText` and the bare `ERR_*`/`DNS_*` form Chrome renders both canonicalize to the token.
 pub(crate) fn extract_net_error_code(text: &str) -> Option<String> {
     static NET_ERROR_CODE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?:net::)?\b(ERR_[A-Z0-9_]+|DNS_[A-Z0-9_]+)").expect("valid net error regex")
@@ -676,12 +562,9 @@ pub(crate) fn extract_net_error_code(text: &str) -> Option<String> {
         .map(|m| m.as_str().to_string())
 }
 
-/// Coarse cause phrase for a net error token: DNS failures, refused
-/// connections, everything else (timed out/reset/unsafe port/disconnected…)
-/// shares one honest "unreachable or failed" bucket — the raw token is the
-/// precise signal for the caller. `ERR_NAME_NOT_RESOLVED` counts as DNS: it
-/// is the canonical DNS-failure code chrome-use surfaces via CDP errorText
-/// (the error page itself renders the `DNS_*`-prefixed token).
+/// Coarse cause phrase for a net error token: DNS failures, refused connections, everything else
+/// shares one "unreachable or failed" bucket. `ERR_NAME_NOT_RESOLVED` counts as DNS: it is the
+/// code chrome-use surfaces via CDP errorText.
 pub(crate) fn net_error_phrase(code: &str) -> &'static str {
     if code.starts_with("DNS_") || code == "ERR_NAME_NOT_RESOLVED" {
         "DNS resolution failure"
@@ -692,24 +575,15 @@ pub(crate) fn net_error_phrase(code: &str) -> &'static str {
     }
 }
 
-/// Start of the canned remediation hint chrome-use (external binary) appends
-/// to some timeout failures. Everything from the first occurrence of this
-/// marker to the end of the message is stripped by
-/// [`sanitize_timeout_message`].
+/// Start of the canned remediation hint chrome-use appends to some timeout failures; everything
+/// from it to the end of the message is stripped by [`sanitize_timeout_message`].
 const STALE_RELAY_HINT_MARKER: &str = "Hint: the session's browser connection is unresponsive";
 
-/// chrome-use (external binary) appends a canned remediation hint to some
-/// timeout failures: "Hint: the session's browser connection is unresponsive
-/// (likely a stale relay/service-worker mid-session). Reconnect with
-/// `connect`, or close the session and reopen it." That hint is wrong in
-/// mahbot's surface — there is no `connect` verb here and the connection is
-/// usually healthy (the condition simply never appeared) — so both frontends
-/// strip it from Timeout-classified messages. Environment-classified relay/
-/// daemon diagnostics are never rewritten: genuine connection-failure
-/// guidance must pass through untouched. The wording is chrome-use's; if a
-/// release rephrases it, the strip degrades to a no-op (acceptable). The
-/// separator period before the hint sentence is dropped too, so appended
-/// remediation reads "…15000ms — …" rather than "…15000ms. — …".
+/// chrome-use appends a canned hint to some timeout failures ("the session's browser connection
+/// is unresponsive … Reconnect with `connect`"), which is wrong in mahbot's surface — there is no
+/// `connect` verb and the connection is usually healthy — so both frontends strip it from
+/// Timeout-classified messages. Environment-classified diagnostics are never rewritten. The
+/// wording is chrome-use's: if a release rephrases it the strip degrades to a no-op.
 pub(crate) fn sanitize_timeout_message(kind: OutKind, message: &str) -> String {
     if kind != OutKind::Timeout {
         return message.to_string();
@@ -723,9 +597,8 @@ pub(crate) fn sanitize_timeout_message(kind: OutKind, message: &str) -> String {
     }
 }
 
-/// Remediation appended to `wait` condition timeouts in BOTH frontends (after
-/// the honest chrome-use text) — one source so the CLI and the interactive
-/// tool never drift.
+/// Remediation appended to `wait` condition timeouts in BOTH frontends, after the honest
+/// chrome-use text — one source so the CLI and the tool never drift.
 pub(crate) const WAIT_TIMEOUT_NOTE: &str = " — the target never appeared within the deadline; consider verifying the \
      selector/text/URL or allowing more time";
 
@@ -733,11 +606,9 @@ pub(crate) const WAIT_TIMEOUT_NOTE: &str = " — the target never appeared withi
 pub(crate) const EXPECT_TIMEOUT_NOTE: &str =
     " — consider verifying the condition or allowing more time";
 
-/// Append the action's condition-timeout remediation note to `message` when
-/// `kind` is Timeout and `message` is chrome-use's own phrased text — an empty
-/// message is the mahbot-side deadline kill, which carries its own factual
-/// error text and never gets the remediation note. No-op for every other
-/// action.
+/// Append the condition-timeout remediation to `message` when `kind` is Timeout and `message` is
+/// chrome-use's own phrased text — an empty message is the mahbot-side deadline kill and carries
+/// its own factual text. No-op for every other action.
 pub(crate) fn with_condition_timeout_note(action: &str, kind: OutKind, message: &mut String) {
     let note = match (kind, action) {
         (OutKind::Timeout, "wait") => Some(WAIT_TIMEOUT_NOTE),
@@ -751,8 +622,7 @@ pub(crate) fn with_condition_timeout_note(action: &str, kind: OutKind, message: 
     }
 }
 
-/// The one-line stdout envelope. `payload` must be a JSON object; it is
-/// flattened after `kind`.
+/// The one-line stdout envelope. `payload` must be a JSON object; it is flattened after `kind`.
 pub(crate) struct OutEnvelope {
     pub(crate) action: String,
     pub(crate) ok: bool,
@@ -807,17 +677,15 @@ mod tests {
             serde_json::from_str(r#"{"success":false}"#).expect("tolerant deserialize");
         assert!(!failed.is_success());
 
-        // Failure precedence — an explicit false on either key loses over a
-        // contradicting success key.
+        // Failure precedence — an explicit false on either key loses over a contradicting
+        // success key.
         let mixed: ChromeResponse =
             serde_json::from_str(r#"{"success":false,"ok":true}"#).expect("tolerant deserialize");
         assert!(!mixed.is_success());
     }
 
-    /// The tolerant parse is what keeps a leftover process from deciding the call:
-    /// bytes written into the inherited channel after chrome-use's own envelope
-    /// must not turn a finished command's answer into malformed output, while an
-    /// answer the product cut short still has no first value to read.
+    /// The tolerant parse keeps a leftover process from deciding the call, while an answer the
+    /// product cut short still has no first value to read.
     #[test]
     fn parse_first_ignores_anything_after_the_first_value() {
         let envelope = br#"{"ok":true,"data":{"count":1}}"#;
@@ -1360,8 +1228,7 @@ mod tests {
         ] {
             assert!(is_session_unresponsive_error(msg), "should detect: {msg}");
         }
-        // The daemon-busy phrasing is a DaemonWedge text, not a session wedge —
-        // the CLI must not attach the session hint to it.
+        // The daemon-busy phrasing is a DaemonWedge text, not a session wedge.
         assert!(!is_session_unresponsive_error(
             "daemon may be busy or unresponsive"
         ));
@@ -1379,8 +1246,7 @@ mod tests {
         ] {
             assert!(is_unreachable_tab_error(msg), "should detect: {msg}");
         }
-        // The recoverable OAuth/SSO retarget and daemon/page-level failures
-        // are not tab-attach problems.
+        // The recoverable OAuth/SSO retarget is not a tab-attach problem.
         assert!(!is_unreachable_tab_error(
             "the tab this command was driving is gone — it navigated across processes"
         ));
@@ -1415,8 +1281,7 @@ mod tests {
         ] {
             assert!(unreached_browser_error(msg), "should detect: {msg}");
         }
-        // The extension's own ownership refusal arrives in the same error field, and
-        // it IS the browser answering — never an unreached class.
+        // The extension's own ownership refusal IS the browser answering, never an unreached class.
         assert!(!unreached_browser_error(
             "call: tabs.remove refused — tab 7 is not owned by this relay \
              (agent-created or adopted tabs only)"

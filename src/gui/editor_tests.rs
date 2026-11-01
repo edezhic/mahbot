@@ -1,5 +1,4 @@
-//! Editor tests: text matching, selection, buffer operations and the
-//! file-backed editing paths.
+//! Editor tests: text matching, selection, buffer operations, file-backed editing.
 
 use super::*;
 use crate::gui::editor_widget::{EditorAction, EditorBuffer};
@@ -28,7 +27,6 @@ fn test_compute_text_matches() {
             &[(0, 5), (12, 17)],
         ),
         ("no_match", "hello world", "xyz", true, &[]),
-        // Non-overlapping matches.
         ("non_overlapping", "aaaaa", "aa", true, &[(0, 2), (2, 4)]),
         (
             "case_insensitive",
@@ -57,8 +55,6 @@ fn test_compute_text_matches() {
         }
     }
 }
-
-// ── validate_file_content ─────────────────────────────────────
 
 #[test]
 fn test_validate_file_content() {
@@ -162,15 +158,11 @@ fn test_save_result_ignores_stale_save() {
     );
 }
 
-// ── saved-tabs restore failure ─────────────────────────────
-
 #[test]
 fn test_failed_saved_tabs_restore_blocks_persistence() {
     let mut state = EditorState::new();
     state.selected_workspace_name = Some("ws".to_string());
 
-    // A failed restore keeps the failure visible — with the persistence block
-    // it implies — and the session uninitialized.
     let _ = state.saved_tabs_loaded(Err("db down".to_string()), state.saved_tabs_gen);
     let err = state
         .tabs_error
@@ -184,8 +176,7 @@ fn test_failed_saved_tabs_restore_blocks_persistence() {
     assert!(!state.session_initialized);
     assert!(state.try_save_current_tabs().is_none());
 
-    // Opening a file marks the session initialized, but the failed restore
-    // still blocks persistence so the persisted tab set is never overwritten.
+    // The failed restore still blocks persistence, so the persisted tabs survive.
     state.session_initialized = true;
     assert!(state.try_save_current_tabs().is_none());
 
@@ -195,8 +186,6 @@ fn test_failed_saved_tabs_restore_blocks_persistence() {
     assert!(state.session_initialized);
 }
 
-// ── byte_offset_to_line_col ────────────────────────────────
-
 #[test]
 fn test_byte_offset_to_line_col() {
     // (name, text, byte offset, expected (line, column))
@@ -205,10 +194,8 @@ fn test_byte_offset_to_line_col() {
         ("start", "hello\nworld", 0, (0, 0)),
         ("second_line", "hello\nworld", 6, (1, 0)),
         ("middle_of_line", "hello\nworld", 8, (1, 2)),
-        // Beyond the text length clamps to the end.
         ("beyond_end", "hello", 100, (0, 5)),
         ("empty", "", 0, (0, 0)),
-        // Empty content with an out-of-bounds offset clamps to the start.
         ("empty_beyond_end", "", 100, (0, 0)),
     ];
     for &(name, text, byte_offset, expected) in &cases {
@@ -259,13 +246,11 @@ impl EditorFixture {
         f
     }
 
-    /// Marks the active tab's content unsaved.
     fn unsaved(mut self) -> Self {
         self.active_tab_data().saved_text_hash = 0;
         self
     }
 
-    /// Installs a case-sensitive find/replace state on the active tab.
     fn find_replace(mut self, query: &str, matches: Vec<Range<usize>>, match_idx: usize) -> Self {
         self.active_tab_data().find_replace_state = Some(FindReplaceState {
             query: crate::gui::common::SingleLineEditorState::new(query),
@@ -289,8 +274,6 @@ impl EditorFixture {
         self.0
     }
 }
-
-// ── Tree keyboard navigation focus state tests ──────────────────
 
 fn make_editor_with_tree() -> EditorState {
     let mut state = EditorState::new();
@@ -472,8 +455,6 @@ fn test_async_dir_load_flow() {
     }
 }
 
-// ── Find/Replace tests ───────────────────────────────────────────
-
 #[test]
 fn test_find_bar_and_match_navigation() {
     type Build = fn() -> EditorState;
@@ -589,10 +570,7 @@ type ReplaceCase<'a> = (
 fn test_find_replace_auto_advance() {
     // (name, text, query, replace, expected text, expected matches)
     let cases: &[ReplaceCase] = &[
-        // Same-length replacement: remaining "ab" at 6..8 is found by advancing
-        // past replace_end (= 0 + 2 = 2).
         ("same_length", "ab cd ab", "ab", "xy", "xy cd ab", &[(6, 8)]),
-        // replace_end = 0 + 1 = 1. Remaining "aaa" at byte 6 in the new text.
         (
             "shorter_replacement",
             "aaa bbb aaa",
@@ -604,16 +582,13 @@ fn test_find_replace_auto_advance() {
         // Using range.end (= 2) as the advance point would skip the remaining
         // match at 1..3, replace_end (= 1) finds it.
         ("adjacent_matches", "aaaa", "aa", "x", "xaa", &[(1, 3)]),
-        // Longer replacement: replace_end = 3, so the remaining "ab" wraps to 0.
         ("longer_replacement", "ab", "ab", "abc", "abc", &[(0, 2)]),
-        // No remaining matches: matches reset to empty, cursor at replace_end.
         ("no_more_matches", "ab", "ab", "xy", "xy", &[]),
     ];
     let path = "/test.rs";
     for &(name, text, query, replace, expected_text, expected_matches) in cases {
         let mut state = EditorFixture::new().tab(path, text).build();
         let tab = state.tab_contents.get_mut(path).unwrap();
-        // The state before the replace holds every match the query has.
         tab.find_replace_state = Some(FindReplaceState {
             query: crate::gui::common::SingleLineEditorState::new(query),
             replace: crate::gui::common::SingleLineEditorState::new(replace),
@@ -644,8 +619,6 @@ fn test_find_replace_auto_advance() {
         assert_eq!(frs.current_match_idx, 0, "case {name}: current_match_idx");
     }
 }
-
-// ── Modal / overlay gating ───────────────────────────────────────
 
 #[expect(clippy::too_many_lines)]
 #[test]
@@ -828,8 +801,6 @@ fn test_overlay_gates_editor_shortcuts() {
     }
 }
 
-// ── Inline rename tests ────────────────────────────────────
-
 #[test]
 fn test_rename_request_and_input() {
     fn tree_state() -> EditorState {
@@ -890,7 +861,6 @@ fn test_rename_request_and_input() {
                 let _ = s.update(EditorMessage::RenameRequested("Cargo.toml".into()));
                 if let Some(ModalKind::Rename(rt)) = s.active_modal.as_mut() {
                     rt.error = Some("bad".into());
-                    // The buffer pre-fills with the file name; clear it before typing.
                     rt.input_text.set_text("");
                 }
                 let _ = s.update(EditorMessage::RenameInput(EditorAction::Paste(
@@ -1009,8 +979,6 @@ fn test_rename_cancel_and_mutual_exclusion() {
     }
 }
 
-// ── Rename validation tests ────────────────────────────────
-
 fn setup_rename_state(state: &mut EditorState, input_text: &str) {
     state.selected_workspace_path = Some("/tmp".to_string());
     let _ = state.update(EditorMessage::RenameRequested("Cargo.toml".into()));
@@ -1061,7 +1029,6 @@ fn test_rename_validation_os_reserved_names() {
 fn test_rename_validation_target_already_exists() {
     let tmp_dir = tempfile::tempdir().unwrap();
     let ws = tmp_dir.path().to_string_lossy().to_string();
-    // Create a file that would conflict.
     let existing = tmp_dir.path().join("existing.txt");
     std::fs::write(&existing, "").unwrap();
 
@@ -1086,24 +1053,19 @@ fn test_rename_validation_target_already_exists() {
 fn test_rename_stale_generation_discarded() {
     let mut state = make_editor_with_tree();
     state.selected_workspace_path = Some("/tmp".to_string());
-    // Expand src so it's visible for RenameRequested.
     state.file_tree.expanded_dirs.insert("src".to_string());
     state.rebuild_tree();
 
-    // Dispatch a rename for a non-root path (src/main.rs) so that the
-    // staleness check in RenameCompleted (which only applies when the
-    // parent dir is non-empty) is actually exercised.
+    // A non-root path (src/main.rs), so RenameCompleted's staleness check — which
+    // only applies to a non-empty parent dir — is exercised.
     let _ = state.update(EditorMessage::RenameRequested("src/main.rs".into()));
     if let Some(ModalKind::Rename(ref mut rt)) = state.active_modal {
         rt.input_text.set_text("lib.rs");
     }
     let _ = state.update(EditorMessage::RenameSubmit);
 
-    // Simulate a stale RenameCompleted whose rename_gen does not
-    // match the current dir_generations entry for the parent dir ("src").
-    // It passes dir_entries: Ok(vec![]) — if the staleness guard fails and
-    // this result is applied, it would overwrite dir_entries["src"] with
-    // an empty vec, losing the original children.
+    // A stale RenameCompleted (rename_gen mismatch) carrying dir_entries Ok(vec![]):
+    // if the guard fails, dir_entries["src"] is emptied and its children lost.
     let task = state.update(EditorMessage::RenameCompleted {
         old_path: "src/main.rs".into(),
         new_path: "src/lib.rs".into(),
@@ -1112,10 +1074,7 @@ fn test_rename_stale_generation_discarded() {
         dir_entries: Ok(vec![]),
         rename_gen: 0, // stale — doesn't match dir_generations["src"]
     });
-    // The stale result should be a no-op (discarded silently).
     let _ = task;
-    // dir_entries["src"] must still contain its original entries — if
-    // the stale result were applied, the empty vec would have replaced them.
     let src_entries = state.dir_entries.get("src");
     assert!(
         src_entries.is_some(),
@@ -1126,11 +1085,8 @@ fn test_rename_stale_generation_discarded() {
         assert_eq!(entries[0].name, "main.rs");
         assert_eq!(entries[0].full_path, "src/main.rs");
     }
-    // selected_file should not have been updated.
     assert_eq!(state.selected_file, None);
 }
-
-// ── rekey helpers ──────────────────────────────────────────
 
 type RebaseCase<'a> = (
     &'a str,
@@ -1178,7 +1134,7 @@ fn test_rebase_tree_key() {
     }
 }
 
-/// The absolute helpers split paths into components, so a trailing base separator still matches.
+/// The absolute helpers split paths into components, so a trailing base separator matches.
 #[test]
 fn test_abs_path_helpers_are_component_wise() {
     assert!(is_within_abs("C:/ws/a.txt", "C:/ws/"));
@@ -1272,24 +1228,17 @@ fn test_rekey_set_prefix_exact() {
 
 #[test]
 fn test_rename_dir_entries_migration_own_entry_and_full_path() {
-    // Verify that after a directory rename completes, the renamed
-    // directory's own dir_entries key is migrated (old_path -> new_path)
-    // and child entries have their full_path fields updated.
     let mut state = make_editor_with_tree();
     state.selected_workspace_path = Some("/tmp".to_string());
 
-    // Set up state as if the user expanded "src" and we have its children.
     state.file_tree.expanded_dirs.insert("src".to_string());
-    // Add a subdirectory entry for recursive testing.
     state.dir_entries.insert(
         "src/subdir".to_string(),
         vec![fs_entry("helper.rs", "src/subdir/helper.rs", false)],
     );
 
-    // Simulate a rename of "src" -> "lib" completing successfully.
-    // Pre-populate dir_generations so the staleness guard passes
-    // (rename_submit would have registered this generation before
-    // firing the async operation).
+    // "src" -> "lib", with dir_generations pre-populated so the staleness guard
+    // passes (`rename_submit` registers the generation before firing the operation).
     state.dir_generations.insert(String::new(), 0);
     let _ = state.update(EditorMessage::RenameCompleted {
         old_path: "src".into(),
@@ -1300,7 +1249,6 @@ fn test_rename_dir_entries_migration_own_entry_and_full_path() {
         rename_gen: 0,
     });
 
-    // The directory's own dir_entries entry should be migrated.
     assert!(
         !state.dir_entries.contains_key("src"),
         "old path key should be removed"
@@ -1310,13 +1258,11 @@ fn test_rename_dir_entries_migration_own_entry_and_full_path() {
         own_entries.is_some(),
         "new path key should exist for the renamed directory"
     );
-    // The own-key entry's children must have their full_path updated.
     if let Some(entries) = own_entries {
         assert_eq!(entries.len(), 1, "src had one child (main.rs)");
         assert_eq!(entries[0].full_path, "lib/main.rs");
     }
 
-    // The child directory entry should be migrated with updated full_path.
     let child_entries = state.dir_entries.get("lib/subdir");
     assert!(
         child_entries.is_some(),
@@ -1331,7 +1277,6 @@ fn test_rename_dir_entries_migration_own_entry_and_full_path() {
         }
     }
 
-    // The expanded_dirs should have been migrated.
     assert!(
         !state.file_tree.expanded_dirs.contains("src"),
         "old expanded_dir should be removed"
@@ -1363,8 +1308,6 @@ fn test_switch_tab_relative() {
         assert_eq!(state.active_tab_index, expected, "case {name}: active tab");
     }
 }
-
-// ── Directory forgetting (deleted directories) ─────────────────
 
 #[test]
 fn test_classify_read_dir_error_not_found_vs_other() {
@@ -1409,7 +1352,6 @@ fn make_editor_with_expanded_subdir() -> EditorState {
         "src/main.rs".to_string(),
         "src/sub/deep.rs".to_string(),
     ];
-    // Absolute-path-keyed caches (workspace root is "/tmp").
     state
         .file_mtimes
         .insert("/tmp/src/main.rs".to_string(), std::time::SystemTime::now());
@@ -1508,8 +1450,8 @@ fn test_dir_expanded_error_cases() {
 
 #[test]
 fn test_forget_directory_prunes_path_descendants_and_root() {
-    // Phase 1: forgetting a subdirectory prunes it and its descendants from
-    // every refresh/cache structure while preserving the parent's state.
+    // Phase 1: forgetting a subdirectory prunes it and its descendants while
+    // preserving the parent's state.
     let mut state = make_editor_with_expanded_subdir();
     state.dir_generations.insert(String::new(), 9); // parent (root) gen must survive
     state.forget_directory("src");
@@ -1524,12 +1466,10 @@ fn test_forget_directory_prunes_path_descendants_and_root() {
     assert_eq!(state.selected_file, None);
     assert_eq!(state.all_workspace_files, vec!["Cargo.toml".to_string()]);
 
-    // Root listing keeps unrelated entries but drops the deleted node.
     let root_entries = state.dir_entries.get("").unwrap();
     assert_eq!(root_entries.len(), 1);
     assert_eq!(root_entries[0].full_path, "Cargo.toml");
 
-    // Absolute-path-keyed caches are pruned as well.
     assert!(state.file_mtimes.is_empty());
     assert!(state.file_generations.is_empty());
     assert!(state.deleted_file_toasted.is_empty());
@@ -1543,9 +1483,8 @@ fn test_forget_directory_prunes_path_descendants_and_root() {
             .any(|(p, _)| p == "src")
     );
 
-    // Phase 2: forgetting the root (workspace itself gone) clears the whole
-    // tree — including the surviving root listing and, per the doc contract,
-    // the absolute-path-keyed caches under the workspace.
+    // Phase 2: forgetting the root clears the whole tree, including the surviving
+    // root listing and the absolute-path-keyed caches under the workspace.
     state
         .file_mtimes
         .insert("/tmp/Cargo.toml".to_string(), std::time::SystemTime::now());
@@ -1576,7 +1515,7 @@ fn test_forget_directory_prunes_path_descendants_and_root() {
 fn test_dir_deleted_cases() {
     type Check = fn(&EditorState) -> Result<(), String>;
 
-    /// The GUI-delete success path prunes the directory and registers a re-read.
+    /// Prunes the directory and registers a re-read.
     fn pruned_and_refreshed(state: &EditorState) -> Result<(), String> {
         let tree = &state.file_tree;
         for (what, kept) in [
@@ -1600,7 +1539,6 @@ fn test_dir_deleted_cases() {
             return Err("quick-open not pruned".to_string());
         }
 
-        // The parent (root) listing survives but no longer shows the deleted dir.
         let root_entries = state.dir_entries.get("").unwrap();
         if root_entries.iter().any(|e| e.full_path == "src") {
             return Err("root still lists src".to_string());
@@ -1612,7 +1550,6 @@ fn test_dir_deleted_cases() {
             return Err("root survivor".to_string());
         }
 
-        // A fresh generation slot for the parent re-read task was registered.
         if !state.dir_generations.contains_key("") {
             return Err("parent re-read not registered".to_string());
         }
@@ -1665,12 +1602,10 @@ fn test_dir_deleted_cases() {
 
 #[test]
 fn test_confirm_delete_dir_defers_prune_until_success() {
-    // ConfirmDelete starts the async remove_dir_all but must NOT prune tree
-    // state yet: if the delete fails (e.g. permission denied), the
-    // still-existing directory must be fully intact in the tree. The prune
-    // only happens in the DirDeleted success message, so asserting the tree
-    // is untouched at delete-start is the testable proxy for the failure
-    // path (the async task is not executed in tests).
+    // ConfirmDelete starts remove_dir_all but must NOT prune yet: a failed delete
+    // (e.g. permission denied) must leave the tree intact. The prune happens in
+    // DirDeleted, so an untouched tree at delete-start is the testable proxy for the
+    // failure path (the async task does not run in tests).
     let mut state = make_editor_with_expanded_subdir();
     state.active_modal = Some(ModalKind::DeleteConfirm(DeleteConfirmTarget {
         path: "src".to_string(),
@@ -1692,13 +1627,10 @@ fn test_confirm_delete_dir_defers_prune_until_success() {
     assert!(state.file_mtimes.contains_key("/tmp/src/main.rs"));
     assert!(state.file_generations.contains_key("/tmp/src/main.rs"));
 
-    // No orphaned parent generation: the dir-delete path registers the
-    // parent slot only when the delete succeeds (via DirDeleted).
+    // No orphaned parent generation: the slot is registered only on DirDeleted.
     assert!(!state.dir_generations.contains_key(""));
     assert_eq!(state.dir_generations.len(), 2); // fixture: "src" and "src/sub"
 }
-
-// ── Gitignore dimming (in-process matcher) ──────────────────────
 
 fn find_node<'a>(nodes: &'a [widgets::TreeNode], path: &str) -> &'a widgets::TreeNode {
     find_in_tree(nodes, path).unwrap_or_else(|| panic!("node not found in tree: {path}"))
@@ -1841,8 +1773,6 @@ fn test_matcher_covers_subdirectory_of_repo() {
         "no .git in the repo ancestry means nothing is dimmed"
     );
 }
-
-// ── Commit/staging mtime detector ───────────────────────────────
 
 /// Bump a file's mtime by rewriting it after a pause for coarse timestamps.
 fn bump_file_mtime(path: &Path) {

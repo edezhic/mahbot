@@ -1,31 +1,26 @@
 //! Pre-shrink consistency gate for reclaiming (TRUNCATE) WAL checkpoints.
 //!
-//! The engine derives that checkpoint's new main-file size from the page-1
-//! header (`database_size × page_size` — exactly the `PRAGMA page_count` asked
-//! for here) and truncates in place with no validation, so a store that answers
-//! 0 pages while its main file is non-empty or its WAL holds frames would be
-//! truncated to nothing. The engine answers 0 both for a header that declares no
-//! pages and for a header read it could not complete, so the record names both
-//! readings. Before any reclaiming checkpoint the product therefore compares that
-//! answer with the file sizes it already stats; an inconsistent or unusable
-//! answer — a panicking probe included — means it is NOT issued and the refusal
-//! is recorded loudly.
+//! The engine derives that checkpoint's new main-file size from the page-1 header (`database_size ×
+//! page_size` — exactly the `PRAGMA page_count` asked for here) and truncates in place with no
+//! validation, so a store that answers 0 pages while its main file is non-empty or its WAL holds
+//! frames would be truncated to nothing. The engine answers 0 both for a header that declares no
+//! pages and for a header read it could not complete, so the record names both readings. Before any
+//! reclaiming checkpoint the product therefore compares that answer with the file sizes it already
+//! stats; an inconsistent or unusable answer — a panicking probe included — means it is NOT issued
+//! and the refusal is recorded loudly.
 //!
-//! This is a consistency check, NOT store classification: what counts as a
-//! damaged store stays defined in [`crate::db::wal_guard`] alone. A refusal is
-//! likewise not a failure — it never enters the checkpoint failure/stop
-//! machinery, never marks the store unusable, is never counted as a failed
-//! attempt, and never triggers recovery.
+//! This is a consistency check, NOT store classification: what counts as a damaged store stays
+//! defined in [`crate::db::wal_guard`] alone. A refusal is likewise not a failure — it never enters
+//! the checkpoint failure/stop machinery, never marks the store unusable, is never counted as a
+//! failed attempt, and never triggers recovery.
 //!
-//! Nothing here opens a store file (wal_guard's lock rule): the answer is the
-//! store's own `PRAGMA page_count` plus [`std::fs::metadata`] stats. On a healthy
-//! store that is one pragma and two stats and changes nothing. Accepted
-//! boundaries: a refused round also leaves the WAL unreclaimed, because the
-//! engine couples the main-file shrink to the reclaiming mode (the service keeps
-//! serving and the round is reported); a write landing between the answer and the
-//! checkpoint, and a declared size that is individually plausible but stale, stay
-//! uncovered; and the engine can also truncate in place on an explicit connection
-//! close, which the product never issues.
+//! Nothing here opens a store file (wal_guard's lock rule): the answer is the store's own `PRAGMA
+//! page_count` plus [`std::fs::metadata`] stats. On a healthy store that is one pragma and two
+//! stats and changes nothing. Accepted boundaries: a refused round also leaves the WAL unreclaimed,
+//! because the engine couples the main-file shrink to the reclaiming mode (the service keeps
+//! serving and the round is reported); a write landing between the answer and the checkpoint, and a
+//! declared size that is individually plausible but stale, stay uncovered; and the engine can also
+//! truncate in place on an explicit connection close, which the product never issues.
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -38,12 +33,11 @@ use crate::db::failure_record::{self, FailureKind, FailureReport, RoundCounter};
 use crate::db::wal_guard::WAL_HEADER_BYTES;
 use crate::db::{OwnConnection, Value};
 
-/// One answer the gate asked for: the value, or why it could not be obtained.
-/// That text is what the durable record keeps.
+/// One answer the gate asked for: the value, or why it could not be obtained. That text is what the
+/// durable record keeps.
 type Answer<T> = Result<T, String>;
 
-/// The store's own answer, and the file sizes, that a reclaiming checkpoint
-/// would shrink from.
+/// The store's own answer, and the file sizes, that a reclaiming checkpoint would shrink from.
 #[derive(Debug)]
 struct ShrinkRefusal {
     /// The store's own answer; `None` when it could not be asked.
@@ -58,18 +52,17 @@ struct ShrinkRefusal {
 
 #[derive(Debug)]
 enum ShrinkRefusalCause {
-    /// The store answered zero pages while its main file is non-empty or its WAL
-    /// holds frames: the shrink would truncate it to nothing.
+    /// The store answered zero pages while its main file is non-empty or its WAL holds frames: the
+    /// shrink would truncate it to nothing.
     ZeroPagesWithData,
-    /// The store's own page count (or a file size it is compared against)
-    /// could not be obtained: the answer is not usable, so no shrink may run.
-    /// The payload names the failed probe.
+    /// The store's own page count (or a file size it is compared against) could not be obtained:
+    /// the answer is not usable, so no shrink may run. The payload names the failed probe.
     UnusableAnswer(String),
 }
 
 impl ShrinkRefusal {
-    /// A refusal from a probe that could not be trusted at all (it panicked):
-    /// nothing was measured, so the detail is the only thing the record carries.
+    /// A refusal from a probe that could not be trusted at all (it panicked): nothing was measured,
+    /// so the detail is the only thing the record carries.
     fn unusable(detail: String) -> Self {
         Self {
             page_count: None,
@@ -79,12 +72,11 @@ impl ShrinkRefusal {
         }
     }
 
-    /// Whether the refusal is an external condition rather than a finding about
-    /// the store's contents: a probe that could not answer because of a
-    /// resource/permission/lock condition, not because the store is damaged. An
-    /// unusable answer with no such signal stays unmarked — the record must not
-    /// rule damage out. A zero answer stays unmarked too: it may be a failed
-    /// header read (see the module docs), not evidence that the store is sound.
+    /// Whether the refusal is an external condition rather than a finding about the store's
+    /// contents: a probe that could not answer because of a resource/permission/lock condition, not
+    /// because the store is damaged. An unusable answer with no such signal stays unmarked — the
+    /// record must not rule damage out. A zero answer stays unmarked too: it may be a failed header
+    /// read (see the module docs), not evidence that the store is sound.
     fn is_environmental(&self) -> bool {
         match &self.cause {
             ShrinkRefusalCause::ZeroPagesWithData => false,
@@ -94,10 +86,9 @@ impl ShrinkRefusal {
         }
     }
 
-    /// One line for the durable record and the log. The measurements live in the
-    /// record's own field lines, so this is the decision, not a second copy of
-    /// the numbers — and it stands alone in `error.log`, which is why a zero
-    /// answer names both of its readings there.
+    /// One line for the durable record and the log. The measurements live in the record's own field
+    /// lines, so this is the decision, not a second copy of the numbers — and it stands alone in
+    /// `error.log`, which is why a zero answer names both of its readings there.
     fn reason(&self) -> String {
         match &self.cause {
             ShrinkRefusalCause::ZeroPagesWithData => "the store answers 0 pages while its files \
@@ -114,17 +105,16 @@ impl ShrinkRefusal {
     }
 }
 
-/// The gate's decision over the facts it collected. `None` = a reclaiming
-/// checkpoint may be issued. The only place a [`ShrinkRefusal`] is built from
-/// answers.
+/// The gate's decision over the facts it collected. `None` = a reclaiming checkpoint may be issued.
+/// The only place a [`ShrinkRefusal`] is built from answers.
 fn verdict(
     page_count: Answer<u64>,
     main_bytes: Answer<u64>,
     wal_bytes: Answer<u64>,
 ) -> Option<ShrinkRefusal> {
-    // An answer this gate cannot trust is itself a reason not to shrink: the
-    // check cannot vouch for the store, so the reclaiming checkpoint is
-    // withheld rather than risked. The real probe text is what the record keeps.
+    // An answer this gate cannot trust is itself a reason not to shrink: the check cannot vouch for
+    // the store, so the reclaiming checkpoint is withheld rather than risked. The real probe text
+    // is what the record keeps.
     let errors: Vec<&str> = [&page_count, &main_bytes, &wal_bytes]
         .into_iter()
         .filter_map(|answer| answer.as_ref().err().map(String::as_str))
@@ -148,19 +138,16 @@ fn verdict(
     })
 }
 
-/// The size of `path` in bytes: absent is 0 (a store without a WAL has nothing
-/// to reclaim), any other stat failure is an unusable answer.
 fn stat_bytes(path: &Path, what: &str) -> Answer<u64> {
     crate::db::wal_guard::stat_size(path).map_err(|e| format!("{what} stat failed: {e}"))
 }
 
-/// Ask the store for its own page count and compare it with the file sizes the
-/// product already stats. `Some(_)` = a reclaiming checkpoint must not be
-/// issued. Reads no store bytes (wal_guard's lock rule). Upkeep: the probe is
-/// what decides whether the compaction may run, so it asks the connection that
-/// will run that compaction ([`OwnConnection`]) rather than a reader whose
-/// snapshot could lag the frames the very next statement tries to fold. The
-/// gate's protection is exactly that both come from ONE connection.
+/// Ask the store for its own page count and compare it with the file sizes the product already
+/// stats. `Some(_)` = a reclaiming checkpoint must not be issued. Reads no store bytes (wal_guard's
+/// lock rule). Upkeep: the probe is what decides whether the compaction may run, so it asks the
+/// connection that will run that compaction ([`OwnConnection`]) rather than a reader whose snapshot
+/// could lag the frames the very next statement tries to fold. The gate's protection is exactly
+/// that both come from ONE connection.
 async fn probe(conn: &impl OwnConnection) -> Option<ShrinkRefusal> {
     let page_count = match conn.own_query("PRAGMA page_count;").await {
         Ok(rows) => match rows.first().map(|row| row.get_value(0)) {
@@ -174,9 +161,9 @@ async fn probe(conn: &impl OwnConnection) -> Option<ShrinkRefusal> {
     verdict(page_count, main_bytes, wal_bytes)
 }
 
-/// The store's answer as the gate must read it: only a non-negative integer is
-/// usable, so a negative or non-integer value and a failed read each come back
-/// as the reason the answer cannot be trusted.
+/// The store's answer as the gate must read it: only a non-negative integer is usable, so a
+/// negative or non-integer value and a failed read each come back as the reason the answer cannot
+/// be trusted.
 fn page_count_value(value: Result<Value, ::turso::Error>) -> Answer<u64> {
     match value {
         Ok(Value::Integer(n)) => {
@@ -189,22 +176,20 @@ fn page_count_value(value: Result<Value, ::turso::Error>) -> Answer<u64> {
     }
 }
 
-/// Per-refusing-file count of rounds whose reclaiming checkpoint was refused,
-/// for the process's lifetime.
+/// Per-refusing-file count of rounds whose reclaiming checkpoint was refused, for the process's
+/// lifetime.
 static REFUSAL_ROUNDS: RoundCounter = RoundCounter::new();
 
-/// Record a refused shrink loudly: the first refusal of a store file in this
-/// process files a durable block (the record survives where the ordinary log may
-/// already be gone), every further round only warns with the running count. Filed
-/// once per condition ([`failure_record::record`]).
+/// Record a refused shrink loudly: the first refusal of a store file in this process files a
+/// durable block (the record survives where the ordinary log may already be gone), every further
+/// round only warns with the running count. Filed once per condition ([`failure_record::record`]).
 ///
-/// `store` names the logical store; `db_path` is the main file actually checked
-/// — the path of the connection that runs the checkpoint ([`OwnConnection::db_path`]):
-/// the writing connection for the boot repair, the store's maintenance
-/// connection for the periodic round — and it keys the count, so a probe of
-/// another file — the boot rebuild's temp copy — never consumes this one's
-/// first-refusal slot. `root` is the storage root the block is filed under
-/// (`None` when unresolvable, in which case the block goes to stderr).
+/// `store` names the logical store; `db_path` is the main file actually checked — the path of the
+/// connection that runs the checkpoint ([`OwnConnection::db_path`]): the writing connection for the
+/// boot repair, the store's maintenance connection for the periodic round — and it keys the count,
+/// so a probe of another file — the boot rebuild's temp copy — never consumes this one's
+/// first-refusal slot. `root` is the storage root the block is filed under (`None` when
+/// unresolvable, in which case the block goes to stderr).
 fn record_refusal(
     store: &'static str,
     db_path: &Path,
@@ -243,9 +228,9 @@ fn record_refusal(
     failure_record::record_and_point(root, "reclaiming checkpoint refused", &report);
 }
 
-/// Probe and, on a refusal, record it loudly; `true` = a reclaiming checkpoint
-/// may be issued. `root` is the storage root the refusing store's durable block
-/// is filed under (the caller passes the root it already resolved).
+/// Probe and, on a refusal, record it loudly; `true` = a reclaiming checkpoint may be issued.
+/// `root` is the storage root the refusing store's durable block is filed under (the caller passes
+/// the root it already resolved).
 pub(crate) async fn shrink_allowed(
     conn: &impl OwnConnection,
     store: &'static str,
@@ -254,14 +239,12 @@ pub(crate) async fn shrink_allowed(
     shrink_allowed_inner(probe(conn), conn, store, root).await
 }
 
-/// The gate over a probe's answer: `true` = a reclaiming checkpoint may be
-/// issued; a refusal is recorded loudly first. A probe that panics is an answer
-/// that cannot be trusted and is refused like any other — the panic never
-/// unwinds into the caller or becomes a checkpoint failure.
+/// The gate over a probe's answer: `true` = a reclaiming checkpoint may be issued; a refusal is
+/// recorded loudly first. A probe that panics is an answer that cannot be trusted and is refused
+/// like any other — the panic never unwinds into the caller or becomes a checkpoint failure.
 ///
-/// `probe` is a parameter, and this module's only seam, because a panicking
-/// probe is not otherwise producible: [`shrink_allowed`] is the single caller
-/// and always passes the real probe.
+/// `probe` is a parameter, and this module's only seam, because a panicking probe is not otherwise
+/// producible: [`shrink_allowed`] is the single caller and always passes the real probe.
 async fn shrink_allowed_inner<F>(
     probe: F,
     conn: &impl OwnConnection,
@@ -289,9 +272,8 @@ where
 mod tests {
     use super::*;
 
-    /// The gate's pure decision over exhaustive (page count, main size, WAL
-    /// size) combinations: it refuses exactly the states a reclaiming checkpoint
-    /// would destroy, or that it cannot trust.
+    /// The gate's pure decision over exhaustive (page count, main size, WAL size) combinations: it
+    /// refuses exactly the states a reclaiming checkpoint would destroy, or that it cannot trust.
     #[test]
     #[expect(clippy::too_many_lines)] // one table-driven case per behavior
     fn verdict_refuses_only_states_a_shrink_would_destroy_or_cannot_trust() {
@@ -425,10 +407,9 @@ mod tests {
         }
     }
 
-    /// The store's own answer is read strictly: only a non-negative integer is
-    /// usable, and every other shape — a negative value, a non-integer value, a
-    /// failed read — is a reason to withhold the shrink, carrying the text the
-    /// durable record keeps.
+    /// The store's own answer is read strictly: only a non-negative integer is usable, and every
+    /// other shape — a negative value, a non-integer value, a failed read — is a reason to withhold
+    /// the shrink, carrying the text the durable record keeps.
     #[test]
     fn an_unusable_page_count_answer_is_refused_rather_than_read() {
         assert_eq!(page_count_value(Ok(Value::Integer(7))), Ok(7));
@@ -445,11 +426,11 @@ mod tests {
         assert!(read.contains("the page count read failed"), "{read:?}");
     }
 
-    /// The first refusal of a store file in the process files one durable block
-    /// with every measured field, in the shape the other per-store blocks use;
-    /// later refusals only count. The block must not read as a checkpoint failure
-    /// — a refusal is not one — and a probe that could not answer for an external
-    /// condition carries the environment note instead of the finding's shape.
+    /// The first refusal of a store file in the process files one durable block with every measured
+    /// field, in the shape the other per-store blocks use; later refusals only count. The block
+    /// must not read as a checkpoint failure — a refusal is not one — and a probe that could not
+    /// answer for an external condition carries the environment note instead of the finding's
+    /// shape.
     #[test]
     fn refusal_is_recorded_once_and_is_not_a_checkpoint_failure() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
@@ -492,9 +473,9 @@ mod tests {
             );
         }
 
-        // A probe that could not answer because of an external condition (here:
-        // lock contention) is marked as environment-caused, so an environmental
-        // refusal is not read as evidence about the store.
+        // A probe that could not answer because of an external condition (here: lock contention) is
+        // marked as environment-caused, so an environmental refusal is not read as evidence about
+        // the store.
         let environmental = verdict(
             Ok(3),
             Ok(20_480),
@@ -514,9 +495,9 @@ mod tests {
         );
     }
 
-    /// A probe that panics is an answer that cannot be trusted: the gate refuses
-    /// the shrink, records the panic as the refusal's reason, and never unwinds
-    /// into the caller — a panicking probe is not a checkpoint failure.
+    /// A probe that panics is an answer that cannot be trusted: the gate refuses the shrink,
+    /// records the panic as the refusal's reason, and never unwinds into the caller — a panicking
+    /// probe is not a checkpoint failure.
     #[tokio::test]
     async fn a_panicking_probe_is_refused_and_recorded() {
         let tmp = tempfile::TempDir::new().expect("temp dir");

@@ -1,49 +1,25 @@
 //! Command-line frontends onto the RUNNING product.
 //!
-//! A command line here is not a second implementation of anything: `mahbot
-//! config …`, `mahbot workspace …` and `mahbot send …` carry the operation into
-//! the instance that is already up, where it is executed by the very tool an
-//! agent's assistant calls — the same validation, and for the setting families
-//! the same immediate effect on the live product (a `send` hands its message to
-//! an agent, one-way, and the answer arrives in the owner's own assistant
-//! conversation). `mahbot document …`, `mahbot image …`, `mahbot video …` and
-//! `mahbot rasterize …` do the same for the product's producing tools — the
-//! document tool, the picture tool, the two video tools and the rasterizer — so a
-//! script reaches a document or a PDF, a picture, a clip and a rendered picture
-//! with the very operations the assistant has, the same values, limits and mutual
-//! exclusions, and the account's own model choice. The document family also runs
-//! the product's own READER as its `read`: the very reading the `read` tool
-//! performs, with the whole text and every image written out. The frontend never
-//! opens or writes a store itself, so there is no second writer and no second
-//! copy of any rule.
+//! A family here is no second implementation: `mahbot config …`,
+//! `mahbot workspace …`, `mahbot send …` and the producing families (`document`,
+//! `image`, `video`, `rasterize`, plus the document family's own `read`) carry
+//! the operation into the live instance, where the very tool an agent calls runs
+//! it — the same validation and limits, and the same immediate effect on the
+//! product (a `send` hands its message to an agent one-way). No store is opened
+//! or written here, so there is no second writer and no second copy of any rule.
 //!
-//! What the producing families add is a destination: where the produced files
-//! go is the COMMAND LINE's own operand, carried beside the operation's own
-//! values and never an argument of the tool (see [`FlagKind::Destination`]) —
-//! the one flag outside the rule that every flag is an argument the tool reads.
-//! The agents keep writing where they always wrote and are told nothing new; the
-//! command line acts as the machine's owner, so the files land where that owner
-//! asks, and it refuses a destination the product's own cleanup would later
-//! empty ([`resolve_output_dir`]).
+//! A producing family adds a destination — the COMMAND LINE's own operand, never
+//! a tool argument ([`FlagKind::Destination`]), refused where the product's own
+//! cleanup would later empty it ([`resolve_output_dir`]) — and takes the
+//! CALLER's paths: relative to this command's directory, `~` against home, a
+//! reference file that is missing or unreadable refused as misuse before
+//! anything is sent ([`caller_path`], [`resolve_embedded_paths`]).
 //!
-//! The paths a producing family takes are the CALLER's, and they are resolved
-//! where the caller is rather than where the product runs: a relative one in the
-//! directory this command was run in, `~` against the home directory, and a
-//! reference file that is not there or cannot be read refused as the caller's own
-//! misuse, before anything is sent ([`caller_path`] — a picture a structured
-//! value carries included, see [`resolve_embedded_paths`]).
-//!
-//! This file holds the instance's own readiness signal — whether operations may
-//! be served at all, and the waiter the instance side blocks on — plus the
-//! execution entry point in [`instance`], and the frontend's own command line:
-//! the family registry that ties every sub-command to the tool it runs (an
-//! operation per action, the tool's own name where it takes no action, the
-//! family word itself where the family IS the operation, or the product's own
-//! reader — [`DOCUMENT_READ`]), the command table that resolves a launch's first
-//! word to its [`EntryPoint`] ([`entry_point`]), the argv parsing under it, the
-//! help, and the [`Exit`] classes a script reads. The flag grammar itself is
-//! [`grammar`], which `mahbot audio` reads too — the browser-automation command
-//! and the OpenRouter benchmark read their own flags and word their own refusals.
+//! Also here: the readiness signal and its waiter, the execution entry point
+//! ([`instance`]), the family registry, the command table ([`entry_point`]), argv
+//! parsing, help and [`Exit`]. The flag grammar is [`grammar`], which `mahbot audio`
+//! reads too; the browser-automation command and the OpenRouter benchmark read
+//! their own flags and word their own refusals.
 
 pub(crate) mod grammar;
 pub(crate) mod instance;
@@ -54,15 +30,10 @@ use std::sync::OnceLock;
 use crate::db::ipc::{CallAttempt, CallOutcome, CallRequest};
 use crate::util::lock::InstanceLockState;
 
-/// The product's top-level `--help` text: every public entry point, the
-/// command-line families among them.
-///
-/// It lives beside the family registry rather than in the binary so that the
-/// check that every entry point is listed runs in the library's own test lane
-/// (`every_entry_point_resolves_and_is_listed_in_the_top_level_usage`) — one
-/// reachable only by someone who already knew its word would not be an entry
-/// point. The command table that refuses an unknown word ([`entry_point`]) lives
-/// there for the same reason.
+/// The product's top-level `--help` text: every public entry point, the command-line
+/// families among them. It lives beside the registry so the tie that every entry
+/// point is listed runs in the library's test lane
+/// (`every_entry_point_resolves_and_is_listed_in_the_top_level_usage`).
 pub const TOP_LEVEL_USAGE: &str = "\
 mahbot — autonomous agentic engineering system with a GUI dashboard daemon
 
@@ -101,13 +72,10 @@ Options:
   -h, --help             Print this help and exit
   -V, --version          Print the version and exit";
 
-/// The transport tag the command line's own operations are attributed to. The
-/// one-way `send` presents a message to the owner's assistant over it — an
-/// incoming message from the owner like any other, mirroring to his Telegram as
-/// one of his own and reaching the history the way a message he typed into the
-/// dashboard (`gui`) or spoke (`voice`) does. The tag is the product's own
-/// record: it tells a shell-sent message apart from those, and never reaches the
-/// message.
+/// The transport tag the command line's own operations are attributed to: the
+/// one-way `send` reaches the history as a message the owner typed (`gui`) or
+/// spoke (`voice`) does, but recorded as shell-sent. It never reaches the
+/// message itself.
 pub(crate) const CHANNEL: &str = "cli";
 
 /// Whether this instance can serve a command-line operation.
@@ -115,17 +83,15 @@ pub(crate) const CHANNEL: &str = "cli";
 enum ServiceState {
     /// The instance is still bringing itself up.
     Starting,
-    /// The instance finished starting: it is the whole product, and an
-    /// operation may be served.
+    /// It finished starting: the whole product, so an operation may be served.
     Ready,
     /// The instance did not finish starting up: it can never serve one.
     Unavailable,
 }
 
-/// The instance's own service state, as a `watch` so a waiter is woken the
-/// moment it changes. A `OnceLock` because there is exactly one instance per
-/// process and this sender never drops, so a subscriber always has a live
-/// counterpart.
+/// The instance's own service state, as a `watch` so a waiter wakes the moment it
+/// changes. A `OnceLock` because one process is one instance and this sender
+/// never drops, so a subscriber always has a live counterpart.
 static SERVICE: OnceLock<tokio::sync::watch::Sender<ServiceState>> = OnceLock::new();
 
 fn service_sender() -> &'static tokio::sync::watch::Sender<ServiceState> {
@@ -148,39 +114,28 @@ pub(crate) enum ServiceGate {
     Ready,
     /// The boot failed: operations can never be served here.
     Unavailable,
-    /// The instance began shutting down — before it finished starting, or after:
-    /// nothing ran, so the caller may retry.
+    /// The instance began shutting down: nothing ran, so the caller may retry.
     NotAccepted,
-    /// The instance neither finished starting nor reported a failed boot within
-    /// [`SERVICE_READY_TIMEOUT`] — a wedged boot. Nothing ran, so the caller is
-    /// told so instead of being held forever.
+    /// Neither finished nor failed within [`SERVICE_READY_TIMEOUT`] — a wedged
+    /// boot. Nothing ran, so the caller is told instead of being held forever.
     StillStarting,
 }
 
 /// How long an operation waits for the instance to finish starting before it is
-/// refused. The wait for the product to come up has to be bounded — a wedged
-/// boot would otherwise hold the caller with no answer and no way to tell it is
-/// waiting — while the OPERATION itself, once the instance has taken it on, is
-/// never given up on.
+/// refused: a wedged boot must not hold the caller with no answer. Once the instance
+/// has taken the operation on, it is never given up on.
 const SERVICE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Wait until this instance can serve a command-line operation.
 ///
-/// An operation must not be served before [`mark_ready`]: until that point the
-/// product is not the WHOLE product — a `mahbot_config` action or a workspace
-/// registration is a side effect that routes into the message pipeline, and
-/// landing it in a half-built instance would act on something that is not yet
-/// there. Waiting is the honest answer.
-///
-/// The caller is never simply dropped while it waits: the wait resolves on
-/// `Ready`, on `Unavailable` (the boot failed, so a frontend must not hang
-/// forever on an instance that can never serve it), on
-/// [`StillStarting`](ServiceGate::StillStarting) after [`SERVICE_READY_TIMEOUT`],
-/// or when the shutdown token fires — before `Ready` as well as while starting,
-/// since an exit already under way must not begin new work — where
-/// [`NotAccepted`] carries nothing run, so the caller may retry safely.
-///
-/// [`NotAccepted`]: ServiceGate::NotAccepted
+/// Nothing is served before [`mark_ready`]: until then the product is not the
+/// WHOLE product, and a `mahbot_config` action or a workspace registration would
+/// land in a half-built instance. The caller is never simply dropped: the wait
+/// resolves on `Ready`, on `Unavailable`, on
+/// [`StillStarting`](ServiceGate::StillStarting) after [`SERVICE_READY_TIMEOUT`], or
+/// when the shutdown token fires — where
+/// [`NotAccepted`](ServiceGate::NotAccepted) carries nothing run, so the caller
+/// may retry safely.
 pub(crate) async fn wait_for_service() -> ServiceGate {
     let mut rx = service_sender().subscribe();
     let shutdown = crate::shutdown::shutdown_token();
@@ -189,8 +144,7 @@ pub(crate) async fn wait_for_service() -> ServiceGate {
     tokio::pin!(bound);
     loop {
         // The product has begun its exit: nothing new is taken on, whatever the
-        // state says — an operation must not start under an exit already under
-        // way (nothing ran, so the caller may retry).
+        // state says (nothing ran, so the caller may retry).
         if shutdown.is_cancelled() {
             return ServiceGate::NotAccepted;
         }
@@ -202,9 +156,8 @@ pub(crate) async fn wait_for_service() -> ServiceGate {
         tokio::select! {
             changed = rx.changed() => {
                 if changed.is_err() {
-                    // The sender is a process-lifetime static; a dropped one
-                    // means the process is tearing down, where nothing can be
-                    // served.
+                    // A process-lifetime static that dropped means the process is
+                    // tearing down, where nothing can be served.
                     return ServiceGate::NotAccepted;
                 }
             }
@@ -218,48 +171,29 @@ pub(crate) async fn wait_for_service() -> ServiceGate {
     }
 }
 
-// ── The exit classes ──────────────────────────────────────────────
-
 /// The exit-code classes a command line here separates — the same numbering the
-/// browser-automation command and `mahbot audio` use: success, a failed
-/// operation, the environment, and the command's own misuse.
+/// browser-automation command and `mahbot audio` use.
 ///
-/// What separates [`Usage`](Exit::Usage) from [`Failed`](Exit::Failed) is who
-/// judges. Misuse covers what a frontend can settle without the target at all: a
-/// word no family, operation or entry point has, a flag the operation does not
-/// take, a flag with no value after it, a token that is not a flag at all, an
-/// argument that is not valid text — and, for a frontend that opens the files
-/// itself, what the filesystem says about the paths it was handed: an input that
-/// is missing, is not a regular file, or cannot be read; a destination directory
-/// that is not there; a destination that is already taken. Everything the TARGET
-/// of the command judges is a failed operation instead: a value the tool does not
-/// accept, an argument the tool finds missing, a refusal the tool returns, an
-/// operation it carried out only in part.
-///
-/// A frontend that only CARRIES the operation to a running product — this one,
-/// over IPC — holds no copy of the target's own rules (see the module doc), so
-/// it must never guess at one and call it misuse: a wrong class would make a
-/// script skip a real refusal or keep retrying a malformed invocation. A frontend
-/// that RUNS the target in its own process — `mahbot audio` — may judge the
-/// closed vocabulary that target publishes — voice and language names, the audio
-/// formats it takes, the one container it writes, text that says nothing — as the
-/// caller's own misuse, because there the rule is data the frontend reads rather
-/// than a guess. What the classes mean for a given family is said by that
-/// family's own help.
+/// Who judges separates misuse from failure. Misuse is what a frontend settles
+/// without the target: a word or flag nobody has, a flag with no value, a token
+/// that is no flag, an argument that is not text — and, for a frontend that opens
+/// files itself, the filesystem's verdict on the paths it was handed. Everything
+/// the TARGET judges is a failed operation instead. A frontend that only CARRIES
+/// the operation (this one) holds no copy of the target's rules, so it never
+/// guesses a class; `mahbot audio`, which RUNS its target, may judge that target's
+/// published vocabulary as misuse. Each family's help says what its classes mean.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Exit {
     /// The operation was carried out.
     Ok = 0,
-    /// The operation was not carried out, was carried out only in part, or its
-    /// outcome could not be confirmed after the call went out (it may have been
-    /// carried out, which is never the environment's class).
+    /// Not carried out, carried out only in part, or an outcome unknowable after
+    /// the call went out (it may have happened — never the environment's class).
     Failed = 1,
     /// Nothing ran: the environment — the instance, the engine, its models —
     /// could not take the operation on. The environment, not the operation.
     Environment = 2,
-    /// The caller's own mistake: an invocation that cannot mean what it asks, and
-    /// — for a frontend that opens the files itself — the paths it was handed, as
-    /// the filesystem itself judges them (see the class's own doc for the line).
+    /// The caller's own mistake: an invocation that cannot mean what it asks, and —
+    /// for a frontend that opens the files itself — the paths it was handed.
     Usage = 3,
 }
 
@@ -270,20 +204,16 @@ impl Exit {
     }
 }
 
-// ── The family / operation / flag registry ────────────────────────
-
-/// One command-line family: the frontend onto a capability of the product — one
+/// One command-line family: the frontend onto one capability of the product — one
 /// of its tools, or the pair of tools that share a capability.
 pub(crate) struct Family {
     /// The command-line word (`mahbot <word> …`).
     pub(crate) word: &'static str,
-    /// The product tools this family fronts, in the order its help lists them:
-    /// one for most families, and both video tools where a capability is split
-    /// across two.
+    /// The product tools this family fronts, in the order its help lists them —
+    /// both video tools where a capability is split across two.
     pub(crate) tools: &'static [&'static str],
     /// The protocol value this family's operation frames carry: the generation of
-    /// the command line's surface it needs. A family the channel has already
-    /// served carries the value
+    /// the surface it needs. A family the channel has already served carries
     /// [`CALL_STORE_BASE`](crate::db::ipc::CALL_STORE_BASE) and keeps working
     /// against a product one build behind; a family this build adds carries the
     /// current one, so a product that does not know it refuses the call as the
@@ -298,14 +228,12 @@ pub(crate) struct Family {
 
 /// What follows a family's word on the command line.
 pub(crate) enum Surface {
-    /// `mahbot <word> <operation> [flags]`: one operation per command-line
-    /// sub-command, each running one of the family's tools — under the tool's own
-    /// `action` where it has one, and as the tool itself where it has none — or,
-    /// in one case, the product's own reader ([`DOCUMENT_READ`]).
+    /// `mahbot <word> <operation> [flags]`: one operation per sub-command, each
+    /// running one of the family's tools — or, in one case, the product's own
+    /// reader ([`DOCUMENT_READ`]).
     Operations(&'static [Operation]),
-    /// The family IS its operation: `mahbot <word> [flags]`, no operation word
-    /// at all. The single tool the family fronts takes no `action`, and the args
-    /// it is handed carry no `action` key.
+    /// The family IS its operation: `mahbot <word> [flags]`, no operation word at
+    /// all, and the args carry no `action` key.
     Standalone(&'static [Flag]),
 }
 
@@ -315,9 +243,8 @@ pub(crate) struct Operation {
     /// The tool this operation runs — one of the family's own.
     pub(crate) tool: &'static str,
     /// The tool's own `action` value, or `None` where the tool takes no action
-    /// (the picture tool and both video tools): the operation then IS that tool,
-    /// and the args it is handed carry no `action` key. [`DOCUMENT_READ`] is the
-    /// one action no tool holds: the instance reads it as the product's reader.
+    /// (the picture tool and both video tools): the operation then IS that tool.
+    /// [`DOCUMENT_READ`] is the one action no tool holds.
     pub(crate) action: Option<&'static str>,
     /// One line for the family's help and the operation's own help.
     pub(crate) purpose: &'static str,
@@ -326,10 +253,9 @@ pub(crate) struct Operation {
 }
 
 /// The sub-command word of one operation, derived rather than written down so a
-/// sub-command can never be spelled a way its tool or action is not: the
-/// operation's action with `_` written `-` (`fill_template` → `fill-template`),
-/// or — for a tool that takes no action — the tool's own name with the family
-/// word it carries dropped (`image_gen` in `image` → `gen`).
+/// sub-command can never be spelled a way its tool or action is not: the action
+/// with `_` written `-` (`fill_template` → `fill-template`), or the tool's own
+/// name with the family word dropped (`image_gen` in `image` → `gen`).
 fn operation_word(family: &Family, operation: &Operation) -> String {
     match operation.action {
         Some(action) => action.replace('_', "-"),
@@ -342,17 +268,17 @@ fn operation_word(family: &Family, operation: &Operation) -> String {
     }
 }
 
-/// The argument carrying the picture tool's generations. Its flags are each one
-/// generation's own setting, and this command always asks for exactly one picture, so
-/// it builds that generation itself — every other tool's flags ARE its arguments.
+/// The argument carrying the picture tool's generations: its flags are one
+/// generation's own settings, so this command builds the single generation it
+/// asks for itself — every other tool's flags ARE its arguments.
 const GENERATIONS_ARG: &str = "generations";
 
 /// Fold the picture tool's flat flags into the one generation this command asks for,
-/// with the prompt left beside it and a flag left out left out of the generation too,
-/// where the tool reads it as unset.
+/// with the prompt left beside it and a flag left out left out of the generation
+/// too, where the tool reads it as unset.
 fn fold_one_generation(args: &mut serde_json::Value) {
-    /// The settings one picture's generation carries — the tool schema's own entries,
-    /// held to them by the tie in the tests.
+    /// The settings one picture's generation carries — the tool schema's own
+    /// entries, held to them by the tie in the tests.
     const GENERATION_SETTINGS: &[&str] = &["images", "aspect_ratio", "size"];
     let Some(map) = args.as_object_mut() else {
         return;
@@ -370,10 +296,9 @@ fn fold_one_generation(args: &mut serde_json::Value) {
 }
 
 /// Whether this family's operations produce FILES — derived from the flags the
-/// registry already carries rather than stated a second time: a producing
-/// family's every operation carries the destination flag
-/// ([`FlagKind::Destination`]) and no other family carries one anywhere, which
-/// is what the registry test holds.
+/// registry already carries rather than stated a second time: every operation of a
+/// producing family carries the destination flag ([`FlagKind::Destination`]) and no
+/// other family carries one anywhere, which is what the registry test holds.
 #[must_use]
 fn produces_files(family: &Family) -> bool {
     match family.surface {
@@ -388,11 +313,9 @@ fn produces_files(family: &Family) -> bool {
 }
 
 /// The words a family answers to, as a usage line states them: the operations'
-/// own sub-command words where the family's tools take no `action` at all (the
-/// picture tool's one, the two video tools'), so the line names the words it
-/// really answers to; `<operation>` where an `action` picks one of many; and
-/// `[flags]` alone where the family IS its operation. Derived from the registry,
-/// so no help can advertise a word the command line no longer answers to
+/// own sub-command words where the family's tools take no `action`, `<operation>`
+/// where an `action` picks one, `[flags]` alone where the family IS its
+/// operation — derived from the registry, so no help can advertise a stale word
 /// (`every_entry_point_is_listed_in_the_top_level_usage`).
 #[must_use]
 fn family_syntax(family: &Family) -> String {
@@ -419,15 +342,15 @@ fn family_syntax(family: &Family) -> String {
 
 /// One flag of one operation: the tool argument it fills.
 pub(crate) struct Flag {
-    /// The tool's own argument name; the command-line spelling is derived from
-    /// it (`ticket_id` → `--ticket-id`), so a flag can never be spelled a way
-    /// the tool does not read. The one exception is the destination flag
+    /// The tool's own argument name; the command-line spelling is derived from it
+    /// (`ticket_id` → `--ticket-id`), so a flag can never be spelled a way the tool
+    /// does not read. The exception is the destination flag
     /// ([`FlagKind::Destination`]), whose name is the command line's own.
     pub(crate) arg: &'static str,
     /// How a value reaches the argument.
     pub(crate) kind: FlagKind,
     /// A value the caller hands over as a secret: never echoed, recorded or
-    /// answered back (the instance removes it from everything it reports).
+    /// answered back.
     pub(crate) secret: bool,
     /// One line for the operation's help.
     pub(crate) purpose: &'static str,
@@ -435,79 +358,60 @@ pub(crate) struct Flag {
 
 /// How a flag carries its value — the shape of the tool argument it fills.
 ///
-/// Two spellings of a value are this command line's own, read the same way by
-/// every kind that carries one: a value written `./@…` is the literal text that
-/// begins with `@` (the `./` is dropped and nothing is read), and — for the kinds
-/// that say so ([`Self::has_file_form`]) — a value written `@<file>` IS what that
-/// file holds. The escape exists because a text value may legitimately begin with
-/// `@` (a prompt naming someone), which is also the only spelling a file name
-/// cannot be confused with.
-///
-/// A kind whose value names a path also RESOLVES it (see [`caller_path`]): a
-/// `Path` its one value, a `PathList` every entry, a `Structured` every string the
-/// fields it carries name.
+/// Two spellings are this command line's own, read the same way by every kind
+/// that carries one: `./@…` is the literal text beginning with `@` (the escape
+/// exists because a text value may legitimately begin with it), and — for the
+/// kinds that say so ([`Self::has_file_form`]) — `@<file>` IS what that file
+/// holds. A kind whose value names a path also RESOLVES it (see [`caller_path`]):
+/// a `Path` its one value, a `PathList` every entry, a `Structured` every string
+/// the fields it carries name.
 pub(crate) enum FlagKind {
-    /// One value per occurrence: `--name bob`. The value is read as text, or —
-    /// like the list and structure kinds below — taken from a FILE by writing
-    /// `@<file>`, so a text too long for one command line travels whole.
+    /// One value per occurrence: `--name bob`, read as text or — like the kinds
+    /// below — taken from a FILE by writing `@<file>`.
     Value,
     /// One value per occurrence that NAMES A FILE on this machine
-    /// (`--path report.pdf`): a string argument like [`Value`](Self::Value),
-    /// whose value the command line resolves before it is sent — a relative one
-    /// in the directory this command was run in, and `~` against the home
-    /// directory — so the operation opens the file the caller meant. The product
-    /// has its own working directory, and a relative path sent on as written
-    /// would name a different file there. Reference material must also be there
-    /// and readable: a path that is not is the caller's own misuse, while a
-    /// public URL — which only the product can fetch — is left to the product.
+    /// (`--path report.pdf`), resolved before it is sent: a relative one in the
+    /// directory this command was run in, and `~` against the home directory. The
+    /// product has a working directory of its own, and a relative path sent on
+    /// would name a different file there. It must also be there and readable —
+    /// that is the caller's misuse, while a URL is left to the product.
     /// No `@<file>` form: the value already names the file.
     Path,
-    /// One NUMBER per occurrence, for a tool argument that is an integer or a
-    /// real (`--duration 8`). A value that is no JSON number is sent on verbatim
-    /// as the text it is, so the tool's own refusal — not this frontend's — is
-    /// what the caller gets: whether a value is one the tool accepts is the
+    /// One NUMBER per occurrence (`--duration 8`). A value that is no JSON number
+    /// travels as the text it is, so the tool's own refusal — not this
+    /// frontend's — is what the caller gets: whether a value is acceptable is the
     /// tool's to judge.
     Number,
-    /// Repeatable, one array entry per occurrence, for an array-of-texts
-    /// argument (`--tools analyze:quick,deep --tools send`) — an entry is taken
-    /// VERBATIM, so an entry that itself contains a comma is unambiguous. An
-    /// occurrence with an EMPTY value is the EMPTY list — `--tools=` — which
-    /// tools read differently from an absent key (`update_custom_role` clears the
-    /// role's tools with it while the absent key leaves them as they are). An
-    /// occurrence whose value starts with `@` names a FILE holding the entries as
-    /// a JSON array of strings, so a list too long for one command line travels
-    /// whole; the `./@…` escape gives an entry that begins with `@` (see the
-    /// enum's own doc).
+    /// Repeatable, one array entry per occurrence — taken VERBATIM, so an entry
+    /// that itself holds a comma is unambiguous. An EMPTY value is the EMPTY list
+    /// (`--tools=`), which tools read differently from an absent key
+    /// (`update_custom_role` clears the role's tools with it). An occurrence
+    /// starting with `@` names a FILE holding the entries as a JSON array of
+    /// strings; the `./@…` escape gives an entry that begins with `@`.
     List,
     /// [`List`](Self::List)'s file-naming form: the same array of texts, with
     /// every entry (and the file named after `@`) resolved the way
     /// [`Path`](Self::Path) resolves its one value.
     PathList,
-    /// One STRUCTURED value per occurrence, for an argument that is an object or
-    /// an array of objects: the value is the JSON it is written as
-    /// (`--values '{"name": "Ada"}'`), or `@<file>` naming a file that holds it.
-    /// A value that is no JSON at all is sent on verbatim as the text it is, so
-    /// the tool judges it; a FILE that cannot be read, or that does not hold JSON,
-    /// is the caller's own misuse — the file form is this command line's own.
+    /// One STRUCTURED value per occurrence, for an object or an array of objects:
+    /// the JSON it is written as, or `@<file>` naming a file that holds it. A
+    /// value that is no JSON is sent on verbatim for the tool to judge; a file
+    /// that cannot be read, or holds no JSON, is this command line's own misuse.
     ///
-    /// The field names it carries are the ones a REFERENCE FILE stands under
-    /// inside the structure — the `image` of a block, of an edit that places one
-    /// — and every string there is resolved like a [`Path`](Self::Path) value:
-    /// the product resolves them against its own directories, so a relative path
-    /// sent on as written would name a file the caller never meant.
+    /// The field names it carries are the ones a REFERENCE FILE stands under — the
+    /// `image` of a block, of an edit that places one — and every string there is
+    /// resolved like a [`Path`](Self::Path) value, since the product would resolve
+    /// them against its own directories.
     Structured(&'static [&'static str]),
-    /// A switch, for a tool argument that is a boolean: the bare `--full` is
-    /// `true`, `--full=true` is the same, and `--full=false` is the `false` a bare
-    /// switch cannot carry. Both values must be spellable because a tool reads
-    /// them differently — an argument left out is the tool's own default, which is
-    /// not the same as an explicit `false` where the default is the provider's (a
-    /// video's `--generate-audio`).
+    /// A switch, for a boolean argument: the bare `--full` and `--full=true` are
+    /// `true`, `--full=false` the `false` a bare switch cannot carry. Both must be
+    /// spellable — an argument left out is the tool's own default, which is not
+    /// `false` where the default is the provider's (a video's `--generate-audio`).
     Present,
     /// The destination of the files the operation produces — the command line's
-    /// OWN operand, and the single flag no tool reads. It names the directory
-    /// produced files go into, and it is the exception the whole registry turns
-    /// on: the tools' arguments and the agents' instructions know nothing of it
-    /// (see the module docs). No `@<file>` form: it names a directory itself.
+    /// OWN operand, and the single flag no tool reads: the exception the whole
+    /// registry turns on (see the module docs). No `@<file>` form: it names a
+    /// directory itself.
     Destination,
 }
 
@@ -516,10 +420,9 @@ impl FlagKind {
     ///
     /// The kinds whose value can be long or structured — a text, a list, a
     /// structure — have it, so a caller is never capped by the command line's own
-    /// length. [`Path`](Self::Path) and [`Destination`](Self::Destination) do
-    /// not: their value names the file (or directory) itself, so a file holding
-    /// it adds nothing. [`Number`](Self::Number) and [`Present`](Self::Present)
-    /// do not either: neither carries text.
+    /// length. [`Path`](Self::Path) and [`Destination`](Self::Destination) do not:
+    /// their value names the file (or directory) itself. [`Number`](Self::Number)
+    /// and [`Present`](Self::Present) do not either: neither carries text.
     #[must_use]
     const fn has_file_form(&self) -> bool {
         matches!(
@@ -531,21 +434,16 @@ impl FlagKind {
 
 /// The document family's `read` operation word — the `action` value the instance
 /// reads as "the product's own reader"
-/// ([`crate::tools::read_document::read_for_command_line`]).
-///
-/// It is deliberately no action of the document tool: agents read documents
-/// through the `read` tool they have, so the tool gains no action and its prompt
-/// nothing new, while the operation is served by the shared reading instead (see
-/// [`instance`]). The registry test ties every tool-backed operation to its
-/// tool's actions and pins this one separately.
+/// ([`crate::tools::read_document::read_for_command_line`]). Deliberately no action
+/// of the document tool: agents read documents through the `read` tool they have,
+/// so the tool gains no action and its prompt nothing new. The registry test ties
+/// every tool-backed operation to its tool's actions and pins this one separately.
 pub(crate) const DOCUMENT_READ: &str = "read";
 
 /// The command lines this file fronts: the admin Assistant's own toolset — the
-/// tools each family's `tools` names. Nothing else the owner holds is reachable
-/// through the channel (the instance serves a tool by name only when a family
-/// below fronts it). Where the words are named elsewhere they are derived from
-/// here — [`family_words`] for the whole set, [`producing_families`] for the
-/// families that make files — so no surface keeps a list of its own to go stale.
+/// tools each family's `tools` names, and nothing else the owner holds is reachable
+/// through the channel. Words are derived from here ([`family_words`],
+/// [`producing_families`]), so no surface keeps a list of its own to go stale.
 pub(crate) const FAMILIES: &[Family] = &[
     Family {
         word: "config",
@@ -764,15 +662,12 @@ pub(crate) const FAMILIES: &[Family] = &[
                     },
                 ],
             },
-            // `pause` (and `resume`, which says the same) can act on ONE
-            // workspace or on the whole fleet, and the two forms are told apart
-            // by ABSENCE: with no `--workspace` the args object the tool is
-            // handed carries no `workspace` key at all, and that absence IS the
-            // fleet-wide form. Naming a workspace is then the only thing the
-            // call may carry — the tool refuses a stray field precisely so a
-            // fleet-wide write can never be widened by accident, so the
-            // frontend must never invent one and must never send a `null`
-            // (which the tool reads as the unnamed form).
+            // `pause` (and `resume`, which says the same) act on ONE workspace or
+            // the whole fleet, told apart by ABSENCE: with no `--workspace` the
+            // args carry no `workspace` key at all, and that absence IS the
+            // fleet-wide form. Naming one is then the only field allowed — the tool
+            // refuses a stray field so a fleet-wide write can never be widened by
+            // accident, so never invent one and never send a `null`.
             Operation {
                 tool: "workspace",
                 action: Some("pause"),
@@ -867,9 +762,9 @@ pub(crate) const FAMILIES: &[Family] = &[
     Family {
         word: "send",
         tools: &["send"],
-        // The family this build adds: a product built before it answers the call
-        // as a failed operation, so it carries the current value and is refused
-        // as the environment's class instead.
+        // This build's own family: a product built before it answers the call as a
+        // failed operation, so it carries the current value and is refused as the
+        // environment's class instead.
         protocol: crate::db::ipc::CALL_STORE,
         purpose: "Hand one message to an agent and finish — an answer arrives later in your \
                   assistant's conversation, and nothing does for the one-way 'guest' address",
@@ -881,9 +776,8 @@ pub(crate) const FAMILIES: &[Family] = &[
                 purpose: "The work to hand over; make it self-contained — the addressee cannot \
                           see your conversation (required)",
             },
-            // The address vocabulary's own words: it lives beside the vocabulary
-            // (`tools::send`), which checks it names every address and every
-            // argument an address requires.
+            // The address vocabulary's own words, which `tools::send` checks name
+            // every address and every argument an address requires.
             Flag {
                 arg: "addressee",
                 kind: FlagKind::Value,
@@ -919,20 +813,15 @@ pub(crate) const FAMILIES: &[Family] = &[
             },
         ]),
     },
-    // ── The producing families: documents, pictures, video and rasterizing ──
-    //
-    // These families front the tools every Assistant holds regardless of its
-    // account (the media models they use resolve per-user), so the command line
-    // reaches exactly what the owner's own assistant can already do — the same
-    // operations, the same values, the same limits and the same mutual
-    // exclusions. What the command line adds is the DESTINATION, its own operand
-    // ([`FlagKind::Destination`]).
+    // These families front the tools every Assistant holds regardless of account (the
+    // media models resolve per-user), so the command line reaches what the owner's own
+    // assistant can already do. What it adds is the DESTINATION ([`FlagKind::Destination`]).
     Family {
         word: "document",
         tools: &["document"],
-        // The families this build adds: a product built before them serves no
-        // such tool, so the call comes back as the environment's class — nothing
-        // ran — rather than as a failed operation.
+        // This build's own families: a product built before them serves no such
+        // tool, so the call comes back as the environment's class — nothing ran —
+        // rather than as a failed operation.
         protocol: crate::db::ipc::CALL_STORE,
         purpose: "Read a document with the product's own reader, or produce one with its document \
                   tool — write, fill a template, edit an Office file, and every PDF operation",
@@ -1186,7 +1075,6 @@ pub(crate) const FAMILIES: &[Family] = &[
     },
 ];
 
-/// The rasterizer's `path` argument: the file to render.
 const RASTER_PATH_FLAG: Flag = Flag {
     arg: "path",
     kind: FlagKind::Path,
@@ -1196,7 +1084,6 @@ const RASTER_PATH_FLAG: Flag = Flag {
               read with the owner's own authority",
 };
 
-/// The rasterizer's `page` argument: which page of a PDF to render.
 const RASTER_PAGE_FLAG: Flag = Flag {
     arg: "page",
     kind: FlagKind::Number,
@@ -1204,9 +1091,8 @@ const RASTER_PAGE_FLAG: Flag = Flag {
     purpose: "The 1-based page to render, for a PDF of several pages",
 };
 
-/// The destination flag every producing family's operation carries: the command
-/// line's OWN operand, the one flag no tool reads (see
-/// [`FlagKind::Destination`]).
+/// The destination every producing operation carries: the command line's OWN
+/// operand, the one flag no tool reads (see [`FlagKind::Destination`]).
 const OUTPUT_DIR_FLAG: Flag = Flag {
     arg: "output_dir",
     kind: FlagKind::Destination,
@@ -1216,9 +1102,7 @@ const OUTPUT_DIR_FLAG: Flag = Flag {
               in when it is left out",
 };
 
-/// The document family's shared `file_name` argument: the base name of what it
-/// produces, which every one of its operations takes — so every one of them
-/// carries it.
+/// The base name of what it produces — every document operation carries it.
 const DOCUMENT_FILE_NAME_FLAG: Flag = Flag {
     arg: "file_name",
     kind: FlagKind::Value,
@@ -1227,7 +1111,6 @@ const DOCUMENT_FILE_NAME_FLAG: Flag = Flag {
               free name is used, so nothing already there is overwritten",
 };
 
-/// The document tool's `format` argument — `create` only.
 const DOCUMENT_FORMAT_FLAG: Flag = Flag {
     arg: "format",
     kind: FlagKind::Value,
@@ -1235,8 +1118,7 @@ const DOCUMENT_FORMAT_FLAG: Flag = Flag {
     purpose: "The format to write: docx, pptx, xlsx or pdf",
 };
 
-/// The document tool's `size` argument — `create`'s slide size, a presentation's
-/// own (the one `size` a `pdf_text` states is the font size, its own flag).
+/// `create`'s slide size (a `pdf_text`'s `size` is a font size, its own flag).
 const DOCUMENT_SLIDE_SIZE_FLAG: Flag = Flag {
     arg: "size",
     kind: FlagKind::Value,
@@ -1244,8 +1126,7 @@ const DOCUMENT_SLIDE_SIZE_FLAG: Flag = Flag {
     purpose: "A pptx slide size: widescreen, standard or portrait; unnamed is the tool's own default deck",
 };
 
-/// The document tool's `content` argument — `create`'s blocks, for every format
-/// but xlsx.
+/// `create`'s blocks, for every format but xlsx.
 const DOCUMENT_CONTENT_FLAG: Flag = Flag {
     arg: "content",
     kind: FlagKind::Structured(&["image"]),
@@ -1254,7 +1135,6 @@ const DOCUMENT_CONTENT_FLAG: Flag = Flag {
               'text'/'table'/'image'/'...' kind it names beside its own fields",
 };
 
-/// The document tool's `header` argument — a created .docx's running header.
 const DOCUMENT_HEADER_FLAG: Flag = Flag {
     arg: "header",
     kind: FlagKind::Value,
@@ -1263,7 +1143,6 @@ const DOCUMENT_HEADER_FLAG: Flag = Flag {
               number and {pages} the document's page count",
 };
 
-/// The document tool's `footer` argument — a created .docx's running footer.
 const DOCUMENT_FOOTER_FLAG: Flag = Flag {
     arg: "footer",
     kind: FlagKind::Value,
@@ -1272,7 +1151,6 @@ const DOCUMENT_FOOTER_FLAG: Flag = Flag {
               number and {pages} the document's page count",
 };
 
-/// The document tool's `sheets` argument — `create`'s worksheets.
 const DOCUMENT_SHEETS_FLAG: Flag = Flag {
     arg: "sheets",
     kind: FlagKind::Structured(&[]),
@@ -1292,8 +1170,7 @@ const DOCUMENT_METADATA_FLAG: Flag = Flag {
               to the write",
 };
 
-/// The document tool's `path` argument: the one input file most of its
-/// operations act on — and the file the reader reads.
+/// The one input most operations act on — and the file the reader reads.
 const DOCUMENT_PATH_FLAG: Flag = Flag {
     arg: "path",
     kind: FlagKind::Path,
@@ -1301,7 +1178,6 @@ const DOCUMENT_PATH_FLAG: Flag = Flag {
     purpose: "The input file to work on",
 };
 
-/// The document tool's `paths` argument — `pdf_merge`'s inputs, in merge order.
 const DOCUMENT_PATHS_FLAG: Flag = Flag {
     arg: "paths",
     kind: FlagKind::PathList,
@@ -1310,7 +1186,6 @@ const DOCUMENT_PATHS_FLAG: Flag = Flag {
               file holding them as a JSON array with '@<file>'",
 };
 
-/// The document tool's `pages` argument: which pages an operation acts on.
 const DOCUMENT_PAGES_FLAG: Flag = Flag {
     arg: "pages",
     kind: FlagKind::List,
@@ -1334,8 +1209,6 @@ const EDITS_PURPOSE: &str = "The edits to apply, as a JSON array — one object 
                               operation it is ('format_text', 'set_cell', 'add_slide', …) beside \
                               its own fields";
 
-/// The document tool's `values` argument: the placeholders a template fill or a
-/// form fill writes.
 const DOCUMENT_VALUES_FLAG: Flag = Flag {
     arg: "values",
     kind: FlagKind::Structured(&[]),
@@ -1344,7 +1217,6 @@ const DOCUMENT_VALUES_FLAG: Flag = Flag {
               name)",
 };
 
-/// The document tool's `degrees` argument — `pdf_rotate`.
 const DOCUMENT_DEGREES_FLAG: Flag = Flag {
     arg: "degrees",
     kind: FlagKind::Number,
@@ -1352,7 +1224,6 @@ const DOCUMENT_DEGREES_FLAG: Flag = Flag {
     purpose: "The rotation to add, in degrees (a multiple of the tool's own step)",
 };
 
-/// The document tool's `area` argument — `pdf_crop`'s visible area.
 const DOCUMENT_AREA_FLAG: Flag = Flag {
     arg: "area",
     kind: FlagKind::Structured(&[]),
@@ -1361,7 +1232,6 @@ const DOCUMENT_AREA_FLAG: Flag = Flag {
               page's visible area, from the displayed top-left",
 };
 
-/// The document tool's `text` argument — `pdf_text`.
 const DOCUMENT_TEXT_FLAG: Flag = Flag {
     arg: "text",
     kind: FlagKind::Value,
@@ -1369,7 +1239,6 @@ const DOCUMENT_TEXT_FLAG: Flag = Flag {
     purpose: "The text to draw",
 };
 
-/// The document tool's `image` argument — `pdf_image`.
 const DOCUMENT_IMAGE_FLAG: Flag = Flag {
     arg: "image",
     kind: FlagKind::Path,
@@ -1377,7 +1246,6 @@ const DOCUMENT_IMAGE_FLAG: Flag = Flag {
     purpose: "The PNG or JPEG to place",
 };
 
-/// The document tool's `x` argument — the `pdf_text`/`pdf_image` position.
 const DOCUMENT_X_FLAG: Flag = Flag {
     arg: "x",
     kind: FlagKind::Number,
@@ -1385,7 +1253,6 @@ const DOCUMENT_X_FLAG: Flag = Flag {
     purpose: "Across the page, in points",
 };
 
-/// The document tool's `y` argument — the `pdf_text`/`pdf_image` position.
 const DOCUMENT_Y_FLAG: Flag = Flag {
     arg: "y",
     kind: FlagKind::Number,
@@ -1393,7 +1260,6 @@ const DOCUMENT_Y_FLAG: Flag = Flag {
     purpose: "Down the page, in points",
 };
 
-/// The document tool's `size` argument — `pdf_text`'s font size.
 const DOCUMENT_SIZE_FLAG: Flag = Flag {
     arg: "size",
     kind: FlagKind::Number,
@@ -1401,7 +1267,6 @@ const DOCUMENT_SIZE_FLAG: Flag = Flag {
     purpose: "The font size, in points",
 };
 
-/// The document tool's `color` argument — `pdf_text`'s colour.
 const DOCUMENT_COLOR_FLAG: Flag = Flag {
     arg: "color",
     kind: FlagKind::Value,
@@ -1409,7 +1274,6 @@ const DOCUMENT_COLOR_FLAG: Flag = Flag {
     purpose: "The text colour, as hex digits",
 };
 
-/// The document tool's `stamp` argument — `pdf_text`.
 const DOCUMENT_STAMP_FLAG: Flag = Flag {
     arg: "stamp",
     kind: FlagKind::Present,
@@ -1417,7 +1281,6 @@ const DOCUMENT_STAMP_FLAG: Flag = Flag {
     purpose: "Draw a box around the text",
 };
 
-/// The document tool's `opacity` argument — `pdf_text`'s ink.
 const DOCUMENT_OPACITY_FLAG: Flag = Flag {
     arg: "opacity",
     kind: FlagKind::Number,
@@ -1425,7 +1288,6 @@ const DOCUMENT_OPACITY_FLAG: Flag = Flag {
     purpose: "Opacity from just above zero to one; unnamed is fully opaque",
 };
 
-/// The document tool's `rotate` argument — `pdf_text`.
 const DOCUMENT_ROTATE_FLAG: Flag = Flag {
     arg: "rotate",
     kind: FlagKind::Number,
@@ -1433,8 +1295,7 @@ const DOCUMENT_ROTATE_FLAG: Flag = Flag {
     purpose: "The text's own rotation, in degrees",
 };
 
-/// The document tool's `width` argument — a `pdf_image`'s placed width and a
-/// `pdf_resize`'s new page width.
+/// `pdf_image`'s placed width, or `pdf_resize`'s new page width.
 const DOCUMENT_WIDTH_FLAG: Flag = Flag {
     arg: "width",
     kind: FlagKind::Number,
@@ -1442,8 +1303,7 @@ const DOCUMENT_WIDTH_FLAG: Flag = Flag {
     purpose: "The width, in points: a picture's placed width, or the page width a resize makes",
 };
 
-/// The document tool's `height` argument — a `pdf_image`'s placed height and a
-/// `pdf_resize`'s new page height.
+/// `pdf_image`'s placed height, or `pdf_resize`'s new page height.
 const DOCUMENT_HEIGHT_FLAG: Flag = Flag {
     arg: "height",
     kind: FlagKind::Number,
@@ -1451,7 +1311,6 @@ const DOCUMENT_HEIGHT_FLAG: Flag = Flag {
     purpose: "The height, in points: a picture's placed height, or the page height a resize makes",
 };
 
-/// The document tool's `flatten` argument — `pdf_form_fill`.
 const DOCUMENT_FLATTEN_FLAG: Flag = Flag {
     arg: "flatten",
     kind: FlagKind::Present,
@@ -1459,7 +1318,6 @@ const DOCUMENT_FLATTEN_FLAG: Flag = Flag {
     purpose: "Bake the fields into the page content and remove them",
 };
 
-/// The picture tool's `prompt` argument.
 const IMAGE_PROMPT_FLAG: Flag = Flag {
     arg: "prompt",
     kind: FlagKind::Value,
@@ -1467,8 +1325,7 @@ const IMAGE_PROMPT_FLAG: Flag = Flag {
     purpose: "The text description of the picture to produce (required)",
 };
 
-/// The reference pictures of the one generation the picture command builds: given any,
-/// it is picture-to-picture rather than text-to-picture.
+/// The one generation's reference pictures: given any, it is picture-to-picture.
 const IMAGE_IMAGES_FLAG: Flag = Flag {
     arg: "images",
     kind: FlagKind::PathList,
@@ -1478,7 +1335,6 @@ const IMAGE_IMAGES_FLAG: Flag = Flag {
               picture-to-picture rather than text-to-picture",
 };
 
-/// The aspect ratio of the one generation the picture command builds.
 const IMAGE_ASPECT_RATIO_FLAG: Flag = Flag {
     arg: "aspect_ratio",
     kind: FlagKind::Value,
@@ -1486,7 +1342,6 @@ const IMAGE_ASPECT_RATIO_FLAG: Flag = Flag {
     purpose: "The aspect ratio, like '16:9', '1:1' or '4:3'",
 };
 
-/// The size of the one generation the picture command builds.
 const IMAGE_SIZE_FLAG: Flag = Flag {
     arg: "size",
     kind: FlagKind::Value,
@@ -1495,7 +1350,6 @@ const IMAGE_SIZE_FLAG: Flag = Flag {
               a model that cannot express the value is not sent the request",
 };
 
-/// The generating video tool's `prompt` argument.
 const VIDEO_PROMPT_FLAG: Flag = Flag {
     arg: "prompt",
     kind: FlagKind::Value,
@@ -1503,7 +1357,6 @@ const VIDEO_PROMPT_FLAG: Flag = Flag {
     purpose: "The text description of the clip to produce (required)",
 };
 
-/// The generating video tool's `images` argument: its one reference picture.
 const VIDEO_IMAGES_FLAG: Flag = Flag {
     arg: "images",
     kind: FlagKind::PathList,
@@ -1513,7 +1366,6 @@ const VIDEO_IMAGES_FLAG: Flag = Flag {
               text-to-clip",
 };
 
-/// The video tools' `duration` argument.
 const VIDEO_DURATION_FLAG: Flag = Flag {
     arg: "duration",
     kind: FlagKind::Number,
@@ -1522,7 +1374,6 @@ const VIDEO_DURATION_FLAG: Flag = Flag {
               ones it takes",
 };
 
-/// The generating video tool's `resolution` argument.
 const VIDEO_RESOLUTION_FLAG: Flag = Flag {
     arg: "resolution",
     kind: FlagKind::Value,
@@ -1530,7 +1381,6 @@ const VIDEO_RESOLUTION_FLAG: Flag = Flag {
     purpose: "The resolution to ask the model for, as that model states it",
 };
 
-/// The video tools' `aspect_ratio` argument.
 const VIDEO_ASPECT_RATIO_FLAG: Flag = Flag {
     arg: "aspect_ratio",
     kind: FlagKind::Value,
@@ -1538,7 +1388,6 @@ const VIDEO_ASPECT_RATIO_FLAG: Flag = Flag {
     purpose: "The aspect ratio to ask the model for, as that model states it",
 };
 
-/// The generating video tool's `size` argument.
 const VIDEO_SIZE_FLAG: Flag = Flag {
     arg: "size",
     kind: FlagKind::Value,
@@ -1546,7 +1395,6 @@ const VIDEO_SIZE_FLAG: Flag = Flag {
     purpose: "The exact size, as WxH (like '1280x720')",
 };
 
-/// The generating video tool's `generate_audio` argument.
 const VIDEO_GENERATE_AUDIO_FLAG: Flag = Flag {
     arg: "generate_audio",
     kind: FlagKind::Present,
@@ -1555,7 +1403,6 @@ const VIDEO_GENERATE_AUDIO_FLAG: Flag = Flag {
               default applies and `=false` asks for a silent clip",
 };
 
-/// The generating video tool's `seed` argument.
 const VIDEO_SEED_FLAG: Flag = Flag {
     arg: "seed",
     kind: FlagKind::Number,
@@ -1573,7 +1420,6 @@ const EDIT_VIDEO_URL_FLAG: Flag = Flag {
               and mutually exclusive with the first and last frames",
 };
 
-/// The editing video tool's `instruction` argument.
 const EDIT_INSTRUCTION_FLAG: Flag = Flag {
     arg: "instruction",
     kind: FlagKind::Value,
@@ -1581,7 +1427,6 @@ const EDIT_INSTRUCTION_FLAG: Flag = Flag {
     purpose: "The edit to apply, described in words (required)",
 };
 
-/// The editing video tool's `duration` argument.
 const EDIT_DURATION_FLAG: Flag = Flag {
     arg: "duration",
     kind: FlagKind::Number,
@@ -1601,8 +1446,7 @@ const EDIT_IMAGES_FLAG: Flag = Flag {
               '@<file>' — needs a clip, and excludes the first and last frames",
 };
 
-/// The editing video tool's `first_frame` argument — the frame-anchor form's
-/// first anchor.
+/// The frame-anchor form's first anchor.
 const EDIT_FIRST_FRAME_FLAG: Flag = Flag {
     arg: "first_frame",
     kind: FlagKind::Path,
@@ -1611,8 +1455,7 @@ const EDIT_FIRST_FRAME_FLAG: Flag = Flag {
               the frame-anchor form, which excludes a clip and reference pictures",
 };
 
-/// The editing video tool's `last_frame` argument — the frame-anchor form's
-/// second anchor.
+/// The frame-anchor form's second anchor.
 const EDIT_LAST_FRAME_FLAG: Flag = Flag {
     arg: "last_frame",
     kind: FlagKind::Path,
@@ -1639,14 +1482,11 @@ const CUSTOM_TOOL_FLAG: Flag = Flag {
 };
 
 /// One of the command lines this module fronts, resolved from its word by
-/// [`entry_point`]. Opaque on purpose: a caller either has one — the word names a
-/// family — or it does not, so the gate and the dispatch cannot disagree and
-/// the registry is looked up once.
+/// [`entry_point`]. Opaque on purpose: the gate and the dispatch cannot disagree.
 pub struct Cli(&'static Family);
 
-/// Resolve a command-line word to its family: `Some` when `mahbot <word>` is one
-/// of these command lines. Every family is an entry point ([`entry_point`]); this
-/// is the registry lookup under it.
+/// Resolve a command-line word to its family: the registry lookup under
+/// [`entry_point`].
 #[must_use]
 fn family(word: &str) -> Option<Cli> {
     FAMILIES.iter().find(|family| family.word == word).map(Cli)
@@ -1656,19 +1496,17 @@ fn family(word: &str) -> Option<Cli> {
 /// tell itself apart from a hand launch. Hidden like `__grep-engine`.
 pub(crate) const LOGIN_START_ARG: &str = "__login-start";
 
-/// One entry point a launch's first word can name: the binary's whole command
-/// table, the families beside the fixed words below. The ladder dispatches on this
-/// answer alone, so a word it serves and a word it knows are one fact, and a word
-/// with no variant here is refused as the caller's own misuse.
+/// One entry point a launch's first word can name: the binary's whole command table,
+/// the families beside the fixed words. The ladder dispatches on this answer alone,
+/// so a word with no variant here is refused as the caller's own misuse.
 pub enum EntryPoint {
     /// `mahbot` with no first word: the dashboard daemon.
     Daemon,
     /// `mahbot paused`: the daemon, with every managed workspace paused before
     /// the poll loop starts.
     Paused,
-    /// `mahbot __login-start`: the daemon, as the system's login registration
-    /// starts it. A launch mode, not a command line: the only difference is that
-    /// a login start is not a second launch and comes up with the tray only.
+    /// `mahbot __login-start`: the daemon as the login registration starts it — not a
+    /// second launch, coming up with the tray only.
     LoginStart,
     /// `-h`/`--help`.
     Help,
@@ -1690,11 +1528,9 @@ pub enum EntryPoint {
     Family(Cli),
 }
 
-/// Resolve a launch's first word — `None` when the launch had none — to the entry
-/// point it names, or `None` when this build has no entry point by that word.
-///
-/// The words are compiled into the binary, so an instance — running or not — takes
-/// no part in the answer.
+/// Resolve a launch's first word — `None` when it had none — to the entry point it
+/// names, or `None` when this build has no such word. The words are compiled in, so
+/// an instance takes no part in the answer.
 #[must_use]
 pub fn entry_point(word: Option<&str>) -> Option<EntryPoint> {
     Some(match word {
@@ -1713,12 +1549,9 @@ pub fn entry_point(word: Option<&str>) -> Option<EntryPoint> {
     })
 }
 
-/// Whether this command line fronts `tool` by name.
-///
-/// The instance serves an operation only for a tool a family fronts, so the
-/// surface reachable through the channel is exactly the surface these
-/// frontends publish (and exactly what the registry tests tie to the tools'
-/// own action sets) — never the owner's whole toolset.
+/// Whether this command line fronts `tool` by name. The instance serves an
+/// operation only for a tool a family fronts, so the surface reachable through
+/// the channel is exactly these frontends — never the owner's whole toolset.
 pub(crate) fn fronts_tool(tool: &str) -> bool {
     family_tools().any(|fronted| fronted == tool)
 }
@@ -1735,10 +1568,9 @@ pub(crate) fn family_words() -> impl Iterator<Item = &'static str> {
     FAMILIES.iter().map(|family| family.word)
 }
 
-/// The family words that make files ([`produces_files`]), as the read-only
-/// surfaces name them: backticked, joined by a slash (`document`/`image`/`video`/
-/// `rasterize`). Written here alone, so a family added to the registry is named —
-/// and refused — by every one of them without an edit, and none can go stale.
+/// The family words that make files ([`produces_files`]), as the read-only surfaces
+/// name them: backticked, joined by a slash. Derived here alone, so a family added
+/// to the registry is named — and refused — by every one of them without an edit.
 pub(crate) fn producing_families() -> String {
     FAMILIES
         .iter()
@@ -1747,8 +1579,6 @@ pub(crate) fn producing_families() -> String {
         .collect::<Vec<_>>()
         .join("/")
 }
-
-// ── Parsing ───────────────────────────────────────────────────────
 
 /// What an operation's flag tail turned out to be.
 enum Tail {
@@ -1761,52 +1591,37 @@ enum Tail {
 
 /// One parsed command line: what is sent with the call.
 struct Parsed {
-    /// The tool's args object: an operation with an `action` carries it, one
-    /// whose tool takes none has no `action` key at all, plus exactly the flags
-    /// that were given. An absent flag leaves its key ABSENT, never null — the
-    /// tools tell absent from null, and `pause`/`resume` read the absence of
-    /// `workspace` as the fleet-wide form.
+    /// The tool's args object: the `action` where the tool takes one, one whose
+    /// tool takes none has no `action` key at all, plus exactly the flags given.
+    /// An absent flag leaves its key ABSENT, never null — the tools tell the two
+    /// apart, and `pause`/`resume` read the absent `workspace` as the fleet-wide form.
     args: serde_json::Value,
-    /// The values of the `secret` flags that were given, in the order they were
-    /// given, as the values that actually travelled: a secret handed over as
-    /// `@<file>` is the FILE's content, which is what must never be echoed,
-    /// recorded or reported back. Nothing else is ever sent.
+    /// The values the `secret` flags really handed over, in order, as they
+    /// travelled: a `@<file>` secret is the FILE's content. Nothing else is sent.
     secrets: Vec<String>,
     /// The directory the produced files must go into, exactly as the caller
-    /// spelled it — `None` when the destination flag was left out. The
-    /// DESTINATION is not one of the tool's arguments (see
-    /// [`FlagKind::Destination`]): it travels beside them, and it is resolved
-    /// into a directory before anything is sent ([`resolve_output_dir`]).
+    /// spelled it — `None` when the flag was left out. The DESTINATION is not a
+    /// tool argument (see [`FlagKind::Destination`]): it travels beside them, and
+    /// is resolved before anything is sent ([`resolve_output_dir`]).
     output_dir: Option<String>,
 }
 
-/// The command-line spelling of a flag's argument: the tool's own argument name
-/// with `_` written `-` (`ticket_id` → `--ticket-id`).
+/// A flag's command-line spelling: the argument name with `_` written `-`.
 fn flag_spelling(arg: &str) -> String {
     arg.replace('_', "-")
 }
 
 /// Parse one operation's flag tail — the tokens after the operation word.
 ///
-/// The grammar itself lives in [`grammar`]; what is this frontend's own is the
-/// handling under it. A `List` flag accumulates one array entry per occurrence,
-/// an empty value emptying it (see [`FlagKind::List`]). Everything a reason says
-/// is a flag's NAME and never a flag's VALUE: a secret the caller handed over
-/// must not travel back out in an error text, so a flag is refused by its
-/// `--spelling` alone (`--full=<value>` names the flag, never the value), and a
-/// token that is no flag at all is not echoed either — a secret mistyped as a
-/// positional is still a secret. A mistake this frontend can judge by itself — a
-/// token that is not a flag, a flag this operation does not take, a missing
-/// value, a flag given twice, a value in the FILE form the caller got wrong — is
-/// returned as its reason, for [`Exit::Usage`]. A flag the operation DOES take
-/// with a value the tool will not accept is not a mistake this command can
-/// judge, so it is sent on: the product refuses it, and that is a failed
-/// operation — which is why a `Number` or a `Structured` value that is no number
-/// and no JSON travels as the text it is rather than being refused here.
+/// The grammar is [`grammar`]; what is this frontend's own is the handling under
+/// it, with a `List` accumulating an entry per occurrence. Every reason names a
+/// flag and never a VALUE — a mistyped secret must not travel back out — and a
+/// token that is no flag is not echoed either. What this frontend judges by itself
+/// is [`Exit::Usage`]; a value the tool refuses travels as written and is a failed
+/// operation, which is why a `Number` or a `Structured` value that is neither
+/// travels as the text it is.
 ///
-/// `action` is the tool's own action for the call, and `None` where the tool
-/// takes none at all (a standalone family's own word, or a producing tool's own
-/// operation).
+/// `action` is the tool's own action, and `None` where the tool takes none.
 fn parse_flags(
     action: Option<&'static str>,
     operation_word: &str,
@@ -1822,9 +1637,8 @@ fn parse_flags(
     }
     let mut secrets = Vec::new();
     let mut output_dir: Option<String> = None;
-    // The flags already given, so a `Value`/`Present` repeat is refused instead
-    // of silently keeping the last one, and the `List` entries, which only
-    // become the array at the end.
+    // The flags already given, so a repeat is refused rather than silently kept,
+    // and the `List` entries, which become the array at the end.
     let mut given: Vec<&'static str> = Vec::new();
     let mut lists: Vec<(&'static str, Vec<serde_json::Value>)> = Vec::new();
     let spellings: Vec<String> = flags.iter().map(|flag| flag_spelling(flag.arg)).collect();
@@ -1871,9 +1685,8 @@ fn parse_flags(
                 };
                 take_value(flag, &value, &mut args, &mut lists, &mut output_dir)?;
                 if flag.secret {
-                    // A secret is what the flag actually handed over, never the
-                    // spelling that named it: the file form makes the FILE's
-                    // content the value (see `Parsed::secrets`).
+                    // A secret is what the flag handed over, never the spelling that
+                    // named it: the file form makes the FILE's content the value.
                     secrets.extend(held_texts(flag, &args, &lists));
                 }
             }
@@ -1890,16 +1703,13 @@ fn parse_flags(
     }))
 }
 
-/// Put one value-carrying flag's value where it belongs: into the args object
-/// for every kind a tool reads, and aside for the destination, which no tool
-/// reads (see [`FlagKind::Destination`]).
+/// Put one value-carrying flag's value where it belongs: into the args object for
+/// every kind a tool reads, and aside for the destination, which no tool reads.
 ///
-/// The `@` file form and the `./@…` escape are read off the value once, here: the
-/// escape is the caller's way to write a value that itself begins with `@` — the
-/// one spelling a file name cannot be confused with — and it is honoured by every
-/// kind, while reading a FILE is the kinds that have that form
-/// ([`FlagKind::has_file_form`]). A value whose flag names a path itself
-/// (`--path`, `--output-dir`) is never read from a file: it names the file.
+/// The `@` file form and the `./@…` escape are read off the value once, here, for
+/// every kind; reading a FILE is only the kinds that have that form
+/// ([`FlagKind::has_file_form`]). A flag whose value names a path itself is never
+/// read from a file: it names the file.
 fn take_value(
     flag: &Flag,
     value: &str,
@@ -1940,14 +1750,10 @@ fn take_value(
             args.insert(arg, structured);
         }
         FlagKind::List | FlagKind::PathList => {
-            // One array entry per occurrence, verbatim: the entry is never split
-            // on its commas, so `name:kind1,kind2` stays one tool specification
-            // and a `List` of a comma-carrying value needs no escaping. An
-            // occurrence whose value is `@<file>` adds the entries that file
-            // holds, so a list too long for one command line travels whole. An
-            // EMPTY value empties the list as of that point — see
-            // [`FlagKind::List`]. A path list resolves every entry the way a
-            // single path is resolved.
+            // One array entry per occurrence, verbatim: never split on its commas,
+            // so `name:kind1,kind2` stays one tool specification. An EMPTY value
+            // empties the list as of that point ([`FlagKind::List`]); a path list
+            // resolves every entry the way a single path is resolved.
             let named = matches!(flag.kind, FlagKind::PathList);
             let entries = if let Some(index) = lists.iter().position(|(held, _)| *held == flag.arg)
             {
@@ -1982,9 +1788,8 @@ fn take_value(
     Ok(())
 }
 
-/// The texts a flag's own argument now holds, as the values a secret flag really
-/// handed over — for the file forms, what the file held rather than the spelling
-/// that named it.
+/// The texts a flag's argument now holds, as the values a secret flag really handed
+/// over — for the file forms, what the file held rather than the spelling.
 fn held_texts(
     flag: &Flag,
     args: &serde_json::Map<String, serde_json::Value>,
@@ -2002,9 +1807,8 @@ fn held_texts(
         .collect()
 }
 
-/// The JSON a `Number` flag carries: the value read as the number it is, and the
-/// text it is otherwise — whether the tool takes the value is the tool's to
-/// judge, never this frontend's.
+/// The JSON a `Number` flag carries: the number it is, else the text — whether the
+/// tool takes it is the tool's to judge.
 fn number_or_text(value: &str) -> serde_json::Value {
     serde_json::from_str::<serde_json::Value>(value)
         .ok()
@@ -2020,18 +1824,13 @@ fn bool_switch_misuse(name: &str) -> String {
 
 /// A path a flag names, as the caller meant it and checked.
 ///
-/// `~` is expanded against the home directory and a relative path is resolved in
-/// the directory this command was run in — the product has a working directory of
-/// its own, and it is not this one, so a relative path sent on as written would
-/// name a different file there, while a shell driving this command means the file
-/// it can see. The named reference material must then be THERE and readable: that
-/// is the caller's own to get right, so a path that is missing or unreadable is
-/// misuse, judged before anything is sent. It must also be a REGULAR file: the
-/// product reads what it is given with no timeout of its own, so a pipe with no
-/// writer would hold the daemon — and the operation's flight guard — forever, and
-/// a device would read without end. Only metadata is looked at here, so the
-/// refusal itself cannot block, and a URL — which only the product can fetch — is
-/// left alone.
+/// `~` expands against the home directory and a relative path resolves in the
+/// directory this command was run in — the product's working directory is another
+/// one, so a path sent on as written would name a different file. The reference
+/// material must be THERE, readable and a REGULAR file: the product reads it with
+/// no timeout, so a pipe with no writer or an endless device would hold the daemon
+/// forever. Missing or unreadable is misuse, judged from metadata alone before
+/// anything is sent, so the refusal cannot block; a URL is left to the product.
 fn caller_path(flag: &Flag, value: &str) -> Result<String, String> {
     if value.is_empty() || crate::util::is_http_url(value) {
         return Ok(value.to_string());
@@ -2068,16 +1867,12 @@ fn caller_path(flag: &Flag, value: &str) -> Result<String, String> {
     Ok(path)
 }
 
-/// Resolve every reference file a structured value names under one of `fields` —
-/// a document's image block, an edit that places a picture.
-///
-/// The product resolves those against its OWN directories (a workspace's
-/// `generated/`, a personal workspace's `uploads/`), so a relative path sent on
-/// as written would read a file the caller never named. Each string under such a
-/// field is resolved exactly like a `--path` value ([`caller_path`]) — in the
-/// directory this command runs in, `~` against the home directory, a URL left
-/// alone — and so is every string of an array under one; a member of another
-/// shape is left to the tool, which judges it the same way wherever it came from.
+/// Resolve every reference file a structured value names under one of `fields` (a
+/// document's image block, an edit that places a picture), which the product would
+/// otherwise resolve against its OWN directories (a workspace's `generated/`, a
+/// personal workspace's `uploads/`). Each string there, and each string of an array
+/// there, is resolved like a `--path` value ([`caller_path`]); a member of another
+/// shape is left to the tool.
 fn resolve_embedded_paths(
     flag: &Flag,
     fields: &'static [&'static str],
@@ -2120,21 +1915,18 @@ fn resolve_embedded_path(flag: &Flag, member: &mut serde_json::Value) -> Result<
     Ok(())
 }
 
-/// Upper bound on the file a flag's `@<file>` form may read: a value travels as
-/// one command-line argument, so a file far past any command line's length is a
-/// mistaken path rather than a value to send — and a bound is what keeps a
-/// mistyped endless file from becoming an out-of-memory.
+/// Upper bound on the file a flag's `@<file>` form may read: a value travels as one
+/// argument, so a file far past any command line is a mistaken path rather than a
+/// value — and the bound keeps an endless file from becoming an out-of-memory.
 const MAX_VALUE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The text of the file a flag's `@<file>` form names — the ONE read every value
 /// form shares, so no two of them can guard differently.
 ///
-/// The file must be a REGULAR file of a bounded size. The parsing path has no
-/// timeout of its own, so a pipe (`--prompt @<fifo>`) would hold the command
-/// forever and an endless device (`--prompt @/dev/zero`) would read until memory
-/// ran out. Every one of those is the caller's own misuse, judged before anything
-/// is sent — and the reason names the FLAG and never the path, like every other
-/// reason.
+/// The file must be a REGULAR file of a bounded size: the parse has no timeout, so
+/// a pipe (`--prompt @<fifo>`) would hold the command forever and an endless device
+/// (`--prompt @/dev/zero`) would read until memory ran out. That is the caller's
+/// own misuse, and the reason names the FLAG and never the path.
 fn value_file_text(flag: &Flag, file: &str, what: &str) -> Result<String, String> {
     let spelling = flag_spelling(flag.arg);
     let unusable = |why: &str| {
@@ -2159,11 +1951,8 @@ fn value_file_text(flag: &Flag, file: &str, what: &str) -> Result<String, String
 }
 
 /// The text the file a value flag's `@<file>` form names holds, without one
-/// trailing line break — a file's last newline is the file's, not the value's.
-///
-/// The file form is this command line's own, so a file it cannot use is the
-/// caller's misuse and is judged here: the reason names the FLAG and never the
-/// path (the same rule every other reason follows).
+/// trailing line break — a file's last newline is the file's, not the value's. A
+/// file it cannot use is misuse, and the reason names the FLAG, never the path.
 fn text_from_file(flag: &Flag, file: &str) -> Result<String, String> {
     let text = value_file_text(flag, file, "the value")?;
     Ok(text
@@ -2175,11 +1964,7 @@ fn text_from_file(flag: &Flag, file: &str) -> Result<String, String> {
 }
 
 /// Read the file a `Structured` flag's `@<file>` form names and take the JSON it
-/// holds.
-///
-/// The file form is this command line's own, so a file it cannot use is the
-/// caller's misuse and is judged here: the reason names the FLAG and never the
-/// path (the same rule every other reason follows).
+/// holds; a file it cannot use is misuse, the reason naming the FLAG, not the path.
 fn json_from_file(flag: &Flag, file: &str) -> Result<serde_json::Value, String> {
     let spelling = flag_spelling(flag.arg);
     let text = value_file_text(flag, file, "the value")?;
@@ -2209,11 +1994,8 @@ fn list_entries_from_file(flag: &Flag, file: &str) -> Result<Vec<serde_json::Val
     }
 }
 
-// ── Help ──────────────────────────────────────────────────────────
-
-/// The exit classes and the one sentence that makes them the contract — shared
-/// by every help (a family's and each operation's) so no two can word it
-/// differently.
+/// The exit classes and the one sentence that makes them the contract — shared by
+/// every help, so no two can word it differently.
 const EXIT_CLASS_HELP: &str = "\nExit codes:\n  0  the operation was carried out\n  1  the \
      operation failed — the product refused it, carried it out only in part, or the exchange was \
      severed after the call went out (an operation that may be under way is never the \
@@ -2222,36 +2004,31 @@ const EXIT_CLASS_HELP: &str = "\nExit codes:\n  0  the operation was carried out
      misused\nA script reads the exit code, not the text: a refusal still prints the product's \
      own answer on stdout, so only the code says whether the operation happened.\n";
 
-/// What one of these command lines IS — shared by every help for the same
-/// reason as the exit classes: a script author entering through one operation's
-/// own help must learn the same contract as one reading the family's.
+/// What one of these command lines IS — shared by every help, so a caller entering
+/// through an operation's help learns the same contract as one reading the family's.
 const RUNNING_CONTRACT_HELP: &str = "\nA frontend onto the RUNNING product, acting with the \
      owner's authority and with no agent session behind it: the operation is carried into the \
      instance that is already up and the product itself runs it there — the same validation, and \
      the same immediate effect (a value it writes is in use at once, with no restart). The product \
      must be running: there is no way to run these operations against its stores directly.\n";
 
-/// Where the two streams go — shared by every help, like the two blocks above.
+/// Where the two streams go — shared by every help, like the contract blocks.
 const OUTPUT_HELP: &str = "\nOutput:\n  stdout  the product's answer, word for word\n  stderr  \
      this command's own diagnostics\n";
 
 /// How a value may be given from a file — shared by every help, because the form
-/// belongs to this command line rather than to any one family's flags (see
-/// [`FlagKind::has_file_form`]).
+/// belongs to this command line rather than to any family's flags.
 const VALUE_FILE_HELP: &str = "\nValues:\n  A text value, a list or a structure may also be given \
      from a FILE by writing `@<file>`: a text value is the file's whole text (without one trailing \
      line break), while a list and a structure must hold JSON there. Write `./@…` for a value that \
      itself begins with `@` — the `./` is dropped and no file is read. A flag whose value names a \
      file or a directory itself (`--path`, `--output-dir`) takes no file form.\n";
 
-/// What a producing family's help says beyond the tool's own flags: where
-/// produced files go, and how the paths the caller hands over are read.
-///
-/// Shared by every help of such a family (the family's and each operation's), so
-/// a script author reads the same thing wherever it enters. The destination's row
-/// is rendered from the registry ([`OUTPUT_DIR_FLAG`]), so its spelling and its
-/// description are stated once. The "Paths" paragraph belongs here for the same
-/// reason: a path this frontend resolves is its own doing, not a tool's.
+/// What a producing family's help adds to the tool's own flags: where produced
+/// files go, and how the caller's paths are read — shared by every help of such a
+/// family. The destination row is rendered from the registry
+/// ([`OUTPUT_DIR_FLAG`]), so its spelling and description are stated once, and
+/// the "Paths" paragraph belongs here because the resolution is this frontend's.
 fn producing_help() -> String {
     let mut out = String::from("\nWhere produced files go:\n");
     out.push_str(&flag_rows(std::iter::once(&OUTPUT_DIR_FLAG)));
@@ -2268,8 +2045,7 @@ fn producing_help() -> String {
     out
 }
 
-/// `mahbot <word> -h`: what this family's command line is and what a caller
-/// reads back from it.
+/// `mahbot <word> -h`: what this family's command line is and what a caller reads.
 fn family_help(family: &Family) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "mahbot {} — {}", family.word, family.purpose);
@@ -2308,8 +2084,7 @@ fn family_help(family: &Family) -> String {
                  whose argument it names.\n\n  -h, --help  Print this help and exit\n"
             });
         }
-        // The family word IS the operation, so there is no operation list below
-        // and nothing to say about how one of them is run.
+        // The family word IS the operation: no operation list below.
         Surface::Standalone(flags) => {
             let _ = write!(out, "\nUsage: {}\n", family_syntax(family));
             if produces_files(family) {
@@ -2326,9 +2101,8 @@ fn family_help(family: &Family) -> String {
     out
 }
 
-/// A flag's purpose with the shared vocabulary filled in: a description field set
-/// or a date grammar the rules state appears in the help as those rules state it,
-/// so neither can drift from the schema and the reading.
+/// A flag's purpose with the shared vocabulary filled in, from the rules themselves,
+/// so the help cannot drift from the schema and the reading.
 fn flag_purpose(flag: &Flag) -> String {
     flag.purpose
         .replace(
@@ -2338,8 +2112,8 @@ fn flag_purpose(flag: &Flag) -> String {
         .replace("{{pdf_date_format}}", crate::docgen::pdf_date_format())
 }
 
-/// The flag table of a help: one width-aligned row per flag, a secret's value
-/// never echoed here because it is never echoed anywhere.
+/// The flag table of a help: one width-aligned row per flag, a secret's value never
+/// echoed here because it is never echoed anywhere.
 fn flag_rows<'a>(flags: impl IntoIterator<Item = &'a Flag>) -> String {
     let rows: Vec<(String, String)> = flags
         .into_iter()
@@ -2380,9 +2154,8 @@ fn flag_rows<'a>(flags: impl IntoIterator<Item = &'a Flag>) -> String {
     out
 }
 
-/// A help's flag table: the destination is stated once, in the block above, since
-/// it is the command line's own operand rather than one of the tool's arguments —
-/// and a table with nothing else in it says so.
+/// A help's flag table: the destination is stated separately, being the command
+/// line's own operand, and a table with nothing else in it says so.
 fn flag_table(flags: &[Flag]) -> String {
     let flags: Vec<&Flag> = flags
         .iter()
@@ -2394,9 +2167,8 @@ fn flag_table(flags: &[Flag]) -> String {
     flag_rows(flags)
 }
 
-/// `mahbot <word> <operation> -h`: what one operation does and the flags it
-/// takes — plus the same contract the family help states, because a script
-/// author may enter here first.
+/// `mahbot <word> <operation> -h`: what one operation does and the flags it takes —
+/// plus the same contract the family help states, since a caller may enter here.
 fn operation_help(family: &Family, operation: &Operation) -> String {
     let word = operation_word(family, operation);
     let mut out = String::new();
@@ -2418,19 +2190,13 @@ fn operation_help(family: &Family, operation: &Operation) -> String {
     out
 }
 
-// ── The run ───────────────────────────────────────────────────────
-
 /// Run one family's command line, returning the process exit code.
 ///
-/// The product's own answer goes to STDOUT exactly as the product worded it
-/// (never shortened, never reformatted); everything this command says on its
-/// own goes to STDERR. Help goes to stdout. The exit code is the thing a script
-/// reads — see [`Exit`].
-///
-/// A producing family's destination is resolved HERE, before the environment is
-/// probed, because it is a mistake this command judges by itself — a destination
-/// that is missing, unusable or the product's own to sweep is the caller's own
-/// misuse, and nothing is sent.
+/// The product's answer goes to STDOUT exactly as it worded it; everything this
+/// command says on its own goes to STDERR, help to stdout, and the exit code is
+/// what a script reads ([`Exit`]). A producing family's destination is resolved
+/// HERE, before the environment is probed: it is misuse this command judges by
+/// itself, so nothing is sent.
 pub async fn run(cli: Cli, args: &[String]) -> i32 {
     let family = cli.0;
     let (tool, mut parsed) = match family.surface {
@@ -2450,12 +2216,10 @@ pub async fn run(cli: Cli, args: &[String]) -> i32 {
             };
             match parse_flags(operation.action, named, operation.flags, &args[1..]) {
                 Ok(Tail::Call(parsed)) => (operation.tool, parsed),
-                // A `-h`/`--help` where a flag could stand is this operation's
-                // help — the same rule the browser-automation command follows,
-                // and it turns a would-be usage error into help rather than the
-                // other way round. A `-h` where a VALUE stands is that value
-                // instead (see `parse_flags`): a script must never read success
-                // for an operation that did not run.
+                // A `-h` where a flag could stand is this operation's help — the rule
+                // the browser-automation command follows too, turning a would-be usage
+                // error into help. Where a VALUE stands it is that value instead (see
+                // `parse_flags`): a script must never read success for a run that did not happen.
                 Ok(Tail::Help) => {
                     crate::util::print_stdout(&operation_help(family, operation));
                     return Exit::Ok.code();
@@ -2463,11 +2227,10 @@ pub async fn run(cli: Cli, args: &[String]) -> i32 {
                 Err(reason) => return misuse(family, &reason),
             }
         }
-        // The family word IS the operation, and the one tool the family fronts
-        // takes no `action`: the first token is already a flag. A bare `mahbot
-        // send` therefore sends nothing and the product refuses it as the missing
-        // message — a failed operation, exactly as a missing required flag is for
-        // every other family (this frontend never judges what the tool requires).
+        // The family word IS the operation and the tool takes no `action`, so the
+        // first token is already a flag: a bare `mahbot send` sends nothing and the
+        // product refuses it as the missing message — a failed operation, since this
+        // frontend never judges what the tool requires.
         Surface::Standalone(flags) => {
             let tool = *family
                 .tools
@@ -2484,15 +2247,14 @@ pub async fn run(cli: Cli, args: &[String]) -> i32 {
         }
     };
 
-    // The picture tool's flags are each one generation's own settings, and this command
-    // asks for exactly one picture: it builds that generation itself.
+    // The picture tool's flags are one generation's settings, and this asks for one
+    // picture: it builds that generation itself.
     if tool == "image_gen" {
         fold_one_generation(&mut parsed.args);
     }
 
-    // The destination, on the same footing as the words: a producing family's
-    // operation writes where the caller says, and a place this command cannot
-    // write into is misuse, judged before the environment is probed.
+    // The destination, like the words: a producing family writes where the caller
+    // says, and a place it cannot write into is misuse, judged before the probe.
     let output_dir = if produces_files(family) {
         match resolve_output_dir(parsed.output_dir.as_deref()) {
             Ok(dir) => Some(dir),
@@ -2502,9 +2264,8 @@ pub async fn run(cli: Cli, args: &[String]) -> i32 {
         None
     };
 
-    // These commands act ON the running product and have no other way to run,
-    // so the storage root and the instance lock are settled before anything is
-    // sent.
+    // These commands act ON the running product and cannot run otherwise, so the
+    // storage root and the instance lock are settled before anything is sent.
     let root = match running_root(family).await {
         Ok(root) => root,
         Err(code) => return code,
@@ -2532,15 +2293,12 @@ pub async fn run(cli: Cli, args: &[String]) -> i32 {
 /// The running product's storage root, or the class to exit with when there is
 /// none to send to.
 ///
-/// These commands act ON the instance and have no other way to run, so the lock
-/// is settled before anything is sent. The probe is the same fail-closed one
-/// `mahbot debug` routes on: an `Unknown` lock is never read as "no instance is
-/// running". A FREE lock on its own is not "nothing is running" either — a
-/// product that is restarting or updating itself releases the lock for the
-/// seconds the replacement needs to take it — so the probe is ridden out over
-/// the same short window the channel itself uses (seconds, not milliseconds: see
-/// `MAHBOT_IPC_BOUND_TIMEOUT_SECS`), and only a window that stays free is
-/// reported as nothing running.
+/// The probe is the same fail-closed one `mahbot debug` routes on: an `Unknown`
+/// lock is never read as "no instance is running". A FREE lock is not "nothing is
+/// running" either — a product restarting or updating itself releases it for the
+/// seconds the replacement needs — so it is ridden out over the window the channel
+/// itself uses (`MAHBOT_IPC_BOUND_TIMEOUT_SECS`), and only a window that stays
+/// free is reported as nothing running.
 async fn running_root(family: &Family) -> Result<std::path::PathBuf, i32> {
     let root = match crate::config::default_config_dir() {
         Ok(root) => root,
@@ -2583,35 +2341,25 @@ async fn running_root(family: &Family) -> Result<std::path::PathBuf, i32> {
     }
 }
 
-/// Report a misuse on STDERR and hand back its class: the reason, then the one
-/// line that says how to see the right form. Nothing was sent, and no operation
-/// judged anything.
+/// Report a misuse on STDERR and hand back its class: the reason, then the line
+/// that says how to see the right form. Nothing was sent and nothing judged.
 fn misuse(family: &Family, reason: &str) -> i32 {
     crate::util::print_stderr(&format!("mahbot {}: {reason}", family.word));
     crate::util::print_stderr(&format!("run 'mahbot {} -h' for usage.", family.word));
     Exit::Usage.code()
 }
 
-// ── The destination ───────────────────────────────────────────────
-
 /// Resolve a producing command's destination — the `--output-dir` value, or the
-/// directory this command was run in when it was left out — into the absolute
-/// directory the produced files go into, or the reason it cannot be used.
+/// directory this command was run in — into the absolute directory the produced
+/// files go into, or the reason it cannot be used. Shared with the `mahbot chrome` screenshot.
 ///
-/// Shared with the `mahbot chrome` screenshot, which produces a file the same way.
-///
-/// The destination is the caller's own operand, so it is spelled as the caller
-/// sees it and RESOLVED where this command runs, in the directory it was run in
-/// — never against the product's own working directory. It must already exist:
-/// this command creates no directory for the caller. And it must not be a place
-/// the product keeps for itself, because a produced file left there would not
-/// stay ([`cleanup_governed`]). Every failure here — a destination that is
-/// missing, is not a directory or cannot be written into — is the caller's own
-/// misuse, judged before anything is sent.
-///
-/// The one place a governed destination can slip through is a daemon whose own
-/// temp environment differs from this process's: it may scan a root this process
-/// cannot name ([`crate::temp::cleanup_scan_roots_unpinned`]).
+/// It is resolved where this command runs, never against the product's working
+/// directory; it must already exist (no directory is created for the caller) and
+/// must not be a place the product keeps for itself, where a produced file would
+/// not stay ([`cleanup_governed`]). Every failure is the caller's misuse, judged
+/// before anything is sent. The one gap: a daemon whose temp environment differs
+/// from this process's may scan a root this process cannot name
+/// ([`crate::temp::cleanup_scan_roots_unpinned`]).
 pub(crate) fn resolve_output_dir(named: Option<&str>) -> Result<String, String> {
     let (raw, what) = match named {
         Some(value) => (
@@ -2640,18 +2388,15 @@ pub(crate) fn resolve_output_dir(named: Option<&str>) -> Result<String, String> 
             "{what} is {place} — a produced file must go to a directory of your own"
         ));
     }
-    // A destination the caller cannot write into is the caller's own to fix:
-    // judged here rather than discovered as a failed operation, so the exit code
-    // says "your invocation" and nothing is sent. `access(2)` answers it on unix
-    // without writing anything into the caller's directory; off unix there is no
-    // such query, and the windowed build that platform serves is outside this
-    // contract either way, so the product's own refusal is the answer there.
+    // A destination the caller cannot write into is the caller's own to fix, judged
+    // here so the exit code says "your invocation" and nothing is sent. `access(2)`
+    // answers it on unix without writing into the caller's directory; off unix the
+    // product's own refusal is the answer.
     #[cfg(unix)]
     if !crate::util::dir_is_writable(&resolved) {
         return Err(format!("{what} cannot be written into"));
     }
-    // The plain spelling rather than the platform's verbatim form, so the value
-    // that travels to the instance is the one the caller wrote.
+    // The plain spelling, so the value that travels is the one the caller wrote.
     Ok(crate::util::strip_verbatim_prefix(&resolved)
         .to_string_lossy()
         .into_owned())
@@ -2660,17 +2405,12 @@ pub(crate) fn resolve_output_dir(named: Option<&str>) -> Result<String, String> 
 /// The place the product keeps for itself that `dir` lies in, or `None` when the
 /// directory is the caller's own to use.
 ///
-/// The roots come from [`crate::temp`] — the module that owns which roots the
-/// product's own cleaner may act in, so the command line and the cleaner cannot
-/// disagree about a place the cleaner acts in — plus the product's own data
-/// directory, whose live stores, personal workspaces (`generated`/`uploads`,
-/// which its media sweep empties) and document-kit scratch are all its own. The
-/// test is on the RESOLVED path, so a spelling that only looks innocent — a link
-/// into one of them — is refused all the same: both sides of every comparison go
-/// through [`crate::util::is_within`], which drops the platform's verbatim
-/// spelling. A machine's temp area is refused as a whole, whether or not the
-/// cleaner happens to sweep it: a produced file belongs in a directory of the
-/// caller's own.
+/// The roots come from [`crate::temp`] — the module that owns where the product's
+/// cleaner may act, so the two cannot disagree — plus its data directory, whose
+/// stores, personal-workspace `generated`/`uploads` (emptied by its media sweep)
+/// and document-kit scratch are its own. The test is on the RESOLVED path, so a
+/// link into one of them is refused all the same ([`crate::util::is_within`]), and
+/// a machine's temp area is refused as a whole.
 fn cleanup_governed(dir: &std::path::Path) -> Option<&'static str> {
     const DATA_DIR: &str = "the product's own data directory, where it keeps its own files";
     const TEMP: &str = "the product's own temporary area, which its cleanup keeps empty";
@@ -2690,39 +2430,29 @@ fn cleanup_governed(dir: &std::path::Path) -> Option<&'static str> {
 }
 
 /// What an argument the process cannot read as text is told — the same sentence
-/// wherever it is met, and it never names the argument: the bytes may be a value
-/// the caller meant as a secret.
+/// everywhere, never naming it: the bytes may be a value the caller meant as a secret.
 const NON_TEXT_ARGUMENT: &str = "an argument that is not valid text was given — no entry point \
                                  and no value can be read from it, and it is not printed here; \
                                  check what you passed";
 
-/// Refuse an argument the runner cannot read as text, returning this command
-/// line's misuse class.
-///
-/// The binary needs this before it can tell which entry point it was invoked as:
-/// an `argv[1]` that is not text names none of them, and an argument that cannot
-/// be read must be answered as the caller's own mistake rather than by the panic
-/// the text-only reader raises — a panic would leave the four classes a script
-/// reads and print the very bytes the caller passed.
+/// Refuse an argument the runner cannot read as text, returning this command line's
+/// misuse class — needed before the entry point can even be told, since a non-text
+/// `argv[1]` names none of them, and the panic the text-only reader raises would
+/// break the classes a script reads and print the caller's own bytes.
 #[must_use]
 pub fn refuse_non_text_argument() -> i32 {
     crate::util::print_stderr(&format!("mahbot: {NON_TEXT_ARGUMENT}"));
     Exit::Usage.code()
 }
 
-/// What a first word no entry point has is told. It is never echoed: a value
-/// mistyped as a word is not printed back ([`grammar::read_token`]), and a first
-/// word is as likely a stray value — a secret among them — as a misspelled
-/// command.
+/// What a first word no entry point has is told. It is never echoed
+/// ([`grammar::read_token`]): a first word is as likely a stray secret as a typo.
 const UNKNOWN_ENTRY_POINT: &str = "the first word names no entry point of this build — nothing \
                                    was started; run 'mahbot -h' for the commands this build has";
 
 /// Refuse a first word this build has no entry point for, returning this command
-/// line's misuse class.
-///
-/// The word names nothing the binary can do, so no instance could give it meaning
-/// and the launch must not fall through to the daemon — where it would either
-/// start one or report the instance lock instead of the caller's own mistake.
+/// line's misuse class. It must not fall through to the daemon, where it would start
+/// one or report the instance lock instead of the caller's own mistake.
 #[must_use]
 pub fn refuse_unknown_entry_point() -> i32 {
     crate::util::print_stderr(&format!("mahbot: {UNKNOWN_ENTRY_POINT}"));
@@ -2731,8 +2461,8 @@ pub fn refuse_unknown_entry_point() -> i32 {
 
 /// What one attempt's result means for the caller.
 struct Verdict {
-    /// The product's own answer, printed to stdout verbatim — present whenever
-    /// the product answered the operation itself, a refusal included.
+    /// The product's own answer, printed to stdout verbatim — present whenever it answered
+    /// the operation itself, a refusal included.
     answer: Option<String>,
     /// This command's own diagnostic, printed to stderr.
     diagnostic: Option<String>,
@@ -2741,21 +2471,16 @@ struct Verdict {
 }
 
 /// Classify one attempt at an operation. A pure function of the attempt, so the
-/// decision can be read (and tested) with no socket anywhere near it.
+/// decision can be read — and tested — with no socket near it.
 ///
-/// An answer the product gave goes to stdout whatever its outcome: its wording
-/// is what the caller is owed, and the exit code — not the text — says whether
-/// the operation happened. An operation carried out only in part gets one short
-/// diagnostic line as well, because the product's answer names the part that
-/// did not succeed in the product's own words and the caller must not be left
-/// to read them for a verdict. An operation the product never took on (or
-/// cannot take at all) has no answer for the caller: the product's own wording
-/// — or this command's, when it could not reach the product — goes to stderr,
-/// and the class is the environment's. An exchange severed after the frame went
-/// out is the one failure that is NOT the environment's: the operation may have
-/// been carried out, so its class is a failed operation, and the diagnostic
-/// says plainly that the outcome is unknown and that it was deliberately not
-/// sent again.
+/// An answer the product gave goes to stdout whatever its outcome: the exit code,
+/// not the text, says whether the operation happened, and a partial run adds one
+/// short diagnostic, so the caller need not read the product's wording for a
+/// verdict. An operation never taken on has no answer: the product's wording (or
+/// this command's) goes to stderr and the class is the environment's. An exchange
+/// severed after the frame went out is NOT the environment's — it may have
+/// happened — so it is a failed operation, and the diagnostic states once that the
+/// outcome is unknown and that it was deliberately not sent again.
 fn verdict(word: &str, attempt: CallAttempt) -> Verdict {
     match attempt {
         CallAttempt::Answered(reply) => match reply.outcome {
@@ -2777,22 +2502,20 @@ fn verdict(word: &str, attempt: CallAttempt) -> Verdict {
                 diagnostic: None,
                 code: Exit::Failed,
             },
-            // A product that did not take the operation on. `Unavailable` reaches
-            // the caller as the instance answered it — an unrestricted socket, a
-            // boot that failed, or one that has not finished, whose own sentence
-            // says whether a later attempt may help — while `NotAccepted` is
-            // folded into `NotServed` by the wire client before the caller sees
-            // it. Either way the product answered nothing about the operation
-            // itself, so the instance's own sentence is this command's diagnostic
-            // here, prefixed like the rest of them.
+            // A product that did not take the operation on: `Unavailable` reaches the
+            // caller as the instance answered it (an unrestricted socket, a failed or
+            // unfinished boot, whose sentence says whether a retry may help), and
+            // `NotAccepted` is folded into `NotServed` by the wire client. Nothing was
+            // answered about the operation itself, so the instance's sentence becomes
+            // this command's diagnostic, prefixed like the rest.
             CallOutcome::NotAccepted | CallOutcome::Unavailable => Verdict {
                 answer: None,
                 diagnostic: Some(format!("mahbot {word}: {}", reply.answer)),
                 code: Exit::Environment,
             },
         },
-        // The operation never reached the product (or the product never took it
-        // on): nothing ran, and this command's own wording says what to do next.
+        // Never reached the product: nothing ran, and this command's wording says what
+        // to do next.
         CallAttempt::NotServed(reason) => Verdict {
             answer: None,
             diagnostic: Some(format!("mahbot {word}: {reason}")),
@@ -2806,12 +2529,9 @@ fn verdict(word: &str, attempt: CallAttempt) -> Verdict {
             )),
             code: Exit::Environment,
         },
-        // Nothing readable came back after the frame went out — an exchange that
-        // was severed, or a reply this build cannot read. The operation may have
-        // been carried out, so the class is a failed operation (never the
-        // environment's). The conclusion is stated ONCE, and the cause sits in
-        // the parentheses: the carried error says what happened, never what the
-        // class is or whether it was sent again.
+        // Nothing readable came back after the frame went out: the operation may have
+        // been carried out, so this is a failed operation, never the environment's —
+        // stated ONCE, with the cause in parentheses and no claim about the class.
         CallAttempt::Severed(e) => Verdict {
             answer: None,
             diagnostic: Some(format!(
@@ -2829,28 +2549,13 @@ mod tests {
     use crate::chrome::contract::OutKind;
     use crate::db::ipc::CallReply;
 
-    /// Every first word this build has is one entry point, and every entry point
-    /// the help publishes is discoverable from `mahbot -h`: the families from the
-    /// registry, and the command lines that belong to none of them — `paused`, the
-    /// speech command, the browser CLI, the debugger and the benchmark. One left
-    /// out of the top-level usage would be reachable only by someone who already
-    /// knew its word; `mahbot audio` above all, which has to be discoverable on a
-    /// platform where it can only refuse.
-    ///
-    /// Resolution is pinned word by word, so a misrouting — `paused` losing the
-    /// pause flag to the daemon, a hidden verb landing on the wrong frontend — is
-    /// caught here rather than by a run. The families are checked in the derived
-    /// form ([`family_syntax`]), so a tool or operation rename cannot leave the
-    /// top-level help stale; the non-family entries have no registry to derive from
-    /// and are checked by their own word.
-    ///
-    /// Both directions of the tie are held: a word this build has an entry point
-    /// for resolves to it, while a word it has none for resolves to nothing and is
-    /// never the daemon by fallback. A bare launch is the daemon; it is the one
-    /// entry with no word.
-    ///
-    /// Here — beside the registry — so the library's own test lane holds the tie,
-    /// not just the whole-workspace run.
+    /// Every entry point this build has is discoverable from `mahbot -h` — the
+    /// families in the derived form ([`family_syntax`]), the rest by their own word —
+    /// so none is reachable only by someone who already knew it, `mahbot audio`
+    /// above all on a platform where it can only refuse. Resolution is pinned word
+    /// by word, so a misrouting is caught here rather than by a run, and both
+    /// directions are held: a word with no entry point resolves to nothing and never
+    /// falls back to the daemon, which is the one wordless entry.
     #[test]
     fn every_entry_point_resolves_and_is_listed_in_the_top_level_usage() {
         assert!(matches!(entry_point(Some("-h")), Some(EntryPoint::Help)));
@@ -2935,9 +2640,7 @@ mod tests {
             .parameters_schema()
     }
 
-    /// The action words a tool's schema publishes: its `action` enum where it has
-    /// one, and the keys of its `oneOf` entries where each action declares its
-    /// own arguments.
+    /// The action words a tool's schema publishes: its `action` enum, or its `oneOf` keys.
     fn tool_actions(schema: &serde_json::Value) -> Vec<&str> {
         let action = &schema["properties"]["action"];
         if let Some(actions) = action["enum"].as_array() {
@@ -2960,23 +2663,19 @@ mod tests {
             .collect()
     }
 
-    /// Whether a tool's actions declare their OWN arguments (`oneOf`) rather
-    /// than sharing one argument set beside the action (`enum`). Only the former
-    /// can be swept per operation; for the latter the tool's own schema states
-    /// the arguments once and every action takes them all.
+    /// Whether a tool's actions declare their OWN arguments (`oneOf`) rather than
+    /// sharing one set beside the action (`enum`): only the former sweeps per
+    /// operation, the latter stating its arguments once for every action.
     fn declares_per_action_arguments(tool: &str) -> bool {
         tool_schema(tool)["properties"]["action"]
             .get("enum")
             .is_none()
     }
 
-    /// The arguments one command line can fill: the tool's whole top-level
-    /// argument set, or — for a tool whose actions declare their own arguments —
-    /// the action's entry plus the arguments that stand beside the action.
+    /// The arguments one command line can fill: the tool's whole top-level set, or —
+    /// where actions declare their own — the action's entry plus those beside it.
     fn argument_schema(operation: &Operation) -> serde_json::Map<String, serde_json::Value> {
-        // The reader is no tool action: its arguments are the two inputs the
-        // reading takes, and the flag tie judges only their type (see
-        // [`DOCUMENT_READ`]).
+        // The reader is no tool action: its arguments are the two inputs the reading takes.
         if operation.action == Some(DOCUMENT_READ) {
             return ["path", "file_name"]
                 .into_iter()
@@ -3011,10 +2710,8 @@ mod tests {
         let declared = entry["properties"]
             .as_object()
             .unwrap_or_else(|| panic!("'{action}' must declare its properties"));
-        // A root argument an action opts into belongs to that action: keeping the
-        // root copy would demand a form for it on an operation whose action
-        // refuses it. Only the root arguments no action declares stand beside
-        // every action.
+        // A root argument an action opts into belongs to that action: keeping the root
+        // copy would demand a form for it where the action refuses it.
         let per_action: Vec<&str> = entries
             .iter()
             .flat_map(|entry| entry["properties"].as_object().into_iter())
@@ -3030,8 +2727,7 @@ mod tests {
         args
     }
 
-    /// The words that appear more than once in `words` — a duplicated operation
-    /// or flag is a registry bug an equality comparison would otherwise hide.
+    /// The words appearing more than once in `words` — a registry bug equality hides.
     fn duplicates<'a>(words: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
         let mut seen: Vec<&'a str> = Vec::new();
         let mut repeated: Vec<&'a str> = Vec::new();
@@ -3080,8 +2776,7 @@ mod tests {
         )
     }
 
-    /// Parse a standalone family's flag tail: it has no operation word, so the
-    /// whole tail is flags.
+    /// Parse a standalone family's flag tail: no operation word, so it is all flags.
     fn parse_standalone(family_word: &str, tokens: &[&str]) -> Result<Tail, String> {
         let cli =
             family(family_word).unwrap_or_else(|| panic!("'mahbot {family_word}' is no family"));
@@ -3113,12 +2808,10 @@ mod tests {
         }
     }
 
-    /// Every operation names a tool its family fronts, and the words a family
-    /// answers to are derived and unique: two operations of one family could
-    /// derive the same word (an action kebab-cased, a tool's own name with the
-    /// family word dropped), and the first match would shadow the second in the
-    /// lookup `run` does. A standalone family has no operation word at all: the
-    /// family word IS its operation.
+    /// Every operation names a tool its family fronts, and the words are derived and
+    /// unique: two operations could derive the same word (an action kebab-cased, a
+    /// tool's own name with the family word dropped) and the first would shadow the
+    /// second in `run`'s lookup. A standalone family has no operation word at all.
     #[test]
     fn every_family_fronts_its_tools_under_unique_words() {
         for family in FAMILIES {
@@ -3169,12 +2862,11 @@ mod tests {
         }
     }
 
-    /// The command line and the tools must agree on what exists, in both
-    /// directions: an operation the tool cannot run, an action the command line
-    /// cannot reach, and a duplicate on either side all fail here. A tool that
-    /// takes no `action` has none in the registry either — its operation IS the
-    /// tool. The one operation no tool action backs is pinned by
-    /// [`the_reader_is_the_one_operation_no_tool_backs`].
+    /// The command line and the tools must agree on what exists, in both directions:
+    /// an operation the tool cannot run, an action the command line cannot reach, a
+    /// duplicate on either side. A tool taking no `action` has none in the registry
+    /// either; the one operation no tool action backs is pinned separately
+    /// ([`the_reader_is_the_one_operation_no_tool_backs`]).
     #[test]
     fn operations_match_the_tools_own_actions() {
         for family in FAMILIES {
@@ -3233,9 +2925,7 @@ mod tests {
     }
 
     /// The reader is the one operation no tool action backs: exactly one operation
-    /// names it, it is the document family's, and the document tool publishes no
-    /// such action — so the tie above stays one-for-one for every tool-backed
-    /// operation without an action invented to satisfy it.
+    /// names it, the document family's, and the tool publishes no such action.
     #[test]
     fn the_reader_is_the_one_operation_no_tool_backs() {
         let mut readers = Vec::new();
@@ -3297,8 +2987,7 @@ mod tests {
         }
     }
 
-    /// One command line of a family, as the flag tie is swept: what it is called,
-    /// the tool it runs, the arguments that tool declares, and the flags it carries.
+    /// One command line of a family, as the tie sweeps it: name, tool, arguments, flags.
     struct CommandLine {
         called: String,
         tool: &'static str,
@@ -3307,9 +2996,7 @@ mod tests {
     }
 
     impl CommandLine {
-        /// The schema of the argument a flag fills: one of the tool's own, or — where
-        /// the command line builds a generation itself ([`Self::generation`]) — one of
-        /// that generation's settings.
+        /// The schema a flag fills: one of the tool's own, or a generation setting.
         fn property(&self, arg: &str) -> Option<&serde_json::Value> {
             self.arguments.get(arg).or_else(|| {
                 self.arguments
@@ -3320,8 +3007,7 @@ mod tests {
             })
         }
 
-        /// The argument holding the one generation the picture command builds from its
-        /// own flags, when this is that command.
+        /// The argument holding the picture command's one generation, if this is it.
         fn generation(&self) -> Option<&'static str> {
             (self.tool == "image_gen").then_some(super::GENERATIONS_ARG)
         }
@@ -3339,8 +3025,7 @@ mod tests {
     /// The JSON types one flag kind can fill.
     fn fillable_types(kind: &FlagKind) -> &'static [&'static str] {
         match kind {
-            // One string, so it can only fill a string argument — and a path is
-            // a string the command line resolves.
+            // One string, so it fills a string argument — a path being one it resolves.
             FlagKind::Value | FlagKind::Path => &["string"],
             // The number it is.
             FlagKind::Number => &["integer", "number"],
@@ -3380,9 +3065,8 @@ mod tests {
         }
     }
 
-    /// Every property name a schema subtree declares, at any depth — the fields a
-    /// structured value can carry, so a declared path-bearing field can be held
-    /// against the tool's own schema rather than against a second list.
+    /// Every property name a schema subtree declares, at any depth: the fields a
+    /// structured value can carry, held against the tool's schema, not a second list.
     fn property_names(schema: &serde_json::Value) -> Vec<String> {
         let mut names = Vec::new();
         match schema {
@@ -3403,11 +3087,10 @@ mod tests {
         }
         names
     }
-    /// The property names a schema subtree declares at any depth whose own schema
-    /// IS one of the tool's picture arguments: a field built that way names a FILE,
-    /// so the resolution the command line does is told which fields it owes — the
-    /// other direction of the field tie. The picture's schema differs by target
-    /// (a `create` block may target a PDF), so the whole family is read.
+    /// The property names a schema subtree declares whose own schema IS one of the
+    /// tool's picture arguments: such a field names a FILE, so the field tie's other
+    /// direction learns which fields the resolution owes. The picture's schema
+    /// differs by target, so the whole family is read.
     fn file_naming_fields(
         schema: &serde_json::Value,
         pictures: &[serde_json::Value],
@@ -3436,9 +3119,7 @@ mod tests {
         names
     }
 
-    /// The command lines of one family, as the flag and argument ties sweep them: what
-    /// each is called, the tool it runs, the arguments that tool declares, and the flags
-    /// it carries.
+    /// The command lines of one family, as the ties sweep them: name, tool, arguments, flags.
     fn command_lines(family: &'static Family) -> Vec<CommandLine> {
         match family.surface {
             Surface::Operations(operations) => operations
@@ -3465,14 +3146,11 @@ mod tests {
         }
     }
 
-    /// Every flag must be an argument the tool actually reads, and it must be
-    /// able to fill that argument's own type — swept per OPERATION, so a flag one
-    /// operation of a family carries is judged against that operation's arguments
-    /// rather than against a sibling's. The ONE exception is the destination
-    /// ([`FlagKind::Destination`]): the command line's own operand, which is why
-    /// it is the one flag that is not looked up among the tool's arguments — and
-    /// it is carried by EVERY operation of a producing family and by nothing
-    /// else.
+    /// Every flag must be an argument the tool actually reads, and able to fill that
+    /// argument's type — swept per OPERATION, so a flag is judged against its own
+    /// operation. The ONE exception is the destination ([`FlagKind::Destination`]),
+    /// the command line's own operand: the one flag not looked up among the tool's
+    /// arguments, carried by every operation of a producing family and nothing else.
     #[test]
     fn flags_stay_tied_to_the_tools_own_arguments() {
         let mut file_fields = 0usize;
@@ -3504,14 +3182,11 @@ mod tests {
                         flag.arg,
                         line.called,
                     );
-                    // A structured value's path-bearing fields are swept the same
-                    // way, in BOTH directions: the command line resolves the
-                    // fields it names, so a field the tool does not have there
-                    // would be a resolution this frontend invented — and a field
-                    // the tool builds as one that NAMES A FILE, which the schema
-                    // itself says (the tool's own `image` argument), must be
-                    // declared here, so a field added to the tool later cannot
-                    // silently stop being resolved.
+                    // A structured value's path-bearing fields are swept in BOTH
+                    // directions: a field the tool does not have would be a resolution
+                    // this frontend invented, and a field the tool builds as one that
+                    // NAMES A FILE (its own `image` argument) must be declared here, so
+                    // a field added later cannot silently stop being resolved.
                     if let FlagKind::Structured(fields) = &flag.kind {
                         let declared = property_names(property);
                         for field in *fields {
@@ -3536,10 +3211,7 @@ mod tests {
                         }
                     }
                 }
-                // The picture tool's flags fill the one generation its command builds,
-                // and they must be exactly the settings that generation declares — a
-                // setting added to the schema cannot be left behind as a flag the tool
-                // would ignore.
+                // The picture tool's flags fill the one generation its command builds.
                 if let Some(declared) = line.generation_settings() {
                     let mut declared: Vec<&str> = declared.keys().map(String::as_str).collect();
                     let mut folded: Vec<&str> = line
@@ -3558,10 +3230,7 @@ mod tests {
                     );
                 }
             }
-            // A producing family is one whose flag list carries the destination
-            // at all; what this holds is that EVERY operation of it carries
-            // exactly one, so no operation of a producing family is left without
-            // a destination to run under.
+            // Every operation of a producing family carries the destination, exactly one.
             if produces_files(family) {
                 for line in &lines {
                     let carried = line
@@ -3578,10 +3247,9 @@ mod tests {
                 }
             }
         }
-        // The reverse direction has to have found every one of them, or it would
-        // hold by being vacuous: the document tool's picture stands in a `create`
-        // block and in a docx, a pptx and an xlsx placing edit — four fields the
-        // command line owes a resolution.
+        // The reverse direction has to have found every one of them, or it would hold
+        // vacuously: the document tool's picture stands in a `create` block and in three
+        // placing edits — four fields the command line owes a resolution.
         assert!(
             file_fields >= 4,
             "the picture fields naming a file were not all found ({file_fields}) — the tie would \
@@ -3589,15 +3257,11 @@ mod tests {
         );
     }
 
-    /// Every argument a tool reads — bar the action — must have a command-line
-    /// form, so a new argument cannot silently arrive with no way to set it.
-    ///
-    /// Swept per OPERATION where a tool's actions declare their OWN arguments
-    /// ([`declares_per_action_arguments`]): there a flag one operation omits is a
-    /// real hole that a union over the tool's lines would hide. Where the actions
-    /// share one argument set beside the action, the union is the right rule —
-    /// the tool's own schema states those arguments once, beside the action, and
-    /// every action takes them all.
+    /// Every argument a tool reads — bar the action — must have a command-line form, so
+    /// a new argument cannot arrive with no way to set it. Swept per OPERATION where
+    /// actions declare their OWN arguments ([`declares_per_action_arguments`]): a flag
+    /// one operation omits is a real hole a union would hide, while where the actions
+    /// share one set the union is the right rule.
     #[test]
     fn every_tool_argument_has_a_command_line_form() {
         for family in FAMILIES {
@@ -3607,9 +3271,7 @@ mod tests {
                 let mut reachable: Vec<&str> = Vec::new();
                 let mut declared: Vec<&str> = Vec::new();
                 for line in lines.iter().filter(|line| line.tool == *tool) {
-                    // The argument holding the one generation a batch-shaped command
-                    // line builds is the command line's OWN shape: it reaches the tool
-                    // as an argument this frontend assembles, never as a flag.
+                    // Its generation argument is this frontend's OWN shape, never a flag.
                     let line_reachable: Vec<&str> = line
                         .flags
                         .iter()
@@ -3649,10 +3311,9 @@ mod tests {
         }
     }
 
-    /// Every family declares a protocol value the listener serves. Both sides are
-    /// plain strings in different modules, so nothing else can see a family sent
-    /// under a value the IPC layer does not recognise — every call of it would
-    /// come back as an unknown store (see [`crate::db::ipc`]).
+    /// Every family declares a protocol value the listener serves — plain strings in two
+    /// modules, so nothing else can see a family sent under an unknown value, whose every
+    /// call would come back as an unknown store (see [`crate::db::ipc`]).
     #[test]
     fn every_family_carries_a_protocol_value_the_listener_serves() {
         for cli in FAMILIES {
@@ -3663,11 +3324,9 @@ mod tests {
                 cli.protocol
             );
         }
-        // Only a family THIS build adds carries the current value: every family
-        // the channel has already served keeps the value those builds know, so a
-        // product one build behind still serves it rather than being told to
-        // restart. The list is the checkpoint — a new family means deciding,
-        // deliberately, which of the two it is.
+        // Only a family THIS build adds carries the current value: one the channel has
+        // already served keeps the older value, so a product one build behind still
+        // serves it. The list is the checkpoint for that decision.
         let current: Vec<&str> = FAMILIES
             .iter()
             .filter(|cli| cli.protocol == crate::db::ipc::CALL_STORE)
@@ -3680,10 +3339,9 @@ mod tests {
         );
     }
 
-    /// The instance serves a tool by NAME only when a family publishes it, so
-    /// the owner's other tools are not reachable through the channel however
-    /// privileged the socket is. The tools named below are the checkpoint: a
-    /// family that ever publishes one of them changes this list deliberately.
+    /// The instance serves a tool by NAME only when a family publishes it, so the
+    /// owner's other tools are unreachable through the channel however privileged the
+    /// socket is. The tools named below are the checkpoint for that.
     #[test]
     fn tools_no_family_publishes_are_not_served_by_name() {
         for tool in ["shell", "edit", "analyze", "say"] {
@@ -3694,12 +3352,10 @@ mod tests {
         }
     }
 
-    /// Both helps carry the whole contract: that the product must be running,
-    /// that these commands act with the owner's authority, and the exit classes a
-    /// script reads — a caller entering through one operation's own help must
-    /// learn no less than one reading the family's. A standalone family has no
-    /// operation help to enter through, so its family help must carry its usage
-    /// line and every flag row itself.
+    /// Both helps carry the whole contract — the product must be running, these
+    /// commands act with the owner's authority, and the exit classes — so a caller
+    /// entering through an operation's help learns no less. A standalone family has
+    /// no operation help, so its family help carries the usage line and every flag row.
     #[test]
     fn every_help_states_the_running_product_and_the_exit_classes() {
         for family in FAMILIES {
@@ -3744,9 +3400,7 @@ mod tests {
                     );
                 }
             }
-            // A family that produces files states the destination in BOTH of its
-            // helps — its row is rendered from the registry, so the spelling and
-            // the description cannot drift from the flag the operations carry.
+            // A producing family states the destination in BOTH helps, from the registry.
             if produces_files(family) {
                 for help in &helps {
                     assert!(
@@ -3759,15 +3413,12 @@ mod tests {
         }
     }
 
-    /// Every flag kind the grammar admits, typed as the tool's schema declares it
-    /// and carried verbatim — a list keeps every occurrence, an empty list is the
-    /// EMPTY list. An ABSENT flag leaves no key; a switch's other value is
-    /// `=<false>`. A value the tool will refuse travels as written, except a
-    /// non-boolean switch, which is this command's misuse.
+    /// Every flag kind the grammar admits, typed as the tool's schema declares it and
+    /// carried verbatim. An ABSENT flag leaves no key; a value the tool will refuse
+    /// travels as written, except a non-boolean switch, which is this command's misuse.
     #[test]
     #[expect(clippy::too_many_lines)] // one section per flag kind, in flag order
     fn parsing_carries_each_value_in_the_type_its_flag_declares() {
-        // ── a list keeps every occurrence, verbatim and in order ──
         let p = parsed(
             "config",
             "create-custom-role",
@@ -3791,9 +3442,8 @@ mod tests {
         assert_eq!(p.args["behavior"], "one_off");
         assert_eq!(p.args["prompt"], "the whole definition");
 
-        // An empty value on a list flag is the EMPTY list, which clears the
-        // role's tools; occurrences after it add to it, and the absence that
-        // leaves the argument alone is still an absence.
+        // An empty value on a list flag is the EMPTY list; occurrences after it add to it,
+        // and an absent flag is still an absence.
         let cleared = parsed(
             "config",
             "update-custom-role",
@@ -3809,7 +3459,6 @@ mod tests {
         let untouched = parsed("config", "update-custom-role", &["--name", "triager"]);
         assert!(untouched.args.get("tools").is_none(), "{}", untouched.args);
 
-        // ── a switch: true when given, =<false> for the other value ──
         let full = parsed("workspace", "ticket", &["--ticket-id", "proj-7", "--full"]);
         assert_eq!(
             full.args,
@@ -3853,8 +3502,7 @@ mod tests {
             fleet.args
         );
 
-        // A switch given a value that is no boolean is misuse, and the reason
-        // spells the form rather than echoing the value.
+        // A non-boolean switch value is misuse, and the reason spells the form.
         let reason = parse(
             "video",
             "gen",
@@ -3872,7 +3520,6 @@ mod tests {
             "a reason must never carry a value: {reason}"
         );
 
-        // ── a number travels as one, and anything else as the text it is ──
         let p = parsed(
             "document",
             "pdf-rotate",
@@ -3893,8 +3540,7 @@ mod tests {
         );
         assert_eq!(p.args["degrees"], serde_json::json!("sideways"));
 
-        // ── a structured value travels as the JSON it is written as, and a
-        // value that is no JSON as the text it is, for the tool to refuse ──
+        // A structured value travels as its JSON, and one that is no JSON as text.
         let p = parsed(
             "document",
             "create",
@@ -3920,13 +3566,11 @@ mod tests {
         assert_eq!(p.args["content"], serde_json::json!("not json"));
     }
 
-    /// The values of the SECRET flags — and only those — travel as secrets, so
-    /// they are the ones kept out of every record and echo. Which token is a
-    /// value and which asks for the help is decided by where it stands: where a
-    /// VALUE stands the very next token IS the value, a leading dash and all
-    /// (a script must never read success for an operation that did not run, so
-    /// `--token -h` performs the operation and the product judges the value),
-    /// while a token where a FLAG could stand asks for the help.
+    /// The values of the SECRET flags — and only those — travel as secrets, kept out
+    /// of every record and echo. Which token is a value is decided by where it stands:
+    /// after a flag the next token IS the value, a leading dash and all (a script must
+    /// never read success for an operation that did not run), while where a FLAG could
+    /// stand `-h` asks for the help.
     #[test]
     fn parsing_hands_secret_flag_values_over_as_secrets() {
         let p = parsed("config", "setup-telegram-bot", &["--token", "NNN:AAA"]);
@@ -3940,8 +3584,7 @@ mod tests {
         );
         assert_eq!(p.secrets, vec!["SEKRIT".to_string()]);
 
-        // A dash-led value is a value, and a dash-led secret is a secret like
-        // any other.
+        // A dash-led value is a value, and a dash-led secret a secret like any other.
         let p = parsed("config", "setup-telegram-bot", &["--token", "-h"]);
         assert_eq!(p.args["token"], "-h");
         assert_eq!(
@@ -3966,13 +3609,10 @@ mod tests {
         );
     }
 
-    /// Anything this frontend can judge by itself is misuse, and its reason says
-    /// what is wrong with WHICH flag — while never carrying a flag's value back
-    /// out.
+    /// Anything this frontend can judge by itself is misuse, its reason naming the flag.
     #[test]
     fn parsing_refuses_misuse_without_echoing_a_value() {
-        /// One misuse case: the tokens, the flag its reason must name, and the
-        /// values that must not come back in that reason.
+        /// One misuse case: the tokens, the flag its reason names, and the values never echoed.
         struct Case {
             family: &'static str,
             operation: &'static str,
@@ -4052,8 +3692,7 @@ mod tests {
             !reason.contains("SEKRIT"),
             "a usage error must never carry a value: {reason}"
         );
-        // Neither does a secret mistyped as a positional — the token the caller
-        // wrote there is not echoed at all.
+        // Neither is a secret mistyped as a positional: the token is not echoed.
         let reason = parse("config", "setup-telegram-bot", &["SEKRIT"])
             .err()
             .expect("a stray token is misuse");
@@ -4063,19 +3702,12 @@ mod tests {
         );
     }
 
-    /// A value too long for one command line may be given by naming a file that
-    /// holds it: a `List` flag's `@<file>` adds the entries the file holds, a
-    /// structured flag's `@<file>` takes the JSON the file holds, and a plain
-    /// text flag's `@<file>` is the file's text without one trailing line break.
-    /// The `./@…` escape gives a value that begins with `@` — the one spelling a
-    /// file name cannot be confused with — and a flag whose value names a path
-    /// itself takes no file form at all: `@` is then just the first character of
-    /// the name it was given.
-    ///
-    /// The file form is this command line's own, so a file it cannot use is
-    /// misuse — and the reason names the FLAG, never the path. A secret given
-    /// from a file is the FILE's content: that is what must not reach a record,
-    /// an echo or the answer, never the spelling that named it.
+    /// A value too long for one command line may be given by naming a file: a `List`'s
+    /// `@<file>` adds the entries it holds, a structured one's takes its JSON, a text
+    /// one's is its text without one trailing line break. `./@…` escapes a value that
+    /// begins with `@`, and a flag whose value names a path itself has no file form.
+    /// A file it cannot use is misuse, the reason naming the FLAG, never the path; a
+    /// secret given from a file is the FILE's content, which must reach no record or echo.
     #[test]
     fn parsing_reads_a_value_from_a_file_the_caller_names() {
         let dir = crate::util::test::test_root().join("cli-file-values");
@@ -4094,8 +3726,7 @@ mod tests {
         assert_eq!(
             p.args["paths"],
             serde_json::json!([
-                // The entries a file holds are paths like any other, so each is
-                // resolved where this command runs.
+                // The entries a file holds are paths, each resolved where this command runs.
                 resolved("Cargo.toml"),
                 resolved("Cargo.lock"),
                 resolved("README.md"),
@@ -4112,8 +3743,7 @@ mod tests {
         );
         assert_eq!(p.args["values"]["name"], "Ada");
 
-        // A file that does not hold what the flag takes is misuse, and the
-        // reason never echoes the path.
+        // A file holding the wrong thing is misuse, the reason never echoing the path.
         let wrong = dir.join("wrong.json");
         std::fs::write(&wrong, r#"{"a": 1}"#).expect("write the wrong shape");
         let from_file = format!("@{}", wrong.display());
@@ -4126,7 +3756,6 @@ mod tests {
             "a reason must never carry a path value: {reason}"
         );
 
-        // ── a plain text value ──
         let text = crate::util::test::test_root().join("cli-text-values");
         std::fs::create_dir_all(&text).expect("a place for the value files");
 
@@ -4136,8 +3765,7 @@ mod tests {
         let p = parsed("image", "gen", &["--prompt", &from_file]);
         assert_eq!(p.args["prompt"], "a cat asleep on a keyboard");
 
-        // A value that begins with `@` is written `./@…`: the `./` is dropped and
-        // no file is read, whether or not a file of that name exists.
+        // A value beginning with `@` is written `./@…`: no file is read, existing or not.
         std::fs::write(text.join("alice"), "not the prompt").expect("write a decoy file");
         let decoy = format!("./@{}", text.join("alice").display());
         let p = parsed("image", "gen", &["--prompt", &decoy]);
@@ -4146,8 +3774,7 @@ mod tests {
             format!("@{}", text.join("alice").display())
         );
 
-        // A file that is not there is misuse, and the reason names the flag and
-        // never the path.
+        // A file that is not there is misuse, the reason naming the flag, never the path.
         let missing = format!("@{}", text.join("nothing-here.txt").display());
         let reason = parse("image", "gen", &["--prompt", &missing])
             .err()
@@ -4158,8 +3785,8 @@ mod tests {
             "a reason must never carry a path value: {reason}"
         );
 
-        // A secret given from a file is the FILE's content: that is what must not
-        // reach a record, an echo or the answer — never the spelling that named it.
+        // A secret given from a file is the FILE's content: that must reach no record,
+        // echo or answer — never the spelling that named it.
         let key = text.join("provider-key.txt");
         std::fs::write(&key, "sk-secret-from-a-file\n").expect("write the key");
         let from_file = format!("@{}", key.display());
@@ -4195,12 +3822,10 @@ mod tests {
         assert!(reason.contains("--paths"), "{reason}");
     }
 
-    /// A flag that names a FILE carries the path the CALLER meant: `~` expanded
-    /// against the home directory and a relative path resolved in the directory
-    /// this command was run in — the product has a working directory of its own,
-    /// and a relative path sent on as written would name a different file there.
-    /// A value that names no file, and an absolute path or a public URL, are left
-    /// exactly as they were written.
+    /// A flag that names a FILE carries the path the CALLER meant: `~` expanded against
+    /// the home directory, a relative path resolved in this command's directory — the
+    /// product's own working directory would name a different file. A value that names
+    /// no file, an absolute path and a public URL are left as written.
     #[test]
     fn parsing_resolves_a_path_where_the_command_runs() {
         let here = std::env::current_dir().expect("a working directory");
@@ -4241,9 +3866,7 @@ mod tests {
         assert_eq!(p.args["video_url"], "https://example.test/clip.mp4");
         assert_eq!(p.args["images"][0], relative("Cargo.toml"));
 
-        // `~` is the home directory, exactly as a shell would read it — asserted
-        // on the destination, the one path operand that may be a directory: a
-        // bare `~` is a directory, and a reference file must be a regular one.
+        // `~` is the home directory: a bare `~` is one, a reference file must be a file.
         if let Ok(home) = std::env::var("HOME") {
             let resolved = resolve_output_dir(Some("~")).expect("the home directory is usable");
             assert_eq!(
@@ -4268,10 +3891,9 @@ mod tests {
         assert_eq!(p.args["prompt"], "a cat by a window");
     }
 
-    /// The picture family's flat flags become the one generation this command asks
-    /// for: the settings go inside the generation, the prompt stands beside the list,
-    /// and a flag left out is left out of the generation rather than sent as a flat
-    /// argument the tool would ignore.
+    /// The picture family's flat flags become the one generation it asks for: the
+    /// settings go inside the generation, the prompt beside the list, and a flag left
+    /// out is left out of the generation rather than sent flat for the tool to ignore.
     #[test]
     fn the_picture_family_folds_its_flags_into_one_generation() {
         let mut args = serde_json::json!({
@@ -4297,17 +3919,15 @@ mod tests {
             generations[0]
         );
 
-        // A call that carries none of the settings is still one generation: every
-        // setting is optional, and none is invented here.
+        // A call carrying no setting is still one generation: all optional, none invented.
         let mut bare = serde_json::json!({ "prompt": "a cat" });
         super::fold_one_generation(&mut bare);
         assert_eq!(bare["generations"][0], serde_json::json!({}), "{bare}");
     }
 
-    /// A path a STRUCTURED value carries resolves exactly like a `--path` value:
-    /// the product resolves an embedded image against its own directories, so a
-    /// relative one sent on as written would read a file the caller never named —
-    /// and a field that names no file is the caller's own text.
+    /// A path a STRUCTURED value carries resolves exactly like a `--path` value, since
+    /// the product resolves an embedded image against its own directories — and a field
+    /// that names no file is the caller's own text.
     #[test]
     fn parsing_resolves_a_path_inside_a_structured_value() {
         let here = std::env::current_dir().expect("a working directory");
@@ -4367,8 +3987,7 @@ mod tests {
             "https://example.test/picture.png"
         );
 
-        // A field no file stands under is a value like any other, however it
-        // reads: a sheet cell that looks like a path is the caller's text.
+        // A field no file stands under is a plain value: a path-like cell is caller text.
         let p = parsed(
             "document",
             "create",
@@ -4381,8 +4000,7 @@ mod tests {
         );
         assert_eq!(p.args["sheets"][0]["rows"][0][0], "generated/logo.png");
 
-        // A reference file inside a value that is not there is the caller's own
-        // misuse: the reason names the flag and never the path.
+        // A reference file inside a value that is missing is misuse, naming the flag.
         let reason = parse(
             "document",
             "create",
@@ -4399,15 +4017,11 @@ mod tests {
         assert!(!reason.contains("no-such-picture-here"), "{reason}");
     }
 
-    /// A file the caller names — a reference path, a path inside a structured
-    /// value, or a file a value is read from — must be a REGULAR file it can
-    /// read: missing, or one of a path list missing, is the caller's own misuse;
-    /// a pipe would hold the command forever (the parse has no timeout and the
-    /// product has none either) and an endless device would read until memory ran
-    /// out, while a value file far past any command line is a mistaken path rather
-    /// than a value. All of it is judged before anything is sent, and the reason
-    /// names the FLAG, never the path. A public URL is not a path at all: only the
-    /// product can fetch one, and its answer says what happened.
+    /// A file the caller names — a reference path, a path inside a structured value, a file
+    /// a value is read from — must be a REGULAR file it can read: a pipe would hold the
+    /// command forever (neither the parse nor the product has a timeout), an endless device
+    /// would exhaust memory, and a value file far past any command line is a mistaken path.
+    /// All of it is judged before anything is sent, naming the FLAG and never the path.
     #[test]
     #[expect(clippy::too_many_lines)] // one section per way a named file can be unusable
     fn the_file_the_caller_names_must_be_a_regular_file_it_can_read() {
@@ -4451,8 +4065,7 @@ mod tests {
         );
         assert_eq!(p.args["video_url"], "https://example.test/x.mp4");
 
-        // Something that exists but is no regular file is misuse as well. Only
-        // metadata is looked at, so the refusal cannot block.
+        // Something that exists but is no regular file is misuse: only metadata is read.
         let dir = crate::util::test::test_root().join("cli-reference-not-a-file");
         std::fs::create_dir_all(&dir).expect("a directory that is no reference file");
         let reason = parse(
@@ -4469,8 +4082,8 @@ mod tests {
             "a reason must never carry a path value: {reason}"
         );
 
-        // The same rule for a file a VALUE is read from — and a bound on its size,
-        // because a value travels as one argument.
+        // The same rule for a file a VALUE is read from, with a bound on its size since a
+        // value travels as one argument.
         let values = crate::util::test::test_root().join("cli-value-file-guards");
         std::fs::create_dir_all(&values).expect("a place for the guard fixtures");
         let reason = parse(
@@ -4549,16 +4162,14 @@ mod tests {
         }
     }
 
-    /// The destination is resolved on the machine this command runs on, in the
-    /// directory it was run in: a directory of the caller's own is taken as it
-    /// resolves, a missing one or one that is not a directory is misuse, and one
-    /// the product keeps for itself is refused however it is spelled.
+    /// The destination is resolved on this machine, in the directory this command was run
+    /// in: a missing one, or one that is no directory, is misuse, and one the product
+    /// keeps for itself is refused however it is spelled.
     #[test]
     fn the_destination_is_resolved_and_the_products_own_places_are_refused() {
-        // The default destination is the directory this command was run in. A
-        // tree checked out under a governed root is refused like any other place
-        // — the rule is about the PLACE, not about who asks — so the default and
-        // the same directory named explicitly must agree either way.
+        // The default destination is the directory this command was run in. A tree under a
+        // governed root is refused like any other place — the rule is about the PLACE — so
+        // the default and the same directory named explicitly agree.
         let cwd = std::env::current_dir().expect("a working directory");
         let cwd_string = cwd.to_string_lossy().into_owned();
         let named = resolve_output_dir(Some(&cwd_string)).ok();
@@ -4587,10 +4198,9 @@ mod tests {
             .expect_err("a file is not a destination");
         assert!(reason.contains("is not a directory"), "{reason}");
 
-        // The product's own temporary area, however it is spelled — a link into
-        // it is refused all the same. The check is on the RESOLVED path, so a
-        // machine where the area is not there has nothing to resolve and nothing
-        // to refuse.
+        // The product's own temporary area, however it is spelled — a link into it is
+        // refused too. The check is on the RESOLVED path, so a machine without the area
+        // has nothing to refuse.
         let temp = std::env::temp_dir();
         if temp.is_dir() {
             let reason = resolve_output_dir(Some(&temp.to_string_lossy()))
@@ -4608,10 +4218,9 @@ mod tests {
             }
         }
 
-        // The product's own data directory, and everything under it. The rule
-        // itself is asserted without the filesystem — a machine where the
-        // directory does not exist yet is one where nothing can be resolved
-        // inside it, not one where it is a usable destination.
+        // The product's own data directory, and everything under it. The rule is asserted
+        // without the filesystem: a machine without the directory has nothing resolvable
+        // inside it, not a usable destination.
         let data = crate::config::default_config_dir().expect("the storage root resolves");
         let inside = data.join("somewhere");
         assert!(
@@ -4625,9 +4234,7 @@ mod tests {
         }
     }
 
-    /// A family whose tool takes no `action` at all: the family word IS the
-    /// operation, so what it sends carries no `action` key and an absent flag
-    /// leaves no key.
+    /// A family whose tool takes no `action`: the family word IS the operation.
     #[test]
     fn a_family_with_no_actions_is_its_own_operation() {
         let sent = parsed_standalone(
@@ -4656,19 +4263,16 @@ mod tests {
             sent.args
         );
 
-        // The required flags are the tool's own judgement, not this frontend's:
-        // a bare family word sends an args object with no key at all.
+        // The required flags are the tool's judgement: a bare family word sends no key.
         assert_eq!(parsed_standalone("send", &[]).args, serde_json::json!({}));
     }
 
-    /// The exit classes are the browser-automation command's own numbering,
-    /// class for class — a script that reads exit codes must not have to learn a
-    /// second table. Asserted against that table rather than restated, so the
-    /// two cannot drift.
+    /// The exit classes are the browser-automation command's own numbering, class for
+    /// class, and asserted against that table rather than restated, so the two cannot
+    /// drift into a second table for a script to learn.
     #[test]
     fn exit_classes_match_the_browser_automation_command() {
-        /// The class each of the other command's kinds belongs to, matched
-        /// exhaustively so a new kind has to be placed here.
+        /// The class each of the other command's kinds belongs to, matched exhaustively.
         fn class_of(kind: OutKind) -> Exit {
             match kind {
                 OutKind::Ok | OutKind::Empty => Exit::Ok,
@@ -4702,8 +4306,7 @@ mod tests {
         }
     }
 
-    /// What one attempt becomes: the stream each part goes to, and the class a
-    /// script reads — decided with no socket in sight.
+    /// What one attempt becomes: where each part goes and the class a script reads.
     #[test]
     fn attempt_decisions_map_to_the_documented_streams_and_exit_codes() {
         let done = verdict(
@@ -4733,9 +4336,7 @@ mod tests {
         );
         assert_eq!(partial.code, Exit::Failed);
 
-        // The two the wire client should never hand over, classified as a
-        // product that did not take the operation on: the instance's sentence
-        // reaches stderr as this command's diagnostic, prefixed like the rest.
+        // The two the wire client should never hand over: not taken on, sentence to stderr.
         for reply in [
             CallReply::not_accepted("still starting"),
             CallReply::unavailable("cannot serve operations"),
@@ -4792,9 +4393,7 @@ mod tests {
         assert_eq!(severed.code, Exit::Failed);
     }
 
-    /// Misuse is exit 3, and it is decided before the environment is touched: an
-    /// instance at some other storage root — or none at all — must not change
-    /// the answer, and this test has neither.
+    /// Misuse is exit 3, decided before the environment is touched: no instance here.
     #[tokio::test]
     async fn misuse_is_exit_3_before_the_environment_is_probed() {
         let invocations: [&[&str]; 12] = [
@@ -4808,8 +4407,7 @@ mod tests {
             &["document", "no-such-operation"],
             &["image", "gen", "--nope"],
             &["video", "gen", "--prompt"],
-            // The producing families' destination is judged here too: a place
-            // that is not there is misuse, and nothing is sent.
+            // The destination is judged here too: a place that is not there is misuse.
             &[
                 "image",
                 "gen",
@@ -4818,8 +4416,7 @@ mod tests {
                 "--output-dir",
                 "/no/such/place",
             ],
-            // The destination is the command line's own: a family that produces
-            // nothing does not take it.
+            // A family that produces nothing does not take the destination.
             &["workspace", "list", "--output-dir", "/tmp"],
         ];
         for invocation in invocations {

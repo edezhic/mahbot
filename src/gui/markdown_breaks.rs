@@ -38,8 +38,7 @@ pub(crate) fn iced_markdown_options() -> pulldown_cmark::Options {
 /// Escape `<` → `&lt;` only inside the regions the markdown parser classifies
 /// as HTML (block-level `Event::Html` plus inline `Event::InlineHtml`), so
 /// angle-bracket tag blocks (`<system-notification>`, `<analyze-tool-result>`,
-/// `<timestamp>` …) render as visible literal text instead of being dropped
-/// wholesale.
+/// `<timestamp>` …) render as visible literal text instead of being dropped wholesale.
 ///
 /// This is deliberately a `<`-only escape: `util::escape_html` is not reused
 /// (it also escapes `>` — breaking blockquotes — and `&`, which would
@@ -95,7 +94,6 @@ pub(crate) fn escape_html_blocks(text: &str) -> Cow<'_, str> {
 /// only newlines are code/paragraph boundaries); otherwise it owns a new
 /// string with two trailing spaces inserted before each soft break.
 pub(crate) fn hard_breaks(text: &str) -> Cow<'_, str> {
-    // Fast path: a single-line message needs no scan.
     if !text.contains('\n') && !text.contains('\r') {
         return Cow::Borrowed(text);
     }
@@ -162,7 +160,6 @@ mod tests {
                 "a\nb\n\npara2",
                 "a  \nb\n\npara2",
             ),
-            // fenced code block (incl. a blank line inside it)
             (
                 "fenced code untouched",
                 "x\n```\ncode\n\nnext\n```\ny",

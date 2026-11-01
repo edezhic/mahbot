@@ -1,34 +1,24 @@
 //! How much memory a command's process tree is holding.
 //!
-//! The watchdog [`super::run_command_with_timeout`] runs needs one number: the
-//! resident memory of the child *and every descendant*, sampled while the
-//! command runs, against a ceiling of [`MEMORY_LIMIT_FRACTION`] of physical RAM.
-//! The ceiling exists because the shell tool imposes no memory bound of its own
-//! — a single command can allocate the whole machine away — and the sample is
-//! what lets the run be ended before the operating system starts thrashing.
+//! The watchdog [`super::run_command_with_timeout`] runs needs one number: the resident memory of
+//! the child *and every descendant*, sampled while the command runs, against a ceiling of
+//! [`MEMORY_LIMIT_FRACTION`] of physical RAM. The ceiling exists because the shell tool imposes no
+//! memory bound of its own — a single command can allocate the whole machine away — and the sample
+//! is what lets the run be ended before the system starts thrashing.
 //!
-//! One mechanism, three platforms; only the two queries below are spelled per
-//! platform:
+//! Only the two queries are spelled per platform: the machine's *total* (`sysctl hw.memsize`,
+//! `sysconf(_SC_PHYS_PAGES)`, `GlobalMemoryStatusEx`) and the tree's *usage* (each process's
+//! resident footprint — `proc_pid_rusage`, `/proc/<pid>/statm`, `GetProcessMemoryInfo` — summed
+//! over the tree the platform's own child discovery yields).
 //!
-//! - the machine's *total*, for the ceiling: `sysctl hw.memsize` on macOS,
-//!   `sysconf(_SC_PHYS_PAGES)` times the page size on Linux,
-//!   `GlobalMemoryStatusEx` on Windows;
-//! - the tree's *usage*: each process's resident footprint (`proc_pid_rusage`
-//!   on macOS, `/proc/<pid>/statm` on Linux, `GetProcessMemoryInfo` on
-//!   Windows), summed over the tree the platform's own child discovery yields
-//!   (`proc_listchildpids`, the `ppid` of `/proc/<pid>/stat`, a Toolhelp
-//!   parent-pid walk).
+//! Everything here fails open. A query that cannot answer returns `None`, a descendant already
+//! gone contributes nothing, and no measurement failure ever ends a run or panics one: a watchdog
+//! that killed a command because it could not read a number would be worse than the unbounded
+//! command it was added to stop.
 //!
-//! Everything here fails open. A query that cannot answer returns `None`, a
-//! descendant that is already gone by the time it is read simply contributes
-//! nothing, and no measurement failure ever ends a run or panics one: a
-//! watchdog that killed a command because it could not read a number would be
-//! worse than the unbounded command it was added to stop.
-//!
-//! One accepted limitation follows from discovering the tree by parent pid: a
-//! descendant whose own parent has already exited is reparented away and is no
-//! longer reachable from the run's root, so its memory is not counted. The
-//! measurement is a lower bound — it can miss memory, never invent it.
+//! One accepted limitation follows from discovering the tree by parent pid: a descendant whose
+//! parent has already exited is reparented away and no longer reachable, so its memory is not
+//! counted. The measurement is a lower bound — it can miss memory, never invent it.
 
 #[cfg(any(target_os = "linux", windows))]
 use std::collections::HashMap;
@@ -39,13 +29,11 @@ use std::collections::HashSet;
 /// watchdog ends the run.
 const MEMORY_LIMIT_FRACTION: f64 = 0.8;
 
-/// The ceiling a run is watched against — [`MEMORY_LIMIT_FRACTION`] of physical
-/// RAM — or `None` when the machine's total cannot be read (fail open: a run is
-/// never ended for memory when the total is unknown).
+/// The ceiling a run is watched against — [`MEMORY_LIMIT_FRACTION`] of physical RAM — or `None`
+/// when the total cannot be read (a run is never ended for memory when the total is unknown).
 #[must_use]
 pub(super) fn default_limit() -> Option<u64> {
-    // The share is the only float involved; physical RAM is far below 2^53, so
-    // the round-trip through `f64` is exact.
+    // The share is the only float involved; physical RAM is far below 2^53, so `f64` is exact.
     #[expect(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
@@ -55,8 +43,7 @@ pub(super) fn default_limit() -> Option<u64> {
     Some(limit)
 }
 
-/// A byte count as a one-decimal GiB figure — the unit a memory failure reports
-/// in (`~15.4 GiB`). Integer arithmetic, so the figure is exact to the tenth.
+/// A byte count as a one-decimal GiB figure (`~15.4 GiB`), in integer arithmetic.
 #[must_use]
 pub(super) fn gib(bytes: u64) -> String {
     /// One gibibyte; a tenth of it is `bytes % GIB * 10 / GIB`.
@@ -70,14 +57,10 @@ pub(super) fn gib(bytes: u64) -> String {
 /// [`super::ProgramOutcome::stop_reason`] reads the reason out of.
 pub(super) const TERMINATED: &str = "terminated: ";
 
-/// The one-line memory failure every run shape reports, e.g.
-/// `terminated: exceeded memory limit (used ~15.4 GiB of 18.0 GiB)`. Spelled
-/// once so the tool's error block and a direct run's typed error cannot drift.
-///
-/// `used` is reported against the machine's total RAM — the figure a reader can
-/// weigh the amount against, since the ceiling itself is a share of it — and
-/// against `limit` only when the total cannot be read. `limit` is the ceiling
-/// that was actually crossed.
+/// The one-line memory failure every run shape reports, e.g. `terminated: exceeded memory limit
+/// (used ~15.4 GiB of 18.0 GiB)`. Spelled once so the tool's error block and a direct run's typed
+/// error cannot drift. `used` is reported against total RAM, and against `limit` only when the
+/// total cannot be read.
 #[must_use]
 pub(super) fn exceeded_failure(used: u64, limit: u64) -> String {
     let total = physical_memory().unwrap_or(limit);
@@ -87,8 +70,6 @@ pub(super) fn exceeded_failure(used: u64, limit: u64) -> String {
         gib(total),
     )
 }
-
-// ── Physical RAM (the ceiling) ────────────────────────────────────────
 
 /// Total physical RAM in bytes, or `None` when it cannot be read.
 #[cfg(target_os = "macos")]
@@ -145,26 +126,20 @@ pub(super) fn physical_memory() -> Option<u64> {
     (ok != 0).then_some(status.ullTotalPhys)
 }
 
-/// No physical-RAM reading on a platform that is neither macOS, Linux nor
-/// Windows (fail open).
+/// No physical-RAM reading on any other platform (fail open).
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 #[must_use]
 pub(super) fn physical_memory() -> Option<u64> {
     None
 }
 
-// ── Resident usage of a process tree ──────────────────────────────────
-
-/// Sum [`process_rss`] over `root` and every pid `children` reaches from it, or
-/// `None` when the root's own reading cannot be had (fail open). The root's own
-/// reading is required; a descendant that cannot be read — it exited mid-walk —
-/// is skipped rather than failing the whole sample, and a pid reached twice is
-/// measured once.
+/// Sum [`process_rss`] over `root` and every pid `children` reaches from it, or `None` when the
+/// root's own reading cannot be had. A descendant that cannot be read — it exited mid-walk — is
+/// skipped rather than failing the sample, and a pid reached twice is measured once.
 ///
-/// Only the discovery of `children` is per platform, and so is what its failure
-/// costs: the Linux `/proc` table degrades to a root-only measurement, the
-/// Windows Toolhelp snapshot yields no total at all, and macOS has nothing that
-/// could fail on its own.
+/// Only the discovery of `children` is per platform, and so is what its failure costs: Linux
+/// degrades to a root-only measurement, the Windows Toolhelp snapshot yields no total at all, and
+/// macOS has nothing that could fail on its own.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn sum_tree_rss(root: u32, children: impl Fn(u32) -> Vec<u32>) -> Option<u64> {
     let mut total = process_rss(root)?;
@@ -184,17 +159,15 @@ fn sum_tree_rss(root: u32, children: impl Fn(u32) -> Vec<u32>) -> Option<u64> {
     Some(total)
 }
 
-/// Resident bytes `root` and every live descendant hold, descended one level at
-/// a time with the kernel's own child listing — macOS has no whole-table
-/// snapshot to walk.
+/// Resident bytes `root` and every live descendant hold, descended one level at a time with the
+/// kernel's own child listing — macOS has no whole-table snapshot.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub(super) fn tree_rss(root: u32) -> Option<u64> {
     sum_tree_rss(root, children_of)
 }
 
-/// Resident bytes `root` and every live descendant hold, from the `/proc`
-/// parent index.
+/// Resident bytes `root` and every live descendant hold, from the `/proc` parent index.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub(super) fn tree_rss(root: u32) -> Option<u64> {
@@ -202,8 +175,7 @@ pub(super) fn tree_rss(root: u32) -> Option<u64> {
     sum_tree_rss(root, |pid| children.get(&pid).cloned().unwrap_or_default())
 }
 
-/// Resident bytes `root` and every live descendant hold, from one Toolhelp
-/// snapshot.
+/// Resident bytes `root` and every live descendant hold, from one Toolhelp snapshot.
 #[cfg(windows)]
 #[must_use]
 pub(super) fn tree_rss(root: u32) -> Option<u64> {
@@ -211,18 +183,14 @@ pub(super) fn tree_rss(root: u32) -> Option<u64> {
     sum_tree_rss(root, |pid| children.get(&pid).cloned().unwrap_or_default())
 }
 
-/// No resident-memory reading on a platform that is neither macOS, Linux nor
-/// Windows (fail open).
+/// No resident-memory reading on any other platform (fail open).
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 #[must_use]
 pub(super) fn tree_rss(_root: u32) -> Option<u64> {
     None
 }
 
-// ── Per-process resident memory ───────────────────────────────────────
-
-/// Resident bytes one macOS process holds: its physical footprint, the figure
-/// the system's own memory accounting reports.
+/// Resident bytes one macOS process holds: its physical footprint.
 #[cfg(target_os = "macos")]
 fn process_rss(pid: u32) -> Option<u64> {
     let id = libc::c_int::try_from(pid).ok()?;
@@ -242,13 +210,11 @@ fn process_rss(pid: u32) -> Option<u64> {
     (ok == 0).then_some(info.ri_phys_footprint)
 }
 
-/// The pids macOS reports as `pid`'s direct children, as the kernel sees them
-/// now. A refusal or an empty answer yields an empty list (fail open: the
-/// parent's own footprint still answers).
+/// The pids macOS reports as `pid`'s direct children. A refusal or an empty answer yields an
+/// empty list (fail open: the parent's own footprint still answers).
 #[cfg(target_os = "macos")]
 fn children_of(pid: u32) -> Vec<u32> {
-    /// Direct children one process may have before this walk stops growing its
-    /// buffer; every real command is far below it.
+    /// Direct children one process may have before this walk stops growing its buffer.
     const CHILD_CAPACITY: usize = 1024;
 
     let Ok(parent) = libc::pid_t::try_from(pid) else {
@@ -271,8 +237,7 @@ fn children_of(pid: u32) -> Vec<u32> {
         .collect()
 }
 
-/// Resident bytes one Linux process holds, from `/proc/<pid>/statm` whose
-/// second field is the resident set in pages.
+/// Resident bytes one Linux process holds, from `/proc/<pid>/statm`'s second field.
 #[cfg(target_os = "linux")]
 fn process_rss(pid: u32) -> Option<u64> {
     let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
@@ -287,13 +252,11 @@ fn process_rss(pid: u32) -> Option<u64> {
 fn page_size() -> u64 {
     // SAFETY: `sysconf` is a read-only query with no arguments to misuse.
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    // A non-positive answer cannot happen for a valid name; falling back to the
-    // near-universal 4 KiB only keeps the sample usable (fail open either way).
+    // A non-positive answer cannot happen for a valid name; 4 KiB only keeps the sample usable.
     u64::try_from(size).unwrap_or(4096)
 }
 
-/// Resident bytes one Windows process holds: its working set, the resident
-/// pages the system has charged to it.
+/// Resident bytes one Windows process holds: its working set.
 #[cfg(windows)]
 fn process_rss(pid: u32) -> Option<u64> {
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -326,11 +289,8 @@ fn process_rss(pid: u32) -> Option<u64> {
     u64::try_from(counters.WorkingSetSize).ok()
 }
 
-// ── Process-tree discovery ────────────────────────────────────────────
-
-/// Every live pid mapped to its parent's, walked from `/proc`. A walk that
-/// cannot read the table yields an empty index (fail open: no descendant is
-/// found, and the root's own footprint still answers).
+/// Every live pid mapped to its parent's, walked from `/proc`. A walk that cannot read the table
+/// yields an empty index (fail open: the root's own footprint still answers).
 #[cfg(target_os = "linux")]
 fn children_map() -> HashMap<u32, Vec<u32>> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -352,10 +312,9 @@ fn children_map() -> HashMap<u32, Vec<u32>> {
     children
 }
 
-/// The pid that spawned `pid`, from `/proc/<pid>/stat`. Its `ppid` is the
-/// second whitespace-separated field after the command name, and the command
-/// name may itself contain spaces or parentheses — hence the parse starts at
-/// the last `)`, not at a field index.
+/// The pid that spawned `pid`, from `/proc/<pid>/stat`. Its `ppid` is the second field after the
+/// command name, and that name may hold spaces or parentheses — hence the parse starts at the
+/// last `)`.
 #[cfg(target_os = "linux")]
 fn parent_of(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -365,9 +324,8 @@ fn parent_of(pid: u32) -> Option<u32> {
     fields.next()?.parse().ok()
 }
 
-/// Every live process mapped to its parent's, from one Toolhelp snapshot — the
-/// Windows spelling of Linux's `/proc` walk. `None` when the snapshot itself
-/// fails (fail open).
+/// Every live process mapped to its parent's, from one Toolhelp snapshot. `None` when the
+/// snapshot itself fails (fail open).
 #[cfg(windows)]
 fn children_map() -> Option<HashMap<u32, Vec<u32>>> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -413,14 +371,12 @@ mod tests {
             return;
         };
         let limit = default_limit().expect("a known total has a limit");
-        // Four fifths, the fraction `default_limit` documents; written here as
-        // integer arithmetic so the assertion cannot drift with the float.
+        // Four fifths, the fraction `default_limit` documents, written as integer arithmetic so
+        // the assertion cannot drift with the float.
         assert_eq!(limit, total.saturating_mul(4) / 5);
     }
 
-    /// The watchdog's own process is measurable: its tree holds at least its own
-    /// footprint. Guards each platform's helper against a total regression (a
-    /// wrong field, a bad path) without allocating anything.
+    /// The watchdog's own process is measurable: its tree holds at least its own footprint.
     #[test]
     fn the_current_process_tree_has_a_nonzero_footprint() {
         let rss = tree_rss(std::process::id()).expect("the measuring process must be readable");

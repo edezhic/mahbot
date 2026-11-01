@@ -1,30 +1,16 @@
 //! Shared model-loading state machine wrapper for the macOS audio subsystem.
 //!
-//! Extracted from the duplicated `AtomicU8` lifecycle blocks (Uninit→Loading→
-//! Ready/Failed) in `audio::tts` and `audio::local_transcriber`.
-//! `ModelState`/`AtomicModelState` provide the shared state representation;
-//! [`ModelLoadGuard`] unifies the byte-identical Loading→Failed Drop guard
-//! used for panic safety in background download tasks (directly by
-//! `audio::local_transcriber`, and inside `audio`'s shared TTS download-retry
-//! loop that `audio::tts` runs through).
+//! Extracted from the duplicated `AtomicU8` lifecycle blocks (Uninit→Loading→Ready/Failed)
+//! in `audio::tts` and `audio::local_transcriber`: [`ModelLoadGuard`] unifies the byte-
+//! identical Loading→Failed Drop guard that keeps a panicking background download from
+//! leaving the state stuck in `Loading`.
 //!
-//! Deliberate non-unifications (semantics-preserving scope):
-//! * The per-module singletons keep their own container/value types — `tts`
-//!   `OnceLock<RwLock<Option<_>>>` and `local_transcriber` `Mutex<Option<_>>`.
-//!   Unifying these would change synchronization semantics (poisoning,
-//!   init-once, contention).
-//! * `local_transcriber` gained its guard when its init moved off the awaited
-//!   path: the background load/download must never leave its state stuck in
-//!   `Loading` — a panic in the spawned chain now flips it to `Failed` (the
-//!   honest terminal state).
+//! Deliberate non-unifications: the per-module singletons keep their own container types
+//! (`OnceLock<RwLock<Option<_>>>` vs `Mutex<Option<_>>`) — unifying them would change
+//! poisoning/init-once/contention semantics.
 //!
-//! Memory-ordering semantics are preserved exactly from the original copies:
-//! `Acquire` loads, `Release` stores, `AcqRel`/`Acquire` compare-exchange.
-//!
-//! All consumers (`audio` shared TTS helpers, `audio::tts`,
-//! `audio::local_transcriber`) use this shared copy; no module-local duplicates
-//! remain.
-
+//! Memory ordering is preserved exactly: `Acquire` loads, `Release` stores,
+//! `AcqRel`/`Acquire` compare-exchange.
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Model loading state with type-safe atomic access.
@@ -38,9 +24,8 @@ pub(crate) enum ModelState {
 }
 
 impl ModelState {
-    /// Decode a raw `u8` back into a [`ModelState`]. Production decoder for
-    /// [`AtomicModelState::load`] and [`AtomicModelState::compare_exchange`]
-    /// (and a test hook in `audio::tts` that sets state numerically).
+    /// Decode a raw `u8` back into a [`ModelState`] — the production decoder for
+    /// [`AtomicModelState::load`] and `compare_exchange`.
     pub(crate) const fn from_u8(v: u8) -> Self {
         match v {
             1 => Self::Loading,
@@ -73,9 +58,8 @@ impl AtomicModelState {
         self.load(Ordering::Acquire) == ModelState::Ready
     }
 
-    /// Atomically compare-and-exchange the current state.
-    ///
-    /// See [`AtomicU8::compare_exchange`] for ordering semantics.
+    /// Atomically compare-and-exchange the current state (see
+    /// [`AtomicU8::compare_exchange`] for ordering).
     pub(crate) fn compare_exchange(
         &self,
         expected: ModelState,
@@ -89,14 +73,12 @@ impl AtomicModelState {
             .map_err(ModelState::from_u8)
     }
 
-    /// Atomically transition `from` → `to` (AcqRel success, Acquire failure
-    /// ordering), returning `true` if the CAS succeeded.
+    /// Atomically transition `from` → `to` (AcqRel success, Acquire failure), returning
+    /// `true` if the CAS succeeded.
     ///
-    /// A failed CAS means another task already moved the state (e.g. a
-    /// concurrent retry or a still-running download loop), so the call is a
-    /// no-op — the caller must not spawn duplicate work.  A `Failed → Uninit`
-    /// reset is normally followed by an `Uninit → Loading` site that spawns
-    /// the download loop (two-step retry dance).
+    /// A failed CAS means another task already moved the state, so the call is a no-op — the
+    /// caller must not spawn duplicate work. A `Failed → Uninit` reset is normally followed by
+    /// an `Uninit → Loading` site that spawns the download loop (two-step retry dance).
     #[must_use]
     pub(crate) fn transition(&self, from: ModelState, to: ModelState) -> bool {
         self.compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
@@ -104,14 +86,12 @@ impl AtomicModelState {
     }
 }
 
-/// Drop guard that transitions a model-loading state from [`ModelState::Loading`]
-/// to [`ModelState::Failed`].
+/// Drop guard that transitions a model-loading state from [`ModelState::Loading`] to
+/// [`ModelState::Failed`].
 ///
-/// If the background download task panics, Tokio catches the panic and swallows
-/// it; without this guard the state would remain permanently stuck in
-/// [`ModelState::Loading`], silently disabling the feature until process
-/// restart.  On normal success or explicit terminal failure the CAS is a no-op
-/// (wrong expected value).
+/// Tokio swallows a panic in the background download task; without this guard the state
+/// would stay stuck in `Loading`, silently disabling the feature until restart. On success
+/// or explicit terminal failure the CAS is a no-op.
 pub(crate) struct ModelLoadGuard<'a>(&'a AtomicModelState);
 
 impl<'a> ModelLoadGuard<'a> {

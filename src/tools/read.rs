@@ -1,7 +1,6 @@
 //! The `read` tool: line-numbered content reads, tree-sitter `symbols` and
 //! `zoom`, directory listings, credential scrubbing for sensitive paths, and
-//! the one-metadata-sniff decision that hands a document container to
-//! `tools::read_document`.
+//! the one-metadata-sniff decision that hands a document container to `tools::read_document`.
 //!
 //! Not the document converter itself — the readers live in `crate::document`
 //! and the tool-facing wrapper in `tools::read_document`; this tool only
@@ -34,17 +33,14 @@ impl ReadTool {
         Self { access }
     }
 
-    /// General read: workspace plus dependency-source / temp-file paths.
     #[must_use]
     pub fn general() -> Self {
         Self::new(PathAccess::Allowlisted)
     }
 }
 
-/// Recognized sensitive file extensions whose read output should be scrubbed for credentials.
 const SENSITIVE_EXTENSIONS: &[&str] = &["cer", "crt", "env", "key", "p12", "pem", "pfx"];
 
-/// Exact file names (lowercased) whose read output is scrubbed for credentials.
 const SENSITIVE_FILE_NAMES: &[&str] = &[
     ".netrc",
     ".npmrc",
@@ -56,12 +52,8 @@ const SENSITIVE_FILE_NAMES: &[&str] = &[
     "credentials.toml",
 ];
 
-/// File-name prefixes whose read output is scrubbed (e.g. `init.gradle`, `init.gradle.kts`).
 const SENSITIVE_FILE_NAME_PREFIXES: &[&str] = &["init.gradle"];
 
-/// File paths whose read output should be scrubbed for credentials (`.env`, certs, keys,
-/// credential config files). Other extensions (e.g. `.rs`, `.md`) are left intact so the
-/// model sees source accurately.
 #[must_use]
 fn is_sensitive_file_path(path: &str) -> bool {
     let Some(file_name) = std::path::Path::new(path)
@@ -74,8 +66,7 @@ fn is_sensitive_file_path(path: &str) -> bool {
 
     // Exact-name / prefix matches (dotfiles like `.netrc` with no extension, and
     // credential config files like `settings.xml` / `gradle.properties`) are
-    // checked first because the rsplit_once('.') extension match below cannot
-    // classify them.
+    // checked first because the rsplit_once('.') extension match below cannot classify them.
     if SENSITIVE_FILE_NAMES.contains(&lower.as_str()) {
         return true;
     }
@@ -86,15 +77,12 @@ fn is_sensitive_file_path(path: &str) -> bool {
         return true;
     }
 
-    // Single rsplit_once handles both dotfiles (.env, .env.local) and regular extensions (.pem, .key).
-    // The `name == ".env"` arm catches `.env.local`-style dotfile prefixes.
     match lower.rsplit_once('.') {
         Some((name, ext)) => name == ".env" || SENSITIVE_EXTENSIONS.contains(&ext),
         None => false,
     }
 }
 
-/// Classify a file's bytes for the image-aware Read behaviour.
 enum SniffedImage {
     /// A native raster (PNG/JPEG/WebP) that can be attached as a native image.
     /// The base annotation is claim-neutral (no "attached" sentence) and
@@ -110,8 +98,7 @@ enum SniffedImage {
 /// (SVG, text, arbitrary binary) so those keep the text/lossy path. Only
 /// PNG/JPEG/WebP are treatable as native; any other recognised format (GIF,
 /// BMP, ...) is reported as unsupported. No decode is performed here — the
-/// decode is deferred to [`ReadTool::image_payload`], the only decoder of a
-/// native image file.
+/// decode is deferred to [`ReadTool::image_payload`], the only decoder of a native image file.
 #[must_use]
 fn sniff_read_image(bytes: &[u8]) -> Option<SniffedImage> {
     let format = image::guess_format(bytes).ok()?;
@@ -136,8 +123,7 @@ async fn is_native_image_file(path: &Path) -> bool {
     let Ok(meta) = tokio::fs::metadata(path).await else {
         return false;
     };
-    // A special file is never reopened — a stream cannot be sampled without
-    // blocking.
+    // A special file is never reopened — a stream cannot be sampled without blocking.
     if !meta.is_file() {
         return false;
     }
@@ -154,9 +140,6 @@ async fn is_native_image_file(path: &Path) -> bool {
     )
 }
 
-/// Produce the annotation text for a content-mode read that discovered a raster
-/// image. Shared between the UTF-8 and binary fallback paths so the annotation
-/// is byte-identical either way.
 #[must_use]
 fn image_read_annotation(path: &Path, kind: SniffedImage) -> String {
     match kind {
@@ -199,16 +182,11 @@ async fn find_recovery_candidates(ws: &Workspace, path: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The `[Recovered path: ...]` note shown when a literal `path` was recovered to
-/// a single high-confidence filename match. Shared so the annotation path and
-/// the injection path word it identically.
 #[must_use]
 fn recovery_note(path: &str, recovered: &str) -> String {
     format!("[Recovered path: requested '{path}', using '{recovered}']")
 }
 
-/// Outcome of resolving a content-read `path`: the canonical path to read, plus
-/// the recovery note when the literal path was recovered to a unique match.
 pub(super) struct ResolvedRead {
     pub(super) path: PathBuf,
     pub(super) recovery_note: Option<String>,
@@ -265,9 +243,6 @@ pub(super) async fn resolve_content_read(
     }
 }
 
-/// The reader a read's `mode` argument selects — the one classification the
-/// content gates, [`read_resolved`]'s dispatch and the advertised enum all refer
-/// to, so none of them can disagree about the same call.
 #[derive(PartialEq, Eq)]
 enum ReadMode {
     Content,
@@ -275,8 +250,6 @@ enum ReadMode {
     Zoom,
 }
 
-/// Classify `args`'s `mode`: the default, and anything that is not one of the two
-/// modes with a reader of their own, is a content read.
 #[must_use]
 fn read_mode(args: &serde_json::Value) -> ReadMode {
     match super::get_opt_str(args, "mode") {
@@ -286,8 +259,6 @@ fn read_mode(args: &serde_json::Value) -> ReadMode {
     }
 }
 
-/// Build the read tool's parameter schema. `path_desc` states this read's own
-/// path boundary, so each [`PathAccess`] advertises the one it enforces.
 fn read_parameters_schema(path_desc: &str) -> serde_json::Value {
     super::tool_params_schema(
         &json!({
@@ -338,13 +309,10 @@ impl Tool for ReadTool {
         let chart_series = crate::reader_output::chart_series(Some("<name>"), 0);
         let chart_series_numbered = crate::reader_output::chart_series(None, 0);
         let chart_size = crate::reader_output::chart_size("<size>");
-        // The kind words a PDF form field is listed with, and the words its line
-        // prints, spelled the way the reading prints them.
         let pdf_field_kinds = crate::docgen::pdf_field_kinds().spelled();
         let form_words = crate::docgen::pdf_form_words();
         // The path boundary, in the wording of this read's own access level —
-        // the skeleton is shared, so the three statements cannot drift from
-        // each other's structure.
+        // the skeleton is shared, so the three statements cannot drift from each other's structure.
         let path_policy = crate::prompt::load_prompt(match self.access {
             PathAccess::Workspace => "tool/read_paths_workspace.md",
             PathAccess::Allowlisted => "tool/read_paths_allowlisted.md",
@@ -398,9 +366,6 @@ impl Tool for ReadTool {
         })
     }
 
-    /// The raw-text read. Documents are converted by
-    /// [`Tool::execute_with_payloads`] (their pages need images), so a direct
-    /// `execute` call gets the lossy path — the agent loop always uses the hook.
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
         execute_read(ws, args, self.access).await
     }
@@ -422,21 +387,17 @@ impl Tool for ReadTool {
             return output.to_string();
         }
 
-        // The output has a header line like "[N lines total]" or
-        // "[Lines X-Y of Z]" followed by "\n" and numbered lines.
-        // Find that separator and keep the header intact.
         if let Some(nl) = output.find('\n') {
             let header = &output[..nl];
             let expected = parse_header_line_count(header);
             if expected > 0 {
                 let body = &output[nl + 1..];
 
-                // Worst-case marker length — `omitted ≤ expected` guarantees the actual marker never exceeds this
+                // Worst-case marker length — `omitted ≤ expected` bounds the actual marker here
                 let marker_budget = format!("\n... ({expected} lines omitted)").len();
                 let body_budget =
                     TOOL_OUTPUT_BUDGET_BYTES.saturating_sub(header.len() + marker_budget + 1);
 
-                // Truncate at last complete line boundary within budget
                 let cut = body.floor_char_boundary(body_budget.min(body.len()));
                 let last_nl = body[..cut].rfind('\n').unwrap_or(cut);
                 let kept_body = &body[..last_nl];
@@ -453,7 +414,6 @@ impl Tool for ReadTool {
             }
         }
 
-        // Fallback (lossy binary output, etc.): standard head+tail truncation
         crate::util::truncate_tool_output(output)
     }
 
@@ -501,8 +461,6 @@ impl Tool for ReadTool {
     }
 }
 
-/// Produce the image payload for a read, resolving the path under the caller's
-/// [`PathAccess`] — the same boundary the read itself used.
 async fn read_image_payload(
     ws: &Workspace,
     args: &serde_json::Value,
@@ -527,9 +485,6 @@ async fn read_image_payload(
     if !is_native_image_file(&res.path).await {
         return None;
     }
-    // The compressed encode applies EXIF orientation and reports the
-    // post-EXIF/post-resize dims + source-format label; its metadata-first
-    // `is_file()` guard keeps a special file from being reopened.
     let meta = crate::util::local_image_to_compressed_data_uri_with_meta(&res.path)
         .await
         .ok()?;
@@ -560,8 +515,6 @@ fn scrub_if_sensitive(resolved_path: &Path, body: String) -> String {
     }
 }
 
-/// The tail a read's body goes through: scrub it when the resolved file is
-/// credential-bearing, then prefix the typo-recovery note, if any.
 fn finish_read_body(resolved_path: &Path, body: String, recovery_note: Option<&str>) -> String {
     let body = scrub_if_sensitive(resolved_path, body);
     super::with_recovery_note(recovery_note, body)
@@ -595,7 +548,6 @@ pub(super) async fn read_resolved(
     Ok(finish_read_body(resolved_path, body, recovery_note))
 }
 
-/// Wildcard path: return matching workspace files instead of failing open.
 async fn recover_wildcard_path(ws: &Workspace, path: &str) -> anyhow::Result<String> {
     if !crate::workspace_index::registry_initialized() {
         anyhow::bail!(
@@ -618,22 +570,19 @@ async fn recover_wildcard_path(ws: &Workspace, path: &str) -> anyhow::Result<Str
     Ok(output)
 }
 
-/// Execute the standard content read mode.
 async fn execute_content(resolved_path: &Path, args: &serde_json::Value) -> anyhow::Result<String> {
     match tokio::fs::read_to_string(resolved_path).await {
         Ok(contents) => {
             // A raster can be valid UTF-8 (e.g. a minimal GIF patch / a
             // NUL-padded header) — sniff magic bytes before treating it as
             // text so it gets the image annotation rather than rendering as
-            // garbage. SVG, source, and other text are not image magic and
-            // stay readable.
+            // garbage. SVG, source, and other text are not image magic and stay readable.
             if let Some(annotation) = sniff_guard(resolved_path, contents.as_bytes()) {
                 return Ok(annotation);
             }
             Ok(format_content(&contents, args)?)
         }
         Err(e) => {
-            // Not valid UTF-8 — read raw bytes and try to extract text
             let bytes = tokio::fs::read(resolved_path).await.map_err(|ee| {
                 anyhow::anyhow!(
                     "io: cannot read {}: failed to read file: {ee} \
@@ -649,8 +598,6 @@ async fn execute_content(resolved_path: &Path, args: &serde_json::Value) -> anyh
                 return Ok(annotation);
             }
 
-            // Lossy UTF-8 for every file but a background session's own output,
-            // which is a program's output and takes the shell's reading of one.
             let text = crate::tools::shell::decode_session_output(resolved_path, &bytes)
                 .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
             Ok(text)
@@ -658,7 +605,6 @@ async fn execute_content(resolved_path: &Path, args: &serde_json::Value) -> anyh
     }
 }
 
-/// List all top-level AST symbols with line ranges.
 async fn execute_symbols(resolved_path: &Path) -> anyhow::Result<String> {
     let ctx = prepare_symbol_query(resolved_path, "symbol extraction").await?;
 
@@ -686,7 +632,6 @@ async fn execute_symbols(resolved_path: &Path) -> anyhow::Result<String> {
     Ok(output)
 }
 
-/// Extract a single named symbol's complete source.
 async fn execute_zoom(resolved_path: &Path, args: &serde_json::Value) -> anyhow::Result<String> {
     let symbol_name = match super::get_opt_str(args, "symbol") {
         Some(s) if !s.is_empty() => s,
@@ -708,7 +653,6 @@ async fn execute_zoom(resolved_path: &Path, args: &serde_json::Value) -> anyhow:
             if let Ok(name) = c.node.utf8_text(ctx.ps.source.as_bytes())
                 && name == symbol_name
             {
-                // Found the matching declaration — grab parent node for zoom
                 found_node = c.node.parent();
                 break;
             }
@@ -745,7 +689,6 @@ async fn execute_zoom(resolved_path: &Path, args: &serde_json::Value) -> anyhow:
     ))
 }
 
-/// Suggest symbol names when zoom lookup fails.
 fn symbol_suggestions(ps: &ParsedSource, query: &Query, wanted: &str) -> Vec<String> {
     // Use collect_symbols for cursor iteration, then filter out any "?"
     // placeholders that were substituted for non-UTF-8 bytes. This preserves
@@ -776,9 +719,6 @@ fn symbol_suggestions(ps: &ParsedSource, query: &Query, wanted: &str) -> Vec<Str
     names
 }
 
-/// The read tool's raw-text read, reached through `Tool::execute`: a wildcard
-/// listing, or a file the document hook did not take. `access` is the caller's
-/// [`PathAccess`], the boundary [`super::path::resolve_read_target`] applies.
 async fn execute_read(
     ws: &Workspace,
     args: serde_json::Value,
@@ -837,12 +777,6 @@ fn format_content(contents: &str, args: &serde_json::Value) -> anyhow::Result<St
     Ok(format!("{summary}\n{numbered}"))
 }
 
-// ── Tree-sitter infrastructure ────────────────────────────────────────
-
-/// Extract a human-readable filename from a path for use in display messages.
-///
-/// Returns `"?"` if the path has no filename component or if the filename
-/// is not valid UTF-8.
 fn display_filename(path: &Path) -> &str {
     path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
 }
@@ -898,7 +832,6 @@ struct LanguageSupport {
     symbol_query: &'static str,
 }
 
-/// Single source of truth mapping extensions to tree-sitter language and symbol query.
 #[expect(clippy::too_many_lines)]
 fn language_support(ext: &str) -> Option<LanguageSupport> {
     const TS_SYMBOL_QUERY: &str = r"(
@@ -1018,13 +951,11 @@ fn language_support(ext: &str) -> Option<LanguageSupport> {
     })
 }
 
-/// Compile the tree-sitter symbol query for the source file's language.
 fn build_symbol_query(ps: &ParsedSource) -> anyhow::Result<Query> {
     Query::new(&ps.language, ps.symbol_query)
         .map_err(|e| anyhow::anyhow!("Failed to build symbol query: {e}"))
 }
 
-/// A single symbol extracted from a tree-sitter query match.
 #[derive(Debug)]
 struct SymbolMatch {
     name: String,
@@ -1033,8 +964,6 @@ struct SymbolMatch {
     kind: String,
 }
 
-/// Bundles a parsed source file with its compiled symbol query,
-/// avoiding redundant `build_symbol_query` calls.
 #[derive(Debug)]
 struct SymbolQueryContext {
     ps: ParsedSource,
@@ -1087,7 +1016,6 @@ fn collect_symbols(ps: &ParsedSource, query: &Query) -> Vec<SymbolMatch> {
     symbols
 }
 
-/// Map tree-sitter node kind to a short human-readable label.
 fn symbol_kind_label(kind: &str) -> &'static str {
     match kind {
         "function_item" | "function_declaration" | "function_definition" => "fn",
@@ -1119,15 +1047,11 @@ fn symbol_kind_label(kind: &str) -> &'static str {
     }
 }
 
-/// Parse the expected line count from a header like "[42 lines total]"
-/// or "[Lines 10-20 of 100]". Returns 0 if unparseable.
 fn parse_header_line_count(header: &str) -> usize {
-    // "[N lines total]"
     if let Some(rest) = header.strip_prefix('[') {
         if let Some(n_str) = rest.strip_suffix(" lines total]") {
             return n_str.parse().unwrap_or(0);
         }
-        // "[Lines X-Y of Z]"
         if let Some(inner) = rest.strip_suffix(']')
             && let Some(range) = inner.strip_prefix("Lines ")
             && let Some((start, _end)) = range.split_once(" of ")
@@ -1155,9 +1079,8 @@ fn parse_header_line_count(header: &str) -> usize {
 ///   (`FindNextFile`), so neither call can fail: a link's size is the reparse
 ///   point's own recorded size (0 B for a symlink), and `FileType::is_dir` is
 ///   false for a symlink there too. std counts a junction as a symlink as well
-///   (both reparse tags carry the name-surrogate bit), so it is a file entry
-///   too; a non-name-surrogate reparse point (a cloud placeholder, say) is an
-///   ordinary entry.
+///   (both reparse tags carry the name-surrogate bit), so it is a file entry too; a
+///   non-name-surrogate reparse point (a cloud placeholder, say) is an ordinary entry.
 ///
 /// A failed call is a Unix-only race that leaves an entry uninspectable: it is
 /// still listed, as a file with an unknown size, and only a directory the
@@ -1222,7 +1145,6 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    /// The general read tool for the common test scenarios.
     fn tool() -> ReadTool {
         ReadTool::general()
     }
@@ -1267,12 +1189,8 @@ mod tests {
         }
     }
 
-    /// `format_output`'s three shapes: short output passes through unchanged, a
-    /// structured long output keeps its header and cuts at the last complete line,
-    /// and unstructured long output falls back to the head+tail truncation.
     #[test]
     fn format_output_cases() {
-        // Short output: byte-identical passthrough.
         let short = "[3 lines total]\n1: a\n2: b\n3: c".to_string();
         assert_eq!(
             tool().format_output(&short),
@@ -1280,8 +1198,6 @@ mod tests {
             "a short output passes through"
         );
 
-        // Structured long output: the header survives and the body is cut at a
-        // complete line, with the omitted count in the marker.
         let header = "[100 lines total]";
         let complete_line = "x".repeat(100);
         let long_body = vec![complete_line.as_str(); 100].join("\n");
@@ -1309,7 +1225,6 @@ mod tests {
             "a structured output uses the line marker: {result}"
         );
 
-        // Unstructured long output: the byte-count fallback marker.
         let result = tool().format_output(&"a".repeat(6000));
         assert!(
             result.contains("bytes omitted at tool output truncation"),
@@ -1321,7 +1236,6 @@ mod tests {
     async fn file_read_basic_scenarios() {
         let (_dir, ws_path) = temp_workspace(&[("test.txt", "hello world")]);
 
-        // existing file
         let result = tool()
             .execute(&Workspace::from_path(&ws_path), json!({"path": "test.txt"}))
             .await;
@@ -1329,7 +1243,6 @@ mod tests {
         let result = result.unwrap();
         assert!(result.contains("1: hello world"));
         assert!(result.contains("[1 lines total]"));
-        // nonexistent file
         let result = tool()
             .execute(&Workspace::from_path(&ws_path), json!({"path": "nope.txt"}))
             .await;
@@ -1339,7 +1252,6 @@ mod tests {
         );
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("File not found"));
-        // empty file
         tokio::fs::write(ws_path.join("empty.txt"), "")
             .await
             .unwrap();
@@ -1356,7 +1268,6 @@ mod tests {
 
     #[tokio::test]
     async fn file_read_blocks_unsafe_paths() {
-        // path traversal
         let (dir1, ws_path1) = temp_workspace(&[]);
 
         let result = tool()
@@ -1368,7 +1279,6 @@ mod tests {
         assert!(result.is_err(), "traversal should be blocked: {result:?}");
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("outside the allowed read envelope"));
-        // absolute path
         let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path1),
@@ -1381,7 +1291,6 @@ mod tests {
         );
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("outside the allowed read envelope"));
-        // null byte in path — separate workspace
         drop(dir1);
         let (_dir2, ws_path2) = temp_workspace(&[]);
 
@@ -1408,7 +1317,6 @@ mod tests {
         let workspace = root.path().join("workspace");
         tokio::fs::create_dir_all(&workspace).await.unwrap();
 
-        // Symlink to /etc/passwd — a real file outside workspace and temp_dir
         symlink("/etc/passwd", workspace.join("escape.txt")).unwrap();
 
         let result = tool()
@@ -1431,8 +1339,6 @@ mod tests {
     async fn read_reaches_private_key_places() {
         use std::os::unix::fs::symlink;
 
-        // A file literally named `id_rsa`, inside a folder named `.ssh`: nothing
-        // about the name or the place is a refusal any more, for any variant.
         let (_dir, ws_path) = temp_workspace(&[(".ssh/id_rsa", "PRIVATE KEY BODY")]);
         let ws = Workspace::from_path(&ws_path);
         for tool in [
@@ -1447,7 +1353,6 @@ mod tests {
             );
         }
 
-        // The same through a symlinked name and a symlinked directory.
         let root = TempDir::new().unwrap();
         let workspace = root.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -1465,17 +1370,12 @@ mod tests {
         }
     }
 
-    /// The admin's read reaches the machine, and a path that is not there is
-    /// answered as missing: no same-named file from the workspace is substituted
-    /// for it (which is what the other access levels still do for a typo).
     #[tokio::test]
     async fn unrestricted_read_neither_frames_nor_substitutes() {
-        // The fuzzy recovery needs the global search-engine registry.
         crate::util::test::init_test_stores().await;
         let (dir, ws_path) = temp_workspace(&[("notes.md", "workspace notes")]);
         let ws = Workspace::from_path(&ws_path);
 
-        // A typo inside the workspace is still recovered for the general read.
         let recovered = tool()
             .execute(&ws, json!({"path": "notez.md"}))
             .await
@@ -1498,7 +1398,6 @@ mod tests {
         assert!(err.to_string().contains("File not found"), "{err}");
         assert!(!err.to_string().contains("Recovered"), "{err}");
 
-        // And a file outside the workspace is read as given.
         let outside = TempDir::new().unwrap();
         let outside_notes = outside.path().join("notes.md");
         std::fs::write(&outside_notes, "outside notes").unwrap();
@@ -1508,7 +1407,6 @@ mod tests {
             .expect("an outside file is readable for the admin");
         assert!(text.contains("outside notes"), "{text}");
 
-        // The general read still stops at its own envelope on the same path.
         let err = tool()
             .execute(&ws, json!({"path": absent.to_string_lossy()}))
             .await
@@ -1522,9 +1420,6 @@ mod tests {
         drop((dir, outside));
     }
 
-    /// A path whose own name carries glob metacharacters is read as the file it
-    /// names when that file exists — the shell's own reading, and what the edit
-    /// tool does — while a pattern that names nothing still lists the workspace.
     #[tokio::test]
     async fn a_metacharacter_name_is_read_as_the_file_it_names() {
         let (dir, ws_path) = temp_workspace(&[("report[1].txt", "the file's own text")]);
@@ -1536,7 +1431,6 @@ mod tests {
             .expect("a metacharacter name that exists is read as a file");
         assert!(text.contains("the file's own text"), "{text}");
 
-        // The admin reads the same kind of name outside the workspace.
         let outside = TempDir::new().unwrap();
         let outside_file = outside.path().join("report[2].txt");
         std::fs::write(&outside_file, "outside the workspace").unwrap();
@@ -1546,7 +1440,6 @@ mod tests {
             .expect("the admin reads a metacharacter name outside the workspace");
         assert!(text.contains("outside the workspace"), "{text}");
 
-        // A pattern that names no file is still a wildcard.
         let err = tool()
             .execute(&ws, json!({"path": "*.missing"}))
             .await
@@ -1558,8 +1451,6 @@ mod tests {
 
     #[tokio::test]
     async fn read_sensitive_config_is_not_denied() {
-        // A credential-bearing config file is readable (Ok) — hardening is the
-        // scrub tier (output scrubbing in `read_resolved`), not a hard deny.
         let (_dir, ws_path) = temp_workspace(&[("settings.xml", "<settings/>")]);
         let result = tool()
             .execute(
@@ -1572,8 +1463,6 @@ mod tests {
 
     #[tokio::test]
     async fn read_scrubs_credential_bearing_file() {
-        // End-to-end scrub tier: the resolved path `.env` is credential-bearing,
-        // so the output is scrubbed before the LLM sees it.
         let (_dir, ws_path) = temp_workspace(&[(".env", "API_KEY=sk-1234567890")]);
         let result = tool()
             .execute(&Workspace::from_path(&ws_path), json!({"path": ".env"}))
@@ -1593,9 +1482,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn read_scrubs_symlinked_credential_file() {
-        // A benign basename whose symlink resolves to a credential file is
-        // scrubbed based on the resolved path (the case the old
-        // `is_sensitive_read_path` test covered).
         use std::os::unix::fs::symlink;
 
         let (_dir, ws_path) = temp_workspace(&[(".env", "API_KEY=sk-1234567890")]);
@@ -1620,7 +1506,6 @@ mod tests {
 
     #[tokio::test]
     async fn read_does_not_scrub_plain_file() {
-        // A non-sensitive filename with the same content is returned verbatim.
         let (_dir, ws_path) = temp_workspace(&[("notes.txt", "API_KEY=sk-1234567890")]);
         let result = tool()
             .execute(
@@ -1644,7 +1529,6 @@ mod tests {
     async fn file_read_offset_handling() {
         let (_dir, ws_path) = temp_workspace(&[("lines.txt", "aaa\nbbb\nccc\nddd\neee")]);
 
-        // Read lines 2-3
         let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),
@@ -1655,7 +1539,6 @@ mod tests {
         let result = result.unwrap();
         assert!(result.contains("2: bbb") && result.contains("3: ccc"));
         assert!(!result.contains("1: aaa") && !result.contains("4: ddd"));
-        // Offset to end
         let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),
@@ -1675,7 +1558,6 @@ mod tests {
         assert!(result.is_ok(), "limit read should succeed: {result:?}");
         let result = result.unwrap();
         assert!(!result.contains("3: ccc"));
-        // Offset beyond end
         tokio::fs::write(ws_path.join("short.txt"), "one\ntwo")
             .await
             .unwrap();
@@ -1698,7 +1580,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ws_path = dir.path().to_path_buf();
 
-        // Create a file just over 10 MB
         let big = vec![b'x'; 10 * 1024 * 1024 + 1];
         tokio::fs::write(ws_path.join("huge.bin"), &big)
             .await
@@ -1715,13 +1596,11 @@ mod tests {
         assert!(err.contains("File too large"));
     }
 
-    /// Non-UTF-8 binary files should be read with lossy conversion.
     #[tokio::test]
     async fn file_read_lossy_reads_binary_file() {
         let dir = TempDir::new().unwrap();
         let ws_path = dir.path().to_path_buf();
 
-        // Write bytes that are not valid UTF-8
         let binary_data: Vec<u8> = vec![0x00, 0x80, 0xFF, 0xFE, b'h', b'i', 0x80];
         tokio::fs::write(ws_path.join("data.bin"), &binary_data)
             .await
@@ -1747,7 +1626,6 @@ mod tests {
         );
     }
 
-    /// Encode a tiny solid-red PNG (test helper).
     fn tiny_png_bytes(width: u32, height: u32) -> Vec<u8> {
         use std::io::Cursor;
         let img = ::image::RgbaImage::from_pixel(width, height, ::image::Rgba([255, 0, 0, 255]));
@@ -1768,9 +1646,7 @@ mod tests {
         present: &'static [&'static str],
         /// Substrings the `execute` annotation must not carry.
         absent: &'static [&'static str],
-        /// The `(width, height, format)` of the payload, when one is produced.
         payload: Option<(u32, u32, &'static str)>,
-        /// Whether the payload names the resolved path of the file.
         payload_path: bool,
     }
 
@@ -1869,9 +1745,6 @@ mod tests {
             assert_eq!(payload.height, height, "{}: payload height", case.name);
             assert_eq!(payload.format, format, "{}: payload format", case.name);
             if case.payload_path {
-                // `payload.path` is the resolved path: canonicalized (which on
-                // macOS resolves the /tmp → /private/tmp symlink) in the spelling
-                // the tool hands on.
                 let expected_path =
                     crate::util::test::canonical_without_verbatim_prefix(&ws_path.join(case.file));
                 assert_eq!(
@@ -1892,7 +1765,6 @@ mod tests {
     /// the 'annotated but not attached' gap.
     #[tokio::test]
     async fn recovered_image_path_is_attached() {
-        // The fuzzy search needs the global search-engine registry.
         crate::util::test::init_test_stores().await;
 
         let dir = TempDir::new().unwrap();
@@ -1903,7 +1775,6 @@ mod tests {
             .unwrap();
         let ws = Workspace::from_path(&ws_path);
 
-        // execute with a typo'd path that the fuzzy matcher recovers to the file.
         let result = tool()
             .execute(&ws, json!({"path": "tiny_imag.png"}))
             .await
@@ -1926,8 +1797,6 @@ mod tests {
         assert!(note.contains("tiny_imag.png"), "note: {note}");
     }
 
-    /// One symbol-mode request — the answer's own labels when it succeeds, the
-    /// refusal's words when it does not.
     struct SymbolModeCase {
         name: &'static str,
         file: &'static str,
@@ -2045,7 +1914,6 @@ mod utils;
         }
     }
 
-    /// Directory listing returns file names instead of erroring.
     #[tokio::test]
     async fn directory_listing_returns_contents() {
         let (_dir, ws_path) =
@@ -2056,8 +1924,6 @@ mod utils;
             .execute(&Workspace::from_path(&ws_path), json!({"path": "."}))
             .await;
         assert!(result.is_ok(), "dir listing should succeed: {result:?}");
-        // Directories first with a mark, then files in byte order with their
-        // size — hidden entries included — and the extension summary.
         assert_eq!(
             result.unwrap(),
             "sub/\n.hidden  1B\na.txt  5B\nb.rs  4B\nSummary: 3 files, 1 dirs (1 .hidden, 1 .rs, 1 .txt)\n"
@@ -2099,7 +1965,6 @@ mod utils;
             .execute(&Workspace::from_path(&ws_path), json!({"path": "sub"}))
             .await;
 
-        // Restore the mode before asserting, so the temp dir can still be cleaned.
         tokio::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
             .await
             .unwrap();
@@ -2123,8 +1988,6 @@ mod utils;
         }
         let (_dir, ws_path) = temp_workspace(&[("sub/inside.txt", "x")]);
         let unsearchable = ws_path.join("sub");
-        // Readable (the names can still be listed) but not searchable, so
-        // nothing inside it can be measured.
         tokio::fs::set_permissions(&unsearchable, std::fs::Permissions::from_mode(0o444))
             .await
             .unwrap();
@@ -2133,7 +1996,6 @@ mod utils;
             .execute(&Workspace::from_path(&ws_path), json!({"path": "sub"}))
             .await;
 
-        // Restore the mode before asserting, so the temp dir can still be cleaned.
         tokio::fs::set_permissions(&unsearchable, std::fs::Permissions::from_mode(0o755))
             .await
             .unwrap();
@@ -2143,8 +2005,6 @@ mod utils;
         );
     }
 
-    /// A listing too large for the tool output budget is spilled to a file with
-    /// the usual hint, so the full listing stays recoverable.
     #[tokio::test]
     async fn directory_listing_large_spills_to_file() {
         let names: Vec<String> = (0..600).map(|i| format!("file_{i:03}.txt")).collect();
@@ -2165,7 +2025,6 @@ mod utils;
         );
     }
 
-    /// Directory listing resolves symlinks to directories.
     #[cfg(unix)]
     #[tokio::test]
     async fn directory_listing_symlink() {
@@ -2181,7 +2040,6 @@ mod utils;
         let link = ws_path.join("link_to_real");
         symlink(&real_dir, &link).unwrap();
 
-        // Reading the symlink directly (it resolves to the directory)
         let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),
@@ -2201,7 +2059,6 @@ mod utils;
 
     #[test]
     fn is_sensitive_file_path_env_and_certs() {
-        // extension + dotfile matches
         assert!(is_sensitive_file_path(".env"));
         assert!(is_sensitive_file_path("proj/.env"));
         assert!(is_sensitive_file_path(".env.local"));
@@ -2211,7 +2068,6 @@ mod utils;
         assert!(is_sensitive_file_path("C:\\keys\\id_rsa.key"));
         assert!(is_sensitive_file_path("a.pem"));
         assert!(is_sensitive_file_path("a.key"));
-        // exact credential config names
         assert!(is_sensitive_file_path("settings.xml"));
         assert!(is_sensitive_file_path("settings-security.xml"));
         assert!(is_sensitive_file_path("gradle.properties"));
@@ -2220,14 +2076,11 @@ mod utils;
         assert!(is_sensitive_file_path(".npmrc"));
         assert!(is_sensitive_file_path(".pypirc"));
         assert!(is_sensitive_file_path(".git-credentials"));
-        // path-qualified exact names match on basename
         assert!(is_sensitive_file_path("~/.m2/settings.xml"));
-        // init.gradle prefix (matches init.gradle and init.gradle.kts)
         assert!(is_sensitive_file_path("init.gradle"));
         assert!(is_sensitive_file_path("init.gradle.kts"));
         assert!(is_sensitive_file_path("init.gradle.sh"));
 
-        // non-credential files stay untouched
         assert!(!is_sensitive_file_path("src/main.rs"));
         assert!(!is_sensitive_file_path("crates/foo/lib.rs"));
         assert!(!is_sensitive_file_path("README.md"));
@@ -2239,10 +2092,7 @@ mod utils;
             "gradle/wrapper/gradle-wrapper.properties"
         )); // basename-only
     }
-    // ── prepare_symbol_query / collect_symbols ──────────────────────────────
 
-    /// A file handed to the symbol query, and the declarations it holds — every
-    /// `(name, start line)` the query collects, in the order it finds them.
     struct SymbolQueryCase {
         name: &'static str,
         file: &'static str,
@@ -2284,7 +2134,6 @@ struct Baz;
 enum Qux {}
 impl Baz {}
 ",
-            // foo, bar, Baz, Qux, Baz (impl)
             symbols: &[("foo", 2), ("bar", 3), ("Baz", 4), ("Qux", 5), ("Baz", 6)],
             refusal: "",
         },
@@ -2361,8 +2210,6 @@ impl Baz {}
             "the refusal must say what the path is: {err}"
         );
 
-        // The read an edit performs meets the same refusal — a relative path, so
-        // it is the file's own kind that decides, not the workspace frame.
         let editor = EditTool::confined();
         let edited = editor.execute(
             &ws,

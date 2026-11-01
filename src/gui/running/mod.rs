@@ -1,59 +1,41 @@
-//! "Running Agents" dashboard page — a live view of every currently-running
-//! agent and in-flight non-agent LLM work, grouped by WORKSPACE, then by
-//! DIRECT PARENT INVOCATION (ticket / analyze round / research run / branch
-//! launch / workspace singleton / unattributable orchestrator calls).
+//! "Running Agents" dashboard page — a live view of every running agent and
+//! in-flight non-agent LLM work, grouped by WORKSPACE, then by DIRECT PARENT
+//! INVOCATION (ticket / analyze round / research run / branch launch / workspace
+//! singleton / unattributable orchestrator calls).
 //!
-//! The view is read-only: at render time it reads the in-memory registries
-//! (`AGENT_REGISTRY` and `NON_AGENT_CALLS`) plus the live transcript snapshots
-//! (`TRANSCRIPT_REGISTRY`), so it reflects the live in-memory conversation
-//! including the unpersisted tail. No database reads, no schema changes, no
-//! history retained between ticks. Re-renders are driven by coalesced runtime
-//! change events (agent/non-agent registries, live transcript content, voice
-//! status) — the GUI refreshes as activity happens, not on a fixed cadence.
+//! Read-only: at render time it reads the in-memory registries (`AGENT_REGISTRY`,
+//! `NON_AGENT_CALLS`) plus the live transcript snapshots (`TRANSCRIPT_REGISTRY`), so
+//! it reflects the live conversation including the unpersisted tail. No database
+//! reads, no history between ticks. Re-renders follow coalesced runtime change
+//! events, not a fixed cadence.
 //!
 //! Truthfulness rules:
 //! - The card's first row is the role icon followed inline by the token/elapsed
-//!   metrics (collapsed and expanded alike), with no fill spacers; the rest of
-//!   the card content (trace-group lines, tool blocks, activity line) starts on
-//!   the second row at the card's left edge. Every trace group renders one line
-//!   about what the agent is doing, derived from that group's newest step by
-//!   [`trace_line`] — see [`visible_lines`] for how a group with no text of its
-//!   own holds the line already on the card, and when the neutral "clanking"
-//!   placeholder appears instead. The live activity phase label (a
-//!   non-tool LLM call) renders as a separate line at the very bottom of the
-//!   card in both the collapsed and expanded state.
-//!   In-flight tool state is derived from the live transcript history: a tool
-//!   call whose result has not been committed yet renders with a live
-//!   in-flight marker. Only non-tool LLM phases remain invisible in the
-//!   transcript and are still shown solely by the registry activity label.
-//! - Trace groups (below the LIVE line) are a projection of the shared
-//!   session ledger (the live transcript snapshot decoded via
-//!   `session_view::build_ledger`): tool-call assistant rounds grouped by
-//!   shared narration, bounded by real user turns. Content-only final answers
-//!   are omitted.
-//! - The trace groups shown on a card are scoped to the CURRENT user turn:
-//!   groups from before the last real user message are never shown.
-//! - Parallel tool execution is a history-derived over-approximation: a call
-//!   shows as in-flight while its result is uncommitted (its tool-call round
-//!   is already in the ledger) — finished-but-uncommitted calls in a parallel
-//!   batch, unknown/pre-flight-cancelled calls before their round commits,
-//!   and drain-suspended calls all appear in-flight. This is accepted for an
-//!   observability view; tools that never produce a committed round simply
-//!   never appear.
-//! - The instrumentation is purely observational — it never affects
-//!   shutdown/drain logic and gains no cancellation semantics.
+//!   metrics (collapsed and expanded alike), with no fill spacers; the rest of the
+//!   content starts on the second row at the card's left edge. Every trace group
+//!   renders one line about what the agent is doing, derived from that group's
+//!   newest step by [`trace_line`] — see [`visible_lines`] for how a group with no
+//!   text of its own holds the line already on the card. The live activity phase
+//!   label (a non-tool LLM call) renders as a separate line at the very bottom.
+//!   In-flight tool state is derived from the live transcript history: a call whose
+//!   result has not been committed renders with a live in-flight marker.
+//! - Trace groups are a projection of the shared session ledger
+//!   (`session_view::build_ledger`): tool-call assistant rounds grouped by shared
+//!   narration, bounded by real user turns, and scoped to the CURRENT user turn.
+//!   Content-only final answers are omitted.
+//! - Parallel tool execution is a history-derived over-approximation: a call shows
+//!   as in-flight while its result is uncommitted. Accepted for an observability
+//!   view; tools that never produce a committed round simply never appear.
+//! - The instrumentation is purely observational — it never affects shutdown/drain
+//!   logic and gains no cancellation semantics.
 //! - The live view shows tool arguments EXACTLY as the agent passed them —
-//!   including any secrets. This is a deliberate, documented divergence from
-//!   the durable logs (tool-call stats, failure feedback), which remain
-//!   credential-scrubbed: the live view is transient and exists for full
-//!   visibility of what the agent is doing.
+//!   including any secrets. A deliberate divergence from the durable logs, which
+//!   stay credential-scrubbed: this view is transient and exists for full visibility.
 //!
-//! The page is DB-free by design: everything it shows is derived from the
-//! live in-memory registries and the live transcript snapshots, plus the
-//! dashboard's managed-workspace map (only for the "(external)" marker on
-//! sections for workspaces outside the managed set — personal and ephemeral
-//! ones). All header labels (ticket titles, analyze/research questions) are
-//! captured observationally at spawn — never read from the DB.
+//! The page is DB-free: everything comes from those registries and snapshots, plus
+//! the dashboard's managed-workspace map (only for the "(external)" marker on
+//! sections for personal and ephemeral workspaces). Header labels are captured
+//! observationally at spawn — never read from the DB.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -80,39 +62,31 @@ use crate::Workspace;
 
 mod trace_line;
 
-/// How many collapsed previous trace groups the expanded card shows, besides
-/// the current one.
+/// How many collapsed previous trace groups the expanded card shows, besides the current one.
 const MAX_PREVIOUS_GROUPS: usize = 5;
 
-/// Maximum display length (Unicode chars) of an analyze/research group header
-/// label (the question/task text). Truncated at a word/path-delimiter boundary
-/// with "…" (see [`truncate_at_boundary`]).
+/// Maximum display length (Unicode chars) of an analyze/research group header label,
+/// truncated at a word/path-delimiter boundary with "…" (see [`truncate_at_boundary`]).
 const MAX_GROUP_LABEL_CHARS: usize = 104;
 
-/// Maximum width (px) of a metric hover tooltip body. Much narrower than
-/// [`MAX_TOOL_TOOLTIP_WIDTH`] (tuned for multi-arg tool calls) since a metric
-/// tooltip holds one short line of explanatory text.
+/// Maximum width (px) of a metric hover tooltip body: narrower than
+/// [`MAX_TOOL_TOOLTIP_WIDTH`], since it holds one short line.
 const MAX_METRIC_TOOLTIP_WIDTH: f32 = 360.0;
 
-/// What a Running-Agents stop action stops: a research run or one branch
-/// launch. Carried by the messages and the confirmation state; never rendered
-/// as text.
+/// What a Running-Agents stop action stops: a research run or one branch launch. Carried by
+/// the messages and the confirmation state; never rendered as text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StopTarget {
     Research(String),
     Launch(String),
 }
 
-/// Messages emitted by the Running Agents page.
-///
-/// The page itself stays stateless — the pending stop confirmation lives on the
-/// [`Dashboard`](super::Dashboard) so the dialog requires no per-run page state
-/// beyond the pending confirmation itself.
+/// Messages emitted by the Running Agents page. The page itself stays stateless — the
+/// pending stop confirmation lives on the [`Dashboard`](super::Dashboard).
 #[derive(Debug, Clone)]
 pub(crate) enum RunningMessage {
-    /// Stop button pressed on a research-run or branch group header.
-    /// Carries the target whose key (run key / launch agent id) is NEVER
-    /// rendered as text; the button action alone carries it.
+    /// Stop button pressed on a research-run or branch group header. The target's key (run
+    /// key / launch agent id) is NEVER rendered as text; the button action alone carries it.
     StopRequest(StopTarget),
     /// The confirmation dialog's danger button — start the async stop.
     StopConfirmed,
@@ -120,27 +94,20 @@ pub(crate) enum RunningMessage {
     StopDismissed,
     /// The async stop finished; carries the toast outcome the task produced.
     StopFinished(Result<String, String>),
-    /// Toggle the expanded/collapsed state of a running-agent card. Keyed by
-    /// (agent_id, generation) so a recycled agent_id never inherits a stale
-    /// expansion.
+    /// Toggle a running-agent card's expanded state. Keyed by (agent_id, generation) so a
+    /// recycled agent_id never inherits a stale expansion.
     ToggleAgentExpanded { agent_id: String, generation: u64 },
 }
 
 /// Render the live running-agents page.
 ///
-/// The page is observational — it reads the live in-memory registries and
-/// renders directly into the dashboard's [`Message`] type; its only
-/// self-emitted messages are the manual-stop flow for research runs and
-/// branch launches ([`RunningMessage`]) and the card expand/collapse
-/// toggle. `workspaces` is the dashboard's managed-workspace map (name →
-/// info) — used only to mark sections for workspaces outside the managed set
-/// — personal and ephemeral ones — with the "(external)" suffix. Everything
-/// else comes from the live in-memory registries.
-///
-/// `expanded` is the dashboard's set of expanded agent cards, keyed by
-/// (agent_id, generation). Stale keys are pruned by the dashboard's
-/// `RuntimeChanged` handler against the freshly-listed agents; rendering here
-/// only reads the set.
+/// Observational: it reads the live in-memory registries and renders into the dashboard's
+/// [`Message`] type; its only self-emitted messages are the manual-stop flow for research
+/// runs and branch launches ([`RunningMessage`]) and the card expand/collapse toggle.
+/// `workspaces` is the managed-workspace map, used only to mark sections for workspaces
+/// outside it with the "(external)" suffix. `expanded` is the dashboard's set of expanded
+/// cards, keyed by (agent_id, generation); stale keys are pruned by its `RuntimeChanged`
+/// handler, and rendering here only reads the set.
 pub(crate) fn view(
     workspaces: &HashMap<String, Workspace>,
     pending_stop: Option<&StopTarget>,
@@ -149,14 +116,13 @@ pub(crate) fn view(
     let agents = crate::agent::registry::AGENT_REGISTRY.list();
     let calls = crate::agent::registry::NON_AGENT_CALLS.list();
 
-    // Workspace-first sections: each section holds its groups, groups
-    // sorted by kind (tickets → analyze rounds → research runs → branch
-    // launches → singletons → unattributed), sections alphabetically by name.
+    // Workspace-first sections: each holds its groups, sorted by kind (tickets → analyze
+    // rounds → research runs → branch launches → singletons → unattributed); sections sort
+    // alphabetically by name.
     let sections = build_sections(build_groups(&agents, &calls), workspaces);
 
     let body: Element<'_, RunningMessage> = if sections.is_empty() {
-        // Shared empty-state pattern: large radar glyph (the page's nav
-        // icon) + label, centered.
+        // Shared empty-state pattern: large radar glyph (the page's nav icon) + label, centered.
         widgets::empty_state_placeholder(
             lucide::radar::<iced::Theme, iced::Renderer>(),
             "Nothing is currently running.",
@@ -170,8 +136,8 @@ pub(crate) fn view(
         widgets::vscroll(content)
     };
 
-    // Confirm-dialog overlay: a type-stable placeholder while closed, so the
-    // page keeps its widget state when the dialog opens and closes.
+    // Confirm-dialog overlay: a type-stable placeholder while closed, so the page keeps its
+    // widget state when the dialog opens and closes.
     let confirm_layer: Element<'_, RunningMessage> = if let Some(target) = pending_stop {
         stop_confirm_dialog(target)
     } else {
@@ -180,11 +146,8 @@ pub(crate) fn view(
     widgets::page_with_dialog(body, confirm_layer).map(Message::RunningAgents)
 }
 
-// ── Display model ─────────────────────────────────────────────────────────
-
-/// One running work item: either an agent card or a non-agent LLM call row.
-/// The agent card is boxed — `AgentHandle` is large and the variant would
-/// otherwise dominate the enum's size (clippy::large_enum_variant).
+/// One running work item: an agent card or a non-agent LLM call row. The card is boxed —
+/// `AgentHandle` is large and would otherwise dominate the enum (clippy::large_enum_variant).
 #[derive(Debug, Clone)]
 enum DisplayItem {
     Agent(Box<AgentCard>),
@@ -215,39 +178,35 @@ enum GroupKind {
 #[derive(Debug, Clone)]
 struct DisplayGroup {
     kind: GroupKind,
-    /// Group key (ticket id / round key / run key / launch agent id /
-    /// workspace name).
+    /// Group key (ticket id / round key / run key / launch agent id / workspace name).
     key: String,
     /// Workspace name for the group header.
     workspace: String,
-    /// Human-readable header label for the group (ticket title / analyze
-    /// question / research question), captured observationally from any
-    /// member's `parent_label`. `None` for singletons/unattributed and for
-    /// parent-keyed groups whose members carried no label (defensive fallback
-    /// — the header then degrades to a generic label, never a raw key).
+    /// Human-readable header label (ticket title / analyze question / research question),
+    /// captured observationally from any member's `parent_label`. `None` for
+    /// singletons/unattributed and for parent-keyed groups whose members carried no label —
+    /// the header then degrades to a generic label, never a raw key.
     label: Option<String>,
     items: Vec<DisplayItem>,
-    /// True when this research group carries a run-lifetime orchestrator
-    /// marker (rendered as a run-lifetime indicator, not a call row).
+    /// True when this research group carries a run-lifetime orchestrator marker (rendered as
+    /// a run-lifetime indicator, not a call row).
     run_lifetime: bool,
 }
 
-/// One workspace section on the page: the groups running in one workspace,
-/// keyed by the raw workspace name and ordered by its resolved label.
+/// One workspace section: the groups running in one workspace, keyed by the raw workspace
+/// name and ordered by its resolved label.
 #[derive(Debug, Clone)]
 struct WorkspaceSection {
     /// Raw workspace name — the grouping key.
     workspace: String,
-    /// Resolved display label: the bare name for managed workspaces, the
-    /// "(external)"-suffixed form for workspaces outside the managed set
-    /// (personal and ephemeral ones), and "workspace" for an empty name.
+    /// Resolved display label: the bare name for managed workspaces, the "(external)"-suffixed
+    /// form for personal and ephemeral ones, and "workspace" for an empty name.
     label: String,
     groups: Vec<DisplayGroup>,
 }
 
 impl DisplayGroup {
-    /// (order, key) — groups sort by kind order first, then by key within
-    /// the kind (stable, deterministic).
+    /// (order, key) — groups sort by kind order first, then by key within the kind.
     fn sort_key(&self) -> (u8, String) {
         let order = match self.kind {
             GroupKind::Ticket => 0,
@@ -261,8 +220,7 @@ impl DisplayGroup {
     }
 }
 
-/// Map a parent key to its display group kind — the DIRECT PARENT INVOCATION
-/// the work item belongs to.
+/// Map a parent key to its display group kind — the DIRECT PARENT INVOCATION it belongs to.
 fn parent_group_kind(parent: &ParentKey) -> GroupKind {
     match parent {
         ParentKey::Ticket(_) => GroupKind::Ticket,
@@ -272,8 +230,7 @@ fn parent_group_kind(parent: &ParentKey) -> GroupKind {
     }
 }
 
-/// The group key payload for a parent key (ticket id / round key / run key /
-/// launch agent id).
+/// The group key payload for a parent key (ticket id / round key / run key / launch agent id).
 fn parent_group_key(parent: &ParentKey) -> &str {
     match parent {
         ParentKey::Ticket(id) => id,
@@ -281,38 +238,22 @@ fn parent_group_key(parent: &ParentKey) -> &str {
     }
 }
 
-/// Group the running agents and non-agent calls by DIRECT PARENT INVOCATION.
+/// Group the running agents and non-agent calls by DIRECT PARENT INVOCATION: tickets, analyze
+/// rounds, research runs, branch launches, workspace singletons (agents with no parent key) and
+/// unattributed calls (non-agent calls with no parent key).
 ///
-/// - Tickets: agents with a [`ParentKey::Ticket`] plus calls with the same
-///   ticket parent.
-/// - Analyze rounds: agents + calls sharing an [`ParentKey::AnalyzeRound`] key.
-/// - Research runs: agents + calls sharing an [`ParentKey::Research`] key.
-/// - Branch launches: agents + calls sharing a [`ParentKey::Launch`]
-///   key (the launch's agent id).
-/// - Workspace singletons: agents with no parent key (manager / maintainer /
-///   discovery / direct chat).
-/// - Unattributed: non-agent calls with no parent key (workspace-scoped).
+/// Group identity is (kind, key) plus — for tickets/analyze rounds/singletons — the workspace:
+/// ticket ids embed the workspace name and analyze-round keys are scoped to one, so the extra
+/// component closes any cross-workspace collision (two concurrent sync analyze rounds drawing
+/// the same short NanoID suffix).
 ///
-/// Group identity is (kind, key) plus — for tickets/analyze rounds/singletons —
-/// the workspace: ticket ids already embed the workspace name and analyze-round
-/// keys are scoped to one workspace, so the extra component closes any
-/// cross-workspace key collision (e.g. two concurrent sync analyze rounds in
-/// different workspaces drawing the same short NanoID suffix). Research and
-/// branch-launch groups are matched on (kind, key) alone because a run/launch
-/// moves between workspaces:
-/// - a research run's worker round executes in an EPHEMERAL per-run workspace
-///   whose name IS the run key (job_id) while its analysts and orchestrator
-///   calls run in the real workspace — a workspace component would split the
-///   group;
-/// - a branch launch's folder is a property of the LAUNCH, not of the branch
-///   identity, so a branch (a custom role's or a worker's) pointed at a
-///   different folder keeps one group: a launch group is keyed by the branch
-///   address alone, so a member whose recorded workspace differs must join the
-///   existing group instead of splitting into a second section.
-///
-/// The run key / launch agent id is a durable unique id, so (kind, key) stays
-/// unique across workspaces; the group's displayed workspace is resolved to the
-/// REAL workspace whenever a non-ephemeral member is seen.
+/// Research and branch-launch groups are matched on (kind, key) alone, because a run/launch
+/// moves between workspaces: a research run's worker round executes in an EPHEMERAL per-run
+/// workspace whose name IS the run key, while its analysts run in the real one; and a branch
+/// launch's folder is a property of the LAUNCH, not of the branch identity, so a branch pointed
+/// at a different folder keeps one group. The run key / launch agent id is durable and unique,
+/// so (kind, key) stays unique across workspaces; the group's displayed workspace is resolved
+/// to the REAL workspace whenever a non-ephemeral member is seen.
 fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<DisplayGroup> {
     let mut groups: Vec<DisplayGroup> = Vec::new();
 
@@ -324,8 +265,8 @@ fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<Dis
                 g.kind == kind && g.key == key && (workspace_agnostic || g.workspace == workspace)
             }) {
                 if research && groups[idx].workspace == key && workspace != key {
-                    // The group currently shows the ephemeral per-run
-                    // workspace; adopt the joining member's real workspace.
+                    // The group shows the ephemeral per-run workspace; adopt the joining
+                    // member's real workspace.
                     groups[idx].workspace = workspace.to_string();
                 }
                 return idx;
@@ -341,9 +282,8 @@ fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<Dis
             groups.len() - 1
         };
 
-    // Adopt a member's parent label into the group (first non-None wins —
-    // all members of one invocation carry the same label; the fallback keeps
-    // a group whose only remaining member is label-less from degrading).
+    // Adopt a member's parent label into the group (first non-None wins — all members of one
+    // invocation carry the same label).
     let adopt_label = |label: &Option<String>, group: &mut DisplayGroup| {
         if group.label.is_none() && label.is_some() {
             group.label.clone_from(label);
@@ -366,8 +306,7 @@ fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<Dis
                     handle: agent.clone(),
                 })));
         } else {
-            // Workspace singleton. An empty workspace name groups under the
-            // empty key; the section label resolver renders it as "workspace".
+            // Workspace singleton. An empty workspace name groups under the empty key.
             let idx = find_group(GroupKind::Singleton, &workspace, &workspace, &mut groups);
             groups[idx]
                 .items
@@ -387,8 +326,8 @@ fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<Dis
                 &mut groups,
             );
             adopt_label(&call.parent_label, &mut groups[idx]);
-            // Run-lifetime orchestrator markers render as a run-lifetime
-            // indicator on the group, not as a transient call card.
+            // Run-lifetime orchestrator markers render as a run-lifetime indicator on the
+            // group, not as a transient call card.
             if call.run_lifetime {
                 groups[idx].run_lifetime = true;
             } else {
@@ -407,14 +346,9 @@ fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<Dis
     groups
 }
 
-/// Group the display groups into WORKSPACE SECTIONS — the page is organized
-/// by workspace, whose resolved label is used only for deterministic ordering
-/// (the label no longer renders as a per-section heading).
-///
-/// Sections are ordered alphabetically by their resolved label (deterministic
-/// — activity-based ordering would flicker as agents come and go); within a
-/// section, groups keep the canonical kind order (tickets → analyze rounds →
-/// research runs → branch launches → singletons → unattributed) via
+/// Group the display groups into WORKSPACE SECTIONS. Sections are ordered alphabetically by
+/// their resolved label (deterministic — activity-based ordering would flicker as agents come
+/// and go); within a section, groups keep the canonical kind order via
 /// [`DisplayGroup::sort_key`].
 fn build_sections(
     groups: Vec<DisplayGroup>,
@@ -440,14 +374,8 @@ fn build_sections(
     sections
 }
 
-// ── Rendering ─────────────────────────────────────────────────────────────
-
-/// Render one workspace section: just the section's groups. The workspace
-/// name no longer gets a visual heading — `section.label` exists only for the
-/// deterministic section ordering in [`build_sections`].
-///
-/// The returned element owns all rendered content (text widgets take owned
-/// Strings), so its lifetime is independent of the `section` borrow.
+/// Render one workspace section: just the section's groups. The workspace name gets no visual
+/// heading — `section.label` exists only for the ordering in [`build_sections`].
 fn render_section(
     section: &WorkspaceSection,
     expanded: &HashSet<(String, u64)>,
@@ -459,20 +387,16 @@ fn render_section(
     groups.into()
 }
 
-/// Resolve a group's header parts: the primary label plus an optional ticket
-/// id. `render_group` composes a single flat header — for ticket groups
-/// `[{id}] {title}`, otherwise just the label.
+/// Resolve a group's header parts: the primary label plus an optional ticket id.
+/// `render_group` composes a single flat `[{id}] {title}` header for ticket groups and just
+/// the label otherwise.
 ///
-/// - Ticket groups: the ticket NAME plus the ticket ID. When no title was
-///   captured (defensive — every live ticket group carries one via its agents
-///   or the synthesis call), the key becomes the sole label.
-/// - Analyze/research groups: the truncated question/task text; a generic
-///   fallback when no label was captured. The raw NanoID key is NEVER shown.
-/// - Branch launches: the display label built at spawn (a custom role's name
-///   plus its branch identifier when named, or a worker branch's own label); a
-///   generic fallback when absent.
-/// - Singleton/unattributed groups: generic labels — their workspace name is
-///   already the section grouping, so repeating it would be redundant.
+/// - Tickets: the ticket NAME plus its ID; with no captured title (defensive) the key becomes
+///   the sole label.
+/// - Analyze/research groups: the truncated question/task text; a generic fallback when no
+///   label was captured. The raw NanoID key is NEVER shown.
+/// - Branch launches: the display label built at spawn; a generic fallback when absent.
+/// - Singleton/unattributed groups: generic labels — the workspace is already the section.
 fn group_title(group: &DisplayGroup) -> (String, Option<String>) {
     match &group.kind {
         GroupKind::Ticket => match &group.label {
@@ -505,19 +429,16 @@ fn group_title(group: &DisplayGroup) -> (String, Option<String>) {
     }
 }
 
-/// Render one group: header (flat label + run-lifetime marker) then its
-/// cards/rows directly on the page background — each agent card carries its
-/// own card style; call rows are unadorned by design.
+/// Render one group: header (flat label + run-lifetime marker) then its cards/rows directly on
+/// the page background — each agent card carries its own style; call rows are unadorned.
 fn render_group(
     group: &DisplayGroup,
     expanded: &HashSet<(String, u64)>,
 ) -> Element<'static, RunningMessage> {
     let (title, id) = group_title(group);
     let mut header_parts: Vec<Element<'_, RunningMessage>> = Vec::new();
-    // Ticket groups render a single flat `[{id}] {title}` header — the id is
-    // composed into the text, never styled as a separate ACCENT element. When
-    // no title was captured (defensive), the key is the sole label. All other
-    // groups render their label as the same flat line.
+    // Ticket groups render a single flat `[{id}] {title}` header — the id is composed into the
+    // text, never styled as a separate ACCENT element. All other groups render the same flat line.
     let header = if group.kind == GroupKind::Ticket {
         match id {
             Some(id) => format!("[{id}] {title}"),
@@ -540,11 +461,9 @@ fn render_group(
                 .into(),
         );
     }
-    // Manual stop: danger-styled button on RESEARCH-run group headers ("Cancel
-    // run" — the run is removed permanently) and on BRANCH launch headers
-    // ("Stop launch" — the branch is marked stopped, not erased). The group key
-    // (run key / launch agent id) is carried by the message, never rendered as
-    // text.
+    // Manual stop: danger-styled button on RESEARCH-run group headers ("Cancel run" — the run
+    // is removed permanently) and on BRANCH launch headers ("Stop launch" — the branch is
+    // marked stopped, not erased). The group key is carried by the message, never rendered.
     let stop = match group.kind {
         GroupKind::Research => Some(("Cancel run", StopTarget::Research(group.key.clone()))),
         GroupKind::Launch => Some(("Stop launch", StopTarget::Launch(group.key.clone()))),
@@ -584,13 +503,9 @@ fn render_group(
     .into()
 }
 
-/// Build the manual-stop confirmation dialog for a research run or a
-/// branch launch, mirroring the board's ticket-cancel pattern:
-/// consequences listed, danger confirm button, Keep/Dismiss (and Escape/
-/// backdrop) to close with no effect.
-///
-/// The target's key (run job id / launch agent id) is NEVER displayed as text —
-/// the button action alone carries it (see the enum docs).
+/// Build the manual-stop confirmation dialog for a research run or a branch launch, mirroring
+/// the board's ticket-cancel pattern: consequences listed, danger confirm button, Keep/Dismiss
+/// (and Escape/backdrop) to close with no effect. The target's key is NEVER displayed.
 fn stop_confirm_dialog(target: &StopTarget) -> Element<'static, RunningMessage> {
     let (title, body, keep, confirm): (&str, &[&str], &str, &str) = match target {
         StopTarget::Research(_) => (
@@ -638,8 +553,8 @@ fn stop_confirm_dialog(target: &StopTarget) -> Element<'static, RunningMessage> 
     )
 }
 
-/// Fallback label for workspaces outside the dashboard's managed set
-/// (personal user spaces, ephemeral run-scoped workspaces).
+/// Fallback label for workspaces outside the dashboard's managed set (personal spaces,
+/// ephemeral run-scoped workspaces).
 fn fallback_workspace_label(workspace: &str) -> String {
     if workspace.is_empty() {
         "workspace".to_string()
@@ -648,10 +563,8 @@ fn fallback_workspace_label(workspace: &str) -> String {
     }
 }
 
-/// Resolve a workspace's display label, used for deterministic section
-/// ordering: the bare name for managed workspaces, the fallback label
-/// (with the "(external)" marker) for workspaces outside the managed set
-/// (personal and ephemeral ones), and "workspace" for an empty name.
+/// Resolve a workspace's display label for section ordering: the bare name for managed
+/// workspaces, the fallback label for personal and ephemeral ones, "workspace" for an empty name.
 fn workspace_label_for(
     name: &str,
     workspaces: &std::collections::HashMap<String, Workspace>,
@@ -665,33 +578,27 @@ fn workspace_label_for(
     }
 }
 
-/// Render one running-agent card: the role icon and the token/elapsed metrics
-/// inline in the first row, then the current user turn's trace groups. The
-/// whole card is clickable to expand/collapse the trace groups.
+/// Render one running-agent card: the role icon and the token/elapsed metrics inline in the
+/// first row, then the current user turn's trace groups. The whole card is clickable to
+/// expand/collapse.
 ///
-/// Each trace group renders one line about what the agent is doing, following
-/// that group's newest step (see [`trace_line`]); no line a newer group already
-/// shows is repeated, and the neutral "clanking" placeholder appears only while
-/// the card has no line at all (see [`visible_lines`]). The live activity phase
-/// label (an in-flight non-tool LLM call, e.g.
-/// extracting/summarizing/transcribing) renders as a separate accent line at the
-/// very bottom of the card in both the collapsed and expanded state. Trace groups
-/// come from the live transcript snapshot (the unpersisted tail included): the
-/// current (latest) group, plus up to [`MAX_PREVIOUS_GROUPS`] previous groups
-/// when expanded.
+/// Each trace group renders one line about what the agent is doing (see [`trace_line`]); no
+/// line a newer group already shows is repeated, and the neutral "clanking" placeholder
+/// appears only while the card has no line at all. The live activity phase label renders as a
+/// separate accent line at the bottom. Trace groups come from the live transcript snapshot
+/// (the unpersisted tail included): the current group, plus up to [`MAX_PREVIOUS_GROUPS`]
+/// previous groups when expanded.
 fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, RunningMessage> {
     let h = &card.handle;
-    // Color resolution via the canonical string helper (handles derivative
-    // names and falls back to muted grey for unknown roles); the icon still
-    // needs a typed Role, so parse with the same Engineer fallback as before.
+    // Color via the canonical string helper (handles derivative names, falls back to muted
+    // grey); the icon needs a typed Role, parsed with the same Engineer fallback.
     let (fg, _bg) = theme::role_badge_color(&h.role);
     let role: crate::Role = h.role.parse().unwrap_or(crate::Role::Engineer);
     let icon = theme::role_icon(&role).size(theme::TEXT_24).color(fg);
     let elapsed = format_elapsed(h.started_at);
 
-    // The live transcript snapshot feeds the trace groups below (and their
-    // lines), scoped to the current user turn, so fetch it once up front. The
-    // groups borrow the ledger, so it outlives them within this render.
+    // The live transcript snapshot feeds the trace groups below, scoped to the current user
+    // turn; the groups borrow the ledger, so it outlives them within this render.
     let snapshot = crate::session::TRANSCRIPT_REGISTRY.snapshot(&h.agent_id);
     let ledger = snapshot
         .as_ref()
@@ -705,30 +612,27 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
         .spacing(theme::SPACE_6)
         .align_x(Alignment::Start)
         .width(Length::Fill);
-    // The card's first row is the role icon followed inline by the token /
-    // elapsed metrics, sitting at the left edge of the card (no fill spacers).
+    // The card's first row: role icon then the token / elapsed metrics, at the card's left
+    // edge (no fill spacers).
     let first_row = Row::new()
         .spacing(theme::SPACE_12)
         .align_y(Alignment::Center)
         .push(icon)
         .push(render_metrics(token_count, &elapsed));
     content = content.push(first_row);
-    // The line each visible group renders, and — while no group has one at all
-    // (a brand-new agent, a new user turn, or a turn whose groups carry no text
-    // yet) — the card-level "clanking" placeholder standing in for it.
+    // The line each visible group renders, and — while no group has one at all — the card-level
+    // "clanking" placeholder standing in for it.
     let lines = visible_lines(&groups, expanded);
     if !lines.iter().any(|line| matches!(line, GroupLine::Line(_))) {
         content = content.push(clanking_placeholder());
     }
-    // Trace groups from the live snapshot, scoped to the current user turn.
-    // Content-only assistant messages (final answers) are deliberately
-    // omitted — only tool-call assistant messages form groups.
+    // Trace groups from the live snapshot, scoped to the current user turn. Content-only
+    // assistant messages are deliberately omitted.
     for group in render_visible_groups(&groups, lines) {
         content = content.push(group);
     }
-    // The live activity phase label (an in-flight non-tool LLM call) renders
-    // as a separate accent line at the very bottom of the card, below the
-    // trace groups, in both the collapsed and expanded view.
+    // The live activity phase label renders as a separate accent line at the very bottom of
+    // the card, in both the collapsed and expanded view.
     if let Some(activity) = &h.activity {
         content = content.push(
             text(activity.to_owned())
@@ -741,9 +645,8 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
         agent_id: h.agent_id.clone(),
         generation: h.generation,
     };
-    // The whole card is a click target (expand/collapse), but it stays a
-    // `container` under a transparent `mouse_area` so the inner tool blocks
-    // keep their hover tooltips (a `button` wrapper would swallow them).
+    // The whole card is a click target, but it stays a `container` under a transparent
+    // `mouse_area` so the inner tool blocks keep their hover tooltips.
     mouse_area(
         container(content)
             .width(Length::Fill)
@@ -754,10 +657,9 @@ fn render_agent_card(card: &AgentCard, expanded: bool) -> Element<'static, Runni
     .into()
 }
 
-/// The typography of a trace group's line: italic at
-/// [`theme::NARRATION_TEXT_SIZE`], wrapping within the row. The text is already
-/// one line of whole sentences within the card's character budget (see
-/// [`trace_line::line_for_step`]); only a sentence longer than the budget is cut.
+/// The typography of a trace group's line: italic at [`theme::NARRATION_TEXT_SIZE`], wrapping
+/// within the row. The text is already one line within the card's character budget (see
+/// [`trace_line::line_for_step`]).
 fn trace_line_text(line: &str) -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
     text(line.to_owned())
         .size(theme::NARRATION_TEXT_SIZE)
@@ -766,25 +668,21 @@ fn trace_line_text(line: &str) -> iced::widget::Text<'static, iced::Theme, iced:
         .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
 }
 
-/// The neutral "clanking" placeholder: the card has no line to show yet — a
-/// brand-new agent, a new user turn, or a turn whose groups are all textless.
+/// The neutral "clanking" placeholder: the card has no line to show yet.
 fn clanking_placeholder() -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
     text("clanking")
         .size(theme::TEXT_13)
         .color(theme::TEXT_SECONDARY)
 }
 
-/// Render the card's metrics: the live session-token count (when known) and
-/// the elapsed run time, each as a compact labeled tooltip. Renders inline in
-/// the card's first row, right after the role icon (see
-/// [`render_agent_card`]).
+/// Render the card's metrics: the live session-token count (when known) and the elapsed run
+/// time, each as a compact labeled tooltip, right after the role icon.
 fn render_metrics(token_count: Option<u64>, elapsed: &str) -> Element<'static, RunningMessage> {
     let mut metrics = Row::new()
         .spacing(theme::SPACE_12)
         .align_y(Alignment::Center);
-    // The live token count comes from the published transcript snapshot (the
-    // registry no longer carries a session_tokens mirror). It renders as a
-    // compact count; hovering reveals the label and the exact unrounded value.
+    // The live token count comes from the published transcript snapshot (the registry carries
+    // no session_tokens mirror); hovering reveals the label and the exact value.
     if let Some(token_count) = token_count {
         metrics = metrics.push(
             tooltip(
@@ -817,15 +715,14 @@ fn render_metrics(token_count: Option<u64>, elapsed: &str) -> Element<'static, R
 enum GroupLine<'a> {
     /// The line the group shows.
     Line(trace_line::Line<'a>),
-    /// Nothing to show here: the group carries no text and no earlier line to
-    /// hold, or a newer group already shows the very same line.
+    /// Nothing to show here: the group carries no text and no earlier line to hold, or a newer
+    /// group already shows the very same line.
     Blank,
 }
 
-/// Render the visible trace groups for a card: the current (latest) group
-/// always (last, chronologically, newest step expanded), plus up to
-/// [`MAX_PREVIOUS_GROUPS`] previous groups (collapsed) when the card is
-/// expanded. `lines` are the lines [`visible_lines`] derived for that same tail.
+/// Render the visible trace groups for a card: the current (latest) group always, plus up to
+/// [`MAX_PREVIOUS_GROUPS`] previous ones (collapsed) when expanded. `lines` are the lines
+/// [`visible_lines`] derived for that same tail.
 fn render_visible_groups<'a>(
     groups: &'a [TraceGroup<'a>],
     lines: Vec<GroupLine<'a>>,
@@ -840,15 +737,12 @@ fn render_visible_groups<'a>(
         .collect()
 }
 
-/// The line every visible group renders, oldest first. A group shows its own
-/// line (its newest step's text); the current group, while it carries no text,
-/// holds the line already on the card — the newest line of an earlier group — so
-/// a running agent's card never goes blank mid-run. One phrase appears at most
-/// once: a line a newer group already shows is dropped from the older group, the
-/// card's line always being the newest copy. A group with nothing to show renders
-/// no line row at all, and the caller renders the neutral placeholder once while
-/// no visible group has a line (a fresh agent, a new user turn, or a turn whose
-/// groups carry no text yet).
+/// The line every visible group renders, oldest first. A group shows its own line (its newest
+/// step's text); the current group, while it carries no text, holds the line already on the
+/// card — so a running agent's card never goes blank mid-run. One phrase appears at most once:
+/// a line a newer group already shows is dropped from the older one. A group with nothing to
+/// show renders no line row, and the caller renders the neutral placeholder once while no
+/// visible group has a line.
 fn visible_lines<'a>(groups: &'a [TraceGroup<'a>], expanded: bool) -> Vec<GroupLine<'a>> {
     let depth = if expanded { MAX_PREVIOUS_GROUPS + 1 } else { 1 };
     let start = groups.len().saturating_sub(depth);
@@ -857,9 +751,8 @@ fn visible_lines<'a>(groups: &'a [TraceGroup<'a>], expanded: bool) -> Vec<GroupL
         .map(|group| group_line(group).map_or(GroupLine::Blank, GroupLine::Line))
         .collect();
     if let Some(GroupLine::Blank) = lines.last() {
-        // The line the card already shows: the newest one already computed for a
-        // visible group, else the newest from the groups scrolled out of the
-        // list (the collapsed card has none of the former).
+        // The line the card already shows: the newest one computed for a visible group, else
+        // the newest from the groups scrolled out of the list.
         let held = lines[..lines.len() - 1]
             .iter()
             .rev()
@@ -891,10 +784,9 @@ fn visible_lines<'a>(groups: &'a [TraceGroup<'a>], expanded: bool) -> Vec<GroupL
     lines
 }
 
-/// The line a trace group shows: the newest step's own line (its narration, else
-/// its reasoning — see [`trace_line::line_for_step`]), or an earlier step's line
-/// while the newest one carries no usable text, so a group that already showed
-/// a line keeps showing one. `None` when no step of the group has any text.
+/// The line a trace group shows: the newest step's own line (its narration, else its
+/// reasoning — see [`trace_line::line_for_step`]), or an earlier step's line while the newest
+/// carries no usable text. `None` when no step of the group has any text.
 fn group_line<'a>(group: &TraceGroup<'a>) -> Option<trace_line::Line<'a>> {
     group
         .steps
@@ -903,11 +795,9 @@ fn group_line<'a>(group: &TraceGroup<'a>) -> Option<trace_line::Line<'a>> {
         .find_map(|step| trace_line::line_for_step(step.narration, step.reasoning))
 }
 
-/// Render one trace group. `expand_current` renders the newest step's calls
-/// expanded (current group); otherwise every call collapses to a name-only line
-/// (previous groups). `line` is the text line the group shows (see
-/// [`visible_lines`]); hovering it reveals the reasoning of the step it came
-/// from (see [`reasoning_tooltip`]).
+/// Render one trace group. `expand_current` renders the newest step's calls expanded (current
+/// group); otherwise every call collapses to a name-only line. `line` is the text the group
+/// shows, and hovering it reveals the reasoning of the step it came from.
 fn render_trace_group<'a>(
     group: &TraceGroup<'a>,
     expand_current: bool,
@@ -923,9 +813,8 @@ fn render_trace_group<'a>(
                 trace_line_text(&line.text).into(),
             ));
         }
-        // Nothing to show here: the card-level placeholder covers the case where
-        // no group has a line at all, and a second copy of another group's line
-        // is never rendered.
+        // The card-level placeholder covers the case where no group has a line at all, and a
+        // second copy of another group's line is never rendered.
         GroupLine::Blank => {}
     }
 
@@ -954,9 +843,8 @@ fn render_trace_group<'a>(
     column.into()
 }
 
-/// A single expanded tool-call row in the current group. Settled calls render
-/// exactly as [`tool_block`]; an in-flight call (result not yet committed)
-/// gains the pulsing activity dot after the block.
+/// A single expanded tool-call row in the current group. Settled calls render exactly as
+/// [`tool_block`]; an in-flight call gains the pulsing activity dot after the block.
 fn tool_row(entry: &ToolCallEntry) -> Element<'static, RunningMessage> {
     let block = tool_block(&entry.tool, ToolBlockView::Compact);
     if entry.result.is_none() {
@@ -971,10 +859,9 @@ fn tool_row(entry: &ToolCallEntry) -> Element<'static, RunningMessage> {
     }
 }
 
-/// Wrap a group's line in a hover tooltip revealing the reasoning of the step
-/// the line came from (see [`TraceStep::reasoning`]), already cut to the prefix
-/// that was read: the whole block reaches tens of kilobytes and is copied per
-/// render. When that step has no reasoning the line renders bare.
+/// Wrap a group's line in a hover tooltip revealing the reasoning of the step it came from,
+/// already cut to the prefix that was read: the whole block reaches tens of kilobytes and is
+/// copied per render. A step with no reasoning renders the line bare.
 fn reasoning_tooltip<'a>(
     reasoning: Option<&str>,
     line: Element<'a, RunningMessage>,
@@ -996,12 +883,10 @@ fn reasoning_tooltip<'a>(
         .into()
 }
 
-/// Compose the collapsed name-only line for a set of trace steps: tool names
-/// with underscores replaced by spaces, in first-appearance order, each unique
-/// name suffixed with `xN` when it appears more than once within the collapsed
-/// set (e.g. `read file x2, list files`). An in-flight call (result not yet
-/// committed) gets its display name suffixed with a running marker (`…`) before
-/// the xN counting, so it never looks settled.
+/// Compose the collapsed name-only line for a set of trace steps: tool names with underscores
+/// replaced by spaces, in first-appearance order, each unique name suffixed with `xN` when it
+/// repeats (e.g. `read file x2, list files`). An in-flight call gets a running marker (`…`)
+/// before the counting, so it never looks settled.
 fn collapsed_calls_line(steps: &[TraceStep<'_>]) -> String {
     let mut order: Vec<String> = Vec::new();
     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -1033,8 +918,8 @@ fn collapsed_calls_line(steps: &[TraceStep<'_>]) -> String {
         .join(", ")
 }
 
-/// Prune stale expanded-state keys: an agent that finished (or was replaced by
-/// a new generation of the same agent_id) must not keep a stale expansion.
+/// Prune stale expanded-state keys: an agent that finished (or was replaced by a new
+/// generation of the same agent_id) must not keep a stale expansion.
 pub(crate) fn prune_expanded(expanded: &mut HashSet<(String, u64)>, agents: &[AgentHandle]) {
     let live: HashSet<(String, u64)> = agents
         .iter()
@@ -1043,40 +928,31 @@ pub(crate) fn prune_expanded(expanded: &mut HashSet<(String, u64)>, agents: &[Ag
     expanded.retain(|key| live.contains(key));
 }
 
-/// One step of an agent's work: one tool-call assistant round with the text
-/// that round itself carried, borrowed from the ledger entry it was projected
-/// from so a re-render copies neither reasoning nor tool payload.
+/// One step of an agent's work: one tool-call assistant round with the text that round itself
+/// carried, borrowed from the ledger entry it was projected from.
 struct TraceStep<'a> {
-    /// The assistant's own intermediate text, the short visible narration it
-    /// wrote for the reader (the decoded assistant `content`, NEVER the long
-    /// `Reasoning` / `[thinking]` block). Empty when the round narrated
-    /// nothing.
+    /// The assistant's own intermediate text, the short visible narration it wrote for the
+    /// reader (the decoded `content`, NEVER the long `Reasoning` / `[thinking]` block).
     narration: &'a str,
-    /// The round's decoded long Reasoning. The step's line falls back to it
-    /// when the narration carries no line, and its bounded prefix is the line's
-    /// hover text otherwise.
+    /// The round's decoded long Reasoning: the step's line falls back to it, and its bounded
+    /// prefix is the line's hover text otherwise.
     reasoning: Option<&'a str>,
-    /// The round's tool calls (name/args pairs plus the tool_call_id-matched
-    /// result), so the display can distinguish an in-flight call (result not
-    /// yet committed) from a settled one.
+    /// The round's tool calls (name/args pairs plus the tool_call_id-matched result), so the
+    /// display can tell an in-flight call from a settled one.
     calls: &'a [ToolCallEntry],
 }
 
-/// One trace group in a running agent's live transcript: a maximal run of
-/// consecutive tool-call assistant rounds sharing a single (possibly empty)
-/// visible narration, bounded by a real user turn or a new narration. Every
-/// round's own text is kept (see [`TraceStep`]) because the group's line
-/// follows the newest step. A group always carries at least one step.
+/// One trace group: a maximal run of consecutive tool-call assistant rounds sharing a single
+/// (possibly empty) visible narration, bounded by a real user turn or a new narration. Every
+/// round's own text is kept because the group's line follows the newest step.
 struct TraceGroup<'a> {
-    /// The group's steps in chronological order; the LAST one is the newest
-    /// (expanded in the current group, and the one its line is derived from).
+    /// The group's steps in chronological order; the LAST one is the newest.
     steps: Vec<TraceStep<'a>>,
 }
 
-/// A real user turn boundary in the ledger: a User message that is neither
-/// an injected tool-result-image message (content starting with
-/// [`crate::util::INJECTED_IMAGE_TAG`]) nor an empty resume signal (no/empty
-/// content). Only such a message starts a new user turn.
+/// A real user turn boundary in the ledger: a User message that is neither an injected
+/// tool-result-image message (content starting with [`crate::util::INJECTED_IMAGE_TAG`]) nor an
+/// empty resume signal.
 fn is_user_turn_boundary(entry: &SessionEntry) -> bool {
     matches!(entry, SessionEntry::Message { role: ChatRole::User, content, .. }
     if content.as_deref().is_some_and(|c| {
@@ -1084,10 +960,8 @@ fn is_user_turn_boundary(entry: &SessionEntry) -> bool {
     }))
 }
 
-/// The slice of the ledger belonging to the CURRENT user turn: everything
-/// after the last real user turn boundary ([`is_user_turn_boundary`]). The
-/// running card shows only the current turn, so groups from previous turns
-/// never leak onto it. When no boundary exists the whole ledger is current.
+/// The slice of the ledger belonging to the CURRENT user turn: everything after the last real
+/// boundary ([`is_user_turn_boundary`]). With no boundary the whole ledger is current.
 fn current_turn_entries(entries: &[SessionEntry]) -> &[SessionEntry] {
     let start = entries
         .iter()
@@ -1096,19 +970,15 @@ fn current_turn_entries(entries: &[SessionEntry]) -> &[SessionEntry] {
     &entries[start..]
 }
 
-/// Project the shared session ledger into a running agent's trace groups, in
-/// chronological order.
+/// Project the shared session ledger into a running agent's trace groups, in chronological order.
 ///
-/// Boundary rules:
-/// - A new (non-blank) narration in a tool-call assistant round starts a new
-///   group; that round becomes the group's first step.
-/// - Consecutive tool-call rounds with no narration accumulate into the current
-///   group as further steps, each keeping its own narration and reasoning.
-/// - A real user turn closes the current group; the next tool-call round then
-///   starts a fresh one even with no narration, and the card has no line to
-///   hold across that turn. An empty (whitespace) User message or a synthetic
-///   tool-injected one (content starting with the
-///   [`crate::util::INJECTED_IMAGE_TAG`] marker) is NOT a boundary.
+/// - A new (non-blank) narration in a tool-call assistant round starts a new group, and that
+///   round becomes its first step.
+/// - Consecutive tool-call rounds with no narration accumulate into the current group as
+///   further steps, each keeping its own narration and reasoning.
+/// - A real user turn closes the current group; the next tool-call round starts a fresh one
+///   even with no narration, and the card has no line to hold across that turn. An empty
+///   (whitespace) User message or a synthetic tool-injected one is NOT a boundary.
 fn derive_trace_groups(entries: &[SessionEntry]) -> Vec<TraceGroup<'_>> {
     let mut groups: Vec<TraceGroup> = Vec::new();
     let mut current: Option<TraceGroup> = None;
@@ -1147,10 +1017,8 @@ fn derive_trace_groups(entries: &[SessionEntry]) -> Vec<TraceGroup<'_>> {
     groups
 }
 
-/// Render a one-line metric tooltip body in a narrow, styled container: the
-/// explanatory text (metric label plus, where useful, the precise value). Kept
-/// narrower than [`MAX_TOOL_TOOLTIP_WIDTH`] because a metric tooltip holds a
-/// single short line, not multi-arg tool calls.
+/// Render a one-line metric tooltip body in a narrow, styled container: the metric label plus,
+/// where useful, the precise value. Narrower than [`MAX_TOOL_TOOLTIP_WIDTH`] by design.
 fn render_metric_tooltip(label: String) -> Element<'static, RunningMessage> {
     container(
         text(label)
@@ -1162,10 +1030,9 @@ fn render_metric_tooltip(label: String) -> Element<'static, RunningMessage> {
     .into()
 }
 
-/// Render a compact non-agent LLM call row: zap marker + purpose + elapsed.
-/// No workspace name (the workspace grouping already names it); the elapsed
-/// time uses the same brighter tone as agent cards. The purpose is the static
-/// human-readable label — raw kind names never leak.
+/// Render a compact non-agent LLM call row: zap marker + purpose + elapsed. No workspace name
+/// (the grouping already names it); the purpose is the static human-readable label, never a raw
+/// kind name.
 fn render_call_row(call: &CallRow) -> Element<'static, RunningMessage> {
     let h = &call.handle;
     let elapsed = format_elapsed(h.started_at);
@@ -1445,8 +1312,7 @@ mod tests {
                 "ws1",
                 "case {name}: workspace"
             );
-            // Inside a workspace section the group headers must not repeat the
-            // workspace name — the section's order already names it.
+            // Group headers must not repeat the workspace name — the section's order names it.
             for group in &groups {
                 let (title, _) = group_title(group);
                 assert!(
@@ -1484,9 +1350,9 @@ mod tests {
 
     #[test]
     fn ticket_group_label_comes_from_members_not_the_key() {
-        // The title is captured observationally at spawn (agents via their
-        // ticket, the synthesis call via the joint verdict), so a group carries
-        // it even when only the synthesis call remains.
+        // The title is captured observationally at spawn (agents via their ticket, the
+        // synthesis call via the joint verdict), so a group carries it even when only the
+        // synthesis call remains.
         let mut analyst = agent("a1", "analyst", "ws1", "t:T1");
         analyst.parent_label = Some("Fix the login flow".to_string());
         let mut synthesis = call("synthesis", "ws1", "t:T1", false);
@@ -1507,8 +1373,7 @@ mod tests {
 
     #[test]
     fn analyze_and_research_groups_render_question_not_raw_key() {
-        // Analyze/research headers show the question text; the raw NanoID key is
-        // never rendered, and a missing label degrades to a generic one.
+        // Analyze/research headers show the question text; the raw NanoID key is never rendered.
         let mut analyst = agent("a1", "analyst", "ws1", "a:job_abc");
         analyst.parent_label = Some("Why is CI flaky?".to_string());
         let groups = build_groups(&[analyst], &[]);
@@ -1528,9 +1393,8 @@ mod tests {
 
     #[test]
     fn sections_group_by_workspace_and_keep_kind_order() {
-        // Workspace-first layout: sections sort alphabetically, groups keep the
-        // canonical kind order inside one, and a singleton lands in its own
-        // workspace's section.
+        // Workspace-first layout: sections sort alphabetically, groups keep the canonical kind
+        // order inside one, and a singleton lands in its own workspace's section.
         let mut workspaces = std::collections::HashMap::new();
         workspaces.insert(
             "ws2".to_string(),
@@ -1555,14 +1419,11 @@ mod tests {
         assert_eq!(sections[0].label, "ws1 (external)");
     }
 
-    // ── Trace-group derivation ──────────────────────────────────────
-
     fn assistant_tool_call(narration: &str, calls: &[(&str, serde_json::Value)]) -> ChatMessage {
         assistant_tool_call_reasoning(narration, calls, None)
     }
 
-    /// A tool-call round carrying `reasoning`, so the ledger's
-    /// `ToolRound.reasoning` is populated.
+    /// A tool-call round carrying `reasoning`, so the ledger's `ToolRound.reasoning` is set.
     fn assistant_tool_call_reasoning(
         narration: &str,
         calls: &[(&str, serde_json::Value)],
@@ -1681,8 +1542,7 @@ mod tests {
 
     #[test]
     fn every_step_keeps_its_own_reasoning() {
-        // Each round keeps its own reasoning, so the label can follow the newest
-        // step instead of latching onto the group's first one.
+        // Each round keeps its own reasoning, so the label can follow the newest step.
         let history = vec![
             assistant_tool_call_reasoning(
                 "",
@@ -1699,8 +1559,8 @@ mod tests {
         assert_eq!(reasoning, vec![None, Some("first"), Some("second")]);
     }
 
-    /// A ledger tool-call entry for the collapsed/in-flight projection tests;
-    /// `result: None` marks the call in-flight.
+    /// A ledger tool-call entry for the collapsed/in-flight projection tests; `result: None`
+    /// marks the call in-flight.
     fn entry(name: &str, args: serde_json::Value, result: Option<&str>) -> ToolCallEntry {
         ToolCallEntry {
             tool_call_id: String::new(),
@@ -1732,8 +1592,8 @@ mod tests {
             entry("read_file", serde_json::json!({"path": "c.rs"}), None),
         ];
         let steps = vec![step(&read_calls), step(&edit_calls)];
-        // Underscores become spaces; settled names stay exact, an in-flight call
-        // gets a running suffix; `xN` counts collapsed repetitions; first-seen order.
+        // Underscores become spaces; an in-flight call gets a running suffix; `xN` counts
+        // collapsed repetitions; first-seen order.
         assert_eq!(
             collapsed_calls_line(&steps),
             "read file x2, list files, read file …"
@@ -1781,8 +1641,7 @@ mod tests {
 
     #[test]
     fn rounds_carry_results_for_in_flight_distinction() {
-        // One round with two calls, only one of which got a result: after the
-        // ledger one call is settled and the other in-flight, both preserved.
+        // One round with two calls, only one of which got a result: one settled, one in flight.
         let calls_json = serde_json::json!([
             {"id": "call_a", "name": "read", "arguments": "{\"path\": \"a.rs\"}"},
             {"id": "call_b", "name": "edit", "arguments": "{\"path\": \"b.rs\"}"},
@@ -1816,8 +1675,8 @@ mod tests {
         );
     }
 
-    /// What each visible line row shows: the text itself, or `<blank>` where the
-    /// group renders no line (no text to show, or a newer group shows it).
+    /// What each visible line row shows: the text itself, or `<blank>` where the group renders
+    /// no line.
     fn shown_lines(groups: &[TraceGroup<'_>], expanded: bool) -> Vec<String> {
         visible_lines(groups, expanded)
             .into_iter()

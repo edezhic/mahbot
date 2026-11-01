@@ -314,8 +314,7 @@ async fn write_command_line_reading(
 /// the payload the agent's read would attach is the caller's own input file, so
 /// nothing is copied beside the reading.
 async fn ordinary_reading(res: &super::read::ResolvedRead) -> anyhow::Result<ConvertedDocument> {
-    // The read tool's own content read, with no arguments and so in its default
-    // mode.
+    // The read tool's own content read, with no arguments and so in its default mode.
     let text = super::read::read_resolved(res, &serde_json::json!({})).await?;
     Ok(ConvertedDocument {
         // The body is the file's own content wherever it has any — the fact the
@@ -457,8 +456,7 @@ async fn attach_images(images: &[PathBuf]) -> (Vec<ImagePayload>, usize) {
 }
 
 /// Turn a converted reading into the read tool's result: attach the rasters when
-/// there are few enough, and say what was delivered and what the reading did not
-/// show.
+/// there are few enough, and say what was delivered and what the reading did not show.
 async fn compose_output(
     res: &super::read::ResolvedRead,
     dir: &Path,

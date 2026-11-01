@@ -1,32 +1,22 @@
 //! The owner's own shell environment.
 //!
-//! An agent's shell command must run in the environment the owner's own
-//! terminal would give it, not in one the product fabricates. Where that
-//! environment comes from is platform-specific:
-//!
-//! - macOS: the shell the account records for itself is started the way
-//!   Terminal.app starts it — a login AND interactive shell — and asked to run
-//!   this binary's hidden `__env-dump` subcommand, so the values are the ones
-//!   that shell's startup files actually export.
-//! - Every other unix: the same, with an interactive (not login) shell — the
-//!   convention those systems' terminals use.
-//! - Windows: there is no shell startup to replay, so the OS's own assembly for
-//!   a program is asked for directly.
+//! An agent's shell command must run in the environment the owner's own terminal
+//! would give it, not one the product fabricates. Where that environment comes from is
+//! platform-specific: on macOS the account's shell is started the way Terminal.app
+//! starts it (login AND interactive) and asked to run this binary's hidden `__env-dump`
+//! subcommand; on every other unix the same with an interactive (not login) shell; on
+//! Windows there is no startup to replay, so the OS's own assembly is asked for directly.
 //!
 //! The read is a background task ([`run_reader_loop`]): it re-reads every
-//! [`READ_INTERVAL`] and never blocks a command — a command reads the cached
-//! [`snapshot`] and nothing else. Until a read has succeeded, and whenever one
-//! cannot be obtained, the reduced environment in [`crate::tools::shell`] is
-//! what the command runs with.
+//! [`READ_INTERVAL`] and never blocks a command, which reads the cached [`snapshot`]
+//! alone. Until a read succeeds, and whenever one cannot be obtained, the reduced
+//! environment in [`crate::tools::shell`] is what the command runs with.
 //!
-//! Running the owner's shell startup files is deliberate: it is the only way to
-//! obtain the environment they produce (a version manager's shim on `PATH`, a
-//! toolchain's root, a compiler's own variable). Nothing is filtered out of the
-//! result — the owner's secrets and tokens reach the agent's commands by design,
-//! because those commands are the owner's own work. No value this module reads
-//! is ever logged or stored anywhere in the product: the reader logs counts,
-//! shape and timing only, and the snapshot lives in memory for the life of the
-//! process.
+//! Running the owner's startup files is deliberate — it is the only way to obtain the
+//! environment they produce. Nothing is filtered out: the owner's secrets reach the
+//! agent's commands by design, because those commands are the owner's own work. No value
+//! is ever logged or stored: the reader logs counts, shape and timing only, and the
+//! snapshot lives in memory for the life of the process.
 
 use std::ffi::OsString;
 use std::sync::Arc;
@@ -39,65 +29,48 @@ use std::ffi::OsStr;
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 
-// ── Cadence ───────────────────────────────────────────────────────────────
-
-/// How long the reader waits between reads while reads keep succeeding. The
-/// environment a startup file produces is stable, so this is a re-check rather
-/// than a poll.
+/// How long the reader waits between reads while reads keep succeeding: a re-check
+/// rather than a poll, the environment a startup file produces being stable.
 const READ_INTERVAL: Duration = Duration::from_mins(10);
 
-/// Ceiling on the retry backoff: [`READ_INTERVAL`] doubles per consecutive
-/// failure up to this, so a shell that is gone for good costs one bounded read
-/// every 80 minutes instead of a spin.
+/// Ceiling on the retry backoff: [`READ_INTERVAL`] doubles per consecutive failure up to
+/// this, so a shell gone for good costs one bounded read every 80 minutes instead of a spin.
 const READ_RETRY_MAX: Duration = Duration::from_mins(80);
 
-/// Bound on one read's capture: the dumper's dump has to arrive inside it, and the
-/// whole process group is killed when it does not. Neither of the two waits around
-/// this one is what it covers — the shell's own exit belongs to the reaper, which
-/// bounds its wait by this same value, and the shell's stderr is drained by a task
-/// that lives only as long as the reaper does. A startup file can be slow (network
-/// mounts, a version manager's first run), so this is generous rather than tight.
+/// Bound on one read's capture: the dumper's dump must arrive inside it, and the whole
+/// process group is killed when it does not. A startup file can be slow (network mounts, a
+/// version manager's first run), so this is generous rather than tight.
 #[cfg(unix)]
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Cap on the bytes collected from the dumper's stdout. A real environment is a
-/// few kilobytes; the cap only keeps a runaway startup file from growing the
-/// reader's buffer without bound.
+/// Cap on the bytes collected from the dumper's stdout: a real environment is a few
+/// kilobytes, and the cap only keeps a runaway startup file from growing the buffer.
 #[cfg(unix)]
 const DUMP_STDOUT_CAP: usize = 1024 * 1024;
 
-/// Size of one read from a pipe.
-///
-/// Deliberately modest: each in-flight read future carries its own chunk inline,
-/// and the whole read's futures (the dump's and the stderr drain's) must stay
-/// well under the size clippy flags as a large future.
+/// Size of one read from a pipe. Deliberately modest: each in-flight read future carries
+/// its own chunk inline, and the whole read's futures must stay well under the size clippy
+/// flags as a large future.
 #[cfg(unix)]
 const READ_CHUNK: usize = 4096;
 
-/// The shell basenames [`shell_recipe`] knows how to start. A shell outside
-/// this list is refused rather than guessed at — the flags that make a shell
-/// read its startup files are shell-specific, and guessing them would run the
-/// wrong files or none at all. A shell whose own convention the recipe cannot
-/// express (csh/tcsh, whose login-ness is not a flag) belongs outside the list
-/// on purpose: its owner keeps the fallback of [`crate::tools::shell`] rather
-/// than a recipe that would run the wrong files.
+/// The shell basenames [`shell_recipe`] knows how to start. A shell outside this list is
+/// refused rather than guessed at — the flags that make a shell read its startup files are
+/// shell-specific. csh/tcsh belongs outside deliberately: its login-ness is not a flag, so
+/// its owner keeps the [`crate::tools::shell`] fallback instead of a wrong recipe.
 #[cfg(unix)]
 const KNOWN_SHELLS: &[&str] = &[
     "sh", "bash", "dash", "ash", "zsh", "fish", "ksh", "ksh93", "mksh", "pdksh",
 ];
 
-/// Whether the product knows `shell` — the one list of the shells whose
-/// environment it reads, and therefore the shells it can read a startup file
-/// out of at all: [`crate::util::owner_path`] writes the product's block into
-/// the startup file of exactly this set, so a shell added here is covered there
-/// too and a shell refused here is never written for.
+/// Whether the product knows `shell` — the one list of the shells whose environment it
+/// reads: [`crate::util::owner_path`] writes the product's block into the startup file of
+/// exactly this set.
 #[cfg(unix)]
 #[must_use]
 pub(crate) fn knows_shell(shell: &str) -> bool {
     KNOWN_SHELLS.contains(&shell)
 }
-
-// ── Failure ───────────────────────────────────────────────────────────────
 
 /// Why a read produced no environment.
 ///
@@ -109,21 +82,19 @@ enum ReadFailure {
     #[cfg(unix)]
     NoShell,
     /// The recorded shell is not one [`shell_recipe`] knows how to start. The
-    /// payload is the basename (which may be a locally installed program name,
-    /// so nothing more than the name is kept).
+    /// payload is the basename (a locally installed program name, so nothing more).
     #[cfg(unix)]
     UnknownShell(String),
-    /// The shell could not be started, or its exit could not be collected. The
-    /// payload is a short I/O description.
+    /// The shell could not be started, or its exit could not be collected (a short I/O
+    /// description).
     #[cfg(unix)]
     Spawn(String),
-    /// The read did not finish within its bound. Together with the kills below,
-    /// this is what keeps a stray startup-file process from holding the reader.
+    /// The read did not finish within its bound. With the kills below, this is what keeps a
+    /// stray startup-file process from holding the reader.
     #[cfg(unix)]
     Timeout,
-    /// The shell started but produced no usable dump: a marker or the entries
-    /// were missing, or an entry was mangled by another writer of the pipe. The
-    /// payload is a short description in words.
+    /// The shell started but produced no usable dump: a missing marker or entries, or an entry
+    /// mangled by another writer of the pipe.
     #[cfg(unix)]
     NoDump(String),
     /// The OS could not assemble the owner's environment (Windows, where there
@@ -153,13 +124,9 @@ impl std::fmt::Display for ReadFailure {
     }
 }
 
-// ── Snapshot ──────────────────────────────────────────────────────────────
-
 /// A successfully read environment, held as `NAME=VALUE` pairs.
 ///
-/// Deliberately not `Debug`: the type exists to be handed to a command, and a
-/// derived `Debug` would let one stray `{:?}` print the owner's secrets into a
-/// log.
+/// Deliberately not `Debug`: a stray `{:?}` would print the owner's secrets into a log.
 pub(crate) struct OwnerEnv {
     vars: Vec<(OsString, OsString)>,
 }
@@ -171,24 +138,18 @@ impl OwnerEnv {
         Self { vars }
     }
 
-    /// The pairs.
     #[must_use]
     pub(crate) fn vars(&self) -> &[(OsString, OsString)] {
         &self.vars
     }
 }
 
-/// The last successfully read environment, empty until one succeeds.
-///
-/// A lock-free holder on purpose: [`snapshot`] runs on the path of every
-/// command, so it must never block, and a failed read must leave the previous
-/// value untouched rather than clear it.
+/// The last successfully read environment, empty until one succeeds. Lock-free on
+/// purpose: [`snapshot`] runs on every command's path, and a failed read must leave the
+/// previous value untouched rather than clear it.
 static SNAPSHOT: ArcSwapOption<OwnerEnv> = ArcSwapOption::const_empty();
 
-/// The cached owner environment, `None` until a read has succeeded.
-///
-/// A cheap lock-free read — safe to call from `connect`-time code on a
-/// command's path.
+/// The cached owner environment, `None` until a read succeeds. Safe to call at connect time.
 #[must_use]
 pub(crate) fn snapshot() -> Option<Arc<OwnerEnv>> {
     SNAPSHOT.load_full()
@@ -199,42 +160,25 @@ fn publish(env: Arc<OwnerEnv>) {
     SNAPSHOT.store(Some(env));
 }
 
-/// Replace the cached environment from a test.
-///
-/// The only test writer: the production writer is the background reader, which
-/// needs a real shell. Unix-only with its callers — the lanes that need a
-/// snapshot drive a real shell's child, which only exists there.
+/// Replace the cached environment from a test — the only test writer (the production
+/// writer is the background reader, which needs a real shell).
 #[cfg(all(test, unix))]
 pub(crate) fn set_snapshot(env: Option<OwnerEnv>) {
     SNAPSHOT.store(env.map(Arc::new));
 }
 
-// ── Reader loop ───────────────────────────────────────────────────────────
-
-/// Read the owner's environment now, then re-read it every [`READ_INTERVAL`],
-/// until shutdown. Spawned as a background task; it never returns except on
-/// shutdown.
+/// Read the owner's environment now, then re-read it every [`READ_INTERVAL`] until
+/// shutdown. Spawned as a background task; never returns except on shutdown.
 ///
-/// A success is logged at DEBUG (the routine per-refresh heartbeat, dropped by the
-/// default level before storage), and carries counts, shape and timing only. A
-/// failure is logged at WARN (which survives retention and is what the app's issue
-/// view shows) with the consecutive-failure count, the next retry delay and the
-/// failure's own short description. Neither line, and nothing else here, ever
+/// A success is logged at DEBUG (the routine heartbeat, dropped by default) and a failure
+/// at WARN with the consecutive-failure count and next retry delay. Neither line ever
 /// carries a value out of the environment.
 ///
-/// The regex-search parity verdict is re-measured after every read attempt (a
-/// read that puts a new environment in place has already dropped the previous
-/// verdict, in the step before it published) — an environment already measured
-/// with a verdict is a no-op, and a run that produced none is attempted again by
-/// the next read — and never before the first read: the read is the thing that has
-/// to start early, and until a verdict for the environment in effect is published
-/// the fast path is closed rather than assumed. When a refresh does measure, it
-/// runs here on the reader's own path, so the period is `READ_INTERVAL` plus that
-/// measurement — typically well under a second, and never on a command's path,
-/// though a battery of ~40 rows against a pathologically slow program on the
-/// owner's own `PATH` can stretch it by minutes, since each child is bounded only
-/// by the battery's own 5 s deadline. The measurement's own line carries booleans,
-/// counts and its probe's finding only.
+/// The regex-search parity verdict is re-measured after every read attempt — an
+/// environment already measured is a no-op. Never before the first read: until a verdict
+/// for the environment in effect is published, the fast path is closed rather than
+/// assumed. A refresh that measures runs on the reader's own path, so the period is
+/// `READ_INTERVAL` plus that measurement, never on a command's path.
 pub async fn run_reader_loop() {
     let mut failures: u32 = 0;
     loop {
@@ -268,15 +212,12 @@ pub async fn run_reader_loop() {
                 // The product's own block in the owner's files is decided from the
                 // environment just published — the one his own commands get — so the
                 // decision is remade here, after every successful read, and never
-                // before one. The publish happened first: the block is only ever
-                // written for an environment a command can already be served.
+                // The publish happened first: the block is only ever written for an environment a
+                // command can already be served before one.
                 crate::util::owner_path::sync(env).await;
-                // How the served search stands under the environment just read: a
-                // measured verdict on unix, where there is a real search to compare
-                // against; on Windows asking is meaningless — its gate never
-                // consults a verdict, the served path is the only search — so the
-                // word says that instead of a `false` that would read as a closed
-                // fast path.
+                // How the served search stands under the environment just read: a measured verdict
+                // on unix; on Windows asking is meaningless (its gate never consults one), so the
+                // word says that instead of a `false` that would read as a closed fast path.
                 #[cfg(unix)]
                 let search = if refresh_grep_parity(pairs).await {
                     "verdict measured for the environment in effect"
@@ -297,8 +238,8 @@ pub async fn run_reader_loop() {
             }
             Err(reason) => {
                 failures = failures.saturating_add(1);
-                // No publish here: a failed read leaves the last good snapshot
-                // in place, so a command never loses an environment it had.
+                // No publish here: a failed read leaves the last good snapshot in place, so a
+                // command never loses an environment it had.
                 let retry_secs = retry_delay(failures).as_secs();
                 tracing::warn!(
                     consecutive_failures = failures,
@@ -306,11 +247,9 @@ pub async fn run_reader_loop() {
                     reason = %reason,
                     "owner environment read failed"
                 );
-                // The environment in effect is unchanged, so this measures only if
-                // no verdict for it has been taken yet — the first read failed and
-                // commands are still on the fallback. The list is the one commands
-                // get now. On Windows there is nothing to measure, and the call
-                // returns without a round trip.
+                // The environment in effect is unchanged, so this measures only if no verdict for
+                // it has been taken yet — the first read failed and commands are still on the
+                // fallback.
                 refresh_grep_parity(crate::tools::shell::agent_env_pairs()).await;
             }
         }
@@ -321,33 +260,20 @@ pub async fn run_reader_loop() {
     }
 }
 
-/// Re-measure the regex-search parity verdict if the environment an agent's
-/// command runs under differs from the one the published verdict was measured
-/// for.
+/// Re-measure the regex-search parity verdict if the environment a command runs under
+/// differs from the one the published verdict was measured for.
 ///
-/// The measurement is blocking — it runs the real search over a fixture — so it
-/// rides the blocking pool. The loop awaits the pool's join, so the *async*
-/// runtime is never blocked, but the reader's own next read does wait for the
-/// measurement; nothing on an agent's command path does (`serve_allowed` reads
-/// the published verdict lock-free). A shutdown that tears the pool down while
-/// it runs is not fatal: the join result is dropped, and the loop's own abort
-/// check ends it.
+/// The measurement is blocking (it runs the real search over a fixture), so it rides the
+/// blocking pool: the async runtime never blocks, but the reader's own next read waits for
+/// it while nothing on a command path does (`serve_allowed` reads the verdict lock-free).
+/// A shutdown that tears the pool down mid-measurement is not fatal — the join result is dropped.
 ///
-/// The verdict for the previous environment is dropped in the step that publishes
-/// a new read (see [`crate::tools::shell::grep_engine::invalidate_verdict_for`]),
-/// so the two never mix: while the battery runs, the fast path is closed and the
-/// real search answers instead.
+/// The previous environment's verdict is dropped in the step that publishes a new read, so
+/// the two never mix: while the battery runs, the fast path is closed and the real search
+/// answers instead.
 ///
-/// Returns whether a verdict for the environment in effect stands afterwards — an
-/// environment already measured is a no-op, and a run that produced no verdict is
-/// attempted again by the next read; the success arm records the flag on its DEBUG
-/// line. `env` is the pairs that read produced (or, after a failed read, the ones
-/// in effect), passed through so the reader derives them once.
-///
-/// The Windows arm below is the reader's own and the gate has the same one for
-/// itself ([`refresh_if_environment_changed`] answers without measuring where there
-/// is no real search): the gate's is the rule, this one keeps a failed read from
-/// asking the pool for that `false`.
+/// Returns whether a verdict for the environment in effect stands afterwards. `env` is the
+/// pairs that read produced (or, after a failed read, the ones in effect).
 async fn refresh_grep_parity(env: Vec<(OsString, OsString)>) -> bool {
     if cfg!(windows) {
         return false;
@@ -359,11 +285,8 @@ async fn refresh_grep_parity(env: Vec<(OsString, OsString)>) -> bool {
     .unwrap_or(false)
 }
 
-/// The wait before the next read after `failures` consecutive failures.
-///
-/// The counter resets to zero on success, so zero failures is [`READ_INTERVAL`]
-/// itself; otherwise the interval doubles per consecutive failure — 10, 20, 40,
-/// then 80 minutes — and stays at [`READ_RETRY_MAX`].
+/// The wait before the next read after `failures` consecutive failures: [`READ_INTERVAL`]
+/// doubled per failure — 10, 20, 40 — then held at [`READ_RETRY_MAX`].
 #[must_use]
 fn retry_delay(failures: u32) -> Duration {
     let doublings = failures.saturating_sub(1).min(3);
@@ -371,9 +294,7 @@ fn retry_delay(failures: u32) -> Duration {
     Duration::from_secs(secs.min(READ_RETRY_MAX.as_secs()))
 }
 
-/// The number of entries in a set's `PATH`, for the reader's log line. Only the
-/// count is ever used — never the value. Case-insensitive because Windows
-/// spells the variable `Path`.
+/// The number of entries in a set's `PATH`, for the log line. Only the count is ever used.
 #[must_use]
 fn path_entry_count(vars: &[(OsString, OsString)]) -> usize {
     vars.iter()
@@ -384,8 +305,6 @@ fn path_entry_count(vars: &[(OsString, OsString)]) -> usize {
                 .count()
         })
 }
-
-// ── The dumper subcommand ─────────────────────────────────────────────────
 
 /// The byte sequence opening a dump: `RS <nonce> US`.
 #[must_use]
@@ -399,16 +318,14 @@ fn end_marker(nonce: &str) -> String {
     format!("\u{1e}{nonce}\u{1d}")
 }
 
-/// Body of the hidden `__env-dump` subcommand: write the environment this
-/// process inherited to stdout in the dump protocol, then return `0`.
+/// Body of the hidden `__env-dump` subcommand: write the inherited environment to stdout
+/// in the dump protocol, then return `0`.
 ///
-/// `args[0]` is the nonce the reader chose. The output is the start marker,
-/// then every entry of [`std::env::vars_os`] as `NAME=VALUE` followed by a NUL,
-/// then the end marker. On unix the raw `OsStr` bytes go out verbatim, so a
-/// value containing a newline, an `=` or invalid UTF-8 survives exactly as the
-/// shell exported it. On Windows the UTF-8 spelling is written — the Windows
-/// read never runs this (it asks the OS directly), so the spelling there is only
-/// for a manual inspection.
+/// `args[0]` is the nonce the reader chose. The output is the start marker, every
+/// [`std::env::vars_os`] entry as `NAME=VALUE` plus a NUL, then the end marker. On unix the
+/// raw `OsStr` bytes go out verbatim, so a value with a newline, an `=` or invalid UTF-8
+/// survives as the shell exported it; on Windows the UTF-8 spelling is written for manual
+/// inspection only.
 ///
 /// Write errors are ignored: a truncated dump reaches the reader as
 /// [`ReadFailure::NoDump`] either way, and a closed stdout must not become a
@@ -445,19 +362,12 @@ pub fn dump_environment(args: &[String]) -> i32 {
     0
 }
 
-// ── Reading (unix) ────────────────────────────────────────────────────────
-
-/// The flags the owner's shell is started with for a read, given its basename
-/// and whether this is macOS.
+/// The flags the owner's shell is started with for a read, given its basename and whether
+/// this is macOS: only the leading flags, the caller appends `-c` and the dump command.
+/// macOS starts it login AND interactive, every other unix interactive only.
 ///
-/// Only the leading flags are returned; the caller appends `-c` and the dump
-/// command. macOS starts the shell the way Terminal.app does — login AND
-/// interactive — while every other unix starts it interactive only.
-///
-/// `None` for a basename outside [`KNOWN_SHELLS`]: the caller then fails the
-/// read with [`ReadFailure::UnknownShell`] rather than running a shell with
-/// flags it may not understand. Unix-only: the Windows read asks the OS, not a
-/// shell.
+/// `None` for a basename outside [`KNOWN_SHELLS`]: the caller then fails the read with
+/// [`ReadFailure::UnknownShell`] rather than running a shell with flags it may not understand.
 #[cfg(unix)]
 #[must_use]
 fn shell_recipe(shell_basename: &str, macos: bool) -> Option<Vec<&'static str>> {
@@ -469,24 +379,17 @@ fn shell_recipe(shell_basename: &str, macos: bool) -> Option<Vec<&'static str>> 
 
 /// Parse a dumper's stdout into `(name, value)` pairs.
 ///
-/// The protocol is the start marker, then `NAME=VALUE\0` per entry, then the end
-/// marker. The LAST start marker wins, so a startup file's own output before it
-/// is ignored rather than mistaken for the dump, and the dump ends at the FIRST
-/// end marker after it, so whatever the shell (or a startup file's background
-/// job) prints after the dump is ignored too.
+/// The protocol is the start marker, `NAME=VALUE\0` per entry, then the end marker. The
+/// LAST start marker wins (a startup file's own output before it is ignored) and the dump
+/// ends at the FIRST end marker after it (a background job's output after it is ignored too).
 ///
-/// Between the markers the bytes are split on NUL, and a chunk that is not
-/// `NAME=VALUE` with a non-empty name is skipped. A write from another holder of
-/// the pipe that lands between two entries glues to the next entry's name, and
-/// the one shape that is caught is a name carrying a control byte — a stray
-/// line's newline, which is what a shell's or a startup file's own output between
-/// entries leaves. No shell exports such a name, so that dump is
-/// [`ReadFailure::NoDump`] rather than a set that is the owner's minus whatever
-/// the stray write swallowed: the fallback is better than an approximation. A
-/// stray write that carries no control byte cannot be told from a name and is not
-/// detected — the read is no more exact than the bytes it is handed.
+/// Between the markers the bytes split on NUL, and a chunk that is not `NAME=VALUE` with a
+/// non-empty name is skipped. A stray write from another pipe holder glues to the next
+/// entry's name; the one shape caught is a name carrying a control byte, which makes the
+/// dump [`ReadFailure::NoDump`] rather than an approximation of the owner's environment. A
+/// stray write with no control byte cannot be told from a name — accepted.
 ///
-/// A missing end marker, or no entries at all, is [`ReadFailure::NoDump`].
+/// A missing end marker, or no entries, is [`ReadFailure::NoDump`].
 #[cfg(unix)]
 fn parse_dump(bytes: &[u8], nonce: &str) -> Result<Vec<(OsString, OsString)>, ReadFailure> {
     use std::os::unix::ffi::OsStrExt as _;
@@ -527,13 +430,9 @@ fn parse_dump(bytes: &[u8], nonce: &str) -> Result<Vec<(OsString, OsString)>, Re
     Ok(vars)
 }
 
-/// Read at most `cap` bytes from `reader`, stopping early once `stop_at` appears
-/// in what has been read (or at EOF, whichever comes first).
-///
-/// The early stop is what keeps the read from waiting on a startup file's own
-/// background process: such a process inherits the reader's pipes, so EOF may
-/// never arrive even though the dump is complete. A complete dump is complete —
-/// what the shell prints after it is not part of the read.
+/// Read at most `cap` bytes from `reader`, stopping early once `stop_at` appears in what
+/// has been read (or at EOF). The early stop keeps the read from waiting on a startup
+/// file's own background process, which inherits the pipes so EOF may never arrive.
 #[cfg(unix)]
 async fn read_capped(
     mut reader: impl tokio::io::AsyncRead + Unpin,
@@ -562,10 +461,8 @@ async fn read_capped(
     buf
 }
 
-/// Read `reader` to EOF, discarding it.
-///
-/// The shell's stderr is never inspected, never logged and never attached to a
-/// failure; it is drained only so a talkative startup file cannot block the
+/// Read `reader` to EOF, discarding it. The shell's stderr is never inspected, logged or
+/// attached to a failure; it is drained only so a talkative startup file cannot block the
 /// shell on a full pipe.
 #[cfg(unix)]
 async fn drain(mut reader: impl tokio::io::AsyncRead + Unpin) {
@@ -581,11 +478,10 @@ async fn drain(mut reader: impl tokio::io::AsyncRead + Unpin) {
 
 /// Releases a read's reaper when its capture is over.
 ///
-/// The release is a `Drop` rather than a plain call because the capture can end
-/// by the read being left early — the reader is cancelled at shutdown, or a panic
-/// unwinds between the spawn and the capture — and the reaper has no other way out
-/// of its wait: a shell left unreaped would park it, and the stderr drainer it
-/// owns, for the life of the process.
+/// A `Drop` rather than a plain call because the capture can end by the read being left
+/// early (cancelled at shutdown, or a panic), and the reaper has no other way out of its
+/// wait: a shell left unreaped would park it, and the stderr drainer it owns, for the life
+/// of the process.
 #[cfg(unix)]
 #[derive(Clone)]
 struct CaptureDone(Arc<tokio::sync::Notify>);
@@ -612,14 +508,12 @@ impl Drop for CaptureDone {
 
 /// SIGKILL a read shell's whole process group.
 ///
-/// The shell leads its own session and group (`setsid` in the spawn below), so
-/// the group id is the pid it was spawned with, and grandchildren (a startup
-/// file's background job) are in that group and die with it.
+/// The shell leads its own session and group (`setsid`), so the group id is the pid it was
+/// spawned with and grandchildren die with it.
 ///
-/// Must be called while the shell is still unreaped: a group whose last member has
-/// been reaped can have its id reused, and the signal would then reach a group the
-/// read never started. [`run_shell`] holds the shell's reap until after this call
-/// for exactly that reason.
+/// Must be called while the shell is still unreaped: a group whose last member has been
+/// reaped can have its id reused, and the signal would reach a group the read never
+/// started. [`run_shell`] holds the reap until after this call.
 #[cfg(unix)]
 fn kill_group(pgid: Option<u32>) {
     let Some(pgid) = pgid else {
@@ -630,25 +524,21 @@ fn kill_group(pgid: Option<u32>) {
     };
     // SAFETY: `kill` with a negative pid signals the process group `-pgid`. The
     // caller's guarantee that the shell is unreaped is what makes that group the
-    // read's own: the shell leads it, and its descendants are its only other
-    // members.
+    // read's own: the shell leads it, and its descendants are its only other members.
     let ret = unsafe { libc::kill(-pgid, libc::SIGKILL) };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        // ESRCH: the group is already gone (this kill follows the capture's own,
-        // or the shell died on its own) — nothing can be in it to stray, so the
-        // warning would claim a stray that does not exist.
+        // ESRCH: the group is already gone, so nothing can be in it to stray and the warning
+        // would claim a stray that does not exist.
         if err.raw_os_error() != Some(libc::ESRCH) {
             tracing::warn!(pgid, err = %err, "kill(-pgid) failed — a read stray may survive");
         }
     }
 }
 
-/// One read through a shell: start `shell` the platform's way, run `dump_cmd`
-/// in it, and parse what it prints.
-///
-/// `nonce` is the marker nonce [`parse_dump`] must look for, and its end marker
-/// is also what stops the capture (see [`run_shell`]).
+/// One read through a shell: start `shell` the platform's way, run `dump_cmd` in it, and
+/// parse what it prints. `nonce` is the marker [`parse_dump`] looks for, and its end marker
+/// also stops the capture.
 #[cfg(unix)]
 async fn read_with_shell(
     shell: &Path,
@@ -662,26 +552,18 @@ async fn read_with_shell(
     Ok(OwnerEnv::new(parse_dump(&bytes, nonce)?))
 }
 
-/// Start `shell` the platform's way and run `cmd` in it, returning what it wrote
-/// to stdout.
+/// Start `shell` the platform's way and run `cmd` in it, returning its stdout.
 ///
-/// The shell inherits this process's environment exactly as it is — deliberately
-/// no `env_clear`, no completion: the point of the read is the environment a
-/// startup file produces on top of the daemon's own. Only the working directory
-/// is set (`cwd`, the owner's home when it is one; the daemon's own when it is
-/// not, which is all a shell needs).
+/// The shell inherits this process's environment exactly as it is — deliberately no
+/// `env_clear`: the point is the environment a startup file produces on top of the
+/// daemon's. Only the working directory is set (`cwd`, the owner's home when it is one).
 ///
-/// The capture ends as soon as `stop_at` has been read (or at EOF), and is
-/// bounded by `timeout` either way: on expiry the whole group is killed, so a
-/// startup file that hangs cannot stretch the read. The shell is not waited for
-/// once its output is in: a detached task reaps it under the same bound — killing
-/// the group first if the shell itself outlives it — and discards its stderr (a
-/// talkative startup file must not block the shell, and nothing it prints is ever
-/// inspected or recorded). A startup file's own background processes therefore
-/// outlive the read holding the shell's own pipes, not a terminal's: one that
-/// writes to the captured stdout after the capture stopped gets EPIPE, and one
-/// still holding the shell's pipes when the bound expires loses the shell to the
-/// reaper's kill.
+/// The capture ends as soon as `stop_at` has been read (or at EOF) and is bounded by
+/// `timeout`: on expiry the whole group is killed. The shell is not waited for once its
+/// output is in — a detached task reaps it under the same bound and discards its stderr. A
+/// startup file's background process therefore outlives the read holding the shell's pipes:
+/// writing to the captured stdout after the stop gets EPIPE, and one still holding them at
+/// the bound loses the shell to the reaper's kill.
 #[cfg(unix)]
 async fn run_shell(
     shell: &Path,
@@ -706,22 +588,18 @@ async fn run_shell(
         if let Some(dir) = cwd {
             cmd_builder.current_dir(dir);
         }
-        // A session of its own, with no controlling terminal: the read is
-        // deliberately not a terminal. This is also what makes an *interactive*
-        // shell usable here — such a shell does job-control setup on startup and
-        // calls `tcsetpgrp`, which stops a process-group leader that does not own
-        // the controlling terminal (SIGTTOU); the shell would sit stopped before
-        // it ever ran the command. `setsid` also makes the child its own group
+        // A session of its own, with no controlling terminal: this is what makes an *interactive*
+        // shell usable here — such a shell does job-control setup and calls `tcsetpgrp`, which
+        // stops a group leader that does not own the controlling terminal (SIGTTOU), leaving it
+        // stopped before it ever ran the command. `setsid` also makes the child its own group
         // leader, which is what lets a timed-out read kill the whole group.
         //
-        // One of the starts that keep the forking path on purpose — the reason is
-        // `tools::shell::program_command`'s — so macOS prints its line about memory
-        // tooling to the daemon's own stderr on each of these reads, some six times an
-        // hour: the terminal the launch came from, or `daemon.log` once it detached from
-        // one. Not a stream to filter: real errors arrive there too.
+        // One of the starts that keep the forking path on purpose
+        // (`tools::shell::program_command`'s reason), so macOS prints its memory-tooling line to
+        // the daemon's stderr on each read.
         //
-        // SAFETY: `setsid` is async-signal-safe, and the child is freshly forked,
-        // so it is not a group leader and the call succeeds.
+        // SAFETY: `setsid` is async-signal-safe, and the child is freshly forked, so
+        // it is not a group leader and the call succeeds.
         unsafe {
             cmd_builder.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -742,18 +620,13 @@ async fn run_shell(
         return Err(ReadFailure::Spawn("no stderr pipe".into()));
     };
 
-    // The reaper owns the child from here. It drains stderr from the moment the
-    // shell is spawned — a talkative startup file must not block the shell on a
-    // full pipe — but it does not reap the shell until the capture below is over:
-    // `kill_group` signals the shell's own process group, and a group whose last
-    // member has been reaped can have its id reused, so the signal must never race
-    // the reap.
+    // The reaper owns the child from here. It drains stderr from the moment the shell is
+    // spawned (a talkative startup file must not block it on a full pipe) but does not reap
+    // until the capture below is over: `kill_group` signals the shell's own process group, and
+    // the signal must never race the reap.
     //
-    // Its wait for the shell is bounded by the read's own timeout, and a shell
-    // that outlives it is killed as a group (still unreaped, so the id is still its
-    // own) and collected under the same bound. A stray holder of the shell's pipes
-    // therefore cannot keep the task alive, and neither can an abandoned read: the
-    // guard below releases the reaper on the way out however this function is left.
+    // Its wait is bounded by the read's own timeout, and a shell that outlives it is killed as
+    // a group (still unreaped, so the id is still its own) and collected under the same bound.
     let capture_done = CaptureDone::new();
     tokio::spawn({
         let capture_done = capture_done.clone();
@@ -761,11 +634,9 @@ async fn run_shell(
             let draining = tokio::spawn(drain(stderr));
             capture_done.wait().await;
             if tokio::time::timeout(timeout, child.wait()).await.is_err() {
-                // The shell outlived its own bound: kill its group — it is still
-                // unreaped, so the id is still its own — and give the kill the same
-                // bound. A shell that survives even SIGKILL (uninterruptible I/O is
-                // the case the bound exists for) is then left to the OS: the task
-                // ends here, and its pipes with it.
+                // The shell outlived its own bound: kill its group (still unreaped, so the id is
+                // still its own) and give the kill the same bound. One that survives even SIGKILL
+                // is left to the OS — the task ends here, and its pipes with it.
                 kill_group(pgid);
                 let _ = tokio::time::timeout(timeout, child.wait()).await;
             }
@@ -784,9 +655,8 @@ async fn run_shell(
     captured.map_err(|_elapsed| ReadFailure::Timeout)
 }
 
-/// The file name of a shell path — what [`shell_recipe`] is keyed on. The
-/// directory is deliberately skipped: the same shell is often reachable by
-/// several paths.
+/// The file name of a shell path — what [`shell_recipe`] is keyed on. The directory is
+/// skipped: the same shell is often reachable by several paths.
 #[cfg(unix)]
 #[must_use]
 pub(crate) fn shell_basename(shell: &Path) -> String {
@@ -816,8 +686,7 @@ fn dump_command(exe: &Path, nonce: &str) -> String {
     )
 }
 
-/// One unix read: resolve the owner's shell, start it the platform's way, and
-/// let the child dumper print the environment it inherited.
+/// One unix read: resolve the owner's shell, start it the platform's way, and let the child
 #[cfg(unix)]
 async fn read_unix() -> Result<OwnerEnv, ReadFailure> {
     let (shell, home) = owner_shell_and_home();
@@ -828,19 +697,16 @@ async fn read_unix() -> Result<OwnerEnv, ReadFailure> {
     read_with_shell(&shell, &dump_cmd, &nonce, home.as_deref(), READ_TIMEOUT).await
 }
 
-/// The owner's shell and home directory, from one lookup of the account record:
-/// the shell the system records for it (falling back to a non-empty `$SHELL`), and
-/// the home a non-empty `$HOME` names when it is a directory, else the passwd home
-/// when that is one.
+/// The owner's shell and home directory, from one lookup of the account record: the shell
+/// the system records (falling back to a non-empty `$SHELL`), and the home a non-empty
+/// `$HOME` names when it is a directory, else the passwd home when that is one.
 ///
-/// The home may resolve to nothing, in which case the read sets no working
-/// directory at all — the shell then starts wherever the daemon is, which is all a
-/// shell needs. (A home that does not exist would fail the spawn outright, leaving
-/// the agent on the fallback for good.)
+/// The home may resolve to nothing, in which case the read sets no working directory and
+/// the shell starts wherever the daemon is (a home that does not exist would fail the
+/// spawn, leaving the agent on the fallback for good).
 ///
-/// The owner-path sync asks for the same shell and home: it writes into the file
-/// the shell resolved here really reads, which is only knowable if it asks for the
-/// shell the reader read.
+/// The owner-path sync asks for the same shell and home: it writes into the file the shell
+/// resolved here really reads.
 #[cfg(unix)]
 #[must_use]
 pub(crate) fn owner_shell_and_home() -> (Option<PathBuf>, Option<PathBuf>) {
@@ -858,17 +724,14 @@ pub(crate) fn owner_shell_and_home() -> (Option<PathBuf>, Option<PathBuf>) {
     (shell, home)
 }
 
-/// The shell and home directory the system records for the effective uid, or
-/// `None` when there is no entry.
-///
+/// The shell and home directory the system records for the effective uid, or `None`.
 /// `getpwuid_r` rather than `getpwuid`: the reentrant form keeps the entry in a
-/// caller-owned buffer instead of returning shared mutable state.
+/// caller-owned buffer instead of shared mutable state.
 #[cfg(unix)]
 #[must_use]
 fn passwd_record() -> Option<(Option<PathBuf>, Option<PathBuf>)> {
     // One passwd entry is a few hundred bytes; 16 KiB is the customary
-    // _SC_GETPW_R_SIZE_MAX with room to spare, and a fixed size keeps this from
-    // needing a retry loop for ERANGE.
+    // _SC_GETPW_R_SIZE_MAX with room to spare, and a fixed size avoids an ERANGE retry loop.
     let mut buf = vec![0; 16 * 1024];
     let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
     let mut found: *mut libc::passwd = std::ptr::null_mut();
@@ -912,28 +775,16 @@ unsafe fn c_path(ptr: *const libc::c_char) -> Option<PathBuf> {
     (!bytes.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(bytes)))
 }
 
-// ── Reading (Windows) ─────────────────────────────────────────────────────
-
-/// One Windows read: the environment the OS assembles for the owner's own
-/// programs.
+/// One Windows read: the environment the OS assembles for the owner's own programs.
 ///
-/// `CreateEnvironmentBlock` builds a fresh block for the user named by the token
-/// it is given, from that user's own settings and the machine's — the same
-/// assembly the system performs for a user at logon, so references are expanded,
-/// the machine's search path and the user's are both there (in whatever order the
-/// system itself puts them: the block is taken as the OS returned it, never
-/// re-merged here), and settings added after this process started are included.
-/// The token passed is the calling account's own (`OpenProcessToken`): *not* a
-/// null token, which returns the system's variables only, and *not* the current
-/// process's environment, which `bInherit = FALSE` deliberately keeps out of the
-/// block. Where the product runs as a service account rather than as the owner at
-/// the keyboard, that account's environment is what this reads — which is what
-/// the token says.
+/// `CreateEnvironmentBlock` builds a fresh block from the token's user's settings and the
+/// machine's — the same assembly the system performs at logon, so references are expanded
+/// and both search paths are there in the system's own order. The token is the calling
+/// account's own (`OpenProcessToken`): *not* a null token (system variables only) and *not*
+/// the current process's environment, which `bInherit = FALSE` keeps out.
 ///
-/// `%USERPROFILE%` and its family are present because a desktop launch runs with
-/// the user's profile loaded; the empty block is refused rather than published,
-/// since a read that yields nothing would leave commands with nothing but the
-/// pinned values.
+/// `%USERPROFILE%` and its family are present because a desktop launch runs with the user's
+/// profile loaded; an empty block is refused rather than published.
 #[cfg(windows)]
 fn read_windows() -> Result<OwnerEnv, ReadFailure> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -1020,9 +871,8 @@ unsafe fn walk_block(block: *const u16) -> Vec<(OsString, OsString)> {
     vars
 }
 
-/// The unit tests: all unix-only (the Windows read is a single OS call with no
-/// shell to drive), so the whole module is gated on unix and needs no per-test
-/// `cfg`.
+/// The unit tests: all unix-only (the Windows read is a single OS call with no shell to
+/// drive), so the module is gated on unix with no per-test `cfg`.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1067,12 +917,10 @@ mod tests {
         );
     }
 
-    /// Whatever a startup file prints around the dump — a warning before it, a
-    /// background job's line after it — is tolerated, while bytes written
-    /// *between* two entries fail the read: they glue to the next entry's name,
-    /// which no environment variable's name could carry, so the read must fail
-    /// rather than hand over a mangled set. A dump that is not framed by both
-    /// markers, or that holds no entry at all, is no dump either.
+    /// Whatever a startup file prints around the dump is tolerated, while bytes written
+    /// *between* two entries fail the read: they glue to the next entry's name, which no
+    /// variable name could carry. A dump not framed by both markers, or holding no entry, is
+    /// no dump either.
     #[test]
     fn parse_dump_tolerates_surrounding_output_and_refuses_a_corrupt_one() {
         let nonce = "feedfacefeedface";
@@ -1130,12 +978,9 @@ mod tests {
         }
     }
 
-    /// The read through a real shell, bounded by the timeout it is given.
-    ///
-    /// `/bin/sh` is driven with the reader's own recipe, so on macOS these lanes run
-    /// the host's startup files (`/etc/profile`, `~/.profile`) — the shells the
-    /// product itself runs every ten minutes. The 10 s timeout is what keeps a slow
-    /// one from hanging the lane.
+    /// The read through a real shell, bounded by the timeout it is given. `/bin/sh` is driven
+    /// with the reader's own recipe, so on macOS these lanes run the host's startup files. The
+    /// 10 s timeout keeps a slow one from hanging the lane.
     #[tokio::test]
     async fn read_with_shell_parses_a_synthetic_dump() {
         const NONCE: &str = "0123456789abcdef";
@@ -1159,8 +1004,7 @@ mod tests {
         );
     }
 
-    /// A shell that prints nothing has no dump, and a shell this reader has no
-    /// recipe for is refused outright — both without waiting for the timeout.
+    /// A shell that prints nothing has no dump, and a shell with no recipe is refused outright.
     #[tokio::test]
     async fn read_with_shell_refuses_a_silent_or_unknown_shell() {
         let failure = read_with_shell(
@@ -1204,24 +1048,15 @@ mod tests {
     }
 }
 
-/// The evidence harness for the owner's shell environment: one manual, ignored run
-/// that compares — by name, count and shape only — the environment an agent's
-/// command actually receives with the one this machine's own login shell produces,
-/// what the fallback gives before a read has succeeded, and what each way a read can
-/// fail records.
+/// The evidence harness for the owner's shell environment: one manual, ignored run that
+/// compares — by name, count and shape only — the environment an agent's command receives
+/// with the one this machine's login shell produces, what the fallback gives before a read
+/// succeeds, and what each read failure records.
 ///
-/// Deliberately outside the suite: the unit tests above run `/bin/sh` alone —
-/// which on macOS still reads the system and user profile, bounded by the read's
-/// own timeout — while this one runs the owner's own shell over his real startup
-/// files. Run it with the binary built:
-///
-/// ```text
-/// cargo build --bin mahbot
-/// cargo test --lib -- --ignored --nocapture evidence
-/// ```
-///
-/// It prints no value of the environment — only names, counts, timings and the
-/// product's own recorded words.
+/// Deliberately outside the suite: the unit tests run `/bin/sh` alone, while this one runs
+/// the owner's own shell over his real startup files (`cargo build --bin mahbot`, then
+/// `cargo test --lib -- --ignored --nocapture evidence`). It prints no value — only names,
+/// counts, timings and the product's own recorded words.
 #[cfg(all(test, unix))]
 mod evidence {
     use super::*;
@@ -1319,7 +1154,6 @@ mod evidence {
             home.is_some()
         );
 
-        // ── The read, next to the same shell's own listing ────────────────────
         let nonce = new_nonce();
         let started = Instant::now();
         let recovered = read_with_shell(
@@ -1354,7 +1188,6 @@ mod evidence {
             "a read that recovered nothing is not a read"
         );
 
-        // ── What an agent's command receives ──────────────────────────────────
         // The product's own environment application, on the product's own command
         // builder path. The read's own values for the two exceptions are replaced by
         // markers first, so the assertions below show the product's values winning
@@ -1444,7 +1277,6 @@ mod evidence {
             "the pinned temp names must win: {temp_names:?}"
         );
 
-        // ── The fallback, before any read has succeeded ───────────────────────
         let fallback: BTreeSet<String> = crate::tools::shell::agent_env_pairs()
             .iter()
             .map(|(name, _)| name.to_string_lossy().into_owned())
@@ -1465,7 +1297,6 @@ mod evidence {
             "the fallback must not carry the owner's own environment: {fallback:?}"
         );
 
-        // ── Every way a read can fail, and what it records ────────────────────
         // `OwnerEnv` is deliberately not `Debug` (a derived one would let a stray
         // `{:?}` print the owner's secrets), so the failures are taken by match.
         let failure_of = |result: Result<OwnerEnv, ReadFailure>| match result {

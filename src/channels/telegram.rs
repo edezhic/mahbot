@@ -1,10 +1,6 @@
-//! The Telegram transport: Bot API long polling, update decoding, send and
-//! edit with the Bot API's own HTML subset, media upload and download, and the
-//! forward-only intake ledger that stops an update being handled twice.
-//!
-//! Not the shared message plane (`crate::channels`) and not the bot command
-//! handlers — this file turns updates into intake claims and `ChannelMessage`
-//! values, and turns replies into Bot API calls.
+//! The Telegram transport: Bot API long polling, update decoding, send and edit with Telegram's
+//! HTML subset, media up/down, and the forward-only intake ledger that stops an update being
+//! handled twice.
 
 use crate::channels::ReplyReference;
 use crate::channels::reply::normalize_reply_text;
@@ -25,58 +21,30 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use strum::IntoEnumIterator;
 
-/// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
-/// Reserve space for continuation markers added by `send_text_chunks`:
-/// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 29 extra
-/// chars (middle chunk); 30 keeps 4066+29 = 4095 within the 4096 limit.
+/// Room for the continuation markers `send_text_chunks` adds: 29 chars worst case (a middle chunk),
+/// so 30 keeps 4066+29 = 4095 within the 4096 limit.
 const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
 
-/// Byte budget for a sanitized attachment filename, extension included. Bytes
-/// rather than characters because the filesystem's own per-component limit
-/// (`NAME_MAX`, 255 here) counts bytes: a character cap would admit a name that
-/// only fails at the write. See [`sanitize_attachment_filename`].
+/// Byte budget for a sanitized attachment filename, extension included: bytes rather than
+/// characters, because `NAME_MAX` counts bytes.
 const MAX_ATTACHMENT_FILENAME_BYTES: usize = 180;
 
-/// Per-request timeout for a media transfer, overriding the channel client's
-/// one-minute default: the cloud's 50 MB upload takes longer than a minute over
-/// a slow link. Still bounded, so a stalled transfer cannot hold the request open
-/// forever. The local server sets its own day-long bound instead.
+/// Per-media-request timeout, overriding the channel client's one minute: a 50 MB cloud upload can
+/// outlast it. Bounded, so a stall still ends.
 const MEDIA_TRANSFER_TIMEOUT: Duration = Duration::from_mins(5);
 
-/// Description for the `/clear` command — used in `setMyCommands` API and `/start` welcome message.
 const CLEAR_COMMAND_DESC: &str = "Reset your session";
-/// Description for the `/image_models` command.
 const IMAGE_MODELS_COMMAND_DESC: &str = "Select image generation model";
-/// Description for the `/video_models` command.
 const VIDEO_MODELS_COMMAND_DESC: &str = "Select video model";
-/// Description for the `/board` command (admin).
 const BOARD_COMMAND_DESC: &str = "List tickets from all workspaces";
-/// Description for the `/archive` command (admin).
 const ARCHIVE_COMMAND_DESC: &str = "Archive done & cancelled tickets (all workspaces)";
-/// Description for the `/update` command (admin, menu form).
 const UPDATE_COMMAND_DESC: &str = "Update MahBot to the latest version";
 
-// ── Action prefixes (__act__) ───────────────────────────────────────
-
-/// Callback data prefix for action callbacks (e.g., model selection, clear session).
 const ACTION_PREFIX: &str = "__act__";
 
-/// Decode action callback data.
-///
-/// Returns `(action, payload)` on success, `None` when `content` does not
-/// carry the `ACTION_PREFIX`.
-///
-/// # Format
-///
-/// `__act__<action>|<payload>` where `<action>` is the action name and
-/// `<payload>` is the action-specific data (may be empty).
-///
-/// **Examples:**
-/// - `__act__set_image_model|google/gemini-3.1-flash-image-preview`
-///   → `("set_image_model", "google/gemini-3.1-flash-image-preview")`
-/// - `__act__clear_session|` → `("clear_session", "")`
-/// - `__act__clear_session` → `("clear_session", "")`
+/// Decode `__act__<action>|<payload>` into `(action, payload)`; `None` when the prefix is absent,
+/// an empty payload when there is no `|`.
 #[must_use]
 pub(crate) fn decode_action(content: &str) -> Option<(String, String)> {
     let rest = content.strip_prefix(ACTION_PREFIX)?;
@@ -86,26 +54,19 @@ pub(crate) fn decode_action(content: &str) -> Option<(String, String)> {
     }
 }
 
-/// The control-plane input a message carries: something the dispatch loop handles
-/// itself, without the assistant. `None` for a message the agent path handles —
-/// including a button press whose payload is neither kind, which has always gone
-/// to the agent.
+/// The control-plane input a message carries, handled without the assistant; `None` for the agent
+/// path, a button press of no known kind included.
 #[derive(Debug)]
 pub enum ControlInput {
-    /// An `__act__` action payload, as `(action, payload)`.
     Action((String, String)),
-    /// A bot command.
     Command(crate::BotCommand),
 }
 
-/// Which control-plane input an inbound message carries, or `None` when the agent
-/// path handles it. A bot command counts only on Telegram: other channels route
-/// `/`-prefixed text as ordinary text. A message that opened with the urgent mark
-/// is never a command, whatever its consumed content reads.
+/// Which control-plane input a message carries. A bot command counts only on Telegram, and a
+/// message that opened with the urgent mark is never one.
 #[must_use]
 pub fn control_input(msg: &ChannelMessage) -> Option<ControlInput> {
-    // The mark was consumed from text that began with it, so `!/clear` arrives
-    // here as `/clear`; removing the mark must not turn it into a command.
+    // The mark was consumed from `!/clear`, which arrives here as `/clear`.
     if msg.urgent {
         return None;
     }
@@ -120,16 +81,14 @@ pub fn control_input(msg: &ChannelMessage) -> Option<ControlInput> {
     None
 }
 
-/// True for a message the burst collector must never hold: one carrying control
-/// input ([`control_input`]), or a button press. This is a superset of
-/// [`control_input`] — the dispatch loop lets a press whose payload is neither
-/// kind fall through to the agent, but a burst must not hold it either.
+/// True for input the burst collector must never hold: anything [`control_input`] recognizes, or a
+/// button press — a superset of [`control_input`].
 #[must_use]
 pub(crate) fn is_control_message(msg: &ChannelMessage) -> bool {
     msg.callback_query_id.is_some() || control_input(msg).is_some()
 }
 
-/// Metadata for an incoming document or photo attachment.
+/// One inbound attachment: a document, photo, video, audio or voice message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IncomingAttachment {
     file_id: String,
@@ -142,28 +101,19 @@ struct IncomingAttachment {
     urgent: bool,
 }
 
-/// The kind of incoming attachment (document, photo, video, audio, or recorded
-/// voice).
+/// The kind of an inbound attachment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IncomingAttachmentKind {
     Document,
     Photo,
     Video,
-    /// A sound file (the `audio` key). On macOS it is transcribed like a
-    /// recorded voice note; with no local audio subsystem elsewhere it takes
-    /// the ordinary file path instead.
+    /// A sound file (the `audio` key): transcribed on macOS, a plain file elsewhere.
     Audio,
-    /// A recorded voice message (the `voice` key). Telegram carries no file
-    /// name for it — OGG/Opus bytes only.
+    /// A recorded voice message (the `voice` key): OGG/Opus bytes, no file name.
     Voice,
 }
-/// Split a message into chunks that respect Telegram's 4096 character limit.
-/// Tries to split at word boundaries when possible, and handles continuation.
-/// The effective per-chunk limit is reduced to leave room for continuation markers.
-/// When the input contains HTML tags, avoids splitting mid-tag unless the tag
-/// would push the chunk past the limit, in which case the split stays at the
-/// 4066-char boundary (the plain-text fallback in `send_text_chunks` tolerates
-/// the resulting malformed HTML).
+/// Split a message into chunks within Telegram's 4096 limit, preferring a word break and reserving
+/// room for the continuation markers.
 fn split_message_for_telegram(message: &str) -> Vec<String> {
     if message.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH {
         return vec![message.to_string()];
@@ -174,7 +124,6 @@ fn split_message_for_telegram(message: &str) -> Vec<String> {
     let chunk_limit = TELEGRAM_MAX_MESSAGE_LENGTH - TELEGRAM_CONTINUATION_OVERHEAD;
 
     while !remaining.is_empty() {
-        // Find a good split point within the chunk_limit region.
         let hard_split = remaining
             .char_indices()
             .nth(chunk_limit)
@@ -183,19 +132,12 @@ fn split_message_for_telegram(message: &str) -> Vec<String> {
         let mut chunk_end = if hard_split == remaining.len() {
             hard_split
         } else {
-            // Try to find a good break point (newline, then space) within hard_split.
             find_split_boundary(remaining, hard_split)
         };
 
-        // If we split inside an HTML tag, extend past the '>'.
-        // Clamp the extension to `hard_split` — the byte offset of the
-        // 4066-char boundary, always a char boundary. Letting the tag push
-        // the chunk past the sendable limit gets the message rejected by
-        // the API (the HTML send and the plain-text retry both fail), while
-        // a mid-tag split only degrades formatting — the existing HTML→plain
-        // fallback in `send_text_chunks` already tolerates it. Clamping to a
-        // char count instead would be unit-mismatched (byte offset vs chars)
-        // and panic on multibyte text.
+        // Extend past the tag's `>`, clamped to `hard_split` (a byte offset, always a char
+        // boundary): a chunk past the sendable limit is rejected outright, while a mid-tag split
+        // only degrades formatting.
         if let Some(adjusted) = extend_past_open_tag(remaining, chunk_end) {
             chunk_end = adjusted.min(hard_split);
         }
@@ -207,12 +149,8 @@ fn split_message_for_telegram(message: &str) -> Vec<String> {
     chunks
 }
 
-/// Apply continuation markers to a chunk in a multi-part Telegram message.
-///
-/// * First chunk: `"...\n\n(continues...)"`
-/// * Middle chunk: `"(continued)\n\n...\n\n(continues...)"`
-/// * Last chunk: `"(continued)\n\n..."`
-/// * Single chunk: passed through unchanged.
+/// Add the continuation markers (`(continued)`, `(continues...)`) a multi-part message needs; a
+/// single chunk passes through unchanged.
 fn wrap_chunk(chunk: &str, index: usize, total: usize) -> String {
     if total > 1 {
         if index == 0 {
@@ -227,10 +165,7 @@ fn wrap_chunk(chunk: &str, index: usize, total: usize) -> String {
     }
 }
 
-/// Find the best split point within the first `hard_split` bytes of `text`.
-/// Returns a byte offset ≤ `hard_split`, preferring the natural break
-/// (newline or space) closest to `hard_split`, or a hard character-boundary
-/// split when neither exists.
+/// Best split offset within `hard_split`: a newline, else a space, else a char boundary.
 fn find_split_boundary(text: &str, hard_split: usize) -> usize {
     let search_area = &text[..hard_split];
     search_area
@@ -239,12 +174,8 @@ fn find_split_boundary(text: &str, hard_split: usize) -> usize {
         .map_or(hard_split, |p| p + 1)
 }
 
-/// Absolute byte offset in `s` of the first unquoted `>` at or after `from`, or
-/// `None` when the tag opened at `from` never closes. A `>` inside a single- or
-/// double-quoted attribute value is not a closer, and a quote opened in one tag
-/// cannot leak into a later one.
-///
-/// Both HTML readers in this module share this scan.
+/// Byte offset of the first unquoted `>` at or after `from`; `None` when the tag never closes. Both
+/// HTML readers in this module share this scan.
 fn tag_end(s: &str, from: usize) -> Option<usize> {
     let mut in_quote = false;
     let mut quote_char = '"';
@@ -262,10 +193,7 @@ fn tag_end(s: &str, from: usize) -> Option<usize> {
     None
 }
 
-/// If `pos` is inside an HTML tag (the last `<` before `pos` has no matching `>`),
-/// return the byte offset just past the closing `>`. Otherwise return `None`.
-///
-/// An unterminated tag scans to the end of `text` and so also yields `None`.
+/// Byte offset just past the `>` closing the tag `pos` sits in, when it is in one.
 fn extend_past_open_tag(text: &str, pos: usize) -> Option<usize> {
     let open = text[..pos].rfind('<')?;
     let gt = tag_end(text, open)?;
@@ -281,20 +209,14 @@ fn extract_sender_user_name(message: &serde_json::Value) -> String {
         .to_string()
 }
 
-/// A Telegram sender that is a person, as Telegram presents the event.
 struct TelegramSender {
-    /// The numeric id Telegram reports, as digits.
     numeric_id: Option<String>,
-    /// The nickname, when the sender has one.
     nickname: Option<String>,
 }
 
-/// The person a Telegram event came from, or `None` when the sender is not a
-/// person: a message sent on behalf of a chat (`sender_chat` — a channel post,
-/// the anonymous group administrator, an auto-forwarded channel post), a bot
-/// (Telegram's own bots included), or one of Telegram's own service identities.
-/// Decided by the sender's identity as Telegram presents it, never by the
-/// spelling of a nickname, so no nickname list can outrun it.
+/// The person a Telegram event came from, or `None` when the sender is not one: a `sender_chat`
+/// post, a bot, or a Telegram service identity — decided by the sender's identity, never by the
+/// spelling of a nickname.
 fn telegram_sender_person(source: &serde_json::Value) -> Option<TelegramSender> {
     if source.get("sender_chat").is_some() {
         return None;
@@ -312,10 +234,8 @@ fn telegram_sender_person(source: &serde_json::Value) -> Option<TelegramSender> 
     {
         return None;
     }
-    // The reserved sentinel means "no nickname": a sender whose reported
-    // username is that literal word is folded to nickname-less here, and the
-    // store's row scan skips a stored row holding it — either alone keeps a
-    // legacy "unknown" binding inert.
+    // The reserved sentinel means "no nickname": it is folded away here and skipped by the store's
+    // row scan, so either alone keeps a legacy row inert.
     let nickname = from
         .get("username")
         .and_then(serde_json::Value::as_str)
@@ -333,18 +253,13 @@ struct MessageContext {
     chat_id: String,
     message_id: i64,
     reply_target: String,
-    /// Reply reference parsed from the update's `reply_to_message` — `None`
-    /// when this message does not reply to anything.
+    /// The reply this message carries, when it replies to one.
     reply_reference: Option<ReplyReference>,
-    /// The `[Forwarded from …]` prefix this message's content opens with, when
-    /// it arrived as forwarded content — rendered once, here, so a path that
-    /// hands the message on in another shape (a refusal notice included)
-    /// cannot lose it.
+    /// The `[Forwarded from …]` prefix this message's content opens with, rendered once here so any
+    /// path that hands the message on keeps it.
     forward_prefix: Option<String>,
-    /// Whether the message came in as forwarded content — the fact the burst
-    /// collector's longer window rests on, kept apart from the rendered
-    /// `forward_prefix` so a forward whose origin this product has no label for
-    /// is still forwarded.
+    /// Whether the message is forwarded — the fact the burst collector's longer window rests on,
+    /// kept apart from the rendered `forward_prefix`.
     forwarded: bool,
     /// Telegram's own time for the message (see `ChannelMessage::update_date`).
     update_date: Option<i64>,
@@ -377,9 +292,8 @@ impl MessageContext {
         }
     }
 
-    /// Build the channel message for a downloaded attachment, recording the
-    /// staging directory the bytes were written into as the only path
-    /// enrichment may later read, copy from, and delete.
+    /// Build the channel message for a downloaded attachment, recording its staging directory as
+    /// the only path enrichment may read and delete.
     fn into_attachment_message(self, content: String, staging_dir: String) -> ChannelMessage {
         ChannelMessage {
             attachment_dirs: vec![staging_dir],
@@ -391,12 +305,10 @@ impl MessageContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TelegramAttachmentKind {
     Image,
-    /// The `[FILE:...]` outbound kind — sent via `sendDocument`. Local image
-    /// files also route through `sendDocument`; see [`Self::file_meta`].
+    /// The `[FILE:...]` outbound kind — `sendDocument`; see [`Self::file_meta`].
     Document,
-    /// The `[VIDEO:...]` outbound kind. Delivered exactly like [`Self::Document`]
-    /// (see [`Self::meta`]); kept apart only because it accepts a wider set of
-    /// targets — any existing file or address — and is named in the chat.
+    /// The `[VIDEO:...]` kind: delivered like [`Self::Document`], but from any file or address, and
+    /// named in the chat.
     Video,
     Audio,
 }
@@ -418,21 +330,16 @@ struct TelegramAttachment {
     target: String,
 }
 
-/// Metadata associated with each attachment kind.
 #[derive(Debug, Clone, Copy)]
 struct AttachmentMeta {
     api_method: &'static str,
     form_field: &'static str,
-    /// Send `disable_content_type_detection=true` with the multipart form so
-    /// Telegram does not re-classify the upload server-side: an image sent as a
-    /// general file would be re-encoded as a photo despite the sendDocument
-    /// path, and a video must not come back as a video message.
+    /// Send `disable_content_type_detection=true` so Telegram does not re-classify the upload: an
+    /// image sent as a file must not come back as a photo.
     disable_content_type_detection: bool,
 }
 
 impl TelegramAttachmentKind {
-    /// How the kind is named where the product reports it: in the delivery
-    /// record's `kind` field.
     const fn label(self) -> &'static str {
         match self {
             Self::Image => "Image",
@@ -462,8 +369,7 @@ impl TelegramAttachmentKind {
         }
     }
 
-    /// Metadata for local-file sends: a local image goes out as a document
-    /// (sendDocument) because sendPhoto always re-encodes server-side.
+    /// `sendDocument` for a local image: `sendPhoto` re-encodes server-side.
     const fn file_meta(self) -> AttachmentMeta {
         match self {
             Self::Image => Self::Document.meta(),
@@ -472,23 +378,16 @@ impl TelegramAttachmentKind {
     }
 }
 
-/// Recognized image file extensions for Telegram receive-path routing — the one
-/// list that decides whether an attachment arrives as an image, so the chat
-/// composer's own intake asks this. PNG/JPEG/WebP only — gif/bmp are
-/// deliberately NOT routed as images anywhere (codec support is trimmed; see the
-/// image dependency's feature list). GIF-picker animations arrive as
-/// `video`-kind attachments and take the video path instead.
+/// Image extensions the receive path routes as images; PNG/JPEG/WebP only — gif and bmp have no
+/// codec here, and the GIF picker's clips take the video path.
 pub(crate) const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
 
-/// MIME prefixes routed as images by the MIME fallback in
-/// [`format_attachment_content`]. Mirrors [`IMAGE_EXTENSIONS`]: only the
-/// PNG/JPEG/WebP MIME types are admitted, so gif/bmp (including the legacy
-/// `image/x-ms-bmp` alias) never route as images.
+/// MIME prefixes routed as images, mirroring [`IMAGE_EXTENSIONS`]: PNG/JPEG/WebP only, so no gif
+/// and no legacy bmp alias.
 const IMAGE_MIME_PREFIXES: &[&str] = &["image/png", "image/jpeg", "image/jpg", "image/webp"];
 
-/// Shared username → `@u`, else `first_name` label chain. Used by both
-/// [`format_sender_label`] and the non-bot branch of [`replied_to_sender_label`];
-/// they differ only in the terminal fallback sentinel.
+/// Shared `@username` → `first_name` → `fallback` label chain; the two callers differ only in the
+/// sentinel they pass.
 fn sender_label_with_fallback(from: &serde_json::Value, fallback: &str) -> String {
     from.get("username")
         .and_then(serde_json::Value::as_str)
@@ -503,26 +402,15 @@ fn sender_label_with_fallback(from: &serde_json::Value, fallback: &str) -> Strin
         )
 }
 
-/// Format a sender label for display: `@username` if a username is present,
-/// otherwise the display name (first_name, or `"unknown"` as ultimate fallback).
+/// `@username`, else `first_name`, else `"unknown"`.
 #[must_use]
 fn format_sender_label(from: &serde_json::Value) -> String {
     sender_label_with_fallback(from, crate::users::TELEGRAM_UNKNOWN_SENTINEL)
 }
 
-/// Resolve the display label for a replied-to message's author.
-///
-/// The fallback chain is deliberately distinct from [`format_sender_label`],
-/// which keeps the `'unknown'` sentinel: a reply quote header must never
-/// surface `'unknown'`, so the ultimate fallback is `"user"`.
-///
-/// 1. `sender_chat` present → its `title`, else `"channel"`.
-/// 2. `from` present → if `is_bot`: `@username` else `"bot"`; otherwise
-///    `@username` → `first_name` → `"user"`.
-/// 3. Neither → `"user"`.
-///
-/// `<` / `>` are stripped from the resulting label since `first_name` /
-/// `title` may contain user-controlled angle brackets.
+/// The label for a replied-to message's author: a `sender_chat` title, else the
+/// `@username`/`first_name` of `from`, with `"user"`/`"channel"` as the terminal fallbacks — never
+/// `"unknown"`, which a reply header must not surface.
 #[must_use]
 fn replied_to_sender_label(message: &serde_json::Value) -> String {
     let label = if let Some(sender_chat) = message.get("sender_chat") {
@@ -549,11 +437,8 @@ fn replied_to_sender_label(message: &serde_json::Value) -> String {
     label.replace(['<', '>'], "")
 }
 
-/// Placeholder text for a media message reply whose text/caption is empty.
-///
-/// The mapping mirrors the original reply-quote logic: photo / voice/audio /
-/// video / document / sticker get a specific label, everything else
-/// (animation, video_note, etc.) falls back to `[Message]`.
+/// Placeholder text for a media reply with no caption: one label per media kind, `[Message]` for
+/// everything else.
 #[must_use]
 fn media_kind_placeholder(reply_to: &serde_json::Value) -> String {
     if reply_to.get("voice").is_some() || reply_to.get("audio").is_some() {
@@ -571,10 +456,7 @@ fn media_kind_placeholder(reply_to: &serde_json::Value) -> String {
     }
 }
 
-/// Derive a reply snippet from a `reply_to_message` object.
-///
-/// Text/caption snippets are normalized via [`normalize_reply_text`]; media
-/// messages with no text/caption use [`media_kind_placeholder`].
+/// A reply snippet: the text or caption, normalized; a media placeholder otherwise.
 #[must_use]
 fn reply_to_snippet(reply_to: &serde_json::Value) -> String {
     if let Some(text) = reply_to.get("text").and_then(serde_json::Value::as_str)
@@ -590,14 +472,8 @@ fn reply_to_snippet(reply_to: &serde_json::Value) -> String {
     }
 }
 
-/// Build a [`ReplyReference`] from a Telegram message's `reply_to_message`,
-/// when present. Returns `None` when the message does not reply to another
-/// message.
-///
-/// The snippet is derived from the replied-to message's text/caption
-/// (normalized via [`normalize_reply_text`]) or, for media messages with no
-/// text, a media-kind placeholder. The author label comes from
-/// [`replied_to_sender_label`].
+/// The reply reference for a message's `reply_to_message`: its author label plus a normalized
+/// snippet or a media-kind placeholder.
 #[must_use]
 fn build_reply_reference(message: &serde_json::Value) -> Option<ReplyReference> {
     let reply_to = message.get("reply_to_message")?;
@@ -610,26 +486,15 @@ fn build_reply_reference(message: &serde_json::Value) -> Option<ReplyReference> 
     })
 }
 
-/// Build the user-facing content string for an incoming attachment.
-///
-/// The kind and the file name/MIME type decide the marker: photos with a
-/// recognized image extension (or image MIME type) use `[IMAGE:/path]` so
-/// enrichment can convert them to native image parts; videos (native
-/// `video`/`video_note`/`animation` messages, or documents with a video
-/// MIME/extension) use `[VIDEO:/path]`; audio messages use `[AUDIO:/path]` on
-/// macOS and `[FILE:/path]` (the ordinary attachment path) where no local
-/// audio subsystem exists; a recorded voice message is only ever
-/// transcribed on macOS, so elsewhere it is refused before it reaches this
-/// function. Everything else uses `[FILE:/path]` — after one last check
-/// of the file's own bytes, since a sender can omit both the name and the MIME
-/// type.
+/// The user-facing content for an inbound attachment: `[IMAGE:]` for a PNG/JPEG/ WebP, `[VIDEO:]`
+/// for video, `[AUDIO:]` for sound on macOS (a plain file elsewhere), `[FILE:]` otherwise — the
+/// bytes deciding when name and MIME do not.
 fn format_attachment_content(
     kind: IncomingAttachmentKind,
     local_path: &Path,
     mime_type: Option<&str>,
 ) -> String {
-    // MIME fallback mirrors the extension whitelist: only the PNG/JPEG/WebP
-    // MIME types route as images (no gif/bmp image support anywhere).
+    // MIME fallback mirrors the extension whitelist: PNG/JPEG/WebP only.
     let is_image = crate::util::has_extension(local_path, IMAGE_EXTENSIONS)
         || mime_type.is_some_and(|m| IMAGE_MIME_PREFIXES.iter().any(|p| m.starts_with(p)));
     let is_video = crate::util::is_video_extension(local_path)
@@ -642,10 +507,8 @@ fn format_attachment_content(
             format!("[VIDEO:{}]", local_path.display())
         }
         IncomingAttachmentKind::Audio | IncomingAttachmentKind::Voice => {
-            // macOS transcribes this through the AUDIO marker enrichment
-            // consumes; elsewhere there is no local audio, so a sound file is
-            // handed over as an ordinary attachment (a recorded voice message,
-            // which has no file name, is refused before it gets here).
+            // macOS transcribes this through the AUDIO marker; elsewhere it is an ordinary
+            // attachment (a recorded voice message is refused before it gets here).
             let kind = if cfg!(target_os = "macos") {
                 "AUDIO"
             } else {
@@ -654,13 +517,8 @@ fn format_attachment_content(
             format!("[{kind}:{}]", local_path.display())
         }
         _ => {
-            // Neither the name nor the declared MIME type classified this
-            // attachment. The bytes still can, through the same decodable-raster
-            // gate enrichment applies to `[IMAGE:...]`, so an image the sender
-            // stripped the name and type from is still fed to the model as an
-            // image instead of being reported as an unconvertible file. That gate
-            // reads and decodes the file, so it is offloaded — this runs on the
-            // Telegram listener task.
+            // Neither name nor MIME classified it, so the bytes decide — the same decodable- raster
+            // gate enrichment uses. It reads and decodes, so it runs off this task.
             let target = local_path.to_string_lossy().to_string();
             if crate::util::with_block_in_place(|| {
                 crate::util::media_target::classify_media_image_target(&target)
@@ -674,12 +532,8 @@ fn format_attachment_content(
     }
 }
 
-/// Normalize a Video-kind or video-MIME attachment's filename to a
-/// recognized video extension. Telegram's GIF picker sends animations as
-/// H.264 MP4 bytes under a ".gif" file_name, which would bounce at
-/// video_edit's extension guard after enrichment copies the clip into
-/// workspace uploads. Documents with a `video/*` MIME get the same
-/// treatment so routing and the guard see the same signal.
+/// Give a Video-kind or `video/*` attachment a recognized video extension: the GIF picker sends MP4
+/// bytes named ".gif", which would bounce at video_edit's extension guard.
 fn normalize_video_filename(
     kind: IncomingAttachmentKind,
     filename: &str,
@@ -688,16 +542,14 @@ fn normalize_video_filename(
     let is_video =
         kind == IncomingAttachmentKind::Video || mime_type.is_some_and(|m| m.starts_with("video/"));
     if is_video && !crate::util::is_video_extension(std::path::Path::new(filename)) {
-        // No stem (`.`, `..`, `""`): nothing to swap, and the sanitizer replaces
-        // the name with the generated fallback either way.
+        // No stem (`.`, `..`, `""`): nothing to swap, and the sanitizer falls back.
         let Some(stem) = std::path::Path::new(filename)
             .file_stem()
             .and_then(|s| s.to_str())
         else {
             return filename.to_string();
         };
-        // From the declared type, so a `video/webm` or `video/quicktime` file is
-        // not mislabeled `mp4`.
+        // From the declared type, so webm or quicktime is not mislabeled `mp4`.
         let extension = match mime_type {
             Some("video/webm") => "webm",
             Some("video/quicktime") => "mov",
@@ -709,19 +561,16 @@ fn normalize_video_filename(
     }
 }
 
-/// Make an attachment filename safe to use as a single path component under the
-/// Telegram temp root: only the final path component survives
-/// (`../../etc/passwd` → `passwd`), [`crate::util::neutralized_name`] maps out
-/// the characters that would break a path component or the `[FILE:<path>]`
-/// marker carrying it, and the result fits [`MAX_ATTACHMENT_FILENAME_BYTES`]
-/// bytes on a char boundary. The sender's name is used when it yields one, and
-/// the caller's `fallback` (cleaned the same way) otherwise.
+/// Make a sender-supplied name safe as one path component under the Telegram temp root: only the
+/// final component survives (`../../etc/passwd` → `passwd`), the characters that would break a
+/// component or the `[FILE:<path>]` marker are neutralized, and the result fits
+/// [`MAX_ATTACHMENT_FILENAME_BYTES`] on a char boundary; `fallback` (cleaned the same way) when the
+/// name yields nothing usable.
 fn sanitize_attachment_filename(name: &str, fallback: &str) -> String {
     let mut cleaned = [name, fallback]
         .into_iter()
         .find_map(|name| {
-            // `Path::file_name` yields only a normal component, so it is already
-            // `None` for `""`, `.`, `..`, a bare separator and a non-UTF-8 name.
+            // `Path::file_name` yields only a normal component: `None` for `""`, `.`, `..`.
             let component = Path::new(name).file_name().and_then(|n| n.to_str())?;
             Some(crate::util::neutralized_name(component))
         })
@@ -731,14 +580,11 @@ fn sanitize_attachment_filename(name: &str, fallback: &str) -> String {
         cleaned.insert(0, '_');
     }
     if cleaned.len() > MAX_ATTACHMENT_FILENAME_BYTES {
-        // Split off the extension (dot included) so truncating the stem never
-        // eats it; a name with no extension has the whole name as its stem and
-        // truncates wholesale.
+        // Split off the extension so truncating the stem never eats it.
         let stem = crate::util::name_stem(&cleaned);
         let ext = &cleaned[stem.len()..];
-        // A stem with no room left in the budget leaves a bare extension — a
-        // dotfile — so the whole name truncates instead, as it does when there
-        // is no stem to keep.
+        // A bare extension left by a truncated stem would be a dotfile: the whole name truncates
+        // instead.
         let truncated = crate::util::truncate_bytes(
             stem,
             MAX_ATTACHMENT_FILENAME_BYTES.saturating_sub(ext.len()),
@@ -752,10 +598,8 @@ fn sanitize_attachment_filename(name: &str, fallback: &str) -> String {
     cleaned
 }
 
-/// Reduce a `getFile`-supplied extension to an ASCII-alphanumeric token, or
-/// `None` when nothing survives: it is remote input that reaches the user's
-/// filename, so separators, control characters and `]` must not survive into
-/// it.
+/// Reduce a `getFile` extension to an ASCII-alphanumeric token: it reaches the user's filename, so
+/// separators, control characters and `]` must not survive.
 fn sanitize_remote_extension(remote_ext: &str) -> Option<String> {
     let cleaned: String = remote_ext
         .chars()
@@ -764,12 +608,8 @@ fn sanitize_remote_extension(remote_ext: &str) -> Option<String> {
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
-/// Resolve the local save name for an inbound attachment: the sender-supplied
-/// `file_name` when Telegram provided one, otherwise a generated
-/// `<kind>_<chat>_<message>.<ext>` fallback from `remote_ext` (the extension
-/// from `getFile`, which is absent before that call). Either way the name goes
-/// through [`sanitize_attachment_filename`], so omitting `file_name` cannot
-/// smuggle a hostile extension past it.
+/// The local save name for an inbound attachment: the sender's `file_name`, else a generated
+/// `<kind>_<chat>_<message>.<ext>`, either way through [`sanitize_attachment_filename`].
 fn local_attachment_name(
     attachment: &IncomingAttachment,
     chat_id: &str,
@@ -778,28 +618,22 @@ fn local_attachment_name(
 ) -> String {
     let remote_ext = remote_ext.and_then(sanitize_remote_extension);
     let ext = remote_ext.as_deref().unwrap_or(match attachment.kind {
-        // video_note has no file_name/mime_type — a ".jpg" default
-        // would misroute it out of the video flow.
+        // video_note has no file_name or mime_type; a ".jpg" default would misroute it.
         IncomingAttachmentKind::Video => "mp4",
-        // A document with no name and no MIME type cannot be routed by
-        // `format_attachment_content`, so it takes the generic file path; the
-        // default stays format-neutral rather than claiming "jpg".
+        // No name and no MIME type: the generic file path, so the default stays neutral.
         IncomingAttachmentKind::Document => "bin",
         _ => "jpg",
     });
     let prefix = match attachment.kind {
         IncomingAttachmentKind::Photo => "photo",
         IncomingAttachmentKind::Video => "video",
-        // A recorded voice message arrives with no `file_name`, so it gets the
-        // generated `audio_<chat>_<message>.<ext>` name — with the generic
-        // fallback extension above, not a recording-specific one.
+        // A recorded voice message has no `file_name`, so it takes the generated audio name.
         IncomingAttachmentKind::Audio | IncomingAttachmentKind::Voice => "audio",
         IncomingAttachmentKind::Document => "file",
     };
     let fallback = format!("{prefix}_{chat_id}_{message_id}.{ext}");
-    // The video extension swap runs before sanitizing: it can lengthen the name
-    // (`.bin` → `.webm`), and the sanitizer's byte budget must cover the name
-    // that is actually written.
+    // The video extension swap runs before sanitizing: it can lengthen the name (`.bin` → `.webm`)
+    // and the byte budget must cover what is written.
     let chosen = normalize_video_filename(
         attachment.kind,
         attachment.file_name.as_deref().unwrap_or(&fallback),
@@ -808,13 +642,9 @@ fn local_attachment_name(
     sanitize_attachment_filename(&chosen, &fallback)
 }
 
-/// Agent-facing content for a rejected attachment: the caption (when non-empty)
-/// first, then the `[File <name>: <outcome> — <reason>]` note. `display_name`
-/// is `None` for an attachment with no usable name to show (a recorded voice
-/// message has none, and [`local_attachment_name`] would invent one with the
-/// wrong extension), which renders the name-less `[File <outcome> — <reason>]`
-/// instead. Neither shape is a media marker: the kind word is never followed by
-/// a colon, so `MEDIA_MARKER_RE` cannot read a product note as one.
+/// Agent-facing content for a rejected attachment: the caption, then the `[File <name>: <outcome> —
+/// <reason>]` note (`display_name` `None` renders it name-less). The kind word never precedes a
+/// colon, so it is no media marker.
 #[must_use]
 fn attachment_rejection_content(
     display_name: Option<&str>,
@@ -835,19 +665,14 @@ fn attachment_rejection_content(
 /// How an outbound attachment reaches Telegram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachmentRoute {
-    /// An existing local file, uploaded from disk.
     LocalFile,
-    /// Telegram fetches the address itself: the image and audio methods. A
-    /// `[FILE:]` target is local-only, so no document arrives this way.
+    /// Telegram fetches the address itself: the image and audio methods.
     ByAddress,
-    /// The product fetches the bytes and uploads them unchanged: a video
-    /// addressed by a URL. Telegram's by-address document form accepts only a
-    /// couple of specific types, and a video message is not the delivery this
-    /// path makes.
+    /// The product fetches the bytes and uploads them: a video by URL, which Telegram's by-address
+    /// document form cannot deliver as a video.
     FetchThenUpload,
 }
 
-/// Which route a target takes.
 fn attachment_route(kind: TelegramAttachmentKind, target: &str) -> AttachmentRoute {
     if !is_http_url(target) {
         return AttachmentRoute::LocalFile;
@@ -858,9 +683,7 @@ fn attachment_route(kind: TelegramAttachmentKind, target: &str) -> AttachmentRou
     AttachmentRoute::ByAddress
 }
 
-/// The last path segment of an address, sanitized as a path component: the name
-/// a file fetched from it is uploaded under, and what a refusal names. `fallback`
-/// when the address names no file.
+/// The address's last segment as a path component, else `fallback`.
 fn address_file_name(url: &str, fallback: &str) -> String {
     let parsed = url::Url::parse(url).ok();
     parsed
@@ -874,9 +697,8 @@ fn address_file_name(url: &str, fallback: &str) -> String {
         )
 }
 
-/// The name a fetched video is uploaded under: the address's own last segment,
-/// normalized to a video extension by the rule the receive direction uses, so the
-/// recipient's client can pick a player for it.
+/// The name a fetched video uploads under: the address's last segment, normalized to a video
+/// extension.
 fn video_upload_name(url: &str, content_type: Option<&str>) -> String {
     let content_type = content_type
         .and_then(|value| value.split(';').next())
@@ -888,23 +710,13 @@ fn video_upload_name(url: &str, content_type: Option<&str>) -> String {
     )
 }
 
-/// The one refusal only a `[FILE:...]` marker can produce: the other kinds
-/// deliberately accept any location on disk, so this reason is not part of the
-/// shared vocabulary.
+/// The refusal only a `[FILE:...]` marker produces: the other kinds accept any location on disk.
 const OUTSIDE_WORKSPACE_REASON: &str = "it is outside your workspace.";
 
-/// Resolve an outbound `[FILE:...]` target within the roots that authorize it.
-///
-/// `path` is where [`media_target::resolve_marker_target`] placed the target: an
-/// absolute path as written, or a relative one joined to the first workspace root
-/// that has it. A URL or an inline payload never reaches here — `[FILE:...]` is
-/// local-only, and [`marker_outcome`] refuses those before containment.
-///
-/// The target is canonicalized (a symlink cannot smuggle out a file from
-/// outside a root) and must be inside one of the roots BEFORE the existence,
-/// directory and size checks, so a refusal does not disclose which of those the
-/// target is. The notice names a bounded last path component, which a malformed
-/// marker can make an arbitrary blob. `Err` is that notice.
+/// Resolve an outbound `[FILE:...]` target within the roots that authorize it. The target is
+/// canonicalized (a symlink cannot smuggle a file out) and must be inside a root BEFORE the
+/// existence, directory and size checks, so a refusal discloses none of them. `Err` is the notice
+/// naming a bounded last component.
 fn resolve_file_target(
     path: &Path,
     file_roots: &[PathBuf],
@@ -913,25 +725,20 @@ fn resolve_file_target(
     let name = media_target::marker_name(&path.to_string_lossy());
     let refuse = |reason: &str| Err(media_target::marker_refusal(&name, reason));
 
-    // Nothing authorizes a local file when the message names no workspace: a
-    // still-relative target never found a root, and an absolute one has no root
-    // to be inside.
+    // Nothing authorizes a local file without a workspace: a relative target never found a root.
     if file_roots.is_empty() {
         return refuse(media_target::NO_WORKSPACE_REASON);
     }
 
-    // Containment compares like with like, so the roots are canonicalized too:
-    // a workspace living under a symlinked path (macOS `/tmp`, `/var`) would
-    // otherwise never contain the canonical target. A root that cannot be
-    // canonicalized is kept as given.
+    // Roots are canonicalized too, so a workspace under a symlinked path (macOS `/tmp`, `/var`)
+    // still contains the canonical target.
     let roots: Vec<PathBuf> = file_roots
         .iter()
         .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.clone()))
         .collect();
 
-    // Containment comes before the directory and size checks: a path outside
-    // the workspace must not have those disclosed to the end user. (Whether it
-    // exists at all is still visible in the refusal text.)
+    // Containment precedes the directory and size checks: a path outside the workspace must not
+    // have those disclosed.
     let Ok(canonical) = std::fs::canonicalize(path) else {
         return refuse(media_target::FILE_NOT_FOUND_REASON);
     };
@@ -955,8 +762,7 @@ fn resolve_file_target(
         );
     }
 
-    // The plain spelling, not the platform's verbatim form: this value becomes
-    // the attachment's `target`.
+    // The plain spelling, not the platform's verbatim form: this becomes `target`.
     Ok(crate::util::strip_verbatim_prefix(&canonical))
 }
 
@@ -970,19 +776,13 @@ enum MarkerOutcome {
     Refuse(String),
 }
 
-/// The refusal for a target that cannot be delivered, named by its bounded last
-/// path component so a malformed marker cannot dump a blob into the chat.
+/// The refusal for an undeliverable target, named by its bounded last component.
 fn refused(target: &str, reason: &str) -> MarkerOutcome {
     MarkerOutcome::Refuse(media_target::marker_refusal_for(target, reason))
 }
 
-/// Decide what one marker becomes: the target is placed first
-/// ([`media_target::resolve_marker_target`]), then the kind's own gate decides
-/// whether it can be delivered as what the marker claims.
-///
-/// A recognized marker never stays markup: it is an attachment or a refusal.
-/// The one exception is a bare word naming nothing (`[IMAGE:path]` in prose),
-/// which is not a reference at all.
+/// Decide one marker: the target is placed, then the kind's own gate decides whether it can be
+/// delivered as what the marker claims.
 fn marker_outcome(
     marker_kind: MediaMarkerKind,
     target: &str,
@@ -1013,31 +813,19 @@ fn marker_outcome(
         };
     }
 
-    // Images, audio and video deliberately accept any location on disk — only
-    // `[FILE:...]` is workspace-confined. The kind's own gate still applies: an
-    // image marker must name a file whose head carries a raster signature, not a
-    // directory or a text file. Nothing is decoded here: a local image goes out
-    // as a document, so a large or unusual-but-valid raster is delivered rather
-    // than refused on a budget that belongs to the receiving side.
+    // Only `[FILE:...]` is workspace-confined; the kind's own gate still applies (an image marker
+    // needs a raster signature). Nothing is decoded here — a local image goes out as a document, so
+    // a large valid raster is delivered, not refused.
     if let Some(reason) = media_target::local_refusal(marker_kind, &path) {
         return refused(target, reason);
     }
     MarkerOutcome::Attach(path.to_string_lossy().into_owned())
 }
 
-/// Parse `[KIND:path]` media markers from a message, returning cleaned text
-/// (with markers removed), extracted attachments, and user-facing refusal
-/// notices.
-///
-/// A recognized marker is never delivered as raw markup: its target is placed by
-/// [`media_target::resolve_marker_target`] — a relative path against `file_roots`,
-/// the workspace the message belongs to — and the marker then either arrives or
-/// leaves a [`media_target::marker_refusal`] notice in the returned notices.
-/// Several markers are independent, so one refusal costs the user neither the
-/// others nor the surrounding text.
-///
-/// The one target kept as written is a bare word naming no file (`[IMAGE:path]`
-/// used to explain the syntax), which is prose rather than a reference.
+/// Parse `[KIND:path]` markers, returning the text with them removed, the attachments, and the
+/// user-facing refusals. Targets resolve against `file_roots`; markers are independent, so one
+/// refusal costs the user neither the others nor the surrounding text. A bare word naming no file
+/// stays as prose.
 fn parse_attachment_markers(
     message: &str,
     file_roots: &[PathBuf],
@@ -1069,13 +857,10 @@ fn parse_attachment_markers(
     (cleaned.trim().to_string(), attachments, refusals)
 }
 
-/// Base URL for Telegram's cloud Bot API.
 pub(crate) const CLOUD_API_BASE: &str = "https://api.telegram.org";
 
-/// The base the transport must use right now: the cloud, or the local server's
-/// own endpoint. `None` means the configured mode is the local server and it has
-/// no endpoint yet — no listener may run, because the only other endpoint would
-/// be the cloud the bot has just left.
+/// The base in force: the cloud, or the local server's endpoint. `None` while the local mode has
+/// none — no listener may run, the only other base being the cloud.
 fn active_base() -> Option<String> {
     match crate::channels::telegram_local::serving_mode() {
         crate::channels::telegram_local::Mode::Cloud => Some(CLOUD_API_BASE.to_string()),
@@ -1088,23 +873,18 @@ fn active_base() -> Option<String> {
 /// The wait between two checks for a base, before it doubles.
 const TRANSPORT_WAIT_FIRST: Duration = Duration::from_millis(100);
 
-/// What that wait doubles towards: a server that never comes up must not cost ten
-/// checks a second for the life of the process.
+/// What that wait doubles towards: an absent server must not cost ten checks a second.
 const TRANSPORT_WAIT_CAP: Duration = Duration::from_secs(5);
 
-/// Wait until the transport has a base to send on — the cloud always has one, the
-/// local mode only once its server has published an endpoint — for as long as that
-/// takes. Only shutdown ends the wait, and `false` says so: a transport that has
-/// not come up yet is not a fault, so nothing is reported and the caller's send is
-/// never attempted.
+/// Wait until the transport has a base, for as long as that takes. `false` means shutdown ended the
+/// wait; a transport not up yet is no fault, so nothing is sent.
 #[must_use]
 pub(crate) async fn wait_for_transport() -> bool {
     wait_until(|| active_base().is_some()).await
 }
 
-/// The wait itself, over any predicate, so a check can drive it without the mode
-/// and endpoint globals. It re-asks rather than waiting for a signal: the base
-/// moves with the serving mode as well as with the published endpoint.
+/// The wait itself over any predicate: it re-asks rather than waiting for a signal, because the
+/// base moves with the mode as well as with the endpoint.
 async fn wait_until(ready: impl Fn() -> bool) -> bool {
     let mut wait = TRANSPORT_WAIT_FIRST;
     while !ready() {
@@ -1116,47 +896,36 @@ async fn wait_until(ready: impl Fn() -> bool) -> bool {
     true
 }
 
-/// What one transfer may be in the mode in force.
-///
-/// The cloud caps a bot at 20 MB per download and 50 MB per upload; the local
-/// server removes the download cap and accepts 2000 MB per upload. The numbers
-/// are the transport's own statement of the limit in force, so every refusal
-/// quotes the limit that actually applies.
+/// What one transfer may be in the mode in force: the cloud caps a bot at 20 MB down and 50 MB up,
+/// the local server removes the download cap and accepts 2000 MB up. Every refusal quotes the limit
+/// that actually applies.
 #[derive(Clone, Copy, Debug)]
 struct TransferLimits {
-    /// The largest file the bot may take in — `None` when the transport imposes
-    /// no cap of its own.
+    /// The largest file the bot may take in, `None` when uncapped.
     download: Option<u64>,
-    /// The largest file the bot may send.
     upload: u64,
-    /// The bound on one transfer request — `None` when the transport imposes no
-    /// bound of its own. The local client's own day-long bound still applies, so
-    /// no real file fails on it and a hung socket still ends.
+    /// The bound on one transfer request, `None` when the transport sets none.
     request: Option<Duration>,
 }
 
-/// The total bound on one transfer to the local server: a day is long enough that
-/// no real file fails on it, short enough that a hung socket still ends.
+/// The total bound on one local transfer: no real file fails on it, a hung socket ends.
 const LOCAL_TRANSFER_BOUND: Duration = Duration::from_hours(24);
 
 impl TransferLimits {
-    /// The cloud's limits.
     const CLOUD: Self = Self {
         download: Some(TELEGRAM_MAX_FILE_DOWNLOAD_BYTES),
         upload: TELEGRAM_CLOUD_MAX_UPLOAD_BYTES,
         request: Some(MEDIA_TRANSFER_TIMEOUT),
     };
 
-    /// The local server's limits: no download cap, 2000 MB per upload, no total
-    /// request bound.
+    /// The local server's limits: no download cap, 2000 MB up, no request bound.
     const LOCAL: Self = Self {
         download: None,
         upload: TELEGRAM_LOCAL_MAX_UPLOAD_BYTES,
         request: None,
     };
 
-    /// The bound on one transfer as a duration: the transport's own when it sets
-    /// one, otherwise the day-long client bound that ends a hung socket.
+    /// The transfer bound: the transport's own, else the day-long client bound.
     fn request_bound(self) -> Duration {
         self.request.unwrap_or(LOCAL_TRANSFER_BOUND)
     }
@@ -1168,33 +937,24 @@ fn local_transfer_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| crate::util::http::build_http_client(LOCAL_TRANSFER_BOUND))
 }
 
-/// The client a fetched address runs on, built once: it follows no redirect of
-/// its own — [`crate::util::http::get_guarded`] screens each hop — and carries
-/// the day-long bound that ends a hung socket. The transfer bound in force bounds
-/// the whole transfer, body included (see
-/// [`TelegramChannel::fetch_remote_upload`]).
+/// The client a fetched address runs on: no redirect of its own (the shared SSRF guard screens each
+/// hop) and a day-long bound that ends a hung socket.
 fn fetch_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| crate::util::http::build_no_redirect_http_client(LOCAL_TRANSFER_BOUND))
 }
 
-/// Bot-API URL for `method` on the bot identified by `token`, at `api_base`.
 fn bot_api_url(api_base: &str, token: &str, method: &str) -> String {
     format!("{api_base}/bot{token}/{method}")
 }
 
-/// What a refused `getMe` starts with when the platform rejected the token, as
-/// opposed to failing to answer. One spelling, so whoever reads the error can tell
-/// a rejected pair from an unreachable endpoint without parsing the sentence.
+/// What a refused `getMe` starts with when the platform rejected the token, as opposed to failing
+/// to answer — one spelling, so the two are tellable.
 pub(crate) const REJECTED_TOKEN_PREFIX: &str = "Telegram rejected the bot token — ";
 
-/// The `getMe` answer for `token` at `api_base`, once the platform has confirmed
-/// the token is one of its own.
-///
-/// Validating a token and naming the account it belongs to are the same call and
-/// the same answer; the caller is what differs — the intake keys its record on the
-/// account's own identity rather than on the token's text, so a rotated token for
-/// the same account still recovers.
+/// The `getMe` answer for `token`, once the platform has confirmed it: validating a token and
+/// naming its account are one call, and the intake keys its record on the account, so a rotated
+/// token for the same account still recovers.
 async fn get_me(
     client: &reqwest::Client,
     api_base: &str,
@@ -1217,32 +977,26 @@ async fn get_me(
     Ok(data)
 }
 
-/// Telegram Bot API maximum file download size on the cloud. The enrichment
-/// gate reuses it as the automatic-processing bound.
+/// Cloud download cap; the enrichment gate reuses it as its processing bound.
 pub(crate) const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 
-/// The largest file the cloud Bot API accepts per upload.
 const TELEGRAM_CLOUD_MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024;
 
-/// The largest file a local Bot API server accepts per upload.
 const TELEGRAM_LOCAL_MAX_UPLOAD_BYTES: u64 = 2000 * 1024 * 1024;
 
-/// A byte cap as the whole-MB figure the user-facing notices quote, derived from
-/// the cap itself so the text cannot drift from the number enforced.
+/// A byte cap as whole MB, derived from the cap so notices cannot drift.
 fn mb(bytes: u64) -> u64 {
     bytes / (1024 * 1024)
 }
 
-/// User-facing reason when a declared attachment size exceeds the inbound limit
-/// of the mode in force, or `None` when it fits.
+/// User-facing reason when a declared size exceeds the inbound limit, `None` when it fits.
 #[must_use]
 fn declared_size_refusal(limits: TransferLimits, size: u64) -> Option<String> {
     let download = limits.download?;
     (size > download).then(|| telegram_download_limit_reason(download))
 }
 
-/// User-facing reason when a declared attachment size exceeds Telegram's own
-/// bot-download limit — which only exists on the cloud.
+/// User-facing reason when a declared size exceeds the cloud's bot-download limit.
 fn telegram_download_limit_reason(download: u64) -> String {
     format!(
         "Telegram only lets the bot download files up to {} MB",
@@ -1250,10 +1004,8 @@ fn telegram_download_limit_reason(download: u64) -> String {
     )
 }
 
-/// User-facing reason when Telegram declared no size (or one under the limit)
-/// but the `getFile`/download step still failed. Naming no figure keeps it
-/// independent of [`TELEGRAM_MAX_FILE_DOWNLOAD_BYTES`], and the download cap is
-/// hinted only where the mode has one — the local server has none at all.
+/// Reason when Telegram declared no size but the download still failed; naming no figure keeps it
+/// independent of [`TELEGRAM_MAX_FILE_DOWNLOAD_BYTES`].
 fn transfer_refused_reason(limits: TransferLimits) -> &'static str {
     if limits.download.is_some() {
         "Telegram refused the transfer (it may exceed what the bot can download)"
@@ -1262,72 +1014,53 @@ fn transfer_refused_reason(limits: TransferLimits) -> &'static str {
     }
 }
 
-/// User-facing reason when the download ran into [`MEDIA_TRANSFER_TIMEOUT`]:
-/// the request was stopped on this side, so it is not described as a refusal by
-/// the transport.
+/// Reason when the download hit [`MEDIA_TRANSFER_TIMEOUT`]: stopped on this side.
 const ATTACHMENT_DOWNLOAD_TIMEOUT_REASON: &str = "the download took too long and was stopped";
 
-/// User-facing reason when the download got no answer out of Telegram at all —
-/// the connection failed before a response. Like the timeout, that is this
-/// side's failure and not a refusal by the transport.
+/// Reason when the connection failed before any answer — this side's failure too.
 const ATTACHMENT_DOWNLOAD_FAILED_REASON: &str = "the connection to Telegram failed";
 
-/// Reported when the local server did not hand over a file it said it had. The
-/// local server serves no download route, so the file must already be on disk.
+/// The local server did not hand over a file it said it had (it serves no route).
 const LOCAL_FILE_MISSING_REASON: &str =
     "the local Bot API server did not hand the file over — it is not on this machine";
 
-/// Reported when the local server names a file outside the directory it was
-/// given: the product only ever takes back what it handed over.
+/// The local server named a file outside the directory it was given.
 const LOCAL_FILE_OUTSIDE_REASON: &str =
     "the local Bot API server handed over a file that is not its own";
 
-/// How long a hand-over may take in total before it is treated as one that will
-/// not finish. A bound on the whole wait, not on a pause: a write stall is
-/// ordinary at the sizes this feature exists for, and only a hand-over that never
-/// reaches the declared size is refused.
+/// How long a hand-over may take in total: a bound on the whole wait, not on a pause, and only a
+/// hand-over that never reaches the declared size is refused.
 const LOCAL_HANDOVER_WAIT: Duration = Duration::from_mins(30);
 
-/// How long the file may take to appear at all. A hand-over naming a path that
-/// never comes into being is a broken answer, not a slow transfer, and waiting the
-/// whole [`LOCAL_HANDOVER_WAIT`] for it would hold the batch for half an hour.
+/// How long the file may take to appear: a broken answer, not a slow transfer, and waiting
+/// [`LOCAL_HANDOVER_WAIT`] for it would hold the batch half an hour.
 const LOCAL_HANDOVER_APPEAR: Duration = Duration::from_mins(1);
 
-/// Reported when Telegram did not return a download path for an attachment the
-/// bot is otherwise allowed to fetch — an API or network failure, not a size
-/// refusal.
+/// Reason when Telegram returned no download path — an API or network failure.
 const TELEGRAM_LOOKUP_REFUSED_REASON: &str = "Telegram could not provide the file";
 
-/// What happened to an attachment in the agent-facing note when the transport
-/// never handed it over.
+/// The agent-facing outcome when the transport never handed the file over.
 const NOT_RECEIVED: &str = "not received";
 
-/// What happened to an attachment in the agent-facing note when it arrived but
-/// the daemon could not keep it, so the agent cannot be given it.
+/// The agent-facing outcome when the file arrived but could not be kept.
 const NOT_STORED: &str = "could not be stored";
 
-/// User-facing reason when the staging directory for a received attachment
-/// could not be created locally — a mahbot-side failure, so it must not be
-/// reported as a transfer refusal.
+/// Reason when the staging directory could not be created — a local failure, not a transfer
+/// refusal.
 const ATTACHMENT_DIR_REFUSED_REASON: &str =
     "the local temp directory for the file could not be created";
 
-/// User-facing reason when a fully downloaded attachment could not be written
-/// to that directory — also a local failure, reported separately from the
-/// transport's own refusals.
+/// Reason when a downloaded attachment could not be written — a local failure.
 const ATTACHMENT_SAVE_REFUSED_REASON: &str = "the file could not be saved locally";
 
-/// An outbound file larger than the upload limit of the mode in force.
-///
-/// Its text names the limit and nothing else — no path, no URL — so it is safe to
-/// render into the chat, unlike the transport's own errors.
+/// An outbound file over the upload limit in force. Its text names the limit and nothing else, so
+/// it is safe to render into the chat.
 #[derive(Debug)]
 struct UploadTooLarge {
     size: u64,
     max: u64,
 }
 
-/// The size refusal in an error's chain, if one of its causes is [`UploadTooLarge`].
 fn upload_too_large(err: &anyhow::Error) -> Option<&UploadTooLarge> {
     err.chain()
         .find_map(|cause| cause.downcast_ref::<UploadTooLarge>())
@@ -1346,45 +1079,36 @@ impl std::fmt::Display for UploadTooLarge {
 
 impl std::error::Error for UploadTooLarge {}
 
-/// User-facing reason when the transport failed to deliver a local file that
-/// passed the product-level size check.
-///
-/// Deliberately static: the transport error text embeds the request URL, which
-/// carries the bot token, so it is logged and returned as an `Err` but never
-/// rendered into the user's chat.
+/// Reason when the transport failed to deliver a local file that passed the size check.
+/// Deliberately static: the transport error embeds the request URL, which carries the token, so it
+/// is logged but never rendered into the chat.
 const ATTACHMENT_UPLOAD_FAILED_REASON: &str = "the upload failed.";
 
-/// User-facing reason when an addressed attachment never arrived: Telegram's
-/// own fetch failed, or ours did before the upload. Static for the same reason
-/// as [`ATTACHMENT_UPLOAD_FAILED_REASON`] — the error itself may carry the URL
-/// and its credentials.
+/// Reason when an addressed attachment never arrived. Static for the same reason as
+/// [`ATTACHMENT_UPLOAD_FAILED_REASON`]: the error may carry the URL.
 const ATTACHMENT_FETCH_FAILED_REASON: &str = "it could not be fetched or sent.";
 
-/// User-facing reason when a recorded voice message arrives off macOS, where
-/// no local audio subsystem exists to transcribe it: it is refused rather than
-/// silently handed on useless.
+/// Reason when a recorded voice message arrives off macOS, where nothing can transcribe it: refused
+/// rather than handed on useless.
 #[cfg(not(target_os = "macos"))]
 const VOICE_UNSUPPORTED_REASON: &str = "voice messages are not supported on this platform";
 
-/// The local server's hand-over produced no usable file.
-///
-/// A type of its own, with one variant per fault, so the refusal reaches the owner
-/// as the hand-over failure it is — "it is not on this machine", "it is not its
-/// own", "it stopped short" — instead of one sentence standing for all of them.
+/// The local server's hand-over produced no usable file: one variant per fault, so the refusal
+/// reaches the owner as what happened — missing, outside, short — rather than one sentence for all
+/// of them.
 #[derive(Debug)]
 enum LocalHandOver {
-    /// It named no path on this machine, or one that is not there. A hand-over
-    /// root that cannot be resolved lands here too: nothing can be taken from a
-    /// directory that does not exist.
+    /// It named no path on this machine, or one that is not there — an unresolvable hand-over root
+    /// lands here too.
     Missing,
-    /// It named a file outside the directory the product gave it.
     Outside,
-    /// It handed over fewer bytes than the attachment declared.
-    Incomplete { got: u64, expected: u64 },
+    Incomplete {
+        got: u64,
+        expected: u64,
+    },
 }
 
 impl LocalHandOver {
-    /// The user-facing reason, in the terms of the variant.
     fn reason(&self) -> String {
         match self {
             Self::Missing => LOCAL_FILE_MISSING_REASON.to_string(),
@@ -1402,29 +1126,19 @@ impl std::fmt::Display for LocalHandOver {
 
 impl std::error::Error for LocalHandOver {}
 
-/// User-facing reason when the local server handed over fewer bytes than the
-/// attachment declared: what is on disk is a truncated copy, so it is refused
-/// rather than delivered short. Both counts are in the sentence, which is why the
-/// text is built rather than held as a constant.
+/// Reason when the hand-over stored fewer bytes than declared: both counts are in the sentence,
+/// which is why the text is built.
 fn local_file_incomplete_reason(got: u64, expected: u64) -> String {
     format!(
         "the local Bot API server handed over {got} of {expected} bytes — the transfer did not finish"
     )
 }
 
-/// Wait for a handed-over path to become the file Telegram declared.
-///
-/// `getFile` normally answers after the server has written the file, but an
-/// answer that races the write is cheap to absorb: the path is waited for until
-/// its size reaches `expected`.
-///
-/// Completeness is decided against the declared size, never by a pause: a size
-/// that stops changing *short* of `expected` is a write stall — a page-cache
-/// flush, a busy disk — and the wait goes on, however long the stall lasts, until
-/// the size is reached or [`LOCAL_HANDOVER_WAIT`] runs out. With no declared size
-/// there is nothing to compare against, and a size that no longer changes is all
-/// the evidence there is. A file that never appears at all is a hand-over that
-/// names nothing, and is given up on after [`LOCAL_HANDOVER_APPEAR`].
+/// Wait for a handed-over path to reach the size Telegram declared. Completeness is decided by
+/// size, never by a pause: a size that stops short is a write stall and the wait goes on until
+/// [`LOCAL_HANDOVER_WAIT`] runs out. With no declared size, a size that stops changing is all the
+/// evidence there is; a file that never appears at all is given up on after
+/// [`LOCAL_HANDOVER_APPEAR`].
 async fn wait_for_hand_over(path: &Path, expected: Option<u64>) -> anyhow::Result<()> {
     let started = tokio::time::Instant::now();
     let mut previous: Option<u64> = None;
@@ -1435,11 +1149,9 @@ async fn wait_for_hand_over(path: &Path, expected: Option<u64>) -> anyhow::Resul
             .filter(std::fs::Metadata::is_file)
             .map(|meta| meta.len());
         match (size, expected) {
-            // A declared size is what Telegram says the file is: reaching it is
-            // complete, and a file at least that large is whole too.
+            // A declared size reached (or exceeded) means the copy is whole.
             (Some(size), Some(expected)) if size >= expected => return Ok(()),
-            // Nothing to compare against: a size that no longer changes is all the
-            // evidence there is.
+            // Nothing to compare against: a size that no longer changes is all the evidence.
             (Some(size), None) if previous == Some(size) => return Ok(()),
             _ => {}
         }
@@ -1450,8 +1162,7 @@ async fn wait_for_hand_over(path: &Path, expected: Option<u64>) -> anyhow::Resul
         };
         if started.elapsed() >= bound {
             return Err(match (size, expected) {
-                // A file that is there but short is a transfer that did not finish;
-                // one that never appeared is a hand-over that named nothing.
+                // There but short is an unfinished transfer; never there names nothing.
                 (Some(size), Some(expected)) => LocalHandOver::Incomplete {
                     got: size,
                     expected,
@@ -1465,17 +1176,13 @@ async fn wait_for_hand_over(path: &Path, expected: Option<u64>) -> anyhow::Resul
     }
 }
 
-/// The user-facing reason for a failed inbound download. A write that failed on
-/// this side is storage, not the transport; only what Telegram itself answered —
-/// an error status, or a body over the limit in force — is a refusal; a transfer
-/// that got no answer at all (a `reqwest` error in the chain, whether it timed out
-/// or the connection failed) is reported as the failure on this side that it is.
-///
-/// The local hand-over's own failures come after those, in its own words
-/// ([`LocalHandOver`]). Anything unrecognised is still the transport's refusal.
+/// The user-facing reason for a failed inbound download: a write that failed here is storage, only
+/// what Telegram answered — an error status, a body over the limit — is a refusal, and a transfer
+/// that got no answer at all is this side's failure. The local hand-over's own failures come after
+/// those ([`LocalHandOver`]); anything unrecognised is still the transport's.
 fn download_failure_reason(error: &anyhow::Error, limits: TransferLimits) -> String {
-    // The transport first: a `reqwest` error wraps the socket's own io error, so
-    // testing io first would report a broken connection as a local write failure.
+    // The transport first: a `reqwest` error wraps the socket's own io error, so testing io first
+    // would report a broken connection as a local write failure.
     if let Some(e) = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
@@ -1510,53 +1217,40 @@ enum ChatMenuState {
     InFlight,
 }
 
-/// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
     bot_token: String,
-    /// Shared HTTP client with connection reuse across all Telegram API calls.
+    /// Shared HTTP client, reusing connections across API calls.
     http_client: reqwest::Client,
 
-    /// Per-instance cancellation token — cancelling this stops only this
-    /// channel's listener, not the entire application.
+    /// Cancelling this stops only this channel's listener, not the whole application.
     cancel: std::sync::Arc<tokio_util::sync::CancellationToken>,
 
-    /// The Bot API base this listener calls — the cloud, or the product's own
-    /// local server's endpoint.
+    /// The Bot API base this listener calls: the cloud, or the local server's endpoint.
     api_base: String,
-    /// Whether that base is the local server's: its transfer limits, its
-    /// file-on-disk hand-over and its unbounded transfers differ from the cloud's.
-    /// A field of its own, not `api_base != CLOUD_API_BASE`, so a channel pointed
-    /// at an endpoint of its own in a check is still a cloud channel.
+    /// Whether that base is the local server's — its limits, hand-over and unbounded transfers
+    /// differ. Not `api_base != CLOUD_API_BASE`, so a channel pointed at an endpoint of its own in
+    /// a check is still a cloud channel.
     local: bool,
-    /// The intake's durable store, resolved the first time a listener runs (the
-    /// stores open after the channel is built).
+    /// The intake's durable store, resolved on the first listener run.
     intake_store: std::sync::OnceLock<TelegramIntakeStore>,
-    /// The claim this listener's rows are recorded under. Every listener mints its
-    /// own, so the listener that replaces this one is a different run and takes over
-    /// what this one left held instead of leaving it for the rest of the process's
-    /// life.
+    /// The claim this listener's rows are recorded under: minted per listener, so the one that
+    /// replaces this takes over what it left held.
     intake_claim: std::sync::Arc<str>,
-    /// Whether a listener frame of this channel is running, and the signal for when it
-    /// stops — what a replacement waits on ([`TelegramChannel::wait_stopped`]). Several
-    /// waiters can be parked on one stop: the teardown of a cleared token, and a hand-over
-    /// that lands while that teardown waits.
+    /// Whether a listener frame is running, and the signal for when it stops, which a replacement
+    /// waits on. Several waiters can be parked on one stop.
     listener_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     listener_stopped: std::sync::Arc<tokio::sync::Notify>,
 
-    /// The messages this listener is preparing right now — taken up and not yet
-    /// handed to the burst collector, which holds that sender's group for that
-    /// chat while a mark is on it (`telegram_group::Preparations`).
+    /// The messages this listener is preparing now, held until the burst collector takes them
+    /// (`telegram_group::Preparations`).
     preparations: std::sync::Arc<crate::channels::telegram_group::Preparations>,
 
-    /// Per-chat command menu state — change detection + in-flight coalescing
-    /// for the per-user `setMyCommands` refresh, so outbound message floods
-    /// (parallel agent responses) don't trip Telegram's rate limiting. Menu
-    /// refreshes are fire-and-forget and fail-open.
+    /// Per-chat command-menu state: change detection plus in-flight coalescing, so a message flood
+    /// does not trip Telegram's rate limiting. Fail-open.
     menu_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, ChatMenuState>>>,
 }
 
-/// Extract chat_id and reply_target from a Telegram message sub-object
-/// (e.g., `update["callback_query"]["message"]` or `update["message"]`).
+/// `(chat_id, reply_target)` from a message sub-object.
 fn extract_chat_context(message: &serde_json::Value) -> Option<(String, String)> {
     let chat_id = message.get("chat")?.get("id")?.as_i64()?.to_string();
     let thread_id = message
@@ -1570,18 +1264,13 @@ fn extract_chat_context(message: &serde_json::Value) -> Option<(String, String)>
     Some((chat_id, reply_target))
 }
 
-/// Inject `message_thread_id` into a JSON request body if present.
 fn set_thread_id_on_json(body: &mut serde_json::Value, thread_id: Option<&str>) {
     if let Some(tid) = thread_id {
         body["message_thread_id"] = serde_json::Value::String(tid.to_string());
     }
 }
 
-/// Parse a Telegram recipient string into `(chat_id, optional thread_id)`.
-///
-/// Supports two formats:
-/// - `"chat_id"` → `("chat_id", None)`
-/// - `"chat_id:thread_id"` → `("chat_id", Some("thread_id"))`
+/// Split a recipient into `(chat_id, thread_id)`: `"chat"` or `"chat:thread"`.
 fn parse_recipient(recipient: &str) -> (&str, Option<&str>) {
     match recipient.split_once(':') {
         Some((chat, thread)) => (chat, Some(thread)),
@@ -1589,35 +1278,21 @@ fn parse_recipient(recipient: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Authorize a Telegram event by the identity of the person it came from, and
-/// derive the reply context it arrived in.
+/// Authorize an event by the identity of the person it came from, and derive the reply context it
+/// arrived in.
 ///
-/// `sender_source` is the object Telegram presents the sender in — the message
-/// itself for a normal message (so `sender_chat` is read there), the
-/// `callback_query` for a button press, so a keyboard attached to a
-/// chat-attributed message still authorizes the person who pressed it.
-/// `chat_source` is the object carrying the `chat` the event arrived in; it
-/// only supplies the delivery address, never the identity.
-///
-/// Returns `Ok(None)` when the sender is not a person ([`telegram_sender_person`]),
-/// matches no binding, or the chat context is missing; otherwise a 3-tuple
-/// `(canonical_user, chat_id, reply_target)` where `canonical_user` is the
-/// account the binding resolved to, `chat_id` the raw chat ID (e.g. `"123456"`)
-/// and `reply_target` the reply target string (e.g. `"123456"`, or
-/// `"123456:789"` for threads). The contact is updated only on success, and only
-/// on the binding that actually matched.
-///
-/// The error is the read of the user bindings failing, which is not a decision:
-/// it is what keeps a caller from turning "cannot decide right now" into a
-/// refusal and dropping the event for good.
+/// `sender_source` is where Telegram presents the sender — the message, or the `callback_query` for
+/// a press, so a keyboard on a chat-attributed message still authorizes the presser; `chat_source`
+/// supplies only the delivery address. `Ok(None)` for a sender that is not a person or matches no
+/// binding, else `(canonical_user, chat_id, reply_target)` — `"123456"` or `"123456:789"` for
+/// threads. `Err` is the bindings read failing, which is no decision and must not become a refusal:
+/// that would drop the event for good.
 async fn resolve_authorized_sender(
     sender_source: &serde_json::Value,
     chat_source: &serde_json::Value,
 ) -> anyhow::Result<Option<(String, String, String)>> {
-    // Authorization keys on the identity of the person who sent the event — a
-    // number first, since it survives a rename or a dropped nickname, then the
-    // nickname. The conversation the event arrived in only supplies the
-    // delivery address.
+    // Authorization keys on the person: a number first, which survives a rename or a dropped
+    // nickname, then the nickname. The chat only supplies the address.
     let Some(sender) = telegram_sender_person(sender_source) else {
         return Ok(None);
     };
@@ -1636,10 +1311,8 @@ async fn resolve_authorized_sender(
     Ok(Some((matched.user_name, chat_id, reply_target)))
 }
 
-/// Parse a Markdown link `[label](url)` starting at byte offset `i`, which must
-/// point at the `[`. Returns the label, the URL, and the offset just past the
-/// closing `)`. `None` when there is no http(s) link here or the label names a
-/// media marker rather than prose (see [`is_marker_label`]).
+/// Parse a Markdown link `[label](url)` at `i`, returning the label, the URL and the offset past
+/// `)`; `None` for a non-http(s) link or a label naming a media marker.
 fn parse_markdown_link(text: &str, i: usize) -> Option<(&str, &str, usize)> {
     let after_open = text.get(i..)?.strip_prefix('[')?;
     let bracket_end = after_open.find(']')?;
@@ -1653,13 +1326,9 @@ fn parse_markdown_link(text: &str, i: usize) -> Option<(&str, &str, usize)> {
     Some((label, url, after_bracket + url.len() + 2))
 }
 
-/// True when a bracketed label names a media marker rather than prose: a known
-/// [`MediaMarkerKind`], in any casing (`[FILE:…]`, `[image:…]`).
-///
-/// A marker [`parse_attachment_markers`] leaves as written is prose explaining
-/// the syntax (`[IMAGE:path]`), and such a marker immediately followed by a
-/// parenthesised URL is delivery scaffolding: an anchor labelled with the
-/// marker's text would fabricate a link out of it.
+/// True when a bracketed label names a media marker rather than prose: a known [`MediaMarkerKind`]
+/// in any casing. Such a marker followed by a parenthesised URL is delivery scaffolding — an anchor
+/// would fabricate a link out of it.
 fn is_marker_label(label: &str) -> bool {
     let Some((kind, _)) = label.split_once(':') else {
         return false;
@@ -1667,38 +1336,20 @@ fn is_marker_label(label: &str) -> bool {
     MediaMarkerKind::iter().any(|marker| marker.token().eq_ignore_ascii_case(kind))
 }
 
-/// Prefix of the anchor `render_inline` emits for a markdown link, shared with
-/// the [`render_if_link`] probe so the two cannot drift.
+/// Prefix of the anchor `render_inline` emits, shared with [`render_if_link`].
 const ANCHOR_PREFIX: &str = "<a href=\"";
 
-/// Render `text` for Telegram HTML, or `None` when the rendering carries no
-/// link, probed via [`ANCHOR_PREFIX`]. The `Some` arm means an enclosing
-/// formatting span has to give way to the top-level anchor (see
-/// [`markdown_to_telegram_html`]); inline code renders no anchor, so a span that
-/// only wraps code keeps its formatting.
+/// The rendering of `text` when it carries a link, else `None`: the `Some` arm makes an enclosing
+/// span give way to the top-level anchor.
 fn render_if_link(text: &str) -> Option<String> {
     let rendered = render_inline(text);
     rendered.contains(ANCHOR_PREFIX).then_some(rendered)
 }
 
-/// If the text at position `i` starts with `delim`, finds the matching closing
-/// `delim`, renders the content, and wraps it in `<tag>...</tag>`.
-///
-/// With `linkify`, a span whose content renders a link yields to it: the span's
-/// formatting is dropped and its content is rendered by [`render_inline`]
-/// instead (see [`markdown_to_telegram_html`]).
-///
-/// On success, advances `i` past the closing delimiter and returns `true`.
-/// Returns `false` if `delim` is not found or when the content between
-/// delimiters is empty (the `end > 0` guard prevents zero-length formatting
-/// spans like `****` or `*` with no content between delimiters).
-///
-/// This is a helper to deduplicate the 5 structurally identical inline
-/// formatting branches (bold `**`/`__`, italic, code, strikethrough). Callers that
-/// need to guard against matching a single character when the previous
-/// character is the same (e.g. the second `*` of `**` for italic, or the
-/// second `` ` `` of ` `` ` for inline code) must apply that guard before
-/// calling this helper.
+/// If `text[i..]` starts with `delim`, find the closing one, render the content and wrap it in
+/// `<tag>`; advances `i` and returns `true`. `false` when `delim` is missing or the content is
+/// empty, so `****` is no span. With `linkify` a span whose content renders a link yields to it.
+/// Callers guard a single-character delimiter that repeats.
 fn try_format_inline(
     text: &str,
     i: &mut usize,
@@ -1725,36 +1376,31 @@ fn try_format_inline(
     false
 }
 
-/// Render one line of Markdown as Telegram HTML: bold (`**`, `__`), italic
-/// (`*`), inline code (`` ` ``), strikethrough (`~~`), and links (`[text](url)`).
+/// Render one line of Markdown as Telegram HTML.
 fn render_inline(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let bytes = text.as_bytes();
     let len = bytes.len();
     let mut i = 0;
     while i < len {
-        // Bold: **text**
         if try_format_inline(text, &mut i, &mut out, "**", "b", true) {
             continue;
         }
-        // Bold: __text__
         if try_format_inline(text, &mut i, &mut out, "__", "b", true) {
             continue;
         }
-        // Italic: *text* — guard against matching second `*` of `**`
+        // Italic: *text* — guard against matching the second `*` of `**`
         if (i == 0 || bytes[i - 1] != b'*')
             && try_format_inline(text, &mut i, &mut out, "*", "i", true)
         {
             continue;
         }
-        // Inline code: `code` — guard against matching second `` ` `` of ` `` `
-        // and never linkify: a URL inside code is code, not a link.
+        // Inline code: guard the second backtick of a fence; never linkify.
         if (i == 0 || bytes[i - 1] != b'`')
             && try_format_inline(text, &mut i, &mut out, "`", "code", false)
         {
             continue;
         }
-        // Markdown link: [text](url)
         if bytes[i] == b'['
             && let Some((label, url, next)) = parse_markdown_link(text, i)
         {
@@ -1767,11 +1413,9 @@ fn render_inline(text: &str) -> String {
             i = next;
             continue;
         }
-        // Strikethrough: ~~text~~
         if try_format_inline(text, &mut i, &mut out, "~~", "s", true) {
             continue;
         }
-        // Default: escape HTML entities
         let ch = text[i..].chars().next().unwrap();
         push_escaped(ch, &mut out);
         i += ch.len_utf8();
@@ -1779,20 +1423,10 @@ fn render_inline(text: &str) -> String {
     out
 }
 
-/// Convert a subset of Markdown to Telegram's HTML parse_mode format.
-/// Telegram HTML supports: &lt;b&gt;, &lt;i&gt;, &lt;u&gt;, &lt;s&gt;, &lt;code&gt;, &lt;pre&gt;, &lt;a href="..."&gt;
-///
-/// Supported: headers (`# …`, `## …`), bold (`**…**`, `__…__`), italic (`*…*`),
-/// inline code (`` `…` ``), links (`[…](url)`), strikethrough (`~~…~~`),
-/// fenced code blocks (` ``` … ``` `), and `<blockquote>` pass-through.
-///
-/// A formatting span (including a heading) whose content renders a link drops
-/// its formatting and emits the anchor at the top level instead of nesting it:
-/// the anchor is what carries clickability, not the span. Code content is never
-/// linkified.
-///
-/// Code block fences are detected first so inline formatting inside them is
-/// never interpreted (single-pass with code-block tracking).
+/// Convert the Markdown subset the model emits to Telegram's HTML parse_mode: headings, bold,
+/// italic, code, strikethrough, links and fenced blocks, plus `<blockquote>` pass-through. Fences
+/// are read first, so their content is never interpreted; a span whose content renders a link
+/// yields to the top-level anchor.
 fn markdown_to_telegram_html(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_code_block = false;
@@ -1801,7 +1435,6 @@ fn markdown_to_telegram_html(text: &str) -> String {
     for line in text.split('\n') {
         let trimmed = line.trim_start();
 
-        // ── Fenced code blocks ────────────────────────────────
         if trimmed.starts_with("```") {
             if in_code_block {
                 in_code_block = false;
@@ -1820,20 +1453,17 @@ fn markdown_to_telegram_html(text: &str) -> String {
             continue;
         }
 
-        // ── Blockquotes — pass through as-is ──────────────────
         if trimmed == "<blockquote>" || trimmed == "</blockquote>" {
             out.push_str(trimmed);
             out.push('\n');
             continue;
         }
 
-        // ── Headers: ## Title → <b>Title</b> ───────────────────
         let stripped = line.trim_start_matches('#');
         let header_level = line.len() - stripped.len();
         if header_level > 0 && stripped.starts_with(' ') {
             let title = stripped.trim();
-            // A heading is a formatting span too: it yields to a link in its
-            // content, which would otherwise be delivered as literal text.
+            // A heading yields to a link in its content like any other formatting span.
             match render_if_link(title) {
                 Some(rendered) => {
                     let _ = writeln!(out, "{rendered}");
@@ -1845,7 +1475,6 @@ fn markdown_to_telegram_html(text: &str) -> String {
             continue;
         }
 
-        // ── Inline formatting per line ────────────────────────
         out.push_str(&render_inline(line));
         out.push('\n');
     }
@@ -1862,11 +1491,8 @@ fn markdown_to_telegram_html(text: &str) -> String {
     out.trim_end_matches('\n').to_string()
 }
 
-/// Strip all HTML tags from a string, leaving only the text content.
-/// Used when falling back from HTML `parse_mode` to plain text so users
-/// don't see raw tags like `<b>`, `<code>`, `<pre>` etc.
-///
-/// Text from an unterminated `<` to the end is dropped.
+/// Strip all HTML tags, leaving the text: the plain-text fallback. Text from an unterminated `<` to
+/// the end is dropped.
 fn strip_html_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
@@ -1881,40 +1507,28 @@ fn strip_html_tags(s: &str) -> String {
     out
 }
 
-/// Shared conversion for outbound text: decode HTML entities (e.g. &#39;
-/// that LLMs may emit) before markdown→HTML conversion so they don't get
-/// double-escaped.
+/// Decode HTML entities (`&#39;`) before markdown→HTML, so they are not escaped twice.
 fn to_telegram_html(text: &str) -> String {
     markdown_to_telegram_html(&decode_html_entities(text))
 }
 
-/// Prefix of the `[Forwarded from …]` attribution a forwarded message's content
-/// opens with. The fact behind it, which the burst collector's longer window
-/// rests on, is a message's `forwarded` flag — never this text.
+/// Prefix of the `[Forwarded from …]` attribution. The fact behind it is the message's `forwarded`
+/// flag — never this text.
 const FORWARD_ATTRIBUTION_PREFIX: &str = "[Forwarded from ";
 
-/// What `TelegramChannel::forward` makes of a message's forward fields: whether it
-/// is forwarded content at all, and the attribution to render for it.
+/// What `TelegramChannel::forward` makes of a message's forward fields.
 struct Forward {
-    /// Whether any forward field of the message is set. The flag is the fact and
-    /// the prefix only its rendering: an origin the product has no name for is
-    /// still forwarded.
+    /// Whether any forward field is set: an origin the product cannot name is still forwarded.
     forwarded: bool,
-    /// The whole `[Forwarded from …] ` prefix, when one can be rendered.
     prefix: Option<String>,
 }
 
-/// The label one value of a legacy forward field renders as.
 type ForwardLabel = fn(&serde_json::Value) -> Option<String>;
 
-/// The older fields Telegram attributes a forwarded message in, in the order the
-/// attribution reads them: each field, and the label a value of it renders as.
-/// The flag and the label both come from this one list, because a field can be
-/// present without the product being able to name what it points at — such a
-/// message is still forwarded.
+/// The older forward fields, in the order the attribution reads them. The flag and the label both
+/// come from this list: a field can be present without a nameable target.
 const LEGACY_FORWARD_FIELDS: [(&str, ForwardLabel); 3] = [
-    // A channel or a group: its title, with the historical "channel: " shape
-    // (these fields carried no reliable kind).
+    // A channel or a group: its title, with the historical "channel: " shape.
     ("forward_from_chat", |chat| {
         Some(format!(
             "channel: {}",
@@ -1936,11 +1550,8 @@ impl TelegramChannel {
     ///
     /// # Panics
     ///
-    /// Panics if `reqwest::Client::build()` fails — with reqwest 0.13's
-    /// `rustls-no-provider` TLS stack this happens when no rustls crypto
-    /// provider is installed. `util::http::install_ring_provider` installs
-    /// the ring provider before the client is built (the TLS stack is
-    /// rustls/ring — OpenSSL is not involved).
+    /// When `reqwest::Client::build()` fails — with no rustls provider installed;
+    /// `util::http::install_ring_provider` installs ring (TLS is rustls/ring).
     #[must_use]
     fn new_with(bot_token: String, api_base: String, local: bool) -> Self {
         Self {
@@ -1967,10 +1578,9 @@ impl TelegramChannel {
             .clone()
     }
 
-    /// A channel pointed at an endpoint of its own and recording into `store`
-    /// instead of the process's database — how the intake's checks drive a listener
-    /// without the running service. The claim is the channel's own, exactly as it is
-    /// for a listener the product builds.
+    /// A channel pointed at an endpoint of its own and recording into `store` instead of the
+    /// process's database, so the intake's checks drive a listener without the running service. Its
+    /// claim is minted as for a product listener.
     #[cfg(test)]
     #[must_use]
     fn for_test(bot_token: String, api_base: String, store: TelegramIntakeStore) -> Self {
@@ -1980,9 +1590,8 @@ impl TelegramChannel {
         }
     }
 
-    /// The channel the configured mode serves, or `None` when that mode is the
-    /// local server and it has no endpoint yet — in which case no listener may
-    /// run at all.
+    /// The channel the configured mode serves, or `None` while the local mode has no endpoint —
+    /// then no listener may run at all.
     #[must_use]
     fn from_config(bot_token: String) -> Option<Self> {
         let local = crate::channels::telegram_local::serving_mode()
@@ -1990,8 +1599,7 @@ impl TelegramChannel {
         Some(Self::new_with(bot_token, active_base()?, local))
     }
 
-    /// The client one transfer runs on: the shared one in the cloud mode, and one
-    /// whose total bound is not sized for a small file in the local mode.
+    /// The client one transfer runs on: the shared one, or the local mode's.
     fn transfer_client(&self) -> &reqwest::Client {
         if self.local {
             local_transfer_client()
@@ -2000,9 +1608,8 @@ impl TelegramChannel {
         }
     }
 
-    /// `request` under the bound the transport imposes on one transfer: the cloud's
-    /// own, or none at all in the local mode — where the client's day-long bound is
-    /// what ends a hung socket.
+    /// `request` under the transport's own bound: the cloud's, or none in local mode, where the
+    /// client's day-long bound ends a hung socket.
     fn with_transfer_bound(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self.limits().request {
             Some(timeout) => request.timeout(timeout),
@@ -2010,7 +1617,6 @@ impl TelegramChannel {
         }
     }
 
-    /// The transfer limits of the server this channel talks to.
     fn limits(&self) -> TransferLimits {
         if self.local {
             TransferLimits::LOCAL
@@ -2019,27 +1625,18 @@ impl TelegramChannel {
         }
     }
 
-    /// Whether a listener frame of this channel is running right now.
     fn running(&self) -> bool {
         self.listener_running
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Wait, briefly, for the listener frame of this channel to end — the state a
-    /// replacement asks for before it takes over what the frame left behind
-    /// ([`stop_listeners`]), because a frame whose collector has drained means
-    /// everything it held is settled or left held in the record. The one thing no
-    /// frame covers is the process itself ending, a crash ([`ListenerFrame`]).
-    ///
-    /// Bounded, so a frame that will not end cannot hold a replacement up for good.
-    /// Past the bound the replacement goes ahead and may take over events the
-    /// still-open frame is about to hand on, which risks the same event reaching the
-    /// pipeline twice — the side to err on, and the reason the bound is generous.
+    /// Wait, briefly, for this channel's listener frame to end — what a replacement asks before it
+    /// takes over what the frame left behind ([`stop_listeners`]). Bounded, so a frame that will
+    /// not end cannot hold it up for good: past the bound the replacement may take over events the
+    /// open frame is about to hand on, and see them twice.
     async fn wait_stopped(&self) {
-        // Enrolled before the check below rather than left to the first poll:
-        // `Notify::notify_waiters` wakes only waiters that are already registered, so a
-        // stop landing in between would be missed and the wait would sit out the whole
-        // bound.
+        // Enrolled before the check: `notify_waiters` wakes only registered waiters, so a stop
+        // landing in between would be missed and the wait would sit out the whole bound.
         let mut stopped = std::pin::pin!(self.listener_stopped.notified());
         stopped.as_mut().enable();
         if !self.running() {
@@ -2053,9 +1650,8 @@ impl TelegramChannel {
         }
     }
 
-    /// Wait out a pause in the intake's work, ending it early when this listener is
-    /// being stopped: a failing store or a contended one must not hold a token change or
-    /// a wind-down up for the whole pause.
+    /// Wait out a pause in the intake's work, ending it early when this listener is being stopped,
+    /// so a failing or contended store cannot hold a token change up for it.
     async fn intake_pause(&self, duration: Duration) {
         tokio::select! {
             () = self.cancel.cancelled() => {}
@@ -2063,9 +1659,8 @@ impl TelegramChannel {
         }
     }
 
-    /// Answer a callback query to dismiss the loading spinner.
-    /// When `text` is provided, shows a toast notification to the user.
-    /// Errors are logged so users don't get stuck on an infinite spinner.
+    /// Dismiss the loading spinner, with a toast when `text` is given. Errors are logged, so a user
+    /// is never stuck on an infinite spinner.
     pub async fn answer_callback_query(&self, callback_query_id: &str, text: Option<&str>) {
         let mut body = serde_json::json!({
             "callback_query_id": callback_query_id,
@@ -2086,8 +1681,7 @@ impl TelegramChannel {
         }
     }
 
-    /// Parse a `callback_query` update into a `ChannelMessage`.
-    /// The callback data becomes the message content.
+    /// Parse a `callback_query` into a `ChannelMessage`; its data is the content.
     async fn parse_callback_query(
         &self,
         cq: &serde_json::Value,
@@ -2103,8 +1697,8 @@ impl TelegramChannel {
             .and_then(serde_json::Value::as_str)
             .map(String::from);
 
-        // Auth is clicker-based (cq.from), never msg author; chat_id/message_id
-        // identify the pressed keyboard's message so handlers can edit it in place.
+        // Auth is clicker-based (cq.from), never msg author; chat_id/message_id identify the
+        // pressed keyboard's message so handlers can edit it in place.
         let Some((user_name, chat_id, reply_target)) = resolve_authorized_sender(cq, msg).await?
         else {
             tracing::debug!(
@@ -2142,11 +1736,9 @@ impl TelegramChannel {
         Some((chat_id, message_id))
     }
 
-    /// Extract sender info, user allow check, chat/message/thread IDs, and
-    /// reply target. `Ok(None)` if the sender is not allowed; the error is the
-    /// binding read failing, which is not a decision and must not be turned into
-    /// a refusal by the caller — it is logged there, where the event it belongs to
-    /// is known.
+    /// Sender info, the allow check, chat/message/thread ids and the reply target. `Ok(None)` when
+    /// the sender is not allowed; `Err` is the binding read failing, which is no decision and must
+    /// not become a refusal by the caller.
     async fn extract_message_context(
         &self,
         message: &serde_json::Value,
@@ -2217,17 +1809,13 @@ impl TelegramChannel {
         bot_api_url(&self.api_base, &self.bot_token, method)
     }
 
-    /// Signal this specific channel's listener to stop, without affecting
-    /// the global shutdown token or other channels.
+    /// Signal this channel's listener to stop, leaving the global token and others alone.
     fn cancel_own(&self) {
         self.cancel.cancel();
     }
 
-    /// Register the bot's global (unscoped) commands via Telegram's
-    /// `setMyCommands` API. `/clear` is global — per-user commands are
-    /// registered per chat via [`Self::spawn_menu_refresh`].
-    ///
-    /// Failure is logged as a warning and does not block the caller.
+    /// Register the bot's global commands via `setMyCommands`; per-user commands go per chat
+    /// ([`Self::spawn_menu_refresh`]). Failure only warns and never blocks the caller.
     pub async fn set_my_commands(&self) {
         let body = serde_json::json!({
             "commands": [
@@ -2237,19 +1825,12 @@ impl TelegramChannel {
         post_set_my_commands(self.http_client(), &self.api_url("setMyCommands"), &body).await;
     }
 
-    /// Spawn a per-user command menu refresh for a chat, triggered after
-    /// every outbound message. Fire-and-forget and fail-open: any failure
-    /// (DB lookup, API error) is logged and never affects message delivery.
-    ///
-    /// Everything except a cheap in-flight check runs in the spawned task:
-    /// the reverse-lookup of the chat's bound user (first match wins for
-    /// group chats), the command payload computed from their current
-    /// admin state, and the scoped `setMyCommands` registration when
-    /// it differs from the last successful one (change detection) with
-    /// in-flight coalescing.
+    /// Spawn a per-user command-menu refresh for a chat, after every outbound message.
+    /// Fire-and-forget and fail-open. Everything but a cheap in-flight check runs in the task: the
+    /// chat's bound user (first match wins in a group), their command payload, and the scoped
+    /// registration when it differs from the last successful one.
     fn spawn_menu_refresh(&self, chat_id: &str) {
-        // Cheap inline coalescing: skip spawning when a refresh for this
-        // chat is already in flight.
+        // Cheap inline coalescing: skip spawning when a refresh for this chat is in flight.
         {
             let cache = self.menu_cache.lock().unwrap_poison();
             if matches!(cache.get(chat_id), Some(ChatMenuState::InFlight)) {
@@ -2321,16 +1902,10 @@ impl TelegramChannel {
         });
     }
 
-    /// Validate a Telegram bot token by asking the Bot API the current mode serves
-    /// for it. Returns `Ok(())` if that base accepts the token, `Err` with the cause
-    /// otherwise.
-    ///
-    /// There is no fallback to the cloud: once the bot has left it, a token-bearing
-    /// cloud request logs the bot back in there and splits its updates. In local
-    /// mode with no published endpoint there is nothing to ask, so nothing is
-    /// checked — the token is saved and the switch reports what the server says when
-    /// it can. A save must stay possible in that state: the token field may be what
-    /// fixes the bot.
+    /// Validate a bot token by asking the Bot API the current mode serves for it. There is no
+    /// fallback to the cloud: a token-bearing cloud request logs the bot back in there and splits
+    /// its updates. With no published endpoint nothing is checked — a save must stay possible, the
+    /// token field may be what fixes the bot.
     pub async fn validate_token(token: &str) -> anyhow::Result<()> {
         if token.trim().is_empty() {
             anyhow::bail!("Telegram bot token is empty");
@@ -2345,8 +1920,7 @@ impl TelegramChannel {
         get_me(&client, &base, token).await.map(|_| ())
     }
 
-    /// The bot's own account id at `api_base` — the same call as validation,
-    /// asked for what it says rather than whether it worked.
+    /// The bot's own account id at `api_base` — the same call as validation, read for its answer.
     pub(crate) async fn probe_bot(api_base: &str, token: &str) -> anyhow::Result<i64> {
         let client = crate::util::http::build_http_client(std::time::Duration::from_secs(10));
         let data = get_me(&client, api_base, token).await?;
@@ -2355,12 +1929,9 @@ impl TelegramChannel {
             .ok_or_else(|| anyhow::anyhow!("the Bot API named no bot account"))
     }
 
-    /// Take the bot out of a Bot API server (`logOut`), the step that lets it be
-    /// served by another one.
-    ///
-    /// A server that already considers the bot logged out (`401`, `Logged out`)
-    /// is the state this asks for, not a failure: the switch is resumable and
-    /// must not be stuck on a step that has nothing left to do.
+    /// Take the bot out of a Bot API server (`logOut`), which lets another serve it. A server that
+    /// already considers it logged out is the state asked for, not a failure: the switch is
+    /// resumable.
     pub(crate) async fn log_out(api_base: &str, token: &str) -> anyhow::Result<()> {
         let client = crate::util::http::build_http_client(std::time::Duration::from_secs(30));
         let response = client
@@ -2373,10 +1944,8 @@ impl TelegramChannel {
             return Ok(());
         }
         let description = data["description"].as_str().unwrap_or("no reason given");
-        // Only "already out" is the state this asks for. A bare `401 Unauthorized`
-        // is a token the server does not know, which must not be mistaken for a
-        // completed logOut — the switch would then record having left a server the
-        // bot is still logged into.
+        // Only "already out" counts: a bare `401` is a token the server does not know, and taking
+        // it for a completed logOut would record leaving a server the bot is still logged into.
         if description.to_ascii_lowercase().contains("logged out") {
             return Ok(());
         }
@@ -2395,13 +1964,11 @@ impl TelegramChannel {
         tracing::debug!("Telegram: message not parseable (unsupported type), skipping: {text}");
     }
 
-    /// Get the file path for a Telegram file ID via the Bot API, with the size the
-    /// server reports for it when it reports one.
+    /// The file path for a file ID, with the size the server reports when it does.
     async fn get_file_path(&self, file_id: &str) -> anyhow::Result<(String, Option<u64>)> {
         let url = self.api_url("getFile");
-        // A local server answers only once it has the file, so this request carries
-        // the mode's own bound: a 1-minute client would cut a large fetch off before
-        // the transfer itself was ever asked for.
+        // A local server answers only once it has the file, so the request carries the mode's own
+        // bound: one minute would cut a large fetch off before the transfer was asked for.
         let request = self.with_transfer_bound(
             self.transfer_client()
                 .get(&url)
@@ -2421,29 +1988,17 @@ impl TelegramChannel {
             .and_then(serde_json::Value::as_str)
             .map(String::from)
             .context("Telegram getFile: missing file_path in response")?;
-        // The size is the one fact that makes a hand-over with no declared size
-        // checkable: the message sometimes carries none, the server always does.
+        // The size is what makes a hand-over with no declared size checkable.
         let size = result.get("file_size").and_then(serde_json::Value::as_u64);
         Ok((path, size))
     }
 
-    /// Fetch one file into `dest`, streaming it there.
-    ///
-    /// A local server hands over an absolute path in `file_path` instead of
-    /// serving the bytes over HTTP: the file is already on this machine, so it is
-    /// copied across and left in place. The hand-over is confined to the directory
-    /// the product handed the server *before* anything else is done with it, so a
-    /// malformed or misbehaving answer can neither copy nor delete anything else —
-    /// and a file outside that tree is refused as such at once, rather than being
-    /// waited for and then called truncated. Both paths stream — a multi-gigabyte
-    /// file is never held in memory.
-    ///
-    /// `expected` is the size Telegram declared — the message's own, or the
-    /// server's answer when the message carried none. The local hand-over checks
-    /// against it twice — while it waits for the file to be complete, and again on
-    /// what the copy actually stored — so a server write that stops short is
-    /// refused instead of being taken as the whole file; the cloud transfer has
-    /// the response's own length for that.
+    /// Fetch one file into `dest`, streaming on both paths so a multi-gigabyte file is never held
+    /// in memory. A local server hands over an absolute path instead of serving bytes: the copy is
+    /// confined to the directory the product gave it BEFORE anything else is done, so a bad answer
+    /// can copy and delete nothing else and a file outside that tree is refused at once rather than
+    /// waited for and called truncated. `expected` is the size Telegram declared, checked twice on
+    /// the local path — while waiting and on what was stored.
     async fn download_file(
         &self,
         file_path: &str,
@@ -2451,9 +2006,8 @@ impl TelegramChannel {
         expected: Option<u64>,
     ) -> anyhow::Result<()> {
         if self.local {
-            // A local server has no `/file/…` route at all: it hands over a path
-            // on this machine, and nothing else. Anything else here is a server
-            // failure and must be reported as that, not as a size refusal.
+            // A local server has no `/file/…` route: it hands over a path. Anything else is a
+            // server failure, reported as that and not as a size refusal.
             let Some(root) = crate::channels::telegram_local::incoming_files_dir() else {
                 return Err(LocalHandOver::Missing.into());
             };
@@ -2461,12 +2015,9 @@ impl TelegramChannel {
             if !source.is_absolute() {
                 return Err(LocalHandOver::Missing.into());
             }
-            // Containment first, on the path as it was named: a file outside the
-            // server's own tree is refused as such at once, instead of being waited
-            // for and then called truncated. Both the configured root and its
-            // canonical form count, because the server's directory may sit under a
-            // symlinked path (macOS `/var`) — and the path may not exist yet, which
-            // is why the check is lexical here.
+            // Containment first, on the path as named, before any wait: both the configured root
+            // and its canonical form count (the directory may sit under a symlinked path), and the
+            // check is lexical because the path may not exist yet.
             let mut roots = vec![root.clone()];
             if let Ok(canonical) = tokio::fs::canonicalize(&root).await {
                 roots.push(canonical);
@@ -2475,8 +2026,7 @@ impl TelegramChannel {
                 return Err(LocalHandOver::Outside.into());
             }
             wait_for_hand_over(source, expected).await?;
-            // And again on the file that actually appeared: a link inside the tree
-            // could still point anywhere.
+            // And again on the file that actually appeared: a link inside the tree points anywhere.
             let source = tokio::fs::canonicalize(source)
                 .await
                 .map_err(|_| anyhow::Error::from(LocalHandOver::Missing))?;
@@ -2484,9 +2034,8 @@ impl TelegramChannel {
                 return Err(LocalHandOver::Outside.into());
             }
             let copied = tokio::fs::copy(&source, dest).await?;
-            // What was stored is what has to be whole: a copy that stopped short
-            // would leave the agent a truncated file and nothing that could ever
-            // complete it.
+            // What was stored must be whole: a short copy would leave the agent a truncated file
+            // and nothing that could ever complete it.
             if let Some(expected) = expected
                 && copied < expected
             {
@@ -2497,10 +2046,9 @@ impl TelegramChannel {
                 }
                 .into());
             }
-            // The server's copy is left where it is: its own record still names it
-            // as downloaded, so dropping it would make a second `getFile` for the
-            // same file wait for a file that will never appear. The age sweep is
-            // what bounds the disk it uses.
+            // The server's copy stays: its record still names it as downloaded, so dropping it
+            // would make a second `getFile` wait for a file that never appears. The age sweep
+            // bounds the disk.
             return Ok(());
         }
 
@@ -2515,28 +2063,17 @@ impl TelegramChannel {
             anyhow::bail!("Telegram file download failed: {}", resp.status());
         }
 
-        // The cloud reports no size for a large file, so the bound is enforced on the
-        // stream as well as on the declared length.
+        // The cloud reports no size for a large file, so the bound is enforced on the stream too.
         stream_capped(resp, dest, self.limits().download, |_, max| {
             anyhow::anyhow!("{}", telegram_download_limit_reason(max))
         })
         .await
     }
 
-    /// Extract attachment metadata from an incoming Telegram message.
-    ///
-    /// Handles `document`, `photo` (array — takes last element for highest
-    /// resolution), `video`, `video_note`, `animation`, `audio`, and `voice`.
-    /// `audio` maps to [`IncomingAttachmentKind::Audio`] and `voice` to
-    /// [`IncomingAttachmentKind::Voice`]; the two differ in what the receive
-    /// path can do with them off macOS.  Returns `None` for text‑only
-    /// and other unsupported message types.
-    ///
-    /// `document` is checked first because Telegram sets both `animation` and
-    /// `document` on animation messages (so those classify as Document).
-    /// `video_note` is a round video with no `file_name`/`mime_type`;
-    /// `animation` is GIF-like (usually webm/mp4).  `photo` is mutually
-    /// exclusive with the other media keys, so it is checked last.
+    /// The attachment metadata of a message: `document`, `photo` (the last array element, the
+    /// highest resolution), `video`, `video_note`, `animation`, `audio` or `voice`; `None` for
+    /// text-only and other kinds. `document` is checked first because an animation sets both keys,
+    /// `photo` is exclusive with the rest, so it is checked last.
     fn parse_attachment_metadata(message: &serde_json::Value) -> Option<IncomingAttachment> {
         for (key, kind) in [
             ("document", IncomingAttachmentKind::Document),
@@ -2550,7 +2087,6 @@ impl TelegramChannel {
                 return Self::build_attachment(v, message, kind);
             }
         }
-        // Photo (array of PhotoSize — take last = highest resolution)
         if let Some(photos) = message.get("photo").and_then(serde_json::Value::as_array) {
             let best = photos.last()?;
             return Self::build_attachment(best, message, IncomingAttachmentKind::Photo);
@@ -2558,11 +2094,8 @@ impl TelegramChannel {
         None
     }
 
-    /// Build an [`IncomingAttachment`] from a pre‑resolved JSON sub‑object.
-    ///
-    /// * `sub_obj` — the value *inside* the attachment key (e.g. the document
-    ///   object, the last photo array element, or the voice object).
-    /// * `message` — the parent Telegram message object (provides `caption`).
+    /// Build an [`IncomingAttachment`] from a pre-resolved sub-object of `message`, which supplies
+    /// the caption.
     fn build_attachment(
         sub_obj: &serde_json::Value,
         message: &serde_json::Value,
@@ -2574,8 +2107,7 @@ impl TelegramChannel {
             .and_then(serde_json::Value::as_str)
             .map(String::from);
         let file_size = sub_obj.get("file_size").and_then(serde_json::Value::as_u64);
-        // The caption is the text the user typed for an attachment, so this is
-        // where the urgent mark is read and consumed.
+        // The caption is the text the user typed, so the urgent mark is read and consumed here.
         let (caption, urgent) = match message.get("caption").and_then(serde_json::Value::as_str) {
             Some(caption) => {
                 let (caption, urgent) = crate::channels::take_urgent(caption);
@@ -2598,27 +2130,16 @@ impl TelegramChannel {
         })
     }
 
-    /// Attempt to parse a Telegram update as a document/photo attachment.
+    /// Parse an update as an attachment message: download it into this message's own staging
+    /// directory (recorded in the returned message's `attachment_dirs`) and return it. `Ok(None)`
+    /// when it is no attachment or the sender is unauthorized — `Err` is the binding read failing,
+    /// which the caller keeps the event held for. An attachment the bot cannot retrieve still
+    /// yields a message, so the caption reaches the agent with the failure in it.
     ///
-    /// Downloads the file into this message's own staging directory in the
-    /// Telegram temp root and returns a `ChannelMessage` recording it (see
-    /// [`ChannelMessage::attachment_dirs`]). `Ok(None)` only when the message is
-    /// not an attachment or the sender is unauthorized — the error is the binding
-    /// read failing, which the caller keeps the event held for. An attachment the
-    /// bot cannot retrieve or store still yields a message, so the caption reaches
-    /// the agent with the failure called out in the content.
-    ///
-    /// Off macOS a recorded voice message is refused (see
-    /// `reject_voice_message`) before any fetch — nothing there can transcribe
-    /// it, and the note names no file. An `audio` sound file is not refused: it
-    /// takes the ordinary path below, so the agent gets the file itself.
-    ///
-    /// The whole preparation — the fetch included — is marked in
-    /// [`TelegramChannel::preparations`], so the collector holds that sender's
-    /// group for that chat until the part it produces has been handed over. The
-    /// `[Forwarded from …]` attribution (and the `forwarded` flag) is applied by
-    /// [`MessageContext::into_channel_message`], so it survives every refusal
-    /// path below as well as the success one.
+    /// Off macOS a recorded voice message is refused before any fetch, nothing there being able to
+    /// transcribe it; an `audio` sound file takes the ordinary path. The whole preparation, fetch
+    /// included, is marked in [`TelegramChannel::preparations`], so the collector holds that
+    /// sender's group in that chat until the part is handed over.
     async fn try_parse_attachment_message(
         &self,
         update: &serde_json::Value,
@@ -2627,8 +2148,7 @@ impl TelegramChannel {
             return Ok(None);
         };
 
-        // Authorization comes first: an unauthorized sender is ignored
-        // entirely and silently, before any attachment work happens.
+        // Authorization first: an unauthorized sender is ignored silently, before any work.
         let Some(ctx) = self.extract_message_context(message).await? else {
             return Ok(None);
         };
@@ -2637,14 +2157,12 @@ impl TelegramChannel {
             return Ok(None);
         };
 
-        // Held for the whole preparation below — the fetch included — so the group
-        // this sender has open in this chat waits for the part this call produces
-        // (see `Preparations`).
+        // Held for the whole preparation, the fetch included, so the group this sender has open in
+        // this chat waits for the part this call produces.
         let _preparing = self.preparations.begin(&ctx.user_name, &ctx.reply_target);
 
-        // No local audio here: a recorded voice message cannot be transcribed,
-        // so refuse it before anything is fetched. A sound file (`audio`) is
-        // not affected — it takes the ordinary attachment path below.
+        // No local audio here: a recorded voice message cannot be transcribed, so refuse it before
+        // anything is fetched. A sound file takes the path below.
         #[cfg(not(target_os = "macos"))]
         if attachment.kind == IncomingAttachmentKind::Voice {
             return Ok(Some(
@@ -2653,9 +2171,8 @@ impl TelegramChannel {
             ));
         }
 
-        // Declared-size gate. Telegram reports the size on most attachments, so
-        // a file the mode in force cannot carry is refused before a transfer is
-        // spent on it; the wording names the limit that applies on this server.
+        // Declared-size gate: a file the mode in force cannot carry is refused before a transfer is
+        // spent on it, in the words of the limit that applies here.
         if let Some(size) = attachment.file_size
             && let Some(reason) = declared_size_refusal(self.limits(), size)
         {
@@ -2666,13 +2183,9 @@ impl TelegramChannel {
             ));
         }
 
-        // Download file from Telegram. The transport does not always report a
-        // size on the message, and the server's own answer reports one — that is
-        // what the hand-over is checked against when the message carried none. A
-        // transfer failure is the other way a limit shows up — surface it instead
-        // of dropping the update. A failure on this side (a timeout, or a
-        // connection that broke) is reported as that, not as a refusal by the
-        // transport.
+        // The message does not always carry a size; the server's answer does, and that is what the
+        // local hand-over is checked against. A transfer failure is the other way a limit shows up
+        // — surface it instead of dropping the update.
         let (tg_file_path, server_size) = match self.get_file_path(&attachment.file_id).await {
             Ok(answer) => answer,
             Err(e) => {
@@ -2694,8 +2207,8 @@ impl TelegramChannel {
             .extension()
             .and_then(|e| e.to_str());
 
-        // The directory is created up front because the transfer streams straight
-        // into it; a refused or cut-off transfer takes the directory with it.
+        // Created up front because the transfer streams into it; a refused transfer takes it with
+        // it.
         let staging_dir = crate::util::telegram_staging_dir_name(&ctx.chat_id, ctx.message_id);
         let save_dir = crate::util::telegram_files_root().join(&staging_dir);
         if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
@@ -2749,12 +2262,9 @@ impl TelegramChannel {
         Ok(Some(msg))
     }
 
-    /// Tell the user an attachment could not be taken and return the
-    /// caption-preserving channel message, so an oversized or refused file still
-    /// produces a user-visible reply and an agent turn. `outcome` is
-    /// [`NOT_RECEIVED`] or [`NOT_STORED`] — it decides whether the note may say
-    /// the file never arrived. The name in the note is
-    /// [`local_attachment_name`]'s.
+    /// Tell the user an attachment could not be taken and return the caption-preserving message, so
+    /// the file still produces a reply and an agent turn. `outcome` is [`NOT_RECEIVED`] or
+    /// [`NOT_STORED`] and decides whether the note says it arrived.
     async fn reject_attachment(
         &self,
         ctx: MessageContext,
@@ -2777,9 +2287,7 @@ impl TelegramChannel {
         msg
     }
 
-    /// Send the user-visible refusal `notice` — best-effort, a send failure is
-    /// only logged — and return the channel message carrying the agent-facing
-    /// `content`.
+    /// Send the user-visible refusal (best-effort) and return the message carrying `content`.
     async fn refuse_with_notice(
         &self,
         ctx: MessageContext,
@@ -2796,12 +2304,8 @@ impl TelegramChannel {
         ctx.into_channel_message(content, None)
     }
 
-    /// Refuse a recorded voice message where the local audio subsystem does
-    /// not exist, before the file is fetched. Same shape as
-    /// [`Self::reject_attachment`], except that the note names no file: the
-    /// message carries no file name, and the fallback name
-    /// [`local_attachment_name`] builds has the wrong extension, so naming it
-    /// would mislead.
+    /// Refuse a recorded voice message before the fetch, where no local audio exists. The note
+    /// names no file: the message has no name and the generated one has the wrong extension.
     #[cfg(not(target_os = "macos"))]
     async fn reject_voice_message(
         &self,
@@ -2817,15 +2321,9 @@ impl TelegramChannel {
         msg
     }
 
-    /// What Telegram says about a message being forwarded content.
-    ///
-    /// The modern `forward_origin` is read first and the older fields (see
-    /// [`LEGACY_FORWARD_FIELDS`]) only where it names nothing — an update carrying
-    /// both must still yield ONE attribution, and an origin of a kind this product
-    /// has no label for falls back to the older fields rather than dropping the
-    /// attribution. The message kinds the product does not handle at all (a
-    /// sticker, a poll, a location) produce no message, so nothing here has to
-    /// attribute them.
+    /// What Telegram says about a message being forwarded content: the modern `forward_origin`
+    /// first, the older fields only where it names nothing, so an update carrying both yields ONE
+    /// attribution. A kind this product cannot label falls back rather than dropping it.
     fn forward(message: &serde_json::Value) -> Forward {
         let mut forwarded = false;
         let mut label = None;
@@ -2848,9 +2346,8 @@ impl TelegramChannel {
         }
     }
 
-    /// The label the modern `forward_origin` names, if it names one this product
-    /// knows: an origin of a kind it does not know yields none, so the older fields
-    /// still get their chance to attribute the message.
+    /// The label a `forward_origin` names, when this product knows the kind — `None` lets the older
+    /// fields attribute the message instead.
     fn forward_origin_label(origin: &serde_json::Value) -> Option<String> {
         origin
             .get("type")
@@ -2863,8 +2360,8 @@ impl TelegramChannel {
                     .get("sender_user_name")
                     .and_then(serde_json::Value::as_str)
                     .map(String::from),
-                // MessageOriginChat / MessageOriginChannel: the chat's title, named
-                // as a channel when the origin says it is one.
+                // MessageOriginChat / Channel: the title, named as a channel when the origin says
+                // so.
                 "chat" | "channel" => origin
                     .get("sender_chat")
                     .and_then(|chat| chat.get("title").and_then(serde_json::Value::as_str))
@@ -2890,25 +2387,22 @@ impl TelegramChannel {
             return Ok(None);
         };
 
-        // Strip @BotUsername suffix from commands (e.g. `/new@MyBot` → `/new`)
-        // Telegram appends the bot username to commands in group chats.
+        // Strip the `@BotUsername` suffix Telegram appends in group chats (`/new@MyBot`).
         let text = if text.starts_with('/') {
             text.split('@').next().unwrap_or(text)
         } else {
             text
         };
 
-        // Read on the text the user typed, before the forward attribution is
-        // composed onto the content (see `MessageContext::into_channel_message`).
+        // Read on the typed text, before the forward attribution is composed onto content.
         let (text, urgent) = crate::channels::take_urgent(text);
         let mut msg = ctx.into_channel_message(text.into_owned(), None);
         msg.urgent = urgent;
         Ok(Some(msg))
     }
 
-    /// POST a JSON body to a Telegram API method; returns the response on 2xx
-    /// or `(status, body)` on failure. Network/transport errors map to
-    /// BAD_GATEWAY (no HTTP response exists).
+    /// POST a JSON body to an API method: the response on 2xx, `(status, body)` otherwise.
+    /// Transport errors map to BAD_GATEWAY, no HTTP response existing.
     async fn post_telegram_json(
         &self,
         method: &str,
@@ -2921,9 +2415,7 @@ impl TelegramChannel {
             .json(&body)
             .send()
             .await
-            // Network/transport errors (connection refused, DNS failure, timeout) produce
-            // no HTTP response, so we use BAD_GATEWAY as a sentinel — it signals an upstream
-            // communication failure, not an actual HTTP-level error from the Telegram API.
+            // No HTTP response exists for a transport error, so BAD_GATEWAY is the sentinel.
             .map_err(|e| (reqwest::StatusCode::BAD_GATEWAY, e.to_string()))?;
 
         let status = resp.status();
@@ -2935,12 +2427,8 @@ impl TelegramChannel {
         }
     }
 
-    /// Send one Telegram text message, with optional `parse_mode`. Returns
-    /// the Telegram message id on success (`None` when the 2xx body omits it
-    /// — the message was still delivered), or the HTTP status and response
-    /// body on failure. Parsing the body for the id couples this method to the
-    /// shared send path's response shape; the `None` case preserves status-only
-    /// semantics for callers that don't need the id.
+    /// Send one text message, returning the message id (the 2xx body may omit it — the message was
+    /// still delivered), or the status and body on failure.
     async fn send_message_get_id(
         &self,
         chat_id: &str,
@@ -2960,9 +2448,8 @@ impl TelegramChannel {
         if let Some(markup) = reply_markup {
             body["reply_markup"] = markup;
         }
-        // Telegram attaches a web-page preview to the first URL unless the send
-        // disables it: Bot API 7.0 replaced `disable_web_page_preview` with
-        // `link_preview_options`, whose object form requires `is_disabled`.
+        // Telegram attaches a web-page preview to the first URL unless disabled: Bot API 7.0
+        // replaced `disable_web_page_preview` with `link_preview_options.is_disabled`.
         body["link_preview_options"] = serde_json::json!({ "is_disabled": true });
 
         let resp = self
@@ -2970,9 +2457,8 @@ impl TelegramChannel {
             .await?;
 
         let status = resp.status();
-        // A 2xx body without a parseable message_id is still a delivered
-        // message: the shared send path only checks the status, so this must
-        // not be treated as a failure.
+        // A 2xx body without a parseable message_id is still a delivered message: the shared send
+        // path only checks the status.
         let id = match resp.json::<serde_json::Value>().await {
             Ok(body) => body["result"]["message_id"].as_i64(),
             Err(e) => {
@@ -2987,8 +2473,7 @@ impl TelegramChannel {
         Ok(id)
     }
 
-    /// Send one Telegram text message, with optional `parse_mode`.
-    /// Returns the HTTP status and response body on failure, or Ok(()) on success.
+    /// Send one text message; status and body on failure, `Ok(())` on success.
     async fn send_single_message(
         &self,
         chat_id: &str,
@@ -3055,11 +2540,8 @@ impl TelegramChannel {
         Ok(())
     }
 
-    /// Replace a previously sent message's inline keyboard in place
-    /// (`editMessageReplyMarkup`). `reply_markup` must be a full
-    /// `{"inline_keyboard": [...]}` value (or `Value::Null` to remove the
-    /// keyboard). Setting a keyboard identical to the current one comes back as
-    /// an error, which is cosmetic for a refresh.
+    /// Replace a sent message's inline keyboard in place. `reply_markup` is a full
+    /// `{"inline_keyboard": [...]}` value or `Value::Null`. An identical keyboard errors.
     pub async fn edit_reply_markup(
         &self,
         chat_id: &str,
@@ -3092,9 +2574,8 @@ impl TelegramChannel {
         let target = attachment.target.trim();
         let route = attachment_route(kind, target);
 
-        // A failure is returned, not papered over with a bare link: the caller
-        // reports every failed attachment to the user with a reason. The delivery
-        // line is written once, below, on success only.
+        // A failure is returned, not papered over: the caller reports every failed attachment with
+        // a reason. The delivery line is written once, on success only.
         let (file, bytes, source_url) = match route {
             AttachmentRoute::ByAddress => {
                 self.send_media_by_url(chat_id, thread_id, kind, target)
@@ -3124,8 +2605,7 @@ impl TelegramChannel {
         Ok(())
     }
 
-    /// Post a pre-built media request and check its status. Success is left to the
-    /// caller, which knows what was delivered and how.
+    /// Post a built media request and check its status; success is the caller's to judge.
     async fn send_media(
         &self,
         api_method: &'static str,
@@ -3140,12 +2620,9 @@ impl TelegramChannel {
         Ok(())
     }
 
-    /// Send a media file (image-as-file/document/video/audio) to a Telegram
-    /// chat, returning how many bytes were uploaded.
-    ///
-    /// The body streams from disk with its own length, so a large file is never
-    /// read into memory; the mode's own upload limit is quoted when it is too
-    /// large, and the local mode imposes no total request bound.
+    /// Send a media file (image-as-file, document, video, audio), returning the bytes uploaded. The
+    /// body streams from disk with its own length; an oversized file quotes the mode's upload
+    /// limit, and the local mode sets no total request bound.
     async fn send_media_file(
         &self,
         chat_id: &str,
@@ -3210,14 +2687,10 @@ impl TelegramChannel {
         self.send_media(meta.api_method, request).await
     }
 
-    /// Fetch a remote attachment's bytes into the daemon's private temp root so
-    /// they can be uploaded as a file.
-    ///
-    /// The address is model-supplied, so every hop is screened by the shared SSRF
-    /// guard. The bytes stream to disk — never held in memory — under the mode's
-    /// upload ceiling, so an oversized address is refused with the same honest
-    /// message a local file gets. The whole transfer — hops, headers and body —
-    /// lives under the bound this mode applies to any other transfer.
+    /// Fetch a remote attachment into the daemon's private temp root so it can be uploaded as a
+    /// file. The address is model-supplied, so every hop is screened by the shared SSRF guard; the
+    /// bytes stream to disk under the mode's upload ceiling, and the whole transfer lives under the
+    /// bound this mode applies to any other.
     async fn fetch_remote_upload(&self, url: &str) -> anyhow::Result<FetchedUpload> {
         let bound = self.limits().request_bound();
         tokio::time::timeout(bound, async {
@@ -3226,8 +2699,8 @@ impl TelegramChannel {
             if !response.status().is_success() {
                 anyhow::bail!("the address answered {}", response.status());
             }
-            // The address last fetched: a redirect chain may end elsewhere, and
-            // that address is the one that names the file.
+            // The address last fetched: a redirect chain may end elsewhere, and that one names the
+            // file.
             let fetched_url = response.url().as_str().to_string();
             let content_type = response
                 .headers()
@@ -3262,19 +2735,16 @@ impl TelegramChannel {
     }
 }
 
-/// A remote attachment's bytes fetched into the daemon's temp root, removed
-/// with this value whatever the upload did; a process that dies mid-transfer
-/// leaves a directory the temp cleaner reclaims.
+/// A fetched upload, removed with this value whatever the upload did; a process that dies
+/// mid-transfer leaves a directory the temp cleaner reclaims.
 struct FetchedUpload {
     path: PathBuf,
-    /// The name the bytes are uploaded and recorded under.
     name: String,
     _dir: tempfile::TempDir,
 }
 
-/// Stream a response body into `dest`, refusing a body over `ceiling` on the
-/// declared length and again on the stream; `too_large` renders the refusal for
-/// the caller's own transport.
+/// Stream a body into `dest`, refusing one over `ceiling` on the declared length and again on the
+/// stream; `too_large` renders the refusal for the caller's own transport.
 async fn stream_capped(
     response: reqwest::Response,
     dest: &Path,
@@ -3293,8 +2763,8 @@ async fn stream_capped(
     let mut stream = response.bytes_stream();
     let mut written: u64 = 0;
     while let Some(chunk) = stream.next().await {
-        // The transport's own error quotes the address it fetched, query and all;
-        // strip it here so no caller can log a caller-supplied address whole.
+        // The transport's own error quotes the address it fetched, query and all; strip it here so
+        // no caller can log a caller-supplied address whole.
         let chunk = chunk
             .map_err(reqwest::Error::without_url)
             .context("the transfer was cut off")?;
@@ -3310,20 +2780,13 @@ async fn stream_capped(
     Ok(())
 }
 
-/// One line per delivered attachment: what went out, on which route, and from
-/// where. Debug level: a successful delivery is routine, not a fault, so ordinary
-/// operation keeps no record of it — the accepted cost — while every failure is
-/// still recorded.
-///
-/// `file` is the name the delivery carries: the path of a local file, the name the
-/// product gave a fetched upload, or the name an address's last segment suggests
-/// for a send Telegram fetches itself. `source_url` is that address for both
-/// remote routes, so one line describes a remote delivery. Both are redacted
-/// by [`crate::util::http::redact_address`]: no query, no fragment — a signed
-/// URL's credentials must not outlive the delivery, exactly as they are kept out
-/// of the chat and out of the errors logged on the same path. `bytes` is how many
-/// bytes the product uploaded; a by-address send has `None` — Telegram fetched and
-/// possibly re-encoded that file, so the product never learns its size.
+/// One debug line per delivered attachment: what went out, on which route, from where. A successful
+/// delivery is routine, so ordinary operation keeps no record of it — every failure still is.
+/// `file` is the name the delivery carries (path, generated name, or the address's last segment)
+/// and `source_url` that address for both remote routes; both are redacted by
+/// [`crate::util::http::redact_address`], so no query, fragment or signed credential outlives the
+/// delivery. `bytes` is what the product uploaded — `None` by address, where Telegram fetched and
+/// may have re-encoded the file.
 fn record_attachment_delivery(
     chat_id: &str,
     kind: TelegramAttachmentKind,
@@ -3354,27 +2817,20 @@ fn record_attachment_delivery(
 
 /// Outcome of a single `getUpdates` poll.
 enum PollOutcome {
-    /// Successfully fetched updates. Still unconfirmed on the platform's side —
-    /// the caller's next poll's offset is what confirms them.
+    /// Fetched updates, still unconfirmed: the next poll's offset is what confirms them.
     Updates(Vec<serde_json::Value>),
     /// 409 Conflict — caller decides backoff.
     Conflict,
-    /// Non-409 API error with description.
+    /// A non-409 API error, with the description it answered.
     Error(String),
     /// Network or parse error (sleep already applied by helper).
     Transport,
 }
 
 impl TelegramChannel {
-    /// Call `getUpdates` and classify the outcome.
-    ///
-    /// The position is the caller's: it asks for everything at or past `offset`,
-    /// and what the next poll resumes from is computed from the intake's record
-    /// rather than from this call.
-    ///
-    /// `ok_default` controls what happens when the `ok` field is missing from
-    /// the response: `false` (handshake) treats it as an error, `true` (main
-    /// loop) assumes success to be lenient.
+    /// Call `getUpdates` for everything at or past `offset` and classify the outcome; what the next
+    /// poll resumes from comes from the intake's record, not from here. `ok_default` decides
+    /// whether a missing `ok` field is an error (handshake) or assumed success (main loop).
     async fn poll_get_updates(&self, offset: i64, timeout: u64, ok_default: bool) -> PollOutcome {
         let url = self.api_url("getUpdates");
         let body = serde_json::json!({
@@ -3429,17 +2885,10 @@ impl TelegramChannel {
         }
     }
 
-    /// The intake's opening handshake: resolve the account the token belongs to
-    /// and claim the `getUpdates` slot. Both must hold before the intake may take
-    /// an event on — the record is keyed by the account's own identity, so the
-    /// platform has to name it before anything is polled, and a previous daemon's
-    /// 30-second poll may still be active on the platform's side.
-    ///
-    /// Retries until the listener is cancelled or the daemon drains, `None` when
-    /// either happens while waiting. The batch the successful claim fetched is
-    /// returned rather than discarded: it is unconfirmed on the platform's side,
-    /// so discarding it would throw away an event the platform has not given up
-    /// on.
+    /// The intake's opening handshake: the account the token belongs to and a claimed `getUpdates`
+    /// slot (a previous daemon's 30-second poll may still be active). Retries until the listener is
+    /// cancelled or the daemon drains (`None` then); the claim's batch is returned rather than
+    /// discarded, being unconfirmed on the platform's side.
     async fn open_intake(&self) -> Option<IntakeSlot> {
         loop {
             if self.cancel.is_cancelled() || crate::shutdown::is_draining() {
@@ -3474,12 +2923,8 @@ impl TelegramChannel {
         }
     }
 
-    /// The account the token belongs to, as the platform reports it.
-    ///
-    /// The intake keys its record on this rather than on the token's text, so
-    /// rotating the token of the same account still recovers what that account is
-    /// holding, while a token pointing at another account neither reads nor is held
-    /// back by what the first one left.
+    /// The account the token belongs to. The record is keyed on it rather than on the token text,
+    /// so a rotated token for the same account still recovers what that account is holding.
     async fn bot_account_id(&self) -> anyhow::Result<String> {
         let data = get_me(self.http_client(), &self.api_base, &self.bot_token).await?;
         let id = data["result"]["id"]
@@ -3488,11 +2933,9 @@ impl TelegramChannel {
         Ok(id.to_string())
     }
 
-    /// Parse one incoming update into a message — polled or recovered: a text
-    /// message, an attachment, or (logged and skipped) nothing. A parsed update
-    /// gets its acknowledgement reaction, as it always has. The error is the
-    /// sender-resolution read failing, which is not "nothing to make of it" and
-    /// is left for the caller to keep the event held for.
+    /// Parse one polled or recovered update into a message, or (logged and skipped) nothing. A
+    /// parsed update gets its acknowledgement reaction. `Err` is the sender-resolution read
+    /// failing, which the caller keeps the event held for.
     async fn parse_incoming_update(
         &self,
         update: &serde_json::Value,
@@ -3515,24 +2958,14 @@ impl TelegramChannel {
         Ok(Some(msg))
     }
 
-    /// Take one polled batch on: record every event, then hand the batch to the
-    /// processor with only the events this call was the first to record.
-    ///
-    /// The record is written here, on the poll loop, because writing it is what
-    /// lets the offset advance; the parse — which may download a large attachment
-    /// for minutes — is not. Polling therefore continues only while the processor
-    /// has room: at [`BATCH_QUEUE`] recorded-but-unparsed batches the poll loop
-    /// stops issuing `getUpdates` until one is taken, so that depth, not the
-    /// parse, is the real responsiveness boundary during a large transfer. Nothing
-    /// is lost at that bound — a batch left unconfirmed is offered again by the
-    /// platform, and the re-offer is deduped against the intake record.
-    ///
-    /// The batch is recorded unit by unit — an album's members as one unit, every
-    /// other update on its own (see [`poll_plan`]) — and a unit the record could not
-    /// be written for holds the position where the unit starts (at the offset the
-    /// request started from, when the platform never identified it), so the platform
-    /// offers the unit again rather than the intake handing on the parts of it that
-    /// could be recorded.
+    /// Take one polled batch on: record every event, then hand the processor the ones this call was
+    /// the first to record. The record is written here, on the poll loop, because writing it is
+    /// what lets the offset advance; the parse, which may download for minutes, is not. Polling
+    /// continues only while the processor has room ([`BATCH_QUEUE`]), the real responsiveness bound
+    /// during a large transfer, and nothing is lost at it: a batch left unconfirmed is offered
+    /// again and deduped against the record. A unit the record could not be written for holds the
+    /// position where it starts, so the platform offers it again instead of the intake handing on
+    /// the parts of it that could be recorded.
     async fn hold_up(
         &self,
         intake: &Intake,
@@ -3540,9 +2973,8 @@ impl TelegramChannel {
         updates: Vec<serde_json::Value>,
         origin: BatchOrigin,
     ) -> (Polled, Option<HeldBatch>) {
-        // A long poll that timed out with nothing to offer leaves the position
-        // where it is: there is nothing behind it the platform has not given up
-        // on already.
+        // A long poll that timed out with nothing to offer leaves the position where it is: there
+        // is nothing behind it the platform has not given up on already.
         if updates.is_empty() {
             return (
                 Polled {
@@ -3554,11 +2986,8 @@ impl TelegramChannel {
         }
         let plan = poll_plan(&updates);
         let mut fresh = HashSet::new();
-        // The unit the record could not be written for — an unwritable store, or an
-        // update the platform never identified, which can be neither held nor
-        // confirmed past (there is no `update_id` to move past): it holds the
-        // position where the request started, and the platform's own offering window
-        // is what retires it.
+        // The unit the record could not be written for — an unwritable store, or an update with no
+        // `update_id` to move past — holds the position where the request started.
         let mut unrecorded: Option<i64> = None;
         let mut record_error: Option<anyhow::Error> = None;
         let mut failed_units = 0usize;
@@ -3584,9 +3013,8 @@ impl TelegramChannel {
             }
         }
 
-        // One warning per batch, not one per event: the pinned position re-offers the
-        // same page every pause, so a persistently unwritable store would otherwise log
-        // a warning per update per poll.
+        // One warning per batch, not per event: a pinned position re-offers the same page every
+        // pause, so a broken store would otherwise log a warning per update per poll.
         if let Some(err) = record_error {
             tracing::warn!(
                 first_unrecorded = ?unrecorded,
@@ -3596,8 +3024,7 @@ impl TelegramChannel {
             );
         }
 
-        // The position stops at the first event the record could not be written
-        // for: the platform then offers that one, and everything behind it, again.
+        // The position stops at the first event the record could not be written for.
         let position = unrecorded.unwrap_or_else(|| {
             updates
                 .iter()
@@ -3606,9 +3033,8 @@ impl TelegramChannel {
                 .map_or(offset, |newest| newest + 1)
         });
 
-        // The batch is handed to the processor rather than parsed here: parsing may
-        // spend minutes downloading an attachment, and the poll loop must keep
-        // acknowledging updates while that happens (see [`HeldBatch`]).
+        // The batch is handed to the processor rather than parsed here: parsing may spend minutes
+        // on a download and the poll loop must keep acknowledging (see [`HeldBatch`]).
         if unrecorded.is_some() {
             self.intake_pause(RECORD_FAILURE_BACKOFF).await;
         }
@@ -3627,18 +3053,10 @@ impl TelegramChannel {
         )
     }
 
-    /// Parse a recorded batch and hand it to the collector.
-    ///
-    /// `fresh` are the events this call was the first to record; the rest are
-    /// skipped. An event nothing can be made of is settled by its taker rather than
-    /// left held (see [`Self::settle_or_hold`]). Returns `false` when the collector
-    /// is gone.
-    ///
-    /// The one thing parsed out of turn is an album (media group): its members are
-    /// parsed together at the position of the album's first member, so an album is
-    /// delivered where the user sent it instead of after the rest of the poll. The
-    /// grouping is the caller's ([`poll_plan`]), which is also what recorded the
-    /// batch, so both walk one batch the same way.
+    /// Parse a recorded batch and hand it to the collector. `fresh` are the events this call was
+    /// the first to record; the rest are skipped, and one nothing can be made of is settled by its
+    /// taker ([`Self::settle_or_hold`]). An album is parsed whole at its first member's position,
+    /// so it is delivered where the user sent it. `false` when the collector is gone.
     async fn process_updates(
         &self,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
@@ -3650,8 +3068,7 @@ impl TelegramChannel {
     ) -> bool {
         for (update, placement) in updates.iter().zip(plan) {
             match placement {
-                // A button press is not a message: its `message` is the message
-                // the button sits on (see `poll_plan`).
+                // A button press is not a message: its `message` is the one the button sits on.
                 PollPlacement::Callback => {
                     let Some(update_id) = Self::fresh_update(update, fresh) else {
                         continue;
@@ -3681,9 +3098,8 @@ impl TelegramChannel {
                         let Some(update_id) = Self::fresh_update(update, fresh) else {
                             continue;
                         };
-                        // A member nothing can be made of is settled by `take_event`,
-                        // and one it cannot decide about yet stays held; either way
-                        // the rest of the album goes on.
+                        // A member nothing can be made of is settled by `take_event`; one it cannot
+                        // decide yet stays held. Either way the rest of the album goes on.
                         if let Some(msg) = self.take_event(intake, origin, update_id, update).await
                         {
                             album = Some(merge_album_member(album, msg));
@@ -3701,28 +3117,17 @@ impl TelegramChannel {
         true
     }
 
-    /// The record entry of a batch update, when this call is the first to take it
-    /// up — taken out of `fresh`, so a batch that repeats an `update_id` walks
-    /// the event once.
-    ///
-    /// `fresh` is the set of ids the record accepted rather than one flag per unit:
-    /// an album is recorded whole or not at all, but what `hold` answers is which of
-    /// the unit's ids it inserted, and a member the record already held is not handed
-    /// on with its album.
+    /// The record entry of a batch update when this call is the first to take it up — taken out of
+    /// `fresh`, so a batch that repeats an `update_id` walks the event once. `fresh` holds the ids
+    /// the record accepted: an album is recorded whole or not at all.
     fn fresh_update(update: &serde_json::Value, fresh: &mut HashSet<i64>) -> Option<i64> {
         let id = update["update_id"].as_i64()?;
         fresh.remove(&id).then_some(id)
     }
 
-    /// The settle-or-hold rule the event path and the callback-press path share:
-    /// turn one recorded unit's parse into the message to hand on, or write the
-    /// record's decision about the unit.
-    ///
-    /// A unit nothing can be made of (`Ok(None)`) is settled, so it never comes back.
-    /// A parse whose read failed (`Err`) is no decision at all, so the unit stays held
-    /// — payload and all — exactly as one a crash left behind, and a later run takes
-    /// it up. Both are the record's own rules, stated in the intake module and in
-    /// [`Intake::settle`].
+    /// Turn one recorded unit's parse into the message to hand on, or write the record's decision
+    /// about it: `Ok(None)` is settled and never comes back, `Err` is no decision, so the unit
+    /// stays held — payload and all — exactly as one a crash left behind ([`Intake::settle`]).
     async fn settle_or_hold(
         intake: &Intake,
         update_id: i64,
@@ -3747,9 +3152,8 @@ impl TelegramChannel {
         Some(msg)
     }
 
-    /// Take one recorded event on: parse it, hand it over or settle it
-    /// ([`Self::settle_or_hold`]), and refuse control input of unknown age
-    /// ([`BatchOrigin::Stale`]) instead of executing it out of context.
+    /// Take one recorded event on: parse it, hand it over or settle it, and refuse control input of
+    /// unknown age ([`BatchOrigin::Stale`]) instead of executing it out of context.
     async fn take_event(
         &self,
         intake: &Intake,
@@ -3766,15 +3170,9 @@ impl TelegramChannel {
         Some(msg)
     }
 
-    /// Tell the user a control input the product never acted on was not acted on,
-    /// and settle it. Control input in a batch of unknown age
-    /// ([`BatchOrigin::Stale`]) is not executed out of context, and a press of that
-    /// age had its press-time answer expire just as long ago — so the plain notice
-    /// is all it gets.
-    ///
-    /// An event whose notice could not be sent stays held: being told is the whole
-    /// of what the event is for, so a later run produces the notice again rather than
-    /// the user never hearing it.
+    /// Tell the user a control input was not acted on, and settle it: input in a batch of unknown
+    /// age is not executed out of context, and its press-time answer expired just as long ago. An
+    /// event whose notice could not be sent stays held, so a later run tries again.
     async fn refuse_unacted_control(&self, intake: &Intake, msg: &ChannelMessage) {
         let (chat_id, thread_id) = parse_recipient(&msg.reply_target);
         if let Err(err) = self
@@ -3787,13 +3185,9 @@ impl TelegramChannel {
         intake.settle(&msg.update_ids).await;
     }
 
-    /// Handle one button press, and report whether the pipeline is still alive.
-    /// The press is parsed on its own — never as the message it sits on — and
-    /// handed over as control input.
-    ///
-    /// The spinner is dismissed only for a press this run polled — the answer of
-    /// a press of unknown age expired just as long ago, so that would be a doomed
-    /// API call. What became of the parse is [`Self::settle_or_hold`]'s.
+    /// Handle one button press, reporting whether the pipeline is still alive. The press is parsed
+    /// on its own, never as the message it sits on. The spinner is dismissed only for a press this
+    /// run polled: a stale press's answer expired long ago, so that would be a doomed API call.
     async fn handle_callback_press(
         &self,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
@@ -3806,9 +3200,8 @@ impl TelegramChannel {
         let cq_id = cq["id"].as_str().map(ToString::to_string);
         let cq_data = cq["data"].as_str().unwrap_or("");
 
-        // For __act__ callbacks, do NOT answer early — the action handler
-        // (handle_action_callback in main.rs) will answer with the appropriate
-        // toast text. Dismiss the spinner now for all other callbacks.
+        // For __act__ callbacks, answer nothing here — the action handler answers with its own
+        // toast. Dismiss the spinner now for all other callbacks.
         if origin == BatchOrigin::Fresh
             && !cq_data.starts_with(ACTION_PREFIX)
             && let Some(ref id) = cq_id
@@ -3821,8 +3214,7 @@ impl TelegramChannel {
         else {
             return true;
         };
-        // A press is control input by construction, so it is refused by the same
-        // rule `take_event` applies.
+        // A press is control input by construction, refused by the same rule `take_event` uses.
         if origin == BatchOrigin::Stale {
             self.refuse_unacted_control(intake, &msg).await;
             return true;
@@ -3830,21 +3222,16 @@ impl TelegramChannel {
         tx.send(msg).await.is_ok()
     }
 
-    /// Take up the events this account's record holds and no run has handed on:
-    /// what a crash, a self-update or a kill in the wrong instant left behind.
-    ///
-    /// A recovered event joins the same collector as a fresh one, which is why an
-    /// event from the record and one from a poll by the same person can land in
-    /// one burst. Returns `false` when the pipeline is gone.
+    /// Take up the events this account's record holds and no run handed on: what a crash, a
+    /// self-update or a kill in the wrong instant left behind. A recovered event joins the same
+    /// collector as a fresh one. `false` when the pipeline is gone.
     async fn recover(
         &self,
         intake: &Intake,
         parts_tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> bool {
-        // A take-over that fails leaves every row it would have claimed held, and the
-        // only other thing that takes them up is a whole listener rebuild — so a
-        // failure that is only transient is worth another try before the event waits
-        // that long.
+        // A failed take-over leaves every row it would have claimed held until a whole listener
+        // rebuild, so a transient failure is worth another try before the event waits that long.
         let mut attempt = 0;
         let updates = loop {
             match intake.take_over().await {
@@ -3876,8 +3263,8 @@ impl TelegramChannel {
             .iter()
             .filter_map(|update| update["update_id"].as_i64())
             .collect();
-        // The album regrouping the stored updates came back in is the same planning
-        // the poll path uses, so a recovered album is one event here too.
+        // The album regrouping the stored updates came back in is the same planning the poll path
+        // uses.
         let plan = poll_plan(&updates);
         self.process_updates(
             parts_tx,
@@ -3890,8 +3277,7 @@ impl TelegramChannel {
         .await
     }
 
-    /// Age the record out — the intake's own retention job, over the events it
-    /// holds and the releases it recorded.
+    /// Age the record out: the intake's own retention job.
     async fn age_out_record(&self) {
         match self.intake_store().age_out().await {
             Ok(0) => {}
@@ -3903,35 +3289,26 @@ impl TelegramChannel {
         }
     }
 
-    /// The intake proper, once the handshake has resolved the account and fetched the
-    /// opening batch: the sweep, the long-poll loop, and the queue of held batches
-    /// the processor takes its work from.
-    ///
-    /// This half never parses or downloads anything: a batch is recorded and
-    /// queued, the offset advances, and the next poll is issued — so a
-    /// multi-gigabyte attachment cannot stop the platform being polled (see
-    /// [`Self::process_updates`] for the other half).
-    ///
-    /// Returns when the listener stops, however it stops; the frame stays the collector's
-    /// until the burst it still held has been handed on ([`ListenerFrame`]).
+    /// The intake proper, once the handshake has resolved the account and fetched the opening
+    /// batch: the sweep, the long-poll loop, and the queue of held batches the processor takes its
+    /// work from. This half never parses or downloads anything — a batch is recorded and queued,
+    /// the offset advances, the next poll is issued — so a multi-gigabyte attachment cannot stop
+    /// the platform being polled. Returns when the listener stops, however it stops; the frame
+    /// stays the collector's until the burst it held has been handed on ([`ListenerFrame`]).
     async fn intake_loop(
         &self,
         batch_tx: &tokio::sync::mpsc::Sender<HeldBatch>,
         intake: &Intake,
         handshake: Vec<serde_json::Value>,
     ) {
-        // The sweep runs before anything is taken up: a row that outlived the
-        // retention bound must never stand in for a later event the platform has
-        // re-used the id of, and dropping it is the only thing that makes that so.
+        // The sweep runs before anything is taken up: a row that outlived the retention bound must
+        // never stand in for a later event the platform re-used the id of.
         self.age_out_record().await;
         let mut aged_at = Instant::now();
 
-        // The batch the handshake fetched was fetched at offset 0, before any
-        // position existed, so it is input of unknown age — as is every batch behind
-        // it: a fetch that fills the platform's own page may not have come to the end
-        // of what it was already holding, and only a fetch that comes back short says
-        // the platform has nothing more from before this run. Control input that
-        // arrived in any of those batches must not be executed out of context.
+        // The handshake's batch was fetched at offset 0, before any position existed, so it is
+        // input of unknown age — as is every batch behind it until a fetch comes back short.
+        // Control input in any of them must not be executed out of context.
         let page_full = handshake.len() >= UPDATES_PAGE;
         let (taken, batch) = self.hold_up(intake, 0, handshake, BatchOrigin::Stale).await;
         let mut offset = taken.position;
@@ -3955,19 +3332,16 @@ impl TelegramChannel {
                     tracing::info!("Telegram channel shutting down (token hot-reload)");
                     break;
                 }
-                // The intake stops fetching before it stops handling: an event
-                // arriving during the wind-down is either left unconfirmed for
-                // the next start or already held durably. The channel itself
-                // stays registered — returning from here does not unregister it
-                // — and outbound sending keeps working.
+                // The intake stops fetching before it stops handling: an event arriving during the
+                // wind-down is either left unconfirmed for the next start or already held durably.
+                // Outbound sending keeps working and the channel stays registered.
                 () = crate::shutdown::drain_wait() => {
                     tracing::info!("Telegram channel stopping the intake (daemon draining)");
                     break;
                 }
                 poll_result = self.poll_get_updates(offset, 30, true) => {
-                    // Every completed poll ages resolved rows out, whatever it
-                    // carried: a run that only ever sees errors or empty batches
-                    // must still trim the record.
+                    // Every completed poll ages resolved rows out, whatever it carried: a run that
+                    // only ever sees errors or empty batches must still trim the record.
                     if aged_at.elapsed() >= AGE_OUT_INTERVAL {
                         self.age_out_record().await;
                         aged_at = Instant::now();
@@ -3983,8 +3357,8 @@ impl TelegramChannel {
                             continue;
                         }
                         PollOutcome::Error(desc) => {
-                            // Informational: the poll is retried every 5s, so an
-                            // unhealthy API would otherwise keep the issues view full.
+                            // Informational: the poll is retried every 5s, so an unhealthy API
+                            // would flood the issues view.
                             tracing::info!("Telegram getUpdates API error: {desc}");
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                             continue;
@@ -4010,49 +3384,33 @@ impl TelegramChannel {
     }
 }
 
-/// One polled batch the poll loop recorded and the processor has yet to parse.
-///
-/// It exists so the two are separate tasks in one `listen` future: the record is
-/// written (and the offset advanced) on the poll loop, while the parse — which
-/// may spend minutes downloading an attachment — happens here. Every event in a
-/// queued batch is already held durably, so a stop between the two leaves nothing
-/// lost: the next listener takes the batch over from the record.
+/// One polled batch the poll loop recorded and the processor has yet to parse, so the record is
+/// written (and the offset advanced) on one task while the parse happens on the other. Every event
+/// in it is held durably, so a stop between the two loses nothing.
 struct HeldBatch {
     updates: Vec<serde_json::Value>,
     /// The album grouping the record wrote the batch by, and the parse walks it by.
     plan: Vec<PollPlacement>,
     origin: BatchOrigin,
-    /// The events this run was the first to record.
     fresh: HashSet<i64>,
 }
 
-/// How many recorded batches may wait for the processor. Deep enough that one long
-/// download leaves the platform's polling running, bounded so a processor that
-/// never returns cannot grow it without limit.
+/// How many recorded batches may wait for the processor: deep enough that one long download leaves
+/// polling running, bounded so a stuck processor cannot grow it without limit.
 const BATCH_QUEUE: usize = 32;
 
 /// What the opening handshake resolves to.
 struct IntakeSlot {
-    /// The bot account the token belongs to, as the platform names it.
     account_id: String,
-    /// The batch the successful claim fetched — still unconfirmed on the
-    /// platform's side, so exactly an event the intake now has to hold.
+    /// The claim's batch, still unconfirmed: exactly what the intake now has to hold.
     updates: Vec<serde_json::Value>,
 }
 
-/// Fold a parsed album member into the album message built so far: content
-/// joined with a newline (the album reads as one message) and the member's
-/// staging directories kept, since each member downloads into its own. The
-/// first member starts the album.
-///
-/// A member being forwarded content makes the album forwarded content: whichever
-/// member carries the attribution, the group the album lands in is owed the same
-/// longer window. The album's own record time stays the first member's — the
-/// platform sends an album's members together.
-///
-/// The member's record entries come along too: an album is one incoming event
-/// whose every part is its own entry, and the merged message is what settles
-/// them — so no member is left held by the record after the album is handed on.
+/// Fold a parsed album member into the album built so far: content joined with a newline (the album
+/// reads as one message) and the member's staging directories kept, since each member downloads
+/// into its own. A forwarded member makes the album forwarded, so the group it lands in is owed the
+/// same longer window; the record time stays the first member's. The merged message settles every
+/// member's entry.
 fn merge_album_member(album: Option<ChannelMessage>, member: ChannelMessage) -> ChannelMessage {
     match album {
         Some(mut album) => {
@@ -4069,42 +3427,29 @@ fn merge_album_member(album: Option<ChannelMessage>, member: ChannelMessage) -> 
     }
 }
 
-/// Whether a batch is one this intake's own poll is seeing for the first time.
-///
-/// Control input is acted on only for a fresh batch: everything else may be older
-/// than this run — the opening handshake's batch was fetched before the intake had
-/// ever run, a batch whose record could not be written for is offered again to the
-/// next poll, and what recovery takes up is what a previous run held and never
-/// handed on — so control input in it is not executed out of context. A message is
-/// handed over regardless; only control input is affected.
+/// Whether a batch is one this run's own poll is seeing for the first time. Control input is acted
+/// on only for a fresh batch: the handshake's, a re-offered one and a recovered one may all be
+/// older than this run. A message is handed over regardless.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BatchOrigin {
-    /// A batch this run's own poll fetched with nothing of what the platform was
-    /// already holding left behind it.
+    /// A batch this run's poll fetched with nothing of the platform's backlog behind it.
     Fresh,
-    /// A batch that may hold events this run already fetched, or events the platform
-    /// was holding before this run started.
+    /// A batch that may repeat what this run fetched, or predate it.
     Stale,
 }
 /// What one taken-up batch leaves behind.
 struct Polled {
-    /// The position the next `getUpdates` resumes from: past the batch once
-    /// every event in it is held, or at the unit the record could not be written
-    /// for — at the offset the request itself started from, when a unit carries
-    /// no `update_id` to pin it at — which the platform then offers again.
+    /// The position the next `getUpdates` resumes from: past the batch once every event is held, or
+    /// at the unit that could not be recorded — which the platform then offers again.
     position: i64,
-    /// True when part of the batch could not be recorded, so the platform is about
-    /// to offer it again — one of the two reasons the batch the next poll fetches is
-    /// of unknown age ([`batch_origin`]).
+    /// True when part of the batch could not be recorded, so the platform re-offers it — one of the
+    /// two reasons the next batch is of unknown age ([`batch_origin`]).
     reoffered: bool,
 }
 
-/// The origin of the batch a poll fetches next, from what the batch just taken up
-/// left unknown: it filled the platform's own page, so the platform may still be
-/// handing over what it was holding before this run (the backlog is open until a
-/// fetch comes back short), or part of it could not be recorded, so the platform
-/// offers it to the next poll again. Either way the next answer may repeat what this
-/// run has already fetched, and control input in it must not run out of context.
+/// The origin of the next batch, from what this one left unknown: it filled the platform's own
+/// page, so the backlog may still be open, or part of it could not be recorded and is offered
+/// again. Either way control input in the next answer must not run out of context.
 fn batch_origin(unknown_age: bool) -> BatchOrigin {
     if unknown_age {
         BatchOrigin::Stale
@@ -4113,15 +3458,10 @@ fn batch_origin(unknown_age: bool) -> BatchOrigin {
     }
 }
 
-/// Marks a listener frame as running for the whole of `listen`, so a listener that
-/// replaces this one can wait for what this frame held to be handed on or left
-/// behind before it takes over ([`TelegramChannel::wait_stopped`]).
-///
-/// The frame is a value the collector owns, not the `listen` future: a listener
-/// whose future is dropped or that panics still leaves the frame open until its
-/// collector has finished — so the frame reads as running for exactly as long as
-/// anything it held may still be handed on. What no frame covers is the process
-/// itself ending, a crash, which is the record's own case.
+/// Marks a listener frame as running for the whole of `listen`, so a replacement can wait for what
+/// this frame held to be handed on ([`TelegramChannel::wait_stopped`]). The frame is a value the
+/// collector owns, not the `listen` future, so a dropped or panicking listener still reads as
+/// running until its collector has finished. Only a crash is uncovered, and that is the record's.
 pub(crate) struct ListenerFrame {
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     stopped: std::sync::Arc<tokio::sync::Notify>,
@@ -4144,69 +3484,51 @@ impl Drop for ListenerFrame {
     fn drop(&mut self) {
         self.running
             .store(false, std::sync::atomic::Ordering::Release);
-        // A running→stopped transition is every waiter's business, not one's: the
-        // frame can be waited on by more than one at a time, and a waiter left
-        // unnotified would sit out the whole bound.
+        // A running→stopped transition is every waiter's business: a waiter left unnotified would
+        // sit out the whole bound.
         self.stopped.notify_waiters();
     }
 }
 
-/// How long the intake pauses after a poll whose record could not be written for.
-/// The platform offers the batch again immediately, so the pause is what keeps
-/// a failing store from becoming a tight loop. Only the unit that could not be
-/// recorded holds the position back — the rest of the batch is still recorded and
-/// handed on — and the wedge ends with the platform's own offering window, which
-/// is what retires the event.
+/// How long the intake pauses after a poll whose record could not be written for, so a failing
+/// store cannot become a tight loop. Only the unrecorded unit holds the position back — the rest of
+/// the batch is recorded and handed on — and the platform's own window retires the event.
 const RECORD_FAILURE_BACKOFF: Duration = Duration::from_secs(5);
 
-/// How often the intake drops the record's rows past the retention bound.
 const AGE_OUT_INTERVAL: Duration = Duration::from_hours(1);
 
-/// The platform's own `getUpdates` page size: with no `limit` asked for, a poll
-/// hands back at most this many updates, so a batch this size means the platform
-/// may still be holding more.
+/// The platform's `getUpdates` page size: a batch this size means the platform may still be holding
+/// more.
 const UPDATES_PAGE: usize = 100;
 
-/// How long a replacement waits for one listener it cancelled to end its frame.
 const LISTENER_STOP_WAIT: Duration = Duration::from_secs(30);
 
-/// How many times the intake tries to take up what the record holds before it leaves
-/// those rows for the next run, and how long it pauses between tries: a read that
-/// fails on contention is worth a retry, and a store that is really unusable must not
-/// delay the listener.
+/// How many times the intake tries to take up what the record holds before leaving those rows to
+/// the next run, and the pause between tries: contention is worth a retry, a really unusable store
+/// must not delay the listener.
 const TAKE_OVER_ATTEMPTS: u32 = 3;
 const TAKE_OVER_RETRY: Duration = Duration::from_secs(1);
 
-/// What the intake tells a user whose control input it never acted on: the input
-/// arrived in a batch of unknown age ([`BatchOrigin::Stale`]), so it is not
-/// executed out of context and the user is asked to repeat it.
+/// What a user whose control input was never acted on is told: it arrived in a batch of unknown
+/// age, so it is not executed out of context and must be repeated.
 const UNACTED_CONTROL_NOTICE: &str = "MahBot did not act on that. Please repeat it.";
 
-/// How one update of a poll is parsed.
-///
-/// An album's members can be separated by other updates in the poll, so an album
-/// is parsed whole at the position of its first member and its other members are
-/// skipped where they sit — that is what keeps the user's send order.
+/// How one update of a poll is parsed: an album is parsed whole at its first member's position, its
+/// other members skipped where they sit, which keeps the user's send order.
 #[derive(Debug, PartialEq, Eq)]
 enum PollPlacement {
-    /// Parse and hand over this update on its own.
     Single,
-    /// An album's first member: parse every listed update (this one first) and
-    /// merge them into the one message an album is.
+    /// An album's first member: parse every listed update (this one first) and merge them.
     Album(Vec<usize>),
-    /// A later album member, already carried by its album's first member.
     Skip,
-    /// A button press, handled as control input. It carries the message its
-    /// button sits on, which is why it is placed apart: reading that message here
-    /// would put an album photo into its album a second time, or — when the press
-    /// is the album's first member of the batch — leave the album's other members
-    /// skipped and lost.
+    /// A button press, handled as control input. It carries the message its button sits on, which
+    /// is why it is placed apart: reading that message here would put an album photo into its album
+    /// twice, or — when the press is the album's first member — lose the album's other members.
     Callback,
 }
 
-/// Read each album's (media group's) member positions from the raw updates, so
-/// the poll can be walked once: nothing has to be parsed for this, album
-/// membership is a field of the raw update.
+/// Read each album's (media group's) member positions from the raw updates, so the poll can be
+/// walked once: album membership is a field of the raw update, nothing has to be parsed.
 fn poll_plan(updates: &[serde_json::Value]) -> Vec<PollPlacement> {
     let mut plan: Vec<PollPlacement> = updates
         .iter()
@@ -4256,17 +3578,13 @@ impl Channel for TelegramChannel {
             return Ok(()); // nothing to send, not an error
         }
 
-        // Parse recipient: "chat_id" or "chat_id:thread_id" format
         let (chat_id, thread_id) = parse_recipient(&message.recipient);
 
-        // Per-user command menu refresh — fire-and-forget, fail-open; never
-        // blocks or affects message delivery.
+        // Per-user command menu refresh — fire-and-forget, fail-open, never blocks delivery.
         self.spawn_menu_refresh(chat_id);
 
-        // Look for inline attachment markers like [IMAGE:path/to/file.png]. The
-        // gates under it stat and head-read local files, so it runs off the async
-        // worker. A relative target resolves against `message.file_roots`; every
-        // marker either arrives or leaves a refusal notice, never raw markup.
+        // The marker gates stat and head-read local files, so this runs off the async worker. A
+        // relative target resolves against `message.file_roots`.
         let (text_without_markers, attachments, refusals) =
             crate::util::with_block_in_place(|| {
                 parse_attachment_markers(content, &message.file_roots, self.limits())
@@ -4278,10 +3596,9 @@ impl Channel for TelegramChannel {
                 .await;
         }
 
-        // Refusal notices ride in the same body as the model's remaining text:
-        // a separate best-effort send would lose the file, the marker AND the
-        // explanation on a transient failure, while the body send's `?` makes
-        // it a real delivery error.
+        // Refusal notices ride in the same body as the model's remaining text: a separate
+        // best-effort send would lose the file, the marker AND the explanation on a transient
+        // failure, while the body send's `?` makes it a real delivery error.
         let body = if refusals.is_empty() {
             text_without_markers
         } else {
@@ -4298,9 +3615,9 @@ impl Channel for TelegramChannel {
                 .await?;
         }
 
-        // One failed attachment must not cost the user the others; the first
-        // error is returned after the loop so delivery-failure logging still
-        // fires, and every failure is surfaced in-chat.
+        // One failed attachment must not cost the user the others: every failure is surfaced
+        // in-chat, and the first error is returned after the loop so delivery-failure logging still
+        // fires.
         let mut first_error: Option<anyhow::Error> = None;
         for attachment in &attachments {
             if let Err(e) = self.send_attachment(chat_id, thread_id, attachment).await {
@@ -4309,9 +3626,9 @@ impl Channel for TelegramChannel {
                     file = %crate::util::http::redact_address(&attachment.target),
                     "Telegram: attachment delivery failed"
                 );
-                // The notice names a bounded last path component, and an
-                // address's query, fragment and userinfo are dropped: a signed
-                // URL's credentials must never be quoted back into the chat.
+                // The notice names a bounded last path component: an address's query, fragment and
+                // userinfo are dropped, so a signed URL's credentials never come back into the
+                // chat.
                 let name = media_target::marker_name(&attachment.target);
                 let notice = match upload_too_large(&e) {
                     Some(too_large) => media_target::marker_refusal(&name, &too_large.to_string()),
@@ -4341,9 +3658,8 @@ impl Channel for TelegramChannel {
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let frame = ListenerFrame::enter(&self.listener_running, &self.listener_stopped);
-        // A listener starting inside a wind-down takes nothing on: the pipeline
-        // is being stopped, so an event fetched now would only have to be held
-        // until the next start.
+        // A listener starting inside a wind-down takes nothing on: an event fetched now would only
+        // have to be held until the next start.
         if crate::shutdown::is_draining() {
             tracing::info!("Telegram channel not starting: the daemon is draining");
             return Ok(());
@@ -4351,8 +3667,8 @@ impl Channel for TelegramChannel {
 
         tracing::info!("Telegram channel listening for messages...");
 
-        // Opening handshake: the account the token belongs to and the getUpdates
-        // slot, before entering the long-poll loop.
+        // Opening handshake: the token's account and the getUpdates slot, before the long-poll
+        // loop.
         let Some(slot) = self.open_intake().await else {
             return Ok(());
         };
@@ -4365,11 +3681,11 @@ impl Channel for TelegramChannel {
             &slot.account_id,
         );
 
-        // Collected bursts are assembled off the poll loop, so getUpdates keeps being
-        // issued while a group waits; the queue's bound and what dropping its sender
-        // does are `telegram_group`'s. The collector also settles the record: a message
-        // it has handed to the pipeline has its events resolved, while one the pipeline
-        // never took leaves them held. It takes the frame, so its life is the collector's.
+        // Collected bursts are assembled off the poll loop, so getUpdates keeps being issued while
+        // a group waits; the queue's bound and drop behaviour are `telegram_group`'s. The collector
+        // also settles the record — a message it handed to the pipeline has its events resolved,
+        // one the pipeline never took leaves them held — and takes the frame, so its life is the
+        // collector's.
         let (parts_tx, parts_rx) =
             tokio::sync::mpsc::channel(crate::channels::telegram_group::QUEUE_CAPACITY);
         let collector = crate::channels::telegram_group::spawn_collector(
@@ -4380,14 +3696,12 @@ impl Channel for TelegramChannel {
             frame,
         );
 
-        // Two halves, one future. The poll loop records a batch and queues it; the
-        // processor parses it and hands the parts to the collector. They run
-        // concurrently, so a large attachment being downloaded keeps the platform
-        // polled while the processor has queue room — and the offset still advances
-        // only on what was recorded, so nothing is lost or acknowledged early.
+        // Two halves, one future: the poll loop records a batch and queues it, the processor parses
+        // it and hands the parts to the collector. A large attachment therefore keeps the platform
+        // polled while the processor has queue room, and the offset advances only on what was
+        // recorded, so nothing is lost or acknowledged early.
         let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<HeldBatch>(BATCH_QUEUE);
-        // Each half owns what it needs, so the queue's sender dies with the poll
-        // loop and the receiver's end tells the processor there is nothing more.
+        // Each half owns what it needs: the sender dies with the poll loop, ending the receiver.
         let fetch_intake = intake.clone();
         let fetch = async move {
             self.intake_loop(&batch_tx, &fetch_intake, slot.updates)
@@ -4395,8 +3709,7 @@ impl Channel for TelegramChannel {
         };
         let process_intake = intake.clone();
         let process = async move {
-            // What a previous run held is taken over first: it is older than
-            // anything the platform is about to offer.
+            // What a previous run held is taken over first: it is older than anything now on offer.
             if self.recover(&process_intake, &parts_tx).await {
                 while let Some(HeldBatch {
                     updates,
@@ -4405,9 +3718,8 @@ impl Channel for TelegramChannel {
                     mut fresh,
                 }) = batch_rx.recv().await
                 {
-                    // A stop refuses new work, exactly as the poll loop does: the
-                    // batch stays recorded, so the listener that takes over finds
-                    // it instead of it being half-handled here.
+                    // A stop refuses new work as the poll loop does: the batch stays recorded, so
+                    // the next listener finds it instead of it being half-handled here.
                     if crate::shutdown::aborting() {
                         tracing::info!(
                             "Telegram listener stopping: recorded batches left for the next run"
@@ -4434,20 +3746,18 @@ impl Channel for TelegramChannel {
             } else {
                 tracing::warn!("Telegram listener stopping: the message pipeline is closed");
             }
-            // Dropping the last sender releases an open burst: the collector hands
-            // it to the pipeline and settles it, so the frame of this listener ends
-            // only once that collector has finished ([`ListenerFrame`]).
+            // Dropping the last sender releases an open burst: the collector hands it to the
+            // pipeline and settles it, so this frame ends only once that collector has finished
+            // ([`ListenerFrame`]).
             drop(parts_tx);
         };
         tokio::pin!(fetch, process);
         tokio::select! {
-            // A stop the poll loop sees closes the queue when it returns, and the
-            // processor then drains what it already holds before the frame ends.
+            // The poll loop closing the queue ends the processor once it has drained what it holds.
             () = &mut fetch => { process.await; }
-            // The pipeline is gone: nothing this listener fetches could be handed
-            // on, so its poll loop is cancelled rather than left polling a bot no
-            // one is reading — two pollers on one token is what that would become
-            // the moment a replacement starts.
+            // The pipeline is gone: nothing fetched could be handed on, so the poll loop is
+            // cancelled rather than left polling a bot no one reads — two pollers on one token the
+            // moment a replacement starts.
             () = &mut process => {
                 self.cancel.cancel();
                 fetch.await;
@@ -4463,8 +3773,6 @@ impl Channel for TelegramChannel {
         Ok(())
     }
 
-    // -- typing indicators --
-
     async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
         let url = self.api_url("sendChatAction");
         let (chat_id, thread_id) = parse_recipient(recipient);
@@ -4478,9 +3786,8 @@ impl Channel for TelegramChannel {
     }
 }
 
-/// The Bot API base the registered listener was built for, when one is
-/// registered: the supervisor compares it with the endpoint that is serving, so a
-/// server restarted on a fresh port is followed by a listener to match.
+/// The Bot API base the registered listener was built for: the supervisor compares it with the
+/// endpoint serving, so a server restarted on a fresh port is followed.
 pub(crate) fn listener_base() -> Option<String> {
     let channel = crate::channel_registry().get("telegram")?;
     channel
@@ -4489,30 +3796,22 @@ pub(crate) fn listener_base() -> Option<String> {
         .map(|channel| channel.api_base.clone())
 }
 
-/// Start the listener the current mode serves, with the configured token.
-///
-/// This is the step that makes a switch real when the mode is the local server:
-/// the token is validated there first, and a token-bearing request is what logs
-/// the bot into that server. `Err` therefore means the bot is not being served
-/// at all — the caller reports the cause it names.
+/// Start the listener the current mode serves. When the mode is the local server this is the step
+/// that makes a switch real: a token-bearing request is what logs the bot into that server. `Err`
+/// therefore means the bot is not being served at all.
 pub(crate) async fn start_telegram_listener() -> anyhow::Result<()> {
     let token = crate::config::CONFIG
         .telegram_bot_token()
         .ok_or_else(|| anyhow::anyhow!("Telegram has no bot token configured"))?;
-    // Checked here, once: this is the switch's own first token-bearing request
-    // against the base it just moved the bot to, and it is what logs the bot in
-    // there. A rejected token is therefore reported as the cause it is, before any
-    // listener is built.
+    // The switch's own first token-bearing request against the base it just moved the bot to, and
+    // what logs it in there: a rejected token is reported before any listener is built.
     TelegramChannel::validate_token(&token).await?;
     restart_telegram_listener(Some(&token))
 }
 
-/// Stop the listener and wait until the frame that holds its events has ended.
-///
-/// A frame that has ended means everything it held is either handed on or left
-/// held in the record, which is the state a switch needs before it takes the bot
-/// out of one server: nothing is still being downloaded from the side being left.
-/// The retirement itself is [`retire_channel`]'s.
+/// Stop the listener and wait until the frame holding its events has ended: everything it held is
+/// then handed on or left held, which is the state a switch needs before it takes the bot out of
+/// one server. The retirement itself is [`retire_channel`]'s.
 pub(crate) async fn stop_telegram_listener() -> anyhow::Result<()> {
     let registry = crate::channel_registry();
     let frames = registry.replaced("telegram");
@@ -4520,13 +3819,12 @@ pub(crate) async fn stop_telegram_listener() -> anyhow::Result<()> {
         Some(current) => {
             retire_channel(registry, std::sync::Arc::clone(&current)).await;
         }
-        // Nothing is registered, but a frame an earlier attempt left running is still
-        // recorded — and still polling the side the switch is leaving.
+        // Nothing is registered, but a frame an earlier attempt left is still polling the side we
+        // leave.
         None => stop_listeners(&frames, None).await,
     }
-    // The wait is bounded, so a listener still finishing what it held is a state
-    // the caller has to know about: a switch that logged the bot out of the cloud
-    // while this frame kept polling it would leave two pollers on one token.
+    // The wait is bounded, so the caller has to know about a listener still finishing: logging the
+    // bot out of the cloud meanwhile would leave two pollers on one token.
     let still_running = frames
         .snapshot()
         .iter()
@@ -4540,12 +3838,9 @@ pub(crate) async fn stop_telegram_listener() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run the Telegram channel the configured mode serves, for the life of the
-/// process: the cloud listener by default, the local server's once it is up.
-///
-/// The boot-time preparation happens here rather than before the pipeline is
-/// built, because the base URL is only known once the server is running and a
-/// switch interrupted by the last shutdown has to finish first.
+/// Run the Telegram channel the configured mode serves, for the life of the process. The boot-time
+/// preparation is here because the base URL is only known once the server runs, and a switch
+/// interrupted by the last shutdown has to finish first.
 pub async fn run_configured_channel(tx: tokio::sync::mpsc::Sender<ChannelMessage>) {
     use crate::channels::telegram_local::Boot;
 
@@ -4587,23 +3882,12 @@ pub async fn run_configured_channel(tx: tokio::sync::mpsc::Sender<ChannelMessage
     }
 }
 
-/// Stop and wait out every listener of the intake's own that may still hold events: the
-/// channels a replace has moved past and no hand-over has confirmed stopped
-/// ([`crate::ReplacedChannels`]). A recorded channel that is not one of them — the registry
-/// is not the intake's alone — has no frame to wait out and is only taken out of the list.
-///
-/// `starting` is the channel the caller is about to start, which is never stopped
-/// ([`hand_over_listener`]); it is left in the list rather than retired, so a hand-over
-/// that lands later still finds it there and stops it.
-///
-/// Taken from the name's own list rather than from what the channels carry, so every
-/// hand-over waits for the same frames: a chain the channels carry is consumed by whichever
-/// hand-over walks it first, and a save landing while an earlier one waited would then start
-/// a listener with the frame that holds undelivered events still open — handing that content
-/// on twice.
-///
-/// A frame still open past the wait bound is left in the list, so the next hand-over waits it
-/// again rather than taking its place behind its back.
+/// Stop and wait out every listener of the intake's own that may still hold events: the channels a
+/// replace moved past ([`crate::ReplacedChannels`]). `starting` is never stopped
+/// ([`hand_over_listener`]) and is left in the list, so a later hand-over still finds it. The list
+/// is taken from the name's own record so every hand-over waits for the same frames — a chain the
+/// channels carried would be consumed by whichever walked it first. A frame still open past the
+/// wait bound is left there, so the next hand-over waits it again.
 async fn stop_listeners(
     frames: &crate::ReplacedChannels,
     starting: Option<&std::sync::Arc<dyn Channel>>,
@@ -4623,49 +3907,29 @@ async fn stop_listeners(
     }
 }
 
-/// Hot-reload the Telegram bot listener with a new token.
+/// Hot-reload the bot listener with a new token, no application restart needed.
 ///
-/// Used when the user changes the bot token in Settings — no full application
-/// restart required.
-///
-/// The hand-over runs in a task of its own, so the caller gets its answer as soon as
-/// the registry holds the new channel: whether the caller is a settings save or the
-/// assistant's config tool, dropping it can no longer leave the registry holding a
-/// channel nothing listens on while the listener it replaced is already stopped.
-///
-/// - **New token provided** (`Some(token)`): the pipeline is resolved (the listener
-///   cannot run without it) and the token is used as given — the paths that must
-///   prove a listener starts validate it first ([`start_telegram_listener`], the
-///   token save path), while a rebuild reuses a token that already served. The new
-///   channel takes the old one's place in the registry, which records what it moved
-///   past; the hand-over task then cancels and waits out every such listener — one
-///   whose collector has drained means everything it held is settled or left held,
-///   so what is left for the take-over is exactly what it could not hand on — and
-///   listens, never stopping the channel it starts itself ([`hand_over_listener`]).
-/// - **Token cleared** (`None`): the old listener is cancelled and the channel
-///   unregistered once it has ended its frame — unless a token saved in the meantime
-///   has already put another channel in its place, which must stay registered. The
-///   channel keeps serving outbound sends while it winds down, so a reply that is
-///   already on its way still leaves through the token being removed.
+/// The hand-over runs in a task of its own, so the caller's answer comes as soon as the registry
+/// holds the new channel. With `Some(token)` the pipeline is resolved (no listener without it) and
+/// the token is used as given — the paths that must prove a listener starts validate it first — and
+/// the hand-over then cancels and waits out every listener the replace moved past. With `None` the
+/// old listener is cancelled and the channel unregistered once its frame has ended, unless a token
+/// saved meanwhile took its place; it keeps serving outbound sends while it winds down.
 pub fn restart_telegram_listener(new_token: Option<&str>) -> anyhow::Result<()> {
     let registry = crate::channel_registry();
 
     if let Some(token) = new_token.filter(|t| !t.trim().is_empty()) {
-        // The listener cannot be started without the pipeline, so the pipeline is
-        // resolved before anything is touched — no platform call, no registry entry —
-        // and a missing one is reported to the caller rather than leaving a token the
-        // product never applied looking saved.
+        // The pipeline is resolved before anything is touched — no platform call, no registry entry
+        // — so a missing one is reported rather than leaving a token the product never applied
+        // looking saved.
         let Some(tx) = crate::MESSAGE_TX.get().cloned() else {
             anyhow::bail!(
                 "the message pipeline is not running — the Telegram listener cannot start"
             );
         };
 
-        // Validating here would be a second token-bearing request for the same save:
-        // the check belongs to the paths that have to prove a listener starts
-        // ([`start_telegram_listener`], the save path before it writes), while a
-        // rebuild after a failure ([`restore_cloud_listener`], the supervisor) reuses
-        // a token that has already served.
+        // Validating here would be a second token-bearing request for one save: the proving paths
+        // do that, and a rebuild reuses a token that has already served.
         let telegram_arc = std::sync::Arc::new(
             TelegramChannel::from_config(token.to_string()).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -4684,16 +3948,14 @@ pub fn restart_telegram_listener(new_token: Option<&str>) -> anyhow::Result<()> 
 
         let new_channel: std::sync::Arc<dyn Channel> = telegram_arc;
 
-        // Atomically replace in the registry — no gap where "telegram" returns None —
-        // which records what it moved past: the listeners the hand-over waits out.
+        // Atomically replace in the registry — no gap where "telegram" returns None.
         let frames = registry.replaced("telegram");
         registry.replace(std::sync::Arc::clone(&new_channel));
 
         tokio::spawn(hand_over_listener(frames, new_channel, tx));
         tracing::info!("Telegram bot listener restarting with new token");
     } else {
-        // Token cleared — stop the old listener and unregister it once it has ended,
-        // unless a token saved while it wound down has already taken its place.
+        // Token cleared — stop the old listener and unregister it once it has ended.
         let old_channel = registry.get("telegram");
         tokio::spawn(async move { retire_listener(registry, old_channel).await });
     }
@@ -4701,13 +3963,9 @@ pub fn restart_telegram_listener(new_token: Option<&str>) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Stop the listener `channel` runs and take it out of the registry once its frame
-/// has ended, reporting whether the registry still held it then.
-///
-/// The channel is recorded among the frames a hand-over waits out: a replace records
-/// what it displaces, but nothing displaces a channel being retired here (a cleared
-/// token, a switch taking the listener away), so the retirement is what moves past it
-/// — and a save landing meanwhile has to wait it out before it starts its own listener.
+/// Stop the listener `channel` runs and take it out of the registry once its frame has ended,
+/// reporting whether the registry still held it. The channel is recorded among the frames a
+/// hand-over waits out, so a save landing meanwhile waits for it before starting its own.
 async fn retire_channel(
     registry: &crate::ChannelRegistry,
     channel: std::sync::Arc<dyn Channel>,
@@ -4718,12 +3976,9 @@ async fn retire_channel(
     registry.unregister_if(&channel)
 }
 
-/// Stop the listener `old` runs and, once its frame has ended, take it out of the
-/// registry — unless the registry holds a channel registered since (a token saved
-/// while the teardown waited), which is the one that is live by then.
-///
-/// The two log lines are what the teardown reports; stopping and unregistering are
-/// [`retire_channel`]'s, the same retirement every other stop goes through.
+/// Stop `old` and, once its frame has ended, take it out of the registry — unless the registry
+/// holds a channel registered since, which is the live one by then. The two log lines are the whole
+/// of it; stopping and unregistering are [`retire_channel`]'s.
 async fn retire_listener(
     registry: &crate::ChannelRegistry,
     old: Option<std::sync::Arc<dyn Channel>>,
@@ -4738,18 +3993,11 @@ async fn retire_listener(
     }
 }
 
-/// The hand-over half of [`restart_telegram_listener`], in a task of its own so a
-/// caller that goes away cannot desynchronise the registry from the listener: the
-/// listeners the replace moved past are stopped and waited out, then the new channel
-/// listens on the shared pipeline.
+/// The hand-over half of [`restart_telegram_listener`], in a task of its own so a caller that goes
+/// away cannot desynchronise the registry from the listener.
 ///
-/// `new` is the channel this hand-over is about to start, and is passed so the hand-over
-/// never stops it: a stop fires the channel's cancel token, so the listener started right
-/// after would return at once and the token this save applied would have no listener.
-/// `new` is in the list only when a later save's replace has already moved past it, and
-/// that needs no case of its own: the superseding hand-over stops `new` — `new` is not the
-/// channel *that* hand-over starts — while the channel the last save built is the one that
-/// listens.
+/// `new` is the channel about to start and is never stopped here: a stop fires its cancel token, so
+/// the listener started right after would return at once.
 async fn hand_over_listener(
     frames: std::sync::Arc<crate::ReplacedChannels>,
     new: std::sync::Arc<dyn Channel>,
@@ -4761,14 +4009,10 @@ async fn hand_over_listener(
     }
 }
 
-/// Send a message directly through the registered Telegram channel, bypassing
-/// the router (no broadcast/persist). Errors if the transport send fails.
+/// Send a message through the registered channel, bypassing the router (no broadcast/persist).
 ///
-/// When no channel is registered — a switch has just taken the listener away,
-/// which is exactly when the owner has to be told — the message goes out through
-/// a one-off channel on the base the current mode serves. That is the only base
-/// the bot can be reached on: the cloud while it has not left it, the local
-/// server once it has. No endpoint at all means it cannot be said at all.
+/// With no channel registered — a switch has just taken the listener away, exactly when the owner
+/// has to be told — the message goes out through a one-off channel on the base the mode serves.
 pub async fn send_direct(
     recipient: &str,
     content: String,
@@ -4791,67 +4035,37 @@ pub async fn send_direct(
     channel.send(&reply).await
 }
 
-/// Send a plain-text message directly via the registered Telegram channel,
-/// ignoring transport/channel errors (best-effort). Used for command replies
-/// and notifications where a send failure should not fail the caller.
+/// Best-effort plain-text send through the registered channel, for replies and notifications.
 pub async fn send_reply(recipient: &str, content: &str) {
     let _ = send_direct(recipient, content.to_string(), None).await;
 }
 
-/// Mirror a local user's message to their Telegram chats as a blockquote, so conversation history is readable from both surfaces.
+/// Mirror a local user's message to their Telegram chats as a blockquote, before enrichment, so the
+/// original typed text is preserved (pre-link-summary, pre-transcription).
 ///
-/// This should be called before enrichment to preserve the original
-/// user-typed text (pre-link-summary, pre-transcription).
+/// Only `gui`, `voice` and `cli` messages mirror — strictly local sources, so accepting them cannot
+/// create an echo loop; Telegram-originated messages stay excluded. Empty messages, and users with
+/// no Telegram binding, are skipped silently, and **all** of a user's bindings get the quote.
 ///
-/// # Guards
-///
-/// * Only mirrors messages where `channel == "gui"`, `channel == "voice"` or
-///   `channel == "cli"` (prevents echo loops: those are strictly local sources
-///   that can never originate from Telegram, so accepting them cannot create
-///   feedback; Telegram-originated messages remain excluded). A command-line
-///   message is the owner's own, so it mirrors as one of his — with nothing added
-///   to its text, exactly as one he typed into the dashboard carries none.
-/// * Skips empty or whitespace-only messages.
-/// * Silently returns when no Telegram channel is registered or the user has no
-///   Telegram binding with a `reply_target` (no error, no crash).
-/// * Sends to **all** Telegram bindings if the user has multiple.
-///
-/// # Quote format
-///
-/// Uses `<blockquote>` HTML tags, which `markdown_to_telegram_html` in the
-/// Telegram channel's `send()` pipeline passes through unchanged. The user's
-/// text retains markdown formatting through the standard inline parser.
-/// Media markers of every kind the pattern matches (`[IMAGE:...]`,
-/// `[AUDIO:...]`, `[VIDEO:...]`, `[FILE:...]`) are stripped so raw marker
-/// syntax does not appear in the quote; a marker-shaped word of any other kind
-/// is not a marker and stays literal. Purely media-only messages are skipped
-/// entirely.
-/// When the message carries a
-/// [`ReplyReference`], a `↩ {author}: {snippet}` header line leads the
-/// blockquote (before the user's text), and a media-only message with a
-/// reference still mirrors — the blockquote then holds only the `↩` line.
+/// Media markers are stripped so no raw marker syntax reaches the quote, and a message that is
+/// nothing but media is skipped — unless it carries a [`ReplyReference`], which leads as a `↩
+/// {author}: {snippet}` line even then.
 pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
-    // Guard: only mirror local-originated user messages — text typed into the
-    // dashboard, spoken locally, or sent from the command line (prevents echo
-    // loops: those are strictly local sources that can never originate from
-    // Telegram, so accepting them cannot create feedback; Telegram-originated
-    // messages remain excluded).
+    // Only local-originated user messages mirror: those sources can never come from Telegram, so
+    // accepting them cannot create feedback.
     if msg.channel != "gui" && msg.channel != "voice" && msg.channel != crate::cli::CHANNEL {
         return;
     }
 
-    // Guard: skip empty or whitespace-only messages.
     let trimmed = msg.content.trim();
     if trimmed.is_empty() {
         return;
     }
 
-    // Guard: Telegram channel must be available.
     let Some(channel) = crate::channel_registry().get("telegram") else {
         return;
     };
 
-    // Look up the user's channel bindings.
     let bindings = match crate::users::store()
         .get_user_channels(&msg.user_name)
         .await
@@ -4867,7 +4081,6 @@ pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
         }
     };
 
-    // Filter to Telegram bindings (reply_target checked per binding below).
     let telegram_bindings: Vec<_> = bindings
         .into_iter()
         .filter(|b| b.channel == "telegram")
@@ -4877,12 +4090,9 @@ pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
         return; // No Telegram binding — silently skip.
     }
 
-    // Strip media markers so users don't see raw `[IMAGE:...]` syntax in the
-    // quote. Every kind the pattern matches is stripped; a marker-shaped word of
-    // an unknown kind is not a marker at all and survives rather than being
-    // deleted. A reply reference is preserved as a `↩` header line inside the
-    // blockquote; when a reference is present the media-only guard below is
-    // relaxed so a reply to a media message still mirrors the `↩` line.
+    // Strip media markers so users don't see raw `[IMAGE:...]` syntax; every kind the pattern
+    // matches goes, an unknown marker-shaped word survives, and a reply reference is preserved as a
+    // `↩` header line — which relaxes the media-only guard below.
     let content = MEDIA_MARKER_RE.replace_all(trimmed, "").to_string();
     let content = content.trim().to_string();
 
@@ -4898,8 +4108,7 @@ pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
         if content.is_empty() {
             return; // Media-only message — nothing to quote.
         }
-        // Wrap in <blockquote> — these tags pass through markdown_to_telegram_html
-        // unchanged, while the user's text retains markdown formatting.
+        // <blockquote> passes through markdown_to_telegram_html unchanged.
         format!("<blockquote>\n{content}\n</blockquote>")
     };
 
@@ -4911,10 +4120,8 @@ pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
             content: quoted.clone(),
             recipient: reply_target.clone(),
             reply_markup: None,
-            // The quote is already marker-free (every mapped kind was stripped
-            // above), so an empty root list cannot turn the user's own text into
-            // a "Could not send ..." refusal; it only states that the mirror
-            // delivers no files.
+            // The quote is already marker-free, so an empty root list cannot turn the user's own
+            // text into a "Could not send ..." refusal.
             file_roots: Vec::new(),
         };
 
@@ -4929,9 +4136,8 @@ pub async fn mirror_gui_message_to_telegram(msg: &ChannelMessage) {
     }
 }
 
-/// POST a `setMyCommands` request. Returns `true` on success; failures are
-/// logged (warn) and reported as `false` so callers can reset their
-/// change-detection state and retry on the next message.
+/// POST a `setMyCommands` request: `true` on success, a logged warning and `false` on failure, so
+/// callers reset their change detection and retry on the next message.
 async fn post_set_my_commands(
     client: &reqwest::Client,
     url: &str,
@@ -4959,14 +4165,9 @@ async fn post_set_my_commands(
     }
 }
 
-/// The phase glyph standing in for the phase word on one `/board` listing
-/// line. Keyed by the phase itself — the match is exhaustive with no fallback
-/// arm, so a newly added phase is a compile error rather than a silently
-/// missing (or transposed) row.
-///
-/// All ten glyphs already default to emoji presentation, so none carries a
-/// variation selector. This is deliberately not `TicketPhase::display_name()`:
-/// the desktop board badge keeps the phase words.
+/// The phase glyph standing in for the phase word on one `/board` line. Keyed by the phase with no
+/// fallback arm, so a new phase is a compile error. All ten already default to emoji presentation,
+/// and this is deliberately not `TicketPhase::display_name()`: the desktop badge keeps the words.
 fn phase_emoji(phase: TicketPhase) -> &'static str {
     match phase {
         TicketPhase::Backlog => "📥",
@@ -4982,26 +4183,16 @@ fn phase_emoji(phase: TicketPhase) -> &'static str {
     }
 }
 
-/// Format one `/board` listing line: the phase emoji, monospace ticket ID,
-/// then the title. Shared by the Telegram `/board` handler and its tests so
-/// the format cannot silently drift between them.
-///
-/// The line opens with the phase emoji rather than a `•`/`*` bullet: a leading
-/// `*` would pair with a `*` in a ticket title and swallow the id and title
-/// into an italic span. The ticket ID is monospace, and each line converts to
-/// Telegram HTML independently, so markdown-special characters in a title
-/// cannot corrupt another line's formatting.
+/// One `/board` line: the phase emoji, monospace ticket id, title. No `•`/`*` bullet — a leading
+/// `*` would pair with one in a title and swallow the id into italics — and each line converts to
+/// HTML on its own, so a title cannot corrupt another line's formatting.
 #[must_use]
 pub fn format_board_line(phase: &TicketPhase, id: &str, title: &str) -> String {
     format!("{} `{}` {}", phase_emoji(*phase), id, title)
 }
 
-/// The complete `/board` reply text for `tickets` (already in the board's
-/// display order): an all-workspaces header followed by one
-/// [`format_board_line`] per ticket.
-///
-/// The listing spans every workspace, so the header names none of them and the
-/// workspace marker of each entry is the ticket id's own prefix. The empty
+/// The complete `/board` reply for `tickets`, already in display order: an all-workspaces header,
+/// then one [`format_board_line`] per ticket, whose id prefix is the workspace marker. An empty
 /// listing says so in the same all-workspaces voice.
 #[must_use]
 pub fn board_listing_text(tickets: &[&Ticket]) -> String {
@@ -5021,9 +4212,8 @@ pub fn board_listing_text(tickets: &[&Ticket]) -> String {
     format!("All workspaces — {} {noun}\n{listing}", tickets.len())
 }
 
-/// (command, description) entries for a user's Telegram command menu, derived
-/// from their admin status. Shared by the per-chat `setMyCommands` refresh and
-/// the `/start` welcome message.
+/// `(command, description)` pairs for a user's menu, from their admin status: shared by the
+/// per-chat refresh and the `/start` welcome.
 #[must_use]
 pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
     let mut entries: Vec<(String, String)> = Vec::new();
@@ -5032,18 +4222,15 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
         entries.push(("board".to_string(), BOARD_COMMAND_DESC.to_string()));
         entries.push(("archive".to_string(), ARCHIVE_COMMAND_DESC.to_string()));
 
-        // `/update` is global (the single admin) and shown only when the shared
-        // availability cache confirms an update — always for a copy built from
-        // sources, and for a downloaded copy only when the release host holds a
-        // newer version. The menu reflects the cached state, never a network call
-        // per refresh.
+        // `/update` is global (the single admin) and shown only when the shared availability cache
+        // confirms an update — always for a copy built from sources. The menu reflects the cache,
+        // never a network call per refresh.
         if crate::self_update::should_show_update(crate::self_update::update_availability()) {
             entries.push(("update".to_string(), UPDATE_COMMAND_DESC.to_string()));
         }
     }
 
-    // Media model-selection commands are available to every user (the media
-    // models are stored per-user, and every user has the Assistant role).
+    // The media model commands are per-user, and every user has the Assistant role.
     entries.push((
         "image_models".to_string(),
         IMAGE_MODELS_COMMAND_DESC.to_string(),
@@ -5053,9 +4240,8 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
         VIDEO_MODELS_COMMAND_DESC.to_string(),
     ));
 
-    // `/clear` is anchored at the very bottom of the menu. The `/agents`
-    // role-switch entry is gone: the Assistant is every account's only role,
-    // so there is nothing to switch.
+    // `/clear` sits at the very bottom. The `/agents` role-switch entry is gone: the Assistant is
+    // every account's only role.
     entries.push(("clear".to_string(), CLEAR_COMMAND_DESC.to_string()));
     entries
 }

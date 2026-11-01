@@ -1,55 +1,40 @@
 //! TTL-ladder executor for the OpenRouter provider benchmark.
 //!
 //! This is a STANDALONE bench HTTP path — it deliberately does NOT use
-//! [`crate::providers::compatible`], [`crate::retry`], or the global CONFIG
-//! provider stack. It owns its reqwest client (provided by the full-run
-//! orchestrator), its own bounded non-jittered retry loop, and its own spend
-//! accounting, so the measurement is independent of the production agent
-//! pipeline.
+//! [`crate::providers::compatible`], [`crate::retry`] or the global CONFIG provider stack. It
+//! owns its reqwest client (provided by the full-run orchestrator), its own bounded
+//! non-jittered retry loop and its own spend accounting, so the measurement is independent of
+//! the production agent pipeline.
 //!
 //! # Protocol
 //!
-//! - **Canonical deterministic requests**: every request body is built from
-//!   the same base prompt (harness system + filler user text) plus the
-//!   verified tool frames of prior rounds ([`build_request_body`] /
-//!   [`build_messages`]). The prompt prefix is byte-identical across a run's
-//!   warmup and ladder rounds, so provider-side prompt caches can be
-//!   measured. `serde_json::json!` builds BTreeMap objects → sorted keys.
-//! - **Warmup gate**: two byte-identical warmup requests (W1, W2) establish
-//!   the base cache. W1 also gates auth/quota failures before any spend.
-//! - **Cache-hold predicate**: a provider "does not cache" ONLY when its raw
-//!   cached tokens are zero across the warmup-2 sample and every ladder round
-//!   (warmup-1 is excluded — it is cross-run contaminated). Any non-zero
-//!   cached observation means the provider caches, and its bucket comes from
-//!   the ladder ([`crate::bench_openrouter::classify::cache_hold_result`]).
-//!   Providers that failed to run (403, 429, etc.) are "not measured".
-//! - **TTL ladder**: the ladder is a list of inactivity GAPS between ladder
-//!   rounds (a 7-entry ladder = 8 rounds). Each round re-sends the grown
-//!   conversation after its gap and compares the provider's reported cached
-//!   tokens against the full-hold expectation
-//!   ([`crate::bench_openrouter::classify::classify_round`]).
-//! - **Bounded non-jittered retries**: at most 3 attempts per round; sleeps
-//!   are fixed (Retry-After clamped into [5 s, 60 s], else 5 s) and NEVER
+//! - **Canonical deterministic requests**: every body is built from the same base prompt plus
+//!   the verified tool frames of prior rounds, and the prompt prefix is byte-identical across
+//!   warmup and ladder rounds so provider-side prompt caches can be measured.
+//! - **Warmup gate**: two byte-identical warmup requests (W1, W2) establish the base cache; W1
+//!   also gates auth/quota failures before any spend.
+//! - **Cache-hold predicate**: a provider "does not cache" ONLY when its raw cached tokens are
+//!   zero across warmup-2 and every ladder round (warmup-1 is cross-run contaminated). Any
+//!   non-zero observation means it caches, and the bucket comes from the ladder. Providers that
+//!   failed to run are "not measured".
+//! - **TTL ladder**: a list of inactivity GAPS between rounds (a 7-entry ladder = 8 rounds);
+//!   each round re-sends the grown conversation after its gap and compares the reported cached
+//!   tokens against the full-hold expectation.
+//! - **Bounded non-jittered retries**: at most 3 attempts per round; sleeps are fixed and NEVER
 //!   jittered — jitter would corrupt the gap measurement.
-//! - **Spend accounting**: per-round billed cost accumulates against a
-//!   per-provider guard and a total cap ([`RunBudget`]); the guard stops this
-//!   provider's ladder, the cap aborts the whole run.
-//! - **Deadline + abort**: [`RUN_DEADLINE_MINS`] caps the whole run; the
-//!   per-provider deadline and the run-level abort token (spend cap / auth /
-//!   quota) both race every ladder sleep, so a stalled provider cannot hang
-//!   the bench and an aborted run interrupts a sleeping provider promptly.
-//! - **Pinning verification**: the serving provider from the response
-//!   metadata is checked against the endpoint's names
-//!   ([`crate::bench_openrouter::classify::verify_pinned`]); a drift is
-//!   retried once and then marked Invalid (`"pin_drift"`).
-//! - **Response-cache detection**: a `hit` in the `x-openrouter-cache-status`
-//!   header means OpenRouter answered from its response cache without
-//!   exercising the model — such a round is re-sent once after a short delay
-//!   and marked Invalid (`"response_cache"`) if it persists.
+//! - **Spend accounting**: per-round billed cost accumulates against a per-provider guard and a
+//!   total cap ([`RunBudget`]); the guard stops this provider's ladder, the cap aborts the run.
+//! - **Deadline + abort**: [`RUN_DEADLINE_MINS`] caps the run, and the per-provider deadline and
+//!   the run-level abort token race every ladder sleep, so a stalled provider cannot hang the
+//!   bench.
+//! - **Pinning verification**: the serving provider is checked against the endpoint's names; a
+//!   drift is retried once and then marked Invalid (`"pin_drift"`).
+//! - **Response-cache detection**: a `hit` in `x-openrouter-cache-status` means OpenRouter
+//!   answered from its response cache without exercising the model — re-sent once after a short
+//!   delay, and marked Invalid (`"response_cache"`) if it persists.
 //!
-//! `run_provider` is driven by the full-run scheduler in [`crate::bench_openrouter`]
-//! and returns a [`ProviderRun`] carrying the tag and the derived cache-hold
-//! result.
+//! `run_provider` is driven by the full-run scheduler in [`crate::bench_openrouter`] and returns
+//! a [`ProviderRun`] carrying the tag and the derived cache-hold result.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -65,60 +50,44 @@ use crate::bench_openrouter::classify::{
 use crate::bench_openrouter::discovery::EndpointInfo;
 use crate::util::UnwrapPoison;
 
-// ── Constants ──────────────────────────────────────────────────────
-
-/// Whole-run deadline (minutes). The orchestrator derives the per-provider
-/// deadline (a [`std::time::Instant`]) from the run start + this constant and
-/// stores it in [`RunContext::deadline`]; the executor races it, it never
-/// computes it.
+/// Whole-run deadline (minutes). The orchestrator derives the per-provider deadline from the
+/// run start plus this constant and stores it in [`RunContext::deadline`]; the executor races
+/// it and never computes it.
 pub(crate) const RUN_DEADLINE_MINS: u64 = 55;
 
-/// OpenRouter chat-completions endpoint (the only HTTP call this module makes).
 const CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
-/// Per-request total timeout (seconds).
 const REQUEST_TIMEOUT_SECS: u64 = 120;
 
-/// Max attempts per round (1 initial + up to 2 retries).
 const MAX_ATTEMPTS: u32 = 3;
 
-/// Retry sleep floor and ceiling (ms) — Retry-After is clamped into this
-/// range; absent/other retryable statuses sleep the floor. Never jittered.
+/// Retry sleep floor and ceiling (ms) — Retry-After is clamped into this range; other
+/// retryable statuses sleep the floor. Never jittered.
 const RETRY_SLEEP_MIN_MS: u64 = 5_000;
 const RETRY_SLEEP_MAX_MS: u64 = 60_000;
 
-/// Delay before the response-cache re-send (seconds).
 const RESPONSE_CACHE_RETRY_DELAY_SECS: u64 = 2;
 
-/// `max_tokens` for warmup and normal ladder rounds (the model only emits one
-/// small tool call).
 const ROUND_MAX_TOKENS: u32 = 128;
 
-/// `max_tokens` for the single bounded retry of a `finish_reason == "length"`
-/// round (same prompt, larger budget).
 const LENGTH_RETRY_MAX_TOKENS: u32 = 1024;
 
-/// Fixed word list for the deterministic filler blob (~16 short words).
 const FILLER_WORDS: &[&str] = &[
     "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet",
     "kilo", "lima", "mike", "november", "oscar", "papa",
 ];
 
-// ── Prompt construction ────────────────────────────────────────────
-
-/// The base prompt for one provider run: the harness system prompt plus the
-/// user message. Byte-identical across all of the run's rounds so the prompt
-/// prefix is cacheable.
+/// The base prompt for one provider run: the harness system prompt plus the user message,
+/// byte-identical across the run's rounds so the prefix is cacheable.
 #[derive(Clone)]
 pub(crate) struct BasePrompt {
     pub system: String,
     pub user: String,
 }
 
-/// Build the base prompt from the harness system prompt, a per-run nonce and
-/// the deterministic filler blob. The nonce is embedded in the user message so
-/// different runs are distinguishable in the API logs while remaining
-/// byte-identical within one run; the user message also carries the fixed
+/// Build the base prompt from the harness system prompt, a per-run nonce and the deterministic
+/// filler blob. The nonce is in the user message so different runs are distinguishable in the
+/// API logs while remaining byte-identical within one run; the message also carries the fixed
 /// step-0 instruction (later steps come from the tool results).
 #[must_use]
 pub(crate) fn build_base_prompt(system: &str, nonce: &str, filler: &str) -> BasePrompt {
@@ -130,11 +99,9 @@ pub(crate) fn build_base_prompt(system: &str, nonce: &str, filler: &str) -> Base
     }
 }
 
-/// Deterministic filler blob: numbered lines from [`FILLER_WORDS`] joined with
-/// '\n', stopping once the accumulated length reaches `prefix_chars` (the last
-/// line may push slightly past it — a partial final line is fine). No
-/// randomness, no wall clock — two calls with the same argument are
-/// byte-identical.
+/// Deterministic filler blob: numbered lines from [`FILLER_WORDS`] joined with '\n', stopping
+/// once the length reaches `prefix_chars` (a partial final line is fine). No randomness and no
+/// wall clock, so two calls with the same argument are byte-identical.
 #[must_use]
 pub(crate) fn generate_filler(prefix_chars: usize) -> String {
     let mut out = String::new();
@@ -149,23 +116,18 @@ pub(crate) fn generate_filler(prefix_chars: usize) -> String {
     out
 }
 
-/// One verified tool-call frame: the model called `fast_tool` with a step, and
-/// the executor records the call id + any reasoning fields for the next
-/// round's message history.
+/// One verified tool-call frame: the model called `fast_tool` with a step, and the executor
+/// records the call id and any reasoning fields for the next round's history.
 struct ToolFrame {
     pub id: String,
     pub step: u64,
     pub reasoning: Option<serde_json::Value>,
 }
 
-/// Build the message array for a round: `[system, user]` followed by one
-/// assistant(tool_calls) + tool(result) pair per verified frame. When a frame
-/// carries `reasoning`, its keys are spread into the assistant message
-/// (`reasoning_content`, `reasoning`, `reasoning_details` — whatever the
-/// provider reported). The step the round expects the model to call lives in
-/// the last tool result ("proceed to step N+1") — it is NOT embedded in the
-/// prompt prefix (that would change it per round and break the cache
-/// measurement); the caller verifies the response against it separately.
+/// Build the message array for a round: `[system, user]` then one assistant(tool_calls) +
+/// tool(result) pair per verified frame, with a frame's `reasoning` keys spread into the
+/// assistant message. The step the round expects lives in the last tool result, NOT in the
+/// prompt prefix — that would change it per round and break the cache measurement.
 #[must_use]
 fn build_messages(base: &BasePrompt, frames: &[ToolFrame]) -> Vec<serde_json::Value> {
     let mut messages = vec![
@@ -206,13 +168,10 @@ fn build_messages(base: &BasePrompt, frames: &[ToolFrame]) -> Vec<serde_json::Va
     messages
 }
 
-/// Build the canonical request body for one round. `provider.order` pins the
-/// endpoint's tag slug with fallbacks off; `tool_choice` is intentionally
-/// omitted (providers default to auto) so the request stays cacheable;
-/// `reasoning_effort` is omitted entirely when `None` so byte-identical
-/// requests across rounds stay byte-identical. The expected step is not in the
-/// body either — it lives in the tool results, keeping the prompt prefix
-/// byte-identical across rounds.
+/// The canonical request body for one round. `provider.order` pins the endpoint's tag slug with
+/// fallbacks off; `tool_choice` and a `None` `reasoning_effort` are omitted so byte-identical
+/// requests stay byte-identical. The expected step is not in the body either — it lives in the
+/// tool results.
 #[must_use]
 fn build_request_body(
     model: &str,
@@ -246,18 +205,14 @@ fn build_request_body(
     body
 }
 
-// ── Wire types (permissive Deserialize) ────────────────────────────
-
-/// Prompt-token detail of a usage object.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct PromptTokensDetails {
     #[serde(default)]
     pub cached_tokens: Option<u64>,
 }
 
-/// Raw `usage` object of a chat-completions response.
-// Deliberately trimmed to what the run consumes (prompt, cached, cost); serde
-// ignores the other wire fields (completion, totals, cache-miss, etc.).
+/// Raw `usage` object, trimmed to what the run consumes (prompt, cached, cost); serde ignores
+/// the other wire fields.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct RawUsage {
     #[serde(default)]
@@ -270,11 +225,8 @@ struct RawUsage {
     pub cost: Option<f64>,
 }
 
-/// Raw chat-completions response envelope. Every field is optional / defaulted
-/// — a missing or malformed field is a parse failure (recorded, not fatal).
-// Deliberately trimmed: all remaining fields are consumed by `verify_pinned` /
-// `usage_from` / the tool-call extraction; serde ignores the other wire fields
-// (id, created, model, etc.).
+/// Raw chat-completions response envelope. Every field is optional, so a missing or malformed one
+/// is a parse failure (recorded, not fatal); serde ignores the wire fields the run does not read.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct RawEnvelope {
     #[serde(default)]
@@ -285,7 +237,6 @@ struct RawEnvelope {
     pub choices: Vec<RawChoice>,
 }
 
-/// One choice of a chat-completions response.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct RawChoice {
     #[serde(default)]
@@ -294,7 +245,6 @@ struct RawChoice {
     pub message: RawMessage,
 }
 
-/// The assistant message of a choice.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct RawMessage {
     #[serde(default)]
@@ -307,7 +257,6 @@ struct RawMessage {
     pub reasoning_details: Option<serde_json::Value>,
 }
 
-/// One tool call of an assistant message.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct RawToolCall {
     #[serde(default)]
@@ -316,7 +265,6 @@ struct RawToolCall {
     pub function: Option<RawToolCallFunction>,
 }
 
-/// The `function` object of a tool call.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct RawToolCallFunction {
     #[serde(default)]
@@ -325,10 +273,9 @@ struct RawToolCallFunction {
     pub arguments: Option<String>,
 }
 
-/// Result of one HTTP round (one [`send_round`] call, including its internal
-/// retries).
-// The outcome exposes only what the ladder consumes: the parsed envelope, the
-// error class, the response-cache flag, and the extracted tool-call fields.
+/// Result of one HTTP round (one [`send_round`] call, including its retries), exposing only
+/// what the ladder consumes: the envelope, the error class, the response-cache flag and the
+/// extracted tool-call fields.
 struct RoundOutcome {
     pub envelope: Option<RawEnvelope>,
     pub error_class: Option<String>,
@@ -339,8 +286,8 @@ struct RoundOutcome {
 }
 
 impl RoundOutcome {
-    /// The invalid-round reason for a round without an envelope: the recorded
-    /// error class, or `"http_error"` when none was recorded.
+    /// The invalid-round reason for a round without an envelope: the recorded error class, or
+    /// `"http_error"` when none was recorded.
     fn error_reason(&self) -> String {
         self.error_class
             .as_deref()
@@ -349,11 +296,9 @@ impl RoundOutcome {
     }
 }
 
-// ── HTTP round ─────────────────────────────────────────────────────
-
-/// Sleep (ms) before retrying a failed round: 429 honors Retry-After clamped
-/// into [5000, 60000] (5000 when absent); any other retryable status sleeps a
-/// fixed 5000. Never jittered — jitter would corrupt the TTL gap measurement.
+/// Sleep (ms) before retrying: 429 honors Retry-After clamped into [5000, 60000] (5000 when
+/// absent); any other retryable status sleeps a fixed 5000. Never jittered — jitter would
+/// corrupt the TTL gap measurement.
 #[must_use]
 fn retry_sleep_ms(status: reqwest::StatusCode, retry_after: Option<u64>) -> u64 {
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -365,34 +310,28 @@ fn retry_sleep_ms(status: reqwest::StatusCode, retry_after: Option<u64>) -> u64 
     }
 }
 
-/// Map a non-2xx status to its error-class string; retryable statuses (429,
-/// 5xx) return None so the caller retries instead of failing the round.
+/// Map a non-2xx status to its error class; retryable statuses (429, 5xx) return `None` so the
+/// caller retries.
 #[must_use]
 fn classify_http_error(status: reqwest::StatusCode) -> Option<&'static str> {
     match status.as_u16() {
         401 => Some("auth"),
         402 => Some("quota"),
-        // Retryable statuses — the caller retries instead of failing the round.
         429 | 500..=599 => None,
         _ => Some("http_4xx"),
     }
 }
 
-/// Send one round's request with bounded (never-jittered) retries and return
-/// the outcome. Every failure is recorded inside the returned [`RoundOutcome`]
-/// (never an `Err`): auth/quota/other-4xx set `error_class` without retrying,
-/// retryable statuses (429/5xx) and transport/timeout errors are retried
-/// internally, and a final failure still yields an outcome with the error
-/// class set. The API key and request body are never logged; at most a
-/// `tracing::debug!` per attempt.
+/// Send one round's request with bounded, never-jittered retries and return the outcome. Every
+/// failure is recorded inside the [`RoundOutcome`] (never an `Err`): auth/quota/other-4xx set
+/// `error_class` without retrying, retryable statuses and transport/timeout errors are retried,
+/// and a final failure still yields an outcome with the class set. The API key and body are
+/// never logged; at most a `tracing::debug!` per attempt.
 ///
-/// Retry policy (3 attempts total):
-/// - 429 → Retry-After clamped into [5 s, 60 s] (or 5 s), retry.
-/// - 5xx → 5 s, retry.
-/// - transport / timeout → `"transport"` / `"timeout"`, 5 s, retry.
-/// - 401 → `"auth"`, 402 → `"quota"`, other 4xx → `"http_4xx"`, no retry.
-/// - 2xx → `x-openrouter-cache-status` inspected for response-cache hits, body
-///   parsed (parse failure → `"parse"`).
+/// Retry policy (3 attempts): 429 → Retry-After clamped into [5 s, 60 s], retry; 5xx → 5 s,
+/// retry; transport/timeout → 5 s, retry; 401 → `"auth"`, 402 → `"quota"`, other 4xx →
+/// `"http_4xx"`, no retry; 2xx → inspect `x-openrouter-cache-status` and parse (a parse failure
+/// → `"parse"`).
 async fn send_round(client: &reqwest::Client, key: &str, body: &serde_json::Value) -> RoundOutcome {
     let mut attempts = 0u32;
     let mut http_status = 0u16;
@@ -455,8 +394,8 @@ async fn send_round(client: &reqwest::Client, key: &str, body: &serde_json::Valu
         }
     }
 
-    // Exhausted retryable statuses (429/5xx) leave error_class None — record a
-    // concrete class so the caller can classify the round as failed.
+    // Exhausted retryable statuses leave error_class None — record a concrete class so the
+    // caller can classify the round as failed.
     if error_class.is_none() && envelope.is_none() && http_status != 0 {
         error_class = Some(if http_status == 429 {
             "rate_limited"
@@ -477,10 +416,8 @@ async fn send_round(client: &reqwest::Client, key: &str, body: &serde_json::Valu
     }
 }
 
-/// Pull the first `fast_tool` tool call out of the envelope: its parsed
-/// `step` argument, its call id, and a combined reasoning object (any of
-/// `reasoning_content` / `reasoning` / `reasoning_details` present on the
-/// first choice's message).
+/// The first `fast_tool` tool call of the envelope: its parsed `step` argument, its call id,
+/// and a combined reasoning object from the first choice's message.
 #[must_use]
 fn extract_tool_call(
     envelope: Option<&RawEnvelope>,
@@ -507,8 +444,7 @@ fn extract_tool_call(
     (step, call.id.clone(), combine_reasoning(&choice.message))
 }
 
-/// Combine the reasoning fields of a message into one object when any are
-/// present (`reasoning_content`, `reasoning`, `reasoning_details`).
+/// Combine a message's reasoning fields into one object when any are present.
 #[must_use]
 fn combine_reasoning(msg: &RawMessage) -> Option<serde_json::Value> {
     let mut obj = serde_json::Map::new();
@@ -528,10 +464,7 @@ fn combine_reasoning(msg: &RawMessage) -> Option<serde_json::Value> {
     }
 }
 
-// ── Round usage ────────────────────────────────────────────────────
-
-/// Aggregated usage of one round (derived from the raw envelope) — only the
-/// fields the cache-hold predicate and the budget need.
+/// Aggregated usage of one round — only the fields the cache-hold predicate and the budget need.
 #[derive(Debug, Clone, Default)]
 struct RoundUsage {
     pub prompt_tokens: Option<u64>,
@@ -539,8 +472,8 @@ struct RoundUsage {
     pub cost: Option<f64>,
 }
 
-/// Cached tokens from a raw usage object: `prompt_tokens_details.cached_tokens`
-/// with a fallback to the Anthropic-style `prompt_cache_hit_tokens`.
+/// Cached tokens from a raw usage object: `prompt_tokens_details.cached_tokens`, falling back
+/// to the Anthropic-style `prompt_cache_hit_tokens`.
 #[must_use]
 fn raw_cached(u: &RawUsage) -> Option<u64> {
     u.prompt_tokens_details
@@ -549,7 +482,6 @@ fn raw_cached(u: &RawUsage) -> Option<u64> {
         .or(u.prompt_cache_hit_tokens)
 }
 
-/// Cached tokens reported by a round's envelope (0 when none/absent).
 #[must_use]
 fn cached_tokens_of(envelope: Option<&RawEnvelope>) -> u64 {
     envelope
@@ -558,7 +490,6 @@ fn cached_tokens_of(envelope: Option<&RawEnvelope>) -> u64 {
         .unwrap_or(0)
 }
 
-/// Derive [`RoundUsage`] from a parsed envelope (all-None when absent).
 #[must_use]
 fn usage_from(envelope: Option<&RawEnvelope>) -> RoundUsage {
     let Some(u) = envelope.and_then(|e| e.usage.as_ref()) else {
@@ -571,10 +502,6 @@ fn usage_from(envelope: Option<&RawEnvelope>) -> RoundUsage {
     }
 }
 
-// ── Budget + run context ───────────────────────────────────────────
-
-/// Spend accounting for the whole bench run: a per-provider guard and a total
-/// cap, both in USD.
 pub(crate) struct RunBudget {
     pub cap_usd: f64,
     pub per_provider_guard: f64,
@@ -593,9 +520,8 @@ impl RunBudget {
         }
     }
 
-    /// Record `billed` USD against `tag`. Returns `(over_guard, over_cap)` —
-    /// true when the provider's guard or the total cap is exceeded AFTER this
-    /// record.
+    /// Record `billed` USD against `tag`, answering `(over_guard, over_cap)` — true when the
+    /// provider's guard or the total cap is exceeded AFTER this record.
     #[must_use]
     pub(crate) fn record(&self, tag: &str, billed: f64) -> (bool, bool) {
         let mut total = self.total_spent.lock().unwrap_poison();
@@ -611,7 +537,6 @@ impl RunBudget {
         *self.total_spent.lock().unwrap_poison()
     }
 
-    /// The abort reason for an exceeded total spend cap.
     fn cap_exceeded_reason(&self) -> String {
         format!(
             "spend cap exceeded (${:.4} > ${:.4})",
@@ -621,8 +546,6 @@ impl RunBudget {
     }
 }
 
-/// Shared context for one provider run: budget, abort token, abort reason and
-/// the run deadline.
 pub(crate) struct RunContext {
     pub budget: RunBudget,
     pub abort: tokio_util::sync::CancellationToken,
@@ -631,25 +554,22 @@ pub(crate) struct RunContext {
 }
 
 impl RunContext {
-    /// Abort the whole run: cancel the abort token (every ladder sleep races
-    /// it) and record `reason` (reported in the manifest and the summary).
+    /// Abort the whole run: cancel the abort token (every ladder sleep races it) and record
+    /// `reason`.
     pub(crate) fn abort(&self, reason: String) {
         self.abort.cancel();
         *self.abort_reason.lock().unwrap_poison() = Some(reason);
     }
 }
 
-// ── Per-provider run ───────────────────────────────────────────────
-
-/// Result of one provider run: the tag and the derived cache-hold result.
 pub(crate) struct ProviderRun {
     pub tag: String,
     pub cache_hold_bucket: String,
 }
 
 impl ProviderRun {
-    /// A provider that never produced a measured cache-hold result (failed to
-    /// run, skipped the ladder, or was aborted before the ladder).
+    /// A provider that never produced a measured cache-hold result (failed to run, skipped the
+    /// ladder, or was aborted before it).
     #[must_use]
     fn not_measured(tag: String) -> Self {
         Self {
@@ -659,9 +579,8 @@ impl ProviderRun {
     }
 }
 
-/// Run one provider's warmup + TTL ladder. Never panics on provider behavior:
-/// every failure degrades to a [`ProviderRun::not_measured`] result (after the
-/// auth/quota abort side-effects) or a ladder-derived cache-hold bucket.
+/// Run one provider's warmup + TTL ladder. Never panics on provider behavior: every failure
+/// degrades to a [`ProviderRun::not_measured`] result or a ladder-derived bucket.
 #[expect(
     clippy::too_many_arguments,     // the full protocol inputs; bundled would obscure the call site
     clippy::too_many_lines,         // one long sequential protocol implementation
@@ -681,7 +600,7 @@ pub(crate) async fn run_provider(
 ) -> ProviderRun {
     let tag = endpoint.tag.clone();
 
-    // ── W1: warmup 1 — the auth/quota gate before any spend ──
+    // W1: warmup 1 — the auth/quota gate before any spend
     let w_body = build_request_body(model, base, &[], &tag, reasoning_effort, ROUND_MAX_TOKENS);
     let outcome_w1 = send_round(client, key, &w_body).await;
 
@@ -698,7 +617,7 @@ pub(crate) async fn run_provider(
         return ProviderRun::not_measured(tag);
     }
 
-    // ── W2: warmup 2 — byte-identical; the base-cache sample ──
+    // W2: warmup 2 — byte-identical; the base-cache sample
     let outcome_w2 = send_round(client, key, &w_body).await;
     let w2_cached = cached_tokens_of(outcome_w2.envelope.as_ref());
     let w2_is_response_cache = outcome_w2.response_cache_hit;
@@ -750,7 +669,7 @@ pub(crate) async fn run_provider(
         return ProviderRun::not_measured(tag);
     }
 
-    // ── Ladder ──
+    // Ladder
     let rounds = ladder_secs.len() + 1;
     let mut frames: Vec<ToolFrame> = Vec::new();
     let mut classifications: Vec<CacheClassification> = Vec::new();
@@ -840,7 +759,6 @@ pub(crate) async fn run_provider(
                         .and_then(|e| e.choices.first())
                         .and_then(|c| c.finish_reason.as_deref());
                     if finish == Some("length") {
-                        // ONE bounded retry with a larger budget (same prompt).
                         let retry_body = build_request_body(
                             model,
                             base,
@@ -863,17 +781,15 @@ pub(crate) async fn run_provider(
             }
         }
 
-        // Tool-call frame for the next round (kept only when verified).
         let tool_call_id = outcome
             .tool_call_id
             .clone()
             .unwrap_or_else(|| format!("call_{r}"));
         let reasoning = outcome.reasoning.clone();
 
-        // 5. Cache classification (ladder rounds only).
         let usage = usage_from(outcome.envelope.as_ref());
-        // Response-cache-hit rounds are Invalid for bucketing and their cached
-        // tokens are stale — they must not count toward the zero-cache predicate.
+        // Response-cache-hit rounds are Invalid for bucketing and their cached tokens are
+        // stale — they must not count toward the zero-cache predicate.
         if !outcome.response_cache_hit {
             cached_observations.push(usage.cached_tokens.unwrap_or(0));
         }
@@ -892,7 +808,6 @@ pub(crate) async fn run_provider(
         classifications.push(classification);
         nominal_gaps.push(nominal_gap_secs);
 
-        // 6. Spend accounting.
         let (over_guard, over_cap) = context.budget.record(&tag, round_billed);
         if over_guard {
             break;
@@ -902,7 +817,6 @@ pub(crate) async fn run_provider(
             break;
         }
 
-        // Verified frame for the next round (kept only when the round was valid).
         if invalid_reason.is_none() {
             frames.push(ToolFrame {
                 id: tool_call_id,
@@ -916,8 +830,7 @@ pub(crate) async fn run_provider(
             invalid_reason.as_deref().unwrap_or(classification_str),
         );
 
-        // Deterministic tool delay; the deadline and the run-level abort both
-        // race the sleep.
+        // Deterministic tool delay; the deadline and the run-level abort both race the sleep.
         if r < ladder_secs.len() {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(ladder_secs[r])) => {}
@@ -931,7 +844,6 @@ pub(crate) async fn run_provider(
         }
     }
 
-    // ── Result ──
     let any_cached = cached_observations.iter().any(|&c| c > 0);
     let cache_hold_bucket = cache_hold_result(any_cached, &classifications, &nominal_gaps);
 
@@ -959,11 +871,10 @@ mod tests {
         }
     }
 
-    /// The request the harness sends: the chat shape (system + user, then one
-    /// assistant/tool pair per frame, with the reasoning fields spread into the
-    /// assistant message), and the pinned body — model, token cap, provider
-    /// order, the single tool — with `reasoning_effort` only when one was
-    /// chosen and `tool_choice` never sent.
+    /// The request the harness sends: the chat shape (system + user, then one assistant/tool
+    /// pair per frame, with the reasoning fields spread into the assistant message) and the
+    /// pinned body — model, token cap, provider order, the single tool — with `reasoning_effort`
+    /// only when one was chosen and `tool_choice` never sent.
     #[test]
     fn request_construction() {
         let frames = vec![
@@ -983,11 +894,9 @@ mod tests {
             },
         ];
         let msgs = build_messages(&base(), &frames);
-        // system + user + 2 × (assistant + tool)
         assert_eq!(msgs.len(), 6);
         assert_eq!(msgs[0], json!({"role": "system", "content": "sys"}));
         assert_eq!(msgs[1], json!({"role": "user", "content": "user text"}));
-        // Frame 0: plain assistant + tool result.
         assert_eq!(msgs[2]["role"], "assistant");
         assert_eq!(msgs[2]["tool_calls"][0]["id"], "call_0");
         assert_eq!(msgs[2]["tool_calls"][0]["type"], "function");
@@ -998,7 +907,6 @@ mod tests {
         assert!(msgs[2].get("reasoning_content").is_none());
         assert_eq!(msgs[3]["role"], "tool");
         assert_eq!(msgs[3]["tool_call_id"], "call_0");
-        // Frame 1: reasoning spread into the assistant message.
         assert_eq!(msgs[4]["role"], "assistant");
         assert_eq!(msgs[4]["reasoning_content"], "rc");
         assert_eq!(msgs[4]["reasoning"], "r");
@@ -1082,7 +990,6 @@ mod tests {
             call.function.as_ref().and_then(|f| f.arguments.as_deref()),
             Some("{\"step\":0}")
         );
-        // Tool-call extraction: step, id, combined reasoning object.
         let (step, id, reasoning) = extract_tool_call(Some(&env));
         assert_eq!(step, Some(0));
         assert_eq!(id.as_deref(), Some("call_0"));

@@ -1,10 +1,6 @@
-//! The markdown block layout for [`super::Selectable`]: headings, paragraphs,
-//! both list kinds and code blocks, plus the `Viewer` that renders a whole
-//! parsed document.
-//!
-//! The blocks lay the document out the way the chat's transcript reads; the
-//! text leaf is ours — every block renders through [`rich_text`], on iced's own
-//! markdown vocabulary (`iced::widget::markdown`).
+//! The markdown block layout for [`super::Selectable`]: headings, paragraphs, both list kinds and
+//! code blocks, plus the `Viewer` that renders a whole parsed document. Every block renders through
+//! [`rich_text`], on iced's own markdown vocabulary (`iced::widget::markdown`).
 
 #![expect(
     clippy::large_types_passed_by_value,
@@ -100,8 +96,7 @@ where
         .into()
 }
 
-/// Displays an unordered list using the default look and
-/// calling the [`Viewer`] for each bullet point item.
+/// Displays an unordered list using the default look, calling the [`Viewer`] per bullet.
 pub(crate) fn unordered_list<'a, Message, Theme, Renderer>(
     viewer: &impl Viewer<'a, Message, Theme, Renderer>,
     settings: Settings,
@@ -144,8 +139,7 @@ where
     .into()
 }
 
-/// Displays an ordered list using the default look and
-/// calling the [`Viewer`] for each numbered item.
+/// Displays an ordered list using the default look, calling the [`Viewer`] per item.
 pub(crate) fn ordered_list<'a, Message, Theme, Renderer>(
     viewer: &impl Viewer<'a, Message, Theme, Renderer>,
     settings: Settings,

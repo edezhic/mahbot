@@ -1,32 +1,22 @@
 //! Report artifacts for `mahbot bench-openrouter` full runs.
 //!
-//! The full-run executor writes four artifacts under
-//! `<output-dir>/bench-openrouter/<run-ts>/`:
+//! The full-run executor writes four artifacts under `<output-dir>/bench-openrouter/<run-ts>/`:
 //!
-//! - `report.json` — the complete structured run report: run meta, one
-//!   three-column entry per provider (`tag` / `static_price_usd_per_m` /
-//!   `cache_hold`), and the artifact paths.
-//! - `summary.md` — the human-readable markdown summary (meta table, the
-//!   per-provider price + cache-hold table, a short methodology, and an abort
-//!   note when applicable).
-//! - `providers.json` — the verbatim discovery snapshot (raw models /
-//!   endpoints / key payloads with the key redacted).
-//! - `manifest.json` — the run manifest: scrubbed argv + env entries +
-//!   config + outcome (exit code, abort state). The API key value is ALWAYS
-//!   scrubbed (see [`build_manifest`]).
+//! - `report.json` — the complete structured run report: run meta, one three-column entry per
+//!   provider (`tag` / `static_price_usd_per_m` / `cache_hold`), and the artifact paths.
+//! - `summary.md` — the human-readable markdown summary (meta table, the per-provider price +
+//!   cache-hold table, a short methodology, and an abort note when applicable).
+//! - `providers.json` — the verbatim discovery snapshot, with the key payload redacted.
+//! - `manifest.json` — the run manifest: scrubbed argv + env entries + config + outcome. The API
+//!   key value is ALWAYS scrubbed (see [`build_manifest`]).
 //!
-//! By default `<output-dir>` is `~/.mahbot/benchmarks/<model-slug>/` — one
-//! folder per model, derived from the model id — so parallel runs of different
-//! models write separate folders and take separate output locks; `--output-dir`
-//! overrides it exactly.
-//!
-//! Every artifact is mirrored into `<output-dir>/bench-openrouter/latest/`
-//! so a consumer can always read the most recent run of that model from a
+//! `<output-dir>` defaults to `~/.mahbot/benchmarks/<model-slug>/`, so parallel runs of different
+//! models write separate folders and take separate output locks. Every artifact is mirrored into
+//! `<output-dir>/bench-openrouter/latest/`, so a consumer can read the most recent run from a
 //! stable path.
 //!
-//! All `build_*` functions are pure (no I/O) and unit-tested against
-//! synthetic inputs; [`write_artifacts`] and [`acquire_run_lock`] are the only
-//! I/O boundaries.
+//! All `build_*` functions are pure and unit-tested against synthetic inputs; [`write_artifacts`]
+//! and [`acquire_run_lock`] are the only I/O boundaries.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,8 +29,6 @@ use crate::bench_openrouter::select::{
     VALIDATED_MIX_CACHED, VALIDATED_MIX_INPUT, VALIDATED_MIX_OUTPUT,
 };
 use crate::bench_openrouter::{BenchOptions, discovery::parse_price};
-
-// ── Paths ──────────────────────────────────────────────────────────
 
 /// All artifact paths of one run. `latest_dir` is the `latest/` mirror target.
 pub(crate) struct ArtifactPaths {
@@ -58,19 +46,14 @@ pub(crate) fn run_dir_name(now: &chrono::DateTime<chrono::Utc>) -> String {
     now.format("%Y%m%d-%H%M%S").to_string()
 }
 
-/// Acquire the bench's own run lock: `<output_dir>/bench-openrouter.lock`.
-///
-/// This is the bench's OWN lock — it never touches the instance's
-/// `mahbot.lock`. Creates `output_dir` first; returns the locked [`File`],
-/// which the caller keeps alive for the run duration (the kernel releases the
-/// lock when the file is closed / the process exits). Bails when another
-/// bench run holds the lock.
+/// Acquire the bench's own run lock: `<output_dir>/bench-openrouter.lock`. It never touches the
+/// instance's `mahbot.lock`. Creates `output_dir` first and returns the locked [`File`], which
+/// the caller keeps alive for the run (the kernel releases the lock when it closes).
 ///
 /// # Errors
 ///
 /// Fails when the directory cannot be created, the file cannot be opened, or
-/// [`try_flock`](crate::util::lock::try_flock) itself errors (as opposed to
-/// reporting "already locked").
+/// [`try_flock`](crate::util::lock::try_flock) itself errors.
 pub(crate) fn acquire_run_lock(output_dir: &Path) -> anyhow::Result<std::fs::File> {
     std::fs::create_dir_all(output_dir)?;
     let path = output_dir.join("bench-openrouter.lock");
@@ -89,14 +72,8 @@ pub(crate) fn acquire_run_lock(output_dir: &Path) -> anyhow::Result<std::fs::Fil
     Ok(file)
 }
 
-// ── Artifact writing ───────────────────────────────────────────────
-
-/// Write all four artifacts into `run_dir` and mirror them into `latest_dir`.
-///
-/// `create_dir_all` both directories first. The three JSON artifacts are
-/// written pretty-printed; `summary_md` is written verbatim. The mirror is
-/// best-effort per file — any copy error propagates (the run is still
-/// reported as failed, but the run_dir artifacts may be intact).
+/// Write all four artifacts into `run_dir` and mirror them into `latest_dir`: the three JSON ones
+/// pretty-printed, `summary_md` verbatim. The mirror is best-effort per file.
 ///
 /// # Errors
 ///
@@ -127,14 +104,11 @@ pub(crate) fn write_artifacts(
     Ok(())
 }
 
-// ── Manifest ───────────────────────────────────────────────────────
+// Manifest
 
-/// Build the run manifest. `args` is the raw argv with any API-key material
-/// scrubbed: the `--api-key` value (both `--api-key VALUE` and
-/// `--api-key=VALUE` forms) becomes `"***"`, and any arg containing the
-/// substring `sk-or-` is replaced wholesale with `"***"`. The `env` object
-/// records ONLY the three key entries (each present-or-absent), with the key
-/// values scrubbed.
+/// Build the run manifest. `args` is the raw argv with any API-key material scrubbed: the
+/// `--api-key` value becomes `"***"`, and any arg containing `sk-or-` is replaced wholesale. The
+/// `env` object records only the three key entries, present-or-absent, values scrubbed.
 #[must_use]
 // The 9-arg signature is the spec'd manifest surface (scrubbed argv + config +
 // outcome); bundling would obscure the manifest's fixed keys.
@@ -215,9 +189,8 @@ pub(crate) fn build_manifest(
     })
 }
 
-/// The scrubbed stand-in for an API key value: `"***"` for anything that looks
-/// like a key (non-empty), the original when empty (a `--api-key=` with an
-/// empty value carries no secret).
+/// The scrubbed stand-in for an API key value: `"***"` for anything non-empty, the original when
+/// empty (a `--api-key=` with an empty value carries no secret).
 #[must_use]
 fn scrub_value(v: &str) -> String {
     if v.is_empty() {
@@ -226,8 +199,6 @@ fn scrub_value(v: &str) -> String {
         "***".to_string()
     }
 }
-
-// ── Report ─────────────────────────────────────────────────────────
 
 /// Run metadata shared by [`build_report`] and [`build_summary_md`].
 pub(crate) struct RunMeta {
@@ -245,11 +216,9 @@ pub(crate) struct RunMeta {
     pub output_dir: PathBuf,
 }
 
-/// Build the complete structured report (pure — no I/O).
-///
-/// Every discovered endpoint gets a providers-array entry; the cache-hold is
-/// the run's `cache_hold_bucket` when a run exists for that tag, else
-/// `"not measured"`.
+/// Build the complete structured report (pure — no I/O). Every discovered endpoint gets a
+/// providers-array entry; the cache-hold is the run's `cache_hold_bucket` when a run exists for
+/// that tag, else `"not measured"`.
 #[must_use]
 pub(crate) fn build_report(
     meta: &RunMeta,
@@ -301,8 +270,6 @@ pub(crate) fn build_report(
     })
 }
 
-// ── Summary markdown ───────────────────────────────────────────────
-
 /// Ladder gap rendered for the summary: raw seconds below 30 minutes, whole
 /// minutes above (the default ladder reads `0s, 5s, 30s, 120s, 300s, 600s, 30m`).
 #[must_use]
@@ -314,15 +281,13 @@ fn format_ladder_gap(secs: u64) -> String {
     }
 }
 
-/// Build the human-readable markdown summary (pure — no I/O). Sections:
-/// header + meta table, the per-provider price + cache-hold table, a short
-/// methodology, and an abort note when the run was aborted.
+/// Build the human-readable markdown summary (pure — no I/O): header + meta table, the per-provider
+/// price + cache-hold table, a short methodology, and an abort note when the run was aborted.
 #[must_use]
 pub(crate) fn build_summary_md(meta: &RunMeta, report: &serde_json::Value) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
 
-    // 1. Header + run meta table.
     let _ = writeln!(out, "# OpenRouter provider benchmark — {}\n", meta.model);
     let _ = writeln!(out, "| | |\n|---|---|");
     let _ = writeln!(out, "| Started | {} |", meta.started_at);
@@ -345,7 +310,6 @@ pub(crate) fn build_summary_md(meta: &RunMeta, report: &serde_json::Value) -> St
     }
     let _ = writeln!(out);
 
-    // 2. Per-provider price + cache-hold table (read from the report JSON).
     let _ = writeln!(out, "## Providers\n");
     let _ = writeln!(out, "| Provider (tag) | Static price ($/1M) | Cache hold |");
     let _ = writeln!(out, "|---|---|---|");
@@ -367,7 +331,6 @@ pub(crate) fn build_summary_md(meta: &RunMeta, report: &serde_json::Value) -> St
     }
     let _ = writeln!(out);
 
-    // 3. Methodology.
     let _ = writeln!(
         out,
         "## Methodology\n\n\
@@ -388,7 +351,6 @@ pub(crate) fn build_summary_md(meta: &RunMeta, report: &serde_json::Value) -> St
     );
     let _ = writeln!(out);
 
-    // 4. Abort note.
     if meta.aborted {
         let _ = writeln!(
             out,
@@ -400,10 +362,8 @@ pub(crate) fn build_summary_md(meta: &RunMeta, report: &serde_json::Value) -> St
     out
 }
 
-/// Static price per 1M tokens at the validated mix
-/// ([`VALIDATED_MIX_CACHED`] / [`VALIDATED_MIX_INPUT`] / [`VALIDATED_MIX_OUTPUT`]),
-/// volume-independent, no per-request fee. `None` when pricing is entirely
-/// absent.
+/// Static price per 1M tokens at the validated mix, volume-independent, no per-request fee.
+/// `None` when pricing is entirely absent.
 #[must_use]
 pub(crate) fn static_price_usd_per_m(pricing: Option<&Pricing>) -> Option<f64> {
     let p = pricing?;
@@ -425,8 +385,6 @@ pub(crate) fn static_price_usd_per_m(pricing: Option<&Pricing>) -> Option<f64> {
     ))
 }
 
-// ── Cost math ──────────────────────────────────────────────────────
-
 /// Session cost in USD for `total_tokens` tokens at the given per-token mix:
 /// `total_tokens × (mix_cached×cache_read + mix_input×prompt + mix_output×completion)`.
 #[must_use]
@@ -442,12 +400,8 @@ fn session_cost(
     total_tokens * (mix_cached * cache_read + mix_input * prompt + mix_output * completion)
 }
 
-// ── Providers snapshot ─────────────────────────────────────────────
-
-/// The verbatim discovery snapshot for `providers.json`, with the key
-/// payload redacted (the raw key JSON may echo the key label / usage — the
-/// API key itself is never present in the discovery payloads, but the file is
-/// flagged `key_redacted: true` by construction).
+/// The verbatim discovery snapshot for `providers.json`, with the key payload redacted. The API
+/// key itself is never present in the discovery payloads, but the file is flagged by construction.
 #[must_use]
 pub(crate) fn providers_snapshot_json(snapshot: &DiscoverySnapshot) -> serde_json::Value {
     json!({
@@ -463,9 +417,8 @@ pub(crate) fn providers_snapshot_json(snapshot: &DiscoverySnapshot) -> serde_jso
 mod tests {
     use super::*;
 
-    /// The manifest is the artifact that leaves the machine, so the key the run
-    /// was invoked with must never appear in it — neither as a bare argv value
-    /// nor inside an `--api-key=…` spelling.
+    /// The manifest is the artifact that leaves the machine, so the key the run was invoked with
+    /// must never appear in it — neither bare nor inside an `--api-key=…` spelling.
     #[test]
     fn build_manifest_redacts_keys() {
         let args = vec![

@@ -1,35 +1,23 @@
-//! PDF marks: the document's own description, its annotations and its form
-//! fields, as document-text blocks.
+//! PDF marks: the document's own description, its annotations and its form fields, as
+//! document-text blocks.
 //!
-//! This is the metadata/annotation/form arm of [`crate::document`]'s PDF
-//! reading. Where [`crate::document`] produces a page's text and rasters, this
-//! module reads what the document says about itself (the Info dictionary), the
-//! marks beside the text — comments, highlights, stamps, free text and
-//! signatures in the page annotations — and the AcroForm fields a user fills in,
-//! and renders them as the sections a model reads. It shares
-//! [`crate::document`]'s invariants.
+//! This is the metadata/annotation/form arm of [`crate::document`]'s PDF reading: what the
+//! document says about itself (the Info dictionary), the marks beside the text — comments,
+//! highlights, stamps, free text and signatures — and the AcroForm fields a user fills in.
 //!
-//! # Invariants
-//!
-//! - **Read-only.** Nothing here writes, and nothing here holds state: the walk
-//!   runs off the already-parsed [`Pdf`] the caller opened.
-//! - **No panics of its own**, for any file: the whole walk runs inside
-//!   [`crate::shutdown::contain_panics`], so a panic in a malformed document
-//!   costs the marks and nothing else ([`Marks::default`]).
-//! - **One page never costs another.** An annotation or field that cannot be
-//!   read is skipped, never an error: the marks around it keep theirs.
-//! - **The walking is bounded.** The field tree has a depth cap and a
-//!   visited-object set, both walks are capped by [`MAX_MARKS`]/[`MAX_FIELDS`],
-//!   and a field's printed option list by [`MAX_FIELD_OPTIONS`]; a cap that
-//!   truncates is named in [`Marks::notes`].
-//! - **A field is listed with the state it is in.** Every field a fill can reach
-//!   is listed, even with no value (the shared empty marker); one it cannot
-//!   reach is listed as not fillable. No value is ever invented, and a choice
-//!   whose option the file does not name shows only the state it is in.
-//! - **One object is one entry.** Identity is the dictionary's own bytes, so a
-//!   mark listed on two pages is one mark while two dictionaries written
-//!   directly into one array stay two, and a form is walked with the same
-//!   `/T`-based field test the filler uses, so the two agree on its fields.
+//! - **Read-only.** Nothing here writes or holds state: the walk runs off the already-parsed
+//!   [`Pdf`] the caller opened.
+//! - **No panics of its own**, for any file: the walk runs inside
+//!   [`crate::shutdown::contain_panics`], so a panic costs the marks and nothing else.
+//! - **One page never costs another.** An annotation or field that cannot be read is skipped,
+//!   never an error: the marks around it keep theirs.
+//! - **The walking is bounded.** The field tree has a depth cap and a visited-object set, both
+//!   walks are capped by [`MAX_MARKS`]/[`MAX_FIELDS`], and a field's printed option list by
+//!   [`MAX_FIELD_OPTIONS`]; a cap that truncates is named in [`Marks::notes`].
+//! - **A field is listed with the state it is in.** Every field a fill can reach is listed, even
+//!   with no value; one it cannot reach is listed as not fillable. No value is ever invented.
+//! - **One object is one entry.** Identity is the dictionary's own bytes, so a mark listed on two
+//!   pages is one mark while two dictionaries written into one array stay two.
 
 use crate::reader_output::{Unshown, UnshownKind};
 use crate::util::html::decode_html_entities;
@@ -39,51 +27,36 @@ use hayro::hayro_syntax::object::dict::Dict;
 use hayro::hayro_syntax::object::{Array, DateTime, Name, Object, String as PdfString};
 use std::collections::{HashMap, HashSet};
 
-// ── Bounds ──────────────────────────────────────────────────────
-
-/// Maximum annotations reported for one document, so a file whose `/Annots`
-/// arrays are effectively unbounded cannot make the walk (or the text it
-/// produces) unbounded with it.
+/// Maximum annotations reported for one document, so a file whose `/Annots` are a cycle cannot
+/// make the reading unbounded.
 const MAX_MARKS: usize = 1000;
 
 /// Maximum form fields reported for one document, for the same reason.
 const MAX_FIELDS: usize = 1000;
 
-/// Maximum options printed for one form field: a list box whose `/Opt` holds
-/// thousands of entries would otherwise make every reading of the file huge.
+/// Maximum options printed for one form field: a list box whose `/Opt` is a cycle.
 const MAX_FIELD_OPTIONS: usize = 100;
 
-/// Maximum depth of the field tree, so a file whose `/Kids` point in a cycle
-/// that does not repeat an object still terminates.
+/// Maximum depth of the field tree, so a file whose `/Kids` point in a cycle terminates.
 const MAX_FIELD_DEPTH: usize = 32;
 
-/// What tells one dictionary from another within one document: the bytes it was
-/// parsed from. The engine resolves a reference to the very bytes it points at
-/// and caches a decoded object stream, so one object resolves to one slice —
-/// while two dictionaries written directly into the same array are two slices.
-/// [`Dict::obj_id`] cannot serve as an identity for that: it is the *enclosing*
-/// indirect object's id, so every direct dictionary in one array would collapse
-/// onto the same one.
+/// What tells one dictionary from another within one document: the bytes it was parsed from. The
+/// engine resolves a reference to the very bytes it points at and caches a decoded object stream,
+/// so one object resolves to one slice — while two dictionaries written directly into one array
+/// are two slices. [`Dict::obj_id`] cannot serve as an identity: it is the *enclosing* indirect
+/// object's id, so every direct dictionary in one array would collapse onto the same one.
 type DictId = (usize, usize);
 
-/// A dictionary's identity ([`DictId`]).
 fn dict_id(dict: &Dict<'_>) -> DictId {
     let data = dict.data();
     (data.as_ptr().addr(), data.len())
 }
 
-// ── Delivery notes ──────────────────────────────────────────────
-
-/// Body of the note shown when a document carries a form but no field the
-/// caller can fill: every field it has is a pushbutton, a signature, or
-/// unreadable. The form is not empty — it simply offers no fillable field.
+/// Body of the note shown when a document carries a form but no field a fill can reach.
 const NO_FILLABLE_FIELDS_NOTE: &str = "the document has a form, but no field that can be filled";
 
-/// Body of the note shown when a document's `/AcroForm` exists but its
-/// `/Fields` could not be read at all.
+/// Body of the note shown when a document's `/AcroForm` exists but cannot be read.
 const FIELDS_UNREADABLE_NOTE: &str = "the document has a form, but its fields could not be read";
-
-// ── Annotation flags and field flags ────────────────────────────
 
 /// `/F` bit 2: the annotation is hidden from the reader.
 const ANNOT_FLAG_HIDDEN: i32 = 2;
@@ -93,39 +66,29 @@ const ANNOT_FLAG_NO_VIEW: i32 = 32;
 const FIELD_FLAG_RADIO: i32 = 1 << 15;
 /// `/Ff` bit 17: a `Btn` field is a pushbutton, which carries no value.
 const FIELD_FLAG_PUSH_BUTTON: i32 = 1 << 16;
-/// `/Ff` bit 18: a `Ch` field is a combo box (a dropdown), whose value a filler
-/// may write even when the field offers no `/Opt`; an edit-less list box cannot.
+/// `/Ff` bit 18: a `Ch` field is a combo box (a dropdown), whose value a filler may type.
 const FIELD_FLAG_COMBO: i32 = 1 << 17;
 
-// ── The public shape ────────────────────────────────────────────
-
-/// What a PDF says beside its page text: its own description, its annotations
-/// and its form fields.
+/// What a PDF says beside its page text: its own description, its annotations and its form fields.
 #[derive(Debug, Default)]
 pub(crate) struct Marks {
-    /// The ready `Description:` section, already labeled and laid out; `None`
-    /// when the document's Info dictionary carries nothing worth showing.
+    /// The ready `Description:` section; `None` when the document has none.
     pub(crate) description: Option<String>,
-    /// The ready `Annotations:` section, already labeled and laid out; `None`
-    /// when the document carries no mark.
+    /// The ready `Annotations:` section; `None` when the document has no mark.
     pub(crate) annotations: Option<String>,
-    /// The ready `Form fields:` section; `None` when the document has no field a
-    /// caller can fill.
+    /// The ready `Form fields:` section; `None` when no field a fill can reach exists.
     pub(crate) fields: Option<String>,
-    /// Non-fatal notes, in `crate::document`'s user-facing note shape.
     pub(crate) notes: Vec<String>,
-    /// The content the marks themselves carry and the reading does not show: the
-    /// files a document attaches and the media its annotations hold, counted for
-    /// the document's report (see [`crate::reader_output::Unshown`]) rather than
-    /// passing unseen.
+    /// The content the marks themselves carry and the reading does not show: the file an attachment
+    /// holds, the media a sound/movie/screen annotation plays.
     pub(crate) unshown: Unshown,
 }
 
 /// Read `pdf`'s own description, its annotations and its form fields.
 ///
-/// The walk is contained exactly like [`crate::document`]'s PDF passes: a panic
-/// in a malformed object yields [`Marks::default`] rather than reaching the
-/// caller, so one bad document can never cost the conversion its page text too.
+/// The walk is contained exactly like [`crate::document`]'s PDF passes: a panic in a malformed
+/// object yields [`Marks::default`] rather than reaching the caller, so one bad document can
+/// never cost the conversion its page text too.
 #[must_use]
 pub(crate) fn read(pdf: &Pdf) -> Marks {
     crate::shutdown::contain_panics(|| read_inner(pdf)).unwrap_or_default()
@@ -182,13 +145,8 @@ fn read_inner(pdf: &Pdf) -> Marks {
     marks
 }
 
-// ── The document's description ─────────────────────────────────
-
-/// The `Description:` block from the document's Info dictionary — only the
-/// entries it actually carries, in the order the shared rules state, each on one
-/// line. A date is rendered in calendar form with the offset the engine kept; a
-/// date that stated no zone (or a zero one) reads as UTC, which is the engine's
-/// own spelling of the two.
+/// The `Description:` block from the document's Info dictionary — only the entries it really
+/// carries.
 fn read_description(pdf: &Pdf) -> Option<String> {
     let metadata = pdf.metadata();
     let mut entries: Vec<(&str, String)> = Vec::new();
@@ -218,19 +176,14 @@ fn read_description(pdf: &Pdf) -> Option<String> {
     })
 }
 
-/// One text entry of the description, decoded and collapsed to one line. `None`
-/// for an entry that is absent or blank: an empty entry says nothing, and the
-/// file carrying it is not the same as the file describing itself with nothing.
+/// One text entry of the description, decoded and collapsed to one line. `None` when it holds
+/// nothing readable.
 fn description_text(bytes: &[u8]) -> Option<String> {
     let text = one_line(decode_text_string(bytes).trim().to_string());
     (!text.is_empty()).then_some(text)
 }
 
-/// A PDF date as `YYYY-MM-DDTHH:MM:SS` with `Z` for a zero offset or
-/// `±HH:MM` for any other. The engine keeps the offset sign only in the hour and
-/// its minutes unsigned, so a file spelling `D:…-00'30'` parses as hour 0 minute
-/// 30 and prints here as `+00:30`; the trailer's `/Info` is not reachable as raw
-/// bytes, so the sign cannot be recovered.
+/// A PDF date as `YYYY-MM-DDTHH:MM:SS` with `Z` for a zero offset or an explicit one.
 fn format_date(date: DateTime) -> String {
     let calendar = format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
@@ -246,25 +199,19 @@ fn format_date(date: DateTime) -> String {
     }
 }
 
-// ── Annotations ─────────────────────────────────────────────────
-
-/// What one walk over every page's `/Annots` yields.
 #[derive(Default)]
 struct AnnotationWalk {
     /// One line per mark, in page order and then in each page's `/Annots` order.
     lines: Vec<String>,
-    /// The page each `/Widget` annotation sits on, so a field can be named with
-    /// the page its widget is bound to.
+    /// The page each `/Widget` annotation sits on, so a field can be named with it.
     widget_pages: HashMap<DictId, usize>,
-    /// Whether [`MAX_MARKS`] cut the walk short.
     truncated: bool,
-    /// The annotations that are no mark but still hold content — an attached
-    /// file, a sound, a movie — counted for the document's report.
+    /// The annotations that are no mark but still hold content — an attached file, media.
     unshown: Unshown,
 }
 
-/// Walk every page's `/Annots` once: the mark lines, the pages its `/Widget`
-/// annotations sit on, and whether [`MAX_MARKS`] cut the walk short.
+/// Walk every page's `/Annots` once: the mark lines, the pages its `/Widget` annotations sit
+/// on, and the content they carry.
 fn read_annotations(pdf: &Pdf) -> AnnotationWalk {
     let mut walk = AnnotationWalk::default();
     let mut reported: HashSet<DictId> = HashSet::new();
@@ -280,19 +227,13 @@ fn read_annotations(pdf: &Pdf) -> AnnotationWalk {
             if is_widget(&dict) {
                 walk.widget_pages.entry(dict_id(&dict)).or_insert(index + 1);
             }
-            // One object, one finding: an annotation listed on another page (or
-            // twice on this one) is one thing the document holds, and identity is
-            // the object, not the bytes of its text — identical marks on two pages
-            // stay two marks, and one attachment listed twice stays one file.
+            // One object, one finding: an annotation listed on another page (or twice on one) is
+            // one mark.
             if !reported.insert(dict_id(&dict)) {
                 continue;
             }
             let Some(mark) = mark_of(&dict, index + 1) else {
-                // An annotation that is no mark can still carry content a reading
-                // never shows — an attached file, or the media a sound, a movie
-                // or a screen recording holds — and its subtype is in hand here,
-                // so the document's report names it instead of the annotation
-                // passing unseen.
+                // An annotation that is no mark can still carry content a reading does not show.
                 if !hidden(&dict)
                     && let Some(kind) = annotation_content(&dict)
                 {
@@ -310,13 +251,10 @@ fn read_annotations(pdf: &Pdf) -> AnnotationWalk {
     walk
 }
 
-/// The one line a mark contributes — `kind (author) on page n`, with the mark's
-/// own text as indented lines when it carries any — or `None` when the
-/// annotation is not a mark a reader would show.
+/// The one line a mark contributes — `kind (author) on page n`, with the mark's text below.
 fn mark_of(dict: &Dict<'_>, page_number: usize) -> Option<String> {
     let kind = mark_kind(dict)?;
-    // The document itself hides this mark from the reader; a hidden note is not
-    // a note the model should read.
+    // The document itself hides this mark from the reader; a hidden note is not content.
     if hidden(dict) {
         return None;
     }
@@ -334,9 +272,7 @@ fn mark_of(dict: &Dict<'_>, page_number: usize) -> Option<String> {
     Some(line)
 }
 
-/// The lowercase kind word for an annotation's `/Subtype`, or `None` when the
-/// subtype is not one a model reads as a mark (a link, a popup, a non-signature
-/// form widget, an unknown subtype).
+/// The lowercase kind word for an annotation's `/Subtype`, or `None` when it marks nothing.
 fn mark_kind(dict: &Dict<'_>) -> Option<&'static str> {
     let subtype = dict.get::<Name<'_>>(b"Subtype")?;
     match subtype.as_str() {
@@ -359,16 +295,12 @@ fn mark_kind(dict: &Dict<'_>) -> Option<&'static str> {
     }
 }
 
-/// The document content an annotation carries that is not a mark in the text, or
-/// `None` when the annotation holds none: a `/FileAttachment` holds a file, and a
-/// `/Sound`, `/Movie`, `/Screen`, `/RichMedia` or `/3D` annotation holds media the
-/// reading never shows. A screen annotation counts only when it really plays
-/// media: one whose actions only navigate holds nothing to show. The subtypes that
-/// mark nothing and hold nothing — a `/Link`, a `/Popup`, a `/Redact`, a
-/// `/PrinterMark` — are none of them content a model is missing. The entry that
-/// holds the content is asked for as well, so an annotation that names a media
-/// subtype without carrying any is not counted: what is reported is content the
-/// file really holds.
+/// The document content an annotation carries that is not a mark in the text, or `None` when it
+/// holds none: a `/FileAttachment` holds a file, a `/Sound`, `/Movie`, `/Screen`, `/RichMedia` or
+/// `/3D` annotation holds media the reading never shows. A screen annotation counts only when it
+/// really plays media — one whose actions only navigate holds nothing. Subtypes that mark nothing
+/// and hold nothing (`/Link`, `/Popup`, `/Redact`, `/PrinterMark`) are no content a model is
+/// missing, and an annotation naming a media subtype without carrying any is not counted.
 fn annotation_content(dict: &Dict<'_>) -> Option<UnshownKind> {
     let (content, kind) = match dict.get::<Name<'_>>(b"Subtype")?.as_str() {
         "FileAttachment" => (b"FS".as_slice(), UnshownKind::Attachment),
@@ -382,11 +314,7 @@ fn annotation_content(dict: &Dict<'_>) -> Option<UnshownKind> {
     dict.contains_key(content).then_some(kind)
 }
 
-/// Whether a screen annotation plays media rather than doing something else with
-/// the annotation: it holds the movie itself (`/Movie`), or one of its actions —
-/// `/A`, or any action of `/AA` — is a media action. A screen annotation whose
-/// actions only navigate (a `/GoTo`, a `/URI`) holds no media, so it is not named
-/// as content the file does not hold.
+/// Whether a screen annotation plays media rather than doing something else with its actions.
 fn plays_media(dict: &Dict<'_>) -> bool {
     if dict.contains_key(b"Movie") {
         return true;
@@ -461,8 +389,7 @@ fn mark_author(dict: &Dict<'_>) -> Option<String> {
     (!author.is_empty()).then(|| one_line(author.to_string()))
 }
 
-/// A mark's text: its `/Contents`, or, when that is missing or blank, its `/RC`
-/// with the markup stripped — the text under a highlight is never reconstructed.
+/// A mark's text: its `/Contents`, or, when that is missing or blank, its `/RC`.
 fn mark_text(dict: &Dict<'_>) -> Option<String> {
     let contents = dict
         .get::<PdfString>(b"Contents")
@@ -481,7 +408,6 @@ fn mark_text(dict: &Dict<'_>) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
-/// Drop every `<…>` tag from `markup` and decode the entities that are left.
 fn strip_markup(markup: &str) -> String {
     let mut text = String::with_capacity(markup.len());
     let mut in_tag = false;
@@ -496,21 +422,15 @@ fn strip_markup(markup: &str) -> String {
     decode_html_entities(&text)
 }
 
-// ── Form fields ─────────────────────────────────────────────────
-
-/// The form fields of one document: the lines it lists and whether either bound
-/// cut a list short.
+/// The form fields of one document: the lines it lists and whether either bound truncated.
 struct FieldLines {
-    /// One rendered line per field, in `/Fields` order.
     lines: Vec<String>,
-    /// Whether [`MAX_FIELDS`] cut the walk short.
     truncated: bool,
-    /// Whether [`MAX_FIELD_OPTIONS`] cut a field's printed options short.
     options_truncated: bool,
 }
 
-/// The form-field lines of `acroform`, in `/Fields` order. `None` when the
-/// form's `/Fields` could not be read at all.
+/// The form-field lines of `acroform`, in `/Fields` order. `None` when no field a fill can
+/// reach exists.
 fn read_fields(acroform: &Dict<'_>, widget_pages: &HashMap<DictId, usize>) -> Option<FieldLines> {
     let fields = acroform.get::<Array<'_>>(b"Fields")?;
     let mut walk = FieldWalk {
@@ -537,22 +457,19 @@ fn read_fields(acroform: &Dict<'_>, widget_pages: &HashMap<DictId, usize>) -> Op
     })
 }
 
-/// One pass over the field tree: the fields it reaches, and the bounds that keep
-/// it finite.
+/// One pass over the field tree: the fields it reaches, and the bounds that keep it finite.
 struct FieldWalk<'a> {
     widget_pages: &'a HashMap<DictId, usize>,
     lines: Vec<String>,
-    /// The field objects already visited, so `/Kids` that point back at an
-    /// ancestor terminate instead of looping.
+    /// The field objects already visited, so `/Kids` that point back terminate.
     visited: HashSet<DictId>,
     truncated: bool,
-    /// Whether [`MAX_FIELD_OPTIONS`] cut any field's option list short.
     options_truncated: bool,
 }
 
 impl FieldWalk<'_> {
-    /// Visit `field` and, through it, the named kids below it. `prefix` is the
-    /// field's fully qualified parent name, `depth` the tree depth so far.
+    /// Visit `field` and, through it, the named kids below it. `prefix` is the qualified name its
+    /// ancestors established.
     fn visit(&mut self, field: &Dict<'_>, prefix: &str, depth: usize) {
         if depth > MAX_FIELD_DEPTH {
             return;
@@ -561,9 +478,8 @@ impl FieldWalk<'_> {
             return;
         }
         let name = field_name(field, prefix);
-        // A dict whose kids are fields of their own is a container, not a field:
-        // the filler lists it as non-terminal and never fills it, so the reading
-        // does not list it either — its kids below are the fields.
+        // A dict whose kids are fields of their own is a container, not a field: its kids are
+        // visited under the prefix it established.
         if !is_non_terminal(field)
             && let Some(kind) = field_kind(field)
         {
@@ -595,11 +511,9 @@ impl FieldWalk<'_> {
             let Some(kid) = object.into_dict() else {
                 continue;
             };
-            // A kid that names itself with `/T` is a field of its own — the same
-            // test the filler uses to tell a sub-field from a field's on-page
-            // half, so the two sides agree on which fields a form has, not just on
-            // their names. Anything else is this field's widget: its value is the
-            // parent's, reported above.
+            // A kid that names itself with `/T` is a field of its own — the same test the filler
+            // uses, so
+            // the two agree on what a field is.
             if !kid.contains_key(b"T") {
                 continue;
             }
@@ -611,10 +525,8 @@ impl FieldWalk<'_> {
     }
 }
 
-/// Whether a field is a container rather than a field: a dict whose `/Kids`
-/// contain a dict that names itself with `/T`, the test pdf-lib's
-/// `isNonTerminalAcroField` uses. Such a dict is not listed — its named kids
-/// are the fields — but the walk still descends into them.
+/// Whether a field is a container rather than a field: a dict whose `/Kids` are fields of their
+/// own.
 fn is_non_terminal(field: &Dict<'_>) -> bool {
     let Some(kids) = field.get::<Array<'_>>(b"Kids") else {
         return false;
@@ -628,8 +540,7 @@ fn is_non_terminal(field: &Dict<'_>) -> bool {
     false
 }
 
-/// A field's fully qualified name: its own `/T` under the `prefix` its ancestors
-/// give it, joined with `.` — the spelling `pdf_form_fill` fills by.
+/// A field's fully qualified name: its own `/T` under the `prefix` its ancestors established.
 fn field_name(field: &Dict<'_>, prefix: &str) -> String {
     let own = field
         .get::<PdfString>(b"T")
@@ -642,9 +553,7 @@ fn field_name(field: &Dict<'_>, prefix: &str) -> String {
     }
 }
 
-/// The kind of a fillable form field, in the vocabulary
-/// [`crate::docgen::pdf_field_kinds`] states once for the reading and the
-/// filler alike.
+/// The kind of a fillable form field, in the vocabulary a model reads.
 #[derive(Clone, Copy)]
 enum FieldKind {
     Text,
@@ -654,7 +563,6 @@ enum FieldKind {
 }
 
 impl FieldKind {
-    /// The word the field line prints for this kind.
     fn word(self) -> &'static str {
         let kinds = crate::docgen::pdf_field_kinds();
         match self {
@@ -666,9 +574,7 @@ impl FieldKind {
     }
 }
 
-/// A field's kind from its (inherited) `/FT` and `/Ff`; `None` for a field no
-/// caller can fill: a pushbutton, a signature, or a field whose `/FT` names no
-/// fillable kind.
+/// A field's kind from its (inherited) `/FT` and `/Ff`; `None` for a field no fill can reach.
 fn field_kind(field: &Dict<'_>) -> Option<FieldKind> {
     match inherited(field, b"FT")?.into_name()?.as_str() {
         "Tx" => Some(FieldKind::Text),
@@ -687,17 +593,14 @@ fn field_kind(field: &Dict<'_>) -> Option<FieldKind> {
     }
 }
 
-/// A field's (inherited) `/Ff`.
 fn field_flags(field: &Dict<'_>) -> i32 {
     inherited(field, b"Ff")
         .and_then(Object::into_i32)
         .unwrap_or(0)
 }
 
-/// The value a field carries, by its kind: a text field's string, a choice's
-/// selected display names, a button's checked state. `None` for a text or choice
-/// field that carries none — the field is still listed, with the shared empty
-/// value marker.
+/// The value a field carries, by its kind: a text field's string, a choice's selected options, a
+/// button's state.
 fn field_value(field: &Dict<'_>, kind: FieldKind, options: &[String]) -> Option<String> {
     match kind {
         FieldKind::Text => text_value(field),
@@ -707,8 +610,8 @@ fn field_value(field: &Dict<'_>, kind: FieldKind, options: &[String]) -> Option<
     }
 }
 
-/// The options a field offers, as the model should read them: a radio's fill
-/// values or a choice's display names. Text and checkbox fields offer none.
+/// The options a field offers, as the model should read them: a radio's fill values, a choice's
+/// display names.
 fn field_options(field: &Dict<'_>, kind: FieldKind) -> Vec<String> {
     match kind {
         FieldKind::Radio => radio_options(field),
@@ -717,10 +620,8 @@ fn field_options(field: &Dict<'_>, kind: FieldKind) -> Vec<String> {
     }
 }
 
-/// Whether a filler can put a value into the field: a radio group or a list box
-/// with no option to select is not one, while a combo box (a dropdown) accepts a
-/// value of the caller's own even without `/Opt`. The filler's own reach is the
-/// rule, so the reading never offers a field a fill would refuse.
+/// Whether a filler can put a value into the field: a radio group or a list box without `/Opt`
+/// cannot.
 fn field_is_fillable(field: &Dict<'_>, kind: FieldKind, options: &[String]) -> bool {
     match kind {
         FieldKind::Text | FieldKind::Checkbox => true,
@@ -737,12 +638,8 @@ fn text_value(field: &Dict<'_>) -> Option<String> {
     (!text.is_empty()).then(|| one_line(text.to_string()))
 }
 
-/// A checkbox's value: whether it is checked, and — when the field offers more
-/// than one on-state — the state it is in, in parentheses. A bare-number state is
-/// left out: it is a service code rather than a name a reader would recognise,
-/// and a checkbox fill takes only true or false, so the state names no value the
-/// caller could pass. A radio's parenthetical, by contrast, is the fill value a
-/// caller does pass (see [`radio_value`]).
+/// A checkbox's value: whether it is checked, and — when the field offers more than one on-state —
+/// the states it offers.
 fn checkbox_value(field: &Dict<'_>) -> String {
     let selected = selected_states(field);
     let checked = selected.iter().any(|state| state != "Off");
@@ -760,8 +657,7 @@ fn checkbox_value(field: &Dict<'_>) -> String {
     value
 }
 
-/// A radio group's value: whether it is checked, and — when the file offers more
-/// than one choice — the fill value the checked state names, in parentheses.
+/// A radio group's value: whether it is checked, and the fill value of its selected state.
 fn radio_value(field: &Dict<'_>, options: &[String]) -> String {
     let selected = selected_states(field);
     let checked = selected.iter().any(|state| state != "Off");
@@ -779,14 +675,12 @@ fn radio_value(field: &Dict<'_>, options: &[String]) -> String {
     value
 }
 
-/// The word a button's checked state reads as.
 fn checked_word(checked: bool) -> String {
     if checked { "checked" } else { "not checked" }.to_string()
 }
 
-/// The fill value a selected radio state names: the `/Opt` entry the state
-/// spells, or the option at the state's position. `None` when the file names no
-/// such option.
+/// The fill value a selected radio state names: the `/Opt` entry the state corresponds to, or
+/// the state itself.
 fn radio_fill_value(state: &str, options: &[String], states: &[String]) -> Option<String> {
     if let Some(option) = options.iter().find(|option| *option == state) {
         return Some(option.clone());
@@ -795,8 +689,7 @@ fn radio_fill_value(state: &str, options: &[String], states: &[String]) -> Optio
     options.get(position).cloned()
 }
 
-/// A choice field's value: each selected `/V` resolved through `/Opt`, joined
-/// when the field allows several. `None` when nothing is selected.
+/// A choice field's value: each selected `/V` resolved through `/Opt`, joined for display.
 fn choice_value(field: &Dict<'_>) -> Option<String> {
     let mut selected = selected_strings(field);
     selected.retain(|value| !value.trim().is_empty());
@@ -816,8 +709,7 @@ fn choice_value(field: &Dict<'_>) -> Option<String> {
     Some(one_line(names.join(", ")))
 }
 
-/// A field's selected button states: its `/V` (a name, or the names of a
-/// multi-select array), falling back to its first widget's `/AS`.
+/// A field's selected button states: its `/V` (a name, or the names of a multi-select).
 fn selected_states(field: &Dict<'_>) -> Vec<String> {
     match inherited(field, b"V") {
         Some(Object::Name(name)) => vec![name.as_str().to_string()],
@@ -826,8 +718,7 @@ fn selected_states(field: &Dict<'_>) -> Vec<String> {
     }
 }
 
-/// A choice field's selected `/V` strings (one, or the several of a multi-select
-/// array).
+/// A choice field's selected `/V` strings (one, or the several of a multi-select).
 fn selected_strings(field: &Dict<'_>) -> Vec<String> {
     match inherited(field, b"V") {
         Some(Object::String(value)) => vec![decode_text_string(value.as_bytes())],
@@ -860,17 +751,15 @@ fn string_items(array: &Array<'_>) -> Vec<String> {
     items
 }
 
-/// A field's first widget's `/AS` — the state a button is in when its `/V` says
-/// nothing.
+/// A field's first widget's `/AS` — the state a button is in when its `/V` says nothing.
 fn first_widget_state(field: &Dict<'_>) -> Option<String> {
     field_widget(field)?
         .get::<Name<'_>>(b"AS")
         .map(|state| state.as_str().to_string())
 }
 
-/// The widget that carries a field's own state and page: the field itself when
-/// it is a widget, otherwise the first widget among its kids. `None` for a field
-/// with no widget anywhere — a hidden or calculated one.
+/// The widget that carries a field's own state and page: the field itself when it is one, else
+/// its first `/Widget` kid.
 fn field_widget<'a>(field: &Dict<'a>) -> Option<Dict<'a>> {
     if is_widget(field) {
         Some(field.clone())
@@ -879,10 +768,8 @@ fn field_widget<'a>(field: &Dict<'a>) -> Option<Dict<'a>> {
     }
 }
 
-/// The distinct on-state names a button offers, `Off` excluded — what tells a
-/// lone checkbox from a group. A field's widgets are its on-page halves, so when
-/// it has any the states are collected from them alone (mirroring the filler's
-/// own walk); a field with no widget kids is its own widget.
+/// The distinct on-state names a button offers, `Off` excluded — what tells a checkbox from a
+/// radio group.
 fn on_states(field: &Dict<'_>) -> Vec<String> {
     let mut states = Vec::new();
     let widgets = widget_kids(field);
@@ -911,16 +798,14 @@ fn collect_on_states(dict: &Dict<'_>, states: &mut Vec<String>) {
     }
 }
 
-/// One `/Opt` entry: the export value a `/V` names, and the display name the
-/// model should read. A single string is both.
+/// One `/Opt` entry: the export value a `/V` names, and the display name the model reads.
 struct OptionEntry {
     export: String,
     display: String,
 }
 
-/// A field's `/Opt` entries, in order. A single string is one entry, the shape
-/// the library's own `getOptions` reads as one option. `/Opt` is not an
-/// inheritable entry, so only the field's own dictionary is read.
+/// A field's `/Opt` entries, in order. A single string is one entry, the shape a one-option list
+/// box uses.
 fn option_entries(field: &Dict<'_>) -> Vec<OptionEntry> {
     let mut entries = Vec::new();
     let mut options = match field.get::<Object<'_>>(b"Opt") {
@@ -964,10 +849,7 @@ fn option_entries(field: &Dict<'_>) -> Vec<OptionEntry> {
     entries
 }
 
-/// A radio group's options: its own `/Opt` — one string, or the string items of
-/// an array — or, with no `/Opt`, the on-state names it offers. A non-string
-/// `/Opt` names nothing to show, so it contributes none. `/Opt` is not
-/// inheritable, so a parent's copy is not the field's.
+/// A radio group's options: its own `/Opt` — one string, or the string items of an array.
 fn radio_options(field: &Dict<'_>) -> Vec<String> {
     match field.get::<Object<'_>>(b"Opt") {
         Some(Object::String(text)) => vec![one_line(decode_text_string(text.as_bytes()))],
@@ -988,14 +870,12 @@ fn choice_options(field: &Dict<'_>) -> Vec<String> {
         .collect()
 }
 
-/// Whether a state name is only digits, and so a service code rather than a name
-/// a reader would recognise.
+/// Whether a state name is only digits, and so a service code rather than a name.
 fn is_bare_number(state: &str) -> bool {
     !state.is_empty() && state.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-/// The page a field's own widget is on. `None` for a field with no widget
-/// anywhere — a hidden or calculated one.
+/// The page a field's own widget is on. `None` for a field with no widget.
 fn field_page(field: &Dict<'_>, widget_pages: &HashMap<DictId, usize>) -> Option<usize> {
     widget_pages.get(&dict_id(&field_widget(field)?)).copied()
 }
@@ -1017,13 +897,12 @@ fn widget_kids<'a>(field: &Dict<'a>) -> Vec<Dict<'a>> {
     widgets
 }
 
-/// Whether a dictionary is a `/Widget` annotation — a form field's on-page half.
 fn is_widget(dict: &Dict<'_>) -> bool {
     matches!(dict.get::<Name<'_>>(b"Subtype").as_deref(), Some(b"Widget"))
 }
 
-/// `key` on `field`, or on the nearest ancestor that carries it — `/FT`, `/Ff`
-/// and `/V` are all inheritable.
+/// `key` on `field`, or on the nearest ancestor that carries it — `/FT`, `/Ff` and the like are
+/// inherited.
 fn inherited<'a>(field: &Dict<'a>, key: &[u8]) -> Option<Object<'a>> {
     let mut current = field.clone();
     for _ in 0..MAX_FIELD_DEPTH {
@@ -1035,11 +914,7 @@ fn inherited<'a>(field: &Dict<'a>, key: &[u8]) -> Option<Object<'a>> {
     None
 }
 
-/// One field's line: `name (kind[; options: …][; not fillable])[ on page n]:
-/// value`. An unnamed field says so and is marked not fillable, as is one the
-/// filler cannot reach; a longer option list is cut at [`MAX_FIELD_OPTIONS`]
-/// with `…`; a field the file gives no value for says the shared empty marker
-/// rather than being left out.
+/// One field's line: `name (kind[; options: …][; not fillable])[ on page n]: value`.
 fn render_field(
     name: &str,
     kind: FieldKind,
@@ -1074,13 +949,8 @@ fn render_field(
     }
 }
 
-// ── Text strings ────────────────────────────────────────────────
-
-/// A PDF text string decoded to Unicode. A leading `FE FF` BOM marks UTF-16BE,
-/// a leading `EF BB BF` BOM marks UTF-8, and anything else is PDFDocEncoding.
-/// Decoding is lossy on malformed input (a lone UTF-16 surrogate, invalid
-/// UTF-8), because a name half-decoded still reads, while an error would cost
-/// the whole mark.
+/// A PDF text string decoded to Unicode. A leading `FE FF` BOM marks UTF-16BE, `FF FE`
+/// UTF-16LE; otherwise PDFDocEncoding applies.
 fn decode_text_string(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         let units = rest
@@ -1096,16 +966,12 @@ fn decode_text_string(bytes: &[u8]) -> String {
     bytes.iter().copied().map(pdf_doc_encoding).collect()
 }
 
-/// The accent characters PDFDocEncoding places at `0x18..=0x1F` (PDF 32000-1,
-/// Annex D.2).
+/// The accent characters PDFDocEncoding places at `0x18..=0x1F` (PDF 32000-1, Annex D).
 const PDF_DOC_ENCODING_ACCENTS: [char; 8] = [
     '\u{02D8}', '\u{02C7}', '\u{02C6}', '\u{02D9}', '\u{02DD}', '\u{02DB}', '\u{02DA}', '\u{02DC}',
 ];
 
-/// The special range PDFDocEncoding places at `0x80..=0xA0` (PDF 32000-1, Annex
-/// D.2): punctuation, ligatures and accented letters, with `0x9F` the range's
-/// one undefined slot (the encoding's other, `0x7F`, falls through to the ASCII
-/// branch) and `0xA0` the euro sign.
+/// The special range PDFDocEncoding places at `0x80..=0xA0` (PDF 32000-1, Annex D).
 const PDF_DOC_ENCODING_SPECIAL: [char; 33] = [
     '\u{2022}', '\u{2020}', '\u{2021}', '\u{2026}', '\u{2014}', '\u{2013}', '\u{0192}', '\u{2044}',
     '\u{2039}', '\u{203A}', '\u{2212}', '\u{2030}', '\u{201E}', '\u{201C}', '\u{201D}', '\u{2018}',
@@ -1114,8 +980,7 @@ const PDF_DOC_ENCODING_SPECIAL: [char; 33] = [
     '\u{20AC}',
 ];
 
-/// One byte of PDFDocEncoding: the two special ranges, and ASCII/Latin-1 for
-/// every other byte.
+/// One byte of PDFDocEncoding: the two special ranges, and ASCII/Latin-1 for the rest.
 fn pdf_doc_encoding(byte: u8) -> char {
     match byte {
         0x18..=0x1F => PDF_DOC_ENCODING_ACCENTS[usize::from(byte - 0x18)],
@@ -1129,11 +994,7 @@ mod tests {
     use super::*;
     use crate::document::test_fixtures::{PdfFixture, pdf_text_string};
 
-    /// A PDF whose catalog carries `/Pages` and the `catalog_extra` of `build`,
-    /// with one page per entry of the returned list. Each page's `/Annots`
-    /// references that entry's annotation objects — or holds a raw token the test
-    /// wants there, so an array can be tested with a non-object in it — and
-    /// `build` pushes the objects it needs first, so one can name another.
+    /// A PDF whose catalog carries `/Pages` and the `catalog_extra` of `build`.
     fn pdf_with(build: impl FnOnce(&mut PdfFixture) -> (Vec<Vec<String>>, String)) -> Vec<u8> {
         pdf_with_trailer(|fixture| {
             let (pages, catalog_extra) = build(fixture);
@@ -1141,8 +1002,7 @@ mod tests {
         })
     }
 
-    /// [`pdf_with`] with `trailer_extra` written into the trailer — the hook a
-    /// fixture has for an `/Info` description.
+    /// [`pdf_with`] with `trailer_extra` written into the trailer — the hook a test uses.
     fn pdf_with_trailer(
         build: impl FnOnce(&mut PdfFixture) -> (Vec<Vec<String>>, String, String),
     ) -> Vec<u8> {
@@ -1237,13 +1097,8 @@ mod tests {
         );
     }
 
-    /// The annotations that are no mark but still hold content are named for the
-    /// document's report rather than passing unseen: an attached file and the media
-    /// a sound or a movie holds. A hidden one is content the reader is not shown,
-    /// so it is not counted either — an annotation listed twice is one file, and
-    /// one naming a media subtype while carrying no media at all (a `/Screen` with
-    /// no action, or one whose action only navigates) is not content the file
-    /// holds.
+    /// The annotations that are no mark but still hold content are named for the model, not
+    /// dropped.
     #[test]
     fn marks_report_attachments_and_media_they_do_not_show() {
         let marks = read_pdf(pdf_with(|fixture| {

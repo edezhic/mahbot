@@ -1,8 +1,7 @@
-//! Single shared source of chrome action descriptions: one table rendered
-//! into BOTH the interactive `chrome` tool's LLM-facing parameter schema and
-//! the `mahbot chrome` CLI help, so the two consumers cannot drift. Each CLI
-//! action declares its flags once ([`CliFlag`]), and both the help renderer and
-//! the parser read that declaration.
+//! Single shared source of chrome action descriptions: one table rendered into BOTH the
+//! interactive `chrome` tool's parameter schema and the `mahbot chrome` CLI help, so the two
+//! cannot drift. Each CLI action declares its flags once ([`CliFlag`]), and both the help
+//! renderer and the parser read that declaration.
 
 use std::sync::LazyLock;
 
@@ -17,19 +16,19 @@ pub(crate) struct ToolParams {
     pub(crate) properties: Value,
 }
 
-/// One CLI flag an action accepts — the single declaration the rendered help row
-/// and the parser both read.
+/// One CLI flag an action accepts — the single declaration the rendered help row and the parser
+/// both read.
 pub(crate) struct CliFlag {
-    /// Printed spelling with its value placeholder (`--expect <sel>`), exactly as
-    /// the help row shows it.
+    /// Printed spelling with its value placeholder (`--expect <sel>`), exactly as the help shows
+    /// it.
     pub(crate) spelling: &'static str,
-    /// Whether the flag takes a value. Declared here, never derived from
-    /// `spelling`: the placeholder and this field disagreeing is drift.
+    /// Whether the flag takes a value. Declared here, never derived from `spelling`: the two
+    /// disagreeing is drift.
     pub(crate) takes_value: bool,
     /// The printed description of the row.
     pub(crate) description: String,
-    /// The `session` subcommand the flag belongs to (`--force` → `Some("stop")`);
-    /// `None` for a flag every invocation of the action accepts.
+    /// The `session` subcommand the flag belongs to (`--force` → `Some("stop")`); `None` for a flag
+    /// every invocation accepts.
     pub(crate) scope: Option<&'static str>,
 }
 
@@ -69,20 +68,15 @@ fn switch_flag(spelling: &'static str, description: impl Into<String>) -> CliFla
 pub(crate) struct CliHelp {
     /// Invocation syntax after the action word, e.g. `<url> [--expect <sel>]`.
     pub(crate) syntax: &'static str,
-    /// This action's own flag rows, in printed order, each carrying the
-    /// subcommand it belongs to (see [`CliFlag::scope`]). The session-wide pair
-    /// is not here: [`CliHelp::session_refusal`] decides whether [`Self::flags`]
-    /// appends it.
+    /// This action's own flag rows, in printed order, each carrying its subcommand
+    /// ([`CliFlag::scope`]). The session-wide pair is appended by [`Self::flags`].
     pub(crate) declared: Vec<CliFlag>,
-    /// `None` while the action takes the session-wide `--session`/`--keep` pair;
-    /// `Some(message)` on the actions that refuse it, with the message the parser
-    /// returns. This one field is what the help renders the pair's rows from and
-    /// what the parser accepts them by, so the two cannot disagree.
+    /// `None` while the action takes the session-wide `--session`/`--keep` pair; `Some(message)` on
+    /// the actions that refuse it, with the message the parser returns.
     pub(crate) session_refusal: Option<&'static str>,
-    /// Kinds this action's dispatch can emit (`Ok` first) — rendered into
-    /// per-action CLI help and enforced by the CLI's `out_env` debug assertion.
+    /// Kinds this action's dispatch can emit (`Ok` first), rendered into per-action help and
+    /// enforced by the CLI's `out_env` debug assertion.
     pub(crate) kinds: &'static [OutKind],
-    /// Prose after the shared purpose line.
     pub(crate) details: &'static str,
     /// Shell invocation examples (1-2 per action).
     pub(crate) examples: &'static [&'static str],
@@ -102,8 +96,7 @@ impl CliHelp {
 }
 
 /// The session-wide flags: taken (and printed as rows) by every action whose
-/// [`CliHelp::session_refusal`] is `None`, refused by the rest. The top-level
-/// help words them its own way; these are the per-action rows.
+/// [`CliHelp::session_refusal`] is `None`, refused by the rest.
 static SESSION_FLAGS: LazyLock<[CliFlag; 2]> = LazyLock::new(|| {
     [
         value_flag(
@@ -119,20 +112,17 @@ static SESSION_FLAGS: LazyLock<[CliFlag; 2]> = LazyLock::new(|| {
 
 pub(crate) struct ActionDesc {
     pub(crate) name: &'static str,
-    /// One-line purpose — the tool's schema description AND the CLI's
-    /// action-list line, from one source.
+    /// One-line purpose — the tool's schema description AND the CLI's action-list line, from one
+    /// source.
     pub(crate) purpose: &'static str,
     pub(crate) tool: Option<ToolParams>,
     pub(crate) cli: Option<CliHelp>,
 }
 
-/// The `--timeout` row for the eight verbs chrome-use takes no per-call deadline
-/// for (click, count, eval, extract, fill, type, press, upload). Their call runs
-/// to the clock mahbot declares to chrome-use and the product kills only above
-/// it, so a bound below that clock cannot be honoured — it is refused (rc 3)
-/// rather than silently discarded — and a larger one widens only mahbot's own
-/// kill. The printed floor is [`CHROME_USE_DECLARED_BUDGET`], the same number
-/// [`parse_bound_timeout`](crate::chrome::cli) enforces.
+/// The `--timeout` row for the eight verbs chrome-use takes no per-call deadline for (click,
+/// count, eval, extract, fill, type, press, upload): their call runs to the clock mahbot declares
+/// and the product kills only above it, so a lower bound is refused (rc 3) and a larger one
+/// widens only mahbot's own kill.
 fn own_bound_flag() -> String {
     let floor = CHROME_USE_DECLARED_BUDGET.as_secs();
     format!(
@@ -145,26 +135,18 @@ fn own_bound_flag() -> String {
     )
 }
 
-/// The `--timeout` description for the verbs chrome-use honours a `--timeout`
-/// on (wait, expect): the declared value IS the chrome-use-side deadline, so
-/// chrome-use's own timeout surfaces at it and the product only kills above it
-/// plus the relay-recovery window. A value at or above chrome-use's own client
-/// tolerance is refused as a usage error. `open` derives the wait's declaration
-/// from what REMAINS of the flag when the wait starts, so a larger `--timeout`
-/// there never pushes the declaration past the tolerance this parse layer
-/// refuses.
+/// The `--timeout` description for the verbs chrome-use honours a `--timeout` on (wait, expect):
+/// the declared value IS the chrome-use-side deadline, so a value at or above chrome-use's own
+/// tolerance is refused as a usage error. `open` derives its wait from what REMAINS of the flag.
 const FORWARDED_DEADLINE_FLAG: &str = "condition deadline in seconds (default 8) — chrome-use \
      honours it in full and gives up first, so its own 'condition was not met' verdict is what \
      you see; the product's kill rides above it plus chrome-use's relay-recovery window. Must \
      stay under 45, chrome-use's own client tolerance — a value at or above it is refused, \
      because the tool would run out of tolerance instead of answering";
 
-/// The kinds an action that works through a chrome-use session can end as,
-/// `Ok` first as `CliHelp::kinds` requires: `Timeout` (its own deadline ran
-/// out), `Network`, `NotFound`, `Error` (the step failed otherwise),
-/// `Environment` (which rules it out), `Usage` (a malformed call). A row with
-/// a different vocabulary spells its own list out (`open` alone can emit
-/// `Redesign`).
+/// The kinds an action that works through a chrome-use session can end as, `Ok` first:
+/// `Timeout`, `Network`, `NotFound`, `Error`, `Environment`, `Usage`. A row with a different
+/// vocabulary spells its own list out (`open` alone can emit `Redesign`).
 const STEP_KINDS: &[OutKind] = &[
     OutKind::Ok,
     OutKind::Timeout,

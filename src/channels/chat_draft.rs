@@ -1,13 +1,10 @@
 //! Persisted composer draft + pending reply-to state for the chat message box.
-//!
-//! There is exactly one draft: the chat has a single composer, and what is
-//! typed in it is not tied to the workspace picked in the footer. The in-memory
-//! draft is mutated synchronously at capture time so it is always current, and
-//! every write persists it immediately under the one mutex; the debounce lives
-//! in the GUI's draft-capture path (`home.rs`: `capture_draft` schedules
-//! `DraftSaveSettled` after `DRAFT_SETTLE_MS`). Because each write serializes the
-//! whole draft under that mutex, a late write can never clobber newer data and
-//! the exit flush can't be overwritten by an in-flight write.
+//! There is exactly one draft: the chat has a single composer, and what is typed is not tied to the
+//! workspace picked in the footer. The in-memory draft is mutated synchronously at capture time and
+//! every write persists it immediately under the one mutex; the debounce lives in the GUI
+//! (`home.rs` schedules `DraftSaveSettled` after `DRAFT_SETTLE_MS`). Each write serializes the
+//! whole draft under that mutex, so a late write can never clobber newer data and the exit flush
+//! cannot be overwritten.
 
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -23,8 +20,7 @@ const DRAFT_FILE_NAME: &str = "chat-draft.json";
 /// The persisted composer draft: the message text and the pending reply-to.
 ///
 /// Loads fail open: a file that does not yield a draft — missing, corrupt, or
-/// left in the previous per-(user, workspace) shape — is discarded by
-/// [`DraftStore::load`].
+/// left in the previous per-(user, workspace) shape — is discarded by [`DraftStore::load`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct ChatDraft {
     #[serde(default)]
@@ -34,25 +30,22 @@ pub(crate) struct ChatDraft {
 }
 
 impl ChatDraft {
-    /// Whether the draft holds nothing to restore — an empty/whitespace text
-    /// with no pending reply.
+    /// Whether the draft holds nothing to restore — empty/whitespace text with no pending reply.
     #[must_use]
     fn is_empty(&self) -> bool {
         self.text.trim().is_empty() && self.reply.is_none()
     }
 }
 
-/// The shared composer-draft store.
-///
-/// `path: None` marks the store disabled (no resolvable storage root) — all ops no-op.
+/// The shared composer-draft store. `path: None` marks it disabled (no resolvable storage root), so
+/// every operation no-ops.
 pub(crate) struct DraftStore {
     path: Option<PathBuf>,
     draft: Mutex<ChatDraft>,
 }
 
 impl DraftStore {
-    /// Resolve the on-disk draft path from the storage root (`None` when it cannot be
-    /// resolved), the same root every other daemon file lives in.
+    /// Resolve the on-disk draft path from the storage root (`None` when it cannot be resolved).
     #[must_use]
     fn file_path() -> Option<PathBuf> {
         crate::config::default_config_dir()
@@ -60,9 +53,8 @@ impl DraftStore {
             .map(|dir| dir.join(DRAFT_FILE_NAME))
     }
 
-    /// Load the draft file (missing/corrupt → no draft, fail-open). A file that
-    /// yields no draft is removed, so the file exists exactly while a draft does
-    /// and a file left by the previous per-(user, workspace) shape cannot linger.
+    /// Load the draft file (missing/corrupt → no draft, fail-open). A file that yields no draft is
+    /// removed, so the file exists exactly while a draft does.
     fn load(path: Option<PathBuf>) -> Self {
         let draft: ChatDraft = path
             .as_deref()
@@ -120,15 +112,13 @@ impl DraftStore {
         self.draft.lock().unwrap_poison().clone()
     }
 
-    /// Write the draft to disk (compact JSON, atomic tmp+rename). A draft with
-    /// nothing in it removes the file, so the file exists exactly while a draft
-    /// does. Fail-open: errors are ignored.
+    /// Write the draft to disk (compact JSON, atomic tmp+rename). A draft with nothing in it
+    /// removes the file. Fail-open: errors are ignored.
     pub(crate) fn persist(&self) {
         let Some(path) = &self.path else {
             return;
         };
-        // Held across the write: concurrent persists must not interleave on the
-        // shared tmp path (see the module docs).
+        // Held across the write: concurrent persists must not interleave on the shared tmp path.
         let draft = self.draft.lock().unwrap_poison();
         if draft.is_empty() {
             let _ = std::fs::remove_file(path);
@@ -139,10 +129,8 @@ impl DraftStore {
         }
     }
 
-    /// Spawn the sync write on the blocking pool. Holding the std mutex
-    /// across the blocking write serializes concurrent writes and orders
-    /// them against the synchronous exit flush. A no-op without a runtime
-    /// (detached test contexts) — the in-memory draft stays authoritative.
+    /// Spawn the sync write on the blocking pool; the std mutex orders concurrent writes and the
+    /// exit flush. A no-op without a runtime (detached test contexts).
     pub(crate) fn persist_async(self: Arc<Self>) {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn_blocking(move || self.persist());

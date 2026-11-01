@@ -1,27 +1,21 @@
 //! One line about what a Running Agents card's agent is doing now.
 //!
-//! The line follows the card's newest step: it is derived from that step's own
-//! text — the intermediate text the model wrote for the reader when it has any,
-//! otherwise that step's reasoning — and assembled from whole sentences within
-//! the card's character budget, so it never reads as a mid-phrase cut. Markdown
-//! syntax is stripped first; characters that belong to code (an underscore or
-//! asterisk inside an identifier or expression, a `__dunder__` name) are not
-//! markers and stay.
+//! The line follows the card's newest step and is derived from that step's own text (its
+//! narration, else its reasoning), assembled from whole sentences within the card's character
+//! budget so it never reads as a mid-phrase cut. Markdown syntax is stripped first; characters
+//! that belong to code (an underscore inside an identifier, a `__dunder__` name) stay.
 
 use crate::gui::markdown_breaks;
 
-/// Character budget of the line: one record, ellipsis included. A longer line
-/// still wraps, exactly as the text it replaced did.
+/// Character budget of the line: one record, ellipsis included. A longer line still wraps.
 const MAX_LINE_CHARS: usize = 200;
 
-/// How much of a step's text is read when picking the line's sentences, and how
-/// much of its reasoning becomes the hover text: reasoning reaches tens of
-/// thousands of characters, and this runs per group on every render.
+/// How much of a step's text is read when picking sentences, and how much reasoning becomes the
+/// hover text: reasoning reaches tens of thousands of characters and this runs per render.
 const MAX_SCAN_CHARS: usize = 2_000;
 
-/// A sentence shorter than this carries nothing to read — a bare
-/// acknowledgement or a fragment — and is skipped when the same block holds a
-/// longer one.
+/// A sentence shorter than this carries nothing to read and is skipped when the same block
+/// holds a longer one.
 const MIN_SENTENCE_CHARS: usize = 20;
 
 /// Characters that may close a sentence behind its terminator.
@@ -30,41 +24,35 @@ const CLOSERS: [char; 7] = ['"', '\'', '”', '’', '»', ')', ']'];
 /// One step's line and the hover text that explains it.
 pub(crate) struct Line<'a> {
     pub(crate) text: String,
-    /// The step's reasoning, cut to [`MAX_SCAN_CHARS`]: the hover text. A blank
-    /// reasoning is no hover text at all.
+    /// The step's reasoning, cut to [`MAX_SCAN_CHARS`]: the hover text. Blank reasoning is none.
     pub(crate) hover: Option<&'a str>,
 }
 
-/// The line of a step with the given own text: its narration (the intermediate
-/// text the model wrote for the reader) when that yields a line, otherwise its
-/// reasoning. `None` when the step carries no usable text at all — the caller
-/// then keeps the line it already shows.
+/// The line of a step with the given own text: its narration when that yields a line, otherwise
+/// its reasoning. `None` when the step carries no usable text — the caller keeps the line it
+/// already shows.
 pub(crate) fn line_for_step<'a>(
     narration: &'a str,
     reasoning: Option<&'a str>,
 ) -> Option<Line<'a>> {
-    // The whole block is never copied into the hover text: the tooltip shows the
-    // same prefix the picker read.
+    // The whole block is never copied into the hover text: the tooltip shows the same prefix the
+    // picker read.
     let hover = reasoning
         .map(bounded_prefix)
         .filter(|reasoning| !reasoning.trim().is_empty());
     let text = match pick_line(bounded_prefix(narration)) {
-        // A narration that strips to nothing (a rule, an image marker, an
-        // emoji) is not text the model wrote for the reader: use the step's
-        // reasoning instead of holding an older line.
+        // A narration that strips to nothing (a rule, an image marker, an emoji) is not text the
+        // model wrote for the reader: use the reasoning instead of holding an older line.
         Some(text) => text,
         None => pick_line(hover?)?,
     };
     Some(Line { text, hover })
 }
 
-/// The line for one block of step text, which the caller has already cut to
-/// [`MAX_SCAN_CHARS`]: whole sentences packed up to [`MAX_LINE_CHARS`], a junk
-/// sentence (see [`MIN_SENTENCE_CHARS`]) skipped in favour of the next one, and
-/// — when no sentence qualifies — the block's last complete sentence. A block
-/// with no sentence at all (a heading-like fragment) is shown as it is. Text
-/// over the budget is the only text cut, and that cut lands on a word boundary
-/// with "…".
+/// The line for one block of step text, already cut to [`MAX_SCAN_CHARS`]: whole sentences packed
+/// up to [`MAX_LINE_CHARS`], a junk sentence skipped in favour of the next one, and — when none
+/// qualifies — the block's last complete sentence. A block with no sentence is shown as it is.
+/// Text over the budget is the only text cut, on a word boundary with "…".
 fn pick_line(text: &str) -> Option<String> {
     let plain = plain_text(text);
     let (sentences, fragment) = split_sentences(&plain);
@@ -98,12 +86,10 @@ fn bounded_prefix(text: &str) -> &str {
     }
 }
 
-/// The text of a markdown block with its syntax stripped: heading, emphasis,
-/// bullet, list-numbering and backtick markers are dropped by pulldown-cmark's
-/// own inline rules (so an underscore inside an identifier or an asterisk in
-/// an expression stays text), fenced and indented code blocks are dropped whole
-/// (source code is not a status line), and block and line boundaries collapse
-/// to single spaces.
+/// The text of a markdown block with its syntax stripped: heading, emphasis, bullet,
+/// list-numbering and backtick markers are dropped by pulldown-cmark's own inline rules, fenced
+/// and indented code blocks are dropped whole (source code is not a status line), and block and
+/// line boundaries collapse to single spaces.
 fn plain_text(text: &str) -> String {
     use pulldown_cmark::{Event, Tag, TagEnd};
     let mut out = String::with_capacity(text.len());
@@ -122,17 +108,17 @@ fn plain_text(text: &str) -> String {
                 push_separator(&mut out, &mut boundary);
                 out.push_str(&text);
             }
-            // pulldown-cmark cannot tell `__init__` from `__strong__`, but the
-            // span in the source can: an underscore pair around one unspaced
-            // word is a dunder identifier and keeps its markers.
+            // pulldown-cmark cannot tell `__init__` from `__strong__`, but the span in the source
+            // can: an underscore pair around one unspaced word is a dunder identifier and keeps its
+            // markers.
             Event::Start(Tag::Strong) | Event::End(TagEnd::Strong)
                 if dunder_markers(&text[span.clone()]) =>
             {
                 push_separator(&mut out, &mut boundary);
                 out.push_str("__");
             }
-            // An inline boundary is not a word break: `**parser**'s` and
-            // `**fast**—always` are one word each.
+            // An inline boundary is not a word break: `**parser**'s` and `**fast**—always` are one
+            // word each.
             Event::Start(
                 Tag::Emphasis
                 | Tag::Strong
@@ -164,8 +150,8 @@ fn plain_text(text: &str) -> String {
     plain
 }
 
-/// Whether a strong-emphasis span's source is `__` around one unspaced word —
-/// an identifier (`__init__`, `__pycache__`) rather than a bold pair.
+/// Whether a strong-emphasis span's source is `__` around one unspaced word — an identifier
+/// (`__init__`) rather than a bold pair.
 fn dunder_markers(span: &str) -> bool {
     span.strip_prefix("__")
         .and_then(|body| body.strip_suffix("__"))
@@ -174,21 +160,20 @@ fn dunder_markers(span: &str) -> bool {
         })
 }
 
-/// Start a new word: a pending block or line boundary becomes one space between
-/// the text already written and whatever comes next.
+/// Start a new word: a pending block or line boundary becomes one space between the text
+/// already written and what comes next.
 fn push_separator(out: &mut String, boundary: &mut bool) {
     if std::mem::take(boundary) && !out.is_empty() {
         out.push(' ');
     }
 }
 
-/// Bullet glyphs a writer typed as decoration rather than a markdown list
-/// marker, dropped from the head of a word.
+/// Bullet glyphs a writer typed as decoration rather than a markdown list marker, dropped from
+/// the head of a word.
 const BULLETS: &[char] = &['•', '·', '‣', '∙', '▪', '●', '◦'];
 
-/// Characters the line never shows: whitespace, control characters, and the
-/// invisible format characters providers leak (byte-order marks, zero-width
-/// spaces, bidi overrides, soft hyphens).
+/// Characters the line never shows: whitespace, control characters, and the invisible format
+/// characters providers leak (byte-order marks, zero-width spaces, bidi overrides, soft hyphens).
 fn is_separator(c: char) -> bool {
     c.is_whitespace()
         || c.is_control()
@@ -198,15 +183,13 @@ fn is_separator(c: char) -> bool {
         )
 }
 
-/// Sentence terminators: a full stop, a question or exclamation mark, or an
-/// ellipsis.
+/// Sentence terminators: a full stop, a question or exclamation mark, or an ellipsis.
 fn is_terminator(c: char) -> bool {
     matches!(c, '.' | '!' | '?' | '…')
 }
 
-/// One-line plain text split into whole sentences (a terminator, any closing
-/// quotes/parens, then whitespace or the end) and the trailing fragment that
-/// carries no terminator.
+/// One-line plain text split into whole sentences (terminator, closing quotes/parens, then
+/// whitespace or the end) and the trailing fragment that carries no terminator.
 fn split_sentences(text: &str) -> (Vec<&str>, &str) {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let mut sentences = Vec::new();
@@ -244,11 +227,9 @@ fn byte_at(chars: &[(usize, char)], text: &str, index: usize) -> usize {
 
 /// Whether the terminator at `i` really ends a sentence. A `.` inside a dotted
 /// abbreviation (`e.g.`, `i.e.`) never does. A `.` behind a token that already
-/// holds a dot — the end of a file name such as `running.rs` — does only when
-/// the next word starts a new sentence or nothing follows, so `… running.rs
-/// and …` keeps running while `… running.rs. Then …` and `… running.rs.` split.
-/// A decimal (`.5`) is never a terminator, because a terminator is only
-/// considered before whitespace or the end.
+/// holds a dot — the end of a file name such as `running.rs` — does only when the next word
+/// starts a new sentence or nothing follows. A decimal (`.5`) is never a terminator, because a
+/// terminator is only considered before whitespace or the end.
 fn ends_sentence(chars: &[(usize, char)], i: usize) -> bool {
     if chars[i].1 != '.' {
         return true;
@@ -264,9 +245,8 @@ fn ends_sentence(chars: &[(usize, char)], i: usize) -> bool {
     if !token.contains('.') {
         return true;
     }
-    // A file name closing the block (`… src/gui/running.rs.`) ends its
-    // sentence like any other word; only a following word can tell the two
-    // apart, so a terminator with nothing behind it is a boundary.
+    // A file name closing the block (`… src/gui/running.rs.`) ends its sentence like any other
+    // word; only a following word can tell the two apart.
     let Some(next) = chars[i + 1..]
         .iter()
         .map(|&(_, c)| c)
@@ -293,12 +273,10 @@ fn is_dotted_abbreviation(token: &str) -> bool {
     letters >= 2 && !letter_next
 }
 
-/// A line trimmed to [`MAX_LINE_CHARS`]: unchanged when it fits, otherwise cut
-/// at its last word boundary with "…". Whitespace is the only boundary reused
-/// here — a `/`, `_` or `-` splits an identifier, which is the broken-word
-/// artefact this line exists to avoid. A line with no whitespace at all (one
-/// long URL or hash) is char-cut: the budget is a hard ceiling, so no boundary
-/// can be honoured there.
+/// A line trimmed to [`MAX_LINE_CHARS`]: unchanged when it fits, otherwise cut at its last word
+/// boundary with "…" — a `/`, `_` or `-` splits an identifier, which is the broken-word artefact
+/// this line exists to avoid. A line with no whitespace at all is char-cut: the budget is a hard
+/// ceiling.
 fn cut_at_word(text: &str) -> String {
     let text = text.trim();
     if text.chars().count() <= MAX_LINE_CHARS {

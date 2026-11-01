@@ -1,5 +1,3 @@
-//! Board dashboard page — ticket management.
-
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -19,7 +17,6 @@ use super::widgets::{
     tooltip_hint,
 };
 
-/// Per-file stat from `git show --numstat`.
 #[derive(Debug, Clone)]
 struct FileStat {
     path: String,
@@ -27,14 +24,11 @@ struct FileStat {
     deletions: i64,
 }
 
-/// Parsed commit stats for a ticket's associated commit.
 #[derive(Debug, Clone)]
 pub(crate) struct CommitStats {
     files: Vec<FileStat>,
 }
 
-// The largest variants carry `Vec<Ticket>`/boxed payloads, so the enum contains
-// both tiny unit variants and sizable ones; that is inherent to a page message.
 #[derive(Debug, Clone)]
 #[expect(clippy::large_enum_variant)]
 pub(crate) enum BoardMessage {
@@ -54,7 +48,6 @@ pub(crate) enum BoardMessage {
     /// The change stream lagged — force a full board refresh (the delta was
     /// lost, so the snapshot is the only safe way to recover).
     BoardRefreshNeeded,
-    /// The re-fetched ticket for a [`TicketChanged`] delta, ready to upsert.
     TicketUpserted(Ticket),
     TicketDetails(Box<Ticket>),
     DetailError(String),
@@ -62,8 +55,7 @@ pub(crate) enum BoardMessage {
     /// [`BoardState::refresh_selected_ticket`]). Carries the comment
     /// generation captured at dispatch so stale callbacks (modal closed
     /// or ticket switched while in flight) are dropped. Unlike
-    /// `TicketDetails`, this is non-destructive: an in-progress comment
-    /// draft survives.
+    /// `TicketDetails`, this is non-destructive: an in-progress comment draft survives.
     TicketDetailsRefreshed(u64, Box<Ticket>),
     /// CDC-driven re-fetch of the open ticket detail failed. Carries the
     /// generation for the same stale-callback detection as
@@ -79,79 +71,53 @@ pub(crate) enum BoardMessage {
     /// (implementation-phase) ticket opens the confirmation modal
     /// ([`BoardMessage::ConfirmCancel`]); otherwise the cancel executes
     /// directly (non-pipeline phases stay single-click). `PerformAction`
-    /// re-checks at execution, so the real pause decision is always
-    /// authoritative.
+    /// re-checks at execution, so the real pause decision is always authoritative.
     RequestCancel(String),
-    /// The user confirmed the mid-pipeline cancel modal — execute the cancel.
     ConfirmCancel(String),
-    /// The user dismissed the mid-pipeline cancel modal (backdrop or button).
-    /// The ticket is left untouched.
     DismissCancel,
 
-    /// Open the ticket detail modal.
     OpenModal(String),
 
-    /// Close the detail modal.
     CloseModal,
 
     /// Dismiss modals/panels (Escape key).
     Escape,
 
-    /// A link was clicked in rendered markdown.
     LinkClicked(String),
 
-    /// Request toast notification.
     Toast(super::ToastMessage),
 
-    /// Batch-archive all done and cancelled tickets.
     ArchiveAllCompleted,
 
-    /// Result of batch archive operation.
     ArchiveAllCompletedResult(Result<u64, String>),
 
-    /// Batch-pause all queued tickets (back to planning).
     PauseAllQueued,
 
-    /// Result of the batch pause operation.
     PauseAllQueuedResult(Result<u64, String>),
 
-    /// Archive a single ticket (sets is_archived = 1).
     ArchiveTicket(String),
 
-    /// Trigger async load of commit stats for a ticket.
     FetchCommitStats(String),
-    /// Commit stats loaded (or error) — carries generation for stale-callback guard.
     CommitStatsLoaded(String, u64, Result<CommitStats, String>),
 
-    /// Navigate to the commit diff view for this ticket.
     ViewCommitDiff {
         commit_hash: String,
-        /// The ticket's own workspace — the project the commit belongs to,
-        /// which may not be the picked one.
         workspace_name: String,
     },
 
-    /// Toggle expansion of a diagnostics comment.
     ToggleCommentExpand(usize),
 
-    /// Comment text input changed in the ticket detail modal.
     CommentInputChanged(super::editor_widget::EditorAction),
-    /// Send a comment on the current ticket.
     SendComment,
     /// Result of adding a comment via the backend. Carries the generation
     /// counter captured at send-time for stale-callback detection.
     CommentSent(u64, Result<(), String>),
 
-    // ── Ticket search (sidebar) ──────────────────────────────────
-    /// Search query text changed (user typing in the sidebar search input).
     SearchInputChanged(super::editor_widget::EditorAction),
-    /// Search results returned from async FTS query.
-    /// Carries a generation counter for stale-callback detection.
     SearchResults(Vec<Ticket>, u64),
     /// The async FTS query failed. Carries the generation counter so a stale
     /// failure cannot replace the results of a newer search.
     SearchError(String, u64),
-    /// Clear the active search and restore the normal ticket list.
     SearchCleared,
 }
 
@@ -161,9 +127,7 @@ pub struct BoardState {
     selected_ticket: Option<Ticket>,
     selected_loading: bool,
     action_loading: Option<String>,
-    /// Cached parsed markdown for the selected ticket description.
     description_md: Option<Vec<markdown::Item>>,
-    /// Cached parsed markdown for comments (re-parsed when ticket changes).
     comments_md: Vec<(usize, Vec<markdown::Item>)>,
     /// Bumped on every refresh request by [`Self::refresh`]. A read outcome is
     /// applied only while its generation still matches, so an older in-flight
@@ -178,31 +142,19 @@ pub struct BoardState {
     /// tickets a lost removal delta would have removed. Cleared on the first
     /// snapshot; subsequent refreshes merge.
     pub(crate) replace_on_refresh: bool,
-    /// Loaded commit stats for the open ticket.
     commit_stats: Option<CommitStats>,
-    /// Failure from the last commit-stats fetch for the open ticket, rendered
-    /// in the modal so a fetch failure is not silently swallowed.
     commit_stats_error: Option<String>,
-    /// Whether a commit stats fetch is in progress.
     commit_stats_loading: bool,
-    /// Incremented on each new fetch; stale callbacks discarded.
     commit_stats_generation: u64,
     /// Ticket awaiting mid-pipeline cancel confirmation. `Some(ticket_id)`
     /// while the cancel-confirmation modal is shown; the cancel only runs
     /// on [`BoardMessage::ConfirmCancel`].
     pending_cancel: Option<String>,
-    /// Tracks which comment indices are expanded (for diagnostics collapse).
     expanded_comments: HashSet<usize>,
-    /// Stores the last detail-load error message for display in the modal.
     detail_error: Option<String>,
-    /// True while a periodic ticket-detail refresh is in flight. Guards
-    /// against overlapping refreshes on slow reads (an older snapshot
-    /// landing after a newer one); cleared on every refresh completion.
     detail_refresh_in_flight: bool,
 
-    /// Comment text input state for the ticket detail modal.
     comment_input: super::editor_widget::EditorBuffer,
-    /// Whether a comment is currently being sent (prevents double-send).
     sending_comment: bool,
     /// Whether the comment input is focused (for Escape-key blur behavior).
     ///
@@ -216,20 +168,11 @@ pub struct BoardState {
     /// `TicketDetails`). Captured in `SendComment` and verified in
     /// `CommentSent` to detect stale async callbacks.
     comment_generation: u64,
-    /// Undo/redo stack for the comment input text editor.
     undo_stack: super::common::UndoStack,
 
-    // ── Ticket search (sidebar) ──────────────────────────────────
-    /// Current search query (empty = no search active).
     pub(crate) search_query: super::common::SingleLineEditorState,
-    /// Search results, populated when `search_query` is non-empty.
     pub(crate) search_results: Vec<Ticket>,
-    /// Last FTS search failure for the active query. Rendered in the sidebar
-    /// instead of "No matching tickets" until a successful search or a cleared
-    /// search replaces it.
     pub(crate) search_error: Option<String>,
-    /// Incremented on each new search; stale callbacks check this before
-    /// applying results. Follows the same pattern as `commit_stats_generation`.
     pub(crate) search_generation: u64,
 }
 
@@ -295,9 +238,7 @@ impl BoardState {
             .is_some_and(|t| t.phase.is_pipeline_occupied())
     }
 
-    /// Reset all modal-related state fields (close detail modal).
     fn reset_modal(&mut self) {
-        // The cancel confirmation is modal state, so resetting the modal clears it.
         self.dismiss_pending_cancel();
         self.selected_ticket = None;
         self.selected_loading = false;
@@ -312,9 +253,6 @@ impl BoardState {
         self.reset_comment_state();
     }
 
-    /// Clear the comment draft and related state, and bump
-    /// `comment_generation` so in-flight comment callbacks for the
-    /// previous ticket no longer match.
     fn reset_comment_state(&mut self) {
         self.comment_input.clear();
         self.sending_comment = false;
@@ -332,8 +270,7 @@ impl BoardState {
     }
 
     /// Request a full board snapshot — every workspace's non-archived
-    /// tickets. Bumps [`Self::board_generation`] so only the newest request's
-    /// snapshot applies.
+    /// tickets. Bumps [`Self::board_generation`] so only the newest request's snapshot applies.
     pub fn refresh(&mut self) -> Task<BoardMessage> {
         self.board_generation += 1;
         let generation = self.board_generation;
@@ -363,8 +300,6 @@ impl BoardState {
             .filter(|t| !t.is_archived && t.phase == TicketPhase::Queued)
     }
 
-    /// Whether the "Pause all queued tickets" context-menu item should be
-    /// offered — at least one non-archived Queued ticket is listed.
     pub(crate) fn has_queued_tickets(&self) -> bool {
         self.queued_tickets().next().is_some()
     }
@@ -377,8 +312,6 @@ impl BoardState {
         self.load_state.has_loaded() && self.load_state.error().is_none() && self.tickets.is_empty()
     }
 
-    /// Workspaces to drain for the bulk pause: the distinct workspaces of the
-    /// listed non-archived Queued tickets, deduplicated. Each is drained once.
     fn queued_workspaces(&self) -> Vec<String> {
         let mut workspaces: Vec<String> = Vec::new();
         for ticket in self.queued_tickets() {
@@ -391,20 +324,15 @@ impl BoardState {
 
     /// Apply a CDC ticket change delta to the board, idempotently by ticket id.
     ///
-    /// - DELETEs (or an archived row) remove the ticket from the list and are
-    ///   recorded in `delta_removed_ids` so a stale baseline snapshot cannot
-    ///   re-add them.
-    /// - INSERT/UPDATE re-fetches the ticket by id and upserts it. Re-fetch uses
-    ///   the board's own parsing so the delta always carries a consistent, current
-    ///   snapshot; the render path re-sorts each frame, so no manual sort
-    ///   maintenance is needed. There is deliberately no global `change_id`
-    ///   watermark: `change_id` is a WAL `NewRowid` that restarts after
-    ///   `turso_cdc` is fully pruned, so a watermark would silently drop deltas.
-    /// - If the changed ticket is the open detail modal and its `updated_at`
-    ///   moved, the modal detail is re-refreshed. Comment inserts bump
-    ///   `tickets.updated_at` (see `add_comment_tx`), so a tickets delta fires
-    ///   for comment activity and this re-refresh covers it; the board LIST
-    ///   does not load comment content (`LoadComments::No`).
+    /// A DELETE (or an archived row) removes the ticket and records it in `delta_removed_ids`, so a
+    /// stale baseline snapshot cannot re-add it. An INSERT/UPDATE re-fetches the ticket by id (with
+    /// the board's own parsing, so the delta carries a consistent snapshot) and upserts it, and the
+    /// render path re-sorts each frame. There is deliberately no global `change_id` watermark:
+    /// `change_id` is a WAL `NewRowid` that restarts after `turso_cdc` is fully pruned, so a
+    /// watermark would silently drop deltas. A change to the open detail modal's ticket whose
+    /// `updated_at` moved re-refreshes the modal.
+    /// Comment inserts bump `tickets.updated_at`, so a tickets delta fires for comment activity;
+    /// the board LIST does not load comment content (`LoadComments::No`).
     fn apply_ticket_change(&mut self, event: &crate::db::cdc::ChangeEvent) -> Task<BoardMessage> {
         use crate::db::cdc::ChangeType;
         let Some(id) = event.ticket_id().map(str::to_string) else {
@@ -471,25 +399,20 @@ impl BoardState {
 
     /// Apply a baseline snapshot.
     ///
-    /// - On a lag recovery (`replace_on_refresh`) the snapshot is authoritative
-    ///   and replaces the board, so a ticket a lost removal delta would have
-    ///   removed cannot linger. This also clears `delta_removed_ids` — the
-    ///   recovery snapshot carries its own removal history.
-    /// - Otherwise it merges by per-ticket `updated_at` freshness: a snapshot
-    ///   ticket older than the cached one is left alone (so a newer delta
-    ///   already applied is never clobbered), but a newer snapshot ticket
-    ///   updates the board (recovering a lost delta). This is correct even if
-    ///   two snapshots arrive out of order, and — unlike a global `change_id`
-    ///   watermark — is immune to `change_id` restarting after `turso_cdc` is
-    ///   fully pruned.
-    /// - Tickets a delta archived/removed (`delta_removed_ids`) are never
-    ///   re-added by a stale snapshot. A board ticket **absent** from the
-    ///   snapshot is kept: with no guaranteed snapshot/delta ordering, an
-    ///   omission is ambiguous (the snapshot may predate the ticket's
-    ///   creation/delta). Dropping it risks a permanent loss (a live ticket that
-    ///   never changes again), while keeping it is self-healing — a removal
-    ///   delta arrives and removes it, or a lag recovery snapshot replaces the
-    ///   board.
+    /// - On a lag recovery (`replace_on_refresh`) the snapshot is authoritative and replaces the
+    ///   board, so a ticket a lost removal delta would have removed cannot linger. It also clears
+    ///   `delta_removed_ids` — the recovery snapshot carries its own removal history.
+    /// - Otherwise it merges by per-ticket `updated_at` freshness: a snapshot ticket older than the
+    ///   cached one is left alone (so a newer delta already applied is never clobbered), while a
+    ///   newer snapshot ticket updates the board (recovering a lost delta). This is correct even if
+    ///   two snapshots arrive out of order, and — unlike a global `change_id` watermark — is immune
+    ///   to `change_id` restarting after `turso_cdc` is fully pruned.
+    /// - Tickets a delta archived/removed (`delta_removed_ids`) are never re-added by a stale
+    ///   snapshot. A board ticket **absent** from the snapshot is kept: with no guaranteed
+    ///   snapshot/delta ordering an omission is ambiguous (the snapshot may predate the ticket's
+    ///   creation/delta). Dropping it risks a permanent loss (a live ticket that never changes
+    ///   again), while keeping it is self-healing — a removal delta arrives and removes it, or a lag
+    ///   recovery snapshot replaces the board.
     fn apply_refreshed(&mut self, tickets: Vec<Ticket>) {
         if self.replace_on_refresh {
             self.tickets = tickets;
@@ -510,7 +433,6 @@ impl BoardState {
                     None => merged.push(snap),
                 }
             }
-            // Keep a board ticket absent from the snapshot (see the doc above).
             for cur in &self.tickets {
                 if !merged.iter().any(|t| t.id == cur.id) {
                     merged.push(cur.clone());
@@ -518,7 +440,6 @@ impl BoardState {
             }
             self.tickets = merged;
         }
-        // A successful snapshot replaces any previous load failure.
         self.load_state.clear_error();
         self.load_state.finish_loading();
     }
@@ -536,13 +457,10 @@ impl BoardState {
         }
     }
 
-    /// Upsert a re-fetched ticket into the board list, honoring the archive
-    /// state.
     fn apply_ticket_upsert(&mut self, ticket: Ticket) {
         if ticket.is_archived {
             self.tickets.retain(|t| t.id != ticket.id);
-            // Track the removal so a stale snapshot read before the archive
-            // cannot re-add it.
+            // Track the removal so a stale snapshot read before the archive cannot re-add it.
             self.delta_removed_ids.insert(ticket.id.clone());
             return;
         }
@@ -593,8 +511,6 @@ impl BoardState {
         )
     }
 
-    /// Parse all comments into the cached-markdown form used by
-    /// `comments_md` (`(index, items)` pairs).
     fn parse_comments_md(comments: &[TicketComment]) -> Vec<(usize, Vec<markdown::Item>)> {
         comments
             .iter()
@@ -603,25 +519,15 @@ impl BoardState {
             .collect()
     }
 
-    /// Apply fresh ticket detail to the modal display state.
-    ///
-    /// Clears the stale error, rebuilds the description/comment markdown
-    /// caches, replaces the selected ticket, and reconciles the
-    /// commit-stats display with the incoming ticket:
-    ///
-    /// - a (project, commit) pair that appeared or changed triggers a fresh
-    ///   stats fetch (gated on the hash being `Some`, so a hash can never
-    ///   leave the loading state stuck),
-    /// - an unchanged pair keeps the already-loaded stats (the refresh is
-    ///   event-driven — unconditional fetches would hammer the git CLI and
-    ///   flash "Loading commit stats" each refresh),
-    /// - no hash clears stale stats and any stuck loading flag.
-    ///
-    /// Returns the task to run (stats fetch or none). Callers must have
-    /// verified the incoming ticket belongs to the open modal (id +
-    /// generation guards). Non-destructive by contract: the comment
-    /// input, undo stack, and generation counter are managed by the
-    /// caller.
+    /// Apply fresh ticket detail to the modal display state: clears the stale error, rebuilds the
+    /// description/comment markdown caches, replaces the selected ticket, and reconciles commit
+    /// stats. A (project, commit) pair that appeared or changed triggers a fresh stats fetch, gated
+    /// on the hash being `Some` so a hash can never leave the loading state stuck; an unchanged
+    /// pair keeps the loaded stats, because the refresh is event-driven and unconditional fetches
+    /// would hammer the git CLI and flash "Loading commit stats" each time; no hash clears stale
+    /// stats and any stuck loading flag. Returns the task to run (stats fetch or none). Callers
+    /// must have verified the incoming ticket belongs to the open modal (id + generation guards).
+    /// The comment input, undo stack and generation counter stay the caller's.
     fn apply_ticket_display(&mut self, ticket: Ticket) -> Task<BoardMessage> {
         self.detail_error = None;
         self.description_md = if ticket.description.is_empty() {
@@ -652,7 +558,6 @@ impl BoardState {
             self.commit_stats_loading = false;
             Task::none()
         } else {
-            // Same project and commit — keep the loaded stats (if any).
             Task::none()
         }
     }
@@ -668,9 +573,6 @@ impl BoardState {
                 ("↩ Back to Backlog", TicketPhase::Backlog),
                 ("🛑 Cancel", TicketPhase::Cancelled),
             ],
-            // Manual override for Backlog/Analysis: skip the planning gate
-            // and send to engineer (cancels in-flight agents via
-            // `transition_to`). Failed tickets re-queue the same way.
             TicketPhase::Failed | TicketPhase::Backlog | TicketPhase::Analysis => vec![
                 ("✅ Queued", TicketPhase::Queued),
                 ("🛑 Cancel", TicketPhase::Cancelled),
@@ -729,9 +631,6 @@ impl BoardState {
         for (label, phase) in actions {
             let is_cancel = label.contains("Cancel");
             if is_cancel && !current_phase.is_pipeline_occupied() {
-                // Pre-pipeline cancel: compact gray X. Padding compensates the
-                // smaller 12px glyph so the hit zone stays the same 36x26 box the
-                // red 16px-glyph cancel renders (12 + 2*12 = 36 wide, ~12 + 2*7 = 26 tall).
                 icon_row = icon_row.push(widgets::compact_x_button(
                     theme::TEXT_SECONDARY,
                     theme::TEXT_12,
@@ -791,23 +690,18 @@ impl BoardState {
         icon_row
     }
 
-    /// Phase badge pill (ticket cards, modal header); colors from [`theme::ticket_phase_color`].
     fn phase_badge<'a>(phase: TicketPhase, metrics: PillMetrics) -> Element<'a, BoardMessage> {
         let (fg, bg) = theme::ticket_phase_color(phase);
         let pill = badge_pill(phase.display_name(), (fg, bg), metrics);
         tooltip_hint(pill, "Current phase")
     }
 
-    /// Priority chip pill; colors from [`theme::ticket_priority_color`].
     fn priority_badge<'a>(priority: i64, metrics: PillMetrics) -> Element<'a, BoardMessage> {
         let (fg, bg) = theme::ticket_priority_color(priority);
         let pill = badge_pill(format!("P{priority}"), (fg, bg), metrics);
         tooltip_hint(pill, "Priority")
     }
 
-    /// Bounce-count badge (icon + count + tooltip, matching the prereq indicator
-    /// style). `None` when the ticket has not bounced. Muted (id color) at or
-    /// below `BOUNCE_BADGE_WARNING_THRESHOLD`, then the prereq warning yellow.
     fn bounce_badge<'a>(
         bounce_count: i64,
         icon_size: f32,
@@ -864,7 +758,6 @@ impl BoardState {
         (count, unfulfilled_ids)
     }
 
-    /// Fetch a single ticket by ID. Returns a Task that resolves to TicketDetails or DetailError.
     fn fetch_ticket(id: String) -> Task<BoardMessage> {
         Task::perform(
             async move {
@@ -887,8 +780,7 @@ impl BoardState {
                 generation,
             } => {
                 // Stale-generation guard: drop a snapshot whose refresh was
-                // superseded by a newer one so it cannot clobber the
-                // current list.
+                // superseded by a newer one so it cannot clobber the current list.
                 if self.applied_read(generation) {
                     self.apply_refreshed(tickets);
                 }
@@ -920,9 +812,6 @@ impl BoardState {
             BoardMessage::OpenModal(id) => {
                 self.selected_loading = true;
                 self.detail_error = None;
-                // Bump generation to invalidate any in-flight comment
-                // callbacks for the previous ticket before the fetch
-                // even completes.
                 self.comment_generation += 1;
                 Self::fetch_ticket(id)
             }
@@ -932,8 +821,6 @@ impl BoardState {
             }
             BoardMessage::Escape => {
                 if self.pending_cancel.is_some() {
-                    // Dismiss the cancel-confirmation modal first — the
-                    // ticket is left untouched.
                     self.dismiss_pending_cancel();
                     Task::none()
                 } else if self.comment_focused {
@@ -950,25 +837,15 @@ impl BoardState {
                 let ticket = *ticket;
                 let stats_task = self.apply_ticket_display(ticket);
                 self.selected_loading = false;
-                // Bump generation to invalidate any in-flight comment
-                // callbacks for the previous ticket, and clear the draft
-                // so it is not accidentally sent to the new ticket.
                 self.reset_comment_state();
                 stats_task
             }
             BoardMessage::TicketDetailsRefreshed(generation, ticket) => {
                 let ticket = *ticket;
-                // The fetch completed — allow the next refresh.
                 self.detail_refresh_in_flight = false;
-                // Stale callback: the modal closed or the user switched
-                // tickets while this fetch was in flight.
                 if generation != self.comment_generation {
                     return Task::none();
                 }
-                // A comment send is in flight: the DB snapshot predates
-                // the optimistic comment push, so applying it would make
-                // the new comment flicker out of the list. `CommentSent`
-                // refetches on completion.
                 if self.sending_comment || self.selected_ticket.is_none() {
                     return Task::none();
                 }
@@ -978,8 +855,6 @@ impl BoardState {
             }
             BoardMessage::TicketDetailsRefreshError(generation, e) => {
                 self.detail_refresh_in_flight = false;
-                // Stale callback: the modal context changed while the
-                // refresh was in flight — do not touch the display.
                 if generation != self.comment_generation {
                     return Task::none();
                 }
@@ -1014,12 +889,8 @@ impl BoardState {
                         // (`is_pipeline_occupied`), independent of whether an
                         // agent is currently in flight. Supersede auto-cancels
                         // and Manager-tool cancels don't go through here;
-                        // shutdown and already-paused are handled inside the
-                        // helper.
+                        // shutdown and already-paused are handled inside the helper.
                         if phase == TicketPhase::Cancelled && source.is_pipeline_occupied() {
-                            // Pause the workspace so queued development tickets
-                            // don't cascade. The pause is silent in ticket
-                            // history.
                             crate::pipeline::pause_workspace_on_failure(
                                 &ticket,
                                 "user cancelled a ticket in the development pipeline",
@@ -1034,9 +905,6 @@ impl BoardState {
                         if phase == TicketPhase::Cancelled {
                             crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket_id);
                         }
-                        // Re-dispatch into development is automatic on a
-                        // post-development non-success — there is no manual
-                        // "Redo Queued" action anymore.
                         board
                             .transition_to(&ticket_id, None, phase, "user")
                             .await
@@ -1048,7 +916,6 @@ impl BoardState {
             }
             BoardMessage::ActionResult(Ok(())) => {
                 self.action_loading = None;
-                // Refresh ticket list and detail
                 let refresh = self.refresh();
                 let detail_refetch = self
                     .selected_ticket
@@ -1097,7 +964,6 @@ impl BoardState {
                 Task::none()
             }
             BoardMessage::CommentInputChanged(action) => {
-                // Any interaction means the input is focused.
                 self.comment_focused = true;
                 super::common::apply_editor_action(
                     &mut self.comment_input,
@@ -1131,8 +997,6 @@ impl BoardState {
                 let now = crate::db::now();
                 let content = trimmed;
 
-                // Optimistically add the comment to local state so it appears
-                // immediately in the comments list.
                 if let Some(ref mut ticket) = self.selected_ticket {
                     ticket.comments.push(crate::pipeline::board::TicketComment {
                         role: role.clone(),
@@ -1160,8 +1024,6 @@ impl BoardState {
                 )
             }
             BoardMessage::CommentSent(generation, result) => {
-                // Stale callback guard: if the modal closed or the user switched
-                // tickets since this async was dispatched, drop the result.
                 if generation != self.comment_generation {
                     self.sending_comment = false;
                     return Task::none();
@@ -1170,13 +1032,10 @@ impl BoardState {
                 if let Err(e) = &result {
                     tracing::warn!(error = %e, "Board: failed to add comment");
                 }
-                // Refresh ticket detail from DB for consistency; on error this
-                // also removes the optimistic comment.
                 let refresh = match self.selected_ticket.as_ref() {
                     Some(ticket) => Self::fetch_ticket(ticket.id.clone()),
                     None => Task::none(),
                 };
-                // The success toast requires an open modal; errors always surface.
                 let toast = match (&result, self.selected_ticket.as_ref()) {
                     (Ok(()), Some(_)) => Task::done(BoardMessage::Toast(
                         super::ToastMessage::SuccessMsg("Comment added.".into()),
@@ -1235,9 +1094,6 @@ impl BoardState {
                 )
             }
             BoardMessage::PauseAllQueuedResult(Ok(count)) => {
-                // Count is the total moved across the drained workspaces: the
-                // listed non-archived Queued tickets, each workspace drained
-                // once.
                 let toast = Task::done(BoardMessage::Toast(super::ToastMessage::SuccessMsg(
                     format!(
                         "Paused {count} ticket{} across all workspaces",
@@ -1273,7 +1129,6 @@ impl BoardState {
                 let id = ticket_id;
                 Task::perform(
                     async move {
-                        // Resolve workspace name to a filesystem path for git.
                         let ws_path = match crate::workspace::get_by_name(&ws_name).await {
                             Ok(Some(ws)) => ws.path,
                             Ok(None) => {
@@ -1294,7 +1149,6 @@ impl BoardState {
                 if self.selected_ticket.as_ref().map(|t| t.id.as_str()) != Some(id.as_str())
                     || generation != self.commit_stats_generation
                 {
-                    // Stale callback — ticket changed or modal reopened
                     return Task::none();
                 }
                 self.commit_stats_loading = false;
@@ -1304,8 +1158,6 @@ impl BoardState {
                         self.commit_stats_error = None;
                     }
                     Err(e) => {
-                        // Non-critical: show the failure rather than rendering
-                        // nothing under the commit-hash line.
                         self.commit_stats = None;
                         self.commit_stats_error = Some(e);
                     }
@@ -1313,9 +1165,7 @@ impl BoardState {
                 Task::none()
             }
 
-            // ── Ticket search (sidebar) ──────────────────────────────
             BoardMessage::SearchInputChanged(action) => {
-                // Single-line Tab moves focus rather than editing.
                 if let Some(task) = super::common::focus_navigation_task(&action) {
                     return task;
                 }
@@ -1374,8 +1224,6 @@ impl BoardState {
             }
             BoardMessage::SearchError(e, generation) => {
                 if generation == self.search_generation {
-                    // A failed search is not an empty result: drop any previous
-                    // results and render the failure instead.
                     self.search_results.clear();
                     self.search_error = Some(e);
                 }
@@ -1391,13 +1239,10 @@ impl BoardState {
         }
     }
 
-    /// Run `git show --numstat` (or `-m --numstat` for merges) and parse the output.
     async fn run_git_numstat(
         ws_path: &str,
         commit_hash: &str,
     ) -> Result<CommitStats, anyhow::Error> {
-        // Detect merge commits: `git rev-list --parents -n 1 <hash>` outputs
-        // `<hash> <parent>` for non-merge, or `<hash> <parent1> <parent2> ...` for merges.
         let is_merge = match run_git_output(
             Path::new(ws_path),
             &["rev-list", "--parents", "-n", "1", commit_hash],
@@ -1433,7 +1278,6 @@ impl BoardState {
         let mut files: Vec<FileStat> = Vec::new();
 
         for entry in parse_numstat_lines(&stdout) {
-            // Skip binary files (additions/deletions are None)
             let Some(additions) = entry.additions else {
                 continue;
             };
@@ -1455,13 +1299,10 @@ impl BoardState {
         Ok(CommitStats { files })
     }
 
-    /// Partition tickets into the four board columns in display order:
-    /// In Progress, Queued, Pending, Completed.
     pub(crate) fn board_sections(tickets: &[Ticket]) -> [Vec<&Ticket>; 4] {
         crate::pipeline::board::BoardStore::board_sections(tickets)
     }
 
-    /// Render a single ticket card: clickable title, ID, phase badge, and action icons.
     #[expect(clippy::too_many_lines)]
     pub fn render_ticket_card<'a>(&'a self, ticket: &'a Ticket) -> Element<'a, BoardMessage> {
         let is_action_disabled = self.action_loading.as_deref() == Some(&ticket.id);
@@ -1470,8 +1311,6 @@ impl BoardState {
         let mut icon_row =
             Self::action_icon_row(&ticket.id, ticket.phase, &actions, is_action_disabled);
         if actions.is_empty() {
-            // Done/Cancelled cards render no action buttons; the ghost pins
-            // the badge row's height to the button-bearing metrics.
             icon_row = icon_row.push(widgets::ghost_icon_button());
         }
 
@@ -1534,7 +1373,6 @@ impl BoardState {
         badge_row = badge_row.push(Space::new().width(Length::Fill));
         badge_row = badge_row.push(icon_row);
 
-        // Per-ticket archive button for done/cancelled tickets
         if matches!(ticket.phase, TicketPhase::Done | TicketPhase::Cancelled) && !ticket.is_archived
         {
             let archive_btn = widgets::icon_tooltip_button(
@@ -1554,29 +1392,25 @@ impl BoardState {
             badge_row = badge_row.push(archive_btn);
         }
 
-        let mut card_children: Vec<Element<'_, BoardMessage>> = vec![
-            // Title + ID row: both clickable
-            tooltip_hint(
-                button(
-                    column![
-                        text(&ticket.title)
-                            .size(theme::TEXT_13)
-                            .color(theme::TEXT_PRIMARY),
-                        text(&ticket.id)
-                            .size(theme::TEXT_10)
-                            .color(theme::TEXT_SECONDARY),
-                    ]
-                    .spacing(theme::SPACE_2),
-                )
-                .padding(iced::Padding::new(theme::PAD_8).bottom(theme::PAD_2))
-                .width(Length::Fill)
-                .style(theme::button_text)
-                .on_press(BoardMessage::OpenModal(ticket.id.clone())),
-                "open ticket details",
-            ),
-        ];
+        let mut card_children: Vec<Element<'_, BoardMessage>> = vec![tooltip_hint(
+            button(
+                column![
+                    text(&ticket.title)
+                        .size(theme::TEXT_13)
+                        .color(theme::TEXT_PRIMARY),
+                    text(&ticket.id)
+                        .size(theme::TEXT_10)
+                        .color(theme::TEXT_SECONDARY),
+                ]
+                .spacing(theme::SPACE_2),
+            )
+            .padding(iced::Padding::new(theme::PAD_8).bottom(theme::PAD_2))
+            .width(Length::Fill)
+            .style(theme::button_text)
+            .on_press(BoardMessage::OpenModal(ticket.id.clone())),
+            "open ticket details",
+        )];
 
-        // Badge + optional prereq indicator + icon row (below the clickable area)
         card_children.push(
             badge_row
                 .align_y(Alignment::Center)
@@ -1594,13 +1428,10 @@ impl BoardState {
             .into()
     }
 
-    /// Whether a ticket detail modal is currently open (or loading).
     const fn is_modal_open(&self) -> bool {
         self.selected_ticket.is_some() || self.selected_loading || self.detail_error.is_some()
     }
 
-    /// Shared detail-modal shell: `dialog_shell` at `width` on the
-    /// close-on-click backdrop.
     fn modal_dialog<'a>(
         content: impl Into<Element<'a, BoardMessage>>,
         width: f32,
@@ -1663,17 +1494,12 @@ impl BoardState {
                 Self::modal_dialog(self.modal_detail(), 720.0)
             }
         } else {
-            // Keep Stack widget type stable to prevent MouseArea state
-            // from becoming orphaned when the modal closes.
             iced::widget::stack([widgets::empty_stack_placeholder()]).into()
         };
 
         let confirm_layer = if let Some(ref ticket_id) = self.pending_cancel {
             Self::cancel_confirm_dialog(ticket_id)
         } else {
-            // Type-stable placeholder so child 1's tag — and therefore the
-            // outer Stack's shape — does not change when the confirmation
-            // is dismissed.
             iced::widget::stack([widgets::empty_stack_placeholder()]).into()
         };
 
@@ -1725,7 +1551,6 @@ impl BoardState {
         )
     }
 
-    /// Render the ticket detail modal content.
     fn modal_detail(&self) -> Element<'_, BoardMessage> {
         let Some(ticket) = &self.selected_ticket else {
             return text("No ticket selected.")
@@ -1765,14 +1590,12 @@ impl BoardState {
             sections.push(el);
         }
 
-        // ── Scrollable content area ──────────────────────────────
         let scrollable_content = widgets::vscroll(
             Column::from_vec(sections)
                 .spacing(theme::SPACE_4)
                 .width(Length::Fill),
         );
 
-        // ── Comment input area (pinned at the bottom) ────────────
         let input_area = self.render_comment_input();
 
         column![scrollable_content, input_area,]
@@ -1794,8 +1617,6 @@ impl BoardState {
         }
     }
 
-    /// Render the modal header: title row, ticket ID + created/updated metadata
-    /// (with optional prerequisites/supersedes line below), then badges + action icons.
     fn render_header_metadata(
         ticket: &Ticket,
         is_action_disabled: bool,
@@ -1904,9 +1725,6 @@ impl BoardState {
         .into()
     }
 
-    /// Render commit stats: summary header + per-file rows, or a loading
-    /// indicator, or the fetch failure. Returns `None` when the ticket has no
-    /// commit hash.
     fn render_commit_stats<'a>(
         ticket: &'a Ticket,
         stats: Option<&'a CommitStats>,
@@ -1967,7 +1785,6 @@ impl BoardState {
         .padding([theme::PAD_4, theme::PAD_8])
         .width(Length::Fill);
 
-        // File stat rows — hide zero-valued sides
         let mut file_col = Column::new().spacing(theme::SPACE_2);
         for f in &stats.files {
             file_col = file_col.push(
@@ -1994,8 +1811,6 @@ impl BoardState {
         )
     }
 
-    /// Render the description section: markdown (if cached) or plain text.
-    /// Returns `None` when the ticket description is empty.
     fn render_description<'a>(
         ticket: &'a Ticket,
         description_md: Option<&'a [markdown::Item]>,
@@ -2032,8 +1847,6 @@ impl BoardState {
         })
     }
 
-    /// Render the comment input widget (text editor + send button) pinned at
-    /// the bottom of the ticket detail modal.
     fn render_comment_input(&self) -> Element<'_, BoardMessage> {
         container(super::widgets::chat_composer(
             &self.comment_input,
@@ -2057,9 +1870,6 @@ impl BoardState {
         .into()
     }
 
-    /// Render the comments list: per-comment chat-style author header, content,
-    /// and diagnostics expand/collapse toggle.
-    /// Returns `None` when the ticket has no comments.
     fn render_comments<'a>(
         ticket: &'a Ticket,
         expanded: &'a HashSet<usize>,
@@ -2100,7 +1910,6 @@ impl BoardState {
                     .into()
             };
 
-            // Toggle button for diagnostics comments
             let toggle_button: Option<Element<'_, BoardMessage>> = if is_diag {
                 let (icon, label) = if is_expanded {
                     (
@@ -2191,8 +2000,6 @@ mod tests {
         TicketFixture::new(id, phase).build()
     }
 
-    /// Build a ticket for the pause-helper tests in `workspace`, optionally
-    /// archived.
     fn ticket_in(workspace: &str, id: &str, phase: TicketPhase, archived: bool) -> Ticket {
         TicketFixture::new(id, phase)
             .workspace(workspace)
@@ -2204,8 +2011,6 @@ mod tests {
         EditorBuffer::with_text(text, Some(HighlightLanguage::Markdown))
     }
 
-    // ── Comment input: cursor actions, editing and undo/redo ──────
-
     fn mv(line: usize, col: usize) -> EditorAction {
         EditorAction::MoveTo { line, col }
     }
@@ -2214,19 +2019,14 @@ mod tests {
         EditorAction::SelectTo { line, col }
     }
 
-    /// Typing `text` into the field, one insert per character.
     fn typed(text: &str) -> Vec<EditorAction> {
         text.chars().map(EditorAction::Insert).collect()
     }
 
-    /// How a case ends the modal session, if at all.
     #[derive(Clone, Copy, PartialEq)]
     enum Close {
-        /// The modal stays open.
         None,
-        /// The `CloseModal` message (backdrop click or close button).
         Message,
-        /// `reset_modal()` itself: the clear the message funnels through.
         Reset,
     }
 
@@ -2316,7 +2116,6 @@ mod tests {
             state.comment_input = draft(case.initial);
             for action in case.actions {
                 let _task = state.update(BoardMessage::CommentInputChanged(action));
-                // Any interaction means the input is focused.
                 assert!(state.comment_focused, "case {name}: comment_focused is set");
             }
             if case.undoes {
@@ -2327,7 +2126,6 @@ mod tests {
                 assert!(changed, "case {name}: undo should change the content");
                 let _task = state.update(BoardMessage::CommentInputChanged(EditorAction::Redo));
             }
-            // Closing the modal clears the field and its undo history.
             if case.close == Close::Reset {
                 state.reset_modal();
             } else if case.close == Close::Message {
@@ -2342,8 +2140,6 @@ mod tests {
             assert_eq!(selected, case.selection, "case {name}: selection");
         }
     }
-
-    // ── SendComment: accept, no ticket, stale callback ────────────
 
     struct SendCommentCase {
         name: &'static str,
@@ -2400,8 +2196,6 @@ mod tests {
             } else {
                 state.sending_comment = true;
                 state.comment_generation = 42;
-                // The stale guard fires before the Ok/Err branch, so one
-                // completion covers both variants.
                 let _task = state.update(BoardMessage::CommentSent(0, Ok(())));
             }
             assert_eq!(
@@ -2421,11 +2215,8 @@ mod tests {
         }
     }
 
-    // ── A new modal context invalidates the comment draft ─────────
-
     #[test]
     fn a_new_modal_context_bumps_the_comment_generation_and_clears_the_draft() {
-        // (case, the context switch is a ticket switch rather than a fresh open)
         let cases = [
             ("opening the modal", false),
             ("switching to another ticket", true),
@@ -2456,9 +2247,6 @@ mod tests {
         }
     }
 
-    // ── TicketDetailsRefreshed (periodic refresh of the open modal) ─
-
-    /// Same-ticket refresh carrying a new phase plus an engineer comment.
     fn refreshed_ticket(phase: TicketPhase) -> Ticket {
         TicketFixture::new("T-1", phase)
             .comment("engineer", "fixed the flaky test", "2026-01-01T00:00:05Z")
@@ -2515,8 +2303,6 @@ mod tests {
             state.sending_comment = case.sending;
             let gen_before = state.comment_generation;
 
-            // The periodic refresh delivers the same ticket with a new phase
-            // and a new engineer comment — the exact staleness the feature fixes.
             let _task = state.update(BoardMessage::TicketDetailsRefreshed(
                 case.callback_generation,
                 Box::new(refreshed_ticket(verification)),
@@ -2561,7 +2347,6 @@ mod tests {
             ticket
         };
 
-        // Hash appeared → fresh stats fetch dispatched.
         let mut state = make_board_state();
         let (g, stats_gen) = (state.comment_generation, state.commit_stats_generation);
         let _task = state.update(BoardMessage::TicketDetailsRefreshed(g, Box::new(hashed())));
@@ -2571,7 +2356,6 @@ mod tests {
             "stats generation bumps"
         );
 
-        // Unchanged project + hash → keep the loaded stats, no refetch.
         let mut state = make_board_state();
         state.selected_ticket.as_mut().unwrap().commit_hash = Some(HASH.into());
         state.commit_stats = Some(CommitStats { files: Vec::new() });
@@ -2581,9 +2365,6 @@ mod tests {
         assert_eq!(state.commit_stats_generation, 5, "no refetch");
         assert!(state.commit_stats.is_some(), "the loaded stats are kept");
 
-        // The same hash in another project is a different (project, commit):
-        // the stats loaded for the first one say nothing about the second, so
-        // they are refetched rather than shown under the wrong project.
         let mut state = make_board_state();
         state.selected_ticket.as_mut().unwrap().commit_hash = Some(HASH.into());
         state.commit_stats = Some(CommitStats { files: Vec::new() });
@@ -2618,8 +2399,7 @@ mod tests {
         let g = state.comment_generation;
 
         // A refresh error keeps the last known good detail visible and must not
-        // clear the modal loading state (that is `DetailError`'s job, for the
-        // initial modal load).
+        // clear the modal loading state (that is `DetailError`'s job, for the initial modal load).
         let _task = state.update(BoardMessage::TicketDetailsRefreshError(
             g,
             "db hiccup".into(),
@@ -2629,7 +2409,6 @@ mod tests {
         assert_eq!(state.detail_error.as_deref(), Some("db hiccup"));
         assert!(!state.detail_refresh_in_flight);
 
-        // Stale refresh error (generation mismatch) is dropped entirely.
         state.comment_generation += 1; // simulate modal close/switch
         let _task = state.update(BoardMessage::TicketDetailsRefreshError(0, "late".into()));
         assert_eq!(
@@ -2641,40 +2420,32 @@ mod tests {
 
     #[test]
     fn test_refresh_selected_ticket_dispatch_gating() {
-        // No modal open → nothing dispatched.
         let mut state = BoardState::new();
         let _task = state.refresh_selected_ticket();
         assert!(!state.detail_refresh_in_flight);
 
-        // Modal open → dispatched (in-flight flag set).
         let mut state = make_board_state();
         let _task = state.refresh_selected_ticket();
         assert!(state.detail_refresh_in_flight);
 
-        // Another refresh while one is in flight → no-op.
         let _task = state.refresh_selected_ticket();
         assert!(state.detail_refresh_in_flight);
 
-        // In-flight flag cleared on completion.
         let g = state.comment_generation;
         let ticket = make_ticket("T-1", TicketPhase::Backlog);
         let _task = state.update(BoardMessage::TicketDetailsRefreshed(g, Box::new(ticket)));
         assert!(!state.detail_refresh_in_flight);
 
-        // Initial modal load in flight → no refresh dispatched.
         let mut state = make_board_state();
         state.selected_loading = true;
         let _task = state.refresh_selected_ticket();
         assert!(!state.detail_refresh_in_flight);
 
-        // Comment send in flight → no refresh dispatched.
         let mut state = make_board_state();
         state.sending_comment = true;
         let _task = state.refresh_selected_ticket();
         assert!(!state.detail_refresh_in_flight);
     }
-
-    // ── Escape: first blurs, second closes ────────────────────────
 
     #[test]
     fn test_escape_first_blurs_then_closes() {
@@ -2694,17 +2465,12 @@ mod tests {
         );
     }
 
-    // ── CDC change-stream delta application ───────────────────────
-
     fn page(id: &str, phase: TicketPhase) -> Vec<Ticket> {
         vec![make_ticket(id, phase)]
     }
 
     #[test]
     fn snapshots_follow_their_generation_and_lag_recovery_replaces() {
-        // (case, (board generation, loading, replace on refresh, listed tickets),
-        // a `Refreshed` payload or `None` for the lag-recovery marker,
-        // (expected ids, expected replace flag, expected load state))
         let cases = [
             (
                 "a stale-generation snapshot is dropped",
@@ -2778,19 +2544,16 @@ mod tests {
             });
         };
         let mut state = BoardState::new();
-        // A lag recovery already consumed: the next refresh merges.
         let mut ticket = make_ticket("T-1", TicketPhase::Backlog);
         ticket.updated_at = OLD.into();
         state.tickets = vec![ticket];
 
-        // A newer snapshot updates the stale cached ticket.
         let mut newer = make_ticket("T-1", TicketPhase::Analysis);
         newer.updated_at = NEW.into();
         refresh(&mut state, vec![newer]);
         assert_eq!(state.tickets[0].phase, TicketPhase::Analysis);
         assert_eq!(state.tickets[0].updated_at, NEW);
 
-        // A removed ticket is not re-added by a stale snapshot.
         state.delta_removed_ids.insert("T-2".into());
         let mut removed = make_ticket("T-2", TicketPhase::Done);
         removed.updated_at = OLD.into();
@@ -2800,9 +2563,6 @@ mod tests {
             "an archived ticket must not be re-added from a stale snapshot"
         );
 
-        // A board ticket absent from a stale snapshot is kept (an omission is
-        // ambiguous — the snapshot may predate its creation/delta), so a
-        // delta-created ticket survives an older snapshot that omits it.
         let mut created = make_ticket("T-3", TicketPhase::Backlog);
         created.updated_at = OLD.into();
         state.tickets = vec![created];
@@ -2814,8 +2574,6 @@ mod tests {
     #[test]
     fn ticket_change_tracks_removal_for_snapshot_merge() {
         let mut state = BoardState::new();
-        // The delta carries no workspace filter: a removal is applied to a
-        // ticket of any workspace.
         let mut ticket = make_ticket("T-1", TicketPhase::Done);
         ticket.workspace_name = "other_ws".into();
         state.tickets = vec![ticket];
@@ -2858,15 +2616,12 @@ mod tests {
         state.apply_ticket_upsert(ticket);
         assert_eq!(state.tickets.len(), 2);
 
-        // Archiving removes the ticket from the list.
         let mut archived = make_ticket("T-1", TicketPhase::Done);
         archived.is_archived = true;
         state.apply_ticket_upsert(archived);
         assert_eq!(state.tickets.len(), 1);
         assert!(state.tickets.iter().all(|t| t.id != "T-1"));
     }
-
-    // ── Mid-pipeline cancel confirmation ─────────────────────────
 
     #[derive(Clone, Copy, PartialEq)]
     enum Follow {
@@ -2996,7 +2751,6 @@ mod tests {
                 .map(|phase| vec![make_ticket("T-1", phase)])
                 .unwrap_or_default();
             if case.follow_up == Follow::Escape {
-                // The comment input is focused with the detail modal open.
                 state.comment_focused = true;
             }
 
@@ -3025,8 +2779,6 @@ mod tests {
             }
         }
     }
-
-    // ── Ticket search (sidebar) ──────────────────────────────────
 
     struct SearchInputCase {
         name: &'static str,
@@ -3094,7 +2846,6 @@ mod tests {
                 }
             }
 
-            // The field shows what was typed, and the results are gone.
             let expected_query = case.pasted.unwrap_or("");
             assert_eq!(
                 state.search_query.text(),
@@ -3105,8 +2856,6 @@ mod tests {
                 state.search_results.is_empty(),
                 "case {name}: results empty"
             );
-            // A text change always bumps the generation, so in-flight tasks
-            // for the previous query are discarded.
             assert!(
                 state.search_generation > case.generation,
                 "case {name}: bumped"
@@ -3125,8 +2874,6 @@ mod tests {
     #[test]
     fn search_results_and_errors_follow_the_generation() {
         let bl = TicketPhase::Backlog;
-        // (case, (generation, stale results shown, error shown),
-        // (the callback, expected ids, expected error))
         let cases = [
             (
                 "a stale result callback is discarded",
@@ -3183,7 +2930,6 @@ mod tests {
         }
     }
 
-    /// A failed board list read stays visible until a successful refresh replaces it.
     #[test]
     fn refresh_error_is_visible_until_a_successful_refresh() {
         let mut state = make_board_state();
@@ -3195,8 +2941,7 @@ mod tests {
         assert_eq!(state.load_state.error(), Some("db down"));
         assert!(!state.load_state.has_loaded());
 
-        // A failure carrying a stale generation must not overwrite the current
-        // list's load state.
+        // A failure carrying a stale generation must not overwrite the current list's load state.
         let stale_generation = state.board_generation.wrapping_sub(1);
         let _ = state.update(BoardMessage::RefreshError {
             error: "stale".to_string(),
@@ -3212,9 +2957,6 @@ mod tests {
         assert!(state.load_state.has_loaded());
     }
 
-    // ── Completed-column ordering ──────────────────────────────────
-
-    /// Build a ticket for sort tests; defaults match the board-state fixture.
     fn test_ticket(
         id: &str,
         phase: TicketPhase,
@@ -3255,8 +2997,6 @@ mod tests {
         assert_eq!(ids, ["d1", "d2", "d3", "c1", "c2", "c3"]);
     }
 
-    // ── Pause-all-queued helpers ──────────────────────────────────
-
     #[test]
     fn has_queued_tickets_reads_the_listed_board() {
         let cases = [
@@ -3296,8 +3036,6 @@ mod tests {
             let mut state = make_board_state();
             state.tickets = tickets;
             if searching {
-                // A Queued ticket in the listed board keeps the context-menu
-                // item available even when the search shows none.
                 state.search_query = super::super::common::SingleLineEditorState::new("foo");
                 state.search_results = vec![ticket_in("ws1", "t2", TicketPhase::Backlog, false)];
             }
@@ -3308,7 +3046,6 @@ mod tests {
     #[test]
     fn the_ticket_column_is_hidden_only_by_a_loaded_empty_board() {
         let mut state = BoardState::new();
-        // Not read yet: the column renders its "Loading…" state.
         assert!(!state.has_nothing_to_show());
 
         state.load_state.start_loading();
@@ -3321,7 +3058,6 @@ mod tests {
         state.load_state.fail("db hiccup".to_string());
         assert!(!state.has_nothing_to_show());
 
-        // A ticket to show keeps it, whatever the read state says.
         state.load_state.clear_error();
         state.tickets = vec![ticket_in("ws1", "t1", TicketPhase::Backlog, false)];
         assert!(!state.has_nothing_to_show());

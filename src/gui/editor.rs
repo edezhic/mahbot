@@ -1,16 +1,6 @@
-//! Code editor dashboard page — tabbed code editor with file tree, syntax-aware
-//! editing, and workspace-backed tab persistence.
-//!
-//! Layout: split view of an auto-sizing file tree (left, widest visible
-//! row clamped to TREE_MIN_WIDTH..TREE_MAX_WIDTH) and a tabbed editor
-//! (right, filling the remaining width). Workspace selection is handled by
-//! the footer workspace picker. Tabs persist to the workspace
-//! database and are restored on workspace selection.
-//! Key bindings: Ctrl+S/Cmd+S to save, Tab/Shift+Tab for indent/outdent,
-//! Ctrl+B for tree focus toggle.
-//!
-//! Tree keyboard navigation: when tree is focused, Arrow Up/Down navigate
-//! entries, Enter opens files or expands directories, Escape exits focus.
+//! Code editor dashboard page — tabbed editor with a file tree and workspace-backed tab
+//! persistence. Key bindings: Ctrl/Cmd+S save, Tab/Shift+Tab indent, Ctrl+B tree focus;
+//! with the tree focused, arrows navigate, Enter opens/expands, Escape leaves.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -46,31 +36,19 @@ use super::widgets::{self, FileTree, TreeNavDirection};
 
 mod editor_dialog;
 
-// ── Constants ─────────────────────────────────────────────────────
-
-/// Estimated advance width of one glyph in JetBrains Mono at the tab-label
-/// size (12px): 0.6em × 12 = 7.2px. Tab labels render in the dashboard's
-/// default font (JetBrains Mono, see [`super::JETBRAINS_MONO`]), so every
-/// ASCII filename character contributes this width.
+/// Advance width of one ASCII glyph in the tab label's 12px JetBrains Mono (0.6em).
 const TAB_CHAR_ADVANCE: f32 = 7.2;
 
-/// Fixed non-text chrome per tab: button padding (`[8, 8]`) + the 2px row
-/// spacing to the close button + the 12px close button itself.
+/// Non-text chrome per tab: button padding, 2px row spacing, 12px close button.
 const TAB_FIXED_CHROME: f32 = 16.0 + 2.0 + 12.0;
 
 /// Extra width for the dirty-indicator dot (8px) plus its 2px row spacing.
 const TAB_DIRTY_EXTRA: f32 = 8.0 + 2.0;
 
-/// Estimate the rendered width of a tab in px for scroll-into-view decisions.
-///
-/// JetBrains Mono is monospace, so char count × [`TAB_CHAR_ADVANCE`] closely
-/// approximates the label width; [`TAB_FIXED_CHROME`] covers padding, spacing
-/// and the close button, plus [`TAB_DIRTY_EXTRA`] for the dirty dot. Unlike
-/// the old flat 140px-per-tab constant (which overestimated every tab and
-/// made the cumulative left-edge error huge), per-tab estimates keep the
-/// error to a few px per tab, and the delta-based reveal in
-/// [`EditorState::scroll_to_active_tab`] never amplifies it into a
-/// right-edge clamp.
+/// Estimate a tab's rendered width in px: char count × [`TAB_CHAR_ADVANCE`], plus
+/// [`TAB_FIXED_CHROME`] and [`TAB_DIRTY_EXTRA`]. Monospace keeps the per-tab error at a few
+/// px, so the delta reveal in [`EditorState::scroll_to_active_tab`] never amplifies it into a
+/// right-edge clamp (the old flat 140px constant accumulated that error).
 #[expect(clippy::cast_precision_loss)]
 fn estimate_tab_width(tab: &Tab) -> f32 {
     let name_w = tab.file_name.chars().count() as f32 * TAB_CHAR_ADVANCE;
@@ -78,8 +56,7 @@ fn estimate_tab_width(tab: &Tab) -> f32 {
     name_w + TAB_FIXED_CHROME + dirty
 }
 
-/// Estimated content-space left edge of tab `idx`: the sum of the estimated
-/// widths of all tabs before it.
+/// Estimated content-space left edge of tab `idx` (the widths of all tabs before it).
 fn estimated_tab_left(tabs: &[Tab], idx: usize) -> f32 {
     tabs.iter().take(idx).map(estimate_tab_width).sum()
 }
@@ -93,34 +70,24 @@ fn estimated_content_width(tabs: &[Tab]) -> f32 {
 const FIND_SEARCH_ID: &str = "find_search_input";
 const FIND_REPLACE_ID: &str = "find_replace_input";
 
-/// Widget ID for the global search input.
 const GLOBAL_SEARCH_INPUT_ID: &str = "global_search_input";
 
-/// Widget ID for the go-to-line input.
 const GOTO_LINE_INPUT_ID: &str = "goto_line_input";
 
-/// Widget ID for the quick-open filter input.
 const QUICK_OPEN_INPUT_ID: &str = "quick_open_input";
 
-/// Widget ID for the new file/directory name input.
 const NEW_ITEM_INPUT_ID: &str = "new_item_input";
 
-/// Maximum number of global search results to display.
 const MAX_GLOBAL_SEARCH_RESULTS: usize = 200;
 
-/// Maximum matches per file for global search — spread results across files.
 const GLOBAL_SEARCH_MATCHES_PER_FILE: usize = 20;
 
-/// Debounce delay for global search query input (milliseconds).
 const GLOBAL_SEARCH_DEBOUNCE_MS: u64 = 300;
 
-/// Shown with a failed saved-tabs restore: the restore failure blocks tab
-/// persistence for the session, and that consequence belongs in the failure the
-/// person sees.
+/// Shown with a failed saved-tabs restore: tab persistence stays blocked until it resolves.
 const TABS_SAVE_PAUSED: &str = "tab saving is paused until this is resolved";
 
-/// Check whether a file name is an OS-generated metadata file that should
-/// be hidden from the file tree.
+/// Is `name` an OS-generated metadata file the tree hides?
 #[must_use]
 fn is_os_file(name: &str) -> bool {
     name.eq_ignore_ascii_case(".ds_store")
@@ -128,8 +95,7 @@ fn is_os_file(name: &str) -> bool {
         || name.eq_ignore_ascii_case("desktop.ini")
 }
 
-/// Wrap a bar row in the full-width bar container. The `.width(Length::Fill)`
-/// keeps the bar background (theme::container_bar) spanning the full width.
+/// Wrap a bar row in the full-width container so the bar background spans the row.
 fn bar_harness<'a>(bar: impl Into<Element<'a, EditorMessage>>) -> Element<'a, EditorMessage> {
     container(bar)
         .style(theme::container_bar)
@@ -137,42 +103,32 @@ fn bar_harness<'a>(bar: impl Into<Element<'a, EditorMessage>>) -> Element<'a, Ed
         .into()
 }
 
-// ── Types ─────────────────────────────────────────────────────────
-
 /// File-system entry for the directory tree.
 #[derive(Debug, Clone)]
 struct FsEntry {
     name: String,
-    /// Path relative to the workspace root.
     full_path: String,
     is_dir: bool,
-    /// Error message if this entry couldn't be properly inspected
-    /// (broken symlink, permission denied, etc.).
+    /// Set when the entry could not be inspected (broken symlink, permission denied).
     error: Option<String>,
 }
 
 /// A single editor tab (metadata, no content).
 #[derive(Debug, Clone)]
 struct Tab {
-    /// Full filesystem path to the file.
     path: String,
-    /// Display name (file name component only).
     file_name: String,
-    /// Whether the file has unsaved changes.
     is_dirty: bool,
-    /// Detected line ending convention.
     line_ending: LineEnding,
 }
 
 /// Content data for a tab, keyed by full path.
 struct TabData {
     content: super::editor_widget::EditorBuffer,
-    /// Undo/redo stack for this tab.
     undo_stack: RefCell<UndoStack>,
     /// Find/replace state (None when bar is hidden).
     find_replace_state: Option<FindReplaceState>,
-    /// Hash of the last saved (or loaded) text. Used by undo/redo to
-    /// detect when the editor returns to the saved state.
+    /// Hash of the last saved (or loaded) text; undo/redo compares against it.
     saved_text_hash: u64,
 }
 
@@ -184,9 +140,7 @@ fn hash_text(text: &str) -> u64 {
     h.finish()
 }
 
-/// Shared helper to construct a `Tab` + `TabData` pair from file text
-/// and metadata.  Returns the pair together with the file's mtime (if
-/// readable) so the caller can record it in `file_mtimes`.
+/// Build the `Tab` + `TabData` pair from file text and metadata, plus the file's mtime.
 fn make_tab_and_data(
     path: &str,
     text: &str,
@@ -220,78 +174,50 @@ fn make_tab_and_data(
     (tab, tab_data, mtime)
 }
 
-// ── Find/Replace ───────────────────────────────────────────────────
-
 /// State for the find/replace search bar.
 struct FindReplaceState {
-    /// Current search query string.
     query: SingleLineEditorState,
-    /// Replace-with string.
     replace: SingleLineEditorState,
     /// Byte ranges of all matches in the file.
     matches: Vec<std::ops::Range<usize>>,
-    /// Index of the currently focused match.
     current_match_idx: usize,
-    /// Whether matching is case-sensitive (default: false).
     case_sensitive: bool,
 }
-
-// ── Global Search ──────────────────────────────────────────────────
 
 /// Status of the global (find-in-files) search.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GlobalSearchStatus {
-    /// Search panel is open but no query entered yet.
     Idle,
-    /// Search is in progress.
     Searching,
-    /// Search completed with results.
     Done,
-    /// Search completed with no results.
     NoResults,
-    /// Search encountered an error.
     Error(String),
 }
 
-/// Owned representation of a single grep match, extracted from
-/// `fff_search::GrepResult` so it can cross async boundaries.
+/// A grep match extracted from `fff_search::GrepResult` so it can cross async boundaries.
 #[derive(Debug, Clone)]
 struct OwnedGrepMatch {
-    /// Absolute filesystem path to the matched file.
     abs_path: String,
-    /// Relative path (for display).
     rel_path: String,
-    /// 1-based line number.
     line_number: u64,
-    /// Content of the matching line.
     line_content: String,
-    /// Byte offsets of the matched portion within `line_content`,
-    /// as `(start, end)` pairs (for highlighting).
+    /// Byte offsets of the match within `line_content`, for highlighting.
     match_byte_offsets: Vec<(u32, u32)>,
 }
 
 /// State for the global search (Cmd+Shift+F) panel.
 struct GlobalSearchState {
-    /// Current query text in the search input.
     query: SingleLineEditorState,
-    /// Search results (empty when no search has been performed).
     results: Vec<OwnedGrepMatch>,
-    /// Index of the currently selected result in the list.
     selected_index: usize,
-    /// Current search status.
     status: GlobalSearchStatus,
 }
 
 use std::ops::Range;
 
-/// Compute byte-range matches of `query` in `text`. Returns empty
-/// when query is shorter than 2 characters.
-///
-/// When `case_sensitive` is `false`, matching uses ASCII-only case
-/// folding via [`str::to_ascii_lowercase`] — this is length-preserving
-/// so returned byte ranges are valid for the original `text`.
-/// Non-ASCII queries are matched literally in case-insensitive mode
-/// (standard editor convention).
+/// Byte-range matches of `query` in `text`; empty when the query is under 2 chars.
+/// Case-insensitive matching folds ASCII only, which is length-preserving so the ranges
+/// stay valid for `text`; non-ASCII queries match literally.
 #[must_use]
 fn compute_text_matches(text: &str, query: &str, case_sensitive: bool) -> Vec<Range<usize>> {
     if query.len() < 2 {
@@ -304,7 +230,6 @@ fn compute_text_matches(text: &str, query: &str, case_sensitive: bool) -> Vec<Ra
             matches.push(start..start + query.len());
         }
     } else {
-        // Case-insensitive: lowercase both strings (ASCII-only, length-preserving).
         let text_lower = text.to_ascii_lowercase();
         let query_lower = query.to_ascii_lowercase();
         for (start, _) in text_lower.match_indices(&query_lower) {
@@ -345,11 +270,9 @@ enum CloseAction {
     Cancel,
 }
 
-/// Pending close action to execute after the next successful save.
-/// Only one such action can be pending at a time.
+/// Pending close action to run after the next successful save; at most one at a time.
 #[derive(Debug, Clone)]
 enum PendingCloseAction {
-    /// Close this tab index.
     CloseTab(usize),
     /// Close all tabs except `keep_idx`; these dirty tab indices
     /// still need to be saved first.
@@ -366,278 +289,180 @@ struct SavedTabData {
     text: String,
     was_dirty: bool,
     line_ending: LineEnding,
-    /// Whether this tab was the active one when saved.
     is_active: bool,
 }
 
-// ── Messages ─────────────────────────────────────────────────────
-
-// EditorMessage's public variants carry editor-internal payload types
-// (FsEntry, OwnedGrepMatch, FileLoadData, CloseAction, SavedTabData,
-// ReadDirError); re-pub any of them only together with dropping this expect.
+// EditorMessage's public variants carry editor-internal payload types (FsEntry,
+// OwnedGrepMatch, FileLoadData, CloseAction, SavedTabData, ReadDirError); re-pub any of them
+// only together with dropping this expect.
 #[derive(Debug, Clone)]
 #[expect(private_interfaces)]
 pub enum EditorMessage {
-    /// The workspace resolved for the current selection (managed name plus
-    /// filesystem path), pushed only by the dashboard's
-    /// `sync_workspace_surfaces` — never a substitution for an unresolved one.
+    /// The workspace resolved for the current selection (name + path), pushed only by the
+    /// dashboard's `sync_workspace_surfaces` — never a substitution for an unresolved one.
     WorkspaceSelected(String, String),
-    /// The editor page became visible or hidden (single source of truth for
-    /// whether the editor is the active page). `true` triggers a refresh-on-entry
-    /// batch; `false` closes any open modal (modals do not survive a page switch).
+    /// The editor page became visible or hidden. `true` triggers a refresh-on-entry batch;
+    /// `false` closes any open modal (modals do not survive a page switch).
     PageVisibilityChanged(bool),
     /// A directory's listing was loaded from the filesystem.
     DirExpanded {
         dir_path: String,
         r#gen: u64,
         entries: Result<Vec<FsEntry>, ReadDirError>,
-        /// When `true`, read errors are logged instead of shown as a toast.
-        /// Used by background (refresh) reads to avoid noise.
-        /// Missing directories are forgotten silently either way.
+        /// `true` logs read errors instead of showing a toast (background refreshes); missing
+        /// directories are forgotten silently either way.
         quiet: bool,
     },
-    /// A GUI-initiated directory deletion succeeded in `workspace_path`.
-    /// The editor prunes the deleted path and its descendants from the tree
-    /// refresh/cache state and re-reads the parent directory.
+    /// A GUI-initiated directory deletion succeeded in `workspace_path`: prune the deleted path
+    /// and its descendants from the tree state, then re-read the parent.
     ///
-    /// `workspace_path` is a staleness guard: the user can switch workspaces
-    /// while the async delete is in flight (large trees can take seconds),
-    /// so the completion must only prune the workspace it was started in —
-    /// applying it against a newly selected workspace would drop that
-    /// workspace's same-relative-path state.
+    /// `workspace_path` is a staleness guard — the user can switch workspaces while the async
+    /// delete is in flight, and only the workspace it was started in may be pruned.
     DirDeleted {
         dir_path: String,
         workspace_path: String,
     },
-    /// User toggled a directory in the file tree.
     ToggleDir(String),
-    /// User selected a file in the file tree.
     SelectFile(String),
-    /// Ctrl+B toggled tree keyboard focus on/off.
     TreeFocusToggled,
-    /// Arrow Up in tree keyboard navigation.
     TreeNavUp,
-    /// Arrow Down in tree keyboard navigation.
     TreeNavDown,
-    /// Enter key in tree navigation — open file or expand directory.
     TreeNavEnter,
-    /// Arrow Left in tree navigation — collapse directory or go to parent.
     TreeNavLeft,
-    /// Arrow Right in tree navigation — expand directory or go to first child.
     TreeNavRight,
-    /// Scroll position changed in the tree panel. First element is the
-    /// absolute vertical scroll offset, second is the visible viewport height.
+    /// Tree scroll: absolute vertical offset and visible viewport height.
     TreeScrolled(f32, f32),
-    /// Scroll position changed in the tab bar. First element is the absolute
-    /// horizontal scroll offset, second is the visible viewport width.
+    /// Tab-bar scroll: absolute horizontal offset and visible viewport width.
     TabBarScrolled(f32, f32),
     /// Escape key — dismiss find bar, go-to-line, quick open, tree focus, or close dialog.
     Escape,
-    /// A file's contents were loaded from disk.
     FileLoaded {
         path: String,
         r#gen: u64,
         result: Result<FileLoadData, String>,
     },
-    /// Saved tabs were loaded from the database with file contents. `Err`
-    /// carries a restore failure (DB read or a non-`NotFound` per-file read);
-    /// the persisted tabs are then left untouched and saving is blocked until
-    /// a successful reload.
+    /// Saved tabs loaded from the database with their contents. `Err` carries a restore failure
+    /// (DB read or a non-`NotFound` per-file read); the persisted tabs stay untouched and saving
+    /// is blocked until a successful reload.
     SavedTabsLoaded {
         tabs_data: Result<Vec<SavedTabData>, String>,
         r#gen: u64,
     },
-    /// User selected an existing tab.
     TabSelected(usize),
-    /// User closed a tab.
     TabClosed(usize),
-    /// User performed an editing action in the text editor.
     EditorAction(super::editor_widget::EditorAction),
-    /// User requested to save the active tab.
     SaveActiveTab,
     /// Result of a save operation.
     SaveResult {
         path: String,
         result: Result<(), String>,
-        /// Hash of the content that was written to disk, so we can
-        /// update `TabData::saved_text_hash` for undo/redo comparison.
+        /// Hash of the written content, stored as `TabData::saved_text_hash`.
         saved_hash: u64,
     },
-    /// User interacted with the close-dirty-tab dialog.
     CloseDialog {
         tab_index: usize,
         action: CloseAction,
     },
-    /// User interacted with the close-others dirty-tab dialog.
     CloseOthersDialog {
         keep_idx: usize,
         action: CloseAction,
     },
-    /// The workspace gitignore matcher was rebuilt in the background.
-    /// `workspace` is the workspace path the matcher was built for — the
-    /// handler drops a matcher whose path differs from the currently-selected
-    /// workspace (a matcher built for a previously-selected workspace is
-    /// discarded). `matcher` is `None` for no dimming (build fallback).
+    /// The workspace gitignore matcher was rebuilt. `workspace` is the path it was built for; a
+    /// matcher built for a previously-selected workspace is dropped on arrival. `matcher` is
+    /// `None` for no dimming.
     IgnoreMatcherReady {
         workspace: String,
         matcher: Option<ignore::IncrementalIgnore>,
     },
     /// Per-file git statuses forwarded from the Git state (single owner of
-    /// `git status --porcelain`). `workspace` is the Git state's resolved
-    /// workspace name; the handler drops a forward whose workspace differs from
-    /// the currently-selected one.
+    /// `git status --porcelain`); a forward from a workspace other than the selected is dropped.
     GitStatusUpdated {
         workspace: Option<String>,
         statuses: HashMap<String, GitFileStatus>,
     },
-    /// Toast message to show.
     Toast(super::ToastMessage),
-    /// Undo the last edit.
     Undo,
-    /// Redo a previously undone edit.
     Redo,
-    /// Open/toggle the find/replace bar.
     FindToggle,
-    /// Search query text changed.
     FindQueryInput(super::editor_widget::EditorAction),
-    /// Replace text changed.
     FindReplaceInput(super::editor_widget::EditorAction),
-    /// Navigate to the next match.
     FindNext,
-    /// Navigate to the previous match.
     FindPrev,
-    /// Replace the current match with the replace text.
     FindReplace,
-    /// Replace all matches.
     FindReplaceAll,
-    /// Toggle case-sensitive matching.
     FindToggleCaseSensitivity,
     /// Manual refresh (Cmd+R / Ctrl+R) of all expanded directory listings from disk.
     RefreshFileTree,
     /// File-tree change event from the global FILE_CHANGE_TX broadcast (coalesced
     /// to at most one per window). Gated on page visibility + a selected workspace.
     FileTreePinged,
-    /// Periodic git-dirty probe (every 1s) — stats `.git/index` and
-    /// `.git/logs/HEAD` and requests a git-status refresh when they change.
+    /// Periodic git-dirty probe (1s): stats `.git/index` and `.git/logs/HEAD` and requests a
+    /// git-status refresh when they change.
     CheckGitDirty,
-    /// Editor-side request for the Git state to run its standard throttled
-    /// file-change refresh. Intercepted by the Dashboard and routed to
+    /// Ask the Git state to run its throttled file-change refresh; the Dashboard routes it to
     /// `GitState::update(GitMessage::FileChanged)`.
     RequestGitStatusRefresh,
-    /// Close all tabs except the given index.
     CloseOtherTabs(usize),
-    /// Periodic check (every 300 ms) for external file changes on the active tab.
-    /// Only fires when a workspace is selected.
+    /// Periodic (300 ms) check for external changes on the active tab, only with a workspace.
     CheckFileChanges,
-    /// A file was reloaded after being detected as changed on disk.
-    /// The cursor position was captured *before* the async read and should
-    /// be restored (clamped to new file bounds) on success.
+    /// The file was reloaded after an on-disk change; the cursor captured *before* the async
+    /// read is restored, clamped to the new bounds.
     FileReloaded {
-        /// Path of the reloaded file.
         path: String,
-        /// Ok(text) on success, Err(msg) on failure.
         result: Result<String, String>,
-        /// Cursor line before reload (preserved, clamped to new bounds).
         cursor_line: usize,
-        /// Cursor column before reload (preserved, clamped to new bounds).
         cursor_col: usize,
     },
-    /// Toggle the go-to-line input bar.
     GoToLineToggle,
-    /// Input text for the go-to-line bar.
     GoToLineInput(super::editor_widget::EditorAction),
-    /// Jump to the entered line number.
     GoToLineGo,
-    /// Toggle the quick-open file picker.
     QuickOpenToggle,
-    /// Filter text for the quick-open file picker.
     QuickOpenInput(super::editor_widget::EditorAction),
-    /// Select a file from the quick-open list by index.
     QuickOpenSelect(usize),
-    /// Switch to the next tab (Ctrl+Tab).
     TabSwitchNext,
-    /// Switch to the previous tab (Ctrl+Shift+Tab).
     TabSwitchPrev,
-    /// Close the active tab (Ctrl+W).
     CloseActiveTab,
-    /// Toggle the global search panel (Cmd+Shift+F / Ctrl+Shift+F).
     GlobalSearchToggle,
-    /// Query text changed in the global search input.
     GlobalSearchInput(super::editor_widget::EditorAction),
-    /// Results returned from the async global search.
     GlobalSearchResults {
-        /// Generation counter for stale-result prevention.
         r#gen: u64,
-        /// Owned grep match results.
         results: Vec<OwnedGrepMatch>,
-        /// Error message if the search failed.
         error: Option<String>,
     },
-    /// A result was clicked or selected in the global search list.
     GlobalSearchSelect(usize),
-    // ── Context menu actions ────────────────────────────────────────
-    /// Context menu: delete a file (shows confirmation dialog).
     DeleteFileRequested(String),
-    /// Context menu: delete a directory (shows confirmation dialog).
     DeleteDirectoryRequested(String),
-    /// Context menu: create a new file in the given parent directory.
     NewFileRequested(String),
-    /// Context menu: create a new directory in the given parent directory.
     NewDirectoryRequested(String),
-    /// Context menu: reveal the path in the system file manager.
     RevealInFinder(String),
-    /// Context menu: copy a relative path to clipboard.
     CopyRelativePath(String),
-    /// Context menu: copy an absolute path to clipboard.
     CopyAbsolutePath(String),
-    /// User confirmed the delete operation.
     ConfirmDelete,
-    /// User cancelled the delete dialog.
     CancelDelete,
-    /// User submitted a name for a new file or directory.
     NewItemSubmit(String),
-    /// User changed the new-item name input.
     NewItemInput(super::editor_widget::EditorAction),
-    // ── Inline rename ───────────────────────────────────────────
-    /// Context menu: rename a file or directory (starts inline rename).
     RenameRequested(String),
-    /// User changed the rename input text.
     RenameInput(super::editor_widget::EditorAction),
-    /// User submitted the rename (Enter pressed in inline input).
     RenameSubmit,
-    /// User cancelled the inline rename.
     RenameCancel,
-    /// Async rename operation completed.
     RenameCompleted {
-        /// Old relative path (workspace-relative).
         old_path: String,
-        /// New relative path (workspace-relative).
         new_path: String,
-        /// Whether the renamed item was a directory.
         is_dir: bool,
-        /// Result of the filesystem rename.
         result: Result<(), String>,
-        /// Re-read parent directory entries.
         dir_entries: Result<Vec<FsEntry>, ReadDirError>,
-        /// Generation counter for the parent directory's `dir_generations`
-        /// slot.  Used for stale-result prevention via the standard
-        /// generation invalidation protocol (see `dir_expanded`).
+        /// Generation slot in the parent's `dir_generations`, for stale-result prevention (see
+        /// `dir_expanded`).
         rename_gen: u64,
     },
 }
 
-// ── Context menu types ──────────────────────────────────────────
-
 /// Target for the delete confirmation dialog.
 #[derive(Debug, Clone)]
 struct DeleteConfirmTarget {
-    /// Full path (relative to workspace root).
     path: String,
-    /// Whether this is a directory.
     is_dir: bool,
-    /// Number of dirty tabs that would be affected (directory deletes only).
     dirty_tab_count: usize,
-    /// Absolute path for filesystem operations.
     abs_path: String,
 }
 
@@ -645,43 +470,25 @@ struct DeleteConfirmTarget {
 struct NewItemTarget {
     /// Parent directory path (relative to workspace root; empty = root).
     parent_dir: String,
-    /// Whether to create a directory (vs a file).
     is_dir: bool,
-    /// Absolute path of the parent directory.
     abs_parent: String,
-    /// Absolute path of the workspace root.
     ws_root: String,
-    /// Current input text.
     input_text: SingleLineEditorState,
 }
 
 /// Target for the inline rename operation.
 struct RenameTarget {
-    /// Full path (relative to workspace root) of the item being renamed.
     path: String,
-    /// Absolute path of the item being renamed.
     abs_path: String,
-    /// Whether this is a directory.
     is_dir: bool,
-    /// Absolute path of the workspace root.
     ws_root: String,
-    /// Current input text (the new name being edited).
     input_text: SingleLineEditorState,
-    /// Optional inline error message (e.g., "File already exists").
     error: Option<String>,
 }
 
-/// Validate a user-supplied file/directory name for new-item or rename operations.
-///
-/// Returns `Some(error_message)` when the name is invalid, `None` when it passes
-/// all checks.  Used by both [`NewItemSubmit`] and [`RenameSubmit`] to avoid
-/// duplicating the common validation rules.
-///
-/// Checks performed:
-/// - Empty (or all-whitespace) name
-/// - Path separators (`/`, `\`, NUL)
-/// - Reserved path components (`.`, `..`)
-/// - OS-reserved names (CON, NUL, PRN, AUX, COM1–COM9, LPT1–LPT9) — Windows only
+/// The user-facing reason `name` is invalid, or `None` when it passes: empty/whitespace,
+/// path separators (`/`, `\`, NUL), `.`/`..`, and Windows OS-reserved names (CON, NUL, PRN,
+/// AUX, COM1–COM9, LPT1–LPT9). Shared by [`NewItemSubmit`] and [`RenameSubmit`].
 fn validate_item_name(name: &str) -> Option<&'static str> {
     if name.is_empty() {
         return Some("Name cannot be empty");
@@ -706,16 +513,12 @@ fn validate_item_name(name: &str) -> Option<&'static str> {
     None
 }
 
-// ── Helpers — collection re-keying ────────────────────────────────
-//
-// One applier pair (`rekey_map`, `rekey_set`) drives both key families: the
-// `/`-joined relative keys of the file tree (`rebase_tree_key`) and the
-// absolute filesystem paths of the open tabs and their caches
+// One applier pair (`rekey_map`, `rekey_set`) serves both key families: the `/`-joined
+// relative tree keys (`rebase_tree_key`) and the absolute paths of tabs and caches
 // (`rebase_abs_path`). Only how a key is rebased differs.
 
-/// The new key for a *relative* file-tree key that lies under `old_prefix`, or
-/// `None` when it does not. `old_prefix` carries the trailing separator (e.g.
-/// `"dir/sub/"`); a key that equals it exactly maps to `new_prefix`.
+/// The new key for a *relative* tree key under `old_prefix`, or `None`. `old_prefix` carries
+/// the trailing separator; a key equal to it maps to `new_prefix`.
 fn rebase_tree_key(key: &str, old_prefix: &str, new_prefix: &str) -> Option<String> {
     let rest = key.strip_prefix(old_prefix)?;
     Some(if rest.is_empty() {
@@ -725,9 +528,8 @@ fn rebase_tree_key(key: &str, old_prefix: &str, new_prefix: &str) -> Option<Stri
     })
 }
 
-/// Re-key every entry of `map` whose key `rebase` accepts, running `modify` on
-/// the value on the way across. The keys are collected first — the map cannot be
-/// mutated while it is being iterated.
+/// Re-key every entry `rebase` accepts, running `modify` on the value. The keys are collected
+/// first because the map cannot be mutated while iterated.
 fn rekey_map<V>(
     map: &mut HashMap<String, V>,
     rebase: impl Fn(&str) -> Option<String>,
@@ -772,18 +574,16 @@ fn rekey_set_prefix(set: &mut HashSet<String>, old_prefix: &str, new_prefix: &st
     rekey_set(set, |k| rebase_tree_key(k, old_prefix, new_prefix));
 }
 
-/// Re-key a single [`FsEntry`]'s `full_path` for a directory rename, the way
-/// [`rebase_tree_key`] re-keys the collections the entry lives in.
+/// Re-key one [`FsEntry`]'s `full_path`, the way [`rebase_tree_key`] re-keys its collections.
 fn update_entry_path(entry: &mut FsEntry, old_prefix: &str, new_prefix: &str) {
     if let Some(new_path) = rebase_tree_key(&entry.full_path, old_prefix, new_prefix) {
         entry.full_path = new_path;
     }
 }
 
-/// Rebase an absolute workspace path from `old_dir` into `new_dir`,
-/// returning `None` when it does not live below `old_dir`. Compared and
-/// rebuilt through [`Path`], so the platform's separator (and a trailing
-/// separator on either side) cannot make the match miss.
+/// Rebase an absolute workspace path from `old_dir` into `new_dir`, or `None` when it does not
+/// live below `old_dir`. Compared through [`Path`], so the platform separator and a trailing
+/// separator on either side cannot make the match miss.
 fn rebase_abs_path(path: &str, old_dir: &str, new_dir: &str) -> Option<String> {
     let rest = Path::new(path).strip_prefix(old_dir).ok()?;
     Some(if rest.as_os_str().is_empty() {
@@ -793,9 +593,7 @@ fn rebase_abs_path(path: &str, old_dir: &str, new_dir: &str) -> Option<String> {
     })
 }
 
-/// Re-key the absolute filesystem paths of `map` that live under `old_dir` to
-/// live under `new_dir`; the values carry over unchanged, which is all any
-/// absolute-key call site needs.
+/// Re-key the absolute paths of `map` under `old_dir`; values carry over unchanged.
 fn rekey_abs_map<V>(map: &mut HashMap<String, V>, old_dir: &str, new_dir: &str) {
     rekey_map(map, |k| rebase_abs_path(k, old_dir, new_dir), |_| {});
 }
@@ -805,32 +603,24 @@ fn rekey_abs_set(set: &mut HashSet<String>, old_dir: &str, new_dir: &str) {
     rekey_set(set, |k| rebase_abs_path(k, old_dir, new_dir));
 }
 
-/// Whether the absolute workspace path `path` is `dir` itself or lies within it:
-/// [`crate::util::is_within`], so the test is component-wise and the trailing
-/// separator a stored workspace root carries is tolerated rather than doubled.
+/// `path` is `dir` itself or lies within it: [`crate::util::is_within`], component-wise, so
+/// the trailing separator a stored workspace root carries is tolerated.
 fn is_within_abs(path: &str, dir: &str) -> bool {
     crate::util::is_within(Path::new(path), Path::new(dir))
 }
 
-// ── Helpers — async I/O ──────────────────────────────────────────
-
-/// Error classifying a failed directory read so callers can tell the
-/// normal "directory no longer exists" case (which the GUI must forget
-/// silently) apart from real problems (permission denied, I/O errors)
-/// that still need to be surfaced.
+/// Error classifying a failed directory read, so callers can tell the routine "directory is
+/// gone" case (forgotten silently) from real problems that must be surfaced.
 #[derive(Debug, Clone)]
 enum ReadDirError {
-    /// The directory does not exist, or is not a directory. This is a
-    /// routine scenario — callers should silently forget the path.
+    /// The directory does not exist, or is not a directory — callers silently forget the path.
     NotFound,
     /// The directory exists but could not be read.
     Other(String),
 }
 
-/// Map an [`std::io::Error`] from a directory read to a [`ReadDirError`].
-/// ENOENT / ENOTDIR mean the directory is gone (or was never a directory) —
-/// a normal, forgettable scenario. Everything else means the directory
-/// exists but cannot be read — a real problem that must keep warning.
+/// ENOENT/ENOTDIR mean the directory is gone (a normal, forgettable case). Everything else
+/// means it exists but cannot be read — a real problem that must keep warning.
 fn classify_read_dir_error(e: &std::io::Error) -> ReadDirError {
     if matches!(
         e.kind(),
@@ -842,13 +632,9 @@ fn classify_read_dir_error(e: &std::io::Error) -> ReadDirError {
     }
 }
 
-/// Read a flat list of directory entries for a given path relative to the
-/// workspace root. The `root` is the workspace's filesystem path; `rel_path`
-/// is the subdirectory relative to root (empty string for root).
-///
-/// A missing directory or a path that is not a directory yields
-/// [`ReadDirError::NotFound`]; any other read failure yields
-/// [`ReadDirError::Other`].
+/// Read the entries of `rel_path` under the workspace `root` (`root` is the workspace's
+/// filesystem path, `rel_path` the subdirectory, empty for root). A missing directory or a
+/// non-directory yields [`ReadDirError::NotFound`]; other failures yield [`ReadDirError::Other`].
 async fn read_directory_entries(root: &str, rel_path: &str) -> Result<Vec<FsEntry>, ReadDirError> {
     let dir_path = if rel_path.is_empty() {
         root.to_string()
@@ -869,9 +655,8 @@ async fn read_directory_entries(root: &str, rel_path: &str) -> Result<Vec<FsEntr
         let entry = match entries.next_entry().await {
             Ok(Some(entry)) => entry,
             Ok(None) => break,
-            // The directory can vanish while the listing is in flight
-            // (deleted mid-read). Classify it like a not-found instead of
-            // caching a partial listing.
+            // The directory can vanish mid-read; classify it as not-found instead of caching a
+            // partial listing.
             Err(e) => return Err(classify_read_dir_error(&e)),
         };
         let name = entry.file_name().to_string_lossy().to_string();
@@ -888,8 +673,7 @@ async fn read_directory_entries(root: &str, rel_path: &str) -> Result<Vec<FsEntr
         } else {
             format!("{rel_path}/{name}")
         };
-        // Use tokio::fs::metadata() on the absolute path to follow symlinks.
-        // DirEntry::file_type() does NOT traverse symlinks (per Rust docs).
+        // Absolute metadata follows symlinks; `DirEntry::file_type()` does not (per Rust docs).
         let abs_path = Path::new(&dir_path).join(&name);
         let (is_dir, err) = match tokio::fs::metadata(&abs_path).await {
             Ok(m) => (m.is_dir(), None),
@@ -943,17 +727,15 @@ fn dir_expanded_task(
 }
 
 /// Resolve the `.git` entry covering `start` via the shared repo-root walk
-/// (`commands::resolve_git_top_level`), so a nested workspace still detects the
-/// enclosing repo's staging dir. For a `.git` file (worktree) the detector's
-/// stat targets do not exist, so detection no-ops (accepted edge; recovery is
-/// the watcher or Cmd+R).
+/// (`commands::resolve_git_top_level`), so a nested workspace still detects the enclosing
+/// repo's staging dir. For a `.git` file (worktree) the detector's stats do not exist, so
+/// detection no-ops (accepted edge; the watcher or Cmd+R recovers).
 fn find_git_dir(start: &Path) -> Option<PathBuf> {
     crate::git::commands::resolve_git_top_level(start).map(|root| root.join(".git"))
 }
 
-/// Stat the git-dirty detector's two targets and return `(index mtime,
-/// logs/HEAD mtime)`. Each is `None` when the file is absent (fresh/unborn repo
-/// has no logs/HEAD; a fresh init has no index yet).
+/// Stat the detector's two targets as `(index mtime, logs/HEAD mtime)`; each is `None` when
+/// the file is absent (unborn repo has no logs/HEAD, a fresh init no index yet).
 fn stat_git_dirty_mtimes(git_dir: &Path) -> (Option<SystemTime>, Option<SystemTime>) {
     let index = git_dir.join("index");
     let logs_head = git_dir.join("logs").join("HEAD");
@@ -967,9 +749,8 @@ fn stat_git_dirty_mtimes(git_dir: &Path) -> (Option<SystemTime>, Option<SystemTi
     )
 }
 
-/// Stream of coalesced file-tree change pings from the global [`super::git::FILE_CHANGE_TX`]
-/// broadcast. A free fn (not a closure) because [`Subscription::run`] takes a
-/// `fn() -> Stream` builder. Bursts collapse into one trailing ping per 300 ms.
+/// Coalesced file-tree change pings from the global [`super::git::FILE_CHANGE_TX`] broadcast.
+/// A free fn because [`Subscription::run`] takes a `fn() -> Stream` builder.
 fn file_tree_change_stream() -> impl futures_util::Stream<Item = EditorMessage> {
     super::common::coalesced_broadcast_producer(
         64,
@@ -979,10 +760,7 @@ fn file_tree_change_stream() -> impl futures_util::Stream<Item = EditorMessage> 
     )
 }
 
-/// Validate file content for size and binary content.
-///
-/// Returns `Ok(())` if the bytes pass size and null-byte checks,
-/// or `Err` with a user-facing error message.
+/// Reject oversized or binary content (null bytes, invalid UTF-8) with a user-facing message.
 fn validate_file_content(bytes: &[u8]) -> Result<(), String> {
     if (bytes.len() as u64) > MAX_FILE_SIZE {
         return Err(format!(
@@ -1009,8 +787,7 @@ fn file_loaded_msg(
     }
 }
 
-/// Load a file's contents from disk with detection of indent style, line
-/// ending, and trailing newline.
+/// Load a file from disk, detecting indent style, line ending and trailing newline.
 async fn load_file_data(full_path: String, r#gen: u64) -> EditorMessage {
     let bytes = match tokio::fs::read(&full_path).await {
         Ok(b) => b,
@@ -1023,9 +800,8 @@ async fn load_file_data(full_path: String, r#gen: u64) -> EditorMessage {
     if let Err(e) = validate_file_content(&bytes) {
         return file_loaded_msg(full_path, r#gen, Err(e));
     }
-    // Reject invalid UTF-8 — the null-byte check above catches one class of
-    // binary content, but binary data can still contain valid UTF-8 with no
-    // null bytes (e.g. some encoded payloads, structured binary formats).
+    // Binary data can be valid UTF-8 with no null bytes (encoded payloads, structured formats),
+    // so reject invalid UTF-8 on top of the null-byte check above.
     let Ok(text) = String::from_utf8(bytes) else {
         return file_loaded_msg(
             full_path,
@@ -1042,12 +818,8 @@ async fn load_file_data(full_path: String, r#gen: u64) -> EditorMessage {
     file_loaded_msg(data.path.clone(), r#gen, Ok(data))
 }
 
-/// Spawn a file load from disk and return a `Task` that produces
-/// `EditorMessage::FileLoaded` when the data is ready.
-///
-/// This is extracted as a free function because the two callers
-/// (`open_file_in_editor` and `select_file`) have different
-/// generation-bumping strategies but share the same spawn logic.
+/// Spawn a file load that answers with [`EditorMessage::FileLoaded`]. A free fn because its
+/// callers (`open_file_in_editor`, `select_file`) bump generations differently but share the spawn.
 fn spawn_file_load(abs_path: String, file_gen: u64) -> Task<EditorMessage> {
     Task::perform(load_file_data(abs_path, file_gen), |msg| msg)
 }
@@ -1075,12 +847,9 @@ fn build_tab_records(
         .collect()
 }
 
-/// Save current tabs to the database for a workspace.
-///
-/// Checks `gen_counter` for staleness before writing (pre-write guard): if a
-/// newer save has superseded this one, the DB write is skipped.  The write is
-/// fire-and-forget — completion is not tracked since the pre-write guard is the
-/// only staleness protection needed.
+/// Save the current tabs for a workspace. `gen_counter` is a pre-write guard: a newer save
+/// supersedes this one and the write is skipped. The write is fire-and-forget — that guard is
+/// the only staleness protection needed.
 fn save_tabs_to_db(
     workspace_name: String,
     records: Vec<crate::workspace::EditorTabRecord>,
@@ -1118,12 +887,8 @@ async fn save_file_to_disk(
         .map_err(|e| format!("Failed to write file: {e}"))
 }
 
-/// Build a `Task` that saves the tab at `idx` to disk asynchronously.
-///
-/// # Panics
-///
-/// Panics in debug builds if `idx` is out of bounds (`idx >= tabs.len()`).
-/// All current callers validate the index before calling.
+/// Build the async save task for tab `idx`. Panics in debug builds if `idx` is out of bounds;
+/// every current caller validates the index first.
 fn build_save_task(
     tabs: &[Tab],
     tab_contents: &HashMap<String, TabData>,
@@ -1167,10 +932,8 @@ fn build_save_task(
     )
 }
 
-/// Update the dirty flag for a tab by comparing current text hash against
-/// the saved hash.  A free function (not a `&mut self` method) so callers
-/// can avoid borrow-checker conflicts from simultaneous mutable borrows
-/// of `self.tabs` and immutable borrows of `self.tab_contents`.
+/// Set the dirty flag by comparing the current text hash with the saved hash. A free fn (not
+/// `&mut self`) so callers avoid borrowing `self.tabs` and `self.tab_contents` at the same time.
 fn update_dirty_flag(
     tabs: &mut [Tab],
     tab_contents: &HashMap<String, TabData>,
@@ -1196,8 +959,6 @@ fn bar_text_button(
         .padding(padding)
         .into()
 }
-
-// ── Helpers — tree building ──────────────────────────────────────
 
 /// Recursively build a hierarchical tree from flat directory entries.
 /// Only expanded directories have their children populated.
@@ -1269,14 +1030,8 @@ fn stamp_ignored_nodes(
     }
 }
 
-// ── Global search helpers ──────────────────────────────────────────
-
-/// Run a global (find-in-files) grep search with debounce.
-///
-/// 1. Debounce: waits 300ms (cancelled if a newer generation supersedes).
-/// 2. Initialises the search engine if needed.
-/// 3. Runs `picker.grep()` on the blocking thread pool.
-/// 4. Extracts owned data from `GrepResult` while holding the picker lock.
+/// Run a global (find-in-files) grep search: a 300 ms debounce (cancelled when a newer generation
+/// supersedes), engine init, `picker.grep()` on the blocking pool, then owned extraction.
 async fn run_global_search(
     ws_path: String,
     ws_name: String,
@@ -1378,128 +1133,88 @@ async fn run_global_search(
     }
 }
 
-// ── Editor State ──────────────────────────────────────────────────
-
 pub struct EditorState {
-    /// The workspace the dashboard resolved for the current selection; `None`
-    /// until one resolves.
     selected_workspace_name: Option<String>,
-    /// Filesystem path of that workspace, pushed with the name.
     selected_workspace_path: Option<String>,
-    /// Whether the editor page is the currently visible page (single source of
-    /// truth for page-visible gating; set via `PageVisibilityChanged` before any
-    /// refresh-on-entry task is dispatched).
+    /// Whether the editor page is visible — single source of truth for page-visible gating;
+    /// set before any refresh-on-entry task is dispatched.
     page_visible: bool,
     /// Monotonically increasing generation counter for stale-result prevention.
     generation: u64,
-    /// Monotonically increasing generation counter for saved-tabs restoration,
-    /// kept separate from `generation` to avoid collision with file loads and
-    /// directory expansions that are dispatched concurrently.
+    /// Generation for saved-tabs restoration, kept separate from `generation` so concurrent
+    /// file loads and directory expansions cannot collide with it.
     saved_tabs_gen: u64,
-    /// Per-directory generation counters.
     dir_generations: HashMap<String, u64>,
-    /// Per-file generation counters (prevents stale FileLoaded results).
+    /// Per-file generation counters (stale `FileLoaded` results).
     file_generations: HashMap<String, u64>,
-    /// Directories currently being loaded.
     loading_dirs: HashSet<String>,
     /// Directory entries loaded from the filesystem (keyed by full path).
     dir_entries: HashMap<String, Vec<FsEntry>>,
     /// Shared file tree state (nodes, expanded dirs, focus, visible nodes, scroll ID).
     file_tree: FileTree,
-    /// Currently selected file in the tree (full path).
     selected_file: Option<String>,
-    /// Open tabs in order.
     tabs: Vec<Tab>,
-    /// Index of the active tab.
     active_tab_index: usize,
     /// Content per tab (keyed by full filesystem path).
     tab_contents: HashMap<String, TabData>,
-    /// Scrollable ID for the tab bar.
     tab_scroll_id: Id,
-    /// Current horizontal scroll offset of the tab bar (px). Updated via
-    /// `on_scroll` on the tab-bar scrollable so scroll-into-view can decide
-    /// whether the active tab is visible without waiting for a layout pass.
+    /// Horizontal scroll offset of the tab bar (px), updated via `on_scroll` so scroll-into-view
+    /// needs no layout pass.
     tab_scroll_x: f32,
-    /// Visible width of the tab-bar viewport (px). `None` until the first
-    /// scroll event fires — `on_scroll` only fires while the content
-    /// overflows the viewport, so short strips (and the strip before its
-    /// first render) leave this unknown. When `None`, tab reveal falls back
-    /// to aligning the estimated left edge, which iced ignores visually
-    /// while the content fits.
+    /// Visible width of the tab-bar viewport (px). `None` until the first `on_scroll`, which only
+    /// fires while the content overflows; tab reveal then falls back to aligning the estimated
+    /// left edge, which iced ignores while the content fits.
     tab_viewport_w: Option<f32>,
     /// Pending close action to execute after the next successful save.
     pending_close: Option<PendingCloseAction>,
-    /// Whether the workspace tabs have been loaded at least once this session.
-    /// Set by a successful restore and by opening a file directly; a failed
-    /// restore leaves it false. Independent of [`Self::tabs_error`]: opening a
-    /// file after a failed restore sets this flag but does not clear that one.
+    /// Whether the workspace tabs were loaded at least once this session (a successful restore or
+    /// a direct open; a failed restore leaves it false). Independent of [`Self::tabs_error`].
     session_initialized: bool,
-    /// Persistent failure of the last saved-tabs restore, as shown: the read
-    /// error plus its consequence. While set, tab persistence stays blocked so
-    /// an incomplete/empty in-memory set can never overwrite the still-intact
-    /// persisted tabs, and the message is rendered until a successful reload
-    /// replaces it.
+    /// Persistent failure of the last saved-tabs restore, as shown: the read error plus its
+    /// consequence. While set, tab persistence stays blocked so an incomplete in-memory set can
+    /// never overwrite the still-intact persisted tabs.
     tabs_error: Option<String>,
-    /// When Enter expands a directory that needs async loading, this holds
-    /// the directory path so DirExpanded can advance focus to the first child.
+    /// Directory whose async expansion should advance focus to the first child.
     pending_enter_dir: Option<String>,
     /// Cached git status per file path (relative to workspace root).
     git_status_cache: HashMap<String, GitFileStatus>,
-    /// In-flight guard for a git-status refresh that will resolve via a
-    /// forwarded `GitStatusUpdated`. Set when a refresh is awaited
-    /// (workspace_selected — a GitState eager refresh is in flight); cleared
-    /// only by the `GitStatusUpdated` handler and workspace clear.
+    /// In-flight guard for a git-status refresh that resolves via a forwarded `GitStatusUpdated`:
+    /// set when one is awaited (`workspace_selected`), cleared only by that handler or a clear.
     git_status_loading: bool,
-    /// The `.git` directory (or `.git` file for worktrees/submodules) covering
-    /// the selected workspace, resolved at `workspace_selected` by walking up
-    /// from the workspace path. `None` when the workspace is not in a git repo.
-    /// Used by the commit/staging mtime detector to stat `.git/index` and
-    /// `.git/logs/HEAD`.
+    /// The `.git` directory (or `.git` file for worktrees/submodules) covering the selected
+    /// workspace, resolved at `workspace_selected` by walking up from the workspace path; `None`
+    /// outside a repo. The mtime detector stats `.git/index` and `.git/logs/HEAD` under it.
     git_dir: Option<PathBuf>,
-    /// Latch of `(index mtime, logs/HEAD mtime)` observed at the last git-status
-    /// resolution. `None` before the first probe; each inner value is `None`
-    /// when the corresponding file does not exist (fresh/unborn repo). A change
-    /// between probes means staging changed on disk and a git-status refresh is
-    /// owed. Re-latched on every `GitStatusUpdated` so a git-status write that
-    /// touches `.git/index` does not re-trigger the detector.
+    /// Latch of `(index mtime, logs/HEAD mtime)` from the last git-status resolution: `None`
+    /// before the first probe, an inner `None` when that file is absent (fresh/unborn repo). A
+    /// change between probes means staging changed and a refresh is owed; re-latched on every
+    /// `GitStatusUpdated` so a git-status write to `.git/index` does not re-trigger the detector.
     git_dirty_mtimes: Option<(Option<SystemTime>, Option<SystemTime>)>,
-    /// The in-process gitignore matcher for the current workspace, if one was
-    /// built. `None` means no dimming (no matcher could be built, or the
-    /// workspace is not in a git repo). Rebuilt on workspace selection and
-    /// file-tree refresh.
+    /// The in-process gitignore matcher for the current workspace; `None` means no dimming (no
+    /// matcher could be built, or not a repo). Rebuilt on selection and tree refresh.
     ignore_matcher: Option<ignore::IncrementalIgnore>,
-    /// Shared atomic counter used by async save tasks for pre-write staleness
-    /// checking.  Written to on every save initiation; read by in-flight tasks
-    /// to determine if a newer save has superseded them.
+    /// Shared atomic counter for save staleness: written on every save initiation, read by
+    /// in-flight tasks to see whether a newer save superseded them.
     tab_save_counter: Arc<AtomicU64>,
-    /// Last-known modification time per open file (keyed by full path).
-    /// Used by the auto-refresh poll to detect external file changes.
+    /// Last-known mtime per open file, for the external-change poll.
     file_mtimes: HashMap<String, SystemTime>,
-    /// Paths for which a "file deleted" toast has already been shown.
-    /// Prevents spamming the toast every 300 ms.
+    /// Paths already toasted as deleted (prevents a toast every 300 ms).
     deleted_file_toasted: HashSet<String>,
-    /// Which modal overlay is currently open (None when no overlay is active).
-    /// Enforced by the type system to be mutually exclusive — only one overlay
-    /// may be open at a time.
+    /// The open modal overlay. [`ModalKind`] makes them mutually exclusive: at most one at a time.
     active_modal: Option<ModalKind>,
-    /// Cached list of all workspace files for quick-open filtering.
-    /// Populated on each quick-open toggle from currently expanded dirs.
+    /// Workspace files cached for quick-open, rebuilt on each toggle from the expanded dirs.
     all_workspace_files: Vec<String>,
     /// Generation counter for global search stale-result prevention.
     global_search_gen: u64,
-    /// When set, the next file load for this path+generation should jump to this line.
-    /// The tuple is (abs_path, 1-based line_number, expected_file_gen). Consumed by the
-    /// `FileLoaded` handler only when both path and generation match.
+    /// Pending jump `(abs_path, 1-based line, expected_file_gen)`, consumed by the `FileLoaded`
+    /// handler only when both path and generation match.
     pending_goto: Option<(String, usize, u64)>,
-    /// Buffer for the go-to-line bar, owned by `EditorState` so it survives
-    /// across the `GotoLine` modal's open/close cycles.
+    /// Go-to-line input buffer, owned here so it survives the modal's open/close cycles.
     goto_line_input: SingleLineEditorState,
 }
 
-/// Identifies which modal overlay is currently open, in Escape-dismissal
-/// priority order (GlobalSearch highest, CloseOthers lowest).
-///
-/// Each variant carries the state data for that overlay.
+/// The open modal overlay, in Escape-dismissal priority order (GlobalSearch highest,
+/// CloseOthers lowest); each variant carries that overlay's state.
 enum ModalKind {
     GlobalSearch(GlobalSearchState),
     GotoLine,
@@ -1513,11 +1228,8 @@ enum ModalKind {
 
 /// State for the quick-open file picker.
 struct QuickOpenState {
-    /// Current filter text.
     filter: SingleLineEditorState,
-    /// Currently highlighted result index.
     selected_index: usize,
-    /// Filtered file list (matching the filter text).
     results: Vec<String>,
 }
 
@@ -1576,9 +1288,8 @@ impl EditorState {
             .map(|ws| Path::new(ws).join(rel_path).to_string_lossy().to_string())
     }
 
-    /// Rebuild both the hierarchical tree and visible node list from `dir_entries`
-    /// and `expanded_dirs`.  Callers that also need `tree_focused = true` must set
-    /// it separately after this call.
+    /// Rebuild the hierarchical tree and visible node list from `dir_entries` and `expanded_dirs`.
+    /// Callers that also need `tree_focused = true` set it separately after this call.
     fn rebuild_tree(&mut self) {
         let mut nodes =
             build_hierarchical_tree(&self.dir_entries, &self.file_tree.expanded_dirs, "");
@@ -1587,29 +1298,17 @@ impl EditorState {
         self.file_tree.rebuild_visible();
     }
 
-    /// Forget `dir_path` and all of its descendants from the file-tree
-    /// refresh/cache state: expanded dirs, cached listings, in-flight loads
-    /// and generations, per-file generation slots, mtimes, toast guards,
-    /// quick-open cache, and the current selection. Also drops the stale
-    /// [`FsEntry`] for `dir_path` from its parent's cached listing so the node
-    /// disappears from the tree immediately instead of lingering until the
-    /// parent is next refreshed.
-    ///
-    /// This is the "forget" counterpart of the state migration directory
-    /// renames already perform — call it whenever a directory no longer exists
-    /// (deleted externally, by scripts, or via the GUI) so the tree stops
-    /// re-reading the path every refresh cycle and quick-open stops offering
-    /// its files. The caller is responsible for calling [`Self::rebuild_tree`]
-    /// afterwards. Open tabs are intentionally NOT touched: externally deleted
-    /// files keep their tabs so unsaved work survives, and GUI deletes close
-    /// their own tabs before calling this.
+    /// Forget `dir_path` and its descendants from the tree refresh/cache state — expanded dirs,
+    /// cached listings, in-flight loads, generations, mtimes, toast guards, quick-open cache and
+    /// selection — and drop the stale [`FsEntry`] from the parent's listing so the node goes at
+    /// once. Call it whenever a directory no longer exists, then call [`Self::rebuild_tree`]. Open
+    /// tabs stay deliberately untouched: externally deleted files keep unsaved work, while GUI
+    /// deletes close their own tabs first.
     fn forget_directory(&mut self, dir_path: &str) {
         let is_root = dir_path.is_empty();
         let rel_prefix = format!("{dir_path}/");
         let within_rel = |p: &str| is_root || p == dir_path || p.starts_with(&rel_prefix);
 
-        // Remove the deleted directory's stale node from its parent's cached
-        // listing so it disappears from the tree right away.
         if !is_root {
             if let Some(parent) = Path::new(dir_path).parent() {
                 let parent = parent.to_string_lossy();
@@ -1619,18 +1318,15 @@ impl EditorState {
             }
         }
 
-        // Relative-path-keyed caches.
         self.file_tree.expanded_dirs.retain(|p| !within_rel(p));
         self.dir_entries.retain(|p, _| !within_rel(p));
         self.loading_dirs.retain(|p| !within_rel(p));
         self.dir_generations.retain(|p, _| !within_rel(p));
         self.all_workspace_files.retain(|p| !within_rel(p));
 
-        // Absolute-path-keyed caches (workspace filesystem paths). For the
-        // root case the directory is the workspace root itself, so every file
-        // under the workspace is pruned — consistent with "all descendants".
-        // Membership is component-wise, so the workspace root's spelling
-        // (Windows separators, any trailing slash) need not be guessed at.
+        // Absolute-path-keyed caches. For the root the directory is the workspace root itself, so
+        // every file is pruned ("all descendants"); membership is component-wise, so the root's
+        // spelling (Windows separators, any trailing slash) need not be guessed at.
         let abs_dir = if is_root {
             self.selected_workspace_path.clone()
         } else {
@@ -1641,7 +1337,6 @@ impl EditorState {
         self.file_mtimes.retain(|p, _| !within_abs(p));
         self.deleted_file_toasted.retain(|p| !within_abs(p));
 
-        // Selection and pending-enter focus.
         if let Some(ref sel) = self.selected_file {
             if within_rel(sel) || within_abs(sel) {
                 self.selected_file = None;
@@ -1658,18 +1353,10 @@ impl EditorState {
         g
     }
 
-    /// Start an async load of a directory's entries.
-    ///
-    /// Returns `Some(Task)` with the async load if a workspace is selected and
-    /// the directory needs loading (the caller is responsible for checking
-    /// `!self.dir_entries.contains_key(dir_path)` before calling this).
-    /// Returns `None` if no workspace is selected (caller should
-    /// early-return `Task::none()`).
-    ///
-    /// After calling this, the caller MUST call [`Self::rebuild_tree`] (or
-    /// equivalent) to reflect the expanded state.  If the caller needs focus
-    /// advancement after the load completes (Enter/Right navigation), it should
-    /// set `self.pending_enter_dir` after this call.
+    /// Start an async load of a directory's entries. `Some` only when a workspace is selected and
+    /// the caller already checked `!dir_entries.contains_key(dir_path)`; `None` means the caller
+    /// should early-return `Task::none()`. The caller MUST then rebuild the tree, setting
+    /// `pending_enter_dir` first if focus should advance when the load completes.
     fn load_dir_async(&mut self, dir_path: &str, label: &str) -> Option<Task<EditorMessage>> {
         debug_assert!(
             !self.dir_entries.contains_key(dir_path),
@@ -1688,15 +1375,9 @@ impl EditorState {
         Some(dir_expanded_task(ws_path, d_path, dir_gen, false))
     }
 
-    /// Expand a directory and either start an async load or focus the first child.
-    ///
-    /// If the directory's entries are not yet cached, starts an async load and
-    /// sets [`Self::pending_enter_dir`] so [`Self::dir_expanded`] can advance
-    /// focus when data arrives.  If the entries are already cached (sync path),
-    /// expands and immediately focuses the first child.
-    ///
-    /// Returns `Task::none()` if no workspace is selected (caller should
-    /// propagate this return).
+    /// Expand `path`, then either async-load it (setting [`Self::pending_enter_dir`] so
+    /// [`Self::dir_expanded`] advances focus on arrival) or, when its entries are cached, expand
+    /// and focus the first child now. `Task::none()` means no workspace is selected.
     fn expand_dir_and_focus(&mut self, path: &str, label: &str) -> Task<EditorMessage> {
         self.selected_file = None;
         self.file_tree.expanded_dirs.insert(path.to_string());
@@ -1708,28 +1389,19 @@ impl EditorState {
                 return Task::none();
             };
             self.pending_enter_dir = Some(path.to_string());
-            // Rebuild tree for the expanded-but-still-loading state.
             self.rebuild_tree();
             return task;
         }
 
-        // Sync path — children are already cached.
         self.rebuild_tree();
         self.file_tree
             .expand_dir_and_focus_first_child::<EditorMessage>(path)
     }
 
-    /// Collapse an expanded directory and keep keyboard focus on it.
-    ///
-    /// Removes `path` from [`expanded_dirs`], rebuilds the tree, and delegates
-    /// focus-and-scroll management to [`FileTree::collapse_dir_and_keep_focus`].
-    /// The caller is responsible for ensuring `expanded_dirs` contains `path`
-    /// before calling.
-    ///
-    /// Note: [`FileTree::collapse_dir_and_keep_focus`] calls [`rebuild_visible`]
-    /// internally, so this helper uses raw [`build_hierarchical_tree`] (not
-    /// [`rebuild_tree`]) to avoid rebuilding the visible list twice. It still
-    /// stamps the freshly built nodes so dimming survives the collapse.
+    /// Collapse `path`, keep focus on it, and let [`FileTree::collapse_dir_and_keep_focus`] manage
+    /// focus and scroll (the caller guarantees `expanded_dirs` holds `path`). Raw
+    /// [`build_hierarchical_tree`] rather than [`rebuild_tree`] because that helper calls
+    /// [`rebuild_visible`] itself; the fresh nodes are still stamped so dimming survives.
     fn collapse_dir(&mut self, path: &str) -> Task<EditorMessage> {
         self.file_tree.expanded_dirs.remove(path);
         let mut nodes =
@@ -1740,9 +1412,8 @@ impl EditorState {
             .collapse_dir_and_keep_focus::<EditorMessage>(path)
     }
 
-    /// Build an inline rename [`EditorWidget`] element for a tree node that is
-    /// currently being renamed.  Returns [`None`] when the node is not the
-    /// rename target, so callers can fall through to their normal label rendering.
+    /// The inline rename editor for this tree node, or `None` when the node is not the rename
+    /// target (callers then render their normal label).
     fn build_rename_input<'a>(
         &'a self,
         node: &'a widgets::TreeNode,
@@ -1768,9 +1439,6 @@ impl EditorState {
                 super::editor_widget::EditorAction::Submit => EditorMessage::RenameSubmit,
                 other => EditorMessage::RenameInput(other),
             });
-        // Only wrap in a Column when an inline error needs to be shown
-        // below the input.  The common (no-error) case returns a bare
-        // EditorWidget to keep widget nesting shallow.
         if let Some(ref err) = rt.error {
             Some(
                 column![
@@ -1785,39 +1453,31 @@ impl EditorState {
         }
     }
 
-    /// The CheckFileChanges / CheckGitDirty timers only run while the Editor page
-    /// is visible (see `self.page_visible`). The FILE_CHANGE_TX tree-refresh
-    /// subscription is always on — it is cheap and drops messages while hidden.
+    /// The CheckFileChanges/CheckGitDirty timers run only while the page is visible; the
+    /// FILE_CHANGE_TX subscription is always on (cheap, and it drops pings while hidden).
     pub fn subscription(&self, dashboard_modal_open: bool) -> Subscription<EditorMessage> {
         let mut subs: Vec<Subscription<EditorMessage>> = Vec::new();
-        // Always-on file-tree change subscription over the global FILE_CHANGE_TX
-        // broadcast (fed by the fff-search watcher). Coalesced to at most one
-        // FileTreePinged per 300 ms window; the handler gates on visibility and
-        // drops pings while hidden (refresh-on-entry catches up).
+        // Always on: file-tree change pings, coalesced to one per 300 ms. The handler drops them
+        // while hidden; refresh-on-entry catches up.
         subs.push(Subscription::run(file_tree_change_stream));
         if self.page_visible && self.selected_workspace_name.is_some() {
-            // Auto-refresh tick for detecting external file changes on the
-            // active tab.  Only the active (visible) tab is polled; dirty
-            // tabs (unsaved edits) are never auto-reloaded.
+            // Auto-refresh tick for external changes: only the active tab is polled, and a dirty
+            // tab is never auto-reloaded.
             subs.push(
                 iced::time::every(Duration::from_millis(300))
                     .map(|_| EditorMessage::CheckFileChanges),
             );
         }
         if self.page_visible && self.git_dir.is_some() {
-            // Commit/staging mtime detector: polls `.git/index` and
-            // `.git/logs/HEAD` and requests a git-status refresh when they
-            // change (staging grew/moved without a watcher event).
+            // Commit/staging mtime detector; a change requests a git-status refresh.
             subs.push(
                 iced::time::every(Duration::from_secs(1)).map(|_| EditorMessage::CheckGitDirty),
             );
         }
-        // Always listen for keyboard events — tree navigation may be active.
-        // When a dashboard-level modal overlay is open the flag is threaded
-        // through so the editor still sees global shortcuts (Cmd+S, Cmd+F, …)
-        // but swallows tree-navigation arrows/Enter behind the modal.
-        // Iced 0.14 `filter_map` demands a non-capturing closure, so the flag
-        // is attached via `with` rather than moved into the closure.
+        // Keyboard events are always listened for — tree navigation may be active. The modal flag
+        // is threaded through so global shortcuts (Cmd+S, Cmd+F, …) still work while
+        // tree-navigation keys are swallowed behind a dashboard modal. `filter_map` needs a
+        // non-capturing closure, so the flag rides along via `with`.
         subs.push(
             keyboard::listen()
                 .with(dashboard_modal_open)
@@ -1826,7 +1486,6 @@ impl EditorState {
         Subscription::batch(subs)
     }
 
-    /// Returns the active tab index, or `None` if there are no tabs open.
     const fn active_tab_idx(&self) -> Option<usize> {
         let idx = self.active_tab_index;
         if idx >= self.tabs.len() {
@@ -1836,13 +1495,11 @@ impl EditorState {
         }
     }
 
-    /// Returns the `(index, path)` of the active tab, or `None` if no tab is open.
     fn active_tab(&self) -> Option<(usize, String)> {
         let idx = self.active_tab_idx()?;
         Some((idx, self.tabs[idx].path.clone()))
     }
 
-    /// Returns `true` when the find/replace bar is open on the active tab.
     fn is_find_bar_open(&self) -> bool {
         self.active_tab_idx()
             .and_then(|idx| self.tabs.get(idx))
@@ -1851,16 +1508,9 @@ impl EditorState {
             .is_some()
     }
 
-    /// Save editor tabs to the database for the currently selected workspace.
-    ///
-    /// Returns a task that performs the async DB write, or [`None`] if:
-    /// - Tabs haven't been initialized yet this session
-    /// - The saved-tabs restore failed (saving would delete the persisted set)
-    /// - No workspace is selected
-    ///
-    /// Uses the shared atomic counter for stale-result prevention: the pre-write
-    /// guard inside the async task checks whether a newer save has superseded
-    /// this one before writing.
+    /// Save the tabs for the selected workspace, or `None` when tabs are not initialized yet, the
+    /// saved-tabs restore failed (saving would delete the persisted set), or no workspace is
+    /// selected. The pre-write guard inside the task skips a save a newer one has superseded.
     fn try_save_current_tabs(&self) -> Option<Task<EditorMessage>> {
         if !self.session_initialized || self.tabs_error.is_some() {
             return None;
@@ -1882,41 +1532,24 @@ impl EditorState {
         ))
     }
 
-    /// Save editor tabs to the database, returning a fallback [`Task::none`] if
-    /// the session isn't initialized or no workspace is selected.
-    ///
-    /// Most callers should use this wrapper; only use
-    /// [`try_save_current_tabs`](Self::try_save_current_tabs) directly when you
-    /// need to inspect whether a save was actually dispatched.
+    /// [`Self::try_save_current_tabs`] with a `Task::none()` fallback. Call that one directly only
+    /// to inspect whether a save was dispatched.
     fn save_current_tabs(&mut self) -> Task<EditorMessage> {
         self.try_save_current_tabs().unwrap_or(Task::none())
     }
 
-    /// Scroll the tab bar to keep the active tab visible.
+    /// Scroll the tab bar so the active tab is visible — deliberately stricter than the file
+    /// tree's `widgets::ScrollMode::ScrollIntoView`, which tolerates partial visibility during
+    /// wheel scrolling: a tab is visible only when both estimated edges are inside the viewport,
+    /// so selecting an already-visible tab never scrolls. A clipped tab moves by exactly the
+    /// overflow — left-clipped flush to the left edge, right-clipped via `scroll_by` (clamped to
+    /// the max offset; the old absolute `index × width` target was only clamped at draw time and
+    /// could land at the far right). An unknown viewport width (no `on_scroll` yet, which only
+    /// fires while the content overflows) falls back to aligning the estimated left edge — a
+    /// visual no-op while the content fits, a genuine reveal when it does not.
     ///
-    /// Reveal semantics (deliberately stricter than the file tree's
-    /// `widgets::ScrollMode::ScrollIntoView`, which tolerates partial visibility at
-    /// an edge to avoid micro-jumps during wheel scrolling): a tab counts as
-    /// visible only when both estimated edges are inside the viewport, so
-    /// selecting an already-visible tab never scrolls. A clipped tab is
-    /// scrolled by exactly the overflow — the strip never overshoots past
-    /// the selected tab or lands arbitrarily at the right edge:
-    ///
-    /// * left-clipped tabs are brought flush with the viewport's left edge;
-    /// * right-clipped tabs advance by the exact overflow via `scroll_by`,
-    ///   which iced clamps to the maximum scroll offset (the old absolute
-    ///   `index × width` target was only clamped at draw time and could
-    ///   land at the far right edge);
-    /// * when the viewport width is unknown (`on_scroll` has not fired yet —
-    ///   it only fires while content overflows), fall back to aligning the
-    ///   estimated left edge. Iced ignores scroll offsets entirely while the
-    ///   content fits the viewport, so this is a visual no-op for short
-    ///   strips and a genuine reveal for overflowing ones (session restore,
-    ///   first selection).
-    ///
-    /// `tab_scroll_x` is updated synchronously so consecutive selections
-    /// within the same frame (e.g. held Ctrl+Tab) judge visibility against
-    /// the offset this call produced, before `on_scroll` fires.
+    /// `tab_scroll_x` is updated synchronously so consecutive selections within one frame (held
+    /// Ctrl+Tab) judge against the offset this call produced, before `on_scroll` fires.
     fn scroll_to_active_tab(&mut self) -> Task<EditorMessage> {
         if self.tabs.is_empty() {
             return Task::none();
@@ -1925,7 +1558,6 @@ impl EditorState {
 
         let left = estimated_tab_left(&self.tabs, idx);
         let Some(viewport_w) = self.tab_viewport_w else {
-            // Viewport width unknown — align the estimated left edge.
             self.tab_scroll_x = left;
             return iced::widget::operation::scroll_to(
                 self.tab_scroll_id.clone(),
@@ -1933,8 +1565,6 @@ impl EditorState {
             );
         };
 
-        // The whole (estimated) strip fits — every tab is fully visible
-        // regardless of any stale scroll offset.
         if estimated_content_width(&self.tabs) <= viewport_w {
             return Task::none();
         }
@@ -1943,8 +1573,7 @@ impl EditorState {
         let viewport_right = self.tab_scroll_x + viewport_w;
 
         if left < self.tab_scroll_x {
-            // Left edge is clipped (scrolled past) — bring it flush with the
-            // viewport's left edge.
+            // Left-clipped: bring it flush with the viewport's left edge.
             let delta = self.tab_scroll_x - left;
             self.tab_scroll_x = left;
             iced::widget::operation::scroll_by(
@@ -1952,9 +1581,7 @@ impl EditorState {
                 iced::widget::operation::AbsoluteOffset { x: -delta, y: 0.0 },
             )
         } else if right > viewport_right {
-            // Right edge is clipped — advance by exactly the overflow.
-            // `scroll_by` clamps the result to the max scroll offset, so the
-            // strip can never be pushed past the right end.
+            // Right-clipped: advance by exactly the overflow; `scroll_by` clamps to the max offset.
             let delta = right - viewport_right;
             let max_scroll = (estimated_content_width(&self.tabs) - viewport_w).max(0.0);
             self.tab_scroll_x = (self.tab_scroll_x + delta).clamp(0.0, max_scroll);
@@ -1963,14 +1590,11 @@ impl EditorState {
                 iced::widget::operation::AbsoluteOffset { x: delta, y: 0.0 },
             )
         } else {
-            // Both estimated edges are inside the viewport — already fully
-            // visible, so the strip must not move.
             Task::none()
         }
     }
 
-    /// Scroll to the tab at `new_idx` without saving tabs.
-    /// Sets the active index and scrolls the tab bar, but does not persist.
+    /// Switch to tab `new_idx` and scroll it into view, without persisting.
     fn scroll_to_tab(&mut self, new_idx: usize) -> Task<EditorMessage> {
         if new_idx >= self.tabs.len() {
             return Task::none();
@@ -1979,8 +1603,7 @@ impl EditorState {
         self.scroll_to_active_tab()
     }
 
-    /// Switch to the tab at `idx`, updating active index, scrolling, and
-    /// persisting the tab list to the database.
+    /// Switch to `idx` and persist the tab list.
     fn switch_to_tab(&mut self, idx: usize) -> Task<EditorMessage> {
         if idx >= self.tabs.len() {
             return Task::none();
@@ -1989,9 +1612,8 @@ impl EditorState {
         Task::batch(vec![self.scroll_to_active_tab(), self.save_current_tabs()])
     }
 
-    /// Switch to the tab one step in the given direction, wrapping around.
-    /// Returns `Task::none()` if a modal overlay is active or if there is
-    /// only one tab.
+    /// Switch one tab in `direction`, wrapping. `Task::none()` when a modal overlay is open or
+    /// there is only one tab.
     fn switch_tab_relative(&mut self, direction: TabDirection) -> Task<EditorMessage> {
         if self.active_modal.is_some() || self.tabs.len() <= 1 {
             return Task::none();
@@ -2004,9 +1626,7 @@ impl EditorState {
         self.scroll_to_tab(new_idx)
     }
 
-    /// Collect all file paths from the workspace's directory entries for
-    /// quick-open filtering. Walks all expanded and known directories.
-    /// Called each time QuickOpen is opened to pick up newly expanded dirs.
+    /// Collect the workspace files known from the cached directory entries, for quick-open.
     fn scan_all_workspace_files(&mut self) {
         self.all_workspace_files.clear();
         let mut paths: Vec<String> = Vec::new();
@@ -2021,8 +1641,7 @@ impl EditorState {
         self.all_workspace_files = paths;
     }
 
-    /// Filter workspace file paths by a fuzzy query string.
-    /// Returns paths that contain the filter text (case-insensitive).
+    /// Case-insensitive substring filter over the cached workspace file list.
     fn filter_workspace_files(&self, filter: &str) -> Vec<String> {
         if filter.is_empty() {
             return self.all_workspace_files.iter().take(200).cloned().collect();
@@ -2054,34 +1673,26 @@ impl EditorState {
             .collect()
     }
 
-    /// Open a file by its workspace-relative path (or an already-absolute path).
-    /// If the file is already open in a tab, switches to that tab.
-    /// Otherwise loads the file and adds a new tab.
+    /// Open a file by workspace-relative (or already absolute) path, reusing its tab when open.
     fn open_file_in_editor(&mut self, path: &str) -> Task<EditorMessage> {
         let Some(ws) = self.workspace_root() else {
             return Task::none();
         };
-        // `Path::is_absolute` is the platform's own absoluteness predicate (on
-        // Unix a leading `/`; on Windows a drive/UNC/verbatim prefix). On
-        // Windows a path like `C:\p`, `C:/p` or `\\?\C:\p` is now kept as-is
-        // rather than joined onto the workspace root, while a drive-rooted `/p`
-        // is treated as relative. On macOS/Linux the old leading-`/` test agrees
-        // with it, so nothing changes there. Both branches currently yield the
-        // same string for every path the editor can receive, but the decision
-        // stays explicit rather than resting on `PathBuf::push` discarding the
-        // base when the appended path is absolute.
+        // `Path::is_absolute` is the platform's own predicate (Unix: leading `/`; Windows: a
+        // drive/UNC/verbatim prefix), so `C:\p` or `\\?\C:\p` is kept as-is rather than joined
+        // onto the workspace root. Both branches yield the same string for every path the editor
+        // can receive, but staying explicit avoids resting on `PathBuf::push` discarding the base
+        // for an absolute path.
         let abs_path = if Path::new(path).is_absolute() {
             path.to_string()
         } else {
             Path::new(&ws).join(path).to_string_lossy().to_string()
         };
 
-        // If already open, just switch to that tab.
         if let Some(existing_idx) = self.tabs.iter().position(|t| t.path == abs_path) {
             return self.scroll_to_tab(existing_idx);
         }
 
-        // Mark tree as not focused when a file is opened.
         self.file_tree.tree_focused = false;
         self.pending_enter_dir = None;
 
@@ -2122,9 +1733,7 @@ impl EditorState {
         }
     }
 
-    /// Close the tab at `idx`. If the tab is dirty, shows the close dialog.
-    /// If clean, immediately removes the tab and persists.
-    /// Returns the task for saving to DB.
+    /// Close tab `idx`: a dirty tab opens the close dialog, a clean one is removed and persisted.
     fn close_tab_at(&mut self, idx: usize) -> Task<EditorMessage> {
         if idx >= self.tabs.len() {
             return Task::none();
@@ -2138,15 +1747,8 @@ impl EditorState {
         self.save_current_tabs()
     }
 
-    /// Apply an undo or redo snapshot to the tab at `idx`.
-    ///
-    /// The snapshot is an owned value so there is no borrow entanglement
-    /// with the undo stack.  The helper does a fresh (O(1)) lookup of
-    /// `tab_contents` by path — the caller must have already resolved
-    /// the path from `self.tabs[idx]`.
-    ///
-    /// # Panics
-    /// Panics if `idx` is out of bounds for `self.tabs`.
+    /// Apply an owned undo/redo snapshot to tab `idx`, doing a fresh O(1) lookup of
+    /// `tab_contents` (the caller resolved the path). Panics if `idx` is out of bounds for `tabs`.
     fn apply_undo_snapshot(&mut self, idx: usize, snapshot: Option<UndoSnapshot>) {
         let Some(snapshot) = snapshot else {
             return;
@@ -2163,10 +1765,6 @@ impl EditorState {
         update_dirty_flag(&mut self.tabs, &self.tab_contents, idx, &path);
     }
 
-    /// Apply an undo or redo operation to the active tab.
-    ///
-    /// `is_redo` selects which operation: `false` for undo,
-    /// `true` for redo.
     fn apply_undo_or_redo(&mut self, is_redo: bool) -> Task<EditorMessage> {
         let Some((idx, path)) = self.active_tab() else {
             return Task::none();
@@ -2183,13 +1781,8 @@ impl EditorState {
         Task::none()
     }
 
-    /// Handle Undo or Redo after checking that the find bar or modal overlay
-    /// won't intercept the keyboard shortcut.
-    ///
-    /// When the find bar or a modal overlay is open, the overlay's shared
-    /// editor widget owns the text field and handles Cmd+Z / Cmd+Shift+Z
-    /// itself (per-field undo). Bail out so the code editor content is not
-    /// undone by a keystroke aimed at the overlay's input.
+    /// Undo/redo, bailing out while the find bar or a modal overlay is open: that overlay's own
+    /// editor widget handles Cmd+Z/Cmd+Shift+Z per field, so the code editor must not undo.
     fn handle_undo_or_redo(&mut self, is_redo: bool) -> Task<EditorMessage> {
         if self.is_find_bar_open() || self.active_modal.is_some() {
             Task::none()
@@ -2198,9 +1791,9 @@ impl EditorState {
         }
     }
 
-    /// Clear all workspace-scoped editor state when switching workspaces.
-    /// Does not touch `selected_workspace_name`, `selected_workspace_path`,
-    /// `generation`, or `saved_tabs_gen` — those are managed at the call site.
+    /// Clear all workspace-scoped editor state. `selected_workspace_name`,
+    /// `selected_workspace_path`, `generation` and `saved_tabs_gen` are left alone — the call
+    /// site manages those.
     fn clear_workspace_editor_state(&mut self) {
         self.file_tree.nodes.clear();
         self.file_tree.expanded_dirs.clear();
@@ -2231,18 +1824,13 @@ impl EditorState {
         self.all_workspace_files.clear();
         self.global_search_gen = 0;
         self.pending_goto = None;
-        // Tab-bar scroll state is per-workspace; reset so the next selection
-        // re-learns the viewport instead of judging visibility against the
-        // previous workspace's stale offset/width.
+        // Per-workspace scroll state: reset so the next selection re-learns the viewport.
         self.tab_scroll_x = 0.0;
         self.tab_viewport_w = None;
     }
 
-    /// Start creating a new item (file or directory) in the given parent directory.
-    ///
-    /// Resolves the absolute parent path and sets up the `new_item_input` state
-    /// so the user can type a name.  Any previously active modal is implicitly
-    /// replaced since `active_modal` enforces mutual exclusion.
+    /// Start creating a file/directory in `parent_dir`: resolve its absolute path and open the name
+    /// input (any active modal is replaced — `active_modal` enforces mutual exclusion).
     fn start_new_item_creation(&mut self, parent_dir: String, is_dir: bool) -> Task<EditorMessage> {
         let Some(ref ws) = self.selected_workspace_path else {
             return Task::none();
@@ -2326,7 +1914,6 @@ impl EditorState {
 
             EditorMessage::Escape => self.escape(),
 
-            // ── Go-to-line ────────────────────────────────────────────
             EditorMessage::GoToLineToggle => self.go_to_line_toggle(),
 
             EditorMessage::GoToLineInput(action) => {
@@ -2335,7 +1922,6 @@ impl EditorState {
 
             EditorMessage::GoToLineGo => self.go_to_line_go(),
 
-            // ── Global search (find-in-files) ──────────────────────────
             EditorMessage::GlobalSearchToggle => self.global_search_toggle(),
 
             EditorMessage::GlobalSearchInput(action) => {
@@ -2350,7 +1936,6 @@ impl EditorState {
 
             EditorMessage::GlobalSearchSelect(idx) => self.global_search_select(idx),
 
-            // ── Context menu actions ─────────────────────────────────
             EditorMessage::DeleteFileRequested(path) => self.delete_file_requested(path),
 
             EditorMessage::DeleteDirectoryRequested(path) => self.delete_directory_requested(path),
@@ -2382,7 +1967,6 @@ impl EditorState {
                 focus_navigation_task(&action).unwrap_or_else(|| self.new_item_input(action))
             }
 
-            // ── Inline rename ────────────────────────────────────────────
             EditorMessage::RenameRequested(path) => self.rename_requested(&path),
 
             EditorMessage::RenameInput(action) => {
@@ -2409,7 +1993,6 @@ impl EditorState {
                 rename_gen,
             ),
 
-            // ── Quick-open file picker ────────────────────────────────
             EditorMessage::QuickOpenToggle => self.quick_open_toggle(),
 
             EditorMessage::QuickOpenInput(action) => {
@@ -2418,13 +2001,11 @@ impl EditorState {
 
             EditorMessage::QuickOpenSelect(idx) => self.quick_open_select(idx),
 
-            // ── Tab switching ─────────────────────────────────────────
             EditorMessage::TabSwitchNext => self.switch_tab_relative(TabDirection::Next),
             EditorMessage::TabSwitchPrev => self.switch_tab_relative(TabDirection::Prev),
 
             EditorMessage::CloseActiveTab => self.close_active_tab(),
 
-            // ── Tree keyboard navigation ─────────────────────────────
             EditorMessage::TreeFocusToggled => self.tree_focus_toggled(),
 
             EditorMessage::TreeScrolled(scroll_y, viewport_h) => {
@@ -2476,9 +2057,7 @@ impl EditorState {
             EditorMessage::CheckGitDirty => self.check_git_dirty(),
 
             EditorMessage::RequestGitStatusRefresh => {
-                // Intercepted by the Dashboard and routed to GitState::update
-                // (FileChanged). This arm is the fallback for direct/test
-                // routing; production never reaches it.
+                // Only reachable by direct/test routing; production hits the Dashboard route.
                 Task::none()
             }
 
@@ -2504,37 +2083,27 @@ impl EditorState {
         }
     }
 
-    // ── Extracted handler methods ────────────────────────────────────
-
-    /// Adopt a workspace the dashboard resolved: initializes the file tree,
-    /// loads the saved tabs and sets up the git integration.
+    /// Adopt a resolved workspace: reset state, read the root, restore saved tabs, resolve git.
     fn workspace_selected(&mut self, name: &str, path: &str) -> Task<EditorMessage> {
         let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
 
         self.selected_workspace_name = Some(name.to_string());
         self.selected_workspace_path = Some(path.to_string());
 
-        // Clear previous state and bump generation counters.
         let r#gen = self.bump_generation();
         let saved_gen = self.saved_tabs_gen.wrapping_add(1);
         self.saved_tabs_gen = saved_gen;
         self.clear_workspace_editor_state();
-        // Resolve the covering `.git` (dir or worktree file) and reset the
-        // mtime latch so the first CheckGitDirty probe re-latches fresh values
-        // instead of diffing against the previous workspace's mtimes.
+        // Resolve the covering `.git` and drop the mtime latch so the first probe re-latches.
         self.git_dir = find_git_dir(Path::new(path));
         self.git_dirty_mtimes = None;
-        // GitState eagerly refreshes on workspace switch and will forward the
-        // per-file statuses via GitStatusUpdated. Mark the in-flight guard so
-        // colors stay absent (not stale) until that forward arrives — only
-        // when a forward can actually happen: a non-git workspace never
-        // produces a snapshot, and the guard must not claim one is in flight.
+        // GitState eagerly refreshes on a workspace switch and forwards the statuses via
+        // GitStatusUpdated, so mark the in-flight guard: colors stay absent rather than stale until
+        // then. Set only when a forward can happen — a non-git workspace produces no snapshot.
         self.git_status_loading = self.git_dir.is_some();
 
-        // Register the root generation so DirExpanded can validate it.
         self.dir_generations.insert(String::new(), r#gen);
 
-        // ── Task 1: read root directory ───────────────────────
         tasks.push(dir_expanded_task(
             path.to_string(),
             String::new(),
@@ -2542,7 +2111,6 @@ impl EditorState {
             false,
         ));
 
-        // ── Task 2: load tabs from DB + file contents ────────
         let tab_ws = name.to_string();
         let tab_path = path.to_string();
         let tab_gen = saved_gen;
@@ -2561,8 +2129,7 @@ impl EditorState {
                 };
                 let mut loaded: Vec<SavedTabData> = Vec::new();
                 for record in &records {
-                    // Belt-and-suspenders: skip tabs with empty file_path —
-                    // load_editor_tabs already filters these, but guard anyway.
+                    // Belt-and-suspenders: `load_editor_tabs` filters these, but guard anyway.
                     if record.file_path.is_empty() || record.file_path.trim().is_empty() {
                         tracing::warn!(
                             workspace = %tab_ws,
@@ -2623,22 +2190,15 @@ impl EditorState {
         );
         tasks.push(load_tabs_task);
 
-        // ── Task 3: build the gitignore matcher for file tree dimming ──
         tasks.push(Self::spawn_ignore_matcher(path));
 
         Task::batch(tasks)
     }
 
-    /// Handle editor-page visibility change (single source of truth for whether
-    /// the editor is the active page).
-    ///
-    /// `false` (navigating away): close any open modal — modals do not survive
-    /// a page switch; unsaved tab changes stay in editor state without warning
-    /// (no confirmation machinery).
-    ///
-    /// `true` (navigating to the editor): refresh-on-entry, which replays any
-    /// tree changes that arrived while the page was hidden. `refresh_file_tree`
-    /// also rebuilds the ignore matcher, so dimming catches up too.
+    /// Handle editor-page visibility change (single source of truth for whether the editor is the
+    /// active page). `false` closes any open modal (modals do not survive a page switch) and leaves
+    /// unsaved changes in place without warning; `true` refreshes on entry, replaying tree changes
+    /// that arrived while hidden (and rebuilding the ignore matcher with them).
     fn page_visibility_changed(&mut self, visible: bool) -> Task<EditorMessage> {
         self.page_visible = visible;
         if !visible {
@@ -2652,17 +2212,13 @@ impl EditorState {
         }
     }
 
-    /// Handle a coalesced file-tree change ping from the global FILE_CHANGE_TX
-    /// broadcast. Dropped while the page is hidden or no workspace is selected —
-    /// refresh-on-entry (PageVisibilityChanged) catches up. When visible, the
-    /// tree (and ignore matcher, rebuilt by `refresh_file_tree`) re-reads the
-    /// expanded directories.
+    /// Handle a coalesced file-tree change ping. Dropped while the page is hidden or no workspace
+    /// is selected — refresh-on-entry catches up; when visible, the expanded directories and the
+    /// ignore matcher are re-read.
     ///
-    /// Accepted consequences: a `.gitignore` edit usually pings the watcher (the
-    /// file is not itself ignored) so dimming refreshes; a rare ignored-
-    /// `.gitignore` setup goes stale until the next event or Cmd+R. Unwatched or
-    /// watch-failed sessions have no automatic tree refresh — recovery is a
-    /// manual Cmd+R or a workspace switch.
+    /// Accepted consequences: a `.gitignore` edit normally pings the watcher, so dimming
+    /// refreshes; a rare ignored-`.gitignore` setup goes stale until the next event or Cmd+R, and
+    /// unwatched or watch-failed sessions refresh only on Cmd+R or a workspace switch.
     fn file_tree_pinged(&mut self) -> Task<EditorMessage> {
         if !self.page_visible || self.selected_workspace_path.is_none() {
             return Task::none();
@@ -2670,8 +2226,7 @@ impl EditorState {
         self.refresh_file_tree()
     }
 
-    /// Insert a newly created tab into the editor state: push the tab,
-    /// store its content, and record the file mtime (if available).
+    /// Push a new tab, store its content and record the file mtime (if the file has one).
     fn insert_tab(&mut self, path: String, tab: Tab, tab_data: TabData, mtime: Option<SystemTime>) {
         self.tabs.push(tab);
         self.tab_contents.insert(path.clone(), tab_data);
@@ -2680,8 +2235,7 @@ impl EditorState {
         }
     }
 
-    /// Handle saved tabs loaded from the database — deserializes tab data,
-    /// builds Tab/TabData structures.
+    /// Handle saved tabs loaded from the database — build the tabs and their `TabData`.
     fn saved_tabs_loaded(
         &mut self,
         tabs_data: Result<Vec<SavedTabData>, String>,
@@ -2697,10 +2251,9 @@ impl EditorState {
                 tabs_data
             }
             Err(e) => {
-                // Leave `session_initialized` false and block writes: the
-                // persisted tabs are still intact and must not be overwritten
-                // by the incomplete in-memory set. The message shown carries
-                // that consequence; it stays until a successful reload.
+                // Leave `session_initialized` false and block writes: the persisted tabs are
+                // still intact and must not be overwritten by the incomplete in-memory set. The
+                // shown message carries that consequence and stays until a successful reload.
                 tracing::warn!(error = %e, "Editor: failed to restore saved tabs");
                 self.tabs_error = Some(format!("{e} — {TABS_SAVE_PAUSED}"));
                 return Task::none();
@@ -2750,8 +2303,7 @@ impl EditorState {
         }
     }
 
-    /// Handle directory expansion — populates dir_entries, rebuilds tree,
-    /// advances focus to first child if requested.
+    /// Directory expansion: populate `dir_entries`, rebuild the tree, advance focus if asked.
     fn dir_expanded(
         &mut self,
         dir_path: &str,
@@ -2762,8 +2314,7 @@ impl EditorState {
         if self.dir_generations.get(dir_path) != Some(&r#gen) {
             return Task::none();
         }
-        // Consume the generation slot (mirroring the pattern in rename_completed).
-        // The entry is no longer needed once the matching result has been accepted.
+        // Consume the generation slot once the result is accepted (as `rename_completed` does).
         self.dir_generations.remove(dir_path);
 
         self.loading_dirs.remove(dir_path);
@@ -2772,8 +2323,6 @@ impl EditorState {
             Ok(entries) => {
                 self.dir_entries.insert(dir_path.to_string(), entries);
                 self.rebuild_tree();
-                // If this was triggered by Enter-on-directory, advance
-                // focus to the first child now that children are loaded.
                 if self.pending_enter_dir.as_deref() == Some(dir_path) {
                     self.pending_enter_dir = None;
                     return self
@@ -2782,11 +2331,8 @@ impl EditorState {
                 }
             }
             Err(ReadDirError::NotFound) => {
-                // The directory no longer exists (deleted externally, by a
-                // script, or via the GUI). Forget it silently — this is a
-                // normal scenario, not an error: no toast, and at most one
-                // low-level log per path (the path is pruned from the
-                // refresh state, so it cannot re-warn every cycle).
+                // Gone (deleted externally, by a script or the GUI): forget it silently — no
+                // toast, and at most one low-level log per path since the refresh state is pruned.
                 self.forget_directory(dir_path);
                 self.rebuild_tree();
                 if !dir_path.is_empty() {
@@ -2796,8 +2342,6 @@ impl EditorState {
                 }
             }
             Err(ReadDirError::Other(err)) => {
-                // The directory still exists but cannot be read — a real
-                // problem that must keep producing warnings.
                 if quiet {
                     tracing::warn!("Failed to read directory '{dir_path}' (refresh): {err}");
                     return Task::none();
@@ -2810,27 +2354,18 @@ impl EditorState {
         Task::none()
     }
 
-    /// Handle dir-deleted — a GUI directory deletion succeeded. Prune the
-    /// deleted path and all descendants from the tree refresh/cache state,
-    /// then re-read the parent directory so the tree reflects the deletion
-    /// immediately (and picks up any unrelated external changes there).
-    ///
-    /// The prune is deferred to this success path so a failed delete (e.g.
-    /// permission denied) leaves a still-existing directory untouched in the
-    /// tree.
+    /// A GUI directory deletion succeeded: prune the deleted path and its descendants from the tree
+    /// state, then re-read the parent so the tree reflects it. Deferred to the success path so a
+    /// failed delete leaves a still-existing directory in the tree.
     fn dir_deleted(&mut self, dir_path: &str, workspace_path: &str) -> Task<EditorMessage> {
-        // Staleness guard: the delete was started in `workspace_path`. If the
-        // user switched workspaces while the async delete was in flight, this
-        // completion belongs to the old workspace and must not prune the
-        // currently selected workspace's state at the same relative path.
+        // Staleness guard: a completion from a workspace the user switched away from must not prune
+        // the current workspace's state at the same relative path.
         if self.selected_workspace_path.as_deref() != Some(workspace_path) {
             return Task::none();
         }
         self.forget_directory(dir_path);
         self.rebuild_tree();
 
-        // Re-read the parent directory (mirrors perform_delete_with_refresh):
-        // register a fresh generation slot and spawn the async read.
         let Some(ws_path) = self.selected_workspace_path.clone() else {
             return Task::none();
         };
@@ -2843,22 +2378,17 @@ impl EditorState {
         dir_expanded_task(ws_path, parent_dir, r#gen, false)
     }
 
-    /// Handle a file being loaded from disk — opens a tab, initializes
-    /// EditorBuffer, sets hash/mtime, and handles pending goto from
-    /// global search.
+    /// A file was loaded from disk: open its tab and honour a pending global-search goto.
     fn file_loaded(
         &mut self,
         path: &str,
         r#gen: u64,
         result: Result<FileLoadData, String>,
     ) -> Task<EditorMessage> {
-        // Check per-file generation to prevent stale loads.
         if self.file_generations.get(path).copied() != Some(r#gen) {
             return Task::none();
         }
-        // Consume the generation slot — it has served its purpose.
-        // This prevents unbounded accumulation in the map without
-        // requiring removal code at every close/delete/rename path.
+        // Consume the slot: bounds the map without removal code at every close/delete/rename path.
         self.file_generations.remove(path);
 
         match result {
@@ -2870,10 +2400,8 @@ impl EditorState {
                 self.active_tab_index = self.tabs.len().saturating_sub(1);
                 self.session_initialized = true;
 
-                // ── Pending goto from global search ────────────
-                // If this file was loaded for a global-search result click,
-                // jump to the matching line. Only consume when both path and
-                // generation match to avoid stealing from a different file load.
+                // A global-search result click: jump to the matched line, consuming the pending
+                // goto only when path and generation both match, so another load cannot steal it.
                 if self
                     .pending_goto
                     .as_ref()
@@ -2903,8 +2431,7 @@ impl EditorState {
         }
     }
 
-    /// Handle the result of a save operation — updates dirty flags,
-    /// handles CloseDialog→close-tab and CloseOthers→save-queue flows.
+    /// A save finished: update the dirty flag and run any pending close action.
     fn save_result(
         &mut self,
         path: &str,
@@ -2927,9 +2454,8 @@ impl EditorState {
                 if let Some(tab_data) = self.tab_contents.get_mut(path) {
                     tab_data.saved_text_hash = saved_hash;
                 }
-                // Update stored mtime so the next auto-refresh tick won't
-                // detect the save-time mtime change as an external edit
-                // and re-read the file, destroying the undo stack.
+                // Store the new mtime so the auto-refresh tick does not mistake the save for an
+                // external edit and re-read the file, destroying the undo stack.
                 if let Ok(meta) = std::fs::metadata(path) {
                     if let Ok(mtime) = meta.modified() {
                         self.file_mtimes.insert(path.to_string(), mtime);
@@ -2941,7 +2467,6 @@ impl EditorState {
                     Some(PendingCloseAction::CloseTab(close_idx)) => {
                         if close_idx < self.tabs.len() {
                             self.remove_tab_at(close_idx);
-                            // Save after removal + scroll.
                             let mut tasks: Vec<Task<EditorMessage>> = Vec::new();
                             if !self.tabs.is_empty() {
                                 tasks.push(self.scroll_to_active_tab());
@@ -2955,9 +2480,7 @@ impl EditorState {
                         remaining_dirty: mut remaining,
                     }) => {
                         return if remaining.is_empty() {
-                            // All dirty tabs saved — close everything except keep_idx.
                             self.remove_all_tabs_except(keep_idx);
-                            // Save after removal.
                             self.try_save_current_tabs().map_or_else(Task::none, |t| {
                                 Task::batch([
                                     t,
@@ -2965,7 +2488,6 @@ impl EditorState {
                                 ])
                             })
                         } else {
-                            // Save the next dirty tab.
                             let next = remaining.remove(0);
                             self.pending_close = Some(PendingCloseAction::CloseOthers {
                                 keep_idx,
@@ -2977,7 +2499,6 @@ impl EditorState {
                     None => {}
                 }
 
-                // Regular save (not from close dialog) — persist clean state.
                 if let Some(save_task) = self.try_save_current_tabs() {
                     save_task
                 } else {
@@ -2992,16 +2513,8 @@ impl EditorState {
         }
     }
 
-    /// Handle Escape key — dismisses modal overlays, find bar, tree focus,
-    /// and residual close-dialog auxiliary state in priority order.
-    ///
-    /// Priority:
-    /// 1. Active modal overlay (closed via [`ModalKind`] match on
-    ///    [`active_modal`] — clears auxiliary state for `CloseDialog`
-    ///    and `CloseOthers`).
-    /// 2. Find/replace bar on the active tab.
-    /// 3. File-tree focus.
-    /// 4. Residual [`pending_close`] state.
+    /// Escape dismisses, in priority order: the active modal overlay (clearing the `CloseDialog`/
+    /// `CloseOthers` state), the find/replace bar, tree focus, residual [`pending_close`].
     fn escape(&mut self) -> Task<EditorMessage> {
         // Close modal overlays first.
         if let Some(modal) = self.active_modal.take() {
@@ -3014,7 +2527,6 @@ impl EditorState {
             return Task::none();
         }
 
-        // Close find bar on active tab next, if open.
         if let Some((_, path)) = self.active_tab() {
             if let Some(tab_data) = self.tab_contents.get_mut(&path) {
                 if tab_data.find_replace_state.is_some() {
@@ -3024,7 +2536,6 @@ impl EditorState {
             }
         }
 
-        // Unfocus the file tree, or clear residual close-dialog state.
         if self.file_tree.tree_focused {
             self.file_tree.tree_focused = false;
             self.pending_enter_dir = None;
@@ -3034,18 +2545,15 @@ impl EditorState {
         Task::none()
     }
 
-    /// Handle global search toggle — opens/closes the search overlay,
-    /// spawns search engine initialization.
+    /// Open or close the global search overlay, initialising the search engine.
     fn global_search_toggle(&mut self) -> Task<EditorMessage> {
         if matches!(self.active_modal, Some(ModalKind::GlobalSearch(_))) {
-            // Close if already open.
             self.active_modal = None;
             return Task::none();
         }
         if self.active_modal.is_some() {
             return Task::none();
         }
-        // Close find bar when opening global search.
         if let Some((_, path)) = self.active_tab() {
             if let Some(tab_data) = self.tab_contents.get_mut(&path) {
                 tab_data.find_replace_state = None;
@@ -3071,7 +2579,6 @@ impl EditorState {
             status: GlobalSearchStatus::Idle,
         }));
 
-        // Start scanning the search engine and show readiness status.
         let engine_task = Task::perform(
             async move {
                 match crate::workspace_index::resolve_engine(&ws_name, &ws_path, "").await {
@@ -3090,22 +2597,19 @@ impl EditorState {
             |msg| msg,
         );
 
-        // Auto-focus the search input when the panel opens.
         let focus_task =
             iced::widget::operation::focus::<EditorMessage>(Id::new(GLOBAL_SEARCH_INPUT_ID));
 
         Task::batch([engine_task, focus_task])
     }
 
-    /// Handle global search results — populates search results, handles
-    /// stale results, error states, and empty results.
+    /// Handle global search results: drop stale generations, record errors and empty results.
     fn global_search_results(
         &mut self,
         r#gen: u64,
         results: Vec<OwnedGrepMatch>,
         error: Option<String>,
     ) -> Task<EditorMessage> {
-        // Stale result? Discard (r#gen is never 0 from the async helper).
         if r#gen != self.global_search_gen {
             return Task::none();
         }
@@ -3656,9 +3160,7 @@ impl EditorState {
         // All-space names fall through to the empty-name check below.
         let trimmed = target.input_text.text().trim().to_string();
 
-        // ── Validation ────────────────────────────────────────
-        // validate_item_name covers empty name, path separators,
-        // dot/dotdot, and OS-reserved names.
+        // `validate_item_name` covers empty names, separators, dot/dotdot and OS-reserved names.
         let error_msg = validate_item_name(&trimmed);
         if let Some(msg) = error_msg {
             let mut rt = target;
@@ -3802,12 +3304,10 @@ impl EditorState {
 
         match result {
             Ok(()) => {
-                // ── Update selected_file if it matches ────
                 if self.selected_file.as_deref() == Some(old_path) {
                     self.selected_file = Some(new_path.to_string());
                 }
 
-                // ── Update open tab paths ────────────────
                 let Some(old_abs) = self.abs_path(old_path) else {
                     return Task::none();
                 };
@@ -3885,10 +3385,8 @@ impl EditorState {
                     }
                 }
 
-                // ── Migrate file_mtimes, deleted_file_toasted, and file_generations ──
-                // Re-key entries from old absolute path to new absolute
-                // path so auto-refresh doesn't spuriously stat the old path
-                // and in-flight FileLoaded results are properly validated.
+                // Re-key from the old absolute path so auto-refresh does not stat it and in-flight
+                // FileLoaded results are still validated.
                 if is_dir {
                     rekey_abs_map(&mut self.file_mtimes, &old_abs, &new_abs);
                     rekey_abs_set(&mut self.deleted_file_toasted, &old_abs, &new_abs);
@@ -3906,7 +3404,6 @@ impl EditorState {
                     }
                 }
 
-                // ── Update dir entries and rebuild tree ───
                 match dir_entries {
                     Ok(entries) => {
                         // re_path was computed at the top of the
@@ -4225,10 +3722,8 @@ impl EditorState {
             return Task::none();
         };
 
-        // ── Phase 1 (read-only): extract owned values upfront ────────────
-        // Cloning range/replace/query here avoids interleaving immutable
-        // borrows (to read state) with mutable borrows (to mutate content
-        // and update state) in the same scope.
+        // Clone the range/replace/query up front so immutable reads and the later mutable borrow do
+        // not interleave in one scope.
         let Some((range, replace_text, case_sensitive, query)) = self
             .tab_contents
             .get(&path)
@@ -4253,7 +3748,6 @@ impl EditorState {
             return Task::none();
         }
 
-        // ── Phase 2 (mutation): perform the replacement ──────────────────
         if let Some(tab_data) = self.tab_contents.get_mut(&path) {
             tab_data
                 .undo_stack
@@ -4392,8 +3886,7 @@ impl EditorState {
 
     /// Build a gitignore matcher for `workspace_path` and return a task that
     /// delivers it as `IgnoreMatcherReady` tagged with the workspace path (so
-    /// a matcher built for a previously-selected workspace is discarded on
-    /// arrival).
+    /// a matcher built for a previously-selected workspace is discarded on arrival).
     fn spawn_ignore_matcher(workspace_path: &str) -> Task<EditorMessage> {
         let path = workspace_path.to_string();
         let tag = path.clone();
@@ -4667,7 +4160,6 @@ impl EditorState {
     /// workspace, so this is only ever reached for one.
     #[must_use]
     pub fn view(&self, dashboard_modal_open: bool) -> Element<'_, EditorMessage> {
-        // ── Split layout ─────────────────────────────────────────────
         let tree_panel = self.build_tree_panel();
         let editor_panel = self.build_editor_panel(dashboard_modal_open);
 
@@ -4676,16 +4168,13 @@ impl EditorState {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        // ── Overlay (single match on active_modal) ────────────────────
         let body = column([split.into()])
             .spacing(0)
             .width(Length::Fill)
             .height(Length::Fill);
 
-        // Keep Stack widget type stable — a Column→Stack type change between frames
-        // destroys widget state (scroll positions, ContextMenu overlay states),
-        // causing stale overlay-to-tab associations. Always return a Stack
-        // with a zero-size placeholder when no overlay is present.
+        // The Stack widget type must stay stable: a Column→Stack change between frames destroys
+        // widget state (scroll positions, ContextMenu overlays) and leaves stale overlay links.
         let placeholder: Element<'_, EditorMessage> = widgets::empty_stack_placeholder();
 
         let overlay: Element<'_, EditorMessage> = match &self.active_modal {
@@ -4744,8 +4233,6 @@ impl EditorState {
 
         iced::widget::stack([body.into(), overlay]).into()
     }
-
-    // ── Tree panel ────────────────────────────────────────────────
 
     fn build_tree_panel(&self) -> Element<'_, EditorMessage> {
         let elements: Vec<Element<'_, EditorMessage>> = self
@@ -4809,11 +4296,8 @@ impl EditorState {
             },
         );
 
-        // Wrap the tree panel with a context menu that fires on empty-space
-        // right-clicks. When the user right-clicks on a tree node, the inner
-        // node-level ContextMenu captures the event, so this outer fallback
-        // does not fire. When right-clicking on empty space below the nodes,
-        // no inner ContextMenu captures it, so this one shows the menu.
+        // A context menu for empty space below the tree nodes: the node-level menus capture
+        // their own right-clicks, so only clicks past the last row reach this fallback.
         ContextMenu::new(
             panel,
             vec![
@@ -4830,14 +4314,12 @@ impl EditorState {
         .into()
     }
 
-    /// Check if any child (file or expanded dir) in the node has a git status.
-    /// Returns the most "interesting" status: Modified > Added. Only meaningful
-    /// for expanded directories (which have children populated).
+    /// The most "interesting" child git status (Modified > Added); only meaningful for an
+    /// expanded directory, which is the only kind with populated children.
     fn dir_git_status(&self, node: &widgets::TreeNode) -> Option<GitFileStatus> {
         let mut best: Option<GitFileStatus> = None;
         for child in &node.children {
             if child.is_dir {
-                // For expanded subdirectories, recurse into their children.
                 if let Some(status) = self.dir_git_status(child) {
                     if best != Some(GitFileStatus::Modified) {
                         best = Some(status);
@@ -4856,23 +4338,10 @@ impl EditorState {
         best
     }
 
-    /// Shared tree-node row helper.  Builds the guide-lines + icon + name row,
-    /// wraps it in a `tree_node_button`, then wraps that in a `ContextMenu`
-    /// with caller-specific items prepended before the common items
-    /// (Copy Relative Path, Copy Absolute Path, Reveal in Finder).
-    ///
-    /// # Parameters
-    ///
-    /// * `guide` — pre-computed tree guide-line prefix string (empty for root-level
-    ///   nodes, otherwise contains box-drawing characters for hierarchy lines).
-    /// * `icon` — pre-built icon element (size and colour already set).
-    /// * `name` — pre-built name element (text content and style already set).
-    /// * `highlight` — whether the row should show the highlight style.
-    /// * `message` — message to fire when the row is clicked.
-    /// * `extra_context_items` — caller-specific context menu items; they are
-    ///   placed *before* the three shared items listed above.
-    /// * `full_path` — workspace-relative path used to compute absolute/relative
-    ///   paths for the shared context menu items.
+    /// Shared tree-node row: guide lines, icon and name wrapped in a `tree_node_button` inside a
+    /// `ContextMenu` whose caller items (`extra_context_items`) precede the shared Copy Relative
+    /// Path / Copy Absolute Path / Reveal in Finder. `full_path` (workspace-relative) builds the
+    /// paths those shared items copy.
     #[expect(clippy::too_many_arguments)]
     fn render_tree_node_row<'a>(
         &'a self,
@@ -5124,12 +4593,9 @@ impl EditorState {
         )
     }
 
-    // ── Editor panel ──────────────────────────────────────────────
-
     fn build_editor_panel(&self, dashboard_modal_open: bool) -> Element<'_, EditorMessage> {
         if self.tabs.is_empty() {
-            // A failed restore must stay visible here, where the legitimately
-            // empty state would render.
+            // A failed restore stays visible where the legitimately empty state would render.
             if let Some(err) = &self.tabs_error {
                 return widgets::empty_state_placeholder(
                     lucide::triangle_alert(),
@@ -5153,15 +4619,13 @@ impl EditorState {
         if let Some(bar) = find_bar {
             col = col.push(bar);
         } else if let Some(bar) = go_to_line {
-            // Go-to-line uses the same UI slot; only one bar visible at a time.
             col = col.push(bar);
         }
         col = col.push(editor_widget);
 
         match &self.tabs_error {
-            // The restore failure — and the paused tab persistence that goes
-            // with it — stays visible until a successful reload replaces it,
-            // also once the editor has tabs of its own.
+            // The restore failure — and the paused tab persistence that goes with it — stays
+            // visible until a successful reload replaces it, even once tabs exist.
             Some(err) => column![widgets::error_banner(err), col]
                 .spacing(0)
                 .width(Length::Fill)
@@ -5177,7 +4641,6 @@ impl EditorState {
         for (i, tab) in self.tabs.iter().enumerate() {
             let is_active = i == self.active_tab_index;
 
-            // Dirty indicator dot.
             let dirty_dot: Option<Element<'_, EditorMessage>> = if tab.is_dirty {
                 Some(
                     lucide::circle::<iced::Theme, iced::Renderer>()
@@ -5319,7 +4782,6 @@ impl EditorState {
             [theme::PAD_2, theme::PAD_6],
         );
 
-        // Case sensitivity toggle: "Aa" label, highlighted when active.
         let case_label_color = if state.case_sensitive {
             theme::ACCENT_LIGHT
         } else {
@@ -5353,8 +4815,7 @@ impl EditorState {
         Some(bar_harness(bar))
     }
 
-    /// Build the go-to-line input bar. Appears in the same slot as the find
-    /// bar (below the tab bar) and is mutually exclusive with it.
+    /// The go-to-line bar, which shares the find bar's slot below the tabs and excludes it.
     fn build_go_to_line_bar(&self) -> Option<Element<'_, EditorMessage>> {
         let ModalKind::GotoLine = self.active_modal.as_ref()? else {
             return None;
@@ -5413,22 +4874,17 @@ impl EditorState {
             );
         };
 
-        // ── Build editor widget ────────────────────────────────────────
         let content = &tab_data.content;
         let tree_focused = self.file_tree.tree_focused;
         let find_bar_open = tab_data.find_replace_state.is_some();
-        // Modal overlays own keyboard input entirely — block all editor keys
-        // (editor-internal modals as well as dashboard-level ones: diff modal,
-        // git branch modal, update confirm).
+        // Modal overlays own keyboard input entirely — editor-internal modals as well as
+        // dashboard-level ones (diff, git branch, update confirm).
         let modal_overlay_open = self.active_modal.is_some() || dashboard_modal_open;
-        // When the find/replace bar is open its text inputs own keyboard focus;
-        // block all editor keys so navigation does not move the code cursor
-        // while editing the search/replace fields.
+        // The open find/replace bar's text inputs own focus the same way, so navigation must
+        // not move the code cursor while they are being edited.
         let ignore_keyboard = tree_focused || modal_overlay_open || find_bar_open;
 
-        // Compute match highlight tuples from find/replace state.
-        // Each tuple is (line, byte_col_start, byte_col_end) for
-        // cosmic_text::Cursor-based highlight rendering.
+        // Match highlights as (line, byte_col_start, byte_col_end) for cosmic_text cursors.
         let (match_tuples, match_current_idx) = tab_data
             .find_replace_state
             .as_ref()
@@ -5448,8 +4904,6 @@ impl EditorState {
             })
             .unwrap_or_default();
 
-        // ── Bracket matching ───────────────────────────────────────────
-        // Compute matching bracket pair from cursor position (if any).
         let cursor = content.cursor();
         let bracket_pair = if !ignore_keyboard && cursor.selection.is_none() {
             let text = content.text();
@@ -5468,7 +4922,6 @@ impl EditorState {
         )
     }
 
-    /// Build an [`Element`] from an editor content reference.
     fn build_highlighted_editor<'a>(
         content: &'a super::editor_widget::EditorBuffer,
         buffer_key: Option<&'a str>,
@@ -5489,20 +4942,16 @@ impl EditorState {
         widgets::page_bare(mapped)
     }
 
-    // ── Context menu action handlers ───────────────────────────────
-
     /// Perform file deletion: close tab, delete file, re-read parent directory.
     fn perform_file_delete(&mut self, target: &DeleteConfirmTarget) -> Task<EditorMessage> {
         // Close tab if open.
         if let Some(tab_idx) = self.tabs.iter().position(|t| t.path == target.abs_path) {
             self.remove_tab_at(tab_idx);
         }
-        // Clear selection if it matches the deleted file.
-        // selected_file stores relative paths (set by SelectFile handler).
+        // `selected_file` stores relative paths (set by the SelectFile handler).
         if self.selected_file.as_deref() == Some(&target.path) {
             self.selected_file = None;
         }
-        // Clean up mtime and toast guard.
         self.file_mtimes.remove(&target.abs_path);
         self.deleted_file_toasted.remove(&target.abs_path);
 
@@ -5519,11 +4968,9 @@ impl EditorState {
         )
     }
 
-    /// Perform directory deletion: remove dir, close affected tabs.
-    ///
-    /// The tree/cache prune is deferred to the delete-success path (via
-    /// [`EditorMessage::DirDeleted`]) so a failed delete — e.g. permission
-    /// denied — leaves a still-existing directory fully intact in the tree.
+    /// Delete a directory and close the affected tabs. The tree/cache prune waits for the success
+    /// path ([`EditorMessage::DirDeleted`]), so a failed delete (permission denied) leaves the
+    /// still-existing directory intact in the tree.
     fn perform_dir_delete(&mut self, target: &DeleteConfirmTarget) -> Task<EditorMessage> {
         // Collect open tabs inside this directory (close in reverse order).
         let mut affected_indices: Vec<usize> = self
@@ -5555,15 +5002,10 @@ impl EditorState {
         )
     }
 
-    /// Shared preamble for deleting a file or directory: bump a generation,
-    /// run the async delete operation, then on success either emit
-    /// `success_msg` (when provided — e.g. a directory delete that must
-    /// prune tree state) or re-read the parent directory and emit a
-    /// [`DirExpanded`] message.
-    ///
-    /// `delete_op` receives the absolute path and returns `Result<(), String>`.
-    /// `error_label` is used in the toast message on failure (e.g. "file" or
-    /// "directory").
+    /// Shared preamble for a file or directory delete: bump a generation, run `delete_op` on the
+    /// absolute path, then on success either emit `success_msg` (a directory delete that must
+    /// prune tree state) or re-read the parent and emit a [`DirExpanded`]. `error_label` names the
+    /// thing in the failure toast.
     fn perform_delete_with_refresh<D, F>(
         &mut self,
         abs_path: String,
@@ -5665,20 +5107,10 @@ impl EditorState {
     }
 }
 
-// ── Keyboard shortcut mapping ──────────────────────────────────────
-
-/// Map a keyboard event to an [`EditorMessage`] action, or `None` if unhandled.
-///
-/// This function is the `filter_map` predicate used by `subscription()` to
-/// translate keyboard events into editor actions.  It is extracted to a
-/// standalone function so that `subscription()` focuses on timer setup and
-/// the shortcut logic is independently readable (and potentially testable).
-///
-/// When `dashboard_modal_open` is `true` (a dashboard-level overlay modal, e.g.
-/// the diff/message, git branch or update-confirm modal, is open over the
-/// editor page), arrow/Enter tree-navigation keys are swallowed so the
-/// file tree behind the modal never navigates.  Global shortcuts above them
-/// (Cmd+S, Cmd+F, Ctrl+B, F3, …) keep working even while a modal is open.
+/// Map a keyboard event to an [`EditorMessage`], or `None`. The `filter_map` predicate of
+/// `subscription()`, kept standalone so timer setup and shortcut precedence read separately.
+/// With `dashboard_modal_open` the arrow/Enter tree keys are swallowed (the tree sits behind the
+/// modal) while the global shortcuts above them (Cmd+S, Cmd+F, Ctrl+B, F3, …) keep working.
 fn map_editor_shortcut(
     event: keyboard::Event,
     dashboard_modal_open: bool,
@@ -5694,15 +5126,12 @@ fn map_editor_shortcut(
     if km.is_shortcut_platform_mod() && latin('b') {
         return Some(EditorMessage::TreeFocusToggled);
     }
-    // Cmd+Shift+F / Ctrl+Shift+F → global search (find-in-files).
-    // Must appear BEFORE the Cmd+F / Ctrl+F check so Cmd+Shift+F
-    // doesn't also trigger FindToggle.
+    // Cmd+Shift+F / Ctrl+Shift+F → global search. Must come BEFORE the Cmd+F check below, and
+    // that check's shift guard keeps Cmd+Shift+F from also triggering FindToggle.
     if km.is_platform_mod && !km.altgr_active && modifiers.shift() && latin('f') {
         return Some(EditorMessage::GlobalSearchToggle);
     }
-    // Cmd+F / Ctrl+F → toggle find/replace bar.
-    // Guard: Cmd+Shift+F handled above, so !modifiers.shift() prevents
-    // Cmd+Shift+F from also triggering FindToggle.
+    // Cmd+F / Ctrl+F → toggle the find/replace bar.
     if km.is_shortcut_platform_mod() && !modifiers.shift() && latin('f') {
         return Some(EditorMessage::FindToggle);
     }
@@ -5713,7 +5142,6 @@ fn map_editor_shortcut(
         }
         return Some(EditorMessage::Undo);
     }
-    // Cmd+S / Ctrl+S → save.
     if km.is_shortcut_platform_mod() && latin('s') {
         return Some(EditorMessage::SaveActiveTab);
     }
@@ -5727,9 +5155,7 @@ fn map_editor_shortcut(
             Some(EditorMessage::TabSwitchNext)
         };
     }
-    // Ctrl+W → close tab (all platforms). Cmd+W on macOS is typically
-    // captured by the window manager to close the window, so we use
-    // Ctrl+W consistently.
+    // Ctrl+W closes the tab on every platform: macOS gives Cmd+W to the window manager.
     if !km.altgr_active && modifiers.control() && latin('w') {
         return Some(EditorMessage::CloseActiveTab);
     }
@@ -5743,17 +5169,14 @@ fn map_editor_shortcut(
     if go_to_line_mod && latin('g') {
         return Some(EditorMessage::GoToLineToggle);
     }
-    // Quick open: Cmd+P / Ctrl+P
     if km.is_shortcut_platform_mod() && latin('p') {
         return Some(EditorMessage::QuickOpenToggle);
     }
-    // Refresh file tree: Cmd+R / Ctrl+R
     if km.is_shortcut_platform_mod() && latin('r') {
         return Some(EditorMessage::RefreshFileTree);
     }
-    // Find next/prev: Cmd+G / F3 → FindNext, Cmd+Shift+G / Shift+F3 → FindPrev.
-    // Cmd+G is macOS's; go-to-line is Ctrl+G everywhere, so F3 and Shift+F3 are
-    // the other platform's find shortcuts.
+    // Cmd+G / F3 → next match, +Shift → previous. Cmd+G is macOS's (Ctrl+G is go-to-line
+    // everywhere), so F3 and Shift+F3 carry the other platform.
     #[cfg(target_os = "macos")]
     if modifiers.command() && !modifiers.control() && latin('g') {
         return if modifiers.shift() {
@@ -5770,17 +5193,13 @@ fn map_editor_shortcut(
             Some(EditorMessage::FindNext)
         };
     }
-    // Shift+Enter → previous match (for use in the find/replace bar;
-    // no-op when find bar is closed — handler checks state).
+    // Shift+Enter → previous match for the find bar (a no-op while it is closed).
     if modifiers.shift() && matches!(key, Key::Named(keyboard::key::Named::Enter)) {
         return Some(EditorMessage::FindPrev);
     }
-    // Arrow/Enter key navigation: when quick-open is active, arrow keys
-    // navigate the results list (handled in the update method by
-    // checking quick_open state before tree focus). When a dashboard-level
-    // modal overlay is open the file tree sits behind it, so swallow these
-    // keys entirely (guards against a stale `tree_focused`) — the global
-    // shortcuts handled above keep working while the modal is open.
+    // Arrow/Enter tree navigation. With quick-open active the arrows drive its result list
+    // (`update` checks quick-open before tree focus); with a dashboard modal open the tree sits
+    // behind it, so these keys are swallowed entirely, guarding against a stale `tree_focused`.
     if dashboard_modal_open {
         return None;
     }
@@ -5796,8 +5215,6 @@ fn map_editor_shortcut(
         _ => None,
     }
 }
-
-// ── Find/Replace helpers ───────────────────────────────────────────
 
 impl FindReplaceState {
     /// Recompute matches against the current text and jump to the first match (or reset the index).

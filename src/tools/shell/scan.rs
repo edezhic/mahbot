@@ -12,11 +12,6 @@
 
 use super::track_char_context;
 
-// ── Quote stripping ─────────────────────────────────────────────────────
-
-/// Strip a balanced pair of surrounding quotes (`'...'` or `"..."`), returning
-/// the inner content and whether the quotes were single. Returns `None` for
-/// mixed (`'..."`), unbalanced, or interior-quote forms — callers fail closed.
 pub(super) fn strip_outer_quotes(word: &str) -> Option<(&str, bool)> {
     let bytes = word.as_bytes();
     if word.len() >= 2
@@ -40,12 +35,9 @@ pub(super) fn strip_outer_quotes(word: &str) -> Option<(&str, bool)> {
     Some((word, false))
 }
 
-/// Strip balanced surrounding quotes, keeping the raw word when unbalanced.
 pub(super) fn strip_quoted_word(word: &str) -> &str {
     strip_outer_quotes(word).map_or(word, |(c, _)| c)
 }
-
-// ── cmd.exe null device ─────────────────────────────────────────────────
 
 /// The platform's null device in the spellings cmd.exe accepts, matched
 /// case-insensitively: `nul`, `nul:` and the extension-qualified `nul.txt`
@@ -67,17 +59,10 @@ pub(super) fn is_null_device(target: &str) -> bool {
     name.eq_ignore_ascii_case("nul")
 }
 
-// ── cd option policy ────────────────────────────────────────────────────
-
-/// Outcome of scanning a `cd`-family verb's argument words for its target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CdScan<'a> {
-    /// Quote-stripped target plus the index of the word after it (the first
-    /// extra-operand position).
     Target(&'a str, usize),
-    /// No target after the options — a bare `cd`/`cd -P` (valid; targets $HOME).
     Bare,
-    /// Option grammar violation (`-e`, `-@`, …) — the cd errors at runtime.
     BadOption,
 }
 
@@ -106,9 +91,6 @@ pub(super) fn cd_target_after_options<'a>(words: &[&'a str], start: usize) -> Cd
     }
 }
 
-// ── Heredoc body stripping ──────────────────────────────────────────────
-
-/// Advance `i` past the current line (to the start of the next line or end of string).
 fn skip_to_next_line(i: &mut usize, chars: &[(usize, char)]) {
     while *i < chars.len() && chars[*i].1 != '\n' {
         *i += 1;
@@ -133,7 +115,6 @@ fn is_heredoc_start(chars: &[(usize, char)], i: usize) -> bool {
     if !bare && !fd_prefixed {
         return false;
     }
-    // Exclude herestrings: `<<<` (bare) and `{digit}<<<` (fd-prefixed).
     let herestring_start = if fd_prefixed { i + 3 } else { i + 2 };
     chars.get(herestring_start).is_none_or(|(_, c)| *c != '<')
 }
@@ -228,7 +209,6 @@ pub(super) fn strip_heredoc_bodies(command: &str) -> String {
     let mut skipping_body = false;
 
     while i < chars.len() {
-        // ── Heredoc body skipping ─────────────────────────────────
         // Skip whole lines until the line matches the front heredoc's
         // terminator. The delimiter-line tail was already emitted.
         if !queue.is_empty() && skipping_body {
@@ -264,8 +244,6 @@ pub(super) fn strip_heredoc_bodies(command: &str) -> String {
                 if emit_body_substitutions(&command[line_start..line_end], &mut out)
                     && line_end < command.len()
                 {
-                    // Keep emitted spans on separate lines so segmentation
-                    // treats each as its own command.
                     out.push('\n');
                 }
             }
@@ -273,7 +251,6 @@ pub(super) fn strip_heredoc_bodies(command: &str) -> String {
             continue;
         }
 
-        // ── Delimiter-line tail ──────────────────────────────────
         // After a heredoc marker, the rest of the delimiter line stays scanned
         // (a redirect there is a real write target) and may declare further
         // heredocs; once the line ends, switch to body-skipping. The newline
@@ -313,12 +290,10 @@ pub(super) fn strip_heredoc_bodies(command: &str) -> String {
 /// parse its delimiter and push `(delimiter, strip_tabs, expands)` onto
 /// `queue`. The marker itself is replaced by a single space in `out` so the
 /// tail of the delimiter line remains scannable (a redirect there is a real
-/// write target). Returns `Some(next_index)` or `None` for a dangling `<<`
-/// at end of input.
+/// write target). Returns `Some(next_index)` or `None` for a dangling `<<` at end of input.
 ///
 /// Shared by the scanner's single dispatch chain so the marker grammar (fd
-/// prefix, `<<-` tabs, whitespace, quoted delimiter) lives in exactly one
-/// place.
+/// prefix, `<<-` tabs, whitespace, quoted delimiter) lives in exactly one place.
 fn consume_heredoc_marker(
     command: &str,
     chars: &[(usize, char)],
@@ -355,9 +330,6 @@ fn consume_heredoc_marker(
     )
 }
 
-/// Emit a herestring operator (`<<<` or `{digit}<<<`) unchanged so the token
-/// classifier still sees it and can skip the herestring content word as a
-/// path argument (a herestring has no body to strip).
 fn emit_herestring(chars: &[(usize, char)], i: usize, out: &mut String) -> usize {
     let skip = if chars[i].1.is_ascii_digit() { 4 } else { 3 };
     for c in &chars[i..i + skip] {
@@ -424,8 +396,6 @@ fn parse_heredoc_delimiter(command: &str, start: usize) -> (String, usize, bool)
     (rest[..end].to_string(), start + end, false)
 }
 
-// ── Substitution spans ─────────────────────────────────────────────────
-
 /// Scan from byte `from` for the close paren that brings `initial_depth` to 0.
 /// Quote- and escape-aware (via track_char_context); every unquoted paren
 /// nests — `$((` arithmetic spans, subshell parens, and nested `$(` alike —
@@ -456,9 +426,6 @@ fn find_paren_close(s: &str, from: usize, initial_depth: usize) -> Option<usize>
     None
 }
 
-/// Find the matching close paren for a `$(` substitution whose content starts
-/// at byte `start`. Returns `(content, index_after_close)`; unterminated
-/// substitutions return the rest as content (still validated — fail-closed).
 fn find_substitution_end(s: &str, start: usize) -> (&str, usize) {
     match find_paren_close(s, start, 1) {
         Some(end) => (&s[start..end - 1], end),
@@ -615,8 +582,6 @@ pub(super) fn for_each_substitution(
     }
 }
 
-// ── Token classification ────────────────────────────────────────────────
-
 /// True when `w` is a standalone redirect token consisting of one or more
 /// digits followed by a single `>` or `<` operator character, with no other
 /// content (e.g. `2>`, `10>`, `3<`).  Combined forms like `2>/dev/null` or
@@ -631,13 +596,9 @@ fn is_digit_suffix_redirect(w: &str, op: u8) -> bool {
     bytes[..bytes.len() - 1].iter().all(u8::is_ascii_digit)
 }
 
-/// Result of classifying a whitespace-split shell token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TokenKind {
-    /// Not a redirect or heredoc — pass through.
     Regular,
-    /// A redirect operator.  When `needs_target`, the caller should skip
-    /// the next whitespace-separated word (the redirect target).
     Redirect { needs_target: bool },
 }
 
@@ -650,8 +611,7 @@ pub(super) enum TokenKind {
 /// Heredoc markers (`<<EOF`, `<<-EOF`, `3<<EOF`) classify as self-contained
 /// redirects (the marker embeds its delimiter). The read-only guard only
 /// ever sees heredoc-stripped segments — [`strip_heredoc_bodies`] replaces
-/// markers with spaces — so this is defensive; there is no heredoc body to
-/// skip here.
+/// markers with spaces — so this is defensive; there is no heredoc body to skip here.
 ///
 /// # Ordering invariants
 ///
@@ -659,15 +619,12 @@ pub(super) enum TokenKind {
 /// checks below (the `w.starts_with('>')` arm would misclassify `>&` as a
 /// self-contained combined token and `&>`/`&>>` as regular words).
 pub(super) fn classify_shell_token(w: &str) -> TokenKind {
-    // ── Exact-match redirect operators ────────────────────────────
     // NOTE: `>&` and `&>`/`&>>` are checked via exact `match` BEFORE the
     // pattern-based checks below (see ordering invariants in doc comment).
     match w {
-        // Operators that consume the next word as their target:
         ">" | ">&" | ">>" | ">|" | "<" | "<&" | "<>" | "&>" | "&>>" => {
             return TokenKind::Redirect { needs_target: true };
         }
-        // Self-contained fd-merge — no target to skip:
         "2>&1" | "1>&2" => {
             return TokenKind::Redirect {
                 needs_target: false,
@@ -676,7 +633,6 @@ pub(super) fn classify_shell_token(w: &str) -> TokenKind {
         _ => {}
     }
 
-    // ── Herestrings (`<<<` / `{digit}<<<`) ────────────────────────
     // A herestring has no body: it behaves like a redirect that consumes the
     // next word as its content. Classifying it as a heredoc would make the
     // caller skip everything after it — hiding a real redirect on the same
@@ -687,30 +643,22 @@ pub(super) fn classify_shell_token(w: &str) -> TokenKind {
         return TokenKind::Redirect { needs_target: true };
     }
 
-    // ── Standalone digit-prefixed redirect ────────────────────────
-    // e.g. 2>, 10>, 3< — expects a target word
     if is_digit_suffix_redirect(w, b'>') || is_digit_suffix_redirect(w, b'<') {
         return TokenKind::Redirect { needs_target: true };
     }
 
-    // ── Combined redirect tokens (operator merged with target) ────
-    // e.g. >/dev/null, >>file, </dev/null, <&2, <>file
     if w.starts_with('>') || w.starts_with('<') {
         return TokenKind::Redirect {
             needs_target: false,
         };
     }
 
-    // ── Combined fd-prefixed redirect (digits + redirect) ─────────
-    // e.g. 2>/dev/null, 3</dev/null, 1>/tmp/out
     if w.len() > 1 && w.as_bytes()[0].is_ascii_digit() && (w.contains('>') || w.contains('<')) {
         return TokenKind::Redirect {
             needs_target: false,
         };
     }
 
-    // ── Combined bash &> redirect ─────────────────────────────────
-    // e.g. &>/dev/null, &>>file
     if w.contains("&>") {
         return TokenKind::Redirect {
             needs_target: false,
@@ -719,8 +667,6 @@ pub(super) fn classify_shell_token(w: &str) -> TokenKind {
 
     TokenKind::Regular
 }
-
-// ── Substitution-aware word splitter ───────────────────────────────────
 
 /// Split a shell command string into words, keeping command-substitution
 /// spans (`$(...)`, backticks, `${...}`, unquoted `<(cmd)`/`>(cmd)`) whole

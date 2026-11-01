@@ -1,67 +1,35 @@
-//! Debug query tool — read-only SQL diagnostics for mahbot's databases.
-//!
-//! Invoked as `mahbot debug --db <name> ["SQL query"]` from the command line.
-//! With a SQL argument it runs a read-only query (pipe-delimited output);
-//! without one it prints a schema dump — per-table DDL blocks with row counts
-//! (internal catalog artifacts excluded, see [`dump_schema`]). `--db all`
-//! accepts both forms, dumping/querying every live store in per-store
-//! sections. `-h`/`--help` prints usage (with the live database list) and
-//! exits 0. Skips tracing initialization and GUI startup.
-//!
-//! ## Instance-up IPC routing
-//!
-//! Since `multiprocess_wal` was removed, an instance is the single-process
-//! writer and holds the instance lock while it runs. `mahbot debug` must never
-//! open a store an instance holds, so when the settled instance-lock probe
-//! ([`crate::util::lock::instance_lock_state_settled`]) reports the location
-//! [`Held`](crate::util::lock::InstanceLockState::Held) the CLI routes queries
-//! through the instance's local IPC endpoint (`crate::db::ipc`) instead —
-//! [`query_over_ipc`] for a query and [`dump_over_ipc`] for a schema dump. The
-//! endpoint is scoped to this storage location, so two instances with different
-//! locations never address each other. Write enforcement there is the store's
-//! own read-only side — a reader connection refused for every change, or the
-//! writing connection's `PRAGMA query_only` set around the query (see
-//! [`crate::db::Connection::query_readonly`]).
-//!
-//! ## No-instance direct open
-//!
-//! When no instance holds the location ([`Free`](crate::util::lock::InstanceLockState::Free))
-//! the CLI opens each store directly in single-process read-only mode via
-//! `turso::core::Database::open_file_with_flags` with
-//! `OpenFlags::ReadOnly | OpenFlags::NoLock` — no create and no whole-file
-//! lock, so the open cannot create or mutate files. The connection layer is not
-//! used here because it opens read-write and steps asynchronously, which is the
-//! wrong shape for a caller that must never take the store's lock and steps its
-//! statements on the current thread. The open reads committed WAL frames in
-//! single-process mode.
-//!
-//! The routing is fail-closed ([`Unknown`](crate::util::lock::InstanceLockState::Unknown)
-//! is never read as "no instance is running"): the CLI refuses outright and
-//! opens nothing, so a live store is never opened directly while an instance may
-//! hold it.
-//!
-//! Two defense-in-depth layers remain on top of the read-only open: an
-//! upfront file-existence check and a SQL validator (mutation-keyword
-//! blocklist plus a PRAGMA allowlist — see [`validate_read_only`]).
-//!
-//! ## Bounded reads
-//!
-//! One budget bounds the whole command, started where it starts reading (see
-//! [`crate::db::read_limit`]). A read that spends it fails at once with the
-//! limit's own message, naming the store or family the user asked about; a read
-//! that never yields is ended by the watchdog, which exits the process with the
-//! same message. Its own knob is [`crate::db::read_limit::ENV`].
-//!
-//! ## Other verbs
-//!
-//! - `mahbot debug families [--db <name>]` — list every forensic family in the
-//!   store directory with its original store, artifact type, timestamp, total
-//!   size, and a file-set/header classification. No engine is opened.
-//! - `mahbot debug --family <id> "SQL query"` — query one forensic family
-//!   (a static snapshot) with the same read-only guarantees as live stores.
-//!   Families have no live-store layers; the engine opens single-process
-//!   read-only. Engine panics on corrupt families are caught and reported as
-//!   clean errors.
+//! Debug query tool — read-only SQL diagnostics for mahbot's databases, invoked as `mahbot debug
+//! --db <name> ["SQL query"]`: with a SQL argument it runs a read-only query (pipe-delimited
+//! output), without one it prints a schema dump — per-table DDL blocks with row counts (internal
+//! catalog artifacts excluded, see [`dump_schema`]). `--db all` accepts both forms over every live
+//! store in per-store sections; `-h`/`--help` prints usage and exits 0. Skips tracing
+//! initialization and GUI startup. ## Instance-up IPC routing An instance is the single-process
+//! writer and holds the instance lock while it runs, so `mahbot debug` must never open a store it
+//! holds: when the settled instance-lock probe ([`crate::util::lock::instance_lock_state_settled`])
+//! reports [`Held`](crate::util::lock::InstanceLockState::Held), the CLI routes queries through the
+//! instance's local IPC endpoint (`crate::db::ipc`) instead — [`query_over_ipc`] for a query,
+//! [`dump_over_ipc`] for a schema dump. The endpoint is scoped to this storage location, so two
+//! instances with different locations never address each other; write enforcement there is the
+//! store's own read-only side (a reader connection refused for every change, or the writing
+//! connection's `PRAGMA query_only` — see [`crate::db::Connection::query_readonly`]). ##
+//! No-instance direct open When no instance holds the location
+//! ([`Free`](crate::util::lock::InstanceLockState::Free)) each store is opened directly in
+//! single-process read-only mode via `turso::core::Database::open_file_with_flags` with
+//! `OpenFlags::ReadOnly | OpenFlags::NoLock` — no create and no whole-file lock, so the open cannot
+//! create or mutate files. The connection layer is not used: it opens read-write and steps
+//! asynchronously, the wrong shape for a caller that must never take the store's lock. The routing
+//! is fail-closed ([`Unknown`](crate::util::lock::InstanceLockState::Unknown) is never read as "no
+//! instance is running"): the CLI refuses and opens nothing. Two defense-in-depth layers remain on
+//! top of the read-only open: an upfront file-existence check and a SQL validator (mutation-keyword
+//! blocklist plus a PRAGMA allowlist — see [`validate_read_only`]). ## Bounded reads One budget
+//! bounds the whole command, started where it starts reading (see [`crate::db::read_limit`]). A
+//! read that spends it fails at once with the limit's own message, naming the store or family asked
+//! about; a read that never yields is ended by the watchdog, which exits with the same message. Its
+//! knob is [`crate::db::read_limit::ENV`]. ## Other verbs `mahbot debug families [--db <name>]`
+//! lists every forensic family with its original store, artifact type, timestamp, total size and a
+//! file-set/header classification, opening no engine. `mahbot debug --family <id> "SQL query"`
+//! queries one static snapshot with the same read-only guarantees (engine panics on corrupt
+//! families are caught and reported as clean errors).
 
 use std::path::{Path, PathBuf};
 
@@ -74,37 +42,29 @@ use crate::db::read_limit::{Budget, Read};
 use crate::db::wal_guard;
 use crate::util::lock::InstanceLockState;
 
-/// Row limit per query to prevent unbounded output. Same LIMIT+1 semantic as
-/// the instance-side IPC bound (`ipc::IPC_ROW_LIMIT`) so the two never drift.
+/// Row limit per query, matching the instance-side IPC bound (`ipc::IPC_ROW_LIMIT`) so the two
+/// never drift.
 const ROW_LIMIT: usize = ipc::IPC_ROW_LIMIT;
 
-/// Mutation keywords blocked by the read-only validator.
-/// Case-insensitive whole-word match (not substring).
+/// Mutation keywords blocked by the read-only validator (whole-word, case-insensitive).
 const BLOCKLIST: &[&str] = &[
     "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "REPLACE", "BEGIN", "COMMIT",
     "ROLLBACK", "VACUUM", "REINDEX", "GRANT", "REVOKE", "ATTACH", "DETACH", "ANALYZE",
 ];
 
-/// SQL punctuation characters used for word-boundary tokenization.
-/// Splitting on these ensures whole-word matching — a column named
-/// `created_at` is not blocked by the `CREATE` keyword. Quote characters
-/// (`'`, `"`, `[`, `]`) are NOT included: [`scan_sql`] consumes them in its
-/// string/identifier arms before they reach the punctuation arm, and the `--`
-/// `/*` comment starts are likewise handled before it.
+/// SQL punctuation used for word-boundary tokenization: splitting on these makes whole-word
+/// matching, so a
+/// column named `created_at` is not blocked by `CREATE`. Quote characters (`'`, `"`, `[`, `]`) are
+/// absent because [`scan_sql`] consumes them, as it does the `--`/`/*` comment starts.
 const SQL_PUNCTUATION: &[char] = &[
     '(', ')', ';', ',', '.', '*', '+', '-', '/', '=', '<', '>', '!', '|', '&', '~', '{', '}', ':',
 ];
 
-/// Run the debug subcommand. Parses `env::args()` for the debug invocation.
-///
-/// Returns `Ok(())` on success (exit code 0), `Err` on failure (exit code 1).
-/// Prints usage to stderr and returns `Err` for invalid argument combinations.
 pub async fn run_debug() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     run_debug_with_args(args, None).await
 }
 
-/// Resolve the mahbot storage root: the test/snapshot override or `~/.mahbot`.
 fn resolve_home(home_override: Option<PathBuf>) -> Result<PathBuf> {
     match home_override {
         Some(home) => Ok(home),
@@ -112,9 +72,8 @@ fn resolve_home(home_override: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-/// Write `text` to stdout, mapping a closed pipe (EPIPE) to an ordinary
-/// error instead of a panic — `println!`/`print!` panic on a closed stdout,
-/// which would surface as a misleading failure (or crash) in piped
+/// Write `text` to stdout, mapping a closed pipe (EPIPE) to an ordinary error instead of a panic —
+/// `println!` panics on a closed stdout, which would surface as a misleading failure in piped
 /// invocations. Single wording for every explicit stdout write.
 fn write_stdout(text: &str) -> Result<()> {
     use std::io::Write as _;
@@ -124,13 +83,10 @@ fn write_stdout(text: &str) -> Result<()> {
         .map_err(|e| anyhow!("{STDOUT_WRITE_ERROR_PREFIX}{e}"))
 }
 
-/// Print one line to stdout (EPIPE-safe, see [`write_stdout`]).
 fn print_line(args: std::fmt::Arguments<'_>) -> Result<()> {
     write_stdout(&format!("{args}\n"))
 }
 
-/// Shared `[--db <name>]` flag parser for the families verb
-/// (`mahbot debug <verb> --db <name>`); `None` means no flag was given.
 fn parse_db_flag(args: &[String], subcommand: &str) -> Result<Option<String>> {
     match args.get(3).map(String::as_str) {
         Some("--db") => match args.get(4) {
@@ -142,14 +98,10 @@ fn parse_db_flag(args: &[String], subcommand: &str) -> Result<Option<String>> {
     }
 }
 
-/// Validate a store name against the accepted set. `all_valid` appends the
-/// literal `all` option to the hint — only callers that accept `--db all`
-/// pass `true`.
-///
-/// The accepted set is [`turso_mod::debug_db_names`]: the logical store names
-/// ([`turso_mod::store_names`]) plus the physical consolidated file name
-/// ([`turso_mod::CONSOLIDATED_DB_NAME`], shown as the label in `--db all`
-/// output).
+/// Validate a store name against the accepted set; `all_valid` appends the literal `all` option to
+/// the hint, so only callers that accept `--db all` pass `true`. The set is
+/// [`turso_mod::debug_db_names`]: the logical store names plus the physical consolidated file name
+/// shown as the label in `--db all` output.
 pub(crate) fn validate_store_name(name: &str, all_valid: bool) -> Result<()> {
     let names = turso_mod::debug_db_names();
     if names.contains(&name) {
@@ -159,16 +111,11 @@ pub(crate) fn validate_store_name(name: &str, all_valid: bool) -> Result<()> {
     bail!("invalid database name '{name}'. Valid names: {hint}");
 }
 
-// ── Forensic families (quarantine / pre-reindex) ─────────────────────────
-
-/// Artifact type of a forensic family. Variant order is the listing sort order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum FamilyKind {
-    /// Renamed-aside artifact family: the original family the verify-then-swap
-    /// rebuild moved aside before putting the rebuilt store in place (never
-    /// deleted).
+    /// Renamed-aside artifact family: the original family the verify-then-swap rebuild moved aside
+    /// before putting the rebuilt store in place (never deleted).
     Quarantine,
-    /// Pre-repair copy taken before an in-place REINDEX.
     PreReindex,
 }
 
@@ -182,31 +129,21 @@ impl FamilyKind {
     }
 }
 
-/// One forensic family discovered in the store directory.
 #[derive(Debug)]
 struct FamilyInfo {
-    /// Base file name — the id fed back into `--family <id>`.
     id: String,
-    /// Original store name (the family's `{store}.db` prefix).
     store: String,
     kind: FamilyKind,
-    /// `%Y%m%dT%H%M%SZ` stamp from the family name.
     stamp: String,
-    /// Total size in bytes of every present family file.
     size: u64,
-    /// File-set/header classification (family-specific — never a live-store
-    /// class, which is meaningless for static files).
+    /// File-set/header classification (family-specific; never a live-store class).
     class: FamilyClass,
-    /// Present members, comma-joined (`db,wal`).
     files: String,
 }
 
-/// State classification of one forensic family (snapshot semantics).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FamilyClass {
-    /// Main DB present with a valid header and its `-wal` beside it.
     Complete,
-    /// Main DB present with a valid header, but its `-wal` is missing.
     Partial,
     /// Main DB present but its header is corrupt/empty — queryable, likely fails.
     BadHeader,
@@ -226,7 +163,6 @@ impl FamilyClass {
     }
 }
 
-/// Parsed family-name components (see [`parse_family_name`]).
 #[derive(Debug)]
 pub(crate) struct FamilyMeta {
     pub(crate) store: String,
@@ -234,24 +170,16 @@ pub(crate) struct FamilyMeta {
     pub(crate) stamp: String,
 }
 
-/// Parse a forensic-family base file name:
-/// `{store}.db.quarantine-{stamp}-{pid}[-{seq}]` or
+/// Parse a forensic-family base file name: `{store}.db.quarantine-{stamp}-{pid}[-{seq}]` or
 /// `{store}.db.pre-reindex-{stamp}-{pid}` (stamp = `%Y%m%dT%H%M%SZ`).
+/// Rejects sidecar members (`-wal`-suffixed names), foreign files, and any path-like name — the
+/// path-safety gate for `--family <id>`, so only a parsed family id reaches the store directory.
+/// The stamp is shape-checked (16 chars, digits around `T`/`Z`), not calendar-validated; a store
+/// name of `.` or `..` parses (flat filename — no traversal possible). Parts match without ASCII
+/// case (the volumes compare names that way) while the parsed fields keep their spelling.
 ///
-/// Rejects sidecar members (`-wal`-suffixed names), foreign files,
-/// and any path-like name — the path-safety gate for `--family <id>`: only a
-/// parsed family id reaches the store directory. The stamp is shape-checked
-/// (16 chars, digits around `T`/`Z`), not calendar-validated; a store name of
-/// `.` or `..` parses (flat filename — no traversal possible).
-///
-/// Every part is matched without ASCII case — the volumes the stores live on
-/// compare file names that way, so a differently-cased spelling of a family name
-/// is the same file — while the parsed fields keep the spelling they came in as.
-///
-/// The formats are written by `db::quarantine_family` (quarantine) and the
-/// pre-reindex snapshot in `db::snapshot_store_via_engine` (REINDEX repair) —
-/// keep both sides of the naming contract in sync; the writer round-trip test
-/// locks the coupling.
+/// The formats are written by `db::quarantine_family` and the pre-reindex snapshot in
+/// `db::snapshot_store_via_engine` — keep both sides of the naming contract in sync.
 pub(crate) fn parse_family_name(name: &str) -> Option<FamilyMeta> {
     let lower = name.to_ascii_lowercase();
     let (kind, marker) = if lower.contains(".quarantine-") {
@@ -261,15 +189,12 @@ pub(crate) fn parse_family_name(name: &str) -> Option<FamilyMeta> {
     } else {
         return None;
     };
-    // The lowercased copy is the same length with the same ASCII offsets, so the
-    // marker's position maps onto the caller's own spelling.
     let at = lower.find(marker)?;
     let (prefix, tail) = (&name[..at], &name[at + marker.len()..]);
     let store = crate::util::strip_suffix_ignoring_case(prefix, ".db")?;
     if store.is_empty() || store.contains('/') || store.contains('\\') {
         return None;
     }
-    // tail = "{stamp}-{pid}[-{seq}]"
     let (stamp, pid_rest) = tail.split_once('-')?;
     if !is_family_stamp(stamp) {
         return None;
@@ -295,8 +220,6 @@ pub(crate) fn parse_family_name(name: &str) -> Option<FamilyMeta> {
     })
 }
 
-/// True for the `%Y%m%dT%H%M%SZ` stamp shape (16 chars, digits around `T`/`Z`,
-/// either case — the files are named on volumes that compare names without it).
 fn is_family_stamp(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 16
@@ -306,14 +229,12 @@ fn is_family_stamp(s: &str) -> bool {
         && b[9..15].iter().all(u8::is_ascii_digit)
 }
 
-/// Discover all forensic families under the store directory and classify them.
-///
-/// Families are found from their base file name or from a `-wal`-only member
-/// (such a quarantine has no base file). Foreign files (`.DS_Store`, live
-/// stores) are ignored. Sorted by (store, kind, stamp).
+/// Discover all forensic families under the store directory and classify them. Families are found
+/// from their
+/// base file name or from a `-wal`-only member (such a quarantine has no base file); foreign files
+/// (`.DS_Store`, live stores) are ignored. Sorted by (store, kind, stamp).
 fn list_families(root: &Path) -> Result<Vec<FamilyInfo>> {
     let db_dir = super::store_dir(root);
-    // Fresh install: no store directory yet — nothing to list, not an error.
     let entries = match std::fs::read_dir(&db_dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -329,8 +250,7 @@ fn list_families(root: &Path) -> Result<Vec<FamilyInfo>> {
         })
         .collect::<Result<_>>()?;
 
-    // Base names first; then sidecar-only families (entries whose base never
-    // appeared — a quarantine can move only the `-wal`).
+    // Base names first, then sidecar-only families: a quarantine can move only the `-wal`.
     let mut bases: std::collections::BTreeMap<String, FamilyMeta> =
         std::collections::BTreeMap::new();
     for name in &names {
@@ -355,10 +275,10 @@ fn list_families(root: &Path) -> Result<Vec<FamilyInfo>> {
     Ok(families)
 }
 
-/// Expected members of a forensic family — one source of truth for both the
-/// listing and the Complete check: the main file plus the engine's `-wal`. A
-/// pre-reindex snapshot has the same shape: `VACUUM INTO` leaves an empty
-/// `<dest>-wal` beside the copy (see `snapshot_store_via_engine`).
+/// Expected members of a forensic family — one source of truth for the listing and the Complete
+/// check: the
+/// main file plus the engine's `-wal`. A pre-reindex snapshot has the same shape: `VACUUM INTO`
+/// leaves an empty `<dest>-wal` beside the copy (see `snapshot_store_via_engine`).
 const FAMILY_MEMBERS: [(&str, &str); 2] = [("", "db"), ("-wal", "wal")];
 
 /// Classify one family's file set — pure filesystem inspection, never opens.
@@ -398,8 +318,6 @@ fn classify_family(root: &Path, id: String, meta: FamilyMeta) -> FamilyInfo {
     }
 }
 
-/// Main-DB header sanity without opening the database: SQLite magic plus a
-/// valid page size (the same checks wal_guard applies to live stores).
 fn db_header_ok(db_path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(db_path) else {
         return false;
@@ -410,15 +328,13 @@ fn db_header_ok(db_path: &Path) -> bool {
     wal_guard::read_db_header(db_path).is_some_and(|h| wal_guard::db_header_valid(&h))
 }
 
-/// `mahbot debug families [--db <name>]` — list all forensic families
-/// (quarantine + pre-reindex) with a stat plus a header read per family, never
-/// an engine open. Informational: exits 0 whether or not families exist.
+/// `mahbot debug families [--db <name>]` — list all forensic families (quarantine + pre-reindex)
+/// with a stat plus a header read per family, never an engine open. Exits 0 either way.
 fn run_debug_families(args: &[String], home_override: Option<PathBuf>) -> Result<()> {
     let mahbot_home = resolve_home(home_override)?;
     let mut families = list_families(&mahbot_home)?;
-    // `--db <name>` filters by store name; a name matching nothing (canonical
-    // store with no families, unknown/legacy name) prints nothing and exits 0
-    // — the filter never depends on the current listing content.
+    // `--db <name>` filters by store name; a name matching nothing prints nothing and exits 0, so
+    // the filter never depends on the current listing content.
     let filter = parse_db_flag(args, "families")?;
     if let Some(store) = filter {
         families.retain(|fam| fam.store == store);
@@ -438,26 +354,21 @@ fn run_debug_families(args: &[String], home_override: Option<PathBuf>) -> Result
     Ok(())
 }
 
-/// Open a forensic family read-only and execute `sql`, returning the rendered
-/// output. Split from [`query_family`] so tests can assert result values
-/// instead of only success.
-///
-/// Snapshot semantics: the family is static, so none of the live-store layers
-/// apply — no IPC routing, no live heuristics. The engine opens the family in
-/// place, read-only (`db` + `-wal`), on the shared read-only stack
-/// ([`open_and_run_readonly`]) — so the read limit bounds a family read exactly
-/// as it bounds a `--db` one, and a damaged family yields a clean error instead
-/// of a CLI crash.
+/// Open a forensic family read-only and execute `sql`, returning the rendered output. Split from
+/// [`query_family`] so tests can assert result values instead of only success. Snapshot semantics:
+/// the family is static, so no live-store layer applies — no IPC routing, no live heuristics. The
+/// engine opens it in place, read-only (`db` + `-wal`), on the shared read-only stack
+/// ([`open_and_run_readonly`]), so the read limit bounds a family read exactly as a `--db` one and
+/// a damaged family yields a clean error instead of a CLI crash.
 fn execute_family_query(read: Read<'_>, family_id: &str, sql: &str, root: &Path) -> Result<String> {
     parse_family_name(family_id).with_context(|| {
         format!("invalid family id '{family_id}' — list valid ids with `mahbot debug families`")
     })?;
     let db_path = super::store_dir(root).join(family_id);
     if !db_path.exists() {
-        // A sidecar-only family (no base file — a quarantine that moved only
-        // the `-wal`, or a failed pre-reindex copy) is a real family that
-        // cannot be opened; a well-formed id with no member at all is a stale
-        // or hand-constructed id — report the two distinctly.
+        // A sidecar-only family (no base file — a moved `-wal`, a failed pre-reindex copy) is a
+        // real family that cannot be opened; a well-formed id with no member is stale — report the
+        // two distinctly.
         if turso_mod::wal_path(&db_path).exists() {
             bail!(
                 "forensic family '{family_id}' has no main database file — \
@@ -469,9 +380,8 @@ fn execute_family_query(read: Read<'_>, family_id: &str, sql: &str, root: &Path)
              `mahbot debug families`"
         );
     }
-    // Snapshot semantics: the main file must be a regular file — a symlink
-    // could redirect the open to a live store, bypassing the read-only IPC
-    // routing / no-instance validation the `--db` path applies.
+    // Snapshot semantics: the main file must be a regular file — a symlink could redirect the open
+    // to a live store, bypassing the IPC routing and validation the `--db` path applies.
     let md = std::fs::symlink_metadata(&db_path)
         .with_context(|| format!("cannot stat forensic family '{family_id}'"))?;
     if !md.file_type().is_file() {
@@ -482,10 +392,10 @@ fn execute_family_query(read: Read<'_>, family_id: &str, sql: &str, root: &Path)
     });
     match result {
         Ok(output) => Ok(output),
-        // An engine panic is deterministic — classify it as a panic before the
-        // generic error fallback. The arm is gated by `is_engine_panic_error`,
-        // so `{e:#}` already starts with the prefix — a single message, no
-        // double-named chain.
+        // An engine panic is deterministic — classify it before the generic error fallback. The arm
+        // is gated by
+        // `is_engine_panic_error`, so `{e:#}` already starts with the prefix: one message, no
+        // double name.
         Err(e) if is_engine_panic_error(&e) => {
             bail!("forensic family '{family_id}' could not be read — {e:#}")
         }
@@ -495,42 +405,33 @@ fn execute_family_query(read: Read<'_>, family_id: &str, sql: &str, root: &Path)
     }
 }
 
-/// `mahbot debug --family <id> "SQL query"` — execute and print.
 fn query_family(read: Read<'_>, family_id: &str, sql: &str, root: &Path) -> Result<()> {
     let output = execute_family_query(read, family_id, sql, root)?;
-    // Write explicitly: a closed stdout (EPIPE) surfaces as an ordinary I/O
-    // error, never a panic misreported as an engine crash.
+    // Write explicitly: a closed stdout (EPIPE) is an ordinary I/O error, never a panic.
     write_stdout(&output)
 }
 
-/// Testable core of [`run_debug`].
-///
-/// `args` has the same shape as `std::env::args()` (`args[0]` is the program
-/// name, `args[1]` is `"debug"`). `home_override`, when provided, replaces the
-/// `~/.mahbot` storage-root resolution (used by tests with temporary roots and
-/// by the snapshot-copy procedure).
+/// Testable core of [`run_debug`]. `args` has the shape of `std::env::args()` (`args[0]` the
+/// program name,
+/// `args[1]` `"debug"`). `home_override` replaces the `~/.mahbot` storage-root resolution (tests
+/// with temporary roots, and the snapshot-copy procedure).
 #[expect(clippy::too_many_lines)] // one linear per-store walk: route, read, per-store failure
 async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) -> Result<()> {
-    // args[0] = "mahbot", args[1] = "debug"
     let tail: Vec<&str> = args.iter().skip(2).map(String::as_str).collect();
-    // Help at any verb position prints the same usage. An exact `--help`/`-h`
-    // element anywhere in the tail (verb, flags, or trailing position) never
-    // falls through to SQL: store/family ids never equal `--help`/`-h`, and a
-    // SQL argument of exactly `--help` is a comment, not a statement, while a
-    // lone `-h` is a syntax error (a single-dash token can never parse as SQL)
-    // — intercepting either loses no valid query.
+    // Help at any verb position prints the same usage. An exact `--help`/`-h` element anywhere in
+    // the tail
+    // never falls through to SQL: ids never equal them, a SQL argument of exactly `--help` is a
+    // comment, and a lone `-h` is a syntax error — intercepting either loses no valid query.
     if tail.contains(&"--help") || tail.contains(&"-h") {
         print_usage();
         return Ok(());
     }
 
-    // `mahbot debug families [--db <name>]` — list forensic families, no opens.
     if args.get(2).is_some_and(|a| a == "families") {
         return run_debug_families(&args, home_override);
     }
 
-    // `mahbot debug --family <id> "SQL query"` — read-only query on one
-    // forensic family (snapshot semantics: no IPC routing, no live heuristics).
+    // `mahbot debug --family <id> "SQL query"` — read-only query on one static family.
     if args.get(2).is_some_and(|a| a == "--family") {
         if args.len() < 5 {
             print_usage();
@@ -544,7 +445,6 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
         return query_family(read, &args[3], sql, &mahbot_home);
     }
 
-    // Need at least: mahbot debug --db <name> [SQL]
     if args.len() < 4 {
         print_usage();
         bail!("expected: mahbot debug --db <name> [\"SQL query\"]");
@@ -557,31 +457,24 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
     }
 
     let db_name = &args[3];
-    // A SQL argument runs a read-only query; without one the command prints a
-    // schema dump (per-table DDL blocks + row counts — see [`dump_schema`]).
+    // A SQL argument runs a read-only query; without one the command prints a schema dump.
     let sql = args.get(4).map(String::as_str);
 
-    // Resolve ~/.mahbot/ (or the test/snapshot override).
     let mahbot_home = resolve_home(home_override)?;
 
-    // Validate SQL is read-only before touching any database. The dump mode
-    // has no user SQL — its queries are internal and read-only by
-    // construction.
+    // Validate SQL is read-only before touching any database; the dump mode has no user SQL.
     if let Some(sql) = sql {
         validate_read_only(sql)?;
     }
 
     let db_list = resolve_db_list(db_name, &mahbot_home)?;
 
-    // Routing hinges on whether an instance is the single-process writer right
-    // now: if it holds the instance lock the CLI must NOT open the live store
-    // directly, so it goes through the debug IPC endpoint (scoped to this
-    // storage location); if no instance holds it, a direct read-only open is
-    // safe. `instance_lock_state_settled` re-checks over a short window so a
-    // self-update handoff (the lock momentarily free between the old instance's
-    // release and the new instance's re-acquire) never falls through to a
-    // concurrent direct open. The third state refuses — see the module doc's
-    // fail-closed rule.
+    // Routing hinges on whether an instance is the single-process writer right now: if it holds the
+    // lock the CLI must NOT open the live store directly, so it goes through the debug IPC endpoint
+    // (scoped to this location); otherwise a direct read-only open is safe.
+    // `instance_lock_state_settled` re-checks over a short window so a self-update handoff (the
+    // lock momentarily free between release and re-acquire) never falls through to a concurrent
+    // direct open. The third state refuses — see the fail-closed rule.
     let route_via_channel = match crate::util::lock::instance_lock_state_settled(&mahbot_home) {
         InstanceLockState::Held => true,
         InstanceLockState::Free => false,
@@ -591,8 +484,7 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
         ),
     };
 
-    // One read budget for the whole command, spent by every read under it and
-    // never reset per store (see [`crate::db::read_limit`]).
+    // One read budget for the whole command, never reset per store (see [`crate::db::read_limit`]).
     let budget = Budget::start();
     let mut failures = 0usize;
     for (label, file_path) in &db_list {
@@ -600,14 +492,11 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
             print_line(format_args!("=== {label} ==="))?;
         }
 
-        // Physical store name the IPC endpoint keys on (the consolidated
-        // "core" file or "logs"), derived from the file stem.
         let physical = file_path
             .file_stem()
             .and_then(|s| s.to_str())
             .map_or_else(|| label.clone(), str::to_string);
 
-        // The user's own label is the target, so a failure names it.
         let read = if route_via_channel {
             Read::over_channel(label, &budget)
         } else {
@@ -620,10 +509,8 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
                 None => dump_over_ipc(read, &mahbot_home, &physical, label).await,
             }
         } else {
-            // No instance holds the location — direct single-process read-only
-            // open. Pre-existence check: the read-only open fails on a
-            // non-existent file, but we check existence upfront for a better
-            // error message.
+            // No instance holds the location — direct single-process read-only open. The existence
+            // check comes first only for a better error message.
             if !file_path.exists() {
                 if db_name == "all" {
                     eprintln!(
@@ -653,8 +540,7 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
         }
     }
 
-    // `--db all` must not exit 0 when any store failed: scripted diagnostics
-    // rely on the exit code to detect failures.
+    // `--db all` must not exit 0 when any store failed: scripts rely on the exit code.
     if db_name == "all" && failures > 0 {
         bail!(
             "{failures} of {} store(s) failed — see the per-store errors above",
@@ -665,8 +551,7 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
     Ok(())
 }
 
-/// Run one read-only SQL query through the instance's debug IPC endpoint,
-/// returning the response or the endpoint's error.
+/// Run one read-only query through the instance's debug IPC endpoint.
 async fn ipc_query_readonly(
     read: Read<'_>,
     root: &Path,
@@ -686,14 +571,12 @@ async fn ipc_query_readonly(
     Ok(resp)
 }
 
-/// Query a live store through the instance's debug IPC endpoint (used when it
-/// holds the storage location and the CLI must not open the store directly).
-/// `physical` is the physical store name the endpoint keys on
-/// ("core" or "logs").
+/// Query a live store through the instance's debug IPC endpoint (used when it holds the location
+/// and the
+/// CLI must not open the store directly). `physical` is the store name the endpoint keys on.
 async fn query_over_ipc(read: Read<'_>, root: &Path, physical: &str, sql: &str) -> Result<()> {
-    // The guard spans the reading only, as on the direct route: the answer is
-    // written after it is dropped, so a read that came back is printed as its
-    // answer and is never cut.
+    // The guard spans the reading only, as on the direct route: the answer is written after it is
+    // dropped, so a read that came back is printed as its answer and is never cut.
     let out = {
         let _watchdog = read.arm()?;
         let resp = ipc_query_readonly(read, root, physical, sql).await?;
@@ -707,10 +590,9 @@ async fn query_over_ipc(read: Read<'_>, root: &Path, physical: &str, sql: &str) 
     write_stdout(&out)
 }
 
-/// Schema dump of a live store through the instance's debug IPC endpoint. One
-/// watchdog for the whole walk — the table list and every per-table count run
-/// under the read's own process-ending half, not one per round trip — and the
-/// dump is written after it is dropped, like the direct route's.
+/// Schema dump through the instance's debug IPC endpoint. One watchdog for the whole walk — the
+/// table list and every per-table count under the read's process-ending half — dropped before the
+/// dump is written.
 async fn dump_over_ipc(read: Read<'_>, root: &Path, physical: &str, label: &str) -> Result<()> {
     use std::fmt::Write as _;
     let dump = {
@@ -719,8 +601,6 @@ async fn dump_over_ipc(read: Read<'_>, root: &Path, physical: &str, label: &str)
         let resp = ipc_query_readonly(read, root, physical, &tables_sql).await?;
         let mut out = format!("== schema dump: {label} ==\n");
         for row in &resp.rows {
-            // Many round trips: stop the walk on a spent budget instead of starting
-            // another one.
             read.check()?;
             let name = row.first().map(ipc::WireValue::format).unwrap_or_default();
             let sql = row.get(1).map(ipc::WireValue::format).unwrap_or_default();
@@ -742,22 +622,16 @@ async fn dump_over_ipc(read: Read<'_>, root: &Path, physical: &str, label: &str)
     write_stdout(&dump)
 }
 
-/// Prefix of [`guard_panics`] errors — shared with the classifier so a wording
-/// change updates both sides (string-matching convention; a marker error type
-/// would be more robust but heavier).
+/// Prefix of [`guard_panics`] errors — shared with the classifier, so a wording change updates both
+/// sides (string-matching convention; a marker error type would be more robust but heavier).
 const ENGINE_PANIC_PREFIX: &str = "the database engine panicked while reading the store: ";
 
-/// Prefix of stdout-write failures from [`write_stdout`] — the single wording
-/// for every explicit stdout write (query results, listings, banners), so a
-/// closed pipe surfaces consistently as an I/O error, never a panic.
 const STDOUT_WRITE_ERROR_PREFIX: &str = "failed writing to stdout: ";
 
-/// Run a blocking store open/query under [`crate::shutdown::contain_panics`],
-/// converting a panic into a clean error — turso_core panics on specific
-/// corruption shapes (pager/wal index OOB — the documented prod class), and
-/// the debug CLI must never crash on a damaged store. `contain_panics` also
-/// keeps the caught panic off stderr: the boot hook skips a panic raised
-/// inside it.
+/// Run a blocking store open/query under [`crate::shutdown::contain_panics`], converting a panic
+/// into a clean
+/// error — turso_core panics on specific corruption shapes (pager/wal index OOB), and the debug CLI
+/// must never crash on a damaged store. `contain_panics` also keeps the caught panic off stderr.
 fn guard_panics<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     match crate::shutdown::contain_panics(f) {
         Ok(r) => r,
@@ -768,23 +642,15 @@ fn guard_panics<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     }
 }
 
-/// True for errors produced by [`guard_panics`] (an engine panic, not an
-/// ordinary query/open error).
+/// True for errors produced by [`guard_panics`] (an engine panic, not an ordinary error).
 fn is_engine_panic_error(err: &anyhow::Error) -> bool {
     format!("{err:#}").starts_with(ENGINE_PANIC_PREFIX)
 }
 
-/// Open a store file read-only with the given engine opts.
-///
-/// Also used by the `bench-openrouter` subcommand for read-only config-store
-/// lookups (worker model / provider key fallbacks) — same guarantees, same
-/// no-write path as the debug CLI.
-///
-/// Uses the low-level `turso::core` API because only it can express
-/// `OpenFlags::ReadOnly | OpenFlags::NoLock`: no create and no whole-file lock,
-/// so the open cannot create or mutate files. The core IO is synchronous
-/// (`FsIO`), so this is intentionally blocking; the debug CLI runs on a
-/// single-task current-thread runtime.
+/// Open a store file read-only with the given engine opts; also used by `bench-openrouter` for
+/// read-only config-store lookups. Uses the low-level `turso::core` API because only it can express
+/// `OpenFlags::ReadOnly | OpenFlags::NoLock`: no create and no whole-file lock, so the open cannot
+/// create or mutate files. The core IO is synchronous, so this is intentionally blocking.
 pub(crate) fn open_readonly(
     db_path: &Path,
     opts: turso::core::DatabaseOpts,
@@ -814,32 +680,16 @@ pub(crate) fn open_readonly(
     Ok((io, db))
 }
 
-/// Connect to an opened store, applying the in-memory temp-store setting and
-/// the per-statement limit.
-///
-/// Also used by the `bench-openrouter` subcommand for read-only config-store
-/// lookups — see [`open_readonly`].
-///
-/// The limit is armed here because this connection serves caller-supplied SQL:
-/// it is what stops one statement from holding the store for as long as it
-/// likes. The engine terminates a statement that overruns
-/// [`crate::db::store::statement_limit`] and the connection stays usable, so
-/// the store answers the next query instead of being held until the statement
-/// ends on its own.
-///
-/// Every turso connection the application opens — the service's opening path
-/// (the writing connection and each reader connection, both of which set the
-/// pragma as they open) and this debug CLI path (they do not share an opening
-/// path) — runs with in-memory temp storage, so no statement or transaction can
-/// ever fail because a temp directory is missing. turso_core's tempdir
-/// creation has no parent-creation and no fallback chain, and resolves
-/// through `$TMPDIR`, which the service pins to its private root; a missing
-/// root used to fail every eager-temp statement (RETURNING buffers, ORDER
-/// BY/LIMIT heap sorts, DISTINCT, subqueries, window functions, spills)
-/// with "I/O error (tempdir): entity not found". The PRAGMA maps to the
-/// per-connection `set_temp_store` (turso_core translate/pragma.rs); if a
-/// future engine rejects it, the CLI fails loudly here instead of silently
-/// regressing to disk-backed temp storage.
+/// Connect to an opened store, applying the in-memory temp-store setting and the per-statement
+/// limit. Also used by `bench-openrouter` — see [`open_readonly`]. The limit is armed here because
+/// this connection serves caller-supplied SQL: the engine terminates a statement that overruns
+/// [`crate::db::store::statement_limit`] and the connection stays usable. Every turso connection
+/// the application opens runs with in-memory temp storage, so no statement fails because a temp
+/// directory is missing: turso_core's tempdir creation has no parent-creation and no fallback
+/// chain, and resolves through `$TMPDIR`, which the service pins to its private root — a missing
+/// root used to fail every eager-temp statement with "I/O error (tempdir): entity not found". The
+/// PRAGMA maps to per-connection `set_temp_store`; an engine that rejected it would fail loudly
+/// here.
 pub(crate) fn connect_readonly(
     db: &std::sync::Arc<turso::core::Database>,
     db_path: &Path,
@@ -857,9 +707,8 @@ pub(crate) fn connect_readonly(
     Ok(conn)
 }
 
-/// Connect to an opened store and execute `sql`, returning the pipe-delimited
-/// output. Output is buffered and returned only on success: a mid-query failure
-/// must not leave a partial column header on stdout.
+/// Connect to an opened store and execute `sql`, returning the pipe-delimited output. Buffered and
+/// returned only on success: a mid-query failure must not leave a partial column header on stdout.
 fn connect_execute(
     read: Read<'_>,
     io: &std::sync::Arc<dyn turso::core::IO>,
@@ -871,9 +720,9 @@ fn connect_execute(
     execute_query_readonly(read, io, &conn, sql, db_path)
 }
 
-/// Open a store read-only and execute `sql`, printing pipe-delimited results.
-/// See [`open_and_run_readonly`] for the shared open+run stack; the write
-/// happens after it returns, so it is never inside the watchdog's scope.
+/// Open a store read-only and execute `sql`, printing pipe-delimited results. See
+/// [`open_and_run_readonly`];
+/// the write happens after it returns, outside the watchdog.
 fn open_and_query_readonly(read: Read<'_>, file_path: &Path, sql: &str) -> Result<()> {
     let output = open_and_run_readonly(read, file_path, |read, io, db, path| {
         connect_execute(read, io, db, sql, path)
@@ -963,27 +812,11 @@ const USER_TABLES_SQL: &str = "SELECT name, sql FROM sqlite_master \
      WHERE type = 'table' AND sql IS NOT NULL AND {filter} \
      ORDER BY name";
 
-/// Build the schema-dump text for one store.
-///
-/// Format (block, not pipe-delimited — DDL contains newlines and pipes):
-///
-/// ```text
-/// == schema dump: board ==
-///
-/// [table] ticket_comments
-/// CREATE TABLE ticket_comments(...);
-/// rows: 7
-///
-/// [table] tickets
-/// CREATE TABLE tickets(...);
-/// rows: 4213
-/// ```
-///
-/// Tables are ordered by name. Internal catalog artifacts — `sqlite_%`
-/// (`sqlite_sequence`, …) and `__turso_internal_%` (turso's sequence and FTS
-/// directory tables) — are excluded: the dump shows only meaningful user
-/// objects, and it reflects the LIVE stored schema (`sqlite_master`), not
-/// source-code constants (live schemas drift from source over time).
+/// Build the schema-dump text for one store: a block format (not pipe-delimited — DDL contains
+/// newlines and pipes), tables ordered by name. Internal catalog artifacts — `sqlite_%`
+/// (`sqlite_sequence`, …) and `__turso_internal_%` (turso's sequence and FTS directory tables) —
+/// are excluded, so the dump shows only meaningful user objects. It reflects the LIVE stored schema
+/// (`sqlite_master`), not source-code constants, which drift over time.
 fn dump_schema(
     read: Read<'_>,
     io: &std::sync::Arc<dyn turso::core::IO>,
@@ -1033,8 +866,7 @@ fn prepare_readonly(
         .ok_or_else(|| anyhow!("query produced no statement on '{}'", db_path.display()))
 }
 
-/// Shared IO/Yield/Busy/Interrupt stepping loop for all read-only
-/// `turso::core` queries.
+/// Shared IO/Yield/Busy/Interrupt stepping loop for all read-only `turso::core` queries.
 ///
 /// `limit` stops stepping with `has_more = true` when a row would exceed the
 /// cap; that row is NOT collected. Callers buffer output so a mid-query
@@ -1092,8 +924,7 @@ fn step_rows<T>(
 }
 
 /// Step a single statement to completion, collecting one owned value per row
-/// (uncapped [`step_rows`]). A failure propagates and the caller reports it as
-/// a clean error.
+/// (uncapped [`step_rows`]). A failure propagates and the caller reports it as a clean error.
 fn collect_rows<T>(
     read: Read<'_>,
     io: &std::sync::Arc<dyn turso::core::IO>,
@@ -1124,7 +955,6 @@ fn physical_store_list(root: &Path) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-/// Map a `--db` argument to a list of `(label, absolute db path)` pairs.
 fn resolve_db_list(name: &str, root: &Path) -> Result<Vec<(String, PathBuf)>> {
     if name == "all" {
         return Ok(physical_store_list(root));
@@ -1136,27 +966,15 @@ fn resolve_db_list(name: &str, root: &Path) -> Result<Vec<(String, PathBuf)>> {
     )])
 }
 
-/// Reject any SQL containing mutation keywords (whole-word, case-insensitive)
-/// or a PRAGMA not on the read-only allowlist.
-///
-/// String literals, `--`/`/* */` comments, and quoted identifiers (`"x"`,
-/// `[x]`, `` `x` ``) are stripped before keyword matching, so a mutation keyword
-/// inside them is ignored rather than rejected. Anything surviving in SQL
-/// position is matched fail-closed.
-///
-/// The allowlist is the reader guard's own ([`turso_mod::READER_PRAGMAS`]): the
-/// connection this validator fronts is opened genuinely read-only (`O_RDONLY`),
-/// so no PRAGMA could mutate the database file anyway — the list is
-/// defense-in-depth on top of that, refusing a mutating PRAGMA with a clear
-/// message instead of a silent no-op.
-///
-/// The reader entry's own rule comes first, taken from where it lives
-/// ([`turso_mod::reader_refusal`]) rather than re-derived: a statement a reader
-/// connection refuses is refused here too, so a query the inspection path
-/// accepts and sends is never turned away by the reader that serves it. This
-/// validator may refuse more (a blocked keyword anywhere, a form the tokenizer
-/// cannot read, a later statement in a multi-statement string) — that direction
-/// only keeps a query from leaving the client.
+/// Reject any SQL containing mutation keywords (whole-word, case-insensitive) or a PRAGMA not on
+/// the read-only allowlist. String literals, `--`/`/* */` comments and quoted identifiers (`"x"`,
+/// `[x]`, `` `x` ``) are stripped before matching, so a keyword inside them is ignored; anything
+/// surviving in SQL position is matched fail-closed. The allowlist is the reader guard's own
+/// ([`turso_mod::READER_PRAGMAS`]): the connection is opened genuinely read-only, so this is
+/// defense-in-depth — a clear message instead of a silent no-op. The reader entry's own rule comes
+/// first, from [`turso_mod::reader_refusal`], so a query this path accepts is never refused by the
+/// reader that serves it; this validator may refuse more, which only keeps a query from leaving the
+/// client.
 pub(crate) fn validate_read_only(sql: &str) -> Result<()> {
     if let Some(refusal) = turso_mod::reader_refusal(sql) {
         bail!("query rejected: {refusal}");
@@ -1217,7 +1035,6 @@ fn scan_sql(sql: &str) -> Result<Vec<SqlToken>, String> {
     while i < chars.len() {
         let c = chars[i];
 
-        // `--` line comment: skip to the next newline or end of input.
         if c == '-' && chars.get(i + 1) == Some(&'-') {
             flush_word(&mut tokens, &mut word);
             i += 2;
@@ -1246,7 +1063,6 @@ fn scan_sql(sql: &str) -> Result<Vec<SqlToken>, String> {
             continue;
         }
 
-        // Single-quoted string literal — consumed entirely, no token.
         if c == '\'' {
             flush_word(&mut tokens, &mut word);
             i += 1;
@@ -1267,7 +1083,6 @@ fn scan_sql(sql: &str) -> Result<Vec<SqlToken>, String> {
             continue;
         }
 
-        // Double-quoted / backtick quoted identifier — one quoted token.
         if c == '"' || c == '`' {
             flush_word(&mut tokens, &mut word);
             let quote = c;
@@ -1319,14 +1134,12 @@ fn scan_sql(sql: &str) -> Result<Vec<SqlToken>, String> {
             continue;
         }
 
-        // Whitespace or SQL punctuation ends the current word.
         if c.is_whitespace() || SQL_PUNCTUATION.contains(&c) {
             flush_word(&mut tokens, &mut word);
             i += 1;
             continue;
         }
 
-        // Anything else: append to the current word.
         word.push(c);
         i += 1;
     }
@@ -1334,7 +1147,6 @@ fn scan_sql(sql: &str) -> Result<Vec<SqlToken>, String> {
     Ok(tokens)
 }
 
-/// Format a single `turso::core` result row as its pipe-table cells.
 fn format_core_row(row: &turso::core::Row, column_count: usize) -> Vec<String> {
     (0..column_count)
         .map(|idx| format_core_value(row.get_value(idx)))
@@ -1529,7 +1341,6 @@ mod tests {
         );
     }
 
-    /// A `mahbot debug` invocation over the given verb tail.
     fn debug_args(tail: &[&str]) -> Vec<String> {
         ["mahbot", "debug"]
             .into_iter()
@@ -1538,9 +1349,6 @@ mod tests {
             .collect()
     }
 
-    /// The direct route and the `--db all` walk read the store they name and
-    /// create nothing beside it; the walk reports every store it could not read
-    /// per store instead of stopping at the first.
     #[serial_test::serial(read_limit)]
     #[tokio::test]
     async fn run_debug_reads_one_store_and_the_whole_set_without_creating_anything() {
@@ -1658,8 +1466,7 @@ mod tests {
 
     /// The held-location route: with the location held, the CLI must reach the
     /// instance's endpoint instead of opening the store — the CLI's own root
-    /// holds no openable store, so a successful read can only have come from the
-    /// running instance.
+    /// holds no openable store, so a successful read can only have come from the running instance.
     #[serial_test::serial(read_limit)]
     #[tokio::test]
     async fn run_debug_reaches_a_held_location_over_the_channel() {
@@ -1700,7 +1507,6 @@ mod tests {
     #[tokio::test]
     async fn schema_dump_prints_user_tables_with_row_counts() {
         let (store, dir) = crate::open_test_store!(crate::logs::LogStore, "log");
-        // One non-trivial row so the dump's row count reflects live contents.
         store
             .conn
             .execute(
@@ -1746,9 +1552,6 @@ mod tests {
             "sqlite_sequence must be excluded: {dump}"
         );
 
-        // Without a SQL argument the same dump is what `mahbot debug --db
-        // <name>` prints: it exits 0 and leaves the store directory untouched,
-        // like the query path.
         let db_dir = dir.path().join("db");
         let before = dir_names(&db_dir);
         let result = run_debug_with_args(
@@ -1766,8 +1569,6 @@ mod tests {
             "the schema dump must leave the store directory unchanged"
         );
     }
-
-    // ── read-limit tests ─────────────────────────────────────────────
 
     /// A spent budget fails every route before it opens anything: the error names
     /// the store or the family id it was given and the limit, the store directory
@@ -1807,7 +1608,6 @@ mod tests {
             "a spent budget must fail before the store is opened"
         );
 
-        // Family: refused before the snapshot file is opened, naming the id.
         let fam_dir = tempfile::TempDir::new().unwrap();
         let fam_db_dir = fam_dir.path().join("db");
         std::fs::create_dir_all(&fam_db_dir).unwrap();
@@ -1876,8 +1676,6 @@ mod tests {
         );
     }
 
-    // ── forensic-family tests ──────────────────────────────────────────
-
     /// The listing's family-name parser must round-trip the writer's exact
     /// naming formats and reject sidecars, foreign files, and malformed names
     /// — a future writer change breaks this test instead of the listing.
@@ -1888,7 +1686,6 @@ mod tests {
         assert_eq!(q.kind, FamilyKind::Quarantine);
         assert_eq!(q.stamp, "20260812T120000Z");
 
-        // Seq-suffixed quarantine (process-local counter, multi-store boots).
         assert!(parse_family_name("board.db.quarantine-20260812T120000Z-1234-2").is_some());
 
         // Legacy/non-canonical stores are listed too.
@@ -1902,16 +1699,11 @@ mod tests {
         let p = parse_family_name("logs.db.pre-reindex-20260812T120000Z-99").unwrap();
         assert_eq!(p.kind, FamilyKind::PreReindex);
 
-        // A differently-cased spelling is the same family — the volumes compare
-        // file names without case — while the fields keep the given spelling.
         let c = parse_family_name("CORE.DB.Quarantine-20260812t120000z-1234").unwrap();
         assert_eq!(c.store, "CORE");
         assert_eq!(c.kind, FamilyKind::Quarantine);
         assert_eq!(c.stamp, "20260812t120000z");
 
-        // Format-focused rejections; the -wal sidecar / path-traversal /
-        // live-store-name cases are covered end-to-end by
-        // `run_debug_family_rejects_invalid_id` at the CLI layer.
         for bad in [
             "board.db.quarantine-20260812T120000Z",       // no pid
             "board.db.quarantine-20260812T120000Z-abc",   // non-digit pid
@@ -1923,7 +1715,6 @@ mod tests {
         }
     }
 
-    /// Main-DB bytes with a valid SQLite header (magic + 4096-byte page size).
     fn valid_db_bytes() -> Vec<u8> {
         let mut b = vec![0u8; 128];
         b[..16].copy_from_slice(b"SQLite format 3\0");
@@ -1941,24 +1732,20 @@ mod tests {
         let db_dir = dir.path().join("db");
         std::fs::create_dir_all(&db_dir).unwrap();
 
-        // Complete quarantine: db + wal.
         let c = "board.db.quarantine-20260812T120000Z-100";
         std::fs::write(db_dir.join(c), valid_db_bytes()).unwrap();
         std::fs::write(db_dir.join(format!("{c}-wal")), b"x").unwrap();
-        // Complete pre-reindex: db + wal (the `VACUUM INTO` snapshot shape).
         let p = "logs.db.pre-reindex-20260812T120000Z-200";
         std::fs::write(db_dir.join(p), valid_db_bytes()).unwrap();
         std::fs::write(db_dir.join(format!("{p}-wal")), b"x").unwrap();
         // Sidecar-only quarantine: no base file.
         let s = "sessions.db.quarantine-20260812T120000Z-300";
         std::fs::write(db_dir.join(format!("{s}-wal")), b"x").unwrap();
-        // Partial quarantine: db without its wal.
         let pa = "users.db.quarantine-20260812T120000Z-400";
         std::fs::write(db_dir.join(pa), valid_db_bytes()).unwrap();
         // Bad-header quarantine: db present, corrupt header.
         let bh = "config.db.quarantine-20260812T120000Z-500";
         std::fs::write(db_dir.join(bh), vec![b'x'; 128]).unwrap();
-        // Foreign files / live stores are ignored.
         std::fs::write(db_dir.join(".DS_Store"), b"").unwrap();
         std::fs::write(db_dir.join("board.db"), valid_db_bytes()).unwrap();
 
@@ -1975,14 +1762,10 @@ mod tests {
         assert_eq!(by_id[pa].class, FamilyClass::Partial);
         assert_eq!(by_id[pa].files, "db");
         assert_eq!(by_id[bh].class, FamilyClass::BadHeader);
-        // Sorted by (store, kind, stamp): board, config, logs, sessions, users.
         let stores: Vec<&str> = families.iter().map(|f| f.store.as_str()).collect();
         assert_eq!(stores, ["board", "config", "logs", "sessions", "users"]);
     }
 
-    /// Rename a live store family into a forensic family name (the boot path
-    /// renames, it does not copy; a missing member is skipped). Returns the
-    /// moved member file names.
     fn move_family_aside(db_dir: &Path, base: &Path, fam: &str) -> Vec<String> {
         let mut moved = Vec::new();
         for (src, suffix) in [(base, ""), (&turso_mod::wal_path(base), "-wal")] {
@@ -1994,7 +1777,6 @@ mod tests {
         moved
     }
 
-    /// (size, mtime) of one file — the no-mutation proof snapshot.
     fn file_state(path: &Path) -> (u64, std::time::SystemTime) {
         let md = std::fs::metadata(path).unwrap();
         (md.len(), md.modified().unwrap())
@@ -2068,9 +1850,6 @@ mod tests {
         }
     }
 
-    /// Help at any verb position (`-h`/`--help` standalone, after a verb, after
-    /// a store/family id, misordered, or with trailing args) prints usage and
-    /// exits 0 instead of falling through to running the flag as a SQL query.
     #[tokio::test]
     async fn run_debug_help_after_verb_prints_usage() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2274,27 +2053,17 @@ mod tests {
         WATCHDOG_CHILD_LIMIT_SECS + EXPECTED_WATCHDOG_GRACE_SECS + 24,
     );
 
-    /// The watchdog is the half of the read limit that does not depend on the
-    /// read yielding: a read that never returns is ended by the process exiting
-    /// with the limit's own failure. Proven across two processes — the only way
-    /// to observe "the process is gone".
-    ///
-    /// The assertions are behaviour, not machine speed: the watchdog must still be
-    /// asleep until the limit plus its own grace has elapsed, and it must end the
-    /// child after that with its own status and sentence — which is what tells the
-    /// watchdog firing apart from a child that gave up before arming. The child
-    /// starts its budget only once released below, so this process's scheduling
-    /// cannot fake an early cut; the residue is the other way: the child's startup
-    /// before it reaches its read, plus this process's delay before the write, still
-    /// hide a cut of that size.
-    ///
-    /// Load still reaches the test through the spawn itself (an `EAGAIN`/`ENOMEM`
-    /// under memory pressure) and through a kill of the child; both fail here as
-    /// what they are rather than as a timing verdict.
-    ///
-    /// The filter below names [`debug_read_limit_watchdog_child`]; if that test is
-    /// renamed the child runs nothing, exits 0, and this driver fails on the
-    /// status.
+    /// The watchdog is the half of the read limit that does not depend on the read yielding: a read
+    /// that never returns is ended by the process exiting with the limit's own failure. Proven
+    /// across two processes — the only way to observe "the process is gone". The assertions are
+    /// behaviour, not machine speed: the watchdog stays asleep until the limit plus its grace has
+    /// elapsed, then ends the child with its own status and sentence, which tells a firing watchdog
+    /// apart from a child that gave up before arming. The child starts its budget only once
+    /// released, so this process's scheduling cannot fake an early cut; the residue is the other
+    /// way — the child's startup plus this process's delay can hide a cut of that size. Load
+    /// reaches the test through the spawn itself and through a kill of the child, failing as what
+    /// it is. The filter below names [`debug_read_limit_watchdog_child`]; a rename makes the child
+    /// run nothing and this driver fail on the status.
     #[test]
     fn run_debug_read_limit_watchdog_ends_a_wedged_read() {
         // The child inherits this process's environment, so hold the env lock for
@@ -2372,8 +2141,7 @@ mod tests {
         let budget = Budget::start();
         let read = Read::direct("logs", &budget);
         // A test binary's watchdog does not end the process (see
-        // [`read_limit::enable_process_exit`]); this child IS the process that
-        // proves it does.
+        // [`read_limit::enable_process_exit`]); this child IS the process that proves it does.
         read_limit::enable_process_exit();
         let _watchdog = read.arm().expect("the child's budget must be live");
         std::thread::sleep(WATCHDOG_CHILD_FALLBACK);

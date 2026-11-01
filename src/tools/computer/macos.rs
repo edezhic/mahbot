@@ -1,153 +1,107 @@
 //! macOS [`Backend`] for the Computer tool: AX accessibility (observe/act),
 //! CGEvent raw input, and ScreenCaptureKit capture. Non-`Send` platform objects
 //! are created and dropped inside the blocking closure of the call that uses them
-//! ([`with_platform`]) — never in struct state or across an await. The one
-//! path outside such a closure is the grant diagnosis ([`permission_error`]),
-//! which resolves the responsible application's name synchronously, with no await
-//! in between.
+//! ([`with_platform`]) — never in struct state or across an await. The one path
+//! outside such a closure is the grant diagnosis ([`permission_error`]), which
+//! resolves the responsible application's name synchronously.
 //!
 //! # Foreign failures
 //!
-//! System frameworks fail in their own terms: an Objective-C exception raised
-//! inside a framework call is not a Rust panic, so Rust cannot contain it — an
-//! unwind that is not caught at the call ends the process, and the panic guard
-//! aborts on it outright. Every async [`Backend`] entry therefore runs behind
-//! [`with_platform`] — the blocking body off the async worker, behind
-//! [`catching_foreign`], inside an autorelease pool — which turns such an exception
-//! into a `framework-failed` failure of the call. The pool is not optional decoration:
-//! these calls run on tokio worker threads that have none of their own, so without it
-//! every object the frameworks autorelease along the way survives until the thread
-//! does. The AX C functions are not messages, so the bindings offer no per-site wrapper
-//! for them: the boundary of the call is the widest point an exception can still be
-//! caught at.
+//! An Objective-C exception is not a Rust panic, so Rust cannot contain it: an
+//! uncaught unwind ends the process and the panic guard aborts on it. Every async
+//! [`Backend`] entry therefore runs behind [`with_platform`] — the blocking body off
+//! the async worker, behind [`catching_foreign`], inside an autorelease pool — which
+//! turns such an exception into a `framework-failed` failure of the call. The pool is
+//! not decoration: these calls run on tokio worker threads that have none, so without
+//! it every autoreleased object survives until the thread does. The AX C functions are
+//! not messages, so the bindings offer no per-site wrapper: the call boundary is the
+//! widest point an exception can still be caught at.
 //!
 //! What runs outside that boundary is guarded where it runs, and a failure there has
 //! no call left to fail, so it is logged and dropped: the grant prompt thread, the
-//! grant-name lookup of [`permission_error`] (in a pool of its own), the main-queue
-//! exchange of [`on_ax_thread`] and the completion handlers the system invokes
-//! ([`contained`] — the waiter may already have given up). The one synchronous entry
-//! without a call to fail into, [`capture_unavailable_error`], guards its own platform
-//! contacts.
+//! grant-name lookup of [`permission_error`], the main-queue exchange of
+//! [`on_ax_thread`] and the completion handlers the system invokes ([`contained`]).
 //!
-//! Answers are checked before they are used: an AX array is filtered to the member
-//! type it is read as ([`typed_members`]) instead of being cast wholesale, an AX
-//! string is cut at the product's cap by its length before a character of it is
-//! copied ([`attribute_text`]), and a capture size is validated before it reaches the
-//! capture framework. This backend charges every frame copy it makes and the
-//! composite it builds to the call's budget; the framework's own texture is bounded
-//! by the same geometry, while the copy this tool keeps is the one budgeted — the
-//! reasoning lives in [`core::CAPTURE_BUDGET_PIXELS`].
+//! Answers are checked before they are used: AX arrays are filtered to the member type
+//! they are read as ([`typed_members`]), AX strings are cut at the product's cap by
+//! length before a character is copied ([`attribute_text`]), and a capture size is
+//! validated before it reaches the framework. Every frame copy and composite is
+//! charged to the call's budget ([`core::CAPTURE_BUDGET_PIXELS`]).
 //!
 //! # A session that cannot receive the call
 //!
-//! Every API below happily creates input for a locked screen and reports it as
-//! delivered, and a still of one is a still of the lock screen. So the state is read
-//! from the system's own session record before any call that needs the desktop
-//! ([`desktop_unavailable_blocking`]): no session dictionary at all, an entry saying
-//! another logged-in user is on the console, and the lock flag. A running screensaver is
-//! deliberately not inferred — macOS publishes nothing for it here, and a false refusal
-//! on a working session would cost more than the call's own failure.
+//! Every API below creates input for a locked screen and reports it as delivered, and
+//! a still of one is a still of the lock screen. The state is read from the system's
+//! own session record before any call that needs the desktop
+//! ([`desktop_unavailable_blocking`]). A running screensaver is deliberately not
+//! inferred: a false refusal on a working session would cost more than the call's own failure.
 //!
 //! # Deadlines
 //!
 //! One AX exchange is bounded by the process-wide messaging timeout this backend sets
 //! on the system-wide element before its first one ([`install_messaging_timeout`],
-//! [`core::EXCHANGE_DEADLINE`], deliberately not shorter than the default applications
-//! rely on). One [`core::Budget`] per call bounds the whole of it; the walk cannot be
-//! bounded from outside — it runs inside the blocking frame no timer can interrupt — so
-//! it checks the budget between exchanges, and a responsive target never reaches it.
+//! [`core::EXCHANGE_DEADLINE`], not shorter than the default applications rely on).
+//! One [`core::Budget`] per call bounds the whole of it; the walk checks the budget
+//! between exchanges because it runs inside a blocking frame no timer can interrupt.
 //!
 //! # Surfaces and identity
 //!
-//! A window target carries the identity this backend gave it when it was
-//! enumerated — a retained AX window element ([`HELD_WINDOWS`]) — so a stored id
-//! resolves to that very window, live: a moved, resized or renamed window keeps
-//! working, and a closed or replaced one fails as `surface-gone` instead of
-//! becoming another window of the same application. An app target names no
-//! window: it is the application's own focused window, re-resolved per call.
+//! A window target carries the identity this backend gave it when it was enumerated —
+//! a retained AX window element ([`HELD_WINDOWS`]) — so a stored id resolves to that
+//! very window, live; a closed or replaced one fails as `surface-gone` instead of
+//! becoming another window of the same application. An app target names no window: it
+//! is the application's own focused window, re-resolved per call.
 //!
-//! Stills of a window are matched to ScreenCaptureKit's list by owning process and
-//! frame (`find_sc_window`), never by title alone or by position, and a minimized
-//! window is refused wherever its frame would be reported or used — capture,
-//! observe and coordinate mapping. The `screen` target is composited at the densest
-//! attached display's scale, so a mixed-density arrangement yields one faithful
-//! image.
+//! Stills are matched to ScreenCaptureKit's list by owning process and frame
+//! (`find_sc_window`), never by title alone or by position, and a minimized window is
+//! refused wherever its frame would be reported or used. The `screen` target is
+//! composited at the densest attached display's scale.
 //!
-//! Input pinned to a window — typed text, a drag, a wheel at a point — is raised
-//! and then verified to be the window the server would deliver to
-//! ([`ensure_window_receives`]); when it could not be brought forward the call
-//! fails with nothing sent. Keyboard chords and a wheel with no point are global
-//! input and are described as such.
+//! Input pinned to a window is raised and then verified to be the window the server
+//! would deliver to ([`ensure_window_receives`]); when it could not be brought forward
+//! the call fails with nothing sent.
 //!
 //! # What is in front, and what lies under a point
 //!
-//! Two questions have no per-application accessibility answer, and each is asked of the one
-//! system that does answer it. *Which window is in front of which* comes from the compositor's
-//! own on-screen list ([`compositor_windows`]), which is ordered front to back and names each
-//! window's process and frame; a listing attributes that order to the windows it actually
-//! read, as their places among them, and counts the ones that found no entry — a minimized
-//! window has no on-screen entry — as unplaced rather than declaring the whole order unknown.
-//!
-//! *What window lies under a point* comes from the system's own hit test
-//! ([`window_at_point`]): the element a click there would reach, and through it the
-//! application and the window it belongs to. That question cannot be answered by comparing
-//! frames: the Dock's window spans the whole display while its bar and icons are only part of
-//! it, so a geometry test either misses a point over the Dock or refuses every point on the
-//! display. Every window the hit test resolves is in the way, because a click there really
-//! would go there — the Dock, the menu bar, a popover, a panel and an unnameable owner
-//! included, since a refusal the caller can retry beats a click that lands somewhere
-//! unexpected. There is no exclusion to make: the window server's backstop surface is not an
-//! accessibility element, so a point over it answers nothing at all and is reported as not
-//! checkable rather than as clear.
-//!
-//! The addressed window itself is recognised by its frame ([`core::same_frame`]), never by
-//! its title: a frame is one coordinate system both reads share, while a title is text each
-//! system spells its own way. A frame read inconsistently — a window mid-animation, a panel
-//! whose accessibility frame excludes its shadow — can therefore name the addressed window
-//! itself as another window of its application: accepted, since the click is sent and the
-//! note is not a refusal.
+//! *Which window is in front* comes from the compositor's on-screen list
+//! ([`compositor_windows`]); a listing attributes that order to the windows it read and
+//! counts those with no entry as unplaced. *What lies under a point* comes from the
+//! system's hit test ([`window_at_point`]), not from comparing frames: the Dock's window
+//! spans the whole display while its bar is only part of it. Every window the hit test
+//! resolves is in the way, since a refusal the caller can retry beats a click that
+//! lands somewhere unexpected. The addressed window is recognised by its frame
+//! ([`core::same_frame`]), never by its title.
 //!
 //! # Availability
 //!
-//! macOS 14 is the product's floor, and the ScreenCaptureKit still API
-//! (`SCScreenshotManager` + `SCContentFilter.pointPixelScale`) is exactly that
-//! old, so [`sck_available`] guards every use of it: on a Mac below the floor
-//! capture degrades to an honest error while observe/act keep working. The guard
-//! is a runtime OS-version test in a build whose deployment target is lower and a
-//! compile-time constant in the published build, whose own floor is 14.0; the
-//! point of having it is that messaging a class or selector the running system
-//! lacks aborts the whole process instead of failing the call, so nothing newer
-//! than the floor may ever be called unguarded.
+//! macOS 14 is the product's floor and the ScreenCaptureKit still API is exactly that
+//! old, so [`sck_available`] guards every use of it: below the floor capture degrades to
+//! an honest error while observe/act keep working. Messaging a class or selector the
+//! running system lacks aborts the process, so nothing newer than the floor may be
+//! called unguarded.
 //!
 //! # Privacy grants
 //!
 //! A bare binary has no privacy identity: macOS attributes every grant to the
-//! RESPONSIBLE PROCESS, which for this product is the terminal the daemon was
-//! started from — a detached daemon keeps it. The owner grants Accessibility
-//! (tree reads and element actions), input sending (synthesized clicks, typing
-//! and key chords) and Screen Recording (stills) to that terminal once, and the
-//! grants survive rebuilds and self-updates because the terminal's signature
-//! never changes. Accepted consequences: every process started from the same
-//! terminal — the shells the agent itself runs included — shares them, and a
-//! daemon started some other way has none until that other thing is granted
-//! them too. A missing grant is requested and, when still missing, reported by
-//! [`permission_error`]; nothing degrades silently.
+//! RESPONSIBLE PROCESS, which for this product is the terminal the daemon was started
+//! from — a detached daemon keeps it. The owner grants Accessibility, input sending and
+//! Screen Recording to that terminal once, and the grants survive rebuilds and
+//! self-updates. Accepted consequence: every process started from the same terminal
+//! shares them, and a daemon started another way has none until that thing is granted
+//! too. A missing grant is requested and, when still missing, reported by
+//! [`permission_error`].
 //!
 //! # Our own windows
 //!
-//! An accessibility request addressed to mahbot's own window is answered inside
-//! this very process, on its main thread. From a worker thread it is not a clean
-//! failure: raising the window or acting on an element traps the process with
-//! SIGTRAP (uncatchable, and fatal on current macOS), while writing a value waits
-//! forever. Every AX exchange aimed at our own process therefore runs on the main
-//! queue and is awaited for a bounded time — see [`on_ax_thread`] — and our
-//! windows stay listed, readable, actionable and capturable like any other
-//! application's.
+//! An accessibility request addressed to mahbot's own window is answered inside this
+//! process, on its main thread. From a worker thread it is not a clean failure: raising
+//! the window or acting on an element traps the process with SIGTRAP, while writing a
+//! value waits forever. Every AX exchange aimed at our own process therefore runs on the
+//! main queue and is awaited for a bounded time ([`on_ax_thread`]).
 
 #![cfg(target_os = "macos")]
-// The many casts and raw-pointer borrows are inherent to the C ABI/geometry
-// types the FFI exposes (u32 display IDs, usize pixel dims, CGFloat floats);
-// suppressing the pedantic cast/pointer lints here keeps the file focused.
+// The casts and raw-pointer borrows are inherent to the C ABI/geometry types the FFI
+// exposes (u32 display ids, usize pixel dims, CGFloat floats).
 #![allow(
     clippy::borrow_as_ptr,
     clippy::cast_lossless,
@@ -204,25 +158,15 @@ pub(crate) static MACOS_BACKEND: MacOsBackend = MacOsBackend;
 
 pub(crate) struct MacOsBackend;
 
-// ── AX exchange deadline ─────────────────────────────────────────────────
-//
-// The contract lives in the module header; this is the one place it is set.
-
-/// Set the AX messaging timeout, once per process, on the system-wide element.
-///
-/// Apple honours a process-wide setting only when it is applied to the system-wide
-/// element — one set on an application or window element bounds that element alone, and
-/// this backend makes its exchanges through fresh per-application elements. Installed
-/// from [`with_platform`], the funnel every AX entry point passes through, rather than
-/// from the grant check: a missing grant must not be what decides whether the setting
-/// was ever applied.
+/// Set the AX messaging timeout, once per process, on the system-wide element: Apple
+/// honours it there only, and this backend exchanges through fresh per-application
+/// elements. Installed from [`with_platform`], not from the grant check.
 fn install_messaging_timeout() {
     static INSTALLED: Once = Once::new();
     INSTALLED.call_once(|| {
         // SAFETY: both calls only configure this process's own accessibility client —
         // creating the system-wide element allocates it, and the timeout is a positive
-        // number of seconds; no pointer outlives the statement and no other process is
-        // contacted.
+        // number of seconds; no pointer outlives the statement and no other process is contacted.
         let err = unsafe {
             AXUIElement::new_system_wide()
                 .set_messaging_timeout(core::EXCHANGE_DEADLINE.as_secs_f32())
@@ -237,14 +181,8 @@ fn install_messaging_timeout() {
     });
 }
 
-// ── Foreign failures ─────────────────────────────────────────────────────
-//
-// The contract lives in the module header; these are the helpers it names.
-
-/// Run a `Result`-returning body behind Objective-C's own exception handler: an
-/// exception the system raises anywhere under it is caught here and returned as a
-/// failed call. A Rust panic passes through untouched (it is not a foreign exception);
-/// where both guards are wanted, [`contained`] owns their order.
+/// Run a `Result`-returning body behind Objective-C's exception handler; a Rust panic
+/// passes through untouched. [`contained`] owns the order where both guards are wanted.
 fn catching_foreign<T>(
     what: &str,
     f: impl FnOnce() -> Result<T, anyhow::Error>,
@@ -260,9 +198,7 @@ fn catching_foreign<T>(
 }
 
 /// Both guards in the one order that works — the exception firewall inside the panic
-/// guard, because a foreign exception reaching that guard aborts the process — for a
-/// body that runs in frames we do not own: a dispatch queue, or a callback the system
-/// invokes. Either failure becomes the error this returns.
+/// guard, because a foreign exception reaching that guard aborts the process.
 fn contained<T>(
     what: &str,
     body: impl FnOnce() -> Result<T, anyhow::Error>,
@@ -278,9 +214,8 @@ fn contained<T>(
     })
 }
 
-/// One entry into the system from the async side: the blocking body off the async
-/// worker, behind the Objective-C firewall, inside an autorelease pool — this process's
-/// own, because the thread it runs on is a tokio worker with none. See the module header.
+/// One entry into the system from the async side: the blocking body off the async worker,
+/// behind the Objective-C firewall, inside an autorelease pool. See the module header.
 fn with_platform<T>(
     what: &str,
     f: impl FnOnce() -> Result<T, anyhow::Error>,
@@ -295,11 +230,8 @@ fn with_platform<T>(
     })
 }
 
-// ── kAX* attribute/action string constants ───────────────────────────────
-//
-// The objc2 bindings do not ship the kAX* string constants, so the ones we use
-// are declared here. `CFString::from_static_str` reuses the static buffer, so
-// the fresh retain per call is cheap; drop happens at the end of the statement.
+// The objc2 bindings do not ship the kAX* string constants. `CFString::from_static_str`
+// reuses the static buffer, so the fresh retain per call is cheap.
 
 const AX_ROLE: &str = "AXRole";
 const AX_TITLE: &str = "AXTitle";
@@ -312,8 +244,7 @@ const AX_WINDOWS: &str = "AXWindows";
 const AX_WINDOW: &str = "AXWindow";
 const AX_FOCUSED_WINDOW: &str = "AXFocusedWindow";
 const AX_FOCUSED: &str = "AXFocused";
-/// The application's focused element — the one input reaches. Read per application, never
-/// from the system-wide element (see [`frontmost_app`]).
+/// The application's focused element — the one input reaches. Never the system-wide one.
 const AX_FOCUSED_ELEMENT: &str = "AXFocusedUIElement";
 const AX_PRESS: &str = "AXPress";
 const AX_OPEN: &str = "AXOpen";
@@ -326,21 +257,15 @@ fn axc(s: &'static str) -> CFRetained<CFString> {
     CFString::from_static_str(s)
 }
 
-// ── Privacy grants (TCC) ─────────────────────────────────────────────────
-//
-// See the module docs for the model. Each grant is probed cheaply, requested at
-// most once per process (the system's dialog is the owner's to answer, and a
-// retry loop must not re-open it), and reported through one actionable error
-// that names the terminal macOS holds the grant against.
+// Each grant is probed cheaply, requested at most once per process (a retry loop must not
+// re-open the system dialog), and reported through one actionable error naming the
+// terminal macOS holds the grant against. See the module docs.
 
 /// The three grants a computer-use action can need.
 #[derive(Clone, Copy)]
 enum Grant {
-    /// Reading the AX tree and acting on elements.
     Accessibility,
-    /// Posting synthesized input events.
     Input,
-    /// Capturing stills of windows and displays.
     ScreenRecording,
 }
 
@@ -357,8 +282,7 @@ impl Grant {
     /// The privacy pane the owner grants it in.
     fn pane(self) -> &'static str {
         match self {
-            // macOS files synthesized input under the same grant that lets an
-            // application control others.
+            // macOS files synthesized input under the same grant that lets an application control others.
             Self::Accessibility | Self::Input => "Accessibility",
             Self::ScreenRecording => "Screen Recording",
         }
@@ -385,19 +309,14 @@ impl Grant {
         }
     }
 
-    /// Ask the system to show its grant dialog, attributed to the responsible
-    /// process (the terminal) and not to this binary. The answer arrives outside
-    /// the call — the caller re-probes. The Accessibility variant returns at once;
-    /// the two CG requests wait for the owner, so the prompt runs on its own
-    /// thread and the caller waits at most [`PROMPT_WAIT`], which bounds how long
-    /// the computer-action lock is held while the dialog sits unanswered.
+    /// Ask the system to show its grant dialog, attributed to the responsible process (the
+    /// terminal). The answer arrives outside the call — the caller re-probes — and the two CG
+    /// requests wait for the owner, so the prompt runs on its own thread.
     fn request(self) {
         let (done, wait) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            // A fresh thread is outside the caller's firewall and nothing there can
-            // fail the call: the answer is read by the caller's re-probe, so a failure
-            // is logged and dropped, and a failing body returns instead of leaving the
-            // caller to its timeout.
+            // Outside the caller's firewall nothing there can fail the call: the answer is read by the
+            // caller's re-probe, so a failure is logged and dropped.
             if let Err(e) = contained("ask for the grant", || {
                 self.prompt();
                 Ok(())
@@ -409,8 +328,7 @@ impl Grant {
         let _ = wait.recv_timeout(PROMPT_WAIT);
     }
 
-    /// The blocking half of [`Grant::request`]; the answer is read by the caller's
-    /// re-probe, not from the return values here.
+    /// The blocking half of [`Grant::request`]; the answer is read by the caller's re-probe.
     fn prompt(self) {
         // SAFETY: each call only asks the system to prompt; nothing is granted
         // behind the owner's back and no pointer outlives the call.
@@ -436,27 +354,23 @@ impl Grant {
     }
 }
 
-/// How long an unanswered grant dialog may hold the action that asked for it
-/// before the call reports the grant as missing; the dialog's late answer still
-/// applies to the next call.
+/// How long an unanswered grant dialog may hold the action that asked for it before the
+/// call reports the grant as missing; the dialog's late answer still applies to the next call.
 const PROMPT_WAIT: Duration = Duration::from_secs(20);
 
-/// Set once this process has asked the system for the grant, so the owner answers
-/// each dialog once instead of once per agent retry.
+/// Set once this process has asked, so the owner answers each dialog once, not once per retry.
 static ACCESSIBILITY_ASKED: AtomicBool = AtomicBool::new(false);
 static INPUT_ASKED: AtomicBool = AtomicBool::new(false);
 static SCREEN_RECORDING_ASKED: AtomicBool = AtomicBool::new(false);
 
-/// Require `grant`, asking the system to prompt for it when this process has not
-/// asked yet. The error is the actionable diagnosis — never a silent fallback and
-/// never a retry behind the owner's back.
+/// Require `grant`, asking the system to prompt when this process has not asked yet. The
+/// error is the actionable diagnosis — never a silent fallback, never a retry behind the owner.
 fn ensure(grant: Grant) -> anyhow::Result<()> {
     if grant.held() {
         return Ok(());
     }
     if !grant.asked().swap(true, Ordering::Relaxed) {
-        // The log carries the same facts as the error the caller will see — the
-        // restart for Screen Recording and its periodic re-ask included.
+        // The log carries the same facts as the error: the restart for Screen Recording included.
         tracing::warn!(
             "computer use: asking the system to prompt — {}",
             permission_error(grant)
@@ -469,9 +383,8 @@ fn ensure(grant: Grant) -> anyhow::Result<()> {
     Err(permission_error(grant))
 }
 
-/// The actionable diagnosis for a grant this process does not hold: what is
-/// unavailable, which application the owner must authorize, where, and what the
-/// grant needs before it applies.
+/// The actionable diagnosis for a grant this process does not hold: what is unavailable,
+/// which application to authorize, where, and what the grant needs before it applies.
 fn permission_error(grant: Grant) -> anyhow::Error {
     let app = responsible_app();
     let consequence = match grant {
@@ -499,12 +412,9 @@ fn permission_error(grant: Grant) -> anyhow::Error {
     ))
 }
 
-/// The application macOS holds this daemon's grants against: the terminal it was
-/// started from. The process tree no longer reaches it once the daemon detaches,
-/// but the environment it inherited names it — terminal emulators export their
-/// own bundle identifier (`__CFBundleIdentifier`, set by AppKit) and program name
-/// (`TERM_PROGRAM`). The last fallback says what to look for rather than claiming
-/// a name it does not know.
+/// The application macOS holds this daemon's grants against: the terminal it was started
+/// from. The process tree no longer reaches it once the daemon detaches, but the inherited
+/// environment names it (`__CFBundleIdentifier`, `TERM_PROGRAM`).
 fn responsible_app() -> String {
     let non_empty = |key: &str| {
         std::env::var(key)
@@ -536,10 +446,7 @@ fn responsible_app() -> String {
     non_empty("TERM_PROGRAM").unwrap_or_else(|| "the terminal you started mahbot from".to_string())
 }
 
-// ── Availability guards ──────────────────────────────────────────────────
-
-/// ScreenCaptureKit stills (`SCScreenshotManager`, `SCContentFilter`'s pixel
-/// scale) need macOS 14. Below it no SCK symbol is touched: capture reports
+/// ScreenCaptureKit stills need macOS 14. Below it no SCK symbol is touched: capture reports
 /// [`screen_capture_needs_14`] and the AX channel stays fully usable.
 fn sck_available() -> bool {
     objc2::available!(macos = 14.0, ..)
@@ -553,22 +460,15 @@ fn screen_capture_needs_14() -> anyhow::Error {
     )
 }
 
-// ── Our own process ─────────────────────────────────────────────────────
-//
-// The thread decision (see the module header) is taken where the target
-// process becomes known, never earlier from NSWorkspace state: the frontmost app
-// can change between that decision and the exchange. Target-addressed exchanges
-// get the pid from [`resolve_window`], the one place a target becomes a platform
-// handle, which raises [`NeedsAxThread`] before its first AX call; the window
-// listing knows the pid up front and enters through [`on_ax_thread`] directly.
-// [`with_target`] turns the marker into a re-run on the main queue.
+// The thread decision (see the module header) is taken where the target process becomes
+// known, never earlier from NSWorkspace state. Target-addressed exchanges raise
+// [`NeedsAxThread`] from [`resolve_window`]; [`with_target`] turns it into a main-queue re-run.
 
 /// The longest a self-targeted AX exchange waits for the main queue.
 const SELF_AX_WAIT: Duration = Duration::from_secs(5);
 
-/// Marker for "this exchange resolved to mahbot itself while off the main
-/// thread". Never reaches the caller: [`with_target`] catches it and re-runs the
-/// exchange on the main queue.
+/// Marker for "this exchange resolved to mahbot itself while off the main thread";
+/// [`with_target`] catches it and re-runs on the main queue. Never reaches the caller.
 #[derive(Debug)]
 struct NeedsAxThread;
 
@@ -585,9 +485,8 @@ fn is_ax_thread(err: &anyhow::Error) -> bool {
     err.downcast_ref::<NeedsAxThread>().is_some()
 }
 
-/// Raise [`NeedsAxThread`] when `pid` is our own process and this is not the main
-/// thread. `pid` must come from the resolved target — for an app element that is a
-/// local getter, not an AX exchange.
+/// Raise [`NeedsAxThread`] when `pid` is our own process and this is not the main thread.
+/// `pid` must come from the resolved target — a local getter, not an AX exchange.
 fn ensure_ax_thread(pid: u32) -> Result<(), anyhow::Error> {
     if pid == std::process::id() && objc2::MainThreadMarker::new().is_none() {
         return Err(anyhow::Error::new(NeedsAxThread));
@@ -595,9 +494,8 @@ fn ensure_ax_thread(pid: u32) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// The wait for mahbot's own main thread ran out. Typed so an actuating call can
-/// report the possibly-applied request as applied-but-unconfirmed, while a read
-/// reports it as the `degraded` failure it is (nothing was read, nothing changed).
+/// The wait for mahbot's own main thread ran out: an actuating call reports the possibly
+/// applied request as applied-but-unconfirmed, a read as `degraded` (nothing was read).
 #[derive(Debug)]
 struct AxBusy(u64);
 
@@ -614,9 +512,8 @@ impl std::fmt::Display for AxBusy {
 
 impl std::error::Error for AxBusy {}
 
-/// A read's rendering of [`AxBusy`]: the taxonomy failure whose guidance is to
-/// retry a read (an element action converts the same marker into the middle
-/// outcome instead — see [`Backend::act_on_element`]).
+/// A read's rendering of [`AxBusy`]: the retryable failure (an element action converts the
+/// same marker into the middle outcome instead — see [`Backend::act_on_element`]).
 fn degraded_read(e: anyhow::Error) -> anyhow::Error {
     match e.downcast_ref::<AxBusy>() {
         Some(busy) => core::taxonomy_error(core::ERR_DEGRADED, format!("{busy}; retry the read")),
@@ -624,10 +521,8 @@ fn degraded_read(e: anyhow::Error) -> anyhow::Error {
     }
 }
 
-/// Run one accessibility exchange where the system requires it: on the main
-/// thread when `pid` is mahbot itself, on the calling thread otherwise. A main
-/// thread that stays busy past [`SELF_AX_WAIT`] gives up as [`AxBusy`] instead of
-/// hanging the call; the request itself may still be applied afterwards.
+/// Run one accessibility exchange on the main thread when `pid` is mahbot itself, on the
+/// calling thread otherwise; a busy main thread gives up as [`AxBusy`] after [`SELF_AX_WAIT`].
 fn on_ax_thread<T: Send + 'static>(
     pid: u32,
     f: impl FnOnce() -> Result<T, anyhow::Error> + Send + 'static,
@@ -646,10 +541,8 @@ fn on_ax_thread<T: Send + 'static>(
     }
 }
 
-/// Run an exchange aimed at `target`, on the main thread when it resolves to
-/// mahbot's own process. The exchange reports that by raising
-/// [`NeedsAxThread`] before it does anything, so the discarded first attempt has
-/// performed nothing.
+/// Run an exchange aimed at `target`, on the main thread when it resolves to mahbot's own
+/// process. The exchange raises [`NeedsAxThread`] before it does anything.
 fn with_target<T: Send + 'static>(
     target: &TargetSpec,
     f: impl Fn(&TargetSpec) -> Result<T, anyhow::Error> + Send + 'static,
@@ -662,8 +555,6 @@ fn with_target<T: Send + 'static>(
         other => other,
     }
 }
-
-// ── AX attribute readers ─────────────────────────────────────────────────
 
 fn attribute_value(el: &AXUIElement, attr: &CFString) -> Result<CFRetained<CFType>, AXError> {
     let mut value: *const CFType = std::ptr::null();
@@ -685,13 +576,9 @@ fn attribute_value(el: &AXUIElement, attr: &CFString) -> Result<CFRetained<CFTyp
     }
 }
 
-/// Read an AX string attribute, copying at most `max` characters of it. The
-/// framework has already materialised the whole value before this is called, so the
-/// cap is on what this copies and keeps: the length decides before a single unit is
-/// read out, and at most `max` characters' worth of UTF-16 units are ever copied.
-/// The caller sets its own ceiling on the result — a value or a name through
-/// [`Truncation::keep_value`]/[`Truncation::keep_name`], a label through
-/// [`core::cap_label`].
+/// Read an AX string attribute, copying at most `max` characters of it. The framework has
+/// already materialised the whole value, so the cap is on what this copies and keeps: the
+/// length decides before a single unit is read out.
 fn attribute_text(el: &AXUIElement, attr: &CFString, max: usize) -> Option<String> {
     let val = attribute_value(el, attr).ok()?;
     let string = val.downcast_ref::<CFString>()?;
@@ -711,10 +598,8 @@ fn attribute_text(el: &AXUIElement, attr: &CFString, max: usize) -> Option<Strin
     Some(String::from_utf16_lossy(&units))
 }
 
-/// A string this backend uses as a label rather than as content — a role, a
-/// subrole, an application or window name — kept to [`core::MAX_NAME_CHARS`], the
-/// ellipsis marking the cut ([`core::cap_label`]). A label is shown, not matched on,
-/// and a window is matched on its frame, so the cap only costs title-only matches.
+/// A string used as a label rather than content — a role, a name — kept to
+/// [`core::MAX_NAME_CHARS`] with an ellipsis ([`core::cap_label`]). Windows match on frames.
 fn attribute_name(el: &AXUIElement, attr: &CFString) -> Option<String> {
     attribute_text(el, attr, core::MAX_NAME_CHARS).map(|text| core::cap_label(&text))
 }
@@ -752,9 +637,8 @@ fn attribute_bool(el: &AXUIElement, attr: &CFString) -> Option<bool> {
     Some(val.downcast_ref::<CFBoolean>()?.value())
 }
 
-/// The members of `array` that really are `T`. An array arrives with whatever its
-/// owner put in it, so each member is checked against the type it is used as; a
-/// member of another type is skipped rather than read as a `T`.
+/// The members of `array` that really are `T`: each member is checked against the type it is
+/// used as, and one of another type is skipped rather than read as a `T`.
 fn typed_members<T: ConcreteType>(array: &CFArray) -> Vec<CFRetained<T>> {
     // SAFETY: an array's members are Core Foundation objects, and `CFType` is the
     // root of them all — the cast makes no claim about a member's own type, which
@@ -767,13 +651,10 @@ fn typed_members<T: ConcreteType>(array: &CFArray) -> Vec<CFRetained<T>> {
         .collect()
 }
 
-/// Raw (AX-prefixed) action names. The AX error is the caller's to report — a tree
-/// walk degrades to no actions, while acting on an element must not turn a failed
-/// read into "element has no press/open action".
-///
-/// `Ok(None)` is the third answer: the system replied with something that is not a
-/// list of names — a list whose members are none of them strings — so the caller
-/// knows it learned nothing rather than that the element has no actions.
+/// Raw (AX-prefixed) action names. The AX error is the caller's to report — a tree walk
+/// degrades to no actions, while acting must not turn a failed read into "no press action".
+/// `Ok(None)` is the third answer: the system replied with something that is not a list of
+/// names, so the caller knows it learned nothing.
 fn raw_action_names(el: &AXUIElement) -> Result<Option<Vec<String>>, AXError> {
     let mut names: *const CFArray = std::ptr::null();
     // SAFETY: `names` points to valid storage the binding fills on success.
@@ -794,8 +675,7 @@ fn raw_action_names(el: &AXUIElement) -> Result<Option<Vec<String>>, AXError> {
     // only widens it to the root type, and the type check follows.
     let object: CFRetained<CFType> =
         unsafe { CFRetained::cast_unchecked(CFRetained::from_raw(raw)) };
-    // An answer that is not an array is not a list of names, so it taught us
-    // nothing — the same conclusion as an array with no usable member.
+    // Not an array is not a list of names: it taught us nothing, like an array with no usable member.
     let Ok(array) = object.downcast::<CFArray>() else {
         return Ok(None);
     };
@@ -803,8 +683,7 @@ fn raw_action_names(el: &AXUIElement) -> Result<Option<Vec<String>>, AXError> {
         .iter()
         .map(ToString::to_string)
         .collect();
-    // An empty array really is "no actions"; a non-empty array with nothing usable
-    // in it taught us nothing.
+    // An empty array really is "no actions"; a non-empty one with nothing usable taught us nothing.
     if names.is_empty() && !array.is_empty() {
         return Ok(None);
     }
@@ -825,8 +704,7 @@ fn normalize_action_name(name: &str) -> String {
     name.strip_prefix("AX").unwrap_or(name).to_lowercase()
 }
 
-/// Arms shared by [`ax_error`] and [`ax_window_error`] — identical messages
-/// and taxonomy codes. `None` falls through to caller-specific handling.
+/// Arms shared by [`ax_error`] and [`ax_window_error`]; `None` falls through to the caller.
 fn ax_error_shared(err: AXError, ctx: impl std::fmt::Display) -> Option<anyhow::Error> {
     match err {
         AXError::CannotComplete => Some(core::taxonomy_error(
@@ -874,22 +752,16 @@ fn ax_window_error(err: AXError, ctx: impl std::fmt::Display) -> anyhow::Error {
     })
 }
 
-// ── AX tree walk ─────────────────────────────────────────────────────────
-
-/// True when the element is a secure (e.g. password) field. macOS reports the
-/// secure marker in either AXRole or AXSubrole — a password field is
-/// AXTextField with the marker in AXSubrole — so both are checked. One predicate
-/// keeps the value-masking in [`walk_element`] and the SetValue refusal in
-/// [`set_element_value`] in agreement.
+/// True when the element is a secure (e.g. password) field. macOS reports the marker in
+/// either AXRole or AXSubrole, so both are checked — one predicate keeps the value-masking
+/// in [`walk_element`] and the SetValue refusal in [`set_element_value`] in agreement.
 fn is_secure_field(role: &str, subrole: Option<&str>) -> bool {
     role.to_lowercase().contains("secure")
         || subrole.is_some_and(|s| s.to_lowercase().contains("secure"))
 }
 
-/// One node and its subtree, read within `budget`. `Ok(None)` is a node not read
-/// because the node ceiling was reached; `Err` is the call's budget spent, which is
-/// the only failure a walk raises — a refused or timed-out attribute stays the tolerant
-/// `None`/empty it has always been, and the walk goes on.
+/// One node and its subtree, read within `budget`. `Ok(None)` is a node not read because the
+/// node ceiling was reached; `Err` is the call's budget spent — the only failure a walk raises.
 fn walk_element(
     element: &AXUIElement,
     origin: (f64, f64),
@@ -907,14 +779,12 @@ fn walk_element(
     *nodes += 1;
     handles.push(element.retain());
 
-    // Each group below is one or two AX exchanges, and the budget is re-checked
-    // between them: a target that stalls across a node's own reads must not spend the
-    // whole walk's budget inside that node.
+    // Each group below is one or two AX exchanges and the budget is re-checked between them, so
+    // a target that stalls across a node's own reads cannot spend the whole walk's budget there.
     budget.check()?;
     let role = attribute_name(element, &axc(AX_ROLE)).unwrap_or_else(|| "unknown".to_string());
-    // Never read a value out of a secure element. A password field reports
-    // AXRole="AXTextField" with the secure marker in AXSubrole, so check the
-    // subrole (or role) for "secure" before pulling the value.
+    // Never read a value out of a secure element: check the subrole (or role) for "secure"
+    // before pulling the value.
     let subrole = attribute_name(element, &axc(AX_SUBROLE));
     budget.check()?;
     let value = if is_secure_field(&role, subrole.as_deref()) {
@@ -932,8 +802,7 @@ fn walk_element(
         _ => None,
     };
     budget.check()?;
-    // A failed or unusable read only leaves the node's actions absent: the walk
-    // degrades, acting on the element is what must not.
+    // A failed read only leaves the node's actions absent: the walk degrades, acting on it must not.
     let actions = raw_action_names(element)
         .ok()
         .flatten()
@@ -961,8 +830,7 @@ fn walk_element(
             }
         }
     } else if !attribute_children(element).is_empty() {
-        // The node's subtree is not read. Only a node that has one is a cut, so a
-        // leaf at the ceiling is not reported as a truncation.
+        // Only a node that has a subtree is a cut, so a leaf at the ceiling is not a truncation.
         truncation.cut_depth(core::MAX_TREE_DEPTH);
     }
     Ok(Some(UiNode {
@@ -977,9 +845,8 @@ fn walk_element(
     }))
 }
 
-/// Build the accessibility tree, returning the root node, a pre-order-aligned
-/// `Vec` of platform handles (used by `act_on_element` to map a matched node back
-/// to its element) and the ceilings the walk hit.
+/// Build the accessibility tree: the root node, a pre-order-aligned `Vec` of platform handles
+/// (used by `act_on_element`) and the ceilings the walk hit.
 fn build_tree(
     root: &AXUIElement,
     origin: (f64, f64),
@@ -998,8 +865,7 @@ fn build_tree(
         budget,
     )?
     .ok_or_else(|| {
-        // The root is the first node, so only its own reads can leave it unread — and an
-        // empty tree would present "nothing was read" as a window with no content.
+        // The root is first, so only its own reads can leave it unread; an empty tree reads as no content.
         core::taxonomy_error(
             core::ERR_DEGRADED,
             format!(
@@ -1012,8 +878,7 @@ fn build_tree(
     Ok((node, handles, truncation))
 }
 
-/// The application a target points at: the name the target carries, else the resolved
-/// application's own (one exchange when the target names none).
+/// The application a target points at: the name it carries, else the resolved application's own.
 fn resolved_app_name(target: &TargetSpec, app: &AXUIElement) -> Result<String, anyhow::Error> {
     match target.app() {
         Some((_, name)) => Ok(name.to_string()),
@@ -1021,10 +886,8 @@ fn resolved_app_name(target: &TargetSpec, app: &AXUIElement) -> Result<String, a
     }
 }
 
-/// The label of the surface a call resolved, for the failures that follow the reads that
-/// name it — the same rule [`core::name_surface`] applies where a budget survives to be
-/// pointed at it. The title is passed in, so a caller that already read it does not read it
-/// again from a target that may be the hung one.
+/// The label of the surface a call resolved, for the failures that follow the reads naming
+/// it. The title is passed in, so a caller that already read it does not read it again.
 fn resolved_surface_label(
     target: &TargetSpec,
     app: &AXUIElement,
@@ -1034,20 +897,17 @@ fn resolved_surface_label(
 }
 
 fn observe_blocking(target: &TargetSpec) -> Result<Observation, anyhow::Error> {
-    // One clock for the whole call, resolution and the reads that name the surface
-    // included, so the budget the model is told about is the one the call pays.
+    // One clock for the whole call, resolution and the reads that name the surface included.
     let mut budget = core::Budget::new(core::OBSERVE_BUDGET, "observation", target.describe());
     let (window, app) = resolve_window(target, &budget)?;
     budget.check()?;
-    // The identity is read before the reads that can go unanswered: a failure has to
-    // name the window, and a title is an exchange it can no longer afford then.
+    // The identity is read before the reads that can go unanswered: a failure has to name the window.
     let app_name = resolved_app_name(target, &app)?;
     // The header title is a name, not a label: read past the cap so a cut is counted.
     let title = attribute_text(&window, &axc(AX_TITLE), core::MAX_NAME_CHARS);
     let label = core::name_surface(&mut budget, &app_name, title.as_deref());
-    // The header reports the window's frame, and a minimized window's is the one it
-    // had before it was minimized: refuse rather than describe a surface that is not
-    // on screen.
+    // A minimized window's frame is the one it had before it was minimized: refuse rather than
+    // describe a surface that is not on screen.
     refuse_minimized(&window)?;
     budget.check()?;
     let origin =
@@ -1056,8 +916,7 @@ fn observe_blocking(target: &TargetSpec) -> Result<Observation, anyhow::Error> {
         window_frame(&window, &budget).map_err(|_| core::unanswered(&label, "for its frame"))?;
     budget.check()?;
     let (root, _handles, mut truncation) = build_tree(&window, origin, &budget)?;
-    // The title is a name like any node's, so a cut one is counted in the same header
-    // ceiling instead of being shortened silently.
+    // The title is a name like any node's, so a cut one is counted in the same header ceiling.
     let title = title.map(|title| truncation.keep_name(&title));
     Ok(Observation {
         truncation,
@@ -1068,13 +927,9 @@ fn observe_blocking(target: &TargetSpec) -> Result<Observation, anyhow::Error> {
     })
 }
 
-// ── Window identity ─────────────────────────────────────────────────────
-
-/// A retained AX window element, addressed by the token that names it in the
-/// target registry. The element itself is the identity: it answers with the
-/// window's live title, frame and process, so nothing here has to re-find a
-/// window by title or by its place in an enumeration. The owner is the agent
-/// that enumerated it, so the session that ends drops its own handles only.
+/// A retained AX window element, addressed by the token that names it in the target registry.
+/// The element itself is the identity — it answers with the window's live title, frame and
+/// process. The owner is the agent that enumerated it, so a session drops its own handles only.
 struct HeldWindow {
     element: CFRetained<AXUIElement>,
     owner: String,
@@ -1093,18 +948,11 @@ static HELD_WINDOWS: LazyLock<Mutex<HashMap<u64, HeldWindow>>> =
 
 static NEXT_WINDOW_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-/// The identity of `window`: the token it already holds, else a fresh one.
-/// `CFEqual` compares accessibility elements by the object they address, so the
-/// same window is recognised across enumerations even though every enumeration
-/// hands back a new element reference. Tokens are per agent, so a session's reset can
-/// never drop a handle another session's id resolves through. A handle is dropped
-/// when a call confirms its window gone, or with the session — never to make room,
-/// so a live id always has the handle it resolves through. An element id an
-/// application recycles after its window closed is the one case this cannot tell
-/// apart; catching it would need a liveness probe per held window on every listing.
-///
-/// `owner` is read by the caller — never inside an exchange routed to the main
-/// queue, where this thread's task-locals are absent.
+/// The identity of `window`: the token it already holds, else a fresh one. `CFEqual` compares
+/// elements by the object they address, so the same window is recognised across enumerations.
+/// Tokens are per agent, so a session's reset can never drop a handle another session's id
+/// resolves through; a handle is dropped when a call confirms its window gone, or with the
+/// session. `owner` is read by the caller — never inside a main-queue exchange.
 fn window_key(window: &AXUIElement, owner: &str) -> WindowKey {
     let mut held = HELD_WINDOWS.lock().unwrap_poison();
     let known = held
@@ -1125,11 +973,9 @@ fn window_key(window: &AXUIElement, owner: &str) -> WindowKey {
     WindowKey::new(format!("ax:{token}"))
 }
 
-/// The window a stored key names, refusing rather than substituting another one.
-/// A token that no longer resolves, or an element whose window is gone, is
-/// `surface-gone`: the call is about a window this process can no longer
-/// identify. A handle whose window is confirmed gone is dropped here, so the table
-/// follows only windows that still exist.
+/// The window a stored key names, refusing rather than substituting another one. A token that
+/// no longer resolves, or an element whose window is gone, is `surface-gone`; a handle whose
+/// window is confirmed gone is dropped here.
 fn window_by_key(
     key: &WindowKey,
     app_name: &str,
@@ -1145,10 +991,8 @@ fn window_by_key(
             .map(|held| held.element.retain())
             .ok_or_else(|| core::surface_gone(app_name))?
     };
-    // A retained element outlives its window: reading it is what tells the two apart.
-    // Only the framework's own "no longer an element" answer is a gone window — a read
-    // that timed out is a live window that stopped answering, and calling that
-    // `surface-gone` would send the model re-enumerating a window that is still there.
+    // A retained element outlives its window: reading it tells the two apart. Only the framework's
+    // own "no longer an element" answer is a gone window — a timeout is a live window that stalled.
     match attribute_value(&window, &axc(AX_ROLE)) {
         Ok(_) => Ok(window),
         Err(AXError::InvalidUIElement) => {
@@ -1162,15 +1006,13 @@ fn window_by_key(
     }
 }
 
-/// Drop every window `agent` holds: its session ended, so the ids these handles
-/// resolve through ended with it.
+/// Drop every window `agent` holds: its session ended, and so did the ids it resolves.
 pub(crate) fn forget_agent_windows(agent: &str) {
     let mut held = HELD_WINDOWS.lock().unwrap_poison();
     held.retain(|_, entry| entry.owner != agent);
 }
 
-/// Refuse a minimized window: it has no visible pixels, and its frame is the one
-/// it had before it was minimized.
+/// Refuse a minimized window: it has no visible pixels, and its frame is its pre-minimized one.
 fn refuse_minimized(window: &AXUIElement) -> Result<(), anyhow::Error> {
     if !attribute_bool(window, &axc(AX_MINIMIZED)).unwrap_or(false) {
         return Ok(());
@@ -1180,11 +1022,8 @@ fn refuse_minimized(window: &AXUIElement) -> Result<(), anyhow::Error> {
     ))
 }
 
-// ── The window server's order, and the system's hit test ─────────────────
-//
-// The two questions the module header names, each answered by the system that can answer
-// it: the order by the compositor's on-screen list, what lies under a point by the
-// accessibility hit test. Both are read here; neither is inferred from the other.
+// The two questions the module header names, each answered by the system that can answer it:
+// the order by the compositor's on-screen list, what lies under a point by the hit test.
 
 /// A value of the compositor's dictionary as an integer.
 fn compositor_number(dict: &CFDictionary<CFString, CFType>, key: &CFString) -> Option<i64> {
@@ -1210,15 +1049,11 @@ fn compositor_frame(
     })
 }
 
-/// The windows the window server has on screen, front to back, as the process that owns each
-/// and its frame — what a listing's windows are matched against to be ranked. `None` when the
-/// list itself cannot be read: a listing then says it could not attribute an order instead of
-/// inventing one.
-///
-/// Every level is kept, since an application's popover, menu or floating panel sits above the
-/// normal level and still comes before the windows it covers. An entry whose process or bounds
-/// cannot be read is dropped: nothing can be matched against it, and its absence changes no
-/// other window's place.
+/// The windows the window server has on screen, front to back, as the process that owns each and
+/// its frame. `None` when the list itself cannot be read: a listing then says it could not
+/// attribute an order instead of inventing one. Every level is kept, since a popover, menu or
+/// floating panel sits above the normal level; an entry with no readable process or bounds is
+/// dropped.
 fn compositor_windows() -> Option<Vec<(u32, SurfaceGeometry)>> {
     // SAFETY: both statics are plain CFString constants the framework owns.
     let (owner, bounds) = unsafe { (kCGWindowOwnerPID, kCGWindowBounds) };
@@ -1248,22 +1083,15 @@ fn compositor_windows() -> Option<Vec<(u32, SurfaceGeometry)>> {
     Some(out)
 }
 
-/// Attribute the compositor's front-to-back order to the windows a listing just read: a
-/// listed window matches the first compositor entry with its process and frame, and its
-/// rank is that window's place among the windows that found one. Answers what the listing
-/// could establish about the order — a failed read of the list is kept apart from a window
-/// that simply has no on-screen entry.
-///
-/// A window that found no entry is common and not a failure to order the rest: a minimized
-/// window, or one on another space, keeps its accessibility record and has no on-screen
-/// entry, so it is counted as unplaced instead of declaring the whole listing's order
-/// unknown. The comparison is a frame one, within [`core::POSITION_TOLERANCE`]: the two
-/// systems report one window's rectangle separately and do not always agree to the point.
+/// Attribute the compositor's front-to-back order to the windows a listing just read: a listed
+/// window matches the first compositor entry with its process and frame, and its rank is that
+/// window's place among the windows that found one. A window with no entry — minimized, on
+/// another space — is counted as unplaced rather than declaring the whole order unknown. The
+/// comparison is a frame one, within [`core::POSITION_TOLERANCE`].
 fn attribute_order(windows: &mut [WindowInfo]) -> core::WindowOrder {
     let Some(compositor) = compositor_windows() else {
-        // The list could not be read this time: nothing was ranked, and the answer says the
-        // read failed — never that no window has a place, and never that the platform cannot
-        // attribute an order at all.
+        // The list could not be read this time: nothing was ranked, and the answer says the read
+        // failed — never that no window has a place.
         return core::WindowOrder::Unread;
     };
     // (compositor position, index among the listed windows) for every listed window.
@@ -1273,8 +1101,7 @@ fn attribute_order(windows: &mut [WindowInfo]) -> core::WindowOrder {
         let Some(pid) = window.app_pid else {
             continue;
         };
-        // Each compositor entry stands for at most one listed window, so two windows that
-        // share a title and a frame still get their own place in the order.
+        // Each compositor entry stands for at most one window, so equal titles and frames still rank.
         let Some(position) =
             compositor
                 .iter()
@@ -1288,9 +1115,8 @@ fn attribute_order(windows: &mut [WindowInfo]) -> core::WindowOrder {
         taken[position] = true;
         matched.push((position, index));
     }
-    // Ranks are places among the windows this listing read, not indices into the whole
-    // compositor list: a frontmost listed window is #1 even when unlisted windows of other
-    // processes sit ahead of it.
+    // Ranks are places among the windows this listing read, not indices into the whole compositor
+    // list: a frontmost listed window is #1 even when unlisted windows sit ahead of it.
     matched.sort_unstable();
     for (rank, (_, index)) in matched.iter().enumerate() {
         windows[*index].rank = Some(rank + 1);
@@ -1302,16 +1128,11 @@ fn attribute_order(windows: &mut [WindowInfo]) -> core::WindowOrder {
     }
 }
 
-/// The window a screen point lies over, from the system's own hit test: the accessibility
-/// element a click there would reach, and through it the application and the window it
-/// belongs to. `None` when the hit test cannot answer — nothing is at the point, or the read
-/// failed — so the click goes and its answer says the point could not be checked. The window
-/// server's backstop surface is not an accessibility element, so it never answers here and
-/// needs no exclusion.
-///
-/// The window's frame is read from the element's `AXWindow`, exactly as the addressed
-/// window's own frame is, so the two are compared in one coordinate system. An element with
-/// no window of its own — a menu-bar item, a Dock tile — names the application alone.
+/// The window a screen point lies over, from the system's own hit test, and through it the
+/// application and window it belongs to. `None` when the hit test cannot answer, so the click
+/// goes and its answer says the point could not be checked; the window server's backstop
+/// surface is not an accessibility element and never answers here. The frame is read from the
+/// element's `AXWindow`, so the two are compared in one coordinate system.
 fn window_at_point(point: (f64, f64), budget: &core::Budget) -> Option<core::WindowAtPoint> {
     budget.check().ok()?;
     let mut element: *const AXUIElement = std::ptr::null();
@@ -1358,20 +1179,14 @@ fn app_name_for_pid(pid: u32) -> String {
         .find(|app| app.processIdentifier() == pid as i32)
         .and_then(|app| app.localizedName().map(|name| name.to_string()))
         .filter(|name| !name.is_empty())
-        // The list can name a process CoreGraphics reports without a running
-        // application (a helper, a system surface): the pid is what the caller can match
-        // against, so it is never guessed at.
+        // The list can name a process CoreGraphics reports without a running application (a helper, a
+        // system surface): the pid is what the caller can match against, so it is never guessed at.
         .unwrap_or_else(|| format!("pid {pid}"))
 }
 
-// ── Window resolution ────────────────────────────────────────────────────
-
-/// The frontmost application's AX element, resolved through `NSWorkspace`.
-///
-/// The system-wide AX element's own focus attributes are deliberately not used:
-/// a process that holds its grant through the terminal gets
-/// `kAXErrorCannotComplete` from them, which would make the DEFAULT surface (a
-/// call with no explicit target) fail while every per-application query works.
+/// The frontmost application's AX element, resolved through `NSWorkspace`. The system-wide
+/// element's own focus attributes are deliberately not used: a process holding its grant
+/// through the terminal gets `kAXErrorCannotComplete` from them.
 fn frontmost_app() -> Result<CFRetained<AXUIElement>, anyhow::Error> {
     let app = NSWorkspace::sharedWorkspace()
         .frontmostApplication()
@@ -1393,12 +1208,9 @@ fn focused_window_of_app(app: &AXUIElement) -> Option<CFRetained<AXUIElement>> {
         .ok()
 }
 
-/// The element holding an application's focus, by kind and name. `None` when it cannot be
-/// read: an application with no focused element, one that stops answering, or our own
-/// interface reached from a worker thread — whose exchange belongs on the main queue and
-/// is not worth that wait for a note. The one budget bounds the whole read: it runs on
-/// every action's answer, so a target that hangs between its attribute reads costs the
-/// call one ceiling rather than one per read.
+/// The element holding an application's focus, by kind and name. `None` when it cannot be read —
+/// no focused element, a target that stops answering, or our own interface reached from a
+/// worker thread. The one budget bounds the whole read, which runs on every action's answer.
 fn focused_element_of_app(app: &AXUIElement, budget: &core::Budget) -> Option<FocusedElement> {
     if ensure_ax_thread(app_pid(app).ok()?).is_err() {
         return None;
@@ -1410,16 +1222,13 @@ fn focused_element_of_app(app: &AXUIElement, budget: &core::Budget) -> Option<Fo
         .ok()?;
     budget.check().ok()?;
     let kind = attribute_name(&element, &axc(AX_ROLE)).unwrap_or_default();
-    // The name is exactly what the tree prints for the same element (its title), so the
-    // report can be read against the observation it came from.
+    // The name is exactly what the tree prints for the element (its title), so the report matches it.
     let name = attribute_name(&element, &axc(AX_TITLE));
     Some(FocusedElement { kind, name })
 }
 
-/// The application in front, as its process and the name the workspace gives it. One read,
-/// so the `[focused]` mark and the "frontmost application" line of a listing can never name
-/// different applications; it answers even for an application the listing does not show (a
-/// menu-bar accessory, a process with no enumerable window), with no accessibility read.
+/// The application in front, as its process and the workspace's name for it. One read, so the
+/// `[focused]` mark and the "frontmost application" line can never name different applications.
 fn frontmost_identity() -> Option<(u32, String)> {
     let app = NSWorkspace::sharedWorkspace().frontmostApplication()?;
     let name = app
@@ -1443,10 +1252,8 @@ fn running_app_pid(name: &str) -> Option<u32> {
         .map(|app| app.processIdentifier() as u32)
 }
 
-/// App display name for a pid: the workspace's authoritative localized name (the
-/// same source `list_apps` uses) with an AXTitle fallback when the running-app
-/// lookup misses. An AXTitle read on the AXApplication element is usually empty,
-/// so relying on it alone yields an app="".
+/// App display name for a pid: the workspace's authoritative localized name, with an AXTitle
+/// fallback when the lookup misses — an AXTitle read on the application is usually empty.
 fn app_display_name(pid: u32, app: &AXUIElement) -> String {
     NSWorkspace::sharedWorkspace()
         .runningApplications()
@@ -1457,10 +1264,8 @@ fn app_display_name(pid: u32, app: &AXUIElement) -> String {
         .unwrap_or_else(|| attribute_name(app, &axc(AX_TITLE)).unwrap_or_default())
 }
 
-/// Whether the application is still running, from the workspace's own record: by pid
-/// when the id carries one, else by localized name — the source [`running_app_pid`]
-/// and `list_apps` both use. It answers the one question a window read cannot: an
-/// `a` id whose application quit says so, instead of blaming a window that closed.
+/// Whether the application is still running, from the workspace's record: by pid when the id
+/// carries one, else by localized name. An `a` id whose application quit says so.
 fn app_running(pid: Option<u32>, name: &str) -> bool {
     match pid {
         Some(pid) => NSWorkspace::sharedWorkspace()
@@ -1483,9 +1288,8 @@ fn app_element(pid: Option<u32>, name: &str) -> Result<CFRetained<AXUIElement>, 
     Ok(unsafe { AXUIElement::new_application(pid as libc::pid_t) })
 }
 
-/// An application's windows. A target that stopped answering is named as such: the
-/// generic "transient AX failure, retry" would send the model re-enumerating a hung
-/// application instead of reporting it.
+/// An application's windows. A target that stopped answering is named as such: the generic
+/// "transient AX failure, retry" would send the model re-enumerating a hung application.
 fn read_windows(
     app: &AXUIElement,
     app_name: &str,
@@ -1503,14 +1307,10 @@ fn read_windows(
     Ok(typed_members::<AXUIElement>(&array))
 }
 
-/// One application's listed windows: the AX window array plus each window's frame,
-/// title and identity. A window with neither a title nor a frame is not a surface
-/// and is dropped. The budget is checked before the window list and before every
-/// window, so an application that stalls is caught at the check after its stall.
-///
-/// The listing is the one path that knows the target process without resolving a
-/// `TargetSpec`, so it calls [`on_ax_thread`] itself with the app's pid. `owner` is
-/// the enumerating agent's key, read before the exchange for the same reason.
+/// One application's listed windows: the AX window array plus each window's frame, title and
+/// identity. A window with neither a title nor a frame is not a surface and is dropped. The
+/// budget is checked before the window list and before every window. The listing knows the
+/// target process without resolving a `TargetSpec`, so it calls [`on_ax_thread`] itself.
 fn windows_of_app(
     pid: u32,
     app_name: &str,
@@ -1523,16 +1323,14 @@ fn windows_of_app(
     let app = unsafe { AXUIElement::new_application(pid as libc::pid_t) };
     budget.check()?;
     let windows = read_windows(&app, app_name)?;
-    // One read names the application's focused window; it is asked only where the
-    // answer is one the caller can use (see the listing's `mark_focused`).
+    // One read names the application's focused window; asked only where the answer is usable.
     let focused = mark_focused.then(|| focused_window_of_app(&app)).flatten();
     let mut out = Vec::new();
     for window in &windows {
         budget.check()?;
         let frame = match window_frame(window, budget) {
             Ok(frame) => frame,
-            // A refused frame loses this window; a spent share ends this application's
-            // answer instead, so the window is never dropped as if it had none.
+            // A refused frame loses this window; a spent share ends the application's answer instead.
             Err(e) if budget.expired() => return Err(e),
             Err(_) => continue,
         };
@@ -1556,13 +1354,10 @@ fn windows_of_app(
     Ok(out)
 }
 
-/// Resolve a target to its AX window and application element.
-///
-/// The only place a target becomes a platform handle, and therefore the one place
-/// the "our own process off the main thread" check belongs ([`ensure_ax_thread`]):
-/// it runs after the app element exists but before the first AX exchange, so a
-/// worker attempt stops here with nothing performed. An app element's pid is a
-/// local getter, not an exchange.
+/// Resolve a target to its AX window and application element. The only place a target becomes
+/// a platform handle, and therefore the one place the "our own process off the main thread"
+/// check belongs ([`ensure_ax_thread`]): it runs after the app element exists but before the
+/// first AX exchange, so a worker attempt stops here with nothing performed.
 fn resolve_window(
     target: &TargetSpec,
     budget: &core::Budget,
@@ -1572,13 +1367,11 @@ fn resolve_window(
         TargetSpec::Focused => {
             let app = frontmost_app()?;
             ensure_ax_thread(app_pid(&app)?)?;
-            // Strictly the frontmost app's focused window: a coordinate action on
-            // a fallback surface would land on whatever is visible, which may not
-            // be that window (another Space, a minimized window).
+            // Strictly the frontmost app's focused window: a coordinate action on a fallback surface would
+            // land on whatever is visible (another Space, a minimized window).
             let Some(window) = focused_window_of_app(&app) else {
-                // Both leave AXFocusedWindow unset, and only a live application's answer
-                // says it has no focused window: one that does not answer at all must be
-                // named as such instead.
+                // Only a live application's answer says it has no focused window; one that does not answer at
+                // all must be named as such instead.
                 return Err(match attribute_value(&app, &axc(AX_ROLE)) {
                     Ok(_) => core::taxonomy_error(
                         core::ERR_NOT_MATCHED,
@@ -1600,10 +1393,8 @@ fn resolve_window(
             app_pid: pinned,
             app_name,
         } => {
-            // An a-id names the application's own focused window and is
-            // deliberately re-resolved per call, so it follows that window. An
-            // application that is gone has no window to re-resolve, and the answer
-            // says that rather than blaming a window.
+            // An a-id names the application's own focused window, re-resolved per call. An application
+            // that is gone has no window to re-resolve, and the answer says that.
             if !app_running(*pinned, app_name) {
                 return Err(core::app_absent(app_name, core::AppAbsence::Quit));
             }
@@ -1613,8 +1404,7 @@ fn resolve_window(
             budget.check()?;
             let window = match focused_window_of_app(&app) {
                 Some(window) => window,
-                // A read that failed is the application's answer, not an application
-                // without a window: only a successful read that found none means that.
+                // A failed read is the application's answer; only a successful read that found none means none.
                 None => read_windows(&app, app_name)?
                     .into_iter()
                     .next()
@@ -1628,8 +1418,7 @@ fn resolve_window(
             key,
             ..
         } => {
-            // A w-id names one window: the key resolves that window or fails,
-            // never another one of the same application.
+            // A w-id names one window: the key resolves that window or fails, never another one.
             let app = app_element(*pinned, app_name)?;
             ensure_ax_thread(app_pid(&app)?)?;
             Ok((window_by_key(key, app_name)?, app))
@@ -1644,8 +1433,7 @@ fn window_origin(window: &AXUIElement) -> Result<(f64, f64), anyhow::Error> {
     Ok((p.x, p.y))
 }
 
-/// A window's frame: position and size, two AX reads, each charged to `budget` so a target
-/// that stalls between them does not outlive the call by a whole extra read.
+/// A window's frame: two AX reads, each charged to `budget` so a stall does not outlive the call.
 fn window_frame(
     window: &AXUIElement,
     budget: &core::Budget,
@@ -1674,11 +1462,9 @@ fn app_pid(app: &AXUIElement) -> Result<u32, anyhow::Error> {
     Ok(pid as u32)
 }
 
-// ── Raw input (CGEvent) ──────────────────────────────────────────────────
-//
-// Every gesture builds all of its events before posting any, and posting cannot fail, so
-// a gesture that cannot be built delivers nothing and one that was delivered completes:
-// nothing here can leave a button or a key down partway.
+// Every gesture builds all of its events before posting any, and posting cannot fail, so a
+// gesture that cannot be built delivers nothing and one that was delivered completes: nothing
+// here can leave a button or a key down partway.
 
 fn cg_mouse_button(button: MouseButton) -> CGMouseButton {
     match button {
@@ -1718,8 +1504,7 @@ fn source() -> Option<CFRetained<CGEventSource>> {
     CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
 }
 
-/// A mouse event of `kind` at `point`. A failed creation is an honest error: an
-/// action that posts nothing must never report success.
+/// A mouse event of `kind` at `point`; a failed creation is an honest error, never a success.
 fn mouse_event(
     source: Option<&CGEventSource>,
     kind: CGEventType,
@@ -1740,8 +1525,7 @@ fn keyboard_event(
         .ok_or_else(|| anyhow!("failed to create a keyboard event"))
 }
 
-/// A click, or a double click, of `button` at `point`. `modifiers` ride on the events as
-/// flags rather than as separate key events, so they can never be left held.
+/// A click, or double click, of `button` at `point`. `modifiers` ride as flags, never held keys.
 fn click(
     point: CGPoint,
     button: MouseButton,
@@ -1874,8 +1658,7 @@ const KNOWN_KEYS: &str = "return, enter, tab, space, delete, forwarddelete, esca
      pageup, pagedown, up, down, left, right, f1..f12, minus, equal, comma, period, slash, \
      semicolon, quote, backslash, backtick, leftbracket, rightbracket, capslock, a-z, 0-9";
 
-/// The virtual keycode for a parsed key name, with the one error message every
-/// caller — the argument pre-check included — reports.
+/// The virtual keycode for a parsed key name, with the one message every caller reports.
 fn lookup_key(key: &str) -> Result<i64, anyhow::Error> {
     key_code(key).ok_or_else(|| anyhow!("unknown key '{key}' — supported keys: {KNOWN_KEYS}"))
 }
@@ -1890,15 +1673,13 @@ fn press_key(key: &str) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Typing is one character at a time, so a failure part-way through leaves the
-/// earlier characters typed: that is the middle outcome, not a failure. A failure
-/// on the FIRST character typed nothing and stays a failure.
+/// Typing is one character at a time, so a failure part-way through leaves the earlier
+/// characters typed: that is the middle outcome. A failure on the FIRST character stays a failure.
 fn type_text(text: &str) -> Result<Impact, anyhow::Error> {
     fn type_char(src: Option<&CGEventSource>, ch: char) -> Result<(), anyhow::Error> {
         let mut buf = [0u16; 2];
         let encoded = ch.encode_utf16(&mut buf);
-        // Built before either is posted, so a failed build leaves the character unposted
-        // while it is counted untyped.
+        // Built before either is posted, so a failed build leaves the character unposted and untyped.
         let down = keyboard_event(src, 0, true)?;
         let up = keyboard_event(src, 0, false)?;
         for event in [&down, &up] {
@@ -1953,16 +1734,14 @@ fn key_chord(chord: &str) -> Result<Impact, anyhow::Error> {
     Ok(Impact::Done)
 }
 
-/// Scroll: wheel 1 = vertical (down positive), wheel 2 = horizontal (right
-/// positive). CGEvent deltas use +ve for down/right on macOS.
+/// Scroll: wheel 1 = vertical (down positive), wheel 2 = horizontal (right positive).
 fn scroll(
     point: Option<CGPoint>,
     direction: ScrollDirection,
     amount: u32,
 ) -> Result<Impact, anyhow::Error> {
     let src = source();
-    // The tool bounds the amount before it gets here; the conversion is still total so
-    // no magnitude can wrap the direction.
+    // The tool bounds the amount; the conversion is total so no magnitude can wrap the direction.
     let ticks = i32::try_from(amount).unwrap_or(i32::MAX);
     let (w1, w2) = match direction {
         ScrollDirection::Down => (ticks, 0),
@@ -2012,8 +1791,6 @@ fn drag(from: CGPoint, to: CGPoint) -> Result<Impact, anyhow::Error> {
     Ok(Impact::Done)
 }
 
-// ── Surface geometry ─────────────────────────────────────────────────────
-
 fn active_display_ids() -> Vec<CGDirectDisplayID> {
     let mut displays = [0u32; 32];
     let mut count = 0u32;
@@ -2050,9 +1827,8 @@ fn screen_surface() -> Result<SurfaceGeometry, anyhow::Error> {
     })
 }
 
-/// The target's surface. A window frame is an AX read, so the grant gate belongs
-/// to [`surface_geometry_with`], which keeps it on the calling thread: a missing
-/// grant is requested there, never from the main queue.
+/// The target's surface. A window frame is an AX read, so the grant gate belongs to
+/// [`surface_geometry_with`], which keeps it on the calling thread.
 fn surface_geometry_blocking(
     target: &TargetSpec,
     budget: &core::Budget,
@@ -2060,8 +1836,7 @@ fn surface_geometry_blocking(
     if matches!(target, TargetSpec::Screen) {
         return screen_surface();
     }
-    // Coordinate input maps normalized points through this frame, so a
-    // pre-minimization frame must be refused here too.
+    // Coordinate input maps points through this frame: a pre-minimization frame is refused here too.
     let (window, app) = resolve_window(target, budget)?;
     budget.check()?;
     let label = resolved_surface_label(target, &app, window_title(&window).as_deref())?;
@@ -2071,10 +1846,8 @@ fn surface_geometry_blocking(
     window_frame(&window, budget).map_err(|_| core::unanswered(&label, "for its frame"))
 }
 
-/// [`surface_geometry_blocking`] with the grant gate hoisted and the read routed
-/// to the thread the system answers a self target on. The budget is owned so it can
-/// cross to that thread; a caller that already holds one passes a [`core::Budget`]
-/// clone, so the lookup cannot outlive the call it belongs to.
+/// [`surface_geometry_blocking`] with the grant gate hoisted and the read routed to the thread
+/// the system answers a self target on. The budget is owned so it can cross to that thread.
 fn surface_geometry_with(
     target: &TargetSpec,
     budget: core::Budget,
@@ -2087,8 +1860,7 @@ fn surface_geometry_with(
     })
 }
 
-/// Raise a window so input aimed at it lands there; `false` when it exposes no
-/// usable raise action.
+/// Raise a window so input aimed at it lands there; `false` when it exposes no usable raise action.
 fn raise_window(window: &AXUIElement) -> Result<bool, anyhow::Error> {
     let Some(names) = raw_action_names(window).ok().flatten() else {
         return Ok(false);
@@ -2104,12 +1876,9 @@ fn raise_window(window: &AXUIElement) -> Result<bool, anyhow::Error> {
     Ok(true)
 }
 
-/// Best-effort raise for input that is not pinned to a window (a coordinate
-/// click, a wheel at a point on `screen`): a refusal is not a failure there,
-/// because the input is allowed to land wherever its point is. Returns whether a
-/// raise was performed, so the caller settles only when there is something to
-/// settle. Pinned input uses [`raise_window`] plus [`ensure_window_receives`]
-/// instead.
+/// Best-effort raise for input not pinned to a window: a refusal is not a failure there,
+/// because the input may land wherever its point is. Returns whether a raise was performed,
+/// so the caller settles only when there is something to settle.
 fn activate_window(target: &TargetSpec, budget: &core::Budget) -> Result<bool, anyhow::Error> {
     let (TargetSpec::Focused | TargetSpec::App { .. } | TargetSpec::Window { .. }) = target else {
         return Ok(false);
@@ -2123,27 +1892,20 @@ fn activate_window(target: &TargetSpec, budget: &core::Budget) -> Result<bool, a
     raise_window(&window)
 }
 
-/// The application, and the live frame, of the surface a click addresses. The frame is
-/// read rather than taken from the enumeration snapshot: the note about "another window of
-/// the same application" must recognise the addressed window itself, whose title the two
-/// systems spell differently, and a frame is the one thing they agree on. A read that fails
-/// leaves the application it can still be named by, and no frame — which the check reports as
-/// uncheckable rather than clear.
-///
-/// The caller answers the screen before reaching here (its points belong to no window), so
-/// the screen's absence of an addressed application is stated once, below.
+/// The application, and the live frame, of the surface a click addresses. The frame is read
+/// rather than taken from the enumeration snapshot: the note about "another window of the same
+/// application" must recognise the addressed window itself, and a frame is the one thing the
+/// two systems agree on. A failed read leaves no frame, which the check reports as uncheckable.
 fn live_surface_identity(
     target: &TargetSpec,
     budget: &core::Budget,
 ) -> (Option<u32>, Option<core::SurfaceGeometry>) {
     match resolve_window(target, budget) {
-        // The frame, not the title: it is what the hit test reads for the window under the
-        // point, so the two are compared in one coordinate system and a title the two
-        // systems spell differently can never decide the answer.
+        // The frame, not the title: it is what the hit test reads for the window under the point, so
+        // the two are compared in one coordinate system.
         Ok((window, app)) => (app_pid(&app).ok(), window_frame(&window, budget).ok()),
-        // A window spec without a pid is one whose application could not be identified —
-        // never the frontmost process, which would attribute its point to whatever happens to
-        // be in front; `core::UnderPoint::classify` answers that as the unknown case.
+        // A window spec without a pid is one whose application could not be identified — never the
+        // frontmost process; `core::UnderPoint::classify` answers that as the unknown case.
         Err(_) => (
             match target {
                 TargetSpec::Focused => frontmost_identity().map(|(pid, _)| pid),
@@ -2158,8 +1920,7 @@ fn live_surface_identity(
     }
 }
 
-/// Whether `window` is where the window server delivers input right now: its
-/// application is frontmost and the window is that application's focused one.
+/// Whether `window` is where input is delivered right now: frontmost application, focused window.
 fn window_receives_input(window: &AXUIElement) -> bool {
     let Ok(app) = frontmost_app() else {
         return false;
@@ -2167,11 +1928,9 @@ fn window_receives_input(window: &AXUIElement) -> bool {
     focused_window_of_app(&app).is_some_and(|focused| &*focused == window)
 }
 
-/// The verification half of pinned input: the window input was aimed at must be
-/// the one the window server would deliver to. A raise completes asynchronously,
-/// so the check is retried over the shared settle budget — the pauses run here, on
-/// the calling thread, and only each accessibility read is routed to the thread
-/// that answers it.
+/// The verification half of pinned input: the window aimed at must be the one the server would
+/// deliver to. A raise completes asynchronously, so the check is retried over the shared settle
+/// budget — the pauses run here, only each accessibility read is routed.
 fn ensure_window_receives(target: &TargetSpec, budget: &core::Budget) -> Result<(), anyhow::Error> {
     for attempt in 0..=core::RAISE_SETTLE_STEPS {
         if attempt > 0 {
@@ -2190,11 +1949,9 @@ fn ensure_window_receives(target: &TargetSpec, budget: &core::Budget) -> Result<
     Err(core::not_brought_forward(target.describe()))
 }
 
-/// The same proof for a window the caller already holds: bring it forward and confirm the
-/// window server delivers input to it. A pointer double click is aimed at the screen, so it
-/// lands on whatever window is in front — the element's own window is raised and checked
-/// before the click rather than clicked blind, and the call is refused when the surface never
-/// receives input.
+/// The same proof for a window the caller already holds: bring it forward and confirm delivery.
+/// A pointer double click is aimed at the screen, so the element's own window is raised and
+/// checked before the click rather than clicked blind.
 fn bring_window_forward(
     window: &AXUIElement,
     surface: &str,
@@ -2213,8 +1970,7 @@ fn bring_window_forward(
     Err(core::not_brought_forward(surface))
 }
 
-/// Reject an argument mistake before any grant is requested: a call that can
-/// never succeed must not raise a system permission dialog.
+/// Reject an argument mistake before any grant request: a call that cannot succeed must not prompt.
 fn check_input_arguments(input: &RawInput) -> Result<(), anyhow::Error> {
     core::check_raw_input(input)?;
     // The chord's key is resolved here, so an unknown key is refused before any event.
@@ -2232,8 +1988,7 @@ fn raw_input_blocking(
     let pinned = core::pinned_input(target, input);
     // A chord goes to whatever already has focus, so nothing is raised for it.
     let raises = !matches!(input, RawInput::KeyChord { .. });
-    // One lookup budget for the whole call: raising a window, proving it receives the
-    // input and reading the frame the input is mapped through all fit in it.
+    // One lookup budget for the whole call: raise, delivery proof and the frame the input maps through.
     let lookup = core::Budget::new(core::LIST_BUDGET, "surface lookup", target.describe());
     let geometry = lookup.clone();
     if pinned {
@@ -2249,8 +2004,7 @@ fn raw_input_blocking(
     } else if raises {
         let raise = lookup.clone();
         if with_target(target, move |target| activate_window(target, &raise))? {
-            // Unpinned input has no delivery to verify, so a best-effort raise gets the
-            // same settle budget before the event is posted.
+            // Unpinned input has no delivery to verify, so a best-effort raise gets the same settle budget.
             sleep_millis((core::RAISE_SETTLE_STEPS as u64) * core::RAISE_SETTLE_MS);
         }
     }
@@ -2269,13 +2023,10 @@ fn raw_input_blocking(
                 from: local,
                 to: None,
             };
-            // Where the point is put, recorded before the event is posted: an exception
-            // raised by the posting itself must not lose a position that is already fixed.
+            // Where the point is put, recorded before posting: an exception must not lose a fixed position.
             *placed = Some(placement);
-            // The check runs here, at the moment the event is posted and after the raise
-            // above: only now is "in front" the state the click meets. A window of another
-            // application means nothing is sent. The screen's points belong to no window, so
-            // nothing is read for them.
+            // The check runs here, at the moment the event is posted and after the raise above: only now is
+            // "in front" the state the click meets. A window of another application means nothing is sent.
             let (addressed_pid, addressed_frame, under) = if matches!(target, TargetSpec::Screen) {
                 (None, None, None)
             } else {
@@ -2295,8 +2046,7 @@ fn raw_input_blocking(
                 Some(note) => core::impact_note(impact, note),
                 None => impact,
             };
-            // The point the event was posted at, from the geometry read that mapped it, so
-            // the answer states the position the click used and not a second one.
+            // The point the event was posted at, from the geometry read that mapped it.
             Ok(core::Actuation::at(impact, placement))
         }
         RawInput::TypeText { text } => type_text(text).map(core::Actuation::of),
@@ -2336,18 +2086,14 @@ fn raw_input_blocking(
     }
 }
 
-// ── Capture (ScreenCaptureKit) ───────────────────────────────────────────
-
-/// Hand-off wrappers letting SCK completion handlers deliver non-`Send` retained
-/// objects across the handler-to-waiter thread boundary.
+/// Hand-off wrappers letting SCK completion handlers deliver non-`Send` retained objects.
 struct SendShareable(Retained<SCShareableContent>);
 unsafe impl Send for SendShareable {}
 
 struct SendImage(Retained<CGImage>);
 unsafe impl Send for SendImage {}
 
-/// The failure a completion handler's `NSError` stands for, classified by its
-/// `SCStreamError` code.
+/// The failure a completion handler's `NSError` stands for, by its `SCStreamError` code.
 fn sc_error(err: &NSError) -> anyhow::Error {
     let code = err.code();
     if code == SCStreamErrorCode::UserDeclined.0 || code == SCStreamErrorCode::MissingEntitlements.0
@@ -2366,8 +2112,7 @@ fn sc_error(err: &NSError) -> anyhow::Error {
     }
 }
 
-/// Block on an SCK completion handler (5s timeout) and return the handed-off
-/// result. The caller spawns the provider call; this consumes the shared slot.
+/// Block on an SCK completion handler (5s) and return the handed-off result.
 fn sc_wait<T: Send>(
     slot: &Arc<Mutex<Option<Result<T, anyhow::Error>>>>,
     semaphore: &Arc<DispatchRetained<DispatchSemaphore>>,
@@ -2382,16 +2127,10 @@ fn sc_wait<T: Send>(
         .ok_or_else(|| anyhow!("{what} handler never invoked"))?
 }
 
-/// Hand one completion handler its answer and release the waiter — the only way a
-/// handler body ends.
-///
-/// The system invokes these bodies on its own frames, where nothing may unwind: a
-/// Rust panic cannot cross into them, and a framework exception raised inside the
-/// body cannot reach the caller's firewall either (the body runs on the system's
-/// thread, possibly after the wait gave up). [`contained`] holds both guards, and a
-/// failure becomes the value the waiter reads — the call that is waiting reports it,
-/// so it is logged at debug rather than as an issue row; a body that fails after the
-/// wait returned is the case with no reader.
+/// Hand one completion handler its answer and release the waiter. The system invokes these
+/// bodies on its own frames, where nothing may unwind: [`contained`] holds both guards, and a
+/// failure becomes the value the waiter reads. A body that fails after the wait returned is the
+/// case with no reader, logged at debug.
 fn sc_complete<T>(
     slot: &Mutex<Option<Result<T, anyhow::Error>>>,
     semaphore: &DispatchSemaphore,
@@ -2406,8 +2145,7 @@ fn sc_complete<T>(
     semaphore.signal();
 }
 
-/// Fetch the shareable-content snapshot (availability probe + window/display
-/// capture source).
+/// Fetch the shareable-content snapshot (availability probe + capture source).
 fn get_shareable_content() -> Result<Retained<SCShareableContent>, anyhow::Error> {
     let semaphore = Arc::new(DispatchSemaphore::new(0));
     let sem2 = Arc::clone(&semaphore);
@@ -2433,26 +2171,18 @@ fn get_shareable_content() -> Result<Retained<SCShareableContent>, anyhow::Error
     // asynchronous call, and the wait below keeps the original alive until the
     // handler has run.
     //
-    // Off-screen windows are included on purpose: a window on another Space, behind
-    // another app or minimized is still the surface a call may name, and excluding
-    // it made the capture path report a missing window as "re-enumerate".
+    // Off-screen windows are included on purpose: a window on another Space, behind another app or
+    // minimized is still the surface a call may name.
     unsafe {
         SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(false, false, &block);
     }
     sc_wait::<SendShareable>(&slot, &semaphore, "shareable content").map(|SendShareable(c)| c)
 }
 
-/// A single still of `filter`'s content, at the pixel size the caller asked for.
-///
-/// Both capture routes derive that size from what the system reported — a window's
-/// frame, a display's frame — so it is put through [`core::capture_size`] BEFORE the
-/// request reaches the framework: zero is what a minimized, off-screen or vanished
-/// surface reduces to, and the framework must never be asked for a size the buffer
-/// cannot match.
-///
-/// Callers guarantee [`sck_available`]: the `SCScreenshotManager` class itself
-/// only exists from macOS 14 on, and messaging a missing class aborts the
-/// process.
+/// A single still of `filter`'s content, at the pixel size the caller asked for. That size is put
+/// through [`core::capture_size`] BEFORE the request reaches the framework: zero is what a
+/// minimized or vanished surface reduces to. Callers guarantee [`sck_available`]: messaging a
+/// class that only exists from macOS 14 on aborts the process.
 fn capture_filter_to_rgba(
     filter: &SCContentFilter,
     px_w: usize,
@@ -2509,12 +2239,9 @@ fn capture_filter_to_rgba(
     capture_image_to_rgba(&image, budget)
 }
 
-/// Turn a CGImage into top-down RGBA bytes. A bitmap context stores its first row
-/// at the top, and drawing an upright image into it with the identity transform
-/// keeps that order; a CTM flip would mirror Y and hand every caller an upside-down
-/// still (and a zoom cropped from the wrong band). The buffer is the call's: its
-/// geometry goes through [`core::capture_size`], and it is charged to `budget` with a
-/// fallible reserve, then filled in one copy from the context's own pixels.
+/// Turn a CGImage into top-down RGBA bytes. A bitmap context stores its first row at the top, so
+/// the identity transform keeps that order — a CTM flip would hand every caller an upside-down
+/// still. The buffer is the call's: [`core::capture_size`], charged to `budget`, one copy.
 fn capture_image_to_rgba(
     image: &CGImage,
     budget: &CaptureBudget,
@@ -2553,9 +2280,8 @@ fn capture_image_to_rgba(
     Capture::from_pixels(budget, "a captured frame", px_w, px_h, pixels)
 }
 
-/// The ScreenCaptureKit window a target's AX window is matched to, or a refusal:
-/// the two are tied together by owning process and frame, never by the order of a
-/// list or a title alone.
+/// The ScreenCaptureKit window a target's AX window is matched to, or a refusal: tied together
+/// by owning process and frame, never by the order of a list or a title alone.
 fn find_sc_window(
     content: &SCShareableContent,
     pid: u32,
@@ -2593,13 +2319,9 @@ fn find_sc_window(
         .filter(|window| near(window))
         .cloned()
         .collect::<Vec<_>>();
-    // The frame is the window's own truth; a title only breaks a tie, and a tie
-    // that survives it means the two cannot be told apart — refusing beats
-    // capturing the wrong one. With no frame match the frameworks merely disagree
-    // about geometry, so a unique exact title in the same process still names the
-    // window honestly. The title this is handed is the AX one, capped at
-    // [`core::MAX_NAME_CHARS`], so a longer one no longer compares equal here: the
-    // frame is the primary key and the cap only costs title-only matches.
+    // The frame is the window's own truth; a title only breaks a tie, and a tie that survives it
+    // means the two cannot be told apart — refusing beats capturing the wrong one. With no frame
+    // match a unique exact title in the same process still names the window honestly.
     let matching = match title.filter(|t| !t.is_empty()) {
         Some(title) if !of_frame.is_empty() => {
             let by_title = titled(&of_frame, title);
@@ -2634,10 +2356,8 @@ fn find_sc_window(
     }
 }
 
-/// The AX half of a window still: which process owns the window, its title and
-/// its frame — the facts ScreenCaptureKit is then matched against. A minimized
-/// window is refused here: it has no visible pixels, and its frame is the one it
-/// had before it was minimized.
+/// The AX half of a window still: owning process, title and frame — what ScreenCaptureKit is
+/// matched against. A minimized window is refused here: no visible pixels, stale frame.
 fn window_capture_facts(
     target: &TargetSpec,
     budget: &core::Budget,
@@ -2659,8 +2379,7 @@ fn capture_window_blocking(
     target: &TargetSpec,
     budget: &CaptureBudget,
 ) -> Result<Capture, anyhow::Error> {
-    // The window is resolved through AX (pid, title, frame) before SCK is asked
-    // for pixels; only that half belongs on the AX thread, never the capture.
+    // AX resolves the window (pid, title, frame) first; only that half belongs on the AX thread.
     let lookup = core::Budget::new(core::LIST_BUDGET, "surface lookup", target.describe());
     let (pid, title, frame) =
         with_target(target, move |target| window_capture_facts(target, &lookup))?;
@@ -2676,17 +2395,10 @@ fn capture_window_blocking(
     capture_filter_to_rgba(&filter, px_w as usize, px_h as usize, true, budget)
 }
 
-/// Composite each active display into one RGBA buffer at the virtual-desktop
-/// bounding rect, each display drawn at its global-frame offset.
-///
-/// One scale governs the whole buffer: the densest display's. Every display is
-/// captured AT that size — ScreenCaptureKit renders a filter's content at the size
-/// it is asked for — so a 1x display beside a 2x one lands at its logical offset ×
-/// that scale instead of covering half the buffer, and a mixed-density arrangement
-/// produces one faithful composite rather than a distorted one.
-///
-/// The composite is the call's largest buffer, so it is charged to `budget` before
-/// it exists — as is each display's frame, which the framework renders at that size.
+/// Composite each active display into one RGBA buffer at the virtual-desktop bounding rect, each
+/// display drawn at its global-frame offset. One scale governs the whole buffer — the densest
+/// display's — and every display is captured AT that size, so a mixed-density arrangement yields
+/// one faithful composite. The composite is charged to `budget` before it exists.
 fn capture_screen_blocking(budget: &CaptureBudget) -> Result<Capture, anyhow::Error> {
     let content = get_shareable_content()?;
     // SAFETY: SCK getter is an ObjC message against a live object.
@@ -2731,9 +2443,8 @@ fn capture_screen_blocking(budget: &CaptureBudget) -> Result<Capture, anyhow::Er
         let px_w = (frame.width * ref_scale).round() as usize;
         let px_h = (frame.height * ref_scale).round() as usize;
         let cap = capture_filter_to_rgba(&filter, px_w, px_h, false, budget)?;
-        // A display that comes back at another size cannot be placed at this
-        // scale, and blitting it would leave part of the buffer black without a
-        // word — refuse instead of composing a wrong image.
+        // A display that comes back at another size cannot be placed at this scale, and blitting it
+        // would leave part of the buffer black without a word.
         if (cap.width as usize, cap.height as usize) != (px_w, px_h) {
             return Err(core::taxonomy_error(
                 core::ERR_DEGRADED,
@@ -2765,8 +2476,7 @@ fn capture_blocking(target: &TargetSpec, budget: &CaptureBudget) -> Result<Captu
     if !sck_available() {
         return Err(screen_capture_needs_14());
     }
-    // A window still is resolved through AX (its frame and title) before SCK is
-    // asked for pixels, so the Accessibility grant is needed as well.
+    // A window still resolves through AX (frame, title) first, so Accessibility is needed as well.
     if !matches!(target, TargetSpec::Screen) {
         ensure(Grant::Accessibility)?;
     }
@@ -2774,23 +2484,17 @@ fn capture_blocking(target: &TargetSpec, budget: &CaptureBudget) -> Result<Captu
         TargetSpec::Screen => capture_screen_blocking(budget),
         _ => capture_window_blocking(target, budget),
     };
-    // A failed still is diagnosed from the grant, never assumed: the attempt
-    // itself is the authority (a preflight answer is only a hint), so a
-    // grantless capture asks for the grant and reports the actionable error,
-    // while a transient failure keeps its own.
+    // A failed still is diagnosed from the grant, never assumed: the attempt is the authority, so a
+    // grantless capture asks for the grant while a transient failure keeps its own.
     result.map_err(|e| ensure(Grant::ScreenRecording).err().unwrap_or(e))
 }
 
 fn capture_available_blocking() -> bool {
-    // Preflight only: the boot probe must never put a TCC dialog on the owner's
-    // screen, and fetching shareable content can raise one.
+    // Preflight only: the boot probe must never put a TCC dialog on the owner's screen.
     sck_available() && Grant::ScreenRecording.held()
 }
 
-// ── Element actions ──────────────────────────────────────────────────────
-
-/// Where a refused element press may have to synthesise a click: the element's own frame
-/// (surface-local) and the window's origin on screen, which is what maps it back.
+/// Where a refused element press may synthesise a click: the element's frame, the window's origin.
 struct PressPoint {
     frame: (f64, f64, f64, f64),
     origin: (f64, f64),
@@ -2805,12 +2509,9 @@ impl PressPoint {
     }
 }
 
-/// Perform a reference's press: its own `AXPress`, else its `AXOpen`. An element that
-/// offers `open` has two further routes, for the platform that advertises the action and
-/// then refuses it (Finder's desktop icons answer `kAXErrorAttributeUnsupported`): open
-/// the item it points at, or double click at its position once the window is proven to
-/// receive input. `point` is where the element sits, when it has a frame; `surface` names
-/// the window in the refusal.
+/// Perform a reference's press: its own `AXPress`, else its `AXOpen`. An element that offers
+/// `open` has two further routes for a platform that advertises the action then refuses it
+/// (Finder's icons answer `kAXErrorAttributeUnsupported`): open the item, or double click it.
 fn press_element(
     element: &AXUIElement,
     window: &AXUIElement,
@@ -2851,8 +2552,7 @@ fn press_element(
             return map_action_err(err, label);
         }
     }
-    // Only an open-capable element has a further route: a refused press has no
-    // equivalent this tool can prove, so it keeps the refusal below.
+    // Only an open-capable element has a further route: a refused press keeps the refusal below.
     if open_capable {
         if open_pointed_at(element) {
             return Ok(Impact::DoneWith(
@@ -2865,9 +2565,8 @@ fn press_element(
             bring_window_forward(window, surface, budget)?;
             let ((x, y), local) = point.centre();
             click(CGPoint::new(x, y), MouseButton::Left, true, &[])?;
-            // A synthesised click is a point action, so it says where the point was put:
-            // the element's own centre in the surface's points, against the size read now
-            // — the one thing only this rare route needs.
+            // A synthesised click is a point action, so it says where the point was put: the element's own
+            // centre in the surface's points, against the size read now.
             let placed = match window_frame(window, budget) {
                 Ok(frame) => core::placed_point(local, &frame),
                 Err(_) => format!(
@@ -2898,8 +2597,7 @@ fn action_list(names: &[String]) -> String {
         .join(", ")
 }
 
-/// An advertised action the platform answers with "unsupported" is one this element
-/// does not really perform, so the next route is tried instead of reporting it.
+/// An action the platform answers with "unsupported" is not really performed: try the next route.
 fn unsupported_action(err: AXError) -> bool {
     matches!(
         err,
@@ -2907,9 +2605,8 @@ fn unsupported_action(err: AXError) -> bool {
     )
 }
 
-/// Open the item an element points at, for a reference whose own action was refused.
-/// The link is the item itself (a file URL for Finder's icons), so the platform opens
-/// it exactly as the element's own action would.
+/// Open the item an element points at, for a reference whose own action was refused: the link is
+/// the item itself, so the platform opens it exactly as the element's own action would.
 fn open_pointed_at(element: &AXUIElement) -> bool {
     let Some(value) = attribute_value(element, &axc(AX_URL)).ok() else {
         return false;
@@ -2951,8 +2648,7 @@ fn act_on_element_blocking(
     locator: &Locator,
     act: &ElementAct,
 ) -> Result<Impact, anyhow::Error> {
-    // One clock for the whole call: resolution, the reads that name the surface, the
-    // walk and the action itself.
+    // One clock for the whole call: resolution, the reads naming the surface, the walk and the action.
     let mut budget = core::Budget::new(core::ACT_BUDGET, "element action", target.describe());
     let (window, app) = resolve_window(target, &budget)?;
     budget.check()?;
@@ -2963,14 +2659,11 @@ fn act_on_element_blocking(
     let origin =
         window_origin(&window).map_err(|_| core::unanswered(&label, "for its position"))?;
     let (root, handles, _truncation) = build_tree(&window, origin, &budget)?;
-    // The ref is acted on only if it is still what the caller saw: the same kind, the
-    // same name and the same place on the surface. Nothing is sent otherwise.
+    // The ref is acted on only if it is still what the caller saw: same kind, name and place.
     let (matched, confirmed) = core::resolve_locator_confirmed(&root, locator)?;
     let element = &handles[core::pre_order_index(&root, matched)];
-    // The element's own frame, for the press the platform can only perform as a pointer
-    // double click: the tree stores frames window-relative, and the window's origin puts
-    // them back on the screen. Read only where an element has a frame at all — a press
-    // that never needs the synthesised route pays nothing for it.
+    // The element's own frame, for a press the platform can only perform as a pointer double click:
+    // the tree stores frames window-relative and the window's origin puts them back on screen.
     let point = matched.frame.map(|frame| PressPoint { frame, origin });
     let impact = match act {
         ElementAct::Press => press_element(element, &window, point.as_ref(), &label, &budget),
@@ -2979,11 +2672,9 @@ fn act_on_element_blocking(
     Ok(core::impact_note(impact, confirmed.note(locator)))
 }
 
-/// Map the result of an AX ACTION onto the outcome the model is owed. The one
-/// action-specific arm is `CannotComplete`: the request reached the target without
-/// confirmation, so it is the middle outcome, [`Impact::Unconfirmed`]. An action the
-/// platform answers with [`unsupported_action`] never reaches here — each caller answers it
-/// with its own next route, or with a refusal written in the words of the action it asked for.
+/// Map the result of an AX ACTION onto the outcome the model is owed. The one action-specific
+/// arm is `CannotComplete`: the request reached the target without confirmation, so it is the
+/// middle outcome, [`Impact::Unconfirmed`].
 fn map_action_err(err: AXError, ctx: &str) -> Result<Impact, anyhow::Error> {
     match err {
         AXError::Success => Ok(Impact::Done),
@@ -3000,18 +2691,14 @@ fn map_action_err(err: AXError, ctx: &str) -> Result<Impact, anyhow::Error> {
     }
 }
 
-// ── Session state ────────────────────────────────────────────────────────
-
-/// One boolean entry of the session dictionary, or `None` when the entry is absent
-/// or is not a boolean — an unknown state, never a guessed one.
+/// One boolean entry of the session dictionary, or `None` when it is absent or not a boolean.
 fn session_flag(dict: &CFDictionary<CFString, CFType>, key: &str) -> Option<bool> {
     let key = CFString::from_str(key);
     let value = dict.get(&key)?;
     Some(value.downcast_ref::<CFBoolean>()?.value())
 }
 
-/// Why this session cannot receive an interactive call, or `None` when it can — the
-/// three answers the module header names, read from this process's session dictionary.
+/// Why this session cannot receive an interactive call, or `None` when it can.
 fn desktop_unavailable_blocking() -> Option<String> {
     let Some(dict) = objc2_core_graphics::CGSessionCopyCurrentDictionary() else {
         return Some(
@@ -3036,8 +2723,6 @@ fn desktop_unavailable_blocking() -> Option<String> {
     None
 }
 
-// ── Backend impl ─────────────────────────────────────────────────────────
-
 #[async_trait::async_trait]
 impl Backend for MacOsBackend {
     fn is_supported(&self) -> bool {
@@ -3045,10 +2730,8 @@ impl Backend for MacOsBackend {
         true
     }
 
-    /// No dictionary, an unreadable one, or a session that says nothing about itself is
-    /// answered by [`desktop_unavailable_blocking`]; a session-dictionary read that
-    /// raises is the one case that reads as "cannot tell", because the call it guards was
-    /// never delivered either way.
+    /// No dictionary, an unreadable one, or a session that says nothing about itself is answered by
+    /// [`desktop_unavailable_blocking`]; a raising read is the one case that reads as "cannot tell".
     async fn desktop_unavailable(&self) -> Option<String> {
         with_platform("read the session state", || {
             Ok(desktop_unavailable_blocking())
@@ -3058,17 +2741,15 @@ impl Backend for MacOsBackend {
     }
 
     async fn capture_available(&self) -> bool {
-        // A probe that cannot answer counts as "no": the capture attempt carries the
-        // real diagnosis, and the failure is logged instead of being lost.
+        // A probe that cannot answer counts as "no": the capture attempt carries the real diagnosis.
         with_platform("probe capture", || Ok(capture_available_blocking())).unwrap_or_else(|e| {
             tracing::warn!("computer use: {e:#}");
             false
         })
     }
 
-    /// The diagnosis for a capture that is unavailable. It has no call to fail into,
-    /// so a raised exception *becomes* the answer, as does the diagnosis itself; its
-    /// platform contacts are the version check and the grant-name lookup.
+    /// The diagnosis for a capture that is unavailable. It has no call to fail into, so a raised
+    /// exception *becomes* the answer; its platform contacts are the version check and the grant name.
     fn capture_unavailable_error(&self) -> anyhow::Error {
         catching_foreign("diagnose capture", || {
             Ok(if sck_available() {
@@ -3097,9 +2778,8 @@ impl Backend for MacOsBackend {
             }
             out.sort_by(|a, b| a.name.cmp(&b.name));
             out.dedup_by(|a, b| a.pid == b.pid);
-            // The workspace names the frontmost application without an accessibility
-            // read, and names one that is not among the listed regular applications —
-            // exactly the case a listing must not leave the caller to guess at.
+            // The workspace names the frontmost application without an accessibility read, including one
+            // that is not among the listed regular applications.
             let frontmost = frontmost_identity().map(|(_, name)| name);
             Ok(AppListing {
                 apps: out,
@@ -3135,16 +2815,13 @@ impl Backend for MacOsBackend {
             };
             let mut listing = WindowListing::default();
             let owner = core::agent_key();
-            // The frontmost application is read once — one read, so the mark and the line
-            // cannot name different applications — and it decides which application's focused
-            // window is worth a read: a background application's cannot receive input, so
-            // marking it would name something the caller cannot use.
+            // The frontmost application is read once — so the mark and the line cannot disagree — and it
+            // decides which application's focused window is worth a read.
             let frontmost = frontmost_identity();
             let mark_focused_pid = frontmost.as_ref().map(|(pid, _)| *pid);
             listing.frontmost = frontmost.map(|(_, name)| name);
-            // One clock for the whole enumeration, and one slice of it per application:
-            // a hung application costs its own part rather than the healthy ones read
-            // before and after it.
+            // One clock for the whole enumeration, and one slice of it per application: a hung application
+            // costs its own part rather than the healthy ones.
             let budget = core::Budget::new(
                 core::LIST_BUDGET,
                 "window listing",
@@ -3156,8 +2833,7 @@ impl Backend for MacOsBackend {
             for ai in app_infos {
                 let Some(pid) = ai.pid else { continue };
                 let name = ai.name;
-                // A listing that runs out of time keeps what it read and names the
-                // applications it did not reach, instead of discarding healthy windows.
+                // A listing that runs out of time keeps what it read and names the applications it did not reach.
                 if let Err(e) = budget.check() {
                     listing.unread.push(UnreadWindows {
                         app_name: name,
@@ -3167,14 +2843,10 @@ impl Backend for MacOsBackend {
                 }
                 let owner = owner.clone();
                 let app_name = name.clone();
-                // An application whose accessibility cannot be read is named in the
-                // listing with what went wrong — never left out as if it had no
-                // windows, and never allowed to fail the whole listing. The AX thread
-                // only makes our OWN window's reads possible at all, so that app's
-                // failure is the app's, listed like any other.
+                // An application whose accessibility cannot be read is named in the listing with what went
+                // wrong — never left out, and never allowed to fail the whole listing.
                 let app_budget = budget.slice(core::APP_SLICE, core::windows_label(&name));
-                // The copy outlives the closure, so the listing can ask afterwards whether
-                // it was this application's share that ran out.
+                // The copy outlives the closure, so the listing can ask whether this application's share ran out.
                 let share = app_budget.clone();
                 let mark_focused = app.is_some() || mark_focused_pid == Some(pid);
                 match on_ax_thread(pid, move || {
@@ -3188,10 +2860,8 @@ impl Backend for MacOsBackend {
                     }),
                 }
             }
-            // The order is attributed to the windows actually listed; a window that found no
-            // compositor entry — a minimized one, one on another space — is counted, never
-            // treated as a hole in an order that covers the rest, and a list that could not be
-            // read is stated as the failed read it is.
+            // The order is attributed to the windows actually listed; one with no compositor entry is
+            // counted, never treated as a hole, and a list that could not be read is stated as such.
             listing.order = attribute_order(&mut listing.windows);
             Ok(listing)
         })
@@ -3261,14 +2931,12 @@ impl Backend for MacOsBackend {
             match with_target(target, move |target| {
                 act_on_element_blocking(target, &locator, &act)
             }) {
-                // The request was handed to mahbot's own main queue and the wait ran
-                // out: it may still be applied when that thread catches up, so this is
+                // Handed to mahbot's own main queue and the wait ran out: it may still be applied, so this is
                 // the middle outcome rather than a failure.
                 Err(e) if e.downcast_ref::<AxBusy>().is_some() => Ok(Impact::Unconfirmed(format!(
                     "{e}; the request may still be applied once that thread catches up"
                 ))),
-                // A framework exception is raised from inside the exchange: where it
-                // stopped is unknown, so the element may already have acted.
+                // A framework exception raised inside the exchange stopped somewhere unknown: it may have acted.
                 Err(e) if core::is_framework_failed(&e) => Ok(Impact::Unconfirmed(format!(
                     "the system raised an exception while the element action was running, so it \
                      may already have been performed — {e}"
@@ -3283,9 +2951,8 @@ impl Backend for MacOsBackend {
         target: &TargetSpec,
         input: RawInput,
     ) -> Result<core::Actuation, anyhow::Error> {
-        // The position the call placed is kept outside the firewall: it is worked out before
-        // the event is posted, so an exception raised by the posting itself still answers
-        // where the point was put.
+        // The position the call placed is kept outside the firewall: it is worked out before the event
+        // is posted, so a posting exception still answers where the point was put.
         let mut placed = None;
         let result = with_platform("synthesize input", || {
             check_input_arguments(&input)?;
@@ -3293,14 +2960,12 @@ impl Backend for MacOsBackend {
             raw_input_blocking(target, &input, &mut placed)
         });
         match result {
-            // An own-window exchange that timed out before any event was posted:
-            // nothing was actuated, so it is a plain retryable failure.
+            // An own-window exchange that timed out before any event was posted: nothing was actuated.
             Err(e) if e.downcast_ref::<AxBusy>().is_some() => Err(core::taxonomy_error(
                 core::ERR_DEGRADED,
                 format!("{e} — nothing was sent to the window; retry the call"),
             )),
-            // An exception raised under the call: the events already posted stay
-            // posted, so this may have landed and is not a failure.
+            // An exception under the call: the events already posted stay posted, so this may have landed.
             Err(e) if core::is_framework_failed(&e) => {
                 let impact = Impact::Unconfirmed(format!(
                     "the system raised an exception while the input was being synthesized, so \
@@ -3321,15 +2986,12 @@ impl Backend for MacOsBackend {
         })
     }
 
-    /// The focused element of the addressed application, read from that application's own
-    /// element. Best-effort by contract: a grant that is gone, a target that stops
-    /// answering or an application with no focus answers `None`, which the action's report
-    /// states as a read that did not establish it.
+    /// The focused element of the addressed application, read from its own element. Best-effort by
+    /// contract: a missing grant, a target that stops answering or no focus answers `None`.
     async fn focused_element(&self, target: Option<&TargetSpec>) -> Option<FocusedElement> {
         let target = target.cloned();
         with_platform("read the focused element", move || {
-            // One budget for the whole probe: it answers every action, so a target that
-            // stops answering between its reads costs one ceiling instead of one per read.
+            // One budget for the whole probe, which answers every action.
             let budget = core::Budget::new(
                 core::LIST_BUDGET,
                 "focused element",
@@ -3366,29 +3028,24 @@ impl Backend for MacOsBackend {
     }
 }
 
-/// The window's title as a capped label ([`core::cap_label`]): a cut is marked with an
-/// ellipsis and counted only where a tree header is at hand, which is
-/// [`observe_blocking`] reading the title through [`Truncation::keep_name`] itself.
+/// The window's title as a capped label ([`core::cap_label`]): a cut is counted only where a tree
+/// header is at hand — [`observe_blocking`] reads it through [`Truncation::keep_name`] itself.
 fn window_title(window: &AXUIElement) -> Option<String> {
     attribute_name(window, &axc(AX_TITLE))
 }
-
-// ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use objc2_core_graphics::{CGBitmapInfo, CGColorRenderingIntent, CGDataProvider};
 
-    /// The evidence for this backend's exception route: a framework call that
-    /// raises must come back as a failed call, and raising it must not kill the
-    /// process running this test.
+    /// The evidence for this backend's exception route: a framework call that raises must come back
+    /// as a failed call, and raising it must not kill the process running this test.
     #[test]
     fn a_framework_exception_becomes_a_failed_call() {
         let err = with_platform("probe", || -> Result<(), anyhow::Error> {
             let array = NSArray::<objc2::runtime::NSObject>::new();
-            // An out-of-range read is the framework's own failure (an
-            // NSRangeException raised by NSArray), not something Rust maps.
+            // An out-of-range read is the framework's own NSRangeException, not something Rust maps.
             let _: *mut objc2::runtime::AnyObject =
                 unsafe { objc2::msg_send![&array, objectAtIndex: 0usize] };
             Ok(())
@@ -3402,8 +3059,7 @@ mod tests {
         assert!(text.contains("exception"), "{text}");
     }
 
-    /// A wrongly-typed member of a system array must not be read as the type it
-    /// was assumed to be, and must not take the well-typed members with it.
+    /// A wrongly-typed member must not be read as the type assumed, nor take the good ones with it.
     #[test]
     fn typed_members_skip_a_member_of_another_type() {
         let name = CFString::from_str("AXPress");
@@ -3416,10 +3072,9 @@ mod tests {
         assert_eq!(names, vec!["AXPress".to_string()]);
     }
 
-    /// The capture conversion must keep the source's row order. A still whose rows
-    /// were reversed puts the menu bar at the bottom, and nothing else in this module
-    /// looks at a pixel; four distinct corners make a Y mirror visible in the first and
-    /// last rows (and an X mirror in the columns).
+    /// The capture conversion must keep the source's row order: a still whose rows were reversed puts
+    /// the menu bar at the bottom, and nothing else here looks at a pixel. Four distinct corners make
+    /// a Y mirror visible in the first and last rows (and an X mirror in the columns).
     #[test]
     fn a_capture_keeps_the_source_row_and_column_order() {
         let corners: [u8; 16] = [
@@ -3463,9 +3118,8 @@ mod tests {
         .expect("a 2x2 fixture image");
         let capture = capture_image_to_rgba(&image, &core::CaptureBudget::default())
             .expect("the fixture converts");
-        // One comparison pins the whole buffer: a Y mirror swaps the red/blue and the
-        // green/white pairs, an X mirror swaps the green/blue pair, and the length is the
-        // 2x2 image's.
+        // One comparison pins the whole buffer: a Y mirror swaps the red/blue and green/white pairs, an X
+        // mirror swaps the green/blue pair, and the length is the 2x2 image's.
         assert_eq!(
             &capture.rgba[..],
             &corners[..],

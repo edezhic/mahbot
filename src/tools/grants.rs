@@ -1,31 +1,24 @@
-//! Tool grants with kinds: the grammar of a custom role's `custom_roles.tools`
-//! column, and the kind vocabulary of the dispatch tools.
+//! Tool grants with kinds: the grammar of a custom role's `custom_roles.tools` column, and the kind
+//! vocabulary of the dispatch tools.
 //!
-//! One entry is `"tool"` (the tool with its narrowest kind) or
-//! `"tool:kind1,kind2"` (the named kinds). [`kinds_of`] is the single source of
-//! each dispatch tool's kind vocabulary — the same const arrays the tool enums
-//! expose ([`AnalyzeDepth::STRS`], [`Addressee::STRS`]) — so a kind can never be
-//! advertised by a tool it does not exist on. The catalog a role may be given is
-//! decided elsewhere ([`crate::Role::custom_role_tool_catalog`]); this module
-//! owns the grammar and the vocabulary only.
+//! One entry is `"tool"` (the tool with its narrowest kind) or `"tool:kind1,kind2"` (the named
+//! kinds). [`kinds_of`] is the single source of each dispatch tool's kind vocabulary — the same
+//! const arrays the tool enums expose ([`AnalyzeDepth::STRS`], [`Addressee::STRS`]) — so a kind can
+//! never be advertised by a tool it does not exist on. The catalog a role may be given is decided
+//! elsewhere ([`crate::Role::custom_role_tool_catalog`]); this module owns the grammar and the
+//! vocabulary only.
 
 use anyhow::Result;
 
 use crate::tools::analyze::AnalyzeDepth;
 use crate::tools::send::Addressee;
 
-/// One granted tool with the kinds it holds. A tool with no kind vocabulary (a
-/// kindless tool) has an empty `kinds`; so does a bare entry for a tool that
-/// has one — such an entry implies the vocabulary's narrowest kind
-/// ([`held_kinds`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolGrant {
     pub tool: String,
     pub kinds: Vec<String>,
 }
 
-/// The kind vocabulary of a dispatch tool, in interface order. `None` for a
-/// tool with no kinds.
 #[must_use]
 pub(crate) fn kinds_of(tool: &str) -> Option<&'static [&'static str]> {
     match tool {
@@ -35,24 +28,21 @@ pub(crate) fn kinds_of(tool: &str) -> Option<&'static [&'static str]> {
     }
 }
 
-/// The tool name of one raw entry — everything before the first `:`. The
-/// grammar's only spelling of that rule, so every reader of a stored entry
-/// agrees on what names the tool.
+/// The tool name of one raw entry — everything before the first `:`. The grammar's only spelling of
+/// that rule, so every reader of a stored entry agrees on what names the tool.
 #[must_use]
 pub(crate) fn tool_name(entry: &str) -> &str {
     entry.split(':').next().unwrap_or(entry)
 }
 
-/// Put a tool's kinds into interface order (the vocabulary's own order).
 fn canonical_kinds(tool: &str, kinds: &mut [String]) {
     if let Some(vocab) = kinds_of(tool) {
         kinds.sort_by_key(|kind| vocab.iter().position(|v| v == kind).unwrap_or(usize::MAX));
     }
 }
 
-/// Parse the stored entries into grants: one entry per tool, in the stored
-/// order, with each tool's kinds in the interface order. A tool named twice is
-/// refused, like an unknown kind.
+/// Parse the stored entries into grants: one entry per tool, in the stored order, with each tool's
+/// kinds in the interface order. A tool named twice is refused, like an unknown kind.
 pub(crate) fn parse(entries: &[String]) -> Result<Vec<ToolGrant>> {
     let mut out: Vec<ToolGrant> = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -67,18 +57,17 @@ pub(crate) fn parse(entries: &[String]) -> Result<Vec<ToolGrant>> {
     Ok(out)
 }
 
-/// Parse the stored entries, dropping only the entries the grammar refuses.
-/// The read side (building a role's tool set) uses this so a single bad row
-/// cannot cost the role its whole tool set — the validated write side never
-/// stores one, so this only ever narrows to what the record can serve.
+/// Parse the stored entries, dropping only the entries the grammar refuses. The read side (building
+/// a role's tool set) uses this so a single bad row cannot cost the role its whole tool set — the
+/// validated write side never stores one, so this only ever narrows to what the record can serve.
 pub(crate) fn parse_lossy(entries: &[String]) -> Vec<ToolGrant> {
     let mut out: Vec<ToolGrant> = Vec::with_capacity(entries.len());
     for entry in entries {
         let Ok(grant) = parse_entry(entry) else {
             continue;
         };
-        // One entry per tool, as `parse` holds: a repeat is dropped like any
-        // other entry the grammar refuses.
+        // One entry per tool, as `parse` holds: a repeat is dropped like any other entry the
+        // grammar refuses.
         if !out.iter().any(|g| g.tool == grant.tool) {
             out.push(grant);
         }
@@ -86,9 +75,8 @@ pub(crate) fn parse_lossy(entries: &[String]) -> Vec<ToolGrant> {
     out
 }
 
-/// Parse one entry into a grant: split on its first `:`, split the kinds on
-/// `,`, and refuse a kind on a tool that has no kind vocabulary (or an unknown
-/// kind, or a kind named twice on one tool).
+/// Parse one entry into a grant: split on its first `:`, split the kinds on `,`, and refuse a kind
+/// on a tool that has no kind vocabulary (or an unknown kind, or a kind named twice on one tool).
 fn parse_entry(entry: &str) -> Result<ToolGrant> {
     let tool = tool_name(entry);
     let mut kinds: Vec<String> = match entry.split_once(':') {
@@ -120,8 +108,6 @@ fn parse_entry(entry: &str) -> Result<ToolGrant> {
     })
 }
 
-/// The kinds a grant holds, with the narrowest kind filled in when the entry
-/// named none (empty for a tool with no kind vocabulary).
 #[must_use]
 pub(crate) fn held_kinds(grant: &ToolGrant) -> Vec<String> {
     if !grant.kinds.is_empty() {
@@ -133,8 +119,6 @@ pub(crate) fn held_kinds(grant: &ToolGrant) -> Vec<String> {
     }
 }
 
-/// The stored entries with every bare dispatch-tool entry spelled out with the
-/// kind it implies — what the admin surfaces list.
 #[must_use]
 pub(crate) fn describe_all(entries: &[String]) -> Vec<String> {
     parse_lossy(entries)
@@ -148,24 +132,19 @@ pub(crate) fn describe_all(entries: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Flip one kind of `tool` in the stored entries: add it when absent, remove it
-/// when present, drop the entry when its last kind goes, and keep the kinds in
-/// interface order and the entry's own position in the list. A tool with no
-/// kind vocabulary is left untouched.
 #[must_use]
 pub(crate) fn toggle(entries: &[String], tool: &str, kind: &str) -> Vec<String> {
-    // Nothing to flip on a tool that has no kinds, nor on a kind the tool's
-    // vocabulary does not name.
+    // Nothing to flip on a tool that has no kinds, nor on a kind the tool's vocabulary does not
+    // name.
     let Some(vocab) = kinds_of(tool) else {
         return entries.to_vec();
     };
     if !vocab.contains(&kind) {
         return entries.to_vec();
     }
-    // An entry the grammar refuses is carried through untouched — rewriting it
-    // is the write side's job, and it refuses such a record outright — so a
-    // record the picker renders checkmarks for is one this can still edit. The
-    // read is the same lenient one the picker and the launch path use.
+    // An entry the grammar refuses is carried through untouched — rewriting it is the write side's
+    // job, and it refuses such a record outright — so a record the picker renders checkmarks for is
+    // one this can still edit. The read is the same lenient one the picker and the launch path use.
     let mut out: Vec<String> = Vec::with_capacity(entries.len() + 1);
     let mut found = false;
     for entry in entries {
@@ -178,8 +157,6 @@ pub(crate) fn toggle(entries: &[String], tool: &str, kind: &str) -> Vec<String> 
             continue;
         }
         found = true;
-        // A bare entry holds the narrowest kind, so the flip starts from what
-        // the tool actually offers.
         let mut kinds = held_kinds(&grant);
         match kinds.iter().position(|k| k == kind) {
             Some(at) => {
@@ -188,7 +165,6 @@ pub(crate) fn toggle(entries: &[String], tool: &str, kind: &str) -> Vec<String> 
             None => kinds.push(kind.to_string()),
         }
         canonical_kinds(tool, &mut kinds);
-        // A grant is a held tool: an entry whose last kind just went is dropped.
         if !kinds.is_empty() {
             grant.kinds = kinds;
             out.push(encode(&grant));
@@ -203,7 +179,6 @@ pub(crate) fn toggle(entries: &[String], tool: &str, kind: &str) -> Vec<String> 
     out
 }
 
-/// Encode one grant back into its stored entry.
 #[must_use]
 fn encode(grant: &ToolGrant) -> String {
     if grant.kinds.is_empty() {
@@ -221,8 +196,6 @@ mod tests {
         items.iter().map(|s| (*s).to_string()).collect()
     }
 
-    /// A bare dispatch-tool entry holds the vocabulary's narrowest kind, and
-    /// the admin-facing spelling fills it in.
     #[test]
     fn held_kinds_and_describe_all_fill_in_the_narrowest_kind() {
         let parsed = parse(&entries(&["analyze", "send:worker,role", "read"])).unwrap();
@@ -241,8 +214,6 @@ mod tests {
         );
     }
 
-    /// Flipping a kind adds it, removes it, and takes the entry with the last
-    /// one — in interface order, and in place.
     #[test]
     fn toggle_adds_removes_and_drops_an_entry() {
         assert_eq!(
@@ -276,9 +247,9 @@ mod tests {
         );
     }
 
-    /// The grant vocabulary is [`Addressee::STRS`], never the wider vocabulary
-    /// [`Addressee::parse`] reads: an entry is validated here before it ever
-    /// reaches the tool's parser, so neither owner-side address is grantable.
+    /// The grant vocabulary is [`Addressee::STRS`], never the wider vocabulary [`Addressee::parse`]
+    /// reads: an entry is validated here before it ever reaches the tool's parser, so neither
+    /// owner-side address is grantable.
     #[test]
     fn a_grant_can_never_name_the_command_lines_own_assistant_or_the_guest_handover() {
         assert!(parse(&entries(&["send:assistant"])).is_err());

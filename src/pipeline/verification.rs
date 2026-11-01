@@ -1,14 +1,13 @@
-//! The `verification` stage runs the workspace's project commands, the read-only
-//! code reviewers and the single functional tester at the same time on one phase
-//! job, and the round produces ONE consolidated comment and one advance/bounce
-//! decision. The project commands are nobody's roster slot: they are the round's
-//! own work, run in parallel with the participants.
+//! The `verification` stage runs the workspace's project commands, the read-only code
+//! reviewers and the single functional tester at the same time on one phase job, and the
+//! round produces ONE consolidated comment and one advance/bounce decision. The project
+//! commands are nobody's roster slot: they are the round's own work, run in parallel with
+//! the participants.
 //!
-//! The round's cohorts are told apart by their stored `agents.kind` labels, never
-//! by slot order, and a roster that is not the round's shape is never resumed as
-//! one. The identical-content skip, the churn-calibrated reviewer count and the
-//! reviewed-base recording are reviewer-only: the tester is never skipped and
-//! never records a reviewed base.
+//! The round's cohorts are told apart by their stored `agents.kind` labels, never by slot
+//! order, and a roster that is not the round's shape is never resumed as one. The
+//! identical-content skip, the churn-calibrated reviewer count and the reviewed-base
+//! recording are reviewer-only: the tester is never skipped.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -32,9 +31,8 @@ use super::{
     run_parallel_agents, sync_phase_job_task, warn,
 };
 
-/// The stage's own name: the role the consolidated round comment is authored
-/// under, the label in log fields and stage comments. (The recorded transition
-/// actor is the phase token — `ACTIVE_PHASE.as_ref()`.)
+/// The stage's own name: the role the consolidated round comment is authored under, and the
+/// label in log fields. (The recorded transition actor is the phase token.)
 pub(crate) const STAGE: &str = "Verification";
 
 /// The phase a verification round works in.
@@ -46,24 +44,22 @@ const SUCCESS_PHASE: TicketPhase = TicketPhase::InSanitation;
 /// Minimum acceptable score (0-10) for a verification verdict.
 const VERIFICATION_THRESHOLD: u8 = 9;
 
-/// The functional tester runs exactly one agent per round — the round's
-/// functional check, which no round may run without.
+/// The functional tester runs exactly one agent per round — the round's functional check,
+/// which no round may run without.
 const TESTER_COUNT: usize = 1;
 
-/// Rendered at the head of the consolidated comment of a round whose reviewer
-/// cohort was not dispatched: the skipped code review is part of the round's
-/// result, so the reader must see it rather than infer it from its absence. It
-/// ends with the blank line that separates it from the round's own sections.
+/// Rendered at the head of the consolidated comment of a round whose reviewer cohort was not
+/// dispatched: the skipped code review is part of the round's result. It ends with the blank
+/// line that separates it from the round's own sections.
 const SKIPPED_REVIEW_NOTE: &str = "\
 **Code review skipped** — the content is identical to what the reviewers were \
 last handed on this ticket (same commit, same working tree, no changes since), \
 so they were not dispatched again. The functional check still ran.\n\n";
 
-/// Static metadata for one participant kind of a verification round. The code
-/// reviewers and the functional tester differ only here: the role (which
-/// selects the system prompt, tools and shell mode), the roster kind their
-/// slots are stored under, the work prompt, the angle supplements and the
-/// extraction prompt.
+/// Static metadata for one participant kind of a verification round. The code reviewers and
+/// the tester differ only here: the role (which selects the system prompt, tools and shell
+/// mode), the roster kind their slots are stored under, the work prompt, the angle supplements
+/// and the extraction prompt.
 #[derive(Copy, Clone)]
 struct Participant {
     role: Role,
@@ -92,8 +88,8 @@ const TESTER: Participant = Participant {
 };
 
 impl Participant {
-    /// The round's work prompt with the engineer's response and the round's own
-    /// project-commands brief baked in.
+    /// The round's work prompt with the engineer's response and the project-commands brief
+    /// baked in.
     fn prompt(self, ticket: &Ticket, commands_brief: &str) -> String {
         substitute(
             &load_prompt(self.prompt_template),
@@ -124,16 +120,15 @@ fn engineer_response(ticket: &Ticket) -> &str {
         .map_or("(no output)", |c| c.content.as_str())
 }
 
-/// Run the verification stage on a phase job: build a fresh round, or resume
-/// the round recorded in the job's roster.
+/// Run the verification stage on a phase job: build a fresh round, or resume the round
+/// recorded in the job's roster.
 pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
     if guard_job_phase(&ticket.id, ACTIVE_PHASE, &job_id).await {
         return;
     }
-    // The round's project-commands part — the workspace's discovered diagnostics
-    // commands — read once before anything is dispatched: not being able to read
-    // them is a technical failure (no bounce budget) — the round cannot be judged
-    // without knowing them.
+    // The workspace's discovered diagnostics commands, read once before anything is
+    // dispatched: not being able to read them is a technical failure (no bounce budget) — the
+    // round cannot be judged without knowing them.
     let commands = match crate::workspace::store().get_diagnostics(&ws.name).await {
         Ok(Some(cmds)) if !cmds.is_empty() => Some(cmds),
         Ok(_) => None,
@@ -159,11 +154,10 @@ pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
     let resume = !roster.is_empty();
     let plan = if resume {
         let Some(plan) = RoundPlan::from_roster(&roster) else {
-            // A roster that is not a verification round (no functional tester
-            // row, or a shape another build wrote) is never resumed as one:
-            // dropping the job makes the poller re-create it, so the round
-            // re-runs whole — with the functional check in it. The job is gone
-            // afterwards, so the roster's shape is logged here or not at all.
+            // A roster that is not a verification round is never resumed as one: dropping the
+            // job makes the poller re-create it, so the round re-runs whole — with the
+            // functional check in it. The job is gone afterwards, so the roster's shape is
+            // logged here or not at all.
             warn!(
                 ticket = %ticket.id,
                 job = %job_id,
@@ -176,9 +170,8 @@ pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
         };
         plan
     } else {
-        // A roster write failure leaves the job with no plan: bail and let the
-        // poller re-drive it rather than run a round the resume path could
-        // misread.
+        // A roster write failure leaves the job with no plan: bail and let the poller re-drive
+        // it rather than run a round the resume path could misread.
         let Some(plan) = RoundPlan::fresh(&ticket, &ws, &job_id, commands.as_ref()).await else {
             return;
         };
@@ -187,16 +180,16 @@ pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
     execute_round(ticket, ws, job_id, plan, resume, commands).await;
 }
 
-/// One verification round's dispatch plan: the two participant cohorts. The
-/// reviewer cohort is empty exactly when this round skipped the code review.
+/// One verification round's dispatch plan: the two participant cohorts. The reviewer cohort
+/// is empty exactly when this round skipped the code review.
 struct RoundPlan {
     reviewers: Vec<AgentSlot>,
     testers: Vec<AgentSlot>,
 }
 
 impl RoundPlan {
-    /// Build a fresh round: calibrated reviewers (none when the content is
-    /// already checked) plus the always-present functional tester.
+    /// Build a fresh round: calibrated reviewers (none when the content is already checked)
+    /// plus the always-present functional tester.
     async fn fresh(
         ticket: &Ticket,
         ws: &Workspace,
@@ -205,8 +198,8 @@ impl RoundPlan {
     ) -> Option<Self> {
         let commands_brief = commands_brief(commands);
         let tester_prompt = TESTER.prompt(ticket, &commands_brief);
-        // The identical-content rule: content already checked on this ticket is
-        // not checked again by the reviewers. It never skips the tester.
+        // The identical-content rule: content already checked on this ticket is not checked
+        // again. It never skips the tester.
         let (reviewer_prompt, reviewers) = if skip_review_for_identical_content(ticket, ws).await {
             info!(
                 ticket = %ticket.id,
@@ -225,9 +218,8 @@ impl RoundPlan {
             );
             (Some(prompt), slots)
         };
-        // The tester's idx continues the reviewer pack — its value only orders
-        // the roster and the Running Agents view, since the cohorts are
-        // identified by their roster kind.
+        // The tester's idx continues the reviewer pack — its value only orders the roster and
+        // the Running Agents view; cohorts are identified by roster kind.
         let testers = build_agent_slots(
             &ticket.id,
             TESTER.role,
@@ -237,8 +229,8 @@ impl RoundPlan {
             TESTER_COUNT,
         );
 
-        // The job's stored task records the round's primary work prompt (the
-        // phase dispatch re-derives the prompts from live state).
+        // The job's stored task records the round's primary work prompt (the phase dispatch
+        // re-derives prompts from live state).
         let task = reviewer_prompt.as_deref().unwrap_or(&tester_prompt);
         sync_phase_job_task(&crate::session::store().conn, &ticket.id, job_id, task).await;
         let cohorts = [
@@ -257,15 +249,12 @@ impl RoundPlan {
         Some(Self { reviewers, testers })
     }
 
-    /// Split a stored roster back into its cohorts by the rows' own roster
-    /// labels — never by slot order, so a slot appended mid-round cannot be
-    /// read as the functional tester.
+    /// Split a stored roster back into its cohorts by the rows' own roster labels — never by
+    /// slot order, so a slot appended mid-round cannot be read as the functional tester.
     ///
-    /// `None` for a roster this stage cannot read back as a round: it must carry
-    /// exactly [`TESTER_COUNT`] tester row (any number of reviewer rows — a
-    /// resumed round replays the cohort it wrote, so the calibration's ceiling is
-    /// not re-applied to it) and no row of any other kind. Such a roster is never
-    /// resumed — see [`run`].
+    /// `None` for a roster this stage cannot read back as a round: it must carry exactly
+    /// [`TESTER_COUNT`] tester row (any number of reviewer rows — a resumed round replays the
+    /// cohort it wrote) and no row of any other kind. Such a roster is never resumed.
     fn from_roster(roster: &[crate::jobs::AgentRow]) -> Option<Self> {
         let cohort = |kind: crate::jobs::AgentKind| -> Vec<AgentSlot> {
             roster
@@ -283,22 +272,20 @@ impl RoundPlan {
     }
 }
 
-/// The content identity the code reviewers were handed: `HEAD` plus the working
-/// tree's identity (see [`crate::git::commands::run_git_worktree_identity`]),
-/// read before the round's cohorts run.
+/// The content identity the code reviewers were handed: `HEAD` plus the working tree's
+/// identity ([`crate::git::commands::run_git_worktree_identity`]), read before the round's
+/// cohorts run.
 ///
-/// On a resumed round that reading happens at resume time, after whatever the
-/// interrupted attempt left in the tree: what the pre-round reading removes from
-/// "already reviewed" is a participant's own work, not an interrupted run's
-/// leftovers.
+/// On a resumed round that reading happens at resume time, after whatever the interrupted
+/// attempt left in the tree: what the pre-round reading removes from "already reviewed" is a
+/// participant's own work, not an interrupted run's leftovers.
 struct ReviewBase {
     head: String,
     tree: String,
 }
 
-/// The round's project-commands brief for the participants' work prompts: the
-/// concrete list of the commands this round runs, in execution order, or the
-/// notice that it runs none.
+/// The round's project-commands brief for the participants' work prompts: the concrete list of
+/// commands this round runs, in execution order, or the notice that it runs none.
 fn commands_brief(commands: Option<&DiagnosticsCommands>) -> String {
     let Some(commands) = commands else {
         return load_prompt("pipeline/round_commands_none.md");
@@ -315,26 +302,21 @@ fn commands_brief(commands: Option<&DiagnosticsCommands>) -> String {
     )
 }
 
-/// The round's project-commands result: the comment section that records the
-/// run (the commands in execution order, what passed, and the command the run
-/// stopped at) and whether every command passed — vacuously true for a
-/// workspace with no commands configured.
+/// The round's project-commands result: the comment section that records the run (commands in
+/// execution order, what passed, and the command it stopped at) and whether every command
+/// passed — vacuously true with no commands configured.
 struct ProjectCommands {
     section: String,
     passed: bool,
 }
 
-/// Run the workspace's project commands — in order, stopping at the first
-/// failure — on the phase body's own task, concurrently with the round's
-/// participant cohorts. A command that changes the tree (an auto-formatter, a
-/// lint auto-fix) is part of the round exactly like a check: no command is
+/// Run the workspace's project commands — in order, stopping at the first failure — on the
+/// phase body's own task, concurrently with the participant cohorts. A command that changes the
+/// tree (an auto-formatter, a lint auto-fix) is part of the round like a check: no command is
 /// held back to a step of its own.
 ///
-/// The judgement is the exit status and nothing else (`Some(0)` is a pass):
-/// what a command writes is kept for the comment — through the output
-/// profiles, which trim it for display — but never read to decide the outcome.
-/// A check command answering in another language is therefore judged exactly as
-/// it is in English (see `profiles`' own note).
+/// The judgement is the exit status and nothing else (`Some(0)` is a pass): what a command
+/// writes is kept for the comment, but never read to decide the outcome.
 async fn run_project_commands(
     commands: Option<&DiagnosticsCommands>,
     ws: &Workspace,
@@ -390,8 +372,8 @@ async fn run_project_commands(
         }
     }
 
-    // The commands' shell spills are this round's own leftovers, not an
-    // agent's — the phase body runs them with no agent identity.
+    // The commands' shell spills are this round's own leftovers, not an agent's — the phase
+    // body runs them with no agent identity.
     crate::tools::shell::cleanup_agent_spills(DIAGNOSTICS_ROLE);
     let footer = match failed_at {
         Some(label) => format!("{} `{label}`", load_prompt("pipeline/commands_failed.md")),
@@ -403,8 +385,7 @@ async fn run_project_commands(
     }
 }
 
-/// Run the plan's cohorts concurrently on the phase job and finalize the
-/// merged round.
+/// Run the plan's cohorts concurrently on the phase job and finalize the merged round.
 async fn execute_round(
     ticket: Arc<Ticket>,
     ws: Workspace,
@@ -414,8 +395,8 @@ async fn execute_round(
     commands: Option<DiagnosticsCommands>,
 ) {
     if resume {
-        // A fresh round's slots are already launched — re-arming those would only
-        // stamp the job's updated time again.
+        // A fresh round's slots are already launched — re-arming them would only stamp the
+        // job's updated time again.
         let cohorts: [&[AgentSlot]; 2] = [&plan.reviewers, &plan.testers];
         rearm_resumed_slots(&ticket.id, &job_id, "verification", &cohorts).await;
     }
@@ -429,13 +410,11 @@ async fn execute_round(
         "Dispatching {reviewer_count} reviewer(s), {tester_count} tester(s) and {command_count} project command(s) in parallel",
     );
 
-    // A skipped code review was never dispatched, so it has neither content to
-    // record nor slots to write. The identity is read BEFORE either cohort runs:
-    // the round records the content the code review was handed, never the tree
-    // the functional tester may have touched by the time the round ends. The
-    // reading stages nothing (see `run_git_worktree_identity`); a repository it
-    // cannot read leaves no base, which only means a later round reviews the
-    // same content again.
+    // A skipped code review was never dispatched, so it has neither content to record nor slots
+    // to write. The identity is read BEFORE either cohort runs: the round records the content
+    // the code review was handed, never the tree the tester may have touched by the end. A
+    // repository the reading cannot read leaves no base, which only means a later round reviews
+    // the same content again.
     let review_skipped = plan.reviewers.is_empty();
     let base = if review_skipped {
         None
@@ -453,8 +432,8 @@ async fn execute_round(
         }
     };
 
-    // One round: the two participant cohorts and the workspace's project
-    // commands, all started at the same time on the same phase job.
+    // One round: the two participant cohorts and the project commands, all started at the same
+    // time on the same phase job.
     let ((reviewer_results, reviewer_paused), (tester_results, tester_paused), commands_outcome) = tokio::join!(
         dispatch_cohort(&ticket, &ws, REVIEWER, &plan.reviewers, &job_id, resume),
         dispatch_cohort(&ticket, &ws, TESTER, &plan.testers, &job_id, resume),
@@ -464,10 +443,9 @@ async fn execute_round(
     if guard_job_phase(&ticket.id, ACTIVE_PHASE, &job_id).await {
         return;
     }
-    // A pause-freeze is NOT a technical failure: leave the job in place for the
-    // unpause re-drive (the typed `paused` signal was captured at bail time, so
-    // it survives a workspace-unpause race that a live re-read of paused state
-    // would miss).
+    // A pause-freeze is NOT a technical failure: leave the job in place for the unpause
+    // re-drive (the typed `paused` signal was captured at bail time, so it survives a
+    // workspace-unpause race).
     if reviewer_paused || tester_paused {
         pause_freezing(&ticket, &job_id).await;
         return;
@@ -485,9 +463,8 @@ async fn execute_round(
     .await;
 }
 
-/// Dispatch one participant cohort of the round on the shared phase job. A
-/// cohort with no slot (a skipped code review) loads nothing and dispatches
-/// nothing — the co-dispatch of the other cohort is what makes the round.
+/// Dispatch one participant cohort on the shared phase job. A cohort with no slot (a skipped
+/// code review) loads nothing and dispatches nothing.
 async fn dispatch_cohort(
     ticket: &Arc<Ticket>,
     ws: &Workspace,
@@ -513,8 +490,7 @@ async fn dispatch_cohort(
     .await
 }
 
-/// Finalize the merged round and record the reviewed base when the code review
-/// ran.
+/// Finalize the merged round and record the reviewed base when the code review ran.
 #[expect(clippy::too_many_arguments)]
 async fn finalize_round(
     ws: &Workspace,
@@ -534,17 +510,15 @@ async fn finalize_round(
     let transitioned =
         process_round_verdicts(ws, ticket, &results, review_skipped, job_id, commands).await;
     if !review_skipped {
-        // Tied to the code review having actually run: the recording is what
-        // makes the identical-content rule fire on a later round, and the
-        // tester's verdict alone must never stand in for it. A round that did
-        // not move the ticket on — the drain abort included — stages nothing.
+        // Tied to the code review having actually run: the recording is what makes the
+        // identical-content rule fire later, and the tester's verdict must never stand in for
+        // it. A round that did not move the ticket on stages nothing.
         record_reviewed_base(ws, &ticket.id, base, transitioned).await;
     }
 }
 
-/// Process the merged round's verdicts: build the consolidated comment, decide
-/// pass/fail, and update the ticket phase. Returns whether the round's outcome
-/// was applied (a pass or a bounce).
+/// Process the merged round's verdicts: build the consolidated comment, decide pass/fail, and
+/// update the ticket phase. Returns whether the outcome was applied.
 async fn process_round_verdicts(
     ws: &Workspace,
     ticket: &Ticket,
@@ -553,14 +527,12 @@ async fn process_round_verdicts(
     job_id: &str,
     commands: &ProjectCommands,
 ) -> bool {
-    // Distinguish the two failure classes: a participant that did NOT complete
-    // (NoResponse/ParseFailed) is a HARD TECHNICAL failure — reset the attempt
-    // (delete job + pause; no bounce budget). A participant that DID
-    // complete but found issues (a Verdict below threshold) is a rework verdict
-    // — bounce to development, consuming bounce budget.
+    // Two failure classes: a participant that did NOT complete (NoResponse/ParseFailed) is a
+    // HARD TECHNICAL failure — reset the attempt (delete job + pause; no bounce budget). One
+    // that completed but found issues is a rework verdict — bounce to development, consuming
+    // bounce budget.
     let technical_failure = results.iter().any(ParallelVerdict::is_technical_failure);
-    // The round's rework condition is the participants' verdicts OR the project
-    // commands: either failing sends the ticket back once per round.
+    // The rework condition is the participants' verdicts OR the project commands.
     let rework_failure = !technical_failure
         && (!commands.passed
             || results
@@ -577,8 +549,7 @@ async fn process_round_verdicts(
     }
 
     if technical_failure {
-        // Hard technical failure: the whole merged round is destroyed and
-        // re-driven as a unit (never resumed participant by participant).
+        // Hard technical failure: the whole merged round is destroyed and re-driven as a unit.
         warn!(
             ticket = %ticket.id,
             stage = STAGE,
@@ -588,17 +559,15 @@ async fn process_round_verdicts(
         return false;
     }
 
-    // The round's one artifact: the consolidated joint comment, which carries
-    // the skipped-code-review note when the reviewers were not dispatched.
+    // The round's one artifact: the consolidated joint comment, carrying the
+    // skipped-code-review note when the reviewers were not dispatched.
     let (round, outcome) = build_round_grouping(
         STAGE,
         results,
-        // The stage's own identity: `stage_role(STAGE)` resolves the
-        // consolidated comment to the functional tester's badge and icon, so
-        // the grouping pass runs and is labelled under the same role.
+        // `stage_role(STAGE)` resolves the comment to the tester's badge and icon, so the
+        // grouping pass runs and is labelled under the same role.
         Role::Qa,
-        // A skipped code review leaves the functional tester as the round's
-        // only participant.
+        // A skipped code review leaves the tester as the round's only participant.
         review_skipped,
         ws,
         &ticket.id,
@@ -613,8 +582,8 @@ async fn process_round_verdicts(
     if review_skipped {
         verdict.insert_str(0, SKIPPED_REVIEW_NOTE);
     }
-    // The round's ONE comment, both halves of its result: the project commands
-    // that ran alongside it, then the participants' verdict.
+    // The round's ONE comment, both halves of its result: the project commands, then the
+    // participants' verdict.
     let comment = format!("{}\n\n---\n\n{verdict}", commands.section);
 
     if !rework_failure {
@@ -634,10 +603,8 @@ async fn process_round_verdicts(
     matches!(outcome, FinalizeOutcome::Applied)
 }
 
-/// Apply the clean-pass outcome of a verification round: write the joint
-/// comment, transition the ticket to sanitation, and delete the phase job.
-/// Returns `false` if the transition was not applied (phase moved
-/// concurrently).
+/// Apply the clean-pass outcome: write the joint comment, transition the ticket to sanitation,
+/// and delete the phase job. `false` if the transition was not applied (phase moved concurrently).
 async fn apply_clean_round(ticket: &Ticket, comment: &str, job_id: &str) -> bool {
     if !matches!(
         comment_and_transition(
@@ -672,18 +639,14 @@ fn verdict_passes(verdict: &crate::Verdict) -> bool {
     verdict.score >= VERIFICATION_THRESHOLD
 }
 
-// ── Reviewer-only git decisions ─────────────────────────────────────────
-
-/// Whether git is usable for the reviewer cohort (a member of the round's
-/// participants; the tester never consults it).
+/// Whether git is usable for the reviewer cohort; the tester never consults it.
 async fn git_available(ws: &Workspace) -> bool {
     crate::git::commands::git_is_installed().await
         && crate::git::commands::is_git_repo(ws.as_path())
 }
 
-/// Whether this round's code review may be skipped: the working tree is
-/// identical to the ticket's recorded reviewed base. A git failure is
-/// fail-open — the reviewers run.
+/// Whether this round's code review may be skipped: the working tree is identical to the
+/// ticket's recorded reviewed base. A git failure is fail-open — the reviewers run.
 async fn skip_review_for_identical_content(ticket: &Ticket, ws: &Workspace) -> bool {
     if !git_available(ws).await {
         return false;
@@ -743,27 +706,24 @@ async fn compute_review_skip(ticket: &Ticket, repo_path: &Path) -> anyhow::Resul
 /// Gather the working-tree churn at review dispatch.
 async fn working_tree_churn(repo_path: &Path) -> anyhow::Result<i64> {
     let snapshot = run_git_worktree_snapshot(repo_path).await?;
-    // An unborn HEAD is not a valid churn baseline: surface as Err so the
-    // caller defaults the reviewer base instead of calibrating on a zero diff.
+    // An unborn HEAD is not a valid churn baseline: surface as Err so the caller defaults the
+    // reviewer base instead of calibrating on a zero diff.
     if snapshot.unborn_head {
         anyhow::bail!("Repository has no commits — no churn baseline");
     }
-    // Churn calibration uses only the exact line counts — the
-    // huge/binary untracked file-count must NOT influence reviewer counts.
+    // Churn calibration uses only the exact line counts — the huge/binary untracked file-count
+    // must NOT influence reviewer counts.
     Ok(snapshot.stats.added + snapshot.stats.removed)
 }
 
-/// Compute the reviewer count for a verification round: the working tree's
-/// churn calibrates the band (1 up to and including
-/// [`crate::pipeline::verdict::DEFAULT_REVIEW_COUNT_LOW_CHURN`] changed lines, 2
-/// below [`crate::pipeline::verdict::DEFAULT_REVIEW_COUNT_HIGH_CHURN`], and
-/// [`crate::pipeline::verdict::MAX_REVIEWERS`] from there), the priority floor is
-/// applied on top, and an unmeasurable churn falls back to the ceiling.
+/// Compute the reviewer count for a round: the working tree's churn calibrates the band (1 up
+/// to [`crate::pipeline::verdict::DEFAULT_REVIEW_COUNT_LOW_CHURN`] changed lines, 2 below
+/// [`crate::pipeline::verdict::DEFAULT_REVIEW_COUNT_HIGH_CHURN`], and
+/// [`crate::pipeline::verdict::MAX_REVIEWERS`] from there), the priority floor applies on top,
+/// and an unmeasurable churn falls back to the ceiling.
 ///
-/// Every path stays between one reviewer and the ceiling — never fewer, because
-/// the round dispatches a reviewer cohort exactly when the code review runs, and
-/// an empty cohort at that point would be indistinguishable from the
-/// identical-content skip (which the *plan* decides, not the count).
+/// Every path stays between one reviewer and the ceiling — an empty cohort would be
+/// indistinguishable from the identical-content skip, which the *plan* decides.
 pub(crate) async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) -> usize {
     use crate::pipeline::verdict::{
         DEFAULT_REVIEW_COUNT_HIGH_CHURN, DEFAULT_REVIEW_COUNT_LOW_CHURN, MAX_REVIEWERS,
@@ -777,8 +737,8 @@ pub(crate) async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) ->
                 DEFAULT_REVIEW_COUNT_LOW_CHURN,
                 DEFAULT_REVIEW_COUNT_HIGH_CHURN,
             );
-            // Debug: per-round calibration bookkeeping; an uncomputable churn
-            // keeps its warn record below.
+            // Debug: per-round calibration bookkeeping; an uncomputable churn keeps its warn
+            // record below.
             debug!(
                 ticket = %ticket.id,
                 total_churn = total,
@@ -799,20 +759,15 @@ pub(crate) async fn compute_reviewer_count(ticket: &Ticket, repo_path: &Path) ->
     review_agent_count(base, ticket.priority)
 }
 
-/// Write out the ticket's reviewed base from the identity read before the round
-/// ran — the content the code reviewers were handed (see [`ReviewBase`]) — in a
-/// round whose code review ran and whose outcome was applied (a pass OR a
-/// bounce, which is what makes the identical-content rule fire on the round
-/// after a bounced one).
+/// Write out the ticket's reviewed base from the identity read before the round ran — the
+/// content the code reviewers were handed (see [`ReviewBase`]) — in a round whose code review
+/// ran and whose outcome was applied (a pass OR a bounce, which is what makes the
+/// identical-content rule fire on the round after a bounced one).
 ///
-/// `git add -A` still runs here, and only here: it is not part of the recording,
-/// but the next round's skip check reads HEAD and the *index* tree, so the index
-/// has to end a recorded round holding the working tree. It runs under the
-/// round's own gate, so a round that never moves on leaves the index and the
-/// working tree exactly as it found them — the only trace of a round that
-/// records nothing is the unreferenced blobs the pre-dispatch reading wrote, as
-/// any content identity does (see
-/// [`crate::git::commands::run_git_worktree_identity`]).
+/// `git add -A` still runs here, and only here: it is not part of the recording, but the next
+/// round's skip check reads HEAD and the *index* tree, so the index has to end a recorded round
+/// holding the working tree. It runs under the round's own gate, so a round that never moves on
+/// leaves the index and the working tree as it found them.
 async fn record_reviewed_base(
     ws: &Workspace,
     ticket_id: &str,
@@ -822,9 +777,8 @@ async fn record_reviewed_base(
     if !transitioned || !git_available(ws).await {
         return;
     }
-    // Staged first, recorded second: a round that moves the ticket on leaves the
-    // index holding the working tree exactly as before, whether or not the
-    // identity could be read.
+    // Staged first, recorded second: a round that moves the ticket on leaves the index holding
+    // the working tree exactly as before, whether or not the identity could be read.
     if let Err(e) = run_git_add_all(ws.as_path()).await {
         warn!(
             ticket = %ticket_id,

@@ -1,11 +1,9 @@
-//! Shared `reqwest::Client` construction, the SSRF screen shared by daemon-side
-//! fetches of a caller-supplied address ([`validate_url`], [`DENIED_IP_NETS`]),
-//! and a redirect-screened GET ([`get_guarded`]).
+//! Shared `reqwest::Client` construction, the SSRF screen for daemon-side fetches of a
+//! caller-supplied address ([`validate_url`], [`DENIED_IP_NETS`]), and a redirect-screened GET
+//! ([`get_guarded`]).
 //!
-//! All call sites that need an HTTP client should use this helper instead of
-//! building one from scratch.  `reqwest::Client` is designed to be created once
-//! and reused — it maintains an internal connection pool, caches DNS
-//! resolutions, and reuses TLS sessions.
+//! Use this helper instead of building a client from scratch: `reqwest::Client` is meant to be
+//! created once and reused — it pools connections, caches DNS and reuses TLS sessions.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -13,18 +11,13 @@ use std::time::Duration;
 
 /// Install the ring crypto provider for rustls.
 ///
-/// reqwest 0.13's `rustls-no-provider` feature leaves the process without a
-/// default `CryptoProvider`; building any `reqwest::Client` without one fails
-/// at build time ("No rustls crypto provider is configured"). Every client
-/// factory must call this before constructing a client — including tests and the
-/// OpenRouter benchmark, which build clients directly.
-///
-/// Idempotent: a process-local `OnceLock` guarantees the underlying
-/// `install_default` runs at most once. The `AlreadyInstalled` error is also
-/// ignored as a belt-and-suspenders — it can only surface if another code
-/// path already installed a provider, in which case the process already has
-/// one. Root certificates come from the OS trust store (macOS Keychain) via
-/// rustls-platform-verifier — bundled roots are deliberately not used.
+/// reqwest 0.13's `rustls-no-provider` feature leaves the process without a default
+/// `CryptoProvider`, and building any client without one fails ("No rustls crypto provider is
+/// configured"), so every client factory must call this first — including tests and the OpenRouter
+/// benchmark, which build clients directly. Idempotent: a process-local `OnceLock` runs
+/// `install_default` at most once, and `AlreadyInstalled` is ignored as belt-and-suspenders. Root
+/// certificates come from the OS trust store (macOS Keychain) via rustls-platform-verifier; bundled
+/// roots are deliberately not used.
 pub(crate) fn install_ring_provider() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
@@ -32,28 +25,20 @@ pub(crate) fn install_ring_provider() {
     });
 }
 
-/// Shared client for media and provider requests: a 2-minute request timeout
-/// and a 10-second connect timeout. [`media_http_client()`] hands it out and
-/// names its consumers.
+/// Shared client for media and provider requests: a 2-minute request timeout and a 10-second
+/// connect timeout. [`media_http_client()`] hands it out and names its consumers.
 static MEDIA_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
-/// Dedicated HTTP client for image-generation POSTs — a 10-minute request
-/// timeout (generations routinely take 92–99 s and load spikes push further).
-/// Kept separate from [`MEDIA_HTTP_CLIENT`] so that window serves image
-/// generation alone instead of becoming the shared media policy.
+/// Dedicated client for image-generation POSTs: a 10-minute request timeout, since generations
+/// routinely take 92–99 s and load spikes push further. Kept separate from [`MEDIA_HTTP_CLIENT`] so
+/// that window serves image generation alone instead of becoming the shared media policy.
 static IMAGE_GEN_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
-/// Return a Bearer Authorization header value built from the configured
-/// provider API key.
-///
-/// Returns `None` when no provider key is configured (the key is missing or
-/// empty).  Callers should propagate this as a clear error message rather than
-/// sending a request with a blank `"Bearer "` header that would produce an
-/// opaque 401 response.
-///
-/// Used by [`crate::tools::image_gen::ImageGenTool`] directly and by the video
-/// and transcription paths through the provider request helpers below.  Any
-/// future OpenRouter-based media tool should reuse this helper as well.
+/// A Bearer Authorization header value built from the configured provider API key, or `None` when
+/// no key is configured (missing or empty) — callers must surface that as a clear error rather than
+/// send a blank `"Bearer "` header and get an opaque 401. Used by
+/// [`crate::tools::image_gen::ImageGenTool`] and, through the provider request helpers below, by
+/// the video and transcription paths; a future OpenRouter media tool should reuse it too.
 #[must_use]
 pub fn bearer_auth_header() -> Option<String> {
     let key = crate::config::CONFIG.provider_key()?;
@@ -63,8 +48,8 @@ pub fn bearer_auth_header() -> Option<String> {
     Some(format!("Bearer {key}"))
 }
 
-/// Safely read a response body on failure, returning a fallback string.
-/// Logs a warning with the provided context and the underlying error.
+/// Safely read a response body on failure, logging a warning with the context and the error and
+/// returning a fallback string.
 pub(crate) async fn read_error_body(response: reqwest::Response, context: &str) -> String {
     response.text().await.unwrap_or_else(|e| {
         tracing::warn!(?e, "Failed to read {context} response body");
@@ -72,17 +57,9 @@ pub(crate) async fn read_error_body(response: reqwest::Response, context: &str) 
     })
 }
 
-/// Check that an HTTP response has a successful status code.
-///
-/// If the status is 2xx the response is returned unmodified for further
-/// processing (body reading, parsing, etc.).  On non-2xx the response body is
-/// consumed, truncated to 500 characters, and wrapped in a
-/// [`HttpError`](super::error::HttpError) that preserves the status
-/// code and body as typed fields (accessible via `err.downcast_ref`).
-///
-/// # Errors
-///
-/// - Non-2xx status: returns the response body as a [`HttpError`](super::error::HttpError).
+/// A non-2xx response's body is consumed, truncated to 500 characters and wrapped in a
+/// [`HttpError`](super::error::HttpError) that keeps the status and body as typed fields (via
+/// `err.downcast_ref`).
 async fn check_response(
     response: reqwest::Response,
     error_context: &str,
@@ -96,12 +73,8 @@ async fn check_response(
     Ok(response)
 }
 
-/// Parse a JSON response body string, producing a detailed error message on
-/// failure that includes the body length and a preview.
-///
-/// # Error format
-///
-/// `"{error_context} response parse error: {e}\nraw response body (N): {body:.500}"`
+/// Parse a JSON response body, with a detailed error on failure: `"{error_context} response parse
+/// error: {e}\nraw response body (N): {body:.500}"`, including the body length and a preview.
 ///
 /// # Errors
 ///
@@ -118,13 +91,10 @@ pub(crate) fn parse_json_response(
     })
 }
 
-/// Shared request boilerplate for provider API calls.
-///
-/// Extracts the Bearer auth header (from [`bearer_auth_header()`]), gets the
-/// shared HTTP client (from [`media_http_client()`]), uses `build_request` to
-/// construct the request, sends it, and checks the response status.  The
-/// Authorization header is injected automatically — the closure only needs to
-/// set the HTTP method, URL, and optional body.
+/// Shared request boilerplate for provider API calls: the auth header (from
+/// [`bearer_auth_header()`]), the shared client (from [`media_http_client()`]), request
+/// construction via `build_request`, the send, and the status check. The Authorization header is
+/// injected automatically, so the closure only sets method, URL and optional body.
 async fn provider_request(
     error_context: &str,
     build_request: impl FnOnce(&reqwest::Client) -> reqwest::RequestBuilder,
@@ -140,19 +110,16 @@ async fn provider_request(
     check_response(response, error_context).await
 }
 
-/// POST JSON to a provider endpoint, check the status, and parse the response
-/// as JSON.
-///
-/// Uses [`bearer_auth_header()`] for the Authorization header and
-/// [`media_http_client()`] for the HTTP client.  Future media tools that need
-/// the same POST → status-check → parse pattern should reuse this helper
-/// instead of duplicating the boilerplate.
+/// POST JSON to a provider endpoint, check the status and parse the JSON response, using
+/// [`bearer_auth_header()`] and [`media_http_client()`]. Future media tools with the same
+/// POST → status-check → parse pattern should reuse it.
 ///
 /// # Errors
 ///
 /// - Transport errors: `"{error_context} request failed: {err}"`
-/// - Non-2xx status: returns a [`HttpError`](super::error::HttpError) with the status code and response body (first 500 chars), accessible via `err.downcast_ref::<HttpError>()`
-/// - JSON parse failure: includes the raw response body length and a preview in the error message for easier debugging.
+/// - Non-2xx status: a [`HttpError`](super::error::HttpError) with the status code and the response
+///   body (first 500 chars), via `err.downcast_ref::<HttpError>()`
+/// - JSON parse failure: the raw body length and a preview in the message.
 pub async fn post_json_to_provider(
     url: &str,
     body: &serde_json::Value,
@@ -168,20 +135,16 @@ pub async fn post_json_to_provider(
     parse_json_response(&body_text, error_context)
 }
 
-/// GET JSON from a provider endpoint, check the status, and parse the response
-/// as JSON.
-///
-/// Uses [`bearer_auth_header()`] for the Authorization header and
-/// [`media_http_client()`] for the HTTP client.  Future consumers that need the
-/// GET → status-check → parse pattern should reuse this helper instead of
-/// duplicating the boilerplate.
+/// GET JSON from a provider endpoint, check the status and parse the JSON response, using
+/// [`bearer_auth_header()`] and [`media_http_client()`]. Future consumers with the same
+/// GET → status-check → parse pattern should reuse it.
 ///
 /// # Errors
 ///
 /// - Transport errors: `"{error_context} request failed: {err}"`
-/// - Non-2xx status: returns a [`HttpError`](super::error::HttpError) with the status code and response body (first 500 chars), accessible via `err.downcast_ref::<HttpError>()`
-/// - JSON parse failure: includes the raw response body length and a preview in
-///   the error message for easier debugging.
+/// - Non-2xx status: a [`HttpError`](super::error::HttpError) with the status code and the response
+///   body (first 500 chars), via `err.downcast_ref::<HttpError>()`
+/// - JSON parse failure: the raw body length and a preview in the message.
 pub async fn get_json_from_provider(
     url: &str,
     error_context: &str,
@@ -196,21 +159,9 @@ pub async fn get_json_from_provider(
     parse_json_response(&body_text, error_context)
 }
 
-/// GET bytes from a provider endpoint, check the status, and return the raw
-/// binary response.
-///
-/// Uses [`bearer_auth_header()`] for the Authorization header and
-/// [`media_http_client()`] for the HTTP client. `request_timeout` overrides
-/// the client's 2-minute cap per request — the async-video tools pass the
-/// remaining job window so large downloads on slow connections are not cut
-/// short. Useful for downloading generated media files or other binary
-/// content from provider endpoints.
-///
-/// # Errors
-///
-/// - Transport errors: `"{error_context} request failed: {err}"`
-/// - Non-2xx status: returns a [`HttpError`](super::error::HttpError) with the status code and response body (first 500 chars), accessible via `err.downcast_ref::<HttpError>()`
-/// - Body read failure: `"{error_context} failed to read response body: {err}"`
+/// GET bytes from a provider endpoint, check the status, and return the raw binary response.
+/// `request_timeout` overrides the client's 2-minute cap per request — the async-video tools pass
+/// the remaining job window so slow downloads are not cut short.
 pub async fn get_bytes_from_provider(
     url: &str,
     error_context: &str,
@@ -228,63 +179,41 @@ pub async fn get_bytes_from_provider(
         .map_err(|e| anyhow::anyhow!("{error_context} failed to read response body: {e}"))
 }
 
-/// Return the shared media HTTP client, initialising it on first call with a
-/// 2-minute request timeout and a 10-second connection timeout.
+/// The shared media HTTP client, initialised on first call with a 2-minute request timeout and a
+/// 10-second connect timeout.
 ///
-/// Direct users are the
-/// [`WebSearchTool`](crate::tools::web_search::WebSearchTool) and
-/// `util::upload_bridge`'s ephemeral-host uploads and URL verification GETs
-/// (the bridge is what `video_edit`'s local clip and image inputs and video
-/// transcription upload through).  Everything else reaches the client through
-/// [`post_json_to_provider`], [`get_json_from_provider`] and
-/// [`get_bytes_from_provider`]: video generation/edit job submit, poll and
-/// download (`tools::fetch_async_video`), transcription
-/// (`providers::transcribe::MediaTranscriber`), and the media catalog cache.
-///
-/// The 2-minute cap is the default, not a guarantee for every caller: the
-/// video download passes the remaining job window as `request_timeout` to
-/// [`get_bytes_from_provider`], the video poll is raced against that same
-/// window by its caller, and the catalog cache bounds its fetch with a
-/// 10-second timeout of its own.  Image generation uses its dedicated
-/// 10-minute client ([`image_gen_http_client`]).  A consumer with a different
-/// timeout policy should build through [`build_http_client`] and hold the
-/// client for the process (a `OnceLock`) rather than rebuild it per call.
+/// Direct users are [`WebSearchTool`](crate::tools::web_search::WebSearchTool) and
+/// `util::upload_bridge`; everything else reaches it through [`post_json_to_provider`],
+/// [`get_json_from_provider`] and [`get_bytes_from_provider`]. The 2-minute cap is a default, not a
+/// guarantee: the video download passes the remaining job window, the poll is raced against it, and
+/// the catalog cache bounds its own fetch at 10 seconds. Image generation uses its own client
+/// ([`image_gen_http_client`]); another timeout policy should build through [`build_http_client`]
+/// and hold the client in a `OnceLock`.
 #[must_use]
 pub fn media_http_client() -> &'static reqwest::Client {
     MEDIA_HTTP_CLIENT.get_or_init(|| build_http_client(Duration::from_mins(2)))
 }
 
-/// Return the dedicated image-generation HTTP client with a 10-minute request
-/// timeout and a 10-second connection timeout.
-///
-/// Used exclusively by [`crate::tools::image_gen::ImageGenTool`]'s POST — slow
-/// generations routinely take 92–99 s, so the shared 2-minute media client
-/// would cut valid in-flight requests short. The image tool performs its own
-/// retry/error handling on top of this client (see `image_gen.rs`).
+/// The dedicated image-generation client: a 10-minute request timeout and a 10-second connect
+/// timeout. Used exclusively by [`crate::tools::image_gen::ImageGenTool`]'s POST — slow generations
+/// routinely take 92–99 s, so the shared 2-minute media client would cut valid in-flight requests
+/// short. The tool does its own retry/error handling on top (see `image_gen.rs`).
 #[must_use]
 pub fn image_gen_http_client() -> &'static reqwest::Client {
     IMAGE_GEN_HTTP_CLIENT.get_or_init(|| build_http_client(Duration::from_mins(10)))
 }
 
-/// Build a configured `reqwest::Client` with the given request `timeout` and a
-/// 10-second connection timeout.
-///
-/// # Panics
-///
-/// Panics if `reqwest::Client::builder()` fails (typically a TLS
-/// initialization failure).  TLS failure is non-recoverable — if the
-/// system's TLS stack is broken, nothing will work — so the process
-/// should stop immediately rather than silently producing wrong
-/// behaviour at runtime.
+/// Panics if `reqwest::Client::builder()` fails (typically a TLS initialization failure). TLS
+/// failure is non-recoverable — a broken system TLS stack breaks everything — so the process should
+/// stop immediately rather than misbehave at runtime.
 #[must_use]
 pub fn build_http_client(timeout: Duration) -> reqwest::Client {
     build_http_client_with(timeout, reqwest::redirect::Policy::default())
 }
 
-/// Build an HTTP client that treats a redirect as the response: the caller
-/// checked the one address it supplied, and a hop the server picks would escape
-/// that check (the `web_search` picture probe and [`get_guarded`] are the users).
-///
+/// Build an HTTP client that treats a redirect as the response: the caller checked the one address
+/// it supplied, and a hop the server picks would escape that check (the `web_search` picture probe
+/// and [`get_guarded`] are the users).
 /// # Panics
 ///
 /// Same as [`build_http_client`].
@@ -328,14 +257,12 @@ static DENIED_IP_NETS: std::sync::LazyLock<[ipnet::IpNet; 4]> = std::sync::LazyL
 });
 
 /// Validate an address is structurally safe for the daemon to fetch — the screen
-/// shared by the daemon-side fetches that use it, navigation and file delivery
-/// alike.
+/// shared by the daemon-side fetches that use it, navigation and file delivery alike.
 ///
 /// The SSRF screen is deliberately narrow: it blocks only the unambiguous
 /// metadata/link-local targets (see [`DENIED_IP_NETS`]), leaving loopback and
 /// RFC1918 reachable by policy. It screens the address as written — a redirect
-/// hop is a second address and must be screened again, which [`get_guarded`]
-/// does.
+/// hop is a second address and must be screened again, which [`get_guarded`] does.
 pub(crate) fn validate_url(url: &str) -> anyhow::Result<()> {
     use url::Host;
 
@@ -591,21 +518,10 @@ impl Drop for TempDownload {
     }
 }
 
-/// Stream a file download with on-the-fly SHA256 verification and atomic
-/// tmp+rename — the single canonical path for model downloads.
-///
-/// * `expected_sha256` — empty skips verification (same semantics as the
-///   macOS-only `crate::audio::util::verify_sha256`).
-/// * `timeout` — per-request timeout; `None` defers to the client's.
-/// * `progress` — invoked `progress(0, total)` before the first byte
-///   ("started"), then per chunk; callers throttle as needed. `total` is 0
-///   when the server omits Content-Length.
-///
-/// On every failure path the temp file is removed (a failed rename included);
-/// on success it is atomically renamed into place. A temp file a killed process
-/// left behind is taken by the next fetch of the same file. The temp name is
-/// unique per fetcher, so a concurrent download of the same file can never
-/// interleave writes into this one.
+/// On every failure path the temp file is removed (a failed rename included); on success it is
+/// atomically renamed into place. A temp file a killed process left behind is taken by the next
+/// fetch of the same file, and the temp name is unique per fetcher, so a concurrent download of the
+/// same file can never interleave writes into this one.
 pub(crate) async fn download_verified(
     client: &reqwest::Client,
     url: &str,
@@ -638,9 +554,9 @@ pub(crate) async fn download_verified(
     // "Started" signal before the first byte is streamed.
     progress(0, total_size);
 
-    // What killed fetchers left beside this file is dead weight: take it before
-    // this fetch adds its own. Off the runtime thread — it is a directory walk and
-    // a process probe, and every download in the process pays it.
+    // What killed fetchers left beside this file is dead weight: take it before this fetch adds
+    // its own. Off the runtime thread — it is a directory walk and a process probe, and every
+    // download in the process pays it.
     let sweep_dest = dest.to_path_buf();
     let _ = tokio::task::spawn_blocking(move || sweep_abandoned_parts(&sweep_dest)).await;
 
@@ -702,7 +618,7 @@ pub(crate) async fn download_verified(
     Ok(())
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────
+// Tests
 
 #[cfg(test)]
 mod tests {
@@ -775,9 +691,8 @@ mod tests {
         );
     }
 
-    /// A non-2xx answer becomes the typed [`crate::util::error::HttpError`]
-    /// carrying the status, while a 2xx answer is handed back as the response
-    /// the caller reads.
+    /// A non-2xx answer becomes the typed [`crate::util::error::HttpError`] carrying the
+    /// status, while a 2xx answer is handed back as the response the caller reads.
     #[tokio::test]
     async fn check_response_maps_the_status_to_an_error_or_success() {
         let http_resp = http::Response::builder()
@@ -812,11 +727,10 @@ mod tests {
 
     #[test]
     fn client_build_installs_ring_provider() {
-        // reqwest 0.13's rustls-no-provider panics at Client build time if no
-        // rustls crypto provider is installed. Every client factory must
-        // install the ring provider first — this exercises the factory path
-        // (and the idempotent double-install, since the process-global is
-        // already set by earlier factories in the same test binary).
+        // reqwest 0.13's rustls-no-provider panics at Client build time if no rustls crypto
+        // provider is installed, so every client factory installs the ring provider first —
+        // this exercises the factory path and the idempotent double-install (the process
+        // global is already set by earlier factories in the same test binary).
         install_ring_provider();
         let _client = build_http_client(Duration::from_secs(5));
         let _ = build_download_client(Duration::from_mins(1)).expect("download client builds");

@@ -1,84 +1,30 @@
-//! The Word (`.docx`/`.docm`) reader: a WordprocessingML walk that keeps the
-//! layout, the tracked changes and the non-body parts a reader needs.
+//! The Word (`.docx`/`.docm`) reader: a WordprocessingML walk that keeps the layout,
+//! the tracked changes and the non-body parts a reader needs.
 //!
-//! [`super`] owns the ZIP plumbing and the other two OOXML families; this
-//! module is the whole Word half. The body, the headers and footers, the
-//! footnotes and endnotes and the comments all go through the same walker, so a
-//! marker means the same thing wherever it appears.
+//! [`super`] owns the ZIP plumbing and the other two OOXML families; this module is
+//! the whole Word half. The body, headers and footers, footnotes and endnotes and the
+//! comments all go through the same walker, so a marker means the same thing wherever
+//! it appears.
 //!
-//! # What the walk preserves
-//!
-//! - **Tables** as a `Table N:` label plus one line per row, two-space
-//!   indented, cells joined with `" | "`, each cell spelled out as
-//!   `C{column}` plus its annotations. Merge geometry is annotation, never
-//!   silence: a cell covering several columns says so, and a merge
-//!   continuation names the cell whose value it carries without repeating it.
-//!   A table inside a cell is read — the cell token carries its own `Table N:`
-//!   block — but the row-per-line shape has no room to indent it.
-//! - **Headings** by the level the paragraph states — its own outline level or
-//!   the one its style chain names — printed as `[heading N]` at the start of
-//!   the paragraph's own line, the line a block it holds opens included, and
-//!   never on a heading whose paragraph printed nothing.
-//! - **Hyperlinks** by their text with the address they point at appended as
-//!   `(link: …)`: an anchor inside the same document reads as `(link: internal)`,
-//!   and a link whose address cannot be established reads as its text alone.
-//! - **Tracked changes** as inline markers rather than as final-looking text:
-//!   a wrapper around the content it revises, a `¶`-suffixed marker for a
-//!   paragraph mark, an annotation on the table, the row or the cell whose own
-//!   formatting changed, `[fmt section]` for a section — and, for the document
-//!   as a whole, an `Unaccepted tracked changes: …` line that tallies every
-//!   kind and names its authors. A revision in a copy the walk deliberately
-//!   does not render — the second half of a duplicated text box — is not
-//!   tallied either.
-//! - **Note, comment and field references** where they are anchored, numbered
-//!   in Word's own display order (a sequence number assigned on the first
-//!   reference, never the raw `w:id`), and marked as such rather than left to
-//!   pass for the note's own text.
-//! - **Text boxes** as an indented `[text box]` block, read once: Word writes
-//!   each one twice, as an `mc:Choice` and as the `mc:Fallback` beside it.
-//! - **A chart** a drawing shows as its content where the drawing sits — its kind,
-//!   its title and other text, one line per series and the annotations its values
-//!   carry ([`chart`]) — in the body and in every peripheral story alike, and no
-//!   longer counted as a loss once its content is printed.
-//!
-//! The notation the model reads, every marker spelled out, is documented in
-//! `src/prompt/tool/read.md`, and every label and mark this walk prints — each
-//! bracket mark, block label and annotation above, and what the chart block a
-//! drawing adds prints: its header, its series label, the annotation beside a
-//! value and the marks standing in for a chart's missing values — is listed once
-//! in `assets/docgen/rules.json` (`docx_marks`), the list the document kit refuses
-//! a `find` carrying one by. The test
-//! `every_docx_mark_the_reader_writes_is_in_the_shared_list` checks this reader's
-//! own output against that list, and the chart module checks the chart vocabulary
-//! it contributes, so a marker renamed on either side cannot leave the kit naming
-//! one the reader no longer prints. A chart's field labels (`Title:`, `Text:`,
-//! `Label:`) and the bare `Chart:` of a part that names no kind are deliberately
-//! not refusal patterns: they are ordinary words a document's own text can carry.
+//! Every label and mark this walk prints is listed once in `assets/docgen/rules.json`
+//! (`docx_marks`), the list the document kit refuses a `find` carrying one by, and
+//! `every_docx_mark_the_reader_writes_is_in_the_shared_list` checks this reader's own
+//! output against it. A chart's field labels (`Title:`, `Text:`, `Label:`) and the bare
+//! `Chart:` of a part naming no kind are deliberately not refusal patterns: they are
+//! ordinary words a document's own text can carry.
 //!
 //! # Invariants
 //!
 //! - **No panics of its own.** A reader error, an element nested past
-//!   [`MAX_ELEMENT_DEPTH`] or a part that will not parse degrades: the body
-//!   makes the package [`DocOutcome::Unreadable`], and every other part is
-//!   skipped. A flow that leaves a field open reports it at the flow's end
-//!   rather than letting the field swallow the rest.
-//! - **Elements are matched on their local name** (namespace- and prefix-blind,
-//!   like the rest of the package reader), so a producer using a prefix other
-//!   than `w:` still parses.
-//! - **One sink stack.** Text always lands in the innermost open sink, so a
-//!   table cell or a text box renders into its own buffer and is placed into
-//!   the enclosing flow as one block — nothing has to count what was written
-//!   where. The chart parts a block shows travel with its text, so a block the
-//!   walk drops (a cell a merge does not repeat, a story it gives up on) takes
-//!   its charts with it and they stay in the report.
-//! - **The walk's own bookkeeping is bounded rather than document-decided.**
-//!   The geometry a table asks for is clamped to [`MAX_TABLE_COLUMNS`] columns
-//!   where its cells are placed — one cell's `w:gridSpan`, a row's
-//!   `w:gridBefore`, and the total a row's cells add up to; a field marker is
-//!   built from the head of its instruction rather than from a copy of it; a
-//!   header/footer part is looked up by name rather than by scanning the parts
-//!   named before it; and an author a revision repeats is remembered rather than
-//!   searched for.
+//!   [`MAX_ELEMENT_DEPTH`] or a part that will not parse degrades: the body makes the
+//!   package [`DocOutcome::Unreadable`] and every other part is skipped.
+//! - **Elements are matched on their local name** (namespace- and prefix-blind), so a
+//!   producer using a prefix other than `w:` still parses.
+//! - **One sink stack**: text lands in the innermost open sink, so a cell or a text box
+//!   renders into its own buffer and is placed into the enclosing flow as one block.
+//! - **The walk's bookkeeping is bounded rather than document-decided**: table geometry
+//!   is clamped to [`MAX_TABLE_COLUMNS`], a field marker is built from the head of its
+//!   instruction, and a part is looked up by name rather than by scanning.
 
 use super::chart;
 use super::{
@@ -100,78 +46,59 @@ use std::path::Path;
 use std::rc::Rc;
 use zip::ZipArchive;
 
-// ── Bounds and part names ───────────────────────────────────────
-
-/// Maximum element nesting the walk enters before it gives up on the part. The
-/// walk recurses — one stack frame per level — and runs on a blocking thread
-/// with a small stack, so a crafted package must not be able to exhaust it.
+/// Maximum element nesting the walk enters. The walk recurses — one stack frame per
+/// level — on a blocking thread with a small stack, so a crafted package must not be
+/// able to exhaust it.
 const MAX_ELEMENT_DEPTH: usize = 128;
 
-/// The most columns a table may be laid out over. The geometry the document
-/// asks for decides how much the walk allocates per column, so it is clamped:
-/// a single `w:gridSpan`/`w:gridBefore` where it is read, and the running
-/// column a row's cells add up to where the cell is placed.
+/// The most columns a table may be laid out over: the geometry the document asks for
+/// decides how much the walk allocates per column, so it is clamped where a
+/// `w:gridSpan`/`w:gridBefore` is read and where a cell is placed.
 const MAX_TABLE_COLUMNS: usize = 256;
 
-/// Part holding the WordprocessingML body.
 pub(crate) const DOCX_BODY_PART: &str = "word/document.xml";
-/// Prefix of the embedded-media parts in a Word package.
 const DOCX_MEDIA_PREFIX: &str = "word/media/";
-/// Charts in a Word package: `word/charts/chart<N>.xml`.
 const DOCX_CHARTS_PREFIX: &str = "word/charts/";
-/// The data part of each SmartArt diagram a Word package holds
-/// (`word/diagrams/data<N>.xml`): Word's reading does not reach them, where the
-/// PowerPoint one reads a slide's diagram through its data.
+/// SmartArt data parts. Word's reading does not reach them, where the PowerPoint one
+/// reads a slide's diagram through its data.
 const DOCX_DIAGRAMS_PREFIX: &str = "word/diagrams/";
-/// The objects a Word package embeds (`word/embeddings/`) — an object's own
-/// bytes, which the reading never opens.
+/// The objects a Word package embeds — an object's own bytes, never opened.
 const DOCX_EMBEDDINGS_PREFIX: &str = "word/embeddings/";
 
-/// Part holding the body's relationships: the notes parts and the header/footer
-/// parts are named there, never in the body itself.
+/// The body's relationships: the notes and header/footer parts are named there.
 const DOCX_RELS_PART: &str = "word/_rels/document.xml.rels";
 
-/// The conventional part holding the package's styles, used when the body's
-/// relationships name none: a style id still names a heading through its own
-/// spelling.
+/// The conventional styles part, used when the relationships name none.
 const DOCX_STYLES_PART: &str = "word/styles.xml";
 
-/// Base a Word relationship target resolves against.
 const DOCX_BASE: &str = "word/";
 
-/// The most styles a paragraph's `w:basedOn` chain is followed through: a
-/// document-controlled chain must not decide how long the walk looks.
+/// The most `w:basedOn` links followed: a document-controlled chain must not decide
+/// how long the walk looks.
 const MAX_STYLE_CHAIN: usize = 10;
 
-/// A field instruction is reported up to this many characters — a runaway
-/// instruction must not dominate the text.
+/// A field instruction is reported up to this length — a runaway instruction must not
+/// dominate the text.
 const MAX_FIELD_INSTRUCTION_CHARS: usize = 80;
 
-/// A link's address is reported up to this many characters — it is
-/// document-controlled, and must not dominate the line its text stands on.
+/// A link's address is reported up to this length — it is document-controlled.
 const MAX_LINK_TARGET_CHARS: usize = 300;
 
-// ── Events ──────────────────────────────────────────────────────
-
-/// A package XML reader over one part.
 type Xml<'a> = Reader<&'a [u8]>;
 
-/// The walker's only fault: the part being read is not usable, so nothing more
-/// can be read out of it.
+/// The walker's only fault: the part being read is not usable.
 struct Fault;
 
-/// One element reduced to what the walk needs: its local name and its
-/// attributes, both owned so nothing borrows the event buffer while the walker
-/// mutates itself.
+/// One element reduced to what the walk needs: its local name and its attributes, both
+/// owned so nothing borrows the event buffer while the walker mutates itself.
 struct Elem {
     name: Vec<u8>,
     attrs: Vec<(Vec<u8>, String)>,
 }
 
 impl Elem {
-    /// The element with every attribute name's namespace/prefix stripped and
-    /// every value unescaped. An unreadable value reads as empty rather than
-    /// costing the part.
+    /// The element with every attribute name's prefix stripped and every value unescaped.
+    /// An unreadable value reads as empty rather than costing the part.
     fn of(event: &BytesStart<'_>) -> Self {
         Self {
             name: event.local_name().as_ref().to_vec(),
@@ -192,7 +119,6 @@ impl Elem {
         }
     }
 
-    /// The value of the attribute whose local name is `name`.
     fn attr(&self, name: &str) -> Option<&str> {
         self.attrs
             .iter()
@@ -215,8 +141,7 @@ enum Ev {
     Fault,
 }
 
-/// Read the next event, resolving text, entity references and errors into owned
-/// values.
+/// Read the next event, resolving text, entity references and errors into owned values.
 fn next_event(reader: &mut Xml<'_>, buffer: &mut Vec<u8>) -> Ev {
     match reader.read_event_into(buffer) {
         Ok(Event::Start(event)) => Ev::Start(Elem::of(&event)),
@@ -242,73 +167,54 @@ fn next_event(reader: &mut Xml<'_>, buffer: &mut Vec<u8>) -> Ev {
 /// Which dispatch table [`Word::content`] uses for a container's children.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ctx {
-    /// Ordinary body content.
     Flow,
-    /// `w:pPr`.
     ParagraphProps,
     /// `w:pPr/w:rPr` — the paragraph mark's own formatting.
     MarkProps,
-    /// A run's own `w:rPr`.
     RunProps,
-    /// `w:tblPr`.
     TableProps,
-    /// `w:trPr`.
     RowProps,
-    /// `w:tcPr`.
     CellProps,
-    /// `w:sectPr`.
     SectionProps,
     /// An unknown child of a property container: it is not body text, and
     /// recursing into it as one would turn `w:tabs/w:tab` into a tab.
     Ignored,
 }
 
-// ── The walker ──────────────────────────────────────────────────
-
-/// One rendered block: its text, and the chart parts whose content that text
-/// shows. A block placed into another carries them along; one the walk drops —
-/// a cell a merge does not repeat, a part that renders nothing — takes them with
-/// it, so a chart never leaves both the reading and the report.
+/// One rendered block: its text and the chart parts whose content that text shows. A
+/// block placed into another carries them; one the walk drops takes them with it, so a
+/// chart never leaves both the reading and the report.
 #[derive(Default)]
 struct Sink {
     text: String,
     charts: Vec<String>,
 }
 
-/// One open `w:p`: the paragraph-mark markers printed at its end and the
-/// heading its own properties (or its style) give it.
+/// One open `w:p`: the markers printed at its end and the heading it is given.
 #[derive(Default)]
 struct Para {
     marks: Vec<&'static str>,
-    /// The `w:outlineLvl` the paragraph states, clamped to 0..=9 — 9 is the
-    /// schema's body text, which overrides what the paragraph's style says.
+    /// The `w:outlineLvl` the paragraph states, clamped to 0..=9 — 9 is the schema's body
+    /// text, which overrides what its style says.
     outline: Option<usize>,
-    /// The `w:pStyle` id the paragraph names.
     style: Option<String>,
 }
 
-/// The state of one package walk.
 struct Word {
-    /// The relationships of the part being walked: relationship id -> the part it
-    /// targets. A package may reference a part a million times, so the lookup is
-    /// one map, not a scan per reference, and each part the walk enters resets it
-    /// to that part's own list.
+    /// The relationships of the part being walked: relationship id -> the part it targets.
+    /// One map, not a scan per reference, reset to each part's own list on entry.
     rel_targets: HashMap<String, String>,
-    /// The directory the part being walked sits in: a relationship target and a
-    /// chart reference resolve against it, wherever the package put the part.
+    /// The directory the part sits in: relationship targets and chart references resolve
+    /// against it.
     base: String,
     footnotes: Notes,
     endnotes: Notes,
     comments: Notes,
-    /// The package's styles part, read once: a paragraph's style id names a
-    /// heading through it.
+    /// The styles part, read once: a style id names a heading through it.
     styles: Styles,
-    /// Text sinks; text always goes to the last one, and so do the chart parts
-    /// whose content it shows, so a block that is dropped takes its charts with
-    /// it.
+    /// Text sinks; text goes to the last one, and so do the chart parts it shows.
     buffers: Vec<Sink>,
-    /// The open `w:p`s, innermost last, with the markers each paragraph prints at
-    /// its end and the heading its own properties or its style name.
+    /// The open `w:p`s, innermost last, with their end markers and headings.
     paras: Vec<Para>,
     /// Open tables, innermost last, so a nested table works.
     tables: Vec<Table>,
@@ -316,43 +222,34 @@ struct Word {
     cells: Vec<Cell>,
     /// Open fields, innermost last.
     fields: Vec<Field>,
-    /// Comment ids whose range was opened in the part being read, so a point
-    /// reference does not repeat them; a range does not run between parts.
+    /// Comment ids whose range was opened in this part; a range does not run between parts.
     comment_ranges: HashSet<String>,
-    /// The content of every chart part the package holds, read once so a chart
-    /// the body draws is printed where it sits.
+    /// Every chart part the package holds, read once so a chart prints where it sits.
     charts: HashMap<String, chart::ChartRead>,
-    /// The chart parts whose content the walk printed where the chart sits: the
-    /// package's census leaves them out.
+    /// The chart parts already printed in place: the package's census leaves them out.
     described: HashSet<String>,
     /// Whether the run's `w:rPr` being read carries an `rPrChange`.
     run_revised: bool,
-    /// Header and footer parts the body's section properties reference, each
-    /// with the variants that named it.
+    /// Header and footer parts the body's section properties reference, with their variants.
     headers: PartRefs,
     footers: PartRefs,
     /// Whether section properties are collected — the body part only.
     collect_sections: bool,
     /// How many `w:txbxContent` blocks are open.
     text_boxes: usize,
-    /// How many tables the package has opened, and how many of those had no
-    /// rows and were not rendered: a `Table N:` label counts their difference,
-    /// so the labels are unique across the package and a nested table is
-    /// numbered after the table that holds it.
+    /// How many tables the package opened, and how many had no rows and were not rendered: a
+    /// `Table N:` label counts their difference, so labels are unique across the package.
     tables_opened: usize,
     tables_empty: usize,
-    /// Whether the walk in progress is rendered: a duplicate copy the walk
-    /// deliberately skips contributes no text, raises no marker and counts no
-    /// revision.
+    /// Whether the walk in progress is rendered: a duplicate copy the walk skips contributes
+    /// no text, raises no marker and counts no revision.
     counting: bool,
     /// The tracked changes seen, for the summary line.
     revisions: Revisions,
 }
 
 impl Word {
-    /// A walker over the package whose parts `rels` names — the body's own
-    /// relationships, which also name the notes parts — with those parts already
-    /// located and read and the package's chart parts already read.
+    /// A walker over the parts `rels` names, with those parts and the chart parts already read.
     fn new<R: Read + Seek>(
         rels: &[Relationship],
         archive: &mut ZipArchive<R>,
@@ -406,22 +303,17 @@ impl Word {
         }
     }
 
-    /// The target part a relationship id names.
     fn rel(&self, id: &str) -> Option<&str> {
         self.rel_targets.get(id).map(String::as_str)
     }
 
-    // ── Sinks ───────────────────────────────────────────────────
-
-    /// Append `s` to the innermost open sink.
     fn push_str(&mut self, s: &str) {
         if let Some(sink) = self.buffers.last_mut() {
             sink.text.push_str(s);
         }
     }
 
-    /// End the current line: a newline unless the sink is empty or already ends
-    /// with one, so layout alone never leaves a blank line behind.
+    /// End the current line: a newline unless the sink is empty or already ends with one.
     fn end_line(&mut self) {
         if let Some(sink) = self.buffers.last_mut()
             && !sink.text.is_empty()
@@ -431,9 +323,8 @@ impl Word {
         }
     }
 
-    /// Append a nested rendered block (a table, a text box, a chart): on a line
-    /// of its own, with a line end after it, carrying the chart parts it shows
-    /// into the enclosing sink.
+    /// Append a nested rendered block on a line of its own, carrying the chart parts it
+    /// shows into the enclosing sink.
     fn block(&mut self, text: &str, charts: Vec<String>) {
         self.end_line();
         self.push_str(text);
@@ -443,10 +334,9 @@ impl Word {
         }
     }
 
-    /// Append run text. Text between a field's `begin` and its `separate` is
-    /// that field's instruction, which the marker reports instead; the field
-    /// holds it until it closes, so a field that never closes cannot swallow
-    /// the rest of the flow.
+    /// Append run text. Text between a field's `begin` and its `separate` is that field's
+    /// instruction, which the marker reports instead; the field holds it until it closes, so
+    /// a field that never closes cannot swallow the rest of the flow.
     fn push_text(&mut self, text: &str) {
         if let Some(field) = self.fields.last_mut()
             && field.pending
@@ -457,50 +347,42 @@ impl Word {
         self.push_str(text);
     }
 
-    /// Count one element as a tracked change, unless the walk in progress is a
-    /// duplicate copy that is not rendered.
+    /// Count one element as a tracked change, unless the walk is a duplicate copy.
     fn record(&mut self, elem: &Elem) {
         if self.counting {
             self.revisions.record(elem);
         }
     }
 
-    // ── Parts ───────────────────────────────────────────────────
-
-    /// Walk the body part, whose own content is the answer: the chart parts it
-    /// shows are described. The body's relationships are the package's, set when
-    /// the walker was built.
+    /// Walk the body part, whose own content is the answer. The body's relationships are the
+    /// package's, set when the walker was built.
     fn body(&mut self, xml: &[u8]) -> Option<String> {
         let sink = self.read_part(xml, true).ok()?;
         self.described.extend(sink.charts);
         Some(sink.text)
     }
 
-    /// Enter the story part `part` through the relationships it names: its
-    /// directory and its relationship lookup are set together, so a reference
-    /// written in the part resolves the way that part's own relationships spell
-    /// it.
+    /// Enter the story part `part`: its directory and relationship lookup are set together,
+    /// so a reference in it resolves the way that part's own relationships spell it.
     fn enter_story_part<R: Read + Seek>(&mut self, archive: &mut ZipArchive<R>, part: &str) {
         let rels = read_relationships(archive, &rels_part_of(part)).unwrap_or_default();
         part_dir(part).clone_into(&mut self.base);
         self.rel_targets = relationship_targets(&rels);
     }
 
-    /// Walk a whole part as ordinary content and return its rendered block.
     fn read_part(&mut self, xml: &[u8], collect_sections: bool) -> Result<Sink, Fault> {
         self.reset_part();
         self.collect_sections = collect_sections;
         let mut reader = Reader::from_reader(xml);
-        // The part's own top level is a block like any other: a field it left
-        // open is reported at its end.
+        // The part's own top level is a block like any other: a field it left open is
+        // reported at its end.
         let result = self.render_block(&mut reader, 0);
         self.collect_sections = false;
         result
     }
 
-    /// Drop what the part read before this one left open: its open tables,
-    /// paragraph marks, fields and comment ranges belong to that part's own
-    /// rendering.
+    /// Drop what the part read left open: its tables, paragraph marks, fields and comment
+    /// ranges belong to that part's rendering.
     fn reset_part(&mut self) {
         self.paras.clear();
         self.tables.clear();
@@ -510,8 +392,7 @@ impl Word {
         self.text_boxes = 0;
     }
 
-    /// Read a container's children, dispatching `Start`/`Empty` by name until
-    /// the element's matching `End`.
+    /// Read a container's children until the element's matching `End`.
     fn content(&mut self, reader: &mut Xml<'_>, level: usize, ctx: Ctx) -> Result<(), Fault> {
         if level >= MAX_ELEMENT_DEPTH {
             return Err(Fault);
@@ -529,15 +410,13 @@ impl Word {
                 }
                 Ev::End | Ev::Eof => return Ok(()),
                 Ev::Fault => return Err(Fault),
-                // Character data belongs to `w:t`/`w:delText`/`w:instrText`
-                // alone, all of which capture it themselves.
+                // Character data belongs to `w:t`/`w:delText`/`w:instrText` alone.
                 Ev::Text(_) | Ev::Skip => {}
             }
             buffer.clear();
         }
     }
 
-    /// Dispatch one element to the table its context selects.
     fn element(
         &mut self,
         reader: &mut Xml<'_>,
@@ -546,8 +425,8 @@ impl Word {
         elem: &Elem,
         empty: bool,
     ) -> Result<(), Fault> {
-        // A property change is a formatting revision, and most of them also
-        // raise the marker of the thing whose formatting changed.
+        // A property change is a formatting revision, and most also raise the marker of the
+        // thing whose formatting changed.
         if is_property_change(&elem.name) {
             self.change_marker(ctx, &elem.name);
             return self.ignored(reader, level, empty);
@@ -563,7 +442,6 @@ impl Word {
         }
     }
 
-    /// Consume an element and everything under it, contributing nothing.
     fn ignored(&mut self, reader: &mut Xml<'_>, level: usize, empty: bool) -> Result<(), Fault> {
         if empty {
             Ok(())
@@ -572,9 +450,8 @@ impl Word {
         }
     }
 
-    /// Consume content the walk does not render — the duplicate half of a text
-    /// box Word writes twice, or a construct read only to be dropped — so it
-    /// contributes no text, raises no marker and counts no revision.
+    /// Consume content the walk does not render — the duplicate half of a text box, or a construct
+    /// read only to be dropped.
     fn discarded(&mut self, reader: &mut Xml<'_>, level: usize, empty: bool) -> Result<(), Fault> {
         let counting = self.counting;
         self.counting = false;
@@ -583,7 +460,6 @@ impl Word {
         result
     }
 
-    /// Read a plain container's children as ordinary content.
     fn flow(&mut self, reader: &mut Xml<'_>, level: usize, empty: bool) -> Result<(), Fault> {
         if empty {
             Ok(())
@@ -592,12 +468,9 @@ impl Word {
         }
     }
 
-    // ── Body content ────────────────────────────────────────────
-
-    /// One `w:p`: its content, the heading its properties give it at the start
-    /// of the paragraph's own line, then its paragraph-mark markers, then the
-    /// line end. An empty element is already over — reading a matching `End`
-    /// would take the enclosing element's.
+    /// One `w:p`: its content, the heading at the start of the paragraph's own line, then its
+    /// paragraph-mark markers and the line end. An empty element is already over — reading a
+    /// matching `End` would take the enclosing element's.
     fn paragraph(&mut self, reader: &mut Xml<'_>, level: usize, empty: bool) -> Result<(), Fault> {
         if empty {
             self.end_line();
@@ -607,9 +480,9 @@ impl Word {
         self.paras.push(Para::default());
         let result = self.content(reader, level + 1, Ctx::Flow);
         let para = self.paras.pop().unwrap_or_default();
-        // The mark opens the first line the paragraph really printed — the line a
-        // block it holds opens, or the text after a leading break — and a heading
-        // that printed only whitespace gets none.
+        // The mark opens the first line the paragraph really printed — the line a block it
+        // holds opens, or the text after a leading break — and a heading that printed only
+        // whitespace gets none.
         if let Some(heading) = self.heading_level(&para)
             && let Some(sink) = self.buffers.last_mut().map(|sink| &mut sink.text)
             && let Some(at) = sink[start..]
@@ -625,9 +498,8 @@ impl Word {
         result
     }
 
-    /// The heading level `para` states: its own `w:outlineLvl` — where the
-    /// schema's body-text value suppresses the style entirely — or else the
-    /// level its style chain names.
+    /// The heading level `para` states: its own `w:outlineLvl` — where the schema's body-text
+    /// value suppresses the style entirely — or else the level its style chain names.
     fn heading_level(&self, para: &Para) -> Option<usize> {
         match para.outline {
             Some(outline) => outline_heading(outline),
@@ -635,8 +507,7 @@ impl Word {
         }
     }
 
-    /// The character data of a `w:t`/`w:delText`. Both are ordinary text: a
-    /// `w:t` inside `w:del` is deleted text because the wrapper says so.
+    /// The character data of a `w:t`/`w:delText`; a `w:t` inside `w:del` is deleted text.
     fn run_text(&mut self, reader: &mut Xml<'_>, level: usize) -> Result<(), Fault> {
         let mut buffer = Vec::new();
         loop {
@@ -655,7 +526,6 @@ impl Word {
         }
     }
 
-    /// Dispatch one element of ordinary content.
     fn body_element(
         &mut self,
         reader: &mut Xml<'_>,
@@ -683,9 +553,8 @@ impl Word {
             b"rPr" => self.run_props(reader, level, empty),
             b"tblPr" => self.props(reader, level, Ctx::TableProps, empty),
             b"tblGrid" => self.table_grid(reader, level, empty),
-            // The row's own properties, and the table-property exceptions Word
-            // writes beside `w:trPr` rather than inside it: the row reports
-            // both.
+            // The row's own properties, and the table-property exceptions Word writes beside
+            // `w:trPr` rather than inside it: the row reports both.
             b"trPr" | b"tblPrEx" => self.props(reader, level, Ctx::RowProps, empty),
             b"tcPr" => self.props(reader, level, Ctx::CellProps, empty),
             b"sectPr" => self.props(reader, level, Ctx::SectionProps, empty),
@@ -708,9 +577,9 @@ impl Word {
                 self.ignored(reader, level, empty)
             }
             b"instrText" => self.instr_text(reader, level, empty),
-            // `w:delInstrText` is part of a deleted field instruction, and
-            // `w:numberingChange` names a list change: neither is text. The
-            // `w:sdt` placeholder properties hold no content either.
+            // `w:delInstrText` is part of a deleted field instruction and `w:numberingChange`
+            // names a list change: neither is text, and the `w:sdt` placeholder properties hold
+            // no content either.
             b"delInstrText" | b"numberingChange" | b"sdtPr" | b"sdtEndPr" => {
                 self.ignored(reader, level, empty)
             }
@@ -721,16 +590,14 @@ impl Word {
                 self.ignored(reader, level, empty)
             }
             b"AlternateContent" => self.alternate_content(reader, level, empty),
-            // Everything else is a plain container (`w:document`, `w:body`,
-            // `w:r`, `w:smartTag`, `w:sdt`, `w:drawing`, `w:pict`, the
-            // bookmarks, …): its children are body content too.
+            // Everything else is a plain container (`w:document`, `w:body`, `w:r`, `w:smartTag`,
+            // `w:sdt`, `w:drawing`, `w:pict`, the bookmarks, …): its children are body content.
             _ => self.flow(reader, level, empty),
         }
     }
 
-    /// The text a leaf run element contributes: `w:softHyphen` and `w:sym` are
-    /// formatting marks with nothing readable to show, a tab is a tab, and a
-    /// line break is a line end.
+    /// The text a leaf run element contributes: `w:softHyphen` and `w:sym` are formatting marks
+    /// with nothing readable, a tab is a tab, and a line break is a line end.
     fn leaf_text(&mut self, elem: &Elem) {
         match elem.name.as_slice() {
             b"tab" => self.push_str("\t"),
@@ -740,11 +607,9 @@ impl Word {
         }
     }
 
-    /// `w:hyperlink`: the link's content as flow, with the address it points at
-    /// shown after the link's own text. A link whose content is a picture alone
-    /// still shows its address — the link is a way to reach something, and the
-    /// address is what the reading can say about it — and one whose address
-    /// cannot be established reads as its text alone.
+    /// `w:hyperlink`: the link's content as flow, with the address it points at shown after the
+    /// link's own text. A picture-only link still shows its address — the link is a way to reach
+    /// something — and one whose address cannot be established reads as its text alone.
     fn hyperlink(
         &mut self,
         reader: &mut Xml<'_>,
@@ -758,11 +623,9 @@ impl Word {
         if let (Some(address), Some(sink)) =
             (address, self.buffers.last_mut().map(|sink| &mut sink.text))
         {
-            // The mark opens the line after the link's content: a space after its
-            // text, and a line of its own after a block the link holds (a text box
-            // printed inside it, whose inner lines are not the link's own line). A
-            // link the flow printed nothing in front of — a picture-only link, one
-            // at the start of its paragraph — needs neither.
+            // The mark opens the line after the link's content: a space after its text, and a
+            // line of its own after a block the link holds. A link the flow printed nothing in
+            // front of needs neither.
             let spans_lines = sink.len() > start && sink[start..].contains('\n');
             if !sink.is_empty() && !sink.ends_with('\n') {
                 sink.push(if spans_lines { '\n' } else { ' ' });
@@ -772,18 +635,12 @@ impl Word {
         result
     }
 
-    /// The address a `w:hyperlink` points at. A relationship target is the
-    /// document's own string — never resolved against the part's directory,
-    /// which would mangle an external URL — with the anchor Word appends when a
-    /// link names both; an anchor alone, with no relationship at all, is a link
-    /// inside the document. A relationship id whose target the part's
-    /// relationships do not establish names no address at all — not one invented
-    /// from another part's relationships, and not `internal` either, which would
-    /// be a claim the link does not make.
-    ///
-    /// The relationships are the ones of the part being walked, rebound by
-    /// [`Self::enter_story_part`]: a link in a header, footer, footnote or
-    /// comment resolves through that part's own `.rels`.
+    /// The address a `w:hyperlink` points at: the relationship target as the document spells it —
+    /// never resolved against the part's directory, which would mangle an external URL — plus the
+    /// anchor Word appends when a link names both. An anchor alone is a link inside the document; a
+    /// relationship id the part's own `.rels` does not establish names no address at all, not
+    /// `internal` either. The relationships are the walked part's, rebound by
+    /// [`Self::enter_story_part`].
     fn link_address(&self, elem: &Elem) -> Option<String> {
         let anchor = elem
             .attr("anchor")
@@ -804,11 +661,9 @@ impl Word {
         Some(truncate(&address, MAX_LINK_TARGET_CHARS))
     }
 
-    /// The chart a `c:chart` reference names, printed where the drawing that holds
-    /// it sits — in the body, in a header or a footer, or in a note. The reference
-    /// resolves through the relationships of the part being walked and against its
-    /// own directory, so a chart any of them shows is described rather than left to
-    /// the package's census.
+    /// The chart a `c:chart` reference names, printed where the drawing holding it sits — in the
+    /// body, a header or a footer, or a note. The reference resolves through the walked part's
+    /// relationships and directory, so a chart any of them shows is described.
     fn chart(&mut self, elem: &Elem) {
         let Some(part) = elem
             .attr("id")
@@ -823,9 +678,6 @@ impl Word {
         }
     }
 
-    // ── Properties ──────────────────────────────────────────────
-
-    /// Read a property container's children with the dispatch they need.
     fn props(
         &mut self,
         reader: &mut Xml<'_>,
@@ -840,8 +692,8 @@ impl Word {
         }
     }
 
-    /// `w:pPr`: the paragraph mark's formatting, the heading the paragraph
-    /// states, and the section properties a paragraph can carry.
+    /// `w:pPr`: the paragraph mark's formatting, the heading the paragraph states, and the
+    /// section properties a paragraph can carry.
     fn paragraph_props(
         &mut self,
         reader: &mut Xml<'_>,
@@ -871,8 +723,8 @@ impl Word {
         self.ignored(reader, level, empty)
     }
 
-    /// `w:pPr/w:rPr`: an insertion or deletion here is the paragraph mark's
-    /// own, marked at the paragraph's end.
+    /// `w:pPr/w:rPr`: an insertion or deletion here is the paragraph mark's own, marked at the
+    /// paragraph's end.
     fn mark_props(
         &mut self,
         reader: &mut Xml<'_>,
@@ -890,8 +742,8 @@ impl Word {
         self.ignored(reader, level, empty)
     }
 
-    /// A run's own `w:rPr`: an `rPrChange` inside it marks the run's formatting
-    /// right before the run's text.
+    /// A run's own `w:rPr`: an `rPrChange` inside it marks the run's formatting just before its
+    /// text.
     fn run_props(&mut self, reader: &mut Xml<'_>, level: usize, empty: bool) -> Result<(), Fault> {
         self.run_revised = false;
         let result = self.props(reader, level, Ctx::RunProps, empty);
@@ -901,8 +753,7 @@ impl Word {
         result
     }
 
-    /// `w:trPr`: the row's own revision, and the `w:gridBefore` that skips grid
-    /// columns before its first cell.
+    /// `w:trPr`: the row's own revision, and the `w:gridBefore` skipping grid columns.
     fn row_props(
         &mut self,
         reader: &mut Xml<'_>,
@@ -913,7 +764,6 @@ impl Word {
         match elem.name.as_slice() {
             b"ins" | b"moveTo" => self.row_mark(Mark::Inserted),
             b"del" | b"moveFrom" => self.row_mark(Mark::Deleted),
-            // `w:gridBefore` skips grid columns before the row's first cell.
             b"gridBefore" => {
                 if let Some(table) = self.tables.last_mut() {
                     table.column = table
@@ -922,16 +772,14 @@ impl Word {
                         .min(MAX_TABLE_COLUMNS);
                 }
             }
-            // Neither schema gives a row's mark properties (`w:rPr` is a child
-            // of `w:pPr` alone), so a stray producer's `w:rPr` here is read and
-            // dropped whole rather than taken for the row's.
+            // Neither schema gives a row's mark properties (`w:rPr` is a child of `w:pPr` alone),
+            // so a stray producer's `w:rPr` here is read and dropped whole.
             b"rPr" => return self.discarded(reader, level, empty),
             _ => {}
         }
         self.ignored(reader, level, empty)
     }
 
-    /// `w:tcPr`: the cell's span, its merges and its own revision.
     fn cell_props(
         &mut self,
         reader: &mut Xml<'_>,
@@ -972,9 +820,8 @@ impl Word {
         self.ignored(reader, level, empty)
     }
 
-    /// `w:sectPr`: record the header/footer parts it names, and mark a
-    /// `sectPrChange`. A section inside a text box is the box's own layout, not
-    /// the document's, so it names no parts.
+    /// `w:sectPr`: record the header/footer parts it names, and mark a `sectPrChange`. A section
+    /// inside a text box is the box's own layout, so it names no parts.
     fn section_props(
         &mut self,
         reader: &mut Xml<'_>,
@@ -990,9 +837,8 @@ impl Word {
         self.ignored(reader, level, empty)
     }
 
-    /// The marker a property change raises on the thing whose formatting
-    /// changed. A copy the walk is not rendering — the duplicate half of a text
-    /// box — raises none.
+    /// The marker a property change raises on the thing whose formatting changed. A copy the walk
+    /// is not rendering raises none.
     fn change_marker(&mut self, ctx: Ctx, name: &[u8]) {
         if !self.counting {
             return;
@@ -1000,31 +846,27 @@ impl Word {
         match ctx {
             Ctx::RunProps => self.run_revised = true,
             Ctx::MarkProps | Ctx::ParagraphProps => self.para_mark("[fmt ¶]"),
-            // A paragraph carries its section's mark at its own end; the
-            // document's last section is carried by no paragraph.
+            // A paragraph carries its section's mark at its own end; the document's last section
+            // is carried by no paragraph.
             Ctx::SectionProps => self.section_mark(),
             Ctx::TableProps => self.table_mark(),
             Ctx::RowProps => self.row_mark(Mark::FormatRevised),
             Ctx::CellProps => self.cell_mark(Mark::FormatRevised),
-            // The one property change a table holds outside `w:tblPr`: a
-            // `w:tblGridChange` written beside its `w:tblGrid` rather than
-            // inside it is still that table's.
+            // The one property change a table holds outside `w:tblPr`: a `w:tblGridChange`
+            // written beside its `w:tblGrid` is still that table's.
             _ if name == b"tblGridChange" => self.table_mark(),
             _ => {}
         }
     }
 
-    /// Mark the innermost open table as formatting-revised.
     fn table_mark(&mut self) {
         if let Some(table) = self.tables.last_mut() {
             table.format_revised = true;
         }
     }
 
-    /// The marker a section's revision carries: at the end of the paragraph
-    /// whose properties hold the section, or — for the document's own last
-    /// section, whose `w:body/w:sectPr` no paragraph holds — in the flow at the
-    /// point the properties were read.
+    /// The marker a section's revision carries: at the end of the paragraph whose properties hold
+    /// the section, or — for the document's own last section — in the flow where it was read.
     fn section_mark(&mut self) {
         if self.paras.is_empty() {
             self.push_str("[fmt section]");
@@ -1033,8 +875,7 @@ impl Word {
         }
     }
 
-    /// The marker a paragraph mark carries, at the end of the paragraph being
-    /// read.
+    /// The marker a paragraph mark carries, at the end of the paragraph being read.
     fn para_mark(&mut self, mark: &'static str) {
         if let Some(para) = self.paras.last_mut() {
             para.marks.push(mark);
@@ -1053,17 +894,13 @@ impl Word {
         }
     }
 
-    // ── Tables ──────────────────────────────────────────────────
-
-    /// One `w:tbl`: buffered in its own record and appended to the enclosing
-    /// sink when it closes, as one block.
+    /// One `w:tbl`: buffered in its own record and appended to the enclosing sink when it closes.
     fn table(&mut self, reader: &mut Xml<'_>, level: usize, empty: bool) -> Result<(), Fault> {
         if empty {
             return Ok(());
         }
-        // The number is taken when the table opens, so a table nested inside
-        // another is numbered after it, not after the rows it happens to close
-        // first.
+        // The number is taken when the table opens, so a nested table is numbered after the one
+        // holding it.
         self.tables.push(Table {
             number: self.tables_opened + 1 - self.tables_empty,
             ..Table::default()
@@ -1074,9 +911,8 @@ impl Word {
         result
     }
 
-    /// Close the innermost table: render its label and rows, and append them to
-    /// the sink below with the chart parts they show. A table with no rows has
-    /// nothing to say, and its number passes to the next table.
+    /// Close the innermost table: render its label and rows and append them with the chart parts
+    /// they show. A table with no rows has nothing to say, and its number passes on.
     fn finish_table(&mut self) {
         let Some(table) = self.tables.pop() else {
             return;
@@ -1103,7 +939,6 @@ impl Word {
         self.block(&text, table.charts);
     }
 
-    /// Count a `w:tblGrid`'s declared columns.
     fn table_grid(&mut self, reader: &mut Xml<'_>, level: usize, empty: bool) -> Result<(), Fault> {
         if empty {
             return Ok(());
@@ -1137,9 +972,8 @@ impl Word {
         Ok(())
     }
 
-    /// One `w:tblGrid` child: a `w:gridCol` widens the declared grid, and a
-    /// `w:tblGridChange` — whose revision is real however empty the element is —
-    /// marks the table revised. Returns whether the child is a column.
+    /// One `w:tblGrid` child: a `w:gridCol` widens the declared grid, and a `w:tblGridChange` marks
+    /// the table revised. Returns whether the child is a column.
     fn grid_child(&mut self, elem: &Elem) -> bool {
         match elem.name.as_slice() {
             b"gridCol" => true,
@@ -1151,8 +985,7 @@ impl Word {
         }
     }
 
-    /// One `w:tr`: reset the running column counter, read the cells, then
-    /// render the row's line.
+    /// One `w:tr`: reset the column counter, read the cells, then render the row's line.
     fn row(&mut self, reader: &mut Xml<'_>, level: usize, empty: bool) -> Result<(), Fault> {
         if empty {
             return Ok(());
@@ -1167,9 +1000,7 @@ impl Word {
         if let Some(table) = self.tables.last_mut() {
             let mut line = format!("  R{}", table.rows.len() + 1);
             if !table.row_marks.is_empty() {
-                // A row the document marked twice in two ways — its own
-                // properties and the table-property exception beside them —
-                // still names each change once.
+                // A row the document marked twice in two ways still names each change once.
                 table.row_marks.sort();
                 table.row_marks.dedup();
                 let names: Vec<&str> = table.row_marks.iter().map(|mark| mark.text()).collect();
@@ -1185,8 +1016,7 @@ impl Word {
         result
     }
 
-    /// One `w:tc`: read its content into its own sink, then place it in the
-    /// table's geometry.
+    /// One `w:tc`: read its content into its own sink, then place it in the table's geometry.
     fn cell(&mut self, reader: &mut Xml<'_>, level: usize, empty: bool) -> Result<(), Fault> {
         if empty {
             return Ok(());
@@ -1198,8 +1028,7 @@ impl Word {
             ..Cell::default()
         });
         let rendered = self.render_block(reader, level);
-        // The cell is popped whatever happened: a fault must not leave it on
-        // the stack for the next cell to be read as.
+        // The cell is popped whatever happened: a fault must not leave it on the stack.
         let cell = self.cells.pop().unwrap_or_default();
         let rendered = rendered?;
         if let Some(table) = self.tables.last_mut() {
@@ -1208,11 +1037,8 @@ impl Word {
         Ok(())
     }
 
-    // ── Revisions ───────────────────────────────────────────────
-
-    /// A run-level revision (`w:ins`/`w:del`/`w:moveTo`/`w:moveFrom`): its
-    /// content, wrapped in its markers. A wrapper that produced no text at all
-    /// is still counted, but emits nothing.
+    /// A run-level revision (`w:ins`/`w:del`/`w:moveTo`/`w:moveFrom`): its content, wrapped in its
+    /// markers. A wrapper that produced no text is still counted, but emits nothing.
     fn revision(
         &mut self,
         reader: &mut Xml<'_>,
@@ -1240,10 +1066,7 @@ impl Word {
         result
     }
 
-    // ── Notes and comments ──────────────────────────────────────
-
-    /// `w:footnoteReference`/`w:endnoteReference`: the note's number at the
-    /// point it is anchored.
+    /// `w:footnoteReference`/`w:endnoteReference`: the note's number where it is anchored.
     fn note_reference(&mut self, elem: &Elem, kind: NoteKind) {
         let Some(id) = elem.attr("id") else {
             return;
@@ -1272,8 +1095,6 @@ impl Word {
         let marker = note_marker(NoteKind::Comment.marker(), number, suffix);
         self.push_str(&marker);
     }
-
-    // ── Fields ──────────────────────────────────────────────────
 
     /// `w:fldSimple`: its instruction's marker, then its cached result.
     fn simple_field(
@@ -1330,8 +1151,7 @@ impl Word {
     }
 
     /// Report the fields a flow left open. A `w:fldChar begin` without its
-    /// `separate` or its `end` must not go on swallowing the flow's text as its
-    /// instruction.
+    /// `separate` or its `end` must not go on swallowing the flow's text as its instruction.
     fn close_fields(&mut self) {
         for field in std::mem::take(&mut self.fields) {
             if field.pending {
@@ -1364,8 +1184,6 @@ impl Word {
         }
         Ok(())
     }
-
-    // ── Text boxes ──────────────────────────────────────────────
 
     /// `w:txbxContent`: rendered as an indented `[text box]` block in the
     /// enclosing flow.
@@ -1467,8 +1285,6 @@ impl Word {
         let sink = self.buffers.pop().unwrap_or_default();
         result.map(|()| sink)
     }
-
-    // ── Headers, footers and notes ──────────────────────────────
 
     /// Record a header/footer reference: the part it names, and the variant it
     /// was named under. A part serving several variants is read once and keeps
@@ -1707,59 +1523,47 @@ impl Word {
     }
 }
 
-// ── Table geometry ──────────────────────────────────────────────
-
-/// A table being read: the rows already rendered, the geometry of the row being
-/// read, and the vertical merges that reach into it.
+/// A table being read: the rows already rendered, the geometry of the row being read, and the
+/// vertical merges reaching into it.
 #[derive(Default)]
 struct Table {
-    /// The rendered row lines.
     rows: Vec<String>,
-    /// The `Table N:` number, taken when the table opens.
     number: usize,
     /// The column count, widened by the widest column covered.
     columns: usize,
-    /// The number of `w:tblGrid/w:gridCol` children, at most
-    /// [`MAX_TABLE_COLUMNS`]: the declared grid is document-controlled and
+    /// The `w:tblGrid/w:gridCol` children, at most [`MAX_TABLE_COLUMNS`]: the declared grid
     /// decides nothing but the label.
     grid: usize,
-    /// The running column counter within the current row.
     column: usize,
-    /// The vertical merge origin of each column: `Some((row, column))` while a
-    /// merge started above still covers it.
+    /// The vertical merge origin of each column: `Some((row, column))` while a merge started
+    /// above still covers it.
     merges: Vec<Option<(usize, usize)>>,
-    /// The cell tokens of the row being read.
     cells: Vec<String>,
-    /// The annotations of the row being read.
     row_marks: Vec<Mark>,
-    /// The origin column of this row's `hMerge` restart, if it has one.
     hmerge: Option<usize>,
-    /// Whether `w:tblPrChange` was seen.
     format_revised: bool,
-    /// The chart parts a cell of this table shows: a chart a cell holds is
-    /// described where the table prints, unless the cell is a merge
-    /// continuation that does not carry its own value.
+    /// The chart parts a cell of this table shows: a chart a cell holds is described where the
+    /// table prints, unless the cell is a merge continuation.
     charts: Vec<String>,
 }
 
 impl Table {
-    /// Place the cell that just closed: annotate it, advance the running
-    /// column, and leave the vertical merge map ready for the row below.
+    /// Place the cell that just closed: annotate it, advance the running column, and leave the
+    /// vertical merge map ready for the row below.
     fn place(&mut self, cell: Cell, rendered: &Sink) {
         let row = self.rows.len() + 1;
-        // One cell's span was clamped where it was read, but a row's cells add
-        // up: the running column is document-controlled arithmetic too, so the
-        // range is clamped here — never past [`MAX_TABLE_COLUMNS`] — and the
-        // merge map never grows past that either.
+        // One cell's span was clamped where it was read, but a row's cells add up: the running
+        // column is document-controlled arithmetic too, so the range is clamped here — never past
+        // [`MAX_TABLE_COLUMNS`] — and the merge map never grows past that either.
         let column = cell.column.min(MAX_TABLE_COLUMNS);
         let span = cell.span.max(1).min(MAX_TABLE_COLUMNS + 1 - column);
-        // A continuation is not a value of its own: it names the cell whose
-        // value it carries, and that value is not repeated here.
+        // A continuation is not a value of its own: it names the cell whose value it carries,
+        // and that value is not repeated.
         let mut holds_value = true;
         let mut origin: Option<(usize, usize)> = None;
         match cell.merge {
-            // `restart` opens a merge over every column it covers; the map
-            // keeps its origin for the rows below.
+            // `restart` opens a merge over every column it covers; the map keeps its origin for
+            // the rows below.
             Merge::Restart => {
                 for covered in column..column + span {
                     set_merge(&mut self.merges, covered, Some((row, column)));
@@ -1783,9 +1587,8 @@ impl Table {
                 }
             }
         }
-        // The annotations read in one fixed order, whatever order the
-        // properties that raised them were written in: the merge a cell
-        // continues, the columns it spans, then its own marks.
+        // The annotations read in one fixed order, whatever order the properties raising them
+        // were written in: the merge a cell continues, the columns it spans, then its own marks.
         let mut notes: Vec<String> = Vec::new();
         if let Some((origin_row, origin_column)) = origin {
             notes.push(format!("part of R{origin_row}C{origin_column}"));
@@ -1797,9 +1600,8 @@ impl Table {
         marks.sort();
         marks.dedup();
         notes.extend(marks.iter().map(|mark| mark.text().to_owned()));
-        // A row is one line, so a cell's own line ends are spelled as spaces. A
-        // continuation shows no value, and so shows none of the charts that
-        // value's content names either.
+        // A row is one line, so a cell's own line ends are spelled as spaces. A continuation
+        // shows no value, and so none of the charts that value's content names either.
         let value = if holds_value {
             self.charts.extend(rendered.charts.iter().cloned());
             rendered.text.trim().replace('\n', " ")
@@ -1821,9 +1623,8 @@ impl Table {
     }
 }
 
-/// Record `origin` — or the absence of one — against `column`, growing the map.
-/// [`Table::place`] clamps the column and the span it covers, so the map is at
-/// most [`MAX_TABLE_COLUMNS`] + 1 entries.
+/// Record `origin` — or its absence — against `column`, growing the map. [`Table::place`] clamps
+/// the column and its span, so the map is at most [`MAX_TABLE_COLUMNS`] + 1 entries.
 fn set_merge(
     merges: &mut Vec<Option<(usize, usize)>>,
     column: usize,
@@ -1835,9 +1636,8 @@ fn set_merge(
     merges[column] = origin;
 }
 
-/// A revision a table's row or one of its cells carries, in the fixed order a
-/// line's annotations read in, whatever order the properties that raised them
-/// were written in.
+/// A revision a table's row or one of its cells carries, in the fixed order a line's annotations
+/// read in.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Mark {
     Inserted,
@@ -1847,7 +1647,6 @@ enum Mark {
 }
 
 impl Mark {
-    /// The word the annotation spells out.
     fn text(self) -> &'static str {
         match self {
             Self::Inserted => "inserted",
@@ -1861,23 +1660,18 @@ impl Mark {
 /// The cell being read.
 #[derive(Default)]
 struct Cell {
-    /// The column the cell starts at, taken when it begins.
     column: usize,
-    /// The column span, from `w:tcPr/w:gridSpan`, at most
-    /// [`MAX_TABLE_COLUMNS`].
+    /// The column span, from `w:tcPr/w:gridSpan`, at most [`MAX_TABLE_COLUMNS`].
     span: usize,
-    /// `w:tcPr/w:vMerge`.
     merge: Merge,
-    /// `w:tcPr/w:hMerge`, the Transitional schema's horizontal merge: Word 2003
-    /// XML writes it where the later output writes `w:gridSpan`.
+    /// `w:tcPr/w:hMerge`, the Transitional schema's horizontal merge: Word 2003 XML writes it
+    /// where the later output writes `w:gridSpan`.
     hmerge: Merge,
-    /// The cell's own annotations.
     marks: Vec<Mark>,
 }
 
-/// A merge state, vertical or horizontal: `w:vMerge w:val="restart"` opens a
-/// merge, and a bare `w:vMerge` (or `w:val="continue"`) continues the one above
-/// — the transitional `w:hMerge` reads the same way, one column over.
+/// A merge state, vertical or horizontal: `w:vMerge w:val="restart"` opens a merge, and a bare
+/// `w:vMerge` continues the one above — the transitional `w:hMerge` reads the same way.
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum Merge {
     #[default]
@@ -1886,9 +1680,6 @@ enum Merge {
     Continue,
 }
 
-// ── Notes and comments ──────────────────────────────────────────
-
-/// The three kinds of definition that live in their own part.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NoteKind {
     Footnote,
@@ -1897,7 +1688,6 @@ enum NoteKind {
 }
 
 impl NoteKind {
-    /// The definition element's local name.
     fn element(self) -> &'static [u8] {
         match self {
             Self::Footnote => b"footnote",
@@ -1906,7 +1696,6 @@ impl NoteKind {
         }
     }
 
-    /// The label a definition block is headed with.
     fn label(self) -> &'static str {
         match self {
             Self::Footnote => WORD_FOOTNOTE,
@@ -1915,12 +1704,8 @@ impl NoteKind {
         }
     }
 
-    /// The kind's own word: the one inside a reference marker (`[footnote 1]`,
-    /// `[comment 2 ends]`), and the name its shared entry is keyed by — the entry
-    /// states the relationship type its part is named by and the conventional part
-    /// name used when the relationship list names none (see
-    /// [`crate::docgen::docx_peripheral_part`]), which the document kit's refusals
-    /// read for the same parts.
+    /// The kind's own word: the one inside a reference marker, and the name its shared entry is
+    /// keyed by (see [`crate::docgen::docx_peripheral_part`]).
     fn marker(self) -> &'static str {
         match self {
             Self::Footnote => "footnote",
@@ -1930,8 +1715,8 @@ impl NoteKind {
     }
 }
 
-/// The part holding one kind of notes: the one the relationship list names by
-/// type, or the conventional name the kind's shared entry carries.
+/// The part holding one kind of notes: the one the relationship list names by type, or the
+/// conventional name the kind's shared entry carries.
 fn notes_part(rels: &[Relationship], kind: NoteKind) -> String {
     let entry = crate::docgen::docx_peripheral_part(kind.marker());
     let conventional = entry
@@ -2032,8 +1817,7 @@ fn definition_ids(xml: &[u8], kind: NoteKind) -> Vec<String> {
     .unwrap_or_default()
 }
 
-/// A header or footer part the body references, with every variant that named
-/// it.
+/// A header or footer part the body references, with every variant that named it.
 struct PartRef {
     part: String,
     /// The variants that named the part, in the order they named it.
@@ -2070,8 +1854,6 @@ impl PartRefs {
     }
 }
 
-// ── Styles ──────────────────────────────────────────────────────
-
 /// The package's styles part: what each style says about itself, read once so a
 /// paragraph's `w:pStyle` resolves to a heading through its `w:basedOn` chain.
 #[derive(Default)]
@@ -2093,13 +1875,10 @@ struct StyleDef {
 }
 
 impl Styles {
-    /// Read the styles part the body's relationships name, or the conventional
-    /// one when they name none. A part that is missing, or one that will not
-    /// parse, is empty by design: the level a style would have given a paragraph
-    /// is then lost unreported, and the paragraph reads as its own outline level
-    /// or style id says — the same silence the part's relationships get, so a
-    /// package that lost its styles reads as a document without headings rather
-    /// than as one that could not be read.
+    /// Read the styles part the body's relationships name, or the conventional one. A part
+    /// that is missing or will not parse is empty by design: a paragraph then reads as its
+    /// own outline level or style id says, so a package that lost its styles reads as a
+    /// document without headings rather than as one that could not be read.
     fn load<R: Read + Seek>(rels: &[Relationship], archive: &mut ZipArchive<R>) -> Self {
         let part = related_part(
             rels,
@@ -2113,8 +1892,7 @@ impl Styles {
     }
 
     /// Parse a styles part: one scan that keeps the style it is inside and
-    /// collects each style as it closes. A part that cannot be read as XML is
-    /// empty.
+    /// collects each style as it closes. A part that cannot be read as XML is empty.
     fn parse(xml: &[u8]) -> Self {
         let mut styles = Self::default();
         let mut scan = StyleScan::default();
@@ -2265,8 +2043,6 @@ fn heading_name_level(text: &str) -> Option<usize> {
     (1..=9).contains(&level).then_some(level)
 }
 
-// ── Fields ──────────────────────────────────────────────────────
-
 /// One open complex field.
 #[derive(Default)]
 struct Field {
@@ -2311,8 +2087,6 @@ fn field_marker(instruction: &str) -> String {
     }
 }
 
-// ── Revisions ───────────────────────────────────────────────────
-
 /// The tracked changes a document carries, for its summary line.
 #[derive(Default)]
 struct Revisions {
@@ -2343,12 +2117,10 @@ struct Tallies {
 }
 
 impl Tallies {
-    /// The move count: one moved range is one move, whatever number of marks
-    /// (`w:moveTo`, `w:moveFrom`, and the paragraph marks between them) it
-    /// carries. A producer that brackets a move with no range marks leaves the
-    /// content marks to count instead, and the two halves of one move are then
-    /// one move, so `w:moveTo` decides it and `w:moveFrom` is only the fallback.
-    /// The tally covers the whole document, not one part of it.
+    /// The move count: one moved range is one move, whatever marks it carries. A producer
+    /// that brackets a move with no range marks leaves the content marks to count instead,
+    /// and `w:moveTo` decides it where `w:moveFrom` is only the fallback. The tally covers
+    /// the whole document.
     fn moves(&self) -> usize {
         // The range marks bracket content the walk renders a marker for. A
         // package that brackets a range and marks no moved content anywhere has
@@ -2440,8 +2212,6 @@ impl Revisions {
     }
 }
 
-// ── Assembly helpers ────────────────────────────────────────────
-
 /// `[footnote 1]`, `[comment 2 ends]`, `[comment ?]`: the kind, the numbered
 /// reference (or `?` for a reference the part does not define) and a suffix.
 fn note_marker(kind: &str, number: Option<usize>, suffix: &str) -> String {
@@ -2475,8 +2245,6 @@ fn numeric_attr(elem: &Elem, max: usize) -> usize {
         .unwrap_or(0)
         .min(max)
 }
-
-// ── Entry point ─────────────────────────────────────────────────
 
 /// Extract the readable content and the embedded images of a `.docx`/`.docm`
 /// ZIP package.
@@ -2588,8 +2356,6 @@ mod tests {
         }
     }
 
-    // ── Media and the body ──────────────────────────────────────
-
     #[test]
     fn docx_extracts_paragraphs_and_media() {
         let bytes = zip_fixture(&[
@@ -2650,13 +2416,10 @@ mod tests {
         assert!(notes.is_empty(), "the report carries the whole loss");
     }
 
-    /// The parts a reading opens nothing in are named by count rather than passing
-    /// unseen: the charts it cannot draw, the diagrams whose data parts it does not
-    /// reach, and the objects a package embeds. A part of the same directory that
-    /// is not one of them (`layout1.xml` beside `data1.xml`) is not a diagram and
-    /// must not be counted, and the data workbook a chart keeps beside the objects
-    /// is the chart's own, not a second embedded object — while a relationship
-    /// naming a workbook that is not there costs no object its line either.
+    /// The parts a reading opens nothing in are named by count: the charts it cannot draw,
+    /// the diagrams whose data parts it does not reach, and the embedded objects. A sibling
+    /// part that is none of them is not counted, and the data workbook a chart keeps beside
+    /// the objects is the chart's own.
     #[test]
     fn docx_reports_the_parts_its_reading_does_not_open() {
         let bytes = zip_fixture(&[
@@ -2693,12 +2456,9 @@ mod tests {
         );
     }
 
-    // ── Charts ──────────────────────────────────────────────────
-
     /// A chart is described where the drawing sits, in the body or in a story the
     /// package prints beside it; one whose story is dropped, or that sits in a
-    /// merge continuation the reading shows no value of, stays a loss the census
-    /// names.
+    /// merge continuation the reading shows no value of, stays a loss the census names.
     #[test]
     fn docx_describes_a_chart_where_it_sits_and_keeps_the_ones_it_cannot() {
         let body = r#"<w:p><w:r><w:t>Before</w:t></w:r></w:p><w:p><w:drawing><wp:inline><a:graphic><a:graphicData><c:chart r:id="rId1"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:p><w:p><w:r><w:t>After</w:t></w:r></w:p>"#;
@@ -2804,8 +2564,6 @@ mod tests {
             }
         }
     }
-
-    // ── Tables ──────────────────────────────────────────────────
 
     /// A table is one block: a labelled header, one line per row, one token per
     /// cell. A `gridSpan` names the columns a cell covers with or without a
@@ -2984,8 +2742,6 @@ mod tests {
         }
     }
 
-    // ── Headers, footers and fields ─────────────────────────────
-
     /// Every variant named is read and labelled, the part serving two variants
     /// is read once, and each is numbered only because more than one is
     /// emitted. A body with no text of its own is not a document with no text:
@@ -3159,8 +2915,6 @@ mod tests {
         }
     }
 
-    // ── Notes, comments and fields ──────────────────────────────
-
     /// A note is numbered in Word's display order, its definition is a labelled
     /// block, a comment's range is not repeated at its point reference, and a
     /// note part's separator entries are not text.
@@ -3315,8 +3069,6 @@ mod tests {
         }
     }
 
-    // ── Revisions ───────────────────────────────────────────────
-
     /// Every marker the walk raises, and the summary line that tallies them:
     /// `w:moveFrom`/`w:moveTo` are one move, not two — one moved range is one
     /// move whatever number of marks it brackets, and a range that brackets no
@@ -3394,8 +3146,6 @@ mod tests {
             assert_eq!(text_of(&package(body, &[])), expected, "{label}");
         }
     }
-
-    // ── Headings and links ──────────────────────────────────────
 
     /// A heading's level comes from the paragraph's own `w:outlineLvl` — where
     /// the body-text value suppresses the style — or from its style chain, and a
@@ -3564,8 +3314,6 @@ mod tests {
         );
     }
 
-    // ── Text boxes ──────────────────────────────────────────────
-
     /// Word writes a text box twice — as an `mc:Choice` and as the
     /// `mc:Fallback` beside it — and reading both would report it twice, in the
     /// body and in a header alike.
@@ -3697,8 +3445,6 @@ mod tests {
         }
     }
 
-    // ── Fields ──────────────────────────────────────────────────
-
     /// A complex field's instruction is reported at its `separate` — the cached
     /// result after it is ordinary text — a field that never separates is
     /// reported at its `end`, and a `w:fldChar begin` a part never closes is
@@ -3749,8 +3495,6 @@ mod tests {
         );
     }
 
-    // ── Degrading ───────────────────────────────────────────────
-
     /// A body that cannot be read as XML is the one part whose failure costs
     /// the whole package.
     #[test]
@@ -3782,13 +3526,9 @@ mod tests {
         assert_eq!(text_of(&bytes), "Body[footnote ?]");
     }
 
-    // ── The shared mark list ────────────────────────────────────
-
-    /// A package whose body draws eight charts — one whose values are cached, one
-    /// whose values are only in the table it attaches, one with no values at all,
-    /// one whose part is no chart, one of the extended schema, one carrying a
-    /// bubble's sizes, one whose number format cannot be reproduced and one past
-    /// the reading's bounds — so that every chart mark the shared list names is a
+    /// A package whose body draws eight charts — cached values, table-only values, none at
+    /// all, not a chart, the extended schema, a bubble's sizes, an unreproducible format and
+    /// one past the reading's bounds — so every chart mark the shared list names is a
     /// spelling a real reading raises.
     fn charts_package() -> Vec<u8> {
         let drawing = |id: &str| {
@@ -3875,17 +3615,13 @@ mod tests {
     }
 
     /// Every mark the shared list names is a spelling this reader really prints:
-    /// `assets/docgen/rules.json`'s `docx_marks` is the one statement the kit's
-    /// refusals and this reader both read, so an entry whose spelling no reading
-    /// ever shows would have the kit name a label that is not there. The fixtures
-    /// below are rich enough to raise every one of them, and each entry's
-    /// `example` must appear in the joined readings.
+    /// `docx_marks` is the one statement the kit's refusals and this reader both read, so an
+    /// entry no reading shows would have the kit name a label that is not there.
     #[test]
     fn every_docx_mark_the_shared_list_names_is_a_mark_the_reader_prints() {
         // A body whose one paragraph carries the run-level and paragraph-mark
         // revisions, a field, a comment range and a text box, beside two headers
-        // (a part per variant, so both are numbered) and a footnote nothing
-        // references.
+        // (a part per variant, so both are numbered) and a footnote nothing references.
         let revised = concat!(
             r#"<w:p><w:pPr><w:pPrChange w:author="Anna"/>"#,
             r#"<w:sectPr><w:sectPrChange w:author="Anna"/></w:sectPr></w:pPr>"#,
@@ -3992,23 +3728,13 @@ mod tests {
             .collect()
     }
 
-    /// The list's other direction: every mark the Word reader's own module writes
-    /// is named by `docx_marks`, so a mark added to the walk without the shared
-    /// list fails here rather than being a spelling the kit can refuse no fragment
-    /// for. The source read is this reader's own code — the test module and a line
-    /// comment are left out, so a mark asserted on in a test or quoted in prose is
-    /// no mark the reader writes. The shared vocabulary module
-    /// ([`crate::reader_output`]) is deliberately not read: it states the Excel and
-    /// PowerPoint families' marks too, which no `docx_marks` entry names, and its
-    /// Word names are pinned by [`every_docx_mark_the_shared_list_names_is_a_mark_the_reader_prints`],
-    /// which requires the reading to print every entry the list holds. Only a
-    /// mark-shaped literal is read at all ([`mark_literals`]), which is what reaches
-    /// the marks a `format!` template builds (`Table {} (formatting revised)`,
-    /// `[field {capped}]`): such a literal must match a pattern of the list or spell
-    /// only the words the list spells. A mark written with none of those characters
-    /// — a bare label such as `Table {}` — is out of this scan's reach, and a rename
-    /// of one is caught by the test that reads a reading, since the list's own
-    /// example stops being printed.
+    /// The list's other direction: every mark the Word reader's own module writes is named by
+    /// `docx_marks`, so a mark added without the shared list fails here. The test module and
+    /// line comments are left out, and so is [`crate::reader_output`], which states the Excel
+    /// and PowerPoint marks too — its Word names are pinned by
+    /// [`every_docx_mark_the_shared_list_names_is_a_mark_the_reader_prints`]. Only a
+    /// mark-shaped literal is read ([`mark_literals`]), which reaches the marks a `format!`
+    /// template builds; a bare label such as `Table {}` is out of this scan's reach.
     #[test]
     fn every_docx_mark_the_reader_writes_is_in_the_shared_list() {
         /// The runs of three or more ASCII letters in `text` — the words a mark's

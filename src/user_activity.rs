@@ -107,12 +107,11 @@ pub(crate) fn is_absent() -> bool {
     read().is_some_and(|state| state.location == Location::Away)
 }
 
-// ── The operating system's input reading ────────────────────────────────
+// The operating system's input reading
 // One reader per platform, where the platform answers without asking for a permission.
 // Each gives "how long since real input", or `None` when it cannot tell.
 
-/// CoreGraphics' combined-session idle time: seconds since any real input in the login
-/// session.
+/// CoreGraphics' combined-session idle time: seconds since any real input in the login session.
 #[cfg(target_os = "macos")]
 fn os_idle() -> Option<Duration> {
     use objc2_core_graphics::{CGEventSource, CGEventSourceStateID, CGEventType};

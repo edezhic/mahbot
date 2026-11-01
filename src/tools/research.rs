@@ -1,38 +1,19 @@
-//! The deep-analysis arm of [`AnalyzeTool`](super::analyze::AnalyzeTool) (its
-//! `deep` depth): the multi-round research orchestrator used by the admin's
-//! Assistant and any custom role granted the depth.
+//! The deep-analysis arm of [`AnalyzeTool`](super::analyze::AnalyzeTool) (its `deep`
+//! depth): the multi-round research orchestrator.
 //!
-//! Unlike `quick` (one round of parallel analysts for quick clarification), the
-//! pipeline is: round 0 decomposes the question
-//! via two independent plans merged by id-based coverage; round 1 runs one
-//! analyst per sub-question (high-risk items get a decorrelated second
-//! angle); conditional gap rounds with shrinking width follow, each targeting
-//! the named gaps. A worker-in-loop prototype pass (`run_worker_round`) runs before
-//! the first gap round and after every progress round that refreshes a
-//! non-empty gap list, gated by the analyst budget, round deadline,
-//! shutdown/cancel, and a 30-minute minimum-remaining guard (`WORKER_MIN_REMAINING`)
-//! — skips are fail-open markers in the report.
+//! Round 0 decomposes the question (two independent plans merged by id-based coverage), round 1
+//! runs an analyst per sub-question (high-risk items get a decorrelated second angle), then
+//! conditional gap rounds of shrinking width. A worker-in-loop prototype pass runs before the
+//! first gap round and after every progress round that refreshes a non-empty gap list, gated by
+//! budget, deadline, shutdown/cancel and `WORKER_MIN_REMAINING`; skips are fail-open markers.
 //!
-//! Deadline-aborted analysts are recovered by the wrap-up stage (a dispatch-time
-//! snapshot of frozen chat params replays the KV-cache prefix for accumulated
-//! findings); sub-agent shell commands are captured per round into the run
-//! folder. Stopping is artifact-based — coverage completion, answerability
-//! abstention (every structural quiet round), and a hard analyst-spawn cap
-//! (never self-assessment) — plus budget exhaustion, deadline expiry,
-//! shutdown, and manual cancel. The verification pass runs after synthesis
-//! and only appends a "## Verification" section; it never stops the run.
-//! Exactly one envelope reaches
-//! the calling agent asynchronously; intermediate rounds never reach the
-//! user, and exhaustion delivers a partial report rather than nothing.
-//!
-//! A single wall-clock deadline (`round_timeout`, default 3h) is computed
-//! once at the start and bounds every phase's member waits; the run has no
-//! additional wall-clock cap. Budgeting
-//! is by analysts spawned (decomposers, round-1 researchers, gap-round
-//! researchers, verification analysts all count); orchestrator coordination
-//! calls do not. The cap is enforced at reservation time and never refunded;
-//! no per-agent tool-call caps — the global iteration backstop and retry
-//! machinery remain untouched.
+//! Stopping is artifact-based (coverage completion, answerability abstention, a hard
+//! analyst-spawn cap — never self-assessment) plus budget exhaustion, deadline expiry, shutdown
+//! and manual cancel. One wall-clock deadline (`round_timeout`, default 3h) bounds every phase's
+//! waits; the budget counts analysts spawned, not coordination calls, and is never refunded.
+//! Exactly one envelope reaches the caller, and exhaustion delivers a partial report. The
+//! wrap-up stage recovers deadline-aborted analysts by replaying their dispatch-time params
+//! (the KV-cache prefix).
 
 use crate::agent::message_router::{self, AgentJob, MessageKind};
 use crate::agent::{chat_request, role_tool_specs, run_default_agent};
@@ -54,12 +35,9 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-// ── Constants (module-local defaults) ────────────────────────────────────
-
 /// Hard cap on research analysts spawned per run — decomposers, round-1
-/// researchers, gap-round researchers, and verification analysts all count;
-/// orchestrator coordination LLM calls do not. Enforced at reservation time,
-/// never refunded.
+/// researchers, gap-round researchers and verification analysts all count;
+/// coordination calls do not. Enforced at reservation time, never refunded.
 const RESEARCH_MAX_ANALYSTS: usize = 30;
 /// Round-0 decomposition fan-out (two independent plans).
 const DECOMPOSE_FAN_OUT: usize = 2;
@@ -67,28 +45,22 @@ const DECOMPOSE_FAN_OUT: usize = 2;
 const GAP_ROUND_WIDTHS: &[usize] = &[4, 3, 2];
 /// Explicit marker when the orchestrator cannot determine the remaining gaps.
 const GAP_EXTRACTION_FAILED: &str = "gap extraction failed — remaining gaps unknown";
-/// Explicit marker when the plan merge fails — the run falls back to the
-/// first valid decomposition plan verbatim.
+/// Explicit marker when the plan merge fails — the run falls back to the first plan.
 const PLAN_MERGE_FAILED: &str = "plan merge failed — using first valid decomposition plan verbatim";
-/// Explicit marker when the claim annotation pass exhausts its retries — all
-/// pending claims are treated as novel.
+/// Explicit marker when the annotation pass exhausts its retries — claims are novel.
 const CLAIM_ANNOTATION_FAILED: &str = "claim annotation failed — all new claims treated as novel";
-/// Explicit marker when the confirm pass over a round's mutating annotation
-/// links fails entirely — every mutating verdict is treated as weak.
+/// Explicit marker when the confirm pass fails — every mutating verdict is weak.
 const CONFIRM_FAILED: &str =
     "annotation link confirmation failed — mutating links treated as weak/unconfirmed";
 /// Minimum remaining round time for a worker round to start (a worker run is
 /// not interrupted — starting one with less left would eat the subsequent
 /// gap rounds).
 const WORKER_MIN_REMAINING: Duration = Duration::from_mins(30);
-/// Default bound on the wrap-up stage: concurrent extraction of
-/// deadline-aborted analysts' accumulated findings (env-overridable via
-/// `MAHBOT_WRAP_UP_TIMEOUT_SECS`, distinct from the round deadline
-/// `MAHBOT_ROUND_TIMEOUT_SECS`). Counted from the stage's own start.
+/// Default bound on the wrap-up stage (env `MAHBOT_WRAP_UP_TIMEOUT_SECS`, distinct from
+/// the round deadline `MAHBOT_ROUND_TIMEOUT_SECS`), counted from its own start.
 const DEFAULT_WRAP_UP_TIMEOUT_SECS: u64 = 5 * 60;
 
-/// Resume pointer for a durable research run: the 4-value stage
-/// enum (plus implicit Done).
+/// Resume pointer for a durable research run: the stage enum, plus implicit Done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 enum ResearchStage {
@@ -103,10 +75,9 @@ enum ResearchStage {
     Synthesis,
 }
 
-/// The research_jobs.state blob: ONE JSON column carrying everything needed
-/// to resume a run at the checkpointed stage. RunStats is NOT stored (see
-/// RunStats pin) — the resumed report's "Run Summary" undercounts the
-/// pre-crash segment and the report carries a one-line best-effort note.
+/// The research_jobs.state blob: ONE JSON column with what is needed to resume a run at
+/// the checkpointed stage. RunStats is NOT stored (see RunStats pin) — the resumed
+/// report's "Run Summary" undercounts the pre-crash segment and says so.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ResearchState {
     stage: ResearchStage,
@@ -117,25 +88,19 @@ struct ResearchState {
     markers: Vec<String>,
     gap_outcome: GapRoundsOutcome,
     budget_spent: usize,
-    /// Gap-loop resume pointer / cumulative completed-round count: incremented
-    /// pre-dispatch, persisted post-completion at every per-round checkpoint,
-    /// restored on resume so the loop continues at the next round (the gap
-    /// list itself is persisted alongside — this field is the continuation
-    /// key). Distinct from the per-invocation dispatch counter,
-    /// [`GapRoundsOutcome::rounds_dispatched`] — see the `gap_rounds` doc for
-    /// why both exist.
+    /// Gap-loop resume pointer / cumulative completed-round count: incremented pre-dispatch,
+    /// persisted at every per-round checkpoint, restored on resume as the continuation key.
+    /// Distinct from the per-invocation [`GapRoundsOutcome::rounds_dispatched`].
     round_index: usize,
     verification: Vec<VerificationResult>,
-    /// Accumulated raw shell commands (UNFILTERED — no zone classification)
-    /// from completed rounds' sessions — collected incrementally at dispatch so
-    /// long runs don't lose early sessions to the transient TTL. NOT persisted
-    /// in the checkpoint blob (a ~10 MiB blob would be rewritten every round);
-    /// the command dump file inside the run folder is the durable artifact.
+    /// Raw shell commands (UNFILTERED — no zone classification) from completed rounds'
+    /// sessions, collected incrementally at dispatch so long runs don't lose early sessions
+    /// to the transient TTL. NOT persisted (a ~10 MiB blob rewritten every round) — the
+    /// run-folder dump is the durable artifact.
     #[serde(skip)]
     commands: Vec<String>,
-    /// Seen-command set for O(1) dedup during collection (a 10 MiB
-    /// `Vec::contains` scan per command would be O(n²)). Rebuilt from the dump
-    /// file on boot resume. Not persisted (same rationale as `commands`).
+    /// Seen-command set for O(1) dedup during collection (a `Vec::contains` scan per command
+    /// would be O(n²)). Rebuilt from the dump file on boot resume; not persisted.
     #[serde(skip)]
     seen_commands: std::collections::HashSet<String>,
     /// Gap-loop round keys after which a worker round already ran (0 = the
@@ -169,17 +134,6 @@ impl ResearchState {
         match serde_json::from_str::<ResearchState>(&json) {
             Ok(mut s) => {
                 s.acc.rebuild_keys();
-                // Rebuild the seen-set AND the command list from the durable
-                // command dump in the run folder. `commands` is serde-skip so
-                // it loads empty after a crash; the dump (written
-                // progressively by capture_round) is the durable capture.
-                // Re-seeding here means a boot resume MERGES the pre-crash
-                // history instead of the first post-resume round overwriting
-                // it (early-round sessions are already TTL'd — the dump is
-                // the only surviving record). The folder is NOT created here
-                // (load is a state read — a missing folder just yields an
-                // empty seed, fail-open); creation happens at dispatch/round
-                // time via `ensure_run_root`.
                 let run_root = crate::research_cleanup::run_root_path(job_id);
                 s.commands = crate::research_cleanup::read_command_dump(&run_root).await;
                 s.seen_commands = s.commands.iter().cloned().collect();
@@ -192,13 +146,10 @@ impl ResearchState {
         }
     }
 
-    /// Checkpoint the state blob + jobs updated_at touch in ONE transaction
-    /// (both rows live in the consolidated domain database — the single
-    /// transaction domain), so a crash can't advance research_jobs.state without the
-    /// matching jobs touch. retry_count is deliberately untouched: the boot
-    /// scan's retry_count bump is the only writer and must survive
-    /// checkpoints. A failed checkpoint logs a structured warning and the run
-    /// continues.
+    /// Checkpoint the state blob + jobs updated_at in ONE transaction (both rows live in the
+    /// consolidated domain database), so a crash can't advance research_jobs.state without the jobs
+    /// touch. retry_count is deliberately untouched — the boot scan's bump must survive
+    /// checkpoints.
     async fn save(&self, job_id: &str) {
         let json = serde_json::to_string(self).unwrap_or_default();
         let now = crate::db::now();
@@ -237,12 +188,10 @@ impl ResearchState {
         }
     }
 
-    /// Collect the given dispatched agents' raw shell commands from their
-    /// persisted sessions (right after each completed round — a run longer
-    /// than the session TTL loses its early sessions to it, so collection
-    /// must be incremental). UNFILTERED: the full command history is written
-    /// to the run folder dump; the Sanitation cleanup agent does the
-    /// attribution. `job_id` is threaded to the dump write for its logging.
+    /// Collect the given agents' raw shell commands from their persisted sessions right after
+    /// each round (a run longer than the session TTL loses early sessions, so collection must
+    /// be incremental). UNFILTERED: the full history goes to the run-folder dump and the
+    /// Sanitation cleanup agent does the attribution.
     async fn capture_round(&mut self, job_id: &str, agent_ids: &[String], run_root: &Path) {
         let fresh = crate::research_cleanup::collect_agent_shell_commands(agent_ids).await;
         for cmd in fresh {
@@ -262,8 +211,6 @@ impl ResearchState {
     }
 }
 
-// ── Shared orchestration types ───────────────────────────────────────────
-
 /// A sub-question from the round-0 decomposition plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SubQuestion {
@@ -279,11 +226,9 @@ struct DecompositionPlan {
     sub_questions: Vec<SubQuestion>,
 }
 
-/// A merged sub-question carrying provenance by global flat item id: the
-/// input-plan item it is a verbatim copy of, plus every other plan's item
-/// containing the identical tuple. question/evidence_needed/risk are resolved
-/// by the system from the cited item after validation — never trusted from
-/// the model's copy.
+/// A merged sub-question carrying provenance by global flat item id: the input-plan item
+/// it copies verbatim, plus every other plan's identical tuple. question/evidence_needed/
+/// risk are resolved by the system from the cited item — never trusted from the model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MergedSubQuestion {
     /// Global flat id of the input-plan item this sub-question copies
@@ -300,8 +245,7 @@ struct MergedSubQuestion {
     risk: String,
 }
 
-/// A round-0 plan item the merge explicitly dropped (never silently omitted),
-/// cited by its global flat id.
+/// A round-0 plan item the merge explicitly dropped (never silently), by flat id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DroppedSubQuestion {
     /// Global flat id of the dropped input-plan item.
@@ -340,8 +284,6 @@ struct AnswerabilityCheck {
     reason: String,
 }
 
-// ── Budget (analysts spawned) ────────────────────────────────────────────
-
 /// Agent-spawn budget: 1 unit = 1 spawned analyst, counted at reservation
 /// time, never refunded.
 #[derive(Debug)]
@@ -373,14 +315,10 @@ impl ResearchBudget {
     }
 }
 
-// ── Deep-analysis dispatch ────────────────────────────────────────────────
-
-/// Dispatch a deep analysis run — the `deep` depth of [`AnalyzeTool`]. It is the
-/// admin Assistant's (and any custom role's granted) long-running arm: decompose
-/// the question, run multiple analyst rounds targeting only the remaining gaps,
-/// and deliver one consolidated, source-cited report. Spawns the resumable run in
-/// the background and returns the dispatch acknowledgement; exactly one report
-/// envelope is delivered to the caller when the run completes.
+/// Dispatch a deep analysis run — the `deep` depth of [`AnalyzeTool`]: decompose the
+/// question, run analyst rounds against the remaining gaps, deliver one source-cited
+/// report. Spawns the resumable background run and returns the dispatch ack; exactly one
+/// report envelope is delivered to the caller when the run completes.
 pub(crate) fn dispatch_deep_analysis(ws: &Workspace, question: &str, caller_role: Role) -> String {
     // Read user context from task-locals BEFORE tokio::spawn so the single
     // result envelope carries the correct user identity. The job id is generated
@@ -390,9 +328,8 @@ pub(crate) fn dispatch_deep_analysis(ws: &Workspace, question: &str, caller_role
     let question = question.to_string();
     let user_name = crate::agent::tool_user_name();
     let channel = crate::agent::tool_channel();
-    // Read the caller's launch synchronously before the spawn (task-local
-    // contract): the round's envelope and job row must carry the custom branch
-    // when the caller is a custom role.
+    // Read the caller's launch synchronously before the spawn (task-local contract): the
+    // round's envelope and job row must carry the custom branch for a custom role.
     let custom = crate::agent::tool_custom_launch();
     let job_id = crate::generate_id();
     let ack = format!(
@@ -420,11 +357,10 @@ pub(crate) fn dispatch_deep_analysis(ws: &Workspace, question: &str, caller_role
         let envelope = match run {
             Ok(Some(envelope)) => envelope,
             Ok(None) => {
-                // Shutdown/drain abort OR manual cancel: no envelope is routed
-                // now. An abort keeps the run alive for the next boot's resume
-                // (the result and artifacts arrive at the real terminalization);
-                // a manual cancel stops the run permanently (the cancelled-run
-                // handoff dispatches the cleanup agent — nothing is delivered).
+                // Shutdown/drain abort OR manual cancel: no envelope is routed now. An abort keeps
+                // the run alive for the next boot's resume (result and artifacts arrive at the real
+                // terminalization); a manual cancel stops it permanently (the cancelled-run handoff
+                // dispatches the cleanup agent — nothing is delivered).
                 tracing::info!(
                     "Deep analysis run ended without delivery (aborted or manually cancelled)"
                 );
@@ -453,27 +389,19 @@ pub(crate) fn dispatch_deep_analysis(ws: &Workspace, question: &str, caller_role
             }
         };
 
-        // Route exactly one final envelope to the caller's agent channel (the
-        // completion helper's own copy — persisted and routed copies can never
-        // drift). A drain in progress may drop the routed copy (the consumer has
-        // stopped pulling), but the pending row survives for boot replay —
-        // at-least-once.
+        // Route exactly one final envelope — the completion helper's own copy, so persisted and
+        // routed copies can never drift. A drain may drop the routed copy; the pending row
+        // survives for boot replay (at-least-once).
         message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
     });
 
     ack
 }
 
-/// Durable deep-research dispatch: SPAWN the job (one tx) → run the resumable
-/// orchestrator (checkpoints at stage boundaries) → COMPLETE (one tx — INSERT
-/// pending_jobs envelope + DELETE jobs row). Returns `Some(envelope)` on real
-/// terminalizations — the envelope is the completion helper's own copy
-/// (pending_job_id set by the tx), routed as-is so persisted and routed copies
-/// cannot drift. Returns `None` on a shutdown/drain abort AND on a manual
-/// cancel — the abort keeps the run alive for boot resume, the cancel stops
-/// the run permanently (cleanup handoff, nothing delivered). The `job_id` is
-/// caller-generated (created in [`dispatch_deep_analysis`] BEFORE the spawn) so
-/// the immediate ack and the delivered envelope share one id.
+/// Durable dispatch: SPAWN the job (one tx) → run the resumable orchestrator → COMPLETE (one tx
+/// — INSERT pending envelope + DELETE jobs row). `Some(envelope)` on real terminalizations (the
+/// completion helper's own copy, routed as-is), `None` on a shutdown/drain abort (run alive for
+/// boot resume) or a manual cancel. `job_id` is caller-generated BEFORE the spawn.
 async fn dispatch_durable_research(
     ws: &Workspace,
     question: &str,
@@ -483,14 +411,12 @@ async fn dispatch_durable_research(
     job_id: &str,
     custom: Option<crate::Launch>,
 ) -> Option<AgentJob> {
-    // The run's cancel signal lives for the whole invocation — fresh dispatch
-    // and its terminalization tail. A manual cancel from the Running Agents
-    // page fires it; the orchestrator's boundary gates observe it and stop
+    // The run's cancel signal lives for the whole invocation — fresh dispatch and its
+    // terminalization tail. A manual cancel fires it; the orchestrator's boundary gates stop
     // permanently (ResearchExit::Cancelled).
     let _cancel_guard = crate::round_cancel::register(job_id, None);
-    // A round dispatched by a custom role owns a custom branch address — its
-    // jobs row and result envelope must say `Role::Custom` plus the launch, not
-    // the tool's construction role.
+    // A round dispatched by a custom role owns a custom branch address — its jobs row and
+    // envelope must say `Role::Custom` plus the launch, not the construction role.
     let caller_role = caller_role.for_launch(custom.as_ref());
     let spawn = async {
         // SPAWN: one tx — jobs + research_jobs child row (the shared in-tx
@@ -519,12 +445,10 @@ async fn dispatch_durable_research(
         Err(e) => ResearchExit::Terminal(Err(e)),
     };
     let result = match exit {
-        // Abort: the run stays alive for the next boot's resume — the jobs row
-        // survives as 'launched' and boot-recovery re-enters the checkpointed
-        // run, so the result (and the artifacts) arrive at the real
-        // terminalization. Nothing is written or routed here (design pin:
-        // "a shutdown/drain abort is not terminalization — the run is alive,
-        // resume later").
+        // Abort: the run stays alive for the next boot's resume — the jobs row survives as
+        // 'launched' and boot-recovery re-enters the checkpointed run, so result and artifacts
+        // arrive at the real terminalization (design pin: a shutdown/drain abort is not
+        // terminalization). Nothing is written or routed here.
         ResearchExit::Aborted => {
             tracing::info!(
                 job = %job_id,
@@ -559,38 +483,19 @@ async fn dispatch_durable_research(
     .await
 }
 
-/// Real-terminalization artifacts (results.md + the command dump), written
-/// BEFORE the exactly-once terminalizing boundary. Called from exactly one
-/// point — the shared [`terminalize_research`] tail, which serves both fresh
-/// dispatch and boot resume. Shutdown/drain
-/// aborts and panics write nothing (the run stays alive for the next boot —
-/// both the fresh-dispatch and resume paths now leave the job row 'launched'
-/// on abort, so boot-recovery re-enters and terminalizes for real). A dump
-/// write failure is logged — never silent (results.md logs internally).
-///
-/// The Sanitation cleanup is NOT dispatched here — it runs after
-/// `complete_durable_job` (the cleanup jobs row reuses id == run_id, so the
-/// completion DELETE must have run first); the [`terminalize_research`] tail
-/// dispatches it.
+/// The Sanitation cleanup is NOT dispatched here — [`terminalize_research`] does it after
+/// `complete_durable_job` (the cleanup jobs row reuses id == run_id, so the completion
+/// DELETE must have run first).
 async fn write_terminalization_artifacts(job_id: &str, delivered: &str, state: &ResearchState) {
     crate::research_cleanup::write_results_md(job_id, delivered).await;
     let run_root = crate::research_cleanup::ensure_run_root(job_id).await;
     crate::research_cleanup::write_command_dump(&run_root, job_id, &state.commands).await;
 }
 
-/// Real-terminalization tail shared by fresh dispatch and boot resume:
-/// artifacts (results.md + command dump) written BEFORE the exactly-once
-/// boundary, then durable completion and cleanup dispatch (in that order —
-/// the cleanup jobs row reuses id == run_id, so the completion DELETE must
-/// free it before the cleanup row is spawned). Returns `Some(envelope)` on a
-/// real terminalization — the envelope is the completion helper's own copy
-/// (`pending_job_id` set by the tx, so persisted and routed copies cannot
-/// drift). Returns `None` on a manual cancel (the cancelled-run handoff
-/// dispatches the cleanup agent; the folder is released only by the cleanup
-/// tail).
-/// The caller routes the returned envelope (fresh: via
-/// [`dispatch_deep_analysis`]; resume: directly), so routing always happens
-/// after the cleanup row exists.
+/// Real-terminalization tail shared by fresh dispatch and boot resume: artifacts written BEFORE
+/// the exactly-once boundary, then durable completion, then cleanup dispatch (the cleanup row
+/// reuses id == run_id, so the DELETE must free it first). `Some` on a real terminalization, `None`
+/// on a manual cancel (the cancelled-run handoff dispatches the cleanup agent).
 #[expect(clippy::too_many_arguments)]
 async fn terminalize_research(
     job_id: &str,
@@ -603,35 +508,27 @@ async fn terminalize_research(
     spawned: bool,
     custom: Option<crate::Launch>,
 ) -> Option<AgentJob> {
-    // Manual-cancel gate BEFORE any artifact is written: a cancel that landed
-    // after the orchestrator's last boundary check (mid-terminalization) must
-    // not write artifacts, complete the job, dispatch cleanup, or route
-    // anything. The cancelled-run handoff dispatches the cleanup agent with
-    // the already-final dump — no racing folder deletion, the dump stays
-    // alive for the cleanup agent.
+    // Manual-cancel gate BEFORE any artifact is written: a cancel landing after the
+    // orchestrator's last boundary check must not write artifacts, complete the job, dispatch
+    // cleanup, or route anything. The cancelled-run handoff dispatches cleanup with the
+    // already-final dump (no racing folder deletion).
     if crate::round_cancel::is_cancelled(job_id) {
         tracing::info!(job = %job_id, "Research terminalization suppressed by manual cancel");
         hand_off_cancelled_or_warn(job_id, ws, question).await;
         return None;
     }
     let delivered = build_async_research_message(job_id, result);
-    // Terminalization artifacts BEFORE the exactly-once boundary, only for
-    // runs that actually started (a spawn failure has no state to archive).
-    // The aborted flag (not the global shutdown state) already gated aborts
-    // above: shutdown firing in the window after a fully successful run
-    // returned must not skip the artifacts.
+    // Terminalization artifacts BEFORE the exactly-once boundary, only for runs that started.
+    // The aborted flag (not the global shutdown state) already gated aborts above: a shutdown
+    // after a fully successful run must not skip the artifacts.
     if spawned {
         let state = ResearchState::load(job_id).await;
         write_terminalization_artifacts(job_id, &delivered, &state).await;
     }
-    // Complete BEFORE the cleanup dispatch (the cleanup jobs row reuses
-    // id == run_id; the completion DELETE must free it first) and BEFORE the
-    // route: a crash between complete and cleanup dispatch leaves the
-    // envelope pending, and boot replay recreates the cleanup row while the
-    // run folder still exists — closing the durability hole where the
-    // envelope was routed before the cleanup row was created. UNCONDITIONAL
-    // (never gated on `spawned`): a failed spawn relies on this completion
-    // to deliver its error envelope.
+    // Complete BEFORE the cleanup dispatch (the cleanup row reuses id == run_id; the DELETE
+    // must free it first) and BEFORE the route: a crash in between leaves the envelope
+    // pending, and boot replay recreates the cleanup row while the folder still exists.
+    // UNCONDITIONAL — a failed spawn relies on this completion for its error envelope.
     let envelope = crate::jobs::complete_durable_job(
         job_id,
         delivered,
@@ -643,21 +540,16 @@ async fn terminalize_research(
         custom,
     )
     .await;
-    // Defensive post-completion gate: the in-tx cancel gate in
-    // complete_job_with_envelope rolled the completion back when the cancel
-    // fired mid-tx — never route the report or dispatch the cleanup. The
-    // cancelled-run handoff suppresses the pending envelope and dispatches the
-    // cleanup agent.
+    // Defensive post-completion gate: the in-tx cancel gate rolled the completion back when
+    // the cancel fired mid-tx — never route the report or dispatch the cleanup.
     if crate::round_cancel::is_cancelled(job_id) {
         tracing::info!(job = %job_id, "Research completion suppressed by manual cancel — not routed");
         hand_off_cancelled_or_warn(job_id, ws, question).await;
         return None;
     }
-    // Cleanup dispatch AFTER the exactly-once boundary: the cleanup jobs row
-    // reuses id == run_id (the folder name) as the durability marker that
-    // holds the folder until the cleanup completes, so it must be spawned
-    // only after complete_durable_job freed that id (a wrongly-ordered row
-    // would be deleted by the completion DELETE).
+    // Cleanup dispatch AFTER the exactly-once boundary: the cleanup row reuses id == run_id as
+    // the marker that holds the folder until it completes (a wrongly-ordered row would be
+    // deleted by the completion DELETE).
     if spawned
         && let Err(e) =
             crate::research_cleanup::dispatch_research_cleanup(job_id, question, ws).await
@@ -680,12 +572,10 @@ async fn hand_off_cancelled_or_warn(job_id: &str, ws: &Workspace, question: &str
     }
 }
 
-/// Boot resume of a research run: re-enter the orchestrator at the
-/// checkpointed stage (retry_count bumped by the boot scan), then terminalize
-/// into the durable envelope exactly like a fresh dispatch. Aborts quietly on
-/// shutdown/drain — no routing, no terminalization (the checkpointed state is
-/// reused by the next boot; routing a partial result here would race the
-/// exit).
+/// Boot resume: re-enter the orchestrator at the checkpointed stage (retry_count bumped by
+/// the boot scan), then terminalize exactly like a fresh dispatch. Aborts quietly on
+/// shutdown/drain — the checkpointed state is reused by the next boot; routing a partial
+/// result here would race the exit.
 pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
     // Register the run's cancel signal for this invocation — the boot-resume
     // path can be cancelled exactly like a fresh dispatch.
@@ -739,16 +629,12 @@ pub(crate) async fn resume_research_run(job_id: &str, ws: &Workspace) {
     crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
 }
 
-/// Build the `<analyze-tool-result>` envelope for the deep-analysis dispatch —
-/// the same tag both analysis depths use. Follows the analyze convention: the
-/// caller-generated `job_id` is embedded so the delivered report is correlatable
-/// with the immediate ack, and failures are wrapped with an explicit marker, never
-/// silently dropped.
+/// Build the `<analyze-tool-result>` envelope — the tag both analysis depths use. The
+/// caller-generated `job_id` is embedded so the delivered report correlates with the
+/// immediate ack; failures are wrapped with an explicit marker, never silently dropped.
 fn build_async_research_message(job_id: &str, result: &anyhow::Result<String>) -> String {
     build_async_result_envelope(job_id, result, "analyze-tool-result", None)
 }
-
-// ── Evidence accumulation ────────────────────────────────────────────────
 
 /// Evidence collected in one research round (post-ledger-dedup).
 #[derive(Debug, Default)]
@@ -763,8 +649,7 @@ struct EvidenceRound {
     /// them were repeats of earlier rounds' queries (no-progress signal).
     queries: usize,
     repeat_queries: usize,
-    /// Raw responses of analysts whose structured extraction failed — never
-    /// silently lost.
+    /// Raw responses of analysts whose extraction failed — never silently lost.
     raw_reports: Vec<String>,
 }
 
@@ -777,12 +662,10 @@ struct AccumulatedEvidence {
     claims: Vec<Claim>,
     /// Deduplicated analysts' self-reported unanswered aspects.
     unanswered: Vec<String>,
-    /// Rebuilt from `unanswered` after deserialize (normalize_claim keys) —
-    /// NOT stored in the state JSON.
+    /// Rebuilt from `unanswered` after deserialize (normalize_claim keys) — not stored.
     #[serde(skip)]
     unanswered_keys: HashSet<String>,
-    /// Raw responses of analysts whose structured extraction failed — never
-    /// silently lost.
+    /// Raw responses of analysts whose extraction failed — never silently lost.
     raw_reports: Vec<String>,
     /// Research-local weak/unconfirmed annotation links (never consensus).
     weak: WeakLinks,
@@ -802,23 +685,16 @@ impl AccumulatedEvidence {
     }
 }
 
-/// Research-local weak/unconfirmed annotation links — the "keep weak, clarify
-/// later" side structure. Claim ids are stable indices into
-/// [`AccumulatedEvidence::claims`] (claims are only appended or merged in
-/// place, never removed), so hints never go stale. Weakness lives ONLY here:
-/// it never leaks into claim notes, consensus markers, or verifier prompts.
-/// Resolution is the verification gate — verifier verdicts are the feedback
-/// loop; this run-local record is intentionally never written back, so the
-/// weak count reflects the run's history, not post-verification status.
+/// Research-local weak/unconfirmed annotation links — the "keep weak, clarify later" structure.
+/// Claim ids are stable indices into [`AccumulatedEvidence::claims`], so hints never go stale.
+/// Weakness lives ONLY here and is never written back: resolution is the verification gate.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct WeakLinks {
-    /// Weak duplicate hints: standalone claim id → the suspected duplicate
-    /// target's id. Recorded even when the confirm model rejected the link —
-    /// fail-open: a possible relation is never silently dropped.
+    /// Weak duplicate hints: standalone claim id → suspected duplicate id, recorded even when
+    /// the confirm model rejected the link — fail-open, a relation is never dropped.
     duplicates: Vec<(usize, usize)>,
-    /// Weak contradiction hints: new claim id → existing claim id. Both sides
-    /// still carry their contradiction notes (verification qualifies them);
-    /// the unconfirmed relation is recorded here.
+    /// Weak contradiction hints: new claim id → existing claim id. Both sides still carry
+    /// their contradiction notes; the unconfirmed relation is recorded here.
     contradictions: Vec<(usize, usize)>,
 }
 
@@ -849,10 +725,9 @@ struct AnnotationPass {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfirmLink {
-    /// 0-based index of the NEW claim within this round's pending claims.
-    /// Pair identity is pinned by the annotation pass — the model never
-    /// re-transcribes the existing id (the transcription-error class this
-    /// pass exists to catch).
+    /// 0-based index of the NEW claim within this round's pending claims. Pair identity is
+    /// pinned by the annotation pass — the model never re-transcribes the existing id (the
+    /// transcription-error class this pass exists to catch).
     new_id: usize,
     /// "confirm" | "reject" — uncertainty maps to reject (weak/unconfirmed).
     verdict: String,
@@ -865,19 +740,17 @@ struct ConfirmPass {
     links: Vec<ConfirmLink>,
 }
 
-/// Outcome of the optional confirm pass: per-pair verdicts, or the whole
-/// call failed (every mutating verdict is weak). Typed so the two states can
-/// never be conflated.
+/// Outcome of the optional confirm pass: per-pair verdicts, or the whole call failed
+/// (every mutating verdict is weak). Typed so the two states can never be conflated.
 enum ConfirmOutcome {
     Passed(ConfirmPass),
     Failed,
 }
 
 impl AccumulatedEvidence {
-    /// Absorb a round's evidence, returning `(novel_urls, pending_claims)`.
-    /// URLs and unanswered aspects dedup exactly as before; claims are
-    /// collected into a pending list — novelty is decided by the per-round
-    /// LLM annotation pass, not embedding similarity.
+    /// Absorb a round's evidence, returning `(novel_urls, pending_claims)`. URLs and
+    /// unanswered aspects dedup exactly as before; claims become a pending list — novelty is
+    /// decided by the per-round LLM annotation pass, not embedding similarity.
     fn absorb(&mut self, round: &EvidenceRound) -> (usize, Vec<Claim>) {
         let novel_urls = round
             .urls
@@ -898,17 +771,11 @@ impl AccumulatedEvidence {
         (novel_urls, round.claims.clone())
     }
 
-    /// Apply an annotation pass over a round's pending claims (the validator
-    /// guarantees id completeness and in-range existing ids): novel claims
-    /// are appended, confirmed duplicates merge into the existing claim
-    /// (sources joined deduplicated, confidence upgraded, contradictions
-    /// appended — never dropped), and contradicting claims are appended AND
-    /// linked to the existing claim so the verification gate targets both
-    /// sides. Weak (unconfirmed) mutating verdicts never merge: a weak
-    /// duplicate stays standalone with a side hint and does NOT count as
-    /// novel; a weak contradiction keeps the bidirectional notes but records
-    /// the unconfirmed relation in the side structure. Returns the number of
-    /// novel claims (the saturation signal).
+    /// Apply an annotation pass over a round's pending claims: novel claims are appended, confirmed
+    /// duplicates merge (sources joined, confidence upgraded, contradictions appended — never
+    /// dropped), contradicting claims are appended AND linked so verification targets both sides.
+    /// Weak mutating verdicts never merge and do not count as novel. Returns the number of novel
+    /// claims.
     fn apply_annotations(
         &mut self,
         pass: &AnnotationPass,
@@ -1000,12 +867,10 @@ impl AccumulatedEvidence {
     }
 }
 
-/// Cross-agent query ledger: later rounds are given the ledger in their task
-/// prompts ("do not repeat these verbatim") — concurrent round-1 analysts
-/// cannot see each other's queries, so pre-dispatch suppression is only
-/// feasible across rounds. Repeats are tallied per round
-/// ([`EvidenceRound::repeat_queries`]) and count as no-progress toward
-/// saturation in `gap_rounds` (telemetry in the run summary).
+/// Cross-agent query ledger: later rounds get it in their task prompts ("do not
+/// repeat these"), because concurrent round-1 analysts cannot see each other's
+/// queries — pre-dispatch suppression is only feasible across rounds. Repeats are
+/// tallied per round ([`EvidenceRound::repeat_queries`]) as a no-progress signal.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct QueryLedger {
     queries: HashSet<String>,
@@ -1033,13 +898,10 @@ impl QueryLedger {
 struct RunStats {
     tool_calls: usize,
     searches: usize,
-    /// Queries already issued earlier in the run (loop rounds, wrap-up, and
-    /// verification all dedupe against the same ledger) — summary telemetry
-    /// only (the saturation signal lives in `EvidenceRound::repeat_queries`,
-    /// wired in `gap_rounds`).
+    /// Queries already issued earlier in the run (all phases dedupe against one ledger)
+    /// — summary telemetry only; saturation lives in `EvidenceRound::repeat_queries`.
     repeat_queries: usize,
-    /// Analysts that failed (no response, empty output, or extraction
-    /// failure) — reported explicitly so failures are never silent.
+    /// Analysts that failed (no response, empty output, or extraction failure).
     failed_analysts: usize,
 }
 
@@ -1049,21 +911,15 @@ struct GapRoundsOutcome {
     abstention: Option<String>,
     unresolved: Vec<String>,
     rounds_dispatched: usize,
-    /// Set when the orchestrator could not determine the remaining gaps —
-    /// the report must carry an explicit marker instead of looking like
-    /// coverage completion.
+    /// Set when the remaining gaps could not be determined — the report must carry an
+    /// explicit marker instead of looking like coverage completion.
     incomplete: Option<String>,
 }
 
-// ── Wrap-up: recover deadline-aborted analysts' findings ──────────────────
-
-/// One deadline-aborted analyst's dispatch-time snapshot: the agent_id plus
-/// the frozen chat params (model, tools, reasoning_effort, routing,
-/// max_tokens) captured BEFORE spawn so the wrap-up call replays the same
-/// KV-cache prefix as the analyst's own calls. Known limitation: config or
-/// daemon-state drift (e.g. chrome tool advertisement flipping between the
-/// snapshot capture and the spawned agent's own derivation) is not reflected
-/// in the snapshot (fail-open — a miss only costs the tail re-encode).
+/// One deadline-aborted analyst's dispatch-time snapshot: the agent_id plus the frozen
+/// chat params (model, tools, reasoning_effort, routing, max_tokens) captured BEFORE
+/// spawn so the wrap-up replays the analyst's KV-cache prefix. Config/daemon-state
+/// drift after the snapshot is not reflected (fail-open: a miss re-encodes the tail).
 #[derive(Clone)]
 struct WrapUpEntry {
     agent_id: String,
@@ -1081,11 +937,9 @@ fn wrap_up_timeout() -> Duration {
     crate::util::env_duration_secs("MAHBOT_WRAP_UP_TIMEOUT_SECS", DEFAULT_WRAP_UP_TIMEOUT_SECS)
 }
 
-/// Build Analyst chat params carrying `purpose`/`agent_id` metadata and
-/// optional tool specs; byte-relevant fields come from the shared
-/// [`chat_request`] helper (same source as
-/// [`crate::agent::Agent::build_chat_request`] — model, reasoning_effort,
-/// routing, max_tokens).
+/// Build Analyst chat params carrying `purpose`/`agent_id` metadata and optional tool
+/// specs; byte-relevant fields come from the shared [`chat_request`] helper (model,
+/// reasoning_effort, routing, max_tokens).
 fn research_params(
     ws: &Workspace,
     purpose: &'static str,
@@ -1104,9 +958,8 @@ fn research_params(
     }
 }
 
-/// Wrap-up params: the advertised tool specs frozen at dispatch time. The
-/// dedicated purpose tag separates wrap-up calls in the request journal
-/// (post-rollout cached_input_tokens check).
+/// Wrap-up params: the tool specs frozen at dispatch. The dedicated purpose tag
+/// separates wrap-up calls in the request journal.
 fn wrap_up_params(ws: &Workspace, agent_id: &str, tool_specs: Vec<ToolSpec>) -> ChatRequest {
     research_params(
         ws,
@@ -1117,10 +970,8 @@ fn wrap_up_params(ws: &Workspace, agent_id: &str, tool_specs: Vec<ToolSpec>) -> 
 }
 
 /// RAII guard for a research-run LLM call: registers with
-/// [`crate::agent::registry::NON_AGENT_CALLS`] under the run's
-/// `ParentKey::Research(run_key)` group. Dropping the guard removes the
-/// registry entry, so the caller must keep the binding alive for the whole
-/// call (or the whole run when `run_lifetime` is set).
+/// [`crate::agent::registry::NON_AGENT_CALLS`] under the run's `ParentKey::Research`
+/// group. Dropping it removes the entry, so the caller must keep the binding alive.
 fn research_call_guard(
     kind: &'static str,
     ws_name: &str,
@@ -1139,22 +990,12 @@ fn research_call_guard(
     )
 }
 
-/// Wrap-up stage after a round deadline: for every analyst aborted by the
-/// deadline, load its persisted session, register its search queries in the
-/// ledger (BEFORE any LLM call — independent of the extraction outcome),
-/// and — only when the session shows at least one successful tool result —
-/// extract the accumulated findings via a fresh LLM call replaying the
-/// dispatch-time params. Fail-open: a failed extraction keeps the analyst
-/// failed. Skipped entirely when shutdown/drain is already in progress;
-/// aborts promptly if the drain starts mid-stage (the orchestrator guard
-/// blocks the drain-watch token, so the wrap-up self-aborts on the drain
-/// flag — the partial report is not delayed past the drain).
-///
-/// Live tracking: one NON_AGENT_CALLS row per wrap-up stage, registered only
-/// when the LLM batch actually runs (the stage is the logical task — the
-/// per-analyst extraction calls share it, never spawning N duplicate rows).
-/// Each extraction call still records its own `llm_requests` row via
-/// its `"research_wrap_up"` ChatRequestMeta.
+/// Wrap-up stage after a round deadline: for every deadline-aborted analyst, load its session,
+/// register its queries in the ledger (BEFORE any LLM call), and — only when the session shows a
+/// successful tool result — extract the accumulated findings by replaying the dispatch-time params.
+/// Fail-open: a failed extraction keeps the analyst failed. Skipped when a drain is in progress
+/// (the orchestrator guard blocks the drain-watch, so the stage self-aborts). One NON_AGENT_CALLS
+/// row per stage.
 async fn wrap_up_timed_out(
     ws: &Workspace,
     timed_out: Vec<WrapUpEntry>,
@@ -1167,14 +1008,10 @@ async fn wrap_up_timed_out(
         return Vec::new();
     }
     let stage_deadline = std::time::Instant::now() + wrap_up_timeout();
-    // Prepare sequentially (cheap DB reads): load the session, register its
-    // queries (mirroring the parse-failed-analyst pattern — ledger + summary
-    // telemetry only, never the round's saturation counters; the shared
-    // ledger makes a later gap-round re-ask count as a repeat), and gate the
-    // LLM call on the presence of at least one successful tool result. Prep
-    // always completes so query registration is guaranteed for every timed-
-    // out analyst independent of the stage deadline — the deadline bounds
-    // only the LLM batch below; a drain mid-prep still aborts the rest.
+    // Prepare sequentially (cheap DB reads): load the session, register its queries (ledger +
+    // summary telemetry only, never the saturation counters), and gate the LLM call on a successful
+    // tool result. Prep always completes, so registration is guaranteed for every timed-out
+    // analyst.
     let mut prepared = Vec::new();
     for entry in timed_out {
         if crate::shutdown::aborting() {
@@ -1203,10 +1040,6 @@ async fn wrap_up_timed_out(
     if prepared.is_empty() || crate::shutdown::aborting() {
         return Vec::new();
     }
-    // Live tracker for the wrap-up stage — registered here, only when the LLM
-    // batch actually runs (prep-only stages register nothing). Attaches to the
-    // research run's group; the whole-run orchestrator guard already blocks
-    // the drain-watch, so this row is purely observational.
     let _wrap_up_call = research_call_guard("research_wrap_up", &ws.name, run_key, false, question);
     let wrap_up_prompt = load_prompt("research/wrap_up.md");
     let handles: Vec<_> = prepared
@@ -1216,15 +1049,6 @@ async fn wrap_up_timed_out(
             tokio::spawn(async move {
                 let mut messages = p.history;
                 messages.push(ChatMessage::user(&wrap_up_prompt));
-                // ~3 attempts, no wall-clock cap: the only per-attempt bound is
-                // the 600 s idle timeout (retry.rs). On the worst-case
-                // cache-miss tail (~170K tokens of prefill) a generation can
-                // legitimately spend minutes before its first byte; a genuinely
-                // stalled attempt is cut at the idle bound. The stage deadline
-                // caps the batch but cannot extend a task's attempts.
-                // Post-rollout telemetry distinguishes cache-hit from policy
-                // starvation (the policy's own backoff/attempts apply; the
-                // wrap-up adds nothing beyond them).
                 crate::agent::extraction::retry_extract_structured_scoped::<AnalystFindings>(
                     &messages,
                     "",
@@ -1247,14 +1071,9 @@ async fn wrap_up_timed_out(
         .collect()
 }
 
-/// True when the session history shows at least one successful tool result —
-/// a persisted tool result whose content does not start with the
-/// tool-failure marker (all-failure or no-result sessions skip the wrap-up
-/// LLM call; their queries are still registered). A successful result
-/// coincidentally beginning with the marker is misclassified as a failure —
-/// accepted, negligible probability. Non-native (non-JSON-wrapped) results
-/// decode to None and count as no-success — conservative fail-open, but
-/// unreachable for research analysts (their results persist native).
+/// True when the session history holds a persisted tool result that does not start with the
+/// tool-failure marker (all-failure or no-result sessions skip the wrap-up call). A success
+/// starting with the marker is misclassified — accepted. Non-native results decode to None.
 fn session_has_successful_tool_result(history: &[ChatMessage]) -> bool {
     history.iter().any(|m| {
         matches!(
@@ -1265,15 +1084,9 @@ fn session_has_successful_tool_result(history: &[ChatMessage]) -> bool {
     })
 }
 
-/// Await the concurrent wrap-up extraction tasks, bounded by the stage
-/// deadline and interrupted by the drain flag (each task's inner provider
-/// call is dropped via the batch cancel token). Returns one result per task
-/// slot. The drain and deadline select arms fire once each and cancel the
-/// batch token; force-cancel needs no per-task arm — the inner retry loop is
-/// shutdown-abortable and resolves on its own.
-/// Not shared with [`await_round_members`] deliberately: round waits must NOT
-/// abort on drain (in-flight analysts complete their turn), while the wrap-up
-/// MUST (the ticket's partial-report-not-delayed requirement).
+/// Await the concurrent wrap-up extraction tasks, bounded by the stage deadline and interrupted by
+/// the drain flag. Deliberately not shared with [`await_round_members`]: round waits must NOT abort
+/// on drain, while the wrap-up MUST.
 async fn await_wrap_up_batch(
     handles: Vec<tokio::task::JoinHandle<Option<AnalystFindings>>>,
     deadline: std::time::Instant,
@@ -1313,9 +1126,8 @@ async fn await_wrap_up_batch(
         })
         .collect();
     let mut out: Vec<Option<AnalystFindings>> = (0..pending.len()).map(|_| None).collect();
-    // The drain/deadline arms fire once each — after that the cancel token
-    // aborts every remaining task so the batch drains promptly (a
-    // permanently-ready select arm would otherwise starve `pending.next()`).
+    // The drain/deadline arms fire once each, then the cancel token aborts every
+    // remaining task (a permanently-ready arm would starve `pending.next()`).
     let mut drain_fired = false;
     let mut deadline_fired = false;
     while !pending.is_empty() {
@@ -1335,10 +1147,9 @@ async fn await_wrap_up_batch(
     out
 }
 
-/// Collapse awaited round members into analyst runs, splitting out the
-/// deadline-aborted members with their dispatch-time snapshots (the wrap-up
-/// stage replays them). Panicked/cancelled members stay plain NoResponse —
-/// the TimedOut distinction survives until the wrap-up stage.
+/// Collapse awaited round members into analyst runs, splitting out the deadline-aborted
+/// members with their dispatch-time snapshots. Panicked/cancelled members stay plain
+/// NoResponse — the TimedOut distinction survives until the wrap-up stage.
 fn resolve_round_members_with_timeouts<T>(
     members: Vec<RoundMember<AnalystRun<T>>>,
     snapshots: &[WrapUpEntry],
@@ -1370,9 +1181,8 @@ fn resolve_round_members_with_timeouts<T>(
     (runs, timed_out)
 }
 
-/// Dispatch a round of analyst members and resolve it: staggered spawn,
-/// deadline-bounded await, timeout resolution against the dispatch-time
-/// wrap-up snapshots (empty for rounds that never wrap up).
+/// Dispatch a round of analyst members and resolve it: staggered spawn, deadline-bounded
+/// await, timeout resolution against the dispatch-time wrap-up snapshots.
 async fn dispatch_analyst_round<T, Fut, F>(
     members: Vec<F>,
     resume: bool,
@@ -1389,18 +1199,16 @@ where
     resolve_round_members_with_timeouts(members_out, snapshots)
 }
 
-// ── Agent runners ────────────────────────────────────────────────────────
-
-/// One analyst run. Mirrors analyze's three-state fail-open typing: a
-/// parse-failed analyst's raw response is preserved, never dropped.
+/// One analyst run. Mirrors analyze's three-state fail-open typing: a parse-failed
+/// analyst's raw response is preserved, never dropped.
 enum AnalystRun<T> {
     /// Agent produced no response (crashed, cancelled, empty output).
     NoResponse,
     /// Agent responded and structured extraction succeeded.
     Findings(AnalystRunOutcome<T>),
-    /// Agent responded but structured extraction failed; the raw response is
-    /// preserved for the fail-open report, plus the run's telemetry (queries
-    /// must still reach the ledger so later rounds do not re-ask them).
+    /// Agent responded but structured extraction failed; the raw response is preserved for
+    /// the fail-open report, plus telemetry (queries must reach the ledger so later rounds
+    /// do not re-ask them).
     ParseFailed {
         raw: String,
         tool_calls: usize,
@@ -1417,14 +1225,9 @@ struct AnalystRunOutcome<T> {
     queries: Vec<String>,
 }
 
-/// Run a single analyst agent on `task` and extract structured output `T`
-/// while the agent is alive (KV-cache reuse). Returns an [`AnalystRun<T>`]:
-/// telemetry `(tool_calls, searches, queries)` from the session history is
-/// folded into the `Findings`/`ParseFailed` outcome.
-///
-/// `run_key` is the durable research job id — the sub-agent registers in the
-/// Running Agents view under the run's group. `question` is the run's
-/// question — threaded as the group header label (purely presentational).
+/// Run a single analyst agent on `task` and extract structured output `T` while the agent is alive
+/// (KV-cache reuse). Telemetry from the session history is folded into the outcome. `run_key`
+/// places the sub-agent in the Running Agents view; `question` is the group header label.
 async fn run_structured_analyst<T: serde::de::DeserializeOwned>(
     ws: &Workspace,
     agent_id: &str,
@@ -1473,9 +1276,8 @@ async fn run_structured_analyst<T: serde::de::DeserializeOwned>(
     }
 }
 
-/// Build a round member closure: run one analyst on `task` and extract
-/// structured output `T`. Takes owned values so the returned closure (and its
-/// boxed future) are `'static` + `Send`, as `spawn_staggered_round` requires.
+/// Build a round member closure: run one analyst on `task` and extract `T`. Takes owned
+/// values so the returned closure (and its boxed future) are `'static` + `Send`.
 fn make_round_member<T: serde::de::DeserializeOwned + Send>(
     ws: Workspace,
     agent_id: String,
@@ -1525,10 +1327,9 @@ fn collect_evidence(
                 run_stats.failed_analysts += 1;
                 run_stats.tool_calls += tool_calls;
                 run_stats.searches += searches;
-                // Failed analysts' queries still reach the ledger (later
-                // rounds must not re-ask them) and the summary telemetry;
-                // they don't drive the per-round saturation signal
-                // (`round.queries` stays from successful analysts only).
+                // Failed analysts' queries still reach the ledger (later rounds must not re-ask
+                // them) and the summary telemetry; they do not drive the per-round saturation
+                // signal (`round.queries` stays from successful analysts only).
                 for q in queries {
                     if !ledger.register(q) {
                         run_stats.repeat_queries += 1;
@@ -1561,13 +1362,9 @@ fn collect_evidence(
     round
 }
 
-// ── Orchestrator LLM helpers (not budgeted) ──────────────────────────────
-
-/// Build the orchestrator's chat params: cheap Analyst model (per-role
-/// overrides respected), constant model/effort/tools across all coordination
-/// calls of a run (KV-cache friendly — the leading general workspace context
-/// system message is constant too; only the user message varies). Byte-relevant
-/// fields come from the shared [`chat_request`] helper.
+/// Orchestrator chat params: cheap Analyst model (per-role overrides respected),
+/// constant model/effort/tools across a run's coordination calls (KV-cache friendly —
+/// the leading workspace-context system message is constant too).
 fn orchestrator_params(ws: &Workspace, purpose: &'static str) -> ChatRequest {
     research_params(
         ws,
@@ -1577,12 +1374,9 @@ fn orchestrator_params(ws: &Workspace, purpose: &'static str) -> ChatRequest {
     )
 }
 
-/// Structured orchestrator extraction via the hardened scoped retry loop.
-/// `prompt` embeds the JSON schema request. The general workspace context is
-/// prepended as the leading system message. `run_key` is the durable research
-/// job id — the orchestrator call registers in the Running Agents view under
-/// the run's group; `question` is the run's question, threaded as the group
-/// header label (purely presentational).
+/// Structured orchestrator extraction via the hardened scoped retry loop; `prompt`
+/// embeds the JSON schema request and the workspace context is prepended as the leading
+/// system message. `run_key`/`question` only place the call in the Running Agents view.
 async fn orchestrator_extract<T: serde::de::DeserializeOwned>(
     ws: &Workspace,
     purpose: &'static str,
@@ -1603,20 +1397,13 @@ async fn orchestrator_extract<T: serde::de::DeserializeOwned>(
     .map_err(|e| anyhow::anyhow!("orchestrator extraction '{purpose}' failed: {e}"))
 }
 
-// ── Round 0: decomposition ───────────────────────────────────────────────
-
-/// Round 0: two independent decomposition plans merged into one
-/// consolidated plan with provenance via a single orchestrator LLM call.
-/// Budget: 2 decomposers. The x2 redundancy lives here, at the steering
-/// decision. On merge failure the run falls back to the first valid plan
-/// verbatim with an explicit marker; only when ALL decomposers failed does
-/// the run error (no plan = no research).
+/// Round 0: two independent decomposition plans merged into one consolidated plan with provenance
+/// via one orchestrator call (budget: 2 decomposers; the x2 redundancy lives at the steering
+/// decision). On merge failure the run falls back to the first valid plan verbatim with a marker;
+/// only when ALL decomposers failed does it error.
 ///
-/// Asymmetry note: a parse-failed decomposer's raw response is intentionally
-/// NOT preserved (unlike `collect_evidence`, which keeps failed analysts'
-/// raws for the fail-open report). Decomposer plans are steering, not
-/// evidence — the failure still counts in `run_stats.failed_analysts`, and
-/// the run aborts with an explicit error if no plan parses.
+/// A parse-failed decomposer's raw is intentionally NOT preserved (unlike `collect_evidence`) —
+/// plans are steering, not evidence.
 #[expect(clippy::too_many_arguments)]
 async fn round0_decompose(
     ws: &Workspace,
@@ -1673,9 +1460,8 @@ async fn round0_decompose(
         resolve_merged_plan_ids(&mut plan, &valid);
         Ok((plan, None))
     } else {
-        // Fail-open: a failed merge must never lose the run — fall back to
-        // the first valid plan verbatim with an explicit marker. Plan 0's
-        // items are the leading ids of the global flat numbering.
+        // Fail-open: a failed merge must never lose the run — fall back to the first valid plan
+        // verbatim with an explicit marker.
         let first = &valid[0];
         let plan = MergedPlan {
             sub_questions: first
@@ -1696,9 +1482,8 @@ async fn round0_decompose(
     }
 }
 
-/// Render the input plans with their global flat item ids for the merge
-/// prompt: `Plan N:` header per plan, one `- {id}: question [evidence, risk]`
-/// line per item, ids numbered flat across all plans in (plan, item) order.
+/// Render the input plans with their global flat item ids for the merge prompt, ids
+/// numbered flat across all plans in (plan, item) order.
 fn render_plans_with_ids(plans: &[DecompositionPlan]) -> String {
     let mut out = String::new();
     let mut id = 0usize;
@@ -1716,8 +1501,7 @@ fn render_plans_with_ids(plans: &[DecompositionPlan]) -> String {
     out
 }
 
-/// Merge 1–2 independent plans into one consolidated plan with provenance
-/// (orchestrator extraction call — not budgeted).
+/// Merge 1–2 independent plans into one consolidated plan with provenance (not budgeted).
 async fn merge_decomposition_plans(
     ws: &Workspace,
     question: &str,
@@ -1744,8 +1528,8 @@ async fn merge_decomposition_plans(
     .await
 }
 
-/// The input-plan items as the global flat id universe — id = (plan, item)
-/// order, matching `render_plans_with_ids` and the merge prompt's numbering.
+/// The input-plan items as the global flat id universe — id = (plan, item) order,
+/// matching `render_plans_with_ids` and the merge prompt's numbering.
 fn plan_item_table(plans: &[DecompositionPlan]) -> Vec<Vec<String>> {
     plans
         .iter()
@@ -1753,9 +1537,8 @@ fn plan_item_table(plans: &[DecompositionPlan]) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// Fill in merged entries' tuple text from the cited input-plan items (the
-/// system resolves id → tuple via the global flat numbering — the model's
-/// copied text is never used).
+/// Fill in merged entries' tuple text from the cited input-plan items — the model's
+/// copied text is never used.
 fn resolve_merged_plan_ids(plan: &mut MergedPlan, plans: &[DecompositionPlan]) {
     let items = plan_item_table(plans);
     let table = crate::consensus::ItemTable::new(&items);
@@ -1769,12 +1552,10 @@ fn resolve_merged_plan_ids(plan: &mut MergedPlan, plans: &[DecompositionPlan]) {
     }
 }
 
-/// Validate a merged plan by id-based coverage: every cited id in range, no
-/// duplicate placement, and full coverage — every input plan item id appears
-/// exactly once across merged sub-questions (as `from_id` or `also_ids`) plus
-/// dropped. Silent dropout is rejected (fail-closed inside the extraction
-/// retry loop). Structural only — tuple text is resolved by the system, never
-/// machine-checked against the plans.
+/// Validate a merged plan by id-based coverage: every cited id in range, no duplicate
+/// placement, and full coverage — every input plan item appears exactly once across
+/// merged sub-questions (as `from_id` or `also_ids`) plus dropped. Silent dropout is
+/// rejected (fail-closed inside the extraction retry loop).
 fn validate_merged_plan(plan: &MergedPlan, plans: &[DecompositionPlan]) -> Result<(), String> {
     let items = plan_item_table(plans);
     let table = crate::consensus::ItemTable::new(&items);
@@ -1807,14 +1588,10 @@ fn validate_merged_plan(plan: &MergedPlan, plans: &[DecompositionPlan]) -> Resul
     Ok(())
 }
 
-// ── Round 1: one analyst per sub-question ────────────────────────────────
-
-/// Round 1: one analyst per sub-question; two for high-risk items (the
-/// second gets a decorrelated research angle). Returns the round's evidence
-/// plus the dispatch-time snapshots of deadline-aborted analysts (the caller
-/// checkpoints FIRST, then runs the wrap-up stage — a crash mid-wrap-up must
-/// not lose the round-1 evidence), or `None` when the analyst budget is
-/// exhausted before dispatch.
+/// Round 1: one analyst per sub-question, two for high-risk items (the second gets a
+/// decorrelated angle). Returns the round's evidence plus dispatch-time snapshots of
+/// deadline-aborted analysts (the caller checkpoints FIRST, then wraps up — a crash
+/// mid-wrap-up must not lose the evidence), or `None` when the budget is exhausted.
 #[expect(clippy::too_many_arguments)]
 async fn round1_research(
     ws: &Workspace,
@@ -1849,9 +1626,9 @@ async fn round1_research(
     let ledger_snapshot = ledger.render();
     let mut members = Vec::new();
     let mut snapshots: Vec<WrapUpEntry> = Vec::new();
-    // Dispatch-time wrap-up snapshots: frozen params + advertised tool
-    // schemas, captured before spawn (aborted tasks lose their values). The
-    // specs are constant across the round's members (same role+workspace).
+    // Dispatch-time wrap-up snapshots: frozen params + advertised tool schemas, captured before
+    // spawn (aborted tasks lose their values). The specs are constant across the round's members
+    // (same role+workspace).
     let wrap_up_specs = role_tool_specs(Role::Analyst, ws, false);
     let mut idx = 0usize;
     for sq in &plan.sub_questions {
@@ -1900,8 +1677,6 @@ async fn round1_research(
     Some((round, timed_out))
 }
 
-// ── Interim consolidation + conditional gap rounds ───────────────────────
-
 /// Interim consolidation: extract the structured gap list from the
 /// accumulated evidence (orchestrator call, not budgeted). `None` marks an
 /// extraction failure — the caller must surface it explicitly, never collapse
@@ -1923,8 +1698,7 @@ async fn extract_gap_list(
             ("{{evidence}}", &evidence),
         ],
     );
-    // The validator captures an owned copy of the plan (the validator type is
-    // `'static`).
+    // The validator captures an owned copy (the validator type is `'static`).
     let plan_owned = plan.clone();
     orchestrator_extract::<GapList>(
         ws,
@@ -1938,9 +1712,8 @@ async fn extract_gap_list(
     .ok()
 }
 
-/// Validate the gap list: every gap's `traces_to` must be a 0-based index
-/// into the merged plan's sub-questions (fail-closed inside the extraction
-/// retry loop — index-range validation guarantees traceability).
+/// Validate the gap list: every gap's `traces_to` is a 0-based index into the merged
+/// plan's sub-questions (fail-closed inside the extraction retry loop).
 fn validate_gap_list(gaps: &GapList, plan: &MergedPlan) -> Result<(), String> {
     for g in &gaps.gaps {
         if g.traces_to >= plan.sub_questions.len() {
@@ -1960,12 +1733,10 @@ fn gap_items(gaps: &[Gap]) -> Vec<String> {
     gaps.iter().map(|g| g.item.clone()).collect()
 }
 
-/// Run one gap round: fresh analysts, one per gap in the given slice (the
-/// width-shrinking 4→3→2 across rounds is the caller's, see [`gap_rounds`]).
-/// Returns the round's analyst runs plus the dispatch-time snapshots
-/// of analysts aborted by the round deadline (the caller runs the wrap-up
-/// stage AFTER collecting the round's evidence so ledger registrations from
-/// recovered analysts cannot skew the round's saturation counters).
+/// Run one gap round: fresh analysts, one per gap in the slice (the width-shrinking
+/// 4→3→2 is the caller's). Returns the runs plus dispatch-time snapshots of analysts
+/// aborted by the round deadline (the caller wraps up AFTER collecting the round's
+/// evidence so recovered registrations cannot skew the saturation counters).
 #[expect(clippy::too_many_arguments)]
 async fn run_gap_round(
     ws: &Workspace,
@@ -1983,8 +1754,7 @@ async fn run_gap_round(
     let ledger_snapshot = ledger.render();
     let mut members: Vec<_> = Vec::new();
     let mut snapshots: Vec<WrapUpEntry> = Vec::new();
-    // Dispatch-time wrap-up snapshots (see round1_research) — same specs for
-    // every member of the round.
+    // Dispatch-time wrap-up snapshots (see round1_research) — same specs for every member.
     let wrap_up_specs = role_tool_specs(Role::Analyst, ws, false);
     for (i, gap) in gaps.iter().enumerate() {
         let ws = ws.clone();
@@ -2022,17 +1792,10 @@ async fn run_gap_round(
     dispatch_analyst_round(members, resume, deadline, &snapshots).await
 }
 
-/// Record a worker-round marker — a GATE-SKIP (`"skipped — {reason}"`; the
-/// round is NOT claimed) or an OUTCOME (dispatched but failed/cancelled).
-/// One marker per key: a fresh marker clears the prior one (a stale
-/// skip/outcome marker is superseded — the report shows one truth per key).
-/// Re-attempt semantics: only the PRE-LOOP key-0 round is re-examined on
-/// boot-resume (`!worker_rounds_done.contains(&0)`); a post-progress round
-/// (key ≥ 1) is dispatched only as a side-effect of a progress event inside
-/// the gap loop, so a gate-skip after a long gap round is FINAL — the loop's
-/// already-advanced round_index never revisits the key. That is fail-open per
-/// design (no silent skips — the marker IS the report note; the run
-/// continues without the prototype).
+/// Record a worker-round marker — a GATE-SKIP (`"skipped — {reason}"`; not claimed) or an
+/// OUTCOME. One marker per key: a fresh one supersedes the prior. Only the PRE-LOOP key-0 round is
+/// re-examined on boot-resume; a post-progress gate-skip is FINAL (fail-open — the marker IS the
+/// report note).
 fn set_worker_marker(state: &mut ResearchState, round_key: usize, suffix: &str) {
     let marker = format!("worker round {round_key} {suffix}");
     clear_worker_markers(state, round_key);
@@ -2046,12 +1809,10 @@ fn clear_worker_markers(state: &mut ResearchState, round_key: usize) {
         .retain(|m| !m.starts_with(&format!("worker round {round_key} ")));
 }
 
-/// Claim a worker round at DISPATCH. The claim is IN-MEMORY here — it reaches
-/// the persisted checkpoint only at the next per-round save (after the round
-/// completes), so a crash mid-worker loses it and boot-resume re-dispatches
-/// (the accepted crash-duplicate pin). Stale skip/outcome markers for this
-/// key are cleared — the report shows one truth (the final outcome), not
-/// a dead skip plus completed prototypes.
+/// Claim a worker round at DISPATCH. The claim is IN-MEMORY: it reaches the checkpoint
+/// only at the next per-round save, so a crash mid-worker loses it and boot-resume
+/// re-dispatches (the accepted crash-duplicate pin). Stale skip/outcome markers for this
+/// key are cleared — one truth per key.
 fn claim_worker_round(state: &mut ResearchState, round_key: usize) {
     if !state.worker_rounds_done.contains(&round_key) {
         state.worker_rounds_done.push(round_key);
@@ -2059,30 +1820,16 @@ fn claim_worker_round(state: &mut ResearchState, round_key: usize) {
     clear_worker_markers(state, round_key);
 }
 
-/// Un-claim a round that was dispatched but never completed (failure or
-/// cancellation). Only the pre-loop key-0 round is re-attempted by
-/// boot-resume; a post-progress failure is final (marked, fail-open).
+/// Un-claim a round that was dispatched but never completed (failure or cancellation).
+/// Only the pre-loop key-0 round is re-attempted by boot-resume.
 fn unclaim_worker_round(state: &mut ResearchState, round_key: usize) {
     state.worker_rounds_done.retain(|k| *k != round_key);
 }
 
-/// One worker round: a single Worker sub-agent builds prototypes in the per-run
-/// folder targeting the current gap list. Blocks on the worker (never hard
-/// timed out — a long worker may overrun the round deadline; the loop-top
-/// checks then skip the following gap rounds, fail-open). The worker's response
-/// text is NOT inserted into the report; failures and skips are marked in the
-/// report, never silent.
-///
-/// Gated at the top by the same checks as the loop top: analyst-budget
-/// exhaustion, round-deadline expiry, shutdown/drain, cancel, and a 30-minute
-/// minimum-remaining guard ([`WORKER_MIN_REMAINING`]). Every gate-skip is
-/// marked in the report, never silent (fail-open). Only the PRE-LOOP key-0
-/// round is re-attempted on boot-resume (`!worker_rounds_done.contains(&0)`);
-/// a post-progress skip (key ≥ 1) is final — the advanced `round_index` never
-/// revisits the key. No speculative inline retry: `run_agent` already
-/// exhausts its internal retry bounds before returning Failed, so a second
-/// full worker session would only double the LLM spend of a confirmed failure
-/// (design: a worker failure is fail-open).
+/// One worker round: a single Worker sub-agent builds prototypes in the per-run folder targeting
+/// the current gap list. Blocks on the worker (never hard timed out — the loop-top checks then skip
+/// the following gap rounds, fail-open). The response text is NOT inserted into the report.
+/// Gated by the loop top's checks plus [`WORKER_MIN_REMAINING`]; no speculative inline retry.
 #[expect(clippy::too_many_arguments)]
 async fn run_worker_round(
     job_id: &str,
@@ -2119,11 +1866,8 @@ async fn run_worker_round(
         );
         return;
     }
-    // Claimed at dispatch (in-memory — persisted only at the next per-round
-    // checkpoint, which happens AFTER the round completes, so a crash
-    // mid-worker loses the claim. Only the PRE-LOOP key-0 round is
-    // re-dispatched by boot-resume (the accepted crash-duplicate pin);
-    // a crashed post-progress round is final, fail-open.
+    // Claimed at dispatch, in-memory until the next per-round checkpoint — a crash mid-worker
+    // loses the claim; only the PRE-LOOP key-0 round is re-dispatched (crash-duplicate pin).
     claim_worker_round(state, round_key);
     let evidence = render_accumulated_evidence(&state.acc);
     let gaps = gap_items(&gap_list.gaps).join("\n");
@@ -2138,12 +1882,9 @@ async fn run_worker_round(
     );
     let worker_ws = Workspace::ephemeral_run(job_id, Path::new(run_root));
     let agent_id = crate::session::research_agent_id(&ws.name, "worker");
-    // Command collection happens after the run completes — a crash mid-worker
-    // loses the session from the sanitizer (accepted: only the PRE-LOOP key-0
-    // round is re-dispatched by boot-resume — with a fresh agent id, since
-    // `research_agent_id` embeds a fresh NanoID suffix per call — and the
-    // design's crash-duplicate pin covers the re-run's prototype duplication;
-    // a crashed post-progress round is final, fail-open).
+    // Command collection happens after the run completes — a crash mid-worker loses the
+    // session from the sanitizer (accepted: only key 0 is re-dispatched, with a fresh agent
+    // id, since `research_agent_id` embeds a fresh NanoID suffix per call).
     let (agent, response) = run_default_agent(
         &agent_id,
         Role::Worker,
@@ -2173,34 +1914,17 @@ async fn run_worker_round(
     }
 }
 
-/// Conditional gap rounds. Stopping is artifact-based, never agent
-/// self-assessment: coverage completion, answerability abstention (checked on
-/// every structural quiet round — a non-abstain verdict continues, with the
-/// analyst budget as the hard bound), budget exhaustion, and shutdown.
+/// Two counters: `round_index` is the persisted resume pointer, `rounds_dispatched` the
+/// report telemetry count; they diverge only on the abstention / gap-extract-failure exit,
+/// where the round's checkpoint is skipped so `round_index` lags by one.
 ///
-/// Checkpoints AFTER EACH gap round: the gap-loop locals (round_index,
-/// rounds_dispatched, the current gap list, budget) are not derivable from
-/// the accumulated evidence — a crash mid-loop would otherwise revert to the
-/// post-round-1 checkpoint and re-run the ENTIRE gap stage from round 0 with
-/// fresh analyst sessions (whole-stage re-run, duplicated LLM spend).
+/// Checkpoint AFTER EACH gap round: the gap-loop locals are not derivable from the
+/// accumulated evidence, so a crash mid-loop would re-run the ENTIRE gap stage from round 0
+/// with fresh sessions.
 ///
-/// Why two counters: `round_index` is the persisted resume pointer
-/// (accumulated across invocations) while `rounds_dispatched` is the report
-/// telemetry count. After the resume fix they are equal at every per-round
-/// checkpoint; they diverge only on the abstention / gap-extract-failure exit
-/// path, where that round's checkpoint is skipped so the persisted
-/// `round_index` lags by one while `rounds_dispatched` still counts the final
-/// completed round.
-///
-/// Worker-in-loop: one prototype pass (key 0) before the loop over the initial
-/// gap list, then one after every progress round that refreshes a non-empty
-/// gap list (key = the round's index). Each pass is gated by the same
-/// budget/deadline/shutdown checks as the loop top and persisted with the
-/// per-round checkpoint. Boot-resume re-attempts ONLY the pre-loop key-0
-/// round (the `!worker_rounds_done.contains(&0)` check below); a skipped or
-/// failed post-progress round (key ≥ 1) is FINAL — the loop resumes at the
-/// advanced round_index and never revisits the key (fail-open per design,
-/// skip marker in the report).
+/// Worker-in-loop: one pass (key 0) before the loop, then one after every progress round
+/// that refreshes a non-empty gap list; each is gated like the loop top and persisted with
+/// the per-round checkpoint. Boot-resume re-attempts ONLY key 0.
 #[expect(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn gap_rounds(
     ws: &Workspace,
@@ -2215,22 +1939,17 @@ async fn gap_rounds(
     resume: bool,
     recovered: &mut Vec<AnalystFindings>,
 ) -> GapRoundsOutcome {
-    // Cumulative across boot-resumes: seed the per-invocation dispatch count
-    // from the persisted checkpoint so a resumed run's "rounds used"
-    // telemetry covers the whole run, not just the post-resume segment. The
-    // reserve-failure exit and the "only count actually-dispatched rounds"
-    // semantics (the increment happens after dispatch, not at the loop top)
-    // are unchanged.
+    // Cumulative across boot-resumes: seed the per-invocation dispatch count from the
+    // persisted checkpoint so a resumed run's "rounds used" telemetry covers the whole run.
+    // The increment happens after dispatch, not at the loop top.
     let mut outcome = GapRoundsOutcome {
         abstention: None,
         unresolved: Vec::new(),
         rounds_dispatched: state.gap_outcome.rounds_dispatched,
         incomplete: None,
     };
-    // Manual-cancel gate before any further orchestrator call or round:
-    // stop without extracting gaps, dispatching the worker, or spawning
-    // another gap round. The caller (run_deep_research) observes the fired
-    // signal and exits Cancelled regardless of this outcome's value.
+    // Manual-cancel gate before any further orchestrator call or round: stop without
+    // extracting gaps, dispatching the worker, or spawning another gap round.
     if crate::round_cancel::is_cancelled(job_id) {
         return GapRoundsOutcome::default();
     }
@@ -2243,8 +1962,7 @@ async fn gap_rounds(
         outcome.incomplete = Some(GAP_EXTRACTION_FAILED.to_string());
         return outcome;
     };
-    // Pre-loop worker round (key 0): one prototype pass over the initial gap
-    // list before the first gap round dispatches.
+    // Pre-loop worker round (key 0): one prototype pass over the initial gap list.
     if !gap_list.gaps.is_empty() && !state.worker_rounds_done.contains(&0) {
         run_worker_round(
             job_id, run_root, ws, question, budget, &gap_list, deadline, state, 0,
@@ -2256,16 +1974,14 @@ async fn gap_rounds(
         if crate::shutdown::aborting()
             || crate::round_cancel::is_cancelled(job_id)
             || budget.is_exhausted()
-            // Round-wide deadline expired: further rounds would be spawned
-            // and instantly aborted — stop instead of burning budget on
-            // no-progress work.
+            // Round-wide deadline expired: further rounds would be spawned and instantly aborted —
+            // stop instead of burning budget on no-progress work.
             || std::time::Instant::now() >= deadline
         {
             outcome.unresolved = gap_items(&gap_list.gaps);
             return outcome;
         }
-        // The gap list is validated (traces_to in range) — every gap is
-        // traceable, so it is used directly.
+        // The gap list is validated (traces_to in range) — every gap is used directly.
         let gaps = &gap_list.gaps;
         if gaps.is_empty() {
             // Coverage completion.
@@ -2295,11 +2011,9 @@ async fn gap_rounds(
             .capture_round(job_id, &round_agents, Path::new(run_root))
             .await;
         let round = collect_evidence(&runs, &mut state.ledger, run_stats);
-        // Wrap-up stays BEFORE the per-round checkpoint here (unlike round 1):
-        // the loop's early returns (abstention / gap-extract failure) follow
-        // this position, and the final round's wrap-up must survive them; the
-        // pre-checkpoint window already contains the annotate + gap-extract
-        // orchestrator calls, so the wrap-up only extends an existing window.
+        // Wrap-up stays BEFORE the per-round checkpoint here (unlike round 1): the loop's early
+        // returns (abstention / gap-extract failure) follow this position and the final round's
+        // wrap-up must survive them.
         recovered.extend(
             wrap_up_timed_out(
                 ws,
@@ -2322,25 +2036,21 @@ async fn gap_rounds(
         )
         .await;
         outcome.rounds_dispatched += 1;
-        // A round whose analysts only re-asked already-asked queries counts
-        // as no-progress (repeat queries are never pre-dispatch-droppable —
-        // concurrent analysts generate them live).
+        // A round whose analysts only re-asked already-asked queries counts as no-progress
+        // (repeat queries are never pre-dispatch-droppable — concurrent analysts generate them).
         let all_repeat_queries = round.queries > 0 && round.queries == round.repeat_queries;
         if (new_urls == 0 && novel_claims == 0) || all_repeat_queries {
-            // Structural quiet-round signal: no new claims and no new sources.
-            // A weak-duplicate-only round also lands here (weak duplicates
-            // append standalone claims but never count as novel) — the
-            // answerability check fires and the gap list is not refreshed,
-            // which is the intended premature-saturation protection: gap-round
-            // criteria, not reclassification, decide saturation.
+            // Structural quiet-round signal: no new claims and no new sources. A
+            // weak-duplicate-only round also lands here (weak duplicates append standalone claims
+            // but never count as novel) — the answerability check fires and the gap list is not
+            // refreshed: intended premature-saturation protection.
             if let Some(reason) = check_answerability(ws, question, &state.acc, job_id).await {
                 outcome.abstention = Some(reason);
                 outcome.unresolved = gap_items(gaps);
                 return outcome;
             }
         }
-        // Refresh the gap list from the accumulated evidence only when the
-        // round produced progress; a quiet round reuses the current list.
+        // Refresh the gap list from the accumulated evidence only when the round produced progress.
         if new_urls != 0 || novel_claims != 0 {
             let Some(next_gap_list) =
                 extract_gap_list(ws, question, &state.acc, plan, job_id).await
@@ -2350,8 +2060,8 @@ async fn gap_rounds(
                 return outcome;
             };
             gap_list = next_gap_list;
-            // Post-progress worker round (key = this gap round's index): fresh
-            // prototypes targeting the refreshed gap list.
+            // Post-progress worker round (key = this gap round's index): fresh prototypes targeting
+            // the refreshed gap list.
             if !gap_list.gaps.is_empty() && !state.worker_rounds_done.contains(&round_index) {
                 run_worker_round(
                     job_id,
@@ -2377,11 +2087,9 @@ async fn gap_rounds(
     }
 }
 
-/// Per-round claim annotation pass: classify each pending claim against the
-/// existing accumulated claims via a single orchestrator extraction call.
-/// The validator guarantees id completeness and in-range existing ids
-/// (fail-closed inside the extraction retry loop). Weak hints render in the
-/// existing-claims listing so later rounds see them (never silent).
+/// Per-round claim annotation pass: classify each pending claim against the accumulated claims via
+/// one orchestrator extraction call (the validator guarantees id completeness and in-range ids).
+/// Weak hints render in the existing-claims listing so later rounds see them.
 async fn annotate_claims(
     ws: &Workspace,
     existing: &[Claim],
@@ -2423,10 +2131,8 @@ async fn annotate_claims(
 }
 
 /// Validate an annotation pass: every pending claim annotated exactly once;
-/// `duplicate`/`contradicts` cite an in-range existing claim; `novel` cites
-/// nothing; the contradiction note is present exactly when the verdict is
-/// "contradicts". Structural only — the verbatim-proof requirement is gone
-/// (id references + the LLM's semantic judgment are the only gates).
+/// `duplicate`/`contradicts` cite an in-range existing claim; `novel` cites nothing; the
+/// contradiction note is present exactly for "contradicts". Structural only.
 fn validate_annotations(
     pass: &AnnotationPass,
     existing: &[Claim],
@@ -2483,12 +2189,9 @@ fn validate_annotations(
     Ok(())
 }
 
-/// Confirm pass over a round's mutating annotation links (duplicate /
-/// contradicts pairs only): ONE lightweight orchestrator extraction
-/// re-judging each pair, between the annotation pass and applying its
-/// results. Fail-closed completeness — every mutating pair judged exactly
-/// once with the {confirm, reject} vocabulary; the caller maps a failed call
-/// to all-weak + marker (never all-novel fallback, never dropped claims).
+/// Confirm pass over a round's mutating annotation links: one lightweight extraction re-judging
+/// each pair between the annotation pass and applying its results. Fail-closed: every pair judged
+/// exactly once with {confirm, reject}; a failed call maps to all-weak + marker.
 async fn confirm_links(
     ws: &Workspace,
     existing: &[Claim],
@@ -2516,9 +2219,8 @@ async fn confirm_links(
     );
     user.push_str("\n\n");
     user.push_str(&load_prompt("extraction/confirm.md"));
-    // The validator captures the mutating new_ids (the validator type is
-    // `'static`) — pair identity is pinned by the annotation pass, the model
-    // never re-transcribes existing ids.
+    // The validator captures the mutating new_ids (the validator type is `'static`) — pair
+    // identity is pinned by the annotation pass.
     let mutating: Vec<usize> = pass
         .annotations
         .iter()
@@ -2536,9 +2238,8 @@ async fn confirm_links(
     .await
 }
 
-/// Validate a confirm pass: exactly the mutating links judged, each exactly
-/// once (set equality on new_ids), verdicts in [confirm, reject]. Structural
-/// only, like the annotation validator.
+/// Validate a confirm pass: exactly the mutating links judged, each exactly once (set
+/// equality on new_ids), verdicts in [confirm, reject]. Structural only.
 fn validate_confirm(pass: &ConfirmPass, mutating: &[usize]) -> Result<(), String> {
     let mut ids: Vec<usize> = pass.links.iter().map(|l| l.new_id).collect();
     ids.sort_unstable();
@@ -2557,12 +2258,9 @@ fn validate_confirm(pass: &ConfirmPass, mutating: &[usize]) -> Result<(), String
     Ok(())
 }
 
-/// Run the annotation pass over a round's pending claims, then the optional
-/// confirm pass over its mutating links, and apply the results. Returns the
-/// number of novel claims (the saturation signal). On annotation exhaustion
-/// every pending claim is treated as novel with an explicit marker — claims
-/// are never dropped. A failed confirm call degrades every mutating verdict
-/// to weak/unconfirmed with an explicit marker — never all-novel fallback.
+/// Run the annotation pass over a round's pending claims, then the optional confirm pass over its
+/// mutating links, and apply the results; returns the number of novel claims. On annotation
+/// exhaustion every pending claim is novel with a marker — claims are never dropped.
 async fn annotate_round(
     ws: &Workspace,
     acc: &mut AccumulatedEvidence,
@@ -2575,10 +2273,9 @@ async fn annotate_round(
         return 0;
     }
     if acc.claims.is_empty() {
-        // First round: nothing to compare against — every pending claim is
-        // novel by construction. Skip the wasted orchestrator call (and with
-        // it the spurious failure marker an out-of-range existing_id would
-        // otherwise trigger).
+        // First round: nothing to compare against — every pending claim is novel by construction.
+        // Skip the wasted orchestrator call (and the spurious failure marker an out-of-range
+        // existing_id would otherwise trigger).
         acc.claims.extend(pending.iter().cloned());
         return pending.len();
     }
@@ -2590,14 +2287,13 @@ async fn annotate_round(
         }
         return pending.len();
     };
-    // Confirm pass over the mutating links only (one call per round). No
-    // mutating links → empty outcome, every verdict applies as-is.
+    // Confirm pass over the mutating links only. No mutating links → every verdict applies as-is.
     let confirm = if pass.annotations.iter().any(|a| a.verdict != "novel") {
         if let Ok(c) = confirm_links(ws, &acc.claims, pending, &pass, run_key, question).await {
             ConfirmOutcome::Passed(c)
         } else {
-            // Fail-open: every mutating verdict becomes weak/unconfirmed
-            // (never all-novel fallback, never dropped claims).
+            // Fail-open: every mutating verdict becomes weak/unconfirmed (never all-novel, no
+            // drops).
             if !markers.iter().any(|m| m == CONFIRM_FAILED) {
                 markers.push(CONFIRM_FAILED.to_string());
             }
@@ -2609,9 +2305,9 @@ async fn annotate_round(
     acc.apply_annotations(&pass, pending, &confirm)
 }
 
-/// After a structural quiet round (no new claims, no new sources): is the
-/// question genuinely unanswerable with the evidence gathered? `Some(abstention)`
-/// when it is (orchestrator call, not budgeted).
+/// After a structural quiet round (no new claims, no new sources): is the question
+/// genuinely unanswerable with the evidence gathered? `Some(abstention)` when it is
+/// (orchestrator call, not budgeted).
 async fn check_answerability(
     ws: &Workspace,
     question: &str,
@@ -2636,10 +2332,8 @@ async fn check_answerability(
     (!verdict.answerable).then_some(verdict.reason)
 }
 
-// ── Final synthesis + verification gate ──────────────────────────────────
-
-/// Marker surfaced in the head-placed `## Run markers` section when the final
-/// synthesis was delivered provider-truncated — never silent success.
+/// Marker surfaced in the head-placed `## Run markers` section when the final synthesis
+/// was delivered provider-truncated — never silent success.
 const SYNTHESIS_TRUNCATED_MARKER: &str =
     "final synthesis truncated by the provider — last produced output delivered";
 
@@ -2650,15 +2344,9 @@ struct SynthesisOutput {
     marker: Option<String>,
 }
 
-/// Final synthesis from the accumulated evidence with the shared synthesis
-/// policy (≤3 informed attempts, transport-only backoff; no wall-clock cap —
-/// the 600 s idle timeout is the only per-attempt bound).
-/// A truncated, empty, or failed attempt counts toward the budget; the next
-/// attempt carries feedback to shorten/compress. The last produced output
-/// wins — a provider-truncated report is delivered with an explicit marker,
-/// never silent success. An exhaustion with no usable output at all (transport
-/// failures / empty responses) errors — the caller's partial-report fail-open
-/// path applies.
+/// Final synthesis with the shared policy (≤3 informed attempts, transport-only backoff; the 600 s
+/// idle timeout is the only per-attempt bound). A truncated, empty or failed attempt counts toward
+/// the budget; the last produced output wins and is delivered with a marker when truncated.
 #[expect(clippy::too_many_lines)]
 async fn synthesize(
     ws: &Workspace,
@@ -2763,8 +2451,8 @@ async fn synthesize(
             }
         }
     }
-    // Exhausted: the last produced output wins (marked when truncated); no
-    // usable output at all errors into the caller's partial-report fail-open.
+    // Exhausted: the last produced output wins (marked when truncated); no usable output at
+    // all errors into the caller's partial-report fail-open.
     let final_class = loop_state.final_class();
     let exhausted = crate::retry::RetryExhausted::with_last_raw(
         loop_state.into_failures(),
@@ -2787,13 +2475,9 @@ async fn synthesize(
     }
 }
 
-/// Build the verification target list: primary targets (contradiction notes
-/// or low confidence) first, then weak-duplicate claims not already primary —
-/// filling only empty slots, never displacing higher-priority targets, never
-/// double-dispatching a claim that qualifies both ways (weak-contradiction
-/// claims are never appended here: they already carry notes and qualify via
-/// the primary filter). Returns `(targets, primary_count)` so the caller can
-/// bound the unresolved filler to primary targets only.
+/// Build the verification target list: primary targets (contradiction notes or low confidence)
+/// first, then weak-duplicate claims not already primary, filling only empty slots and never
+/// double-dispatching. Returns `(targets, primary_count)`.
 fn verification_targets(acc: &AccumulatedEvidence) -> (Vec<VerificationTarget>, usize) {
     let mut seen = HashSet::new();
     let mut targets = Vec::new();
@@ -2808,12 +2492,6 @@ fn verification_targets(acc: &AccumulatedEvidence) -> (Vec<VerificationTarget>, 
         }
     }
     let primary_count = targets.len();
-    // Weak duplicates fill only empty slots — appended AFTER primaries with a
-    // hint-free target (weakness never leaks toward verifiers). The verify
-    // schema has no "duplicate" verdict, so the verifier judges the standalone
-    // claim's truth and the duplicate-vs-novel ambiguity resolves indirectly:
-    // the claim stays visible as its own evidence entry, and the fresh
-    // analyst's web tools can surface the relation.
     for &(claim_id, _) in &acc.weak.duplicates {
         if seen.insert(claim_id) {
             let c = &acc.claims[claim_id];
@@ -2827,10 +2505,8 @@ fn verification_targets(acc: &AccumulatedEvidence) -> (Vec<VerificationTarget>, 
 /// accumulated claims (budgeted, bounded), plus any weak-duplicate claims
 /// filling empty verifier slots. Anything still disputed stays marked
 /// unresolved in the final report. Verifier tool calls / searches / queries
-/// count toward the run summary and register in the query ledger (later
-/// rounds must not re-ask them) — repeats here inflate the summary's
-/// repeat-queries line but never the per-round saturation signal
-/// (`EvidenceRound::repeat_queries` is untouched).
+/// … register in the query ledger (later rounds must not re-ask them); repeats here
+/// inflate the summary's repeat-queries line but never `EvidenceRound::repeat_queries`.
 #[expect(clippy::too_many_arguments)]
 async fn research_verification_pass(
     ws: &Workspace,
@@ -2856,9 +2532,8 @@ async fn research_verification_pass(
     // highest-priority targets instead of nothing.
     let n = cap.min(budget.cap.saturating_sub(budget.spent));
     let mut results = Vec::new();
-    // Never spawn verifiers once the round-wide deadline expired — they
-    // would be aborted instantly; the primary targets are marked unresolved
-    // below instead (same shape as the budget-exhaustion path).
+    // Never spawn verifiers once the round-wide deadline expired — they would be aborted
+    // instantly; the primary targets are marked unresolved below instead.
     if n > 0 && std::time::Instant::now() < deadline && budget.try_reserve(n).is_ok() {
         let ledger_snapshot = ledger.render();
         let task_extra = format!(
@@ -2891,10 +2566,9 @@ async fn research_verification_pass(
             }
         }
     }
-    // Primary targets beyond the verified set are explicitly marked
-    // unresolved — never silently skipped. Appended weak-duplicate targets
-    // that did not fit are not (they fill only empty slots; their weak state
-    // stays visible in the evidence view and run summary).
+    // Primary targets beyond the verified set are explicitly marked unresolved — never
+    // silently skipped. Appended weak-duplicate targets that did not fit are not (their weak
+    // state stays visible in the evidence view and run summary).
     for t in targets
         .iter()
         .skip(results.len())
@@ -2911,12 +2585,9 @@ async fn research_verification_pass(
     results
 }
 
-// ── Rendering ────────────────────────────────────────────────────────────
-
-/// Render the weak/unconfirmed hints involving claim `id` (one indented line
-/// per hint, empty when none). Shared by the accumulated-evidence view, the
-/// annotate listing, and the partial report — weakness is per-claim visible
-/// and never silent.
+/// Render the weak/unconfirmed hints involving claim `id` (one indented line per hint,
+/// empty when none). Shared by the evidence view, the annotate listing and the partial
+/// report — weakness is per-claim visible and never silent.
 fn render_weak_hints(weak: &WeakLinks, id: usize) -> String {
     let mut out = String::new();
     for &(claim, target) in &weak.duplicates {
@@ -2943,8 +2614,7 @@ fn source_or_na(source: &str) -> &str {
     if source.is_empty() { "n/a" } else { source }
 }
 
-/// Unanswered section; `escape` fences entries for the caller-visible
-/// partial report (the orchestrator-prompt view stays raw).
+/// Unanswered section; `escape` fences entries for the partial report (prompt views stay raw).
 fn render_unanswered(out: &mut String, unanswered: &[String], escape: bool) {
     if unanswered.is_empty() {
         return;
@@ -2971,11 +2641,9 @@ fn render_raw_reports(out: &mut String, raw_reports: &[String], heading: &str) {
     }
 }
 
-/// Render the accumulated evidence as a compact numbered list, plus
-/// analysts' self-reported unanswered aspects. Used by the orchestrator
-/// prompts and the worker brief (`run_worker_round`).
-/// Claim ids are their stable 0-based indices in `acc.claims` — the
-/// annotation pass and final synthesis reference them by these ids.
+/// Render the accumulated evidence as a compact numbered list plus analysts' unanswered
+/// aspects. Used by the orchestrator prompts and the worker brief (`run_worker_round`).
+/// Claim ids are their stable 0-based indices in `acc.claims`.
 fn render_accumulated_evidence(acc: &AccumulatedEvidence) -> String {
     let mut out = String::new();
     for (i, c) in acc.claims.iter().enumerate() {
@@ -3004,10 +2672,6 @@ fn render_accumulated_evidence(acc: &AccumulatedEvidence) -> String {
     out
 }
 
-/// Render the run summary: rounds, incomplete-gap-round marker, run markers,
-/// agents vs budget, tool calls, searches, repeat queries, failed analysts,
-/// wall time, evidence counts, weak/unconfirmed links, abstention or
-/// incomplete marker, and unresolved gaps.
 #[expect(clippy::too_many_arguments)]
 fn render_run_summary(
     run_stats: &RunStats,
@@ -3070,10 +2734,9 @@ fn render_run_summary(
     out
 }
 
-/// Render the recovered-from-timed-out-analysts section. Separate from the
-/// main evidence by design: recovered findings never entered verification or
-/// synthesis. Empty when there is nothing recovered (also the boot path).
-/// Head-placed by callers so the section survives report truncation.
+/// Render the recovered-from-timed-out-analysts section. Separate from the main evidence by
+/// design: recovered findings never entered verification or synthesis. Empty when there is
+/// nothing recovered; head-placed by callers so it survives report truncation.
 fn render_recovered_findings(recovered: &[AnalystFindings]) -> String {
     if recovered.is_empty() {
         return String::new();
@@ -3108,11 +2771,10 @@ fn render_recovered_findings(recovered: &[AnalystFindings]) -> String {
     out
 }
 
-/// Partial envelope when a run cannot reach synthesis (round 1 skipped on
-/// budget exhaustion, or a synthesis failure): whatever evidence was gathered
-/// is delivered with an explicit incomplete marker — findings are never lost.
-/// Shutdown/abort paths return `ResearchExit::Aborted`/`Cancelled` directly
-/// and never produce this report.
+/// Partial envelope when a run cannot reach synthesis (round 1 skipped on budget
+/// exhaustion, or a synthesis failure): whatever evidence was gathered is delivered with an
+/// explicit incomplete marker — findings are never lost. Shutdown/abort paths never produce
+/// this report.
 fn partial_report(
     acc: &AccumulatedEvidence,
     reason: &str,
@@ -3142,31 +2804,23 @@ fn partial_report(
     out
 }
 
-// ── Orchestrator ─────────────────────────────────────────────────────────
-
 /// Exit of one `run_deep_research` invocation.
 enum ResearchExit {
-    /// Real terminalization (success, partial, or error) — the caller writes
-    /// results.md + the command dump and completes the durable job.
+    /// Real terminalization (success, partial, or error) — the caller writes results.md + the
+    /// command dump and completes the durable job.
     Terminal(anyhow::Result<String>),
-    /// Shutdown/drain abort — the run stays alive for the next boot; nothing
-    /// is written, terminalized, or routed (design pin).
+    /// Shutdown/drain abort — the run stays alive for the next boot; nothing is written or routed.
     Aborted,
-    /// Manual cancel (Running Agents page): a PERMANENT stop — the run must
-    /// never resume, re-dispatch, or deliver a report, now or after any
-    /// restart. The caller hands the record to the cancelled-run handoff
-    /// ([`hand_off_cancelled_run`](crate::research_cancel::hand_off_cancelled_run)),
-    /// which decides what is held and what is removed; nothing is delivered
-    /// either way. Distinct from [`Aborted`](ResearchExit::Aborted) (run stays
-    /// alive for boot resume).
+    /// Manual cancel (Running Agents page): a PERMANENT stop — the run must never resume,
+    /// re-dispatch or deliver a report, now or after any restart. The caller hands the record to
+    /// the cancelled-run handoff, which decides what is held. Distinct from
+    /// [`Aborted`](ResearchExit::Aborted).
     Cancelled,
 }
 
-/// Run the resumable deep-research orchestrator: round 0 (decomposition),
-/// round 1 (per-sub-question researchers), conditional gap rounds, one-shot
-/// final synthesis, verification gate, and the run summary. `job_id` names
-/// the durable research job whose `research_jobs.state` checkpoint is loaded
-/// on entry and saved at every stage boundary.
+/// Run the resumable deep-research orchestrator: round 0, round 1, conditional gap rounds,
+/// one-shot synthesis, verification gate and run summary. `job_id` names the durable job
+/// whose `research_jobs.state` checkpoint is loaded on entry and saved at every boundary.
 #[expect(clippy::too_many_lines)]
 async fn run_deep_research(
     ws: &Workspace,
@@ -3174,14 +2828,9 @@ async fn run_deep_research(
     job_id: &str,
     resume: bool,
 ) -> ResearchExit {
-    // Hold a non-agent-call guard for the WHOLE run: the drain-watch fires the
-    // token only when both registries are empty, and this guard bridges the
-    // inter-phase windows (analyst deregistration → the next orchestrator LLM
-    // call) so the token is never fired into a just-about-to-start call. The
-    // orchestrator checks the drain at every round boundary and exits via the
-    // partial-report path, releasing the guard promptly. Registered as a
-    // run-lifetime call: the Running Agents view renders it inside the run's
-    // group as a run-lifetime indicator, not a transient LLM-call card.
+    // Hold a non-agent-call guard for the WHOLE run: the drain-watch fires the token only when both
+    // registries are empty, and this guard bridges the inter-phase windows so the token never lands
+    // in a just-starting call. It renders in the Running Agents view as a run-lifetime indicator.
     let _orchestrator_guard =
         research_call_guard("research_orchestrator", &ws.name, job_id, true, question);
     let start = Instant::now();
@@ -3194,23 +2843,21 @@ async fn run_deep_research(
     let mut budget = ResearchBudget::new(RESEARCH_MAX_ANALYSTS);
     budget.spent = state.budget_spent;
     let mut run_stats = RunStats::default();
-    // Per-run scratch folder — created idempotently BEFORE round 0 (decompose
-    // receives it first). The absolute temp-dir path is what the readonly
-    // shell allows; `$TMPDIR` in the agent shell differs on macOS.
+    // Per-run scratch folder — created idempotently BEFORE round 0 (decompose receives it
+    // first). The absolute temp-dir path is what the readonly shell allows; `$TMPDIR` in the
+    // agent shell differs on macOS.
     let run_root = crate::research_cleanup::ensure_run_root(job_id).await;
     let run_root_str = run_root.to_string_lossy().to_string();
-    // Recovered-from-timed-out-analysts findings: round locals only (never
-    // checkpointed) — a crash between rounds loses them, and a resumed run
-    // starts with an empty set (analysts re-run from their unchanged sessions).
+    // Recovered-from-timed-out-analysts findings: round locals only (never checkpointed) — a
+    // crash between rounds loses them, and a resumed run starts with an empty set.
     let mut recovered: Vec<AnalystFindings> = Vec::new();
 
-    // Manual-cancel gate BEFORE round 0: a cancel that landed between the
-    // dispatch registration and the first boundary must stop immediately.
+    // Manual-cancel gate BEFORE round 0: a cancel that landed between the dispatch
+    // registration and the first boundary must stop immediately.
     if crate::round_cancel::is_cancelled(job_id) {
         return ResearchExit::Cancelled;
     }
 
-    // ── Round 0 — decomposition + merge (resumable) ───────────────────
     let mut round_agents: Vec<String> = Vec::new();
     if state.stage == ResearchStage::Decompose {
         let round0 = round0_decompose(
@@ -3225,9 +2872,8 @@ async fn run_deep_research(
             job_id,
         )
         .await;
-        // Capture on EVERY outcome — a hard decompose failure still leaves
-        // the dispatched agents' sessions behind (their OS-temp scratch must
-        // reach the command dump).
+        // Capture on EVERY outcome — a hard decompose failure still leaves the dispatched agents'
+        // sessions behind (their OS-temp scratch must reach the command dump).
         state.capture_round(job_id, &round_agents, &run_root).await;
         round_agents.clear();
         let plan = match round0 {
@@ -3238,12 +2884,9 @@ async fn run_deep_research(
                 plan
             }
             Err(_) if crate::shutdown::aborting() => {
-                // Checkpoint the state: the run stays alive for boot resume,
-                // which re-dispatches round 0 with FRESH agent ids — the
-                // aborted agents' OS-temp scratch already reached the command
-                // dump (capture_round above wrote it); the resume re-reads it
-                // from the dump, so the in-memory capture dying here loses
-                // nothing.
+                // Checkpoint the state: boot resume re-dispatches round 0 with FRESH agent ids, and
+                // the aborted agents' OS-temp scratch already reached the command dump
+                // (capture_round wrote it), so the in-memory capture dying here loses nothing.
                 state.save(job_id).await;
                 return ResearchExit::Aborted;
             }
@@ -3251,9 +2894,8 @@ async fn run_deep_research(
                 return ResearchExit::Cancelled;
             }
             Err(e) => {
-                // Checkpoint the state — the dump was already written by
-                // capture_round above; a hard decompose failure must not lose
-                // the agents' sessions from the report.
+                // Checkpoint the state — the dump was already written by capture_round; a hard
+                // decompose failure must not lose the agents' sessions from the report.
                 state.save(job_id).await;
                 return ResearchExit::Terminal(Err(e));
             }
@@ -3264,8 +2906,7 @@ async fn run_deep_research(
         state.save(job_id).await;
     }
 
-    // Check shutdown/drain between rounds — never spawn round-1 analysts
-    // during shutdown or the graceful drain.
+    // Check shutdown/drain between rounds — never spawn round-1 analysts during the drain.
     if crate::shutdown::aborting() {
         return ResearchExit::Aborted;
     }
@@ -3274,7 +2915,6 @@ async fn run_deep_research(
         return ResearchExit::Cancelled;
     }
 
-    // ── Round 1 — one analyst per sub-question (resumable) ────────────
     if state.stage == ResearchStage::Round1 {
         let Some(plan) = state.plan.as_ref() else {
             return ResearchExit::Terminal(Err(super::internal_fault(
@@ -3317,11 +2957,9 @@ async fn run_deep_research(
         state.budget_spent = budget.spent;
         state.stage = ResearchStage::GapRounds;
         state.save(job_id).await;
-        // Wrap-up AFTER the checkpoint: a crash mid-wrap-up loses only the
-        // recovered findings (ticket-accepted), never the round-1 evidence.
-        // Its ledger registrations are not in the checkpoint (fail-open — a
-        // crash during the wrap-up resumes with a ledger missing the dead
-        // analysts' queries, so gap rounds may re-ask them, bounded).
+        // Wrap-up AFTER the checkpoint: a crash mid-wrap-up loses only the recovered findings
+        // (ticket-accepted), never the round-1 evidence. Its ledger registrations are not in the
+        // checkpoint (fail-open — a resumed ledger misses the dead analysts' queries).
         recovered.extend(
             wrap_up_timed_out(
                 ws,
@@ -3335,10 +2973,9 @@ async fn run_deep_research(
         );
     }
 
-    // ── Interim consolidation + conditional gap rounds (resumable) ────
     if state.stage == ResearchStage::GapRounds {
-        // Clone the plan so gap_rounds can take &mut state (per-round
-        // checkpoints) while still referencing the merged decomposition.
+        // Clone the plan so gap_rounds can take &mut state (per-round checkpoints) while still
+        // referencing the merged decomposition.
         let Some(plan) = state.plan.clone() else {
             return ResearchExit::Terminal(Err(super::internal_fault(
                 "research lost its plan state before gap rounds",
@@ -3358,13 +2995,10 @@ async fn run_deep_research(
             &mut recovered,
         )
         .await;
-        // Aborting mid-gap-loop (drain/shutdown): leave the stage at
-        // GapRounds so the next boot's resume CONTINUES the loop at the
-        // accumulated round_index (the per-round checkpoints inside
-        // gap_rounds already persisted it + the current gap list) instead of
-        // skipping the remaining gap rounds and synthesizing from truncated
-        // evidence (design pin: round_index is the cumulative completed-round
-        // count, restored on resume as the continuation key).
+        // Aborting mid-gap-loop (drain/shutdown): leave the stage at GapRounds so the next boot's
+        // resume CONTINUES the loop at the accumulated round_index (the per-round checkpoints
+        // already persisted it plus the current gap list) instead of skipping the remaining gap
+        // rounds and synthesizing from truncated evidence.
         if crate::shutdown::aborting() {
             state.gap_outcome = gap_outcome;
             state.budget_spent = budget.spent;
@@ -3372,16 +3006,13 @@ async fn run_deep_research(
             return ResearchExit::Aborted;
         }
         if crate::round_cancel::is_cancelled(job_id) {
-            // Manual cancel: permanent stop — the cancelled-run handoff owns
-            // the cleanup dispatch; nothing further is checkpointed or
-            // delivered.
+            // Manual cancel: permanent stop — the cancelled-run handoff owns the cleanup dispatch;
+            // nothing further is checkpointed or delivered.
             return ResearchExit::Cancelled;
         }
-        // Round-trip the gap-loop locals on NORMAL exit (coverage complete,
-        // abstention, or budget/deadline exhaustion): round_index is already
-        // accumulated by the per-round checkpoints inside gap_rounds (it
-        // starts from the stored value and increments per round — do NOT
-        // clobber it with the per-invocation count).
+        // Round-trip the gap-loop locals on NORMAL exit: round_index is already accumulated by the
+        // per-round checkpoints inside gap_rounds — do NOT clobber it with the per-invocation
+        // count.
         state.gap_outcome = gap_outcome;
         state.budget_spent = budget.spent;
         state.stage = ResearchStage::Synthesis;
@@ -3389,8 +3020,7 @@ async fn run_deep_research(
     }
     let rounds_used = 2 + state.gap_outcome.rounds_dispatched;
 
-    // The gap loop may have exited early on shutdown/drain — never run a full
-    // synthesis or spawn verification analysts during shutdown or the drain.
+    // The gap loop may have exited early on shutdown/drain — never synthesize or verify then.
     if crate::shutdown::aborting() {
         return ResearchExit::Aborted;
     }
@@ -3399,12 +3029,8 @@ async fn run_deep_research(
         return ResearchExit::Cancelled;
     }
 
-    // ── Final synthesis (resumable) ───────────────────────────────────
-    // Stage is always Synthesis here (set at the gap-loop exit or inherited
-    // on resume) — every path re-synthesizes, deterministic modulo LLM
-    // nondeterminism (the accumulated evidence is unchanged). The marker-dedup
-    // guard makes re-runs idempotent (a resume after a failed checkpoint save
-    // cannot duplicate markers).
+    // Stage is always Synthesis here (set at the gap-loop exit or inherited on resume) — every
+    // path re-synthesizes; the marker-dedup guard makes re-runs idempotent.
     let synthesis = match synthesize(
         ws,
         question,
@@ -3437,7 +3063,6 @@ async fn run_deep_research(
         }
     };
 
-    // ── Verification gate (budgeted, resumable) ───────────────────────
     // Never spawn verifiers during shutdown or the drain — deliver the
     // synthesized report as-is (partial is acceptable).
     let verification = if crate::shutdown::aborting() {
@@ -3495,11 +3120,6 @@ async fn run_deep_research(
         }
     }
     render_raw_reports(&mut report, &state.acc.raw_reports, "##");
-    // RunStats pin: a resumed run's counts undercount the pre-crash segment —
-    // the summary carries a one-line best-effort note instead of pretending.
-    // Keyed off the job's boot-resume retry count (the real resume signal) —
-    // gap rounds dispatched within THIS process are complete and need no
-    // caveat (and the abort path can skip a run's own accumulation).
     if crate::jobs::job_retry_count(&crate::session::store().conn, job_id).await > 0 {
         let _ = writeln!(
             report,
@@ -3549,18 +3169,11 @@ mod tests {
         assert!(budget.is_exhausted());
     }
 
-    /// Direct resume test for `resume_research_run`: a job
-    /// checkpointed at stage=Synthesis with pre-populated verification
-    /// resumes — it re-enters the orchestrator, synthesizes from the
-    /// accumulated evidence (ONE provider call), skips the verification pass
-    /// (stored results reused — no analysts spawned), terminalizes into the
-    /// durable envelope, and delivers to the ORIGINAL caller
-    /// (role/user/channel persisted on the job row, not hardcoded to Manager).
     #[tokio::test]
     #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn resume_research_run_continues_at_synthesis_stage() {
-        // Pre-collapse blobs stored stage="verification"; without this alias the
-        // state fails to deserialize and the run silently restarts from Decompose.
+        // Pre-collapse blobs stored stage="verification"; without this alias the state fails to
+        // deserialize and the run silently restarts from Decompose.
         let legacy: ResearchStage =
             serde_json::from_str(r#""verification""#).expect("the old stage reads");
         assert_eq!(
@@ -3593,10 +3206,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Checkpointed state: stage=Synthesis (post-fix crash state — the
-        // verification pass completed and its results were persisted), one
-        // accumulated claim, one stored verification result (the post-crash
-        // resume must reuse it — never re-run the verification pass).
+        // Checkpointed state: stage=Synthesis, one accumulated claim, one stored verification
+        // result (the post-crash resume must reuse it — never re-run the verification pass).
         let mut state = ResearchState {
             stage: ResearchStage::Synthesis,
             plan: None,
@@ -3637,12 +3248,9 @@ mod tests {
 
         resume_research_run(job_id, &ws).await;
 
-        // Terminalized into the durable envelope addressed to the stored
-        // caller (the consumer skips it — the workspace is not a managed
-        // workspace, so the pending row survives for the assertion). The
-        // surviving jobs row is the research_cleanup durability row (id ==
-        // run_id == folder name) — the cleanup's resume marker, held until it
-        // completes.
+        // Terminalized into the durable envelope addressed to the stored caller (the consumer skips
+        // it — the workspace is not managed, so the pending row survives for the assertion). The
+        // surviving jobs row is the research_cleanup durability row (id == run_id == folder name).
         let job_rows = conn
             .query(
                 "SELECT kind FROM jobs WHERE id = ?1",
@@ -3683,13 +3291,10 @@ mod tests {
         );
     }
 
-    /// Spawn-failure terminalization: when the spawn tx failed (no jobs row
-    /// exists), the shared tail must STILL complete the durable job so the
-    /// error envelope is delivered (never a silent drop), and must write no
-    /// artifacts (there is no run state to archive, and no cleanup
-    /// durability row is created). The pending row is NOT asserted on: the
-    /// completion INSERT succeeds even with no jobs row (a 0-row DELETE is
-    /// not an error, so the tx commits and the pending row persists).
+    /// Spawn-failure terminalization: when the spawn tx failed (no jobs row exists), the shared
+    /// tail must STILL complete the durable job so the error envelope is delivered (never a
+    /// silent drop), and must write no artifacts (no run state, no cleanup durability row). The
+    /// pending row is NOT asserted on: the completion INSERT succeeds with no jobs row.
     #[tokio::test]
     async fn terminalization_spawn_failure_delivers_error_envelope_without_artifacts() {
         crate::util::test::init_management_test_stores().await;
@@ -3729,11 +3334,9 @@ mod tests {
         assert!(!archive.exists(), "spawn failure must not write results.md");
     }
 
-    /// A fired manual-cancel signal must stop the orchestrator at its next
-    /// stage boundary with `ResearchExit::Cancelled` (distinct from Aborted) —
-    /// before synthesis runs, no LLM calls, no partial report. The durable
-    /// row/fs lifecycle (sweep, dump-guarded folder release, cleanup-row
-    /// transition) is covered by research_cancel.rs tests.
+    /// A fired manual-cancel signal must stop the orchestrator at its next stage boundary with
+    /// `ResearchExit::Cancelled` (distinct from Aborted) — before synthesis, no LLM calls, no
+    /// partial report. The durable lifecycle is covered by research_cancel.rs tests.
     #[tokio::test]
     async fn cancelled_run_exits_cancelled_at_stage_boundary() {
         crate::util::test::init_management_test_stores().await;
@@ -3780,8 +3383,7 @@ mod tests {
                         crate::workspace::test_ws_named("/tmp/test_ws", "research_synth_truncated");
                     let acc = AccumulatedEvidence::default();
 
-                    // Every attempt provider-truncated (finish_reason=length): the last
-                    // produced output wins, marked — never silent success.
+                    // Every attempt provider-truncated: the last produced output wins, marked.
                     let fake = crate::util::test::FakeProvider::new()
                         .ok_with_finish("report part one", Some("length"))
                         .ok_with_finish("report part two", Some("length"))
@@ -3817,8 +3419,8 @@ mod tests {
                         case.name
                     );
 
-                    // All transport failures → no usable output → Err (the caller's
-                    // partial-report fail-open path).
+                    // All transport failures → no usable output → Err (the caller's partial-report
+                    // fail-open).
                     let fake = crate::util::test::FakeProvider::new()
                         .err(crate::retry::FailureClass::Transport, "outage")
                         .err(crate::retry::FailureClass::Transport, "outage")
@@ -4037,13 +3639,10 @@ mod tests {
         }
     }
 
-    // ── Orchestrator helpers (no provider needed) ───────────────────────
-
     #[test]
     fn test_evidence_absorb_counts_novelty() {
-        // URLs and unanswered aspects dedup inside absorb exactly as before;
-        // claims are returned as a pending list — novelty is decided by the
-        // annotation pass, never dropped here.
+        // URLs and unanswered aspects dedup inside absorb exactly as before; claims come back as a
+        // pending list — novelty is decided by the annotation pass, never dropped here.
         let mut acc = AccumulatedEvidence::default();
         let round1 = EvidenceRound {
             urls: vec!["u1".into(), "u2".into()],
@@ -4078,9 +3677,9 @@ mod tests {
         );
     }
 
-    /// Shared fixture for the verdict x confirm 2x2 matrix: one existing claim,
-    /// one pending claim, a single-annotation pass linking new_id 0 to
-    /// existing_id 0, and a Passed confirm pass with a single link for new_id 0.
+    /// Shared fixture for the verdict x confirm 2x2 matrix: one existing claim, one pending
+    /// claim, a single-annotation pass linking new_id 0 to existing_id 0, and a Passed confirm
+    /// pass with a single link for new_id 0.
     struct AnnotationsMatrix {
         acc: AccumulatedEvidence,
         pending: Vec<Claim>,
@@ -4117,8 +3716,7 @@ mod tests {
         }
     }
 
-    /// One verdict × confirm matrix scenario: the two claims, the annotation
-    /// verdicts, and everything the applied result must show.
+    /// One verdict × confirm scenario: the two claims, the verdicts, and the applied result.
     struct AnnotationsCase {
         name: &'static str,
         existing: Claim,
@@ -4287,13 +3885,13 @@ mod tests {
         });
         // Weak duplicate of claim 0 — appended after primaries.
         acc.claims.push(claim("a restated", "u3", "high"));
-        // Weak duplicate of claim 1 that is ALSO low confidence — already
-        // primary, must not be double-appended.
+        // Weak duplicate of claim 1 that is ALSO low confidence — already primary, must not be
+        // double-appended.
         acc.claims.push(claim("b restated", "u4", "low"));
         acc.weak.duplicates.push((2, 0));
         acc.weak.duplicates.push((3, 1));
-        // A weak contradiction must NEVER be appended from the side structure
-        // — it already carries notes and qualifies via the primary filter.
+        // A weak contradiction must NEVER be appended from the side structure — it already carries
+        // notes and qualifies via the primary filter.
         acc.weak.contradictions.push((1, 2));
         let (targets, primary_count) = verification_targets(&acc);
         assert_eq!(
@@ -4316,9 +3914,8 @@ mod tests {
 
     #[test]
     fn test_resolve_round_members_with_timeouts_preserves_timed_out() {
-        // The TimedOut distinction survives until the wrap-up stage: only
-        // deadline-aborted members are paired with their snapshots; panicked
-        // and cancelled members collapse to NoResponse like before.
+        // The TimedOut distinction survives until the wrap-up stage: only deadline-aborted members
+        // are paired with their snapshots; panicked and cancelled members collapse to NoResponse.
         let snapshots: Vec<WrapUpEntry> = (0..4)
             .map(|i| WrapUpEntry {
                 agent_id: format!("a{i}"),
@@ -4462,11 +4059,6 @@ mod tests {
         );
     }
 
-    /// Crash-resume must re-seed the command history from the run folder's
-    /// dump: `commands`/`seen_commands` are serde-skip, so the checkpoint blob
-    /// alone loads empty — without the dump the first post-resume
-    /// `capture_round` would OVERWRITE the pre-crash capture (whose early
-    /// sessions are already TTL'd).
     #[tokio::test]
     async fn load_seeds_commands_from_dump_after_crash() {
         crate::util::test::init_management_test_stores().await;

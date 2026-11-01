@@ -1,31 +1,23 @@
 //! Making the product's own tools visible in the owner's own search path.
 //!
 //! One guarded block in the file the owner's own shell reads names the standard
-//! directories — the per-user programs directory and the runtime's own, and on
-//! Windows also the folder the product's own copy lives in, which is not one of
-//! those two there — and nothing else: the product's old private tools folder is
-//! never put on the search path.
+//! directories and nothing else: the old private tools folder is never put on the
+//! search path. The decision is remade after each successful read of his environment,
+//! from the path that environment carries; his files are read only to recognise the
+//! blocks the product itself wrote, so a stale or duplicated block is replaced by
+//! exactly one correct block and a block an earlier release left in another shell's
+//! startup file is taken out wherever it sits. A shell whose startup file cannot be
+//! resolved gets no block, and then no earlier block is taken out anywhere either —
+//! one of them may be the only thing keeping a directory on his search path.
 //!
-//! The decision is remade after each successful read of his environment, from the
-//! path that environment carries — the text of his files is read only to recognise
-//! the blocks the product itself wrote: entries those blocks contributed do not
-//! count as already visible, so a stale or duplicated block is replaced by exactly
-//! one correct block, and a block an earlier release left in another shell's
-//! startup file is taken out wherever it sits — while every other byte of his files
-//! stays as it is. A shell whose startup file the product cannot resolve gets no
-//! block at all, and then no earlier block is taken out anywhere either: one of
-//! them may be the only thing keeping a directory on his search path, so the files
-//! are left as they are and the reason is recorded instead. A rewrite preserves
-//! the file's remaining content and its permissions, follows a symlinked
-//! configuration file instead of replacing the link, and lands atomically, so a
-//! half-written file is never read. Windows gets the `Path` value written the way
-//! the system itself writes it, without expanding away the references existing
-//! entries contain. When nothing can be done safely, nothing is written and the
-//! reason is recorded at WARN — the level that survives the 8-hour INFO retention
-//! and shows in the product's own issues view — once per distinct reason, carrying
-//! no value read from the owner's environment.
+//! A rewrite preserves the file's remaining bytes and its permissions, follows a
+//! symlinked configuration file rather than replacing the link, and lands atomically;
+//! Windows gets the `Path` value written as the system writes it, without expanding
+//! the references existing entries contain. When nothing can be done safely, nothing
+//! is written and the reason is recorded at WARN — the level that survives the 8-hour
+//! INFO retention — once per distinct reason, carrying no value read from the owner's environment.
 //!
-//! [`sync`] is the only entry point, and it is called by
+//! [`sync`] is the only entry point, called by
 //! [`crate::shell_env::run_reader_loop`] with the environment it just published.
 
 use std::path::{Path, PathBuf};
@@ -34,61 +26,46 @@ use std::sync::{Arc, Mutex};
 use crate::shell_env::OwnerEnv;
 use crate::util::UnwrapPoison;
 
-// ── The block ─────────────────────────────────────────────────────────────
-
-/// The line opening a block the product appended to the owner's startup file.
-/// Byte-compatible with what is already in owners' files, so a block an earlier
-/// release wrote is recognised and rewritten rather than duplicated.
+/// The line opening a block the product appended to the owner's startup file,
+/// byte-compatible with what is already in owners' files.
 #[cfg(unix)]
 const BLOCK_START: &str = "# >>> mahbot managed binaries >>>";
 
-/// The line closing it.
 #[cfg(unix)]
 const BLOCK_END: &str = "# <<< mahbot managed binaries <<<";
 
-// ── Entry point ───────────────────────────────────────────────────────────
-
-/// Make the product's own directories visible in the owner's own search path,
-/// from the environment the owner's commands get.
-///
-/// The decision is made from `env` — the environment the reader has just
-/// published — never from the text of the owner's files, and never before a read
-/// has succeeded. The work itself is blocking (startup-file or registry edits,
-/// and on Windows a bounded broadcast), so it rides the blocking pool: the
-/// reader's own next read waits for it, nothing on a command's path does.
+/// Make the product's own directories visible in the owner's own search path, from the
+/// environment the owner's commands get: never from the text of his files, and never
+/// before a read has succeeded. The work is blocking, so it rides the blocking pool —
+/// the reader's next read waits for it, nothing on a command's path does.
 pub(crate) async fn sync(env: Arc<OwnerEnv>) {
     #[cfg(any(unix, windows))]
     if tokio::task::spawn_blocking(move || sync_blocking(&env))
         .await
         .is_err()
     {
-        // A panic in the blocking work is a failure like any other: it is recorded
-        // at WARN rather than disappearing with the join handle. The join error's
-        // own display is the panic payload, which is not guaranteed to be free of a
-        // value out of the owner's environment, so the line carries its own
-        // sentence instead.
+        // A panic in the blocking work is recorded at WARN rather than disappearing with
+        // the join handle. The join error's own display is the panic payload, which is not
+        // guaranteed free of a value out of the owner's environment.
         begin_sync();
         record_failure("the work that makes the product's own tools visible did not finish");
         end_sync();
     }
-    // A target with neither a shell startup file nor a user `Path` value has
-    // nothing to make visible.
+    // A target with neither a shell startup file nor a user `Path` value has nothing to
+    // make visible.
     #[cfg(not(any(unix, windows)))]
     drop(env);
 }
 
-/// [`sync`] on the platform's own module, with the failure bookkeeping of one
-/// whole sync around it.
+/// [`sync`] on the platform's own module, with one whole sync's failure bookkeeping.
 #[cfg(any(unix, windows))]
 fn sync_blocking(env: &OwnerEnv) {
     let dirs = visible_dirs();
     begin_sync();
     if dirs.is_empty() {
-        // A host where neither directory resolves — no home directory at all — has
-        // nothing to put on a search path, and an empty body would render as a
-        // trailing entry naming the current directory. That it could not be
-        // arranged is still worth a record: the owner would otherwise never learn
-        // why.
+        // A host where neither directory resolves has nothing to put on a search path, and
+        // an empty body would render as a trailing entry naming the current directory. It
+        // is still worth a record: the owner would otherwise never learn why.
         record_failure(
             "the product's own tools have no directory to make visible (the owner's home \
              directory could not be resolved)",
@@ -102,51 +79,29 @@ fn sync_blocking(env: &OwnerEnv) {
     end_sync();
 }
 
-/// The directories the owner's own terminal must resolve by bare name, by the
-/// convention of the platform: the folder the product itself is installed in
-/// ([`crate::util::managed_bin::mahbot_install_dir`]), the browser helper's own
-/// directory — a folder of its own beside the product's on Windows, and the same
-/// per-user programs directory the product's own folder is on unix — and the
-/// runtime's own directory.
-///
-/// The system-wide directory is deliberately not named: it is on the owner's own
-/// search path by default already. Neither is the private tools folder an earlier
-/// release used.
+/// The directories the owner's own terminal must resolve by bare name: the folder the
+/// product is installed in ([`crate::util::managed_bin::mahbot_install_dir`]), the browser
+/// helper's own directory, and the runtime's own directory. The system-wide directory is
+/// not named (it is on his search path by default), and neither is the private tools
+/// folder an earlier release used.
 #[cfg(any(unix, windows))]
 #[must_use]
 fn visible_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
-    // The product's own directory, named as itself rather than through the helper's,
-    // so a move of either one cannot leave the product's own command unnamed.
+    // The product's own directory, named as itself rather than through the helper's.
     dirs.extend(crate::util::managed_bin::mahbot_install_dir());
-    // On Windows the browser helper's installer puts it in a folder beside the
-    // product's; on unix its per-user fallback is the directory above.
+    // On Windows the helper sits beside the product; on unix its fallback is the parent.
     #[cfg(not(unix))]
     dirs.extend(crate::util::managed_bin::chrome_use_user_bin_dir());
     dirs.extend(crate::util::managed_bin::bun_bin_dir());
     dirs
 }
 
-// ── Visibility from the environment the product read ──────────────────────
-
-/// Whether `dir` is NOT visible in the `PATH` the owner's own environment
-/// carries, the occurrences the product's own contribution could have supplied
-/// (`made_of_them` of them) excluded.
-///
-/// On unix that contribution is the block appended to his startup files, which
-/// names each directory it takes in once per block — and, for a directory a block
-/// names, the same entries in the search path the daemon itself was started with:
-/// the read's shell inherits that path and applies his startup files on top, so an
-/// entry there may be the block's own, applied by the shell that started the daemon,
-/// rather than the owner's own arrangement (the unix side's `run` counts them). An
-/// occurrence beyond those is the owner's own — from his own `.local/bin/env`, say —
-/// and is the only thing that counts as visible. What a path holds is still read from
-/// his environment; the count of the product's own contribution is used only to say
-/// which occurrences are the product's. Entries are compared the way the platform
-/// compares them (see [`same_entry`]).
-///
-/// Windows passes `0`: the entries of the user `Path` value are the product's own
-/// contribution and are recognised separately, by `entry_names`.
+/// Whether `dir` is NOT visible in the `PATH` the owner's own environment carries, the
+/// occurrences the product's own contribution could have supplied (`made_of_them` of them)
+/// excluded. An occurrence beyond those is the owner's own and is the only thing that
+/// counts as visible. Entries are compared the way the platform compares them ([`same_entry`]).
+/// Windows passes `0`: its user `Path` entries are recognised separately, by `entry_names`.
 #[cfg(any(unix, windows))]
 #[must_use]
 fn dir_missing(env: &OwnerEnv, dir: &Path, made_of_them: usize) -> bool {
@@ -157,9 +112,8 @@ fn dir_missing(env: &OwnerEnv, dir: &Path, made_of_them: usize) -> bool {
         <= made_of_them
 }
 
-/// The entries of the `PATH` the owner's environment carries, or none when it
-/// carries no `PATH` at all. Split the platform's own way (`:` on unix, `;` on
-/// Windows), because that is the way the shell that produced it reads it.
+/// The entries of the `PATH` the owner's environment carries, split the platform's own way
+/// (`:` on unix, `;` on Windows).
 #[cfg(any(unix, windows))]
 #[must_use]
 fn path_entries(env: &OwnerEnv) -> Vec<PathBuf> {
@@ -171,39 +125,31 @@ fn path_entries(env: &OwnerEnv) -> Vec<PathBuf> {
         })
 }
 
-/// The separators a path on this host may end with, which name the same directory
-/// as the text without them: `/` everywhere, `\` as well on Windows, where both
-/// separate. On unix `\` is an ordinary name byte rather than a separator, so it is
-/// not one of these — an entry spelled `~/.local/bin\` there names a directory of
-/// its own, and reading it as one of the product's own would leave the directory the
-/// product must put on his path un-named.
+/// The separators a path on this host may end with, which name the same directory as the
+/// text without them: `/` everywhere, `\` as well on Windows. On unix `\` is an ordinary
+/// name byte, so an entry spelled `~/.local/bin\` names a directory of its own.
 #[cfg(any(unix, windows))]
 const TRAILING_SEPARATORS: &[char] = if cfg!(unix) { &['/'] } else { &['/', '\\'] };
 
-/// Whether a `PATH` entry of this host or one of the product's own directories names
-/// `dir`, compared the way the platform's own lookup compares them: byte for byte on
-/// unix, case-insensitively on Windows, with a trailing separator of this host
-/// ignored either way (the lookup ignores one, so `~/.local/bin/` is the directory
-/// `~/.local/bin`).
+/// Whether a `PATH` entry of this host or one of the product's own directories names `dir`,
+/// compared the way the platform's own lookup compares them: byte for byte on unix,
+/// case-insensitively on Windows, a trailing separator ignored either way.
 #[cfg(any(unix, windows))]
 #[must_use]
 fn same_entry(entry: &Path, dir: &Path) -> bool {
     names(entry, dir, TRAILING_SEPARATORS, cfg!(not(unix)))
 }
 
-/// Whether an entry of a Windows `Path` value names `dir`: the same comparison, with
-/// both of a Windows path's separators ignored and its letters folded wherever this
-/// runs, because those entries hold Windows paths on any host.
+/// Whether an entry of a Windows `Path` value names `dir`: the same comparison, with both
+/// of a Windows path's separators ignored.
 #[cfg(any(windows, test))]
 #[must_use]
 fn same_entry_windows(entry: &Path, dir: &Path) -> bool {
     names(entry, dir, &['/', '\\'], true)
 }
 
-/// Whether `entry` and `dir` are the same directory: their text equal — byte for byte
-/// or case-insensitively, as `fold_case` says — once a trailing separator in
-/// `separators` is ignored. A path that is nothing but separators is left as it
-/// stands.
+/// Whether `entry` and `dir` are the same directory: their text equal once a trailing
+/// separator in `separators` is ignored. A path of nothing but separators is left as it stands.
 #[cfg(any(unix, windows))]
 #[must_use]
 fn names(entry: &Path, dir: &Path, separators: &[char], fold_case: bool) -> bool {
@@ -225,14 +171,9 @@ fn names(entry: &Path, dir: &Path, separators: &[char], fold_case: bool) -> bool
     }
 }
 
-// ── Failure ───────────────────────────────────────────────────────────────
-
-/// The lines a sync can record, kept as two sets rather than one: a sync touches
-/// several of the owner's files and can fail on more than one of them, so a reason
-/// is compared against the previous whole sync and not against the failure before
-/// it. Without that a reason that keeps failing would be one WARN row per read,
-/// every time the environment reader re-reads the owner's files, for as long as
-/// they stay in that state.
+/// The lines a sync can record, kept as two sets rather than one: a sync touches several of
+/// the owner's files, so a reason is compared against the previous whole sync. Without that
+/// a reason that keeps failing would be one WARN row per read.
 #[cfg(any(unix, windows))]
 struct Failures {
     /// The reasons the sync in progress has recorded.
@@ -252,16 +193,14 @@ static FAILURES: Mutex<Failures> = Mutex::new(Failures {
 const PATH_FAILURE_MESSAGE: &str =
     "could not make the product's own tools visible in the owner's own search path";
 
-/// The audit line both platforms write when one of the product's own directories is
-/// put into what the owner's own shell reads. One literal, so the two recordings
-/// cannot drift.
+/// The audit line both platforms write when one of the product's own directories is put into
+/// what the owner's own shell reads.
 #[cfg(any(unix, windows))]
 const PATH_VISIBLE_MESSAGE: &str =
     "made the product's own tools visible in the owner's own search path";
 
-/// One refusal for both platforms and for both renderers: a directory whose text
-/// cannot be written into the owner's own configuration without changing what it
-/// means there (a shell's quoting or a `Path` entry's expansion).
+/// One refusal for both platforms: a directory whose text cannot be written into the owner's
+/// own configuration without changing what it means there.
 #[cfg(any(unix, windows))]
 const UNSAFE_DIRECTORY: &str = "a directory that cannot be written into the owner's own search \
                                 path (the product's own tools directory looks unsafe)";
@@ -272,12 +211,9 @@ fn begin_sync() {
     FAILURES.lock().unwrap_poison().current.clear();
 }
 
-/// Record a failure of the sync in progress, once per distinct reason — the sync
-/// in progress and the one before it both count, so the same reason from two files
-/// of one sync is one row, and one that persists across syncs stays one row too.
-/// The line carries the reason and nothing else: the failing step is named by the
-/// reason's own text, and neither the shell whose startup file it was nor any other
-/// value read from the owner's environment is carried.
+/// Record a failure of the sync in progress, once per distinct reason — the sync in progress
+/// and the one before it both count, so one reason from two files is one row. The line carries
+/// the reason and nothing else, never a value read from the owner's environment.
 #[cfg(any(unix, windows))]
 fn record_failure(reason: &str) {
     {
@@ -295,9 +231,8 @@ fn record_failure(reason: &str) {
     tracing::warn!(reason = %reason, "{PATH_FAILURE_MESSAGE}");
 }
 
-/// Close the sync: its reasons become the ones the next sync compares against, so
-/// a failure that persists stays one row while one that comes back after a sync
-/// without it is reported again.
+/// Close the sync: its reasons become the ones the next sync compares against, so a failure
+/// that persists stays one row while one that comes back is reported again.
 #[cfg(any(unix, windows))]
 fn end_sync() {
     let mut failures = FAILURES.lock().unwrap_poison();
@@ -310,30 +245,21 @@ fn end_sync() {
 enum Written {
     /// Nothing: it already says exactly what it must.
     Nothing,
-    /// One of the product's own directories is on his search path because of this
-    /// write, and from nowhere else: what he already has does not name it — neither
-    /// his own environment nor an earlier contribution of the product's own, which is
-    /// a block on unix and an entry the `Path` value already held on Windows. A block
-    /// counts as having reached his search path even where the file it sits in is not
-    /// one his shell reads (`read_earlier_blocks` holds that approximation), so a
+    /// One of the product's own directories is on his search path because of this write, and from
+    /// nowhere else. A block counts as having reached his search path even where the file it sits
+    /// in is not one his shell reads ([`read_earlier_blocks`] holds that approximation), so a
     /// directory only such a block named is never reported here.
     Added,
-    /// Nothing was added by that same measure: what the write changed is the
-    /// product's own earlier contribution — on unix a block brought to the current
-    /// spelling or taken out where his own files already name those directories, on
-    /// Windows duplicate entries naming the product's own directories — whichever copy
-    /// had put them there. By the same approximation this is also what a write that
-    /// does put a directory of the product's own on his real search path is reported
-    /// as, when only a block in a file his shell may not read named it before.
+    /// Nothing was added by that same measure: the write changed the product's own earlier
+    /// contribution — a block brought to the current spelling or taken out, duplicate `Path`
+    /// entries — whichever copy had put it there. By the same approximation this is also what a
+    /// write that does reach his real search path is reported as.
     Removed,
 }
 
-// ── Unix: the block in the owner's startup file ───────────────────────────
-
-/// The owner's own `PATH` is set by his shell's startup files, so on unix the
-/// block goes into the one file the shell he actually runs reads — never one
-/// invented for him, and never a file whose mere presence would change which
-/// files that shell reads.
+/// The owner's own `PATH` is set by his shell's startup files, so the block goes into the one
+/// file the shell he actually runs reads — never one invented for him, and never a file whose
+/// mere presence would change which files that shell reads.
 #[cfg(unix)]
 mod unix {
     use std::fs;
@@ -345,11 +271,8 @@ mod unix {
         dir_missing, record_failure, same_entry,
     };
 
-    /// Bring the owner's startup file in line with `dirs`.
-    ///
-    /// The owner's shell and home are resolved once here and handed to [`run`]: his
-    /// shell only says which startup file is his, and it is also what the audit
-    /// line of a write names.
+    /// Bring the owner's startup file in line with `dirs`. His shell and home are resolved once
+    /// here and handed to [`run`]: the shell only says which startup file is his.
     pub(super) fn sync(env: &OwnerEnv, dirs: &[PathBuf]) {
         let (shell, home) = crate::shell_env::owner_shell_and_home();
         let name = shell.as_deref().map(crate::shell_env::shell_basename);
@@ -357,15 +280,12 @@ mod unix {
         let outcome = match (name.as_deref(), home.as_deref()) {
             (Some(name), Some(home)) => run(name, home, env, &inherited, dirs).map(|written| match written {
                 Written::Nothing => {}
-                // A write into the owner's own file happens once, when the block is
-                // first needed or has to change, so recording it is not per-start
-                // noise: it is the audit line for a change to his configuration.
+                // A write into his own file happens once, when the block is first needed or has
+                // to change, so this is the audit line for a change to his configuration.
                 Written::Added => {
                     tracing::info!(shell = name, "{PATH_VISIBLE_MESSAGE}");
                 }
-                // Nothing was added by the product's own measure: what the write
-                // changed was the product's own earlier block — brought to the current
-                // spelling, or taken out — or its own duplicate entries.
+                // The write changed only the product's own earlier block.
                 Written::Removed => {
                     tracing::info!(
                         shell = name,
@@ -385,31 +305,22 @@ mod unix {
         }
     }
 
-    /// The entries of the search path the daemon itself was started with. The read's
-    /// shell inherits this process's environment and applies the owner's startup files
-    /// on top of it, so an entry here may be the product's own block's — left by the
-    /// shell that started the daemon — and not the owner's own arrangement.
+    /// The entries of the search path the daemon itself was started with: the read's shell
+    /// inherits this process's environment and applies the owner's startup files on top, so an
+    /// entry here may be the product's own block's, not the owner's own arrangement.
     fn inherited_path_entries() -> Vec<PathBuf> {
         std::env::var_os("PATH")
             .map_or_else(Vec::new, |value| std::env::split_paths(&value).collect())
     }
 
-    /// Resolve the file today's block belongs in, read it and every other file the
-    /// product may have left a block in, and rewrite today's file when what it must
-    /// say differs from what it says.
-    ///
-    /// Nothing else is written until his own file holds its block, so a write that
-    /// fails there — a read-only `~/.zshrc`, say — cannot cost him a directory an
-    /// earlier block was the only source of, and neither can a refusal raised before
-    /// the file is read: without a file to put the block in, no earlier block is
-    /// taken out anywhere either. Each rewrite is atomic, so the next read sees the
-    /// whole block or none of it; a crash between today's file and the others leaves
-    /// an earlier block standing, which is a duplicate on his search path until the
-    /// next read takes it out.
-    ///
-    /// `inherited` is the search path the daemon itself was started with, which the
-    /// read's shell inherited: it is what tells an occurrence the product's own block
-    /// left behind from one the owner's own arrangement gives him (see below).
+    /// Resolve the file today's block belongs in, read it and every other file the product may
+    /// have left a block in, and rewrite today's file when what it must say differs from what it
+    /// says. Nothing else is written until his own file holds its block, so a write that fails
+    /// there cannot cost him a directory an earlier block was the only source of; each rewrite is
+    /// atomic, and a crash between the files leaves an earlier block standing until the next read.
+    /// `inherited` is the search path the daemon itself was started with, which the read's shell
+    /// inherited: it is what tells an occurrence the product's own block left behind from one the
+    /// owner's own arrangement gives him (see [`Self::inherited_path_entries`]).
     fn run(
         shell: &str,
         home: &Path,
@@ -417,39 +328,27 @@ mod unix {
         inherited: &[PathBuf],
         dirs: &[PathBuf],
     ) -> Result<Written, String> {
-        // Refuse before anything is read or written: with a directory the block
-        // cannot name on this shell (the refusals [`render`] raises), today's file
-        // can get no block — and taking the earlier blocks out of the other files
-        // would then leave him without the directory they were keeping on his
-        // search path.
+        // Refuse before anything is read or written: with a directory the block cannot name on
+        // this shell, today's file can get no block — and taking the earlier blocks out would
+        // leave him without the directory they were keeping on his search path.
         render(shell, dirs, home)?;
-        // A shell with no startup file the product can resolve is the same case: an
-        // earlier block may be the only thing keeping a directory on his search
-        // path, so nothing is taken out anywhere and the reason is recorded instead.
+        // A shell with no startup file the product can resolve is the same case, and the
+        // reason is recorded instead.
         let target = target_file(shell, home, env)?;
         remove_leftover_temp(&target);
-        // A missing file is an empty one: it is the state the owner would have
-        // written nothing in, and the block is what it is missing. It is read before
-        // any of his files is written, because one that cannot be read is as much a
-        // reason not to touch the others as one that cannot be written.
+        // A missing file is an empty one, read before any of his files is written: one that
+        // cannot be read is as much a reason not to touch the others as one that cannot be written.
         let existing = read_startup_file(&target, FILE_UNREADABLE)?.unwrap_or_default();
         let regions = block_regions(&existing);
-        // The product's own earlier blocks are read wherever they could sit. What
-        // they put on the owner's search path is part of what today's block has to
-        // account for, so their occurrences are counted here, and the rewrite each
-        // of those files needs is held back until his own file is in place.
+        // The product's own earlier blocks are read wherever they could sit, and the rewrite
+        // each of those files needs is held back until his own file is in place.
         let mut made = vec![0; dirs.len()];
         let strips = read_earlier_blocks(home, env, &target, dirs, &mut made);
         add_contributions(&existing, &regions, dirs, home, &mut made);
-        // An entry the daemon itself was started with is not the owner's evidence:
-        // the shell that started it had the product's own block applied too, so the
-        // block's directories arrive in the read's environment inherited as well as
-        // freshly applied by the shell this read used, and counting only the fresh
-        // ones would read the block's own work as the owner's own arrangement — and
-        // take the block out of the file the owner's terminal reads. Those occurrences
-        // count against the block instead, where a block of the product's own names
-        // that directory: one no block names is his own arrangement, and an occurrence
-        // of it there is his.
+        // An entry the daemon itself was started with is not the owner's evidence: the shell
+        // that started it had the product's own block applied too. Counting only the fresh
+        // occurrences would read the block's own work as his arrangement and take the block out
+        // of the file his terminal reads, so they count against the block instead.
         for (count, dir) in made.iter_mut().zip(dirs) {
             if *count > 0 {
                 *count += inherited
@@ -458,33 +357,27 @@ mod unix {
                     .count();
             }
         }
-        // Only what his own environment does not already give him is named: a
-        // directory that is on his search path anyway is one entry there, and naming
-        // it again would put it there twice.
+        // Only what his own environment does not already give him is named: naming it again
+        // would put it on his search path twice.
         let missing: Vec<PathBuf> = dirs
             .iter()
             .zip(&made)
             .filter(|(dir, count)| dir_missing(env, dir, **count))
             .map(|(dir, _)| dir.clone())
             .collect();
-        // The refusals were raised before any of this was read, so rendering what
-        // is left to name cannot fail.
+        // The refusals were raised before any of this was read, so rendering cannot fail.
         let desired = render(shell, &missing, home)?;
         let Some(content) = planned_content(&existing, &regions, &desired) else {
             strip_earlier_blocks(strips);
             return Ok(Written::Nothing);
         };
-        // Everything else waits on this write: a failure here leaves the earlier
-        // blocks, and the entries they contributed, where they are.
+        // Everything else waits on this write: a failure here leaves the earlier blocks where
+        // they are.
         write_atomically(&target, &content)?;
         strip_earlier_blocks(strips);
-        // A write is an addition only where it is what puts a directory of the
-        // product's own on his search path: the directory his own environment does
-        // not have at all and no earlier block named, so that today's block is its
-        // only source. One an earlier block named was already on that path through
-        // the block — today's is what keeps it there — and one of his own is his
-        // arrangement, so a rewrite touching either is not reported as a new
-        // directory.
+        // A write is an addition only where it is what puts a directory of the product's own on
+        // his search path: the directory his own environment does not have at all and no earlier
+        // block named.
         let added = dirs
             .iter()
             .zip(&made)
@@ -496,8 +389,8 @@ mod unix {
         })
     }
 
-    /// One earlier block of the product's own, still sitting in one of the owner's
-    /// own startup files, with the content that file must have once it is gone.
+    /// One earlier block of the product's own, with the content that file must have once it is
+    /// gone.
     struct Strip {
         /// The shell that file belongs to, which only says which file it is.
         shell: &'static str,
@@ -505,51 +398,29 @@ mod unix {
         content: String,
     }
 
-    /// Read every startup file that could hold an earlier block of the product's
-    /// own, count how many times each of `dirs` those blocks name (the ones in
-    /// today's own file are counted by the caller), and report what each of those
-    /// files must be rewritten to. Nothing is written here: the strips are applied
-    /// by [`strip_earlier_blocks`], once his own file is known to hold its block.
+    /// Read every startup file that could hold an earlier block of the product's own, count how
+    /// many times each of `dirs` those blocks name (today's own file is counted by the caller),
+    /// and report what each of those files must be rewritten to. Nothing is written here: the
+    /// strips are applied by [`strip_earlier_blocks`], once his own file holds its block.
     ///
-    /// An earlier release appended the same block to `~/.zshrc` and `~/.bashrc` —
-    /// whichever of the two belonged to the login shell, and both when that could
-    /// not be determined — so a block can sit in a file today's shell never reads,
-    /// and one naming the old private tools folder would leave that folder on the
-    /// owner's own search path. Only a block the product itself wrote is taken out
-    /// (see [`block_regions`]); every other byte of those files, and every
-    /// candidate without such a block, is left exactly as it is. No block is added
-    /// to any of them: today's only ever goes into the file the owner's own shell
-    /// really reads.
+    /// An earlier release appended the same block to `~/.zshrc` and `~/.bashrc` — whichever
+    /// belonged to the login shell, and both when that could not be determined — so a block can
+    /// sit in a file today's shell never reads, and one naming the old private tools folder would
+    /// leave that folder on the owner's search path. Only a block the product itself wrote is
+    /// taken out (see [`block_regions`]); every other byte is left as it is, and no block is ever
+    /// added to these files.
     ///
-    /// Every block found here is counted here and taken out here: the two sets are
-    /// the same one, and that is what keeps a directory of `dirs` from being
-    /// dropped — what a counted block contributed is either still on his search
-    /// path without it or named by today's block (see [`dir_missing`]). A block
-    /// naming anything else, the private tools folder an earlier release used, is
-    /// counted for nothing and leaves his search path with the block: that is the
-    /// one directory nothing here keeps. A run of lines that is not a block of the
-    /// product's own — a body [`is_product_body`] does not recognise, or any second
-    /// line between the markers (see [`block_regions`]) — is neither counted nor
-    /// taken out: the same rule from the other side.
+    /// Every block found here is counted here and taken out here, which is what keeps a directory
+    /// of `dirs` from being dropped: what a counted block contributed is either still on his
+    /// search path without it or named by today's block (see [`dir_missing`]). A block naming the
+    /// private tools folder is counted for nothing and leaves his search path with the block.
     ///
-    /// Counting a block is an approximation of its having reached his search path.
-    /// Its ordinary error is the harmless one: a block in a file he does not source
-    /// is still counted as the product's own contribution, so a directory that is on
-    /// his path anyway can be named once more by today's block. That extra entry does
-    /// not survive a read: it is one occurrence more than the product's own block
-    /// accounts for — the entries it writes and the ones the same block left in the
-    /// search path the daemon was started with ([`dir_missing`]) — so the next read
-    /// counts the directory as his and its rewrite does not name it — the block that
-    /// named it comes back without it, or out altogether when there was nothing else
-    /// to name ([`planned_content`] with an empty body) — and the read after that one
-    /// is the settled state, where every occurrence of the directory is his own again.
-    ///
-    /// The count covers the spellings [`add_contributions`] reads. A body entry it
-    /// cannot read at all — a directory reached through the shell's own arithmetic,
-    /// which nothing the product writes produces — is counted for nothing while the
-    /// block carrying it is taken out, so a directory whose only source that block was
-    /// leaves his search path with it: the one harmful direction, and it takes a
-    /// hand-edit of a block the product itself wrote to reach.
+    /// Counting a block approximates its having reached his search path. The ordinary error is
+    /// harmless — a block in a file he does not source is still counted, so a directory can be
+    /// named once more by today's block, and the read after the next one settles it. A body entry
+    /// [`add_contributions`] cannot read at all is the one harmful direction: it is counted for
+    /// nothing while its block is taken out, and reaching it takes a hand-edit of a block the
+    /// product wrote.
     fn read_earlier_blocks(
         home: &Path,
         env: &OwnerEnv,
@@ -583,9 +454,7 @@ mod unix {
     }
 
     /// Take the earlier blocks out, [once the owner's own file holds its
-    /// block](run). A write into one of the owner's own files happens once, when
-    /// the earlier block is finally gone, so it is the audit line for that change
-    /// rather than per-start noise.
+    /// block](run), recording the change rather than per-start noise.
     fn strip_earlier_blocks(strips: Vec<Strip>) {
         for Strip {
             shell,
@@ -603,13 +472,9 @@ mod unix {
         }
     }
 
-    /// The startup files the product may have left its own block in, besides the
-    /// one the owner's own shell reads today: the plain `~/.zshrc` and `~/.bashrc`
-    /// an earlier release appended to for the login shell — and the plain
-    /// `~/.zshrc` even when `$ZDOTDIR` moves zsh's own file today — plus the file
-    /// every other shell the product knows reads. A file that does not exist, or
-    /// that holds no block of the product's own, is not written at all, and a path
-    /// two entries resolve to is looked at once.
+    /// The startup files the product may have left its own block in, besides the one the owner's
+    /// own shell reads today: the plain `~/.zshrc` and `~/.bashrc` an earlier release appended to
+    /// for the login shell, plus the file every other shell the product knows reads.
     fn candidates(env: &OwnerEnv, home: &Path, target: &Path) -> Vec<(&'static str, PathBuf)> {
         let mut files = vec![
             ("zsh", home.join(".zshrc")),
@@ -622,10 +487,9 @@ mod unix {
         if let Ok(file) = env_startup_file(env) {
             files.push(("sh", file));
         }
-        // Files are recognised by what they really are, not by how they are spelled:
-        // `~/.zshrc` symlinked to `$ZDOTDIR/.zshrc` is one startup file, and sweeping
-        // it as "another file" would take today's own block out on every read and let
-        // [`run`] put it back — a rewrite per interval that says nothing.
+        // Files are recognised by what they really are: `~/.zshrc` symlinked to
+        // `$ZDOTDIR/.zshrc` is one startup file, and sweeping it as another would take today's
+        // block out on every read and let [`run`] put it back.
         let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let mut seen: Vec<PathBuf> = vec![canonical(target)];
         let mut kept: Vec<(&'static str, PathBuf)> = Vec::with_capacity(files.len());
@@ -640,16 +504,14 @@ mod unix {
         kept
     }
 
-    /// The reason a startup file that could not be read is recorded with; only the
-    /// I/O kind is appended.
+    /// The reason a startup file that could not be read is recorded with.
     const FILE_UNREADABLE: &str = "the owner's startup file could not be read";
 
     /// The same, for one of the other files the product may have left a block in.
     const FILE_WITH_AN_EARLIER_BLOCK: &str =
         "a startup file holding an earlier mahbot block could not be read";
 
-    /// The content of one of the owner's own startup files, or `None` when it does
-    /// not exist — a missing file is an empty one for every purpose here.
+    /// The content of one of the owner's own startup files, or `None` when it does not exist.
     fn read_startup_file(path: &Path, what: &str) -> Result<Option<String>, String> {
         match fs::read_to_string(path) {
             Ok(content) => Ok(Some(content)),
@@ -658,22 +520,11 @@ mod unix {
         }
     }
 
-    /// The file the owner's own terminal really reads for `shell`, which is not
-    /// the same file for every shell or on every unix.
-    ///
-    /// macOS starts all of these as login shells, so bash reads the login
-    /// profile file there and the POSIX family reads `~/.profile`; elsewhere each
-    /// shell reads the file its own convention names, and a shell whose files the
-    /// product does not know is refused rather than guessed at — exactly the
-    /// shells whose environment the reader reads
-    /// ([`crate::shell_env::knows_shell`]).
-    ///
-    /// This one file is the only one a block is ever written into. An earlier
-    /// release appended its block to whichever startup file happened to exist (a
-    /// `.bashrc` beside a zsh login, say); such a file belongs to a shell the
-    /// product does not read, so today's block never goes there — while a block the
-    /// product itself left in it is taken out ([`read_earlier_blocks`]), and nothing
-    /// else in it is touched.
+    /// The file the owner's own terminal really reads for `shell`, which is not the same file for
+    /// every shell or on every unix: macOS starts all of these as login shells, elsewhere each
+    /// shell reads the file its own convention names, and an unknown shell is refused rather than
+    /// guessed at ([`crate::shell_env::knows_shell`]). This is the only file a block is ever
+    /// written into — a block an earlier release left elsewhere is taken out, nothing added.
     fn target_file(shell: &str, home: &Path, env: &OwnerEnv) -> Result<PathBuf, String> {
         let macos = cfg!(target_os = "macos");
         match shell {
@@ -694,16 +545,13 @@ mod unix {
         }
     }
 
-    /// `~/.zshrc`, or `$ZDOTDIR/.zshrc` when the owner moved zsh's own startup
-    /// directory — zsh reads its rc files from `$ZDOTDIR`, so `$HOME` would be a
-    /// file his terminal never reads.
+    /// `~/.zshrc`, or `$ZDOTDIR/.zshrc` when the owner moved zsh's own startup directory.
     fn zsh_startup_file(home: &Path, env: &OwnerEnv) -> PathBuf {
         env_dir(env, "ZDOTDIR").map_or_else(|| home.join(".zshrc"), |dir| dir.join(".zshrc"))
     }
 
-    /// `~/.config/fish/config.fish`, or `$XDG_CONFIG_HOME/fish/config.fish` when the
-    /// owner moved fish's own configuration directory — fish reads its config there,
-    /// so `$HOME` would be a file his terminal never reads.
+    /// `~/.config/fish/config.fish`, or `$XDG_CONFIG_HOME/fish/config.fish` when the owner moved
+    /// fish's configuration directory.
     fn fish_startup_file(home: &Path, env: &OwnerEnv) -> PathBuf {
         env_dir(env, "XDG_CONFIG_HOME").map_or_else(
             || home.join(".config").join("fish").join("config.fish"),
@@ -711,10 +559,8 @@ mod unix {
         )
     }
 
-    /// The directory the owner's own environment names in `name`, or none when the
-    /// variable is absent, empty — an empty value is no setting at all — or not an
-    /// absolute path, which would put the block wherever the daemon's own working
-    /// directory happened to be.
+    /// The directory the owner's own environment names in `name`, or none when the variable is
+    /// absent, empty, or not an absolute path.
     fn env_dir(env: &OwnerEnv, name: &str) -> Option<PathBuf> {
         env.vars()
             .iter()
@@ -723,9 +569,8 @@ mod unix {
             .filter(|dir| dir.is_absolute())
     }
 
-    /// The first of the login profile files a login bash reads when it exists,
-    /// else `~/.bash_profile` — the file a login bash reads when the owner has
-    /// none.
+    /// The first of the login profile files a login bash reads when it exists, else
+    /// `~/.bash_profile`.
     fn login_profile_file(home: &Path) -> PathBuf {
         [".bash_profile", ".bash_login", ".profile"]
             .iter()
@@ -734,12 +579,9 @@ mod unix {
             .unwrap_or_else(|| home.join(".bash_profile"))
     }
 
-    /// The one startup file an interactive POSIX shell reads on a non-macOS
-    /// unix: the file `$ENV` names. Any other file would be a guess at which of
-    /// several files that shell reads, and writing the wrong one would put the
-    /// block where the owner's terminal never looks. A relative value is refused
-    /// like an empty one: the shell resolves it against its own directory, not the
-    /// daemon's.
+    /// The one startup file an interactive POSIX shell reads on a non-macOS unix: the file `$ENV`
+    /// names. A relative value is refused like an empty one — the shell resolves it against its
+    /// own directory, not the daemon's.
     fn env_startup_file(env: &OwnerEnv) -> Result<PathBuf, String> {
         env.vars()
             .iter()
@@ -751,22 +593,17 @@ mod unix {
             })
     }
 
-    /// The two body lines [`render`] writes and [`body_entries`] reads back: the
-    /// product's directories after whatever the owner's own path already holds, one
-    /// line per shell family. One spelling for the writer and the reader, so a change
-    /// to one of them cannot stop the product recognising its own blocks.
+    /// The body line [`render`] writes and [`body_entries`] reads back: the product's directories
+    /// after whatever the owner's own path already holds.
     const SH_BODY_PREFIX: &str = "export PATH=\"$PATH:";
     const SH_BODY_SUFFIX: &str = "\"";
     const FISH_BODY_PREFIX: &str = "set -gx PATH $PATH ";
 
-    /// The block body without its markers: one line that puts `dirs` after
-    /// whatever the owner's own path already holds, so his own installs keep
-    /// precedence in his terminal. Empty for an empty list — the caller has no
-    /// block to write then, and an empty body would name the current directory.
-    ///
-    /// fish's `PATH` is a list, and `set -gx PATH $PATH …` appends to it —
-    /// `fish_add_path` is deliberately not used, because it is a function an
-    /// older fish may not have.
+    /// The block body without its markers: one line that puts `dirs` after whatever the owner's
+    /// own path already holds, so his own installs keep precedence. Empty for an empty list — an
+    /// empty body would name the current directory. fish's `PATH` is a list and `set -gx PATH`
+    /// appends to it; `fish_add_path` is deliberately not used, because it is a function an older
+    /// fish may not have.
     fn render(shell: &str, dirs: &[PathBuf], home: &Path) -> Result<String, String> {
         if dirs.is_empty() {
             return Ok(String::new());
@@ -783,25 +620,12 @@ mod unix {
         })
     }
 
-    /// One directory as the shell line spells it: `$HOME/<relative>`, refused
-    /// unless it really is inside the home whose startup file the block goes into —
-    /// and with fish's own form in mind, where the token is unquoted, so a `set`
-    /// would split a directory whose name holds whitespace and a glob character would
-    /// expand rather than name it.
-    ///
-    /// The home check is what keeps the block honest: the directories are resolved
-    /// from a `$HOME` that is set and non-empty whether or not it is a directory,
-    /// while the file the block goes into is under a home that really is one — the
-    /// passwd home, when `$HOME` is not — and a block naming another home's
-    /// directories must not be written into this home's file at all. It is also the
-    /// precondition [`run`] applies before anything is written, so a state it
-    /// refuses cannot leave the owner's other files stripped. Nothing is written in
-    /// that state, and the refusal is recorded like any other failure.
-    ///
-    /// The byte check below guards the interpolation rather than today's two
-    /// directories — those always render to `.local/bin`/`.bun/bin` — because a
-    /// directory a future change feeds in must not be able to break the file the
-    /// owner's own shell reads.
+    /// One directory as the shell line spells it: `$HOME/<relative>`, refused unless it really is
+    /// inside the home whose startup file the block goes into — and with fish's unquoted form in
+    /// mind, where a `set` would split a directory holding whitespace and a glob character would
+    /// expand. The home check is also the precondition [`run`] applies before anything is written,
+    /// so a state it refuses cannot leave the owner's other files stripped. The byte check guards
+    /// the interpolation rather than today's two directories.
     fn render_dir(dir: &Path, home: &Path, fish: bool) -> Result<String, String> {
         let Ok(relative) = dir.strip_prefix(home) else {
             return Err(
@@ -811,37 +635,28 @@ mod unix {
             );
         };
         let relative = relative.to_string_lossy();
-        // `"`, `` ` ``, `$` and `\` end the posix form's quoting early, a newline
-        // splits the file, and `:` separates the entries of the posix form — a
-        // directory holding one would add a second, relative entry resolved against
-        // the shell's own directory instead of naming itself.
+        // `"`, `` ` ``, `$` and `\` end the posix form's quoting early, a newline splits the
+        // file, and `:` separates the entries of the posix form.
         if relative.contains(['"', '`', '$', '\\', '\n', ':']) {
             return Err(UNSAFE_DIRECTORY.to_string());
         }
         let token = format!("$HOME/{relative}");
-        // The fish form is unquoted: whitespace would split the line into two
-        // entries of its list, and a glob character would name whatever it expands to
-        // instead of the directory.
+        // The fish form is unquoted: whitespace would split the line and a glob character would
+        // expand.
         if fish && token.contains([' ', '\t', '*', '?', '[']) {
             return Err(UNSAFE_DIRECTORY.to_string());
         }
         Ok(token)
     }
 
-    /// The file's new full content, or `None` when the file already is what it
-    /// must be. `regions` are the product's own previous appends, as
-    /// [`block_regions`] found them, and `desired` is the body of the block the
-    /// file must carry — empty when his own environment already gives him every
-    /// directory, which is why it is also what says whether a block is written.
-    ///
-    /// Those appends are taken out first, whatever they name, so a block left by
-    /// an earlier release (the one naming the private tools folder) or a
-    /// duplicate of the current one is not something the file keeps; everything
-    /// else comes back byte for byte.
+    /// The file's new full content, or `None` when the file already is what it must be. `regions`
+    /// are the product's own previous appends ([`block_regions`]) and `desired` the body of the
+    /// block the file must carry — empty when his own environment already gives him every
+    /// directory, which is why it also says whether a block is written. Those appends are taken
+    /// out first, whatever they name; everything else comes back byte for byte.
     fn planned_content(existing: &str, regions: &[Range<usize>], desired: &str) -> Option<String> {
         let appended = block_text(desired);
-        // Already exactly right, including the owner's own file mode and every
-        // other byte in it.
+        // Already exactly right, including the owner's own file mode.
         if regions.len() == 1 && existing[regions[0].clone()] == appended {
             return None;
         }
@@ -849,19 +664,16 @@ mod unix {
         match (regions.is_empty(), desired.is_empty()) {
             // Nothing to add and nothing of the product's own to take out.
             (true, true) => None,
-            // The directories are visible from the owner's own environment, so
-            // nothing is added — but a stale or duplicated block is still taken
-            // out, which is what leaves the file as the owner would have it.
+            // The directories are visible from his environment, so nothing is added — but a stale
+            // or duplicated block is still taken out.
             (_, true) => Some(cleaned),
-            // Otherwise exactly one correct block follows everything the file
-            // held besides the product's own blocks.
+            // Otherwise exactly one correct block follows everything else the file held.
             _ => Some(append_block(&cleaned, desired)),
         }
     }
 
-    /// `content` with one freshly rendered block appended. A last line without a
-    /// newline is closed first, so the block's leading newline either follows a
-    /// blank one or opens an empty file — never a line of the owner's own.
+    /// `content` with one freshly rendered block appended. A last line without a newline is
+    /// closed first, so the block never continues a line of the owner's own.
     fn append_block(content: &str, desired: &str) -> String {
         let mut out = String::from(content);
         if !out.is_empty() && !out.ends_with('\n') {
@@ -871,32 +683,22 @@ mod unix {
         out
     }
 
-    /// The block as it is written today, byte for byte: one leading newline
-    /// before the start marker and one trailing newline after the end marker.
-    /// An append of an earlier release wrote exactly this, so a file it touched
-    /// is recognised rather than appended to again.
+    /// The block as it is written today, byte for byte: one leading newline before the start
+    /// marker and one trailing newline after the end marker — exactly what an append of an earlier
+    /// release wrote, so a file it touched is recognised.
     fn block_text(desired: &str) -> String {
         format!("\n{BLOCK_START}\n{desired}\n{BLOCK_END}\n")
     }
 
-    /// The byte ranges of `content` the product's own previous appends occupy:
-    /// each is the run from a [`BLOCK_START`] line through the [`BLOCK_END`] line
-    /// that follows it, together with the newline its append wrote in front of
-    /// the start marker — the exact shape [`append_block`] leaves, which is why
-    /// what a strip takes out is what an append put in and every other byte is
-    /// where it was.
-    ///
-    /// A pair counts only when exactly one line sits between the markers — the
-    /// one body line [`render`] writes, and no other. A start marker the owner
-    /// never closed, a stray end marker, or a run holding any second line, his
-    /// own or another body-shaped one, therefore takes nothing of his with it:
-    /// only the product's own appends are the product's to take out.
+    /// The byte ranges of `content` the product's own previous appends occupy: the run from a
+    /// [`BLOCK_START`] line through the [`BLOCK_END`] line that follows it, with the newline its
+    /// append wrote in front — the exact shape [`append_block`] leaves. A pair counts only when
+    /// exactly one line sits between the markers, so a stray marker or any second line takes
+    /// nothing of the owner's with it.
     fn block_regions(content: &str) -> Vec<Range<usize>> {
         let mut regions: Vec<Range<usize>> = Vec::new();
-        // The line the marker opened on and whether a body line has been seen:
-        // 0 = no body line yet, 1 = exactly the one body line the product writes,
-        // 2 = a run the product never wrote. Any second line — his own or another
-        // body-shaped one — leaves the run in the 2 state and disqualifies it.
+        // The line the marker opened on and whether a body line has been seen: 0 = no body line
+        // yet, 1 = exactly the one body line the product writes, 2 = a run the product never wrote.
         let mut opened: Option<(usize, u8)> = None;
         let mut offset = 0;
         for line in content.split_inclusive('\n') {
@@ -907,14 +709,11 @@ mod unix {
                 opened = Some((line_start, 0));
             } else if text == BLOCK_END {
                 if let Some((from, 1)) = opened.take() {
-                    // The newline the append wrote in front of the marker is taken
-                    // back, so what a strip removes is exactly what an append added.
-                    // It is the append's own when the file begins with it or when a
-                    // blank line precedes the marker; when the marker sits directly
-                    // under one of the owner's own lines that newline is his, and
-                    // taking it would glue two of his lines together. `claimed` keeps
-                    // a region from taking a newline the region before it already
-                    // owns.
+                    // The newline the append wrote in front of the marker is taken back, so a strip
+                    // removes exactly what an append added. It is the append's own when the file
+                    // begins with it or a blank line precedes the marker; directly under one of the
+                    // owner's lines it is his, and taking it would glue two of his lines together.
+                    // `claimed` keeps a region from taking a newline the region before it owns.
                     let claimed = regions.last().map_or(0, |previous| previous.end);
                     let appended = from > claimed
                         && from > 0
@@ -934,17 +733,13 @@ mod unix {
         regions
     }
 
-    /// Whether `text` is a body line of the product's own block: the line
-    /// [`render`] writes for this platform, naming the product's directories after
-    /// whatever the owner's own `PATH` already holds.
+    /// Whether `text` is a body line of the product's own block for this platform.
     fn is_product_body(text: &str) -> bool {
         !body_entries(text).is_empty()
     }
 
-    /// The directories one body line names, in the spelling the block writes them
-    /// (`$HOME/<relative>`), for either form the block has — posix
-    /// ([`SH_BODY_PREFIX`], `:`-separated) or fish ([`FISH_BODY_PREFIX`],
-    /// space-separated). Empty for a line that is not a body line at all.
+    /// The directories one body line names, in the spelling the block writes them, for either
+    /// form (posix or fish). Empty for a line that is not a body line at all.
     fn body_entries(line: &str) -> Vec<&str> {
         if let Some(rest) = line
             .strip_prefix(SH_BODY_PREFIX)
@@ -958,25 +753,17 @@ mod unix {
         Vec::new()
     }
 
-    /// Add, for each of `counts`, how many times the product's own appends in
-    /// `content` name that directory, so that the occurrences of a directory in the
-    /// owner's own `PATH` can be reduced by exactly those and no more.
+    /// Add, for each of `counts`, how many times the product's own appends in `content` name that
+    /// directory, so the occurrences in the owner's own `PATH` can be reduced by exactly those.
     ///
-    /// An entry counts when it *names* the directory the way the platform's own
-    /// lookup reads one ([`same_entry`]): as the absolute path every earlier release
-    /// wrote or as the `$HOME/<relative>` token today's block writes, with a trailing
-    /// separator or without one, and through a leading home reference however a
-    /// hand-edit spells it (`${HOME}/…`, `~/…`). Recognising a block by its shape
-    /// while counting its entries by their exact text would leave a respelled entry
-    /// counted for nothing while the block it sits in is taken out all the same — and
-    /// the count coming up short is the one error that costs him a directory (see
-    /// [`read_earlier_blocks`]).
-    ///
-    /// The count is per directory, never per block: a block an earlier release
-    /// wrote names the private tools folder the block does not name today, so
-    /// counting blocks would credit a directory with occurrences it never had — and
-    /// one the owner's own environment already supplies would look missing, which
-    /// would add an entry he already has.
+    /// An entry counts when it *names* the directory the way the platform's own lookup reads one
+    /// ([`same_entry`]): absolute or as the `$HOME/<relative>` token today's block writes, with or
+    /// without a trailing separator, through a leading home reference however a hand-edit spells
+    /// it. Counting by exact text would leave a respelled entry counted for nothing while its
+    /// block is taken out all the same, and a count coming up short is what costs him a directory
+    /// (see [`read_earlier_blocks`]). The count is per directory, never per block: an earlier
+    /// block names a folder the block does not name today, so counting blocks would credit a
+    /// directory with occurrences it never had.
     fn add_contributions(
         content: &str,
         regions: &[Range<usize>],
@@ -998,10 +785,8 @@ mod unix {
         }
     }
 
-    /// `entry` with a leading home reference — `$HOME/`, `${HOME}/`, `~/` — replaced
-    /// by the owner's own home, so a body entry a hand-edit respelled still names the
-    /// directory it points at. Anything else, a `$HOME` not followed by a separator
-    /// included, is left as it stands.
+    /// `entry` with a leading home reference — `$HOME/`, `${HOME}/`, `~/` — replaced by the
+    /// owner's own home. Anything else, a `$HOME` not followed by a separator included, stands.
     fn expand_home(entry: &str, home: &Path) -> String {
         for reference in ["$HOME", "${HOME}", "~"] {
             if let Some(rest) = entry.strip_prefix(reference)
@@ -1013,8 +798,7 @@ mod unix {
         entry.to_string()
     }
 
-    /// `content` with the product's own regions taken out; every other byte is
-    /// where it was.
+    /// `content` with the product's own regions taken out.
     fn strip_regions(content: &str, regions: &[Range<usize>]) -> String {
         if regions.is_empty() {
             return content.to_string();
@@ -1029,16 +813,11 @@ mod unix {
         cleaned
     }
 
-    /// Replace `target` with `content` in one atomic step, keeping everything
-    /// about the file that is not its content.
-    ///
-    /// A symlinked configuration file is written through (the owner's dotfiles
-    /// arrangement must not be replaced by a regular file), including a link
-    /// whose destination does not exist yet — see [`resolved_target`] — a missing
-    /// directory is created (fish's `~/.config/fish`), and the write lands on a
-    /// sibling temp file that is renamed over the target — the same filesystem, so
-    /// the rename either happens or does not — carrying the target's own
-    /// permissions so the owner's file mode survives.
+    /// Replace `target` with `content` in one atomic step, keeping everything about the file that
+    /// is not its content. A symlinked configuration file is written through, including a link
+    /// whose destination does not exist yet ([`resolved_target`]), a missing directory is created,
+    /// and the write lands on a sibling temp file renamed over the target, carrying the target's
+    /// own permissions.
     fn write_atomically(target: &Path, content: &str) -> Result<(), String> {
         let resolved = resolved_target(target);
         if let Some(parent) = resolved.parent()
@@ -1054,10 +833,9 @@ mod unix {
         let Some(tmp) = temp_path(&resolved) else {
             return Err("the owner's startup file has no name to write next to".to_string());
         };
-        // Whatever sits at the staging name is a leftover from an interrupted write
-        // — or something else in the owner's own home. Removing it (the link itself,
-        // if it is one, never what it points at) before staging is what keeps a write
-        // from landing through it: the stage is then created anew, never opened.
+        // Whatever sits at the staging name is a leftover from an interrupted write — or something
+        // else in the owner's own home. Removing it (the link itself, never what it points at) is
+        // what keeps a write from landing through it.
         let _ = fs::remove_file(&tmp);
         if let Err(e) = write_temp(&tmp, &resolved, content) {
             let _ = fs::remove_file(&tmp);
@@ -1076,26 +854,22 @@ mod unix {
         Ok(())
     }
 
-    /// The sibling a rewrite stages into before the rename, or `None` when the
-    /// target has no file name to build one from.
+    /// The sibling a rewrite stages into before the rename.
     fn temp_path(resolved: &Path) -> Option<PathBuf> {
         resolved
             .file_name()
             .map(|name| resolved.with_file_name(format!("{}.mahbot_tmp", name.to_string_lossy())))
     }
 
-    /// Remove the temp file an interrupted write may have left beside `target`. The
-    /// next rewrite of that file clears it anyway, but one nothing needs to write
-    /// again would keep it in the owner's home forever.
+    /// Remove the temp file an interrupted write may have left beside `target`.
     fn remove_leftover_temp(target: &Path) {
         if let Some(tmp) = temp_path(&resolved_target(target)) {
             let _ = fs::remove_file(tmp);
         }
     }
 
-    /// The path a write to `target` must land on: whatever a symlink at `target`
-    /// points at — even when that file does not exist yet, so a dangling link is
-    /// filled in rather than replaced by a regular file — or `target` itself.
+    /// The path a write to `target` must land on: whatever a symlink at `target` points at — even
+    /// when that file does not exist yet — or `target` itself.
     fn resolved_target(target: &Path) -> PathBuf {
         let Ok(destination) = fs::read_link(target) else {
             return target.to_path_buf();
@@ -1107,12 +881,9 @@ mod unix {
         fs::canonicalize(&dest).unwrap_or(dest)
     }
 
-    /// The temp file's own write. It is created fresh — never opened — with the
-    /// target's own permissions where there is a target: the rename carries the temp
-    /// file's mode onto the owner's file, and creating it that way means the content
-    /// is never briefly readable by others under the process umask — and, because the
-    /// umask masks what `open` is given, those exact bits are set again before the
-    /// rename.
+    /// The temp file's own write: created fresh, never opened, with the target's own permissions,
+    /// so the content is never briefly readable under the process umask — and, because the umask
+    /// masks what `open` is given, those exact bits are set again before the rename.
     fn write_temp(tmp: &Path, target: &Path, content: &str) -> std::io::Result<()> {
         use std::io::Write as _;
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -1132,10 +903,8 @@ mod unix {
         Ok(())
     }
 
-    /// A failure's reason for the log: the module's own sentence with only the
-    /// I/O kind appended. Never the path and never the `io::Error`'s own
-    /// display, both of which would carry something out of the owner's own files
-    /// and environment.
+    /// A failure's reason for the log: the module's own sentence with only the I/O kind appended.
+    /// Never the path and never the `io::Error`'s display, which carry the owner's own files.
     #[must_use]
     fn io_reason(what: &str, error: &std::io::Error) -> String {
         format!("{what} ({})", error.kind())
@@ -1147,8 +916,7 @@ mod unix {
         use std::ffi::OsString;
         use tempfile::TempDir;
 
-        /// A daemon started by a launcher, rather than from one of the owner's own
-        /// shells, inherits no search path of its own.
+        /// A daemon started by a launcher inherits no search path of its own.
         const NO_INHERITED: &[PathBuf] = &[];
 
         /// Two directories inside a fake home, the shape the block always has.
@@ -1161,8 +929,7 @@ mod unix {
             render("zsh", &home_dirs(home), home).expect("render")
         }
 
-        /// How many times each of `dirs` is named by the product's own blocks in
-        /// `content`, the way the caller counts them.
+        /// How many times each of `dirs` is named by the product's own blocks in `content`.
         fn made(content: &str, dirs: &[PathBuf], home: &Path) -> Vec<usize> {
             let mut counts = vec![0; dirs.len()];
             add_contributions(content, &block_regions(content), dirs, home, &mut counts);
@@ -1173,8 +940,7 @@ mod unix {
             OwnerEnv::new(vec![(OsString::from("PATH"), OsString::from(path))])
         }
 
-        /// The two halves [`run`] runs around the write of the owner's own file —
-        /// [`read_earlier_blocks`] then [`strip_earlier_blocks`] — with what each
+        /// The two halves [`run`] runs around the write of the owner's own file, with what each
         /// file's earlier blocks contributed.
         fn sweep(home: &Path, env: &OwnerEnv, target: &Path, dirs: &[PathBuf]) -> Vec<usize> {
             let mut made = vec![0; dirs.len()];
@@ -1182,8 +948,6 @@ mod unix {
             strip_earlier_blocks(strips);
             made
         }
-
-        // ── planned_content ───────────────────────────────────────────────
 
         /// `planned_content` over content the product has not touched before.
         fn plan(existing: &str, desired: &str) -> Option<String> {
@@ -1199,8 +963,6 @@ mod unix {
                 appended,
                 format!("export FOO=1\n\n{BLOCK_START}\n{desired}\n{BLOCK_END}\n")
             );
-            // The directory is already visible from the owner's own environment,
-            // so nothing is to be written and the file he has is left alone.
             assert_eq!(plan("export FOO=1\n", ""), None);
         }
 
@@ -1212,8 +974,6 @@ mod unix {
             let stale = block_text("export PATH=\"$PATH:$HOME/.mahbot/bin\"");
             let expected = format!("export FOO=1\n{fresh}");
 
-            // A block naming the product's old private tools folder is replaced
-            // with the correct one, and the owner's own line is untouched.
             let replaced = plan(&format!("export FOO=1\n{stale}"), &desired).expect("rewrite");
             assert_eq!(replaced, expected);
             assert!(
@@ -1221,7 +981,6 @@ mod unix {
                 "the private tools folder is gone"
             );
 
-            // Two copies of the block collapse to exactly one.
             let collapsed =
                 plan(&format!("export FOO=1\n{fresh}{fresh}"), &desired).expect("collapse");
             assert_eq!(collapsed, expected);
@@ -1232,19 +991,12 @@ mod unix {
             let home = Path::new("/home/o");
             let desired = block_body(home);
             let stale = block_text("export PATH=\"$PATH:$HOME/.mahbot/bin\"");
-            // Nothing is to be added — the owner's own environment gives him both
-            // directories — and a block the product left behind (here the one
-            // naming its old private tools folder) is not kept either.
             assert_eq!(
                 plan(&format!("export FOO=1\n{stale}"), ""),
                 Some("export FOO=1\n".to_string())
             );
-            // The same when what it left behind is the correct block: a block the
-            // owner does not need is not one he has to carry.
             let with_block = format!("export FOO=1\n{}", block_text(&desired));
             assert_eq!(plan(&with_block, ""), Some("export FOO=1\n".to_string()));
-            // While a block that is needed and already exactly right stays: the
-            // file is what it must be, with the owner's own bytes around it.
             assert_eq!(plan(&with_block, &desired), None);
         }
 
@@ -1252,9 +1004,6 @@ mod unix {
         fn planned_content_round_trips_the_owners_file_and_is_idempotent() {
             let home = Path::new("/home/o");
             let desired = block_body(home);
-            // A file whose last line has no newline, and one that ends in one:
-            // both come back with their own bytes, the missing newline being the
-            // one byte the block's own leading newline has to close.
             for (original, restored) in [
                 ("export FOO=1\n", "export FOO=1\n"),
                 ("export FOO=1", "export FOO=1\n"),
@@ -1262,12 +1011,9 @@ mod unix {
                 let written = plan(original, &desired).expect("append");
                 let cleaned = strip_regions(&written, &block_regions(&written));
                 assert_eq!(cleaned, restored);
-                // A second pass over what was written has nothing left to do.
                 assert_eq!(plan(&written, &desired), None);
             }
         }
-
-        // ── render ────────────────────────────────────────────────────────
 
         #[test]
         fn render_writes_the_posix_and_the_fish_form() {
@@ -1286,15 +1032,8 @@ mod unix {
         #[test]
         fn render_refuses_a_directory_outside_the_owners_home_and_unwritable_bytes() {
             let home = Path::new("/home/o");
-            // A directory of another home — the state a `$HOME` that is set but is
-            // not a directory leaves the product in, where the shell is read from
-            // the passwd home while the tools resolve under the `$HOME` it names —
-            // is refused rather than written into this home's own file.
             assert!(render("zsh", &[PathBuf::from("/opt/tools/bin")], home).is_err());
 
-            // A `\` escapes the closing quote of the posix form, `:` would split off
-            // a second, relative entry, and the rest are bytes a shell would
-            // interpret inside the line.
             for unsafe_dir in [
                 "/home/o/a\"b",
                 "/home/o/a`b",
@@ -1306,8 +1045,6 @@ mod unix {
                 let dirs = vec![PathBuf::from(unsafe_dir)];
                 assert!(render("zsh", &dirs, home).is_err(), "{unsafe_dir}");
             }
-            // fish's body is unquoted, so a space would split the directory in
-            // two there — while the posix form quotes the line and keeps it.
             let spaced = vec![PathBuf::from("/home/o/a b")];
             assert!(render("fish", &spaced, home).is_err());
             assert_eq!(
@@ -1316,15 +1053,12 @@ mod unix {
             );
         }
 
-        // ── the visibility decision ──────────────────────────────────────
-
         #[test]
         fn a_directory_is_visible_only_beyond_what_the_block_contributed() {
             let home = Path::new("/home/o");
             let local = home.join(".local/bin");
             let bun = home.join(".bun/bin");
 
-            // One directory is in his path, the other is not.
             assert!(dir_missing(
                 &env_with_path("/home/o/.local/bin:/usr/bin"),
                 &bun,
@@ -1336,27 +1070,20 @@ mod unix {
                 0
             ));
 
-            // The block appended both directories, so its own occurrence of each
-            // is not the owner's.
             let both = env_with_path("/usr/bin:/home/o/.local/bin:/home/o/.bun/bin");
             assert!(dir_missing(&both, &local, 1));
             assert!(dir_missing(&both, &bun, 1));
 
-            // Two appends contributed two of each.
             let doubled =
                 env_with_path("/usr/bin:/home/o/.local/bin:/home/o/.bun/bin:/home/o/.bun/bin");
             assert!(dir_missing(&doubled, &bun, 2));
             assert!(!dir_missing(&doubled, &bun, 1));
 
-            // He has his own entry for the runtime in addition to the block's, so
-            // that one is visible; the other directory has only the block's and is
-            // not.
             let mixed =
                 env_with_path("/home/o/.bun/bin:/usr/bin:/home/o/.local/bin:/home/o/.bun/bin");
             assert!(!dir_missing(&mixed, &bun, 1));
             assert!(dir_missing(&mixed, &local, 1));
 
-            // No `PATH` at all is nothing visible.
             assert!(dir_missing(&OwnerEnv::new(Vec::new()), &local, 0));
         }
 
@@ -1366,7 +1093,6 @@ mod unix {
             let home = dir.path().join("home");
             fs::create_dir_all(&home).expect("mkdir home");
             let dirs = home_dirs(&home);
-            // His own file puts `~/.local/bin` on his path; nothing else does.
             let env = env_with_path(&format!("{}/.local/bin:/usr/bin", home.display()));
             fs::write(home.join(".zshrc"), "export A=1\n").expect("write");
 
@@ -1380,15 +1106,10 @@ mod unix {
                     "export A=1\n\n{BLOCK_START}\nexport PATH=\"$PATH:$HOME/.bun/bin\"\n{BLOCK_END}\n"
                 )
             );
-            // Exactly what it must be: the next run writes nothing at all.
             assert!(matches!(
                 run("zsh", &home, &env, NO_INHERITED, &dirs).expect("run"),
                 Written::Nothing
             ));
-            // A body he hand-edited into a spelling the product's own writing still
-            // recognises is not an addition: the directory it names was already on
-            // his search path through that block, so the write only brings the block
-            // back to the current spelling and is reported as the removal it is.
             fs::write(
                 home.join(".zshrc"),
                 format!(
@@ -1407,8 +1128,6 @@ mod unix {
                 run("zsh", &home, &env, NO_INHERITED, &dirs).expect("run"),
                 Written::Nothing
             ));
-            // Nothing to name renders nothing: an empty body would put the current
-            // directory on the owner's path.
             assert_eq!(render("zsh", &[], &home).expect("render"), "");
             assert_eq!(render("fish", &[], &home).expect("render"), "");
         }
@@ -1422,20 +1141,11 @@ mod unix {
             let with_block = format!("export MINE=1\n{}", block_text(&block_body(&home)));
             fs::write(home.join(".zshrc"), &with_block).expect("write");
 
-            // The owner starts the product from a terminal of his own, so the daemon
-            // is started with his search path — which the block in that same file
-            // already contributes to. The read's shell then applies the block on top
-            // of it: each directory is in the read's `PATH` twice, while the block
-            // accounts for one of them, and the other is the shell that started the
-            // daemon, not the owner. The block stays, and this write is no write at
-            // all.
             let path = format!(
                 "{local}:{bun}:{local}:{bun}",
                 local = home.join(".local/bin").display(),
                 bun = home.join(".bun/bin").display()
             );
-            // The daemon's own search path as the shell that started it left it: one
-            // entry for each of the two, put there by that same block.
             let inherited = home_dirs(&home);
             assert!(matches!(
                 run("zsh", &home, &env_with_path(&path), &inherited, &dirs).expect("run"),
@@ -1446,9 +1156,6 @@ mod unix {
                 with_block
             );
 
-            // An occurrence neither the block nor the daemon's own path explains is
-            // the owner's own: the same environment started with an empty path means
-            // his own files give him both directories, so the block goes.
             assert!(matches!(
                 run("zsh", &home, &env_with_path(&path), NO_INHERITED, &dirs).expect("run"),
                 Written::Removed
@@ -1464,21 +1171,12 @@ mod unix {
             let home = Path::new("/home/o");
             let dirs = home_dirs(home);
 
-            // The shape the owner's own file has: a block an earlier release wrote,
-            // naming the private tools folder and the runtime's directory — by
-            // absolute path, the spelling every earlier release wrote and the one
-            // no block writes today. It contributed nothing to `~/.local/bin`,
-            // which his own environment supplies, so counting its blocks instead of
-            // its directories would judge that one missing and add an entry he
-            // already has.
             let earlier = format!(
                 "export FOO=1\n{}",
                 block_text("export PATH=\"$PATH:/home/o/.mahbot/bin:/home/o/.bun/bin\"")
             );
             assert_eq!(made(&earlier, &dirs, home), vec![0, 1]);
 
-            // Today's own spelling reads the same way, and a block naming one of
-            // the two contributes nothing to the other.
             let current = block_text(&block_body(home));
             assert_eq!(made(&current, &dirs, home), vec![1, 1]);
             let one = format!(
@@ -1487,20 +1185,11 @@ mod unix {
             );
             assert_eq!(made(&one, &dirs, home), vec![0, 1]);
 
-            // Two blocks contribute one each per block, and fish's own form reads
-            // the same way.
             let doubled = format!("{current}{current}");
             assert_eq!(made(&doubled, &dirs, home), vec![2, 2]);
             let fish = block_text("set -gx PATH $PATH $HOME/.local/bin $HOME/.bun/bin");
             assert_eq!(made(&fish, &dirs, home), vec![1, 1]);
 
-            // A spelling the product never wrote still names the directory it is: a
-            // block is taken out by its shape rather than by what its body says
-            // ([`block_regions`]), so an entry respelled inside one — a trailing
-            // separator, the absolute path where today's token belongs, the home
-            // reference in the shells' own `~` or braces form — has to count as well,
-            // or a directory that block was the only source of would be dropped with
-            // it.
             let respelled = block_text("export PATH=\"$PATH:$HOME/.local/bin/:$HOME/.bun/bin\"");
             assert_eq!(made(&respelled, &dirs, home), vec![1, 1]);
             let absolute_separated =
@@ -1508,13 +1197,9 @@ mod unix {
             assert_eq!(made(&absolute_separated, &dirs, home), vec![1, 1]);
             let braces = block_text("export PATH=\"$PATH:${HOME}/.local/bin:~/.bun/bin\"");
             assert_eq!(made(&braces, &dirs, home), vec![1, 1]);
-            // What no spelling of the product's reaches — a directory the shell itself
-            // computes — counts for nothing, which is the one direction the count can
-            // still come up short in.
             let computed = block_text("export PATH=\"$PATH:$HOME/.$(echo local)/bin\"");
             assert_eq!(made(&computed, &dirs, home), vec![0, 0]);
 
-            // Nothing of the product's own in the file, nothing contributed.
             assert_eq!(made("export FOO=1\n", &dirs, home), vec![0, 0]);
         }
 
@@ -1526,8 +1211,6 @@ mod unix {
             let zshrc = home.join(".zshrc");
             let bashrc = home.join(".bashrc");
             let dirs = home_dirs(&home);
-            // What an earlier release appended: the private tools folder and the
-            // runtime's directory, by absolute path.
             let stale = block_text(&format!(
                 "export PATH=\"$PATH:{}/.mahbot/bin:{}/.bun/bin\"",
                 home.display(),
@@ -1537,11 +1220,6 @@ mod unix {
             fs::write(&bashrc, format!("export A=1\n{stale}export B=2\n")).expect("write bashrc");
             let env = OwnerEnv::new(Vec::new());
 
-            // The block is taken out of the file it sits in and the runtime's
-            // directory is counted as one the product put on the search path —
-            // whether or not the shell of today really reads that file is not
-            // knowable, and counting it and taking it out together is what keeps
-            // that approximation harmless.
             let made = sweep(&home, &env, &zshrc, &dirs);
             assert_eq!(
                 fs::read_to_string(&bashrc).expect("read bashrc"),
@@ -1552,13 +1230,8 @@ mod unix {
                 "export MINE=1\n"
             );
             assert_eq!(made, vec![0, 1]);
-            // A second pass has nothing left to take out, because the block is
-            // gone rather than because the file is not looked at.
             assert_eq!(sweep(&home, &env, &zshrc, &dirs), vec![0, 0]);
 
-            // The same block in the file of the shell whose own profile sources
-            // `.bashrc`: the runtime's directory is one it put on the owner's path,
-            // so the count has to account for it.
             fs::write(&bashrc, format!("export A=1\n{stale}export B=2\n")).expect("write bashrc");
             assert_eq!(
                 sweep(&home, &env, &home.join(".bash_profile"), &dirs),
@@ -1570,14 +1243,11 @@ mod unix {
             );
         }
 
-        /// The reachable shape of "no file the product can write": an interactive
-        /// POSIX shell reads the file `$ENV` names, so on this side of the platform
-        /// one that names nothing leaves it none — the reader only ever reads a
-        /// shell it knows, so an unknown shell is not a shape that reaches `run`.
-        /// An earlier block may be the only thing keeping a directory on his search
-        /// path, so nothing is taken out anywhere and the reason is recorded
-        /// instead. (On the other side of the platform the same property is pinned
-        /// by the test below: every refusal precedes the reads, whichever one it is.)
+        /// The reachable shape of "no file the product can write": an interactive POSIX shell
+        /// reads the file `$ENV` names, so one that names nothing leaves it none. An earlier block
+        /// may be the only thing keeping a directory on his search path, so nothing is taken out
+        /// anywhere. (On the other side of the platform the same property is pinned by the test
+        /// below: every refusal precedes the reads, whichever one it is.)
         #[cfg(not(target_os = "macos"))]
         #[test]
         fn a_shell_with_no_startup_file_the_product_can_write_keeps_every_block() {
@@ -1608,13 +1278,6 @@ mod unix {
 
         #[test]
         fn a_block_that_cannot_be_rendered_leaves_the_other_files_alone() {
-            // The state a `$HOME` that is set but is not a directory produces: the
-            // product's own directories are resolved from that `$HOME` value, while
-            // the file the block belongs in is under a home that really is a
-            // directory — the passwd home, when `$HOME` is not — so no block can be
-            // written into this home's file. Taking the earlier blocks out of the
-            // other files first would leave him without the directory they were
-            // keeping on his search path.
             let dir = TempDir::new().expect("tempdir");
             let home = dir.path().join("home");
             fs::create_dir_all(&home).expect("mkdir home");
@@ -1637,9 +1300,6 @@ mod unix {
 
         #[test]
         fn todays_own_file_is_not_swept_as_another_shells_file() {
-            // `ZDOTDIR=$HOME/.config/zsh` with `~/.zshrc` symlinked into it is one
-            // startup file: sweeping the plain spelling as "another file" would take
-            // today's own block out on every read and let the append put it back.
             let dir = TempDir::new().expect("tempdir");
             let home = dir.path().join("home");
             let zdot = home.join(".config").join("zsh");
@@ -1684,8 +1344,6 @@ mod unix {
             )]);
             let dirs = home_dirs(&home);
             let stale = block_text("export PATH=\"$PATH:$HOME/.mahbot/bin\"");
-            // The plain `~/.zshrc` is the file an earlier release always wrote, so
-            // it is swept even though zsh reads `$ZDOTDIR/.zshrc` today.
             fs::write(home.join(".zshrc"), format!("export A=1\n{stale}")).expect("write zshrc");
             fs::write(zdot.join(".zshrc"), "export MINE=1\n").expect("write zdot zshrc");
 
@@ -1704,8 +1362,6 @@ mod unix {
                 "export MINE=1\n"
             );
         }
-
-        // ── write_atomically ──────────────────────────────────────────────
 
         #[test]
         fn write_atomically_creates_a_missing_parent_directory() {
@@ -1765,8 +1421,6 @@ mod unix {
             let link = dir.path().join(".zshrc");
             std::os::unix::fs::symlink(&real, &link).expect("symlink");
 
-            // The destination does not exist yet: the link is filled in rather
-            // than replaced by a regular file.
             write_atomically(&link, "new").expect("write");
             assert!(
                 fs::symlink_metadata(&link)
@@ -1781,9 +1435,6 @@ mod unix {
         #[cfg(unix)]
         #[test]
         fn a_leftover_temp_file_is_removed() {
-            // An interrupted write leaves `<startup-file>.mahbot_tmp` beside it, and
-            // a file nothing needs to write again would keep it in the owner's home
-            // for good.
             let dir = TempDir::new().expect("tempdir");
             let target = dir.path().join(".zshrc");
             fs::write(&target, "export MINE=1\n").expect("write zshrc");
@@ -1792,15 +1443,11 @@ mod unix {
 
             remove_leftover_temp(&target);
             assert!(!tmp.exists());
-            // The owner's own file is not what is removed.
             assert_eq!(
                 fs::read_to_string(&target).expect("read zshrc"),
                 "export MINE=1\n"
             );
 
-            // The staging name is removed as a link rather than written through: a
-            // symlink planted at it is gone afterwards, the file it pointed at is
-            // untouched, and the write lands on the target.
             let elsewhere = dir.path().join("elsewhere");
             fs::write(&elsewhere, "his own file").expect("write elsewhere");
             std::os::unix::fs::symlink(&elsewhere, &tmp).expect("symlink temp");
@@ -1821,9 +1468,6 @@ mod unix {
         fn a_write_that_cannot_land_leaves_the_earlier_blocks_in_place() {
             use std::os::unix::fs::PermissionsExt as _;
 
-            // His own file cannot be replaced (the directory holding it is read-only
-            // for him), so the earlier block of another file — and the directory it
-            // is the only source of — must still be there when the sync is over.
             let dir = TempDir::new().expect("tempdir");
             let home = dir.path().join("home");
             fs::create_dir_all(&home).expect("mkdir home");
@@ -1854,8 +1498,6 @@ mod unix {
             fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).expect("chmod back");
         }
 
-        // ── target_file ───────────────────────────────────────────────────
-
         #[test]
         fn target_file_maps_the_shells_whose_startup_file_is_known() {
             let dir = TempDir::new().expect("tempdir");
@@ -1871,9 +1513,6 @@ mod unix {
                 target_file("fish", &home, &env).expect("fish"),
                 home.join(".config/fish/config.fish")
             );
-            // fish reads its config from its own configuration directory, which
-            // `$XDG_CONFIG_HOME` moves when the owner has set it; an empty value
-            // is no setting at all.
             let moved = OwnerEnv::new(vec![(
                 OsString::from("XDG_CONFIG_HOME"),
                 home.join("cfg").into_os_string(),
@@ -1887,8 +1526,6 @@ mod unix {
                 target_file("fish", &home, &empty).expect("fish"),
                 home.join(".config/fish/config.fish")
             );
-            // A shell whose startup file the product does not know is refused
-            // rather than guessed at.
             assert!(target_file("csh", &home, &env).is_err());
             assert!(target_file("tcsh", &home, &env).is_err());
 
@@ -1897,7 +1534,6 @@ mod unix {
                     target_file("bash", &home, &env).expect("bash"),
                     home.join(".bash_profile")
                 );
-                // The first of the login profile files that exists wins.
                 fs::write(home.join(".profile"), "").expect("write profile");
                 assert_eq!(
                     target_file("bash", &home, &env).expect("bash"),
@@ -1922,13 +1558,10 @@ mod unix {
                 zdot.clone().into_os_string(),
             )]);
 
-            // zsh reads its rc files from `$ZDOTDIR`, so the block goes there
-            // rather than into a `~/.zshrc` his terminal never reads.
             assert_eq!(
                 target_file("zsh", &home, &env).expect("zsh"),
                 zdot.join(".zshrc")
             );
-            // An empty variable is no setting at all.
             let empty = OwnerEnv::new(vec![(OsString::from("ZDOTDIR"), OsString::new())]);
             assert_eq!(
                 target_file("zsh", &home, &empty).expect("zsh"),
@@ -1943,8 +1576,6 @@ mod unix {
             fs::create_dir_all(&home).expect("mkdir home");
 
             if cfg!(target_os = "macos") {
-                // The POSIX shells read `~/.profile` there, never bash's own
-                // login profile files.
                 assert_eq!(
                     target_file("sh", &home, &OwnerEnv::new(Vec::new())).expect("sh"),
                     home.join(".profile")
@@ -1954,8 +1585,6 @@ mod unix {
                     home.join(".profile")
                 );
             } else {
-                // Without `$ENV` an interactive POSIX shell reads no startup file
-                // the product can write.
                 assert!(target_file("sh", &home, &OwnerEnv::new(Vec::new())).is_err());
                 let startup = dir.path().join("startup");
                 fs::write(&startup, "").expect("write startup");
@@ -1972,13 +1601,10 @@ mod unix {
             let home = Path::new("/home/o");
             let body = block_body(home);
             let block = block_text(&body);
-            // Two whole appends: each is one region, and the product's own bytes
-            // come back exactly.
             let doubled = format!("{block}{block}");
             assert_eq!(block_regions(&doubled).len(), 2);
             assert_eq!(strip_regions(&doubled, &block_regions(&doubled)), "");
 
-            // A start marker no end marker closes is not a region at all.
             let unclosed = format!("export KEEP=1\n{BLOCK_START}\nexport KEEP=2\n");
             assert!(block_regions(&unclosed).is_empty());
             assert_eq!(
@@ -1986,20 +1612,12 @@ mod unix {
                 unclosed
             );
 
-            // A stray start marker above a real append: the run it opens holds one
-            // of the owner's own lines, so it is not the product's own shape and
-            // the only region taken out is the append's own.
             let stray = format!("{BLOCK_START}\nexport KEEP=1\n{block}");
             assert_eq!(
                 strip_regions(&stray, &block_regions(&stray)),
                 format!("{BLOCK_START}\nexport KEEP=1\n")
             );
 
-            // Two appends with one of the owner's own lines between them, the
-            // second marker written directly on that line (the shape an older
-            // append left, or his own edit): both blocks go and every one of his
-            // lines stays whole — the newline that ends his line is his, never
-            // the second append's to take.
             let between = format!(
                 "export A=1\n{block}export B=2\n{BLOCK_START}\n{body}\n{BLOCK_END}\nexport C=3\n"
             );
@@ -2013,23 +1631,16 @@ mod unix {
         fn block_regions_never_take_a_pair_the_owner_wrote() {
             let home = Path::new("/home/o");
             let body = block_body(home);
-            // A start marker he never closed, one of his own lines, a stray end
-            // marker: no pair of the product's own, so nothing of his is touched.
             let owned = format!("{BLOCK_START}\nexport KEEP=1\n{BLOCK_END}\n");
             assert!(block_regions(&owned).is_empty());
             assert_eq!(strip_regions(&owned, &block_regions(&owned)), owned);
 
-            // The marker opens, one of his own lines follows and then a
-            // body-shaped line: two lines between the markers, so the run is his
-            // and every one of his bytes stays.
             let his_then_body = format!("{BLOCK_START}\nexport KEEP=1\n{body}\n{BLOCK_END}\n");
             assert!(block_regions(&his_then_body).is_empty());
             assert_eq!(
                 strip_regions(&his_then_body, &block_regions(&his_then_body)),
                 his_then_body
             );
-            // The same shape with the order swapped — a body-shaped line first,
-            // his own line second — is still two lines and still his.
             let body_then_his = format!("{BLOCK_START}\n{body}\nexport KEEP=1\n{BLOCK_END}\n");
             assert!(block_regions(&body_then_his).is_empty());
             assert_eq!(
@@ -2037,13 +1648,9 @@ mod unix {
                 body_then_his
             );
 
-            // A genuine single-body append is still the product's own and still
-            // goes whole.
             let genuine = block_text(&block_body(home));
             assert_eq!(strip_regions(&genuine, &block_regions(&genuine)), "");
 
-            // A real append above one of his pairs is still the product's own and
-            // still goes, leaving his pair exactly as it was.
             let with_append = format!("{}{owned}", block_text(&block_body(home)));
             assert_eq!(
                 strip_regions(&with_append, &block_regions(&with_append)),
@@ -2051,12 +1658,9 @@ mod unix {
             );
         }
 
-        /// `install.sh` writes this product's own block and the product then keeps it
-        /// in step, so the two must spell it the same way: markers byte for byte, and
-        /// a body line this module reads back naming exactly the folder the product's
-        /// update moves itself into. A drift either way leaves a second block beside
-        /// the first, or one naming a folder the product never uses, and nothing else
-        /// in the tree would say so.
+        /// `install.sh` writes this product's own block and the product then keeps it in step,
+        /// so the two must spell it the same way: markers byte for byte, and a body line this
+        /// module reads back naming the folder the product's update moves itself into.
         #[test]
         fn the_install_script_writes_the_product_s_own_block() {
             let script =
@@ -2071,11 +1675,6 @@ mod unix {
                 script.contains(&format!("BLOCK_END='{BLOCK_END}'")),
                 "install.sh's closing marker: {BLOCK_END}"
             );
-            // The script recognises a body line with these openings and this closing
-            // (see its `holds_block`), and that recognition must be the product's own:
-            // a body line it does not recognise is a block the product would not take
-            // out, and a second one beside it would sit on the owner's search path for
-            // good.
             assert!(
                 script.contains(&format!("SH_BODY_PREFIX='{SH_BODY_PREFIX}'")),
                 "install.sh's body-line opening: {SH_BODY_PREFIX}"
@@ -2089,10 +1688,6 @@ mod unix {
                 "install.sh's fish body-line opening: {FISH_BODY_PREFIX}"
             );
 
-            // The script's own body lines, read back the way this module reads its own
-            // blocks: each must be a line it recognises, and the folder it names — with
-            // its home reference expanded — must be the product's own install
-            // directory, which is also where the product puts itself.
             let home = directories::UserDirs::new().expect("a home directory");
             let home = home.home_dir();
             let install = crate::util::managed_bin::mahbot_install_dir().expect("a home directory");
@@ -2119,12 +1714,8 @@ mod unix {
     }
 }
 
-// ── The failure bookkeeping both platforms share ──────────────────────────
-
-/// The reasons one sync records are compared against the sync before it — the
-/// bookkeeping [`FAILURES`], [`begin_sync`], [`end_sync`] and [`record_failure`]
-/// hold for both platforms — so it is exercised here rather than from either
-/// platform's own tests.
+/// The reasons one sync records are compared against the sync before it — the bookkeeping
+/// both platforms share — so it is exercised here.
 #[cfg(all(test, any(unix, windows)))]
 mod failure_tests {
     use super::{FAILURES, begin_sync, end_sync, record_failure};
@@ -2137,56 +1728,34 @@ mod failure_tests {
             FAILURES.lock().unwrap_poison().previous.clone()
         }
 
-        // One sync can fail on more than one file — on unix, the file his own shell
-        // reads and the other files the product may have left a block in: every
-        // reason it records is kept for the next sync to compare against, including
-        // the ones recorded before a later step of the same sync went well.
         begin_sync();
         record_failure("the first reason");
         record_failure("the second reason");
         end_sync();
         assert_eq!(recorded(), vec!["the first reason", "the second reason"]);
 
-        // The next sync recording the same reason again compares against exactly
-        // those, so it is not warned about a second time...
         begin_sync();
         record_failure("the first reason");
         end_sync();
         assert_eq!(recorded(), vec!["the first reason"]);
 
-        // ...while a sync that goes well clears them, so a failure that comes
-        // back is reported again.
         begin_sync();
         end_sync();
         assert!(recorded().is_empty());
     }
 }
 
-// ── Windows: the entries of the owner's own `Path` value ──────────────────
-
-/// The `Path` value the owner's own environment must end up holding, or `None`
-/// when the value already is what it must be. Pure text work — the registry read
-/// and write stay outside — so these rules hold on every host and can be tested
-/// on one.
+/// The `Path` value the owner's own environment must end up holding, or `None` when the value
+/// already is what it must be. Pure text work, so these rules hold on every host.
 ///
-/// Each of the product's own directories keeps its first entry where it is and
-/// loses every later one, so the owner's own order is never changed and no
-/// directory is named twice. A directory with no entry at all is added as the
-/// literal path the platform resolved, but only when his own environment carries
-/// it from nowhere else: what an entry of this value already gives him is never
-/// counted as his own.
-///
-/// `raw` is the value as the key holds it — split the Windows way, because that
-/// is what reads it — or `None` when the key holds no value there at all. The two
-/// are not the same state: a value that is not there holds no entries of the
-/// owner's, so the one the product writes names only the directories it names and
-/// no empty entry may appear in it, while a value that is there keeps the empty
-/// entries it has, because an empty entry names the current directory and that is
-/// his own arrangement rather than ours to tidy.
-///
-/// The [`Written`] says whether the write puts one of the product's own
-/// directories on his search path or only takes the product's own duplicates out
-/// of it — what the audit line tells apart.
+/// Each of the product's own directories keeps its first entry where it is and loses every later
+/// one, so his order is never changed and no directory is named twice; a directory with no entry
+/// is added as the literal path the platform resolved, but only when his own environment carries
+/// it from nowhere else. `raw` is the value as the key holds it, or `None` when the key holds no
+/// value at all — the two are not the same state, because a value that is there keeps the empty
+/// entries it has (an empty entry names the current directory, his own arrangement). The
+/// [`Written`] says whether the write puts a directory on his search path or only takes the
+/// product's own duplicates out.
 #[cfg(any(windows, test))]
 fn planned_path_value(
     raw: Option<&str>,
@@ -2198,8 +1767,8 @@ fn planned_path_value(
     let mut kept: Vec<&str> = Vec::with_capacity(entries.len());
     let mut present = vec![false; dirs.len()];
     for entry in entries {
-        // The first entry naming one of the directories stays where it is (with the
-        // spelling the owner gave it); every later one is a duplicate.
+        // The first entry naming one of the directories stays where it is; every later one is a
+        // duplicate.
         if let Some(index) = dirs.iter().position(|dir| entry_names(entry, dir, env))
             && std::mem::replace(&mut present[index], true)
         {
@@ -2210,18 +1779,15 @@ fn planned_path_value(
 
     let mut written = Written::Removed;
     let mut value = kept.join(";");
-    // Whether the value already holds an entry: the owner's own entries are always
-    // still there — an empty one he holds included, which he is appended to rather
-    // than written over — while a key holding no value has none, and there the
-    // value starts at the first directory named, with no separator and so no empty
-    // entry in front of it.
+    // Whether the value already holds an entry: the owner's own entries are always still there —
+    // an empty one included, which he is appended to rather than written over — while a key
+    // holding no value has none.
     let mut holds_an_entry = !kept.is_empty();
     for (index, dir) in dirs.iter().enumerate() {
         if present[index] || !dir_missing(env, dir, 0) {
             continue;
         }
-        // `%` expands and `;` splits the entry the owner's environment reads, so
-        // a directory holding either would not name itself once written.
+        // `%` expands and `;` splits the entry the owner's environment reads.
         let text = dir.to_string_lossy();
         if text.contains(['%', ';']) {
             return Err(UNSAFE_DIRECTORY.to_string());
@@ -2233,9 +1799,8 @@ fn planned_path_value(
         holds_an_entry = true;
         written = Written::Added;
     }
-    // What the value was, absence included: a key holding none, with nothing to
-    // add, is left alone — writing would create an empty value, which is exactly
-    // the entry the product must never put on his search path.
+    // What the value was, absence included: a key holding none with nothing to add is left alone,
+    // because writing would create exactly the empty entry the product must never leave behind.
     let changed = match raw {
         Some(raw) => value != raw,
         None => !value.is_empty(),
@@ -2243,13 +1808,10 @@ fn planned_path_value(
     Ok(changed.then_some((value, written)))
 }
 
-/// Whether a raw `Path` entry names `dir`: compared the way that platform's own
-/// lookup compares them (case-insensitively, ignoring a trailing separator), and
-/// with the references the entry contains resolved from the owner's own
-/// environment — which is what the platform does to the entry before it uses it,
-/// and what the helper's own installer does before it compares one. Only ever used
-/// to recognise an entry: a reference the owner's value holds is never written out
-/// expanded.
+/// Whether a raw `Path` entry names `dir`: compared the way that platform's own lookup compares
+/// them, with the references the entry contains resolved from the owner's own environment — what
+/// the platform and the helper's own installer do before using or comparing one. Only ever used
+/// to recognise an entry: a reference is never written out expanded.
 #[cfg(any(windows, test))]
 #[must_use]
 fn entry_names(entry: &str, dir: &Path, env: &OwnerEnv) -> bool {
@@ -2257,9 +1819,8 @@ fn entry_names(entry: &str, dir: &Path, env: &OwnerEnv) -> bool {
         || same_entry_windows(Path::new(&resolve_references(entry, env)), dir)
 }
 
-/// `text` with every `%NAME%` the owner's environment defines replaced by its
-/// value. A `%` without a partner, and a name the environment does not define, are
-/// left as they stand — exactly as the platform's own expansion leaves them.
+/// `text` with every `%NAME%` the owner's environment defines replaced by its value. A `%`
+/// without a partner, and an undefined name, are left as they stand.
 #[cfg(any(windows, test))]
 #[must_use]
 fn resolve_references(text: &str, env: &OwnerEnv) -> String {
@@ -2279,8 +1840,6 @@ fn resolve_references(text: &str, env: &OwnerEnv) -> String {
             out.push_str(&value);
             rest = &after[name.len() + 1..];
         } else {
-            // Not a reference this environment defines: the `%` is a byte of the
-            // text, and the scan continues after it.
             out.push_str(&rest[..=start]);
             rest = after;
         }
@@ -2289,12 +1848,8 @@ fn resolve_references(text: &str, env: &OwnerEnv) -> String {
     out
 }
 
-// ── Windows: the `Path` value in the owner's own environment key ──────────
-
-/// Windows has no startup file to append to. The owner's own `Path` value lives
-/// in his own environment key, which is the place `setx` writes and the place a
-/// terminal opened afterwards reads — so that value is what the product edits,
-/// as a list of the directories that made it up.
+/// Windows has no startup file to append to: the owner's own `Path` value lives in his
+/// environment key, which is the place `setx` writes and a terminal opened afterwards reads.
 #[cfg(windows)]
 mod windows {
     use std::path::PathBuf;
@@ -2311,22 +1866,18 @@ mod windows {
     use super::{OwnerEnv, PATH_VISIBLE_MESSAGE, Written, planned_path_value, record_failure};
     use crate::util::registry::{os_reason, utf16_text, wide};
 
-    /// The per-user environment key `setx` writes and the system reads the
-    /// owner's own environment from. The machine-wide environment is deliberately
-    /// left alone: nothing here is the owner's own unless it is per-user.
+    /// The per-user environment key. The machine-wide environment is deliberately left alone:
+    /// nothing here is the owner's own unless it is per-user.
     const ENVIRONMENT_KEY: &str = "Environment";
 
-    /// The value name. The registry spells it `Path`, and value names are
-    /// case-insensitive there anyway.
+    /// The value name, spelled `Path`; value names are case-insensitive there anyway.
     const PATH_NAME: &str = "Path";
 
-    /// How long the change broadcast waits for one window to answer. Generous for
-    /// a running program that is busy, and bounded so a hung one cannot hold the
-    /// reader.
+    /// How long the change broadcast waits for one window to answer: generous for a busy program,
+    /// bounded so a hung one cannot hold the reader.
     const BROADCAST_TIMEOUT_MS: u32 = 5_000;
 
-    /// The owner's own `Path` value as the key holds it: its type and its raw
-    /// text.
+    /// The owner's own `Path` value as the key holds it: its type and its raw text.
     struct RawValue {
         kind: REG_VALUE_TYPE,
         text: String,
@@ -2335,9 +1886,8 @@ mod windows {
     /// Bring the owner's own `Path` value in line with `dirs`.
     pub(super) fn sync(env: &OwnerEnv, dirs: &[PathBuf]) {
         match run(env, dirs) {
-            // A write into the owner's own environment happens once, when the
-            // value is first needed or has to change, so recording it is the audit
-            // line for a change to his environment rather than per-start noise.
+            // A write into his own environment happens once, when the value is first needed or has
+            // to change, so this is the audit line for a change to it.
             Ok(Written::Added) => {
                 tracing::info!("{PATH_VISIBLE_MESSAGE}");
             }
@@ -2352,8 +1902,7 @@ mod windows {
         }
     }
 
-    /// Read the value, decide what it must become, and store it — with the key
-    /// closed on every path out, including the failing ones.
+    /// Read the value, decide what it must become, and store it — the key closed on every path out.
     fn run(env: &OwnerEnv, dirs: &[PathBuf]) -> Result<Written, String> {
         let key = open_key()?;
         let outcome = match plan(key, env, dirs) {
@@ -2390,14 +1939,9 @@ mod windows {
         Ok(key)
     }
 
-    /// The value the key must end up holding — its type and its text — or `None`
-    /// when the value already is what it must be.
-    ///
-    /// The type is the one the owner's value already has, so a value that is
-    /// `REG_EXPAND_SZ` stays one and a reference he adds later still expands; a
-    /// value that is not there yet gets the type the system's own writers give it.
-    /// The text itself comes from [`planned_path_value`], which never expands a
-    /// reference out of the owner's own entries.
+    /// The value the key must end up holding — its type and its text — or `None` when the value
+    /// already is what it must be. The type is the one the owner's value already has, so a
+    /// `REG_EXPAND_SZ` stays one and a reference he adds later still expands.
     fn plan(key: HKEY, env: &OwnerEnv, dirs: &[PathBuf]) -> Result<Option<Planned>, String> {
         let current = query_value(key)?;
         let kind = current.as_ref().map_or(REG_EXPAND_SZ, |value| value.kind);
@@ -2416,16 +1960,12 @@ mod windows {
         kind: REG_VALUE_TYPE,
         /// The value's new text.
         value: String,
-        /// Whether the write puts one of the product's own directories on his
-        /// search path or only takes the product's own duplicates out.
+        /// Whether the write puts a directory on his search path or only takes duplicates out.
         written: Written,
     }
 
-    /// The owner's own `Path` value, or `None` when the key holds none.
-    ///
-    /// The size is queried first and the buffer allocated here: a null data
-    /// pointer with a size request is what the API documents for that, and it
-    /// leaves nothing for the caller to free afterwards.
+    /// The owner's own `Path` value, or `None` when the key holds none. The size is queried first
+    /// and the buffer allocated here, as the API documents, so nothing is left to free.
     fn query_value(key: HKEY) -> Result<Option<RawValue>, String> {
         let name = wide(PATH_NAME);
         let mut kind: REG_VALUE_TYPE = 0;
@@ -2451,8 +1991,7 @@ mod windows {
                 status,
             ));
         }
-        // The product edits a string value; anything else is left alone rather
-        // than rewritten as one.
+        // The product edits a string value; anything else is left alone.
         if !matches!(kind, REG_SZ | REG_EXPAND_SZ) {
             return Err("the owner's own Path value is not one the product can edit".to_string());
         }
@@ -2483,8 +2022,8 @@ mod windows {
         }))
     }
 
-    /// Store the value with the type it already has, then tell running programs
-    /// that the environment changed.
+    /// Store the value with the type it already has, then tell running programs the environment
+    /// changed.
     fn store(key: HKEY, kind: REG_VALUE_TYPE, text: &str) -> Result<(), String> {
         let name = wide(PATH_NAME);
         let mut data: Vec<u16> = text.encode_utf16().collect();
@@ -2514,10 +2053,8 @@ mod windows {
         Ok(())
     }
 
-    /// Tell running programs the environment changed — the same broadcast `setx`
-    /// makes, so a terminal opened afterwards sees the new value without a
-    /// logoff. Best effort: a window that does not answer in time is not a
-    /// failure of the write.
+    /// Tell running programs the environment changed — the same broadcast `setx` makes. Best
+    /// effort: a window that does not answer in time is not a failure of the write.
     fn broadcast_change() {
         let payload = wide(ENVIRONMENT_KEY);
         // SAFETY: `payload` is a NUL-terminated UTF-16 string that outlives the
@@ -2536,19 +2073,14 @@ mod windows {
     }
 }
 
-// ── Tests for the Windows value rules, runnable on any host ───────────────
-
-/// The rules [`planned_path_value`] applies are pure text work. The owner's
-/// environment is the one the reader publishes, its `PATH` built with this host's own
-/// path joiner so the same fixtures hold on any host; the value is always split the
+/// The rules [`planned_path_value`] applies are pure text work: the value is always split the
 /// Windows way, because that is what reads it.
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
 
-    /// The two directories the block names, written the way this host compares
-    /// paths — the rules under test are text rules.
+    /// The two directories the block names, written the way this host compares paths.
     fn dirs() -> Vec<PathBuf> {
         vec![
             PathBuf::from("/home/o/.local/bin"),
@@ -2564,9 +2096,7 @@ mod tests {
         )
     }
 
-    /// A `PATH` value the way the shell that produced it writes one on this host, so
-    /// a fixture reads the same on any host — [`path_entries`] splits it the way the
-    /// platform's own lookup does, which is this host's own way too.
+    /// A `PATH` value written the way the shell that produced it writes one on this host.
     fn path_var(entries: &[&str]) -> String {
         std::env::join_paths(entries)
             .expect("join paths")
@@ -2574,8 +2104,7 @@ mod tests {
             .into_owned()
     }
 
-    /// An environment whose `PATH` holds the system directory only, so neither of
-    /// the product's directories is visible from it.
+    /// An environment whose `PATH` holds the system directory only.
     fn own_env() -> OwnerEnv {
         environment(&[("PATH", "/usr/bin"), ("HOME", "/home/o")])
     }
@@ -2589,35 +2118,26 @@ mod tests {
 
     #[test]
     fn the_owners_own_order_and_his_references_survive() {
-        // His value names his own tool directory first and the runtime through a
-        // reference; the helper's directory is not there at all.
         assert_eq!(
             planned(Some("C:\\tools;%HOME%/.bun/bin"), &own_env(), &dirs()),
-            // His entries stay where they are and keep their spelling, and only
-            // the directory his environment does not give him is added.
             Some("C:\\tools;%HOME%/.bun/bin;/home/o/.local/bin".to_string())
         );
     }
 
     #[test]
     fn a_duplicate_entry_is_collapsed_and_never_re_appended() {
-        // The same directory twice, once as his reference and once as a literal
-        // entry, while the helper's directory is in his own `PATH` already.
         let env = environment(&[
             ("PATH", &path_var(&["/home/o/.local/bin", "/usr/bin"])),
             ("HOME", "/home/o"),
         ]);
         assert_eq!(
             planned(Some("%HOME%/.bun/bin;/home/o/.bun/bin"), &env, &dirs()),
-            // The duplicate goes, the first entry stays as he spelled it, and
-            // nothing is appended for a directory he already resolves.
             Some("%HOME%/.bun/bin".to_string())
         );
     }
 
     #[test]
     fn nothing_is_written_when_the_value_already_says_it() {
-        // Both directories named exactly once.
         assert_eq!(
             planned(
                 Some("/home/o/.local/bin;%HOME%/.bun/bin"),
@@ -2626,9 +2146,6 @@ mod tests {
             ),
             None
         );
-        // Neither is in the value, but his own environment carries both — and his
-        // entries, including an empty one (which names the current directory), are
-        // left exactly as they are.
         let visible = environment(&[
             (
                 "PATH",
@@ -2657,8 +2174,6 @@ mod tests {
                 .expect("plan")
                 .map(|(_, written)| written)
         };
-        // The value already names both directories — one of them twice — so the
-        // write only collapses the duplicate and adds nothing.
         assert_eq!(
             written(
                 "/home/o/.local/bin;/home/o/.local/bin;%HOME%/.bun/bin",
@@ -2666,14 +2181,10 @@ mod tests {
             ),
             Some(Written::Removed)
         );
-        // A directory the value does not name and his own environment does not
-        // carry is the addition the audit line names...
         assert_eq!(
             written("/home/o/.local/bin", &own_env()),
             Some(Written::Added)
         );
-        // ...and one his own environment already carries is not added at all, so
-        // there is nothing to write.
         let visible = environment(&[
             ("PATH", &path_var(&["/home/o/.bun/bin", "/usr/bin"])),
             ("HOME", "/home/o"),
@@ -2683,31 +2194,22 @@ mod tests {
 
     #[test]
     fn an_empty_entry_is_kept_and_a_missing_directory_goes_after_it() {
-        // A value whose only entry is empty names the current directory: the
-        // owner's own arrangement, appended to rather than written over.
         assert_eq!(
             planned(Some(""), &own_env(), &dirs()),
             Some(";/home/o/.local/bin;/home/o/.bun/bin".to_string())
         );
         assert_eq!(
             planned(Some(";C:\\tools"), &own_env(), &dirs()),
-            // The empty entry stays first, his own entry keeps its place, and the
-            // directories his environment does not give him follow.
             Some(";C:\\tools;/home/o/.local/bin;/home/o/.bun/bin".to_string())
         );
     }
 
     #[test]
     fn a_value_that_is_not_there_names_only_the_product_directories() {
-        // With no value at all there are no entries of his to carry over, so the
-        // value the product creates names the two directories and nothing else — an
-        // empty entry names the current directory, which he never asked for.
         assert_eq!(
             planned(None, &own_env(), &dirs()),
             Some("/home/o/.local/bin;/home/o/.bun/bin".to_string())
         );
-        // A key holding no value with nothing to add is no write at all: writing
-        // would create exactly the empty value the product must never leave behind.
         let visible = environment(&[
             (
                 "PATH",
@@ -2716,7 +2218,6 @@ mod tests {
             ("HOME", "/home/o"),
         ]);
         assert_eq!(planned(None, &visible, &dirs()), None);
-        // And the addition it does make is an addition, not a removal.
         assert_eq!(
             planned_path_value(None, &own_env(), &dirs())
                 .expect("plan")
@@ -2729,9 +2230,6 @@ mod tests {
     fn an_entry_is_recognised_the_way_the_platform_expands_it() {
         let env = environment(&[("USERPROFILE", "C:\\Users\\o")]);
         let dir = PathBuf::from("C:\\Users\\o\\Programs\\chrome-use");
-        // A trailing separator does not make it another directory, and a
-        // reference is resolved before the comparison — while the raw text is
-        // what gets written back.
         assert!(entry_names(
             "C:\\Users\\o\\Programs\\chrome-use\\",
             &dir,
@@ -2742,7 +2240,6 @@ mod tests {
             &dir,
             &env
         ));
-        // That platform's lookup folds letters, wherever this runs.
         assert!(entry_names(
             "C:\\USERS\\O\\programs\\CHROME-USE",
             &dir,
@@ -2751,8 +2248,6 @@ mod tests {
         assert!(!entry_names("C:\\Users\\o\\Programs\\other", &dir, &env));
         assert!(!entry_names("", &dir, &env));
 
-        // A reference the environment does not define, and a `%` without a
-        // partner, are text.
         assert_eq!(resolve_references("a%NOPE%b", &env), "a%NOPE%b");
         assert_eq!(resolve_references("a%b", &env), "a%b");
         assert_eq!(

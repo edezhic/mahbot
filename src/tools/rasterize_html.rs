@@ -1,20 +1,19 @@
 //! Capturing an HTML page as a picture, through the product's connected browser.
 //!
-//! A `file://` URL is outside the product's URL policy, and Chrome needs a manual
-//! per-extension toggle to open a local file, so a local page is served over a
-//! temporary read-only loopback server that lives only while the capture runs.
-//! The server hands out one file per request through the same read gate an
-//! ordinary read goes through, and its addresses are unguessable to other local
-//! processes: a long random path token, and the cookie it sets on the page so a
-//! root-relative reference carries the token too. A wrong `Host` is refused.
+//! A `file://` URL is outside the product's URL policy and Chrome needs a manual
+//! per-extension toggle for local files, so a local page is served over a temporary
+//! read-only loopback server that lives only while the capture runs. The server hands out one
+//! file per request through the same read gate an ordinary read goes through, and its
+//! addresses are unguessable to other local processes: a long random path token, plus the
+//! cookie it sets on the page so a root-relative reference carries the token too. A wrong
+//! `Host` is refused.
 //!
-//! The capture runs in a chrome-use session of its own, through the interactive
-//! tool's own dispatch ([`ChromeTool::dispatch_call`]), so it never touches an
-//! agent's tab. The page is captured at a fixed 1280 px viewport at ratio 1,
-//! clipped to the page's own box, and the browser fits that to the product's
-//! long-side cap: one image of the whole page, at a size this process can decode
-//! whole. Every browser step is bounded by one budget; the session is stopped on
-//! every path that can run its cleanup, and the server's port is released even
+//! The capture runs in a chrome-use session of its own through the interactive tool's own
+//! dispatch ([`ChromeTool::dispatch_call`]), so it never touches an agent's tab. The page is
+//! captured at a fixed 1280 px viewport at ratio 1, clipped to the page's own box, and the
+//! browser fits that to the product's long-side cap: one image of the whole page, at a size
+//! this process can decode whole. Every browser step shares one budget; the session is
+//! stopped on every path that can run its cleanup, and the server's port is released even
 //! when the capture is cut off.
 
 use std::io::{ErrorKind, Read as _, Write as _};
@@ -36,30 +35,28 @@ use crate::tools::path::PathAccess;
 #[cfg(test)]
 use crate::util::UnwrapPoison;
 
-/// The viewport a page is captured at, with device pixel ratio 1: a fixed page
-/// size is what makes the same page render the same on every machine.
+/// Captured at device pixel ratio 1: a fixed page size is what makes the same page render the
+/// same on every machine.
 const VIEWPORT_WIDTH: u32 = 1280;
 const VIEWPORT_HEIGHT: u32 = 900;
 const DEVICE_SCALE: u32 = 1;
 
-/// One overall bound over every browser step of the capture. The readiness gate
-/// and the teardown (the session stop) sit outside it: each has the product's own
-/// bound, and a stop must still run when the steps were cut off. A page that has
-/// not settled by then is refused as such, rather than reported as opened.
+/// One bound over every browser step. The readiness gate and the teardown (the session stop)
+/// sit outside it: each has the product's own bound, and a stop must still run when the steps
+/// were cut off. A page not settled by then is refused as such, not reported as opened.
 const CAPTURE_BUDGET: Duration = Duration::from_secs(150);
 
-/// How long one best-effort settle wait (network idle, webfonts) may take before
-/// the picture is taken anyway.
+/// How long one best-effort settle wait (network idle, webfonts) may take before the picture is
+/// taken anyway.
 const SETTLE_BOUND: Duration = Duration::from_secs(6);
 
 /// How long the server's authorization cookie may live in the owner's profile.
 const COOKIE_MAX_AGE_SECS: u64 = 300;
 
-/// Capture an HTML document out of the caller's personal workspace. `root` and
-/// `document` are canonical, the document inside the root; the file is served
-/// over a temporary loopback server for the duration of the capture only. `name`
-/// is the caller's own spelling, quoted in every refusal, and `workspace` is what
-/// a leftover browser helper is attributed to.
+/// Capture an HTML document out of the caller's personal workspace. `root` and `document` are
+/// canonical, the document inside the root; the file is served over a temporary loopback server
+/// for the capture only. `name` is the caller's own spelling, quoted in every refusal, and
+/// `workspace` is what a leftover browser helper is attributed to.
 pub(super) async fn render_file(
     root: &Path,
     document: &Path,
@@ -70,9 +67,8 @@ pub(super) async fn render_file(
     let mut server = PageServer::start(root, document, access, name)?;
     let page_url = server.page_url().to_string();
     let outcome = capture(&page_url, name, workspace, Some(&mut server)).await;
-    // The server lives only for the capture: however it ended — a refusal before
-    // the browser was reached, or steps cut off by the budget — the port is
-    // released before the caller returns.
+    // The server lives only for the capture: however it ended, the port is released before
+    // the caller returns.
     server.stop();
     outcome
 }
@@ -82,8 +78,8 @@ pub(super) async fn render_url(url: &str, name: &str, workspace: &str) -> anyhow
     capture(url, name, workspace, None).await
 }
 
-/// The steps' outcome, with the capture budget's expiry turned into the tool's
-/// own refusal — the page's own settling has [`SETTLE_BOUND`] and is not this.
+/// The steps' outcome, with the budget's expiry turned into the tool's own refusal — the
+/// page's settling has [`SETTLE_BOUND`] and is not this.
 fn budgeted(
     outcome: Result<anyhow::Result<Vec<u8>>, tokio::time::error::Elapsed>,
     name: &str,
@@ -97,9 +93,8 @@ fn budgeted(
     }
 }
 
-/// The capture: readiness, the session of its own, the steps, and teardown.
-/// `server`, when present, is the temporary page server that must stop before the
-/// session stop, which may take its own minute.
+/// Readiness, the session of its own, the steps, and teardown. `server`, when present, must
+/// stop before the session stop, which may take its own minute.
 async fn capture(
     page_url: &str,
     name: &str,
@@ -110,9 +105,8 @@ async fn capture(
     if let Some(hook) = capture_stand_in() {
         return hook(page_url);
     }
-    // Resolved before the gate so a definitively missing helper keeps the
-    // product's own install path: the gate's text is audience-neutral, and the
-    // rasteriser is the surface that still points at it.
+    // Resolved before the gate so a definitively missing helper keeps the product's own install
+    // path: the gate's text is audience-neutral, and the rasteriser points at it.
     let cli = super::chrome_daemon::cli_path().ok_or_else(|| {
         anyhow::anyhow!(
             "cannot render {name}: the browser helper is not installed. {}",
@@ -123,9 +117,8 @@ async fn capture(
         .await
         .map_err(|error| anyhow::anyhow!("cannot render {name}: {error:#}"))?;
     let mut session = RenderSession::new(cli, render_session_name());
-    // Only the steps are inside the budget: a refusal at any of them still
-    // reaches the teardown below, and a stop that runs past the budget is not
-    // cut off.
+    // Only the steps are inside the budget: a refusal at any of them still reaches the teardown,
+    // and a stop that runs past the budget is not cut off.
     let picture = budgeted(
         tokio::time::timeout(CAPTURE_BUDGET, async {
             open_page(&session, page_url, name, workspace).await?;
@@ -136,7 +129,7 @@ async fn capture(
         .await,
         name,
     );
-    // The server is only needed while the browser is looking at the page.
+    // Only needed while the browser is looking at the page.
     if let Some(server) = server.as_mut() {
         server.stop();
     }
@@ -144,10 +137,9 @@ async fn capture(
     picture
 }
 
-/// One render's chrome-use session. The `mahbot-chrome-ephemeral-` prefix is
-/// load-bearing: it is what the product's orphan sweep reclaims, so a render
-/// killed outright leaves a tab the product closes for free rather than one
-/// nothing ever will.
+/// The `mahbot-chrome-ephemeral-` prefix is load-bearing: it is what the product's orphan sweep
+/// reclaims, so a render killed outright leaves a tab the product closes rather than one nothing
+/// ever will.
 fn render_session_name() -> String {
     format!(
         "{}rasterize-{:016x}",
@@ -156,8 +148,8 @@ fn render_session_name() -> String {
     )
 }
 
-/// Load `page_url` in a tab of this render's own, at the fixed viewport, and
-/// refuse when the navigation did not commit to the page.
+/// Load `page_url` in a tab of this render's own, at the fixed viewport, and refuse when the
+/// navigation did not commit to the page.
 async fn open_page(
     session: &RenderSession,
     page_url: &str,
@@ -183,9 +175,9 @@ async fn open_page(
     let opened = step(cli, session_name, &["open", page_url], name, workspace).await?;
     // The page may have been opened into a fresh tab, so size it again.
     step(cli, session_name, &viewport, name, workspace).await?;
-    // What the navigation committed to: a blank tab never loaded the page, and
-    // an error page is Chrome's own report of why it could not (the same reading
-    // the interactive `chrome` tool makes of its `open`).
+    // What the navigation committed to: a blank tab never loaded the page, and an error page is
+    // Chrome's own report of why it could not (the reading the interactive `chrome` tool makes
+    // of its `open`).
     match crate::chrome::navigation_failure(&opened) {
         Some(crate::chrome::NavigationFailure::Blank) => anyhow::bail!(
             "cannot render {name}: the browser never loaded the page — the tab stayed on a blank \
@@ -210,12 +202,10 @@ async fn open_page(
         }
         None => {}
     }
-    // Best-effort settle: the page's own resources finish loading before the
-    // picture is taken. Bounded product-side, so a page that never goes idle
-    // costs a few seconds rather than the capture's whole budget.
+    // Best-effort settle: the page's own resources finish loading first. Bounded product-side,
+    // so a page that never goes idle costs seconds rather than the whole budget.
     best_effort_step(cli, session_name, &["wait", "--load", "networkidle"], name).await;
-    // Best-effort too: a page whose webfonts never settle is still worth
-    // capturing.
+    // Best-effort too: a page whose webfonts never settle is still worth capturing.
     best_effort_step(
         cli,
         session_name,
@@ -226,15 +216,15 @@ async fn open_page(
     Ok(())
 }
 
-/// The page's own size in CSS pixels: the box the capture is clipped to, so the
-/// picture is the page and nothing the browser happened to draw around it.
+/// The page's own size in CSS pixels — the box the capture is clipped to, so the picture is the
+/// page and nothing the browser drew around it.
 async fn page_box(
     session: &RenderSession,
     name: &str,
     workspace: &str,
 ) -> anyhow::Result<(u32, u32)> {
-    // The scrolling document's own size: the viewport for a page shorter than it,
-    // the whole content for a taller one.
+    // The scrolling document's own size: the viewport for a shorter page, the whole content for
+    // a taller one.
     const PAGE_BOX_JS: &str = "JSON.stringify({w: Math.max(document.documentElement.scrollWidth, \
         document.body ? document.body.scrollWidth : 0), h: \
         Math.max(document.documentElement.scrollHeight, document.body ? \
@@ -266,10 +256,9 @@ async fn page_box(
     }
 }
 
-/// A settle wait: best effort, never the render's failure, bounded by
-/// [`SETTLE_BOUND`] through the shared product probe
-/// ([`super::chrome_daemon::run_cli_bounded_at`]) — chrome-use's `--fn` form
-/// ignores a forwarded `--timeout`, so the product's own bound is what ends it.
+/// Best effort, never the render's failure, bounded by [`SETTLE_BOUND`] through the shared
+/// product probe ([`super::chrome_daemon::run_cli_bounded_at`]) — chrome-use's `--fn` form
+/// ignores a forwarded `--timeout`, so the product's bound is what ends it.
 async fn best_effort_step(cli: &Path, session: &str, args: &[&str], name: &str) {
     match super::chrome_daemon::run_cli_bounded_at(cli, args, Some(session), SETTLE_BOUND).await {
         CliRun::Output(_) => {}
@@ -283,11 +272,9 @@ async fn best_effort_step(cli: &Path, session: &str, args: &[&str], name: &str) 
     }
 }
 
-/// The whole page in one image, written by the browser to a temp file this call
-/// owns. The clip is the page's own box, so what is captured is the page and
-/// nothing the browser laid out around it; the cap makes the browser fit that to
-/// the product's long-side limit — one image of the whole page, at a size this
-/// process can decode whole.
+/// The whole page in one image, written by the browser to a temp file this call owns. The clip
+/// is the page's own box, and the cap makes the browser fit it to the product's long-side limit,
+/// so this process can decode it whole.
 async fn screenshot(
     session: &RenderSession,
     page: (u32, u32),
@@ -317,8 +304,8 @@ async fn screenshot(
         workspace,
     )
     .await;
-    // The file is the capture: a truncated envelope must not lose a good
-    // picture, and a reported capture with no picture is no capture at all.
+    // The file is the capture: a truncated envelope must not lose a good picture, and a reported
+    // capture with no picture is no capture at all.
     match (shot, std::fs::read(&path).ok()) {
         (_, Some(bytes)) => Ok(bytes),
         (Err(error), None) => Err(error),
@@ -328,11 +315,9 @@ async fn screenshot(
     }
 }
 
-/// One chrome-use step in this render's session, through the interactive tool's
-/// own dispatch ([`ChromeTool::dispatch_call`]): it runs to the action clocks and
-/// may use chrome-use's relay self-heal, and a self-launched browser, a cut-off
-/// answer and a leftover helper are read the same way the `chrome` tool reads
-/// them.
+/// One chrome-use step in this render's session, through the interactive tool's dispatch: it
+/// runs to the action clocks and may use chrome-use's relay self-heal, and a self-launched
+/// browser, a cut-off answer and a leftover helper are read the way the `chrome` tool reads them.
 async fn step(
     cli: &Path,
     session: &str,
@@ -351,17 +336,16 @@ async fn step(
     .await
     .map_err(|error| anyhow::anyhow!("cannot render {name}: {error:#}"))?;
     if output.leftover_pipes {
-        // A helper chrome-use left holding this call's output is the same fact
-        // the interactive tool records; the call itself succeeded.
+        // A helper holding this call's output is the same fact the interactive tool records; the
+        // call itself succeeded.
         ChromeTool::record_leftover(session, workspace, started.elapsed());
     }
     Ok(output.output)
 }
 
-/// One render's browser session, stopped exactly once: the explicit stop is the
-/// product's own verified stop ([`session_stop_outcome`]), and the drop path is
-/// the cancellation safety net (a detached best-effort stop) so a cut future
-/// cannot leave it behind.
+/// Stopped exactly once: the explicit stop is the product's verified stop
+/// ([`session_stop_outcome`]), and the drop path is the cancellation safety net (a detached
+/// best-effort stop) so a cut future cannot leave it behind.
 struct RenderSession {
     cli: PathBuf,
     name: String,
@@ -398,9 +382,8 @@ impl Drop for RenderSession {
     }
 }
 
-/// Stop one render's session through the product's own recovery stop: the answer
-/// says whether the stop was confirmed, so a session left in an unknown state is
-/// reported rather than assumed gone.
+/// Stop through the product's own recovery stop: the answer says whether the stop was
+/// confirmed, so a session in an unknown state is reported rather than assumed gone.
 async fn stop_session(cli: &Path, name: &str) {
     let recovery =
         super::chrome_daemon::session_stop_outcome(cli, name, SESSION_STOP_TIMEOUT).await;
@@ -413,7 +396,7 @@ async fn stop_session(cli: &Path, name: &str) {
     }
 }
 
-/// The temporary screenshot file, removed on every exit path.
+/// Removed on every exit path.
 struct TempCapture(PathBuf);
 
 impl Drop for TempCapture {
@@ -422,10 +405,9 @@ impl Drop for TempCapture {
     }
 }
 
-/// The picture the browser wrote, checked to decode whole: a file cut off
-/// mid-image is a broken picture, not a capture. The browser already fitted it to
-/// the long-side cap, so the decode is bounded. Decoding runs on a blocking
-/// thread.
+/// Checked to decode whole: a file cut off mid-image is a broken picture, not a capture. The
+/// browser already fitted it to the long-side cap, so the decode is bounded and runs on a
+/// blocking thread.
 async fn verified_picture(bytes: Vec<u8>, name: &str) -> anyhow::Result<Vec<u8>> {
     match tokio::task::spawn_blocking(move || (image::load_from_memory(&bytes).is_ok(), bytes))
         .await
@@ -437,11 +419,8 @@ async fn verified_picture(bytes: Vec<u8>, name: &str) -> anyhow::Result<Vec<u8>>
     }
 }
 
-// ── The temporary page server ───────────────────────────────────────────
-
-/// The workspace the server hands out: `root` is the boundary, in the one
-/// spelling the read gate answers in, and `document` the file the capture
-/// navigates to.
+/// The workspace the server hands out: `root` is the boundary, in the one spelling the read
+/// gate answers in, and `document` the file the capture navigates to.
 struct ServerContext {
     root: PathBuf,
     document: PathBuf,
@@ -461,10 +440,9 @@ struct PageServer {
 }
 
 impl PageServer {
-    /// `root` and `document` are canonical and already reduced to the spelling
-    /// the read gate answers in, so the boundary, the document's relative path
-    /// and every resolved request are read in one spelling (`\\?\…` on Windows
-    /// would not agree with the stripped target the gate resolves).
+    /// Both canonical and already reduced to the read gate's spelling, so the boundary, the
+    /// document's relative path and every resolved request are read in one spelling (`\?\…` on
+    /// Windows would not agree with the stripped target the gate resolves).
     fn start(root: &Path, document: &Path, access: PathAccess, name: &str) -> anyhow::Result<Self> {
         let token = format!(
             "{:032x}{:032x}",
@@ -505,9 +483,8 @@ impl PageServer {
         &self.page_url
     }
 
-    /// Release the listening socket. Idempotent: the accept loop polls, so this
-    /// returns within one poll; a connection already accepted runs on its own
-    /// thread to its own read or write bound and holds no listener.
+    /// Idempotent: the accept loop polls, so this returns within one poll; a connection already
+    /// accepted runs on its own thread to its own read or write bound and holds no listener.
     fn stop(&mut self) {
         self.stopped.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
@@ -518,16 +495,15 @@ impl PageServer {
 
 impl Drop for PageServer {
     fn drop(&mut self) {
-        // Cancellation must not block on the accept thread; the explicit `stop`
-        // is what guarantees the port is released before the caller returns.
+        // Cancellation must not block on the accept thread; the explicit `stop` guarantees the
+        // port is released before the caller returns.
         self.stopped.store(true, Ordering::Relaxed);
     }
 }
 
-/// Every accepted connection on a thread of its own: the browser opens several at
-/// once and may park an idle preconnect, so a page's stylesheet must not wait
-/// behind another socket. Only the accept loop is joined on stop; a handler
-/// finishes on its own read and write bounds.
+/// Every accepted connection on a thread of its own: the browser opens several at once and may
+/// park an idle preconnect, so a stylesheet must not wait behind another socket. Only the accept
+/// loop is joined on stop.
 fn accept_loop(listener: &TcpListener, context: &Arc<ServerContext>, stopped: &AtomicBool) {
     while !stopped.load(Ordering::Relaxed) {
         match listener.accept() {
@@ -541,8 +517,8 @@ fn accept_loop(listener: &TcpListener, context: &Arc<ServerContext>, stopped: &A
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            // A transient accept failure (a descriptor limit, say) is not the
-            // capture's end: the page may still be served once it clears.
+            // A transient accept failure (a descriptor limit, say) is not the capture's end: the
+            // page may still be served once it clears.
             Err(_) => std::thread::sleep(Duration::from_millis(10)),
         }
     }
@@ -558,9 +534,8 @@ fn handle_connection(stream: &mut TcpStream, context: &ServerContext) {
     let _ = stream.write_all(&handle_request(&request, context));
 }
 
-/// One parsed request: the method, the target, and the two headers the
-/// authorization rules read. Bodies are not read — the one accepted method
-/// carries none.
+/// The method, the target, and the two headers the authorization rules read. Bodies are not
+/// read — the one accepted method carries none.
 struct Request {
     method: String,
     target: String,
@@ -629,8 +604,8 @@ fn handle_request(request: &Request, context: &ServerContext) -> Vec<u8> {
     let Some(mut components) = request_components(&request.target) else {
         return error_response(404, "Not Found");
     };
-    // The document's address carries the token as its first segment; a
-    // root-relative reference, authorized by the cookie, does not.
+    // The document's address carries the token as its first segment; a root-relative reference,
+    // authorized by the cookie, does not.
     if components
         .first()
         .is_some_and(|first| *first == context.token)
@@ -649,8 +624,8 @@ fn handle_request(request: &Request, context: &ServerContext) -> Vec<u8> {
     else {
         return error_response(404, "Not Found");
     };
-    // The hard boundary: a canonical target outside the workspace — a symlink
-    // that leaves it, a `..` that survived the component check — is not served.
+    // A canonical target outside the workspace — a symlink that leaves it, a `..` that survived
+    // the component check — is not served.
     if !crate::util::is_within(&canonical, &context.root) {
         return error_response(404, "Not Found");
     }
@@ -662,9 +637,8 @@ fn handle_request(request: &Request, context: &ServerContext) -> Vec<u8> {
     let Ok(bytes) = std::fs::read(&resolved) else {
         return error_response(404, "Not Found");
     };
-    // The document is a page whatever its extension says: a file classified as
-    // HTML by its bytes may be named `.txt`. Only the document sets the cookie;
-    // subresources carry it from there.
+    // The document is a page whatever its extension says: a file classified as HTML by its bytes
+    // may be named `.txt`. Only the document sets the cookie; subresources carry it from there.
     let document = resolved == context.document;
     let content_type = if document {
         "text/html; charset=utf-8"
@@ -679,9 +653,9 @@ fn handle_request(request: &Request, context: &ServerContext) -> Vec<u8> {
     )
 }
 
-/// The file components the request's target names under the root, decoded once:
-/// `None` when it is not a plain relative file path — no path at all, an empty,
-/// `.` or `..` component, or a segment that decodes to a separator.
+/// The file components the target names under the root, decoded once: `None` when it is not a
+/// plain relative file path — no path at all, an empty, `.` or `..` component, or a segment that
+/// decodes to a separator.
 fn request_components(target: &str) -> Option<Vec<String>> {
     let url = url::Url::parse(&format!("http://127.0.0.1{target}")).ok()?;
     url.path_segments()?
@@ -698,10 +672,9 @@ fn request_components(target: &str) -> Option<Vec<String>> {
         .collect()
 }
 
-/// Whether the request carries the render's token: in its path, or in the cookie
-/// the document response set. The cookie is what authorizes a page's
-/// root-relative references, which resolve to the origin root and cannot carry
-/// the path token.
+/// Whether the request carries the render's token: in its path, or in the cookie the document
+/// response set. The cookie authorizes a page's root-relative references, which resolve to the
+/// origin root and cannot carry the path token.
 fn authorized(request: &Request, token: &str) -> bool {
     if request.target.starts_with(&format!("/{token}/")) {
         return true;
@@ -760,8 +733,7 @@ fn error_response(code: u16, reason: &str) -> Vec<u8> {
     response
 }
 
-/// The page address: the token, then the document's path relative to the root,
-/// every segment percent-encoded.
+/// The token, then the document's path relative to the root, every segment percent-encoded.
 fn build_page_url(document: &Path, root: &Path, addr: SocketAddr, token: &str) -> String {
     let relative = document.strip_prefix(root).unwrap_or(document);
     let mut url = url::Url::parse(&format!("http://127.0.0.1:{}", addr.port()))
@@ -780,9 +752,8 @@ fn build_page_url(document: &Path, root: &Path, addr: SocketAddr, token: &str) -
     url.to_string()
 }
 
-/// The content type the server serves a file as, by its extension: the kinds a
-/// page needs to render as it looks — styles, scripts, images, fonts and text.
-/// Anything else is opaque bytes.
+/// By extension: the kinds a page needs to render as it looks — styles, scripts, images, fonts
+/// and text. Anything else is opaque bytes.
 fn content_type_for(path: &Path) -> &'static str {
     match path
         .extension()
@@ -809,19 +780,15 @@ fn content_type_for(path: &Path) -> &'static str {
     }
 }
 
-// ── Test seam ───────────────────────────────────────────────────────────
-
-/// A test stand-in for the browser: set by tests so no capture touches a real
-/// browser. Clone the hook out before invoking it, so the lock is never held
-/// across the render.
+/// Set by tests so no capture touches a real browser. Clone the hook out before invoking it, so
+/// the lock is never held across the render.
 #[cfg(test)]
 type CaptureHook = Arc<dyn Fn(&str) -> anyhow::Result<Vec<u8>> + Send + Sync>;
 
 #[cfg(test)]
 static CAPTURE_STAND_IN: Mutex<Option<CaptureHook>> = Mutex::new(None);
 
-/// Installs a capture stand-in for the duration of one test, clearing it on
-/// drop. Every test that installs one holds the `html_capture` serial key.
+/// Clears the stand-in on drop. Every test installing one holds the `html_capture` serial key.
 #[cfg(test)]
 pub(super) struct CaptureStandIn;
 
@@ -850,15 +817,14 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// A server over `document` (a name inside `root`), both canonical.
+    /// Both canonical, `document` a name inside `root`.
     fn served(root: &TempDir, document: &str) -> PageServer {
         let root = std::fs::canonicalize(root.path()).unwrap();
         let document = std::fs::canonicalize(root.join(document)).unwrap();
         PageServer::start(&root, &document, PathAccess::Workspace, "page").unwrap()
     }
 
-    /// One request over a fresh connection, answered to EOF: status, headers
-    /// (lower-cased names), and body.
+    /// Answered to EOF: status, headers (lower-cased names), and body.
     fn request(addr: SocketAddr, raw: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
         let mut stream = TcpStream::connect(addr).unwrap();
         stream.write_all(raw.as_bytes()).unwrap();

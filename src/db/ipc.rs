@@ -1,94 +1,46 @@
-//! IPC query endpoint for the `mahbot debug` read-only CLI, plus the
-//! command-line operation channel.
+//! IPC query endpoint for the `mahbot debug` read-only CLI, plus the command-line operation
+//! channel.
 //!
-//! After `multiprocess_wal` was removed, the debug CLI can no longer open a
-//! second physical instance of a live store's database (single-process mode
-//! holds the flock). Instead the running instance exposes a local IPC endpoint
-//! (a Unix-domain socket on Unix, a named pipe on Windows) that accepts
-//! read-only SQL queries and returns the rows. The debug CLI connects to it
-//! instead of opening the database directly.
+//! After `multiprocess_wal` was removed, the debug CLI cannot open a second physical instance of a
+//! live store's database (single-process mode holds the flock). Instead the running instance
+//! exposes a local endpoint (a Unix-domain socket, a named pipe on Windows) that accepts read-only
+//! SQL and returns the rows.
 //!
-//! Where the window can be hidden (macOS and Windows, see `crate::window_requests`),
-//! the same socket carries a third request shape next to the two it always did — the
-//! read-only diagnostic query and the command-line operation (any family [`crate::cli`]
-//! publishes — `mahbot config …`, `mahbot send …`) that rides the query's SAME frame with
-//! an extra `call` field:
+//! The same socket carries three request shapes, all length-prefixed JSON (`[u32 LE
+//! payload_len][payload]`): a diagnostic query (`IpcRequest` with no `call`, answered with
+//! `QueryResponse`); a command-line operation (any family [`crate::cli`] publishes, which adds
+//! `call` and names its family's protocol value in `store`, answered with `CallReply`); and, where
+//! the window can be hidden (macOS, Windows), a second launch asking the interface to bring its
+//! window up.
 //!
-//! - an operation names its family's protocol value in `store` and carries its `call`;
-//! - a second launch of the product names the window store to bring the window up, and is
-//!   answered when the interface took it.
+//! The compatibility rule is why the operation rides the old frame: an operation frame carries a
+//! magic `store` value — the generation its family declares ([`CALL_STORE`] / [`CALL_STORE_BASE`]),
+//! never a store name — so a product that does not know it parses the frame as a diagnostic query
+//! and refuses it as an unknown store: an honest "this product does not serve that here" rather
+//! than a protocol complaint. A new frame type could be parsed as something else and answered
+//! misleadingly; a superset of the old frame is the only shape that degrades honestly. The value
+//! belongs to the FAMILY, so a family already served keeps working one build behind and only a
+//! family added since carries an unknown value. This build serves every generation
+//! ([`CALL_STORES`]); its frontend sends the one its family declares.
+//! The call channel is same-user-only, like the diagnostic one, and FAIL-CLOSED: when the socket
+//! could not be restricted to the instance's own user, queries keep working and operations are
+//! refused.
 //!
-//! Protocol (length-prefixed JSON over a local socket stream):
-//! - request  → `[u32 LE payload_len][payload]`, payload is JSON `IpcRequest`
-//!   (`call` present on the operation shape, absent on a diagnostic query and on the
-//!   window raise).
-//! - response → `[u32 LE payload_len][payload]`, payload is JSON `QueryResponse`
-//!   for a diagnostic query and a window raise, `CallReply` for an operation.
+//! An operation is never given up on by either side: the instance answers every call it accepted
+//! (it waits for the product to finish starting and holds a flight guard the graceful drain waits
+//! for) and the client reads that answer with no bound; only the wait for the product to come up is
+//! bounded. The two paths are bounded apart: a query answers to [`crate::db::read_limit`] (one
+//! command-wide budget covering the wait, the answer and the retries), the operation channel to
+//! [`ipc_bound_timeout`]. The operation surface is the command line's own: a tool is served by name
+//! only when a [`crate::cli`] family fronts it.
 //!
-//! The compatibility rule is why the operation rides the old frame instead of a
-//! new one: an operation frame carries a magic `store` value — the value of the
-//! command-line surface generation its family declares ([`CALL_STORE`] /
-//! [`CALL_STORE_BASE`]), never a store name — so a product that does not know it
-//! parses the frame as an ordinary diagnostic query and refuses it as an unknown
-//! store: a clear refusal of the environment class ("this product does not serve
-//! that here") rather than a protocol complaint about a frame it cannot read. A
-//! new frame type, or any shape the old product could parse as something else,
-//! would answer something misleading or nothing at all; a superset of the old
-//! frame is the only shape that degrades honestly.
-//!
-//! The value belongs to the FAMILY, because a family is what an older product
-//! either serves or would misanswer: every family the channel has already served
-//! carries the generation that served it, so it keeps working against a product
-//! one build behind, and only a family added since carries a value that product
-//! does not know. This build serves every generation at once ([`CALL_STORES`])
-//! while its frontend sends the one its family declares, so the degradation runs
-//! both ways: a product older than the frontend does not know what the frontend
-//! sends for such a family, and a frontend older than the product sends the
-//! value of the generation it was built in.
-//!
-//! The call channel is same-user-only, exactly like the diagnostic one, and it
-//! is FAIL-CLOSED: when the socket could not be restricted to the instance's
-//! own user, diagnostic queries keep working and operations are refused (the
-//! listener computes this and passes it into each connection).
-//!
-//! An operation is never given up on by either side: the instance answers every
-//! call it accepted (it waits for the product to finish starting before running
-//! one, and holds a whole-flight guard the graceful drain waits for), and the
-//! client reads that answer with no bound at all. The only bound is on the WAIT
-//! for the product to come up — a wedged boot is answered rather than hung on.
-//! Later operations that carry files the caller keeps, or that hand over without
-//! an answer, extend [`CallReply`] — the payload is additive JSON, so neither
-//! the framing nor the compatibility rule above has to change for them.
-//!
-//! The two paths are bounded apart. A read-only query is bounded by
-//! [`crate::db::read_limit`]: one command-wide budget that covers the wait to
-//! reach the instance, the instance's answer and the retries alike, and whose
-//! own failure is what a read that ran out is reported with. The operation
-//! channel keeps its own window ([`ipc_bound_timeout`]) and its reply read is
-//! deliberately unbounded (above), so widening one never changes the other.
-//!
-//! The operation surface is the command line's own: a tool is served by name
-//! only when one of [`crate::cli`]'s families fronts it, so the channel can
-//! never reach the rest of the owner's toolset (see
-//! [`crate::cli::fronts_tool`]).
-//!
-//! Write enforcement for the read-only query channel is the store's own, and it
-//! is the same per store. The statement forms a read-only connection refuses
-//! ([`crate::db::reader_refusal`] — transaction control, `ATTACH`/`DETACH`, and
-//! the pragmas that write without being classified as such) are refused on
-//! whichever path serves the query: the reader entry refuses them on a reader,
-//! and [`crate::db::Connection::query_readonly`] refuses them on the
-//! writing-connection fallback. On a store that serves its reads (the core
-//! store) the query then runs on a reader connection: one created read-only
-//! (`PRAGMA query_only = 1`, kept on for its whole life), so nothing has to be
-//! set, reset or carried over. On a store that does not (the log store) it runs
-//! on the writing connection's path in
-//! [`crate::db::Connection::query_readonly`], which sets the pragma, runs the
-//! query and resets it under a single hold of that connection's mutex. Which of
-//! the two serves a query is not the client's business.
-//! The client side of the inspection path (`mahbot debug`, the `mahbot_debug`
-//! tool) applies its own validator on top
-//! ([`crate::db::debug::validate_read_only`]), which takes the same decision.
+//! Write enforcement is the store's own. The statement forms a read-only connection refuses
+//! ([`crate::db::reader_refusal`]) are refused whichever path serves the query: on a store that
+//! serves its reads (the core store) the query runs on a connection created read-only (`PRAGMA
+//! query_only = 1`, kept for its whole life); on one that does not (the log store) it runs on the
+//! writing connection under a single hold of its mutex, setting the pragma and resetting it around
+//! the query. The client side adds its own validator ([`crate::db::debug::validate_read_only`])
+//! taking the same decision.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -104,32 +56,24 @@ use crate::db::{ReadonlyRows, Value};
 /// Maximum number of result rows served per IPC query (LIMIT+1 semantics).
 pub(crate) const IPC_ROW_LIMIT: usize = 10_000;
 
-/// Socket file name for the debug IPC endpoint (a filesystem socket on Unix).
 #[cfg(not(windows))]
 const IPC_SOCKET_FILE_NAME: &str = "mahbot-debug.sock";
-/// Prefix of the Windows named-pipe name. Named pipes live in a global
-/// `\\.\pipe\` namespace with no per-directory scope, and the `GenericFilePath`
-/// name type only accepts `\\.\pipe\`-prefixed paths there — the location
-/// digest is appended below.
+/// Prefix of the Windows named-pipe name. Pipes live in a global `\\.\pipe\` namespace with no
+/// per-directory scope, and `GenericFilePath` only accepts `\\.\pipe\`-prefixed paths there — the
+/// location digest is appended below.
 #[cfg(windows)]
 const IPC_PIPE_PREFIX: &str = r"\\.\pipe\mahbot-debug-";
 
-/// Bounds the retry window of the command-line OPERATION channel
-/// (`mahbot config …`, `mahbot send …`) while an instance holds the lock but
-/// has not bound its listener yet (boot / self-update hand-off).
-///
-/// Every failed attempt that did not reach the instance is retried while the
-/// window has time left — the window is not restricted to transport failures —
-/// and an operation that reached the instance is never retried at all
-/// ([`ipc_call_with_wait`]). The read-only query paths answer to
-/// [`crate::db::read_limit`] instead — its own knob, so widening one never
-/// changes the other's responsiveness.
+/// Bounds the retry window of the command-line OPERATION channel while an instance holds the lock
+/// but has not bound its listener yet (boot, self-update hand-off). Every failed attempt that did
+/// not reach the instance is retried while the window has time left; an operation that reached the
+/// instance is never retried at all. The query paths answer to [`crate::db::read_limit`] instead —
+/// its own knob.
 const IPC_BOUND_TIMEOUT_SECS: u64 = 15;
 
-/// [`IPC_BOUND_TIMEOUT_SECS`], overridable with `MAHBOT_IPC_BOUND_TIMEOUT_SECS`
-/// (0 = give up after the first attempt) — the same env-override pattern the
-/// other bounded waits use, and what lets a test exercise the refusal without
-/// waiting out the default.
+/// [`IPC_BOUND_TIMEOUT_SECS`], overridable with `MAHBOT_IPC_BOUND_TIMEOUT_SECS` (0 = give up after
+/// the first attempt), which is what lets a test exercise the refusal without waiting out the
+/// default.
 pub(crate) fn ipc_bound_timeout() -> std::time::Duration {
     crate::util::env_duration_secs("MAHBOT_IPC_BOUND_TIMEOUT_SECS", IPC_BOUND_TIMEOUT_SECS)
 }
@@ -137,36 +81,29 @@ pub(crate) fn ipc_bound_timeout() -> std::time::Duration {
 /// Retry backoff schedule (ms) for the IPC socket-not-yet-bound window.
 const IPC_RETRY_BACKOFF_MS: [u64; 6] = [50, 100, 200, 400, 800, 1600];
 
-/// Length (bytes) of the `u32 LE` length prefix on each IPC frame.
 const FRAME_LEN: usize = std::mem::size_of::<u32>();
 
-/// Upper bound (bytes) on a single IPC frame payload, enforced on read so a
-/// same-user misbehaving client cannot trigger a multi-GiB allocation and OOM
-/// the instance. Requests are a few KB; responses are bounded by
+/// Upper bound (bytes) on a single frame payload, enforced on read so a misbehaving same-user
+/// client cannot trigger a multi-GiB allocation. Requests are a few KB and responses are bounded by
 /// [`IPC_ROW_LIMIT`], so this is far beyond legitimate use.
 const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 
-/// Resolve the IPC socket name.
-///
-/// On Unix this is a filesystem socket file under the storage root. On Windows
-/// it is a named pipe scoped to that storage location: the pipe namespace is
-/// global, so a machine-wide name would let one instance reach another
-/// instance's data. Both the listener and the clients call this so they agree
-/// on the endpoint name.
+/// Resolve the IPC endpoint name. On Unix, a socket file under the storage root; on Windows, a
+/// named pipe scoped to that storage location (the pipe namespace is global, so a machine-wide name
+/// would let one instance reach another instance's data). Listener and clients both call this so
+/// they agree.
 #[must_use]
 fn socket_path(storage_root: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         use sha2::{Digest, Sha256};
 
-        // A digest of the location, not the path itself: a pipe name may not
-        // contain a backslash, must stay well under the 256-char limit, and is
-        // case-insensitive. `canonicalize` gives the real spelling of an
-        // existing directory (both sides derive the root from the same
-        // `default_config_dir`), falling back to the given path when that
-        // directory does not exist yet — no instance can be running there;
-        // lowercasing removes case-only differences, and SHA-256 truncated to
-        // 16 hex chars keeps the name short and collision-free.
+        // A digest of the location, not the path: a pipe name may not contain a backslash, must
+        // stay well under the 256-char limit and is case-insensitive. `canonicalize` gives the real
+        // spelling of an existing directory (both sides derive the root from the same
+        // `default_config_dir`), falling back to the given path when it does not exist yet;
+        // lowercasing removes case-only differences, and SHA-256 truncated to 16 hex chars keeps
+        // the name short and collision-free.
         let resolved =
             std::fs::canonicalize(storage_root).unwrap_or_else(|_| storage_root.to_path_buf());
         let digest = crate::util::hex_string(&Sha256::digest(
@@ -185,17 +122,15 @@ fn socket_path(storage_root: &Path) -> PathBuf {
 pub(crate) enum WireValue {
     Null,
     Integer(i64),
-    /// serde_json serializes non-finite floats as `null`; `de_real` maps it
-    /// back to `NaN` so the IPC path round-trips them like the direct
-    /// (no-instance) read path renders them ("NaN").
+    /// serde_json writes non-finite floats as `null`; map it back so they round-trip as `NaN`.
     Real(#[serde(deserialize_with = "de_real")] f64),
     Text(String),
     /// Base64-encoded blob.
     Blob(String),
 }
 
-/// Deserialize a `WireValue::Real` payload: a finite JSON number, or `null`
-/// (which serde_json emits for NaN/Inf on the wire) mapped to `NaN`.
+/// Deserialize a `WireValue::Real` payload: a finite JSON number, or `null` (which serde_json emits
+/// for NaN/Inf) mapped to `NaN`.
 fn de_real<'de, D>(d: D) -> std::result::Result<f64, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -204,7 +139,7 @@ where
     Ok(v.unwrap_or(f64::NAN))
 }
 
-/// Decode a base64-encoded blob, defaulting to empty on malformed input.
+/// Decode a base64-encoded blob, empty on malformed input.
 fn decode_blob(b: &str) -> Vec<u8> {
     crate::util::base64_decode(b).unwrap_or_default()
 }
@@ -230,8 +165,8 @@ impl WireValue {
         }
     }
 
-    /// The cell as [`crate::db::format_cell`] prints it in a pipe table —
-    /// delegates through [`Self::to_turso`], so the rules stay in one place.
+    /// The cell as [`crate::db::format_cell`] prints it in a pipe table — delegated through
+    /// [`Self::to_turso`], so the rules stay in one place.
     #[must_use]
     pub(crate) fn format(&self) -> String {
         crate::db::format_cell(&self.to_turso())
@@ -244,62 +179,54 @@ pub(crate) struct IpcRequest {
     pub sql: String,
     #[serde(default)]
     pub params: Vec<WireValue>,
-    /// Present only on the operation shape of a frame; `None` for a diagnostic
-    /// query, and omitted from the wire entirely for one.
+    /// Present only on the operation shape; `None` for a diagnostic query, and omitted from the
+    /// wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call: Option<CallRequest>,
 }
 
-/// The CURRENT operation-frame PROTOCOL value: what a family this build adds
-/// carries, so a product built before it refuses the frame as an unknown store —
-/// the environment's class, and the truth (nothing ran) — instead of answering a
-/// call it cannot carry out as a failed operation. Bump it when a family is
-/// added that an older product would misanswer that way.
+/// The CURRENT operation-frame PROTOCOL value: what a family this build adds carries, so a product
+/// built before it refuses the frame as an unknown store — the environment's class, and the truth
+/// (nothing ran) — instead of answering a call it cannot carry out. Bump it when such a family is
+/// added.
 pub(crate) const CALL_STORE: &str = "cli2";
 
-/// The value every family the channel has already served carries: any product
-/// that knows the operation channel at all serves it, so those families keep
-/// working against a product one build behind instead of being told to restart.
+/// The value every family the channel has already served carries: any product that knows the
+/// operation channel serves it, so those families keep working one build behind.
 pub(crate) const CALL_STORE_BASE: &str = "cli";
 
-/// Every protocol value this build serves — one per generation of the command
-/// line's surface.
+/// Every protocol value this build serves — one per generation of the command line's surface.
 pub(crate) const CALL_STORES: &[&str] = &[CALL_STORE, CALL_STORE_BASE];
 
-/// The store value a second launch's frame names: not a store, and nothing is
-/// queried — the frame asks the interface to bring its window up (see
-/// [`crate::window_requests`]) and is answered when the interface took it. A
-/// product that does not know the value refuses the frame as an unknown store,
-/// and so does one that cannot show a window, which the caller reads as "no
-/// window came up".
+/// The store value a second launch's frame names: not a store, and nothing is queried — the frame
+/// asks the interface to bring its window up and is answered when it took it. A product that does
+/// not know the value, or cannot show a window, refuses it, which the caller reads as "no window
+/// came up".
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const SHOW_WINDOW_STORE: &str = "window";
 
-/// The answer a window raise gets when the socket could not be restricted to the
-/// instance's own user: the fail-closed rule the operations follow (see the module
-/// doc), stated for this request.
+/// The answer a window raise gets when the socket could not be restricted to the instance's own
+/// user: the fail-closed rule stated for this request.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const SHOW_WINDOW_UNRESTRICTED_ANSWER: &str = concat!(
     "the command-line channel could not be restricted to this machine's own user, so a window ",
     "is not brought up through it"
 );
 
-/// One command-line operation: the tool the frontend addressed and the
-/// arguments it passed, plus the values the caller handed over as secrets.
+/// One command-line operation: the tool the frontend addressed, its arguments, and the secrets
+/// handed over.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CallRequest {
     pub tool: String,
     pub args: serde_json::Value,
-    /// The values the caller handed over as secrets: they are never echoed
-    /// back, never recorded and never reported — the instance removes them from
-    /// the answer, from the error text and from the recorded arguments.
+    /// The values the caller handed over as secrets: never echoed back, recorded or reported — the
+    /// instance removes them from the answer, the error text and the recorded arguments.
     #[serde(default)]
     pub secrets: Vec<String>,
-    /// The directory the produced files must go into, resolved on the machine the
-    /// command runs on by the caller that named it. It is the command line's own
-    /// operand and never a tool argument, so no tool sees it in `args`; only the
-    /// command line's producing families send one, and the tools that write files
-    /// are the only readers (see [`crate::agent::CURRENT_TOOL_OUTPUT_DIR`]).
+    /// The directory the produced files must go into, resolved on the machine the command runs on
+    /// by the caller that named it. The command line's own operand, never a tool argument, so no
+    /// tool sees it in `args`; only the producing families send one and only the file-writing tools
+    /// read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_dir: Option<String>,
 }
@@ -310,22 +237,18 @@ pub(crate) struct CallRequest {
 pub(crate) enum CallOutcome {
     /// The tool carried it out.
     Done,
-    /// The tool carried it out in part; its own answer names the part that did
-    /// not succeed. A failure for the caller, whose answer is printed all the
-    /// same.
+    /// The tool carried it out in part; its own answer names what did not succeed. A failure for
+    /// the caller, whose answer is printed all the same.
     Partial,
-    /// The product refused it: the tool returned an error and nothing was
-    /// carried out.
+    /// The product refused it: the tool returned an error and nothing was carried out.
     Refused,
-    /// The product could not take it at all right now (still starting up, or
-    /// shutting down) and nothing ran, so a caller MAY retry it safely — it MAY
-    /// be served later.
+    /// The product could not take it at all right now (still starting, or shutting down) and
+    /// nothing ran, so a caller MAY retry it safely — it MAY be served later.
     NotAccepted,
-    /// The instance cannot take this operation on and nothing ran — either it
-    /// can never serve operations (a socket it could not restrict to the owner,
-    /// a boot that failed), it fronts no family for the named tool, or it is not
-    /// ready yet. The client does not retry it inside one command invocation; the
-    /// instance's own sentence says whether a later attempt may help.
+    /// The instance cannot take this operation on and nothing ran — it can never serve operations
+    /// (a socket it could not restrict to the owner, a failed boot), it fronts no family for the
+    /// named tool, or it is not ready yet. The client does not retry it within one invocation; the
+    /// instance's sentence says whether a later attempt may help.
     Unavailable,
 }
 
@@ -345,8 +268,7 @@ impl CallReply {
         }
     }
 
-    /// The operation was carried out in part; `answer` names what did not
-    /// succeed.
+    /// The operation was carried out in part; `answer` names what did not succeed.
     pub(crate) fn partial(answer: impl Into<String>) -> Self {
         Self {
             outcome: CallOutcome::Partial,
@@ -362,8 +284,7 @@ impl CallReply {
         }
     }
 
-    /// The product could not take the operation; nothing ran and a retry is
-    /// safe.
+    /// The product could not take the operation; nothing ran and a retry is safe.
     pub(crate) fn not_accepted(answer: impl Into<String>) -> Self {
         Self {
             outcome: CallOutcome::NotAccepted,
@@ -371,10 +292,9 @@ impl CallReply {
         }
     }
 
-    /// The product cannot take the operation on right now and nothing ran. Its
-    /// own sentence says whether a later attempt may help: a socket it could not
-    /// restrict to the owner, or a boot that failed, will never serve one, while
-    /// an instance that has not finished starting may.
+    /// The product cannot take the operation on right now and nothing ran. Its own sentence says
+    /// whether a later attempt may help: a socket it could not restrict to the owner, or a boot
+    /// that failed, will never serve one, while an instance that has not finished starting may.
     pub(crate) fn unavailable(answer: impl Into<String>) -> Self {
         Self {
             outcome: CallOutcome::Unavailable,
@@ -443,7 +363,6 @@ fn response_error(msg: &str) -> QueryResponse {
     }
 }
 
-/// The answer to a request that was taken on, with nothing to report.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn response_ok() -> QueryResponse {
     QueryResponse {
@@ -454,10 +373,9 @@ fn response_ok() -> QueryResponse {
     }
 }
 
-/// Serialize one response — a `QueryResponse` or a `CallReply` — into an IPC
-/// frame and write it. (serde_json emits `null` — not an error — for non-finite
-/// floats, which `de_real` maps back to NaN, so serialization never fails for
-/// the response types used.)
+/// Serialize one response — a `QueryResponse` or a `CallReply` — into an IPC frame and write it.
+/// (serde_json emits `null`, not an error, for non-finite floats, so this never fails for these
+/// types.)
 async fn write_json_frame<S, T>(stream: &mut S, message: &T) -> std::io::Result<()>
 where
     S: AsyncWrite + Unpin,
@@ -467,17 +385,14 @@ where
     write_frame(stream, &payload).await
 }
 
-/// The one shape of a malformed-frame answer, so every undecodable request —
-/// whether the whole frame failed to decode or the operation store named one
-/// that is not there — gets the same actionable wording instead of an
-/// EOF/timeout.
+/// The one shape of a malformed-frame answer, so every undecodable request gets the same actionable
+/// wording instead of an EOF or timeout.
 fn malformed_response(e: impl std::fmt::Display) -> QueryResponse {
     response_error(&format!("malformed IPC request: {e}"))
 }
 
-/// The answer when the socket could not be restricted to the instance's own
-/// user: the channel is fail-closed, so operations are refused while diagnostic
-/// queries keep working (see the module doc).
+/// The answer when the socket could not be restricted to the instance's own user: operations are
+/// refused while diagnostic queries keep working.
 const UNRESTRICTED_SOCKET_ANSWER: &str = concat!(
     "the command-line channel could not be restricted to this machine's own user, so ",
     "operations are not served through it (diagnostic queries are unaffected)"
@@ -492,7 +407,6 @@ async fn handle_connection(
     let req: IpcRequest = match serde_json::from_slice(&payload) {
         Ok(req) => req,
         Err(e) => {
-            // A malformed request must get an actionable error, not an EOF/timeout.
             let resp = malformed_response(e);
             write_json_frame(&mut stream, &resp).await?;
             return Ok(());
@@ -501,9 +415,8 @@ async fn handle_connection(
 
     // A second launch of the product: its one frame asks the interface to bring the window up.
     // Served only on a channel restricted to the instance's own user, and taken only while the
-    // product can still show a window — a launch that finds a drain or an exit under way is
-    // refused the way every second launch was, since no window will come up. The answer says
-    // the request was taken, not that the window is up.
+    // product can still show a window — a launch that finds a drain or exit under way is refused as
+    // every second launch was. The answer says the request was taken, not that the window is up.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     if req.store == SHOW_WINDOW_STORE {
         let resp = if !serve_calls {
@@ -519,10 +432,9 @@ async fn handle_connection(
         return Ok(());
     }
 
-    // The operation shape: the magic store plus its `call`. A frame that names
-    // one of the protocol values this build serves and carries nothing to run is
-    // malformed — no client writes an operation store for a diagnostic query —
-    // and is answered exactly like a frame that failed to decode.
+    // The operation shape: the magic store plus its `call`. A frame naming a protocol value this
+    // build serves with nothing to run is malformed — no client writes an operation store for a
+    // query — and answered like a frame that failed to decode.
     if CALL_STORES.contains(&req.store.as_str()) {
         let Some(call) = req.call else {
             let resp = malformed_response(format!(
@@ -532,11 +444,10 @@ async fn handle_connection(
             write_json_frame(&mut stream, &resp).await?;
             return Ok(());
         };
-        // One guard covers the whole flight: it is taken BEFORE the operation is
-        // served and lives to the END of this connection's handling, so a
-        // graceful drain (or an update hand-off) cannot end the process with an
-        // accepted operation unfinished or with its answer unwritten — the
-        // caller is owed that answer.
+        // One guard covers the whole flight: taken BEFORE the operation is served and living to the
+        // end of this connection, so a graceful drain or update hand-off cannot end the process
+        // with an accepted operation unfinished or its answer unwritten — the caller is owed that
+        // answer.
         let _flight = serve_calls.then(crate::cli::instance::hold_flight);
         let reply = if serve_calls {
             crate::cli::instance::execute(call).await
@@ -616,15 +527,12 @@ pub async fn run_ipc_listener(
             return;
         }
     };
-    // Restrictive perms: only the instance's user can connect. `ListenerOptions::mode`
-    // is NOT used — it calls `fchmod` on the socket fd, which returns
-    // EINVAL→Unsupported on macOS UDS; `chmod` via the path works everywhere.
-    //
-    // Whether that restriction took is what decides whether this listener
-    // serves command-line OPERATIONS: the channel can carry a side effect, so
-    // an endpoint another user could connect to must not reach the tool layer.
-    // Diagnostic queries are read-only and unaffected. On other platforms the
-    // endpoint is user-scoped by construction, so operations are served.
+    // Restrictive perms: only the instance's user can connect. `ListenerOptions::mode` is NOT used
+    // — it `fchmod`s the socket fd, which returns EINVAL/Unsupported on macOS UDS; `chmod` via the
+    // path works everywhere. Whether the restriction took decides whether this listener serves
+    // OPERATIONS: the channel can carry a side effect, so an endpoint another user could reach must
+    // not reach the tool layer. Queries are read-only and unaffected; on other platforms the
+    // endpoint is user-scoped by construction.
     #[cfg(unix)]
     let serve_calls = {
         use std::os::unix::fs::PermissionsExt;
@@ -671,11 +579,10 @@ pub async fn run_ipc_listener(
     }
 }
 
-/// One attempt at a read-only query, in the shape the retry loop can act on.
-///
-/// The distinction that matters is delivery: an attempt that never reached the
-/// instance sent nothing, so it is the only one worth sending again — resending
-/// one the instance took would run a second copy of the same work.
+/// One attempt at a read-only query, in the shape the retry loop can act on. The distinction that
+/// matters is delivery: an attempt that never reached the instance sent nothing, so it is the only
+/// one worth sending again — resending one the instance took would run a second copy of the same
+/// work.
 enum Attempt {
     /// The instance answered.
     Answered(QueryResponse),
@@ -687,14 +594,11 @@ enum Attempt {
     Broken(String),
 }
 
-/// One attempt: connect, send, and wait what is left of the command's budget for
-/// the answer.
-///
-/// The connect is deliberately OUTSIDE the wait: a connection that is refused is
-/// "nothing was delivered" (retryable), which the timeout wrapper could not tell
-/// apart from an instance that took the query and went quiet. The wait is read
-/// AFTER the connect, so an attempt can never run past the budget by the
-/// connect's own duration.
+/// One attempt: connect, send, and wait what is left of the command's budget for the answer. The
+/// connect is deliberately OUTSIDE the wait, so a refused connection reads as "nothing was
+/// delivered" (retryable) rather than as an instance that took the query and went quiet; the wait
+/// is read AFTER the connect, so an attempt cannot run past the budget by the connect's own
+/// duration.
 async fn ipc_query_once(
     root: &Path,
     req: &IpcRequest,
@@ -713,11 +617,10 @@ async fn ipc_query_once(
         Ok(payload) => payload,
         Err(e) => return Attempt::Broken(e.to_string()),
     };
-    // A budget spent while the connect ran cannot be waited on at all, and a
-    // zero wait is not an immediate failure for the timer below (its own first
-    // poll can let an answer through), so it is reported as the limit outright —
-    // as `NoAnswer`, because a connect succeeded and the query must not be sent
-    // again.
+    // A budget spent while the connect ran cannot be waited on at all, and a zero wait is not an
+    // immediate failure for the timer (its first poll can let an answer through), so it is reported
+    // as the limit outright — as `NoAnswer`, because a connect succeeded and the query must not be
+    // sent again.
     let wait = read.remaining();
     if wait.is_zero() {
         return Attempt::NoAnswer;
@@ -742,11 +645,10 @@ pub(crate) fn retry_backoff(attempt: usize) -> Duration {
     Duration::from_millis(IPC_RETRY_BACKOFF_MS[attempt.min(IPC_RETRY_BACKOFF_MS.len() - 1)])
 }
 
-/// Refusal wording for the client side when an instance holds the storage
-/// location but its debug channel cannot be reached. Callers only get here after
-/// the probe reported the location held, so a bare OS error ("connection
-/// refused", "no such file") would read as "the store is gone" instead of "an
-/// instance is running and its store was deliberately left alone".
+/// Refusal wording for the client when an instance holds the storage location but its debug channel
+/// cannot be reached. Callers only get here after the probe reported the location held, so a bare
+/// OS error would read as "the store is gone" instead of "an instance is running and its store was
+/// deliberately left alone".
 fn channel_unreachable(socket: &Path) -> String {
     format!(
         "a mahbot instance is running against this storage location and holds its stores, but its \
@@ -755,39 +657,34 @@ fn channel_unreachable(socket: &Path) -> String {
     )
 }
 
-/// [`channel_unreachable`] with the transport's own error appended — the shape
-/// every terminal channel failure takes, whichever branch produced it.
+/// [`channel_unreachable`] with the transport's own error appended — the shape every terminal
+/// channel failure takes, whichever branch produced it.
 fn unreachable(socket: &Path, detail: &str) -> anyhow::Error {
     anyhow::anyhow!("{}: {detail}", channel_unreachable(socket))
 }
 
-/// The failure for a budget that is spent before another attempt can be made:
-/// while only never-delivered attempts ran, the instance is what could not be
-/// reached; before the first attempt there is no such history, so the limit's own
-/// failure (`spent`) stands — its smallest value means "fail now".
+/// The failure for a budget spent before another attempt can be made: while only never-delivered
+/// attempts ran, the instance is what could not be reached; before the first attempt that history
+/// does not exist, so the limit's own failure stands.
 fn not_attempted(undelivered: Option<&str>, spent: anyhow::Error, socket: &Path) -> anyhow::Error {
     undelivered.map_or(spent, |detail| unreachable(socket, detail))
 }
 
-/// What a finished attempt means to the retry loop: one classification for both
-/// clients, so they cannot drift on which failures are sent again or on what a
-/// failure says.
+/// What a finished attempt means to the retry loop: one classification for both clients, so they
+/// cannot drift on which failures are sent again or on what a failure says.
 enum Outcome {
     /// The instance answered.
     Answer(QueryResponse),
-    /// The instance never took it: send the next attempt after the backoff. The
-    /// transport's own error is carried along, for the case where the budget runs
-    /// out before an attempt can be made after it.
+    /// The instance never took it: send the next attempt after the backoff. The transport's error
+    /// is carried along, for the case where the budget runs out before another attempt can be made.
     Resend(String),
     /// Report this; the attempt is not sent again.
     Report(anyhow::Error),
 }
 
-/// Classify one attempt for the retry loop that made it, framing everything but
-/// the limit's own failure with [`channel_unreachable`]: the caller only gets
-/// here after the probe reported the location held, so a bare OS text would read
-/// as "the store is gone" instead of "an instance is running and its store was
-/// deliberately left alone".
+/// Classify one attempt for the retry loop that made it, framing everything but the limit's own
+/// failure with [`channel_unreachable`]: a bare OS text would read as "the store is gone" instead
+/// of "an instance is running and its store was deliberately left alone".
 fn classify(attempt: Attempt, read: crate::db::read_limit::Read<'_>, socket: &Path) -> Outcome {
     match attempt {
         // An answer the budget was spent on is not an answer, however well the
@@ -815,23 +712,16 @@ fn classify(attempt: Attempt, read: crate::db::read_limit::Read<'_>, socket: &Pa
     }
 }
 
-/// Bounded-retry async client used by `mahbot debug` when an instance holds the
-/// storage location but the IPC socket is not yet bound (it is between
-/// lock-acquire and listener-bind, e.g. boot or self-update hand-off). The
-/// caller must only use this when [`crate::util::lock::instance_lock_state_settled`]
-/// reports the location [`Held`](crate::util::lock::InstanceLockState::Held) —
-/// otherwise the retry would mask a genuinely-down instance.
-///
-/// The whole exchange runs under the command's read budget
-/// ([`crate::db::read_limit`]): every attempt waiting what the budget has left —
-/// never a per-statement window — and a spent budget reported as the limit's own
-/// failure. Only an attempt that never reached the instance is sent again; one
-/// the instance took is never resent, so a slow instance is waited out rather
-/// than misreported as an unreachable channel.
-///
-/// The caller owns the limit's process-ending half ([`crate::db::read_limit::Read::arm`]),
-/// which is what covers a wait that never comes back — armed ONCE for the route
-/// that makes the reads, not per attempt or per round trip.
+/// Bounded-retry async client used by `mahbot debug` when an instance holds the storage location
+/// but the socket is not yet bound (it is between lock-acquire and listener-bind, e.g. boot or a
+/// self-update hand-off). Use it only when the instance-lock probe reports the location
+/// [`Held`](crate::util::lock::InstanceLockState::Held) — otherwise the retry would mask a
+/// genuinely-down instance. The whole exchange runs under the command's read budget
+/// ([`crate::db::read_limit`]): every attempt waits what the budget has left, never a per-statement
+/// window, and a spent budget is reported as the limit's own failure. Only an attempt that never
+/// reached the instance is sent again, so a slow instance is waited out rather than misreported as
+/// an unreachable channel. The caller owns the limit's process-ending half
+/// ([`crate::db::read_limit::Read::arm`]), armed ONCE for the route.
 pub(crate) async fn ipc_query_with_wait(
     storage_root: &Path,
     req: &IpcRequest,
@@ -862,21 +752,14 @@ pub(crate) async fn ipc_query_with_wait(
     }
 }
 
-/// Synchronous bounded-retry client used by `bench-openrouter`'s synchronous
-/// config-resolution path (which cannot await the async [`ipc_query_with_wait`];
-/// the call blocks the current thread). Like the async client, the caller must
-/// only use it after the instance-lock probe reported the location held.
-///
-/// The whole exchange runs under the command's read budget
-/// ([`crate::db::read_limit`]) exactly like the async client's: every attempt
-/// checked at the top and waiting what is left, and a spent budget failing before
-/// anything is sent. Only an attempt that never reached the instance is sent
-/// again.
-///
-/// As on the async path, the caller owns the process-ending half
-/// ([`crate::db::read_limit::Read::arm`]) — armed once for the route. Here it is
-/// also the only end a wedged exchange has on a platform whose local sockets
-/// carry no timeout (Windows named pipes).
+/// Synchronous bounded-retry client for `bench-openrouter`'s config resolution, which cannot await
+/// the async [`ipc_query_with_wait`] (the call blocks the thread). Like the async client, use it
+/// only after the instance-lock probe reported the location held, and the whole exchange runs under
+/// the command's read budget: every attempt checked at the top and waiting what is left, a spent
+/// budget failing before anything is sent, and only an attempt that never reached the instance sent
+/// again. The caller owns the process-ending half (armed once for the route) — here also the only
+/// end a wedged exchange has on a platform whose local sockets carry no timeout (Windows named
+/// pipes).
 pub(crate) fn ipc_query_sync(
     storage_root: &Path,
     req: &IpcRequest,
@@ -998,8 +881,6 @@ fn read_frame_sync(stream: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> 
     Ok(payload)
 }
 
-// ── Second-launch request ────────────────────────────────────────
-
 /// Ask the running instance to bring its window up — the one request a second launch of the
 /// product makes (see `main`).
 ///
@@ -1048,8 +929,6 @@ fn ask_window_show(storage_root: &Path) -> bool {
     serde_json::from_slice::<QueryResponse>(&payload).is_ok_and(|response| response.error.is_none())
 }
 
-// ── Command-line operation client ───────────────────────────────
-
 /// One attempt's outcome for a command-line operation (see `CallAttempt`).
 pub(crate) enum CallAttempt {
     /// The instance answered the operation; its own outcome is in the reply.
@@ -1074,22 +953,15 @@ pub(crate) enum CallAttempt {
     Severed(anyhow::Error),
 }
 
-/// Classify one reply frame to an operation.
+/// Classify one reply frame to an operation. A `CallReply` is the channel's own answer — except
+/// [`NotAccepted`], which is the instance saying it did not take the operation on, so it reads as
+/// "nothing ran, may be served later" rather than as an answer. Anything else is examined for the
+/// unknown-store shape: a product that does not know the protocol value parses the frame as a
+/// diagnostic query and refuses that store, so a `QueryResponse` whose error is `unknown store
+/// '<the value>'` is [`TooOld`] — a definite "this product cannot serve what this command line
+/// sends", not a severed answer.
 ///
-/// A `CallReply` is the channel's own answer — except for [`NotAccepted`],
-/// which is the instance itself saying it did not take the operation on, so it
-/// reads as "nothing ran, may be served later" rather than as an answer.
-///
-/// Anything else is examined for the unknown-store shape: a product that does
-/// not know the protocol value this call carried parses the operation frame as
-/// an ordinary diagnostic query and refuses that store, so a `QueryResponse`
-/// whose error is `unknown store '<the value the call carried>'` is [`TooOld`] —
-/// a definite "this product cannot serve what this command line sends" (one
-/// built before the channel, or before the generation that value names), not an
-/// unreadable/severed answer.
-///
-/// [`NotAccepted`]: CallOutcome::NotAccepted
-/// [`TooOld`]: CallAttempt::TooOld
+/// [`NotAccepted`]: CallOutcome::NotAccepted [`TooOld`]: CallAttempt::TooOld
 fn classify_reply(payload: &[u8], protocol: &str) -> CallAttempt {
     if let Ok(reply) = serde_json::from_slice::<CallReply>(payload) {
         return match reply.outcome {
@@ -1110,15 +982,10 @@ fn classify_reply(payload: &[u8], protocol: &str) -> CallAttempt {
     ))
 }
 
-/// Failure wording for the client side when an operation could not be handed
-/// over: the caller only gets here after the lock probe reported the storage
-/// location held, so a bare OS error ("connection refused", "no such file")
-/// would read as a product that is not there. This says what happened instead —
-/// nothing ran, so the operation may be tried again.
-///
-/// Used for the PRE-WRITE failures only, where the caller's own address of the
-/// endpoint is all there is to say. Once a frame is out, the instance's own
-/// answer is a complete sentence on its own and is passed through untouched.
+/// Failure wording for an operation that could not be handed over. The caller only gets here after
+/// the lock probe reported the location held, so a bare OS error would read as a product that is
+/// not there; this says nothing ran, so it may be tried again. For the PRE-WRITE failures only —
+/// once a frame is out, the instance's own answer is a complete sentence passed through untouched.
 fn call_not_served(socket: &Path, detail: &str) -> String {
     format!(
         "the running product's command-line channel at {} did not take the operation on: \
@@ -1127,23 +994,13 @@ fn call_not_served(socket: &Path, detail: &str) -> String {
     )
 }
 
-/// One attempt at a command-line operation: connect to the instance's endpoint,
-/// write the operation frame, then read the answer with NO timeout.
-///
-/// The write boundary is the point of no return. An incomplete frame is never
-/// executed by the instance (it reads the length prefix and then the payload
-/// whole), so a connect, serialization or write failure is `NotServed` —
-/// nothing ran and the operation may be retried. Once the frame is out, the
-/// answer is awaited with no bound at all — an operation the product is still
-/// performing is never given up on — and the frame is never written again.
-///
-/// A `NotServed` here always carries a COMPLETE caller-facing sentence: the one
-/// [`call_not_served`] composes for a pre-write failure, or the instance's own
-/// answer text when it said it did not accept the operation. Nothing re-wraps
-/// either.
-///
-/// `protocol` is the value the call's family declares (see [`crate::cli`]) and is
-/// what the frame's magic `store` carries.
+/// One attempt at a command-line operation: connect, write the frame, then read the answer with NO
+/// timeout. The write boundary is the point of no return — an incomplete frame is never executed
+/// (the instance reads the length prefix and then the payload whole), so a connect, serialization
+/// or write failure is `NotServed` and may be retried, while once the frame is out the answer is
+/// awaited with no bound and the frame is never written again. A `NotServed` always carries a
+/// COMPLETE caller-facing sentence. `protocol` is the value the call's family declares and is what
+/// the frame's magic `store` carries.
 async fn ipc_call_once(storage_root: &Path, call: &CallRequest, protocol: &str) -> CallAttempt {
     let socket = socket_path(storage_root);
     let name = match socket.as_path().to_fs_name::<GenericFilePath>() {
@@ -1179,37 +1036,19 @@ async fn ipc_call_once(storage_root: &Path, call: &CallRequest, protocol: &str) 
     }
 }
 
-/// Client: run one command-line operation against the instance at
-/// `storage_root`.
-///
-/// It retries ONLY while the operation is known not to have run: a connect or
-/// frame-write failure (an incomplete frame is never executed, so nothing ran)
-/// and a reply whose outcome is [`NotAccepted`] (the instance said so itself).
-/// The retry window is [`ipc_bound_timeout()`] with the [`retry_backoff`]
-/// schedule; when it expires the result is [`CallAttempt::NotServed`] — always a
-/// COMPLETE caller-facing sentence, never a bare OS error: either the one
-/// [`call_not_served`] composed for an OS-level failure, or the instance's own
-/// wording, returned verbatim as it was received.
-///
-/// A reply with outcome [`Unavailable`] is returned AT ONCE as
-/// [`CallAttempt::Answered`] — never retried: the instance cannot take this
-/// operation on and said so itself (whether a later attempt may help is in its
-/// own sentence), so another attempt here would only wait for an answer that is
-/// already known.
-///
-/// Once the frame has been written in full, it is NEVER sent again in any
-/// circumstance: it reads the answer with NO timeout (an operation the product
-/// is still performing is never given up on), and a read error, EOF or an
-/// undecodable reply is [`CallAttempt::Severed`] — or [`CallAttempt::TooOld`]
-/// when it decodes as the unknown-store shape (a `QueryResponse` whose `error`
-/// contains `unknown store '<the value this build sent>'`).
-///
-/// This deliberately does NOT go through the read-only path's
-/// [`ipc_query_with_wait`]: that one bounds each attempt's wait by the command's
-/// own read budget, which an operation must not inherit — an operation the
-/// product is still performing is never given up on.
-///
-/// [`NotAccepted`]: CallOutcome::NotAccepted
+/// Client: run one command-line operation against the instance at `storage_root`. It retries ONLY
+/// while the operation is known not to have run: a connect or frame-write failure (an incomplete
+/// frame is never executed) and a reply whose outcome is [`NotAccepted`] (the instance said so
+/// itself). The retry window is [`ipc_bound_timeout()`] with the [`retry_backoff`] schedule; when
+/// it expires the result is [`CallAttempt::NotServed`], always a COMPLETE caller-facing sentence —
+/// the one [`call_not_served`] composed, or the instance's own wording returned verbatim. A reply
+/// with outcome [`Unavailable`] comes back AT ONCE as [`CallAttempt::Answered`], never retried: the
+/// instance cannot take this operation on and said so, so another attempt would only wait for an
+/// answer already known. Once the frame has been written in full it is NEVER sent again: the answer
+/// is read with NO timeout, and a read error, EOF or undecodable reply is [`CallAttempt::Severed`]
+/// — or [`CallAttempt::TooOld`] when it decodes as the unknown-store shape. This deliberately does
+/// NOT go through [`ipc_query_with_wait`]: that one bounds each attempt by the command's read
+/// budget, which an operation must not inherit. [`NotAccepted`]: CallOutcome::NotAccepted
 /// [`Unavailable`]: CallOutcome::Unavailable
 pub(crate) async fn ipc_call_with_wait(
     storage_root: &Path,
@@ -1290,8 +1129,7 @@ mod tests {
             CallAttempt::Answered(reply) if reply.outcome == CallOutcome::Unavailable
         ));
 
-        // The exact JSON a product that does not know the value the call carried
-        // returns.
+        // The exact JSON a product that does not know the value the call carried returns.
         let old = serde_json::to_vec(&serde_json::json!({
             "columns": [],
             "rows": [],
@@ -1461,15 +1299,11 @@ mod tests {
         let _ = listener.await;
     }
 
-    /// A hand-rolled listener for the client tests below: it accepts EVERY
-    /// connection, reads one request frame, and then answers after
-    /// `answer_after` — or never, when that is `None`, which is the instance
-    /// that took the query and went quiet. Accepted streams are held (nothing
-    /// closes under the client's read), connections are counted so a test can
-    /// prove a taken query was not sent again, and the stop signal — or the
-    /// listener's own drop — ends it.
-    ///
-    /// No store is involved: the socket path is the whole endpoint.
+    /// A hand-rolled listener for the client tests below: it accepts EVERY connection, reads one
+    /// request frame, then answers after `answer_after` — or never, when that is `None` (the
+    /// instance that took the query and went quiet). Streams are held, connections counted so a
+    /// test can prove a taken query was not sent again, and the stop signal (or the listener's
+    /// drop) ends it. No store is involved.
     fn slow_listener(
         root: &Path,
         answer_after: Option<Duration>,
@@ -1535,8 +1369,7 @@ mod tests {
     /// not an immediate failure on its own — the timer's own first poll can let a
     /// fast answer through — so the only deterministic reading of the smallest
     /// limit is to refuse before anything is sent. `serial(read_limit)`: this
-    /// shrinks the read limit, so it must not overlap another test that reads the
-    /// knob.
+    /// shrinks the read limit, so it must not overlap another test that reads the knob.
     #[serial_test::serial(read_limit)]
     #[tokio::test]
     async fn a_spent_budget_never_reaches_the_instance() {
@@ -1659,17 +1492,12 @@ mod tests {
         );
     }
 
-    /// The same limit bounds the SYNCHRONOUS client, which is the one
-    /// `bench-openrouter` resolves its config through: a query the instance took
-    /// and never answered fails with the limit's own wording — never as an
-    /// unreachable channel — and is never sent again. `serial(read_limit)`: this
-    /// shrinks the read limit, so it must not overlap another test that reads the
-    /// knob.
-    ///
-    /// Unix only: the sync client's end here is its socket timeout, and named
-    /// pipes carry none — on Windows the only end a wedged exchange has is the
-    /// read-limit watchdog, which a test binary disarms, so this test could never
-    /// finish there.
+    /// The same limit bounds the SYNCHRONOUS client `bench-openrouter` resolves its config through:
+    /// a query the instance took and never answered fails with the limit's own wording — never as
+    /// an unreachable channel — and is never sent again. `serial(read_limit)`: this shrinks the
+    /// knob. Unix only: the sync client's end here is its socket timeout, and named pipes carry
+    /// none — on Windows only the read-limit watchdog would end a wedged exchange, and a test
+    /// binary disarms it, so this test could never finish there.
     #[cfg(unix)]
     #[serial_test::serial(read_limit)]
     #[test]
@@ -1711,18 +1539,12 @@ mod tests {
         );
     }
 
-    /// End-to-end: the same listener serves the OPERATION shape of a frame —
-    /// `handle_connection` reads the `call` off a protocol value it serves and
-    /// routes it through the instance-side executor, and the client reads the
-    /// instance's own `CallReply` back. The tool here is one no family fronts —
-    /// the executor's own guard against a frame this build's value never carries
-    /// in practice — so the frame is served as an operation and refused as
-    /// something the product cannot take on at all, with the restart the
-    /// environment's class carries — enough to prove the frame is served as an
-    /// operation and not as a diagnostic query.
-    /// `serial(ipc_bound)`: the call channel's wait is read from that knob (the
-    /// listener may bind after the first attempt), so it must not overlap the
-    /// test that shrinks it.
+    /// End-to-end: the same listener serves the OPERATION shape — `handle_connection` reads the
+    /// `call` off a protocol value it serves and routes it through the executor, and the client
+    /// reads the `CallReply` back. The tool here is one no family fronts, so the frame is served as
+    /// an operation and refused as something the product cannot take on — enough to prove it is not
+    /// served as a diagnostic query. `serial(ipc_bound)`: the call channel's wait is read from that
+    /// knob, so this must not overlap the test that shrinks it.
     #[serial_test::serial(ipc_bound)]
     #[tokio::test]
     async fn ipc_call_serves_an_operation_frame_end_to_end() {
@@ -1769,18 +1591,12 @@ mod tests {
         let _ = listener.await;
     }
 
-    /// End-to-end through the whole command line: the frame a `mahbot send`
-    /// invocation writes is served by the instance-side executor, which hands the
-    /// message to the owner's own assistant — the one-way send with no addressee
-    /// named, which is the command's default address. What comes back is the
-    /// product's own acknowledgement, the handover is durable in `pending_jobs`
-    /// when the caller reads it, the message reaches the assistant's
-    /// conversation, and it is persisted to the conversation's history as the
-    /// owner's own incoming message. The store is shared with the parallel tests,
-    /// so the test reclaims the durable row AND the conversation row it created —
-    /// no other test can pick the handover up and route it into a live turn.
-    /// `serial(ipc_bound, …)`: the call channel's wait is read from that knob,
-    /// and this registers the owner's assistant consumer in the
+    /// End-to-end through the whole command line: the frame a `mahbot send` invocation writes is
+    /// served by the executor, which hands the message to the owner's own assistant — the one-way
+    /// send with no addressee named. What comes back is the product's acknowledgement, the handover
+    /// is durable in `pending_jobs`, and the message reaches and is persisted to the assistant's
+    /// conversation. The store is shared with the parallel tests, so the test reclaims BOTH rows it
+    /// created. `serial(ipc_bound, …)`: this also registers the owner's assistant consumer in the
     /// process-global router, which the dispatch tests hold too.
     #[serial_test::serial(ipc_bound, provider, channel_registry, drain)]
     #[tokio::test]

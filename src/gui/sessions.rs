@@ -1,13 +1,10 @@
-//! Sessions dashboard page — view and manage conversation sessions.
+//! Sessions dashboard page — view and manage conversation sessions. No rail entry: the
+//! dashboard's Cmd+K shortcut is the only way in.
 //!
-//! The page has no rail entry: the dashboard's Cmd+K (Ctrl+K elsewhere)
-//! shortcut is its only way in.
-//!
-//! The list is a live projection of the registry, not a snapshot: a session
-//! whose agent is running is pinned to the top of the list for as long as it
-//! runs — including an agent that has not stored its first message yet — and the
-//! rows are re-read on every runtime tick rather than only on page entry, so the
-//! page converges on its own. See [`session_rows`].
+//! The list is a live projection of the registry, not a snapshot: a session whose agent is running
+//! is pinned to the top for as long as it runs — including one that has not stored its first
+//! message yet — and rows are re-read on every runtime tick, so the page converges on its own.
+//! See [`session_rows`].
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -35,40 +32,29 @@ use super::session_view::{self, ParsedBody, SessionEntry, ToolCallEntry};
 use super::theme;
 use super::widgets::{self, BubbleSide, align_bubble, selectable_text};
 
-/// Fraction of the transcript row width a chat bubble occupies (FillPortion 3
-/// of a 3:1 row). The collapse measurement uses this to narrow the measured
-/// width to the actual bubble body (container padding + a safety margin).
+/// Fraction of the transcript row width a chat bubble occupies (FillPortion 3 of a 3:1 row); the
+/// collapse measurement narrows the measured width to the bubble body.
 const BUBBLE_BODY_RATIO: f32 = 0.75;
 
-/// Delay before a click-scheduled collapse of an expanded element actually
-/// applies: the widget's double-click window (300 ms) plus a small margin, so
-/// a canceling second click published at the window boundary always arrives
-/// before the commit. A click inside the margin (beyond the double-click
-/// window) is a deliberate second click and re-affirms the still-scheduled
-/// collapse.
+/// Delay before a click-scheduled collapse applies: the widget's double-click window (300 ms) plus
+/// a small margin, so a double-click's first click does not collapse before the second lands.
 const COLLAPSE_COMMIT_DELAY: Duration = Duration::from_millis(350);
 
-/// Max characters for the card title (a user/workspace name) before an ellipsis
-/// is appended — the card column is 350px wide. A custom-role row carries its
-/// own compact spelling under the same bound (see [`custom_role_title`]).
+/// Max characters for the card title before an ellipsis.
 const CARD_TITLE_MAX_CHARS: usize = 32;
 
-/// Max characters of the branch identifier inside a custom-role card title — a
-/// branch is the discriminating half of the label, so it keeps half the budget.
+/// Max characters of the branch identifier inside a custom-role card title — half the title
+/// budget, so the role name keeps the rest.
 const CARD_TITLE_BRANCH_MAX_CHARS: usize = CARD_TITLE_MAX_CHARS / 2;
 
-/// Shared transcript render context: the flat session ledger, its per-entry
-/// parsed bodies, the element expansion set, the collapse-measurement
-/// cache, the single text measurement width (bubble body width, used for
-/// all collapsible-element measurement), and whether the ledger can be
-/// truncated (a stored, idle session).
+/// Shared transcript render context: the flat session ledger, its per-entry parsed bodies, the
+/// element expansion set, the collapse-measurement cache, the text measurement width, and whether
+/// the ledger can be truncated (a stored, idle session).
 struct TranscriptCtx<'a> {
     entries: &'a [SessionEntry],
     entry_md: &'a [Option<ParsedBody>],
-    /// Root folder of the conversation's workspace; a relative file marker
-    /// resolves against it. Owned because the `responsive` closure that builds
-    /// the transcript is a `move` closure — a `Fn` closure cannot lend a
-    /// captured value to the element it returns.
+    /// Root folder of the conversation's workspace; a relative file marker resolves against it.
+    /// Owned because the `responsive` closure that builds the transcript is a `move` closure.
     workspace_root: Option<PathBuf>,
     expanded: &'a HashSet<(usize, usize)>,
     measure_cache: &'a RefCell<HashMap<(usize, usize), MessageMeasure>>,
@@ -78,141 +64,99 @@ struct TranscriptCtx<'a> {
 
 #[derive(Debug, Clone)]
 pub(crate) enum SessionsMessage {
-    /// A finished list read — page entry and the runtime tick alike.
     Settled(Result<Vec<SessionMetadata>, String>),
     SelectSession(String),
     SessionMessages(String, Vec<ChatMessage>),
-    /// A transcript read failure. `key` is the session the failed read
-    /// belonged to, so a slow read for a session the user has since left does
-    /// not render in the newly selected transcript.
+    /// A transcript read failure. `key` is the session the failed read belongs to.
     SessionError {
         key: String,
         error: String,
     },
-    /// Toggle an element's collapsed preview / full content, keyed by
-    /// (entry index, element index within entry). Expanding applies
-    /// immediately; collapsing is deferred past the double-click window (see
-    /// `SessionsState::update`) and confirmed by [`SessionsMessage::ToggleCommit`].
+    /// Toggle an element's collapsed preview / full content, keyed by `id`.
     ToggleExpand(usize, usize),
 
-    /// The second click of a double-click on a collapsible element: a
-    /// word/line selection, so any collapse scheduled by the first click is
-    /// dropped.
+    /// The second click of a double-click on a collapsible element: cancel the scheduled collapse.
     ToggleCancel(usize, usize),
 
-    /// Apply a collapse previously scheduled by [`SessionsMessage::ToggleExpand`]
-    /// once the double-click window has passed without a canceling second
-    /// click.
+    /// Apply a collapse previously scheduled by [`SessionsMessage::ToggleExpand`].
     ToggleCommit(usize, usize),
 
-    /// Scroll position changed in the transcript viewport.
     ScrollChanged(scrollable::Viewport),
 
-    /// Dismiss modals/panels (Escape key).
     Escape,
 
-    /// A link was clicked in rendered markdown.
     LinkClicked(String),
 
-    /// A `[FILE:…]` marker was clicked: reveal `target` in the file manager,
-    /// resolving a relative target against `workspace`.
+    /// A `[FILE:…]` marker was clicked: reveal `target` in the file manager.
     RevealFile {
         target: String,
         workspace: Option<PathBuf>,
     },
 
-    /// A [`SessionsMessage::RevealFile`] finished: an error becomes an error
-    /// toast, success needs no action.
+    /// A [`SessionsMessage::RevealFile`] finished: an error becomes an error toast.
     FileRevealed(Result<(), String>),
 
-    /// A toast notification to surface from the dashboard.
     Toast(ToastMessage),
-    /// Delete a session (context-menu action).
     DeleteSession(String),
-    /// A session delete finished — remove it from the list. The bool is the
-    /// store-reported row deletion (`true` when a real removal happened).
+    /// A session delete finished — remove it from the list. The bool is whether a row was removed.
     SessionDeleted(String, bool),
 
-    /// Truncate the selected session (context-menu action): remove the ledger
-    /// entry at this index and every stored message from it on.
+    /// Truncate the selected session: remove the ledger from this index on.
     TruncateSession(usize),
-    /// A session truncate finished: the store removed `deleted` rows from
-    /// `entry` on (`0` = the cut was a no-op).
+    /// A session truncate finished: the store removed `deleted` rows from index `from`.
     SessionTruncated {
         key: String,
         entry: usize,
         deleted: usize,
     },
 
-    /// Coalesced runtime-change tick (250 ms): re-read the list so rows that
-    /// appear, grow or finish converge, refresh the cached rows and their
-    /// relative-time labels, and merge the selected session's live transcript
-    /// when its agent is running.
+    /// Coalesced runtime-change tick (250 ms): re-read the list so rows that started or stopped
+    /// are reflected.
     RuntimeChanged,
 }
 
 #[derive(Debug, Clone)]
 struct CachedSessionItem {
     agent_id: String,
-    /// Agent role parsed from the metadata role string (`None` renders the
-    /// title without an icon); for a running agent without a stored row, the
-    /// role the registry reports.
+    /// Agent role parsed from the metadata role string (`None` renders the fallback).
     role: Option<crate::Role>,
-    /// User name when present (Some and non-empty), otherwise the workspace
-    /// name (may be empty if both are absent). Workspace-scoped roles ignore
-    /// this and are titled by [`Self::workspace_name`] — see
-    /// [`Self::display_title`].
+    /// User name when present and non-empty, otherwise the workspace name.
     title: String,
     /// The workspace the agent belongs to, as recorded in the session context.
-    /// `None` when the session has no workspace (or an empty one).
     workspace_name: Option<String>,
-    /// The custom role this session belongs to, when it is a custom-role
-    /// session — its name titles the row instead of `title`. `None` for a worker
-    /// branch.
+    /// The custom role this session belongs to, when it is a custom-role session.
     custom_role: Option<String>,
-    /// The named branch this continuable session continues, when the branch was
-    /// named — a custom role's identifier, or a worker branch's name.
+    /// The named branch this continuable session continues, when named.
     custom_identifier: Option<String>,
-    /// Pre-formatted message count, `None` only for a running agent whose first
-    /// message is not stored yet — its row is synthesised from the registry, so
-    /// there is no count and no session to delete.
+    /// Pre-formatted message count, `None` only for a running agent whose first message is not
+    /// stored yet.
     msg_count_label: Option<String>,
-    /// Pre-formatted compact token count (same format as the Running Agents
-    /// card), when the session ever recorded a provider-reported length.
+    /// Pre-formatted compact token count (the Running Agents format).
     token_label: Option<String>,
-    /// Pre-formatted timestamp string.
     timestamp_label: String,
-    /// What the session's agent is doing right now.
     activity: SessionActivity,
 }
 
-/// What a session's agent is doing right now — the whole difference between a
-/// row pinned on top of the list and a row in its last-activity place.
+/// What a session's agent is doing right now — the whole difference between a live row and a
+/// stored one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionActivity {
-    /// No agent holds the session.
     Idle,
-    /// A registered agent is working in it: the row is pinned to the top of the
-    /// list and carries the activity dot.
+    /// A registered agent is working in it: the row is pinned to the top of the list.
     Working,
-    /// A registered agent was frozen by a workspace pause. It stops at its next
-    /// round boundary, so it is not working: the row keeps its place and shows
-    /// the state instead of the dot.
+    /// A registered agent was frozen by a workspace pause. It stops at its next checkpoint, so the
+    /// row keeps its normal place.
     Paused,
 }
 
 impl CachedSessionItem {
-    /// The row's title as the list shows it. A custom-role session is titled by
-    /// the role it belongs to — and its branch, when the branch was named —
-    /// instead of the user/workspace name every other role shows; a worker branch
-    /// is titled `Worker · <branch>` so it is distinguishable from a single worker
-    /// run.
+    /// The row's title as the list shows it. A custom-role session is titled by its role — and its
+    /// branch, when named — instead of the user/workspace name every other role shows; a worker
+    /// branch is titled `Worker · <branch>` so it is distinguishable from a single worker run.
     ///
-    /// A workspace's manager and maintainer belong to exactly one managed
-    /// workspace, so their rows are titled by its managed name (`mahbot_rlx`,
-    /// never the folder basename and never the account name). When that
-    /// workspace is no longer a managed workspace the row shows the role
-    /// alone rather than a stale name.
+    /// A workspace's manager and maintainer belong to exactly one managed workspace, so their rows
+    /// are titled by its managed name (never the folder basename, never the account name); once it
+    /// is no longer managed the row shows the role alone rather than a stale name.
     fn display_title(&self, workspaces: &HashMap<String, Workspace>) -> String {
         match (self.role, self.custom_role.as_deref()) {
             (Some(crate::Role::Custom), Some(name)) => {
@@ -235,8 +179,7 @@ impl CachedSessionItem {
     }
 }
 
-/// The compact ` · <branch>` suffix a branch row carries, under the same
-/// [`CARD_TITLE_MAX_CHARS`] bound every other row's title has.
+/// The compact ` · <branch>` suffix a branch row carries, under the title budget.
 fn branch_suffix(identifier: &str) -> String {
     format!(
         " · {}",
@@ -244,18 +187,12 @@ fn branch_suffix(identifier: &str) -> String {
     )
 }
 
-/// Card title for a custom-role row: the compact `name · branch` spelling under
-/// the same [`CARD_TITLE_MAX_CHARS`] bound every other row's title has. A named
-/// branch keeps its identifier: the role's own name is truncated (a role name
-/// may itself be [`crate::custom_role::MAX_ROLE_NAME_CHARS`] long) so the
-/// suffix always fits. The full [`crate::launch::display_label`] wording is
-/// used where the surface has room for it — the Running Agents card.
+/// Card title for a custom-role row: the compact `name · branch` spelling under the title budget,
+/// the identifier capped at half of it.
 fn custom_role_title(name: &str, identifier: Option<&str>) -> String {
     let Some(identifier) = identifier else {
         return crate::util::truncate(name, CARD_TITLE_MAX_CHARS);
     };
-    // The identifier is capped at half the budget, so the rest of the budget is
-    // always enough for the separator and a usable share of the name.
     let suffix = branch_suffix(identifier);
     let room = CARD_TITLE_MAX_CHARS - suffix.chars().count();
     format!("{}{suffix}", crate::util::truncate(name, room))
@@ -263,18 +200,14 @@ fn custom_role_title(name: &str, identifier: Option<&str>) -> String {
 
 /// The session list's rows, in display order.
 ///
-/// A session whose agent is working is pinned to the top for as long as it runs
-/// (ordered by run start, so the block stays still while the runs go on) and
-/// settles into its last-activity place once it stops: a run in progress must
-/// never be lost below the fold of a long list, and the list is not re-sorted
-/// between a run's start and its end. A paused (frozen) agent is not working, so
-/// its row keeps its normal place.
+/// A working agent's session is pinned to the top for as long as it runs (ordered by run start, so
+/// the block stays still) and settles into its last-activity place once it stops: a run in progress
+/// must never be lost below the fold, and the list is not re-sorted mid-run. A paused (frozen)
+/// agent is not working, so its row keeps its normal place.
 ///
-/// A registered agent whose first message is not stored yet has no row of its
-/// own and gets a synthesised one from what the registry knows — its role, its
-/// project and that it is working. Rows are keyed by `agent_id`, so the
-/// synthesised row is replaced by the stored one as soon as the first message
-/// lands.
+/// A registered agent whose first message is not stored yet gets a synthesised row from what the
+/// registry knows. Rows are keyed by `agent_id`, so it is replaced by the stored one as soon as the
+/// first message lands.
 fn session_rows(
     sessions: &[SessionMetadata],
     agents: &[crate::agent::registry::AgentHandle],
@@ -317,11 +250,9 @@ fn session_rows(
             },
         });
     }
-    // What remains in `live` has no stored row yet.
     for handle in live.into_values() {
         let activity = session_activity(Some(handle));
         let workspace_name = Some(handle.workspace_name.clone()).filter(|n| !n.is_empty());
-        // A personal workspace is titled by its user, like a stored row is.
         let title = workspace_name
             .as_deref()
             .and_then(crate::users::personal_user_name)
@@ -343,9 +274,8 @@ fn session_rows(
             },
         });
     }
-    // A running row sorts by the run's start; the rest keep last-activity order
-    // (a synthesised row has no stored activity of its own, so its start stands
-    // in for one).
+    // A running row sorts by the run's start; the rest keep last-activity order (a
+    // synthesised row's start stands in for activity).
     rows.sort_by(|a, b| match (a.pinned_at, b.pinned_at) {
         (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.row.agent_id.cmp(&b.row.agent_id)),
         (Some(_), None) => std::cmp::Ordering::Less,
@@ -358,17 +288,13 @@ fn session_rows(
     rows.into_iter().map(|ListRow { row, .. }| row).collect()
 }
 
-/// One row of the list with the two keys its order is decided by.
 struct ListRow {
     row: CachedSessionItem,
-    /// Start of the run the row is pinned for; `None` when it keeps its
-    /// last-activity place.
+    /// Start of the run the row is pinned for; `None` when it keeps its last-activity place.
     pinned_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// The row's last activity, or the run's start for a synthesised row.
     last_activity: chrono::DateTime<chrono::Utc>,
 }
 
-/// What a session's agent is doing right now, from the live registry alone.
 fn session_activity(handle: Option<&crate::agent::registry::AgentHandle>) -> SessionActivity {
     match handle {
         Some(handle) if handle.paused => SessionActivity::Paused,
@@ -377,8 +303,7 @@ fn session_activity(handle: Option<&crate::agent::registry::AgentHandle>) -> Ses
     }
 }
 
-/// The pin key of a row: the start of the run it is pinned for, `None` when it
-/// keeps its last-activity place.
+/// The pin key of a row: the start of the run it is pinned for, `None` when it is not pinned.
 fn pinned_at(
     handle: Option<&crate::agent::registry::AgentHandle>,
     activity: SessionActivity,
@@ -388,10 +313,8 @@ fn pinned_at(
         .map(|handle| handle.started_at)
 }
 
-/// The root a transcript's relative `[FILE:…]` markers resolve against: the
-/// session's own workspace. A personal workspace is synthetic (never in the
-/// map), so it resolves by name; a stored name that is itself an absolute path
-/// still resolves when the workspace row is gone.
+/// The root a transcript's relative `[FILE:…]` markers resolve against: the conversation's
+/// workspace, or the selected one.
 fn workspace_root_for(name: &str, workspaces: &HashMap<String, Workspace>) -> Option<PathBuf> {
     if let Some(user) = crate::users::personal_user_name(name) {
         return Some(crate::users::personal_workspace_path(user));
@@ -404,8 +327,7 @@ fn workspace_root_for(name: &str, workspaces: &HashMap<String, Workspace>) -> Op
 
 pub(crate) struct SessionsState {
     /// The stored session rows, re-read on page entry and on every runtime tick
-    /// so rows that appear, grow or finish converge without the user leaving the
-    /// page.
+    /// so rows that appear, grow or finish converge without the user leaving the page.
     sessions: super::common::PolledList<SessionMetadata>,
     selected_session: Option<String>,
     /// The flat session ledger built from the selected session's messages.
@@ -443,20 +365,18 @@ pub(crate) struct SessionsState {
     /// Per-element collapse measurement cache, keyed like `expanded`. The
     /// ledger only appends or drops its tail, so a surviving entry keeps its
     /// index and its key stays valid — only new elements are measured lazily.
-    /// Mutated during layout (the bubble width is only known there), hence
-    /// `RefCell`.
+    /// Mutated during layout (the bubble width is only known there), hence `RefCell`.
     measure_cache: RefCell<HashMap<(usize, usize), MessageMeasure>>,
     /// Cached session list display data. Rebuilt whenever the row set changes —
     /// a settled read or a runtime tick (which also moves relative-time labels
-    /// and the live rows). `view()` builds widgets from this data on every
-    /// frame.
+    /// and the live rows). `view()` builds widgets from this data on every frame.
     cached_session_items: Option<Vec<CachedSessionItem>>,
     /// A read was asked for while one was in flight: its rows are stale by the
     /// time they land, so one more read follows the settled one. This is what
     /// makes the last event of a burst count.
     refresh_pending: bool,
 
-    // ── Transcript viewport fields ───────────────────────────────
+    // Transcript viewport fields
     /// Stable scrollable ID for the transcript area, preserves scroll position
     /// across widget rebuilds.
     scrollable_id: Id,
@@ -485,12 +405,10 @@ impl SessionsState {
         }
     }
 
-    /// Re-read the session list: entering the page, every runtime tick, and
-    /// after a delete or truncation, so a session created, grown, removed or
-    /// finished while the page is open converges on its own. A read already in
-    /// flight makes this a no-op that queues one more read for when it settles,
-    /// so ticks never pile up and the last change of a burst is never lost. A
-    /// failed read keeps the rows already on screen.
+    /// Re-read the session list: entering the page, every runtime tick, and after a delete or
+    /// truncation. A read already in flight makes this a no-op that queues one more read for when
+    /// it settles, so ticks never pile up and the last change of a burst is never lost. A failed
+    /// read keeps the rows already on screen.
     pub(crate) fn refresh(&mut self) -> Task<SessionsMessage> {
         if !self.sessions.begin() {
             self.refresh_pending = true;
@@ -519,9 +437,7 @@ impl SessionsState {
         match msg {
             SessionsMessage::Settled(result) => {
                 self.sessions.settle(result);
-                // The selected session's workspace may only be named now: adopt
-                // it so its relative marker targets resolve, and re-parse the
-                // bodies already loaded.
+                // The selected session's workspace may only be named now: adopt it.
                 if self.adopt_workspace_root(workspaces) {
                     self.entry_md = session_view::parse_entry_bodies(
                         &self.entries,
@@ -529,8 +445,7 @@ impl SessionsState {
                     );
                 }
                 self.rebuild_session_cache();
-                // Changes that landed while this read was in flight are older
-                // than the read's own rows: one more read settles them.
+                // Changes that landed while this read was in flight are older than the reply.
                 if std::mem::take(&mut self.refresh_pending) {
                     return self.refresh();
                 }
@@ -542,13 +457,9 @@ impl SessionsState {
                 self.selected_error = None;
                 self.expanded.clear();
                 self.pending_collapses.clear();
-                // The measurement cache is cleared in SessionMessages when the
-                // new session's messages actually arrive; a failure for the new
-                // session renders the error rather than the previous
-                // transcript, so stale cache entries stay unused until the next
-                // successful load clears them. Do NOT set auto_scroll_enabled
-                // here — ScrollChanged owns it; the initial snap to bottom
-                // happens in SessionMessages.
+                // The measurement cache is cleared in SessionMessages when the new session's
+                // messages arrive; a failure renders the error rather than the previous transcript.
+                // Do NOT set auto_scroll_enabled here — ScrollChanged owns it.
                 Task::perform(
                     async move {
                         let store = crate::session::store();
@@ -573,22 +484,18 @@ impl SessionsState {
                         &self.entries,
                         self.workspace_root.as_deref(),
                     );
-                    // Fresh session load: reset the measurement cache (the
-                    // previous session's keys are index-stale) and any pending
-                    // collapse from the old ledger.
+                    // Fresh session load: reset the measurement cache.
                     self.measure_cache.borrow_mut().clear();
                     self.pending_collapses.clear();
                     self.selected_loading = false;
                     self.selected_error = None;
-                    // Snap to bottom so the user sees the most recent messages
-                    // immediately.
+                    // Snap to bottom so the user sees the most recent messages.
                     return iced::widget::operation::snap_to_end(self.scrollable_id.clone());
                 }
                 Task::none()
             }
             SessionsMessage::SessionError { key, error } => {
-                // A slow read for a session the user has since left must not
-                // render its failure in the newly selected transcript.
+                // A slow read for a session the user has since left must not land.
                 if self.selected_session.as_deref() == Some(&key) {
                     self.selected_error = Some(error);
                     self.selected_loading = false;
@@ -596,9 +503,7 @@ impl SessionsState {
                 Task::none()
             }
             SessionsMessage::ScrollChanged(viewport) => {
-                // The fit check must stay first: `relative_offset` divides by
-                // the content/viewport height difference, so a fitting
-                // transcript reads as not-pinned there (exact fit is 0/0).
+                // The fit check must stay first: `relative_offset` divides by the content height.
                 self.auto_scroll_enabled = viewport.content_bounds().height
                     <= viewport.bounds().height
                     || viewport.relative_offset().y >= 0.99;
@@ -606,13 +511,11 @@ impl SessionsState {
             }
             SessionsMessage::ToggleExpand(i, j) => self.handle_toggle_expand(i, j),
             SessionsMessage::ToggleCancel(i, j) => {
-                // Double-click word/line selection: the scheduled collapse is
-                // dropped and the block stays put.
+                // Double-click word/line selection: the scheduled collapse is canceled.
                 self.pending_collapses.remove(&(i, j));
                 Task::none()
             }
             SessionsMessage::ToggleCommit(i, j) => {
-                // Apply the collapse only if no double-click canceled it.
                 if self.pending_collapses.remove(&(i, j)) {
                     self.expanded.remove(&(i, j));
                 }
@@ -620,10 +523,8 @@ impl SessionsState {
             }
             SessionsMessage::DeleteSession(key) => Task::perform(
                 async move {
-                    // User-initiated deletion: abandon the session's unfinished
-                    // sync jobs first — a delete must not orphan them. A failure
-                    // surfaces via the error toast and the delete is skipped so
-                    // the user can retry.
+                    // User-initiated deletion: abandon the session's unfinished jobs before the
+                    // rows go.
                     crate::jobs::abandon_session_jobs(&key)
                         .await
                         .map_err(|e| e.to_string())?;
@@ -642,12 +543,10 @@ impl SessionsState {
                 if self.selected_session.as_deref() == Some(&key) {
                     self.clear_selection();
                 }
-                // A read in flight may predate the delete and would put the row
-                // back; refreshing here settles the store's own answer.
+                // A read in flight may predate the delete and would put the row back.
                 let refresh = self.refresh();
-                // Only claim a "Deleted" success when a real row removal
-                // happened; an already-absent session (cleaned up elsewhere)
-                // just vanishes from the list without an inaccurate toast.
+                // Only claim a "Deleted" success when a real row removal happened; an
+                // already-absent session just vanishes from the list without an inaccurate toast.
                 let toast = if deleted {
                     Task::done(SessionsMessage::Toast(ToastMessage::Deleted))
                 } else {
@@ -659,8 +558,7 @@ impl SessionsState {
                 let Some(key) = self.selected_session.clone() else {
                     return Task::none();
                 };
-                // The stored row the entry was built from; without one the
-                // ledger has no stored-row identity and the cut is a no-op.
+                // The stored row the entry was built from; without one the cut is a no-op.
                 let Some(row) = self
                     .entry_rows
                     .as_ref()
@@ -691,10 +589,9 @@ impl SessionsState {
                 entry,
                 deleted,
             } => {
-                // A no-op cut has nothing to drop. A live merge landing between
-                // the click and this reply can at worst prune at a stale index —
-                // cosmetic: the store cut is durable and a re-select corrects
-                // the view.
+                // A no-op cut has nothing to drop. A live merge landing between the click and this
+                // reply can at worst prune at a stale index — cosmetic: the store cut is durable
+                // and a re-select corrects the view.
                 if deleted > 0 && self.selected_session.as_deref() == Some(key.as_str()) {
                     self.entries.truncate(entry);
                     self.entry_md.truncate(entry);
@@ -706,9 +603,7 @@ impl SessionsState {
                     self.measure_cache
                         .borrow_mut()
                         .retain(|(i, _), _| *i < entry);
-                    // The card's count renders from the list snapshot: drop the
-                    // removed messages here and let the store confirm both the
-                    // count and the cut (a read in flight may predate them).
+                    // The card's count renders from the list snapshot: drop the cached one.
                     if let Some(session) = self
                         .sessions
                         .entries_mut()
@@ -725,8 +620,7 @@ impl SessionsState {
             SessionsMessage::RuntimeChanged => self.on_runtime_changed(workspaces),
             SessionsMessage::Toast(_) | SessionsMessage::LinkClicked(_) => Task::none(),
             SessionsMessage::RevealFile { target, workspace } => Task::perform(
-                // The reveal stats and spawns a launcher: keep it out of the
-                // update handler.
+                // The reveal stats and spawns a launcher: keep it out of the update thread.
                 async move { media_markers::reveal_file_marker(&target, workspace.as_deref()) },
                 SessionsMessage::FileRevealed,
             ),
@@ -741,11 +635,8 @@ impl SessionsState {
         }
     }
 
-    /// Click-to-toggle of one collapsible element: expanding applies
-    /// immediately; collapsing is scheduled and confirmed by a delayed
-    /// [`SessionsMessage::ToggleCommit`]. The widget's second-click message
-    /// ([`SessionsMessage::ToggleCancel`]) drops a scheduled collapse so a
-    /// word/line-selection double-click never moves the block.
+    // Click-to-toggle of one collapsible element: expanding applies immediately, collapsing waits
+    // out the double-click window.
     fn handle_toggle_expand(&mut self, i: usize, j: usize) -> Task<SessionsMessage> {
         let key = (i, j);
         if self.expanded.contains(&key) {
@@ -760,8 +651,7 @@ impl SessionsState {
         }
     }
 
-    /// Clear the currently selected session and ALL per-session transcript
-    /// state, returning the transcript column to its placeholder.
+    // Clear the currently selected session and ALL per-session transcript state.
     fn clear_selection(&mut self) {
         self.selected_session = None;
         self.entries.clear();
@@ -776,8 +666,7 @@ impl SessionsState {
         self.measure_cache.borrow_mut().clear();
     }
 
-    /// Rebuild the cached session list display data from the settled rows and
-    /// the live registry. `view()` builds widgets from this data on every frame.
+    // Rebuild the cached session list display data from the settled rows.
     fn rebuild_session_cache(&mut self) {
         let items = session_rows(
             self.sessions.entries(),
@@ -787,14 +676,8 @@ impl SessionsState {
         self.cached_session_items = if items.is_empty() { None } else { Some(items) };
     }
 
-    /// Coalesced runtime-change tick: re-read the list, rebuild the display data
-    /// and merge the selected session's live transcript into the view.
-    ///
-    /// The registry publishes this tick on every agent start and stop, which is
-    /// the whole of the list's convergence: rows are re-read here rather than on
-    /// a timer because a session is only ever created or grown by a running
-    /// agent. Being event-driven also keeps the order still while agents work —
-    /// nothing re-sorts under the cursor between a run's start and its end.
+    // Coalesced runtime-change tick: re-read the list, rebuild the display data, merge the live
+    // transcript.
     fn on_runtime_changed(
         &mut self,
         workspaces: &HashMap<String, Workspace>,
@@ -803,9 +686,7 @@ impl SessionsState {
         Task::batch([self.merge_selected_transcript(workspaces), self.refresh()])
     }
 
-    /// The root the selected session's relative marker targets resolve against:
-    /// its workspace, by stored name. `None` while no session is selected or
-    /// when its workspace row is gone and the name is not a path of its own.
+    // The root the selected session's relative marker targets resolve against.
     fn selected_workspace_root(&self, workspaces: &HashMap<String, Workspace>) -> Option<PathBuf> {
         self.selected_session
             .as_deref()
@@ -819,9 +700,7 @@ impl SessionsState {
             .and_then(|name| workspace_root_for(name, workspaces))
     }
 
-    /// Adopt the selected session's workspace root: `true` when it changed, in
-    /// which case the bodies and measurements made under the old root must be
-    /// rebuilt by the caller.
+    // Adopt the selected session's workspace root: `true` when it changed.
     fn adopt_workspace_root(&mut self, workspaces: &HashMap<String, Workspace>) -> bool {
         let root = self.selected_workspace_root(workspaces);
         if root == self.workspace_root {
@@ -832,19 +711,13 @@ impl SessionsState {
         true
     }
 
-    /// Merge the selected session's live transcript into the view while its
-    /// agent is running.
+    /// Merge the selected session's live transcript into the view while its agent is running.
     ///
-    /// The merge is append-oriented and diffed by the longest common entry
-    /// prefix, so markdown re-parsing is limited to the changed tail and
-    /// measurement-cache keys of unchanged entries stay valid (built entries
-    /// drop their key and re-measure lazily; an in-place edit changes the
-    /// content length, which re-measures it anyway).
-    /// Index-keyed expansion sets stay valid because the tail is append-only
-    /// and out-of-range keys are harmless. Snapshot lookup doubles as the
-    /// running check — `None` when the agent is not running; a recycled agent
-    /// id surfaces the new run's fresh (empty) holder, replacing the displayed
-    /// transcript wholesale.
+    /// Append-oriented and diffed by the longest common entry prefix, so markdown re-parsing is
+    /// limited to the changed tail and measurement-cache keys of unchanged entries stay valid.
+    /// Index-keyed expansion sets stay valid because the tail is append-only and out-of-range keys
+    /// are harmless. Snapshot lookup doubles as the running check — `None` when the agent is not
+    /// running; a recycled agent id surfaces the new run's fresh holder, replacing the transcript.
     fn merge_selected_transcript(
         &mut self,
         workspaces: &HashMap<String, Workspace>,
@@ -859,8 +732,7 @@ impl SessionsState {
             return Task::none();
         };
         let live = session_view::build_ledger(&snapshot.history);
-        // A workspace resolved after the first load re-parses the whole ledger
-        // and re-measures every bubble under it.
+        // A workspace resolved after the first load re-parses the whole ledger.
         let root_changed = self.adopt_workspace_root(workspaces);
         let common = if root_changed {
             0
@@ -874,8 +746,7 @@ impl SessionsState {
             .borrow_mut()
             .retain(|(i, _), _| *i < common);
         self.entries = live;
-        // Live history positions, not stored rows: the merged ledger has no
-        // stored-row identity (see `entry_rows`).
+        // Live history positions, not stored rows: the merged ledger has no stored ids.
         self.entry_rows = None;
         self.entry_md.truncate(common);
         self.entry_md.extend(session_view::parse_entry_bodies(
@@ -883,8 +754,7 @@ impl SessionsState {
             self.workspace_root.as_deref(),
         ));
 
-        // Live updates only auto-scroll when the user was already following
-        // the bottom (same rule as the fresh-load path).
+        // Live updates only auto-scroll when the user was already following.
         if self.auto_scroll_enabled {
             iced::widget::operation::snap_to_end(self.scrollable_id.clone())
         } else {
@@ -899,15 +769,12 @@ impl SessionsState {
     ) -> Element<'_, SessionsMessage> {
         let mut content = column![];
 
-        // Error display — inset to align with the vscroll-wrapped list below.
         content = widgets::push_error_banner_inset(content, self.sessions.error());
 
         if !self.sessions.loaded() {
             content = content.push(widgets::scroll_h_inset(widgets::loading_text()));
         } else if let Some(cached) = self.cached_session_items.as_ref() {
-            // Session list on the left side — built from cached display data
-            // (rebuilt on every settled read and runtime tick); cards are
-            // rebuilt from it on every frame.
+            // Session list on the left side — built from cached display data.
             let mut session_list = Column::new().spacing(theme::SPACE_4);
             for item in cached {
                 let is_selected = self.selected_session.as_deref() == Some(&item.agent_id);
@@ -939,8 +806,7 @@ impl SessionsState {
                             .push(Space::new().width(Length::Fill))
                             .push(super::activity_dot());
                     }
-                    // A frozen agent produces nothing: its row keeps its place
-                    // and says so rather than carrying the activity dot.
+                    // A frozen agent produces nothing: its row keeps its place.
                     SessionActivity::Paused => {
                         title_row = title_row
                             .push(Space::new().width(Length::Fill))
@@ -949,9 +815,8 @@ impl SessionsState {
                     SessionActivity::Idle => {}
                 }
 
-                // A synthesised row (a run whose first message is not stored
-                // yet) has no count of its own: it says what it is doing
-                // instead.
+                // A synthesised row (a run whose first message is not stored yet) has no stored
+                // session.
                 let count_label = item
                     .msg_count_label
                     .as_deref()
@@ -965,11 +830,8 @@ impl SessionsState {
                                     column![
                                         title_row,
                                         {
-                                            // Meta row: messages left / tokens center /
-                                            // time right, spread via two Fill gaps
-                                            // across the card. Sessions that never
-                                            // recorded a token length leave the center
-                                            // empty.
+                                            // Meta row: messages left / tokens center / timestamp
+                                            // right.
                                             let mut meta_row =
                                                 iced::widget::Row::new().width(Length::Fill);
                                             if let Some(count) = count_label {
@@ -1015,8 +877,7 @@ impl SessionsState {
                 )
                 .style(theme::surface_card_style);
 
-                // A synthesised row has no stored session behind it, so there is
-                // nothing to delete.
+                // A synthesised row has no stored session behind it, so there is nothing to act on.
                 let sess_row: Element<'_, SessionsMessage> = if item.msg_count_label.is_some() {
                     ContextMenu::new(
                         card,
@@ -1037,9 +898,8 @@ impl SessionsState {
             let session_scroll =
                 widgets::vscroll_sized(session_list, Length::Fixed(350.0), Length::Shrink);
 
-            // Transcript on the right side. Wrapped in `responsive` so the
-            // collapse measurement uses the real bubble body width, correct on
-            // first render and after every window resize.
+            // Transcript on the right side, wrapped in `responsive` so the bubble width is
+            // measured.
             let workspace_root = self.workspace_root.clone();
             let transcript: iced::Element<'_, SessionsMessage> = if self.selected_loading {
                 iced::widget::container(widgets::loading_text())
@@ -1048,18 +908,14 @@ impl SessionsState {
                     .padding(theme::PAD_16)
                     .into()
             } else if let Some(err) = self.selected_error.as_deref() {
-                // The transcript read failed: render the failure where the
-                // transcript would be, instead of the previous transcript or
-                // the empty-session message.
+                // The transcript read failed: render the failure where the transcript would be.
                 container(widgets::error_banner_fill(err))
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .padding(theme::PAD_16)
                     .into()
             } else if self.selected_session.is_some() {
-                // Truncate targets stored rows and is offered only on an idle
-                // session — registered membership is what disables it, so a
-                // frozen agent (registered, but not working) keeps it off too.
+                // Truncate targets stored rows and is offered only on an idle session.
                 let truncatable = self.entry_rows.is_some()
                     && self
                         .selected_session
@@ -1071,12 +927,9 @@ impl SessionsState {
                 let measure_cache = &self.measure_cache;
                 let scrollable_id = self.scrollable_id.clone();
                 responsive(move |size| {
-                    // The transcript scrollable wrapper adds 8px padding per
-                    // side. Every transcript round (message or tool round)
-                    // renders as a chat bubble; all content measures at the
-                    // bubble body width = 3/4 of the transcript row minus the
-                    // bubble's 10px padding per side, folded in with a +4px
-                    // safety margin that errs toward collapse.
+                    // The transcript scrollable wrapper adds 8px padding per side, so the content
+                    // width is
+                    // narrower than the row.
                     let text_width = ((size.width - 16.0) * BUBBLE_BODY_RATIO - 24.0).max(0.0);
                     let ctx = TranscriptCtx {
                         entries,
@@ -1117,8 +970,7 @@ impl SessionsState {
                 .height(Length::Fill),
             );
         } else if self.sessions.error().is_none() {
-            // A failed read must not masquerade as a legitimately empty list:
-            // the error banner above is the only thing rendered.
+            // A failed read must not masquerade as a legitimately empty list.
             content = content.push(widgets::empty_state_placeholder(
                 lucide::layout_dashboard::<iced::Theme, iced::Renderer>(),
                 "No sessions",
@@ -1126,26 +978,17 @@ impl SessionsState {
             ));
         }
 
-        // The page-level dialog slot is stacked above the padded page, as on
-        // Settings, so a dialog added here dims the whole page area too. Closed
-        // is the type-stable placeholder, keeping the page's widget state.
+        // The page-level dialog slot is stacked above the padded page, as on every other page.
         widgets::page_with_dialog(content, widgets::no_dialog())
     }
 }
 
-/// Length of the longest common prefix of two ledgers (first differing
-/// entry index). `build_ledger` is deterministic, so an unchanged message
-/// prefix yields an identical entry prefix.
+/// Length of the longest common prefix of two ledgers (first differing entry index).
 fn common_entry_prefix(old: &[SessionEntry], new: &[SessionEntry]) -> usize {
     old.iter().zip(new).take_while(|(a, b)| a == b).count()
 }
 
-/// Author label above a bubble for the roles that carry one, flush left like
-/// their bubbles. One non-accent color for every labeled role, so roles stay
-/// visually consistent.
-///
-/// `Assistant` bubbles are unlabelled — `None`, so neither the label nor the
-/// gap it occupied is emitted.
+/// Author label above a bubble for the roles that carry one, flush left like the bubble.
 fn author_label<'a>(role: crate::ChatRole) -> Option<Element<'a, SessionsMessage>> {
     let name = match role {
         crate::ChatRole::System => "System",
@@ -1157,13 +1000,8 @@ fn author_label<'a>(role: crate::ChatRole) -> Option<Element<'a, SessionsMessage
     Some(align_bubble(label, BubbleSide::Left))
 }
 
-/// Chat-bubble row for one ledger entry: the roles that carry an author label
-/// render it above the bubble; the bubble itself aligns right for assistant
-/// rounds and left otherwise. Same background/typography as the Home chat
-/// bubbles.
-///
-/// `menu` wraps the BUBBLE alone — not the label, and not the spacer
-/// `align_bubble` adds beside it, so the menu's hit target is the bubble.
+/// Chat-bubble row for one ledger entry: the roles that carry an author label get it, the bubble
+/// is aligned by side.
 fn bubble_row(
     role: crate::ChatRole,
     body: Column<'_, SessionsMessage>,
@@ -1198,18 +1036,15 @@ fn bubble_row(
     row.push(align_bubble(bubble, side)).into()
 }
 
-/// Resolve the collapse measurement for an element at the current
-/// `text_width`, measuring on cache miss (cached per element and width). Returns
-/// the wrapped-line count and — only when `need_preview` is set (the element is
-/// currently collapsed) — its 3-line plain-text preview, so expanded elements do
-/// not pay a per-frame preview clone. `font_size` is the body size the element
-/// renders at (body or narration); `body` is how the text is drawn, so the
-/// measurement matches it.
+/// Resolve the collapse measurement for an element at the current `text_width`, measuring on
+/// cache miss (cached per element and width). Returns the wrapped-line count and — only when
+/// `need_preview` is set (the element is currently collapsed) — its 3-line plain-text preview, so
+/// expanded elements do not pay a per-frame preview clone. `font_size` is the body size the element
+/// renders at; `body` is how the text is drawn, so the measurement matches it.
 ///
-/// Stale-fingerprint semantics: a cache hit with the same content length and
-/// `font_size` is reused when its width bucket still matches, re-measured via
-/// [`re_measure`] when only the bucket moved, and otherwise replaced by a fresh
-/// measurement.
+/// Stale-fingerprint semantics: a cache hit with the same content length and `font_size` is reused
+/// when its width bucket still matches, re-measured via [`re_measure`] when only the bucket moved,
+/// and otherwise replaced by a fresh measurement.
 #[expect(
     clippy::float_cmp,
     reason = "font sizes are theme constants passed verbatim; exact identity is intended"
@@ -1226,8 +1061,7 @@ fn element_measurement(
     let bucket = width_bucket(text_width);
     let mut cache = measure_cache.borrow_mut();
     let cache_hit = cache.get(&key);
-    // The same body at the same size: only a width change can be served from
-    // the cached processed text (an `Arc` clone) instead of a fresh measure.
+    // The same body at the same size: only a width change can be served from the cache.
     let unchanged =
         cache_hit.filter(|m| m.source.len() == content.len() && m.font_size == font_size);
     if unchanged.is_none_or(|m| m.width_bucket != bucket) {
@@ -1248,14 +1082,8 @@ fn element_measurement(
     )
 }
 
-/// The collapsed-preview-versus-full content of a collapsible element: when
-/// it can collapse and is collapsed, a [`MAX_PREVIEW_LINES`]-line preview
-/// (in `size`/`font`) with an "ellipsis" cue for the hidden content on its own
-/// line under the preview, flush left — never trailing the last preview line,
-/// where only a line that happens to wrap would put it on a line of its own;
-/// otherwise the caller's `expanded` element. Callers wrap the result in
-/// [`click_toggle`] — never nesting two toggle areas (a nested double-toggle
-/// cancels out).
+/// The collapsed-preview-versus-full content of a collapsible element: when it is collapsed, the
+/// preview replaces the body.
 fn collapsible_text_block(
     collapses: bool,
     is_expanded: bool,
@@ -1355,10 +1183,7 @@ fn plain_collapsible<'a>(
     click_toggle(key, collapses, el)
 }
 
-/// The collapsible Thinking block: lucide `brain` + "Thinking" header above a
-/// 3-line-collapse body measured at the bubble body width. The measurement
-/// stays at [`theme::MARKDOWN_TEXT_SIZE`] (the body renders at 11px) — the
-/// err-toward-collapsing bias.
+/// The collapsible Thinking block: lucide `brain` + "Thinking" header above a collapsible body.
 fn thinking_block<'a>(
     ctx: &TranscriptCtx<'a>,
     key: (usize, usize),
@@ -1396,16 +1221,8 @@ fn thinking_block<'a>(
     click_toggle(key, collapses, whole)
 }
 
-/// The message/narration body with the 3-line collapse rule: a collapsed
-/// element shows a plain clickable preview; an expanded (or short) element
-/// draws the body through [`media_markers::body`] — its attachments as one
-/// group above its whole text, never interleaved and neither ever dropped.
-/// `content` is the plain text used for the collapse measurement (at the bubble
-/// body width; it is measured the way the body is drawn, so preview and expanded
-/// agree); `md` is the parsed body (markdown items and attachments) for the
-/// expanded view, `None` when the body draws as raw text. Narration bodies
-/// render italic at [`theme::NARRATION_TEXT_SIZE`]; user/assistant bodies stay at
-/// [`theme::MARKDOWN_TEXT_SIZE`] regular.
+/// The message/narration body with the 3-line collapse rule: a collapsed body draws its
+/// plain-text preview, an expanded one the parsed markdown.
 fn body_block<'a>(
     ctx: &TranscriptCtx<'a>,
     key: (usize, usize),
@@ -1418,8 +1235,7 @@ fn body_block<'a>(
     } else {
         theme::MARKDOWN_TEXT_SIZE
     };
-    // A body with no parsed form — promoted reasoning, an unparsed message —
-    // draws as raw text, so it must be measured as raw text too.
+    // A body with no parsed form — promoted reasoning, an unparsed message — drawn as plain text.
     let body = if md.is_some() {
         BodyText::Markdown(ctx.workspace_root.as_deref())
     } else {
@@ -1431,8 +1247,6 @@ fn body_block<'a>(
     } else {
         theme::FONT_REGULAR
     };
-    // The unadorned body: what an unparsed message draws, and what a parsed one
-    // falls back to when the composition leaves nothing to show.
     let plain = || {
         selectable_text(content, theme::TEXT_PRIMARY)
             .size(size)
@@ -1475,10 +1289,7 @@ fn body_block<'a>(
     click_toggle(key, collapses, el)
 }
 
-/// The tool-call result block: plain collapsible text at [`theme::TEXT_SECONDARY`]
-/// (11px) with the 3-line collapse — no leading icon (results are recognizable
-/// from context; "(no result)" keeps its arrow below). Results render inside
-/// the assistant bubble, so they measure at the bubble body width.
+/// The tool-call result block: plain collapsible text at [`theme::TEXT_SECONDARY`].
 fn result_block<'a>(
     ctx: &TranscriptCtx<'a>,
     key: (usize, usize),
@@ -1487,11 +1298,8 @@ fn result_block<'a>(
     plain_collapsible(ctx, key, result, theme::TEXT_SECONDARY)
 }
 
-/// Render one session round as a single assistant bubble containing the
-/// reasoning block, the narration body, and one tool block per call with its
-/// collapsible result beneath. An empty narration slot with a decoded
-/// Reasoning block promotes the reasoning into the narration slot (plain
-/// text) instead of a separate Thinking block.
+/// Render one session round as a single assistant bubble containing the narration, the reasoning
+/// and the tool blocks.
 fn render_tool_round<'a>(
     ctx: &TranscriptCtx<'a>,
     i: usize,
@@ -1503,10 +1311,7 @@ fn render_tool_round<'a>(
     let mut bubble_col = Column::new().spacing(theme::SPACE_4);
 
     if let Some(reasoning) = session_view::promoted_reasoning(narration, reasoning) {
-        // The reasoning IS the narration for this round: render it in the
-        // narration slot as plain text (md None — no markdown parse, so CoT
-        // characters never become formatting) and skip the Thinking block,
-        // whose text would duplicate it.
+        // The reasoning IS the narration for this round: render it in the narration's place.
         bubble_col = bubble_col.push(body_block(ctx, (i, 0), reasoning, None, true));
     } else {
         if let Some(reasoning) = reasoning {
@@ -1519,8 +1324,7 @@ fn render_tool_round<'a>(
 
     for (j, call) in calls.iter().enumerate() {
         let key = (i, 2 + j);
-        // Only a result that actually collapses makes the tool block a click
-        // target (toggling a short result's expansion would be a no-op).
+        // Only a result that actually collapses makes the tool block a click target.
         let collapses = call.result.as_deref().is_some_and(|result| {
             let (wrapped_lines, _) = element_measurement(
                 ctx.measure_cache,
@@ -1533,11 +1337,8 @@ fn render_tool_round<'a>(
             );
             wrapped_lines > MAX_PREVIEW_LINES
         });
-        // The tool block is wrapped in a click-to-toggle (not a button) so the
-        // shared tool block's hover tooltip keeps working; a short click
-        // anywhere toggles the associated result's collapse, and dragging over
-        // the selectable tool-args text selects instead. click_to_toggle also
-        // never captures the pointer, so the tooltip stays.
+        // The tool block is wrapped in a click-to-toggle (not a button) so the whole block is the
+        // target.
         let tool_block = container(session_view::tool_block(
             &call.tool,
             session_view::ToolBlockView::Full,
@@ -1554,8 +1355,7 @@ fn render_tool_round<'a>(
             Some(result) if !result.is_empty() => {
                 bubble_col = bubble_col.push(result_block(ctx, key, result));
             }
-            // Empty or missing ToolResult record: the old view's explicit
-            // "(no result)" indicator.
+            // Empty or missing ToolResult record: the explicit placeholder.
             _ => {
                 bubble_col = bubble_col.push(
                     row![
@@ -1573,19 +1373,12 @@ fn render_tool_round<'a>(
         }
     }
 
-    // One bubble for the whole round, same container as assistant text rounds
-    // (right-aligned, 75% width, no author label).
+    // One bubble for the whole round, same container as assistant text rounds.
     bubble_row(crate::ChatRole::Assistant, bubble_col, None)
 }
 
-/// Render one ledger entry as a chat-bubble row: a `Message` renders its own
-/// bubble, and a `ToolRound` renders a single assistant bubble containing the
-/// round's reasoning, narration, and tool calls with their results.
-///
-/// `None` means the entry has nothing to render at all: a message with neither
-/// a body nor thinking whose role carries no author label (i.e. an assistant
-/// message) would be a blank row, so the caller skips it — a zero-size child
-/// would still leave a band of inter-entry spacing.
+/// Render one ledger entry as a chat-bubble row: a `Message` renders its own bubble, a tool round
+/// its assistant bubble, a narration its divider.
 fn render_entry<'a>(ctx: &TranscriptCtx<'a>, i: usize) -> Option<Element<'a, SessionsMessage>> {
     let entry = &ctx.entries[i];
     match entry {
@@ -1595,8 +1388,7 @@ fn render_entry<'a>(ctx: &TranscriptCtx<'a>, i: usize) -> Option<Element<'a, Ses
             thinking,
         } => {
             if thinking.is_none() && content.is_none() {
-                // Nothing to show but the author: the row is the author label,
-                // which exists only for the labelled roles.
+                // Nothing to show but the author: the row is the author label.
                 return author_label(*role);
             }
             let mut bubble_col = Column::new().spacing(theme::SPACE_4);
@@ -1625,9 +1417,8 @@ fn render_entry<'a>(ctx: &TranscriptCtx<'a>, i: usize) -> Option<Element<'a, Ses
     }
 }
 
-/// Render the transcript column for the selected session: build the chat
-/// bubbles from the shared ledger and apply the 3-line collapse rule to
-/// message bodies, thinking blocks, and tool results.
+/// Render the transcript column for the selected session: build the chat column, or the
+/// placeholder when nothing is selected.
 fn render_transcript<'a>(
     ctx: &TranscriptCtx<'a>,
     scrollable_id: &Id,
@@ -1743,8 +1534,7 @@ mod tests {
         let rendered: Vec<bool> = (0..entries.len())
             .map(|i| render_entry(&ctx, i).is_some())
             .collect();
-        // Only the bodyless assistant row is skipped: the labelled roles keep
-        // their label-only row, and an assistant row with a body still renders.
+        // Only the bodyless assistant row is skipped: the labelled roles keep theirs.
         assert_eq!(rendered, [true, true, true, false, true]);
     }
 
@@ -1757,7 +1547,6 @@ mod tests {
     type ProjRow<'a> = (&'a str, i64);
     type RunRow<'a> = (&'a str, &'a str, i64, bool);
     type OrderCase<'a> = (&'a str, &'a [ProjRow<'a>], &'a [RunRow<'a>], &'a [&'a str]);
-    /// Running sessions are pinned on top in start order; everything else follows by last activity.
     #[test]
     fn test_session_row_ordering() {
         let cases: &[OrderCase] = &[
@@ -1794,7 +1583,6 @@ mod tests {
                 if sessions.iter().any(|&(stored, _)| stored == id) {
                     continue;
                 }
-                // A running agent with no stored row is synthesised from the registry.
                 assert_eq!(row.msg_count_label, None, "case {name}: no count");
                 assert_eq!(row.title, "ws", "case {name}: titled by project");
                 assert_eq!(
@@ -1813,8 +1601,7 @@ mod tests {
         std::fs::create_dir_all(photo.parent().unwrap()).unwrap();
         std::fs::write(&photo, b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR").unwrap();
 
-        // Loaded before the workspace could be named: the marker is a reference
-        // either way, so its row is there — with nothing to resolve it to.
+        // Loaded before the workspace could be named: the marker is a reference, not a path.
         let mut state = SessionsState::new();
         state.selected_session = Some("s1".to_string());
         state.entries = vec![msg(
@@ -1841,8 +1628,7 @@ mod tests {
                 .all(|item| !matches!(item, iced::widget::markdown::Item::Image { .. }))
         );
 
-        // The workspace list arrives later: the already-loaded ledger is
-        // re-parsed under the root, so the picture now resolves to its file.
+        // The workspace list arrives later: the already-loaded ledger is re-parsed.
         let workspaces = HashMap::from([(
             "ws".to_string(),
             Workspace {
@@ -1879,13 +1665,11 @@ mod tests {
         );
     }
 
-    /// The common prefix is the count of leading entries the two ledgers share.
     #[test]
     fn test_common_entry_prefix() {
         use ChatRole::{Assistant, User};
         use Ledger::{Msg, Tool};
 
-        /// One entry of a ledger: a message, or the tool-round fixture.
         enum Ledger {
             Msg(ChatRole, Option<&'static str>),
             Tool,
@@ -1918,10 +1702,8 @@ mod tests {
         }
     }
 
-    /// A transcript failure stays in the selected session's pane; a successful load clears it.
     #[test]
     fn test_transcript_load_errors() {
-        /// A transcript result for one session key.
         #[derive(Clone, Copy)]
         enum Load {
             Failed(&'static str),
@@ -1989,7 +1771,6 @@ mod tests {
             .collect()
     }
 
-    /// A stored workspace name resolves a session's media root and titles workspace-scoped cards.
     #[test]
     fn test_workspace_root_and_card_titles() {
         use crate::Role;

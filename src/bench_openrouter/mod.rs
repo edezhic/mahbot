@@ -1,47 +1,33 @@
 //! `mahbot bench-openrouter` — standalone OpenRouter provider benchmark CLI.
 //!
-//! Dispatched from `main()` BEFORE the instance flock is acquired (like
-//! `debug` and `__grep-engine`), so it runs while an instance holds the
-//! storage location. It never opens a live store: when the location is held it
-//! resolves the worker model / provider key through that instance's debug
-//! channel, only when nothing holds it does it read the config store directly
-//! (ReadOnly|NoLock) — the same routing `mahbot debug` uses — and a probe that
-//! cannot tell whether the location is held refuses instead of opening.
+//! Dispatched from `main()` BEFORE the instance flock is acquired (like `debug` and
+//! `__grep-engine`), so it runs while an instance holds the storage location. It
+//! never opens a live store: held, it resolves the worker model / provider key
+//! through that instance's debug channel; only when nothing holds it does it read
+//! the config store directly (ReadOnly|NoLock) — `mahbot debug`'s routing — and a
+//! probe that cannot tell refuses instead of opening.
 //!
-//! # Modes
+//! `--dry-run` runs the full discovery (models catalog, requested-model endpoints,
+//! key envelope) and cost-based provider selection, then emits the canonical plan
+//! JSON with ZERO chat-completions calls. The default mode adds the TTL-ladder
+//! executor: one tokio task per selected provider runs the warmup + ladder rounds
+//! against the pinned endpoint, and the run writes report.json / summary.md /
+//! providers.json / manifest.json under `<output-dir>/bench-openrouter/<run-ts>/`
+//! plus a `latest/` mirror. The report lists, per provider, the static price and
+//! the cache-hold result ("does not cache" / TTL hold bucket / "not measured").
 //!
-//! `--dry-run` performs the full discovery (models catalog, requested-model
-//! endpoints, key envelope) and cost-based provider selection, then emits the
-//! canonical plan JSON to stdout with ZERO chat-completions calls.
+//! Without `--output-dir` the default is `~/.mahbot/benchmarks/<model-slug>/` — a
+//! per-model folder from the model id ([`model_slug`]) — so parallel runs of
+//! different models never contend for the output lock. `--output-dir` remains an
+//! exact override.
 //!
-//! The default (full-run) mode adds the TTL-ladder executor: one tokio task
-//! per selected provider runs the warmup + ladder rounds against the pinned
-//! endpoint, and the run writes report.json / summary.md / providers.json /
-//! manifest.json under `<output-dir>/bench-openrouter/<run-ts>/` plus a
-//! `latest/` mirror ([`crate::bench_openrouter::report`]). The report is a
-//! per-provider list of the static price and the cache-hold result ("does not
-//! cache" / TTL hold bucket / "not measured").
+//! Exit codes: `0` dry-run success or a full run whose artifacts were written; `1`
+//! hard error (bad key, unaffordable estimate, discovery failure, lock held, write
+//! failure) — a full-run abort still writes the partial report first; `2` usage.
 //!
-//! Without `--output-dir`, `<output-dir>` defaults to
-//! `~/.mahbot/benchmarks/<model-slug>/` — a per-model folder derived from the
-//! model id ([`model_slug`]) — so parallel runs of different models write
-//! separate folders and never contend for the output lock. `--output-dir`
-//! remains an exact override (e.g. for a second run of the same model with a
-//! restricted `--providers` allowlist).
-//!
-//! # Exit codes
-//!
-//! `0` dry-run success, or a full run whose artifacts were written; `1` hard
-//! error (bad key, unaffordable estimate, discovery failure, lock held, write
-//! failure) — a full-run hard abort still writes the partial report first;
-//! `2` usage error (unknown flag / bad value).
-//!
-//! # Prompt
-//!
-//! The harness system prompt lives at `src/prompt/bench_openrouter.md`
-//! (embedded via rust-embed) and is loaded through [`bench_system_prompt`] so
-//! the "all LLM-sent prompts under src/prompt/" rule is enforced by
-//! construction.
+//! The harness prompt lives at `src/prompt/bench_openrouter.md` and is loaded
+//! through [`bench_system_prompt`], which enforces the "prompts under src/prompt/"
+//! rule by construction.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -66,36 +52,30 @@ use crate::bench_openrouter::select::{
     plan_cost, select_providers,
 };
 
-// ── Constants ──────────────────────────────────────────────────────
-
-/// Minimum context window (tokens) for a provider to be benchmarked.
+/// Tokens; a provider below this is not benchmarked.
 const MIN_CONTEXT: i64 = 128_000;
 
-/// Warmup rounds per provider: establish the base cache before the ladder.
+/// Establish the base cache before the ladder.
 const WARMUP_ROUNDS: usize = 2;
 
-/// Characters per token heuristic for the prompt-size estimate.
+/// Prompt-size estimate heuristic.
 const CHARS_PER_TOKEN: f64 = 4.0;
 
-/// Fixed prompt-history growth (tokens) added to the prefix estimate: the
-/// conversation grows across the 2 warmup + N ladder rounds.
+/// Added to the prefix estimate: the conversation grows across the 2 warmup + N
+/// ladder rounds.
 const HISTORY_GROWTH_TOKENS: f64 = 3360.0;
 
-// ── CLI types ──────────────────────────────────────────────────────
-
-/// A CLI failure: `Usage` → exit 2 (with usage on stderr), `Hard` → exit 1.
+/// `Usage` → exit 2 (with usage on stderr), `Hard` → exit 1.
 #[derive(Debug)]
 pub(crate) enum CliError {
     Usage(String),
     Hard(String),
 }
 
-/// Parsed `bench-openrouter` options.
-///
 /// `model` is fully resolved at parse time (flag > env `MAHBOT_BENCH_MODEL` >
-/// read-only config-store `worker_model` > [`crate::config::DEFAULT_WORKER_MODEL`]);
-/// the API key is resolved later (flag > env > config store, hard error when
-/// nothing is configured) so the error path can be reported cleanly.
+/// read-only config-store `worker_model` > `DEFAULT_WORKER_MODEL`); the API key is
+/// resolved later (flag > env > config store, hard error when unconfigured) so its
+/// error path reports cleanly.
 pub(crate) struct BenchOptions {
     pub model: String,
     pub api_key: Option<String>,
@@ -107,7 +87,7 @@ pub(crate) struct BenchOptions {
     pub dry_run: bool,
 }
 
-/// One lowercase hex digit for a 4-bit nibble (e.g. `0xf` → `'f'`).
+/// One lowercase hex digit per 4-bit nibble.
 const fn hex_digit(n: u8) -> char {
     match n {
         0..=9 => (b'0' + n) as char,
@@ -115,17 +95,11 @@ const fn hex_digit(n: u8) -> char {
     }
 }
 
-/// Derive a deterministic, path-safe, collision-free folder name from a model
-/// id, used for the default per-model output directory.
-///
-/// Encoding: bytes in `[A-Za-z0-9.-]` are kept verbatim; every other byte
-/// (including `/` and `_`) is escaped as `_` + two lowercase hex digits.
-/// The mapping is injective because the escape introducer `_` is never kept
-/// verbatim (a literal `_` becomes `_5f`), so a slug unambiguously decodes
-/// back to the original id. Examples:
-///
-/// - `deepseek/deepseek-v4-flash-0731` → `deepseek_2fdeepseek-v4-flash-0731`
-/// - `a/b` → `a_2fb`, while `a-b` → `a-b` and `a_b` → `a_5fb` (all distinct)
+/// A deterministic, path-safe folder name for the default per-model output
+/// directory. Bytes in `[A-Za-z0-9.-]` are kept verbatim, every other byte
+/// (including `/` and `_`) becomes `_` + two lowercase hex digits. The mapping is
+/// injective because `_` is never kept verbatim (a literal `_` becomes `_5f`), so a
+/// slug decodes back unambiguously: `a/b` → `a_2fb`, `a_b` → `a_5fb`, `a-b` → `a-b`.
 #[must_use]
 fn model_slug(model: &str) -> String {
     let mut slug = String::with_capacity(model.len() + 8);
@@ -142,8 +116,7 @@ fn model_slug(model: &str) -> String {
     slug
 }
 
-/// Fetch the value of `flag` — either the inline `--flag=value` part or the
-/// next argument; advances `i` in the latter case.
+/// The inline `--flag=value` part or the next argument; advances `i` in the latter case.
 fn next_value(
     args: &[String],
     i: &mut usize,
@@ -164,7 +137,6 @@ fn next_value(
         .ok_or_else(|| CliError::Usage(format!("flag {flag} requires a value")))
 }
 
-/// Parse a `--ladder` CSV into gap seconds.
 fn parse_ladder(s: &str) -> Result<Vec<u64>, CliError> {
     let vals: Result<Vec<u64>, CliError> = s
         .split(',')
@@ -186,10 +158,9 @@ fn parse_ladder(s: &str) -> Result<Vec<u64>, CliError> {
 }
 
 impl BenchOptions {
-    /// Parse `bench-openrouter` CLI arguments (no clap — manual, mirroring the
-    /// debug subcommand's style). Both `--flag value` and `--flag=value` are
-    /// accepted. The model lookup below is this subcommand's first store read, so
-    /// it runs under `budget` — the command's one read clock
+    /// Manual parsing, mirroring the debug subcommand's style; both `--flag value`
+    /// and `--flag=value` are accepted. The model lookup is this subcommand's first
+    /// store read and runs under `budget` — the command's one read clock
     /// ([`crate::db::read_limit`]), which the caller started and also hands to the
     /// later key lookup.
     pub(crate) fn parse(
@@ -265,16 +236,15 @@ impl BenchOptions {
             i += 1;
         }
 
-        // Flag values are validated BEFORE anything is read: the model resolution
-        // below can read the config store (through a running instance), and a
-        // usage error must not wait out a read to say so.
+        // Flags are validated BEFORE anything is read: the model resolution can read
+        // the config store (through a running instance), and a usage error must not
+        // wait out a read to say so.
         if !cap_usd.is_finite() || cap_usd <= 0.0 {
             return Err(CliError::Usage(
                 "--cap-usd must be a positive number".to_string(),
             ));
         }
 
-        // Model resolution: --model > env > read-only config store > default.
         let model = match model {
             Some(m) => m,
             None => model_from_env_or_config(budget),
@@ -294,18 +264,15 @@ impl BenchOptions {
     }
 }
 
-/// Resolve the output directory: `--output-dir` is an exact override (e.g. a
-/// second run of the same model with a restricted `--providers` allowlist
-/// targets its own directory). When omitted the default is per model —
-/// `~/.mahbot/benchmarks/<model-slug>/` — so parallel runs of different models
-/// write separate folders and never contend for the output lock.
+/// `--output-dir` is an exact override; omitted, the default is per model
+/// (`~/.mahbot/benchmarks/<model-slug>/`), so parallel runs of different models never
+/// contend for the output lock.
 fn resolve_output_dir(model: &str, output_dir: Option<PathBuf>) -> Result<PathBuf, CliError> {
     if let Some(dir) = output_dir {
         return Ok(dir);
     }
     let slug = model_slug(model);
-    // The slug is a name the product builds for itself, so it must be a folder
-    // name every platform can create before it is used as one.
+    // The slug must be a folder name every platform can create before it is used as one.
     if let Some(problem) = crate::util::folder_name::folder_name_problem(&slug) {
         return Err(CliError::Usage(format!(
             "model '{model}' gives the benchmark folder name '{slug}', which cannot be a folder \
@@ -317,9 +284,8 @@ fn resolve_output_dir(model: &str, output_dir: Option<PathBuf>) -> Result<PathBu
     Ok(root.join("benchmarks").join(slug))
 }
 
-/// Resolve the benchmark model when `--model` was not given:
-/// env `MAHBOT_BENCH_MODEL` > read-only config-store `worker_model` >
-/// [`crate::config::DEFAULT_WORKER_MODEL`]. Never fails.
+/// When `--model` was not given: env `MAHBOT_BENCH_MODEL` > read-only config-store
+/// `worker_model` > `DEFAULT_WORKER_MODEL`. Never fails.
 fn model_from_env_or_config(budget: &crate::db::read_limit::Budget) -> String {
     if let Ok(m) = std::env::var("MAHBOT_BENCH_MODEL")
         && !m.is_empty()
@@ -343,9 +309,8 @@ fn model_from_env_or_config(budget: &crate::db::read_limit::Budget) -> String {
     crate::config::DEFAULT_WORKER_MODEL.to_string()
 }
 
-/// Resolve the API key: `--api-key` > env `MAHBOT_BENCH_API_KEY` >
-/// env `OPENROUTER_API_KEY` > read-only config-store `provider_key` > hard error.
-/// Returns the key and its source label for the plan.
+/// `--api-key` > `MAHBOT_BENCH_API_KEY` > `OPENROUTER_API_KEY` > read-only
+/// config-store `provider_key` > hard error. Returns the key and its source label.
 fn resolve_key(
     opts: &BenchOptions,
     budget: &crate::db::read_limit::Budget,
@@ -378,23 +343,18 @@ fn resolve_key(
     ))
 }
 
-// ── Read-only config-store helper ────────────────────────────────────
-
 /// Read one `config_kv` value from the live config store, read-only.
 ///
-/// A store is never opened while an instance holds the storage location: when
-/// the settled instance-lock probe reports the location
-/// [`Held`](InstanceLockState::Held) the lookup is routed through the debug IPC
-/// endpoint (the same query-only guard `mahbot debug` uses), and a probe that
-/// could not tell ([`Unknown`](InstanceLockState::Unknown)) refuses instead of
-/// opening. Only a definitively [`Free`](InstanceLockState::Free) location is
-/// opened directly with `ReadOnly|NoLock`, which never creates or mutates files.
+/// A store is never opened while an instance holds the storage location:
+/// [`Held`](InstanceLockState::Held) routes the lookup through the debug IPC
+/// endpoint (the query-only guard `mahbot debug` uses), [`Unknown`](InstanceLockState::Unknown)
+/// refuses instead of opening, and only a definitively [`Free`](InstanceLockState::Free)
+/// location is opened directly with `ReadOnly|NoLock`.
 ///
-/// Any failure — unreadable store, a refused probe, an unreachable channel —
-/// degrades to `None` instead of failing the run, but never silently: this
-/// subcommand's log is not live this early, so the failure and the `fallback`
-/// the caller continues on go to stderr. A not-yet-created config store is
-/// `Ok(None)`, i.e. not a failure.
+/// Any failure — unreadable store, refused probe, unreachable channel — degrades to
+/// `None` rather than failing the run, but never silently: the log is not live this
+/// early, so the failure and the `fallback` go to stderr. A not-yet-created config
+/// store is `Ok(None)`, not a failure.
 fn read_config_kv(
     storage_root: &Path,
     budget: &crate::db::read_limit::Budget,
@@ -419,16 +379,15 @@ fn read_config_kv_inner(
     key: &str,
 ) -> anyhow::Result<Option<String>> {
     // In the consolidated layout the config store lives in the single domain
-    // database; a not-yet-created consolidated file means no config store yet.
+    // database; a missing consolidated file means no config store yet.
     let db_path = crate::db::store_db_path(storage_root, "config");
     if !db_path.exists() {
         return Ok(None);
     }
-    // Routing, and why it is fail-closed, is in the caller's doc.
     match crate::util::lock::instance_lock_state_settled(storage_root) {
         InstanceLockState::Held => {
-            // The process-ending half of the read limit, armed for the whole
-            // exchange — the channel client itself carries no watchdog.
+            // The process-ending half of the read limit, armed for the whole exchange
+            // — the channel client carries no watchdog itself.
             let read = crate::db::read_limit::Read::over_channel("config", budget);
             let _watchdog = read.arm()?;
             let req = crate::db::ipc::IpcRequest {
@@ -457,9 +416,8 @@ fn read_config_kv_inner(
     }
 }
 
-/// Read one `config_kv` value directly from a store file. Callers guarantee
-/// `db_path` exists (see [`read_config_kv_inner`]), so this does not re-check — a
-/// missing file degrades to `Ok(None)` there.
+/// Directly from a store file; callers guarantee `db_path` exists, so this does not
+/// re-check — a missing file degrades to `Ok(None)` in [`read_config_kv_inner`].
 fn read_config_kv_file(
     db_path: &Path,
     budget: &crate::db::read_limit::Budget,
@@ -473,12 +431,10 @@ fn read_config_kv_file(
     read_config_value(&conn, &io, key, read)
 }
 
-/// Step one `config_kv` lookup to its end under the command's read limit, asking
-/// the budget as every step comes back — so neither a row nor a "no such key" is
-/// reported past the limit. The first step is kept off a spent budget by the
-/// caller's [`crate::db::read_limit::Read::arm`]. Kept apart from the open so a
-/// check can drive this loop against a store it built itself, with a budget it
-/// spent itself — a lookup this cheap cannot be made to cross a limit by waiting.
+/// Asks the budget as every step comes back, so neither a row nor a "no such key" is
+/// reported past the limit; the caller's `Read::arm` keeps the first step off a spent
+/// budget. Kept apart from the open so a check can drive it against a store and a
+/// budget of its own — this lookup cannot be made to cross a limit by waiting.
 fn read_config_value(
     conn: &std::sync::Arc<turso::core::Connection>,
     io: &std::sync::Arc<dyn turso::core::IO>,
@@ -527,12 +483,9 @@ fn read_config_value(
     }
 }
 
-// ── CLI entry ──────────────────────────────────────────────────────
-
-/// Full `bench-openrouter` CLI entry. Called from `main()` on a current-thread
-/// runtime, before the instance flock is acquired. `-h`/`--help` prints usage
-/// to stdout and exits 0; usage errors print usage to stderr and exit 2; hard
-/// errors exit 1; a successful dry-run exits 0.
+/// Called from `main()` on a current-thread runtime, before the instance flock is
+/// acquired. `-h`/`--help` prints usage to stdout and exits 0; usage errors print
+/// usage to stderr and exit 2; hard errors exit 1.
 pub async fn run_cli() -> i32 {
     let args: Vec<String> = std::env::args().skip(2).collect();
 
@@ -544,9 +497,8 @@ pub async fn run_cli() -> i32 {
         return 0;
     }
 
-    // The command's own read clock ([`crate::db::read_limit`]), started where the
-    // command starts reading and spent by both config lookups — the model
-    // resolution inside `parse` and the key resolution in the preamble.
+    // The command's read clock, spent by both config lookups — the model resolution
+    // inside `parse` and the key resolution in the preamble.
     let budget = crate::db::read_limit::Budget::start();
     let opts = match BenchOptions::parse(&args, &budget) {
         Ok(o) => o,
@@ -560,10 +512,9 @@ pub async fn run_cli() -> i32 {
     }
 }
 
-/// Usage text shared by `--help` (stdout) and usage errors (stderr). Built rather
-/// than a constant so the read-limit knob is printed from its own name
-/// ([`crate::db::read_limit::ENV`]), which cannot then drift from the knob it
-/// bounds the config reads by.
+/// Shared by `--help` (stdout) and usage errors (stderr). Built rather than a constant
+/// so the read-limit knob is printed from its own name
+/// ([`crate::db::read_limit::ENV`]) and cannot drift from the knob it bounds.
 fn usage() -> String {
     let knob = crate::db::read_limit::ENV;
     format!(
@@ -630,10 +581,7 @@ the streaming probe, and the /generation audit.
     )
 }
 
-// ── Shared helpers (dry-run + full-run) ────────────────────────────
-
-/// Model-level capabilities resolved from the discovery catalog: the reasoning
-/// effort the run will request and which request parameters the model
+/// The reasoning effort the run will request and which request parameters the model
 /// advertises support for.
 pub(crate) struct ModelConfig {
     reasoning_effort_used: Option<String>,
@@ -642,10 +590,8 @@ pub(crate) struct ModelConfig {
     supports_reasoning_effort: bool,
 }
 
-/// Resolve the reasoning config + supported parameters from the catalog entry
-/// for `model`. The reasoning effort picks the LAST (lowest) supported effort;
-/// a model that advertises reasoning without a supported-efforts list falls
-/// back to `"low"`.
+/// The reasoning effort picks the LAST (lowest) supported effort; a model advertising
+/// reasoning without a supported-efforts list falls back to `"low"`.
 fn resolve_model_config(snapshot: &DiscoverySnapshot, model: &str) -> ModelConfig {
     let catalog_entry = snapshot.catalog.iter().find(|e| e.id == model);
     let reasoning_effort_used = catalog_entry
@@ -669,9 +615,8 @@ fn resolve_model_config(snapshot: &DiscoverySnapshot, model: &str) -> ModelConfi
     }
 }
 
-/// Selection pipeline outputs for one snapshot: per-endpoint cost estimate +
-/// health classification, the estimate flags, the selection decisions, and the
-/// plan cost (total estimate + per-provider spend guard).
+/// Per-endpoint cost estimate + health classification, the estimate flags, the
+/// selection decisions, and the plan cost (total estimate + per-provider guard).
 pub(crate) struct SelectionBundle {
     inputs: Vec<SelectionInput>,
     flags: Vec<Vec<String>>,
@@ -680,8 +625,7 @@ pub(crate) struct SelectionBundle {
     per_provider_guard: f64,
 }
 
-/// Build the selection bundle: per-endpoint cost estimate + health
-/// classification → selection decisions → plan cost.
+/// Cost estimate + health classification → selection decisions → plan cost.
 fn build_selection(opts: &BenchOptions, snapshot: &DiscoverySnapshot) -> SelectionBundle {
     let rounds = rounds_per_provider(&opts.ladder_secs);
     let total_tokens = total_tokens_estimate(opts.prefix_chars, rounds);
@@ -714,8 +658,7 @@ fn build_selection(opts: &BenchOptions, snapshot: &DiscoverySnapshot) -> Selecti
     }
 }
 
-/// Everything the dry-run plan and the full-run executor need from the shared
-/// preamble: resolved key, discovery snapshot, model config, and selection.
+/// Resolved key, discovery snapshot, model config, and selection.
 struct RunPreamble {
     key: String,
     key_source: &'static str,
@@ -724,9 +667,8 @@ struct RunPreamble {
     bundle: SelectionBundle,
 }
 
-/// Shared preamble for both modes: key resolution → discovery → model config
-/// → selection → affordability preflight. Returns a hard/usage error the
-/// callers turn into an exit code.
+/// Key resolution → discovery → model config → selection → affordability preflight.
+/// Returns the hard/usage error the callers turn into an exit code.
 async fn run_preamble(
     opts: &BenchOptions,
     budget: &crate::db::read_limit::Budget,
@@ -750,7 +692,7 @@ async fn run_preamble(
     })
 }
 
-/// Print a CLI error the way run_cli does today and return its exit code.
+/// Print a CLI error the way run_cli does, and return its exit code.
 fn cli_error_exit(e: CliError) -> i32 {
     match e {
         CliError::Usage(msg) => {
@@ -765,10 +707,8 @@ fn cli_error_exit(e: CliError) -> i32 {
     }
 }
 
-/// The affordability preflight shared by both modes: `Some` with a hard-fail
-/// message when the estimate exceeds the remaining key limit (the caller turns
-/// it into an error/exit code), `None` otherwise. Warns on stderr (non-fatal)
-/// above 25% of the remaining limit.
+/// `Some` with a hard-fail message when the estimate exceeds the remaining key limit,
+/// `None` otherwise; warns on stderr (non-fatal) above 25% of the remaining limit.
 fn affordability_preflight(snapshot: &DiscoverySnapshot, total_est: f64) -> Option<String> {
     let remaining = snapshot.key.limit_remaining?;
     if total_est > remaining {
@@ -784,13 +724,9 @@ fn affordability_preflight(snapshot: &DiscoverySnapshot, total_est: f64) -> Opti
     None
 }
 
-// ── Dry-run orchestration ──────────────────────────────────────────
-
-/// Discovery → selection → plan JSON to stdout. Never makes a chat-completions
-/// call. Prints nothing secret (the resolved API key is never echoed).
+/// Discovery → selection → plan JSON to stdout; never a chat-completions call, and
+/// the resolved API key is never echoed.
 async fn dry_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -> i32 {
-    // 1-4. Shared preamble: key → discovery → model config → selection →
-    //      affordability preflight.
     let preamble = match run_preamble(opts, budget).await {
         Ok(p) => p,
         Err(e) => return cli_error_exit(e),
@@ -803,7 +739,6 @@ async fn dry_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) ->
         bundle,
     } = preamble;
 
-    // 5. Plan JSON → stdout (EPIPE-tolerant).
     let plan = build_plan(&PlanData {
         opts,
         snapshot: &snapshot,
@@ -824,27 +759,19 @@ async fn dry_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) ->
     0
 }
 
-// ── Full-run orchestration ─────────────────────────────────────────
-
-/// The full-run executor: discovery + selection → one task per selected
-/// provider (staggered) → TTL-ladder rounds → report artifacts.
+/// Discovery + selection → one task per selected provider (staggered) → TTL-ladder
+/// rounds → report artifacts.
 ///
-/// Exit codes: `0` when the artifacts were written and the run was not aborted
-/// at run level; `1` on a hard failure (bad key, unaffordable estimate,
-/// discovery failure, lock held, write failure) or a run-level abort (spend
-/// cap / outer deadline / auth / quota) — the partial report is still written
-/// before returning 1; `2` is not used here (parse errors exit before this
-/// point).
-// One long sequential orchestration (steps 1-15); splitting it
-// would obscure the step ordering.
+/// `0` when the artifacts were written and the run was not aborted at run level; `1`
+/// on a hard failure or a run-level abort (spend cap / outer deadline / auth /
+/// quota) — the partial report is still written first. `2` is not used here.
+// One long sequential orchestration; splitting it would obscure the step ordering.
 #[expect(clippy::too_many_lines)]
 async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -> i32 {
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
-    // 1-4. Shared preamble: key → discovery → model config → selection →
-    //      affordability preflight.
     let preamble = match run_preamble(opts, budget).await {
         Ok(p) => p,
         Err(e) => return cli_error_exit(e),
@@ -857,7 +784,6 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
         bundle,
     } = preamble;
 
-    // 5. The bench's own run lock (never the instance's mahbot.lock).
     let _run_lock = match report::acquire_run_lock(&opts.output_dir) {
         Ok(file) => file,
         Err(e) => {
@@ -866,7 +792,6 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
         }
     };
 
-    // 6. Run start + base prompt (per-run nonce, deterministic filler).
     let run_started = std::time::Instant::now();
     let run_ts = chrono::Utc::now();
     let started_at = run_ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -874,8 +799,6 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
     let filler = run::generate_filler(opts.prefix_chars);
     let base = run::build_base_prompt(&bench_system_prompt(), &nonce, &filler);
 
-    // 7. Bench reqwest client (run.rs's send_round applies the 120s request
-    //    timeout itself).
     crate::util::http::install_ring_provider();
     let client = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -888,8 +811,6 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
         }
     };
 
-    // 8. Run context: budget + abort token + abort reason + deadline. Shared
-    //    with the spawned tasks via Arc (JoinSet tasks are 'static).
     let ctx = std::sync::Arc::new(run::RunContext {
         budget: run::RunBudget::new(opts.cap_usd, bundle.per_provider_guard),
         abort: CancellationToken::new(),
@@ -897,9 +818,6 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
         deadline: run_started + Duration::from_secs(run::RUN_DEADLINE_MINS * 60),
     });
 
-    // 9. One task per SELECTED provider (index = position among selected),
-    //    staggered deterministically. The tasks share ctx immutably — the
-    //    abort token and budget are internally synchronized.
     let selected: Vec<usize> = bundle
         .decisions
         .iter()
@@ -943,16 +861,12 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
         });
     }
 
-    // 10. Join with an outer 60-minute guard (the per-provider deadline inside
-    //     run_provider is 55 min; the outer guard catches anything stuck).
     let mut provider_runs: Vec<run::ProviderRun> = Vec::new();
     let join = tokio::time::timeout(Duration::from_hours(1), async {
         while let Some(res) = tasks.join_next().await {
             match res {
                 Ok(run) => provider_runs.push(run),
                 Err(e) => {
-                    // A panicked task is exceptional: log and continue — the
-                    // report covers the providers that finished.
                     eprintln!("Warning: a provider task panicked: {e}");
                 }
             }
@@ -969,11 +883,9 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
         }
     }
 
-    // 11. Run-level abort state.
     let abort_reason = ctx.abort_reason.lock().unwrap_poison().clone();
     let aborted = abort_reason.is_some();
 
-    // 12. Artifacts: meta → report/summary/providers/manifest → write.
     let finished_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let duration_secs = run_started.elapsed().as_secs_f64();
     let exit_code = i32::from(aborted);
@@ -1034,7 +946,6 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
         return 1;
     }
 
-    // 14. Stdout (EPIPE-tolerant).
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let _ = writeln!(
@@ -1043,8 +954,6 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
         run_dir.display()
     );
 
-    // 15. 0 when the artifacts were written; 1 when the run aborted at run
-    //     level (the partial report above is already written).
     if meta.aborted {
         eprintln!(
             "Error: benchmark run aborted: {}",
@@ -1054,10 +963,7 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
     exit_code
 }
 
-// ── Plan building ──────────────────────────────────────────────────
-
-/// All inputs the plan builder needs (bundled so `build_plan` is pure and
-/// testable without I/O).
+/// Bundled so `build_plan` is pure and testable without I/O.
 pub(crate) struct PlanData<'a> {
     pub opts: &'a BenchOptions,
     pub snapshot: &'a DiscoverySnapshot,
@@ -1073,25 +979,22 @@ pub(crate) struct PlanData<'a> {
     pub per_provider_guard: f64,
 }
 
-/// Rounds per provider: 2 warmup rounds (no gap) + one ladder round per
-/// ladder entry plus one — the ladder is a list of inactivity GAPS between
-/// ladder rounds, so a 7-entry ladder yields 2 + 8 = 10 requests per provider.
+/// 2 warmup rounds (no gap) + one ladder round per entry plus one: the ladder lists
+/// inactivity GAPS between rounds, so a 7-entry ladder is 2 + 8 = 10 requests.
 #[must_use]
 pub(crate) fn rounds_per_provider(ladder_secs: &[u64]) -> usize {
     WARMUP_ROUNDS + ladder_secs.len() + 1
 }
 
-/// Total tokens per provider for the cost estimate: the prefix-size estimate
-/// (`prefix_chars / chars-per-token`) across all rounds, plus the fixed
-/// prompt-history growth.
+/// The prefix-size estimate (`prefix_chars / chars-per-token`) across all rounds plus
+/// the fixed prompt-history growth.
 #[must_use]
 #[expect(clippy::cast_precision_loss)] // usize→f64 exact below 2^53; estimate math
 pub(crate) fn total_tokens_estimate(prefix_chars: usize, rounds: usize) -> f64 {
     (prefix_chars as f64 / CHARS_PER_TOKEN) * rounds as f64 + HISTORY_GROWTH_TOKENS
 }
 
-/// Build the canonical dry-run plan JSON (keys sorted — serde_json's default
-/// `Map` is a `BTreeMap`).
+/// Canonical dry-run plan JSON; keys are sorted because serde_json's `Map` is a `BTreeMap`.
 #[must_use]
 pub(crate) fn build_plan(data: &PlanData<'_>) -> serde_json::Value {
     let opts = data.opts;
@@ -1138,7 +1041,6 @@ pub(crate) fn build_plan(data: &PlanData<'_>) -> serde_json::Value {
         },
         "key": {
             "source": data.key_source,
-            // Discovery succeeded, so the key authenticated against the API.
             "valid": true,
             "label": snapshot.key.label,
             "limit": snapshot.key.limit,
@@ -1179,8 +1081,8 @@ pub(crate) fn build_plan(data: &PlanData<'_>) -> serde_json::Value {
     })
 }
 
-/// Build the `providers` plan array: selected providers first, sorted by est
-/// cost ascending (rule 7); unselected providers keep input order.
+/// Selected providers first, sorted by estimated cost ascending; unselected ones keep
+/// input order.
 fn provider_entries(
     endpoints: &[EndpointInfo],
     decisions: &[SelectionDecision],
@@ -1203,9 +1105,8 @@ fn provider_entries(
         .map(|&i| {
             let ep = &endpoints[i];
             let decision = &decisions[i];
-            // A human string from the ExclusionReason when one is recorded
-            // (e.g. padded providers show "padding (expected to fail)"),
-            // otherwise "selected"/"not selected".
+            // The ExclusionReason's own text when recorded (e.g. "padding (expected to
+            // fail)"), otherwise "selected"/"not selected".
             let selection_reason = decision.reason_text();
             json!({
                 "tag": ep.tag,
@@ -1226,11 +1127,8 @@ fn provider_entries(
         .collect()
 }
 
-// ── Harness prompt ─────────────────────────────────────────────────
-
-/// The benchmark harness system prompt (loaded from the embedded asset so the
-/// "all LLM-sent prompts live under src/prompt/" rule holds by construction).
-/// Sent by the full-run executor; the dry run never sends it.
+/// Loaded from the embedded asset so the "prompts live under src/prompt/" rule holds
+/// by construction. Sent by the full-run executor; the dry run never sends it.
 #[must_use]
 pub(crate) fn bench_system_prompt() -> String {
     crate::prompt::load_prompt("bench_openrouter.md")
@@ -1240,26 +1138,17 @@ pub(crate) fn bench_system_prompt() -> String {
 mod tests {
     use super::*;
 
-    /// The read limit's verdict covers a step that yields NOTHING as well as one
-    /// that yields a row: with the budget spent, a lookup of an absent key is the
-    /// limit's failure — never "no key configured", which is what a check asked
-    /// only on the row path would report. The budget is spent rather than reached
-    /// because this lookup is a key probe on a store the test built: it cannot be
-    /// made to cross a limit by waiting, and the check under test is the same one
-    /// either way.
-    ///
-    /// The direct route's own arm and open are pinned by
-    /// `the_direct_config_read_is_bounded_by_the_read_limit`; the channel half of
-    /// the route (an instance holding the location) runs through the same bounded
-    /// client the debug tests exercise.
+    /// The verdict covers a step that yields NOTHING as well as one that yields a
+    /// row: with the budget spent, a lookup of an absent key is the limit's failure,
+    /// never "no key configured". The budget is spent rather than reached because this
+    /// probe cannot be made to cross a limit by waiting.
     #[tokio::test]
     #[serial_test::serial(read_limit)]
     async fn a_spent_budget_fails_the_config_reads_no_row_path() {
         let _env = crate::util::test::set_env_var(crate::db::read_limit::ENV, Some("0"));
         let (store, dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
-        // The read-only open below is a second opener of this file: close the
-        // fixture's own connection first. The schema is created but no key is set,
-        // so the lookup ends on an empty result (the no-row path).
+        // The read-only open below is a second opener of this file, so the fixture's
+        // own connection closes first. No key is set, so the lookup ends on the no-row path.
         drop(store);
         let db_path = crate::db::store_db_path(dir.path(), "config");
         let (io, db) =
@@ -1282,9 +1171,8 @@ mod tests {
         );
     }
 
-    /// The direct config read fails at its own arm — with the budget spent it must
-    /// not even open the store, so a path holding no store at all still fails with
-    /// the limit's failure rather than an open error.
+    /// With the budget spent it must not even open the store, so a path holding no
+    /// store fails with the limit's failure rather than an open error.
     #[test]
     #[serial_test::serial(read_limit)]
     fn the_direct_config_read_is_bounded_by_the_read_limit() {
@@ -1304,7 +1192,7 @@ mod tests {
         );
     }
 
-    /// Synthetic discovery snapshot (no HTTP, no DBs).
+    /// Synthetic: no HTTP, no DBs.
     fn test_snapshot() -> DiscoverySnapshot {
         let models = serde_json::json!({"data": [{
             "id": "acme/model-1",
@@ -1457,22 +1345,20 @@ mod tests {
             prices, sorted,
             "selected providers must be static-price-ascending"
         );
-        // The old est-cost key is gone from the plan.
         assert!(
             providers[0].get("est_cost_usd").is_none(),
             "est_cost_usd must be absent from the plan"
         );
 
-        // Redaction marker present; the resolved key value never appears.
         assert_eq!(plan["key"]["redacted"], true);
         assert!(!plan.to_string().contains("sk-or-secret-key"));
     }
 
     #[test]
     fn ladder_rounds_derivation() {
-        // 7 gaps between 8 ladder rounds → 2 warmup + 8 = 10.
+        // 7 gaps between 8 ladder rounds → 2 + 8 = 10 requests.
         assert_eq!(rounds_per_provider(&[0, 5, 30, 120, 300, 600, 1800]), 10);
-        // 8 gaps → 2 warmup + 9 = 11.
+        // 8 gaps → 2 + 9 = 11.
         assert_eq!(
             rounds_per_provider(&[0, 5, 30, 120, 300, 600, 1800, 3600]),
             11
@@ -1482,22 +1368,18 @@ mod tests {
     #[test]
     fn cli_parse_errors() {
         let budget = crate::db::read_limit::Budget::start();
-        // Unknown flag → Usage.
         assert!(matches!(
             BenchOptions::parse(&["--bogus".to_string()], &budget),
             Err(CliError::Usage(_))
         ));
-        // Missing value → Usage.
         assert!(matches!(
             BenchOptions::parse(&["--model".to_string()], &budget),
             Err(CliError::Usage(_))
         ));
-        // Bad numeric value → Usage.
         assert!(matches!(
             BenchOptions::parse(&["--cap-usd".to_string(), "abc".to_string()], &budget),
             Err(CliError::Usage(_))
         ));
-        // Non-positive / non-finite caps → Usage.
         for v in ["0", "-1", "nan", "inf"] {
             assert!(
                 matches!(
@@ -1512,8 +1394,7 @@ mod tests {
             Err(CliError::Usage(_))
         ));
 
-        // A model whose slug cannot be a folder name → Usage, so no benchmark
-        // run ever derives a folder the platform cannot create.
+        // Usage, so no run derives a folder the platform cannot create.
         for model in [".", "..", "NUL", "acme/."] {
             assert!(
                 matches!(

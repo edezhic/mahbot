@@ -1,37 +1,28 @@
 //! Shared semantics for `[KIND:…]` media-marker targets.
 //!
-//! [`resolve_marker_target`] is the single authority on what a target names,
-//! used by the delivery surfaces and by the desktop's display layer (which
-//! canonicalises an address's scheme casing before asking): an http(s) address,
-//! an inline payload, a bare word of prose, or a local path — a relative one
-//! resolved against the workspace the message belongs to, exactly as `[FILE:…]`
-//! targets are. It reads a scheme exactly as written, so only a canonical
-//! lowercase http(s) target is an address. It performs no containment: only
-//! `[FILE:…]` is workspace-confined, and the other kinds deliberately accept any
-//! location on disk. What a placed target becomes is also decided here —
-//! [`local_refusal`] gates delivery (Telegram, which must ship bytes), and
-//! [`remote_marker`] and [`inline_marker_refusal`] are asked wherever a marker of
-//! a kind the target cannot serve is refused — and a target that cannot be
-//! delivered is reported with [`marker_refusal`], whose wording is shared so a
-//! refused marker reads the same wherever it is shown.
+//! [`resolve_marker_target`] is the single authority on what a target names, used by the
+//! delivery surfaces and by the desktop's display layer (which canonicalises an address's
+//! scheme casing first): an http(s) address, an inline payload, a bare word of prose, or a
+//! local path — a relative one resolved against the workspace the message belongs to, exactly
+//! as `[FILE:…]` targets are. It reads a scheme as written, so only a canonical lowercase
+//! http(s) target is an address, and it performs no containment: only `[FILE:…]` is
+//! workspace-confined; the other kinds deliberately accept any location on disk. What a
+//! placed target becomes is decided here too — [`local_refusal`] gates delivery (Telegram,
+//! which must ship bytes), [`remote_marker`] and [`inline_marker_refusal`] answer wherever a
+//! marker of an unservable kind is refused, and [`marker_refusal`] words the refusal, shared
+//! so it reads the same wherever shown.
 //!
-//! Consumers that must decide whether a target is a "real image" use
-//! [`classify_media_image_target`] (Telegram and enrichment, which offload the
-//! blocking local-file decode off the async path). Two consumers deliberately
-//! do NOT route a decode through it: the GUI render path (a full decode would
-//! run on the render thread — the display layer decides from
-//! [`resolve_marker_target`] whether a marker is a row, reading no bytes (a
-//! relative target only costs a workspace-existence probe), and the viewer does
-//! the bounded decode itself) and the provider's agent-context
-//! scanner (`compatible.rs`, which must never read a local file during request
-//! serialization and calls [`is_native_data_uri`] directly). No
-//! workspace-boundary containment — a valid raster anywhere on disk is valid.
-//! Local files are validated by a real raster decode (memoized per canonical
-//! path + mtime); remote URLs by well-formedness. A `data:...` URI is NOT
-//! classified here — it is an inline payload validated by its own
-//! [`is_native_data_uri`] gate, which only the provider uses directly; other
-//! consumers route through the classifier, which rejects a `data:` target
-//! cheaply before any decode.
+//! Consumers deciding whether a target is a "real image" use
+//! [`classify_media_image_target`] (Telegram and enrichment, which offload the blocking decode
+//! off the async path). Two deliberately do not: the GUI render path (a full decode would run
+//! on the render thread — the display layer decides from [`resolve_marker_target`] whether a
+//! marker is a row, reading no bytes, and the viewer does the bounded decode itself) and the
+//! provider's agent-context scanner (`compatible.rs`, which must never read a local file
+//! during request serialization and calls [`is_native_data_uri`] directly). No
+//! workspace-boundary containment — a valid raster anywhere on disk is valid. Local files are
+//! validated by a real raster decode (memoized per canonical path + mtime), remote URLs by
+//! well-formedness. A `data:...` URI is NOT classified here: it is an inline payload
+//! validated by its own [`is_native_data_uri`] gate, which only the provider uses directly.
 
 use crate::util::{MediaMarkerKind, UnwrapPoison};
 use base64::{
@@ -44,50 +35,36 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
-/// A classified `[IMAGE:...]` marker target.
-///
-/// The variant is what every production consumer matches on; the validated
-/// value itself (canonical path / URL / URI) is re-read from the marker text
-/// by the caller, so no payload is carried here.
+/// A classified `[IMAGE:...]` marker target: what consumers match on. The value itself
+/// (canonical path / URL / URI) is re-read from the marker text by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MediaTarget {
-    /// Absolute path to an existing regular file that decodes as a genuine
-    /// PNG/JPEG/WebP raster — a corrupt-but-magic-valid file is not accepted.
+    /// Absolute path to an existing regular file that decodes as a genuine PNG/JPEG/WebP
+    /// raster — a corrupt-but-magic-valid file is not accepted.
     LocalImage,
     /// Well-formed http(s) URL for an image reference.
     RemoteUrl,
-    /// Anything else — not deliverable as an image reference, so a delivery
-    /// consumer refuses it instead. (A `data:...` URI is NOT classified here: it
-    /// is an inline payload validated by [`is_native_data_uri`], which the
-    /// provider uses directly.)
+    /// Anything else — not deliverable as an image reference. A `data:...` URI is not
+    /// classified here: it is an inline payload validated by [`is_native_data_uri`].
     Invalid,
 }
 
-/// Encoded-payload ceiling for any `data:...;base64,...` URI (shared by the
-/// classifier and the GUI viewer). Over-cap payloads are refused from length
-/// alone — never base64-decoded — so neither the render thread nor an async
-/// worker buffers a huge payload.
+/// Encoded-payload ceiling for any `data:...;base64,...` URI. Over-cap payloads are refused from
+/// length alone — never decoded — so no thread buffers a huge payload.
 pub(crate) const MAX_DATA_URI_ENCODED_BYTES: usize = 20 * 1024 * 1024;
 
-/// Shared raster-decode allocation budget (provider data-URI gate, classifier
-/// local-file decode, and the GUI render downscale). Bounded so a header-bomb
-/// target is refused, but generous enough that a legitimate tall screenshot
-/// still decodes. Together with [`RASTER_DECODE_MAX_DIMENSION_PX`] this is the
-/// one raster envelope the inbound pipeline decodes under — including the
-/// document converter's embedded-image guard, which checks a declared PDF
-/// image's geometry against both.
+/// Shared raster-decode allocation budget: bounded so a header bomb is refused, generous enough
+/// that a legitimate tall screenshot decodes. With [`RASTER_DECODE_MAX_DIMENSION_PX`] it is the
+/// one raster envelope the inbound pipeline decodes under.
 pub(crate) const RASTER_DECODE_MAX_ALLOC_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Longest side (px) the shared raster decode will accept — rejects a dimension
-/// bomb from the header before any pixel buffer is allocated.
+/// Longest side (px) the shared decode accepts — rejects a dimension bomb from the header
+/// before any pixel buffer is allocated.
 pub(crate) const RASTER_DECODE_MAX_DIMENSION_PX: u32 = 16384;
 
-/// The shared generous raster-decode [`image::Limits`]: a dimension and alloc
-/// cap so a header bomb is refused before any pixel buffer, while a legitimate
-/// tall screenshot still decodes. Used by the provider's data-URI gate
-/// ([`is_native_data_uri`]), the classifier's local-file decode, and the GUI
-/// render decode + downscale step. Built via `Default` + field mutation
-/// (`Limits` is `#[non_exhaustive]`).
+/// The shared [`image::Limits`]: a dimension and alloc cap so a header bomb is refused before
+/// any pixel buffer. Used by the provider's data-URI gate ([`is_native_data_uri`]), the
+/// classifier's local decode, and the GUI render decode + downscale.
 #[must_use]
 pub(crate) fn raster_decode_limits() -> image::Limits {
     let mut limits = image::Limits::default();
@@ -97,9 +74,8 @@ pub(crate) fn raster_decode_limits() -> image::Limits {
     limits
 }
 
-/// Classify a raw `[IMAGE:...]` marker target. A `data:...` URI is not a target
-/// this classifier handles (it is an inline payload validated by
-/// [`is_native_data_uri`]); pass it there instead.
+/// Classify a raw `[IMAGE:...]` marker target. A `data:...` URI is not a target this
+/// classifier handles (it is an inline payload for [`is_native_data_uri`]).
 #[must_use]
 pub(crate) fn classify_media_image_target(target: &str) -> MediaTarget {
     let trimmed = target.trim();
@@ -115,37 +91,25 @@ pub(crate) fn classify_media_image_target(target: &str) -> MediaTarget {
 /// Where a `[KIND:…]` marker target points after workspace-relative resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MarkerTarget {
-    /// A bare word naming no file — `[IMAGE:path]`, the form prose uses to
-    /// explain the syntax. Kept as the author wrote it.
+    /// A bare word naming no file — `[IMAGE:path]`, the form prose uses to explain the
+    /// syntax. Kept as written.
     NotAReference,
-    /// An inline `data:` payload, or the placeholder left where one was
-    /// stripped: a value, not a location.
+    /// An inline `data:` payload, or the placeholder left where one was stripped.
     Inline,
     /// An http(s) address.
     Remote,
-    /// A local path: an absolute target as written, a relative one joined to
-    /// the workspace root that has it (the first root when none does).
+    /// A local path: an absolute target as written, a relative one joined to the workspace
+    /// root that has it (the first root when none does).
     Local(PathBuf),
 }
 
-/// Resolve a marker target against the workspace roots of the message it
-/// belongs to: `https://…` is an address, `data:…` an inline payload, a bare
-/// word of prose is not a reference, and any other target is a local path.
-///
-/// A relative path names a file in the workspace the message belongs to — the
-/// first root that actually has it (relayed content names a file in the
-/// originating workspace, which is the second root), exactly as a `[FILE:…]`
-/// target resolves. Existence decides whether a bare word is a reference, so
-/// `[FILE:Makefile]` delivers the workspace's file; only a target that names
-/// nothing anywhere stays prose. Without a root the path stays relative, which
-/// [`local_target_refusal`] reports as an unknown workspace, while the desktop
-/// still shows it as the row it is: a reference is one whether or not its file
-/// is there.
+/// What an http(s) address becomes for a marker of `kind`: the address itself (the surface
+/// renders its own form) or the notice a user reads instead.
 #[must_use]
 pub(crate) fn resolve_marker_target(target: &str, roots: &[PathBuf]) -> MarkerTarget {
     let target = target.trim();
-    // The stripped-payload placeholder is a data URI's stand-in: still a value,
-    // never a path or an address.
+    // The stripped-payload placeholder is a data URI's stand-in: still a value, never a path
+    // or an address.
     if is_inline_payload(target) {
         return MarkerTarget::Inline;
     }
@@ -173,17 +137,16 @@ pub(crate) fn resolve_marker_target(target: &str, roots: &[PathBuf]) -> MarkerTa
     )
 }
 
-/// True when `target` is a value rather than a location: a `data:` payload, or
-/// the placeholder left where one was stripped.
+/// True when `target` is a value rather than a location: a `data:` payload, or the placeholder
+/// left where one was stripped.
 #[must_use]
 pub(crate) fn is_inline_payload(target: &str) -> bool {
     target.starts_with("data:") || target.starts_with(crate::util::DATA_URI_OMITTED_PREFIX)
 }
 
-/// True when a target names something rather than being a bare word: it has a
-/// path separator, or its last segment carries an extension (`photo.png`). Only
-/// `[IMAGE:path]`-shaped prose — a bare word, no separator, no extension, and no
-/// workspace file of that name (see [`resolve_marker_target`]) — does not.
+/// True when a target names something: it has a path separator, or its last segment carries an
+/// extension (`photo.png`). Only `[IMAGE:path]`-shaped prose — a bare word with neither, and no
+/// workspace file of that name — does not.
 fn names_a_reference(target: &str) -> bool {
     target.contains('/')
         || target.contains('\\')
@@ -196,14 +159,13 @@ fn names_a_reference(target: &str) -> bool {
 pub(crate) enum RemoteMarker {
     /// The address is the whole target; the surface renders its own form of it.
     Deliverable,
-    /// The address is not a supported target for this kind: the notice a user
-    /// reads instead.
+    /// Not a supported target for this kind: the notice a user reads instead.
     Refused(String),
 }
 
-/// Judge an http(s) address for `kind`: a `[FILE:…]` address is never a local
-/// file, and an `[IMAGE:…]` address must be well-formed. Every delivering
-/// surface asks this, so none states the rule itself.
+/// Judge an http(s) address for `kind`: a `[FILE:…]` address is never a local file, and an
+/// `[IMAGE:…]` address must be well-formed. Every delivering surface asks this, so none states
+/// the rule itself.
 #[must_use]
 pub(crate) fn remote_marker(kind: MediaMarkerKind, target: &str) -> RemoteMarker {
     let reason = match kind {
@@ -216,19 +178,17 @@ pub(crate) fn remote_marker(kind: MediaMarkerKind, target: &str) -> RemoteMarker
     RemoteMarker::Refused(marker_refusal_for(target, reason))
 }
 
-/// The notice for a marker whose target is a value rather than a location: an
-/// inline payload cannot be attached as the kind it claims.
+/// The notice for a target that is a value rather than a location: an inline payload cannot be
+/// attached as the kind it claims.
 #[must_use]
 pub(crate) fn inline_marker_refusal(kind: MediaMarkerKind) -> String {
     marker_refusal(&kind.noun(), INLINE_PAYLOAD_REASON)
 }
 
-/// Why a resolved local target cannot be delivered as `kind`, or `None` when it
-/// can: an image must carry a native raster signature, any other kind only needs
-/// to name an existing regular file. No size cap applies — an outgoing
-/// attachment's only size gate is the transport's own. Delivery only: the
-/// desktop display layer never asks this, so a local reference shows its row
-/// whether or not the file is there.
+/// Why a resolved local target cannot be delivered as `kind`, or `None` when it can: an image
+/// must carry a native raster signature, any other kind only needs an existing regular file.
+/// No size cap applies — an outgoing attachment's only size gate is the transport's own.
+/// Delivery only: the desktop display layer never asks this.
 #[must_use]
 pub(crate) fn local_refusal(kind: MediaMarkerKind, path: &Path) -> Option<&'static str> {
     if kind == MediaMarkerKind::Image {
@@ -238,9 +198,9 @@ pub(crate) fn local_refusal(kind: MediaMarkerKind, path: &Path) -> Option<&'stat
     }
 }
 
-/// Why a resolved local target cannot be handed over, or `None` when it is an
-/// existing regular file. A path still relative names a file in a workspace the
-/// message has none of; an unreadable one is reported as unreadable, not missing.
+/// Why a resolved local target cannot be handed over, or `None` when it is an existing regular
+/// file. A still-relative path names a file in a workspace the message has none of; an
+/// unreadable one is reported as unreadable, not missing.
 #[must_use]
 fn local_target_refusal(path: &Path) -> Option<&'static str> {
     if path.is_relative() {
@@ -255,12 +215,10 @@ fn local_target_refusal(path: &Path) -> Option<&'static str> {
     }
 }
 
-/// Why a local image target cannot be delivered, or `None` when it is a regular
-/// file whose head carries a native raster signature. Metadata plus a bounded
-/// head read — no decode — so a delivery path can ask this cheaply. A file that
-/// passes the signature without decoding is still delivered as the attachment it
-/// was named: the desktop shows the viewer's placeholder for it, and the
-/// transport carries it as a document.
+/// Why a local image target cannot be delivered, or `None` when it is a regular file whose head
+/// carries a native raster signature. Metadata plus a bounded head read — no decode. A file that
+/// passes the signature without decoding is still delivered as a document, and the desktop shows
+/// the viewer's placeholder.
 #[must_use]
 fn image_target_refusal(path: &Path) -> Option<&'static str> {
     use std::io::Read as _;
@@ -284,8 +242,8 @@ fn image_target_refusal(path: &Path) -> Option<&'static str> {
     }
 }
 
-/// Why a marker could not be delivered. Every surface quotes the same reasons,
-/// so a refusal reads identically wherever it is shown.
+/// Why a marker could not be delivered. Every surface quotes the same reasons, so a refusal
+/// reads identically wherever it is shown.
 pub(crate) const FILE_NOT_FOUND_REASON: &str = "file not found.";
 pub(crate) const DIRECTORY_REASON: &str = "it is a directory.";
 pub(crate) const NO_WORKSPACE_REASON: &str = "the message's workspace is unknown.";
@@ -296,8 +254,8 @@ pub(crate) const NOT_A_FILE_REASON: &str = "it is not a regular file.";
 pub(crate) const INVALID_ADDRESS_REASON: &str = "it is not a valid address.";
 pub(crate) const FILE_URL_REASON: &str = "an address is not a local file.";
 
-/// The name a refusal quotes: the target's last path component, bounded so a
-/// malformed marker cannot dump an arbitrary blob into the chat.
+/// The name a refusal quotes: the target's last path component, bounded so a malformed marker
+/// cannot dump an arbitrary blob into the chat.
 #[must_use]
 pub(crate) fn marker_name(target: &str) -> String {
     crate::util::truncate(
@@ -306,9 +264,8 @@ pub(crate) fn marker_name(target: &str) -> String {
     )
 }
 
-/// `target` without what can carry credentials but names nothing: an address's
-/// query, fragment and authority userinfo. Only an address has any of them — a
-/// local path keeps its own `#` and `?`, which its name may legitimately carry.
+/// `target` without what can carry credentials but names nothing: an address's query, fragment
+/// and authority userinfo. Only an address has them — a local path keeps its own `#` and `?`.
 fn without_credentials(target: &str) -> Cow<'_, str> {
     let Some((scheme, rest)) = target.split_once("://") else {
         return Cow::Borrowed(target);
@@ -321,10 +278,8 @@ fn without_credentials(target: &str) -> Cow<'_, str> {
     Cow::Owned(format!("{scheme}://{host}/{path}"))
 }
 
-/// The notice a user reads where a marker could not be delivered: either the
-/// thing arrives, or this says why it did not. The desktop display layer quotes
-/// the same wording for the targets it cannot attach as the kind they claim (an
-/// inline payload for audio, video or a file, an address for a file), while a
+/// The notice a user reads where a marker could not be delivered. The desktop display layer
+/// quotes the same wording for targets it cannot attach as the kind they claim, while a
 /// reference whose file is gone keeps its row there.
 #[must_use]
 pub(crate) fn marker_refusal(name: &str, reason: &str) -> String {
@@ -337,12 +292,10 @@ pub(crate) fn marker_refusal_for(target: &str, reason: &str) -> String {
     marker_refusal(&marker_name(target), reason)
 }
 
-/// True when `target` is a well-formed http(s) URL for an image reference.
-/// Rejects whitespace anywhere, an empty or malformed authority, userinfo
-/// (`@`), a bad or empty port, and malformed brackets. Deliberately STRICTER
-/// than the config endpoint check (which defers embedded-space hosts to
-/// warmup) — a space, a bad/duplicate port, or userinfo is malformed for an
-/// image reference and cannot be delivered as one.
+/// True when `target` is a well-formed http(s) URL for an image reference. Rejects whitespace
+/// anywhere, an empty or malformed authority, userinfo (`@`), a bad or empty port, and malformed
+/// brackets. Deliberately STRICTER than the config endpoint check (which defers embedded-space
+/// hosts to warmup).
 #[must_use]
 pub(crate) fn is_valid_remote_url(target: &str) -> bool {
     let Some(rest) = target
@@ -361,17 +314,16 @@ pub(crate) fn is_valid_remote_url(target: &str) -> bool {
     let Some((host, port)) = split_authority_host_port(authority) else {
         return false;
     };
-    // A port, when present, must be non-empty, all decimal digits, within u16,
-    // and non-zero. An absent port is `""` and passes.
+    // A port, when present, must be non-empty, all decimal digits, within u16, and non-zero.
+    // An absent port is `""` and passes.
     if !port.is_empty()
         && (!port.bytes().all(|b| b.is_ascii_digit()) || !port.parse::<u16>().is_ok_and(|x| x > 0))
     {
         return false;
     }
-    // A bracketed host is `[...]` with a non-empty inner and exactly one pair of
-    // brackets; a non-bracketed host is non-empty with no `:` (a second `:`
-    // would have been an extra port separator) and no `[` (a stray unmatched
-    // bracket — e.g. `host[` — is malformed).
+    // A bracketed host is `[...]` with a non-empty inner and exactly one pair of brackets; a
+    // non-bracketed one is non-empty with no `:` (a second would be an extra port separator) and
+    // no `[` (a stray unmatched bracket is malformed).
     if host.starts_with('[') {
         host.ends_with(']')
             && host.len() > 2
@@ -382,12 +334,9 @@ pub(crate) fn is_valid_remote_url(target: &str) -> bool {
     }
 }
 
-/// Split an authority into `(host, port)`; an absent port is `""`. A bracketed
-/// IPv6 host may contain `:` inside `[...]`, so its port (if any) is the `:`
-/// right after `]`; a non-bracketed host has at most one `:port`. Returns
-/// `None` for a malformed authority: a trailing-colon empty port (`host:` or
-/// `[...]:`), a `[...]` host not at the very start (`host[::1]:80`), or bare
-/// text after `]` (`[::1]foo:80`).
+/// Split an authority into `(host, port)`; an absent port is `""`. A bracketed IPv6 host may
+/// contain `:`, so its port is the `:` right after `]`. `None` for a malformed authority: an
+/// empty trailing port, a `[...]` host not at the very start, or bare text after `]`.
 fn split_authority_host_port(authority: &str) -> Option<(&str, &str)> {
     if let Some(close) = authority.find(']') {
         if !authority.starts_with('[') {
@@ -411,11 +360,9 @@ fn split_authority_host_port(authority: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// Extract the base64 payload of a `data:...;base64,...` URI — everything after
-/// the LAST `;base64,` token (RFC 2397 allows mediatype parameters before the
-/// marker, e.g. `data:image/png;charset=utf-8;base64,...`). `None` when the
-/// string is not a data URI with a base64 payload, or when the payload exceeds
-/// [`MAX_DATA_URI_ENCODED_BYTES`] (refused from length alone, never decoded).
+/// The base64 payload of a `data:...;base64,...` URI — everything after the LAST `;base64,`
+/// token (RFC 2397 allows mediatype parameters before it). `None` when the string is not such a
+/// URI, or when the payload exceeds [`MAX_DATA_URI_ENCODED_BYTES`] (refused from length alone).
 /// Shared with the GUI viewer so the cap and extraction live in one place.
 #[must_use]
 pub(crate) fn data_uri_base64_payload(uri: &str) -> Option<&str> {
@@ -425,9 +372,9 @@ pub(crate) fn data_uri_base64_payload(uri: &str) -> Option<&str> {
     (payload.len() <= MAX_DATA_URI_ENCODED_BYTES).then_some(payload)
 }
 
-/// The declared raster subtype of a `data:image/<subtype>;base64,...` URI, or
-/// `None` for a non-native or malformed subtype. (The base64 payload itself is
-/// validated by [`data_uri_base64_payload`] and [`decode_base64_payload`].)
+/// The declared raster subtype of a `data:image/<subtype>;base64,...` URI, or `None` for a
+/// non-native or malformed subtype. The payload itself is validated by
+/// [`data_uri_base64_payload`] and [`decode_base64_payload`].
 fn declared_data_uri_format(target: &str) -> Option<image::ImageFormat> {
     let rest = target.strip_prefix("data:image/")?;
     let subtype = rest.split(';').next().unwrap_or("").trim();
@@ -437,13 +384,10 @@ fn declared_data_uri_format(target: &str) -> Option<image::ImageFormat> {
         .then_some(declared)
 }
 
-/// Parse a `data:image/<native-subtype>;base64,...` URI into its declared
-/// format and decoded bytes, verifying the declared subtype matches the actual
-/// raster format. `None` for a non-native / malformed subtype, an over-cap
-/// payload, invalid base64, or a declared/actual mismatch. Shared by the
-/// provider's validity gate ([`is_native_data_uri`]) and the GUI's pixel
-/// decode ([`decode_native_data_uri`]) so the declared/actual check stays
-/// single-sourced.
+/// Parse a `data:image/<native-subtype>;base64,...` URI into its format and decoded bytes,
+/// verifying the declared subtype matches the actual raster. `None` for a non-native or
+/// malformed subtype, an over-cap payload, invalid base64, or a mismatch. Shared by the
+/// provider's gate and the GUI's pixel decode so the check stays single-sourced.
 fn parse_native_data_uri(uri: &str) -> Option<(image::ImageFormat, Vec<u8>)> {
     let declared = declared_data_uri_format(uri)?;
     let payload = data_uri_base64_payload(uri)?;
@@ -454,11 +398,9 @@ fn parse_native_data_uri(uri: &str) -> Option<(image::ImageFormat, Vec<u8>)> {
     Some((declared, bytes))
 }
 
-/// Decode a `data:image/<native-subtype>;base64,...` URI into a renderable
-/// raster, verifying the declared subtype matches the actual bytes so the GUI
-/// renderer and the provider's image gate reach the same verdict. Returns
-/// `None` for a non-native or malformed subtype, an over-cap payload, invalid
-/// base64, a declared/actual mismatch, or a decode failure under `limits`.
+/// Decode such a URI into a renderable raster, verifying the declared subtype matches the bytes
+/// so the GUI renderer and the provider's gate reach the same verdict. `None` also on a decode
+/// failure under `limits`.
 #[must_use]
 pub(crate) fn decode_native_data_uri(
     uri: &str,
@@ -468,25 +410,17 @@ pub(crate) fn decode_native_data_uri(
     decode_raster_bytes(&bytes, limits)
 }
 
-/// True when `target` is a `data:image/<native-subtype>;base64,...` URI whose
-/// payload base64-decodes to a genuine raster of that declared subtype. A
-/// `data:image/png` holding JPEG bytes is mismatched (declared != actual) and
-/// rejected, so the provider never forwards a MIME it may reject. Shared
-/// [`parse_native_data_uri`] + [`decode_raster`] path (no RGBA8 conversion) so
-/// the provider gate's verdict matches the GUI pixel decode's verdict. The GUI
-/// render thread never calls this (it hands `data:` markers to the viewer).
+/// The shared [`image::Limits`]: a dimension and alloc cap so a header bomb is refused before any
+/// pixel buffer.
 #[must_use]
 pub(crate) fn is_native_data_uri(target: &str) -> bool {
     parse_native_data_uri(target)
         .is_some_and(|(_, bytes)| decode_raster(&bytes, raster_decode_limits()).is_some())
 }
 
-/// Decode standard or URL-safe base64, stripping ASCII whitespace. Rejects
-/// alphabet lookalikes that are not actually decodable (`...`, truncated pad).
-/// Reached by the GUI viewer transitively (via [`decode_native_data_uri`],
-/// which goes through [`parse_native_data_uri`]) so its data-URI base64 decode
-/// matches the provider's gate (a URL-safe payload the provider injects must
-/// render too).
+/// Decode standard or URL-safe base64, stripping ASCII whitespace. Rejects alphabet lookalikes
+/// that are not decodable (truncated pad). Reached by the GUI viewer transitively, so a URL-safe
+/// payload the provider injects renders too.
 #[must_use]
 fn decode_base64_payload(s: &str) -> Option<Vec<u8>> {
     let compact: Cow<'_, [u8]> = if s.as_bytes().iter().any(u8::is_ascii_whitespace) {
@@ -508,10 +442,9 @@ fn decode_base64_payload(s: &str) -> Option<Vec<u8>> {
         .or_else(|| URL_SAFE_NO_PAD.decode(compact.as_ref()).ok())
 }
 
-/// Decode `bytes` as a native raster (PNG/JPEG/WebP) under `limits`. The single
-/// shared decode path — the format is gated through [`image_format_native_label`]
-/// and the pixels are read under `limits` — with the failure kept for a caller
-/// that reports it (computer-use's portal capture names the cap that refused).
+/// Decode `bytes` as a native raster (PNG/JPEG/WebP) under `limits`: the single shared decode
+/// path, gated through [`image_format_native_label`]. The failure is kept for a caller that
+/// reports it (computer-use's portal capture names the cap that refused).
 pub(crate) fn decode_raster_image(
     bytes: &[u8],
     limits: image::Limits,
@@ -533,16 +466,13 @@ pub(crate) fn decode_raster_image(
     Ok(reader.decode()?)
 }
 
-/// [`decode_raster_image`] for a caller that only needs to know the bytes decode
-/// (the classifier and the provider's data-URI gate).
+/// [`decode_raster_image`] for a caller that only needs to know the bytes decode.
 fn decode_raster(bytes: &[u8], limits: image::Limits) -> Option<image::DynamicImage> {
     decode_raster_image(bytes, limits).ok()
 }
 
-/// Decode `bytes` as a native raster under `limits`, returning
-/// `(width, height, RGBA8 pixels)` on success. Used where actual pixels are
-/// needed (the GUI viewer); a validity-only consumer uses [`decode_raster`]
-/// so it never pays for the RGBA8 conversion.
+/// Decode `bytes` as a native raster under `limits`, returning `(width, height, RGBA8 pixels)`.
+/// Used where actual pixels are needed (the GUI viewer).
 #[must_use]
 pub(crate) fn decode_raster_bytes(
     bytes: &[u8],
@@ -553,28 +483,20 @@ pub(crate) fn decode_raster_bytes(
     Some((rgba.width(), rgba.height(), rgba.into_raw()))
 }
 
-/// Process-lifetime memo of local-raster decode results, keyed by
-/// (canonical path, mtime). A stable path decodes at most once per process — so
-/// the GUI render thread / async worker pays for a single real decode per unique
-/// image rather than repeatedly on every repaint/check — while a file replaced
-/// on disk gets a new mtime and is re-evaluated. Bounded: once it exceeds
-/// [`LOCAL_RASTER_CACHE_MAX_ENTRIES`] it is fully cleared (a degenerate file
-/// churn is the only way to grow it, and re-decoding a handful of paths is
-/// cheaper than a permanent unbounded map).
+/// Process-lifetime memo of local-raster decode results, keyed by (canonical path, mtime): a
+/// stable path decodes at most once per process, while a replaced file gets a new mtime and is
+/// re-evaluated. Bounded — once it exceeds [`LOCAL_RASTER_CACHE_MAX_ENTRIES`] it is fully
+/// cleared, since re-decoding a handful of paths beats an unbounded map.
 static LOCAL_RASTER_DECODE_CACHE: LazyLock<Mutex<HashMap<(PathBuf, std::time::SystemTime), bool>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Entry cap for [`LOCAL_RASTER_DECODE_CACHE`] before it is cleared. A daemon
-/// that touches many unique temp/agent images stays bounded; a map clear just
-/// costs a handful of re-decodes for the next unique paths.
+/// Entry cap for [`LOCAL_RASTER_DECODE_CACHE`] before it is cleared.
 const LOCAL_RASTER_CACHE_MAX_ENTRIES: usize = 4096;
 
-/// True when `target` is an absolute path to an existing regular file that
-/// decodes as a genuine PNG/JPEG/WebP raster. The classifier is the single
-/// "is a real image" gate for every consumer, so it must be authoritative: an
-/// O(1) magic sniff is not enough (a corrupt-but-magic-valid file would be
-/// accepted), hence a real decode via [`is_decodable_raster_file`], memoized per
-/// (canonical path, mtime) in [`LOCAL_RASTER_DECODE_CACHE`].
+/// True when `target` is an absolute path to an existing regular file that decodes as a genuine
+/// PNG/JPEG/WebP raster. The single "is a real image" gate must be authoritative: an O(1) magic
+/// sniff would accept a corrupt-but-magic-valid file, hence a real decode, memoized per
+/// (canonical path, mtime).
 #[must_use]
 fn is_decodable_local_raster(target: &str) -> bool {
     let path = Path::new(target);
@@ -590,8 +512,8 @@ fn is_decodable_local_raster(target: &str) -> bool {
     let Ok(mtime) = meta.modified() else {
         return false;
     };
-    // Canonicalize so the same file reached via different spellings (e.g. the
-    // /tmp -> /private/tmp symlink) shares a single cache slot.
+    // Canonicalize so the same file reached through different spellings (the /tmp →
+    // /private/tmp symlink) shares one cache slot.
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let key = (canonical.clone(), mtime);
     {
@@ -610,13 +532,10 @@ fn is_decodable_local_raster(target: &str) -> bool {
     result
 }
 
-/// Decode validity for a local file: true when `path` reads as a native
-/// PNG/JPEG/WebP raster that decodes under the shared [`raster_decode_limits`]
-/// budget. Reusing the single [`decode_raster`] pipeline keeps the
-/// native-format restriction and the decode budget identical to the data-URI /
-/// provider gate, so a local file the classifier accepts is also accepted by the
-/// provider once it is inlined as a data-URI (no mismatch). Memoized per
-/// canonical path + mtime by the classifier; must not run on the render thread.
+/// True when `path` reads as a native PNG/JPEG/WebP raster that decodes under the shared budget.
+/// Reusing [`decode_raster`] keeps the native-format restriction and decode budget identical to
+/// the data-URI / provider gate, so a local file the classifier accepts is also accepted once
+/// inlined. Memoized by the classifier; must not run on the render thread.
 #[must_use]
 fn is_decodable_raster_file(path: &Path) -> bool {
     std::fs::read(path).is_ok_and(|bytes| decode_raster(&bytes, raster_decode_limits()).is_some())
@@ -627,7 +546,7 @@ mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD;
 
-    /// A real 1×1 PNG file written to a unique path in the system temp dir.
+    /// A real 1×1 PNG written to a unique path in the system temp dir.
     fn write_temp_png(tag: &str) -> std::path::PathBuf {
         use std::io::Write;
         let path = std::env::temp_dir().join(format!(
@@ -654,8 +573,7 @@ mod tests {
             classify_media_image_target("http://127.0.0.1:8080/img.png"),
             MediaTarget::RemoteUrl
         );
-        // Malformed: empty host, whitespace host (interior + leading), authority
-        // starting with ':'.
+        // Malformed: empty host, whitespace host, authority starting with ':'.
         assert_eq!(classify_media_image_target("http://"), MediaTarget::Invalid);
         assert_eq!(
             classify_media_image_target("https://exa mple.com/x.png"),
@@ -678,8 +596,7 @@ mod tests {
             classify_media_image_target("https://example.com:/x.png"),
             MediaTarget::Invalid
         );
-        // Unterminated IPv6 bracket and a userinfo host (the `:pass` is not a
-        // port) are malformed for an image reference.
+        // Unterminated IPv6 bracket and a userinfo host (the `:pass` is not a port).
         assert_eq!(
             classify_media_image_target("https://[::1/x.png"),
             MediaTarget::Invalid
@@ -688,8 +605,8 @@ mod tests {
             classify_media_image_target("https://user:pass@host/x.png"),
             MediaTarget::Invalid
         );
-        // Userinfo without a password/port is equally malformed for an image
-        // reference (previously a false positive: the port check was skipped).
+        // Userinfo without a password/port is equally malformed (previously a false positive:
+        // the port check was skipped).
         assert_eq!(
             classify_media_image_target("https://user@host/x.png"),
             MediaTarget::Invalid
@@ -708,8 +625,8 @@ mod tests {
             classify_media_image_target("http://[::1]:80:90/img.png"),
             MediaTarget::Invalid
         );
-        // Degenerate bracketed hosts are malformed: empty IPv6 host, bare text
-        // after the host, and a host not at the start.
+        // Degenerate bracketed hosts: empty IPv6 host, bare text after the host, and a host not
+        // at the start.
         assert_eq!(
             classify_media_image_target("http://[]/x.png"),
             MediaTarget::Invalid
@@ -727,14 +644,13 @@ mod tests {
             classify_media_image_target("https://[::1]/img.png"),
             MediaTarget::RemoteUrl
         );
-        // A space anywhere in the URL (path/query) is malformed.
+        // A space anywhere in the URL is malformed.
         assert_eq!(
             classify_media_image_target("https://example.com/foo bar.png"),
             MediaTarget::Invalid
         );
-        // A stray unmatched `[` in a non-bracketed host is malformed (the
-        // bracket-balance guard must not regress: `host[` and `host[foo:80` are
-        // not valid remote URL hosts).
+        // A stray unmatched `[` in a non-bracketed host is malformed (the bracket-balance guard
+        // must not regress).
         assert_eq!(
             classify_media_image_target("http://host[/x.png"),
             MediaTarget::Invalid
@@ -753,18 +669,16 @@ mod tests {
             .expect("test PNG must encode");
         let uri = format!("data:image/png;base64,{}", STANDARD.encode(&buf));
 
-        // A data-URI is NOT classified by `classify_media_image_target` (it is
-        // an inline payload, not a local path / URL); its validity is the
-        // dedicated `is_native_data_uri` gate, which the provider uses directly.
+        // A data-URI is NOT classified: it is an inline payload, validated by the dedicated
+        // `is_native_data_uri` gate.
         assert_eq!(classify_media_image_target(&uri), MediaTarget::Invalid);
 
         // Valid base64 + real raster decode -> a native data-URI.
         assert!(is_native_data_uri(&uri));
         // Valid base64 but non-image bytes.
         assert!(!is_native_data_uri("data:image/png;base64,abcd"));
-        // Truncated PNG (valid magic + IHDR, no IDAT): a data-URI must decode to
-        // a genuine raster — a truncated payload is rejected, so the provider
-        // never forwards a magic-valid-but-undecodable image part.
+        // Truncated PNG (magic + IHDR, no IDAT): a data-URI must decode to a genuine raster, so
+        // the provider never forwards a magic-valid-but-undecodable part.
         let truncated = {
             let payload = uri
                 .strip_prefix("data:image/png;base64,")
@@ -778,9 +692,8 @@ mod tests {
         assert!(!is_native_data_uri(&truncated));
         // Unsupported subtype (gif decoder not compiled) -> not native.
         assert!(!is_native_data_uri("data:image/gif;base64,R0lGOD"));
-        // Declared subtype must match the actual bytes: a data:image/png holding
-        // JPEG bytes is rejected (a provider may decode strictly by the declared
-        // MIME, so a mismatched payload would be the same class of 400).
+        // Declared subtype must match the bytes: a data:image/png holding JPEG is rejected, since
+        // a provider may decode strictly by the declared MIME.
         let mut jbuf = Vec::new();
         image::RgbImage::from_pixel(1, 1, image::Rgb([255, 0, 0]))
             .write_to(
@@ -813,11 +726,10 @@ mod tests {
         assert_eq!(data_uri_base64_payload(&over), None);
     }
 
-    /// A local target is a path the classifier can decode. A placeholder, a
-    /// relative basename, a missing path, a non-image file and a
-    /// magic-valid-but-truncated raster are all refused as targets — the
-    /// classifier requires a real decode, so nothing downstream renders a broken
-    /// image or emits a junk data-URI.
+    /// A local target is a path the classifier can decode. A placeholder, a relative basename, a
+    /// missing path, a non-image file and a magic-valid-but-truncated raster are all refused — the
+    /// classifier requires a real decode, so nothing renders a broken image or emits a junk
+    /// data-URI.
     #[test]
     fn local_targets_classify_by_a_real_decode() {
         let png = write_temp_png("valid");
@@ -862,9 +774,8 @@ mod tests {
 
     #[test]
     fn an_oversized_raster_is_not_refused_as_a_target() {
-        // The transport's own upload limit is the only size gate on an outgoing
-        // attachment, so the inbound decode budget must not refuse one. Sparse, so
-        // the test costs no disk.
+        // The transport's own upload limit is the only size gate on an outgoing attachment, so
+        // the inbound decode budget must not refuse one. Sparse, so the test costs no disk.
         let png = write_temp_png("oversized");
         std::fs::File::options()
             .write(true)
@@ -877,8 +788,8 @@ mod tests {
 
     #[test]
     fn refusal_names_hide_credentials() {
-        // A refusal quotes a bounded name, never the target's payload: an
-        // address's query, fragment and userinfo can all carry a secret.
+        // A refusal quotes a bounded name, never the target's payload: an address's query,
+        // fragment and userinfo can all carry a secret.
         assert_eq!(
             marker_name("https://cdn.example.com/a/poster.png?token=s3cret"),
             "poster.png"
@@ -898,9 +809,9 @@ mod tests {
 
     #[test]
     fn workspace_files_decide_bare_word_references() {
-        // Existence decides whether a bare word is a reference: `[FILE:Makefile]`
-        // names the workspace's file, so it must not fall back to raw prose just
-        // because its name has no extension (or an unusual one).
+        // Existence decides whether a bare word is a reference: `[FILE:Makefile]` names the
+        // workspace's file, so it must not fall back to prose just because its name has no
+        // extension (or an unusual one).
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Makefile"), b"all:").unwrap();
         std::fs::write(dir.path().join("poster.thumbnail"), b"x").unwrap();
@@ -912,8 +823,8 @@ mod tests {
                 "{name} is a file the workspace has"
             );
         }
-        // Nothing by that name anywhere: a bare word stays prose, while a
-        // target shaped like a path still names a (missing) file.
+        // Nothing by that name anywhere: a bare word stays prose, while a path-shaped target
+        // still names a (missing) file.
         assert_eq!(
             resolve_marker_target("path", &roots),
             MarkerTarget::NotAReference

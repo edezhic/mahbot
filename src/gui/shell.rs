@@ -1,10 +1,8 @@
 //! Shell dashboard page — tabbed embedded terminal widget (full page).
 //!
-//! Multiple persistent PTY terminals can be open per workspace, each as a tab.
-//! Tabs survive page navigation (switching away and back preserves all tabs).
-//! Tab state is per-workspace — switching workspaces swaps the entire tab set.
-//! A right-click context menu on the terminal area offers Clear (Ctrl+L)
-//! and Select All (viewport-only visual selection).
+//! Multiple persistent PTY terminals can be open per workspace, each as a tab; tabs survive
+//! page navigation and are per-workspace (switching workspaces swaps the whole tab set). A
+//! right-click menu offers Clear (Ctrl+L) and Select All (viewport-only visual selection).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,15 +16,10 @@ use super::menus::{ContextMenu, MenuItem};
 use super::theme;
 use super::widgets;
 
-// ── Constants ─────────────────────────────────────────────────────────
-
 /// Large coordinate for "select all" — alacritty clamps to grid bounds.
 const LARGE_COORD: f32 = 999_999.0;
 
-// ── Theme ─────────────────────────────────────────────────────────────
-
-/// Zed One Dark ANSI color palette for the embedded terminal.
-/// Matches Zed's default dark terminal theme.
+/// Zed One Dark ANSI color palette for the embedded terminal (Zed's default dark theme).
 fn zed_one_dark_palette() -> iced_term::ColorPalette {
     iced_term::ColorPalette {
         foreground: "#abb2bf".into(),
@@ -61,8 +54,6 @@ fn zed_one_dark_palette() -> iced_term::ColorPalette {
     }
 }
 
-// ── Types ─────────────────────────────────────────────────────────────
-
 /// A single shell tab with an independent terminal session.
 struct ShellTab {
     label: String,
@@ -75,11 +66,9 @@ struct WorkspaceShellState {
     active_idx: usize,
     /// Label counter for generating unique sequential names ("Shell 1", …).
     label_counter: u64,
-    /// Cached workspace filesystem path, so new tabs (via '+' or reopen)
-    /// start in the correct working directory.
+    /// Cached workspace path, so new tabs (via '+' or reopen) start in the right directory.
     workspace_path: Option<String>,
-    /// If set, all terminal spawns have failed for this workspace; the
-    /// message explains why.
+    /// If set, all terminal spawns have failed for this workspace; the message explains why.
     spawn_error: Option<String>,
 }
 
@@ -87,8 +76,7 @@ struct WorkspaceShellState {
 pub enum ShellMessage {
     /// Terminal event forwarded from an embedded terminal widget.
     TerminalEvent(iced_term::Event),
-    /// The workspace resolved for the current selection (managed name plus
-    /// filesystem path), pushed only by the dashboard's
+    /// The workspace resolved for the current selection (managed name plus path), pushed only by
     /// `sync_workspace_surfaces` — never a substitution for an unresolved one.
     WorkspaceSelected(String, String),
     /// Select a tab by its index in the tab list.
@@ -104,36 +92,25 @@ pub enum ShellMessage {
 }
 
 pub struct ShellState {
-    /// The workspace the dashboard resolved for the current selection; `None`
-    /// until one resolves.
+    /// The workspace the dashboard resolved for the current selection; `None` until one does.
     selected_workspace_name: Option<String>,
-    /// Tabs grouped by workspace name.
     workspace_states: HashMap<String, WorkspaceShellState>,
     /// Monotonically increasing counter for unique terminal IDs.
     next_term_id: u64,
-    /// The most recent layout pixel size captured from `BackendCommand::Resize`
-    /// events.  Replayed onto newly created terminals so they immediately get
-    /// the correct character grid instead of the tiny ~8×2 default.
+    /// The last layout pixel size captured from `BackendCommand::Resize`, replayed onto new
+    /// terminals so they get the right character grid instead of the tiny default.
     last_seen_layout_size: Option<Size>,
 }
 
 /// The command interpreter a Shell-page terminal starts.
 ///
-/// Unix starts the program `$SHELL` names. Windows has no `$SHELL`: it is unset
-/// on a native launch, and a POSIX layer that does export it names a `/usr/bin/…`
-/// path the native spawn cannot resolve — so Windows starts
-/// [`crate::tools::shell::WINDOWS_COMMAND_INTERPRETER`], the same program the
-/// agent-facing shell spawns. `%COMSPEC%` is deliberately not consulted: the
-/// terminal crate assembles the ConPTY command line without quoting, so an
-/// interpreter installed under a path with spaces would name a program Windows
-/// cannot find.
+/// Unix starts the program `$SHELL` names. Windows has no `$SHELL`: it starts
+/// [`crate::tools::shell::WINDOWS_COMMAND_INTERPRETER`], the same program the agent-facing
+/// shell spawns; `%COMSPEC%` is deliberately not consulted, because the terminal crate
+/// assembles the ConPTY command line without quoting and a path with spaces would not resolve.
 ///
-/// The terminal crate starts this program in a session of its own — its own
-/// `pre_exec` does the `setsid` and takes the controlling terminal — so this is one
-/// of the two starts that keep the forking path and hand the name over as it is
-/// (the other is the periodic read of the owner's shell environment; the reason
-/// both do is [`crate::tools::shell::program_command`]'s). macOS prints its line
-/// about memory tooling to this process's terminal once per tab, as it did before.
+/// The terminal crate starts it in a session of its own, so this is one of the two starts that
+/// keep the forking path ([`crate::tools::shell::program_command`]'s reason).
 fn terminal_program() -> Result<String, String> {
     if cfg!(windows) {
         return Ok(crate::tools::shell::WINDOWS_COMMAND_INTERPRETER.into());
@@ -158,10 +135,8 @@ impl ShellState {
 
     /// Ensure a workspace state exists; if not, create one with a single default tab.
     ///
-    /// `working_dir` is the workspace's current filesystem path: an existing
-    /// workspace state adopts a corrected path, so new tabs (via '+' or reopen)
-    /// start in the right directory. A live PTY keeps the directory it was
-    /// spawned with — that cannot be changed.
+    /// `working_dir` is the workspace's current path: an existing state adopts a corrected path, so
+    /// new tabs start in the right directory. A live PTY keeps the directory it spawned with.
     fn ensure_workspace_state(&mut self, ws_name: &str, working_dir: String) {
         if let Some(ws) = self.workspace_states.get_mut(ws_name) {
             ws.workspace_path = Some(working_dir);
@@ -195,8 +170,8 @@ impl ShellState {
         }
     }
 
-    /// Spawn a single terminal and return a [`ShellTab`], or an error string
-    /// explaining why it could not be created.
+    /// Spawn a single terminal and return a [`ShellTab`], or an error string saying why it
+    /// could not be created.
     fn spawn_one_terminal(
         next_id: &mut u64,
         label: &str,
@@ -248,12 +223,8 @@ impl ShellState {
         Some(f(tab))
     }
 
-    // ── View ─────────────────────────────────────────────────────────
-
-    /// Render the shell. The dashboard renders this page only for a resolved
-    /// workspace, so this is only ever reached for one; the fallback below is
-    /// defensive — it covers a missing tab-state entry and never points the
-    /// view at another workspace.
+    /// Render the shell. The dashboard renders this page only for a resolved workspace; the
+    /// fallback below covers a missing tab-state entry and never points the view elsewhere.
     pub fn view(&self) -> Element<'_, ShellMessage> {
         let Some(ws_state) = self
             .selected_workspace_name
@@ -322,17 +293,8 @@ impl ShellState {
         )
     }
 
-    /// Build a centered title + subtitle message display.
-    ///
-    /// The layout wraps both texts in a centered container:
-    ///   <title>          — 24px bold
-    ///   8px spacer
-    ///   <subtitle>       — customizable size
-    ///
-    /// The `spacing` parameter controls the column gap between the two texts.
-    /// The 8px spacer is a fixed element between title and subtitle — the
-    /// total visual gap from title baseline to subtitle baseline is
-    /// the 8px spacer plus the column spacing above/below.
+    /// Build a centered title + subtitle message display: a 24px bold title, an 8px spacer, then
+    /// the subtitle at a customizable size; `spacing` is the column gap between the two texts.
     fn centered_title_subtitle<'a>(
         title: &'a str,
         title_color: iced::Color,
@@ -403,8 +365,6 @@ impl ShellState {
         widgets::tab_scrollable(tab_buttons, None, None::<fn(_) -> ShellMessage>)
     }
 
-    // ── Update ───────────────────────────────────────────────────────
-
     #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: ShellMessage) -> Task<ShellMessage> {
         match msg {
@@ -414,18 +374,16 @@ impl ShellState {
                 Task::none()
             }
             ShellMessage::TerminalEvent(iced_term::Event::BackendCall(id, cmd)) => {
-                // Capture the most recent layout resize so we can replay it
-                // onto newly created terminals (see NewTab / TabClosed /
-                // ensure_workspace_state).
+                // Capture the most recent layout resize so it can be replayed onto newly created
+                // terminals.
                 if let BackendCommand::Resize(Some(layout_size), _) = &cmd {
                     self.last_seen_layout_size = Some(*layout_size);
                 }
 
-                // Route event by terminal ID across ALL workspaces.
-                // We subscribe to all terminals globally to prevent PTY stalls,
-                // so the handler must match globally too — matching only the
-                // current workspace would silently drop output from background
-                // workspace terminals, leaving stale grid buffers on switch-back.
+                // Route events by terminal ID across ALL workspaces: we subscribe globally to
+                // prevent PTY stalls, so the handler must match globally too — matching only the
+                // current workspace would silently drop output from background terminals, leaving
+                // stale grids on switch-back.
                 for ws_state in self.workspace_states.values_mut() {
                     if let Some(tab) = ws_state.tabs.iter_mut().find(|t| t.terminal.id == id) {
                         let _ = tab.terminal.handle(iced_term::Command::ProxyToBackend(cmd));
@@ -481,9 +439,8 @@ impl ShellState {
                         // Closed a tab before the active one — shift down.
                         ws_state.active_idx = ws_state.active_idx.saturating_sub(1);
                     }
-                    // else: active index stays valid as-is:
-                    //   - idx == active_idx: next tab shifted into this position
-                    //   - idx > active_idx: no effect on active index
+                    // else: active index stays valid — idx == active_idx takes the tab shifted into
+                    // this position, idx > active_idx has no effect.
                 }
                 Task::none()
             }
@@ -505,8 +462,8 @@ impl ShellState {
                             ws_state.spawn_error = None;
                         }
                         Err(msg) => {
-                            // If other tabs exist, the error is invisible in
-                            // the UI — log it so it's at least discoverable.
+                            // If other tabs exist, the error is invisible in the UI — log it so it
+                            // is discoverable.
                             if ws_state.tabs.is_empty() {
                                 ws_state.spawn_error = Some(msg);
                             } else {
@@ -542,16 +499,11 @@ impl ShellState {
         }
     }
 
-    // ── Subscription ─────────────────────────────────────────────────
-
     pub fn subscription(&self) -> Subscription<ShellMessage> {
-        // Subscribe to ALL terminals across ALL workspaces to prevent PTY
-        // stalls — iced_term's backend uses a bounded mpsc channel (cap 100)
-        // with blocking_send; undrained channels cause the PTY reader thread
-        // to block, freezing the shell process.  This applies to both
-        // background tabs within a workspace and terminals in workspaces the
-        // user has navigated away from.  Events are routed to the correct
-        // terminal by ID in the update handler.
+        // Subscribe to ALL terminals across ALL workspaces to prevent PTY stalls: iced_term's
+        // backend uses a bounded mpsc channel (cap 100) with blocking_send, so an undrained channel
+        // freezes the PTY reader thread. Events are routed to the right terminal by ID in the
+        // update handler.
         let all_tab_subs: Vec<Subscription<ShellMessage>> = self
             .workspace_states
             .values()
@@ -570,8 +522,7 @@ impl ShellState {
 mod tests {
     use super::*;
 
-    /// A workspace state with no tabs — enough to exercise the path bookkeeping
-    /// without spawning a PTY.
+    /// A workspace state with no tabs — enough to exercise the path bookkeeping without a PTY.
     fn tabless_state(working_dir: Option<&str>) -> WorkspaceShellState {
         WorkspaceShellState {
             tabs: Vec::new(),
@@ -582,9 +533,8 @@ mod tests {
         }
     }
 
-    /// An already-created workspace adopts a corrected path, so its next tab
-    /// starts in the right directory (a live PTY keeps the directory it was
-    /// spawned with).
+    /// An already-created workspace adopts a corrected path, so its next tab starts in the right
+    /// directory (a live PTY keeps the one it spawned with).
     #[test]
     fn existing_workspace_state_adopts_a_corrected_path() {
         let mut shell = ShellState::new();

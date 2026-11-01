@@ -1,13 +1,8 @@
-//! One agent's turn: from a routed job to a finalized session, through every
-//! tool round in between, plus the role and toolset metadata a turn is built
-//! from. The entry points are `run_agent` and `run_default_agent`.
-//!
-//! The submodules own what a running agent reads and publishes: static `Role`
-//! metadata (`role`), the live running-agent registry (`registry`), the
-//! per-agent message mailbox (`message_router`), workspace skills (`skills`),
-//! structured extraction (`extraction`) and the maintenance agent
-//! (`maintainer`). Not the conversation store (`crate::session`) and not the
-//! dashboard's view of a run.
+//! One agent's turn: from a routed job to a finalized session through every tool
+//! round in between, plus the role/toolset metadata a turn is built from
+//! (`run_agent`, `run_default_agent`). The submodules own what a running agent
+//! reads and publishes (`role`, `registry`, `message_router`, `skills`,
+//! `extraction`, `maintainer`) — not the conversation store of `crate::session`.
 
 use std::fmt::Write;
 use std::path::Path;
@@ -35,41 +30,29 @@ pub mod registry;
 pub(crate) mod role;
 pub(crate) mod skills;
 
-// ── Tool-batch user context ────────────────────────────────────────
-// Set once per tool batch by the Agent work loop's `execute_tool_group`,
-// read by tools that need user context (e.g. AnalyzeTool async dispatch).
-//
-// # Contract
-// - Set once per tool batch (per `execute_tool_group` round), not before
-//   each individual tool `execute()`.
-// - Must be read synchronously (before any `tokio::spawn` boundary) when
-//   the value is needed across an async boundary.
-// - Falls back to `unwrap_or_default()` → empty string for background
-//   agents (management, maintainer, workspace) that have no user context.
-//
-/// Synchronous read of [`CURRENT_TOOL_USER_NAME`]. See the task-local contract
-/// above: reads must happen before any `tokio::spawn` boundary if the value is
-/// needed across one.
+// Set once per tool batch (per `execute_tool_group` round), not per individual
+// tool `execute()`, and read synchronously — before any `tokio::spawn` boundary
+// when the value must cross one. Background agents (management, maintainer,
+// workspace) fall back to an empty string.
+/// Synchronous read of [`CURRENT_TOOL_USER_NAME`]; the task-local contract above applies.
 pub(crate) fn tool_user_name() -> String {
     CURRENT_TOOL_USER_NAME
         .try_with(String::clone)
         .unwrap_or_default()
 }
 
-/// The calling agent's SESSION id on its own — the identity a session-scoped
-/// action needs when the user is not part of it. A workspace-scoped Manager
-/// session is driven by pipeline ticket notifications, whose turns carry an
-/// empty user name, so [`tool_identity`] refuses those turns while this one
-/// answers them.
+/// The calling agent's session id alone — the identity a session-scoped action
+/// needs when the user is not part of it: a Manager session driven by pipeline
+/// ticket notifications carries no user name, so [`tool_identity`] refuses those
+/// turns while this one answers them.
 pub(crate) fn tool_agent_id() -> anyhow::Result<String> {
     current_agent_id()
         .context("No agent identity available — the tool must run in an agent session.")
 }
 
-/// Identity of the agent currently executing a tool call: `(agent_id, user_name)`.
-/// Errors when the call runs outside a user session — there is no addressable
-/// identity to associate side effects with. The session id it returns is the one
-/// [`tool_agent_id`] returns, from the same read.
+/// Identity of the agent executing a tool call: `(agent_id, user_name)`. Errors
+/// outside a user session — there is no addressable identity to attribute side
+/// effects to.
 pub(crate) fn tool_identity() -> anyhow::Result<(String, String)> {
     let user_name = tool_user_name();
     let agent_id = current_agent_id()
@@ -78,9 +61,8 @@ pub(crate) fn tool_identity() -> anyhow::Result<(String, String)> {
     Ok((agent_id, user_name))
 }
 
-/// The calling agent's session id as the task-local carries it, `None` outside an
-/// agent run and for the empty id a turn can carry — the one read above, and what the
-/// computer tool files its session-scoped state under.
+/// The calling agent's session id as the task-local carries it: `None` outside an
+/// agent run and for the empty id a turn can carry.
 pub(crate) fn current_agent_id() -> Option<String> {
     CURRENT_TOOL_AGENT_ID
         .try_with(Option::clone)
@@ -89,8 +71,7 @@ pub(crate) fn current_agent_id() -> Option<String> {
         .filter(|agent_id| !agent_id.is_empty())
 }
 
-/// The scope a tool-call row states: the calling agent's identity and role, and
-/// the ticket the run works on (empty when it has none).
+/// The scope a tool-call row states; the ticket is empty when the run has none.
 #[derive(Default)]
 pub(crate) struct ToolRecordAttribution {
     pub agent_id: String,
@@ -98,13 +79,9 @@ pub(crate) struct ToolRecordAttribution {
     pub ticket: String,
 }
 
-/// The calling agent's attribution for the warning row
-/// [`crate::logs::record_stray_event`] leaves: empty outside an agent run
-/// (inbound enrichment, tests), and with the ticket empty whenever the run has no
-/// ticket of its own. The tracing writer takes this attribution from the current
-/// span; a row that travels to the telemetry queue must take it from the same
-/// task-local, read here — synchronously, while the calling task is still the one
-/// running, since no task-local is in scope where the row is written.
+/// The attribution [`crate::logs::record_stray_event`] rows carry: empty outside an
+/// agent run, ticket empty when the run has none. Read here, synchronously — no
+/// task-local is in scope where the row is written.
 pub(crate) fn tool_record_attribution() -> ToolRecordAttribution {
     CURRENT_TOOL_AGENT_TRACKING
         .try_with(|t| {
@@ -119,25 +96,23 @@ pub(crate) fn tool_record_attribution() -> ToolRecordAttribution {
         .unwrap_or_default()
 }
 
-/// Synchronous read of [`CURRENT_TOOL_CHANNEL`]. Same contract as
-/// [`tool_user_name`].
+/// Synchronous read of [`CURRENT_TOOL_CHANNEL`]. Same contract as [`tool_user_name`].
 pub(crate) fn tool_channel() -> String {
     CURRENT_TOOL_CHANNEL
         .try_with(String::clone)
         .unwrap_or_default()
 }
 
-/// Synchronous read of [`CURRENT_TOOL_COMMAND_LINE`]: false outside the
-/// command line's own call. Same contract as [`tool_user_name`].
+/// Synchronous read of [`CURRENT_TOOL_COMMAND_LINE`]; false outside that call.
 pub(crate) fn tool_command_line() -> bool {
     CURRENT_TOOL_COMMAND_LINE
         .try_with(|flag| *flag)
         .unwrap_or(false)
 }
 
-/// Synchronous read of [`CURRENT_TOOL_CUSTOM_LAUNCH`]. Same contract as
-/// [`tool_user_name`]: a tool that dispatches a durable round must read it
-/// before its `tokio::spawn` boundary so the round carries the caller's branch.
+/// Synchronous read of [`CURRENT_TOOL_CUSTOM_LAUNCH`]: a tool that dispatches a
+/// durable round must read it before its `tokio::spawn` boundary so the round
+/// carries the caller's branch.
 pub(crate) fn tool_custom_launch() -> Option<crate::Launch> {
     CURRENT_TOOL_CUSTOM_LAUNCH
         .try_with(std::clone::Clone::clone)
@@ -145,8 +120,7 @@ pub(crate) fn tool_custom_launch() -> Option<crate::Launch> {
 }
 
 /// Synchronous read of [`CURRENT_TOOL_OUTPUT_DIR`]: where a command-line call's
-/// produced files must land, `None` for every other caller. A producing tool
-/// reads it before its `tokio::spawn` boundary, like the neighbours above.
+/// produced files must land, `None` for every other caller.
 pub(crate) fn tool_output_dir() -> Option<std::path::PathBuf> {
     CURRENT_TOOL_OUTPUT_DIR
         .try_with(std::clone::Clone::clone)
@@ -156,114 +130,78 @@ pub(crate) fn tool_output_dir() -> Option<std::path::PathBuf> {
 tokio::task_local! {
     pub(crate) static CURRENT_TOOL_USER_NAME: String;
     pub(crate) static CURRENT_TOOL_CHANNEL: String;
-    /// Whether THIS tool call is the command line's own — `mahbot send …` (see
-    /// [`crate::cli`]) running in the instance with no agent session behind it.
-    /// Set ONLY by [`crate::cli::instance`], around the one call it serves: the
-    /// command line is a distinct EXECUTOR, and it is never inferred from values
-    /// a call carries, because other executors carry the same ones — a message the
-    /// command line hands to an agent runs that agent's turn with the command
-    /// line's channel and its own session like any other turn.
+    /// Whether THIS call is the command line's own — `mahbot send …` (see
+    /// [`crate::cli`]) in the instance with no agent session behind it. Set ONLY
+    /// by [`crate::cli::instance`]; never inferred from values a call carries,
+    /// since other executors carry the same ones (a message handed to an agent
+    /// runs that agent's turn with the command line's channel like any other).
     pub(crate) static CURRENT_TOOL_COMMAND_LINE: bool;
-    /// The calling agent's DIRECT PARENT INVOCATION grouping key (ticket /
-    /// analyze round / research run) — set for the duration of tool execution so
-    /// tools that spawn sub-agents (e.g. `send`) can propagate the caller's
-    /// group to the Running Agents view. `None` = workspace singleton caller.
+    /// The caller's DIRECT PARENT INVOCATION key (ticket / analyze round /
+    /// research run), so tools that spawn sub-agents (`send`) land in the caller's
+    /// Running Agents group. `None` = workspace singleton caller.
     pub(crate) static CURRENT_TOOL_PARENT_KEY: Option<crate::agent::registry::ParentKey>;
-    /// The calling agent's DIRECT PARENT INVOCATION human-readable label
-    /// (ticket title / analyze question / research question) — set alongside
-    /// [`CURRENT_TOOL_PARENT_KEY`] for the duration of tool execution so tools
-    /// that spawn sub-agents can propagate the caller's group header label to
-    /// the Running Agents view. Purely presentational; `None` for workspace
-    /// singletons.
+    /// The caller's parent invocation label (ticket title / question), set
+    /// alongside [`CURRENT_TOOL_PARENT_KEY`] for spawned sub-agents. Purely
+    /// presentational; `None` for workspace singletons.
     pub(crate) static CURRENT_TOOL_PARENT_LABEL: Option<String>;
-    /// The calling agent's background shell session registry — set for the
-    /// duration of tool execution so the shell tool (Full roles only) can
-    /// register/stop background sessions that are force-killed when the agent
-    /// is dropped. `None` outside an agent run (management diagnostics,
-    /// tests) — background mode is unavailable there.
+    /// The caller's background shell session registry, so the shell tool (Full
+    /// roles only) registers/stops sessions that are force-killed when the agent
+    /// drops. `None` outside an agent run — background mode is unavailable there.
     pub(crate) static CURRENT_TOOL_BACKGROUND_SESSIONS:
         Option<std::sync::Arc<crate::tools::shell::BackgroundSessions>>;
-    /// The calling agent's id — set for the duration of tool execution so the
-    /// shell tool can attribute the spill files it creates to the owning agent
-    /// (owner-deletes-at-end: the run's spill files are deleted when the agent
-    /// run ends). `None` outside an agent run (management diagnostics, tests).
+    /// The caller's id, so the shell tool attributes its spill files to the owning
+    /// agent (deleted when the run ends). `None` outside an agent run.
     pub(crate) static CURRENT_TOOL_AGENT_ID: Option<String>;
-    /// The calling agent's registry identity + generation — set for the
-    /// duration of tool execution so tool-internal LLM calls (e.g. media
-    /// transcription in video tool results) can attribute themselves to the
-    /// owning agent's Running Agents card and telemetry. `None` outside an
-    /// agent run (inbound enrichment, tests) — such calls register in
-    /// [`crate::agent::registry::NON_AGENT_CALLS`] instead.
+    /// The caller's registry identity + generation, so tool-internal LLM calls
+    /// (media transcription in video results) attribute to the owning Running
+    /// Agents card and telemetry. `None` outside an agent run — such calls
+    /// register in [`crate::agent::registry::NON_AGENT_CALLS`] instead.
     pub(crate) static CURRENT_TOOL_AGENT_TRACKING:
         Option<crate::agent::registry::AgentTracking>;
-    /// The calling agent's custom-role launch — set for the duration of tool
-    /// execution so a tool that dispatches a durable round (`analyze`/`send`)
-    /// carries the caller's branch address into the round's envelope
-    /// and job row. `None` for every built-in role.
+    /// The caller's custom-role launch, so a tool dispatching a durable round
+    /// (`analyze`/`send`) carries its branch address into the envelope and job
+    /// row. `None` for every built-in role.
     pub(crate) static CURRENT_TOOL_CUSTOM_LAUNCH: Option<crate::Launch>;
-    /// The directory a command-line call's produced files must land in — set
-    /// ONLY by [`crate::cli::instance`] around the one call it serves, because a
-    /// frontend caller knows where it wants the file and the tool's arguments
-    /// never carry it. `None` (the whole agent path) means the tool's own
-    /// workspace directory: the producing tools fall back to it.
+    /// Where a command-line call's produced files must land — set ONLY by
+    /// [`crate::cli::instance`], because the tool's arguments never carry it.
+    /// `None` (the whole agent path) means the tool's own workspace directory.
     pub(crate) static CURRENT_TOOL_OUTPUT_DIR: Option<std::path::PathBuf>;
 }
 
 /// Maximum number of completed tool rounds before the agent loop bails out.
 ///
-/// A tool round is the LLM call(s) that returned tool calls plus the execution
-/// and commit of that tool group. The counter increments only after a committed
-/// tool group; the final-answer LLM call and the image-rejection strip
-/// `continue` do not increment it, so an agent can legitimately make more LLM
-/// calls than this cap. These semantics are deliberate — do not "fix" the
-/// counter (or the strip path) to count raw LLM calls while touching this file.
+/// A tool round is the LLM call(s) that returned tool calls plus execution and
+/// commit of that group. The counter increments only after a committed group; the
+/// final-answer call and the image-rejection strip `continue` do not, so an agent
+/// can legitimately make more LLM calls than this cap. Do not "fix" these
+/// semantics while touching this file.
 ///
-/// **DO NOT REDUCE this value without benchmarking against real ticket tool-round
-/// distributions in this codebase.**
-///
-/// # Why this is intentionally generous (1000)
-///
-/// * Agents routinely consume hundreds of tool rounds in normal, legitimate
-///   work: multi-file editing with compile-error feedback loops, research →
-///   implement → review cycles, and sequential tool dependencies all require
-///   many turns — this is deliberate problem-solving, not a runaway loop.
-///
-/// * Cost is not a concern. Even a full 1000-round run on the current
-///   default models costs well under $1, so there is zero cost reason to
-///   lower the limit.
-///
-/// * Running to the tool-round cap is EXTREMELY rare with modern models. The
-///   limit exists only as a safety net for pathological edge cases — it is not
-///   protecting against a common or recurring problem.
-///
-/// * Reducing the cap prematurely would cause legitimate long-running agents to
-///   fail mid-task, wasting more time and tokens on restarts than the tool
-///   rounds themselves would have consumed.
-///
+/// **DO NOT REDUCE without benchmarking against real ticket tool-round
+/// distributions.** 1000 is deliberate: legitimate work consumes hundreds of
+/// rounds, a full run costs well under $1, and hitting the cap is EXTREMELY rare
+/// — it is a safety net, not a common guard. Lowering it fails long-running
+/// agents mid-task, wasting more on restarts than the rounds would have cost.
 /// Value last intentionally reviewed: 2026-07-11
 const MAX_TOOL_ROUNDS: usize = 1000;
 
-/// Retry-exhaustion marker shared by the producer contexts
-/// (`llm_call`/`summarize`) and the `engineer_failure_notice` match; drift is
-/// cosmetic-only (typed classification uses `RetryExhausted`).
+/// Retry-exhaustion marker shared by `llm_call`/`summarize` and the
+/// `engineer_failure_notice` match; drift is cosmetic (classification uses the
+/// typed `RetryExhausted`).
 pub(crate) const RETRY_EXHAUSTION_MARKER: &str = "exhausted retry budget";
 
-/// Attempts allowed for the summarization call when the model answers with a
-/// tool call instead of a summary — the request is re-sent verbatim, so the
-/// attempts are byte-identical (prompt-prefix cache preserved) and the tool
-/// call is never executed. Bounded on purpose: on exhaustion the compaction is
-/// abandoned exactly as before (full history kept, owner not disturbed).
+/// Attempts for the summarization call when the model answers with a tool call
+/// instead of a summary — re-sent verbatim, so attempts stay byte-identical
+/// (prompt-prefix cache preserved) and the call is never executed. On exhaustion
+/// the compaction is abandoned exactly as before: full history kept, owner not disturbed.
 const SUMMARIZE_ATTEMPTS: u32 = 3;
 
-/// The interrupted turn's whole reply, delivered on the surface its urgent
-/// message came from and recorded in the conversation, so both the user and the
-/// assistant see that the previous turn was cut short instead of answered.
+/// The interrupted turn's whole reply, delivered on the urgent message's surface
+/// and recorded, so both sides see the turn was cut short instead of answered.
 const URGENT_INTERRUPT_NOTICE: &str =
     "⏹️ Interrupted: an urgent message arrived, so I stopped that turn.";
 
-/// The one result a tool call the urgent-message interrupt cut before it
-/// returned is settled with: an ordinary tool result — not a failure — that says
-/// what happened and claims no knowledge of the call's effect.
+/// The result a call the urgent interrupt cut is settled with: an ordinary tool
+/// result — not a failure — claiming no knowledge of the call's effect.
 fn interrupted_outcome() -> ToolExecutionOutcome {
     ToolExecutionOutcome {
         output: crate::prompt::load_prompt("tool_interrupted.md")
@@ -277,25 +215,16 @@ fn interrupted_outcome() -> ToolExecutionOutcome {
     }
 }
 
-/// Boxed future returned by [`Agent::complete_pending_tool_calls`] — a pinned
-/// box so the caller (`Agent::work`) awaits a `dyn Future` instead of a concrete
-/// opaque type. Naming the boxed future breaks the async opaque-type Send cycle
-/// that a concrete `impl Future` return would create between `agent` and
-/// `tools::analyze` (the resume cores re-enter agent sub-agent runs).
+/// Boxed future returned by [`Agent::complete_pending_tool_calls`]: naming the box
+/// breaks the async opaque-type Send cycle a concrete `impl Future` would create
+/// between `agent` and `tools::analyze` (resume cores re-enter sub-agent runs).
 type CompletePendingToolCallsFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>;
 
-/// Extract file paths from successful media-generation tool outcomes.
-///
-/// Scans the zipped tool calls and outcomes for media-generation tools,
-/// parsing the output for their media marker prefixes (e.g. `[IMAGE:path]`,
-/// `[VIDEO:path]`) and returning `(marker_prefix, path)` pairs.
-///
-/// Only successfully-executed tools with a defined [`Tool::media_marker`] are
-/// inspected. Non-media tools and failed outcomes are silently skipped.
-///
-/// Limitation: file paths containing `]` are truncated by the regex — not a
-/// concern in practice, as media-generation tools produce temporary files with safe names.
+/// `(marker_prefix, path)` for every successful media tool outcome carrying its
+/// [`Tool::media_marker`] (e.g. `[IMAGE:path]`); failed outcomes and non-media
+/// tools are skipped. Limitation: a path containing `]` is truncated by the regex
+/// — harmless, media tools write safe temporary names.
 fn extract_media_from_outcomes(
     tools: &[Box<dyn Tool>],
     tool_calls: &[ToolCall],
@@ -312,8 +241,7 @@ fn extract_media_from_outcomes(
         let Some(marker_prefix) = tool.media_marker() else {
             continue;
         };
-        // Derive the regex kind from the marker prefix, e.g. "[IMAGE:" -> "IMAGE".
-        // This relies on the documented invariant that media_marker() returns "[KIND:".
+        // "[IMAGE:" -> "IMAGE", per `media_marker()`'s documented `[KIND:` shape.
         let marker = &marker_prefix[1..marker_prefix.len() - 1];
         let mut matched = false;
         for caps in MEDIA_MARKER_RE.captures_iter(&outcome.output) {
@@ -326,9 +254,8 @@ fn extract_media_from_outcomes(
         if matched {
             continue;
         }
-        // A tool whose every answer carries a marker ([`Tool::media_marker_always`])
-        // and did not: that is a defect to see. A tool that also answers with text
-        // alone (the renderer's documents and checks) is normal here.
+        // A marker-always tool ([`Tool::media_marker_always`]) that carried none is
+        // a defect to see; a tool that also answers with text alone is normal here.
         let message = "a successful media call carried no media marker";
         if tool.media_marker_always() {
             tracing::warn!(
@@ -347,9 +274,8 @@ fn extract_media_from_outcomes(
     paths
 }
 
-/// Iterate the values carried by `[IMAGE:...]` markers in the session's user
-/// messages. Only User-role messages are scanned: that is where images are
-/// promoted to provider vision parts (`parse_image_markers`).
+/// Values carried by `[IMAGE:...]` markers in the session's User-role messages —
+/// the only role whose images are promoted to provider vision parts.
 fn user_image_marker_values(history: &[ChatMessage]) -> impl Iterator<Item = &str> {
     history
         .iter()
@@ -364,25 +290,20 @@ fn user_image_marker_values(history: &[ChatMessage]) -> impl Iterator<Item = &st
         })
 }
 
-/// Collect the values carried by `[IMAGE:...]` markers already present in the
-/// session's user messages (the read tool's synthetic injection data-URIs, or
-/// file paths from other tools' media markers). Used as the dedup key for the
-/// read tool's synthetic image injection: a repeat read of an already-attached
-/// image (same marker value) is not injected again.
+/// The dedup key for synthetic image injection: `[IMAGE:...]` values already in
+/// the session's user messages, so a repeat read of an attached image (same marker
+/// value) is not injected again.
 fn existing_image_marker_values(history: &[ChatMessage]) -> std::collections::HashSet<String> {
     user_image_marker_values(history)
         .map(str::to_string)
         .collect()
 }
 
-/// Count DISTINCT data-URI image markers in the session's user messages —
-/// the second summarization trigger
-/// ([`crate::session::SUMMARIZATION_IMAGE_COUNT`]). The `data:image/` prefix
-/// pre-gate keeps the per-turn scan cheap (no full raster decode per marker)
-/// and never undercounts: every marker the provider promotes to a vision
-/// part (`is_native_data_uri` accepts PNG/JPEG/WebP only, all
-/// `data:image/…`) passes the gate. The gate is deliberately a superset —
-/// an invalid `data:image/*` payload may be counted too.
+/// Count DISTINCT data-URI image markers in the session's user messages — the
+/// second summarization trigger ([`crate::session::SUMMARIZATION_IMAGE_COUNT`]).
+/// The `data:image/` pre-gate keeps the per-turn scan cheap and never undercounts
+/// (every vision-promoted marker carries that prefix); it is a deliberate
+/// superset, so an invalid `data:image/*` payload may be counted too.
 fn session_image_marker_count(history: &[ChatMessage]) -> usize {
     user_image_marker_values(history)
         .filter(|value| value.starts_with("data:image/"))
@@ -390,22 +311,15 @@ fn session_image_marker_count(history: &[ChatMessage]) -> usize {
         .len()
 }
 
-/// Derive an [`ImagePayload`] from a successful tool's raw output when the tool
-/// did not supply its own payload but returned a real on-disk `[IMAGE:path]`
-/// marker, so a marker-delivered image still reaches the agent's own context.
-/// Fails open (`None`) when the marker path is not absolute or cannot be
-/// compressed into a bounded JPEG data-URI (e.g. an SVG, which the compressor
-/// cannot rasterize) — the user still receives the file via the marker in the raw
-/// output.
+/// An [`ImagePayload`] derived from a real on-disk `[IMAGE:path]` marker in a
+/// successful tool output that supplied none, so a marker-delivered image reaches
+/// the agent's own context. Fails open (`None`) for a non-absolute or
+/// non-compressible path (e.g. an SVG); the marker still delivers the file.
 ///
-/// This deliberately does NOT route through the shared classifier: as a
-/// *producer* it must emit a bounded compressed payload, so the async
-/// full-decode + compression (`local_image_to_compressed_data_uri_with_meta`)
-/// is its authoritative validity check. Routing through the classifier would
-/// only add a redundant decode — the classifier's local-file validity check
-/// (`raster_decode_limits`: 256 MiB / 16384 px) is a bounded decode but adds no
-/// encoding value on top of the producer's own decode + resize + JPEG-encode,
-/// which is what actually bounds the emitted payload.
+/// Deliberately not routed through the shared classifier: as a *producer* it must
+/// emit a bounded compressed payload, so the async full decode + resize + JPEG
+/// (`local_image_to_compressed_data_uri_with_meta`) is its authoritative check;
+/// the classifier would add a redundant decode and no encoding value.
 async fn derive_image_payload_from_marker(output: &str) -> Option<ImagePayload> {
     // Cheap guard: skip the regex scan for outputs carrying no image marker.
     if !crate::util::has_media_marker(output, MediaMarkerKind::Image) {
@@ -435,23 +349,17 @@ async fn derive_image_payload_from_marker(output: &str) -> Option<ImagePayload> 
     None
 }
 
-/// Format a tool's outcome for persistence and derive any fresh image payloads —
-/// the shared "outcome → content" step used by both
-/// [`Agent::commit_tool_results`] and resume-completion re-execution.
+/// Format a tool's outcome for persistence and derive its fresh image payloads —
+/// the shared "outcome → content" step of [`Agent::commit_tool_results`] and
+/// resume-completion re-execution.
 ///
-/// Reading [`ToolExecutionOutcome::text_is_content`]: content keeps the
-/// annotations as an appendix and its own markers literal; a claim is replaced
-/// by them.
-///
-/// `format_output` (or the truncation fallback) first, then the outcome's own
-/// image payloads take precedence over a payload derived from a real on-disk
-/// `[IMAGE:path]` marker in a successful tool output. When payloads apply, the
-/// dedup key `seen` (computed lazily from `history` on first use) decides
-/// fresh/attached per payload; the returned vec holds every FRESH attachment,
-/// which the caller injects as ONE synthetic user message
-/// ([`crate::util::injected_image_user_message`]). The outcome's payloads are
-/// taken rather than copied — they carry base64 data URIs, and this runs once
-/// per outcome.
+/// [`ToolExecutionOutcome::text_is_content`]: content keeps the annotations as an
+/// appendix and its markers literal; a claim is replaced by them. `format_output`
+/// (or the truncation fallback) runs first, then the outcome's own payloads take
+/// precedence over one derived from a real on-disk `[IMAGE:path]` marker. The dedup
+/// key `seen` (lazily from `history`) decides fresh/attached; the returned vec is
+/// every FRESH attachment, injected as ONE synthetic user message. Payloads are
+/// taken, not copied — they carry base64 data URIs.
 async fn tool_result_content(
     tools: &[Box<dyn Tool>],
     call_name: &str,
@@ -464,13 +372,9 @@ async fn tool_result_content(
         None => crate::util::truncate_tool_output(&outcome.output),
     };
 
-    // The outcome's own payloads (read tool, image_gen) take precedence;
-    // otherwise derive an injected image from a real on-disk `[IMAGE:path]`
-    // marker in a successful tool output that supplied no payload of its own, so
-    // a marker-delivered image reaches the agent's own context. Only a text that
-    // is a claim about its images can be the source of such a claim — in content
-    // (a converted document's extracted text) a marker is text, so nothing is
-    // derived from it. Derivation fails open: a non-rasterizable path (e.g. SVG)
+    // The outcome's own payloads (read, image_gen) take precedence; otherwise derive one
+    // from a real on-disk `[IMAGE:path]` marker, but only from a claim — in content (a
+    // converted document's text) a marker is text. Fails open: a non-rasterizable path
     // yields no payload while the marker stays in the raw output.
     let mut payloads: Vec<ImagePayload> = outcome.image_payloads;
     if payloads.is_empty() && !outcome.text_is_content && outcome.success {
@@ -501,8 +405,7 @@ async fn tool_result_content(
 }
 
 /// The single synthetic User-role message carrying a round's fresh tool images;
-/// `None` when the round attached nothing. Why one message per round rather than
-/// one per image or per call: [`crate::util::injected_image_user_message`].
+/// `None` when the round attached nothing.
 fn injected_images_message(
     agent_id: &str,
     role: crate::Role,
@@ -527,13 +430,10 @@ fn injected_images_message(
 }
 
 /// One-pass derivation of a role's advertised tools and their specs — the single
-/// source for both [`Agent::new`] and the research wrap-up snapshot
-/// ([`role_tool_specs`]), so the frozen post-deadline replay can never drift from
-/// the live agent's tools (KV-cache byte identity). The caller owns the run-scoped
-/// tracker of the chrome sessions those tools open, which the run's end releases
-/// ([`crate::tools::chrome::ChromeRunSessions::for_run`]). `launch` is the
-/// launch a branch role runs under (its record's tool subset); `None` for every
-/// built-in role.
+/// source for [`Agent::new`] and [`role_tool_specs`], so the frozen replay can never
+/// drift from the live tools (KV-cache byte identity). The caller owns the run-scoped
+/// chrome tracker, released at the run's end. `launch` is a branch role's launch (its
+/// record's tool subset); `None` for built-ins.
 #[must_use]
 pub(crate) fn role_tools_and_specs(
     role: crate::Role,
@@ -542,9 +442,8 @@ pub(crate) fn role_tools_and_specs(
     chrome_sessions: std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
     launch: Option<&crate::Launch>,
 ) -> (Vec<Box<dyn Tool>>, Vec<crate::ToolSpec>) {
-    // A custom role's tool set is derived from its record's chosen subset of the
-    // admin Assistant's tools (at the admin's strength), not from the static
-    // per-role factory — every other role keeps `role.tools(...)`.
+    // A custom role's set is its record's chosen subset of the admin Assistant's
+    // tools; every other role keeps the static per-role factory.
     let tools: Vec<Box<dyn Tool>> = if role == crate::Role::Custom {
         crate::Role::custom_role_tools(launch.map(|c| c.tools.as_slice()).unwrap_or_default())
     } else {
@@ -557,10 +456,8 @@ pub(crate) fn role_tools_and_specs(
     (tools, tool_specs)
 }
 
-/// The advertised tool specs of one role without a run: a caller that builds the
-/// tools only to snapshot their schemas has no run to own chrome sessions, so the
-/// tools get a tracker with no namespace (`ChromeRunSessions::default`) — one that
-/// never claims a run's.
+/// The advertised tool specs of one role without a run: the tools get a tracker
+/// with no namespace (`ChromeRunSessions::default`), which never claims a run's.
 #[must_use]
 pub(crate) fn role_tool_specs(
     role: crate::Role,
@@ -577,22 +474,18 @@ pub(crate) fn role_tool_specs(
     .1
 }
 
-/// A role's derived chat-request triplet (model slot → per-model provider
-/// routing → per-role reasoning effort). Named fields keep the order
-/// unambiguous across cross-module callers — a bare tuple would have two
-/// type-identical `Option<String>` slots.
+/// A role's derived chat-request triplet (model → provider routing → reasoning
+/// effort); named fields keep the order unambiguous for cross-module callers.
 pub(crate) struct RoleChatParams {
     pub model: String,
     pub provider_order: Option<String>,
     pub reasoning_effort: Option<String>,
 }
 
-/// Derive a role's chat-request triplet — the single source of the
-/// model/routing/reasoning_effort derivation shared by [`chat_request`],
-/// [`crate::pipeline::verdict::synthesis_request`], and
+/// Derive a role's chat-request triplet — the single source shared by
+/// [`chat_request`], [`crate::pipeline::verdict::synthesis_request`] and
 /// [`crate::tools::analyze::consolidate_findings`]. Consumers keep their own
-/// `max_tokens`, `tools`, and `meta`; the call sites do not share a KV-cache
-/// prefix with each other (distinct conversations/system prompts).
+/// `max_tokens`, `tools` and `meta`; the call sites share no KV-cache prefix.
 #[must_use]
 pub(crate) fn role_chat_params(role: crate::Role) -> RoleChatParams {
     let model = crate::config::CONFIG.role_model(role);
@@ -608,15 +501,9 @@ pub(crate) fn role_chat_params(role: crate::Role) -> RoleChatParams {
     }
 }
 
-/// Build the byte-relevant chat params (model, tools, reasoning_effort,
-/// routing, max_tokens) for a role. The model/routing/reasoning_effort
-/// triplet comes from [`role_chat_params`] — the single source also used by
-/// [`Agent::build_chat_request`], the research wrap-up snapshot and
-/// orchestrator params (both in [`crate::tools::research`]),
-/// [`crate::pipeline::verdict::synthesis_request`], and
-/// [`crate::tools::analyze::consolidate_findings`] — so every consumer derives
-/// the same triplet for a role. `meta` is telemetry-only (never part of the
-/// provider request body) and attached by call sites.
+/// Build the byte-relevant chat params (model, tools, reasoning_effort, routing,
+/// max_tokens) for a role; the triplet comes from [`role_chat_params`]. `meta` is
+/// telemetry-only (never in the request body) and attached by call sites.
 #[must_use]
 pub(crate) fn chat_request(
     role: crate::Role,
@@ -640,28 +527,15 @@ pub(crate) fn chat_request(
 }
 
 impl Agent {
-    /// Create a new agent with the given agent_id, role, workspace, and optional ticket.
+    /// Create an agent (tools from [`crate::Role::tools`]) and register it with
+    /// [`crate::agent::registry::AGENT_REGISTRY`]; deregistered on [`Drop`].
     ///
-    /// Tools are derived from [`crate::Role`] via [`crate::Role::tools`].
-    /// Automatically registers with [`crate::agent::registry::AGENT_REGISTRY`] and creates an
-    /// internal [`tokio_util::sync::CancellationToken`]. The agent is deregistered on [`Drop`].
+    /// `parent_key` is its DIRECT PARENT INVOCATION grouping key for the Running Agents
+    /// view — `None` means a workspace singleton, ticket agents get [`ParentKey::Ticket`]
+    /// implicitly; `parent_label` is that invocation's presentational label.
     ///
-    /// `parent_key` carries the DIRECT PARENT INVOCATION grouping key for the
-    /// Running Agents view (ticket / analyze round / research run). `None` means
-    /// the agent is a workspace singleton (manager / maintainer / discovery /
-    /// direct chat) — ticket agents pass the ticket and get
-    /// [`ParentKey::Ticket`] implicitly.
-    ///
-    /// `parent_label` is the human-readable label of that parent invocation
-    /// (ticket title / analyze question / research question) — purely
-    /// presentational. `None` falls back to the ticket title when the effective
-    /// parent is a ticket; callers of analyze/research rounds pass the
-    /// question/task text explicitly.
-    ///
-    /// `launch` is the launch this agent runs under — a custom role's (name,
-    /// authorial prompt, tool subset, branch address) or a worker branch's
-    /// address. `Some` only for a branch role. It is attached to the session so
-    /// the system prompt is assembled from it (see `Session::append_turn_message`).
+    /// `launch` is the launch this agent runs under; it is attached to the session so
+    /// the system prompt is assembled from it.
     #[must_use]
     #[expect(clippy::too_many_arguments)] // one positional arg per construction field; callers use literals
     pub fn new(
@@ -687,31 +561,25 @@ impl Agent {
 
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let pause_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // Ticket agents group by their ticket; an explicit parent key (analyze
-        // round / research run) takes precedence when both are present.
+        // Ticket agents group by ticket; an explicit parent key takes precedence.
         let parent_key = parent_key.or_else(|| {
             ticket
                 .as_ref()
                 .map(|t| crate::agent::registry::ParentKey::Ticket(t.id.clone()))
         });
-        // The group header label: an explicit parent label (analyze/research
-        // question) wins; a ticket-parented agent without one falls back to
-        // the ticket title. Purely presentational — never affects behavior.
+        // The group header label: an explicit one wins, a ticket-parented agent falls
+        // back to the ticket title. Presentational only.
         let parent_label = parent_label.or_else(|| match parent_key {
             Some(crate::agent::registry::ParentKey::Ticket(_)) => {
                 ticket.as_ref().map(|t| t.title.clone())
             }
             _ => None,
         });
-        // Registration-time manual-cancel check: a sub-agent of a research run
-        // or of an analyze round whose cancel signal already fired (the user
-        // cancelled the run from the Running Agents page, or the caller
-        // cancelled its round) must never run a round — even when it registers
-        // AFTER the registry's cancel sweep (the late-register race: an analyze
-        // round's verification analysts are dispatched after the analysts it
-        // started with). The token is pre-cancelled, so the agent's llm_loop
-        // bails at its first tool-round-top check and the round yields no
-        // response.
+        // Registration-time manual-cancel check: a sub-agent of a research run or
+        // analyze round whose cancel signal already fired must never run a round —
+        // even when it registers AFTER the registry's cancel sweep (the
+        // late-register race). The token is pre-cancelled, so llm_loop bails at its
+        // first round-top check.
         if let Some(
             crate::agent::registry::ParentKey::Research(run_id)
             | crate::agent::registry::ParentKey::AnalyzeRound(run_id),
@@ -733,18 +601,16 @@ impl Agent {
             pause_stop.clone(),
         );
 
-        // Register a fresh live-transcript snapshot holder for this agent run
-        // and attach it to the session, so the Running Agents GUI can read the
-        // in-memory conversation (including the unpersisted tail) at render
-        // time. A replacement run reusing the same agent_id gets a fresh holder
-        // (see the transcript registry's generation guard).
+        // A fresh live-transcript snapshot holder for this run, so the Running
+        // Agents GUI reads the in-memory conversation (including the unpersisted
+        // tail) at render time; a replacement run gets a fresh one via the
+        // registry's generation guard.
         let mut session = Session::default();
         session.attach_transcript(
             crate::session::TRANSCRIPT_REGISTRY.register(agent_id.clone(), generation),
         );
-        // The launch travels with the session: the prompt is
-        // assembled from it at the first turn and the fixed workspace block is
-        // re-rendered from it on later turns.
+        // The launch travels with the session: the prompt is assembled from it at the
+        // first turn, and the workspace block re-rendered from it later.
         session.launch = launch;
 
         Self {
@@ -789,33 +655,23 @@ impl Drop for Agent {
             crate::agent::registry::AGENT_REGISTRY.deregister(&self.agent_id, self.generation);
             crate::session::TRANSCRIPT_REGISTRY.deregister(&self.agent_id, self.generation);
         }
-        // Teardown kill: the agent's background shell sessions must not
-        // outlive it. Force-kill only (no grace), mirroring the existing
-        // teardown-kill behavior for in-flight shell children. Synchronous —
-        // SIGKILL to each live process group on unix, one TerminateJobObject per
-        // session on Windows ("end the tree", no grace — see
-        // `tools::shell::tree`).
+        // Teardown kill: background shell sessions must not outlive the agent —
+        // force-kill only, no grace (SIGKILL per process group; one
+        // TerminateJobObject per session on Windows).
         self.background_sessions.terminate_all();
     }
 }
 
-/// Render a board ticket comment as a user-visible message for the agent's
-/// session. Shared by live delivery ([`Agent::drain_incoming_messages`]) and
-/// the empty-message resume catch-up ([`Agent::inject_outstanding_comments`])
-/// so both paths produce identical comment rendering.
+/// Render a board ticket comment as a user-visible message, shared by live
+/// delivery and the resume catch-up so both render identically.
 fn format_comment_message(user_name: &str, content: &str) -> String {
     format!("[Comment from {user_name} on ticket]: {content}")
 }
 
 impl Agent {
-    /// Hand the accumulated tool stats to the telemetry queue, then persist the
-    /// final assistant message via `session.finalize(&self.agent_id)`.
-    ///
-    /// An empty unpersisted tail is logged here with full agent/role/workspace/
-    /// ticket attribution: at INFO when the graceful drain cut the turn
-    /// (expected and lossless — committed tool frames are durable, ticket
-    /// rounds resume at boot), at DEBUG when the turn ended via the `sleep`
-    /// tool (equally expected), at INFO otherwise (genuine anomaly).
+    /// Hand the tool stats to the telemetry queue, then persist the final assistant
+    /// message. An empty unpersisted tail is logged: INFO after a drain cut (lossless),
+    /// DEBUG after the `sleep` tool, INFO otherwise (genuine anomaly).
     pub async fn finalize_session(&mut self) -> anyhow::Result<()> {
         // The batch leaves on the telemetry queue ([`crate::telemetry`]).
         let stats = {
@@ -835,12 +691,9 @@ impl Agent {
             ));
         }
 
-        // When cancelled (deliberate stop or global shutdown), no assistant
-        // message is expected — skip finalization to avoid the "finalize called
-        // but no assistant message" warning. Tool results were already
-        // persisted via commit_tool_results inside llm_loop; any unpersisted
-        // tail (failed drain) is in-memory only and dropped at the next init
-        // (comments remain recoverable from the board DB).
+        // Cancelled (stop or shutdown): no assistant message is expected, so skip
+        // finalization. Tool results are durable; a dropped tail loses nothing
+        // (comments stay in the board DB).
         if self.cancel_token.is_cancelled() || crate::shutdown::shutdown_token().is_cancelled() {
             tracing::debug!(
                 agent_id = %self.agent_id,
@@ -856,12 +709,9 @@ impl Agent {
             crate::session::FinalizeOutcome::Flushed => {}
             crate::session::FinalizeOutcome::NoUnpersistedTail => {
                 if crate::shutdown::is_draining() {
-                    // Graceful drain cut the turn right after the last
-                    // tool-group commit: nothing was left unpersisted.
-                    // Expected and lossless — committed tool frames are
-                    // durable, ticket rounds resume at boot (job stays
-                    // status='launched'), direct sessions resume on the next
-                    // user message.
+                    // Drain cut the turn right after the last commit: expected and
+                    // lossless — committed frames are durable, ticket rounds resume at
+                    // boot (job stays 'launched'), direct sessions on the next message.
                     tracing::info!(
                         agent_id = %self.agent_id,
                         role = %self.role,
@@ -871,9 +721,8 @@ impl Agent {
                          committed frames are durable; resumes at boot or on the next user message"
                     );
                 } else if self.sleep_ended {
-                    // Turn ended via the sleep tool: the round's tool results are
-                    // durable and the Assistant is intentionally silent while waiting
-                    // for new input — a normal outcome, not the anomaly below.
+                    // Sleep tool: results are durable and the Assistant is
+                    // intentionally silent — normal, not the anomaly below.
                     tracing::debug!(
                         agent_id = %self.agent_id,
                         role = %self.role,
@@ -882,10 +731,8 @@ impl Agent {
                         "Session finalize no-op: turn ended via sleep — waiting for new input"
                     );
                 } else {
-                    // Genuine anomaly: the turn ended with no persisted output
-                    // outside a drain (e.g. an LLM call failing with no output
-                    // produced). Keep the byte-identical historical message so
-                    // external correlation keeps working.
+                    // Genuine anomaly: no persisted output outside a drain. Keep the
+                    // byte-identical message so external correlation keeps working.
                     tracing::info!(
                         agent_id = %self.agent_id,
                         role = %self.role,
@@ -899,33 +746,27 @@ impl Agent {
         Ok(())
     }
 
-    /// Check whether cancellation has been triggered on this agent.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancel_token.is_cancelled()
     }
 
-    /// Check whether a workspace-pause (strict freeze) cancellation was requested
-    /// (distinct from an internal code-driven cancellation).
+    /// Whether a workspace-pause (strict freeze) stop was requested.
     #[must_use]
     fn is_cancelled_by_pause(&self) -> bool {
         self.pause_stop.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// IMMUTABLE bail-time snapshot of whether this agent's run was stopped by
-    /// a cooperative workspace-pause freeze. Set once at the LLM-round boundary
-    /// (never cleared), so a pipeline finalizer can distinguish a frozen run
-    /// from a technical failure even if the workspace is resumed before the
-    /// finalizer reads it.
+    /// IMMUTABLE bail-time snapshot of a cooperative workspace-pause freeze: set once at
+    /// the LLM-round boundary and never cleared, so a finalizer can tell a frozen run from
+    /// a technical failure after the workspace is resumed.
     #[must_use]
     pub(crate) fn is_paused_frozen(&self) -> bool {
         self.paused_frozen.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Human-readable failure reason with the same global-token-first ordering
-    /// as [`failure_classification`]: shutdown cancels every per-agent token,
-    /// so the global token must be checked before an internal cancel is
-    /// reported.
+    /// Failure reason, global-token-first like [`failure_classification`]: shutdown
+    /// cancels every per-agent token, so it is checked before an internal cancel.
     #[must_use]
     pub(crate) fn failure_reason(&self, fallback: &str) -> String {
         if crate::shutdown::shutdown_token().is_cancelled() {
@@ -937,17 +778,14 @@ impl Agent {
         }
     }
 
-    /// True when the last run was classified as a technical failure at failure
-    /// time (see [`crate::RunFailure`]) — the gate for the destructive pipeline
-    /// reset/discard path.
+    /// Whether the last run failed technically — the gate for the destructive reset path.
     #[must_use]
     pub(crate) fn failed_technically(&self) -> bool {
         matches!(self.run_failure, Some(crate::RunFailure::Technical))
     }
 
-    /// Single-sourced shutdown/drain bail guard: the session is durable, so
-    /// the round is cut short and resumes when re-driven (boot job replay or
-    /// the next dispatch).
+    /// The shutdown/drain bail guard: the session is durable, so a cut round resumes
+    /// when re-driven.
     fn bail_on_shutdown() -> anyhow::Result<()> {
         if crate::shutdown::aborting() {
             anyhow::bail!(
@@ -957,16 +795,13 @@ impl Agent {
         Ok(())
     }
 
-    /// Log-only drain-cut marker for `complete_pending_tool_calls`: drain began
-    /// mid-resume/completion — the call stays dangling for the next cycle.
+    /// Log-only marker: drain began mid-completion, so the call stays dangling.
     fn log_drain_cut(tool: &str) {
         tracing::info!(tool = %tool, "Drain-cut during resume-completion — leaving calls dangling");
     }
 
-    /// Live-view activity guard: shows `label` on the agent's card while an
-    /// observational LLM call runs (extraction, summarization) — these calls
-    /// never register a separate non-agent call row, so the card is the only
-    /// tracker. Clears on drop.
+    /// Show `label` on the agent's card while an observational LLM call runs — those
+    /// register no non-agent row, so the card is the only tracker. Clears on drop.
     fn activity_guard(&self, label: &'static str) -> crate::agent::registry::ActivityGuard {
         crate::agent::registry::AGENT_REGISTRY.activity_started(
             &self.agent_id,
@@ -975,20 +810,11 @@ impl Agent {
         )
     }
 
-    /// Run a complete agent turn: initialize session, work loop (with shutdown
-    /// cancellation), finalize session.
-    ///
-    /// `messages` is what the turn answers, in arrival order: one message for an
-    /// ordinary turn, several when an urgent message cut the previous turn and
-    /// brought everything already waiting with it. Every message is appended to
-    /// the session as its own user message — the model reads them as consecutive
-    /// messages — while the per-turn blocks (personal changes, the model-change
-    /// line, the activity line) ride the first one only.
-    ///
-    /// The turn's log scope rides one span for the whole turn — the agent, its
-    /// role, the workspace's name (never its path) and the ticket when the run has
-    /// one — so every record the turn produces is scoped to the work it belongs to,
-    /// including the ones outside the LLM loop (see [`crate::logs`]).
+    /// Run a complete agent turn: session init, the work loop under shutdown
+    /// cancellation, finalize. `messages` arrives in arrival order (several when an
+    /// urgent message cut the previous turn); each is its own user message, while the
+    /// per-turn blocks ride the first one only. The turn's log scope is one span —
+    /// agent, role, workspace name (never its path) and ticket.
     pub async fn work(&mut self, messages: &[&str], resume: bool) -> anyhow::Result<String> {
         let span = tracing::info_span!(
             "agent",
@@ -1000,25 +826,19 @@ impl Agent {
         self.run_turn(messages, resume).instrument(span).await
     }
 
-    /// [`Self::work`]'s body, running inside the turn's scope span.
+    /// [`Self::work`]'s body, inside the turn's span.
     async fn run_turn(&mut self, messages: &[&str], resume: bool) -> anyhow::Result<String> {
-        // Whether this turn's user message lands decides whether the turn may
-        // advance a personal folder's change baseline at its end (the report
-        // rides that message); see `session::personal_changes::refresh_after_turn`.
-        // Cleared first, so no early return can carry a previous turn's answer.
+        // Whether the turn's message lands decides whether it may advance a personal
+        // folder's change baseline; cleared first, so no early return carries the old one.
         self.turn_recorded = false;
-        // Load the session WITHOUT appending the turn message: the universal
-        // completion below must settle any dangling tool calls BEFORE the new
-        // message lands (results insert directly after their frame, so the
-        // history stays provider-valid even when the frame is not the tail).
+        // Load the session WITHOUT the turn message: completion below must settle
+        // dangling calls BEFORE the new message lands (results insert right after their
+        // frame, keeping the history provider-valid).
         self.session.init(&self.agent_id).await?;
 
-        // The session is re-engaging (any job kind: user message, async result,
-        // automation, boot replay): clear a stale sleep-ended flag BEFORE this turn
-        // runs, so a genuine crash mid-round on this turn is still recovered
-        // normally by the dead-session poller. Only the Assistant, the Manager
-        // and a custom role (which is granted the sleep tool) can write the
-        // flag, so other roles skip the read.
+        // Re-engaging (any job kind): clear a stale sleep-ended flag BEFORE this turn, so
+        // a crash mid-round is still recovered by the dead-session poller. Only the
+        // Assistant, the Manager and a custom role can write it, so other roles skip it.
         if self.role.is_long_lived_chat()
             && crate::session::store()
                 .get_sleep_ended(&self.agent_id)
@@ -1034,9 +854,8 @@ impl Agent {
             );
         }
 
-        // A branch launch also clears the persisted deliberate-stop mark,
-        // fail-soft like the sleep mark above: a fresh launch of a stopped branch
-        // re-enables dead-session recovery for it.
+        // A branch launch also clears the persisted deliberate-stop mark, fail-soft
+        // like the sleep mark: relaunching a stopped branch re-enables recovery.
         if self.session.launch.is_some()
             && crate::session::store()
                 .get_launch_stopped(&self.agent_id)
@@ -1052,22 +871,17 @@ impl Agent {
             );
         }
 
-        // Universal deterministic resume-completion: settle the session's last
-        // tool-call frame's result-less calls BEFORE any LLM call, on every
-        // role/path (no resume-flag gating). Drain mid-call, a hard crash and a
-        // stage re-drive all go through this identical mechanism. Recorded on the
-        // agent (not a local): the consumer loop's post-delivery compaction gate
-        // reads it after the reply is delivered.
+        // Universal resume-completion: settle the last tool-call frame's result-less
+        // calls BEFORE any LLM call, ungated — drain mid-call, hard crash and stage
+        // re-drive all converge here. Recorded on the agent for the later gate.
         self.turn_state.settled_tool_results = if crate::shutdown::aborting() {
             false
         } else {
             self.complete_pending_tool_calls().await?
         };
 
-        // A turn that recorded no user message (an empty-message recovery retry)
-        // leaves `turn_recorded` false, so it advances no baseline. The index the
-        // turn's own messages start at is recorded first: a compaction triggered
-        // below must keep every one of them (see `select_retention_window`).
+        // The index the turn's messages start at: a compaction below must keep every one
+        // of them.
         let turn_start = self.session.history().len();
         if messages.iter().any(|msg| !msg.is_empty()) {
             self.session
@@ -1086,35 +900,25 @@ impl Agent {
             self.turn_recorded = true;
         }
 
-        // Pre-maybe_summarize drain check: a fresh dispatch that starts during
-        // the graceful drain (or a fired shutdown token) must not destructively
-        // compact an over-threshold session before the llm_loop drain
-        // check fires. The round is cut before any LLM work; boot resume
-        // continues the session.
+        // Pre-maybe_summarize drain check: a dispatch starting during the drain must not
+        // destructively compact an over-threshold session before llm_loop's own check.
+        // The round is cut before any LLM work; boot resume continues it.
         Self::bail_on_shutdown()?;
-        // Pre-maybe_summarize cancel check, same rule: an agent stopped before
-        // its first model call (an analyze round's analyst whose round its
-        // caller cancelled) must not spend a summarization call on itself. The
-        // bail matches the llm_loop's own cancellation check, which would have
-        // fired one step later — after that call.
+        // Pre-maybe_summarize cancel check, same rule: an agent stopped before its first
+        // model call must not spend a summarization call on itself.
         if self.cancel_token.is_cancelled() {
             anyhow::bail!("Agent cancelled");
         }
 
-        // A resumed stage-agent round starting with an empty message would
-        // otherwise never surface board comments (the session-start ticket block
-        // is not re-rendered). Inject any it has not seen.
+        // A resumed stage round with an empty message would otherwise never surface
+        // board comments (the session-start ticket block is not re-rendered).
         self.inject_outstanding_comments(resume, messages).await;
 
-        // Mandatory: destructive over-threshold compaction is SKIPPED on resumed
-        // turns AND on turns that just settled dangling tool results — the
-        // pre-crash trail the resume was meant to preserve must survive (the
-        // design's resume-flag rule; do NOT infer resume from an empty message
-        // — RecoveryRetry semantics are unchanged). A settlement is resume-like:
-        // the retention window excludes tool frames/results, so over-threshold
-        // compaction right after settling would drop the settled result (e.g. a
-        // stage re-drive on a >SUMMARIZATION_THRESHOLD session); summarization
-        // happens on the next plain turn instead.
+        // Mandatory: destructive over-threshold compaction is SKIPPED on resumed turns
+        // AND on turns that just settled dangling results — the pre-crash trail must
+        // survive (do NOT infer resume from an empty message). A settlement is resume-like:
+        // the retention window excludes tool frames/results, so compacting right after
+        // settling would drop the settled result; the next plain turn summarizes.
         if !resume && !self.turn_state.settled_tool_results {
             self.maybe_summarize(turn_start).await;
         }
@@ -1127,7 +931,7 @@ impl Agent {
             result = self.llm_loop() => result,
         };
 
-        // Always finalize session — even on global shutdown, persist progress
+        // Always finalize, even on global shutdown: persist progress.
         if let Err(e) = self.finalize_session().await {
             tracing::error!(error = %e, "Session finalize failed");
         }
@@ -1136,31 +940,19 @@ impl Agent {
         Ok(response)
     }
 
-    /// Universal deterministic resume-completion: settle the session's last
-    /// tool-call frame's result-less calls BEFORE any LLM call, on every
-    /// role/path. Durable sync rounds (an `analyze` or `send` call) owned by this
-    /// session pin are slot-resumed; every other call is re-executed. Only the
-    /// rounds the frame itself dispatched are bindable — a pool entry older than
-    /// the frame's own row belongs to an earlier, already-settled frame and is
-    /// abandoned with the settle, never bound. Result settlement and job
-    /// terminalization commit in ONE transaction — a crash rolls back both, the
-    /// job stays launched, and the next cycle re-settles idempotently. Results
-    /// settle contiguously after their frame — the history stays provider-valid.
-    /// No-op when nothing is dangling.
+    /// Universal resume-completion: settle the last tool-call frame's result-less calls
+    /// BEFORE any LLM call, on every role/path. Durable sync rounds (`analyze`, `send`)
+    /// owned by this session pin are slot-resumed, everything else re-executed. Only
+    /// rounds the frame itself dispatched are bindable — an older pool entry belongs to a
+    /// settled frame and is abandoned, never bound. Settlement and terminalization commit
+    /// in ONE transaction, so a crash rolls back both and the next cycle re-settles
+    /// idempotently; results settle contiguously after their frame.
     ///
-    /// The single position where dangling calls are completed is intentionally
-    /// ungated: a graceful drain mid-call, a hard crash and a stage re-drive all
-    /// converge here. Already-completed calls are never re-run (their result is
-    /// present, so `pending_tool_frame` excludes them).
-    ///
-    /// Returns `true` when any results were settled this run — recorded on the
-    /// turn ([`TurnState::settled_tool_results`]) so that both the pre-turn and the
-    /// post-delivery summarization gates skip a resume-like turn, whose just-settled
-    /// result the retention window would drop — `false` otherwise.
-    ///
-    /// Returns a boxed future (rather than an opaque `impl Future`) so the
-    /// agent/tools async-opaque Send cycle around the resume cores (which
-    /// re-enter agent sub-agent runs) is broken at the box boundary.
+    /// Intentionally ungated: drain mid-call, hard crash and stage re-drive all converge
+    /// here. Completed calls are never re-run (`pending_tool_frame` excludes them).
+    /// Returns `true` when anything settled — the [`TurnState::settled_tool_results`] both
+    /// summarization gates skip a resume-like turn from. Boxed to break the async-opaque
+    /// Send cycle around the resume cores.
     #[expect(clippy::too_many_lines)] // deliberate: one cohesive resume+settle path
     fn complete_pending_tool_calls(&mut self) -> CompletePendingToolCallsFuture<'_> {
         Box::pin(async move {
@@ -1176,19 +968,15 @@ impl Agent {
             );
 
             let conn = &crate::session::store().conn;
-            // The caller-owned launched-jobs pool, fetched ONCE before the loop
-            // (newest-first) and CONSUMED per call below, so two same-kind calls
-            // in one frame bind to two DISTINCT jobs — and because jobs are
-            // newest-first while frame calls are in dispatch order, each call
-            // binds the OLDEST remaining job (see the rposition below).
+            // Launched jobs, fetched ONCE (newest-first) and CONSUMED per call, so two
+            // same-kind calls bind DISTINCT jobs; jobs being newest-first while calls are
+            // in dispatch order, each call takes the OLDEST remaining one.
             let pool = crate::jobs::find_owned_launched_jobs(conn, &self.agent_id).await?;
-            // Bind only the rounds THIS frame dispatched: the frame row is
-            // written before its calls run (emission-time durability), so its own
-            // rounds are strictly newer than it, while a pool entry left behind by
-            // an earlier frame (an infra-failed dispatch never terminalizes its
-            // row) is older. Binding the older one would settle an old report as
-            // this call's own result. The split is frame OWNERSHIP, not freshness
-            // — the pool query has no age gate.
+            // Bind only rounds THIS frame dispatched: the frame row precedes its calls
+            // (emission-time durability), so its own rounds are strictly newer, while a
+            // leftover from an earlier frame (an infra-failed dispatch never terminalizes
+            // its row) is older and binding it would settle an old report as this call's
+            // result. The split is frame OWNERSHIP, not freshness.
             let (pre_frame, mut owned) = match crate::session::store()
                 .last_assistant_created_at(&self.agent_id)
                 .await?
@@ -1197,10 +985,9 @@ impl Agent {
                 Some(frame) => pool.into_iter().partition(|j| {
                     crate::db::parse_utc_timestamp(&j.created_at).is_ok_and(|c| c < frame)
                 }),
-                // No frame row on record to anchor against (unreachable for a
-                // frame: it is persisted before its calls run): nothing can be
-                // told apart, so NOTHING is bindable and every call is re-run
-                // rather than risk settling another round's report as its result.
+                // No frame row to anchor against (unreachable: it is persisted first):
+                // NOTHING is bindable, so every call is re-run rather than risk settling
+                // another round's report as its result.
                 None => (pool, Vec::new()),
             };
             if !pre_frame.is_empty() {
@@ -1214,30 +1001,23 @@ impl Agent {
             let mut pairs: Vec<(String, String)> = Vec::with_capacity(calls.len());
             let mut follow_up: Vec<ChatMessage> = Vec::new();
             let mut terminalize: Vec<String> = Vec::new();
-            // Fresh image payloads of the whole resumed round — injected as ONE
-            // synthetic user message after the loop, like the commit path.
+            // Fresh images of the resumed round, injected as ONE message after the loop.
             let mut fresh_images: Vec<ImagePayload> = Vec::new();
-            // Shared dedup key for fresh-image injection across the re-executed
-            // calls (computed lazily on first image payload).
+            // Shared dedup key for fresh-image injection, lazily computed.
             let mut seen_data_uris: Option<std::collections::HashSet<String>> = None;
 
             for call in calls {
-                // Durable-resume attempt for a durable call's owned job: the
-                // JOBS ROW is the source of truth. A terminal job yields content
-                // (terminalized after settlement); a DrainCut stops the whole
-                // completion; a gone job was explicitly abandoned — the call is
-                // not re-executed, it surfaces a short model-facing note. The
-                // round kind comes from the call's tool and its choice argument
-                // — never a stored kind matched against the call's name.
+                // Durable-resume attempt: the JOBS ROW is the source of truth. A terminal
+                // job yields content (terminalized after settlement), a DrainCut stops the
+                // completion, a gone job surfaces a short note. The round kind comes from
+                // the call's tool and choice argument, never a stored kind.
                 let mut resumed_content: Option<String> = None;
                 if let Some(core) =
                     crate::tools::SyncDurableCore::from_call(&call.name, &call.arguments)
                     && let Some(pos) = owned.iter().rposition(|j| j.kind == core.kind_str())
                 {
-                    // `rposition` (not `position`): jobs are newest-first while
-                    // frame calls are in dispatch order, so the FIRST call must
-                    // bind the OLDEST matching job — position would give the
-                    // first call the NEWEST job (crossed results).
+                    // `rposition`, not `position`: the FIRST call must bind the OLDEST
+                    // matching job (`position` would cross the results).
                     let job = owned.swap_remove(pos);
                     let outcome = core.resume_sync_core(&self.workspace, &job.id, true).await;
                     match outcome {
@@ -1249,17 +1029,13 @@ impl Agent {
                             });
                         }
                         Ok(crate::jobs::SyncResumeOutcome::DrainCut) => {
-                            // Drain began mid-resume — leave everything dangling
-                            // for the next completion cycle.
+                            // Drain began mid-resume: leave everything dangling.
                             Self::log_drain_cut(&call.name);
                             return Ok(false);
                         }
                         Ok(crate::jobs::SyncResumeOutcome::Gone) => {
-                            // The job was explicitly abandoned (session /clear or
-                            // workspace deletion) racing this resume — no result
-                            // is available and the row is already gone, so do NOT
-                            // push onto `terminalize`. Surface a short note to
-                            // the model instead of re-executing or erroring.
+                            // Explicitly abandoned (session /clear, workspace deletion):
+                            // the row is gone, so do NOT push onto `terminalize`.
                             tracing::info!(
                                 job = %job.id,
                                 "Job row gone (explicitly abandoned) — surfacing note instead of re-executing"
@@ -1271,10 +1047,9 @@ impl Agent {
                             );
                         }
                         Err(e) => {
-                            // A resume-core INFRA failure (roster/checkpoint DB
-                            // error) must fail the round rather than spawn a
-                            // duplicate fresh job — the job row stays launched
-                            // for the next drive.
+                            // An INFRA failure (roster/checkpoint DB error) must fail
+                            // the round rather than spawn a duplicate fresh job — the
+                            // job row stays launched for the next drive.
                             tracing::error!(
                                 job = %job.id,
                                 error = %e,
@@ -1294,10 +1069,9 @@ impl Agent {
                     && let Some(reason) =
                         sleep_rejection_reason(frame.has_text, frame.call_count > 1)
                 {
-                    // Sleep-delivery guard on the resume path: re-executing the
-                    // sleep would settle a "Zzz..." result over text the user
-                    // never saw — settle the rejection instead so the model
-                    // resends the text as a plain round.
+                    // Sleep-delivery guard on the resume path: re-executing the sleep
+                    // would settle a "Zzz..." result over text the user never saw —
+                    // settle the rejection so the model resends it as a plain round.
                     tracing::warn!(
                         agent_id = %self.agent_id,
                         tool = %call.name,
@@ -1315,7 +1089,7 @@ impl Agent {
                         .0
                         .output
                 } else {
-                    // Re-execute the call (under the tool task-local context).
+                    // Re-execute under the tool task-local context.
                     let outcome = self
                         .in_tool_context(async {
                             self.execute_tool(&call.name, call.arguments.clone()).await
@@ -1326,10 +1100,7 @@ impl Agent {
                         Self::log_drain_cut(&call.name);
                         return Ok(false);
                     }
-                    // Format through the tool exactly like the commit path and
-                    // capture any freshly-derived image payloads. The payloads
-                    // are collected across the whole resumed round and injected
-                    // as ONE message after the loop, like the commit path.
+                    // Format through the tool and collect fresh image payloads.
                     let (formatted, fresh_payloads) = tool_result_content(
                         &self.tools,
                         &call.name,
@@ -1349,14 +1120,10 @@ impl Agent {
                 follow_up.push(message);
             }
 
-            // Settle + terminalize + abandon in ONE transaction: the settle
-            // rewrites the post-frame session rows while the deletes drop the
-            // bound jobs and everything this frame cannot own, so a crash rolls
-            // back BOTH — the jobs stay launched and the next cycle re-settles
-            // idempotently (the settle DELETEs the rows after the frame and
-            // reinserts, so re-settling an already-settled frame is a structural
-            // no-op). Every terminalize id also pushed a pair, so the guard only
-            // needs the pairs/follow_up terms.
+            // Settle + terminalize + abandon in ONE transaction: a crash rolls back BOTH,
+            // so the jobs stay launched and the next cycle re-settles idempotently (the
+            // settle DELETEs the post-frame rows and reinserts, so re-settling is a
+            // structural no-op). Every terminalize id also pushed a pair.
             if !pairs.is_empty() || !follow_up.is_empty() {
                 let tx = conn
                     .begin_tx()
@@ -1374,12 +1141,8 @@ impl Agent {
                     .await
                     .with_context(|| format!("terminalize job {id}"))?;
                 }
-                // Everything this frame cannot own is abandoned with the settle:
-                // the pool's leftovers (bound to no call — a call's round kind is
-                // resolved from the call itself) and the pre-frame rows above,
-                // which no call of this frame dispatched. Repeating a cut-mid-
-                // flight call is the accepted cost; an old report settled as
-                // another call's result is not.
+                // Everything this frame cannot own is abandoned with the settle. Repeating
+                // a cut-mid-flight call is the accepted cost; a crossed report is not.
                 for job in pre_frame.iter().chain(owned.iter()) {
                     tx.execute(
                         "DELETE FROM jobs WHERE id = ?1",
@@ -1389,9 +1152,7 @@ impl Agent {
                     .with_context(|| format!("abandon job {}", job.id))?;
                 }
                 tx.commit().await.context("commit settle+terminalize tx")?;
-                // Mirror into the in-memory history only AFTER the durable
-                // commit: a commit failure rolls the DB back, and a pre-commit
-                // mirror would leave the history settled while the DB is not.
+                // Mirror into the history only AFTER the durable commit.
                 self.session
                     .mirror_settled(settled)
                     .context("mirror settled results")?;
@@ -1400,9 +1161,8 @@ impl Agent {
         })
     }
 
-    /// Run the full agent loop: LLM calls → tool execution → loop until final answer.
-    ///
-    /// Runs inside [`Self::work`]'s turn span, which carries the run's log scope.
+    /// The round loop: LLM call → tool execution → repeat until a final answer.
+    /// Runs inside [`Self::work`]'s span, which carries the run's log scope.
     #[expect(clippy::too_many_lines)] // the round loop with its cut and drain gates
     async fn llm_loop(&mut self) -> anyhow::Result<String> {
         let mut tool_rounds = 0usize;
@@ -1411,32 +1171,24 @@ impl Agent {
             if self.cancel_token.is_cancelled() {
                 anyhow::bail!("Agent cancelled");
             }
-            // Cooperative workspace-pause (strict freeze): the current LLM
-            // round ends at this boundary — no new LLM call starts. The
-            // pause does NOT fire the per-agent cancel token, so the round
-            // that was already in flight completes and commits first. The
-            // phase finalizer treats the frozen agent as a no-op (the job
-            // stays in place for the unpause re-drive).
+            // Cooperative workspace-pause (strict freeze): the round ends here, no new LLM
+            // call starts. The pause does NOT fire the cancel token, so an in-flight round
+            // completes and commits first; the finalizer treats the agent as a no-op (the
+            // job stays for the unpause re-drive).
             if self.is_cancelled_by_pause() {
-                // Record the freeze IMMUTABLY at the bail so a later
-                // unpause (which clears the live pause_stop) cannot turn a
-                // frozen run into a misclassified hard failure.
+                // Record the freeze IMMUTABLY, so a later unpause (which clears the
+                // live pause_stop) cannot turn it into a misclassified hard failure.
                 self.paused_frozen
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 anyhow::bail!("Agent frozen by workspace pause — resumes at unpause");
             }
-            // Shutdown/drain: checked at tool-round top (after the previous
-            // tool group's commit) so the CURRENT tool group completes —
-            // no new LLM call starts once the drain begins (or the token
-            // fires). The round is resumed at boot via the job row
-            // (status='launched').
+            // Shutdown/drain: checked at round top, after the previous group's commit, so
+            // the current group completes and no new LLM call starts. The round resumes at
+            // boot from the job row.
             Self::bail_on_shutdown()?;
-            // Urgent-message interrupt: an urgent message arrived and cut this
-            // turn. It is not a cancellation — the turn ends with its
-            // interruption notice, delivered as its reply, and every tool result
-            // it produced is already committed above — so it is checked here,
-            // after shutdown/drain (their priority is unchanged), and before
-            // another model call.
+            // Urgent-message interrupt: not a cancellation — the turn ends with its notice
+            // as its reply, every result already committed. Checked after shutdown/drain
+            // (their priority is unchanged) and before another model call.
             if self.interrupt_token.is_cancelled() {
                 return Ok(self.notice_interruption());
             }
@@ -1447,19 +1199,15 @@ impl Agent {
                 );
             }
 
-            // Messages arrive as user messages with a descriptive prefix so
-            // the model understands their source (ticket comments get the
-            // `format_comment_message` framing).
+            // Messages arrive as user messages with a descriptive prefix, so the
+            // model understands their source (`format_comment_message`).
             self.drain_incoming_messages().await;
 
-            // Leader-stagger signal: fire after the FIRST LLM call
-            // completes, success or failure — the wait is fail-open;
-            // Notify's stored permit covers a fire-before-wait race.
-            //
-            // Raced against the urgent-message interrupt: cutting a model
-            // request means dropping it (nothing of it is recorded), which is
-            // what makes the cut immediate. The stagger signal is skipped on that
-            // path: this turn ends here.
+            // Leader-stagger signal: fired after the FIRST LLM call completes,
+            // success or failure — fail-open; Notify's stored permit covers a
+            // fire-before-wait race. Raced against the urgent interrupt: cutting a
+            // request means dropping it (nothing recorded), which is what makes the
+            // cut immediate. The signal is skipped on that path.
             let interrupt = self.interrupt_token.clone();
             let llm_result = tokio::select! {
                 biased;
@@ -1472,31 +1220,18 @@ impl Agent {
                 notify.notify_one();
             }
 
-            // Provider input-image content-inspection rejection (e.g.
-            // OpenRouter HTTP 400 `data_inspection_failed`): the rejected
-            // image must not fail the run wholesale nor stay sticky in the
-            // session. Strip the image markers from the most recent user
-            // message (durable-first) and continue the loop — the next
-            // tool round re-runs `llm_call` with the corrected message as
-            // part of the NORMAL loop, not a dedicated retry step. No
-            // retry guard: a subsequent failure whose most recent user
-            // message no longer contains image markers takes the normal
-            // failure path (no repeated stripping).
+            // Provider input-image content-inspection rejection: strip the markers from
+            // the most recent user message (durable-first) and continue — the next round
+            // re-runs `llm_call` as part of the NORMAL loop. No retry guard: once the
+            // message carries no image marker, a failure takes the normal path.
             //
-            // The leader-stagger signal above has already fired (first
-            // call completed, success or failure): a stripped leader's next
-            // request diverges from its followers' byte-stable prefix —
-            // fail-open by design, and moot for the direct-chat Assistant
-            // scenario that exercises this path (management rounds never
-            // send images). Note: the retried call re-runs the tool-round-0
-            // `notify_one` above, but the stagger has a single waiter (the
-            // `select!` in `spawn_staggered_round`, already consumed) — the
-            // second notification stores an unconsumed permit and is
-            // dropped with the Notify. No follower is released twice.
-            //
-            // The downcast is extracted to a local first: `anyhow::Chain`
-            // is not `Send`, so it must not be held across the await below
-            // (the agent runs inside a spawned, Send-bound task).
+            // The leader-stagger signal has already fired, so the stripped leader's next
+            // request diverges from its followers' byte-stable prefix — fail-open, and
+            // moot for direct chat (management rounds never send images). The retried
+            // call re-runs the tool-round-0 `notify_one`, but the stagger's single waiter
+            // has consumed it: the extra permit is dropped, no follower released twice.
+            // The downcast is taken into a local first — `anyhow::Chain` is not `Send`
+            // and must not be held across the await (a Send-bound spawned task).
             let image_rejection = llm_result.as_ref().err().and_then(|e| {
                 e.chain()
                     .find_map(|cause| cause.downcast_ref::<crate::retry::RetryExhausted>())
@@ -1535,12 +1270,11 @@ impl Agent {
                 return Ok(display_text);
             }
 
-            // EMISSION-TIME DURABILITY: the assistant frame with its tool
-            // calls is committed BEFORE the calls execute — a crash or drain
-            // mid-execution leaves the calls durably recorded with their
-            // results absent, and the universal resume-completion step (run
-            // before any LLM call on this session) re-runs or resumes them.
-            // The end-of-round commit below persists only the results.
+            // EMISSION-TIME DURABILITY: the assistant frame and its tool calls are
+            // committed BEFORE the calls execute — a crash or drain mid-execution
+            // leaves them recorded with results absent, and resume-completion (run
+            // before any LLM call) re-runs or resumes them. The end-of-round commit
+            // persists only the results.
             self.session
                 .persist_messages(
                     &self.agent_id,
@@ -1556,19 +1290,17 @@ impl Agent {
                 .flatten();
             let all_outcomes = self.execute_tool_round(&tool_calls, sleep_rejection).await;
 
-            // A call the interrupt cut (`None`) is settled with the one fixed
-            // synthetic result — an ordinary tool result saying it was
-            // interrupted before it returned and whether it had any effect is
-            // unknown — in its own place, so every call of the frame ends with a
-            // result contiguous with it and the exchange stays valid for the
-            // model. A call that had already returned keeps its real result.
+            // A call the interrupt cut (`None`) is settled with the fixed synthetic
+            // result, in its own place, so every call ends with a result contiguous
+            // with it and the exchange stays model-valid. A call already returned
+            // keeps its real result.
             let cut = all_outcomes.iter().any(Option::is_none);
             let all_outcomes: Vec<ToolExecutionOutcome> = all_outcomes
                 .into_iter()
                 .map(|outcome| outcome.unwrap_or_else(interrupted_outcome))
                 .collect();
 
-            // Track media generation outcomes for marker fallback
+            // Track media outcomes for the marker fallback.
             accumulated_media_paths.extend(extract_media_from_outcomes(
                 &self.tools,
                 &tool_calls,
@@ -1580,10 +1312,9 @@ impl Agent {
 
             self.commit_tool_results(&tool_calls, all_outcomes).await?;
 
-            // Sleep stop: a successful `sleep` call ends the run gracefully AFTER
-            // this round — every tool result above is already committed, nothing
-            // is lost. Ordered before the loop-top MAX_TOOL_ROUNDS guard: the
-            // return happens before the next iteration is even evaluated.
+            // Sleep stop: a successful `sleep` ends the run gracefully AFTER this
+            // round — every result above is committed. It returns before the next
+            // iteration, so the loop-top MAX_TOOL_ROUNDS guard never sees it.
             if sleep_ended {
                 self.sleep_ended = true;
                 if let Err(e) = crate::session::store()
@@ -1599,11 +1330,9 @@ impl Agent {
                 return Ok(String::new());
             }
 
-            // The cut round's results are committed, so the interruption is
-            // answered by its notice — this turn's whole reply — instead of
-            // another round. A sleep that succeeded returned above: that round
-            // concluded inside its only call, so nothing was cut and no notice
-            // follows.
+            // The cut round's results are committed, so the interruption is answered
+            // by its notice instead of another round. A successful sleep returned
+            // above: that round concluded inside its only call, so nothing was cut.
             if cut || self.interrupt_token.is_cancelled() {
                 return Ok(self.notice_interruption());
             }
@@ -1612,28 +1341,24 @@ impl Agent {
         }
     }
 
-    /// End this turn on an urgent-message interrupt: record the notice as the
-    /// turn's reply — so the session shows the previous turn was cut short — and
-    /// hand it back for delivery on the surface the urgent message came from.
-    /// The interrupted answer is abandoned; nothing of it is delivered later.
+    /// End this turn on an urgent-message interrupt: record the notice as the turn's
+    /// reply and hand it back for delivery on the urgent message's surface. The
+    /// interrupted answer is abandoned — nothing of it is delivered later.
     fn notice_interruption(&mut self) -> String {
         self.session
             .push_assistant(URGENT_INTERRUPT_NOTICE.to_string());
         URGENT_INTERRUPT_NOTICE.to_string()
     }
 
-    /// Execute a batch of tool calls respecting side-effect ordering.
-    ///
-    /// Read-only tools run in parallel within groups; side-effecting tools
-    /// run one at a time. Groups execute sequentially in the original call
-    /// order. The returned outcomes correspond one-to-one with `tool_calls`;
-    /// `None` is a call the urgent-message interrupt cut before it returned.
+    /// Execute a batch of tool calls respecting side-effect ordering: read-only
+    /// runs of consecutive calls execute in parallel, a side-effecting call runs
+    /// alone, and groups keep the original call order. Outcomes stay one-to-one with
+    /// `tool_calls`; `None` is a call the urgent interrupt cut before it returned.
     async fn execute_tool_group(
         &self,
         tool_calls: &[ToolCall],
     ) -> Vec<Option<ToolExecutionOutcome>> {
-        // Determine side_effects for each tool call. Unknown tools are
-        // conservatively treated as side-effecting (default: true).
+        // Unknown tools are conservatively treated as side-effecting.
         let side_flags: Vec<bool> = tool_calls
             .iter()
             .map(|call| find_tool(&self.tools, &call.name).is_none_or(super::Tool::side_effects))
@@ -1645,7 +1370,7 @@ impl Agent {
         self.in_tool_context(async {
             while i < tool_calls.len() {
                 if side_flags[i] {
-                    // Side-effecting: single-call group, executed alone.
+                    // Side-effecting: a single-call group.
                     let outcome = self
                         .race_interrupt(
                             self.execute_tool(&tool_calls[i].name, tool_calls[i].arguments.clone()),
@@ -1654,16 +1379,16 @@ impl Agent {
                     outcomes.push(outcome);
                     i += 1;
                 } else {
-                    // Read-only group: extend while consecutive calls are also read-only.
+                    // Read-only group: extend while the next call is read-only too.
                     let group_start = i;
                     while i < tool_calls.len() && !side_flags[i] {
                         i += 1;
                     }
                     let group_calls = &tool_calls[group_start..i];
 
-                    // Execute the entire read-only group in parallel. Each call is
-                    // raced on its own, so one that had already returned keeps its
-                    // real result while its cut siblings settle as interrupted.
+                    // The whole group runs in parallel, each call raced on its own, so
+                    // one already returned keeps its real result while cut siblings
+                    // settle as interrupted.
                     let group_outcomes: Vec<_> =
                         futures_util::future::join_all(group_calls.iter().map(|call| {
                             self.race_interrupt(
@@ -1681,12 +1406,11 @@ impl Agent {
         outcomes
     }
 
-    /// Run one tool call against the urgent-message interrupt: `None` when the cut
-    /// came first, which drops the call — stopping it the way an abort stops a
-    /// call today (a shell call's whole process tree with it). A cut that had
-    /// already landed must not start the call at all: one poll is enough to spawn
-    /// a child or write a file. Biased on the call, so one that completed in the
-    /// same instant the cut fired keeps its real result.
+    /// Run one tool call against the urgent interrupt: `None` when the cut came
+    /// first, which drops the call and its whole process tree. A cut that already
+    /// landed must not start the call at all — one poll is enough to spawn a child or
+    /// write a file. Biased on the call, so one completing in the same instant keeps
+    /// its real result.
     async fn race_interrupt<F>(&self, call: F) -> Option<ToolExecutionOutcome>
     where
         F: std::future::Future<Output = ToolExecutionOutcome>,
@@ -1702,14 +1426,10 @@ impl Agent {
         }
     }
 
-    /// Execute one tool round under the sleep-delivery guard: when a rejection
-    /// is active, every `sleep` call in the round is intercepted BEFORE
-    /// execution (a successful sleep would end the run silently via
-    /// `ends_turn_on_success`) and settled as a synthetic failure outcome at
-    /// its original position, while all sibling calls execute normally. The
-    /// returned outcomes stay one-to-one with `tool_calls` (`commit_tool_results`
-    /// relies on the alignment); `None` is a call the urgent-message interrupt
-    /// cut.
+    /// Execute one tool round under the sleep-delivery guard: with a rejection active,
+    /// every `sleep` call is intercepted BEFORE execution and settled as a synthetic
+    /// failure at its own position, siblings running normally. Outcomes stay one-to-one
+    /// with `tool_calls` — `commit_tool_results` relies on that alignment.
     async fn execute_tool_round(
         &self,
         tool_calls: &[ToolCall],
@@ -1728,9 +1448,8 @@ impl Agent {
             "Sleep call rejected — must run alone in a text-free round"
         );
 
-        // Execute only the non-sleep calls; the sleep calls are intercepted
-        // and settled as synthetic failures at their original positions so the
-        // round stays aligned one-to-one with `tool_calls`.
+        // Only non-sleep calls execute; sleep calls settle as synthetic failures at
+        // their own positions, keeping the round aligned one-to-one.
         let sibling_calls: Vec<ToolCall> = tool_calls
             .iter()
             .filter(|c| c.name != "sleep")
@@ -1762,11 +1481,8 @@ impl Agent {
         outcomes
     }
 
-    /// Run `fut` under the `CURRENT_TOOL_*` task-local context derived from this
-    /// agent's fields. Set once per tool batch (not per-call), so concurrent
-    /// read-only tools never interleave each other's user context. Reused by
-    /// the universal resume-completion step, which re-executes dangling calls
-    /// and needs the same context.
+    /// Run `fut` under this agent's `CURRENT_TOOL_*` task-locals, scoped once per tool
+    /// batch so concurrent read-only tools never interleave their user context.
     async fn in_tool_context<T>(&self, fut: impl std::future::Future<Output = T>) -> T {
         let user_name = self.user_name.clone();
         let channel = self.channel.clone();
@@ -1821,15 +1537,8 @@ impl Agent {
 
     /// Construct a failure outcome tuple for an error reason.
     ///
-    /// [`Self::execute_tool`] calls this helper from three arms: the pre-flight
-    /// cancellation bail and the two error arms (unknown tool and execution error).
-    /// The helper always returns a full `(ToolExecutionOutcome, String)` tuple; the
-    /// two error arms consume it as-is, while the cancellation bail unwraps `.0`
-    /// and discards the reason string. This centralizes the byte-for-byte duplicated
-    /// construction of the two error arms.
-    ///
-    /// Assumes `reason` may contain sensitive data; scrubs before use in feedback
-    /// text, tracing logs, and stats.
+    /// Assumes `reason` may contain sensitive data; scrubs it before use in feedback
+    /// text, tracing logs and stats.
     #[must_use]
     fn failure_outcome(
         call_name: &str,
@@ -1851,10 +1560,8 @@ impl Agent {
         )
     }
 
-    /// Record one tool invocation into the agent's in-memory stats (handed to
-    /// the telemetry queue on session finalization). The argument text is built by
-    /// [`crate::stats::recorded_arguments`] — serialized, redacted, scrubbed and
-    /// truncated to the stats budget.
+    /// Record one tool invocation into the in-memory stats (sent to telemetry at
+    /// finalization); arguments go through [`crate::stats::recorded_arguments`].
     fn push_tool_call_record(
         &self,
         tool_name: String,
@@ -1874,19 +1581,15 @@ impl Agent {
         });
     }
 
-    /// Execute a single tool call and return the result.
     #[expect(clippy::too_many_lines)]
     async fn execute_tool(
         &self,
         call_name: &str,
         call_arguments: serde_json::Value,
     ) -> ToolExecutionOutcome {
-        // Pre-flight cancellation check: if the agent has been cancelled (e.g., by
-        // user pressing Stop), bail immediately without executing the tool.  This
-        // prevents side-effecting tools (shell commands, file edits, sub-agents)
-        // from running after cancellation.  The `llm_loop` checks cancellation at
-        // the top of each tool round, but tool calls dispatched before that check
-        // can still reach this method.
+        // Pre-flight cancellation check: a call dispatched before llm_loop's round-top
+        // check can still reach here, and a side-effecting tool (shell, file edits,
+        // sub-agents) must not run after a Stop.
         if self.cancel_token.is_cancelled() {
             let reason = "Agent cancelled — tool execution skipped";
             tracing::debug!(
@@ -1906,8 +1609,8 @@ impl Agent {
             );
         }
 
-        // Two distinct log levels for error arms (info vs debug) distinguish
-        // unknown-tool failures from execution errors without string-prefix matching.
+        // The arms log at distinct levels (info vs debug), so unknown-tool failures
+        // are distinguishable from execution errors without string matching.
         let (outcome, error_reason) = match find_tool(&self.tools, &tool_name) {
             None => {
                 let reason = format!("Unknown tool: {tool_name}");
@@ -1950,13 +1653,10 @@ impl Agent {
                         )
                     }
                     Err(e) => {
-                        // Drain-cut suspension: the tool's durable work (e.g. a
-                        // sync analyze/worker round) was deliberately left
-                        // launched for deterministic resume. The outcome is
-                        // marked `suspended` so the tool-result commit SKIPS it
-                        // — the call's frame is already durably persisted and
-                        // its result is intentionally absent; the universal
-                        // resume-completion step re-runs/resumes it.
+                        // Drain-cut suspension: the tool's durable work was deliberately
+                        // left launched for deterministic resume. `suspended` makes the
+                        // result commit SKIP it — the frame is durable and the result
+                        // intentionally absent; resume-completion settles it later.
                         if e.downcast_ref::<crate::tools::CallSuspended>().is_some() {
                             tracing::debug!(
                                 tool = %tool_name,
@@ -1967,8 +1667,7 @@ impl Agent {
                             );
                             (
                                 ToolExecutionOutcome {
-                                    // Never read: consumers skip suspended
-                                    // outcomes before reading their output.
+                                    // Never read: suspended outcomes are skipped.
                                     output: String::new(),
                                     success: false,
                                     image_payloads: Vec::new(),
@@ -1997,8 +1696,7 @@ impl Agent {
             }
         };
 
-        // Per-call stats recording — each tool invocation produces one record
-        // with arguments, duration, success/failure, and error.
+        // One stats record per invocation: arguments, duration, outcome, error.
         let elapsed_ms = start.elapsed().as_millis();
         let duration_ms = i64::try_from(elapsed_ms).unwrap_or(0);
         self.push_tool_call_record(
@@ -2020,36 +1718,27 @@ impl Agent {
             .await
             .with_context(|| format!("LLM call {RETRY_EXHAUSTION_MARKER}"))?;
 
-        // Reasoning-only stop: recovered here — before any promotion,
-        // persistence or display — via the bounded continuation (leak-safety
-        // invariants are documented on `recover_if_reasoning_only_stop`).
+        // Reasoning-only stop: recovered here, before any promotion, persistence or
+        // display, via the bounded continuation.
         let response = self
             .recover_if_reasoning_only_stop(messages, response, Self::AGENT_REASONING_RECOVERY)
             .await?;
 
-        // A SUCCESSFUL agent-purpose call updates the session length; failures
-        // never reach here (the error above propagates), and a reasoning-only
-        // turn that exhausted its continuation returned early above without
-        // recording anything — so only the response actually returned to the
-        // loop updates the value.
+        // Only a response actually returned to the loop updates the session length:
+        // failures propagate above, and an exhausted reasoning-only turn returned
+        // early having recorded nothing.
         self.record_session_usage(&response).await;
         Ok(response)
     }
 
-    /// Detect a provider input-image content-inspection rejection on the error
-    /// trail and durably strip the image from the most recent user message.
-    /// Returns `true` when the strip was applied (the caller continues the
-    /// normal loop with the corrected message), `false` for a conservative
-    /// no-op (the caller keeps the original error path).
+    /// Detect a provider input-image content-inspection rejection and durably strip the
+    /// image from the most recent user message. `true` when the strip applied, `false`
+    /// for a conservative no-op (the original error path stands).
     ///
-    /// Persist ordering: the store rewrite completes before the in-memory
-    /// swap, so a persist failure (or an unpersisted-tail target) leaves the
-    /// session untouched and the original LLM error propagates — no
-    /// half-stripped continuation, no swallowed errors. Telemetry note: the
-    /// rejected attempt already recorded one `non_retryable` `llm_requests`
-    /// row (from the retry loop's `fail_exhausted` tail) before this runs;
-    /// the corrected call records its own success row — by design, not a
-    /// swallowed error.
+    /// Persist ordering: the store rewrite completes before the in-memory swap, so a
+    /// persist failure leaves the session untouched and the LLM error propagates.
+    /// Telemetry: the rejected attempt already recorded its `non_retryable` row; the
+    /// corrected call records its own success row.
     async fn strip_rejected_input_image(
         &mut self,
         exhausted: &crate::retry::RetryExhausted,
@@ -2061,13 +1750,11 @@ impl Agent {
             return false;
         };
         let reason = crate::session::image_strip::extract_provider_reason(exhausted);
-        // Invariant guard: detection and the strip share one marker predicate
-        // (see `image_strip::has_image_marker`), so a detected rejection always
-        // changes the content. If they ever drift — e.g. a malformed `[IMAGE:`
-        // fragment passes detection but the regex leaves it verbatim — a
-        // no-change rewrite would report `Rewritten` and the loop `continue`
-        // below would skip `tool_rounds += 1`, an unbounded retry loop. Treat a
-        // no-change strip as a non-strip: keep the original error path.
+        // Invariant guard: detection and the strip share one marker predicate, so a
+        // detected rejection always changes the content. If they drift — a malformed
+        // `[IMAGE:` passes detection but the regex leaves it verbatim — a no-change
+        // rewrite would report `Rewritten`, the loop `continue` would skip
+        // `tool_rounds += 1`, and retries unbounded. Treat it as a non-strip.
         let content = {
             let original = &self.session.history()[idx].content;
             let stripped =
@@ -2110,50 +1797,26 @@ impl Agent {
         }
     }
 
-    /// Bounded continuation recovery for the reasoning-only-stop class
-    /// (empty content, no parsed tool calls — see [`is_reasoning_only_stop`]).
+    /// Bounded continuation recovery for the reasoning-only-stop class (empty content, no
+    /// parsed tool calls): re-request with the thinking attached as the assistant's
+    /// reasoning plus a continuation prompt. **Appended-only** — a transport failure NEVER
+    /// grows the tail (the next attempt re-sends the PREVIOUS request verbatim,
+    /// byte-identical even across a config hot-reload), so the prefix stays byte-stable
+    /// (prompt-prefix cache preserved). The tail lives only in the re-request list, never
+    /// in the session, so a failed attempt leaves no trace and the thinking cannot leak.
     ///
-    /// Re-requests with the already-generated thinking attached as the
-    /// assistant's reasoning for that turn (empty content) plus an appended
-    /// continuation prompt. **Strictly appended-only**: the tail is seeded
-    /// with the first in-class response's reasoning, and each LATER in-class
-    /// response appends its own (assistant reasoning payload + nudge) pair —
-    /// a transport failure NEVER grows the tail (the next attempt re-sends
-    /// the PREVIOUS request object verbatim, byte-identical even across a
-    /// concurrent config hot-reload). The request prefix stays byte-stable
-    /// across attempts (prompt-prefix cache preserved). The tail exists only
-    /// in the re-request message list — it is never pushed to the session, so
-    /// a failed attempt leaves no transcript trace and the raw thinking can
-    /// never reach the user.
+    /// Bounded by [`crate::retry::RetryPolicy::continuation`] (3 attempts, no wall-clock
+    /// cap — the 600 s idle timeout is the only bound), checked against
+    /// [`crate::shutdown::aborting`] and the cancel token between attempts; retryable
+    /// errors re-send the same bytes, non-retryable ones break at once. Telemetry is
+    /// operation-level: one success row, or one failure row via `fail_exhausted`, plus
+    /// one `llm_failures` row per failed attempt.
     ///
-    /// Bounded by [`crate::retry::RetryPolicy::continuation`] (3 attempts,
-    /// no wall-clock cap — the 600 s idle timeout is the only bound),
-    /// checked against [`crate::shutdown::aborting`] and the agent's cancel
-    /// token between attempts. Each attempt
-    /// is a single [`crate::providers::chat_scoped`] call; retryable provider
-    /// errors re-send the same bytes, non-retryable errors break immediately
-    /// (a payload-rejecting 400 never burns the budget).
-    ///
-    /// Telemetry is operation-level — one `llm_requests` row per continuation
-    /// operation, matching the single-row-per-operation convention of the
-    /// other retry loops: a resolution records one success row with
-    /// `retry_attempts` = the resolving attempt index; exhaustion records one
-    /// failure row via the shared `fail_exhausted` tail with
-    /// `retry_attempts` = the total attempt count and the last attempt's
-    /// finish_reason carried on its failure record. Any response with visible
-    /// text or parsed tool calls resolves the turn and is persisted normally
-    /// by the caller. Each failed attempt additionally persists one
-    /// `llm_failures` row under the operation's id (the synthetic
-    /// shutdown/cancellation trail entries excepted — no request is made).
-    ///
-    /// Exhaustion returns a [`crate::retry::RetryExhausted`] with
-    /// `last_raw: None` and a final class derived from the last recorded
-    /// failure ([`FailureClass::NoResponse`] for a pure thinking-only
-    /// exhaustion, [`FailureClass::Shutdown`] when the global abort fired) — the
-    /// thinking text is never embedded in the error, so failure
-    /// comments/logs cannot leak it, and it is not misclassified as LLM
-    /// provider retry exhaustion (no
-    /// [`crate::agent::RETRY_EXHAUSTION_MARKER`]).
+    /// Exhaustion returns a [`crate::retry::RetryExhausted`] with `last_raw: None` and a
+    /// class from the last failure ([`FailureClass::NoResponse`], or
+    /// [`FailureClass::Shutdown`] when the global abort fired) — the thinking text is
+    /// never embedded, so logs cannot leak it and it is not misclassified as provider
+    /// retry exhaustion.
     async fn recover_reasoning_only_stop(
         &self,
         base: Vec<ChatMessage>,
@@ -2279,39 +1942,26 @@ impl Agent {
         }
     }
 
-    /// Recovery policy for the agent loop ([`Self::llm_call`]): continuation
-    /// exhaustion fails the turn.
+    /// Agent-loop policy: continuation exhaustion fails the turn.
     const AGENT_REASONING_RECOVERY: ReasoningOnlyStopRecovery = ReasoningOnlyStopRecovery {
         purpose: "agent-continuation",
         exhausted_ctx: "model returned only reasoning without an answer after continuation attempts",
     };
 
-    /// Recovery policy for summarization ([`Self::summarize`]): continuation
-    /// exhaustion fails open with the full history.
+    /// Summarization policy: continuation exhaustion fails open with full history.
     const SUMMARIZE_REASONING_RECOVERY: ReasoningOnlyStopRecovery = ReasoningOnlyStopRecovery {
         purpose: "summarize-continuation",
         exhausted_ctx: "summarization continuation exhausted — failing open with full history",
     };
 
-    /// Recover a reasoning-only stop via the bounded continuation, or pass
-    /// the response through unchanged.
+    /// Recover a reasoning-only stop via the bounded continuation, or pass the response
+    /// through unchanged — the single classification point for that class, reached by both
+    /// LLM paths before any promotion, persistence or display.
     ///
-    /// This is the single classification point for the reasoning-only stop
-    /// (empty content, no parsed tool calls), reached by both LLM paths before
-    /// any promotion, persistence or display. The provider-layer reasoning→text
-    /// promotion is gone, so the response is the model's honest output.
-    ///
-    /// On continuation exhaustion the returned error carries
-    /// `recovery.exhausted_ctx` — the caller's failure semantics: the agent
-    /// loop fails the turn safely (nothing persisted, nothing displayed; the
-    /// existing failure indicators — direct chat emoji / pipeline comment —
-    /// fire), while the summarize path fails open, warning and continuing with
-    /// the full history.
-    ///
-    /// Leak-safety invariants (shared by both paths): the continuation is
-    /// appended-only and never touches the session transcript, so the thinking
-    /// can never leak to the user — and the exhaustion error never embeds the
-    /// thinking text either (see [`Self::recover_reasoning_only_stop`]).
+    /// On exhaustion the error carries `recovery.exhausted_ctx`: the agent loop fails the
+    /// turn safely (nothing persisted or displayed), while summarize fails open with the
+    /// full history. Leak safety: appended-only, never touching the transcript, and the
+    /// exhaustion error never embeds the thinking text.
     async fn recover_if_reasoning_only_stop(
         &self,
         messages: Vec<ChatMessage>,
@@ -2326,16 +1976,9 @@ impl Agent {
             .map_err(|e| anyhow::Error::new(e).context(recovery.exhausted_ctx))
     }
 
-    /// Record the real provider-reported session length after a SUCCESSFUL
-    /// agent-purpose LLM call: `input_tokens + output_tokens` of the full
-    /// request envelope plus the response that just arrived.
-    ///
-    /// Only agent-purpose calls pass through here — extraction, summarize,
-    /// consolidate, synthesis, and research sub-calls use other builders and
-    /// are excluded (they are not session context).
-    ///
-    /// A compaction clears the value with the history it replaces (see
-    /// [`Session::apply_summary`]).
+    /// Record the provider-reported session length after a SUCCESSFUL agent-purpose call:
+    /// `input_tokens + output_tokens`. Other builders are not session context and never
+    /// pass through here; a compaction clears the value with the history it replaces.
     async fn record_session_usage(&mut self, response: &ChatResponse) {
         let Some(usage) = &response.usage else {
             return;
@@ -2358,18 +2001,10 @@ impl Agent {
         }
     }
 
-    /// Persist tool results to the session store and push them into the
-    /// in-memory history (via the session) for the next tool round.
-    ///
-    /// The assistant frame with its tool calls is already durably persisted at
-    /// EMISSION time (before the calls executed), so this commit writes ONLY
-    /// the tool-result rows. Suspended outcomes (drain-cut durable work) are
-    /// SKIPPED — no row is written, the call stays dangling, and the universal
-    /// resume-completion step settles it later. Returns early with no DB write
-    /// when every outcome is suspended (nothing to settle this round).
-    ///
-    /// Takes `outcomes` by value because each one's `image_payloads` are MOVED
-    /// into the injected image message (they carry base64 data URIs).
+    /// Persist tool results and push them into memory for the next round. The assistant
+    /// frame is already durable from EMISSION time, so this writes ONLY the result rows.
+    /// Suspended outcomes are SKIPPED, and an all-suspended round writes nothing. Takes
+    /// `outcomes` by value: their payloads are MOVED into the injected image message.
     async fn commit_tool_results(
         &mut self,
         tool_calls: &[ToolCall],
@@ -2377,23 +2012,16 @@ impl Agent {
     ) -> anyhow::Result<()> {
         let tools = &self.tools;
 
-        // Data-URIs already attached in the session (prior rounds) — the dedup
-        // key for the read-tool's "already attached" reference. Computed lazily
-        // (only once the first image payload is encountered) so rounds with no
-        // image read skip the full-history scan entirely.
+        // Dedup key for attached images, lazily computed.
         let mut seen_data_uris: Option<std::collections::HashSet<String>> = None;
 
-        // Synthetic User-role image messages are injected AFTER the whole
-        // tool-result block (preserves OpenAI-compatible tool-stream contiguity:
-        // assistant(tool_calls) → tool_result_* → user(IMAGE_*)). Injecting one
-        // per image inline would interleave a user message between tool results.
+        // Image messages go AFTER the tool-result block, preserving OpenAI-compatible
+        // contiguity (assistant(tool_calls) → tool_result_* → user(IMAGE_*)).
         let mut fresh_image_payloads: Vec<ImagePayload> = Vec::new();
 
         let mut db_messages = Vec::with_capacity(outcomes.len());
         for (call, outcome) in tool_calls.iter().zip(outcomes) {
-            // A suspended outcome has no result to commit — the frame is already
-            // durable and the durable work is left launched for the universal
-            // resume-completion step. Skip it entirely.
+            // Suspended: nothing to commit; the work is left for resume-completion.
             if outcome.suspended {
                 continue;
             }
@@ -2410,23 +2038,19 @@ impl Agent {
             db_messages.push(ChatMessage::tool_result(&call.id, &output));
         }
 
-        // Inject every fresh image of the round as ONE synthetic user message
-        // after the round's tool-result block, tagged so the model can tell a
-        // tool-injected image apart from a user-uploaded one.
+        // Inject the round's fresh images as ONE tagged synthetic user message.
         if let Some(message) =
             injected_images_message(&self.agent_id, self.role, fresh_image_payloads)
         {
             db_messages.push(message);
         }
 
-        // Nothing to commit (all outcomes suspended — no results, no derived
-        // images): the frame is already durable, so no DB write is needed.
+        // Nothing to commit (all suspended): the frame is already durable.
         if db_messages.is_empty() {
             return Ok(());
         }
 
-        // Batch-persist the tool results (preceded by any unpersisted history
-        // tail) and push them into in-memory history.
+        // Batch-persist (after any unpersisted tail) and push into memory.
         self.session
             .persist_messages(&self.agent_id, &db_messages)
             .await
@@ -2435,23 +2059,11 @@ impl Agent {
         Ok(())
     }
 
-    /// Drain any incoming messages from the router (e.g., ticket comments)
-    /// and inject them into the session history.
-    ///
-    /// Called at the start of each tool round, before the LLM call.
-    /// Messages are persisted to the session DB AND pushed to in-memory
-    /// history so they survive crashes and are visible to the model.
-    ///
-    /// On persist failure the messages are still delivered to the in-memory
-    /// history (the model sees them this turn) and left in the unpersisted
-    /// tail; the next successful persist — tool round, later drain, or
-    /// finalize (which flushes the tail even on aborted turns) — writes
-    /// them, so nothing is lost once the turn is finalized. A cancel before
-    /// finalize drops the in-memory tail at the next turn — comments remain
-    /// in the board DB.
-    ///
-    /// This is a no-op when no receiver is configured (e.g., chat agents
-    /// that use the consumer_loop instead).
+    /// Drain routed messages (ticket comments) into the session history, at the start of
+    /// each tool round before the LLM call. Persisted AND pushed to memory so they survive
+    /// a crash. On a persist failure they are still visible this turn and stay in the
+    /// unpersisted tail the next persist flushes; a cancel before finalize drops them.
+    /// No-op without a receiver (chat agents use the consumer loop).
     async fn drain_incoming_messages(&mut self) {
         let Some(rx) = &mut self.incoming_rx else {
             return;
@@ -2471,8 +2083,7 @@ impl Agent {
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    // Channel closed — no more messages will arrive.
-                    // Drop the receiver so we don't try again.
+                    // Channel closed: drop the receiver so we never retry.
                     self.incoming_rx = None;
                     break;
                 }
@@ -2483,15 +2094,11 @@ impl Agent {
             return;
         }
 
-        // Persist to session DB — fail-open. The comment is already saved in
-        // the board DB, so losing the session copy is recoverable; log and
-        // continue rather than aborting the tool round.
+        // Fail-open: the comment is already in the board DB, so log and continue.
         self.persist_messages_fail_open(&messages).await;
     }
 
-    /// Persist messages to the session, fail-open: on a persist failure the
-    /// messages are still delivered to in-memory history (visible to the model
-    /// this turn) and left in the unpersisted tail, flushed by the next persist.
+    /// Persist fail-open: on failure they still reach the memory and the tail.
     async fn persist_messages_fail_open(&mut self, messages: &[ChatMessage]) {
         if let Err(e) = self
             .session
@@ -2507,17 +2114,11 @@ impl Agent {
         }
     }
 
-    /// Inject board comments a resumed stage round has not seen.
-    ///
-    /// A resumed round starts with an empty message when the session already has
-    /// content, so it never re-renders the `<current-ticket>` block and would
-    /// otherwise miss comments added after the boot snapshot. Re-reads the board
-    /// and injects comments absent from the loaded history (content-based dedup,
-    /// whether a previously-delivered `[Comment from ...]` message or the
-    /// session-start ticket block). Gated to `resume` + empty `msg`: the
-    /// bounce-feedback path runs with `resume=false` (non-empty `msg`), so the
-    /// `!resume` check excludes it. Runs once per turn, fail-open persist like
-    /// live delivery.
+    /// Inject board comments a resumed stage round has not seen: it starts with an empty
+    /// message, never re-renders `<current-ticket>`, and would miss comments added after
+    /// the boot snapshot. Re-reads the board and injects those absent from the history
+    /// (content-based dedup). Gated to `resume` + empty `msg`, so the bounce-feedback path
+    /// is excluded. Runs once per turn, fail-open persist like live delivery.
     async fn inject_outstanding_comments(&mut self, resume: bool, messages: &[&str]) {
         if !resume || messages.iter().any(|msg| !msg.is_empty()) {
             return;
@@ -2527,11 +2128,10 @@ impl Agent {
             return;
         };
 
-        // Fresh snapshot — the boot get_ticket is stale. Snapshot the board
-        // FIRST, then drain the channel: a comment routed after registration is
-        // already in the channel and deduped against the post-drain history. A
-        // comment routed after the drain can still be delivered twice; that is
-        // the accepted no-watermark limitation (content-based dedup only).
+        // Fresh snapshot — the boot get_ticket is stale. Snapshot the board FIRST, then
+        // drain: a comment routed after registration is already in the channel and deduped
+        // against the post-drain history. One routed after the drain can still arrive
+        // twice — the accepted no-watermark limitation.
         let comments = match crate::pipeline::board::store()
             .get_comments(&ticket_id)
             .await
@@ -2583,25 +2183,13 @@ impl Agent {
         );
     }
 
-    /// Build a [`ChatRequest`] from the given messages, using the agent's
-    /// current model, tools, reasoning-effort, and provider-routing settings.
+    /// Build a [`ChatRequest`] from the messages with the agent's current model, tools,
+    /// reasoning-effort and provider routing — resolved each call, so a hot-reload is
+    /// reflected immediately (reasoning effort is baked into role metadata).
     ///
-    /// All parameter sources are lazily resolved each call so that runtime
-    /// hot-reload (model, routing) is reflected immediately. Reasoning effort
-    /// is baked into the role metadata — it is not
-    /// hot-reloadable.
-    ///
-    /// # KV-cache preservation
-    ///
-    /// Every call site that produces a chat request for the same logical
-    /// conversation *must* use exactly the same parameter sources — model,
-    /// reasoning_effort, tools (critically tools!), and provider routing — so
-    /// that the provider can reuse the cached prefix computed
-    /// during the original agent call.  Any deviation (including dropping
-    /// tools) forces the provider to recompute the entire KV-cache prefix.
-    ///
-    /// [`Self::extract_verdict`] calls this method internally to derive its
-    /// parameter set.  [`Self::summarize`] calls this method directly.
+    /// Every call site for the same conversation *must* use exactly the same parameter
+    /// sources — model, reasoning_effort, tools (critically tools!) and routing — or the
+    /// provider recomputes the whole KV-cache prefix.
     fn build_chat_request(&self, messages: Vec<ChatMessage>, purpose: &'static str) -> ChatRequest {
         ChatRequest {
             meta: Some(crate::ChatRequestMeta {
@@ -2615,19 +2203,11 @@ impl Agent {
         }
     }
 
-    // ── Extraction / summarisation ──
-
-    /// Extract a structured verdict with the hardened scoped retry loop.
-    ///
-    /// KV-cache requirements: the params come from [`Self::build_chat_request`]
-    /// (model, reasoning_effort, tools, provider routing) so all
-    /// attempts are byte-identical except the parse-failure re-prompt.
-    ///
-    /// `validate` runs fail-closed on the parsed value (e.g. score ∈ [0,10]):
-    /// a rejected value is treated as a parse failure and re-prompted.
-    /// Pass `validate = None` for plain structured extraction (diagnostics
-    /// discovery). `policy_override` supplies a shorter retry schedule for
-    /// fail-open callers; `None` uses the default verdict budget.
+    /// Extract a structured verdict with the hardened scoped retry loop. KV-cache:
+    /// params come from [`Self::build_chat_request`], so attempts are byte-identical
+    /// except the parse-failure re-prompt. `validate` runs fail-closed (e.g. score ∈
+    /// [0,10]) and a rejected value is re-prompted as a parse failure — `None` for
+    /// plain extraction. `policy_override` gives fail-open callers a shorter schedule.
     pub(crate) async fn extract_verdict<T: serde::de::DeserializeOwned>(
         &self,
         extraction_prompt: &str,
@@ -2646,19 +2226,13 @@ impl Agent {
         .await
     }
 
-    /// Summarise the agent's session history.
+    /// Summarise the session history. KV-cache: see [`Self::build_chat_request`] — the
+    /// request is built once and re-sent verbatim, so every attempt is byte-identical.
     ///
-    /// KV-cache requirements: see [`Self::build_chat_request`]. The request is
-    /// built once and re-sent verbatim, so every attempt is byte-identical —
-    /// same messages, same tool set, same parameters.
-    ///
-    /// A tool call is not a summary: it carries no summary text, so it is
-    /// re-asked (`SUMMARIZE_ATTEMPTS` in total, each attempt a successful
-    /// `summarize` request of its own) and never executed. An answer carrying
-    /// both text and a tool call needs no re-ask — the text is the summary and
-    /// the tool call is discarded as always. Exhaustion raises the
-    /// empty-response error as before, so [`Self::maybe_summarize`] fails open
-    /// with the full history.
+    /// A tool call is not a summary: it carries no text, so it is re-asked
+    /// (`SUMMARIZE_ATTEMPTS` in total, each a successful `summarize` request of its
+    /// own) and never executed; text alongside a tool call is the summary. Exhaustion
+    /// raises the empty-response error, so [`Self::maybe_summarize`] fails open.
     pub(crate) async fn summarize(&self) -> anyhow::Result<String> {
         let _activity = self.activity_guard("summarizing");
         let mut history = self.session.history().to_vec();
@@ -2672,10 +2246,8 @@ impl Agent {
                 .await
                 .with_context(|| format!("summarization LLM call {RETRY_EXHAUSTION_MARKER}"))?;
 
-            // Reasoning-only stop: the same bounded continuation as the agent
-            // loop (leak-safety invariants on `recover_if_reasoning_only_stop`).
-            // On exhaustion, fail open below — the empty-response error path
-            // warns and continues with the full history.
+            // Reasoning-only stop: the same bounded continuation as the agent loop; on
+            // exhaustion, fail open below with the full history.
             let chat_resp = self
                 .recover_if_reasoning_only_stop(
                     history.clone(),
@@ -2703,21 +2275,15 @@ impl Agent {
         anyhow::bail!("summarization produced empty response")
     }
 
-    /// Check the session against the summarization triggers and summarise if
-    /// necessary: the provider-reported session token length exceeding
-    /// [`SUMMARIZATION_THRESHOLD`], or the history accumulating
-    /// [`SUMMARIZATION_IMAGE_COUNT`] distinct data-URI images (see
-    /// [`session_image_marker_count`]). The token length is the REAL
-    /// provider-reported value (input + output tokens of the last successful
-    /// agent LLM call), loaded at session init; `None` — no successful
-    /// usage-bearing call ever recorded a value (new sessions, pre-migration
-    /// sessions; approved no-backfill), or the session's last compaction cleared it
-    /// ([`Session::apply_summary`]) — only disables the token trigger. A FAILED call
-    /// never updates the value (the session did not change).
+    /// Check the summarization triggers and summarise if necessary: the
+    /// provider-reported session token length over [`SUMMARIZATION_THRESHOLD`], or
+    /// [`SUMMARIZATION_IMAGE_COUNT`] distinct data-URI images. The token length is the
+    /// REAL value of the last successful agent call, loaded at session init; `None`
+    /// (never recorded — approved no-backfill — or cleared by the last compaction)
+    /// only disables the token trigger. A FAILED call never updates it.
     ///
-    /// KV-cache preservation: [`Agent::summarize`] keeps all parameters
-    /// identical (see [`Agent::build_chat_request`]) so the cached prefix is
-    /// reusable.
+    /// KV-cache preservation: [`Agent::summarize`] keeps all parameters identical, so
+    /// the cached prefix stays reusable.
     async fn maybe_summarize(&mut self, turn_start: usize) {
         let token_length = self.session.token_length();
         let image_count = session_image_marker_count(self.session.history());
@@ -2762,23 +2328,19 @@ impl Agent {
         }
     }
 
-    /// Compact the session of a long-lived chat role — Assistant, Manager or
-    /// custom — right after its reply was delivered, so the user's next message
-    /// does not wait. Runs on the per-session consumer loop: the serialized path
-    /// that already handles one turn at a time for this session.
+    /// Compact a long-lived chat role's session (Assistant, Manager, custom) right
+    /// after its reply was delivered, so the user's next message does not wait. Runs
+    /// on the per-session consumer loop — the serialized path that already handles one
+    /// turn at a time here.
     ///
-    /// [`Self::maybe_summarize`] is unchanged (same limit and triggers, prompt,
-    /// result, retention policy) and its pre-turn call in [`Self::work`] stays the
-    /// safety net for every role and case this does not cover; the pre-turn skips
-    /// a turn here can hit carry over — settled tool results, cancellation, going
-    /// down. `resume` needs no clause: this loop runs every job as a plain turn
-    /// (`run_agent(…, resume = false)`), so a resumed round never reaches the call.
+    /// [`Self::maybe_summarize`] keeps the same limit, triggers, prompt, result and
+    /// retention policy, and its pre-turn call in [`Self::work`] stays the safety net
+    /// for everything this skips — settled tool results, cancellation, shutdown.
+    /// `resume` needs no clause: this loop runs every job as a plain turn.
     ///
-    /// Settled: a session over a trigger at delivery compacts, whatever put it
-    /// there — a turn that regrew past the limit after its own compaction in the
-    /// same turn, or one whose compaction failed to persist (still over the limit,
-    /// so this call retries it). A repeat costs at most one extra summarization
-    /// call per turn, accepted over the wait it removes.
+    /// A session over a trigger at delivery compacts whatever put it there, even when
+    /// its own compaction failed to persist; a repeat costs at most one extra
+    /// summarization call per turn, accepted over the wait it removes.
     pub(crate) async fn maybe_summarize_after_delivery(&mut self) {
         if !self.role.is_long_lived_chat()
             || self.turn_state.settled_tool_results
@@ -2792,10 +2354,8 @@ impl Agent {
     }
 }
 
-/// Decide whether [`Agent::maybe_summarize`] should compact, and why.
-/// Strict `>` for the token threshold, `>=` for the image count — the
-/// asymmetry is deliberate (see [`crate::session::SUMMARIZATION_IMAGE_COUNT`]).
-/// Returns `None` when no trigger fires.
+/// Which trigger fires, if any: strict `>` for the token threshold but `>=` for the
+/// image count — the asymmetry is deliberate.
 #[must_use]
 fn summarization_trigger(token_length: Option<u64>, image_count: usize) -> Option<&'static str> {
     if token_length.is_some_and(|t| t > crate::session::SUMMARIZATION_THRESHOLD) {
@@ -2807,17 +2367,11 @@ fn summarization_trigger(token_length: Option<u64>, image_count: usize) -> Optio
     }
 }
 
-/// Parameters for a reasoning-only-stop recovery: the telemetry purpose tag
-/// forwarded to [`Agent::recover_reasoning_only_stop`] and the context
-/// attached to the exhaustion error. The two strings travel as a single
-/// named-field struct (rather than two adjacent `&'static str` arguments) so
-/// they cannot be silently swapped at a call site — see the per-path
-/// constants on [`Agent`].
+/// Parameters for a reasoning-only-stop recovery: the telemetry purpose tag and the
+/// context attached to the exhaustion error. Named fields, not two adjacent
+/// `&'static str` arguments, so they cannot be silently swapped at a call site.
 struct ReasoningOnlyStopRecovery {
-    /// Purpose tag for the continuation LLM request (telemetry).
     purpose: &'static str,
-    /// Context attached to the `anyhow` error when continuation attempts are
-    /// exhausted.
     exhausted_ctx: &'static str,
 }
 
@@ -2826,32 +2380,24 @@ struct PreparedAssistantTurn {
     display_text: String,
     tool_calls: Vec<ToolCall>,
     history_content: String,
-    /// The raw LLM response text (the faithful carrier of accompanying text in
-    /// tool rounds, where `history_content` is a JSON payload and
-    /// `display_text` is empty). Reasoning content never reaches
-    /// `prepare_assistant_turn`, so this excludes it by construction.
+    /// The raw response text, the faithful carrier of accompanying text in tool rounds
+    /// (where `history_content` is a JSON payload and `display_text` is empty).
+    /// Reasoning never reaches this builder, so it excludes it by construction.
     raw_text: String,
 }
 
-/// Classify the "reasoning-only stop" class: raw empty content (think tags
-/// stripped — they are reasoning, not content) with no parsed tool calls,
-/// REGARDLESS of finish reason. The provider-layer reasoning→text promotion
-/// is gone, so an empty `text` is the model's honest empty content.
-///
-/// Tool-call turns (empty text by design) are excluded by the tool-call
-/// check. Degenerate members — fully-empty responses (no reasoning attached)
-/// and think-tag-only content — are consciously in-class: the continuation
-/// then carries just the nudge, and a previously-`Ok("")` silent answer now
-/// resolves via the continuation or fails the turn safely (never CoT-as-text).
+/// The "reasoning-only stop" class: empty content (think tags stripped — they are
+/// reasoning) with no parsed tool calls, REGARDLESS of finish reason. Tool-call turns
+/// are excluded by the tool-call check. Degenerate members — fully empty responses and
+/// think-tag-only content — are consciously in class: the continuation carries just the
+/// nudge, and a silent `Ok("")` now resolves there or fails the turn safely (never CoT-as-text).
 #[must_use]
 fn is_reasoning_only_stop(response: &ChatResponse) -> bool {
     response.tool_calls.is_empty() && response.text.as_deref().is_none_or(|t| t.trim().is_empty())
 }
 
 /// Persist one continuation-attempt failure row when the operation is
-/// metadata-tracked (fail-open; see
-/// [`crate::stats::record_llm_attempt_failure`]). The per-attempt duration is
-/// measured from `attempt_started` (the attempt's launch instant).
+/// metadata-tracked (fail-open); the duration is measured from `attempt_started`.
 fn record_continuation_failure(
     operation: Option<&crate::stats::LlmOperationCtx>,
     attempt: u32,
@@ -2863,9 +2409,9 @@ fn record_continuation_failure(
     }
 }
 
-/// Context for a failed LLM step: the run-local tool-round counter plus the
-/// session depth — a resumed long-lived session must not read as freshly
-/// started ("tool round 0"). The token segment is omitted when unknown.
+/// Context for a failed LLM step: the run-local round counter plus session depth — a
+/// resumed long-lived session must not read as freshly started. The token segment is
+/// omitted when unknown.
 fn llm_step_failure_context(session: &Session, tool_rounds: usize) -> String {
     let tokens = session
         .token_length()
@@ -2877,26 +2423,19 @@ fn llm_step_failure_context(session: &Session, tool_rounds: usize) -> String {
     )
 }
 
-/// Prepare assistant response data from the LLM response.
 fn prepare_assistant_turn(response: ChatResponse) -> PreparedAssistantTurn {
     let response_text = response.text_or_empty().to_string();
     let raw_text = response_text.clone();
     let tool_calls = response.tool_calls;
     let reasoning = response.reasoning.as_ref();
 
-    // The structured payload faithfully captures the model's original response
-    // (empty content for a reasoning-only return). Reasoning-only stops never
-    // reach this point — the agent loop classifies and recovers them in
-    // llm_call before any persistence/display — so this builder only ever
-    // serializes real answers and tool-call turns.
+    // The payload captures the model's original response. Reasoning-only stops never
+    // reach here — llm_call recovers them before any persistence or display.
     let json_payload =
         assistant_replay_payload(Some(&response_text), &tool_calls, reasoning).to_string();
 
-    // Dispatch on whether tool calls and/or reasoning are present.
-    // Three arms: plain answer (no tools, no reasoning), reasoning+text
-    // (reasoning present alongside visible text), and tool calls (tools
-    // present). Reasoning-only responses (reasoning present, empty text) are
-    // the recovered class and never arrive here.
+    // Plain answer, reasoning+text, or tool calls. Reasoning-only responses are the
+    // recovered class and never arrive here.
     let (display_text, history_content) = match (tool_calls.is_empty(), reasoning.is_some()) {
         // Plain final answer — both display and history use response text directly.
         (true, false) => (response_text.clone(), response_text),
@@ -2923,10 +2462,8 @@ const SLEEP_WITH_TEXT_REJECTION: &str = "sleep must be called alone: your text w
 /// Rejection message for a `sleep` call bundled with other tool calls.
 const SLEEP_BUNDLED_REJECTION: &str = "sleep must be called alone: it was bundled with other tool calls. Call sleep in its own round with no other tool calls — and no text, since text written in a tool round is never delivered to the user.";
 
-/// Sleep-delivery guard predicate: a `sleep` call must run alone in a
-/// text-free round, otherwise the round either swallows the accompanying
-/// text or ends the run silently right after it. Returns the model-facing
-/// rejection reason for the round, `None` when the round is legal.
+/// Sleep-delivery guard: a `sleep` call must run alone in a text-free round, or it
+/// swallows the accompanying text or ends the run silently. `None` when legal.
 #[must_use]
 fn sleep_rejection_reason(has_text: bool, bundled: bool) -> Option<&'static str> {
     if has_text {
@@ -2938,48 +2475,36 @@ fn sleep_rejection_reason(has_text: bool, bundled: bool) -> Option<&'static str>
     }
 }
 
-/// Round-scoped agent options for parallel-round members.
-///
-/// `round_ts` pins the first user message's timestamp (one value per round —
-/// byte-identical task messages across members); `first_call_notify` is the
-/// leader-stagger signal — fired after the leader's first LLM call completes
-/// (success or failure, after the full retry budget: a leader whose call
-/// exceeds the stagger bound releases followers via the sleep arm and misses
-/// the cached prefix) or when the leader bails at the phase gate before any
-/// LLM call.
+/// Round-scoped options for parallel-round members: `round_ts` pins the first user
+/// message's timestamp (byte-identical task messages across members), and
+/// `first_call_notify` is the leader-stagger signal, fired after the leader's first
+/// LLM call — a leader exceeding the stagger bound misses the cached prefix.
 #[derive(Clone)]
 pub(crate) struct RoundOpts {
     pub(crate) round_ts: String,
     pub(crate) first_call_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
-/// Default fail-open bound on the leader-stagger wait: how long followers wait
-/// for the leader's first LLM call before starting anyway. First calls take
-/// ~4-6 s; the bound is a safety cap, not the expected wait. Overridable via
-/// env for tuning (mirrors [`crate::tools::analyze::round_timeout`]).
+/// Fail-open bound on the leader-stagger wait — a safety cap, not the expected wait
+/// (first calls take ~4-6 s). Overridable via env for tuning, like
+/// [`crate::tools::analyze::round_timeout`].
 const DEFAULT_STAGGER_WAIT_SECS: u64 = 8;
 
 fn leader_stagger_wait() -> std::time::Duration {
     crate::util::env_duration_secs("MAHBOT_STAGGER_WAIT_SECS", DEFAULT_STAGGER_WAIT_SECS)
 }
 
-/// Spawn a round's member tasks with a leader-stagger: member 0 (the leader)
-/// starts immediately; the rest start after the leader's first LLM call
-/// completes (the notify fires) or the bounded wait elapses — whichever
-/// first. The wait is fail-open (a failed/never-starting leader still releases
-/// the followers) and interrupted by daemon shutdown or the drain flag.
+/// Spawn a round's members with a leader-stagger: member 0 starts immediately, the
+/// rest once the leader's first LLM call completes or the bounded wait elapses —
+/// whichever first. The wait is fail-open (a failed or never-starting leader still
+/// releases the followers) and interrupted by shutdown or drain.
 ///
-/// Single-member rounds are a no-op stagger, and boot-resumed rounds
-/// (`resume = true`) skip the stagger entirely — their sessions already
-/// diverged, so the leader's prefix would not be shared anyway and the wait
-/// would only add latency.
-///
-/// Renders the round timestamp once and hands every member factory a
-/// ready-made [`RoundOpts`] (only the leader carries the first-call signal).
-///
-/// The first-call signal has a single waiter — the `select!` below — so
-/// `notify_one()` releases all followers at once; its stored permit also
-/// covers a fire-before-wait race that `notify_waiters()` would lose.
+/// Single-member rounds are a no-op stagger, and boot-resumed rounds (`resume = true`)
+/// skip it: their sessions already diverged, so the wait would only add latency.
+/// The round timestamp is rendered once and every member gets a ready-made
+/// [`RoundOpts`] (only the leader carries the first-call signal, which has a single
+/// waiter, so `notify_one()` releases all followers and its stored permit covers a
+/// fire-before-wait race `notify_waiters()` would lose).
 pub(crate) async fn spawn_staggered_round<T, Fut, F>(
     members: Vec<F>,
     resume: bool,
@@ -2996,8 +2521,7 @@ where
     let followers: Vec<F> = members.collect();
     let round_ts = crate::session::render_timestamp();
     if resume || followers.is_empty() {
-        // Resume (sessions already diverged — no shared prefix to hit) or a
-        // single-member round: no stagger, spawn everything immediately.
+        // Resumed or single-member: no stagger, spawn everything immediately.
         let opts = RoundOpts {
             round_ts,
             first_call_notify: None,
@@ -3023,10 +2547,9 @@ where
         () = shutdown.cancelled() => {}
         () = crate::shutdown::drain_wait() => {}
     }
-    // Drain/shutdown arms still spawn the followers — their Session::init
-    // append runs before the aborting() bail. Deliberate: it pre-seeds the
-    // session so boot resume's has_session guard skips the re-append
-    // (consistent with the leader's init-then-abort drain path).
+    // Drain/shutdown arms still spawn the followers: their Session::init append runs
+    // before the aborting() bail, pre-seeding the session so boot resume's
+    // has_session guard skips the re-append (as on the leader's path).
     handles.extend(
         followers
             .into_iter()
@@ -3035,26 +2558,19 @@ where
     handles
 }
 
-/// Everything an agent run releases for its own temporary use when the run ends:
-/// its spill files, its per-agent computer registry entries, and the chrome
-/// sessions it opened. Released from a `Drop` rather than from trailing statements
-/// because a run cut off mid-flight never reaches a trailing statement, and
-/// everything it used would then be stranded with nothing left that records it. The
-/// chrome part is only handed over (the `chrome-run-releases` task does the work,
-/// outliving the run).
+/// Everything a run releases for its own temporary use when it ends: its spill files,
+/// its per-agent computer registry entries, and the chrome sessions it opened. A `Drop`
+/// rather than trailing statements, because a run cut off mid-flight never reaches one;
+/// the chrome part is only handed over (the `chrome-run-releases` task outlives the run).
 ///
-/// The one limit this rule owns: a run still working when the process exits, and
-/// a run killed outright (SIGKILL), never run destructors — the self-update path's
-/// `exit(0)` bypasses them by design — so nothing is ever queued for that run's
-/// chrome sessions. The reclaim pass still closes those tabs: it sweeps the
-/// browser's live `agent-tab-*` groups (where chrome-use still titles a group after its
-/// session — [`crate::tools::chrome_tabs`]' honest limits) and closes any whose namespace
-/// no guard claims — not a live run's, not one inside a record's hold, not one a queued or
-/// parked record still claims, and not one durable state names for a job that has not been
-/// terminalized ([`crate::tools::chrome_release::ProtectedNamespaces`]). It asks the
-/// browser at a run end that queued names, at a revisit a leftover owes, and — when the
-/// durable record file handed it something — at the start of a process, so a run end hook
-/// that never fired leaves nothing behind and a start with nothing pending opens no page.
+/// Accepted limit: a run still working at process exit, or killed outright (`exit(0)`
+/// bypasses destructors by design), queues nothing. The reclaim pass still closes its
+/// tabs — it sweeps the browser's live `agent-tab-*` groups ([`crate::tools::chrome_tabs`]'s
+/// honest limits) and closes any namespace no guard claims: not a live run's, not inside a
+/// record's hold, not one a queued or parked record claims, not one durable state names for
+/// a non-terminalized job ([`crate::tools::chrome_release::ProtectedNamespaces`]). It asks
+/// the browser at a run end that queued names, at a revisit a leftover owes, and — when the
+/// durable record file handed it something — at process start.
 struct RunEndCleanup {
     agent_id: String,
     chrome: std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
@@ -3075,9 +2591,7 @@ impl RunEndCleanup {
     }
 
     /// Record how the run ended — which ends hold the release back is
-    /// [`holds_run_end`]'s rule.
-    ///
-    /// [`holds_run_end`]: crate::tools::chrome_release::holds_run_end
+    /// [`crate::tools::chrome_release::holds_run_end`]'s rule.
     fn ended(&mut self, classification: &str) {
         self.held = crate::tools::chrome_release::holds_run_end(classification);
     }
@@ -3085,15 +2599,13 @@ impl RunEndCleanup {
 
 impl Drop for RunEndCleanup {
     fn drop(&mut self) {
-        // Owner-deletes-at-end: remove the spill files this agent run created
-        // (safe on macOS — the run is over, nothing will read them again).
+        // Owner-deletes-at-end: remove this run's spill files (the run is over).
         crate::tools::shell::cleanup_agent_spills(&self.agent_id);
-        // Drop what this turn's computer use owns (its capture and element refs).
-        // Its application/window ids last for the session, not the run.
+        // Drop what this turn's computer use owns; app/window ids last for the session.
         crate::tools::computer::cleanup_turn_state(&self.agent_id);
-        // Hand the run's chrome sessions to the release queue, under the run's own
-        // agent id so a leftover report can name the run it came from. The tracker's
-        // own `Drop` unregisters the run's namespace once the run's last owner goes.
+        // Hand the chrome sessions to the release queue under the run's own agent id,
+        // so a leftover report names its run; the tracker's own `Drop` unregisters the
+        // namespace once its last owner goes.
         crate::tools::chrome_release::queue_run_session_release(
             &self.chrome,
             self.held,
@@ -3102,28 +2614,18 @@ impl Drop for RunEndCleanup {
     }
 }
 
-/// Core agent lifecycle: create agent (auto-registers with its own
-/// CancellationToken), run work, handle cancellation and errors.
-/// Returns the agent (even on failure) and the response on success.
+/// Core agent lifecycle: create the agent (auto-registered with its own
+/// CancellationToken), run work, handle cancellation and errors. Returns the agent
+/// even on failure, with the response only on success (an error is already logged).
 ///
-/// `user_name` and `channel` identify the origin of the message being
-/// processed — used by tools (e.g. AnalyzeTool async dispatch) to route
-/// sub-agent results to the correct user.
+/// **Cancellation safety**: a completed `Ok` result is never discarded on cancel
+/// cause — downstream consumers (pipeline finalizers, the message router) decide how
+/// a cancelled run's result is handled.
 ///
-/// **Cancellation safety**: A completed `Ok` result is never discarded based
-/// on cancel cause — downstream consumers (pipeline finalizers, the message
-/// router) are the authority on how a cancelled run's result is handled.
-///
-/// Returns `(agent, Some(response))` on success.
-/// Returns `(agent, None)` on error (already logged).
-///
-/// `launch` is the launch this run executes — `Some` for a branch role (a
-/// custom role's authorial prompt and tool subset taken at launch, or a worker
-/// branch's address); `None` for every built-in role.
-///
-/// `messages` is what the turn answers, in arrival order: one message for an
-/// ordinary run, several when an urgent message cut the previous turn and
-/// brought everything already waiting with it (see [`Agent::work`]).
+/// `user_name` and `channel` identify the message's origin, so tools route sub-agent
+/// results to the right user. `launch` is the launch this run executes — `Some` for a
+/// branch role, `None` for built-ins. `messages` arrives in arrival order (see
+/// [`Agent::work`]).
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn run_agent(
     agent_id: String,
@@ -3143,12 +2645,10 @@ pub(crate) async fn run_agent(
     parent_label: Option<String>,
     launch: Option<crate::Launch>,
 ) -> (Agent, Option<String>) {
-    // Unregister from the message router on EVERY exit path, including a
-    // panic mid-work (Drop runs during unwind) — a leaked router entry would
-    // keep routing comments to a dead agent. Only for caller-registered paths
-    // (Some(incoming_rx)): the persistent consumer_loop path (None) owns its
-    // router entry via route()'s catch_unwind cleanup and must keep it across
-    // jobs. Idempotent.
+    // Unregister from the message router on EVERY exit path, a mid-work panic
+    // included — a leaked entry keeps routing comments to a dead agent. Only for
+    // caller-registered paths: the consumer_loop path owns its entry via route()'s
+    // catch_unwind cleanup and keeps it across jobs. Idempotent.
     struct UnregisterOnDrop(String);
     impl Drop for UnregisterOnDrop {
         fn drop(&mut self) {
@@ -3175,18 +2675,16 @@ pub(crate) async fn run_agent(
         agent.round_ts = Some(round.round_ts);
         agent.first_call_notify = round.first_call_notify;
     }
-    // Everything this run owns for its own temporary use is released by this
-    // guard — including on the paths that never reach a trailing statement.
+    // Everything this run owns is released by this guard, on every path.
     let mut run_end = RunEndCleanup::new(
         agent.agent_id.clone(),
         std::sync::Arc::clone(&agent.chrome_sessions),
     );
     let result = agent.work(messages, resume).await;
 
-    // Absorb the product's own writes into a personal folder before the turn
-    // ends, or a later change report would blame the user for them. Every turn
-    // that returns — Ok, error, cancel or drain — passes here; the gate is the
-    // module's, and matches the report's (see `personal_changes`).
+    // Absorb the product's own writes into a personal folder before the turn ends, or
+    // a later change report blames the user for them. Every returning turn passes here;
+    // the gate matches the report's.
     crate::session::personal_changes::refresh_after_turn(
         &agent.role,
         &agent.workspace,
@@ -3194,15 +2692,13 @@ pub(crate) async fn run_agent(
     )
     .await;
 
-    // A completed Ok result is kept regardless of cancel cause — the token may
-    // have fired just as work() finished; downstream finalizers are the
-    // authority on how a cancelled run's result is used.
+    // A completed Ok is kept regardless of cancel cause — the token may have fired
+    // just as work() finished.
     match result {
         Ok(response) => (agent, Some(response)),
         Err(e) => {
-            // Capture the real cause (full chain) so dispatchers can report it
-            // in failure logs and Manager notices instead of a generic
-            // placeholder.
+            // Capture the full chain, so dispatchers report the real cause instead of
+            // a generic placeholder.
             agent.failure = Some(format!("{e:#}"));
             agent.failure_class = failure_class_from_error(&e);
             let classification = failure_classification(&agent, Some(&e));
@@ -3214,9 +2710,8 @@ pub(crate) async fn run_agent(
             // The chrome release's hold (`holds_run_end`'s rule).
             run_end.ended(classification);
             let error_chain = crate::util::failure_detail(&format!("{e:#}"), "agent failure log");
-            // The cooperative ends (drain, shutdown, pause) and a deliberate
-            // cancellation (internal_cancel — user/GUI cancel or a re-dispatch)
-            // get the same treatment; this log's own classification decides that.
+            // Cooperative ends and a deliberate cancel get the same treatment; the
+            // classification above decides which log fires.
             if is_cooperative_stop(classification) {
                 tracing::debug!(
                     agent_id = %agent.agent_id,
@@ -3243,16 +2738,10 @@ pub(crate) async fn run_agent(
     }
 }
 
-/// Default dispatch: no ticket, empty user/channel, no inbox.
-///
-/// `resume` selects the slot-resume primitive (empty committed-tail
-/// continuation, summarization skipped); default `false` for fresh dispatches.
-///
-/// `parent_key` carries the DIRECT PARENT INVOCATION grouping key for the
-/// Running Agents view (ticket / analyze round / research run); `None` for
-/// workspace singletons (manager / maintainer / discovery / direct chat).
-/// `parent_label` is the human-readable label of that parent invocation
-/// (analyze question / research question) — purely presentational.
+/// Default dispatch: no ticket, empty user/channel, no inbox. `resume` selects the
+/// slot-resume primitive (empty committed-tail continuation, summarization skipped),
+/// `false` for fresh dispatches. `parent_key`/`parent_label` are the Running Agents
+/// grouping key and its presentational label; `None` for workspace singletons.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn run_default_agent(
     agent_id: &str,
@@ -3283,12 +2772,9 @@ pub(crate) async fn run_default_agent(
     .await
 }
 
-/// Extract the typed provider failure class from an error chain, when the
-/// chain carries a [`RetryExhausted`] (the terminal retry-loop error that
-/// preserves the granular [`crate::retry::FailureClass`]).
-///
-/// `None` means the error is not provider-classified (runtime errors, panics,
-/// plain I/O failures) — callers treat that as a genuine non-provider failure.
+/// The typed provider failure class from an error chain, when it carries a
+/// [`RetryExhausted`]. `None` means the error is not provider-classified (runtime
+/// errors, panics, plain I/O) — callers treat that as a genuine non-provider failure.
 pub(crate) fn failure_class_from_error(
     error: &anyhow::Error,
 ) -> Option<crate::retry::FailureClass> {
@@ -3298,9 +2784,7 @@ pub(crate) fn failure_class_from_error(
         .map(|exhausted| exhausted.final_class)
 }
 
-/// Classification labels that mean the run stopped cooperatively — drain,
-/// shutdown, a workspace pause-freeze, or a deliberate cancel — rather than
-/// failing technically.
+/// Labels meaning the run stopped cooperatively rather than failing technically.
 const COOPERATIVE_STOP_CLASSES: [&str; 4] = ["drain", "shutdown", "pause", "internal_cancel"];
 
 fn is_cooperative_stop(classification: &str) -> bool {
@@ -3309,33 +2793,25 @@ fn is_cooperative_stop(classification: &str) -> bool {
 
 /// Stable failure classification for the agent-failure log.
 ///
-/// Order matters: the global shutdown token fires on any stop request — SIGTERM/SIGINT, the
-/// dashboard's quit (macOS's own or the tray menu's), a close that could not hide, a Windows
-/// console or session-end request, a self-update — and when a graceful drain completes;
-/// the per-agent token on a deliberate stop —
-/// check the global token first so shutdown isn't mislabeled as an internal cancel. The global
-/// token also cancels every per-agent token via
-/// [`crate::agent::registry::AgentRegistry::shutdown_all`]. `error` is the raw
-/// error source when one is present (the `run_agent` `Err` arm); `None` only in
-/// tests, where the classifier falls through to the token checks.
-/// [`RetryExhausted`] (kept as an error source by
-/// [`llm_call`]/[`summarize`]) carries the granular
-/// [`crate::retry::FailureClass`]; everything else (I/O, tool errors, panics)
-/// falls back to `runtime`. The cooperative labels are listed once in
-/// [`COOPERATIVE_STOP_CLASSES`], consumed by both the `run_agent` exit log and
-/// [`Agent::failed_technically`] (through the snapshot captured on the agent).
+/// Order matters: the global shutdown token fires on any stop request (SIGTERM/SIGINT,
+/// the dashboard's quit, a console or session-end, a self-update) and on a completed
+/// drain, so it is checked first — shutdown must never be mislabeled an internal
+/// cancel. `error` is the raw source when present (`run_agent`'s `Err` arm), `None`
+/// only in tests. A [`RetryExhausted`] carries the granular
+/// [`crate::retry::FailureClass`]; everything else falls back to `runtime`. The
+/// cooperative labels live in [`COOPERATIVE_STOP_CLASSES`], consumed by both the exit
+/// log and [`Agent::failed_technically`].
 fn failure_classification(agent: &Agent, error: Option<&anyhow::Error>) -> &'static str {
     if crate::shutdown::is_draining() {
-        // The graceful drain cut the round short — not a failure. Checked
-        // before the token so drained agents are never mislabeled as
-        // cancelled/shutdown (no AGENT_FAILURE_EMOJI, no exit rollback).
+        // The drain cut the round short — not a failure. Checked before the token, so
+        // a drained agent is never mislabeled cancelled/shutdown (no failure emoji,
+        // no exit rollback).
         "drain"
     } else if crate::shutdown::shutdown_token().is_cancelled() {
         "shutdown"
     } else if agent.is_paused_frozen() {
-        // A strictly-frozen (paused-workspace) run — not a failure. The
-        // immutable bail-time snapshot (not the live pause_stop, which an
-        // unpause can clear) is authoritative.
+        // A strictly-frozen run — not a failure. The immutable bail-time snapshot is
+        // authoritative, not the live pause_stop an unpause can clear.
         "pause"
     } else if agent.is_cancelled() {
         "internal_cancel"
@@ -3435,8 +2911,7 @@ mod tests {
         }
     }
 
-    /// Construct an agent with an explicit workspace and id (for tools that
-    /// resolve paths against a real directory, e.g. the read tool).
+    /// Construct an agent with an explicit workspace and id, for path-resolving tools.
     fn make_agent_on(tools: Vec<Box<dyn Tool>>, agent_id: &str, ws: crate::Workspace) -> Agent {
         let mut agent = make_agent_with_role(tools, crate::Role::Engineer);
         agent.agent_id = agent_id.to_string();
@@ -3447,11 +2922,9 @@ mod tests {
     #[test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     fn failure_classification_recovers_retry_exhaustion() {
-        // failure_classification consults the process-global drain flag before
-        // everything else — serialize against the drain-flag writers.
-        // Mirror llm_call's error construction: the RetryExhausted must
-        // survive as a source (via .context, not string flattening) so the
-        // granular FailureClass is recoverable from the chain.
+        // Serialize against the drain-flag writers: failure_classification reads the
+        // process-global flag first. Mirror llm_call's error construction — via
+        // .context, not string flattening — so the granular FailureClass survives.
         let exhausted = crate::retry::RetryExhausted::with_last_raw(
             vec![],
             crate::retry::FailureClass::NonRetryable,
@@ -3475,9 +2948,8 @@ mod tests {
             "runtime"
         );
 
-        // A code-driven (internal) cancellation fires the generic token — it
-        // must classify as an internal cancel (there is no separate user stop
-        // anymore; all non-shutdown/non-pause cancellations are internal).
+        // An internal cancellation fires the generic token and must classify as an
+        // internal cancel — every non-shutdown/non-pause stop is one.
         let internally_cancelled = make_agent(vec![]);
         internally_cancelled.cancel_token.cancel();
         assert_eq!(
@@ -3490,12 +2962,9 @@ mod tests {
         );
     }
 
-    /// The graceful-drain cut is classified as "drain" (NOT cancelled/
-    /// shutdown/failure) — the consumer suppresses the failure emoji and the
-    /// dispatch tails skip the exit-time ticket rollback for drained agents.
-    /// Serialized against other tests: the drain flag is process-global, so a
-    /// concurrent test consulting is_draining() could be misclassified during
-    /// the assertion window.
+    /// The graceful-drain cut classifies as "drain", NOT cancelled/shutdown/failure: no
+    /// failure emoji, and the dispatch tails skip the exit-time rollback. Serialized —
+    /// the drain flag is process-global.
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn failure_classification_recognizes_drain() {
@@ -3509,17 +2978,15 @@ mod tests {
             "drain",
             "a drained agent must classify as drain, never failure",
         );
-        // A per-agent cancel during drain still classifies as drain — the
-        // drain is checked first so no failure emoji fires on exit.
+        // A per-agent cancel during drain still classifies as drain (checked first).
         agent.cancel_token.cancel();
         assert_eq!(failure_classification(&agent, None), "drain");
-        // Restore isolation — the drain flag is process-global; the token
-        // must never be fired from a test (it would cancel every parallel
-        // retry loop).
+        // Restore isolation: the drain flag is process-global, and the token must never
+        // be fired from a test — it would cancel every parallel retry loop.
         crate::shutdown::drain_clear();
     }
 
-    /// Shared helper: create an agent with a TestTool, execute_tool it, and assert scrubbing behavior.
+    /// Shared helper: an agent with a TestTool, executed and asserted for scrubbing.
     async fn assert_scrubbed(should_scrub: bool) {
         let tool: Box<dyn Tool> = Box::new(TestTool {
             output: SCRUBBABLE_LINE.into(),
@@ -3548,9 +3015,8 @@ mod tests {
         }
     }
 
-    /// The scrub decision belongs to the tool: one that opts out returns its
-    /// output verbatim, one that opts in has the secret-like line redacted
-    /// before the output reaches the transcript.
+    /// The scrub decision belongs to the tool: one that opts out returns its output
+    /// verbatim, one that opts in has the secret-like line redacted.
     #[tokio::test]
     async fn tool_output_scrubbing_follows_the_tool_setting() {
         for should_scrub in [false, true] {
@@ -3558,9 +3024,8 @@ mod tests {
         }
     }
 
-    /// A media-generation test tool that returns a configurable [`Tool::media_marker`].
-    ///
-    /// Used to test [`extract_media_from_outcomes`] without real image/video generation.
+    /// A media-generation test tool with a configurable [`Tool::media_marker`], for
+    /// [`extract_media_from_outcomes`] without real generation.
     struct MediaTestTool {
         name: &'static str,
         marker: &'static str,
@@ -3593,15 +3058,12 @@ mod tests {
         }
     }
 
-    // ── extract_media_from_outcomes tests ───────────────────────────────────
-
     #[test]
     #[expect(clippy::too_many_lines)]
     fn extract_media_outcomes_consolidated() {
         enum ToolDef {
-            /// [`Media`] carries a marker prefix; [`NonMedia`] uses a unit variant because
-            /// `extract_media_from_outcomes` only consults [`Tool::media_marker`], never
-            /// [`Tool::execute`] — the output value on [`TestTool`] has no behavioral effect.
+            /// [`NonMedia`] is a unit variant: only [`Tool::media_marker`] is consulted,
+            /// never [`Tool::execute`], so the output value has no behavioral effect.
             Media {
                 name: &'static str,
                 marker: &'static str,
@@ -3636,8 +3098,7 @@ mod tests {
                 }],
                 expected: vec![("[IMAGE:", "/tmp/img.png")],
             },
-            // Marker prefix with nothing parseable after it (e.g. at end of output)
-            // produces an empty path which the filter rejects.
+            // A bare marker prefix yields an empty path, which the filter rejects.
             TestCase {
                 name: "skips_malformed_marker",
                 msg: "malformed marker should be skipped",
@@ -3741,8 +3202,7 @@ mod tests {
                         Box::new(MediaTestTool { name, marker }) as Box<dyn Tool>
                     }
                     ToolDef::NonMedia => Box::new(TestTool {
-                        // Output value is irrelevant — extract_media_from_outcomes
-                        // only consults media_marker(), never execute().
+                        // The output value is irrelevant: only media_marker() is consulted.
                         output: String::new(),
                         scrub: false,
                     }) as Box<dyn Tool>,
@@ -3823,8 +3283,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_locals_propagate_to_parallel_tool_execution() {
-        /// Tool that reads CURRENT_TOOL_USER_NAME and CURRENT_TOOL_CHANNEL
-        /// from task-locals and returns them in its output.
+        /// Reads CURRENT_TOOL_USER_NAME and CURRENT_TOOL_CHANNEL from the task-locals.
         struct ReadTaskLocalsTool;
         #[async_trait]
         impl Tool for ReadTaskLocalsTool {
@@ -3854,8 +3313,8 @@ mod tests {
         agent.user_name = "alice".into();
         agent.channel = "gui".into();
 
-        // Call through execute_tool_group so task-locals are set once for
-        // the entire batch — this is the path used by the agent work loop.
+        // Through execute_tool_group: the task-locals are set once per batch, as in the
+        // agent work loop.
         let call = ToolCall {
             id: "call_1".into(),
             name: name.to_string(),
@@ -3884,11 +3343,8 @@ mod tests {
         );
     }
 
-    // ── drain_incoming_messages tests ─────────────────────────────────
-
-    /// `drain_incoming_messages` turns a queued job into a user message: a
-    /// ticket comment carries its author and ticket as a prefix, any other kind
-    /// passes its content through without prefix formatting.
+    /// A queued job becomes a user message: a ticket comment carries its author prefix,
+    /// any other kind passes its content through unformatted.
     #[tokio::test]
     async fn test_drain_incoming_messages_injects_the_job_as_a_user_message() {
         crate::util::test::init_management_test_stores().await;
@@ -3957,8 +3413,7 @@ mod tests {
         }
     }
 
-    /// drain_incoming_messages handles a closed receiver gracefully
-    /// (sets incoming_rx to None, no panic).
+    /// A closed receiver is handled: incoming_rx becomes None, no panic.
     #[tokio::test]
     async fn test_drain_incoming_messages_disconnected() {
         let (tx, rx) =
@@ -3967,10 +3422,8 @@ mod tests {
         agent.incoming_rx = Some(rx);
         agent.agent_id = "_test_drain_disconnected".into();
 
-        // Drop the sender so the channel is disconnected
         drop(tx);
 
-        // Should not panic or error
         agent.drain_incoming_messages().await;
         assert!(
             agent.incoming_rx.is_none(),
@@ -3978,12 +3431,9 @@ mod tests {
         );
     }
 
-    // ── inject_outstanding_comments tests ──────────────────────────
-
-    /// Build an agent (with the given role) whose ticket is attached and whose
-    /// session is seeded with one `sessions` row (when `seed_content` is
-    /// `Some`) and then initialized with an empty message — mirroring the
-    /// empty-message resume dispatch for a deterministic stage round.
+    /// An agent with the given role and ticket attached, its session seeded with one
+    /// `sessions` row (when `seed_content` is `Some`) and initialized with an empty
+    /// message — mirroring the empty-message resume dispatch.
     async fn make_inject_agent(
         agent_id: &str,
         role: crate::Role,
@@ -4173,8 +3623,6 @@ mod tests {
         );
     }
 
-    // ── Leader-stagger mechanics ───────────────────────────────────
-
     /// Single-member rounds are a no-op stagger: the sole member starts
     /// immediately with no first-call signal.
     #[tokio::test]
@@ -4269,8 +3717,7 @@ mod tests {
     }
 
     /// Fail-open: a leader that never fires its signal (stuck first call)
-    /// still releases the followers after the bounded wait — the round never
-    /// hangs.
+    /// still releases the followers after the bounded wait — the round never hangs.
     #[tokio::test]
     async fn spawn_staggered_round_leader_timeout_fail_open() {
         // 0 → immediate timeout (deliberate test seam, see env_duration_secs).
@@ -4373,7 +3820,6 @@ mod tests {
         let ws = crate::workspace::test_ws_named("/tmp/ws_sleep_stop", "sleep_stop");
         let agent_id = "sleep_stop_agent".to_string();
 
-        // ── Turn 1: the sleep call ends the run ──────────────────────
         let (agent, response) = run_agent(
             agent_id.clone(),
             crate::Role::Assistant,
@@ -4420,7 +3866,6 @@ mod tests {
             "the durable sleep-ended flag must be set"
         );
 
-        // ── Turn 2: re-engagement clears the flag and runs normally ──
         let (agent2, response2) = run_agent(
             agent_id.clone(),
             crate::Role::Assistant,
@@ -4657,12 +4102,9 @@ mod tests {
         assert!(agent.session.pending_tool_frame().is_none());
     }
 
-    // ── Reasoning-only stop recovery ─────────────────────────────────
-
-    /// The class predicate: raw empty content + no parsed tool calls,
-    /// regardless of finish reason. Tool-call turns (empty text by design)
-    /// and real answers are excluded. Degenerate members (fully-empty, no
-    /// reasoning) are consciously in-class.
+    /// The class predicate: raw empty content + no parsed tool calls, regardless of finish
+    /// reason. Tool-call turns and real answers are excluded; fully-empty responses are
+    /// consciously in class.
     #[test]
     fn reasoning_only_stop_classification() {
         let reasoning = || {
@@ -4719,10 +4161,9 @@ mod tests {
         assert!(!is_reasoning_only_stop(&resp));
     }
 
-    /// A reasoning-only stop resolves via the continuation: the final answer
-    /// is returned, the continuation request carries the appended tail
-    /// (assistant reasoning payload + the resume nudge), and the nudge never
-    /// appears in the original request.
+    /// A reasoning-only stop resolves via the continuation: the answer is returned, the
+    /// continuation request carries the appended tail (reasoning payload + nudge), and the
+    /// nudge never appears in the original request.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
     async fn llm_call_recovers_reasoning_only_stop_via_continuation() {
@@ -4756,8 +4197,7 @@ mod tests {
         );
     }
 
-    /// Consecutive reasoning-only responses accumulate: each failed attempt
-    /// appends its own (assistant reasoning + nudge) pair, so the request
+    /// Consecutive reasoning-only responses accumulate one pair each, so the request
     /// prefix stays byte-stable and only the tail grows.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
@@ -4779,8 +4219,7 @@ mod tests {
 
         let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
         assert_eq!(fingerprints.len(), 3);
-        // Strictly appended-only: one nudge after the first continuation, two
-        // after the second (the first pair is part of the byte-stable prefix).
+        // Appended-only: one nudge after the first continuation, two after the second.
         assert_eq!(
             fingerprints[1]
                 .matches("Resume your unfinished turn")
@@ -4798,10 +4237,8 @@ mod tests {
         assert!(fingerprints[2].contains("thinking 1"));
         assert!(fingerprints[2].contains("thinking 2"));
 
-        // Direct byte-prefix pin of the KV-cache property: attempt 3's message
-        // list begins with attempt 2's messages verbatim (append-only growth,
-        // nothing rewritten). The capture joins per-message Debug with NUL, so
-        // a plain prefix check holds.
+        // Direct byte-prefix pin of the KV-cache property: attempt 3's messages begin with
+        // attempt 2's verbatim (nothing rewritten).
         let messages = fake.request_messages.lock().unwrap().clone();
         assert_eq!(messages.len(), 3);
         assert!(
@@ -4810,10 +4247,9 @@ mod tests {
         );
     }
 
-    /// Continuation exhaustion fails the turn safely: a NoResponse
-    /// [`RetryExhausted`] with `last_raw: None`, no reasoning text in the
-    /// error, no provider-retry-exhaustion marker, no transcript trace, and
-    /// granular "no_response" classification.
+    /// Exhaustion fails the turn safely: a NoResponse [`RetryExhausted`] with
+    /// `last_raw: None`, no reasoning text, no retry marker, no transcript trace, and a
+    /// granular "no_response" class.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
     async fn llm_call_continuation_exhaustion_fails_safely_without_leaking() {
@@ -4872,9 +4308,8 @@ mod tests {
         assert_eq!(failure_classification(&agent, Some(&err)), "no_response");
     }
 
-    /// A transport error mid-recovery never duplicates the thinking tail: the
-    /// retried request is byte-identical, and exhaustion derives the final
-    /// class from the last recorded failure (Transport, not NoResponse).
+    /// A transport error mid-recovery never duplicates the tail: the retried request is
+    /// byte-identical, and the final class comes from the last failure (Transport).
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
     async fn llm_call_continuation_transport_error_does_not_duplicate_tail() {
@@ -4923,8 +4358,7 @@ mod tests {
         );
     }
 
-    /// A non-retryable provider error mid-recovery breaks immediately instead
-    /// of burning the remaining attempts, and keeps the granular class.
+    /// A non-retryable error breaks immediately and keeps the granular class.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
     async fn llm_call_continuation_non_retryable_error_breaks_immediately() {
@@ -4956,10 +4390,9 @@ mod tests {
         );
     }
 
-    /// A global abort (drain) between recovery attempts classifies the
-    /// terminal error as Shutdown, not NoResponse — the real cause must not be
-    /// masked, even when the break happens before the first attempt (no
-    /// request was ever sent, so there is also nothing to record in telemetry).
+    /// A global abort between attempts classifies the terminal error as Shutdown, not
+    /// NoResponse — the real cause must not be masked, even before the first attempt (no
+    /// request sent, nothing in telemetry).
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn recover_reasoning_only_stop_abort_classifies_as_shutdown() {
@@ -4975,8 +4408,7 @@ mod tests {
             ..crate::ChatResponse::default()
         };
 
-        // The drain flag is process-global — set it for the duration of the
-        // recovery, then restore (never fire the global token from a test).
+        // The drain flag is process-global: set, then restore (never fire the token here).
         crate::shutdown::drain_begin();
         let exhausted = agent
             .recover_reasoning_only_stop(vec![], first, "agent-continuation")
@@ -4991,10 +4423,8 @@ mod tests {
         );
     }
 
-    /// A reasoning-only turn whose continuation exhausts is a FAILED call: it
-    /// must never update the session token length (the `maybe_summarize`
-    /// "a FAILED call never updates the value" invariant), even though the
-    /// invisible in-class response carried real usage.
+    /// An exhausted reasoning-only turn is a FAILED call: it must never update the session
+    /// token length, even though the invisible in-class response carried real usage.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
     async fn llm_call_continuation_exhaustion_does_not_update_session_length() {
@@ -5028,9 +4458,8 @@ mod tests {
         );
     }
 
-    /// On continuation success, the session length is updated from the
-    /// RESOLVING response only — the in-class response the continuation
-    /// consumed is never recorded (no inflated value, no wasted double write).
+    /// On success the session length comes from the RESOLVING response only — the
+    /// in-class response is never recorded.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
     async fn llm_call_continuation_success_records_only_resolving_usage() {
@@ -5090,8 +4519,7 @@ mod tests {
         }
     }
 
-    /// Summarize recovers a reasoning-only stop via the same bounded
-    /// continuation; the continuation answer becomes the summary.
+    /// Summarize recovers a reasoning-only stop the same way; the answer is the summary.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
     async fn summarize_recovers_reasoning_only_stop_via_continuation() {
@@ -5118,9 +4546,8 @@ mod tests {
         assert!(fingerprints[1].contains("Resume your unfinished turn"));
     }
 
-    /// Summarize continuation exhaustion keeps the fail-open behavior: the
-    /// empty-response error fires (warn + full history in `maybe_summarize`),
-    /// and the thinking never leaks into the error.
+    /// Summarize exhaustion keeps failing open: the empty-response error fires and the
+    /// thinking never leaks into it.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
     async fn summarize_continuation_exhaustion_fails_open_without_leaking() {
@@ -5152,9 +4579,8 @@ mod tests {
         );
     }
 
-    /// A summarisation answer that is a tool call carries no summary text: it
-    /// is re-asked byte-identically (the request is re-sent verbatim, tool set
-    /// included) instead of being accepted as the summary.
+    /// A summarisation answer that is a tool call carries no text: it is re-asked
+    /// byte-identically (verbatim, tool set included) instead of being accepted.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
     async fn summarize_reasks_a_tool_call_answer_byte_identically() {
@@ -5176,9 +4602,8 @@ mod tests {
         );
     }
 
-    /// Tool-call answers exhaust the bounded re-ask budget at
-    /// [`SUMMARIZE_ATTEMPTS`] attempts without changing today's outcome: the
-    /// empty-response error fires (fail-open in `maybe_summarize`).
+    /// Tool-call answers exhaust the budget at [`SUMMARIZE_ATTEMPTS`] with the same
+    /// outcome: the empty-response error fires.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
     async fn summarize_tool_call_exhaustion_keeps_the_empty_response_error() {
@@ -5209,10 +4634,7 @@ mod tests {
         );
     }
 
-    // ── Real provider-token session length semantics ───────────────────
-
-    /// Both-or-nothing / keep-last / never-zero rule of
-    /// [`Agent::record_session_usage`].
+    /// Both-or-nothing / keep-last / never-zero rule of [`Agent::record_session_usage`].
     #[tokio::test]
     async fn record_session_usage_keeps_last_on_missing_or_partial_usage() {
         crate::util::test::init_test_stores().await;
@@ -5268,8 +4690,7 @@ mod tests {
         );
     }
 
-    /// Saturating sum: an overflowing usage pair cannot wrap into a small
-    /// bogus session length.
+    /// Saturating sum: an overflowing pair cannot wrap into a small bogus length.
     #[tokio::test]
     async fn record_session_usage_overflow_saturates() {
         crate::util::test::init_test_stores().await;
@@ -5286,10 +4707,8 @@ mod tests {
         assert_eq!(agent.session.token_length(), Some(u64::MAX));
     }
 
-    /// The LLM-step failure context carries BOTH the run-local tool round and
-    /// the session depth (history length + token length, the latter omitted
-    /// when unknown) — a resumed 100-round-deep session must not read as
-    /// freshly started.
+    /// The failure context carries BOTH the run-local tool round and the session depth
+    /// (history length + tokens, the latter omitted when unknown).
     #[tokio::test]
     async fn llm_step_failure_context_reports_run_round_and_session_depth() {
         crate::util::test::init_test_stores().await;
@@ -5314,11 +4733,9 @@ mod tests {
         );
     }
 
-    /// An unknown session length (`None` — no successful usage-bearing call
-    /// ever recorded) only disables the token trigger; with no images present
-    /// it is still a no-op: the check exits before the summarize LLM call. No
-    /// provider is installed on purpose — reaching [`Agent::summarize`] would
-    /// panic on the unset provider.
+    /// An unknown session length only disables the token trigger; with no images present
+    /// the check exits before the summarize call. No provider is installed on purpose —
+    /// reaching [`Agent::summarize`] would panic.
     #[tokio::test]
     async fn maybe_summarize_none_and_below_threshold_are_noops() {
         crate::util::test::init_test_stores().await;
@@ -5335,12 +4752,10 @@ mod tests {
         agent.maybe_summarize(agent.session.history().len()).await;
     }
 
-    /// The post-delivery compaction of the long-lived chat roles: only they may
-    /// compact with the reply already delivered, and never on a turn that settled
-    /// dangling tool results, was cancelled, or ran while the service was going
-    /// down. Both triggers of the unchanged limit fire there on the next turn's
-    /// own terms, and the recorded length goes with the compacted history in the
-    /// same transaction, so the next turn does not compact a second time.
+    /// Post-delivery compaction for the long-lived chat roles: only they may compact with
+    /// the reply delivered, and never on a turn that settled dangling results, was
+    /// cancelled, or ran while going down. Both triggers fire on the next turn's own
+    /// terms, and the recorded length goes with the compacted history in one transaction.
     #[tokio::test]
     #[serial_test::serial(active_models, provider, drain)]
     async fn post_delivery_summarization_compacts_chat_roles_and_clears_the_length() {
@@ -5370,8 +4785,7 @@ mod tests {
             over_threshold(role).maybe_summarize_after_delivery().await;
         }
 
-        // A settled turn is resume-like: the retention window would drop the
-        // just-settled result — the trail a resume is recovered from.
+        // A settled turn is resume-like: the window would drop the just-settled result.
         let mut settled = over_threshold(crate::Role::Assistant);
         settled.turn_state.settled_tool_results = true;
         settled.maybe_summarize_after_delivery().await;
@@ -5394,9 +4808,8 @@ mod tests {
             "no excluded role or turn may spend a summarization call"
         );
 
-        // Each chat role does compact, and the length recorded for its session —
-        // through the production writer, so the durable half is exercised too —
-        // goes with the history it described.
+        // Each chat role does compact, and its recorded length goes with the history,
+        // through the production writer.
         for (role, agent_id) in [
             (crate::Role::Assistant, "e2e_post_delivery_assistant"),
             (crate::Role::Manager, "e2e_post_delivery_manager"),
@@ -5442,9 +4855,9 @@ mod tests {
                 "the next turn must compact nothing again"
             );
 
-            // The second trigger fires on its own terms: the images are pushed
-            // after the compaction above, so this session is over the image
-            // count, and the delivery call carries no "already compacted" clause.
+            // The image trigger fires on its own terms: images pushed after the compaction
+            // leave the session over the count, and delivery carries no "already
+            // compacted" clause.
             agent.session.push_messages_unpersisted(
                 &(0..crate::session::SUMMARIZATION_IMAGE_COUNT)
                     .map(|i| ChatMessage::user(format!("[IMAGE:data:image/jpeg;base64,img{i}]")))
@@ -5464,8 +4877,6 @@ mod tests {
             );
         }
     }
-
-    // ── Provider input-image rejection strip ────────
 
     /// The observed provider rejection body (OpenRouter HTTP 400
     /// `data_inspection_failed`, image variant).
@@ -5492,10 +4903,9 @@ mod tests {
         )));
     }
 
-    /// A rejected input image must not fail the run: the image is durably
-    /// stripped from the most recent user message (replaced by the explanatory
-    /// phrase) and the run continues through its normal loop — the retried
-    /// call carries the corrected message and the agent answers.
+    /// A rejected image must not fail the run: it is durably stripped from the most recent
+    /// user message (replaced by the phrase) and the loop continues — the retried call
+    /// carries the corrected message and the agent answers.
     #[tokio::test]
     #[serial_test::serial(active_models, provider, drain)] // seeds the process-global catalog caches + process-global fake provider + shutdown drain flag
     async fn rejected_input_image_is_stripped_and_run_continues() {
@@ -5523,10 +4933,9 @@ mod tests {
             "The image was rejected by the provider's content check."
         );
 
-        // The corrected message reached the model: the second request's
-        // message list carries the phrase and no image marker in the user
-        // message (the Assistant system prompt mentions "[IMAGE:path]" markers
-        // literally — the assertion must target the user segment).
+        // The corrected message reached the model: the phrase and no marker in the user
+        // message (the system prompt mentions "[IMAGE:path]" literally, so assert on the
+        // user segment).
         let messages = fake.request_messages.lock().unwrap().clone();
         assert_eq!(messages.len(), 2, "rejected attempt + normal-loop retry");
         assert!(
@@ -5565,9 +4974,7 @@ mod tests {
             last_user.content.contains("describe this photo"),
             "user's accompanying text preserved"
         );
-        // The user's original text plus the phrase, and NO extra assistant/system
-        // message was injected for the rejection (single phrase inside the
-        // user's own message).
+        // The original text plus the phrase, with NO extra message injected.
         assert_eq!(
             history
                 .iter()
@@ -5578,9 +4985,8 @@ mod tests {
         );
     }
 
-    /// A text-content rejection with the same provider code ("Input data ..."
-    /// without "image") does not trigger the strip — the run takes the normal
-    /// failure path and the image stays in the session.
+    /// A text-content rejection with the same code does not trigger the strip: the run
+    /// takes the normal failure path and the image stays.
     #[tokio::test]
     #[serial_test::serial(active_models, provider, drain)] // seeds the process-global catalog caches + process-global fake provider + shutdown drain flag
     async fn text_content_rejection_follows_normal_failure_path() {
@@ -5616,10 +5022,8 @@ mod tests {
         );
     }
 
-    /// After a successful strip, a subsequent failure in the same run does NOT
-    /// re-strip: the most recent user message no longer contains image markers,
-    /// so the normal failure path applies (no repeated stripping, no infinite
-    /// retry loop).
+    /// After a successful strip, a later failure does NOT re-strip: the message carries no
+    /// marker, so the normal path applies (no infinite retry loop).
     #[tokio::test]
     #[serial_test::serial(active_models, provider, drain)] // seeds the process-global catalog caches + process-global fake provider + shutdown drain flag
     async fn subsequent_failure_after_strip_takes_normal_failure_path() {
@@ -5677,9 +5081,8 @@ mod tests {
         );
     }
 
-    /// Collect IMAGE marker data-URIs from user messages — the dedup key for the
-    /// read tool's synthetic image injection. Only IMAGE markers are collected;
-    /// AUDIO/VIDEO markers and plain text are ignored.
+    /// IMAGE marker data-URIs from user messages — the injection dedup key. AUDIO/VIDEO
+    /// markers and plain text are ignored.
     #[test]
     fn existing_image_marker_values_extracts_image_markers() {
         let history = vec![
@@ -5698,11 +5101,9 @@ mod tests {
         assert!(set.contains("data:image/jpeg;base64,aaa"));
     }
 
-    /// `session_image_marker_count` counts DISTINCT `data:image/`-prefixed
-    /// IMAGE markers in User-role messages. The gate is prefix-only (no full
-    /// raster decode): real PNG data-URIs count, duplicates collapse to one,
-    /// while file-path markers, non-IMAGE kinds, and assistant-role messages
-    /// do not count.
+    /// DISTINCT `data:image/`-prefixed IMAGE markers in User-role messages. The gate is
+    /// prefix-only: real PNG data-URIs count, duplicates collapse, file paths, non-IMAGE
+    /// kinds and assistant messages do not.
     #[test]
     fn session_image_marker_count_prefix_gate() {
         let png = crate::util::test::tiny_png_data_uri();
@@ -5721,9 +5122,8 @@ mod tests {
         );
     }
 
-    /// The trigger decision is asymmetric by design: strict `>` for the token
-    /// threshold, `>=` for the image count; the token trigger reports as the
-    /// reason when both fire (both still lead to one summarize).
+    /// The decision is asymmetric: strict `>` for tokens, `>=` for images; the token
+    /// trigger reports the reason when both fire.
     #[test]
     fn summarization_trigger_decides_reason() {
         use crate::session::{SUMMARIZATION_IMAGE_COUNT, SUMMARIZATION_THRESHOLD};
@@ -5752,9 +5152,8 @@ mod tests {
         );
     }
 
-    /// `commit_tool_results` injects the synthetic image user message AFTER the
-    /// round's tool-result block (preserving tool-message contiguity) and dedups
-    /// a repeat read of an already-attached image.
+    /// The synthetic image message lands AFTER the round's tool-result block and dedups a
+    /// repeat read of an attached image.
     #[tokio::test]
     #[expect(clippy::too_many_lines)]
     async fn commit_tool_results_injects_image_after_tool_results_with_dedup() {
@@ -5765,8 +5164,7 @@ mod tests {
         agent.session.push_messages_unpersisted(&[ChatMessage::user(
             "[IMAGE:data:image/jpeg;base64,prior]",
         )]);
-        // Mirror the emission-time durability: the assistant frame with the tool
-        // calls is persisted (in-memory here) before the results commit.
+        // Emission-time durability: the frame is persisted before the results commit.
         agent
             .session
             .push_assistant("assistant with tool_calls".to_string());
@@ -5827,9 +5225,8 @@ mod tests {
 
         let history = agent.session.history();
         let roles: Vec<crate::ChatRole> = history.iter().map(|m| m.role).collect();
-        // Order: [prior user, assistant(tool_calls), tool_result(call1),
-        // tool_result(call2), user(fresh)] — the fresh image is injected AFTER
-        // both tool results, and the 'prior' image is NOT re-injected.
+        // Order: prior user, assistant(tool_calls), both tool results, then user(fresh) —
+        // the 'prior' image is NOT re-injected.
         assert_eq!(
             roles,
             vec![
@@ -5870,18 +5267,15 @@ mod tests {
             fresh_msg.starts_with("<injected-tool-result-image>\n[IMAGE:data:image/jpeg;base64,"),
             "injected image carries the provenance tag: {fresh_msg:?}"
         );
-        // Dedup: the repeat read of the already-attached 'prior' image is not
-        // re-injected; the fresh image is injected exactly once.
+        // The repeat read of 'prior' is not re-injected; the fresh image exactly once.
         let fresh_count = history
             .iter()
             .filter(|m| m.role == crate::ChatRole::User && m.content.contains("base64,fresh"))
             .count();
         assert_eq!(fresh_count, 1, "a fresh image is injected exactly once");
-        // The persisted tool-result text is built from the payload metadata (no
-        // brittle string rewrite): the deduped repeat read returns the
-        // 'already attached' reference and the fresh read returns the 'attached'
-        // wording. Tool-result content is a JSON envelope (`{"tool_call_id",
-        // "content"}`), so parse out the `content` field.
+        // The text comes from the payload metadata: the deduped read returns the
+        // 'already attached' reference, the fresh one the 'attached' wording. Content is a
+        // JSON envelope, so parse out the `content` field.
         let tool_results: Vec<String> = history
             .iter()
             .filter(|m| m.role == crate::ChatRole::Tool)
@@ -5903,9 +5297,8 @@ mod tests {
         );
     }
 
-    /// Two identical image reads within the SAME round (same data-URI) are
-    /// deduped by `seen_data_uris`: only the first is injected; the second
-    /// returns the 'already-attached' reference.
+    /// Two identical reads within one round are deduped by `seen_data_uris`: only the
+    /// first is injected.
     #[tokio::test]
     async fn commit_tool_results_dedups_identical_reads_in_same_round() {
         crate::util::test::init_test_stores().await;
@@ -5981,8 +5374,7 @@ mod tests {
             "identical reads in one round inject exactly once, got: {image_users:?}"
         );
 
-        // The first tool result claims a fresh attachment; the second returns a
-        // reference (already attached).
+        // The first claims a fresh attachment; the second an already-attached reference.
         let tool_results: Vec<String> = history
             .iter()
             .filter(|m| m.role == crate::ChatRole::Tool)
@@ -6006,9 +5398,8 @@ mod tests {
         );
     }
 
-    /// Every fresh image of one round lands in a SINGLE synthetic user message,
-    /// so a rejected page from any call of the round is clearable —
-    /// [`crate::util::injected_image_user_message`].
+    /// Every fresh image of one round lands in a SINGLE synthetic user message, so a
+    /// rejected page from any call is clearable.
     #[tokio::test]
     async fn commit_tool_results_injects_one_image_message_per_round() {
         crate::util::test::init_test_stores().await;
@@ -6084,17 +5475,14 @@ mod tests {
         }
     }
 
-    /// The content side of the image invariant: a result whose flag says its text
-    /// is content — a converted document's extracted text — is neither read as a
-    /// claim nor replaced by an annotation. An `[IMAGE:path]` marker inside it
-    /// stays literal text and injects nothing, while a real payload SUPPLEMENTS
-    /// the text: the annotation is appended, so the extracted text and the
-    /// converter's notes survive into the persisted round.
+    /// The content side of the image invariant: a result whose text is content — a
+    /// document's extracted text — is neither read as a claim nor replaced by an
+    /// annotation. A marker inside it stays literal and injects nothing, while a real
+    /// payload SUPPLEMENTS the text: the annotation is appended.
     #[tokio::test]
     async fn commit_tool_results_handles_content_text() {
         crate::util::test::init_test_stores().await;
 
-        // ── A marker inside content text stays literal ──
         // A real on-disk raster, so derivation would succeed if it were allowed.
         let dir = tempfile::TempDir::new().expect("tempdir");
         let png_path = dir.path().join("page.png");
@@ -6146,7 +5534,6 @@ mod tests {
             "nothing is derived from a marker in content text: {history:?}"
         );
 
-        // ── A payload alongside content text supplements it ──
         let mut agent = make_agent(vec![]);
         let tool_calls = vec![ToolCall {
             id: "call1".into(),
@@ -6213,9 +5600,8 @@ mod tests {
         std::fs::write(&png_path, crate::util::test::noisy_png(4, 4)).expect("write png");
         let abs = std::fs::canonicalize(&png_path).expect("canonicalize");
 
-        // A media tool that supplies no payload of its own: the derived-image path
-        // exists for such output — image_gen, chrome and computer all ship their own
-        // payloads and never reach it.
+        // A media tool with no payload of its own: the derived-image path exists for such
+        // output — image_gen, chrome and computer ship their own and never reach it.
         let tool = Box::new(MediaTestTool {
             name: "media_probe",
             marker: "[IMAGE:",
@@ -6228,9 +5614,7 @@ mod tests {
             name: "media_probe".into(),
             arguments: serde_json::json!({}),
         }];
-        // `MediaTestTool` does not override the hook, so this round takes the
-        // trait default: a media tool's marker line is a claim about its image,
-        // not content.
+        // The trait default: a media tool's marker line is a claim about its image.
         let outcomes = vec![ToolExecutionOutcome {
             output: marker.clone(),
             success: true,
@@ -6240,8 +5624,7 @@ mod tests {
             ends_turn: false,
         }];
 
-        // User delivery via the marker in the raw output is preserved — read
-        // before the commit, which consumes the outcomes.
+        // Delivery via the raw-output marker is preserved; read before the commit.
         let media = extract_media_from_outcomes(&agent.tools, &tool_calls, &outcomes);
         assert_eq!(
             media,
@@ -6298,11 +5681,8 @@ mod tests {
         );
     }
 
-    // ── Universal resume-completion ──────────────────────────────────────
-
-    /// (c) `complete_pending_tool_calls` re-executes a non-durable dangling call
-    /// and settles the real output as its tool result with the ORIGINAL call id,
-    /// contiguously after the frame.
+    /// (c) A non-durable dangling call is re-executed and settles with the ORIGINAL call
+    /// id, contiguously after the frame.
     #[tokio::test]
     async fn complete_pending_tool_calls_reexecutes_non_durable_call() {
         crate::util::test::init_test_stores().await;
@@ -6373,8 +5753,7 @@ mod tests {
     /// caller-owned job `launched` (the result is absent); after `drain_clear`,
     /// the completion resumes the durable job — a reconstructable Done slot is
     /// replayed (zero LLM calls), the consolidated tool result settles
-    /// contiguously after the frame, and only then is the resumed job
-    /// terminalized.
+    /// contiguously after the frame, and only then is the resumed job terminalized.
     #[tokio::test]
     #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn drain_mid_sync_analyze_leaves_call_dangling_then_completion_resumes() {
@@ -6785,11 +6164,9 @@ mod tests {
         );
     }
 
-    /// (g) A pool entry OLDER than the frame belongs to an earlier frame — the
-    /// row an infra-failed dispatch left launched — and this frame's call must
-    /// never bind it: doing so would settle that old round's report as this
-    /// call's own result. It is abandoned with the settle instead, and the call
-    /// runs fresh.
+    /// (g) A pool entry OLDER than the frame belongs to an earlier frame, and this
+    /// frame's call must never bind it — that would settle the old round's report as its
+    /// own result. It is abandoned with the settle and the call runs fresh.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
     async fn complete_pending_tool_calls_never_binds_a_job_older_than_its_frame() {
@@ -6823,8 +6200,7 @@ mod tests {
             .await
             .unwrap();
 
-        // The leftover of an EARLIER frame: a launched worker round with a stored
-        // outcome, backdated behind the frame row above.
+        // The leftover of an EARLIER frame: a launched round with a stored outcome.
         crate::jobs::spawn_job(
             conn,
             "stale_frame_job",
@@ -6895,11 +6271,8 @@ mod tests {
         );
     }
 
-    // ── Run-end cleanup guard ────────────────────────────────────────
-
-    /// Seed a spill file owned by a fresh test-only agent id, plus a run
-    /// session tracker holding one name. The temp dir is returned so it
-    /// outlives the guard: only the guard may reclaim the spill file.
+    /// Seed a spill file for a fresh test-only agent id plus a run session tracker
+    /// holding one name; the temp dir outlives the guard that reclaims it.
     async fn seed_run_owned_state(
         agent_id: &str,
     ) -> (
@@ -6915,16 +6288,14 @@ mod tests {
                 crate::tools::shell::record_spill_owner(spill.clone());
             })
             .await;
-        // The run's own tracker (`for_run`, not `default`), holding a name the way a
-        // `ChromeTool` dispatch would.
+        // The run's own tracker (`for_run`), holding a name as a `ChromeTool` would.
         let sessions = crate::tools::chrome::ChromeRunSessions::for_run(agent_id);
         sessions.track(&format!("{}default", sessions.namespace()));
         (dir, spill, sessions)
     }
 
-    /// A run whose future is dropped — a round/research deadline abort or a
-    /// panic, the paths that never reach a trailing statement — still reclaims
-    /// its spill files and hands its chrome sessions to the release queue.
+    /// A run whose future is dropped — a deadline abort or a panic — still reclaims its
+    /// spill files and hands its chrome sessions to the release queue.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn run_end_guard_cleans_up_a_dropped_run() {
@@ -6948,9 +6319,8 @@ mod tests {
         chrome_release::clear_pending_releases();
     }
 
-    /// The run-end decision wired to the guard: every end hands its sessions over
-    /// (the dropped-run test covers that half), and the ends that
-    /// `chrome_release::holds_run_end` names hold them back.
+    /// Every end hands its sessions over, and the ends `chrome_release::holds_run_end`
+    /// names hold them back.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn an_ended_run_hands_its_sessions_over_and_holds_only_a_resumed_run() {
@@ -6995,8 +6365,7 @@ mod tests {
         chrome_release::clear_pending_releases();
     }
 
-    /// Tools for the urgent-interrupt test: both read-only, so they run in one
-    /// parallel group; one returns at once, the other (`hang`) never returns and
+    /// Both read-only, so they run in one parallel group; `hang` never returns and
     /// announces that it started.
     struct UrgentTestTool {
         tool_name: &'static str,
@@ -7037,10 +6406,9 @@ mod tests {
         }
     }
 
-    /// A turn cut by an urgent message: the call that had already returned keeps
-    /// its real result, the call still in flight is settled where it stands with
-    /// the one fixed interrupted result, nothing is replayed, and the notice is
-    /// the turn's whole reply — not a failure, not a cancellation.
+    /// A turn cut by an urgent message: the returned call keeps its result, the in-flight
+    /// one settles with the fixed interrupted result, nothing is replayed, and the notice
+    /// is the whole reply — not a failure, not a cancellation.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
     async fn urgent_interrupt_settles_the_cut_round_with_the_notice() {

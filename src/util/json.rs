@@ -187,8 +187,7 @@ pub(crate) fn get_object(val: &Value, key: &str) -> anyhow::Result<serde_json::M
 
 /// Extract an optional bool field.
 ///
-/// Absent or null yields [`Option::None`]; a present non-boolean is a usage
-/// error.
+/// Absent or null yields [`Option::None`]; a present non-boolean is a usage error.
 pub(crate) fn get_opt_bool(val: &Value, key: &str) -> anyhow::Result<Option<bool>> {
     match val.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -197,7 +196,7 @@ pub(crate) fn get_opt_bool(val: &Value, key: &str) -> anyhow::Result<Option<bool
     }
 }
 
-// ── JSON parsing from LLM output ─────────────────────────────────────────
+// JSON parsing from LLM output
 
 /// Attempt to repair malformed JSON using [`jsonrepair_rs::jsonrepair`] then re-parse.
 ///
@@ -263,7 +262,7 @@ mod tests {
         issues: Vec<String>,
     }
 
-    // ── parse_fenced_json tests ──────────────────────────────────────────
+    // parse_fenced_json tests
 
     #[test]
     fn parse_fenced_json_valid_inputs() {

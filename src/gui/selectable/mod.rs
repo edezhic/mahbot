@@ -1,18 +1,15 @@
-//! Read-only selectable rich text — the widget every GUI reading surface
-//! renders through.
+//! Read-only selectable rich text — the widget every GUI reading surface renders through.
 //!
-//! A highlight rectangle is a visual run's own line box (`line_top` /
-//! `line_height`) with its x-range from cosmic-text's `LayoutRun::highlight`,
-//! so the paint follows the real per-visual-line layout instead of a uniform
-//! line pitch, and shortcuts match the physical key, so a non-Latin layout
-//! copies and selects all the same. Selection ends are byte offsets, never
-//! grapheme counts, so what is painted and what is copied are the same range.
+//! A highlight rectangle is a visual run's own line box (`line_top` / `line_height`) with its
+//! x-range from cosmic-text's `LayoutRun::highlight`, so the paint follows the real per-visual-line
+//! layout rather than a uniform pitch, and shortcuts match the physical key, so a non-Latin layout
+//! copies and selects all the same. Selection ends are byte offsets, never grapheme counts, so what
+//! is painted and what is copied are the same range.
 //!
-//! A press and drag selects by character, a double click a word and a triple
-//! click a line. The keyboard follows an editor's caret map: Shift with an
-//! arrow, Home or End extends the selection (Command to the line or document
-//! edge, the jump modifier a word or a line), Escape clears it, and Cmd+C /
-//! Cmd+A copy and select-all, whichever layout produced the key.
+//! A press and drag selects by character, a double click a word and a triple click a line. The
+//! keyboard follows an editor's caret map: Shift with an arrow, Home or End extends the selection
+//! (Command to the line or document edge, the jump modifier a word or a line), Escape clears it,
+//! and Cmd+C / Cmd+A copy and select-all, whichever layout produced the key.
 
 pub(crate) mod markdown;
 
@@ -36,10 +33,8 @@ use super::theme;
 use super::widgets::{CLICK_DRAG_MAX_DISTANCE, DOUBLE_CLICK_WINDOW};
 use crate::util::is_word_char;
 
-// ── Style ────────────────────────────────────────────────────────
-
-/// The colours of a [`Selectable`]: the text colour (inherited from the
-/// renderer when `None`) and the selection highlight.
+/// The colours of a [`Selectable`]: the text colour (inherited from the renderer when `None`) and
+/// the selection highlight.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Style {
     pub color: Option<Color>,
@@ -55,10 +50,6 @@ impl Default for Style {
     }
 }
 
-// ── Selection model ──────────────────────────────────────────────
-
-/// The direction a selection was last extended in; the opposite end is the
-/// anchor that stays put.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum Direction {
     #[default]
@@ -66,7 +57,6 @@ enum Direction {
     Left,
 }
 
-/// One end of a selection: a logical line and a **byte** offset into it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct SelectionEnd {
     line: usize,
@@ -92,7 +82,6 @@ impl Selection {
         self.start == self.end
     }
 
-    /// The end the next extension moves.
     fn active_end(&self) -> SelectionEnd {
         match self.direction {
             Direction::Right => self.end,
@@ -100,7 +89,6 @@ impl Selection {
         }
     }
 
-    /// The end that stays put while the other moves.
     fn anchor(&self) -> SelectionEnd {
         match self.direction {
             Direction::Right => self.start,
@@ -113,8 +101,6 @@ impl Selection {
         self.end = start.max(end);
     }
 
-    /// Move the active end to `new_end`, flipping the direction when it passes
-    /// the anchor.
     fn change_selection(&mut self, new_end: SelectionEnd) {
         let (start, end) = match self.direction {
             Direction::Right => {
@@ -146,7 +132,6 @@ impl Selection {
         );
     }
 
-    /// Select the whole logical `line`, endings excluded.
     fn select_line(&mut self, line: usize, paragraph: &Paragraph) {
         let Some(source) = paragraph.buffer().lines.get(line) else {
             return;
@@ -158,7 +143,6 @@ impl Selection {
         );
     }
 
-    /// Select the word around `index` on `line`.
     fn select_word(&mut self, line: usize, index: usize, paragraph: &Paragraph) {
         let Some(source) = paragraph.buffer().lines.get(line) else {
             return;
@@ -168,10 +152,9 @@ impl Selection {
         self.select_range(SelectionEnd::new(line, start), SelectionEnd::new(line, end));
     }
 
-    /// The selected text: per-line byte slices, line endings between lines. A
-    /// selection end that cuts a character of several code points in half is
-    /// moved out to the whole character, exactly as [`State::selection_quads`]
-    /// paints it — the copy and the highlight read one span.
+    /// The selected text: per-line byte slices with line endings between. An end that cuts a
+    /// character of several code points in half is moved out to the whole character, exactly as
+    /// [`State::selection_quads`] paints it — copy and highlight read one span.
     fn text(&self, paragraph: &Paragraph) -> String {
         let lines = &paragraph.buffer().lines;
         let mut value = String::new();
@@ -206,15 +189,13 @@ impl Selection {
     }
 }
 
-/// [`str::floor_char_boundary`] with the index clamped into the text: a stored
-/// selection end can run past the line it was measured on.
 fn clamp_char_boundary(text: &str, index: usize) -> usize {
     text.floor_char_boundary(index.min(text.len()))
 }
 
-/// The character of several code points — an emoji, a combining mark — that
-/// `index` falls inside of, as its byte span. A selection end is moved out to
-/// that span by both the paint and the copy, so neither can cut one in half.
+/// The character of several code points — an emoji, a combining mark — that `index` falls inside,
+/// as its byte span. Both the paint and the copy move a selection end out to that span, so neither
+/// cuts one.
 fn character_span(run: &LayoutRun<'_>, index: usize) -> Option<(usize, usize)> {
     let index = clamp_char_boundary(run.text, index);
     run.glyphs
@@ -223,7 +204,6 @@ fn character_span(run: &LayoutRun<'_>, index: usize) -> Option<(usize, usize)> {
         .map(|glyph| (glyph.start, glyph.end))
 }
 
-/// [`character_span`] for a whole logical line, whatever run `index` landed in.
 fn split_character(paragraph: &Paragraph, line: usize, index: usize) -> Option<(usize, usize)> {
     paragraph
         .buffer()
@@ -232,8 +212,6 @@ fn split_character(paragraph: &Paragraph, line: usize, index: usize) -> Option<(
         .find_map(|run| character_span(&run, index))
 }
 
-/// Which run a double click grabs: word characters, whitespace, or the
-/// punctuation in between.
 fn char_class(c: char) -> u8 {
     if is_word_char(c) {
         0
@@ -244,9 +222,8 @@ fn char_class(c: char) -> u8 {
     }
 }
 
-/// The byte range of the run at `index`: the class of the character there, or of
-/// the one before it when the caret sits just past a run — so a press at the end
-/// of a word still selects that word.
+/// The byte range of the run at `index`: the class of the character there, or of the one before it
+/// when the caret sits just past a run, so a press at the end of a word still selects that word.
 fn word_bounds(text: &str, index: usize) -> (usize, usize) {
     let index = clamp_char_boundary(text, index);
     let seed = text[index..]
@@ -278,22 +255,16 @@ fn word_bounds(text: &str, index: usize) -> (usize, usize) {
     (start, end)
 }
 
-/// The selectable the user last pressed in. iced dispatches a key press to
-/// every widget in the tree, so without this one Cmd+A would select every block
-/// on the page and the following Cmd+C would copy whichever block came last.
+/// The selectable the user last pressed in. iced dispatches a key press to every widget in the
+/// tree, so without this one Cmd+A would select every block on the page and the following Cmd+C
+/// would copy whichever came last.
 static ACTIVE: AtomicU64 = AtomicU64::new(0);
 
-/// Source of the per-widget identity [`ACTIVE`] is compared against.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Hand the text-selection shortcuts back: called when a focus-id editor takes
-/// the keyboard (a press inside it, or the page focusing it), since that field
-/// now owns copy, paste and select-all.
 pub(crate) fn deactivate() {
     ACTIVE.store(0, Ordering::Relaxed);
 }
-
-// ── Click tracking ───────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClickKind {
@@ -303,7 +274,6 @@ enum ClickKind {
 }
 
 impl ClickKind {
-    /// A fourth consecutive press keeps acting like a triple click.
     const fn next(self) -> Self {
         match self {
             Self::Single => Self::Double,
@@ -320,7 +290,6 @@ struct Click {
 }
 
 impl Click {
-    /// Classify a press, given the previous one.
     fn new(previous: Option<Self>, position: Point, time: Instant) -> Self {
         let kind = match previous {
             Some(previous) if previous.is_consecutive(position, time) => previous.kind.next(),
@@ -339,7 +308,6 @@ impl Click {
     }
 }
 
-/// What a drag extends by, set by the click that started it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Dragging {
     Character,
@@ -347,16 +315,14 @@ enum Dragging {
     Line,
 }
 
-// ── Shortcuts ────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shortcut {
     Copy,
     SelectAll,
 }
 
-/// The shortcut a key press stands for, matched on the **latin** character so a
-/// Cyrillic (or any other) layout still copies.
+/// The shortcut a key press stands for, matched on the **latin** character so a Cyrillic (or any
+/// other) layout still copies.
 fn shortcut(
     key: &keyboard::Key,
     physical_key: key::Physical,
@@ -372,9 +338,6 @@ fn shortcut(
     }
 }
 
-// ── Widget ───────────────────────────────────────────────────────
-
-/// A read-only, selectable run of rich-text spans.
 pub(crate) struct Selectable<'a, Link, Message, Theme = iced::Theme, Renderer = iced::Renderer>
 where
     Link: Clone + 'static,
@@ -433,7 +396,6 @@ where
         self
     }
 
-    /// Wrap at word or glyph level; word wrapping is the default.
     pub(crate) fn wrapping(mut self, wrapping: Wrapping) -> Self {
         self.wrapping = wrapping;
         self
@@ -463,10 +425,7 @@ where
     }
 }
 
-// ── Widget state ─────────────────────────────────────────────────
-
 struct State<Link> {
-    /// This widget's identity in [`ACTIVE`].
     id: u64,
     /// The spans the paragraph was laid out from; `Paragraph::compare` cannot
     /// see content changes, so this decides when to rebuild it.
@@ -476,15 +435,11 @@ struct State<Link> {
     hovered_link: Option<usize>,
     selection: Selection,
     dragging: Option<Dragging>,
-    /// The byte offset a vertical keyboard move began at, kept while it keeps
-    /// passing shorter lines.
     goal: Option<usize>,
     last_click: Option<Click>,
     modifiers: keyboard::Modifiers,
 }
 
-/// The pointer in paragraph space: clamped into the widget bounds, whose
-/// top-left corner is where the paragraph starts.
 fn pointer(position: Point, bounds: Rectangle) -> Point {
     Point::new(
         position.x.clamp(bounds.x, bounds.x + bounds.width) - bounds.x,
@@ -493,7 +448,6 @@ fn pointer(position: Point, bounds: Rectangle) -> Point {
 }
 
 impl<Link> State<Link> {
-    /// The caret position nearest `position`.
     fn hit(&self, position: Point, bounds: Rectangle) -> Option<SelectionEnd> {
         let point = pointer(position, bounds);
         let cursor = self.paragraph.buffer().hit(point.x, point.y)?;
@@ -501,8 +455,6 @@ impl<Link> State<Link> {
         Some(SelectionEnd::new(cursor.line, cursor.index))
     }
 
-    /// One rectangle per selected visual line, from the real layout: wrapped
-    /// lines, per-line heights and any scroll offset come out exactly.
     fn selection_quads(&self) -> Vec<Rectangle> {
         let Selection { start, end, .. } = self.selection;
 
@@ -542,8 +494,6 @@ impl<Link> State<Link> {
     }
 }
 
-/// One character left of `end`, crossing to the previous line's end at the top
-/// of a line.
 fn char_left(end: SelectionEnd, lines: &[BufferLine]) -> SelectionEnd {
     if end.index > 0 {
         let text = lines.get(end.line).map_or("", BufferLine::text);
@@ -555,8 +505,6 @@ fn char_left(end: SelectionEnd, lines: &[BufferLine]) -> SelectionEnd {
     }
 }
 
-/// One character right of `end`, crossing to the next line's start at the end
-/// of a line.
 fn char_right(end: SelectionEnd, lines: &[BufferLine]) -> SelectionEnd {
     let text = lines.get(end.line).map_or("", BufferLine::text);
     if let Some(next) = text.get(end.index..).and_then(|rest| rest.chars().next()) {
@@ -568,8 +516,6 @@ fn char_right(end: SelectionEnd, lines: &[BufferLine]) -> SelectionEnd {
     }
 }
 
-/// The start of the word before `end` (or of `end`'s own word), crossing to the
-/// previous line when the caret stands at the top of one.
 fn word_left(end: SelectionEnd, lines: &[BufferLine]) -> SelectionEnd {
     let line = if end.index == 0 && end.line > 0 {
         end.line - 1
@@ -599,8 +545,6 @@ fn word_left(end: SelectionEnd, lines: &[BufferLine]) -> SelectionEnd {
     SelectionEnd::new(line, index)
 }
 
-/// The end of the word after `end` (or of `end`'s own word), crossing to the
-/// next line when the caret stands at the end of one.
 fn word_right(end: SelectionEnd, lines: &[BufferLine]) -> SelectionEnd {
     let line = if end.index >= line_len(lines, end.line) && end.line + 1 < lines.len() {
         end.line + 1
@@ -630,13 +574,10 @@ fn word_right(end: SelectionEnd, lines: &[BufferLine]) -> SelectionEnd {
     SelectionEnd::new(line, index)
 }
 
-/// The byte length of logical `line`.
 fn line_len(lines: &[BufferLine], line: usize) -> usize {
     lines.get(line).map_or(0, |line| line.text().len())
 }
 
-/// The word around `end` cut at the edge a word-wise drag moves toward: its
-/// stop when the drag went forward, its start when it went back.
 fn word_edge(end: SelectionEnd, anchor: SelectionEnd, paragraph: &Paragraph) -> SelectionEnd {
     let text = paragraph
         .buffer()
@@ -691,10 +632,8 @@ fn extended_to(
     );
 
     Some(match (name, modifiers.macos_command(), modifiers.jump()) {
-        // The document edge: Command on Up/Down, the jump modifier on Home/End.
         (key::Named::ArrowUp, true, _) | (key::Named::Home, _, true) => SelectionEnd::default(),
         (key::Named::ArrowDown, true, _) | (key::Named::End, _, true) => document_end,
-        // The line edge: Command on Left/Right, the jump modifier on Up/Down.
         (key::Named::ArrowLeft, true, _)
         | (key::Named::Home, _, false)
         | (key::Named::ArrowUp, false, true) => line_start,
@@ -709,8 +648,6 @@ fn extended_to(
         _ => return None,
     })
 }
-
-// ── Widget implementation ────────────────────────────────────────
 
 impl<Link, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
     for Selectable<'_, Link, Message, Theme, Renderer>

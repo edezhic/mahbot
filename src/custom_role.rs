@@ -1,9 +1,8 @@
-//! Admin-defined custom roles: the record (name, authorial prompt, tool subset,
-//! default branching) plus its validation. The record carries no
-//! owner column because there is exactly one owner — the admin — and two
-//! surfaces reach these functions: the admin's configuration tool (a role the
-//! admin granted `mahbot_config` runs at his strength and can call them) and
-//! the local Settings page. The tool set is the boundary, by design.
+//! Admin-defined custom roles: the record (name, authorial prompt, tool subset, default
+//! branching) plus its validation. There is exactly one owner — the admin — so no owner column;
+//! two surfaces reach these functions: the admin's configuration tool (a role granted
+//! `mahbot_config` runs at his strength) and the local Settings page. The tool set is the
+//! boundary, by design.
 
 use anyhow::Result;
 
@@ -13,8 +12,6 @@ crate::define_store! {
     pub(crate) static CUSTOM_ROLES: CustomRoleStore,
     expect = "CUSTOM_ROLES not initialized — call init_all_stores() first",
 }
-
-// ── Column index constants ────────────────────────────────────────────────
 
 crate::columns! {
     CUSTOM_ROLE_COLUMNS [CR] {
@@ -31,9 +28,8 @@ pub(crate) const MAX_ROLE_NAME_CHARS: usize = 32;
 /// Upper bound on a custom role branch identifier, in characters.
 pub(crate) const MAX_ROLE_IDENTIFIER_CHARS: usize = 32;
 
-/// How a custom role branches when a launch names no branch: keep one continuable
-/// conversation ([`Self::Continuous`]) or run once and report back
-/// ([`Self::OneOff`]).
+/// How a custom role branches when a launch names no branch: keep one continuable conversation
+/// ([`Self::Continuous`]) or run once and report back ([`Self::OneOff`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CustomRoleBehavior {
     Continuous,
@@ -60,8 +56,7 @@ impl CustomRoleBehavior {
     }
 }
 
-/// The label the settings picker shows — never the stored value
-/// ([`CustomRoleBehavior::as_str`] is what the column holds).
+/// The label the settings picker shows — never the stored value.
 impl std::fmt::Display for CustomRoleBehavior {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -96,9 +91,8 @@ fn encode_tools(tools: &[String]) -> String {
     serde_json::to_string(tools).expect("a tool name list is always serializable")
 }
 
-/// Decode the `tools` column. A value that does not decode reads as the empty
-/// subset rather than failing the whole listing — only this module writes the
-/// column, so an undecodable value is not a state the product produces.
+/// Decode the `tools` column. A value that does not decode reads as the empty subset rather
+/// than failing the listing — only this module writes the column.
 fn decode_tools(raw: &str) -> Vec<String> {
     serde_json::from_str(raw).unwrap_or_default()
 }
@@ -117,8 +111,7 @@ pub(crate) async fn get(name: &str) -> Result<Option<CustomRole>> {
     rows.first().map(custom_role_from_row).transpose()
 }
 
-/// Create a custom role. The name must be free (an existing role is never
-/// silently overwritten) and every field is validated first.
+/// Create a custom role. The name must be free (an existing role is never replaced).
 pub(crate) async fn create(
     name: &str,
     prompt: &str,
@@ -152,8 +145,7 @@ pub(crate) async fn create(
     Ok(())
 }
 
-/// Update the provided fields of an existing custom role; the omitted ones keep
-/// their stored value. The record is read, patched and written back whole.
+/// Update the provided fields of an existing custom role; the omitted ones keep their value.
 pub(crate) async fn update(
     name: &str,
     prompt: Option<&str>,
@@ -181,15 +173,13 @@ pub(crate) async fn update(
     Ok(())
 }
 
-/// Delete a custom role: confirm it exists, drop its record, remove the automations
-/// addressed to it, stop every branch of the role (so a running one is cancelled
-/// and never resumed), then tell the owner through his Assistant.
+/// Delete a custom role: confirm it exists, drop its record, remove the automations addressed
+/// to it, stop every branch of the role (so a running one is cancelled and never resumed), then
+/// tell the owner through his Assistant.
 ///
-/// The record goes FIRST: everything after it is best-effort, so a failure
-/// leaves the role fully deleted and reported rather than half-removed — and a
-/// record whose automation removal failed still gets them removed when they fire
-/// ([`crate::automations::fire_custom_role_automation`] drops an automation whose target role
-/// is gone).
+/// The record goes FIRST: everything after it is best-effort, so a failure leaves the role fully
+/// deleted and reported rather than half-removed — and a record whose automation removal failed
+/// still gets them removed when they fire.
 pub(crate) async fn delete(name: &str) -> Result<()> {
     // Check existence FIRST: a nonexistent role must never mutate its automations.
     anyhow::ensure!(get(name).await?.is_some(), "no custom role named '{name}'");
@@ -200,8 +190,7 @@ pub(crate) async fn delete(name: &str) -> Result<()> {
             db::params![name],
         )
         .await?;
-    // Sanity check on the row count (the existence check above already
-    // guarantees it): never claim success for a delete of nothing.
+    // Sanity check on the row count (the existence check above already proved the record).
     anyhow::ensure!(deleted > 0, "no custom role named '{name}'");
     // Past the record: nothing below aborts, so the owner is always told.
     let removed = match crate::automations::delete_automations_for_role(name).await {
@@ -215,12 +204,10 @@ pub(crate) async fn delete(name: &str) -> Result<()> {
             0
         }
     };
-    // "Continued branches of a deleted role are never resumed — they no longer
-    // have a prompt or a tool set": stop each one now, so a running launch is
-    // cancelled and its deferred envelopes cannot re-drive it after a restart.
-    // A failed stop must not skip the owner notice below, so log it and
-    // continue; likewise a failed branch listing is best-effort (the record is
-    // already gone) and must not abort the delete.
+    // "Continued branches of a deleted role are never resumed — they no longer have a prompt or
+    // a tool set": stop each one now, so a running launch is cancelled and its deferred
+    // envelopes cannot re-drive it after a restart. A failed stop or branch listing must not skip
+    // the owner notice below, so both are logged and the delete continues.
     let branches = match crate::session::store().custom_role_sessions(name).await {
         Ok(branches) => branches,
         Err(e) => {
@@ -263,10 +250,9 @@ pub(crate) async fn delete(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate a custom role's name: non-empty, within
-/// [`MAX_ROLE_NAME_CHARS`], every char ASCII alphanumeric / `_` / `-`, the
-/// first char an ASCII letter, and not colliding with a built-in agent
-/// namespace (see [`crate::session::custom_role_name_is_reserved`]).
+/// Validate a custom role's name: non-empty, within [`MAX_ROLE_NAME_CHARS`], every char ASCII
+/// alphanumeric / `_` / `-`, the first an ASCII letter, and not colliding with a built-in agent
+/// namespace ([`crate::session::custom_role_name_is_reserved`]).
 pub(crate) fn validate_name(name: &str) -> Result<()> {
     validate_segment(name, MAX_ROLE_NAME_CHARS, "a custom role name")?;
     anyhow::ensure!(
@@ -285,17 +271,16 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate a custom role branch identifier: the same charset and length rule
-/// as a name, but it may start with any allowed char and carries no reserved
-/// namespace restriction (an identifier is never the leading segment of an
-/// agent address).
+/// Validate a custom role branch identifier: the same charset and length rule as a name, but it
+/// may start with any allowed char and carries no reserved-namespace restriction (an identifier
+/// is never the leading segment of an agent address).
 pub(crate) fn validate_identifier(identifier: &str) -> Result<()> {
     validate_segment(identifier, MAX_ROLE_IDENTIFIER_CHARS, "an identifier")
         .map_err(|e| anyhow::anyhow!("invalid custom role branch: {e}"))
 }
 
-/// Validate a worker branch name: the same charset and length rule as a custom
-/// role identifier, with a wording of its own.
+/// Validate a worker branch name: the same charset and length rule as a custom role identifier,
+/// with a wording of its own.
 pub(crate) fn validate_worker_branch(branch: &str) -> Result<()> {
     validate_segment(branch, MAX_ROLE_IDENTIFIER_CHARS, "a branch")
         .map_err(|e| anyhow::anyhow!("invalid worker branch: {e}"))
@@ -317,21 +302,19 @@ fn validate_segment(value: &str, max_chars: usize, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate a tool subset a caller wrote, against the catalog of what a custom
-/// role may be given ([`crate::Role::custom_role_tool_catalog`]). Each entry is
-/// `"tool"` (the tool with its narrowest kind) or `"tool:kind1,kind2"` (see
-/// [`crate::tools::grants`]); an empty subset is allowed, an unknown tool name,
-/// a tool a custom role cannot hold, an unknown kind and a tool named twice are
-/// not.
+/// Validate a tool subset a caller wrote, against the catalog of what a custom role may be given
+/// ([`crate::Role::custom_role_tool_catalog`]). Each entry is `"tool"` (the tool with its
+/// narrowest kind) or `"tool:kind1,kind2"` ([`crate::tools::grants`]); an empty subset is
+/// allowed, an unknown tool, a tool a custom role cannot hold, an unknown kind and a tool named
+/// twice are not.
 ///
-/// Names the record ALREADY holds are exempt from the catalog check: a tool the
-/// catalog lists but this installation cannot serve right now, or one a custom
-/// role is no longer offered, stays on the record — the launch simply omits the
-/// tool — so editing another field must never drop it.
+/// Names the record ALREADY holds are exempt from the catalog check: a tool this installation
+/// cannot serve right now, or one no longer offered, stays on the record — the launch simply
+/// omits it — so editing another field must never drop it.
 pub(crate) fn validate_tools_against(tools: &[String], held: &[String]) -> Result<()> {
     let catalog = crate::Role::custom_role_tool_catalog();
-    // parse() validates the grammar: an unknown kind, a kind on a kindless tool,
-    // a kind named twice on one tool, and a tool named twice.
+    // parse() validates the grammar: an unknown kind, a kind on a kindless tool, a kind named
+    // twice on one tool, and a tool named twice.
     let grants = crate::tools::grants::parse(tools)?;
     let held: Vec<&str> = held
         .iter()
@@ -351,9 +334,9 @@ pub(crate) fn validate_tools_against(tools: &[String], held: &[String]) -> Resul
 mod tests {
     use super::*;
 
-    /// The stored grant grammar: a tool name, or `tool:kind1,kind2`. A bare name
-    /// is the tool's narrowest kind; an unknown kind, a kind on a tool that has
-    /// no kinds, an unknown tool and a tool named twice are all refused.
+    /// The stored grant grammar: a tool name, or `tool:kind1,kind2`. A bare name is the tool's
+    /// narrowest kind; an unknown kind, a kind on a tool that has no kinds, an unknown tool and a
+    /// tool named twice are all refused.
     #[test]
     fn validate_tools_against_reads_the_kind_grammar() {
         let entries =

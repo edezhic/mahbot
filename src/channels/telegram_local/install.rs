@@ -1,16 +1,11 @@
-//! Install and update the Bot API server binary.
-//!
-//! The binary is the product's own build of `tdlib/telegram-bot-api`, published
-//! in a release stream of its own: prereleases tagged `tgapi-v<version>` in the
-//! product's repository. Prereleases are what keeps the product's updater
-//! untouched — it reads `releases/latest` and `version.txt`, which never point
-//! at one — while release assets stay downloadable by a plain HTTP client with
-//! no credentials.
-//!
-//! Everything after the download is the shared managed-binary machinery Bun and
-//! chrome-use already use: SHA-256 from the release's `SHA256SUMS`, a streamed
-//! verified download, one file extracted out of the archive, an atomic swap into
-//! place. The owner never fetches, unpacks or replaces anything by hand. Taking
+//! Install and update the Bot API server binary. The binary is the product's own build of
+//! `tdlib/telegram-bot-api`, published in a release stream of its own: prereleases tagged
+//! `tgapi-v<version>` in the product's repository. Prereleases are what keeps the product's updater
+//! untouched — it reads `releases/latest` and `version.txt`, which never point at one — while
+//! release assets stay downloadable by a plain HTTP client with no credentials. Everything after
+//! the download is the shared managed-binary machinery Bun and chrome-use already use: SHA-256 from
+//! the release's `SHA256SUMS`, a streamed verified download, one file extracted out of the archive,
+//! an atomic swap into place. The owner never fetches, unpacks or replaces anything by hand. Taking
 //! the install away — the way back to the cloud — is the whole server root
 //! ([`super::server::remove_state`]), binary included.
 
@@ -18,16 +13,12 @@ use std::path::PathBuf;
 
 use semver::Version;
 
-/// The tag prefix of the server's own release stream.
 const TAG_PREFIX: &str = "tgapi-v";
 
-/// Test hook: a releases listing that answers in GitHub's shape instead of the
-/// real one. The product's own update channel is a different contract and is
-/// never read or written here.
+/// Test hook: a releases listing that answers in GitHub's shape instead of the real one. The
+/// product's own update channel is a different contract and is never read or written here.
 const RELEASES_URL_ENV: &str = "MAHBOT_TGAPI_RELEASES_URL";
 
-/// The GitHub release listing of the product's own repository — the same one the
-/// ffmpeg stream uses. The page query is added by [`latest`].
 fn releases_url() -> String {
     format!(
         "https://api.github.com/repos/{}/releases",
@@ -35,7 +26,6 @@ fn releases_url() -> String {
     )
 }
 
-/// The executable's file name on this platform.
 const fn file_name() -> &'static str {
     if cfg!(windows) {
         "telegram-bot-api.exe"
@@ -44,8 +34,8 @@ const fn file_name() -> &'static str {
     }
 }
 
-/// Where the binary lives: beside the server's own state, inside the product's
-/// configuration directory — never in the daemon's temp root, which is swept.
+/// Where the binary lives: beside the server's own state, inside the product's configuration
+/// directory — never in the daemon's temp root, which is swept.
 pub(super) fn binary_path() -> Option<PathBuf> {
     Some(
         crate::config::default_config_dir()
@@ -56,12 +46,10 @@ pub(super) fn binary_path() -> Option<PathBuf> {
     )
 }
 
-/// Whether a usable copy is installed.
 pub(super) fn present() -> bool {
     binary_path().is_some_and(|path| crate::util::is_executable(&path))
 }
 
-/// One release the stream offers for this host.
 pub(super) struct Release {
     tag: String,
     pub(super) version: Version,
@@ -69,12 +57,12 @@ pub(super) struct Release {
     sums_url: Option<String>,
 }
 
-/// This host's asset tag (`telegram-bot-api-<version>-<os>-<arch>`), or the
-/// platform it is not published for.
+/// This host's asset tag (`telegram-bot-api-<version>-<os>-<arch>`), or the platform it is not
+/// published for.
 ///
-/// Windows has one artifact: x64. Windows 11 on ARM emulates x64 user-mode
-/// processes — file, socket and child-process behaviour included — so the same
-/// artifact serves both architectures and there is no unsupported state.
+/// Windows has one artifact: x64. Windows 11 on ARM emulates x64 user-mode processes — file, socket
+/// and child-process behaviour included — so the same artifact serves both architectures and there
+/// is no unsupported state.
 fn asset_platform() -> Result<(&'static str, &'static str), String> {
     let (os, arch) = crate::util::managed_bin::host_os_arch()?;
     let arch = if os == "windows" && arch == "aarch64" {
@@ -87,14 +75,13 @@ fn asset_platform() -> Result<(&'static str, &'static str), String> {
 
 /// The newest release on offer for this host.
 ///
-/// Pages are read until one carries a server build. The listing is ordered by
-/// creation date, so the newest build is on the earliest page that holds one.
+/// Pages are read until one carries a server build. The listing is ordered by creation date, so the
+/// newest build is on the earliest page that holds one.
 pub(super) async fn latest() -> Result<Release, String> {
     let (os, arch) = asset_platform()?;
     let base = std::env::var(RELEASES_URL_ENV).unwrap_or_else(|_| releases_url());
     for page in 1..=crate::util::managed_bin::LISTING_PAGES {
-        // A body that is not a listing offers this stream nothing, exactly as an empty
-        // page does.
+        // A body that is not a listing offers this stream nothing, exactly as an empty page does.
         let listing =
             crate::util::managed_bin::release_page(&base, page, "the newest server release")
                 .await?
@@ -102,7 +89,6 @@ pub(super) async fn latest() -> Result<Release, String> {
         if let Some(release) = newest_for(&listing, os, arch) {
             return Ok(release);
         }
-        // A short page is the end of the listing: no further page can hold one.
         if listing.len() < crate::util::managed_bin::LISTING_PAGE_SIZE {
             break;
         }
@@ -110,14 +96,10 @@ pub(super) async fn latest() -> Result<Release, String> {
     Err(format!("no server release is published for {os}-{arch}"))
 }
 
-/// The Bot API version a `tgapi-v*` tag names (`tgapi-v10.3`), read with the
-/// same padding the server's own banner needs.
 fn parse_version(text: &str) -> Option<Version> {
     crate::util::managed_bin::parse_short_version(text.strip_prefix(TAG_PREFIX)?)
 }
 
-/// The newest `tgapi-v*` release in `listing` that carries this host's archive,
-/// as the number the artifact reports.
 fn newest_for(listing: &[serde_json::Value], os: &str, arch: &str) -> Option<Release> {
     let extension = if os == "windows" { "zip" } else { "tar.gz" };
     listing
@@ -145,10 +127,9 @@ fn newest_for(listing: &[serde_json::Value], os: &str, arch: &str) -> Option<Rel
         .max_by(|a, b| a.version.cmp(&b.version))
 }
 
-/// Download, verify, extract and atomically place `release`'s archive.
-/// Returns the release version now installed. Every failure names the operation
-/// and a reason with no local path and no URL, because it is recorded and shown
-/// verbatim.
+/// Download, verify, extract and atomically place `release`'s archive. Returns the release version
+/// now installed. Every failure names the operation and a reason with no local path and no URL,
+/// because it is recorded and shown verbatim.
 pub(super) async fn install(release: Release) -> Result<Version, String> {
     use crate::util::http::{DownloadSizeCheck, download_verified};
 
@@ -197,10 +178,10 @@ pub(super) async fn install(release: Release) -> Result<Version, String> {
     } else {
         crate::util::managed_bin::extract_single_file_tar_gz(&archive, work.path(), file)?
     };
-    // Proven before it replaces a working copy: a checksum-valid artifact can still
-    // be unable to run (a missing library, the wrong runtime), and placing it would
-    // leave nothing but a copy that fails every attempt — with no version to
-    // compare, the update check would never repair it either.
+    // Proven before it replaces a working copy: a checksum-valid artifact can still be unable to
+    // run (a missing library, the wrong runtime), and placing it would leave nothing but a copy
+    // that fails every attempt — with no version to compare, the update check would never repair it
+    // either.
     if super::server::reported_version_at(&fresh).await.is_none() {
         return Err("the downloaded server binary could not run".to_string());
     }

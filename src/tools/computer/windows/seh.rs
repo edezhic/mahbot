@@ -1,28 +1,23 @@
 //! Structured-exception containment for the Windows backend: [`guard`] runs one
-//! closure inside the C frame in `seh.c`, and reports an exception raised inside it
+//! closure inside the C frame in `seh.c` and reports an exception raised inside it
 //! as `Err(code)` instead of letting the process die.
 //!
-//! The frame has to be C (Rust cannot catch a structured exception), and it is the
-//! only such frame in the product. It owns every fault and every C++ exception a
-//! foreign component throws across the boundary. Three things it cannot cover are
-//! stated here rather than worked around:
+//! The frame has to be C (Rust cannot catch a structured exception) and is the only
+//! such frame in the product; it owns every fault and every C++ exception thrown
+//! across the boundary. Three things it cannot cover, stated not worked around:
 //!
-//! * A fault raised on a driver's own internal thread never passes this frame: the
-//!   frame covers only the thread that called it, so nothing in this process can
-//!   catch one raised elsewhere.
-//! * A Rust panic passes through by design. It travels as a C++-style unwind too, and
-//!   containing one would stop the panic before Rust's handler could run. The shim
-//!   tells the two apart by the identity the panic runtime gives its throw (the type
-//!   name on MSVC, the exception class on windows-gnu), and only contains a record
-//!   whose shape it reads as a foreign throw.
-//! * A code that is not an error status passes through, because it is control flow
-//!   rather than failure (a debugger print, a single step, a longjmp), and so does a
-//!   stack overflow: reporting one allocates and logs, which a thread with no stack
-//!   left must not be asked to do.
+//! * A fault on a driver's own internal thread never passes this frame — it covers
+//!   only the thread that called it.
+//! * A Rust panic passes through by design: containing one would stop it before
+//!   Rust's handler could run. The shim tells them apart by the identity the panic
+//!   runtime gives its throw (type name on MSVC, exception class on windows-gnu) and
+//!   contains only a record whose shape it reads as a foreign throw.
+//! * A non-error status code passes through, being control flow rather than failure
+//!   (a debugger print, a single step, a longjmp), and so does a stack overflow:
+//!   reporting one allocates and logs, which a thread with no stack must not do.
 //!
-//! A fourth limit lives where it happens, in `seh.c`'s own record walk: the filter
-//! trusts the offsets a recognized throw record carries, and a filter has no frame of
-//! its own to catch a bad one.
+//! A fourth limit lives in `seh.c`'s own record walk: the filter trusts the offsets
+//! a recognized throw record carries, and has no frame of its own to catch a bad one.
 
 use std::ffi::c_void;
 
@@ -30,8 +25,7 @@ use std::ffi::c_void;
 // `seh.c`; its `unsigned long` is 32 bits on Windows, hence `u32`.
 //
 // `C-unwind` on both the function and the body so a Rust panic unwinding out of the
-// body keeps unwinding through this frame to Rust's own handler; the calling
-// convention is identical to `C`.
+// body keeps unwinding through this frame to Rust's own handler.
 unsafe extern "C-unwind" {
     fn mb_seh_guard(
         body: extern "C-unwind" fn(*mut c_void),
@@ -40,16 +34,12 @@ unsafe extern "C-unwind" {
     ) -> i32;
 }
 
-// ── The guard ───────────────────────────────────────────────────────────
-
-/// What one guarded call leaves the frame with: the body until the frame runs it,
-/// then the value it returned.
+/// The body until the frame runs it, then the value it returned.
 struct Slot<F, T> {
     body: Option<F>,
     out: Option<T>,
 }
 
-/// The one function the C frame calls back: run the slot's body and keep its value.
 extern "C-unwind" fn run<F: FnOnce() -> T, T>(ctx: *mut c_void) {
     // SAFETY: `guard` hands over the address of its own live `Slot<F, T>` for
     // exactly the duration of the `mb_seh_guard` call, and this is the only place
@@ -62,8 +52,7 @@ extern "C-unwind" fn run<F: FnOnce() -> T, T>(ctx: *mut c_void) {
     slot.out = Some(body());
 }
 
-/// Run `body` inside a structured-exception frame; `Err(code)` is an exception it
-/// raised.
+/// Run `body` inside a structured-exception frame; `Err(code)` is an exception it raised.
 ///
 /// Whatever the body was mutating is unknowable once an exception is caught, so the
 /// caller must fail the call and never reuse what the body owned.
@@ -93,24 +82,21 @@ pub(super) fn guard<T, F: FnOnce() -> T>(body: F) -> Result<T, u32> {
 mod tests {
     use super::guard;
 
-    /// Containment checked against a real fault: that the shim returns at all is the
-    /// whole claim, so this test dies with the process rather than failing if the
-    /// frame is ever broken.
+    /// Containment checked against a real fault: if the frame is ever broken this
+    /// test dies with the process rather than failing.
     #[test]
     fn a_fault_inside_the_guard_is_caught() {
         // A null read is the cheapest real fault.
         let caught = guard(|| unsafe { std::ptr::read_volatile(std::ptr::null::<u8>()) });
         assert!(caught.is_err(), "the shim must report the fault");
-        // Still here — which is the whole claim.
         assert_eq!(guard(|| 42), Ok(42));
     }
 
     /// A C++ exception raised by foreign code while the call runs is a failed call,
     /// not the end of the process.
     ///
-    /// The record is built by hand in the MSVC ABI's shape — magic number, object,
-    /// throw info, image base, with the throw info's own fields as image-relative
-    /// offsets — so no C++ compiler is needed to raise one.
+    /// The record is hand-built in the MSVC ABI's shape (magic number, object,
+    /// throw info, image base), so no C++ compiler is needed to raise one.
     #[cfg(all(target_env = "msvc", target_pointer_width = "64"))]
     #[test]
     fn a_foreign_cpp_exception_becomes_a_fault() {

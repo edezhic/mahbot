@@ -1,180 +1,90 @@
 //! Computer (GUI observe/act) tool for the admin's Assistant.
 //!
-//! The platform-agnostic core (types, coordinate math, ref lifecycle, backend
-//! trait) lives in [`core`]; [`linux`], [`macos`], [`windows`] and [`stub`]
-//! implement the backend per platform. All GUI actions are serialized through a
-//! process-wide lock so two concurrent agent runs can never race on the live GUI.
+//! The platform-agnostic core (types, coordinate math, ref lifecycle, backend trait) lives in
+//! [`core`]; [`linux`], [`macos`], [`windows`] and [`stub`] implement the backend. All GUI
+//! actions are serialized through a process-wide lock so two agent runs cannot race on the
+//! live GUI.
 //!
-//! The tool is offered on Linux, macOS and Windows. Linux has no grant model of
-//! its own (AT-SPI and the X11/portal channels are what decides); on macOS the
-//! three privacy grants belong to the terminal the daemon was started from, are
-//! asked for when first needed and reported on every action they block — see
-//! [`macos`]. Windows needs no grant at all, but refuses to actuate on windows of
-//! elevated processes and cannot reach the secure desktop — see [`windows`].
+//! The tool is offered on Linux, macOS and Windows. Linux has no grant model of its own; on
+//! macOS the three privacy grants belong to the terminal the daemon was started from and are
+//! reported on every action they block ([`macos`]); Windows needs no grant but refuses to
+//! actuate on windows of elevated processes and cannot reach the secure desktop
+//! ([`windows`]). Mahbot's own windows are targets like any other, but the system answers
+//! accessibility requests for them inside this process, so each backend handles them deliberately.
 //!
-//! Mahbot's own windows are targets like any other — listed, readable and
-//! capturable — but the system answers accessibility requests addressed to them
-//! inside this process, so each backend handles them deliberately: on macOS their
-//! exchanges run on the main thread under a bounded wait (so they stay
-//! actionable), on Windows element actions are refused because there is no way
-//! onto the interface thread, and Linux never sees our window at all (no AT-SPI
-//! surface).
-//!
-//! The agent-facing description is the shared `src/prompt/tool/computer.md` plus
-//! only the running platform's own file ([`PLATFORM_DESCRIPTION`]): one
-//! installation is one platform, so no agent is handed another's caveats. It carries
-//! only what shapes an ordinary call — what the actions are, which surface one acts on,
-//! the coordinate space, the result states — because a caveat that matters only when a
-//! call goes wrong belongs in the failure that raises it, as one line saying what to do
-//! next, not in text every request carries. That next step names only a route that works
-//! in the state the call found: a screenshot is offered only when stills are known to
-//! work ([`capture_known_available`]), and the accessibility listing or a retry is named
-//! otherwise.
+//! The agent-facing description is `src/prompt/tool/computer.md` plus only the running
+//! platform's own file ([`PLATFORM_DESCRIPTION`]) — one installation is one platform. It
+//! carries only what shapes an ordinary call; a caveat that matters only when a call goes
+//! wrong belongs in the failure that raises it, as one line saying what to do next. That next
+//! step names only a route that works in the state the call found
+//! ([`capture_known_available`]).
 //!
 //! # Identifiers last for the session
 //!
-//! `apps` and `windows` answer with opaque ids (`a1754…`, `w1754…`) that later actions
-//! take as a target. An id names that one surface for the whole session — across turns,
-//! across the owner's replies — and is never handed to another surface, however many
-//! applications launch or quit in between: a surface gets a new id when it appears,
-//! and an id never points at something else. A reset ends them ([`end_session`], called
-//! where the session store deletes the conversation) and so does a restart; nothing else
-//! does, and no listing evicts a live one.
+//! `apps` and `windows` answer with opaque ids (`a1754…`, `w1754…`) that later actions take as
+//! a target. An id names that one surface for the whole session, is never handed to another
+//! surface, and never points at something else. A reset ends them ([`end_session`], called
+//! where the session store deletes the conversation) and so does a restart.
 //!
-//! Every use re-checks the surface against the live system before acting, and the two
-//! ways it can be absent are answered differently: a surface that has gone — a window
-//! that closed, an application that quit — is `surface-gone` naming it, while an id the
-//! tool no longer knows says exactly that and names the listing that mints ids again. A
-//! failed lookup never claims an application is not running. Element refs are not ids:
-//! they belong to the full observation they came from, are replaced only by the next
-//! full observation of that same surface, and expire with the turn that minted them
+//! Every use re-checks the surface against the live system: a surface that has gone is
+//! `surface-gone` naming it, while an id the tool no longer knows says exactly that. A failed
+//! lookup never claims an application is not running. Element refs are not ids: they belong to
+//! the full observation they came from and expire with the turn that minted them
 //! ([`core::cleanup_turn`]).
 //!
 //! # What is in front, what the tool remembers, what an action answers
 //!
 //! A listing names the frontmost application, marks the focused window and gives a
-//! front-to-back order only where the platform can attribute one
-//! ([`core::WindowListing`]); one record per surface ([`core::Look`]) is what a narrow
-//! look, a change answer and every statement about that surface are measured against; and
-//! input answers what it could observe afterwards, best-effort and without ever claiming
-//! the effect ([`answer`]). A coordinate click is additionally checked at the moment it is
-//! sent ([`core::UnderPoint`]); raising and delivery are unchanged.
+//! front-to-back order only where the platform can attribute one ([`core::WindowListing`]);
+//! one record per surface ([`core::Look`]) is what every statement about that surface is
+//! measured against; and input answers what it could observe afterwards, best-effort and
+//! without ever claiming the effect ([`answer`]).
 //!
 //! # Bounded by the product, not by the machine
 //!
-//! This process aborts on a failed allocation, so no figure the machine reports may
-//! decide how much is allocated: one [`core::CaptureBudget`] per capture call bounds
-//! every pixel buffer the call holds at once, and every string a read keeps is capped
-//! at [`core::MAX_VALUE_CHARS`] (values) or [`core::MAX_NAME_CHARS`] (names and
-//! labels) where it is read. A refusal is `degraded` and names the ceiling, the
-//! geometry and what the call already holds; a cut is stated in the observation
-//! header, or marked by the ellipsis where the string is a label. The accounting and
-//! its reasoning live in [`core`].
+//! This process aborts on a failed allocation, so no figure the machine reports may decide how
+//! much is allocated: one [`core::CaptureBudget`] per capture call bounds every pixel buffer
+//! the call holds at once, and every string a read keeps is capped at
+//! [`core::MAX_VALUE_CHARS`] or [`core::MAX_NAME_CHARS`] where it is read.
 //!
 //! # Every argument is bounded
 //!
-//! Every [`ComputerAction`] argument is either a value from a declared set or bounded by
-//! a range or a length cap. Those bounds are stated in the schema or the description and
-//! named by the refusal that enforces them, and they are checked before [`ACTION_LOCK`]
-//! is taken — so a bad call costs a round trip, never a wait behind the lock, a capture,
-//! a permission prompt or a lookup. An argument the chosen action cannot honour is
-//! refused with the form the action does accept rather than dropped: a field it does not
-//! take fails as [`check_action_fields`] says, and a combination it cannot honour — half
-//! a coordinate pair, a ref together with coordinates, a target on a pointer-less wheel —
-//! fails in [`validate_action`].
+//! Every [`ComputerAction`] argument is a value from a declared set or bounded by a range or a
+//! length cap, and the bounds are checked before [`ACTION_LOCK`] is taken — so a bad call
+//! costs a round trip, never a wait behind the lock, a capture, a permission prompt or a
+//! lookup. An argument the chosen action cannot honour is refused with the form it does accept
+//! ([`check_action_fields`], [`validate_action`]).
 //!
 //! # No call waits forever
 //!
-//! Every accessibility exchange is bounded by a deadline the product chose, and each
-//! backend bounds a whole call on top of that: Linux and macOS with the aggregate budget
-//! on [`core`]'s deadline constants, checked between exchanges; Windows with a per-shape
-//! job deadline and the walk's own. A bound that runs out always answers — naming the
+//! Every accessibility exchange is bounded by a deadline the product chose, and each backend
+//! bounds a whole call on top of that. A bound that runs out always answers — naming the
 //! surface and saying whether anything was applied, since an abandoned actuation may have
-//! landed — so [`ACTION_LOCK`] is released by an answer and the next call proceeds; a
-//! responsive target never reaches one. Each backend's header states its mechanism; the
-//! figures themselves reach the model only in the answer that reports the bound it hit.
+//! landed — so [`ACTION_LOCK`] is released by an answer and the next call proceeds.
 //!
 //! # A session that cannot receive the call is refused, not served
 //!
 //! A locked screen, a session another user switched away from and a machine with no
-//! interactive desktop cannot receive input and show nothing to read, so the calls that
-//! read or drive a surface ask [`Backend::desktop_unavailable`] first and fail with
-//! `desktop-unavailable` — naming the state, and saying that nothing was delivered or
-//! read. Listing applications and windows, and `wait`, need no desktop and keep working.
-//! The tag is not `degraded` on purpose: its guidance is to retry, and a retry into such
-//! a state cannot succeed, so the model would loop instead of telling the owner.
+//! interactive desktop ask [`Backend::desktop_unavailable`] first and fail with
+//! `desktop-unavailable`. Listing applications and windows, and `wait`, need no desktop. The
+//! tag is not `degraded` on purpose: its guidance is to retry, and a retry into such a state
+//! cannot succeed, so the model would loop instead of telling the owner.
 //!
-//! # Manual check (run once on a machine of each platform)
+//! # Manual check
 //!
-//! Computer use is offered only to the admin's Assistant, so what can be checked
-//! automatically is the accounting, not the pixels:
-//!
-//! 1. `screenshot { target: "screen" }` on an ordinary display: the image is the
-//!    same as before, the summary names its size and the PNG is attached.
-//! 2. `zoom` over a quarter of that screen: the same crop as before, no refusal.
-//! 3. `observe` a document or a browser page: the tree reads as before. A field
-//!    holding more than 120 characters shows its first 120, marked with an ellipsis,
-//!    and the header counts the cut (`1 value cut at 120 chars`); macOS and Windows
-//!    also read past their own 2000-character value cap, counted the same way
-//!    (`1 value cut at 2000 chars`).
-//! 4. A refusal needs a call whose live buffers together exceed 128 Mi pixels — a
-//!    whole-desktop `zoom` on a wall of four or more 6K displays, or a framework
-//!    reporting an absurd geometry — so it is not reachable from an ordinary desktop:
-//!    the accounting is verified by the unit tests on [`core::CaptureBudget`] and
-//!    [`core::Capture::alloc`], and the other platforms by the cross-compile lanes in
-//!    `scripts/`.
-//! 5. A target that stops answering: `kill -STOP` a throwaway application, `observe`
-//!    it, and the call ends inside its budget with `degraded` naming the window
-//!    instead of hanging; `kill -CONT` and the next call works again. Linux only: a
-//!    restarted at-spi (`kill` its bus launcher) is picked up by the next call, and a
-//!    target advertising an absurd child count is read without its children and says
-//!    so in the header.
-//! 6. An argument outside its stated bound is refused before anything happens: a
-//!    `scroll` with `amount: 1000` fails naming the tick range without moving the wheel,
-//!    a `type` over the string cap fails naming the cap without typing a character, and
-//!    `click { ref, x, y }` fails naming which one to drop without clicking. The bounds
-//!    themselves are covered by the unit tests on [`validate_action`] and
-//!    [`check_action_fields`], so this step confirms the live path only.
-//! 7. Lock the screen and call `screenshot` / `observe` / `press`: each fails with
-//!    `desktop-unavailable` naming the lock, while `apps` still lists. Unlock and the
-//!    same calls work again. A machine that cannot be locked (or a platform with no
-//!    signal for it) keeps working — that is the intended behaviour, not a gap.
-//! 8. An id survives the turn that minted it: `apps` then `windows` in one turn, let the
-//!    owner answer, then act by the `a`/`w` id in the next — the same surface is
-//!    addressed, with no re-listing. Then reset the conversation (`/clear`) and use that
-//!    id again: it is refused as one the tool no longer knows, never as a closed window
-//!    or an application that is not running. The split itself is covered by the unit
-//!    tests on [`core::cleanup_turn`] and [`core::end_session`].
-//! 9. The listings say what is in front: put one application in front and run `apps` —
-//!    the last line names it; then run `windows` — its focused window carries
-//!    `[focused]`, a single application's listing says whether it is in front, and the
-//!    order line is present only where the platform can attribute one. Linux names the
-//!    frontmost application from the active state of its windows and no order at all,
-//!    which is its honest answer.
-//! 10. Narrow looks and change answers read what was already observed: `observe` a page,
-//!     then `observe { kind: "button" }` — the flat list says it covers part of the
-//!     surface; mistype the kind and the answer names the kinds present; then
-//!     `observe { changed: true }` — nothing changed, or what did, against the age of the
-//!     observation. Neither replaces the remembered look: `observe { ref: "e2" }` after
-//!     them still resolves. The state itself is covered by the unit tests on
-//!     [`core::render_narrow`], [`core::render_changes`] and [`core::remember_look`].
-//! 11. Every delivered action reports after itself: a `click` on a point answers with the
-//!     resolved point, the surface's size, the input values, the focused element and
-//!     whether the surface sits where the remembered observation found it; move the window
-//!     between two calls and the second says it moved. Click a point covered by another
-//!     application's window — its own body, its popover, its open menu (macOS, Windows):
-//!     nothing is sent and the answer names that application; cover it with the addressed
-//!     application's own dialog and the click goes, named as another window of that
-//!     application. On macOS the same holds for the Dock's icons and a menu-bar item of
-//!     another application, which refuse and name them, while a point inside the addressed
-//!     window's body is sent with no note; Linux checks nothing and says so.
+//! Computer use is offered only to the admin's Assistant, so what is checked automatically is
+//! the accounting, not the pixels: the budgets by the tests on [`core::CaptureBudget`], the
+//! bounds by those on [`validate_action`] and [`check_action_fields`], and the other platforms
+//! by the cross-compile lanes in `scripts/`. One live pass per platform covers the
+//! screenshot/zoom/observe shapes, a target stopped with `kill -STOP` ending inside its
+//! budget, an out-of-range argument refused before anything happens, and a locked screen
+//! answering `desktop-unavailable` while `apps` still lists.
 
 mod core;
 mod linux;
 mod macos;
 mod windows;
-// Every other platform: the capability is absent, so the stub is never
-// advertised.
+// Every other platform: the capability is absent, so the stub is never advertised.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod stub;
 
@@ -196,17 +106,14 @@ use std::time::{Duration, Instant};
 use strum::IntoEnumIterator;
 use tracing::debug;
 
-// ── Action enum ─────────────────────────────────────────────────────────
-
 /// One computer tool call. All points/regions are normalized 0-1000 relative to
 /// the surface the call names (see the `## Which surface` prompt section).
 #[derive(Debug, Clone, Deserialize, Serialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 enum ComputerAction {
-    /// Read a surface. With no narrowing argument this is a full observation, which is
-    /// the only thing that records a surface and mints refs; `ref`, `depth` and `kind`
-    /// narrow it to part of the tree already read, and `changed` answers what differs
-    /// from that recorded look. See [`observe`].
+    /// Read a surface. With no narrowing argument this is a full observation, the only thing
+    /// that records a surface and mints refs; `ref`, `depth` and `kind` narrow it to part of the
+    /// tree already read, and `changed` answers what differs from that recorded look.
     Observe {
         target: Option<String>,
         #[serde(rename = "ref")]
@@ -222,13 +129,10 @@ enum ComputerAction {
         target: Option<String>,
         region: Region,
     },
-    // NOTE: `Apps`/`Cursor` must stay EMPTY STRUCT variants (`{}`), not unit
-    // variants. The canonical wire form is `{"apps": {}}` (empty object), which
-    // serde's externally-tagged representation only accepts for a struct variant
-    // — a unit variant would reject the map with "invalid type: map, expected
-    // unit", making both actions dead on every input path. Serializing an empty
-    // struct still yields the same `{"apps": {}}` key, so wire-name extraction
-    // and `EnumIter` are unaffected.
+    // NOTE: `Apps`/`Cursor` must stay EMPTY STRUCT variants (`{}`), not unit variants. The
+    // canonical wire form is `{"apps": {}}`, which serde's externally-tagged representation
+    // only accepts for a struct variant — a unit variant would reject the map, making both
+    // actions dead on every input path.
     Apps {},
     Windows {
         app: Option<String>,
@@ -270,18 +174,16 @@ enum ComputerAction {
     },
 }
 
-/// Canonical wire names for every [`ComputerAction`] variant, derived from the
-/// enum itself via `strum::EnumIter` + serde external tagging — a new variant
-/// is auto-discovered rather than hand-maintained. Used as the
-/// [`normalize_action`] allowlist and by the schema lockstep test.
+/// Canonical wire names for every [`ComputerAction`] variant, derived from the enum itself via
+/// `strum::EnumIter` + serde external tagging. Used as the [`normalize_action`] allowlist and by
+/// the schema lockstep test.
 static ACTION_WIRE_NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
     <ComputerAction as IntoEnumIterator>::iter()
         .map(|action| wire_name(&action))
         .collect()
 });
 
-/// Serialize a [`ComputerAction`] and extract its wire name: a lone tag for a
-/// fielded variant, or a plain string for a unit variant.
+/// Serialize a [`ComputerAction`] and extract its wire name.
 fn wire_name(action: &ComputerAction) -> String {
     let v = serde_json::to_value(action).expect("ComputerAction serializes");
     match v {
@@ -315,11 +217,9 @@ const MAX_WAIT_SECS: f64 = 10.0;
 const MODIFIERS: [&str; 4] = ["cmd", "ctrl", "alt", "shift"];
 
 /// One schema entry per [`ComputerAction`], built once: the model-facing schema and
-/// [`check_action_fields`] read the same entries, so the arguments a call may carry
-/// cannot drift from the interface the model is given.
-///
-/// The tool description carries what the arguments mean; an entry says only what its
-/// action does and which of its arguments the name alone does not settle.
+/// [`check_action_fields`] read the same entries, so the arguments a call may carry cannot drift
+/// from the interface the model is given. An entry says only what its action does and which of
+/// its arguments the name alone does not settle.
 static ACTION_ENTRIES: LazyLock<Vec<Value>> = LazyLock::new(|| {
     vec![
         super::action_entry_schema(
@@ -427,10 +327,9 @@ static ACTION_ENTRIES: LazyLock<Vec<Value>> = LazyLock::new(|| {
     ]
 });
 
-/// Refuse a field the action does not take, before serde would drop it: the schema
-/// declares `additionalProperties: false` for every action, so an unlisted argument is
-/// a mistake to report, not a value to ignore. `action_value` is the normalized tagged
-/// form (`{"click": {...}}`); shape errors are left to the deserializer.
+/// Refuse a field the action does not take, before serde would drop it: the schema declares
+/// `additionalProperties: false`, so an unlisted argument is a mistake to report. `action_value`
+/// is the normalized tagged form; shape errors are left to the deserializer.
 fn check_action_fields(action_value: &Value) -> anyhow::Result<()> {
     let Some((name, payload)) = action_value.as_object().and_then(|o| o.iter().next()) else {
         return Ok(());
@@ -461,10 +360,9 @@ fn check_action_fields(action_value: &Value) -> anyhow::Result<()> {
     )
 }
 
-/// Check every argument an action carries before the action lock is taken and before
-/// anything is captured, prompted for or looked up. Each string is within
-/// [`core::MAX_ARG_CHARS`], each number within its stated range, and a combination the
-/// action cannot honour is refused with the form it does accept.
+/// Check every argument an action carries before the action lock is taken and before anything is
+/// captured, prompted for or looked up: each string within [`core::MAX_ARG_CHARS`], each number
+/// within its stated range, each combination one the action can honour.
 fn validate_action(action: &ComputerAction) -> anyhow::Result<()> {
     match action {
         ComputerAction::Observe {
@@ -542,8 +440,8 @@ fn validate_action(action: &ComputerAction) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The three arguments that narrow an observation, and the one that replaces it with a
-/// change answer: a bounded depth, a kind to match, and no mixing of the two questions.
+/// The three arguments that narrow an observation, and the one that replaces it with a change
+/// answer.
 fn check_observation(
     reference: Option<&str>,
     depth: Option<usize>,
@@ -568,8 +466,7 @@ fn check_observation(
     Ok(())
 }
 
-/// A click is one of two forms, and neither carries the other's arguments: a press by
-/// ref, or a point with a button, a second click and modifiers.
+/// A click is one of two forms, and neither carries the other's arguments.
 fn check_click(
     target: Option<&str>,
     reference: Option<&str>,
@@ -582,8 +479,8 @@ fn check_click(
     check_opt_arg("target", target)?;
     check_opt_arg("ref", reference)?;
     match (reference, x, y) {
-        // An element press is one form: a button, a second click or a modifier would
-        // name a gesture the ref-based path does not perform.
+        // An element press is one form: a button, a second click or a modifier would name a
+        // gesture the ref-based path does not perform.
         (Some(reference), None, None) => {
             if modifiers.is_some_and(|m| !m.is_empty())
                 || button.is_some_and(|b| b != MouseButton::Left)
@@ -616,8 +513,7 @@ fn check_click(
     Ok(())
 }
 
-/// A coordinate pair argument: both members, or neither. Half a point cannot be
-/// mapped, so it names no position the action could honour.
+/// A coordinate pair argument: both members, or neither — half a point names no position.
 fn coord_pair(x: Option<f64>, y: Option<f64>, what: &str) -> anyhow::Result<Option<(f64, f64)>> {
     match (x, y) {
         (Some(x), Some(y)) => {
@@ -636,8 +532,8 @@ fn check_opt_arg(field: &str, value: Option<&str>) -> anyhow::Result<()> {
     value.map_or(Ok(()), |value| core::check_arg_len(field, value))
 }
 
-/// Refuse a modifier list longer than the modifiers there are: a click holds each one
-/// or it does not, and every entry drives a key event under the action lock.
+/// Refuse a modifier list longer than the modifiers there are: every entry drives a key event
+/// under the action lock.
 fn check_modifiers(modifiers: Option<&[core::Modifier]>) -> anyhow::Result<()> {
     let Some(modifiers) = modifiers else {
         return Ok(());
@@ -653,8 +549,7 @@ fn check_modifiers(modifiers: Option<&[core::Modifier]>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Corrective error for an unrecoverable action shape, echoing the exact
-/// expected form so the model can self-correct in one round-trip.
+/// Corrective error for an unrecoverable action shape, echoing the expected form.
 fn corrective_action_error(received: &Value) -> String {
     format!(
         "Invalid computer action arguments. Expected action to be {EXPECTED_ACTION_SHAPE}. \
@@ -662,9 +557,9 @@ fn corrective_action_error(received: &Value) -> String {
     )
 }
 
-/// Tolerant action normalization, mirroring the chrome tool: a canonical tagged
-/// object `{"click":{...}}`, a plain action name with flattened sibling fields
-/// `{"action":"click","x":0,"y":0}`, or a stringified JSON object.
+/// Tolerant action normalization, mirroring the chrome tool: a canonical tagged object
+/// `{"click":{...}}`, a plain action name with flattened sibling fields, or a stringified JSON
+/// object.
 fn normalize_action(action: Value, args: &Value) -> Result<(Value, Option<String>), String> {
     match action {
         Value::Object(map) if map.len() == 1 => {
@@ -702,8 +597,7 @@ fn normalize_action(action: Value, args: &Value) -> Result<(Value, Option<String
     }
 }
 
-/// Build a tagged action object from a plain action name plus sibling fields,
-/// e.g. `{"action":"click","x":0,"y":0}` → `{"click":{"x":0,"y":0}}`.
+/// Build a tagged action object from a plain action name plus sibling fields.
 fn build_action_from_siblings(name: &str, args: &Value) -> Result<(Value, Option<String>), String> {
     let Some(obj) = args.as_object() else {
         return Err(corrective_action_error(args));
@@ -736,8 +630,6 @@ fn build_action_from_siblings(name: &str, args: &Value) -> Result<(Value, Option
     ))
 }
 
-// ── Backend factory ─────────────────────────────────────────────────────
-
 /// The backend for the running platform.
 fn backend() -> &'static dyn Backend {
     #[cfg(target_os = "linux")]
@@ -758,10 +650,7 @@ fn backend() -> &'static dyn Backend {
     }
 }
 
-// ── Capability probe ────────────────────────────────────────────────────
-
-/// Cheap, synchronous availability check for advertisement — the platform
-/// contract behind it is [`Backend::is_supported`].
+/// Cheap, synchronous availability check for advertisement ([`Backend::is_supported`]).
 pub(crate) fn is_advertised() -> bool {
     backend().is_supported()
 }
@@ -772,13 +661,11 @@ type CaptureProbe = (Instant, bool);
 static CAPTURE_CACHE: LazyLock<std::sync::Mutex<Option<CaptureProbe>>> =
     LazyLock::new(|| std::sync::Mutex::new(None));
 
-/// TTL for a cached capture probe; an expired cache is treated as empty so a
-/// fresh probe runs.
+/// TTL for a cached capture probe; an expired cache is treated as empty.
 const CAPTURE_PROBE_TTL: Duration = Duration::from_secs(60);
 
 /// Probe the capture channel and cache the result. Spawned once at daemon start
-/// (see `spawn_background_tasks` in `main.rs`); `cached_capture_available()`
-/// reads it.
+/// (`spawn_background_tasks` in `main.rs`); `cached_capture_available()` reads it.
 pub async fn warm_capture_probe() {
     let ok = backend().capture_available().await;
     set_capture_cache(ok);
@@ -799,30 +686,23 @@ pub(crate) fn cached_capture_available() -> Option<bool> {
     Some(*ok)
 }
 
-/// Whether a still is known to work right now — the only state in which a result
-/// offers a screenshot as the way forward. Unknown counts as "no": a cached answer is
-/// kept for at most [`CAPTURE_PROBE_TTL`], and after that it is gone, so advice must
-/// never treat either state as permission to recommend a still. Checking it costs no
-/// platform work, so it is safe under [`ACTION_LOCK`].
+/// Whether a still is known to work right now — the only state in which a result offers a
+/// screenshot as the way forward. Unknown counts as "no", so advice must never treat it as
+/// permission to recommend a still. Costs no platform work, so it is safe under [`ACTION_LOCK`].
 pub(crate) fn capture_known_available() -> bool {
     cached_capture_available() == Some(true)
 }
 
-// ── Process-wide action serialization ───────────────────────────────────
-
 static ACTION_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-/// The last screenshot/zoom of each agent, keyed by [`core::agent_key`], so a
-/// concurrent agent's capture can never be re-attached by another agent's call. An
-/// entry is replaced per agent on each capture and left stale (the last one is what
-/// the attachment takes).
+/// The last screenshot/zoom of each agent, keyed by [`core::agent_key`], so a concurrent agent's
+/// capture is never re-attached by another agent's call.
 static CAPTURES: LazyLock<std::sync::Mutex<HashMap<String, CaptureRecord>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-/// One capture as it was produced: the file on disk and the pixel size it was
-/// taken at. The attachment is compressed and possibly reduced on its way to the
-/// model, and it needs the capture's own size to say so.
+/// One capture as it was produced: the file on disk and the pixel size it was taken at, so the
+/// attachment can say when it had to reduce the image.
 #[derive(Clone)]
 struct CaptureRecord {
     path: PathBuf,
@@ -830,33 +710,25 @@ struct CaptureRecord {
     height: u32,
 }
 
-/// Drop the state one turn owns when its agent run ends: the capture waiting to be
-/// attached and the element refs of its last observation. Application and window
-/// ids and the last observed or captured surface are kept — [`end_session`] is what
-/// ends those. Called from the agent's run-end cleanup guard (`RunEndCleanup`) with
-/// the agent's id string (matching [`core::agent_key`]'s task-local value).
+/// Drop the state one turn owns when its agent run ends: the capture waiting to be attached and
+/// the element refs of its last observation. Application and window ids are kept —
+/// [`end_session`] ends those. Called from the agent's run-end cleanup guard.
 pub(crate) fn cleanup_turn_state(agent_key: &str) {
     CAPTURES.lock().unwrap_poison().remove(agent_key);
     core::cleanup_turn(agent_key);
 }
 
-/// End everything a reset session minted: its application and window ids, the
-/// surface it last observed or captured, and — on macOS — the window handles those
-/// ids resolved through, which have to go with them or a live id would read as a
-/// closed window. The only caller is the session store's delete, where every reset
-/// converges; a service restart ends the same state by ending the process. See
-/// [`core::end_session`] for the lifetime itself.
+/// End everything a reset session minted: its application and window ids, the surface it last
+/// observed, and — on macOS — the window handles those ids resolved through, which have to go
+/// with them or a live id would read as a closed window. Called from the session store's delete.
 pub(crate) fn end_session(agent_key: &str) {
     core::end_session(agent_key);
     #[cfg(target_os = "macos")]
     macos::forget_agent_windows(agent_key);
 }
 
-// ── Description ────────────────────────────────────────────────────────
-
-/// The asset holding this platform's own half of the description, appended to
-/// the shared `tool/computer.md`. `None` where the tool is never advertised (the
-/// stub backend), which leaves the shared text alone.
+/// The asset holding this platform's own half of the description. `None` where the tool is
+/// never advertised (the stub backend), which leaves the shared text alone.
 const PLATFORM_DESCRIPTION: Option<&str> = if cfg!(target_os = "linux") {
     Some("tool/computer_linux.md")
 } else if cfg!(target_os = "macos") {
@@ -867,8 +739,7 @@ const PLATFORM_DESCRIPTION: Option<&str> = if cfg!(target_os = "linux") {
     None
 };
 
-/// Tool for observing and acting on the local GUI via the OS accessibility
-/// channel. Every action is serialized through [`ACTION_LOCK`].
+/// Tool for observing and acting on the local GUI via the OS accessibility channel.
 #[derive(Default)]
 pub(crate) struct ComputerTool;
 
@@ -878,8 +749,7 @@ impl Tool for ComputerTool {
         "computer"
     }
 
-    /// The shared contract plus this platform's own half — an installation is one
-    /// platform, so the other platforms' caveats never reach an agent.
+    /// The shared contract plus this platform's own half — one installation is one platform.
     fn description(&self) -> String {
         let mut sections = vec![crate::prompt::load_prompt("tool/computer.md")];
         if let Some(asset) = PLATFORM_DESCRIPTION {
@@ -892,10 +762,8 @@ impl Tool for ComputerTool {
             .join("\n\n")
     }
 
-    /// Every computer output is credential-scrubbed inside the tool: `observe`
-    /// scrubs the tree text before its spill; all other actions are scrubbed once
-    /// at the dispatch boundary. The agent-level pass must therefore not scrub
-    /// again (mirrors the shell/read scrub-internally rule).
+    /// Every computer output is credential-scrubbed inside the tool, so the agent-level pass must
+    /// not scrub again (mirrors the shell/read scrub-internally rule).
     fn should_scrub_output(&self, _args: &serde_json::Value) -> bool {
         false
     }
@@ -948,16 +816,15 @@ impl Tool for ComputerTool {
             ensure_interactive_desktop().await?;
         }
 
-        // Serialize every GUI-touching action so concurrent agent runs can't race. The
-        // probes an answer makes after the input was delivered run outside it: a slow
-        // probe must not lengthen another action's wait, and on Windows it must not count
-        // against the deadline that decides whether the action itself was confirmed.
+        // Serialize every GUI-touching action so concurrent agent runs can't race. The probes an
+        // answer makes after the input was delivered run outside it: a slow probe must not
+        // lengthen another action's wait, nor count against Windows' confirmation deadline.
         let result = {
             let _lock = ACTION_LOCK.lock().await;
             dispatch(&action).await
         };
-        // A failure that confirmed the surface gone drops the id it was asked
-        // through, so the table follows only surfaces that still exist.
+        // A failure that confirmed the surface gone drops the id, so the table follows only
+        // surfaces that still exist.
         if let Err(err) = &result {
             forget_confirmed_gone(&action, err);
         }
@@ -966,10 +833,8 @@ impl Tool for ComputerTool {
         Ok(crate::util::scrub_credentials(&answer))
     }
 
-    /// The tool's text is a real result (a surface summary, an action's outcome),
-    /// never a claim about an image, so annotations are appended rather than
-    /// replacing it. A capture whose image cannot be attached says so here instead
-    /// of leaving the call looking like a successful observation.
+    /// The tool's text is a real result, never a claim about an image, so annotations are
+    /// appended rather than replacing it. A capture whose image cannot be attached says so here.
     async fn execute_with_payloads(
         &self,
         ws: &crate::Workspace,
@@ -992,12 +857,9 @@ impl Tool for ComputerTool {
     }
 }
 
-/// The image a `screenshot`/`zoom` call produced, or `None` for every other action.
-///
-/// The action is re-parsed so a stale capture from a prior round is never attached
-/// to a non-capture call, and the record is looked up per agent so two concurrent
-/// agents never share a screenshot. Failing to produce the attachment is an error
-/// the caller must report, never a silent `None`.
+/// The image a `screenshot`/`zoom` call produced, or `None` for every other action: the action
+/// is re-parsed so a stale capture is never attached to a non-capture call, and the record is
+/// looked up per agent. Failing to attach is an error the caller must report.
 async fn captured_payload(
     args: &serde_json::Value,
 ) -> anyhow::Result<Option<crate::tools::ImagePayload>> {
@@ -1032,9 +894,8 @@ async fn captured_payload(
         None,
         crate::tools::ImagePayloadSource::Computer,
     );
-    // A capture larger than the shared attachment cap reaches the model reduced, so
-    // the model is told: an image it measured at its capture size would otherwise
-    // silently describe pixels it was never shown.
+    // A capture larger than the shared attachment cap reaches the model reduced, so the model is
+    // told: an image it measured at its capture size would otherwise describe pixels it never saw.
     let longest = record.width.max(record.height);
     if longest > crate::util::INBOUND_IMAGE_MAX_SIDE {
         payload.note = Some(format!(
@@ -1050,12 +911,9 @@ async fn captured_payload(
     Ok(Some(payload))
 }
 
-// ── Action dispatch ─────────────────────────────────────────────────────
-
-/// Whether an action needs the interactive desktop. Listing applications and windows and
-/// `wait` describe the session rather than receive anything from it, so they stay available
-/// while it is locked; everything else is written as an exclusion so an action added later
-/// is gated by default.
+/// Whether an action needs the interactive desktop. Listing applications and windows and `wait`
+/// describe the session rather than receive anything from it, so everything else is written as
+/// an exclusion and an action added later is gated by default.
 fn needs_desktop(action: &ComputerAction) -> bool {
     !matches!(
         action,
@@ -1063,9 +921,9 @@ fn needs_desktop(action: &ComputerAction) -> bool {
     )
 }
 
-/// Refuse a call whose session cannot receive it, before any surface is resolved or
-/// captured and before [`ACTION_LOCK`] is taken. Deliberately outside the per-action
-/// code: a state refusal is the one answer `cursor` must not degrade into "no surface".
+/// Refuse a call whose session cannot receive it, before any surface is resolved or captured and
+/// before [`ACTION_LOCK`] is taken: a state refusal is the one answer `cursor` must not degrade
+/// into "no surface".
 async fn ensure_interactive_desktop() -> anyhow::Result<()> {
     let Some(reason) = backend().desktop_unavailable().await else {
         return Ok(());
@@ -1080,11 +938,10 @@ async fn ensure_interactive_desktop() -> anyhow::Result<()> {
     ))
 }
 
-/// The one place a `framework-failed` answer gains its next step, written for the call that
-/// failed: a listing or a cursor read is worth one retry, a capture is not helped by being
-/// taken again, and the rest check the surface first. The constructor stays plain because a
-/// framework failure raised during an actuation is folded into `applied but unconfirmed`
-/// (the input may already have landed), where "the call was abandoned" would be wrong.
+/// The one place a `framework-failed` answer gains its next step: a listing or a cursor read is
+/// worth one retry, a capture is not helped by being taken again, and the rest check the surface
+/// first. The constructor stays plain because a framework failure during an actuation is folded
+/// into `applied but unconfirmed`.
 fn framework_next_step(action: &ComputerAction, err: anyhow::Error) -> anyhow::Error {
     if !core::is_framework_failed(&err) {
         return err;
@@ -1112,9 +969,8 @@ async fn dispatch(action: &ComputerAction) -> anyhow::Result<Delivered> {
     match action {
         ComputerAction::Apps {} => Ok(Delivered::Read(apps().await?)),
         ComputerAction::Windows { app } => Ok(Delivered::Read(windows(app.as_deref()).await?)),
-        // An observation spills and scrubs its own tree before handing it over; every
-        // answer is scrubbed once more at the boundary, which is also where the
-        // post-action report is appended.
+        // An observation spills and scrubs its own tree; every answer is scrubbed once more at the
+        // boundary, which is also where the post-action report is appended.
         ComputerAction::Observe {
             target,
             reference,
@@ -1179,8 +1035,7 @@ async fn dispatch(action: &ComputerAction) -> anyhow::Result<Delivered> {
     }
 }
 
-/// A chord is global input: it goes to the focused application, so no surface is
-/// resolved and none is raised on its behalf.
+/// A chord is global input: it goes to the focused application, so no surface is resolved.
 async fn press(keys: &str) -> anyhow::Result<Delivered> {
     let actuation = backend()
         .raw_input(
@@ -1196,9 +1051,8 @@ async fn press(keys: &str) -> anyhow::Result<Delivered> {
     )))
 }
 
-/// A drag states both ends of its gesture in the surface's own points: where it started,
-/// where it ended, and the surface they were mapped through — as the backend that posted
-/// them reported it.
+/// A drag states both ends of its gesture in the surface's own points, and the surface they were
+/// mapped through as the backend that posted them reported it.
 async fn drag(from: (f64, f64), to: (f64, f64), target: Option<&str>) -> anyhow::Result<Delivered> {
     let surface = resolve_in_place(target).await?;
     let gesture = core::RawInput::Drag { from, to };
@@ -1225,20 +1079,18 @@ async fn drag(from: (f64, f64), to: (f64, f64), target: Option<&str>) -> anyhow:
     })
 }
 
-/// What one call delivered, and therefore what its answer still owes the caller.
-///
-/// A read (an observation, a listing, a crop) is answered as it is. Input delivered to a
-/// surface carries that surface, so its answer reports what could be observed after it —
-/// read only once the action lock is released. Input that addresses no surface (a key
-/// chord, a wheel at no point) reports the focus only.
+/// What one call delivered, and therefore what its answer still owes the caller. A read is
+/// answered as it is; input delivered to a surface carries that surface, so its answer reports
+/// what could be observed after it, read once the action lock is released; input that addresses
+/// no surface reports the focus only.
 enum Delivered {
     Read(String),
     OnSurface { text: String, surface: TargetSpec },
     Global(String),
 }
 
-/// A point as an answer states the input the call gave: the normalized pair, so a
-/// coordinate is never quoted without the scale it was read in.
+/// A point as an answer states it: the normalized pair, so a coordinate is never quoted without
+/// the scale it was read in.
 fn point_text(point: (f64, f64)) -> String {
     format!(
         "({}, {}) of 0-{:.0}",
@@ -1248,10 +1100,8 @@ fn point_text(point: (f64, f64)) -> String {
     )
 }
 
-/// The surface clause of an action result: the surface the call named, or — when it named
-/// none — the window the input was actually mapped through, named by where that window sits
-/// (its size is already in the placement the same answer states). `""` when the call named
-/// no surface and the backend resolved none.
+/// The surface clause of an action result: the surface the call named, or the window the input
+/// was actually mapped through, named by where it sits. `""` when neither is known.
 fn on_surface(target: &TargetSpec, placed: Option<&core::Placement>) -> String {
     match target {
         TargetSpec::Focused => placed.map_or_else(String::new, |placed| {
@@ -1262,13 +1112,9 @@ fn on_surface(target: &TargetSpec, placed: Option<&core::Placement>) -> String {
     }
 }
 
-/// The clause a pointer gesture appends when it is not pinned to the surface: its
-/// coordinates were mapped there, but the input lands wherever the pointer is. Pinned
-/// input omits it, having been delivered to the surface it named.
-///
-/// A coordinate click carries no such clause: what it lands on is checked at the moment
-/// it is sent ([`core::UnderPoint`]), so the clause survives only where it is still true
-/// — a drag and a wheel at a point.
+/// The clause a pointer gesture appends when it is not pinned to the surface: its coordinates
+/// were mapped there, but the input lands wherever the pointer is. A coordinate click carries no
+/// such clause — what it lands on is checked when it is sent ([`core::UnderPoint`]).
 fn unpinned_clause(target: &TargetSpec, input: &core::RawInput) -> &'static str {
     if core::pinned_input(target, input) {
         ""
@@ -1277,13 +1123,10 @@ fn unpinned_clause(target: &TargetSpec, input: &core::RawInput) -> &'static str 
     }
 }
 
-/// The final text of one call: what it did, and — for input that was delivered — what
-/// could be observed after it.
-///
-/// Every part of the report is read best-effort: a probe that fails or cannot answer is
-/// stated as unread, never turned into a failure of an action that already happened,
-/// and never used to widen the answer into "applied but unconfirmed". The answer states
-/// what it saw; it never claims that the intended effect occurred.
+/// The final text of one call: what it did, and — for input that was delivered — what could be
+/// observed after it. Every part is read best-effort: a probe that fails is stated as unread,
+/// never turned into a failure of an action that already happened. The answer never claims that
+/// the intended effect occurred.
 async fn answer(delivered: Delivered) -> String {
     match delivered {
         Delivered::Read(text) => text,
@@ -1299,22 +1142,21 @@ async fn answer(delivered: Delivered) -> String {
     }
 }
 
-/// The element that holds the focus, as the answer states it: by kind and name, or the
-/// plain statement that this read did not establish it.
+/// The element that holds the focus, as the answer states it: by kind and name, or the plain
+/// statement that this read did not establish it.
 async fn focus_text(surface: Option<&TargetSpec>) -> String {
     match backend().focused_element(surface).await {
         Some(element) => format!("focus: {}", element.describe()),
         // The read failed this time — a target that does not answer, or one with no focused
-        // element. Every platform here can answer for some targets, so this is never stated
-        // as an incapability of the platform.
+        // element. Every platform here can answer for some targets, so this is never stated as an
+        // incapability of the platform.
         None => "focus: could not be read this time".to_string(),
     }
 }
 
-/// Why there is no remembered look of a surface, said as the answers say it. One clause for
-/// every case — never observed, dropped for newer surfaces, discarded after the surface was
-/// confirmed gone — because all three are true of it and the answer is not the place to
-/// explain the cache's internals.
+/// Why there is no remembered look of a surface. One clause for every case — never observed,
+/// dropped for newer surfaces, discarded after the surface was confirmed gone — because all
+/// three are true of it and the answer is not the place to explain the cache.
 fn no_look() -> String {
     format!(
         "the tool keeps the {} most recently observed surfaces and holds no remembered look of \
@@ -1323,8 +1165,8 @@ fn no_look() -> String {
     )
 }
 
-/// Whether the surface still sits where its remembered look found it — the one thing an
-/// action's answer may say about movement, measured against that single record.
+/// Whether the surface still sits where its remembered look found it — the one thing an action's
+/// answer may say about movement.
 async fn surface_state(surface: &TargetSpec) -> String {
     let Some((remembered, taken)) = core::remembered_geometry(surface) else {
         return format!("nothing to compare against — {}", no_look());
@@ -1344,10 +1186,9 @@ async fn surface_state(surface: &TargetSpec) -> String {
     }
 }
 
-/// The surface an action addresses: the explicit target, else the surface this
-/// session last observed or captured, else — with nothing pinned yet — whatever the
-/// system has focused. Coordinate actions use it so a focus shift between observe
-/// and the action never lands them on a different surface than the refs came from.
+/// The surface an action addresses: the explicit target, else the surface this session last
+/// observed or captured, else whatever the system has focused — so a focus shift between observe
+/// and the action never lands it on a different surface than the refs came from.
 fn resolve_action_target(target: Option<&str>) -> anyhow::Result<TargetSpec> {
     if let Some(t) = target {
         return core::resolve_target(Some(t));
@@ -1355,13 +1196,10 @@ fn resolve_action_target(target: Option<&str>) -> anyhow::Result<TargetSpec> {
     Ok(core::last_surface().unwrap_or(TargetSpec::Focused))
 }
 
-/// [`resolve_action_target`] with the surface made concrete: a call that ends up on the
-/// focused window, or on an application id, names the one window it addresses. Everything
-/// recorded about a surface — the remembered look, the order a listing gives it — is about
-/// one window, so an application address is made concrete before anything is stored, and
-/// an application id that now names a different window has nothing to compare against
-/// rather than a fabricated move. This is [`resolve_in_place`] plus the focused surface,
-/// which a read or a point action needs named.
+/// [`resolve_action_target`] with the surface made concrete: a call that ends up on the focused
+/// window, or on an application id, names the one window it addresses. Everything recorded about a
+/// surface is about one window, so an application address is made concrete before anything is
+/// stored.
 async fn resolve_surface(target: Option<&str>) -> anyhow::Result<TargetSpec> {
     let surface = resolve_in_place(target).await?;
     if !matches!(surface, TargetSpec::Focused) {
@@ -1371,14 +1209,10 @@ async fn resolve_surface(target: Option<&str>) -> anyhow::Result<TargetSpec> {
     Ok(TargetSpec::from_window(&win))
 }
 
-/// The surface an action that may go to whatever holds the focus addresses — typing, a
-/// drag, a wheel at a point. It is resolved exactly once and the input is delivered through
-/// what it resolved: an `a` id is made concrete, so the window the answer is about is the
-/// window that receives the input, while a call that names nothing and has observed
-/// nothing keeps addressing the focused surface, as global input always has.
-///
-/// Nothing here can fail for a surface that cannot be *named*: the only read is the one an
-/// `a` id owes anyway.
+/// The surface an action that may go to whatever holds the focus addresses — typing, a drag, a
+/// wheel at a point. It is resolved exactly once and the input delivered through what it
+/// resolved: an `a` id is made concrete, while a call that names and has observed nothing keeps
+/// addressing the focused surface.
 async fn resolve_in_place(target: Option<&str>) -> anyhow::Result<TargetSpec> {
     match resolve_action_target(target)? {
         app @ TargetSpec::App { .. } => {
@@ -1389,13 +1223,10 @@ async fn resolve_in_place(target: Option<&str>) -> anyhow::Result<TargetSpec> {
     }
 }
 
-/// Drop the id a failed call was asked through when the failure confirmed that
-/// surface gone, and forget the remembered look of that surface however the call
-/// addressed it — by an id, by a ref, or as the surface it last used. Only a confirmed
-/// death counts: a busy or unanswering surface keeps both, and an identifier the call
-/// never named (a global key chord) has neither to drop. This is what keeps the tables
-/// following the desktop without any polling — nothing is remembered about a surface
-/// that no longer exists.
+/// Drop the id a failed call was asked through when the failure confirmed that surface gone, and
+/// forget the remembered look of that surface however the call addressed it. Only a confirmed
+/// death counts: a busy or unanswering surface keeps both. This is what keeps the tables
+/// following the desktop without polling.
 fn forget_confirmed_gone(action: &ComputerAction, err: &anyhow::Error) {
     if !core::is_surface_gone(err) {
         return;
@@ -1425,11 +1256,9 @@ fn forget_confirmed_gone(action: &ComputerAction, err: &anyhow::Error) {
         } => core::resolve_ref(reference).ok().map(|(_, target)| target),
         _ => None,
     };
-    // The surface to forget: the one the ref belongs to (which may not be the surface this
-    // session last used), else the id the call named, else — for a call that named its
-    // surface by name or pid, which never had an id — that application's own records. The
-    // session's last surface is the fallback only when the call named none: forgetting it
-    // for a surface the call did name would drop an unrelated record.
+    // The surface to forget: the one the ref belongs to, else the id the call named, else that
+    // application's own records. The session's last surface is the fallback only when the call
+    // named none: forgetting it for a named surface would drop an unrelated record.
     if let Some(surface) = by_ref.or_else(|| named.and_then(|arg| core::get_target(arg.trim()))) {
         core::forget_look(&surface);
     } else if let Some(arg) = named {
@@ -1471,9 +1300,8 @@ async fn apps() -> anyhow::Result<String> {
     Ok(lines.join("\n"))
 }
 
-/// The line that names what is in front — the one thing a listing must never leave the
-/// caller to infer, including when that application is not among those listed (a
-/// menu-bar accessory, a process with no enumerable window).
+/// The line that names what is in front — the one thing a listing must never leave the caller to
+/// infer, including when that application is not among those listed.
 fn frontmost_line(frontmost: Option<&str>, listed: &[&str]) -> String {
     match frontmost {
         None => "frontmost application: unknown — the application in front could not be named"
@@ -1492,9 +1320,8 @@ async fn windows(app: Option<&str>) -> anyhow::Result<String> {
     let app_info = match app {
         Some(arg) => {
             let info = resolve_app(arg).await?;
-            // An id outlives the run that minted it, so the application it names is
-            // confirmed against the running system before the listing can present a
-            // quit application as one without windows.
+            // An id outlives the run that minted it, so the application it names is confirmed
+            // against the running system before the listing presents it as one without windows.
             if backend().app_running(&info).await == Some(false) {
                 return Err(core::app_absent(&info.name, core::AppAbsence::Quit));
             }
@@ -1513,10 +1340,8 @@ async fn windows(app: Option<&str>) -> anyhow::Result<String> {
 }
 
 /// The listing as the model reads it: one line per window, then what the platform could
-/// establish about the set — its order, the application in front and, for a single
-/// application, whether it is that one — then one line per set of windows that is not
-/// listed. A failed read is never presented as an absence, and the note never claims
-/// anything about the windows listed above it — an application can have both.
+/// establish about the set, then one line per set of windows that is not listed. A failed read is
+/// never presented as an absence.
 fn render_windows(
     listing: &core::WindowListing,
     ids: &[String],
@@ -1527,9 +1352,8 @@ fn render_windows(
         .iter()
         .zip(ids)
         .map(|(win, id)| {
-            // The place in the order and the focused mark sit beside the identity: two
-            // windows that share a title and a position still stand apart by the id and,
-            // where the platform has one, by their place in the order.
+            // The place in the order and the focused mark sit beside the identity: two windows
+            // that share a title and a position still stand apart by the id.
             let mut line = format!("[{id}] ");
             if let Some(rank) = win.rank {
                 let _ = write!(line, "#{rank} ");
@@ -1560,9 +1384,7 @@ fn render_windows(
             .to_string(),
         );
     }
-    // An order that is not complete says which kind of incompleteness it is: a failed read
-    // names the read, a platform that cannot attribute an order says that, and a listing
-    // whose windows simply have no place says how many of the listed ones it covers.
+    // An order that is not complete says which kind of incompleteness it is.
     if !listing.windows.is_empty() {
         match listing.order {
             core::WindowOrder::All => {}
@@ -1626,10 +1448,9 @@ fn render_windows(
     lines.join("\n")
 }
 
-/// Resolve a `windows` app argument: a stored a-id (or w-id, whose app is what is
-/// being asked about), a numeric pid, or a raw app name. Always returns a
-/// fully-resolved [`AppInfo`] (with a pid) or a clear error, so the macOS backend
-/// never silently skips a pid-less app.
+/// Resolve a `windows` app argument: a stored a-id (or w-id, whose app is what is being asked
+/// about), a numeric pid, or a raw app name. Always a fully-resolved [`AppInfo`] or a clear
+/// error, so no backend silently skips a pid-less app.
 async fn resolve_app(arg: &str) -> anyhow::Result<AppInfo> {
     let trimmed = arg.trim();
     if trimmed == "screen" {
@@ -1640,9 +1461,8 @@ async fn resolve_app(arg: &str) -> anyhow::Result<AppInfo> {
     {
         return Ok(AppInfo { pid, name });
     }
-    // Something shaped like one of this tool's ids is read as an id even when the
-    // session no longer knows it: calling it a missing application would blame the
-    // wrong thing. A name or a pid keeps the route below and its own refusal.
+    // Something shaped like one of this tool's ids is read as an id even when the session no
+    // longer knows it: calling it a missing application would blame the wrong thing.
     if core::is_identifier(trimmed) {
         return Err(core::unknown_identifier(trimmed));
     }
@@ -1660,9 +1480,8 @@ async fn resolve_app(arg: &str) -> anyhow::Result<AppInfo> {
     Err(no_app_error(trimmed, &apps))
 }
 
-/// The refusal for an app argument that matches no running application: the
-/// candidates are the first few names and a count of the rest, so a truncated list
-/// is never presented as the whole set.
+/// The refusal for an app argument that matches no running application: the first few candidate
+/// names and a count of the rest, so a truncated list never reads as the whole set.
 fn no_app_error(name: &str, apps: &[AppInfo]) -> anyhow::Error {
     if apps.is_empty() {
         anyhow::anyhow!(
@@ -1689,11 +1508,9 @@ fn no_app_error(name: &str, apps: &[AppInfo]) -> anyhow::Error {
     }
 }
 
-/// A ref-based action pins the observed surface; an explicit target that
-/// resolves to a DIFFERENT surface is almost always a mistake (the model kept
-/// both arguments). An equal target is fine, and so is an application id whose
-/// application is the ref's — the ref itself names the window the caller saw, and that is
-/// what the action is delivered to.
+/// A ref-based action pins the observed surface; an explicit target that resolves to a DIFFERENT
+/// surface is almost always a mistake. An equal target is fine, and so is an application id whose
+/// application is the ref's — the ref itself names the window the caller saw.
 fn ensure_ref_target_match(
     reference: &str,
     target: Option<&str>,
@@ -1715,25 +1532,15 @@ fn ensure_ref_target_match(
     Ok(())
 }
 
-/// Read a surface — the whole of it, part of what is already known of it, or what
-/// changed on it.
+/// Read a surface — the whole of it, part of what is already known of it, or what changed on it.
 ///
-/// A **full** observation (`target` only, or a call in which nothing narrows) is the one
-/// thing that records a surface: it pins the surface a later target-less call addresses,
-/// mints the refs the caller may act on, and replaces the remembered look every later
-/// statement about that surface is measured against. It replaces all three together, and
-/// a failed observation replaces nothing.
-///
-/// A **narrow** look (`ref`, `depth`, `kind`) reads the remembered look instead of the
-/// platform: it shows part of a tree the tool already holds, says that it covers part of
-/// the surface, and replaces nothing — not the look, not the refs. On a surface never
-/// fully observed there is nothing to narrow, and the answer says so.
-///
-/// A **change** answer (`changed`) reads the surface afresh and compares it against the
-/// remembered look: what appeared, disappeared, moved and changed, against what and how
-/// old. It replaces nothing either. With no remembered look there is nothing to compare
-/// against, so the call is an ordinary full observation: it records the surface and its
-/// refs like any other.
+/// A **full** observation is the one thing that records a surface: it pins the surface a later
+/// target-less call addresses, mints the refs the caller may act on, and replaces the remembered
+/// look every later statement is measured against. A failed observation replaces nothing. A
+/// **narrow** look (`ref`, `depth`, `kind`) reads the remembered look instead of the platform and
+/// replaces nothing; on a surface never fully observed there is nothing to narrow. A **change**
+/// answer (`changed`) reads the surface afresh and compares it against the remembered look, also
+/// replacing nothing — with no remembered look it is an ordinary full observation.
 async fn observe(
     target: Option<&str>,
     reference: Option<&str>,
@@ -1741,9 +1548,8 @@ async fn observe(
     kind: Option<String>,
     changed: bool,
 ) -> anyhow::Result<Delivered> {
-    // The surface a ref names is the one it was observed on, so a narrow look by ref never
-    // resolves a different one; every other form resolves the surface concretely, never
-    // `Focused`, so what is recorded is the window this call actually read.
+    // The surface a ref names is the one it was observed on; every other form resolves
+    // concretely, never `Focused`, so what is recorded is the window this call actually read.
     let (surface, at) = match reference {
         Some(reference) => {
             let (locator, cache_target) = core::resolve_ref(reference)?;
@@ -1773,15 +1579,14 @@ async fn observe(
 
     let obs = backend().observe(&surface).await?;
     let counts = core::counts(&obs.root);
-    // Rendered before the observation is remembered: the record owns the tree, so nothing
-    // is copied and the answer is built from the read itself.
+    // Rendered before the observation is remembered: the record owns the tree, so nothing is
+    // copied.
     let full = render_full(&obs, counts);
     record_observation(&surface, obs, counts);
     Ok(Delivered::Read(spill(&full)))
 }
 
-/// The change answer: what differs from the surface's remembered look, or an ordinary
-/// full observation when there is nothing to compare against.
+/// The change answer, or an ordinary full observation when there is nothing to compare against.
 async fn observe_changed(surface: &TargetSpec) -> anyhow::Result<String> {
     let obs = backend().observe(surface).await?;
     let counts = core::counts(&obs.root);
@@ -1798,18 +1603,17 @@ async fn observe_changed(surface: &TargetSpec) -> anyhow::Result<String> {
     Ok(spill(&output))
 }
 
-/// Record a full observation: the surface a later target-less call addresses, the refs
-/// the caller may act on now, and the remembered look later statements are measured
-/// against. One place writes all three, so no path can record one without the others.
+/// Record a full observation: the surface a later target-less call addresses, the refs the caller
+/// may act on, and the remembered look later statements are measured against. One place writes
+/// all three, so no path can record one without the others.
 fn record_observation(surface: &TargetSpec, obs: core::Observation, counts: core::Counts) {
     core::set_last_surface(surface.clone());
     core::store_observation(surface.clone(), &obs);
     core::remember_look(surface, obs, counts);
 }
 
-/// The full observation as the model reads it, with the thin-surface hint when the tree
-/// barely describes what is on screen. The hint fires here and nowhere else: a narrow
-/// look and a change answer are views of a tree, not a statement about the surface.
+/// The full observation as the model reads it, with the thin-surface hint when the tree barely
+/// describes what is on screen. The hint fires here and nowhere else.
 fn render_full(obs: &core::Observation, counts: core::Counts) -> String {
     let mut output = core::render_tree(obs, counts);
     if counts.interactive < core::AX_THIN_INTERACTIVE_ELEMENTS {
@@ -1818,9 +1622,9 @@ fn render_full(obs: &core::Observation, counts: core::Counts) -> String {
             "surface exposes few actionable elements — {} interactive of {} nodes read: {}",
             counts.interactive,
             counts.nodes,
-            // A hint may only name a route that works at this moment: a still when stills
-            // are known to work, a statement that they are unavailable when that is known,
-            // and neither when availability is unknown.
+            // A hint may only name a route that works at this moment: a still when stills are
+            // known to work, a statement that they are unavailable when that is known, and neither
+            // when availability is unknown.
             match cached_capture_available() {
                 Some(true) => "use screenshot to see the rest",
                 Some(false) => {
@@ -1836,8 +1640,8 @@ fn render_full(obs: &core::Observation, counts: core::Counts) -> String {
     output
 }
 
-/// Hand the answer to the spill budget, scrubbed first: the tree is the one result that
-/// can be large enough to be written to a file instead of returned whole.
+/// Hand the answer to the spill budget, scrubbed first: the tree is the one result that can be
+/// large enough to be written to a file instead of returned whole.
 fn spill(output: &str) -> String {
     crate::tools::shell::try_spill_to_file(
         crate::util::scrub_credentials(output),
@@ -1874,8 +1678,8 @@ async fn click(
     let Some((x, y)) = coord_pair(x, y, "click point")? else {
         anyhow::bail!("click requires an element ref (preferred) or normalized x/y coordinates");
     };
-    // A concrete surface: its own points are what the point is mapped through, what the
-    // window under the point is compared against, and what the answer names.
+    // A concrete surface: its own points are what the point is mapped through, what the window
+    // under the point is compared against, and what the answer names.
     let target = resolve_surface(target).await?;
     let input = core::RawInput::Click {
         point: (x, y),
@@ -1883,10 +1687,8 @@ async fn click(
         double: double.unwrap_or(false),
         modifiers: modifiers.unwrap_or_default().to_vec(),
     };
-    // What the point lies over is checked by the backend at the moment it sends, after
-    // its own raise: only there is "in front" the state the click meets. The same call
-    // reports the position it actually put, so the answer never quotes a point from a
-    // different read of the surface than the one the click used.
+    // What the point lies over is checked by the backend when it sends, after its own raise: only
+    // there is "in front" the state the click meets. The call reports the position it put.
     let actuation = backend().raw_input(&target, input.clone()).await?;
     let mut text = match &actuation.placed {
         Some(placed) => format!(
@@ -1903,8 +1705,8 @@ async fn click(
     })
 }
 
-/// What a point action's answer says when the call ended without an answer: the position it
-/// was asked to put could not be read, so nothing is claimed about where it went.
+/// What a point action's answer says when the call ended without an answer: nothing is claimed
+/// about where it went.
 const UNREAD_POSITION: &str = " — its position could not be read";
 
 async fn type_text(
@@ -1935,10 +1737,8 @@ async fn type_text(
             surface: cache_target,
         });
     }
-    // Typing without a ref goes to whatever holds the focus. The surface is resolved once
-    // and the input delivered through it: an `a` id becomes the window that receives the
-    // text, while a call with nothing observed yet keeps the global typing it has always
-    // done.
+    // Typing without a ref goes to whatever holds the focus. The surface is resolved once and the
+    // input delivered through it: an `a` id becomes the window that receives the text.
     let surface = resolve_in_place(target).await?;
     let input = core::RawInput::TypeText {
         text: text.to_string(),
@@ -1970,8 +1770,8 @@ async fn scroll(
 ) -> anyhow::Result<Delivered> {
     let amount = amount.unwrap_or(DEFAULT_SCROLL_AMOUNT);
     let Some(point) = coord_pair(x, y, "scroll anchor")? else {
-        // A point-less wheel is global input: no surface is resolved or raised, and the
-        // validator has already refused a target that names one.
+        // A point-less wheel is global input: no surface is resolved or raised, and the validator
+        // has already refused a target that names one.
         let actuation = backend()
             .raw_input(
                 &TargetSpec::Focused,
@@ -2016,8 +1816,7 @@ async fn scroll(
     })
 }
 
-/// The surface a `cursor` reading is relative to, with its geometry: a concrete
-/// one, so the numbers say what they are relative to.
+/// The surface a `cursor` reading is relative to, with its geometry.
 async fn cursor_surface() -> anyhow::Result<(TargetSpec, core::SurfaceGeometry)> {
     let target = resolve_surface(None).await?;
     let geo = backend().surface_geometry(&target).await?;
@@ -2026,12 +1825,9 @@ async fn cursor_surface() -> anyhow::Result<(TargetSpec, core::SurfaceGeometry)>
 
 async fn cursor() -> anyhow::Result<String> {
     let (ax, ay) = backend().cursor_position().await?;
-    // A surface that cannot be read degrades to the absolute pointer, as it always
-    // has (no focused window, an unreachable AT-SPI bus, a Wayland portal failure, a
-    // self-target read the main thread did not answer), and the reason is passed on
-    // rather than guessed. The one exception is a grant denial, which is a typed
-    // failure: it is actionable (its text names the terminal and the pane), and "no
-    // surface" would misname it.
+    // A surface that cannot be read degrades to the absolute pointer, as it always has, and the
+    // reason is passed on rather than guessed. The one exception is a grant denial, which is a
+    // typed, actionable failure — "no surface" would misname it.
     let (target, geo) = match cursor_surface().await {
         Ok(resolved) => resolved,
         Err(e) if !core::is_permission_denied(&e) => {
@@ -2060,38 +1856,32 @@ async fn cursor() -> anyhow::Result<String> {
     }
 }
 
-/// Capture the target surface (optionally cropping a normalized region) to a PNG
-/// under the managed temp dir, record it for this call's attachment, and return a
-/// summary naming the surface actually captured. The capture probe is cached: a
-/// successful capture always refreshes the cache; a failed capture on a cold cache
-/// probes once and caches the grant state, so a genuinely-grantless setup maps
-/// failures to the actionable [`Backend::capture_unavailable_error`] while a real
-/// success upgrades the cache immediately — a stale cached negative never locks
-/// out a working channel.
+/// Capture the target surface (optionally cropping a normalized region) to a PNG under the
+/// managed temp dir, record it for this call's attachment, and return a summary naming the
+/// surface actually captured. The capture probe is cached: a success always refreshes it; a
+/// failure on a cold cache probes once and caches the grant state, so a grantless setup maps to
+/// the actionable [`Backend::capture_unavailable_error`] while a stale cached negative never
+/// locks out a working channel.
 async fn capture(target: Option<&str>, region: Option<&Region>) -> anyhow::Result<String> {
-    // One resolution for the whole call: the surface captured, the geometry the
-    // region is mapped against and the surface pinned afterwards are the same.
+    // One resolution for the whole call: the surface captured, the geometry the region is mapped
+    // against and the surface pinned afterwards are the same.
     let target = resolve_surface(target).await?;
-    // One allowance for everything this call holds at once — the frame, the composite
-    // and the crop — so no reported geometry can drive an allocation the process
-    // cannot survive.
+    // One allowance for everything this call holds at once — the frame, the composite and the
+    // crop — so no reported geometry can drive an allocation the process cannot survive.
     let budget = core::CaptureBudget::default();
 
     let capture_result = backend().capture(&target, &budget).await;
     let cap = match capture_result {
         Ok(cap) => {
-            // A successful capture proves the channel works — always refresh the
-            // cache (overwriting a cached negative) so a fresh probe isn't
-            // re-run and later failures map to the real grant state.
+            // A successful capture proves the channel works — always refresh the cache so a fresh
+            // probe isn't re-run and later failures map to the real grant state.
             set_capture_cache(true);
             cap
         }
         Err(e) => {
-            // First failure in this process: probe once and cache the grant
-            // state. A cached negative means the grant is genuinely missing —
-            // map subsequent failures to the actionable capture error. A cached
-            // positive (or a freshly re-probed positive) means this failure is
-            // transient — surface the original error.
+            // First failure in this process: probe once and cache the grant state. A cached
+            // negative means the grant is genuinely missing; a cached positive means this failure
+            // is transient, so the original error is surfaced.
             if cached_capture_available().is_none() {
                 let ok = backend().capture_available().await;
                 set_capture_cache(ok);
@@ -2103,8 +1893,8 @@ async fn capture(target: Option<&str>, region: Option<&Region>) -> anyhow::Resul
         }
     };
 
-    // The region is mapped into the capture's own pixels, so it cannot be taken
-    // against a different surface than the one this call captured.
+    // The region is mapped into the capture's own pixels, so it cannot be taken against a
+    // different surface than the one this call captured.
     let (cropped, rect_opt) = match region {
         Some(region) => {
             let rect = core::region_to_pixels(region, cap.width, cap.height)?;
@@ -2118,11 +1908,10 @@ async fn capture(target: Option<&str>, region: Option<&Region>) -> anyhow::Resul
 
     let (cw, ch) = (cropped.width, cropped.height);
     let path = encode_png(cropped)?;
-    // A capture that produced pixels is an observation of that surface: later
-    // calls with no target address it.
+    // A capture that produced pixels is an observation of that surface: later calls with no
+    // target address it.
     core::set_last_surface(target.clone());
-    // Stash the capture under the owning agent id, with the size it was taken at so
-    // the attachment can say when it had to reduce it.
+    // Stash the capture under the owning agent id, with the size it was taken at.
     CAPTURES.lock().unwrap_poison().insert(
         core::agent_key(),
         CaptureRecord {
@@ -2147,14 +1936,11 @@ async fn capture(target: Option<&str>, region: Option<&Region>) -> anyhow::Resul
     Ok(summary)
 }
 
-/// Encode a capture to PNG on disk (CPU + fs work offloaded with
-/// [`crate::util::with_block_in_place`]), returning the random-nonce path under
-/// the managed agent temp `computer/` dir. The encode holds no second pixel copy
-/// ([`image::RgbaImage::from_raw`] takes the buffer over) and its compressed output
-/// is bounded by the pixels it encodes, which the call's budget already capped.
+/// Encode a capture to PNG on disk (offloaded with [`crate::util::with_block_in_place`]),
+/// returning the random-nonce path under the managed agent temp `computer/` dir. The encode holds
+/// no second pixel copy and its output is bounded by the pixels the budget already capped.
 fn encode_png(cap: Capture) -> anyhow::Result<PathBuf> {
-    // The claim rides with the pixels: the call keeps paying for them until the encode
-    // is done with them.
+    // The claim rides with the pixels: the call keeps paying for them until the encode is done.
     let (width, height, rgba, _claim) = cap.into_parts();
     crate::util::with_block_in_place(move || {
         let img = image::RgbaImage::from_raw(width, height, rgba)
@@ -2210,8 +1996,7 @@ mod tests {
         }
     }
 
-    /// A minimal payload that deserializes each action variant, used by the
-    /// schema lockstep: every declared field has a slot in the variant.
+    /// A minimal payload that deserializes each action variant, used by the schema lockstep.
     fn action_payload(name: &str) -> Value {
         match name {
             "observe" | "screenshot" | "windows" | "apps" | "cursor" => json!({}),
@@ -2226,8 +2011,8 @@ mod tests {
         }
     }
 
-    /// One listing and what the rendered answer must say: the whole text when the
-    /// case is exact, or the fragments a longer one must carry.
+    /// One listing and what the rendered answer must say: the whole text, or the fragments a
+    /// longer one must carry.
     struct ListingCase {
         name: &'static str,
         /// `(title, focused, rank)` of each window, in the order listed.
@@ -2247,9 +2032,8 @@ mod tests {
     #[test]
     fn window_listing_cases() {
         let cases = [
-            // The unread note sits on its own line, so it can neither run into the
-            // last window line nor claim that an application has nothing listed when
-            // it does.
+            // The unread note sits on its own line, so it can neither run into the last window
+            // line nor claim that an application has nothing listed when it does.
             ListingCase {
                 name: "an_unread_note_has_its_own_line",
                 windows: &[("Start", false, Some(2))],
@@ -2349,8 +2133,7 @@ mod tests {
                      ranked by",
                 ],
             },
-            // An application in front that the listing could not show is named all the
-            // same, with the note that it is not among those listed.
+            // An application in front that the listing could not show is named all the same.
             ListingCase {
                 name: "a_frontmost_application_the_listing_could_not_show",
                 windows: &[("Inbox", false, Some(1))],
@@ -2362,8 +2145,7 @@ mod tests {
                 exact: None,
                 present: &["frontmost application: Dock (not in the list above)"],
             },
-            // A list that could not be read is a failed read, not a fact about the
-            // windows.
+            // A list that could not be read is a failed read, not a fact about the windows.
             ListingCase {
                 name: "an_unread_list_is_not_a_fact_about_the_windows",
                 windows: &[("Inbox", false, None)],
@@ -2533,8 +2315,8 @@ mod tests {
         ));
         assert!(err.contains("never both"), "{err}");
 
-        // A gesture only the coordinate form performs, and the same defaults restated
-        // on an element click (the form the tool has always tolerated).
+        // A gesture only the coordinate form performs, and the same defaults restated on an
+        // element click.
         assert!(
             validate_action(&parsed_action(
                 "click",
@@ -2550,8 +2332,7 @@ mod tests {
             .is_ok()
         );
 
-        // Half a coordinate pair names no point, and a target with no point addresses
-        // no surface.
+        // Half a coordinate pair names no point, and a target with no point addresses no surface.
         assert!(validate_action(&parsed_action("click", json!({"x": 5}))).is_err());
         assert!(
             validate_action(&parsed_action(
@@ -2568,8 +2349,7 @@ mod tests {
             .is_err()
         );
 
-        // An observation either narrows what is already known or asks what changed, and
-        // its depth is bounded like every other argument.
+        // An observation either narrows what is already known or asks what changed.
         assert!(
             validate_action(&parsed_action("observe", json!({"depth": 0}))).is_err(),
             "a depth of 0 shows nothing"
@@ -2648,9 +2428,8 @@ mod tests {
             );
         }
 
-        // Every field a variant carries is declared in its schema entry, and every
-        // declared field is one the variant takes: a field serde would drop, and a
-        // field refused without a slot in the variant, both fail here.
+        // Every field a variant carries is declared in its schema entry, and every declared field
+        // is one the variant takes.
         for action_schema in action_schemas {
             let Some((name, inner)) = action_schema["properties"]
                 .as_object()
@@ -2685,22 +2464,17 @@ mod tests {
             );
         }
 
-        // Every wire name must normalize (be accepted by the allowlist) and its
-        // canonical tagged form must round-trip deserialize. A new
-        // `ComputerAction` variant fails here until a oneOf entry + payload are
-        // added; the enum is the single source of truth for the name set.
+        // Every wire name must normalize and its canonical tagged form must round-trip
+        // deserialize. A new variant fails here until a oneOf entry and payload are added.
         for name in &enum_names {
             let payload = action_payload(name);
 
-            // Wrapped form, as the schema produces it in the model's call:
-            // `{"action": {name: payload}}`.
+            // Wrapped form, as the schema produces it: `{"action": {name: payload}}`.
             let wrapped_args = json!({"action": {*name: payload.clone()}});
             let (wrapped_norm, _) = normalize_action(wrapped_args["action"].clone(), &wrapped_args)
                 .unwrap_or_else(|_| panic!("wrapped '{name}' should normalize"));
 
-            // Bare-string form, with the payload spread as siblings — the
-            // runtime's `build_action_from_siblings` flattening path:
-            // `{"action": name, ...payload}`.
+            // Bare-string form, with the payload spread as siblings.
             let mut bare_args = json!({"action": *name});
             if let Value::Object(payload_obj) = &payload {
                 bare_args
@@ -2711,10 +2485,8 @@ mod tests {
             let (bare_norm, _) = normalize_action(bare_args["action"].clone(), &bare_args)
                 .unwrap_or_else(|_| panic!("bare '{name}' should normalize"));
 
-            // Both forms must yield a tagged payload serde accepts for the
-            // variant — this is the real runtime path and would fail for a
-            // variant whose normalized payload mismatches its serde shape (e.g.
-            // apps/cursor as unit variants rejecting the schema's `{}`).
+            // Both forms must yield a tagged payload serde accepts for the variant — this would
+            // fail for a variant whose normalized payload mismatches its serde shape.
             for normalized in [&wrapped_norm, &bare_norm] {
                 let action: ComputerAction = serde_json::from_value(normalized.clone())
                     .unwrap_or_else(|e| {

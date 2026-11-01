@@ -4,8 +4,7 @@
 //! Routes, in order, per target:
 //!
 //! * a window — a `GraphicsCaptureItem` for the window (its own content), then a
-//!   desktop `BitBlt` over the window's rect (what a person sees, occluders
-//!   included);
+//! desktop `BitBlt` over the window's rect (what a person sees, occluders included);
 //! * the screen — one capture item per display stitched into the virtual-desktop
 //!   rect, then a single desktop `BitBlt`.
 //!
@@ -20,13 +19,11 @@
 //! a display's or a window's frame copy, the GDI readback and the crop back to the
 //! window's surface — holds a [`core::Claim`] on that call's [`CaptureBudget`].
 //! [`MAX_CAPTURE_EDGE`] stays what it always was, the API's own per-edge limit, with
-//! the product's budget stacked on top; see [`core::CAPTURE_BUDGET_PIXELS`] for the
-//! reasoning.
+//! the product's budget stacked on top; see [`core::CAPTURE_BUDGET_PIXELS`] for the reasoning.
 //!
 //! Everything here runs on the apartment thread. The D3D device is created lazily and
 //! dropped when a route fails, so a lost device (a driver reset, a GPU switch) is
-//! rebuilt by the next capture instead of leaving this route dead for the thread's
-//! life.
+//! rebuilt by the next capture instead of leaving this route dead for the thread's life.
 
 use super::super::core::{self, Capture, CaptureBudget, SurfaceGeometry, TargetSpec};
 use super::window;
@@ -61,19 +58,13 @@ use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemIntero
 use windows::Win32::System::WinRT::RoGetActivationFactory;
 use windows::core::{BOOL, HSTRING, IInspectable, Interface as _};
 
-/// How long one route waits for a frame before the next route runs.
 const FRAME_WAIT: Duration = Duration::from_millis(2_500);
 /// The whole multi-display stitch, so a host with many displays cannot spend
 /// [`super::CAPTURE_TIMEOUT`] waiting one display at a time.
 const SCREEN_BUDGET: Duration = Duration::from_secs(12);
-/// Poll interval while waiting — the free-threaded pool has no event we could await.
 const FRAME_POLL: Duration = Duration::from_millis(10);
-/// A pixel at or below this on every channel is "black" for the frame check.
 const BLACK_LEVEL: u8 = 8;
-/// How far a frame may differ from the surface it shows: a compositor rounds by a
-/// pixel or two at a display or DWM seam, which is not a resize.
 const EXTENT_TOLERANCE: u32 = 2;
-/// Refuse an absurd allocation rather than trying it.
 const MAX_CAPTURE_EDGE: f64 = 16_384.0;
 const BLANK_CAUSE: &str = "an all-black frame (a minimized window, protected content, or a surface \
      that refuses readback)";
@@ -102,8 +93,6 @@ impl CaptureContext {
     fn screen(&mut self, budget: &CaptureBudget) -> anyhow::Result<Capture> {
         let geometry = window::screen_geometry()?;
         let mut causes = Vec::new();
-        // A route that fails has already dropped its buffers, so the fallback is not
-        // charged for an attempt whose buffers are gone.
         let graphics = self.with_device(|gpu| screen_graphics(gpu, &geometry, budget));
         if let Some(frame) = take_route(graphics, "Windows.Graphics.Capture", &mut causes) {
             return Ok(frame);
@@ -154,8 +143,6 @@ impl CaptureContext {
         result
     }
 
-    /// The D3D device, created on first use and reused until a route fails (then
-    /// dropped, see [`with_device`]).
     fn gpu(&mut self) -> anyhow::Result<&Gpu> {
         let gpu = match self.device.take() {
             Some(gpu) => gpu,
@@ -165,8 +152,6 @@ impl CaptureContext {
     }
 }
 
-/// One window item's frame, aligned with the surface the model's coordinates refer
-/// to (see [`align_to_surface`]).
 fn window_graphics(
     gpu: &Gpu,
     resolved: &window::TargetWindow,
@@ -181,8 +166,7 @@ fn window_graphics(
     align_to_surface(frame, resolved.hwnd, &resolved.surface, budget)
 }
 
-/// The virtual desktop stitched from one capture item per display, within
-/// [`SCREEN_BUDGET`].
+/// The virtual desktop stitched from one capture item per display, within [`SCREEN_BUDGET`].
 fn screen_graphics(
     gpu: &Gpu,
     geometry: &SurfaceGeometry,
@@ -191,8 +175,6 @@ fn screen_graphics(
     let displays = monitors()?;
     let width = pixels(geometry.width)?;
     let height = pixels(geometry.height)?;
-    // Opaque black: an L-shaped desktop leaves gaps no display covers, and a
-    // transparent hole would read as "nothing there" in the PNG.
     let mut canvas = opaque_canvas(width, height, budget)?;
     let deadline = Instant::now() + SCREEN_BUDGET;
     for (monitor, rect) in displays {
@@ -205,8 +187,6 @@ fn screen_graphics(
         if remaining.is_zero() {
             return Err(anyhow!("the displays did not produce frames in time"));
         }
-        // One display's frame is alive at a time and its claim is released when it
-        // drops, so the stitch costs its canvas plus the frame in flight.
         let frame = grab(gpu, &item, remaining.min(FRAME_WAIT), budget)?;
         let extent = SurfaceGeometry {
             x: f64::from(rect.left),
@@ -256,8 +236,6 @@ fn grab(
             size.Height
         ));
     }
-    // The free-threaded pool needs no dispatcher queue, which is exactly the shape
-    // of this thread; the older `Create` is the fallback for an older build.
     let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
         &gpu.winrt,
         DirectXPixelFormat::B8G8R8A8UIntNormalized,
@@ -294,7 +272,6 @@ fn grab(
     pixels
 }
 
-/// The frame's pixels, through the D3D texture its surface exposes.
 fn read_frame(
     gpu: &Gpu,
     frame: &Direct3D11CaptureFrame,
@@ -403,7 +380,6 @@ fn read_texture(
     Ok(capture)
 }
 
-/// The reusable D3D11 device, also exposed as the WinRT device the frame pool takes.
 struct Gpu {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -523,9 +499,6 @@ unsafe extern "system" fn collect_monitor(
     BOOL(1)
 }
 
-// ── GDI routes ──────────────────────────────────────────────────────────
-
-/// A 32-bit top-down DIB section selected into a memory DC, freed on drop.
 struct Dib {
     dc: HDC,
     bitmap: HBITMAP,
@@ -541,7 +514,6 @@ impl Dib {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth: i32::try_from(width).unwrap_or(i32::MAX),
-                // Negative: a top-down bitmap, so row 0 is the top row.
                 biHeight: -i32::try_from(height).unwrap_or(i32::MAX),
                 biPlanes: 1,
                 biBitCount: 32,
@@ -593,8 +565,6 @@ impl Dib {
         })
     }
 
-    /// Copy the DIB's pixels into `rgba`, which the caller has already charged and
-    /// sized to this DIB's canvas.
     fn read_into(&self, rgba: &mut [u8]) -> anyhow::Result<()> {
         if self.bits.is_null() {
             return Err(anyhow!("the DIB section has no pixels"));
@@ -651,7 +621,6 @@ fn blit_window(surface: &SurfaceGeometry, budget: &CaptureBudget) -> anyhow::Res
     )
 }
 
-/// The whole virtual desktop, whose origin can be negative.
 fn blit_screen(geometry: &SurfaceGeometry, budget: &CaptureBudget) -> anyhow::Result<Capture> {
     let width = pixels(geometry.width)?;
     let height = pixels(geometry.height)?;
@@ -711,8 +680,6 @@ fn blit_rect(
     Ok(capture)
 }
 
-// ── Frame checks and errors ─────────────────────────────────────────────
-
 /// A black, fully opaque canvas: gaps no display covers stay black rather than
 /// transparent, which would read as "nothing there" in the PNG. Charged to the call
 /// before it exists — the composite is the largest buffer one capture holds.
@@ -724,9 +691,6 @@ fn opaque_canvas(width: u32, height: u32, budget: &CaptureBudget) -> anyhow::Res
     Ok(canvas)
 }
 
-/// BGRA in, opaque RGBA out — the one place that byte order is stated. Both readers
-/// above hand it a row (or a whole DIB) whose alpha is dropped: a still is what the
-/// screen shows, and a transparent pixel in the PNG would read as "nothing there".
 fn bgra_to_rgba(out: &mut [u8], src: &[u8]) {
     for (out, pixel) in out
         .as_chunks_mut::<4>()
@@ -781,9 +745,6 @@ fn align_to_surface(
     ))
 }
 
-/// Where the visible frame starts inside the window rect. An offset outside the rect
-/// the compositor just reported means a resize during the grab, refused rather than
-/// clamped onto the wrong pixel.
 fn crop_offset(value: f64) -> anyhow::Result<u32> {
     let value = value.round();
     if !(0.0..=f64::from(u32::MAX)).contains(&value) {
@@ -795,15 +756,11 @@ fn crop_offset(value: f64) -> anyhow::Result<u32> {
     Ok(value as u32)
 }
 
-/// Whether a frame is exactly the surface's size, up to [`EXTENT_TOLERANCE`].
 fn matches_extent(frame: &Capture, width: u32, height: u32) -> bool {
     frame.width.abs_diff(width) <= EXTENT_TOLERANCE
         && frame.height.abs_diff(height) <= EXTENT_TOLERANCE
 }
 
-/// One failed route as [`no_frame_error`] reports it: the cause, labelled with the
-/// route that produced it, and whether the product's own bound refused it
-/// (`degraded`) rather than a failure occurring.
 struct Cause {
     text: String,
     ceiling: bool,
@@ -873,7 +830,6 @@ fn no_frame_error(target: &str, causes: &[Cause]) -> anyhow::Error {
     )
 }
 
-/// A surface edge in pixels, refusing a degenerate or absurd size.
 fn edge(surface: &SurfaceGeometry) -> anyhow::Result<(u32, u32)> {
     if surface.width < 1.0 || surface.height < 1.0 {
         return Err(core::taxonomy_error(

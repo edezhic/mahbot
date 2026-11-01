@@ -1,60 +1,30 @@
-//! Dead-session recovery poller.
+//! Dead-session recovery poller: periodically check all direct user-agent sessions for silent
+//! failure and re-trigger the agent by routing a recovery job through the message router.
 //!
-//! Periodically checks all direct user-agent sessions for signs of silent
-//! failure and automatically re-triggers the agent by routing a recovery job
-//! through the message router. Three states are treated as dead:
+//! Three states are treated as dead: an **unanswered user message** (user sent one, no agent
+//! responded, none running); an **unfinished turn** whose last persisted message is a tool result
+//! (the run was cut before its final reply — recovery re-runs from the history it already has); and
+//! a **dangling tool-call frame**, persisted at emission time, whose calls have no results (the
+//! recovery re-run's `complete_pending_tool_calls` step settles them deterministically before the
+//! next LLM call).
 //!
-//! * **Unanswered user message** — the user sent a message, no agent
-//!   responded, and no agent is running.
-//! * **Unfinished turn (terminal tool frame)** — the agent committed a tool
-//!   result but was cut (drain/restart) before producing the final assistant
-//!   reply, so the last persisted message is a tool result. The tool result
-//!   is already in the session history; the recovery re-run continues from
-//!   there and delivers the missing answer.
-//! * **Dangling tool-call frame** — the assistant tool-call frame is persisted
-//!   at emission time (before the results), so a run cut (crash/drain)
-//!   mid-tool-round leaves the tail an assistant frame whose calls have no
-//!   results. The recovery re-run's universal `complete_pending_tool_calls`
-//!   step settles the dangling calls deterministically (resuming durable jobs
-//!   / re-executing) before the next LLM call, so recovery continues the
-//!   interrupted work.
+//! Recovery is checked once a minute for `STARTUP_WINDOW` after start — when a restart matters —
+//! and every `POLL_INTERVAL` afterwards, since an agent lost under a running process is rare. A
+//! candidate is recovered only once its last message is at least `STALE_GRACE_PERIOD` old, so an
+//! interrupted turn resumes ~two minutes after it was cut.
 //!
-//! # Poll cadence
+//! The poller skips `manager_*` (Manager has its own lifecycle) plus every prefix in
+//! [`super::TRANSIENT_AGENT_ID_PREFIXES`] — the union returned by
+//! `super::non_user_facing_agent_id_prefixes`; a custom role's continuable `role_*` branch IS
+//! recovered. Only direct user-agent sessions (`{user}_{ws}_{role}`, or the deduped
+//! `{user}_personal:{role}`) and custom roles' continuable branches are eligible.
 //!
-//! Recovery is checked once a minute for the first `STARTUP_WINDOW` after
-//! start — the window in which a restart actually matters — and once every
-//! `POLL_INTERVAL` afterwards: an agent lost while the process keeps running is
-//! rare, so the steady-state cadence is deliberately coarse.
-//!
-//! A candidate is recovered only once its last message is at least
-//! `STALE_GRACE_PERIOD` old, so an interrupted turn resumes about two minutes
-//! after it was cut, while a session abandoned under a running process waits
-//! for the next cycle in effect.
-//!
-//! # Exclusion list
-//!
-//! The poller skips `manager_*` (Manager has its own lifecycle) plus every
-//! prefix in [`super::TRANSIENT_AGENT_ID_PREFIXES`] (transient or
-//! background-only agents) — the union returned by
-//! `super::non_user_facing_agent_id_prefixes`. A custom role's continuable
-//! `role_*` branch is NOT in that union and IS recovered.
-//!
-//! Only direct user-agent sessions (format `{user}_{ws}_{role}`, or the
-//! deduped `{user}_personal:{role}` for the user's own personal workspace) and
-//! custom roles' continuable branches are eligible for recovery.
-//!
-//! # Retry safety design
-//!
-//! Every recovery attempt (regardless of whether routing succeeds) counts
-//! toward the per-session retry cap.  There is no "success feedback" from
-//! the consumer loop — the agent executes asynchronously, so routing
-//! success ≠ recovery success.  A persistently failing agent (rate-limited,
-//! API errors) will hit `MAX_RETRIES` after roughly six hours of adaptive
-//! backoff (first wait ~20 min, ~40 min per subsequent attempt, each attempt
-//! landing on the next poll cycle) and be permanently given up.
-//! The session becoming healthy is detected naturally on the next poll
-//! cycle when the last message is an assistant reply (condition 1 no longer
-//! holds).
+//! Retry safety: every recovery attempt counts toward the per-session retry cap regardless of
+//! whether routing succeeded, because the consumer loop gives no success feedback — the agent runs
+//! asynchronously, so routing success is not recovery success. A persistently failing agent hits
+//! `MAX_RETRIES` after roughly six hours of adaptive backoff (first wait ~20 min, ~40 min per
+//! subsequent attempt) and is given up; a session becoming healthy is detected on the next poll
+//! cycle, when the last message is an assistant reply.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -68,8 +38,6 @@ use crate::session::SessionContext;
 use crate::util::UnwrapPoison;
 use crate::{ChatRole, Role};
 
-// ── Constants ───────────────────────────────────────────────────────────────
-
 /// Interval between poller cycles once the startup window has passed.
 const POLL_INTERVAL: Duration = Duration::from_mins(10);
 
@@ -82,21 +50,18 @@ const STARTUP_WINDOW: Duration = Duration::from_mins(5);
 /// Maximum consecutive recovery attempts before giving up on a session.
 const MAX_RETRIES: u8 = 10;
 
-/// Base backoff in minutes.  Doubles on each consecutive failure, capped at
-/// `MAX_BACKOFF_MINUTES`.  This is the effective minimum delay between
-/// recovery attempts (the `or_insert` default is immediately doubled).
+/// Base backoff in minutes, doubled on each consecutive failure and capped at
+/// `MAX_BACKOFF_MINUTES` — the effective minimum delay between attempts (the `or_insert` default
+/// already starts doubled).
 const BASE_BACKOFF_MINUTES: i64 = 10;
 
 /// Maximum backoff in minutes.
 const MAX_BACKOFF_MINUTES: i64 = 40;
 
-/// Grace period: only attempt recovery if the session's last candidate
-/// message (user message, terminal tool frame, or dangling tool-call frame)
-/// is at least this old.
-/// Prevents races with agents that are still spawning or loading.
+/// Grace period: only attempt recovery if the session's last candidate message (user message,
+/// terminal tool frame, or dangling tool-call frame) is at least this old, so agents still spawning
+/// or loading are not raced.
 const STALE_GRACE_PERIOD: Duration = Duration::from_mins(2);
-
-// ── Retry tracker (in-memory) ───────────────────────────────────────────────
 
 struct RetryState {
     attempt_count: u8,
@@ -104,22 +69,12 @@ struct RetryState {
     backoff_minutes: i64,
 }
 
-/// Tracks recovery attempts per agent ID.
+/// Tracks recovery attempts per agent ID, in memory only — a restart drops the tracker, which is
+/// consistent with treating every session as fresh (the retry counter starts at zero).
 ///
-/// In-memory only — reset on daemon restart, which is consistent with the
-/// "no startup grace period" reasoning in the ticket: after restart, all
-/// sessions are treated as fresh, and the retry counter starts at zero.
-///
-/// ## Entry lifecycle
-///
-/// * An entry is created on the first recovery attempt (`record_attempt`).
-/// * If the session self-heals (agent responds), the entry is removed by
-///   `cleanup()` — the retry cap counts *consecutive* failures per episode.
-/// * If the session exhausts `MAX_RETRIES`, the entry persists permanently,
-///   causing `should_retry` to return `false` for the remainder of the
-///   daemon's lifetime.
-/// * On daemon restart all entries are lost, giving every session a fresh
-///   retry budget.
+/// An entry appears on the first attempt (`record_attempt`), is removed by `cleanup()` when the
+/// session self-heals — the cap counts *consecutive* failures per episode — and persists once
+/// `MAX_RETRIES` is exhausted, so `should_retry` stays `false` for the rest of the daemon's life.
 struct DeadSessionTracker {
     inner: Mutex<HashMap<String, RetryState>>,
 }
@@ -131,10 +86,8 @@ impl DeadSessionTracker {
         }
     }
 
-    /// Check whether a session is eligible for another recovery attempt.
-    ///
-    /// Returns `true` if the session has not exceeded the retry cap AND
-    /// the adaptive backoff period has elapsed since the last attempt.
+    /// Whether the session may be retried: under the retry cap AND the adaptive backoff has
+    /// elapsed.
     fn should_retry(&self, agent_id: &str) -> bool {
         let map = self.inner.lock().unwrap_poison();
         match map.get(agent_id) {
@@ -149,7 +102,7 @@ impl DeadSessionTracker {
         }
     }
 
-    /// Record a recovery attempt (increments counter, updates backoff).
+    /// Record a recovery attempt (increments the counter, updates the backoff).
     fn record_attempt(&self, agent_id: &str) {
         let mut map = self.inner.lock().unwrap_poison();
         let state = map.entry(agent_id.to_string()).or_insert(RetryState {
@@ -162,39 +115,24 @@ impl DeadSessionTracker {
         state.backoff_minutes = (state.backoff_minutes * 2).min(MAX_BACKOFF_MINUTES);
     }
 
-    /// Remove the tracking entry for a session that no longer needs recovery.
-    ///
-    /// Called from `recover_dead_sessions` on the self-heal paths (the tail
-    /// is a completed assistant reply, or the turn ended via the `sleep`
-    /// tool), on stale-entry cleanup (empty tail — no recovery candidate),
-    /// and on permanent-abandon paths (missing session context, invalid
-    /// role). In every case the retry cap counts *consecutive* failures per
-    /// episode — a session that fails, recovers (or is abandoned), then
-    /// fails again starts with a fresh retry budget.
-    ///
-    /// Safe to call for untracked sessions (no-op).
+    /// Remove the tracking entry for a session that no longer needs recovery — called on the
+    /// self-heal paths (a completed assistant reply, or a turn ended by the `sleep` tool), on
+    /// stale-entry cleanup and on permanent abandon (missing session context, invalid role). The
+    /// cap counts *consecutive* failures per episode, so a session that fails, recovers or is
+    /// abandoned, then fails again gets a fresh budget. Safe for untracked sessions (no-op).
     fn cleanup(&self, agent_id: &str) {
         self.inner.lock().unwrap_poison().remove(agent_id);
     }
 }
 
-// ── Global instance ─────────────────────────────────────────────────────────
-
 static DEAD_SESSION_TRACKER: std::sync::LazyLock<DeadSessionTracker> =
     std::sync::LazyLock::new(DeadSessionTracker::new);
 
-// ── Poller loop ─────────────────────────────────────────────────────────────
-
-/// Run the dead-session recovery poller loop.
-///
-/// Cycles run once a minute for the first `STARTUP_WINDOW`, then once every
-/// `POLL_INTERVAL`. The first cycle is a minute in, never at once:
-/// `spawn_background_tasks` starts this task before `init_message_pipeline`, so
-/// an immediate scan could route a recovery into a half-built pipeline.
-///
-/// Follows the established background-task pattern: cooperative shutdown via
-/// [`crate::shutdown::sleep_or_shutdown_or_drain`], single-failure isolation
-/// via `tracing::warn!`.
+/// Run the dead-session recovery poller loop: once a minute for the first `STARTUP_WINDOW`, then
+/// every `POLL_INTERVAL`. The first cycle is a minute in, never immediate —
+/// `spawn_background_tasks` starts this task before `init_message_pipeline`, so an immediate scan
+/// could route a recovery into a half-built pipeline. Cooperative shutdown via
+/// [`crate::shutdown::sleep_or_shutdown_or_drain`], single-failure isolation via `tracing::warn!`.
 pub async fn run_dead_session_recovery_loop() {
     let started = Instant::now();
     loop {
@@ -212,32 +150,18 @@ pub async fn run_dead_session_recovery_loop() {
     }
 }
 
-// ── Core detection + recovery logic ─────────────────────────────────────────
-
-/// Classify a session by its last persisted message role (and, for an
-/// Assistant tail, its raw content): is it a dead-session recovery candidate?
+/// Classify a session by its last persisted message role (and, for an `Assistant` tail, its raw
+/// content): is it a dead-session recovery candidate?
 ///
-/// Candidates:
+/// Candidates: a `User` tail (the user sent a message and the agent never answered); a `Tool` tail
+/// (a tool result was committed but the run was cut before the final reply — resuming is safe
+/// because the codebase has no user-facing cancel path, so this cannot mean "cancelled"); and an
+/// `Assistant` tail that is a dangling emission-time tool-call frame (`last_content` = the tail
+/// row's raw content), whose non-empty calls mean unresolved — exactly what
+/// `complete_pending_tool_calls` settles.
 ///
-/// * `User` tail — the user sent a message and the agent never answered.
-/// * `Tool` tail — the agent committed a tool result but was cut (drain or
-///   restart) before producing the final assistant reply, so the turn is
-///   unfinished. The tool result is already in the session history; the
-///   recovery re-run continues from it and delivers the missing answer.
-///   There is no user-facing cancel path in the codebase, so a tool-frame
-///   tail cannot mean "cancelled" — resuming is safe.
-/// * `Assistant` tail that is a dangling emission-time tool-call frame
-///   (`last_content` = the tail row's raw content). A tail frame can have no
-///   following result rows, so non-empty calls there means unresolved —
-///   exactly what the consumer-side `complete_pending_tool_calls` settles.
-///
-/// Healthy (not candidates):
-///
-/// * `Assistant` tail with any other content — the turn completed; the agent
-///   already responded.
-/// * `System` tail — no in-flight turn.
-///
-/// `last_content` is only consulted for the `Assistant` arm.
+/// Healthy: an `Assistant` tail with any other content (the turn completed) and a `System` tail (no
+/// in-flight turn). `last_content` is only consulted for the `Assistant` arm.
 fn is_recovery_candidate(last_role: ChatRole, last_content: &str) -> bool {
     match last_role {
         ChatRole::User | ChatRole::Tool => true,
@@ -246,18 +170,14 @@ fn is_recovery_candidate(last_role: ChatRole, last_content: &str) -> bool {
     }
 }
 
-/// Check all sessions for dead direct user-agent sessions and route recovery
-/// jobs where needed.
+/// Check all sessions for dead direct user-agent sessions and route recovery jobs where needed.
 async fn recover_dead_sessions() -> anyhow::Result<()> {
     let now = Utc::now();
 
-    // Use SQL-side filtering to avoid loading excluded sessions (manager_ and
-    // every prefix in TRANSIENT_AGENT_ID_PREFIXES) from the database.  The
-    // per-session `get_last_message_tail` queries below are lightweight
-    // (indexed `ORDER BY id DESC LIMIT 1`) — fetching both the role and the
-    // content of the tail row in a single read — and only run for eligible
-    // sessions. A custom role's continuable `role_` branch is deliberately not
-    // excluded: it is recovered like a direct session.
+    // SQL-side filtering keeps excluded sessions (manager_ and every TRANSIENT_AGENT_ID_PREFIXES
+    // prefix) from being loaded; the per-session `get_last_message_tail` reads below are
+    // lightweight (indexed `ORDER BY id DESC LIMIT 1`) and run only for eligible sessions. A custom
+    // role's continuable `role_` branch is deliberately not excluded.
     let sessions = crate::session::store()
         .list_sessions_with_metadata_excluding(
             &crate::session::non_user_facing_agent_id_prefixes().collect::<Vec<&str>>(),
@@ -267,7 +187,6 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
     for session in &sessions {
         let agent_id = &session.agent_id;
 
-        // ── Condition 1: the tail is a recovery candidate ───────────────
         let Some((last_role, tail_content)) = crate::session::store()
             .get_last_message_tail(agent_id)
             .await
@@ -276,11 +195,9 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
             continue; // empty session — clean up any stale tracker entry
         };
         if !is_recovery_candidate(last_role, &tail_content) {
-            // Last message is an assistant reply that is not a dangling
-            // frame, or a system message: the turn is complete — the agent
-            // has already responded. Clean up the retry-tracking entry so a
-            // future failure starts with a fresh retry budget
-            // (consecutive-failure-per-episode, matching the ticket spec).
+            // An assistant reply that is not a dangling frame, or a system message, means the turn
+            // is complete — the agent already responded. Clean up the retry-tracking entry so a
+            // future failure starts with a fresh budget (consecutive-failure-per-episode).
             DEAD_SESSION_TRACKER.cleanup(agent_id);
             continue;
         }
@@ -288,13 +205,11 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
         // remember that for the pause guard below.
         let needs_pause_guard = last_role == ChatRole::Assistant;
 
-        // ── Condition 2: no live agent ─────────────────────────────────
         if AGENT_REGISTRY.contains(agent_id) {
             // Agent is still running (or was just spawned).
             continue;
         }
 
-        // ── Condition 3: candidate message is stale ────────────────────
         let age = now - session.last_activity;
         let grace = chrono::Duration::from_std(STALE_GRACE_PERIOD)
             .expect("STALE_GRACE_PERIOD fits in chrono::Duration");
@@ -303,30 +218,23 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
             continue;
         }
 
-        // ── Condition 4: sleep-ended sessions ended their turns deliberately ──
         if crate::session::store().get_sleep_ended(agent_id).await {
-            // The agent ended its turn via the `sleep` tool: the tool tail
-            // is an intentional stop while waiting for new input, not a crash —
-            // never recover it. Unmarked tool tails (real crash/drain cuts)
-            // keep recovering exactly as before. The session has self-healed:
-            // reset any stale retry budget from an earlier episode so a later
-            // genuine crash on this session recovers with a fresh cap
-            // (consecutive-failures-per-episode semantics).
+            // The agent ended its turn via the `sleep` tool: that tail is an intentional stop while
+            // waiting for input, not a crash — never recover it. Unmarked tool tails (real
+            // crash/drain cuts) keep recovering. The session has self-healed, so reset any stale
+            // retry budget from an earlier episode.
             DEAD_SESSION_TRACKER.cleanup(agent_id);
             continue;
         }
 
-        // ── Condition 5: a deliberately stopped launch stays stopped ──────
-        // A branch launch stopped before it produced anything must never be
-        // auto-restarted. It does NOT consume retry budget — clean up any
-        // stale tracker entry and skip; a later fresh launch re-enables
-        // recovery by clearing the mark (see `Agent::work`).
+        // A branch launch stopped before it produced anything must never be auto-restarted. It does
+        // NOT consume retry budget: clean up any stale tracker entry and skip, and a later fresh
+        // launch re-enables recovery by clearing the mark (see `Agent::work`).
         if session.launch_stopped {
             DEAD_SESSION_TRACKER.cleanup(agent_id);
             continue;
         }
 
-        // ── Safety guard: retry cap / adaptive backoff ─────────────────
         if !DEAD_SESSION_TRACKER.should_retry(agent_id) {
             // Either the session exhausted its retries (the entry persists
             // in the tracker permanently, blocking future attempts) or the
@@ -335,7 +243,7 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
             continue;
         }
 
-        // ── Recover! ───────────────────────────────────────────────────
+        // Recover!
         //
         // Phase 1: retrieve session context and validate it.  Permanent
         // data issues (missing context, invalid role) are non-recoverable —
@@ -362,7 +270,7 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
             continue;
         };
 
-        // ── Pause guard (dangling-frame resumption only) ────────────────
+        // Pause guard (dangling-frame resumption only)
         // A paused workspace is a strict freeze: auto-resuming interrupted work
         // the user explicitly paused must not happen (unpausing re-drives via
         // the puller / next user prompt). A frozen agent is not recoverable
@@ -370,8 +278,7 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
         // User/Tool tails stay exempt: answering a pending user prompt matches
         // normal direct-chat behavior, which a workspace pause does not freeze.
         // A custom role is exempt too: a workspace pause freezes only launches
-        // tied to a ticket, never a continuable branch (a custom role's or a worker
-        // branch's).
+        // tied to a ticket, never a continuable branch (a custom role's or a worker branch's).
         if needs_pause_guard && !is_continuable_branch(role, agent_id) {
             match crate::workspace::get_by_name(&ctx.workspace_name).await {
                 Ok(Some(ws)) if ws.paused => {
@@ -410,18 +317,8 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Route a recovery job for a dead session with validated context.
-///
-/// # Preconditions
-///
-/// Caller must have already called [`get_session_context`](super::SessionStore::get_session_context)
-/// and validated that the role can be parsed.  The routing is fire-and-forget
-/// (sends on an mpsc channel).
-///
-/// Returns `true` when the attempt should count against the retry budget (a job
-/// was routed, or the retry was refused for a reason a later retry might
-/// outlive). Returns `false` when the branch is permanently un-recoverable —
-/// the caller drops its tracker entry.
+/// Caller must have already called
+/// [`get_session_context`](super::SessionStore::get_session_context).
 async fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) -> bool {
     // Execution-time invariant: pinned roles (Assistant) never
     // run outside the user's personal workspace, even on recovery. A pinned
@@ -526,17 +423,15 @@ async fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) -> b
         channel: ctx.channel.clone(),
         kind: MessageKind::RecoveryRetry,
         role,
-        // reply_target is not available from session metadata — the recovery
-        // response will be persisted to chat_history and broadcast via the
-        // GUI channel, but may not be deliverable via Telegram to unregistered
-        // users.  This is an accepted limitation.
+        // reply_target is not available from session metadata — the recovery response is persisted
+        // to chat_history and broadcast via the GUI channel, but may not reach unregistered
+        // Telegram users. An accepted limitation.
         reply_target: None,
         pending_job_id: None,
         originating_workspace: None,
         custom_role: launch,
-        // A recovered worker branch's asker travels on its launch above
-        // (`Launch::reply_to`), read by the report path; this field's remaining
-        // user is the Manager leg.
+        // A recovered worker branch's asker travels on its launch above (`Launch::reply_to`), read
+        // by the report path; this field's remaining user is the Manager leg.
         reply_to_custom: None,
         urgent: false,
     };
@@ -545,9 +440,9 @@ async fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) -> b
     true
 }
 
-/// Whether a dead session is a continuable branch — a custom role's or a worker
-/// branch's. Such a session is exempt from the workspace-pause guard: a pause
-/// freezes only launches tied to a ticket, never a branch.
+/// Whether a dead session is a continuable branch (a custom role's or a worker branch's). Such a
+/// session is exempt from the workspace-pause guard: a pause freezes only launches tied to a
+/// ticket.
 fn is_continuable_branch(role: Role, agent_id: &str) -> bool {
     match role {
         Role::Custom => true,
@@ -556,17 +451,15 @@ fn is_continuable_branch(role: Role, agent_id: &str) -> bool {
     }
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::super::BatchMetadata;
     use super::*;
     use crate::Tool;
 
-    /// A custom branch with no role record (or a session that never recorded
-    /// one) has no prompt and no tool set: `attempt_recovery` abandons it rather
-    /// than consuming the retry budget on a turn that could never run.
+    /// A custom branch with no role record (or a session that never recorded one) has no prompt and
+    /// no tool set: `attempt_recovery` abandons it rather than spending retry budget on a turn that
+    /// could never run.
     #[tokio::test]
     async fn attempt_recovery_abandons_a_custom_branch_without_a_role_record() {
         crate::util::test::init_test_stores().await;
@@ -593,10 +486,9 @@ mod tests {
         );
     }
 
-    /// A worker branch survives a restart: the poller rebuilds its launch from the
-    /// recorded branch name — no role record is needed — and re-routes the
-    /// unfinished turn with the conversation that asked restored, so the report
-    /// returns there instead of the admin's Assistant.
+    /// A worker branch survives a restart: the poller rebuilds its launch from the recorded branch
+    /// name — no role record needed — and re-routes the unfinished turn with the conversation that
+    /// asked restored, so the report returns there instead of the admin's Assistant.
     #[tokio::test]
     async fn attempt_recovery_rebuilds_a_worker_branch_with_its_asker() {
         crate::util::test::init_management_test_stores().await;
@@ -710,17 +602,16 @@ mod tests {
             tracker.record_attempt(agent_id);
         }
 
-        // Once the cap is reached, should_retry returns false permanently —
-        // the entry stays in the map, and no removal mechanism resets the
-        // counter (a previous removal mechanism had a critical bug and was
-        // deliberately removed).
+        // Once the cap is reached, should_retry returns false permanently — the entry stays in the
+        // map and no removal mechanism resets the counter (a previous one had a critical bug and
+        // was deliberately removed).
         assert!(
             !tracker.should_retry(agent_id),
             "should be blocked after {MAX_RETRIES} attempts"
         );
 
-        // Backdate the last attempt far past any possible backoff: the cap
-        // alone (not backoff timing) must block further retries.
+        // Backdate the last attempt far past any possible backoff: the cap alone, not backoff
+        // timing, must block further retries.
         if let Some(state) = tracker.inner.lock().unwrap_poison().get_mut(agent_id) {
             state.last_attempt_at = Utc::now() - chrono::Duration::hours(24);
         }
@@ -729,8 +620,8 @@ mod tests {
             "cap must block even after the backoff has long elapsed"
         );
 
-        // The entry persists with the cap reached — distinguishing a
-        // cap-blocked session from one merely waiting out its backoff.
+        // The entry persists with the cap reached — distinguishing a cap-blocked session from one
+        // merely waiting out its backoff.
         assert_eq!(
             tracker
                 .inner
@@ -742,10 +633,9 @@ mod tests {
         );
     }
 
-    /// The tracker's per-session budget at every entry point: a first attempt is
-    /// allowed, recording it backs the retry off, cleanup forgets the session —
-    /// allowing a fresh start on the same tracker — and a daemon restart starts
-    /// from an empty tracker again.
+    /// The tracker's per-session budget at every entry point: a first attempt is allowed, recording
+    /// it backs the retry off, cleanup forgets the session (allowing a fresh start on the same
+    /// tracker), and a daemon restart begins from an empty tracker.
     #[test]
     fn dead_session_tracker_backoff_cleanup_and_restart_reset() {
         let tracker = DeadSessionTracker::new();
@@ -771,23 +661,17 @@ mod tests {
         );
     }
 
-    // ── End-to-end recovery tests ───────────────────────────────────────
-    //
-    // Four tests share the process-global test DB, the retry tracker, and
-    // the agent registry, and all but `sleep_ended_session_is_not_recovered`
-    // also depend on the drain flag, so each carries the serial_test keys
-    // guarding the globals it touches (`provider` for the fake provider,
+    // Four tests share the process-global test DB, retry tracker and agent registry, and all
+    // but `sleep_ended_session_is_not_recovered` also depend on the drain flag, so each carries
+    // the serial_test keys for the globals it touches (`provider` for the fake provider,
     // `drain` for the shutdown drain flag).
 
-    /// Seed a direct session whose tail is a dangling emission-time analyze
-    /// tool-call frame plus the caller-owned launched durable job, checkpointed
-    /// as if a prior run had completed the analyst round. Returns the `job_id`.
-    ///
-    /// This is the shared scaffolding for the e2e/live/paused recovery tests:
-    /// it persists the frame + context, backdates `last_activity` past the
-    /// grace period, drives the sync analyze dispatch under a drain (leaving
-    /// the job `launched`, the frame's call result-less), then checkpoints the
-    /// roster outcomes as the durable resume input.
+    /// Seed a direct session whose tail is a dangling emission-time analyze tool-call frame
+    /// plus the caller-owned launched durable job, checkpointed as if a prior run completed the
+    /// analyst round; returns the `job_id`. Shared scaffolding for the e2e/live/paused recovery
+    /// tests: it persists the frame and context, backdates `last_activity` past the grace
+    /// period, drives the sync analyze dispatch under a drain (leaving the job `launched` with
+    /// the call result-less), then checkpoints the roster outcomes as the durable resume input.
     #[expect(clippy::too_many_lines)] // deliberate: seeding the durable-job state is one cohesive fixture
     async fn seed_dangling_durable_session(agent_id: &str, ws: &crate::Workspace) -> String {
         let conn = &crate::session::store().conn;
@@ -905,17 +789,16 @@ mod tests {
         job_id
     }
 
-    /// Full poller e2e: a dangling emission-time analyze frame (drain-cut
-    /// mid-tool-round) is classified as a recovery candidate, the recovery
-    /// re-run routes a RecoveryRetry, the consumer's universal
-    /// `complete_pending_tool_calls` resumes the durable job LLM-free, and only
-    /// then does the recovery round call the model once — asserted to exactly
-    /// one fingerprint.
+    /// Full poller e2e: a dangling emission-time analyze frame (drain-cut mid-tool-round) is
+    /// classified as a recovery candidate, the recovery re-run routes a RecoveryRetry, the
+    /// consumer's universal `complete_pending_tool_calls` resumes the durable job LLM-free, and
+    /// only then does the recovery round call the model once — asserted to exactly one
+    /// fingerprint.
     #[tokio::test]
     #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
-    // Joins the `provider` group (serial key guards the global fake provider,
-    // `drain` the shutdown drain flag) so two per-test runtimes never drive
-    // the shared global stores concurrently.
+    // Joins the `provider` group (its serial key guards the global fake provider, `drain` the
+    // shutdown drain flag) so two per-test runtimes never drive the shared global stores
+    // concurrently.
     async fn recovery_resumes_dangling_durable_job_end_to_end() {
         let fake = std::sync::Arc::new(
             crate::util::test::FakeProvider::new()
@@ -923,10 +806,9 @@ mod tests {
         );
         let _seam = crate::util::test::install_retry_seam_dyn(fake.clone());
         crate::util::test::init_management_test_stores().await;
-        // The router's consumer-loop path (typing setup / unregistered delivery)
-        // requires the channel registry. A default (empty) registry is enough:
-        // there is no telegram channel and the recovery response is persisted
-        // without a transport.
+        // The router's consumer-loop path (typing setup / unregistered delivery) needs the
+        // channel registry; a default (empty) one is enough — no telegram channel exists
+        // and the recovery response is persisted without a transport.
         let _ = crate::CHANNEL_REGISTRY.set(crate::ChannelRegistry::default());
         let ws = crate::util::test::create_test_workspace(
             "/tmp/dead_session_e2e_ws",
@@ -1013,9 +895,8 @@ mod tests {
         assert!(pending_jobs.is_empty(), "no envelope pending after resume");
     }
 
-    /// A live (registered) agent blocks recovery at the registry gate: the
-    /// dangling durable job is NOT resumed and no attempt is recorded — the
-    /// session is still eligible on a later cycle.
+    /// A live (registered) agent blocks recovery at the registry gate: the dangling durable job is
+    /// NOT resumed and no attempt is recorded, so the session is still eligible on a later cycle.
     #[tokio::test]
     #[serial_test::serial(provider, drain)] // serializes the process-global fake provider (providers::PROVIDER) + shutdown drain flag
     async fn live_running_session_is_not_recovered() {

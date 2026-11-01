@@ -1,48 +1,24 @@
-//! Research-run cleanup: per-run temp folders, results archive, the raw
-//! shell-command dump, and the Sanitation-agent cleanup dispatch.
+//! Research-run cleanup: per-run temp folders, results archive, the raw shell-command dump, and
+//! the Sanitation-agent cleanup dispatch.
 //!
-//! ## Run folders
+//! Every run's folder lives under `<temp_dir()>/mahbot-research/{job_id}` — inside the
+//! readonly-shell's allowed temp roots — and is created idempotently at dispatch and boot resume
+//! (lost prototypes are fail-open). [`release_run_folder`] is the single release point, invoked
+//! per-job from the completion tail and, dump-guarded, from the cancel sweep for folders with no
+//! cleanup intent. Orphaned folders are reclaimed only by the periodic temp cleaner's blunt 24-hour
+//! age rule (`crate::temp`); live run folders are protected by that cleaner's prompt instruction,
+//! never programmatically.
 //!
-//! Every deep-research run gets a per-run folder under
-//! `<temp_dir()>/mahbot-research/{job_id}` — inside the readonly-shell's
-//! allowed temp roots, so analysts can write scratch files there. The folder
-//! is created idempotently at dispatch AND boot resume (a resume recreates it
-//! when it is gone; lost prototypes are fail-open).
+//! At terminalization the run's raw shell commands (UNFILTERED — attribution is the cleanup
+//! agent's job) are dumped inside the run folder, and a Sanitation agent is dispatched with
+//! `src/prompt/research/cleanup.md` to clean artifacts attributable to the run OUTSIDE the folder.
+//! Its durable `research_cleanup` jobs row holds the folder until cleanup completes and survives a
+//! crash for boot resume (durability is separate from filesystem reclamation); the final response
+//! is only logged, there is no report archive.
 //!
-//! The folder is removed via [`release_run_folder`], the single run-folder
-//! release point, invoked per-job (never as a sweep) from the completion tail
-//! ([`run_cleanup_agent_and_finish`]) and — dump-guarded — from the cancel
-//! sweep ([`crate::research_cancel::sweep_cancelled_run`]) for folders with
-//! NO cleanup intent. A folder WITH a command dump is normally released by
-//! the cleanup tail; the only other way it goes away is orphaning — e.g. a
-//! failed cleanup dispatch — after which the periodic temp cleaner reclaims it
-//! once it is older than 24 hours. There is no scan-based run-folder sweep in
-//! the run machinery itself: orphaned folders of crashed runs are reclaimed the
-//! same way, by the cleaner's blunt age rule (see `crate::temp` — live,
-//! in-flight run folders are protected by the cleaner's prompt instruction,
-//! never programmatically).
-//!
-//! ## Command dump + Sanitation cleanup
-//!
-//! At terminalization the run's accumulated raw shell commands (UNFILTERED —
-//! no zone classification; attribution is the cleanup agent's job) are written
-//! as a command dump file INSIDE the run's per-run folder. At the same time a
-//! Sanitation-role agent is dispatched with a dedicated task prompt
-//! (see `src/prompt/research/cleanup.md`) to clean artifacts attributable to
-//! the run OUTSIDE the folder. Its run is recorded as a durable
-//! `research_cleanup` jobs row (the row holds the folder until the cleanup
-//! completes and survives a crash for boot resume — durability is a separate
-//! mechanism from filesystem reclamation). The agent's final response is
-//! logged for observability; there is no report archive.
-//!
-//! ## Media sweep
-//!
-//! `sweep_media` deletes generated/uploads files in userspaces that no
-//! media-keeping session (the Assistant's or a custom role's) mentions
-//! (keep-detection is strictly session-based, except that a file a live run
-//! still owns is never a candidate).
-//! It is orthogonal to research-run cleanup and stays in the periodic
-//! cleanup loop.
+//! `sweep_media` deletes generated/uploads files no media-keeping session mentions (keep-detection
+//! is session-based, except that a file a live run still owns is never a candidate). It is
+//! orthogonal to run cleanup and stays in the periodic cleanup loop.
 
 use crate::Workspace;
 use crate::config;
@@ -52,29 +28,21 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-// ── Constants ─────────────────────────────────────────────────────────────
-
-/// Command-dump cap (bytes, soft — newest-wins): the raw unfiltered shell
-/// command history of a run, written at terminalization inside the run folder.
-/// The dump is intent for the Sanitation cleanup agent, not a report body,
-/// so the cap is deliberately generous.
+/// Command-dump cap (bytes, soft — newest-wins) for the run's raw unfiltered shell history. The
+/// dump is intent for the Sanitation cleanup agent, not a report body, so the cap is generous.
 pub(crate) const COMMAND_DUMP_CAP_BYTES: usize = 10 * 1024 * 1024;
-/// Filename of the raw shell-command dump inside a run folder. Load-bearing:
-/// the cancel sweep spares a folder iff this file exists (see
-/// [`command_dump_exists`]) and the cleanup prompt receives its path.
+/// Filename of the raw shell-command dump inside a run folder. Load-bearing: the cancel sweep
+/// spares a folder iff this file exists (see [`command_dump_exists`]) and the cleanup prompt
+/// receives its path.
 pub(crate) const COMMAND_DUMP_FILE: &str = "commands.dump";
-/// Per-tick media-keeping-session scan budget (bytes of session content).
-/// Typical bases (~3 MB) fit in one tick; pathological growth is cut across
-/// ticks.
+/// Per-tick media-keeping-session scan budget (bytes of session content): typical bases (~3 MB) fit
+/// in one tick, pathological growth is cut across ticks.
 const MEDIA_SCAN_BUDGET_BYTES: usize = 10 * 1024 * 1024;
 /// Video extensions for case-insensitive keep-matching.
 const MEDIA_VIDEO_EXTS: &[&str] = &[".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"];
 
-// ── Run-root helpers ──────────────────────────────────────────────────────
-
-/// Base directory holding all per-run folders. Under the daemon's private temp
-/// root (after the TMPDIR pin, `temp_dir()` IS the root) — inside the
-/// readonly-shell's allowed temp roots, so analysts can write scratch there.
+/// Base directory holding all per-run folders, under the daemon's private temp root (after the
+/// TMPDIR pin, `temp_dir()` IS the root) and inside the readonly-shell's allowed temp roots.
 #[must_use]
 fn research_root_base() -> PathBuf {
     std::env::temp_dir().join("mahbot-research")
@@ -86,10 +54,9 @@ pub(crate) fn run_root_path(job_id: &str) -> PathBuf {
     research_root_base().join(job_id)
 }
 
-/// Create the per-run folder (idempotent — never delete+recreate: a boot
-/// resume must keep whatever survived). Returns the CANONICAL absolute path
-/// (the workspace path is canonicalized, and the Sanitation agent compares
-/// paths against the same canonical form).
+/// Create the per-run folder (idempotent — never delete+recreate, so a boot resume keeps whatever
+/// survived) and return its CANONICAL absolute path; the Sanitation agent compares paths against
+/// that same canonical form.
 pub(crate) async fn ensure_run_root(job_id: &str) -> PathBuf {
     let path = run_root_path(job_id);
     if let Err(e) = tokio::fs::create_dir_all(&path).await {
@@ -98,73 +65,41 @@ pub(crate) async fn ensure_run_root(job_id: &str) -> PathBuf {
     canonical_run_root(job_id).await.unwrap_or(path)
 }
 
-/// The run folder's canonical path in its PLAIN spelling, for callers that must
-/// not create it (a manual cancel must not resurrect a folder the periodic temp
-/// cleaner already removed). Never the platform's verbatim prefix: this path
-/// reaches prompts, the run's workspace root and shell commands (see
-/// [`crate::util::strip_verbatim_prefix`]).
+/// The run folder's canonical path in its PLAIN spelling, for callers that must not create it (a
+/// manual cancel must not resurrect a folder the temp cleaner already removed). Never the
+/// platform's verbatim prefix: this path reaches prompts, the run's workspace root and shell
+/// commands (see [`crate::util::strip_verbatim_prefix`]).
 pub(crate) async fn canonical_run_root(job_id: &str) -> std::io::Result<PathBuf> {
     tokio::fs::canonicalize(run_root_path(job_id))
         .await
         .map(|canonical| crate::util::strip_verbatim_prefix(&canonical))
 }
 
-/// Does the run's per-run folder exist? The boot-replay crash-window
-/// classifier: the cleanup tail removes the folder when the cleanup
-/// completes, so folder absence on the replay path means the cleanup already
+/// Does the run's per-run folder exist? The boot-replay crash-window classifier: the cleanup tail
+/// removes the folder when cleanup completes, so absence on the replay path means cleanup already
 /// ran in a previous lifetime (see [`dispatch_cleanup_for_pending_envelope`]).
 ///
-/// Fail-closed by design (`unwrap_or(false)`): a transient IO error on the
-/// replay path skips row recreation, so a crash-window cleanup never runs and
-/// its outside-folder scratch leaks to the periodic temp cleaner — the safe
-/// direction.
-/// The alternative (fail-open on error) would re-dispatch a cleanup LLM round
-/// for a run that ALREADY completed, per boot, until the envelope is delivered
-/// — an avoidable, unbounded-until-delivery cost for a transient read error
-/// that is far more likely than a genuine crash-window hit.
+/// Fail-closed by design: an IO error reports absence, so no row is recreated and a crash-window
+/// cleanup never re-dispatchhes an LLM round for an ALREADY-completed run on every boot — the safe
+/// direction is leaking scratch to the temp cleaner.
 async fn run_folder_exists(job_id: &str) -> bool {
     tokio::fs::try_exists(run_root_path(job_id))
         .await
         .unwrap_or(false)
 }
 
-/// Does the run folder hold its command dump (the cleanup intent)? The
-/// cancel-sweep folder-release guard: a folder with a dump must survive for
-/// the cleanup tail / periodic temp cleaner.
-///
-/// Errors resolve to `true` (`unwrap_or(true)`), the OPPOSITE default of
-/// [`run_folder_exists`]: a transient IO error assumes the dump IS present,
-/// so the folder is never released uncleaned and the handoff never skips
-/// cleanup dispatch. Only a genuine `Ok(false)` means "no dump". (On the
-/// replay path [`run_folder_exists`] defaults to `false` instead, because
-/// error⇒false guards against re-dispatching a cleanup for a run that
-/// already completed.)
+/// Does the run folder hold its command dump (the cleanup intent)? The cancel-sweep folder-release
+/// guard: a folder with a dump must survive for the cleanup tail or the temp cleaner. Errors
+/// resolve to `true` — the OPPOSITE default of [`run_folder_exists`] — so an assumed dump never
+/// releases a folder uncleaned; only a genuine `Ok(false)` means "no dump".
 pub(crate) async fn command_dump_exists(job_id: &str) -> bool {
     tokio::fs::try_exists(run_root_path(job_id).join(COMMAND_DUMP_FILE))
         .await
         .unwrap_or(true)
 }
 
-/// Release a run's per-run folder and its search-engine state — the SOLE
-/// run-folder deleter now that the sweeps are gone. Search-engine registry
-/// entry first (drops the picker), then the whole folder.
-///
-/// Called by the completion tail ([`run_cleanup_agent_and_finish`], folder
-/// before row terminalize) and the cancel sweep
-/// ([`crate::research_cancel::sweep_cancelled_run`]) only for folders with NO
-/// command dump (dump-guarded upstream in [`command_dump_exists`]); a folder
-/// WITH a dump is normally released by the cleanup tail — though a failed
-/// cleanup dispatch (see `crate::tools::research`) orphans it, exactly like a
-/// crashed run (module header). The cleanup jobs row is NOT touched here:
-/// callers own row removal.
-///
-/// Removal failure is swallowed (the folder is "left for the OS") and the row
-/// is still terminalized by the caller — the crash-window classifier then
-/// self-heals: if the completion envelope stayed undelivered, the next boot's
-/// replay sees the surviving folder and re-dispatches the cleanup, which
-/// retries the removal; if the envelope was delivered, the folder leaks to the
-/// periodic temp cleaner only — the accepted crash-class edge, no retry
-/// machinery).
+/// Release a run's per-run folder and its search-engine state — the SOLE run-folder deleter. The
+/// registry entry goes first (dropping the picker), then the folder.
 pub(crate) async fn release_run_folder(job_id: &str) {
     if crate::workspace_index::registry_initialized() {
         crate::workspace_index::remove_engine(job_id);
@@ -180,11 +115,10 @@ pub(crate) async fn release_run_folder(job_id: &str) {
     }
 }
 
-// ── Results archive (results.md) ──────────────────────────────────────────
+// Results archive (results.md)
 
-/// Shared results-archive location `<storage_root>/research/results/{job_id}.md`.
-/// The writer and the cancel sweep must agree on it, or a cancel would delete
-/// the wrong file (or nothing).
+/// Shared results-archive location `<storage_root>/research/results/{job_id}.md` — the writer and
+/// the cancel sweep must agree on it, or a cancel deletes the wrong file (or nothing).
 pub(crate) fn results_archive_path(job_id: &str) -> Option<PathBuf> {
     let root = config::CONFIG
         .try_storage_root()
@@ -197,12 +131,10 @@ pub(crate) fn results_archive_path(job_id: &str) -> Option<PathBuf> {
     )
 }
 
-/// Write the run's archived result to the shared results-archive location
-/// (delivered result, including partial terminalizations).
-/// Overwrites idempotently on resume; a failed write is fail-open (the
-/// terminalization is never blocked on the archive). The storage root comes
-/// from CONFIG when set (test stores point it at a temp dir — no test writes
-/// into the real `~/.mahbot`), falling back to the default config dir.
+/// Write the run's archived result (delivered result, including partial terminalizations) to the
+/// shared results-archive location. Overwrites idempotently on resume; a failed write is fail-open,
+/// never blocking terminalization. The storage root comes from CONFIG when set (test stores point
+/// it at a temp dir, so no test writes into the real `~/.mahbot`), else the default config dir.
 pub(crate) async fn write_results_md(job_id: &str, result: &str) {
     let Some(path) = results_archive_path(job_id) else {
         tracing::warn!(job = %job_id, "results.md skipped — no config dir");
@@ -219,12 +151,12 @@ pub(crate) async fn write_results_md(job_id: &str, result: &str) {
     }
 }
 
-// ── Raw shell-command capture ────────────────────────────────────────────
+// Raw shell-command capture
 
 /// Extract every shell tool-call command from a session history. The canonical
-/// [`decoded_tool_calls`](crate::session::decoded_tool_calls) already un-nests
-/// provider-wrapped JSON arguments — read them directly. Never fails:
-/// unreadable sessions contribute nothing (fail-open).
+/// [`decoded_tool_calls`](crate::session::decoded_tool_calls) already un-nests provider-wrapped
+/// JSON arguments, so read them directly. Never fails: unreadable sessions contribute nothing
+/// (fail-open).
 fn commands_from_history(history: &[crate::ChatMessage]) -> Vec<String> {
     let mut out = Vec::new();
     for msg in history {
@@ -249,19 +181,15 @@ fn commands_from_history(history: &[crate::ChatMessage]) -> Vec<String> {
     out
 }
 
-/// Collect ALL shell commands from the persisted sessions of the given agents
-/// (incremental stage collection — early sessions of long runs are TTL'd, so
-/// the research orchestrator collects right after each round). UNFILTERED:
-/// no zone classification, no write-intent patterns — the raw history IS the
-/// dump; attribution is the Sanitation cleanup agent's job (filesystem
-/// enumeration as fact + this dump as intent).
+/// Collect ALL shell commands from the persisted sessions of the given agents (incremental stage
+/// collection — early sessions of long runs are TTL'd, so the orchestrator collects right after
+/// each round). UNFILTERED: no zone classification, no write-intent patterns — the raw history IS
+/// the dump, and attribution is the Sanitation agent's job.
 ///
-/// Credentials are scrubbed AT COLLECTION (not only at dump-write): the
-/// in-memory `commands`/`seen_commands` must match the scrubbed dump form, or
-/// a credential-bearing command re-collected after a crash-resume would be
-/// treated as distinct from its scrubbed dump form and both variants would
-/// accumulate. Multi-line commands don't round-trip through the line-oriented
-/// dump (a documented minor fidelity loss — the cap bounds the growth).
+/// Credentials are scrubbed AT COLLECTION, not only at dump-write, so the in-memory commands match
+/// the scrubbed dump form; otherwise a command re-collected after a crash-resume looks distinct
+/// from its scrubbed form and both variants accumulate. Multi-line commands don't round-trip
+/// through the line-oriented dump (a documented minor fidelity loss; the cap bounds the growth).
 pub(crate) async fn collect_agent_shell_commands(agent_ids: &[String]) -> Vec<String> {
     let store = crate::session::store();
     let mut out = Vec::new();
@@ -290,14 +218,10 @@ fn dedup_newest_wins(commands: &[String]) -> Vec<String> {
     out
 }
 
-/// Cap a command list to [`COMMAND_DUMP_CAP_BYTES`], newest wins (drop the
-/// oldest commands). A single command larger than the cap is dropped ON ITS
-/// OWN — it could never fit the dump, and dropping the older fitting commands
-/// for it would lose the only evidence that could be reported.
-///
-/// THE canonical cap helper: `ResearchState::capture_round` (in-memory bound)
-/// and `write_command_dump` (file bound) both call it, so the drop order can
-/// never diverge between the two surfaces.
+/// Cap a command list to [`COMMAND_DUMP_CAP_BYTES`], newest wins. A command larger than the cap is
+/// dropped ON ITS OWN — it could never fit, and dropping older fitting commands for it would lose
+/// the only reportable evidence. THE canonical helper: `ResearchState::capture_round` (in-memory
+/// bound) and `write_command_dump` (file bound) both call it, so the drop order cannot diverge.
 pub(crate) fn cap_command_dump(commands: &mut Vec<String>, cap: usize) {
     // Drop oversized commands wherever they are (they can never fit), keeping
     // the rest in order.
@@ -348,7 +272,7 @@ pub(crate) async fn read_command_dump(run_root: &Path) -> Vec<String> {
     }
 }
 
-// ── Sanitation cleanup dispatch ──────────────────────────────────────────
+// Sanitation cleanup dispatch
 
 /// Dedicated task prompt for the research-cleanup Sanitation agent.
 const CLEANUP_PROMPT_KEY: &str = "research/cleanup.md";
@@ -628,21 +552,18 @@ async fn run_cleanup_agent_and_finish(
         "Research cleanup finished: {}",
         crate::util::scrub_credentials(&report)
     );
-    // Release the folder — the sole deleter of folders WITH a command dump
-    // (the dump-less cancel sweep, dump-guarded via [`command_dump_exists`],
-    // is the only other release point): search-engine state, then the whole
-    // folder, then the row. Folder first, row last: a crash between folder
-    // removal and row terminalize leaves row + no folder, which boot resume
-    // converges from with one extra round. Invariant (up to that bounded
-    // dump-guarded sweep race): cleanup row exists ⟺ cleanup not finished.
+    // Release the folder — the sole deleter of folders WITH a dump (the dump-less cancel sweep,
+    // guarded by [`command_dump_exists`], is the other release point): search-engine state, folder,
+    // then row. Folder before row, so a crash between them leaves row + no folder, which boot
+    // resume converges from in one extra round. Invariant (up to that bounded sweep race): cleanup
+    // row exists ⟺ cleanup not finished.
     release_run_folder(job_id).await;
     let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
 }
 
-/// Boot-scan resume of a `research_cleanup` job: re-dispatch the Sanitation
-/// agent with the stored task (the row survived a crash mid-cleanup). The
-/// folder is still held by the jobs row (recreated empty if the crash was in
-/// the folder-release window), so the cleanup completes and the folder is
+/// Boot-scan resume of a `research_cleanup` job: re-dispatch the Sanitation agent with the stored
+/// task (the row survived a crash mid-cleanup). The jobs row still holds the folder — recreated
+/// empty if the crash hit the folder-release window — so cleanup completes and the folder is
 /// released exactly like a fresh dispatch.
 pub(crate) async fn resume_research_cleanup(job_id: &str, ws: &Workspace) {
     let Some((caller, _role)) = crate::jobs::resume_job_preamble(
@@ -653,10 +574,9 @@ pub(crate) async fn resume_research_cleanup(job_id: &str, ws: &Workspace) {
     )
     .await
     else {
-        // None = drain abort (the row STAYS — the folder stays held for the
-        // next boot) or a gone row (explicit abandon — the abandon's cancel
-        // sweeps the rows, and its dump-guarded release leaves a dump-holding
-        // folder for the periodic temp cleaner; nothing left to release here).
+        // None = drain abort (the row and its hold on the folder STAY for the next boot) or a gone
+        // row (explicit abandon: its cancel sweep released what it could, leaving a dump-holding
+        // folder for the temp cleaner — nothing left to release here).
         return;
     };
     let prompt = caller.task.clone();
@@ -665,45 +585,35 @@ pub(crate) async fn resume_research_cleanup(job_id: &str, ws: &Workspace) {
     run_cleanup_agent_and_finish(job_id, None, ws, &prompt).await;
 }
 
-// ── Sweep: assistant generated/uploads keep-detection ──────────────────────
-
-/// Per-user keep-scan cursor (in-memory; a restart resets it — safe, because
-/// files only become deletion candidates after a full coverage pass within
-/// one process lifetime). tokio Mutex: the sweep holds the guard across
-/// awaits (DB + fs) and the cleanup-loop future must stay `Send`.
+/// Per-user keep-scan cursor (in-memory; a restart resets it — safe, since files only become
+/// deletion candidates after a full coverage pass within one process lifetime). A tokio Mutex: the
+/// sweep holds the guard across awaits (DB + fs) and the cleanup-loop future must stay `Send`.
 static MEDIA_CURSORS: tokio::sync::Mutex<Option<HashMap<String, MediaCursor>>> =
     tokio::sync::Mutex::const_new(None);
 
 #[derive(Default)]
 struct MediaCursor {
-    /// Agent id → `session_metadata.last_activity` at scan time. Keyed by
-    /// content VERSION, NOT index or bare id: a session scanned on an earlier
-    /// tick whose content grew (new file mentions) must be re-scanned before
-    /// the deletion pass — deleting against a stale keep-set is the unsafe
-    /// direction. An unchanged activity skips the DB re-read entirely (the
-    /// per-tick scan budget stays available for other users — no starvation).
-    /// `last_activity` is written by [`crate::db::now`] (chrono AutoSi —
-    /// fractional-second precision when non-zero), so the practical residual
-    /// of an unchanged activity hiding a content append is sub-microsecond —
-    /// far narrower than a whole-second window.
+    /// Agent id → `session_metadata.last_activity` at scan time, keyed by content VERSION
+    /// rather than index or bare id: a session whose content grew must be re-scanned before the
+    /// deletion pass — deleting against a stale keep-set is the unsafe direction. An unchanged
+    /// activity skips the DB re-read entirely, so the per-tick budget stays available for other
+    /// users. `last_activity` comes from [`crate::db::now`] (fractional-second precision when
+    /// non-zero), so an unchanged activity can hide a content append for well under a second.
     scanned: HashMap<String, String>,
-    /// Agent id → stripped content contribution. REPLACED on re-scan, never
-    /// re-appended: `last_activity` bumps on every message append, so an
-    /// active assistant session would otherwise duplicate its whole history
-    /// into the keep-set every tick — daemon memory growth plus a premature
-    /// hit of the overflow cap that permanently disables the user's sweep.
+    /// Agent id → stripped content contribution. REPLACED on re-scan, never re-appended:
+    /// `last_activity` bumps on every append, so an active session would otherwise duplicate
+    /// its whole history into the keep-set each tick — daemon memory growth plus a premature
+    /// overflow-cap hit that permanently disables the user's sweep.
     session_content: HashMap<String, String>,
-    /// Rebuilt from `session_content` after each scan — the keep-set
-    /// (paths/basenames are matched against it).
+    /// Rebuilt from `session_content` after each scan — the keep-set paths and basenames match
+    /// against.
     content: String,
-    /// Set when the accumulated content hit the hard cap — the keep-set is
-    /// incomplete, so the deletion pass is SKIPPED (keep everything: the safe
-    /// direction is never deleting a file whose mention was not scanned).
+    /// Set when the accumulated content hit the hard cap: the keep-set is incomplete, so the
+    /// deletion pass is SKIPPED — never delete a file whose mention was not scanned.
     overflowed: bool,
 }
 
-/// Reset the in-memory media-sweep cursors (tests only — production never
-/// needs a reset: a restart clears the process-global anyway).
+/// Reset the in-memory media-sweep cursors. Tests only — a restart clears the process global.
 #[cfg(test)]
 async fn reset_media_cursors() {
     if let Some(map) = MEDIA_CURSORS.lock().await.as_mut() {
@@ -799,16 +709,11 @@ async fn media_keeping_session_content(agent_id: &str) -> anyhow::Result<String>
 }
 
 /// Sweep generated/uploads under the userspaces root — production entry.
-///
-/// Resolves where user workspaces live through `crate::users::userspaces_root`
-/// so it always agrees with `personal_workspace_path` (production:
-/// `~/.mahbot/userspaces`; tests: the shared test root).
 pub async fn sweep_media() -> Result<u64> {
     sweep_media_at(&crate::users::userspaces_root()).await
 }
 
-/// Assistant-media sweep over an explicit userspaces root (injectable for
-/// tests).
+/// Assistant-media sweep over an explicit userspaces root (injectable for tests).
 pub(crate) async fn sweep_media_at(userspaces_root: &Path) -> Result<u64> {
     sweep_media_at_budgeted(userspaces_root, MEDIA_SCAN_BUDGET_BYTES).await
 }
@@ -939,8 +844,7 @@ async fn sweep_user_media(
     // WITHOUT a DB re-read — their mentions are already in the keep-set and
     // the budget stays available for other users. `total` tracks the keep-set
     // size incrementally (the content rebuild is deferred below, so
-    // `cursor.content.len()` would be stale across multiple changes in one
-    // tick).
+    // `cursor.content.len()` would be stale across multiple changes in one tick).
     let mut total = cursor.content.len();
     let mut changed = false;
     for (id, activity) in &session_ids {
@@ -1012,12 +916,6 @@ async fn sweep_user_media(
 
 /// The deletion phase of a covered user's sweep: remove every generated/uploads
 /// file no stored session mentions and no live run still owns.
-///
-/// The cursor is NOT reset after the pass — the keep-set grows incrementally, so
-/// the session base is re-scanned only for changes. Standing cost
-/// (design-accepted): the pass is unbudgeted — a re-list of every
-/// generated/uploads file plus one `contains` per file, every 10-min tick, for
-/// every covered user (~seconds of CPU for heavy users near the cap).
 async fn sweep_unmentioned_files(user_path: &Path, content: &str) -> u64 {
     // Basename uniqueness across this user's generated+uploads UNION (exact,
     // case-sensitive) — the only path for basename matching.
@@ -1096,7 +994,7 @@ fn is_kept(
     MEDIA_VIDEO_EXTS.iter().any(|e| lower_base.ends_with(e)) && content_lower.contains(&lower_base)
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────
+// Tests
 
 #[cfg(test)]
 mod tests {

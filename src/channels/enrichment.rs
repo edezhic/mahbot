@@ -1,40 +1,28 @@
-//! Channel message enrichment: media marker processing, link enrichment, file
-//! operations, and media handling.
+//! Channel message enrichment: media markers, link enrichment, file operations and media
+//! handling — what transforms a [`ChannelMessage`]'s content before it reaches the agent pipeline.
 //!
-//! This module transforms [`ChannelMessage`] content before it reaches the
-//! agent pipeline. It handles:
-//! - **Media markers** (`[IMAGE: ...]`, `[AUDIO: ...]`, `[VIDEO: ...]`,
-//!   `[FILE: ...]`) → inbound local images become native data-URI parts
-//!   carrying the original bytes, re-encoded to a bounded JPEG only when they
-//!   would exceed the encoded-payload cap; audio is transcribed to text on
-//!   macOS, where the local audio subsystem lives (elsewhere no such
-//!   transcription exists, so an audio marker is annotated honestly instead);
-//!   video handling is workspace copy + transcription; an inbound document is
-//!   copied into the workspace and converted to text plus images
-//! - **Link enrichment** → prepends webpage summaries for URLs in the message
-//! - **File operations** → saving media to workspace, cleaning up temporary
-//!   files
+//! Media markers (`[IMAGE: ...]`, `[AUDIO: ...]`, `[VIDEO: ...]`, `[FILE: ...]`): an inbound
+//! local image becomes a native data-URI part carrying the original bytes, re-encoded to a
+//! bounded JPEG only when it would exceed the encoded-payload cap; audio is transcribed to
+//! text on macOS, where the audio subsystem lives (elsewhere the marker is annotated
+//! honestly); video is a workspace copy plus transcription; an inbound document is copied
+//! into the workspace and converted to text and images. Link enrichment prepends webpage
+//! summaries for URLs in the message.
 //!
-//! **Containment invariant**: all local file reads, copies, and deletes are
-//! scoped to the message's own staging directories — the names in
-//! [`ChannelMessage::attachment_dirs`] (built by `util::telegram_staging_dir_name`),
-//! one for a single message and several for an album merged into a single one.
-//! A marker is in scope only when it names a file inside one of those
-//! directories; everything else — another chat's or message's attachment, a
-//! hand-typed `[IMAGE:...]` / `[AUDIO:...]` / `[VIDEO:...]` / `[FILE:...]`
-//! annotation, or a message that owns no directory at all (a voice message, or
-//! any message whose producer staged nothing) — is inert text: IMAGE/AUDIO/VIDEO
-//! degrade to a plain annotation and `[FILE:...]` stays verbatim, so it is never
-//! read, transcribed, copied into workspace uploads, or deleted. The desktop
-//! chat's composer stages its attachments the same way (`gui::attachment`), so a
-//! GUI message is enriched exactly like a Telegram one.
+//! **Containment invariant**: every local read, copy and delete is scoped to the message's
+//! own staging directories ([`ChannelMessage::attachment_dirs`], built by
+//! `util::telegram_staging_dir_name`) — one for a single message, several for a merged
+//! album. A marker is in scope only when it names a file inside one of those; everything
+//! else (another chat's or message's attachment, a hand-typed marker, a message owning no
+//! directory) is inert text: IMAGE/AUDIO/VIDEO degrade to a plain annotation and
+//! `[FILE:...]` stays verbatim, so nothing is read, transcribed, copied or deleted. The
+//! desktop composer stages attachments the same way (`gui::attachment`), so a GUI message is
+//! enriched exactly like a Telegram one.
 //!
-//! The entry points are [`enrich_message`] and [`enrich_links`], re-exported
-//! from [`crate::channels`], and [`has_inbound_temp_marker`], which
-//! [`crate::channels::persist_content`] calls directly to decide what content is
-//! persisted to chat history. [`enrich_message`] also takes the workspace whose
-//! `uploads/` dir receives saved full-resolution media copies (`None` disables
-//! copies) — that uploads path is what makes video transcription possible.
+//! Entry points are [`enrich_message`] and [`enrich_links`]; [`has_inbound_temp_marker`] is
+//! called by `channels::persist_content` to decide what is persisted to chat history.
+//! [`enrich_message`] takes the workspace whose `uploads/` receives saved full-resolution
+//! copies (`None` disables copies) — the path that makes video transcription possible.
 
 use crate::ChannelMessage;
 use crate::document::{DocOutcome, INLINE_TEXT_MAX_CHARS, convert_document_file};
@@ -50,53 +38,43 @@ use std::fmt::Write;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// URL regex: matches http:// and https:// URLs, stopping at whitespace, angle
-/// brackets, or double-quotes.
+/// Matches http:// and https:// URLs, stopping at whitespace, angle brackets or quotes.
 static URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).expect("URL regex must compile"));
 
-/// Process-global sequence for link-enricher session names. The
-/// `link-enricher-` prefix is load-bearing: `is_mahbot_session_name` sweeps
-/// only sessions starting with it. Unique suffixes keep concurrent
-/// `enrich_links` runs from sharing a chrome session.
+/// Process-global sequence for link-enricher session names: the `link-enricher-` prefix is
+/// load-bearing (`is_mahbot_session_name` sweeps only sessions starting with it) and unique
+/// suffixes keep concurrent [`enrich_links`] runs from sharing a chrome session.
 static LINK_ENRICHER_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// The audio-transcription icon combo (sound written into text). Used both as
-/// the transcription-failure fallback and as the annotation for out-of-scope
-/// `[AUDIO:...]` markers that must never be read or deleted.
+/// The audio-transcription icon combo, used as the failure fallback and as the annotation for
+/// out-of-scope `[AUDIO:...]` markers that must never be read or deleted.
 #[cfg(target_os = "macos")]
 const AUDIO_ICON: &str = "🔊✍️";
 
-/// A transcribed message as it is presented: the audio icon combo, one space,
-/// then the text. The one definition of the marker's form — an inbound audio
-/// attachment and a voice recording (`audio::voice`, whose transcript the Home
-/// composer sends as the leading part of its message) both go through it, so a
-/// spoken message reads the same however it reached the product.
+/// A transcribed message as presented: the icon combo, one space, then the text. The one
+/// definition of that form — an inbound audio attachment and a voice recording both go
+/// through it, so a spoken message reads the same however it arrived.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub(crate) fn marked_transcript(text: &str) -> String {
     format!("{AUDIO_ICON} {text}")
 }
 
-/// Annotation for an `[AUDIO:...]` marker on a platform with no local audio
-/// subsystem: the marker cannot be consumed there, so the model gets an honest
-/// note instead of the bare icon macOS falls back to.
+/// For a platform with no local audio subsystem: the model gets an honest note instead of
+/// the bare icon macOS falls back to.
 #[cfg(not(target_os = "macos"))]
 const AUDIO_UNAVAILABLE: &str = "[Audio is not supported on this platform]";
 
-/// Transcribe an audio file referenced by a `[AUDIO:...]` marker and return
-/// the content to embed in the message: the audio-transcription icon combo
-/// (`🔊✍️` — sound written into text) followed by the transcription text.
+/// The content to embed for an `[AUDIO:...]` marker: the icon combo followed by the transcription.
 ///
-/// The audio file is a pure intermediate artifact — the caller deletes it
-/// regardless of outcome (scoped to this message's inbound attachments), so the
-/// returned string never contains the file name or path. On failure just the
-/// icon combo is returned (no text).
+/// The audio file is a pure intermediate artifact — the caller deletes it regardless of
+/// outcome — so the returned string never contains its name or path. On failure just the
+/// icon combo is returned.
 #[cfg(target_os = "macos")]
 async fn transcribe_audio_marker(path: &str) -> String {
     let path_buf = std::path::PathBuf::from(path);
 
-    // ── Step 1: Try local Qwen3-ASR transcription ────────────────────
     // Default to enabled; only explicitly "false" disables local transcription.
     let use_local = crate::config::CONFIG
         .snapshot()
@@ -128,7 +106,6 @@ async fn transcribe_audio_marker(path: &str) -> String {
         }
     }
 
-    // ── Step 2: Icon-only fallback (no text, no filename) ────────────
     tracing::warn!("Audio transcription unavailable");
     AUDIO_ICON.to_string()
 }
@@ -156,8 +133,7 @@ struct SavedMedia {
 
 /// Copy a media file (image/video) into the workspace `uploads/` directory
 /// under a fresh `upload_<millis>.<ext>` name, so the agent can reference it
-/// via tool calls. Returns `None` when no uploads dir is available or the copy
-/// fails.
+/// via tool calls. Returns `None` when no uploads dir is available or the copy fails.
 async fn save_media_to_workspace(
     media_path: &std::path::Path,
     uploads_dir: Option<&std::path::Path>,
@@ -235,8 +211,7 @@ enum ImageAction {
     /// Replace the marker with the given text, optionally including an
     /// upload-path annotation for agent tool references. `delete_temp` is set
     /// only when the source file was consumed from this message's inbound
-    /// attachments (copied/read) — out-of-scope and missing files are never
-    /// deleted.
+    /// attachments (copied/read) — out-of-scope and missing files are never deleted.
     Replace {
         replacement: String,
         upload_annotation: Option<String>,
@@ -272,8 +247,8 @@ async fn bounded_image_data_uri(path: &std::path::Path) -> anyhow::Result<String
     match crate::util::local_image_to_data_uri(path).await {
         Ok(uri) if uri.len() <= media_target::MAX_DATA_URI_ENCODED_BYTES => Ok(uri),
         Ok(_) => {
-            // Over-cap: fall back to a bounded JPEG re-encode. If it is still
-            // over-cap it fails closed rather than forward an over-cap payload.
+            // Over-cap: fall back to a bounded JPEG re-encode; still over cap means failing
+            // closed rather than forwarding an over-cap payload.
             tracing::warn!(path = %path.display(), "image data-URI exceeds the encoded-payload cap — re-encoding to a bounded JPEG");
             let reencoded = crate::util::local_image_to_compressed_data_uri_with_meta(path)
                 .await?
@@ -290,22 +265,18 @@ async fn bounded_image_data_uri(path: &std::path::Path) -> anyhow::Result<String
     }
 }
 
-/// Handle an IMAGE marker — convert to a data URI, an [`ImageAction::Invalid`]
-/// target, or (for out-of-scope paths) a plain-text annotation. Saves a
-/// workspace copy if `uploads_dir` is available. The data URI carries the
-/// original bytes, re-encoded to a bounded JPEG only when it would exceed the
-/// encoded-payload cap. The returned action's `delete_temp` tells the caller
-/// whether the source temp file was consumed from this message's inbound
-/// attachments and may be cleaned up.
+/// Handle an IMAGE marker — a data URI, an [`ImageAction::Invalid`] target, or (out of scope)
+/// a plain-text annotation; a workspace copy is saved when `uploads_dir` is available. The
+/// reported `delete_temp` tells the caller whether the source temp file was consumed from this
+/// message's inbound attachments and may be cleaned up.
 async fn handle_image(
     path: &str,
     path_obj: &std::path::Path,
     uploads_dir: Option<&std::path::Path>,
     staging_dirs: &[String],
 ) -> ImageAction {
-    // Only a well-formed http(s) URL is sent as-is; a malformed one falls
-    // through to the classifier (which is equally strict) and stays inert text,
-    // matching the provider's final image gate.
+    // Only a well-formed http(s) URL is sent as-is; a malformed one falls through to the
+    // classifier and stays inert text, matching the provider's final image gate.
     if media_target::is_valid_remote_url(path) {
         return ImageAction::Keep;
     }
@@ -315,8 +286,7 @@ async fn handle_image(
         return ImageAction::Invalid { delete_temp: false };
     }
 
-    // Containment: only this message's own inbound attachment may be read,
-    // copied, or deleted.
+    // Containment: only this message's own inbound attachment may be read, copied or deleted.
     if !is_inbound_attachment(path_obj, staging_dirs).await {
         tracing::warn!(%path, "Image path outside this message's inbound attachments — annotating without copy");
         return ImageAction::Replace {
@@ -326,11 +296,9 @@ async fn handle_image(
         };
     }
 
-    // Only a real raster may be converted. The file is in-scope (containment
-    // passed), so it is a pure temp artifact and is cleaned up even though it is
-    // never consumed as an image. The classifier requires a real decode for a
-    // local file (authoritative, not a magic sniff), so it is offloaded off the
-    // async worker (the cached result makes repeated calls cheap).
+    // Only a real raster converts. The file is in scope, so it is a pure temp artifact and
+    // is cleaned up even though it is never consumed as an image. The classifier needs a real
+    // decode (authoritative, not a magic sniff), so it runs off the async worker.
     if !matches!(
         crate::util::with_block_in_place(|| media_target::classify_media_image_target(path)),
         MediaTarget::LocalImage
@@ -338,16 +306,12 @@ async fn handle_image(
         return ImageAction::Invalid { delete_temp: true };
     }
 
-    // Convert to data URI for the API request. The classifier above already
-    // established the file is a decodable native raster, so the only failure
-    // left is an image too large even after the bounded re-encode — never a
-    // junk data-URI, because the authoritative classifier gate already rejected
-    // any corrupt-but-magic-valid file.
+    // The classifier established a decodable native raster, so the only failure left is an
+    // image too large even after the bounded re-encode — never a junk data-URI.
     let data_uri = bounded_image_data_uri(path_obj).await;
 
-    // Save a workspace copy only once the image actually converts, so a dead /
-    // corrupt file never leaves a junk upload copy plus a "[Saved image: ...]"
-    // annotation alongside the invalid ref.
+    // The workspace copy waits until the image converts, so a dead file leaves no junk upload
+    // plus a "[Saved image: ...]" annotation beside the invalid ref.
     let saved = match &data_uri {
         Ok(_) => save_media_to_workspace(path_obj, uploads_dir, "image", "png")
             .await
@@ -369,29 +333,22 @@ async fn handle_image(
     }
 }
 
-/// Canonical path of the daemon's Telegram attachment temp root, which the
-/// receive path downloads every inbound attachment into. `None` when the
-/// directory does not exist (then nothing can be in scope).
+/// Canonical path of the daemon's Telegram attachment temp root; `None` when the directory
+/// does not exist (then nothing can be in scope).
 async fn canonical_telegram_files_root() -> Option<std::path::PathBuf> {
     tokio::fs::canonicalize(crate::util::telegram_files_root())
         .await
         .ok()
 }
 
-/// Whether `path` names an inbound attachment of the message that owns one of
-/// `staging_dirs`: a file inside one of the message's own staging directories
-/// under the Telegram temp root (the names recorded on the message by the
-/// receive path, see `util::telegram_staging_dir_name`).
+/// A file inside one of the message's own staging directories under the Telegram temp root
+/// (see `util::telegram_staging_dir_name`).
 ///
-/// This is the only legitimate source of inbound media, and the narrower of the
-/// two inbound containment predicates: [`has_inbound_temp_marker`] only widens
-/// which text is replaced in chat history, while this one authorizes reading,
-/// copying and deleting, so it demands the exact owning directory. A marker
-/// naming anything else — another chat's attachment, another message's
-/// attachment, or a hand-typed `[FILE:/etc/passwd]` — is inert text and must
-/// never be read, copied into a workspace, or deleted. A message without an
-/// attachment owns no directory — that is all this predicate asks of the channel
-/// it came from (a GUI message's directories are staged by its composer).
+/// This is the only legitimate source of inbound media, and the narrower of the two inbound
+/// containment predicates: [`has_inbound_temp_marker`] only widens which text is replaced in
+/// chat history, while this authorizes reading, copying and deleting, so it demands the exact
+/// owning directory. Anything else — another chat's or message's attachment, a hand-typed
+/// `[FILE:/etc/passwd]` — is inert text and is never read, copied or deleted.
 async fn is_inbound_attachment(path: &std::path::Path, staging_dirs: &[String]) -> bool {
     if staging_dirs.is_empty() {
         return false;
@@ -399,14 +356,11 @@ async fn is_inbound_attachment(path: &std::path::Path, staging_dirs: &[String]) 
     let Some(root) = canonical_telegram_files_root().await else {
         return false;
     };
-    // A path that exists must canonicalize inside the root on its own; the
-    // parent fallback applies ONLY to a path that is not there at all: an
-    // attachment deleted before enrichment cannot be canonicalized, and the
-    // download path creates a per-message directory for the file it just wrote,
-    // so a marker naming a since-vanished file inside such a directory is still
-    // ours. A symlink planted in a per-message directory but pointing outside
-    // the root exists, so it is never rescued by the fallback — its canonical
-    // target is outside and the marker is left inert.
+    // A path that exists must canonicalize inside the root on its own; the parent fallback
+    // applies ONLY to a path that is not there at all (an attachment deleted before
+    // enrichment, in the per-message directory the download created for it). A symlink
+    // planted in a per-message directory but pointing outside the root exists, so the
+    // fallback never rescues it and the marker is left inert.
     let candidate = match tokio::fs::canonicalize(path).await {
         Ok(canonical) => canonical,
         Err(_) => match path.parent() {
@@ -420,8 +374,7 @@ async fn is_inbound_attachment(path: &std::path::Path, staging_dirs: &[String]) 
     let Ok(relative) = candidate.strip_prefix(&root) else {
         return false;
     };
-    // Exact match on the directory name: a prefix comparison would also accept a
-    // sibling directory of the same chat.
+    // Exact match: a prefix comparison would also accept a sibling directory of the same chat.
     relative
         .components()
         .next()
@@ -429,24 +382,18 @@ async fn is_inbound_attachment(path: &std::path::Path, staging_dirs: &[String]) 
         .is_some_and(|dir| staging_dirs.iter().any(|staging_dir| staging_dir == dir))
 }
 
-/// Whether `name` is a single plain path component — the only shape the receive
-/// path generates for a staging directory (see
-/// [`crate::util::telegram_staging_dir_name`]). [`ChannelMessage::attachment_dirs`]
-/// is a public field, and an empty or relative name would make the removal below
-/// target the shared Telegram root (or leave it) instead of a directory inside
-/// it.
+/// The only shape the receive path generates for a staging directory.
+/// [`ChannelMessage::attachment_dirs`] is a public field, and an empty or relative name would
+/// make the removal below target the shared Telegram root instead of a directory inside it.
 fn is_staging_dir_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains(std::path::is_separator)
 }
 
-/// Outcome of processing a VIDEO marker: the replacement text, whether the
-/// source temp file was copied into the workspace uploads (so the agent can
-/// feed the clip to the video-edit flow) and can be cleaned up, and the
-/// optional "[Video transcription of <name>]: <text>" annotation
-/// (prepended as an annotation block by the caller). HTTP(S) URLs, missing
-/// files, and out-of-scope paths degrade to plain annotations; in-scope inbound
-/// attachments are always cleaned up (whether or not the workspace copy
-/// succeeded).
+/// The replacement text, whether the source temp file was copied into the workspace uploads
+/// (so the agent can feed the clip to the video-edit flow) and can be cleaned up, and the
+/// optional "[Video transcription of <name>]: <text>" annotation. HTTP(S) URLs, missing files
+/// and out-of-scope paths degrade to plain annotations; in-scope inbound attachments are
+/// always cleaned up.
 struct VideoAction {
     replacement: String,
     delete_temp: bool,
@@ -454,7 +401,7 @@ struct VideoAction {
 }
 
 impl VideoAction {
-    /// Plain annotation: no workspace copy, no transcription.
+    /// No workspace copy, no transcription.
     fn annotation(replacement: String) -> Self {
         Self {
             replacement,
@@ -484,12 +431,9 @@ async fn handle_video(
         return VideoAction::annotation(format!("[Video attached: {}]", file_name_or_path(path)));
     }
     if let Some(saved) = save_media_to_workspace(path_obj, uploads_dir, "video", "mp4").await {
-        // Transcribe the persistent workspace copy — never the temp file
-        // (deleted after a successful copy). The annotation keeps the original
-        // Telegram filename; fail-open: any failure degrades to the plain
-        // [Saved video: ...] annotation. A file only the local server could have
-        // delivered is saved and left alone: uploading or decoding it is not part
-        // of receiving it.
+        // Transcribe the persistent workspace copy, never the temp file. The annotation keeps
+        // the original Telegram filename; any failure degrades to the plain `[Saved video: ...]`
+        // annotation. A file only the local server could deliver is saved and left alone.
         let transcription = if let Some(bound) = processing_bound
             && too_large_to_process(&saved.dest, bound).await
         {
@@ -507,10 +451,8 @@ async fn handle_video(
             transcription,
         };
     }
-    // Copy failed (or no uploads dir — e.g. a message with no workspace):
-    // annotate without transcription, but the in-scope temp file is still a
-    // pure intermediate artifact and is cleaned up. `is_inbound_attachment` was
-    // verified above, so the delete stays inside the containment boundary.
+    // Copy failed (or no uploads dir): annotate without transcription, but the in-scope temp
+    // file is still a pure intermediate and is cleaned up.
     VideoAction {
         replacement: format!("[Video attached: {}]", file_name_or_path(path)),
         delete_temp: true,
@@ -518,14 +460,12 @@ async fn handle_video(
     }
 }
 
-/// Handle an AUDIO marker, answering the annotation to add and whether the
-/// source temp file may be deleted.
+/// The annotation to add and whether the source temp file may be deleted.
 ///
-/// macOS transcribes only this message's own inbound attachment. A recording
-/// above the automatic-processing bound is saved to the workspace instead: only
-/// the local Bot API server could have delivered it, and receiving it means
-/// keeping it. Elsewhere an audio marker can only come from outside the
-/// attachment path, so it gets an honest note rather than the bare icon.
+/// macOS transcribes only this message's own inbound attachment; a recording above the
+/// automatic-processing bound is saved to the workspace instead (only the local Bot API server
+/// could have delivered it, and receiving it means keeping it). Elsewhere an audio marker can
+/// only come from outside the attachment path, so it gets an honest note.
 #[cfg_attr(not(target_os = "macos"), expect(clippy::unused_async))]
 async fn handle_audio(
     path: &str,
@@ -566,14 +506,11 @@ async fn handle_audio(
     }
 }
 
-/// Transcribe a saved workspace video copy for the Assistant, returning the
-/// "[Video transcription of <name>]: <text>" annotation (using the original
-/// source `file_name`). Fail-open: returns `None` (plain annotation) when the
-/// transcription fails (unavailable transcriber, unsupported format, upload
-/// or model error, timeout, empty output) — the overall timeout lives inside
-/// [`transcribe_video_file`](crate::providers::transcribe_video_file),
-/// bounding both callers. `workspace` names the workspace for telemetry and
-/// the live non-agent call row (the inbound path has no agent card).
+/// The "[Video transcription of <name>]: <text>" annotation, using the original source
+/// `file_name`. Fail-open: `None` (plain annotation) when transcription fails — unavailable
+/// transcriber, unsupported format, upload or model error, timeout, empty output; the overall
+/// timeout lives inside `providers::transcribe_video_file`, bounding both callers. `workspace`
+/// names the workspace for telemetry and the live non-agent call row.
 async fn transcribe_saved_video(
     path: &std::path::Path,
     file_name: &str,
@@ -583,17 +520,13 @@ async fn transcribe_saved_video(
     Some(format!("[Video transcription of {file_name}]: {text}"))
 }
 
-/// Handle a FILE marker — an inbound attachment the receive path saved under
-/// the daemon's Telegram temp dir. Returns the marker's replacement text, or
-/// `None` for an out-of-scope path: a user-typed `[FILE:...]` is the user's own
-/// text, and another chat's or message's attachment must never be read, copied,
-/// or deleted. An in-scope attachment is copied into the workspace uploads dir
-/// under the sender's name and converted into text and images for the agent,
-/// accumulating the workspace copy, the extracted text and the converter's
-/// notes into `batch`; a missing attachment, an unrouted message and a failed
-/// copy each degrade to a plain annotation rather than dropping the user's
-/// message. A file above the automatic-processing bound is saved and left
-/// alone: receiving it means keeping it, not reading it.
+/// An inbound attachment the receive path saved under the daemon's Telegram temp dir. Returns
+/// the marker's replacement text, or `None` out of scope: a user-typed `[FILE:...]` is the
+/// user's own text, and another chat's or message's attachment is never read, copied or
+/// deleted. An in-scope attachment is copied into the workspace uploads dir under the sender's
+/// name and converted into text and images, accumulating the copy, the text and the converter's
+/// notes into `batch`; a missing attachment, an unrouted message and a failed copy each degrade
+/// to a plain annotation. A file above the automatic-processing bound is saved, not read.
 async fn handle_file(
     path: &str,
     path_obj: &std::path::Path,
@@ -602,19 +535,16 @@ async fn handle_file(
     processing_bound: Option<u64>,
     batch: &mut EnrichmentBatch,
 ) -> Option<String> {
-    // Containment: only this message's own inbound attachment may be read,
-    // copied, or deleted.
+    // Containment: only this message's own inbound attachment may be read, copied or deleted.
     if !is_inbound_attachment(path_obj, staging_dirs).await {
-        // Also the vanished-staging-directory shape: the parent fallback needs
-        // that directory to exist, so the path reads as hand-typed and its marker
-        // stays verbatim.
+        // Also the vanished-staging-directory shape: the parent fallback needs that directory
+        // to exist, so the path reads as hand-typed and its marker stays verbatim.
         tracing::warn!(%path, "File path outside this message's inbound attachment — leaving the marker untouched");
         return None;
     }
     let name = file_name_or_path(path);
-    // An inbound attachment is a pure intermediate: the workspace copy (or the
-    // extracted text) is what outlives this call, so a real file is queued for
-    // deletion; a marker naming the staging directory itself is never removed.
+    // A pure intermediate: the workspace copy (or the extracted text) outlives this call, so a
+    // real file is queued for deletion; a marker naming the staging directory is never removed.
     if path_obj.is_file() {
         batch.files_to_delete.push(path_obj.to_path_buf());
     } else if path_obj.exists() {
@@ -628,15 +558,14 @@ async fn handle_file(
         ));
     }
     let Some(uploads_dir) = uploads_dir else {
-        // No workspace path: nowhere to copy the file into and no agent to
-        // convert it for.
+        // No workspace path: nowhere to copy the file into and no agent to convert it for.
         return Some(format!(
             "[File {name}: received, not saved to the workspace]"
         ));
     };
 
-    // Copy first — the workspace handle is what the agent reads later, and the
-    // conversion then runs off a file that outlives the temp cleanup.
+    // Copy first: the workspace handle is what the agent reads, and the conversion then runs
+    // off a file that outlives the temp cleanup.
     let copy = copy_to_uploads(path_obj, uploads_dir, name).await;
     let copied_to_workspace = copy.is_some();
     let replacement = match &copy {
@@ -644,10 +573,8 @@ async fn handle_file(
         None => format!("[File {name}: received, not saved to the workspace]"),
     };
 
-    // A file above the automatic-processing bound could only have arrived through
-    // the local Bot API server, and receiving it means keeping it: converting it
-    // would read the whole file into memory. The agent still gets the marker and can
-    // open it with its own tools, whose refusals name their own limits.
+    // Above the bound the file could only have come through the local Bot API server, and
+    // receiving it means keeping it: converting would read the whole file into memory.
     if let Some(bound) = processing_bound
         && too_large_to_process(path_obj, bound).await
     {
@@ -664,9 +591,8 @@ async fn handle_file(
         return Some(replacement);
     }
 
-    // Extracted images go into the attachment's own per-message directory, so
-    // they stay inside the directory the inbound IMAGE containment accepts.
-    // A file (checked above) always has a parent directory.
+    // Extracted images go into the attachment's own per-message directory, which is what the
+    // inbound IMAGE containment accepts. A file always has a parent directory.
     let out_dir = path_obj.parent().unwrap_or(path_obj);
     match convert_document_file(path_obj, name, out_dir).await {
         DocOutcome::Text {
@@ -677,35 +603,28 @@ async fn handle_file(
             all_page_text_lost,
             page_text,
         } => {
-            // Extracted images go through the ordinary IMAGE pipeline before the
-            // annotations are composed, because whether an image was delivered
-            // decides how the no-text sentence reads. Its batch effects are applied
-            // below, in their old order.
+            // The IMAGE pipeline runs before the annotations are composed, because whether an
+            // image was delivered decides how the no-text sentence reads.
             let images = deliver_document_images(images, uploads_dir, staging_dirs).await;
-            // The reader failed on every page it was asked for, so the pages
-            // carry no text of their own: the notes below name them, and the
-            // "no text could be extracted" sentence — which would report a reader
-            // failure as an absence — is left out. Anything else the conversion
-            // read (a comment, a filled field value) is content and is delivered
-            // whatever happened to the page text, so the gate is about what the
-            // conversion actually produced.
+            // The reader failed on every page, so the pages carry no text: the notes below name
+            // them and the "no text could be extracted" sentence — which would report a reader
+            // failure as an absence — is left out. Anything else the conversion read (a comment,
+            // a filled field value) is content and is delivered regardless.
             if !all_page_text_lost || !text.trim().is_empty() {
                 batch.annotations.push(
                     extracted_text_annotation(uploads_dir, name, &text, images.kept > 0).await,
                 );
             }
-            // The report of what the reading did not show leads the notes, the
-            // same way round as the read tool's answer: a kind and its count,
-            // ahead of the detail of each loss.
+            // The report of what the reading did not show leads the notes, as in the read tool's
+            // answer: a kind and its count ahead of the detail of each loss.
             for line in unshown.lines() {
                 batch.annotations.push(format!("[File {name}: {line}]"));
             }
             for note in notes {
                 batch.annotations.push(format!("[File {name}: {note}]"));
             }
-            // A description, an annotation or a form list can carry the text
-            // while no page produced any: the reading still says so, and names an
-            // image only when one was delivered.
+            // A description, annotation or form list can carry the text while no page produced
+            // any: the reading still says so, naming an image only when one was delivered.
             if !page_text && !all_page_text_lost && !text.trim().is_empty() {
                 let note = if images.kept == 0 {
                     crate::document::NO_TEXT_NOTE
@@ -728,8 +647,8 @@ async fn handle_file(
             batch.annotations.push(format!("[File {name}: {reason}]"));
         }
         DocOutcome::Unsupported => {
-            // The copy is what the agent would open, so only claim it is
-            // openable when it actually landed in the workspace.
+            // The copy is what the agent would open, so claim it is openable only when it landed
+            // in the workspace.
             let saved = if copied_to_workspace {
                 " — open the saved file directly"
             } else {
@@ -743,11 +662,9 @@ async fn handle_file(
     Some(replacement)
 }
 
-/// The images a document reading extracted, delivered through the ordinary IMAGE
-/// pipeline: a native data-URI part plus a workspace copy, so the model sees them
-/// and the agent can reopen them. An image the pipeline rejects is counted into
-/// one note, like the converter's own skipped-media note; the batch effects are
-/// collected here and applied by the caller in the order it composes its answer.
+/// Delivered through the ordinary IMAGE pipeline: a native data-URI part plus a workspace copy,
+/// so the model sees them and the agent can reopen them. A rejected image is counted into one
+/// note, like the converter's skipped-media note; the batch effects are applied by the caller.
 struct DeliveredImages {
     /// How many images the model actually received.
     kept: usize,
@@ -757,7 +674,6 @@ struct DeliveredImages {
     deletes: Vec<std::path::PathBuf>,
 }
 
-/// Run a reading's extracted images through the ordinary IMAGE pipeline.
 async fn deliver_document_images(
     images: Vec<std::path::PathBuf>,
     uploads_dir: &std::path::Path,
@@ -775,9 +691,8 @@ async fn deliver_document_images(
         match handle_image(&image_path, &image, Some(uploads_dir), staging_dirs).await {
             ImageAction::Keep => delivered.kept += 1,
             ImageAction::Invalid { delete_temp } => {
-                // The image is a temp artifact written by this pass into the
-                // attachment's per-message directory, so the note must not name
-                // it — the file is deleted right below.
+                // A temp artifact written by this pass, so the note must not name it — the file
+                // is deleted right below.
                 delivered.unreadable += 1;
                 if delete_temp {
                     delivered.deletes.push(image);
@@ -802,12 +717,9 @@ async fn deliver_document_images(
     delivered
 }
 
-/// Annotation block for a document's extracted text.
-///
-/// Short text is inlined; longer text is spilled to
-/// `<uploads>/<stem>.extracted.txt` and the annotation points at that file, so
-/// a book-sized document cannot blow up the message. Empty text (a scanned,
-/// image-only document) names the delivered images instead.
+/// Short text is inlined; longer text is spilled to `<uploads>/<stem>.extracted.txt` and the
+/// annotation points at that file, so a book-sized document cannot blow up the message. Empty
+/// text (a scanned, image-only document) names the delivered images instead.
 async fn extracted_text_annotation(
     uploads_dir: &std::path::Path,
     name: &str,
@@ -847,32 +759,27 @@ async fn extracted_text_annotation(
     )
 }
 
-/// Accumulators shared by the per-kind marker handlers in [`enrich_message`]:
-/// what the finished message gets prepended/appended, and which temp artifacts
-/// the pass consumed.
+/// What the finished message gets prepended/appended, and which temp artifacts the pass consumed.
 #[derive(Default)]
 struct EnrichmentBatch {
     /// Annotation blocks prepended to the finished message.
     annotations: Vec<String>,
     /// `[Saved ...]` upload annotations appended to the body.
     upload_annotations: Vec<String>,
-    /// `[IMAGE:data:...]` parts a FILE ingestion extracted, appended to the
-    /// body after the marker loop (`captures_iter` already snapshotted the
-    /// source content, so the loop never visits them).
+    /// `[IMAGE:data:...]` parts a FILE ingestion extracted, appended after the marker loop
+    /// (`captures_iter` already snapshotted the source, so the loop never visits them).
     appended_markers: Vec<String>,
-    /// Temp files to remove — only ever queued for this message's own inbound
-    /// attachments, so user-typed markers can never delete arbitrary local
-    /// files. The message's staging directories are removed afterwards.
+    /// Only ever queued for this message's own inbound attachments, so user-typed markers can
+    /// never delete arbitrary local files. The staging directories go afterwards.
     files_to_delete: Vec<std::path::PathBuf>,
 }
 
 impl EnrichmentBatch {
-    /// Delete the queued temp artifacts and the message's staging directories,
-    /// then assemble the enriched content: append the collected native parts,
-    /// strip the handled markers and prepend the annotations.
+    /// Delete the queued artifacts and the message's staging directories, then assemble the
+    /// enriched content: append the native parts, strip the handled markers, prepend the
+    /// annotations.
     async fn finish(self, mut body: String, staging_dirs: &[String]) -> String {
-        // Deletion errors are logged (not silently discarded); a file that is
-        // already gone is not an error.
+        // Deletion errors are logged; a file already gone is not an error.
         for file_path in &self.files_to_delete {
             if let Err(e) = tokio::fs::remove_file(file_path).await
                 && e.kind() != std::io::ErrorKind::NotFound
@@ -885,10 +792,9 @@ impl EnrichmentBatch {
             }
         }
 
-        // `remove_dir` removes only an empty directory, so a staging directory
-        // still holding an unconsumed artifact is left alone until the OS
-        // reclaims the temp root; any failure (a directory that is already gone)
-        // is not an error.
+        // `remove_dir` removes only an empty directory, so a staging directory still holding an
+        // unconsumed artifact is left to the OS temp sweep; an already-gone directory is not an
+        // error.
         let root = crate::util::telegram_files_root();
         for staging_dir in staging_dirs {
             if !is_staging_dir_name(staging_dir) {
@@ -897,8 +803,7 @@ impl EnrichmentBatch {
             let _ = tokio::fs::remove_dir(root.join(staging_dir)).await;
         }
 
-        // Append upload path annotations so the model can reference saved
-        // files, preceded by the `[IMAGE:data:...]` parts a document produced.
+        // Upload path annotations, preceded by the `[IMAGE:data:...]` parts a document produced.
         if !self.appended_markers.is_empty() {
             let _ = write!(body, "\n\n{}", self.appended_markers.join("\n"));
         }
@@ -907,11 +812,8 @@ impl EnrichmentBatch {
             let _ = write!(body, "\n\n{annotation_block}");
         }
 
-        // ── Marker stripping and annotation prepending ──
-        // Strip only the kinds this pass consumed (AUDIO, VIDEO): IMAGE carries
-        // the native parts the Assistant's model consumes, FILE is the
-        // workspace handle the agent opens itself, and anything else is the
-        // user's own words.
+        // Strip only the kinds this pass consumed (AUDIO, VIDEO): IMAGE carries the native parts
+        // the model consumes, FILE the workspace handle the agent opens itself.
         let cleaned = MEDIA_MARKER_RE
             .replace_all(&body, |caps: &regex::Captures| {
                 if matches!(
@@ -926,10 +828,9 @@ impl EnrichmentBatch {
             .to_string();
         let cleaned = cleaned.trim().to_string();
 
-        // Prepend the accumulated text descriptions: transcribed AUDIO content,
-        // VIDEO transcription annotations, and a FILE's extracted document
-        // text. Prepending (rather than inlining at the marker) is what keeps
-        // marker-shaped text inside a document away from the strip pass above.
+        // Prepend the accumulated text descriptions: transcribed AUDIO content, VIDEO
+        // annotations and a FILE's extracted text. Prepending rather than inlining at the marker
+        // keeps marker-shaped text inside a document away from the strip pass above.
         if self.annotations.is_empty() {
             return cleaned;
         }
@@ -942,40 +843,31 @@ impl EnrichmentBatch {
     }
 }
 
-/// Process all media markers (`[IMAGE:...]`, `[AUDIO:...]`, `[VIDEO:...]`,
-/// `[FILE:...]`) in a single pass:
+/// Process every media marker (`[IMAGE:...]`, `[AUDIO:...]`, `[VIDEO:...]`, `[FILE:...]`) in a
+/// single pass:
 ///
 /// | Kind | Behavior |
 /// |------|----------|
-/// | IMAGE | data URI conversion (original bytes, re-encoded to a bounded JPEG only when over the encoded-payload cap) + workspace copy when in scope |
-/// | AUDIO | transcription on macOS; an honest "not supported" note where the local audio subsystem does not exist |
+/// | IMAGE | data URI (original bytes, bounded-JPEG re-encode over the cap only) + in-scope copy |
+/// | AUDIO | transcription on macOS; an honest "not supported" note elsewhere |
 /// | VIDEO | workspace copy + `[Saved video: path]` + transcription |
-/// | FILE | workspace copy under the sender's name + extracted text and images; out-of-scope markers stay verbatim |
+/// | FILE | workspace copy + extracted text and images; verbatim when out of scope |
 ///
-/// After processing, the markers this pass consumed (AUDIO, VIDEO) are stripped
-/// from the content, every other kind is preserved (IMAGE is the native image
-/// parts and FILE the workspace handle the Assistant's model consumes), and
-/// annotations are prepended. Temp files are cleaned up after processing,
-/// scoped to this message's own per-message directories — out-of-scope marker
-/// paths are never read, copied, or deleted: IMAGE/AUDIO/VIDEO degrade to plain
-/// annotations and an out-of-scope `[FILE:...]` is left verbatim.
-///
-/// `workspace_path` is the workspace whose `uploads/` dir receives saved media
-/// copies; `None` disables copies.
-// Marker dispatch hub (4 kinds, per-kind handling is extracted into the
-// handler functions above, keeping this loop flat on purpose).
+/// The kinds this pass consumed (AUDIO, VIDEO) are then stripped and the annotations prepended;
+/// IMAGE (native parts) and FILE (workspace handle) are preserved. Temp files are cleaned up
+/// within this message's own directories. `workspace_path` is the workspace whose `uploads/`
+/// receives saved media copies; `None` disables copies.
+// Marker dispatch hub: per-kind handling lives in the handlers above, keeping this loop flat.
 pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&std::path::Path>) {
     let mut batch = EnrichmentBatch::default();
     let mut result = msg.content.clone();
     let uploads_dir = workspace_path.map(|p| p.join("uploads"));
-    // The staging directories this message's producer created for it: the
-    // Telegram receive path, or the desktop composer (`gui::attachment`). Empty
-    // when it has no attachment.
+    // The staging directories this message's producer created: the Telegram receive path or the
+    // desktop composer. Empty when it has no attachment.
     let staging_dirs = msg.attachment_dirs.clone();
-    // Automatic processing stops at the bound of the transport that carried the
-    // file, and only the Telegram side has one: a file above the cloud's download
-    // limit can only have come through the local Bot API server, and receiving it
-    // means keeping it. A composer attachment has its own cap and no such bound.
+    // Automatic processing stops at the carrying transport's bound, and only the Telegram side
+    // has one: a file above the cloud's download limit can only have come through the local Bot
+    // API server, and receiving it means keeping it.
     let processing_bound = (msg.channel == "telegram")
         .then_some(crate::channels::telegram::TELEGRAM_MAX_FILE_DOWNLOAD_BYTES);
 
@@ -986,9 +878,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&st
 
         match kind {
             MediaMarkerKind::File => {
-                // `None` = an out-of-scope user-typed marker, left verbatim:
-                // the strip pass preserves FILE markers, so it survives
-                // untouched.
+                // `None` = an out-of-scope user-typed marker, left verbatim.
                 if let Some(replacement) = handle_file(
                     path,
                     path_obj,
@@ -1026,16 +916,15 @@ pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&st
                         }
                     }
                 }
-                // Local IMAGE temp files are cleaned up only when consumed from
-                // this message's inbound attachments (delete_temp).
+                // Local IMAGE temp files are cleaned up only when consumed from this message's
+                // inbound attachments (`delete_temp`).
                 if delete_temp {
                     batch.files_to_delete.push(path_obj.to_path_buf());
                 }
             }
             MediaMarkerKind::Audio => {
-                // macOS: containment applies — only this message's own inbound
-                // attachment is transcribed or deleted; an out-of-scope marker
-                // degrades to the icon only.
+                // macOS: only this message's own inbound attachment is transcribed or deleted;
+                // an out-of-scope marker degrades to the icon only.
                 let (annotation, delete_temp) = handle_audio(
                     path,
                     path_obj,
@@ -1077,18 +966,13 @@ pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&st
     msg.content = batch.finish(result, &staging_dirs).await;
 }
 
-/// Whether `content` carries a media marker naming an inbound Telegram
-/// attachment — a path under the daemon's Telegram temp root.
+/// A marker naming a path under the daemon's Telegram temp root.
 ///
-/// Used by [`crate::channels::persist_content`] to decide what reaches chat
-/// history: those markers name temp files the daemon deletes right after
-/// enrichment, so the enriched content (transcription, workspace path, image
-/// placeholder) is persisted instead of the original text.
-///
-/// Purely syntactic and deliberately looser than [`is_inbound_attachment`]: a
-/// hand-typed marker naming that root also qualifies, which is safe because
-/// this only decides which text is replaced in history — it never reads, copies
-/// or deletes anything.
+/// [`crate::channels::persist_content`] uses it to decide what reaches chat history: those
+/// markers name temp files the daemon deletes right after enrichment, so the enriched content
+/// is persisted instead. Purely syntactic, and deliberately looser than
+/// [`is_inbound_attachment`]: a hand-typed marker naming that root also qualifies, which is
+/// safe because this only decides which text is replaced — it never reads, copies or deletes.
 #[must_use]
 pub(crate) fn has_inbound_temp_marker(content: &str) -> bool {
     let root = crate::util::telegram_files_root();
@@ -1098,11 +982,8 @@ pub(crate) fn has_inbound_temp_marker(content: &str) -> bool {
     })
 }
 
-/// Extract all unique URLs from message text.
-///
-/// Strips common trailing punctuation (commas, periods, closing brackets,
-/// colons, semicolons, exclamation/question marks) that naturally appears
-/// around URLs in prose.
+/// Strips common trailing punctuation (commas, periods, closing brackets, colons, semicolons,
+/// exclamation/question marks) that naturally appears around URLs in prose.
 fn extract_urls(text: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
@@ -1119,25 +1000,21 @@ fn extract_urls(text: &str) -> Vec<String> {
     result
 }
 
-/// Enrich a message by prepending link summaries for any URLs found in the text.
-///
-/// If no URLs are found, the original message is returned unchanged.
-/// Links are fetched concurrently using the shared `ChromeTool` — each URL
-/// gets its own isolated session tab that is closed after text extraction.
+/// Prepends link summaries for any URLs found in the text; with none, the message is returned
+/// unchanged. Links are fetched concurrently through the shared `ChromeTool` — each URL gets
+/// its own isolated session tab, closed after text extraction.
 pub async fn enrich_links(content: &str) -> Cow<'_, str> {
-    // Keep messages manageable: the cap is in bytes, and it is the only bound on
-    // page text reaching the model, so it must not grow with a page's character count.
+    // The cap is in bytes: it is the only bound on page text reaching the model, so it must not
+    // grow with a page's character count.
     const MAX_TEXT_BYTES: usize = 5000;
     let urls = extract_urls(content);
     if urls.is_empty() {
         return Cow::Borrowed(content);
     }
 
-    // Gate on the cached (non-probing) daemon advertisement first — the cheap
-    // in-memory check short-circuits the `--version` spawn below while the
-    // daemon is confirmed down. A stale/unknown state passes optimistically
-    // and the concurrent fetch tasks re-discover liveness (bounded by the
-    // probe timeout) without failing the message.
+    // Gate on the cached (non-probing) daemon advertisement first — the in-memory check
+    // short-circuits the `--version` spawn while the daemon is confirmed down. A stale state
+    // passes optimistically and the fetch tasks re-discover liveness under the probe timeout.
     if !(crate::tools::chrome_daemon::is_advertised()
         && matches!(
             crate::tools::chrome_daemon::cli_probe().await,
@@ -1148,7 +1025,6 @@ pub async fn enrich_links(content: &str) -> Cow<'_, str> {
         return Cow::Borrowed(content);
     }
 
-    // Fetch all URLs concurrently.
     let chrome = std::sync::Arc::new(ChromeTool::default());
     let mut tasks = Vec::with_capacity(urls.len());
     for url in &urls {
@@ -1160,7 +1036,7 @@ pub async fn enrich_links(content: &str) -> Cow<'_, str> {
         let chrome = std::sync::Arc::clone(&chrome);
         tasks.push(tokio::spawn(async move {
             let result = chrome.fetch_page_text(&url, &tab).await;
-            // Close the tab (best-effort) regardless of fetch outcome.
+            // Close the tab (best-effort) whatever the fetch outcome.
             chrome.close_session(&tab).await;
             (url, result)
         }));
@@ -1171,7 +1047,7 @@ pub async fn enrich_links(content: &str) -> Cow<'_, str> {
         match task.await {
             Ok((url, Ok(body_text))) => {
                 if body_text.trim().is_empty() {
-                    // Blank/empty page — don't insert an empty snippet.
+                    // A blank page inserts no empty snippet.
                     tracing::debug!(url, "Link enricher: page text is empty, skipping snippet");
                     continue;
                 }
@@ -1201,8 +1077,8 @@ mod tests {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
 
-    /// Both schemes count, a repeat is one URL, and the sentence punctuation or
-    /// brackets around an address are not part of it.
+    /// Both schemes count, a repeat is one URL, and the punctuation or brackets around an
+    /// address are not part of it.
     #[test]
     fn extract_urls_applies_its_rules() {
         let cases: &[(&str, &[&str])] = &[
@@ -1228,16 +1104,12 @@ mod tests {
         }
     }
 
-    // ── enrich_message tests ──────────────────────────────────────────
-
-    /// The chat id every inbound fixture belongs to: the test messages carry it
-    /// and the fixture directories are named after it.
+    /// The chat id every inbound fixture belongs to: the test messages carry it and the fixture
+    /// directories are named after it.
     const TEST_CHAT_ID: &str = "1";
 
-    /// Helper: quick ChannelMessage for enrichment tests. It carries
-    /// [`TEST_CHAT_ID`] but no message id, so it owns no inbound attachment —
-    /// containment is per message, and any inbound fixture is therefore out of
-    /// scope for it.
+    /// Carries [`TEST_CHAT_ID`] but no message id, so it owns no inbound attachment — containment
+    /// is per message, and any inbound fixture is out of scope for it.
     fn test_msg(content: &str) -> ChannelMessage {
         ChannelMessage {
             user_name: "test".into(),
@@ -1260,12 +1132,8 @@ mod tests {
         }
     }
 
-    /// Like [`test_msg`], but owning the staging directories of `message_ids` —
-    /// one for a single message, several for the album shape (one merged message
-    /// carrying every member's directory). Each entry makes an
-    /// [`inbound_attachment_fixture`] of the same id ingestible, and
-    /// `message_id` stays the first entry, as an album merge keeps the first
-    /// member's id for addressing.
+    /// Owning the staging directories of `message_ids` — one for a single message, several for
+    /// the album shape. `message_id` stays the first, as an album merge keeps the first.
     fn inbound_album_msg(message_ids: &[i64], content: &str) -> ChannelMessage {
         ChannelMessage {
             message_id: message_ids.first().copied(),
@@ -1277,27 +1145,22 @@ mod tests {
         }
     }
 
-    /// A message owning the inbound directory of a single `message_id`.
     fn inbound_msg(message_id: i64, content: &str) -> ChannelMessage {
         inbound_album_msg(&[message_id], content)
     }
 
-    /// The daemon's Telegram attachment temp root.
     fn telegram_root() -> std::path::PathBuf {
         crate::util::telegram_files_root()
     }
 
-    /// Create the daemon's Telegram temp dir. The containment root must exist
-    /// before path canonicalization — a missing root makes every path look
-    /// out of scope.
+    /// The containment root must exist before path canonicalization — a missing root makes every
+    /// path look out of scope.
     async fn ensure_telegram_files_dir() {
         tokio::fs::create_dir_all(telegram_root()).await.unwrap();
     }
 
-    /// Set up an out-of-scope fixture: a unique scratch dir under the system
-    /// temp dir (outside the Telegram temp dir) containing a fake workspace
-    /// (`ws_path`) and a single arbitrary media file. Returns
-    /// `(tmp_root, ws_path, arbitrary_file)`.
+    /// A unique scratch dir under the system temp dir (outside the Telegram temp dir) with a fake
+    /// workspace and one arbitrary media file. Returns `(tmp_root, ws_path, arbitrary_file)`.
     async fn out_of_scope_fixture(
         prefix: &str,
         file_name: &str,
@@ -1312,11 +1175,9 @@ mod tests {
         (tmp_root, ws_path, arbitrary)
     }
 
-    /// Set up an inbound attachment exactly as the receive path delivers one:
-    /// the file inside its own staging subdirectory of the Telegram temp root
-    /// (see [`crate::util::telegram_staging_dir_name`]). Each test uses its own
-    /// message id, which is what the per-message containment compares against.
-    /// Returns `(msg_dir, attachment)`.
+    /// Exactly as the receive path delivers one: the file inside its own staging subdirectory of
+    /// the Telegram temp root. Each test uses its own message id, which is what the per-message
+    /// containment compares against. Returns `(msg_dir, attachment)`.
     async fn telegram_attachment_fixture(
         chat_id: &str,
         message_id: i64,
@@ -1332,8 +1193,7 @@ mod tests {
         (msg_dir, attachment)
     }
 
-    /// An inbound attachment of [`TEST_CHAT_ID`]: in scope for
-    /// [`inbound_msg`] with the same message id.
+    /// In scope for [`inbound_msg`] with the same message id.
     async fn inbound_attachment_fixture(
         message_id: i64,
         file_name: &str,
@@ -1342,8 +1202,7 @@ mod tests {
         telegram_attachment_fixture(TEST_CHAT_ID, message_id, file_name, bytes).await
     }
 
-    /// Set up an inbound attachment of [`TEST_CHAT_ID`] plus a workspace to
-    /// ingest it into. Returns `(tmp_root, ws_path, msg_dir, attachment)`.
+    /// Plus a workspace to ingest it into. Returns `(tmp_root, ws_path, msg_dir, attachment)`.
     async fn inbound_ingest_fixture(
         prefix: &str,
         message_id: i64,
@@ -1391,16 +1250,13 @@ mod tests {
         );
     }
 
-    /// The annotation an `[AUDIO:...]` marker produces: the transcription
-    /// fallback icon on macOS (no transcriber is configured in the tests), and
-    /// the honest "not supported" note where the local audio subsystem does not
-    /// exist.
+    /// The transcription fallback icon on macOS (no transcriber in tests), and the honest
+    /// "not supported" note where no local audio subsystem exists.
     #[cfg(target_os = "macos")]
     fn audio_annotation() -> &'static str {
         AUDIO_ICON
     }
 
-    /// See the macOS definition above.
     #[cfg(not(target_os = "macos"))]
     fn audio_annotation() -> &'static str {
         AUDIO_UNAVAILABLE
@@ -1410,7 +1266,6 @@ mod tests {
     async fn enrich_audio_annotation_and_strip() {
         let mut msg = test_msg("Listen [AUDIO:/tmp/audio_xyz.mp3] to this");
         enrich_message(&mut msg, None).await;
-        // AUDIO marker stripped; annotation prepended
         assert!(
             msg.content.contains(audio_annotation()),
             "Audio annotation must be present, got: {}",
@@ -1420,24 +1275,20 @@ mod tests {
             !msg.content.contains("[AUDIO:"),
             "AUDIO marker must be stripped"
         );
-        // No file name may survive in any form
         assert!(
             !msg.content.contains("audio_xyz"),
             "Audio temp file name must not appear, got: {}",
             msg.content
         );
-        // The original text is preserved
         assert!(msg.content.contains("Listen"), "Original text preserved");
         assert!(msg.content.contains("to this"), "Original text preserved");
     }
 
-    /// A real raster in this message's inbound directory is read into a data URI
-    /// that is the source bytes exactly, and the temp file and its per-message
-    /// directory go with the read.
+    /// Read into a data URI of the source bytes exactly, with the temp file and its per-message
+    /// directory going with the read.
     #[tokio::test]
     async fn enrich_image_valid_file_converts_to_data_uri_and_deletes_temp() {
-        // The fixture must be one of this message's inbound attachments to be in
-        // scope for reading (data URI) and cleanup.
+        // The fixture must be one of this message's inbound attachments to be in scope.
         let source_bytes = real_png(2, 1);
         let (msg_dir, tmp) = inbound_attachment_fixture(7001, "photo.png", &source_bytes).await;
         let path_str = tmp.to_string_lossy().to_string();
@@ -1445,7 +1296,6 @@ mod tests {
         let mut msg = inbound_msg(7001, &format!("Image: [IMAGE:{path_str}]"));
         enrich_message(&mut msg, None).await;
 
-        // Marker replaced with data URI
         assert!(
             msg.content.contains("[IMAGE:data:image/png;base64,"),
             "Expected data URI, got: {}",
@@ -1455,7 +1305,6 @@ mod tests {
             !msg.content.contains(&path_str),
             "Raw file path must not remain in content"
         );
-        // Temp file and its per-message directory deleted
         assert!(
             !tmp.exists(),
             "Temp image file must be deleted after enrichment"
@@ -1489,8 +1338,7 @@ mod tests {
         let ws_path = tmp_root.join("myworkspace");
         tokio::fs::create_dir_all(&ws_path).await.unwrap();
 
-        // The fixture must be one of this message's inbound attachments to be in
-        // scope for reading (data URI) and cleanup.
+        // The fixture must be one of this message's inbound attachments to be in scope.
         let source_bytes = real_png(2, 1);
         let (_msg_dir, tmp_img) =
             inbound_attachment_fixture(7002, "photo.png", &source_bytes).await;
@@ -1499,19 +1347,16 @@ mod tests {
         let mut msg = inbound_msg(7002, &format!("Image: [IMAGE:{img_path_str}]"));
         enrich_message(&mut msg, Some(ws_path.as_path())).await;
 
-        // Data URI present and upload annotation added
         assert!(msg.content.contains("[IMAGE:data:image/png;base64,"));
         assert!(
             msg.content.contains("[Saved image:"),
             "Upload annotation must be present, got: {}",
             msg.content
         );
-        // Temp file deleted
         assert!(
             !tmp_img.exists(),
             "Temp file must be deleted after enrichment"
         );
-        // Cleanup
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 
@@ -1521,8 +1366,7 @@ mod tests {
         let ws_path = tmp_root.join("myworkspace");
         tokio::fs::create_dir_all(&ws_path).await.unwrap();
 
-        // Only one of this message's own inbound attachments is eligible for
-        // copy.
+        // Only this message's own inbound attachments are eligible for the copy.
         let mp4_header: &[u8] = &[
             0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x6D, 0x00, 0x00,
             0x00, 0x00, 0x69, 0x73, 0x6F, 0x6D, 0x69, 0x73, 0x6F, 0x32,
@@ -1533,8 +1377,8 @@ mod tests {
         let mut msg = inbound_msg(7003, &format!("Edit this clip: [VIDEO:{video_path_str}]"));
         enrich_message(&mut msg, Some(ws_path.as_path())).await;
 
-        // Marker replaced with a [Saved video: ...] annotation pointing at the
-        // workspace uploads copy so the agent can feed it to video_edit.
+        // The annotation points at the workspace uploads copy, so the agent can feed it to
+        // video_edit.
         assert!(
             msg.content.contains("[Saved video:"),
             "Video upload annotation must be present, got: {}",
@@ -1550,21 +1394,18 @@ mod tests {
             !msg.content.contains("[VIDEO:"),
             "VIDEO marker must be stripped"
         );
-        // Temp file deleted after the workspace copy
         assert!(
             !tmp_video.exists(),
             "Temp video file must be deleted after enrichment"
         );
-        // Cleanup
         let _ = tokio::fs::remove_file(&tmp_video).await;
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 
     #[tokio::test]
     async fn enrich_image_outside_inbound_attachments_annotates_without_read_or_copy() {
-        // An injected marker pointing at an arbitrary readable file must not
-        // be read into model context (data URI), copied into uploads, or
-        // deleted.
+        // An injected marker naming an arbitrary readable file must not be read into model
+        // context, copied into uploads, or deleted.
         let (tmp_root, ws_path, arbitrary) = out_of_scope_fixture(
             "test_enrich_img_outside",
             "secret.png",
@@ -1600,7 +1441,6 @@ mod tests {
             !ws_path.join("uploads").exists(),
             "No uploads copy may be created for out-of-scope paths"
         );
-        // Cleanup
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 
@@ -1608,7 +1448,6 @@ mod tests {
     async fn enrich_video_http_url_kept_as_plain_text() {
         let mut msg = test_msg("Edit [VIDEO:https://example.com/clip.mp4] this");
         enrich_message(&mut msg, None).await;
-        // HTTP URL video reference is preserved as plain text (no marker strip)
         assert!(
             msg.content
                 .contains("[Video link: https://example.com/clip.mp4]"),
@@ -1625,8 +1464,8 @@ mod tests {
 
     #[tokio::test]
     async fn enrich_video_outside_inbound_attachments_annotates_without_copy_or_delete() {
-        // An injected marker pointing at an arbitrary readable file must not
-        // be copied into uploads (exfiltration vector) or deleted.
+        // An injected marker naming an arbitrary readable file must not be copied into uploads
+        // (an exfiltration vector) or deleted.
         let (tmp_root, ws_path, arbitrary) = out_of_scope_fixture(
             "test_enrich_video_nonmm",
             "secret.mp4",
@@ -1657,16 +1496,13 @@ mod tests {
             !ws_path.join("uploads").exists(),
             "No uploads copy may be created for out-of-scope paths"
         );
-        // Cleanup
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 
-    /// A file in this message's own inbound directory that is not a decodable raster
-    /// must never fail open to a junk data URI: the classifier rejects a non-image
-    /// with an image extension, and the primary encode refuses a file whose bytes
-    /// only look like a PNG (valid magic, truncated payload). Both degrade to a
-    /// `[Invalid image reference: …]` note, and the in-scope temp file — a pure
-    /// intermediate — is cleaned up.
+    /// A file in this message's own inbound directory that is not a decodable raster must never
+    /// fail open to a junk data URI: the classifier rejects a non-image with an image extension,
+    /// and the primary encode refuses a PNG whose payload is truncated. Both degrade to an
+    /// `[Invalid image reference: …]` note, and the in-scope temp file is cleaned up.
     #[tokio::test]
     async fn enrich_image_that_is_not_a_decodable_raster_never_fails_open_to_a_junk_data_uri() {
         // A non-image file with an image extension.
@@ -1745,8 +1581,6 @@ mod tests {
         let _ = tokio::fs::remove_file(&tmp).await;
     }
 
-    // ── FILE marker tests ─────────────────────────────────────────────
-
     #[tokio::test]
     async fn enrich_file_inlines_text_and_copies_to_uploads() {
         let document = "# Title\n\nHello from a document";
@@ -1786,7 +1620,6 @@ mod tests {
             !msg_dir.exists(),
             "Inbound per-message directory must be deleted"
         );
-        // Cleanup
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 
@@ -1833,7 +1666,6 @@ mod tests {
             "delivered text must never be reported as a document without one, got: {}",
             msg.content
         );
-        // Cleanup
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 
@@ -1861,7 +1693,6 @@ mod tests {
             "the report must reach the inbound answer too, got: {}",
             msg.content
         );
-        // Cleanup
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 
@@ -1934,7 +1765,6 @@ mod tests {
             "the page whose text was lost still comes back as an image, got: {}",
             msg.content
         );
-        // Cleanup
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 
@@ -1986,7 +1816,6 @@ mod tests {
             text.trim(),
             "Sidecar must carry the full extracted text"
         );
-        // Cleanup
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 
@@ -2014,7 +1843,6 @@ mod tests {
             !ws_path.join("uploads").exists(),
             "No uploads copy may be created for out-of-scope paths"
         );
-        // Cleanup
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 
@@ -2058,7 +1886,6 @@ mod tests {
             !ws_path.join("uploads").exists(),
             "No uploads copy may be created for another message's attachment"
         );
-        // Cleanup
         let _ = tokio::fs::remove_dir_all(&other_msg_dir).await;
         let _ = tokio::fs::remove_dir_all(&longer_id_dir).await;
         let _ = tokio::fs::remove_dir_all(&sibling_msg_dir).await;
@@ -2111,7 +1938,6 @@ mod tests {
             !first_dir.exists() && !second_dir.exists(),
             "Both per-message directories must be deleted"
         );
-        // Cleanup
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 
@@ -2144,13 +1970,11 @@ mod tests {
             !ws_path.join("uploads").exists(),
             "A vanished attachment must not be copied into the workspace"
         );
-        // Cleanup
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 
     /// The staging-directory cleanup is per message, not per marker kind: an
-    /// image attachment that is gone by enrichment still leaves no directory
-    /// behind.
+    /// image attachment that is gone by enrichment still leaves no directory behind.
     #[tokio::test]
     async fn enrich_vanished_image_attachment_leaves_no_staging_dir() {
         let (tmp_root, ws_path, msg_dir, attachment) =
@@ -2170,7 +1994,6 @@ mod tests {
             !msg_dir.exists(),
             "The empty staging directory must be removed"
         );
-        // Cleanup
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 
@@ -2237,7 +2060,6 @@ mod tests {
             !ws_path.join("uploads").exists(),
             "No uploads copy may be created through a symlink"
         );
-        // Cleanup
         let _ = tokio::fs::remove_file(&link).await;
         let _ = tokio::fs::remove_dir_all(&msg_dir).await;
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
@@ -2274,7 +2096,6 @@ mod tests {
             "Workspace copy must be byte-identical to the inbound file"
         );
         assert!(!attachment.exists() && !msg_dir.exists());
-        // Cleanup
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 

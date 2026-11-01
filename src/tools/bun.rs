@@ -1,10 +1,8 @@
-//! Managed bun runtime (JS/TS runtime, <https://bun.sh>) — installed in bun's
-//! OWN standard user directory (`~/.bun/bin`). On every product start its
-//! installed version is compared with the newest release and the runtime is
-//! downloaded only when the two differ (a copy that is absent or not executable
-//! is installed straight away). Silent: there is no consent flow (agents invoke
-//! `bun` through the Shell tool, and the product's own tools spawn it by
-//! absolute path).
+//! Managed bun runtime (JS/TS runtime, <https://bun.sh>) — installed in bun's OWN standard user
+//! directory (`~/.bun/bin`). On every product start its version is compared with the newest release
+//! and the runtime is downloaded only when the two differ (an absent or non-executable copy is
+//! installed straight away). Silent: no consent flow (agents invoke `bun` through the Shell tool
+//! and the product's own tools spawn it by absolute path).
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -12,31 +10,24 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
-/// GitHub repo whose releases host the bun runtime (single source of truth).
 const BUN_RELEASE_REPO: &str = "oven-sh/bun";
 
-/// Timeout for resolving the latest bun release tag.
 const BUN_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Timeout for a bun release download (zips are ~30–90 MB).
 const BUN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Timeout for the local `bun --version` probe. A healthy runtime answers in
-/// milliseconds; the bound only keeps a hung copy from holding the start-time
-/// management task.
+/// Timeout for the local `bun --version` probe: a healthy runtime answers in milliseconds, so the
+/// bound only keeps a hung copy from holding the start-time management task.
 const BUN_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Timeout for the macOS AVX2 `sysctl` probe.
 #[cfg(target_os = "macos")]
 const BUN_SYSCTL_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// The flags every product invocation of the managed bun carries before the
-/// script: no dependency install (a missing package must fail rather than be
-/// fetched into whatever directory the run was given) and no `.env` file (bun must
-/// not load the environment of that directory either).
+/// The flags every product invocation of the managed bun carries before the script: no dependency
+/// install (a missing package must fail rather than be fetched into the run's directory) and no
+/// `.env` file (bun must not load that directory's environment either).
 pub(crate) const SCRIPT_GUARDS: [&str; 2] = ["--no-install", "--no-env-file"];
 
-/// The platform-appropriate bun binary name.
 const fn bun_file_name() -> &'static str {
     if cfg!(target_os = "windows") {
         "bun.exe"
@@ -45,24 +36,22 @@ const fn bun_file_name() -> &'static str {
     }
 }
 
-/// The product resolves the runtime itself rather than through the search path:
-/// only bun's own directory (`~/.bun/bin`) is probed. A user's Homebrew/npm bun
-/// is never managed or updated by us, and the owner's own terminal is made to
-/// see the runtime's directory by [`crate::util::owner_path`].
+/// The product resolves the runtime itself: only bun's own directory (`~/.bun/bin`) is probed, so a
+/// user's Homebrew/npm bun is never managed or updated by us, and the owner's terminal sees the
+/// directory through [`crate::util::owner_path`].
 ///
-/// `None` when the product's own copy is absent or not executable — the callers
-/// that launch single-file scripts (the `custom` tool) report that as a
-/// mahbot-side fault rather than falling back to an unmanaged interpreter.
+/// `None` when the product's own copy is absent or not executable — the callers that launch
+/// single-file scripts (the `custom` tool) report that as a mahbot-side fault rather than falling
+/// back to an unmanaged interpreter.
 pub(crate) fn bun_binary_path() -> Option<PathBuf> {
     crate::util::managed_bin::bun_bin_dir()
         .map(|d| d.join(bun_file_name()))
         .filter(|p| crate::util::is_executable(p))
 }
 
-/// The installed copy's version, from `bun --version`. `None` means the copy is
-/// absent or unusable — it cannot be spawned, times out, exits non-zero or prints
-/// no parseable version — which is exactly the "needs (re)install" answer the
-/// start-time policy takes.
+/// The installed copy's version from `bun --version`. `None` means absent or unusable — cannot
+/// spawn, times out, exits non-zero, or prints no parseable version — which is exactly the "needs
+/// (re)install" answer the start-time policy takes.
 async fn installed_version() -> Option<semver::Version> {
     let path = bun_binary_path()?;
     let mut cmd = Command::new(path);
@@ -85,11 +74,9 @@ async fn installed_version() -> Option<semver::Version> {
         .and_then(crate::util::managed_bin::parse_version_token)
 }
 
-/// Bun release-asset platform tag, e.g. `darwin-x64` or `linux-x64-musl`.
-/// `None` on platform/arch combos the vendor does not publish. Mirrors the
-/// vendor's own asset naming, Windows on ARM included; the `-baseline` suffix
-/// marks an AVX2-less x64 build (only x64 ships baseline builds, so aarch64 has
-/// none on any platform).
+/// Bun release-asset platform tag, e.g. `darwin-x64` or `linux-x64-musl`; `None` on combos the
+/// vendor does not publish. Mirrors the vendor's asset naming, Windows on ARM included; the
+/// `-baseline` suffix marks an AVX2-less x64 build (only x64 ships those).
 #[must_use]
 fn bun_asset_target(os: &str, arch: &str, musl: bool, avx2: bool) -> Option<String> {
     let base = match (os, arch, musl) {
@@ -100,11 +87,7 @@ fn bun_asset_target(os: &str, arch: &str, musl: bool, avx2: bool) -> Option<Stri
         ("linux", "aarch64", false) => "linux-aarch64",
         ("linux", "aarch64", true) => "linux-aarch64-musl",
         ("windows", "x86_64", _) => "windows-x64",
-        // Windows on ARM: the vendor's own arm64 build (`bun-windows-aarch64.zip`,
-        // first published in bun v1.3.10) — there is no `-baseline` variant of it.
         ("windows", "aarch64", _) => "windows-aarch64",
-        // Everything else — Windows' half-way `arm64ec` arch included — stays
-        // unsupported rather than taking another processor's build.
         _ => return None,
     };
     let asset = if !avx2 && arch == "x86_64" {
@@ -115,9 +98,8 @@ fn bun_asset_target(os: &str, arch: &str, musl: bool, avx2: bool) -> Option<Stri
     Some(asset)
 }
 
-/// Asset platform tag for THIS build, or `Err` naming the unsupported
-/// platform. Uses the compile-time target triple (`cfg!`) so it is correct
-/// regardless of the runtime host.
+/// Asset platform tag for THIS build, or `Err` naming the unsupported platform. Uses the
+/// compile-time target triple (`cfg!`), so it is correct regardless of the runtime host.
 async fn bun_asset_name() -> Result<String, String> {
     let (os, arch) = crate::util::managed_bin::host_os_arch()?;
     let musl = os == "linux" && crate::util::managed_bin::linux_host_is_musl();
@@ -125,10 +107,9 @@ async fn bun_asset_name() -> Result<String, String> {
         .ok_or_else(|| format!("bun has no release asset for {os}-{arch}"))
 }
 
-/// Runtime AVX2 probe mirroring bun's install.sh. Returns true ("use the plain
-/// asset") for non-x86_64 hosts (no baseline split exists) and for hosts with
-/// no probe available (e.g. Windows). On Linux read `/proc/cpuinfo`; on macOS
-/// run `sysctl -a`. Probe failure → false (baseline, safe on old CPUs,
+/// Runtime AVX2 probe mirroring bun's install.sh: true ("use the plain asset") for non-x86_64 hosts
+/// (no baseline split exists) and where no probe is available (Windows). Linux reads
+/// `/proc/cpuinfo`, macOS runs `sysctl -a`; probe failure → false (baseline, safe on old CPUs,
 /// SIGILL-free).
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
@@ -151,14 +132,10 @@ async fn host_has_avx2() -> bool {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        // No AVX2 probe is available (e.g. Windows) — prefer the plain asset
-        // rather than depending on upstream's redundant `-baseline` copies.
         true
     }
 }
 
-/// The `/proc/cpuinfo` flags line (`flags\t\t: fpu ... avx2 ...`) — true when
-/// any flag token is exactly `avx2`.
 #[cfg(any(target_os = "linux", test))]
 #[must_use]
 fn cpuinfo_has_avx2(cpuinfo: &str) -> bool {
@@ -167,8 +144,6 @@ fn cpuinfo_has_avx2(cpuinfo: &str) -> bool {
         .any(|l| l.starts_with("flags") && l.split_whitespace().any(|f| f == "avx2"))
 }
 
-/// The `sysctl -a` output (`machdep.cpu.features: ... AVX2 ...`) — mirrors
-/// install.sh's `sysctl -a | grep machdep.cpu | grep AVX2` (case-sensitive).
 #[cfg(any(target_os = "macos", test))]
 #[must_use]
 fn sysctl_has_avx2(sysctl_out: &str) -> bool {
@@ -177,7 +152,6 @@ fn sysctl_has_avx2(sysctl_out: &str) -> bool {
         .any(|l| l.contains("machdep.cpu") && l.contains("AVX2"))
 }
 
-/// The macOS AVX2 probe: bounded `sysctl -a`, kill-on-drop, stdout piped.
 #[cfg(target_os = "macos")]
 async fn macos_sysctl_has_avx2() -> bool {
     let mut cmd = Command::new("sysctl");
@@ -197,10 +171,9 @@ async fn macos_sysctl_has_avx2() -> bool {
     sysctl_has_avx2(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Find the SHA-256 hash for `asset` in a `SHASUMS256.txt` body (one
-/// `<64-hex>  <filename>` line per asset, parsed with the shared sidecar
-/// parser). `Err` when no line matches — the caller treats this as a soft
-/// non-fatal failure (the upstream asset name set is not frozen).
+/// Find the SHA-256 hash for `asset` in a `SHASUMS256.txt` body (one `<64-hex> <filename>` line per
+/// asset, parsed with the shared sidecar parser). `Err` when nothing matches — a soft non-fatal
+/// failure, since the upstream asset name set is not frozen.
 fn shasums256_hash_for(body: &str, asset: &str) -> Result<String, String> {
     for line in body.lines() {
         if let Some((hash, name)) = crate::util::managed_bin::parse_sha256_sidecar(line)
@@ -212,9 +185,8 @@ fn shasums256_hash_for(body: &str, asset: &str) -> Result<String, String> {
     Err(format!("SHASUMS256.txt has no entry for {asset}"))
 }
 
-/// Fetch the release's aggregate `SHASUMS256.txt` and extract the hash for
-/// `asset` via [`shasums256_hash_for`]. Request failures are classified
-/// (path-free and URL-free) through
+/// Fetch the release's aggregate `SHASUMS256.txt` and extract the hash for `asset` via
+/// [`shasums256_hash_for`]; request failures are classified path-free and URL-free through
 /// [`crate::util::managed_bin::request_reason`].
 async fn shasums256_hash(
     client: &reqwest::Client,
@@ -244,15 +216,11 @@ async fn shasums256_hash(
     shasums256_hash_for(&body, asset)
 }
 
-/// Bring the runtime's own directory (`~/.bun/bin`) up to the newest bun
-/// release: take the tag (the one the caller resolved, or — for an absent copy,
-/// which has no version to compare — the newest release's own), download this
-/// platform's asset, verify it against the published `SHASUMS256.txt` hash,
-/// extract the single binary and place it. Returns the installed path. Called
-/// only when the installed copy differs from the newest release (a missing or
-/// unusable copy included). Every failure message is path-free and URL-free (see
-/// [`crate::util::managed_bin::download_reason`]), because it is recorded
-/// verbatim.
+/// Bring `~/.bun/bin` up to the newest bun release: take the tag (the caller's, or the newest
+/// release's for an absent copy with no version to compare), download this platform's asset, verify
+/// it against the published `SHASUMS256.txt` hash, extract the single binary and place it; returns
+/// the installed path. Called only when the installed copy differs from the newest release. Every
+/// failure message is path-free and URL-free.
 async fn install_latest(
     release: Option<crate::util::managed_bin::Release>,
 ) -> Result<PathBuf, String> {
@@ -372,7 +340,6 @@ mod tests {
         assert_eq!(bun_asset_target("windows", "arm64ec", false, true), None);
     }
 
-    /// One AVX2 detection rule: the line and whether it counts as detected.
     struct Avx2Case {
         name: &'static str,
         detected: fn(&str) -> bool,

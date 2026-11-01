@@ -1,14 +1,8 @@
 //! Settings page — dynamic configuration editor.
 //!
-//! Reads the current config snapshot from [`crate::config::CONFIG`],
-//! presents editable fields organised in sections, and persists every change
-//! immediately when the value settles (debounced text inputs, immediate
-//! toggles/pickers) via the per-field persistence
-//! functions in [`crate::config`].
-//!
-//! Also manages workspaces, users, the custom-tools list and the admin-defined
-//! custom roles (formerly separate pages), with modal dialogs for the add
-//! operations.
+//! Edits the [`crate::config::CONFIG`] snapshot and persists each field when its value
+//! settles (debounced text inputs, immediate toggles and pickers). Also manages
+//! workspaces, users, custom tools and custom roles, each with its modal dialogs.
 
 use crate::Role;
 use crate::Workspace;
@@ -54,18 +48,12 @@ use super::users;
 use super::widgets;
 use super::workspaces;
 
-// ── Shared helpers ────────────────────────────────────────────────
-
-/// Parse a newline-separated model list into a vector of non-empty model names.
-///
-/// Delegates to [`crate::config::parse_newline_list`] — the shared implementation
-/// used by both the config typed accessors and the Settings GUI.
+/// Parse a newline-separated model list (the shared config parser).
 fn parse_models(raw: Option<&str>) -> Vec<String> {
     raw.map_or_else(Vec::new, crate::config::parse_newline_list)
 }
 
-/// Add a model from an input buffer to a model list, preventing duplicates.
-/// Clears the input buffer after the operation.
+/// Add the buffer's trimmed model to the list unless present, then clear the buffer.
 fn add_model_to_list(input: &mut SingleLineEditorState, list: &mut Option<String>) {
     let model = input.text().trim().to_string();
     if !model.is_empty() {
@@ -78,8 +66,7 @@ fn add_model_to_list(input: &mut SingleLineEditorState, list: &mut Option<String
     }
 }
 
-/// Shared body of the single-line editor update arms: route
-/// focus-navigation actions out, otherwise apply the edit to the buffer.
+/// Shared body of the single-line editor arms: focus navigation out, else apply.
 fn apply_simple_editor_action(
     editor: &mut SingleLineEditorState,
     action: EditorAction,
@@ -91,7 +78,6 @@ fn apply_simple_editor_action(
     Task::none()
 }
 
-/// Remove a model from a list.
 fn remove_model_from_list(model: &str, list: &mut Option<String>) {
     let mut models = parse_models(list.as_deref());
     models.retain(|m| m != model);
@@ -102,11 +88,8 @@ fn remove_model_from_list(model: &str, list: &mut Option<String>) {
     };
 }
 
-/// Build one model-picker entry row: the model name and the shared compact gray
-/// [`widgets::compact_x_button`] removal button. Both the row and the label take
-/// the width they are given — the name wraps instead of pushing the button out
-/// of the popup, and a shrink-width row would measure the name against the whole
-/// row and leave the button nothing.
+/// Build one model-picker entry row: the name and [`widgets::compact_x_button`], both
+/// taking the width they are given so the name wraps instead of pushing the button out.
 fn model_entry_row(target: ModelPickerTarget, model: String) -> Element<'static, SettingsMessage> {
     let mut entry = row![
         text(model.clone())
@@ -129,10 +112,8 @@ fn model_entry_row(target: ModelPickerTarget, model: String) -> Element<'static,
     entry.align_y(Alignment::Center).width(Length::Fill).into()
 }
 
-/// Render a model picker with a list of model entries, remove buttons per
-/// entry, and an add-model row (text input + "Add" button). The current active
-/// selection is per-user and not shown here. Accepts a `target` to build the
-/// correct parameterized `SettingsMessage::ModelPicker` values internally.
+/// A model picker: one row per model with a remove button, plus an add row. The per-user
+/// active selection is not shown here.
 fn model_picker_list<'a>(
     target: ModelPickerTarget,
     models_field: Option<&'a str>,
@@ -195,10 +176,7 @@ fn model_picker_list<'a>(
     col.into()
 }
 
-// ── Telegram Bot API mode helpers ────────────────────────────────
-
-/// A mode in the words the one-line block shows it — short enough to sit beside
-/// its controls in a half-width settings column.
+/// A mode's short name, sized to sit beside its controls in a half-width column.
 fn mode_name(mode: Mode) -> &'static str {
     match mode {
         Mode::Cloud => "Cloud",
@@ -206,16 +184,12 @@ fn mode_name(mode: Mode) -> &'static str {
     }
 }
 
-/// The one line the mode block carries, or `None` when it must not be drawn at
-/// all: a local server that is installed and answering has nothing to report, so a
-/// quiet bot and a busy one look exactly alike. Installing, starting, a switch in
-/// flight and every failure do have something to say, the last one through its
-/// reason.
+/// The mode line, or `None` when there is nothing to report: a healthy local server is
+/// silent. Installing, starting, a switch in flight and every failure do say something.
 fn telegram_line(status: &telegram_local::Status) -> Option<String> {
     let mode = mode_name(status.serving);
     let switching = status.target != status.serving;
-    // Healthy is silence: installed, answering, nothing under way. A switch in
-    // flight is not healthy, even once it reached the side it is heading to.
+    // Healthy is silence — installed, answering, nothing under way; a switch in flight is not.
     if status.serving == Mode::Local
         && !switching
         && !status.migrating
@@ -225,21 +199,17 @@ fn telegram_line(status: &telegram_local::Status) -> Option<String> {
         return None;
     }
     let state = if switching {
-        // Where a pending switch is taking the bot is the new information; the
-        // mode just named is what serves until it gets there.
+        // Where a pending switch is taking the bot is the news; the named mode serves until then.
         Some(format!("switching to {}…", mode_name(status.target)))
     } else if status.last_error.is_some() {
-        // A failure is the whole message: no state word beside it, which would
-        // misdescribe a server that answers but refuses the bot — or one whose
-        // listener never came back.
+        // A failure is the whole message: a state word would misdescribe it.
         None
     } else if status.serving == Mode::Cloud {
         Some("served by Telegram".to_string())
     } else if status.health == Health::Down {
         Some("not running".to_string())
     } else {
-        // Installing or starting, or a switch that already cut over and has not
-        // finished bringing the bot up on this side.
+        // Installing or starting, or a cut-over switch still bringing the bot up on this side.
         Some("installing or starting…".to_string())
     };
     let mut line = match state {
@@ -247,22 +217,17 @@ fn telegram_line(status: &telegram_local::Status) -> Option<String> {
         None => mode.to_string(),
     };
     if let Some(reason) = status.last_error.as_deref() {
-        // The reason lives in the status snapshot, not in the page state. When
-        // the switch is blocked this is the journal's cause, which survives
-        // restarts.
+        // The reason lives in the status snapshot — for a blocked switch, the journal's cause.
         line.push_str(" — ");
         line.push_str(reason);
     }
     Some(line)
 }
 
-/// Whether the way back to the cloud is offered: only a failure of the local
-/// server earns it, never a bot that has merely been quiet.
+/// Only a local-server failure earns the way back to the cloud, never a quiet bot.
 fn telegram_escape(status: &telegram_local::Status) -> bool {
     status.target == Mode::Local && status.last_error.is_some()
 }
-
-// ── Messages ─────────────────────────────────────────────────────
 
 /// Which model picker is being operated on.
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, EnumCount)]
@@ -288,8 +253,7 @@ pub enum ModelPickerAction {
     RemoveModel(String),
 }
 
-/// Map a `ModelPickerTarget` to the corresponding model-list field in
-/// `ConfigData`.
+/// The `ConfigData` model-list field a picker target edits.
 fn picker_list_field<'a>(
     t: &'a ModelPickerTarget,
     config: &'a mut ConfigData,
@@ -300,8 +264,7 @@ fn picker_list_field<'a>(
     }
 }
 
-/// Map a `ModelPickerTarget` to its `config:…` settings field key — the
-/// persisted-form counterpart of [`picker_list_field`].
+/// A picker target's `config:` field key, the persisted form of [`picker_list_field`].
 fn picker_list_key(t: ModelPickerTarget) -> &'static str {
     match t {
         ModelPickerTarget::ImageGen => CONFIG_FIELD_IMAGE_GEN_MODELS,
@@ -309,9 +272,8 @@ fn picker_list_key(t: ModelPickerTarget) -> &'static str {
     }
 }
 
-/// Whether `field` is one the Models settings popup owns — the two model slots
-/// and the two model lists. A save that fails for one of them reopens the popup,
-/// so its inline error is never hidden behind a closed window.
+/// Whether a field belongs to the Models popup: a failed save there reopens it, so its
+/// inline error is never hidden behind a closed window.
 fn is_model_setting_field(field: &str) -> bool {
     matches!(
         field,
@@ -337,214 +299,143 @@ pub enum PasswordTarget {
 #[derive(Debug, Clone)]
 #[expect(private_interfaces)] // CustomToolsMsg wraps pub(crate) CustomToolsMessage
 pub enum SettingsMessage {
-    /// Generic editable config field identified by its snake_case key
-    /// (matches the keys in [`crate::config::ConfigData::set_string_field`]).
-    /// Stages the value in the editable snapshot; text inputs also arm a
-    /// debounced settle, immediate controls (toggles / pick lists) persist
-    /// right away, and the value is settled via
-    /// [`ConfigFieldSettleNow`](Self::ConfigFieldSettleNow).
+    /// A generic editable config field, keyed by its snake_case config key (as in
+    /// [`crate::config::ConfigData::set_string_field`]): staged at once, persisted when it settles.
     ConfigField {
         key: &'static str,
         value: String,
     },
-    /// A config field value has settled and should be persisted now.
-    ///
-    /// `field` is the canonical field id (`config:<key>`,
-    /// `routing_order:<model>`). `generation` is the
-    /// generation counter captured when the value was staged; a settle whose
-    /// generation no longer matches the current counter is stale and dropped,
-    /// so per-keystroke and out-of-order writes are impossible.
+    /// A field value settled and should be persisted now. `field` is the canonical id
+    /// (`config:<key>`, `routing_order:<model>`), `generation` the counter captured at
+    /// staging: a mismatch makes the settle stale, so out-of-order writes cannot land.
     ConfigFieldSettled {
         field: String,
         value: String,
         generation: u64,
     },
-    /// Settle the staged value of a field immediately (Enter on a text input)
-    /// instead of waiting for the debounce timer.
+    /// Settle a field now (Enter on a text input) instead of waiting for the debounce.
     ConfigFieldSettleNow {
         field: String,
     },
-    /// Result of an async per-field persist. `Ok` carries a
-    /// [`crate::config::PersistOutcome`]: the canonical persisted value
-    /// (trimmed, `None` collapsed to `""`) plus an optional non-fatal warning
-    /// (e.g. an unreachable custom endpoint saved anyway). The handler
-    /// applies the value only when the generation is still current (a stale
-    /// result is dropped).
+    /// An async persist finished. `Ok` carries the canonical value (trimmed, `None` → `""`)
+    /// and an optional non-fatal warning; the handler applies it only if its generation is
+    /// still current, and drops a stale result.
     ConfigFieldSaveResult {
         field: String,
         generation: u64,
         result: Result<crate::config::PersistOutcome, String>,
     },
-    /// Toggle the custom chat-completions endpoint section.
-    /// ON only reveals the endpoint fields — nothing is staged, settled, or
-    /// persisted (an endpoint becomes active when the user settles a
-    /// genuinely non-default URL). OFF reverts to OpenRouter: closes the
-    /// section and settles the endpoint field with `""`, so the persist
-    /// path clears both persisted endpoint rows.
+    /// Toggle the custom chat-endpoint section: ON only reveals its fields (nothing is staged
+    /// or persisted); OFF reverts to OpenRouter, settling the endpoint with `""` to clear both.
     CustomEndpointToggle(bool),
     /// Per-model provider routing edits
     ModelRoutingOrder {
         model: String,
         action: EditorAction,
     },
-    /// A shared-editor action on a stateless config text field. The field's
-    /// buffer lives in [`SettingsState::field_editors`] keyed by
-    /// `config:<key>`; the handler applies the action to it and stages the
-    /// resulting text as a [`ConfigField`], settling immediately on
-    /// [`EditorAction::Submit`].
+    /// A shared-editor action on a stateless config text field, whose buffer lives in
+    /// [`SettingsState::field_editors`] keyed by `config:<key>`: the text is staged as a
+    /// [`ConfigField`], settling at once on [`EditorAction::Submit`].
     ConfigFieldAction {
         key: &'static str,
         action: EditorAction,
     },
-    /// A shared-editor action on a masked config (password) field. Mirrors
-    /// [`ConfigFieldAction`], with [`password_field_editor`](super::widgets::password_field_editor)
-    /// rendering and the eye toggle handled separately.
+    /// A shared-editor action on a masked config field; the eye toggle is handled apart.
     PasswordFieldAction {
         key: &'static str,
         action: EditorAction,
     },
     /// Toggle password visibility for a specific field.
     TogglePasswordVisibility(PasswordTarget),
-    // ── Application ─────────────────────────────────────────
-    /// The Autolaunch switch: apply the decision to the system's own
-    /// registration.
+    /// The Autolaunch switch: apply the decision to the system's own registration.
     AutolaunchToggle(bool),
-    /// The system's answer to a read of its login registration, tagged with the
-    /// click count it was taken under (`None` when the read itself failed, which
-    /// is unknown rather than off).
+    /// The system's answer to a read of its login registration, tagged with the click count
+    /// it was taken under (`None` when the read failed — unknown rather than off).
     AutolaunchRead {
         epoch: u64,
         state: Option<bool>,
     },
-    /// One apply's result: the state the system reports afterwards (`None` when it
-    /// could not tell), or the failure.
+    /// An apply's result: the state the system reports afterwards (`None` = could not tell).
     AutolaunchApplied(Result<Option<bool>, String>),
-    // ── Telegram Bot API mode messages ──────────────────────────
-    /// Open the api_id/api_hash dialog, re-seeded from CONFIG.
     OpenTelegramCredentials,
-    /// Close the api_id/api_hash dialog without switching.
     CloseTelegramCredentials,
-    /// A shared-editor action on the dialog's api_id field.
     TelegramApiIdInput(EditorAction),
-    /// A shared-editor action on the dialog's api_hash field.
     TelegramApiHashInput(EditorAction),
-    /// Save the pair, then ask for the switch to the local server. Refused
-    /// while a save or switch started here is still in flight.
+    /// Save the pair, then switch to the local server; refused while a save or switch runs.
     SubmitTelegramCredentials,
-    /// Open the confirmation that gives up the local server and its data.
     RequestSwitchToCloud,
-    /// Close that confirmation without switching.
     DismissSwitchToCloud,
-    /// The confirmation was accepted: ask for the switch back to the cloud.
     ConfirmSwitchToCloud,
-    /// Re-attempt the switch that is pending. The direction is read from the
-    /// journal at the moment of the click, so a retry can only repeat the switch
-    /// the owner already asked for — never start the opposite one.
+    /// Re-attempt the pending switch: its direction comes from the journal, so a retry can
+    /// only repeat what the owner asked for.
     RetrySwitch,
-    /// Result of a save-and-switch this page started. `target` names which
-    /// switch it was, so a failure is reported where it happened.
+    /// The result of a save-and-switch this page started; `target` says where a failure belongs.
     TelegramSwitchResult {
         target: Mode,
         result: Result<(), String>,
     },
-    // ── Workspace management (sub-messages) ─────────────────────
-    /// Wrapped workspace message.
     WorkspaceMsg(workspaces::WorkspacesMessage),
-    /// Toggle the add-workspace modal.
     ToggleAddWorkspaceModal,
-    /// Add-workspace modal fields.
     AddWorkspaceName(EditorAction),
     AddWorkspacePath(EditorAction),
-    /// Submit the add-workspace modal.
     SubmitAddWorkspace,
-    /// Result of workspace add.
     AddWorkspaceResult(Result<Workspace, String>),
-    // ── User management (sub-messages) ──────────────────────────
-    /// Wrapped user message.
     UserMsg(users::UsersMessage),
-    /// Toggle the add-user modal.
     ToggleAddUserModal,
-    /// Add-user modal fields.
     AddUserSender(EditorAction),
-    /// Submit the add-user modal.
     SubmitAddUser,
-    /// Result of user add.
     AddUserResult(Result<crate::users::AddUserOutcome, String>),
-    // ── Custom tools area (sub-messages) ────────────────────────
-    /// Wrapped custom-tools area message.
     CustomToolsMsg(custom_tools::CustomToolsMessage),
-    // ── Custom roles area (sub-messages) ────────────────────────
-    /// Wrapped custom-roles area message.
     CustomRolesMsg(custom_roles::CustomRolesMessage),
     /// Escape key pressed (dismisses modal if open).
     Escape,
-    // ── Model settings popup ───────────────────────────────
-    /// Open the Models settings popup from the Provider section.
     OpenModelsPopup,
-    /// Close the Models settings popup. Closing is not a cancel: text still
-    /// inside its settle window keeps saving.
+    /// Close the Models popup — not a cancel: text inside its settle window keeps saving.
     CloseModelsPopup,
-    // ── Model picker messages ─────────────────────────────
-    /// Operations on a model picker (add/remove list models).
     ModelPicker {
         target: ModelPickerTarget,
         action: ModelPickerAction,
     },
-    /// Result of an async model-picker add: validated against the image-models
-    /// catalog before the model is appended to the list.
+    /// Result of an async model-picker add, validated against the catalog before it lands.
     ModelPickerAddResult {
         target: ModelPickerTarget,
         model: String,
         ok: Result<(), String>,
     },
-    // ── Transcription messages ────────────────────────────
-    /// Toggle local transcription on/off. Turning it OFF also turns Wake Word
-    /// Detection off (they share the loaded ASR model — the cascade persists
-    /// `voice_enabled` away and stops the pipeline). Toggling ON kicks the
-    /// model load/download in the background (auto-activates when ready).
+    /// Toggle local transcription. OFF also turns Wake Word Detection off (both share the
+    /// loaded ASR model); ON kicks the model load/download in the background.
     #[cfg(target_os = "macos")]
     TranscriptionToggle(bool),
-    /// Result of the async transcription-toggle persistence. `voice_was_enabled`
-    /// carries the pre-toggle wake-word state so a failed persist can roll both
-    /// keys (and the pipeline) back. `generation` guards against stale results
-    /// from rapid toggling (mirrors [`Self::VoiceToggleResult`]).
+    /// The toggle persist's result: `voice_was_enabled` lets a failure roll both keys (and the
+    /// pipeline) back; `generation` drops results from a superseded toggle.
     #[cfg(target_os = "macos")]
     TranscriptionToggleResult {
         generation: u64,
         voice_was_enabled: bool,
         result: Result<(), String>,
     },
-    /// Retry the local ASR model load/download after a terminal failure
-    /// (re-toggling alone cannot recover — a dedicated action is required).
+    /// Retry the ASR model load after a terminal failure — re-toggling alone cannot recover.
     #[cfg(target_os = "macos")]
     RetryTranscription,
-    // ── Voice assistant messages ──────────────────────────
     /// Toggle voice assistant on/off (immediately activates/deactivates the pipeline).
     #[cfg(target_os = "macos")]
     VoiceToggle(bool),
-    /// Result of async DB persistence after a voice toggle.
-    /// The `u64` is a generation counter used to detect stale results
-    /// from rapid toggling — if it doesn't match `SettingsState::voice_toggle_gen`,
-    /// the result is ignored as stale.
+    /// The persist's result: the `u64` generation drops results from superseded toggles
+    /// (compared against [`SettingsState::voice_toggle_gen`]).
     #[cfg(target_os = "macos")]
     VoiceToggleResult(u64, Result<(), String>),
-    /// Start enrollment session for wake word.
     #[cfg(target_os = "macos")]
     StartVoiceEnrollment,
-    /// Cancel enrollment session.
     #[cfg(target_os = "macos")]
     CancelVoiceEnrollment,
     /// Retry loading voice models after a [`VoiceStatus::ModelError`].
     #[cfg(target_os = "macos")]
     RetryVoiceModels,
-    // ── TTS messages ─────────────────────────────────────
     /// Toggle TTS on/off (persisted to config DB).
     #[cfg(target_os = "macos")]
     TtsToggle(bool),
-    /// Result of async DB persistence after a TTS toggle.
-    /// The `u64` is a generation counter used to detect stale results
-    /// from rapid toggling — if it doesn't match `SettingsState::tts_toggle_gen`,
-    /// the result is ignored as stale.
+    /// The persist's result: the `u64` generation drops results from superseded toggles
+    /// (compared against [`SettingsState::tts_toggle_gen`]).
     #[cfg(target_os = "macos")]
     TtsToggleResult(u64, Result<(), String>),
     /// Retry TTS model download after a permanent failure.
@@ -552,14 +443,10 @@ pub enum SettingsMessage {
     TtsRetryModels,
 }
 
-// ── State ────────────────────────────────────────────────────────
-
-/// Debounce delay for text inputs: a change is persisted only when the value
-/// has settled (typing paused this long), or immediately on Enter.
+/// Debounce for text inputs: persist once typing pauses this long, or at once on Enter.
 const SETTLE_MS: u64 = 700;
 
-/// Config keys rendered as free-text inputs — persisted only after the value
-/// settles (debounce / Enter), never per keystroke.
+/// Config keys rendered as free-text inputs, persisted only after the value settles.
 const TEXT_INPUT_KEYS: &[&str] = &[
     CONFIG_KEY_PROVIDER_KEY,
     CONFIG_KEY_PROVIDER_ENDPOINT,
@@ -571,32 +458,20 @@ const TEXT_INPUT_KEYS: &[&str] = &[
     CONFIG_KEY_WORKER_MODEL,
 ];
 
-/// Config keys rendered as discrete controls (toggles / pick lists) that
-/// persist immediately on change. `audio_transcription_use_local` is not a
-/// generic ConfigField key — it is a dedicated
-/// [`SettingsMessage::TranscriptionToggle`] toggle with its own transactional
-/// persist path (macOS only, like the rest of the audio settings).
+/// Config keys rendered as discrete controls, persisted at once on change.
+/// `audio_transcription_use_local` is not one of them: it has its own transactional
+/// [`SettingsMessage::TranscriptionToggle`] persist path (macOS only).
 const IMMEDIATE_KEYS: &[&str] = &[CONFIG_KEY_WEB_SEARCH_PROVIDER, CONFIG_KEY_AUTOUPDATE];
 
-/// Field id of the custom chat-endpoint URL (the `config:`-prefixed form of
-/// [`CONFIG_KEY_PROVIDER_ENDPOINT`]).
 const CONFIG_FIELD_PROVIDER_ENDPOINT: &str = "config:provider_endpoint";
-/// Field id of the custom chat-endpoint API key (the `config:`-prefixed form
-/// of [`CONFIG_KEY_PROVIDER_ENDPOINT_KEY`]).
 const CONFIG_FIELD_PROVIDER_ENDPOINT_KEY: &str = "config:provider_endpoint_key";
-/// Field id of the web-search provider pick list.
 const CONFIG_FIELD_WEB_SEARCH_PROVIDER: &str = "config:web_search_provider";
-/// Field id of the image-generation model picker list.
 const CONFIG_FIELD_IMAGE_GEN_MODELS: &str = "config:image_gen_models";
-/// Field id of the video-generation model picker list.
 const CONFIG_FIELD_VIDEO_MODELS: &str = "config:video_models";
-/// Field id of the Autoupdate switch.
 const CONFIG_FIELD_AUTOUPDATE: &str = "config:autoupdate";
 
-/// The two routable model slots (manager + worker), resolved to their
-/// trimmed/default model names. This is the set of models represented by
-/// [`SettingsState::routing_section`] — saved routing rows for models outside
-/// these slots are not rendered (they are inert orphans).
+/// The two routable model slots (manager + worker) as trimmed/default names. Saved routing
+/// rows for other models are inert orphans and are not rendered.
 fn routing_slots(config: &ConfigData) -> BTreeSet<String> {
     let mut models = BTreeSet::new();
     models.insert(crate::config::resolve_or(
@@ -622,161 +497,96 @@ fn routing_order_of(config: &ConfigData, model: &str) -> Option<String> {
 pub struct SettingsState {
     /// Current editable snapshot, loaded from CONFIG each refresh.
     config: ConfigData,
-    /// Per-field generation counters for settled autosaves, keyed by the
-    /// canonical field id (see [`SettingsMessage::ConfigFieldSettled`]).
-    ///
-    /// Bumped every time a field's value is staged (keystroke, toggle,
-    /// picker action). A settle or persist result whose generation no longer
-    /// matches is stale and dropped, so out-of-order async writes can never
-    /// land after a newer edit.
+    /// Per-field generation counters keyed by canonical field id, bumped on every stage: a
+    /// settle or persist result whose generation no longer matches is stale and dropped.
     field_gen: HashMap<String, u64>,
-    /// Fields with a persist task currently in flight. Only one persist per
-    /// field runs at a time, so the last settle always lands last in the DB —
-    /// generation counters alone protect the UI snapshot, not write ordering
-    /// (two concurrent persists for the same field could otherwise complete
-    /// out of order and the older value would land last).
+    /// Fields with a persist in flight. One persist per field at a time keeps the DB write
+    /// order — generations protect the UI snapshot, not write ordering.
     in_flight_persists: HashSet<String>,
-    /// Values queued for fields whose persist is in flight: the user's latest
-    /// edit for that field (value plus the generation at which it was
-    /// queued), flushed when the in-flight persist completes. The flush
-    /// carries the queued generation — if a newer edit was staged in the
-    /// meantime, the flushed persist's result is dropped by the stale-result
-    /// check instead of clobbering the newer staged value.
+    /// Values queued while a field's persist is in flight, with the generation they were
+    /// queued at: flushed with that generation, so a newer staged edit still wins.
     pending_persists: HashMap<String, (String, u64)>,
-    /// Per-field inline errors from rejected settles (invalid values are
-    /// never persisted — the error is shown next to the offending control).
+    /// Per-field inline errors from rejected settles (invalid values are never persisted).
     field_errors: HashMap<String, String>,
-    /// Inline warning from the last custom-endpoint save (non-fatal — e.g.
-    /// an unreachable endpoint saved anyway). Only the
-    /// endpoint persist arm can produce a warning, so a single slot
-    /// suffices — a keyed map here would be single-key dead state.
+    /// Inline warning from the last custom-endpoint save (non-fatal — an unreachable endpoint
+    /// saved anyway). Only that arm warns, so a single slot suffices.
     endpoint_warning: Option<String>,
-    /// Last error message rendered in the bottom banner — failed custom-endpoint
-    /// saves, failed Autolaunch registration changes, plus voice/TTS toggle
-    /// failures on macOS.
+    /// Last error shown in the bottom banner: endpoint saves, Autolaunch changes, voice/TTS.
     error: Option<String>,
-    /// Per-field presentation/undo state for stateless config fields rendered
-    /// through the shared single-line editor. Keyed by the canonical field id
-    /// (`config:<key>`, `routing_order:<model>`), so each field owns its own
-    /// buffer and undo stack across renders while `view(&self)` stays immutable.
-    /// Entries are seeded from the config snapshot at construction and
-    /// re-synced on [`Self::refresh`]; update handlers insert lazily via
-    /// [`Self::field_editor_mut`].
+    /// Per-field presentation/undo state for stateless config fields, keyed by canonical field
+    /// id so `view(&self)` stays immutable; re-synced on refresh, inserted lazily by handlers.
     field_editors: HashMap<String, SingleLineEditorState>,
-    /// Shared empty editor used as a never-panicking render fallback by
-    /// [`Self::field_editor`]. Config keys are always pre-populated and routing
-    /// rows are seeded at every manager/worker model mutation, so this is a
-    /// pure safety net: a current model always has a routing row before render.
+    /// Never-panicking render fallback for [`Self::field_editor`]; every key is pre-populated.
     empty_field_editor: SingleLineEditorState,
     /// Which password fields are currently visible.
     password_visible: HashSet<PasswordTarget>,
-    /// Whether the custom-endpoint section was revealed by the user this
-    /// session (UI-only). An active custom endpoint keeps the section open
-    /// across renders without this flag. Distinct from
-    /// [`Self::custom_endpoint_active_ui`]: revealing the fields alone does
-    /// not configure a custom endpoint (nothing is persisted on reveal).
-    /// A failed endpoint save closes the section (the runtime stayed on
-    /// OpenRouter), so the toggle never shows ON while nothing is configured.
+    /// Whether the user revealed the custom-endpoint section this session (UI-only). An active
+    /// endpoint keeps it open without this flag; a failed save closes it, so the toggle never
+    /// shows ON while the runtime stays on OpenRouter.
     custom_revealed: bool,
-    /// Whether the Models settings popup is open. Held, not derived, because a
-    /// save that fails after the owner closed the popup reopens it with its
-    /// inline error — the failure is never hidden behind a closed window.
+    /// Whether the Models popup is open. Held, not derived: a save that fails after the owner
+    /// closed it reopens it with its inline error.
     models_popup_open: bool,
 
-    // ── Application state ───────────────────────────────────────
-    /// What the system reports about starting the product at login — the
-    /// Autolaunch switch's shown state, not the config decision. `None` while it
-    /// is not known: before the first answer, from the start of every read, and
-    /// again after a failed apply.
+    /// What the system reports about starting the product at login — the switch's shown state,
+    /// not the config decision. `None` while unknown: before a read answers, or after a failure.
     autolaunch: Option<bool>,
-    /// Whether an apply is running. One at a time, and the switch is inert
-    /// meanwhile: a click made then is lost, which is intended — it keeps one
-    /// apply from overtaking another.
+    /// Whether an apply is running. One at a time, and the switch is inert meanwhile: a click
+    /// made then is lost, which keeps one apply from overtaking another.
     autolaunch_applying: bool,
-    /// Bumped by every Autolaunch click. A read carries the count it was taken
-    /// under, so an answer that was already on its way when the owner clicked is
-    /// discarded instead of painting the state the click replaced.
+    /// Bumped by every Autolaunch click. A read carries the count it was taken under, so a late
+    /// answer is discarded instead of painting the state the click replaced.
     autolaunch_epoch: u64,
 
-    // ── Telegram Bot API mode state ─────────────────────────────
     /// Whether the api_id/api_hash dialog is open.
     telegram_credentials_open: bool,
-    /// api_id field of the credentials dialog. Seeded from CONFIG when the
-    /// dialog opens; its own buffer so an abandoned edit is not staged into the
-    /// config snapshot before submit.
+    /// api_id field of the credentials dialog, seeded from CONFIG; its own buffer so an
+    /// abandoned edit is not staged into the config snapshot before submit.
     telegram_api_id_input: SingleLineEditorState,
-    /// api_hash field of the credentials dialog — rendered masked, like every
-    /// other secret on this page (masking is render-only).
+    /// api_hash field of the credentials dialog, rendered masked (masking is render-only).
     telegram_api_hash_input: SingleLineEditorState,
-    /// Inline error inside the credentials dialog: a rejected save, or the
-    /// switch request refusing to start. Never carries the values themselves.
+    /// Inline error in the credentials dialog: a rejected save or a refused switch, never a value.
     telegram_credentials_error: Option<String>,
-    /// Whether the switch-back-to-the-cloud confirmation is open.
     confirm_switch_to_cloud: bool,
-    /// A save-and-switch this page started is in flight. Kept apart from the
-    /// feature's own `migrating` flag because it exists from the click until
-    /// the request returns — before anything is journaled and after a request
-    /// that refused to start — so a double submit cannot start two switches.
+    /// A save-and-switch this page started is in flight — from the click until the request
+    /// returns, so a double submit cannot start two switches.
     telegram_switch_busy: bool,
 
-    // ── Workspace management state ──────────────────────────────
     pub(crate) workspaces_state: workspaces::WorkspacesState,
-    /// Whether the add-workspace modal is visible.
     show_add_workspace_modal: bool,
-    /// Name field in the add-workspace modal.
     add_workspace_name: SingleLineEditorState,
-    /// Path field in the add-workspace modal.
     add_workspace_path: SingleLineEditorState,
-    /// Whether the add-workspace operation is in flight.
     add_workspace_adding: bool,
 
-    // ── User management state ───────────────────────────────────
     pub(crate) users_state: users::UsersState,
-    /// Whether the add-user modal is visible.
     show_add_user_modal: bool,
-    /// Name field in the add-user modal.
     add_user_sender: SingleLineEditorState,
-    /// Whether the add-user operation is in flight.
     add_user_adding: bool,
 
-    // ── Custom tools area state ─────────────────────────────────
     /// The read-only list of custom tool files (see [`custom_tools`]).
     pub(crate) custom_tools_state: custom_tools::CustomToolsState,
 
-    // ── Custom roles area state ─────────────────────────────────
     /// The admin-defined custom roles, their create/edit window and their
     /// deletion (see [`custom_roles`]).
     pub(crate) custom_roles_state: custom_roles::CustomRolesState,
 
-    // ── Model picker state ────────────────────────────────
     /// Text input buffers for model pickers, indexed by [`ModelPickerTarget::idx`].
     model_picker_inputs: [SingleLineEditorState; ModelPickerTarget::COUNT],
 
-    // ── Voice assistant state ─────────────────────────────
-    /// Generation counter for voice toggle operations.
-    /// Incremented before each `VoiceToggle`; the expected value is
-    /// passed through to `VoiceToggleResult` so stale results from
-    /// earlier toggles are detected and ignored.
+    /// Generation counter for voice toggles: bumped before each one, so stale results drop.
     #[cfg(target_os = "macos")]
     voice_toggle_gen: u64,
-    /// Generation counter for transcription toggle operations.
-    /// Incremented before each `TranscriptionToggle`; the expected value is
-    /// passed through to `TranscriptionToggleResult` so stale results from
-    /// earlier toggles are detected and ignored.
+    /// Generation counter for transcription toggles: bumped before each one, so stale
+    /// results drop.
     #[cfg(target_os = "macos")]
     transcription_toggle_gen: u64,
 
-    // ── TTS state ─────────────────────────────────────────
-    /// Generation counter for TTS toggle operations.
-    /// Incremented before each `TtsToggle`; the expected value is
-    /// passed through to `TtsToggleResult` so stale results from
-    /// earlier toggles are detected and ignored.
+    /// Generation counter for TTS toggles: bumped before each one, so stale results drop.
     #[cfg(target_os = "macos")]
     tts_toggle_gen: u64,
 }
 
-/// Sync the voice assistant pipeline state with `CONFIG.voice_enabled()`.
-/// Called from the immediate `VoiceToggle` handler after the toggle persists.
+/// Sync the voice pipeline state with `CONFIG.voice_enabled()` (after the toggle persists).
 #[cfg(target_os = "macos")]
 fn sync_voice_state(enabled: bool) {
     if enabled {
@@ -788,31 +598,25 @@ fn sync_voice_state(enabled: bool) {
     }
 }
 
-/// The custom-role prompt editor's own resizing range: it grows with its text up
-/// to the maximum, and gives that height back down to the minimum when the window
-/// runs out of room for the tools below it.
+/// The custom-role prompt editor's resizing range: it grows with its text up to the maximum
+/// and gives that height back down to the minimum when the window runs out of room.
 const CUSTOM_ROLE_PROMPT_MIN_HEIGHT: f32 = 120.0;
 const CUSTOM_ROLE_PROMPT_MAX_HEIGHT: f32 = 280.0;
 
-/// Space the tools section keeps under the prompt editor: the branching field,
-/// the tool list's label and a few of its rows. The editor shrinks to its own
-/// minimum before this does.
+/// Space the tools section keeps under the prompt editor: the branching field, the tool
+/// list's label and a few rows. The editor shrinks to its own minimum first.
 const CUSTOM_ROLE_TOOLS_MIN_HEIGHT: f32 = 146.0;
 
-/// The behaviours the custom-role window's picker offers, in the order it shows
-/// them. The labels it shows are [`CustomRoleBehavior`]'s `Display`; the stored
-/// value stays `as_str()`.
+/// The behaviours the custom-role window's picker offers, in order: labels come from
+/// [`CustomRoleBehavior`]'s `Display`, the stored value from `as_str()`.
 const BEHAVIORS: [CustomRoleBehavior; 2] =
     [CustomRoleBehavior::Continuous, CustomRoleBehavior::OneOff];
 
 impl SettingsState {
     pub fn new() -> Self {
-        // The field editors are seeded from `self.config` (see
-        // `resync_field_editors`), so the editable config and the editors always
-        // reflect one snapshot: two independent CONFIG reads could race a
-        // concurrent write and seed routing editors for a model set that does
-        // not match `config`, leaving the current model to render the empty
-        // fallback instead of its saved routing order.
+        // The field editors are seeded from `self.config` (see `resync_field_editors`), so the
+        // editable config and the editors always reflect one snapshot: two independent CONFIG
+        // reads could seed routing editors for a model set that does not match `config`.
         let mut state = Self {
             config: CONFIG.snapshot(),
             field_gen: HashMap::new(),
@@ -858,36 +662,25 @@ impl SettingsState {
         state
     }
 
-    /// Reload the editable snapshot from the current CONFIG and read what the
-    /// system reports about Autolaunch.
-    ///
-    /// Inline errors are cleared (the page is being shown fresh). Pending
-    /// debounced settles are NOT invalidated — a value typed before
-    /// navigating away must still be persisted when its settle fires.
-    ///
-    /// Re-entered on every page entry, so the switch reports the system as it
-    /// is now — including a disable the owner made in the system's own
-    /// settings. The read runs off the update thread, so it is started rather
-    /// than awaited.
+    /// Reload the editable snapshot from CONFIG and read what the system reports about
+    /// Autolaunch. Inline errors are cleared, but pending debounced settles are not — a value
+    /// typed before navigating away must still be persisted. The read runs off the update
+    /// thread, so it is started rather than awaited.
     pub fn refresh(&mut self) -> Task<SettingsMessage> {
         self.config = CONFIG.snapshot();
         self.error = None;
         self.field_errors.clear();
         self.endpoint_warning = None;
         self.resync_field_editors();
-        // A copy built from sources never registers, so there is nothing to
-        // read and no subprocess to pay for. A running apply answers for
-        // itself, so a read now could only report a stale state.
+        // A copy built from sources never registers, so there is nothing to read or pay for.
         if crate::self_update::is_published_copy() && !self.autolaunch_applying {
             return self.read_system_autolaunch();
         }
         Task::none()
     }
 
-    /// Start a read of the system's registration, tagged with the click count it
-    /// was taken under so a click made while it was in flight supersedes it. What
-    /// the system last said is not what it says now, so the state is unknown again
-    /// until the answer is in.
+    /// Start a read of the system's registration, tagged with the click count it was taken
+    /// under so a later click supersedes it. The state is unknown until the answer is in.
     fn read_system_autolaunch(&mut self) -> Task<SettingsMessage> {
         self.autolaunch = None;
         let epoch = self.autolaunch_epoch;
@@ -896,13 +689,9 @@ impl SettingsState {
         })
     }
 
-    /// Re-sync the config text editors from the current config snapshot.
-    /// Called from [`Self::new`] (initial seeding) and [`Self::refresh`] (page
-    /// navigation). A config editor is rewritten only when the snapshot value
-    /// actually differs from what it already shows — an identical-value
-    /// rewrite would reset its caret and undo stack. Routing editors are
-    /// seeded insert-if-absent (see [`Self::seed_routing_editors`]) so
-    /// existing routing rows keep their undo stack / caret across refreshes.
+    /// Re-sync the config text editors from the snapshot, on construction and page entry. A
+    /// value identical to what the editor already shows is not rewritten (that would reset the
+    /// caret and undo stack); routing editors are seeded insert-if-absent.
     fn resync_field_editors(&mut self) {
         for key in TEXT_INPUT_KEYS {
             let field = format!("config:{key}");
@@ -943,18 +732,10 @@ impl SettingsState {
         }
     }
 
-    /// Push the canonical value for a single field id into its editor (if the
-    /// editor has been created). Called after a completed persist (via
-    /// [`Self::sync_persisted`]) and from the endpoint toggle-off cascade so
-    /// the rendered value reflects the source of truth.
-    ///
-    /// The rewrite is skipped when the editor already shows the canonical
-    /// value: a settled persist echoes back exactly what the user typed, and
-    /// rewriting identical text would snap the caret to (0,0) (cursor reset
-    /// lives in `EditorBuffer::set_text`) and drop the undo stack (cleared in
-    /// `SingleLineEditorState::set_text`). A genuinely different canonical
-    /// value (e.g. whitespace trimmed on save) still rewrites the editor and
-    /// moves the caret — accepted, the text changed.
+    /// Push the canonical value for a field id into its editor (if created), after a persist or
+    /// the endpoint toggle-off cascade. The rewrite is skipped when the editor already shows
+    /// that value: rewriting identical text would snap the caret to (0,0) and drop the undo
+    /// stack. A genuinely different value (whitespace trimmed on save) still rewrites.
     fn resync_field_editor(&mut self, field: &str) {
         if let Some(value) = self.staged_value(field) {
             if let Some(editor) = self.field_editors.get_mut(field) {
@@ -966,30 +747,23 @@ impl SettingsState {
         }
     }
 
-    /// Borrow the per-field editor for a rendered stateless config field.
-    ///
-    /// Config keys are always pre-populated and routing rows are seeded at every
-    /// manager/worker model mutation, so the empty fallback is a pure safety net
-    /// that can never abort a render.
+    /// Borrow the per-field editor for a rendered stateless config field. Every key is
+    /// pre-populated, so the empty fallback is a pure safety net.
     fn field_editor(&self, key: &str) -> &SingleLineEditorState {
         self.field_editors
             .get(key)
             .unwrap_or(&self.empty_field_editor)
     }
 
-    /// Mutable variant of [`Self::field_editor`] used by update handlers. The
-    /// editor is inserted from `initial` if the field was never rendered (and
-    /// thus not yet pre-populated).
+    /// Mutable variant of [`Self::field_editor`], inserting the field from `initial` if new.
     fn field_editor_mut(&mut self, key: &str, initial: &str) -> &mut SingleLineEditorState {
         self.field_editors
             .entry(key.to_string())
             .or_insert_with(|| SingleLineEditorState::new(initial))
     }
 
-    /// Apply an [`EditorAction`] to a stateless `config:<key>` field's editor
-    /// and stage the resulting text. Non-submit edits arm the debounced settle
-    /// via [`ConfigField`]; [`EditorAction::Submit`] settles immediately (the
-    /// staged value is already current in the editable snapshot).
+    /// Apply an [`EditorAction`] to a stateless `config:<key>` field's editor and stage the
+    /// text: non-submit edits arm the debounce, [`EditorAction::Submit`] settles at once.
     fn handle_field_action(
         &mut self,
         key: &'static str,
@@ -1017,17 +791,13 @@ impl SettingsState {
         }
     }
 
-    /// Whether a genuinely non-default custom chat endpoint is staged or
-    /// persisted in the editable snapshot (normalized — trivial variants of
-    /// the default OpenRouter URL never count). Single predicate for the
-    /// OpenRouter-key highlight, the toggle state, and the visibility of
-    /// the OpenRouter Provider Routing section, so UI state can never
-    /// diverge from the normalized runtime endpoint.
+    /// Whether a genuinely non-default custom endpoint is staged or persisted (normalized —
+    /// trivial variants of the default OpenRouter URL never count). One predicate for the key
+    /// highlight, the toggle state and the routing section's visibility.
     fn custom_endpoint_active_ui(&self) -> bool {
         crate::config::is_custom_endpoint(&crate::config::effective_chat_endpoint(&self.config))
     }
 
-    /// Close the add-workspace modal and reset all form fields.
     fn close_add_workspace_modal(&mut self) {
         self.show_add_workspace_modal = false;
         self.add_workspace_name.clear();
@@ -1035,30 +805,28 @@ impl SettingsState {
         self.add_workspace_adding = false;
     }
 
-    /// Close the add-user modal and reset all form fields.
     fn close_add_user_modal(&mut self) {
         self.show_add_user_modal = false;
         self.add_user_sender.clear();
         self.add_user_adding = false;
     }
 
-    /// Mirror a config value into both snapshots: the editable `self.config`
-    /// and the global `CONFIG`, so a refresh() can't revert the change.
+    /// Mirror a config value into both `self.config` and the global `CONFIG`, so a refresh()
+    /// cannot revert the change.
     #[cfg(target_os = "macos")]
     fn set_both(&mut self, key: &str, value: &str) {
         let _ = self.config.set_string_field(key, value);
         let _ = crate::config::CONFIG.set_string_field(key, value);
     }
 
-    /// Mirror a toggle in both config snapshots: `"true"`/`""` (the empty
-    /// string keeps the `non_empty` accessor collapsing to None = disabled).
+    /// Mirror a toggle as `"true"`/`""` (the empty string keeps the `non_empty` accessor
+    /// collapsing to None = disabled).
     #[cfg(target_os = "macos")]
     fn set_toggle(&mut self, key: &str, enabled: bool) {
         self.set_both(key, if enabled { "true" } else { "" });
     }
 
-    /// Shared voice/TTS toggle arm: mirror the new state, fire the per-toggle
-    /// side effect, bump the generation counter, then persist to the DB.
+    /// Shared voice/TTS toggle arm: mirror, fire the side effect, bump generation, persist.
     #[cfg(target_os = "macos")]
     fn run_toggle(
         &mut self,
@@ -1087,8 +855,8 @@ impl SettingsState {
         )
     }
 
-    /// Shared voice/TTS result arm: ignore stale generations; on DB error
-    /// revert both config snapshots and the pipeline via `on_revert`.
+    /// Shared voice/TTS result arm: stale generations are ignored; a DB error reverts both
+    /// snapshots and the pipeline via `on_revert`.
     #[cfg(target_os = "macos")]
     fn handle_toggle_result(
         &mut self,
@@ -1117,8 +885,6 @@ impl SettingsState {
         }
     }
 
-    // ── Per-field autosave helpers ─────────────────────────────
-
     /// Bump the generation counter for a field and return the new value.
     fn bump_gen(&mut self, field: &str) -> u64 {
         let g = self.field_gen.entry(field.to_string()).or_insert(0);
@@ -1126,12 +892,8 @@ impl SettingsState {
         *g
     }
 
-    /// Read the currently staged value of a canonical field id from the
-    /// editable snapshot (used by Enter/submit settles).
-    ///
-    /// Only text-style fields reach this path: `ConfigFieldSettleNow` is
-    /// dispatched by the Enter/submit handlers, and discrete controls settle
-    /// with their value passed directly to [`Self::settle_now`] instead.
+    /// The staged value of a canonical field id, read from the editable snapshot (Enter and
+    /// submit settles). Only text fields reach this: discrete controls settle with their value.
     fn staged_value(&self, field: &str) -> Option<String> {
         if let Some(key) = field.strip_prefix("config:") {
             return self.config.get_string_field(key).map(String::from);
@@ -1168,15 +930,9 @@ impl SettingsState {
         self.schedule_settle(field, value, 0)
     }
 
-    /// Spawn the async persist for a settled field. The generation captured
-    /// at settle time rides along so a stale persist result can be dropped.
-    /// Callers pass the generation at which the value settled (or, for a
-    /// pending flush, the generation at which the value was queued) — never
-    /// the current one, so a flushed value can never carry a newer
-    /// generation than the edit it represents.
-    /// The persist layer returns the canonical value (trimmed, `None`
-    /// collapsed to `""`), which is surfaced through the result's `Ok` so
-    /// the display snapshot re-syncs to exactly what was written.
+    /// Spawn the async persist for a settled field, carrying the generation at which the value
+    /// settled (or was queued) so a stale result is dropped — never the current one. The
+    /// canonical value the persist returns re-syncs the display snapshot.
     fn spawn_field_persist(field: String, value: String, generation: u64) -> Task<SettingsMessage> {
         let f_async = field.clone();
         let v_async = value;
@@ -1194,13 +950,9 @@ impl SettingsState {
         )
     }
 
-    /// Re-sync a single persisted column of a routing row into the editable
-    /// snapshot.
-    ///
-    /// `value` is the canonical persisted value for the field's own column;
-    /// when `None` (a failed persist rolling back a discrete control) the
-    /// column is read back from CONFIG, the source of truth. When the persist
-    /// deleted the row, the row is dropped from the snapshot.
+    /// Re-sync one persisted column of a routing row: `value` is the canonical persisted value;
+    /// `None` (a failed persist rolling back a discrete control) reads the column back from
+    /// CONFIG; a row the persist deleted is dropped from the snapshot.
     fn sync_field(&mut self, field: &str, value: Option<&str>) {
         if let Some(model) = field.strip_prefix("routing_order:") {
             let order = value.and_then(crate::config::trimmed_or_none).or_else(|| {
@@ -1224,17 +976,15 @@ impl SettingsState {
             let _ = self
                 .config
                 .set_string_field(key, value.as_deref().unwrap_or_default());
-            // A persist/revert of a manager/worker model updates the routing
-            // key set; seed the routing editor for the applied (trimmed) model
-            // so the routing rows render without a missing-editor panic.
+            // A model change re-keys the routing rows: seed the routing editor for the applied
+            // model so the rows render without a missing-editor panic.
             if matches!(key, CONFIG_KEY_MANAGER_MODEL | CONFIG_KEY_WORKER_MODEL) {
                 self.seed_routing_editors();
             }
         }
     }
 
-    /// Drop a routing row from the editable snapshot when the persist deleted
-    /// it from the DB/CONFIG.
+    /// Drop a routing row from the snapshot when the persist deleted it from the DB/CONFIG.
     fn drop_routing_row_if_cleared(&mut self, model: &str) {
         if crate::config::CONFIG.model_routing_by_key(model).is_none() {
             self.config
@@ -1243,27 +993,17 @@ impl SettingsState {
         }
     }
 
-    /// Sync a field's staged snapshot and editor with the last persisted value:
-    /// `None` reverts the staged value (a failed persist on a discrete
-    /// toggle/picker control), `Some(value)` applies a canonical persisted value
-    /// (a settled text field may have been replaced by a refresh while the
-    /// persist was in flight — the persisted value is the user's last edit and
-    /// must win).
+    /// Sync a field's snapshot and editor with the last persisted value: `None` reverts it (a
+    /// failed persist on a discrete control), `Some(value)` applies the canonical value, which
+    /// wins over a refresh that raced the persist.
     fn sync_persisted(&mut self, field: &str, value: Option<&str>) {
         self.sync_field(field, value);
         self.resync_field_editor(field);
     }
 
-    /// Whether a failed persist should roll the control back to the last
-    /// persisted value. Discrete-state controls (toggles, pick lists, and the
-    /// model pickers' optimistic list markers) revert; free-text inputs
-    /// keep the typed value so the user can correct it.
-    ///
-    /// `config:provider_endpoint` is treated as discrete because it defines the
-    /// chat provider mode (custom vs default): a failed save (e.g. the
-    /// toggle-off cascade) must not leave the UI showing a mode the runtime
-    /// isn't in — the field reverts and the toggle re-derives from the
-    /// persisted value.
+    /// Whether a failed persist rolls the control back to the last persisted value: discrete
+    /// controls revert, free-text inputs keep the typed value so it can be corrected. The
+    /// endpoint field is discrete — it defines the provider mode, which the UI must not misstate.
     fn field_reverts_on_error(field: &str) -> bool {
         matches!(
             field,
@@ -1275,8 +1015,7 @@ impl SettingsState {
         )
     }
 
-    /// Persist a model-picker's list field immediately (discrete action —
-    /// add/remove a model). Clears the picker's inline error and settles now.
+    /// Persist a model-picker's list at once (add/remove is discrete) and clear its inline error.
     fn persist_picker_list(&mut self, target: ModelPickerTarget) -> Task<SettingsMessage> {
         let field = picker_list_key(target);
         let value = picker_list_field(&target, &mut self.config)
@@ -1289,21 +1028,17 @@ impl SettingsState {
     #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, msg: SettingsMessage) -> Task<SettingsMessage> {
         match msg {
-            // ── Config field edits ─────────────────────────────
             SettingsMessage::ConfigField { key, value } => {
                 let _ = self.config.set_string_field(key, &value);
-                // A manager/worker model change re-keys the routing rows, so
-                // seed the routing editor for the new (resolved/trimmed) model
-                // before the next render — a mid-keystroke partial name must
-                // render its routing row without a missing-editor panic.
+                // A model change re-keys the routing rows: seed the routing editor for the new
+                // model before the next render, so a mid-keystroke name keeps its row.
                 if matches!(key, CONFIG_KEY_MANAGER_MODEL | CONFIG_KEY_WORKER_MODEL) {
                     self.seed_routing_editors();
                 }
                 let field = format!("config:{key}");
                 self.field_errors.remove(&field);
                 if TEXT_INPUT_KEYS.contains(&key) {
-                    // Text input: persist only after the value settles
-                    // (debounce), never per keystroke.
+                    // Text input: persist only after the value settles.
                     self.schedule_settle(&field, value, SETTLE_MS)
                 } else if IMMEDIATE_KEYS.contains(&key) {
                     // Toggles / pick lists are discrete: persist right away.
@@ -1351,10 +1086,9 @@ impl SettingsState {
                 generation,
                 result,
             } => {
-                // A completed persist frees the field. If a newer settle
-                // queued a pending value while this persist was in flight,
-                // persist it now — the pending value is the user's latest edit
-                // and must win regardless of this result's age.
+                // A completed persist frees the field; a value queued while it was in
+                // flight is flushed now — it is the user's latest edit and must be
+                // persisted regardless of this result's age.
                 let pending = if self.in_flight_persists.remove(&field) {
                     self.pending_persists.remove(&field)
                 } else {
@@ -1362,11 +1096,9 @@ impl SettingsState {
                 };
                 if let Some((pending_value, queued_generation)) = pending {
                     self.in_flight_persists.insert(field.clone());
-                    // Flush with the generation at which the value was queued
-                    // — NOT the current one: if a newer edit was staged since,
-                    // the flushed persist's result is dropped as stale and can
-                    // never clobber the newer staged value, while the value
-                    // itself still lands in the DB.
+                    // Flush with the generation the value was queued at, NOT the current one: if
+                    // a newer edit was staged since, this result is dropped as stale while the
+                    // value itself still lands.
                     return Self::spawn_field_persist(field, pending_value, queued_generation);
                 }
                 // Ignore results from a superseded persist.
@@ -1377,19 +1109,15 @@ impl SettingsState {
                     Ok(outcome) => {
                         self.field_errors.remove(&field);
                         self.sync_persisted(&field, Some(&outcome.value));
-                        // Switching Autoupdate back on must restore today's
-                        // behaviour now, not up to ten minutes from now: wake
-                        // the availability loop for a tick. The stored spelling is
-                        // free, so it is read by the same rule as everywhere else.
+                        // Wake the availability loop for a tick: Autoupdate back on must take
+                        // effect now, not up to ten minutes from now.
                         if field == CONFIG_FIELD_AUTOUPDATE
                             && crate::config::flag_on(Some(outcome.value.as_str()))
                         {
                             crate::self_update::nudge_update_tick();
                         }
-                        // The endpoint arm's warning has a slot of its own, and it
-                        // is the only arm that carries one: a post-write failure
-                        // that leaves the save standing is logged by the persist
-                        // layer instead.
+                        // The endpoint arm's warning has a slot of its own: a post-write failure
+                        // that leaves the save standing is logged by the persist layer instead.
                         if field == CONFIG_FIELD_PROVIDER_ENDPOINT {
                             self.endpoint_warning = outcome.warning;
                         }
@@ -1400,29 +1128,22 @@ impl SettingsState {
                         if field == CONFIG_FIELD_PROVIDER_ENDPOINT {
                             self.endpoint_warning = None;
                         }
-                        // The model settings live in a popup: a save that fails
-                        // there reopens it, so the inline error is never hidden
-                        // behind a closed window (closing is not a cancel).
+                        // The model settings live in a popup: a failed save there reopens it with
+                        // its inline error.
                         if is_model_setting_field(&field) {
                             self.models_popup_open = true;
                         }
                         if Self::field_reverts_on_error(&field) {
-                            // Discrete-state controls (toggles/pickers) roll
-                            // back to the last persisted value; free text
+                            // Discrete controls roll back to the last persisted value; free text
                             // keeps the typed value for correction.
                             self.sync_persisted(&field, None);
-                            // A failed endpoint save means no configuration change — close
-                            // the revealed section so the toggle cannot show ON while the
-                            // runtime stays on OpenRouter. The error stays visible in the
-                            // bottom banner (the inline row hides with the section) and
-                            // re-appears inline if the user reveals the section again.
+                            // A failed endpoint save changed nothing: close the revealed section
+                            // so the toggle cannot show ON while the runtime stays on OpenRouter.
                             if field == CONFIG_FIELD_PROVIDER_ENDPOINT {
                                 self.custom_revealed = false;
                                 self.error = Some(e);
-                                // Toggle-off clears both endpoint fields as one discrete
-                                // action — a failed endpoint persist must restore the key
-                                // field too, so the UI cannot show a half-reverted custom
-                                // setup (endpoint defaulted, key cleared).
+                                // Toggle-off clears both endpoint fields as one action: a failed
+                                // persist restores the key field too, so no half-reverted setup.
                                 self.sync_persisted(CONFIG_FIELD_PROVIDER_ENDPOINT_KEY, None);
                             }
                         }
@@ -1431,22 +1152,16 @@ impl SettingsState {
                 }
             }
             SettingsMessage::CustomEndpointToggle(true) => {
-                // ON: reveal the custom-endpoint fields. Nothing is persisted
-                // here — the endpoint becomes active only when the user
-                // settles a genuinely non-default URL
-                // ([`Self::custom_endpoint_active_ui`]), so a reveal alone
-                // never leaves a spurious persisted row, and the toggle state
-                // never diverges from the normalized runtime endpoint.
+                // ON only reveals: nothing is persisted, and the endpoint activates only when a
+                // genuinely non-default URL settles, so a reveal never leaves a spurious row.
                 self.custom_revealed = true;
                 self.field_errors.remove(CONFIG_FIELD_PROVIDER_ENDPOINT);
                 Task::none()
             }
             SettingsMessage::CustomEndpointToggle(false) => {
-                // OFF: revert to OpenRouter and clear both persisted rows. Bump
-                // generation for both fields (drops pending settles/results),
-                // remove pending persists, clear both from the editable
-                // snapshot, then settle the endpoint field with `""` — the
-                // persist path cascades the provider_endpoint_key row deletion.
+                // OFF reverts to OpenRouter: bump both generations (dropping pending settles),
+                // clear both from the snapshot, then settle the endpoint with `""` so the
+                // persist path deletes the key row.
                 self.custom_revealed = false;
                 let endpoint_field = CONFIG_FIELD_PROVIDER_ENDPOINT;
                 let key_field = CONFIG_FIELD_PROVIDER_ENDPOINT_KEY;
@@ -1504,16 +1219,12 @@ impl SettingsState {
                 Task::none()
             }
 
-            // ── Application ────────────────────────────────────
             SettingsMessage::AutolaunchToggle(enabled) => {
-                // The switch is inert while an apply runs, so a click that still
-                // reaches here is lost — intended: applies cannot overtake each
-                // other.
+                // A click while an apply runs is lost — intended: applies cannot overtake.
                 if self.autolaunch_applying {
                     return Task::none();
                 }
-                // Optimistic: the switch follows the click until the system
-                // answers, and this click supersedes any read already on its way.
+                // Optimistic: the switch follows the click, which supersedes any read on its way.
                 self.autolaunch_epoch += 1;
                 self.autolaunch_applying = true;
                 self.autolaunch = Some(enabled);
@@ -1548,7 +1259,6 @@ impl SettingsState {
                 }
             }
 
-            // ── Telegram Bot API mode ──────────────────────────
             SettingsMessage::OpenTelegramCredentials => {
                 // Seed from what is on file, so a correction starts from the
                 // pair already saved — this dialog is the only place it is ever
@@ -1582,8 +1292,7 @@ impl SettingsState {
                 let (id_error, hash_error) =
                     telegram_local::credential_problems(&api_id, &api_hash);
                 if id_error.is_some() || hash_error.is_some() {
-                    // Both messages are already inline under their fields; the
-                    // dialog stays open and nothing is saved or started.
+                    // Both messages are already inline under their fields; nothing is saved.
                     return Task::none();
                 }
                 self.telegram_switch_busy = true;
@@ -1628,8 +1337,8 @@ impl SettingsState {
                 if self.telegram_switch_busy {
                     return Task::none();
                 }
-                // The pending direction comes from the journal, so the retry
-                // repeats what was asked for — a blocked revert stays a revert.
+                // The direction comes from the journal, so a retry repeats what was asked for — a
+                // blocked revert stays a revert.
                 let target = telegram_local::status().target;
                 self.telegram_switch_busy = true;
                 Task::perform(
@@ -1644,23 +1353,19 @@ impl SettingsState {
             SettingsMessage::TelegramSwitchResult { target, result } => {
                 self.telegram_switch_busy = false;
                 match (target, result) {
-                    // The local switch is journaled and runs in the background
-                    // from here; the dialog's job is done.
+                    // The local switch is journaled and runs in the background; the dialog is done.
                     (Mode::Local, Ok(())) => {
                         self.telegram_credentials_open = false;
                         self.telegram_credentials_error = None;
                         self.telegram_api_id_input.clear();
                         self.telegram_api_hash_input.clear();
                     }
-                    // The pair is saved but the switch did not start: reopen the
-                    // dialog if the owner dismissed it while the request ran,
-                    // so the reason is never hidden behind a closed window.
+                    // The pair is saved but the switch did not start: reopen the dialog to say why.
                     (Mode::Local, Err(e)) => {
                         self.telegram_credentials_open = true;
                         self.telegram_credentials_error = Some(e);
                     }
-                    // The back-to-cloud switch reports on the page banner: its
-                    // confirmation is gone by the time the answer lands.
+                    // The back-to-cloud switch reports on the banner; its confirmation is gone.
                     (Mode::Cloud, Ok(())) => {}
                     (Mode::Cloud, Err(e)) => {
                         self.error = Some(format!("The bot could not return to the cloud: {e}"));
@@ -1669,43 +1374,32 @@ impl SettingsState {
                 Task::none()
             }
 
-            // ── Transcription ───────────────────────────────────
             #[cfg(target_os = "macos")]
             SettingsMessage::TranscriptionToggle(enabled) => {
                 self.transcription_toggle_gen += 1;
                 let generation = self.transcription_toggle_gen;
                 let voice_was_enabled = self.config.voice_enabled.as_deref() == Some("true");
-                // enabled → "" = absent row; disabled → "false", matching the
-                // persisted row semantics.
+                // enabled → "" = absent row; disabled → "false": the persisted row semantics.
                 let transcription_value = if enabled { "" } else { "false" };
                 self.set_both(
                     CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL,
                     transcription_value,
                 );
-                // Turning transcription OFF also turns Wake Word Detection OFF
-                // (shared ASR model): stop the pipeline now.
+                // Turning transcription OFF also turns Wake Word Detection OFF (shared ASR model).
                 if !enabled && voice_was_enabled {
                     self.set_both(CONFIG_KEY_VOICE_ENABLED, "");
                     sync_voice_state(false);
                 }
-                // Toggle ON: kick the model load/download in the background now
-                // (otherwise the recogniser loads on the first voice
-                // operation) — load from cache first, otherwise download with
-                // retries. A terminal failure is recovered via retry_init (same
-                // path as the inline Retry button); any other state falls
-                // through to spawn_background_init, which claims Uninit→Loading
-                // with the same panic→Failed guard every background load uses
-                // (a raw spawn here could strand the transcriber in Loading on
-                // a panic).
+                // Toggle ON: kick the model load/download now — cache first, else with retries.
+                // spawn_background_init claims Uninit→Loading with the same panic→Failed guard
+                // every background load uses, so a raw spawn could not strand it in Loading.
                 if enabled && !crate::audio::local_transcriber::is_loaded() {
                     if !crate::audio::local_transcriber::retry_init() {
                         crate::audio::local_transcriber::spawn_background_init();
                     }
                 }
-                // Wake the voice pipeline so it re-reads config: the 1s
-                // periodic timer is parked while transcription is disabled, and
-                // a runtime re-enable must re-resolve status / auto-start here.
-                // Cheap no-op wake for the enable path too.
+                // Wake the voice pipeline so it re-reads config: its 1s timer is parked while
+                // transcription is disabled, and a re-enable must re-resolve status and auto-start.
                 crate::audio::voice::send_command(crate::audio::voice::VoiceCommand::ConfigChanged);
                 Task::perform(
                     async move {
@@ -1736,8 +1430,7 @@ impl SettingsState {
                     Ok(()) => Task::none(),
                     Err(e) => {
                         self.error = Some(e);
-                        // Revert the transcription snapshot to the opposite
-                        // staged state (binary toggle).
+                        // Revert the transcription snapshot to the opposite staged state.
                         let currently_off =
                             self.config.audio_transcription_use_local.as_deref() == Some("false");
                         let restore = if currently_off { "" } else { "false" };
@@ -1757,7 +1450,6 @@ impl SettingsState {
                 Task::none()
             }
 
-            // ── Voice assistant ─────────────────────────────────
             #[cfg(target_os = "macos")]
             SettingsMessage::VoiceToggle(enabled) => self.run_toggle(
                 CONFIG_KEY_VOICE_ENABLED,
@@ -1789,11 +1481,10 @@ impl SettingsState {
                 SettingsMessage::TtsToggleResult,
                 |enabled| {
                     if enabled {
-                        // Open the OS audio output device so playback works immediately without a restart.
+                        // Open the OS audio output device so playback works without a restart.
                         let _ = crate::audio::tts::ensure_audio_output();
                     }
-                    // Toggle ON with uncached models triggers download (handles
-                    // ModelState::Failed retries too, matching voice's auto-retry).
+                    // ON with uncached models downloads them, retrying ModelState::Failed.
                     if enabled && !crate::audio::tts::try_load_cached() {
                         crate::audio::tts::spawn_or_retry_download();
                     }
@@ -1835,7 +1526,6 @@ impl SettingsState {
                 Task::none()
             }
 
-            // ── Workspace messages ──────────────────────────────
             SettingsMessage::WorkspaceMsg(msg) => self
                 .workspaces_state
                 .update(msg)
@@ -1889,7 +1579,6 @@ impl SettingsState {
                     workspaces::WorkspacesMessage::Toast(super::ToastMessage::Error(e)),
                 ))
             }
-            // ── User messages ───────────────────────────────────
             SettingsMessage::UserMsg(msg) => {
                 self.users_state.update(msg).map(SettingsMessage::UserMsg)
             }
@@ -1961,31 +1650,25 @@ impl SettingsState {
                 )))
             }
 
-            // ── Custom tools area ───────────────────────────────
             SettingsMessage::CustomToolsMsg(msg) => self
                 .custom_tools_state
                 .update(msg)
                 .map(SettingsMessage::CustomToolsMsg),
 
-            // ── Custom roles area ───────────────────────────────
-            // The list is only ever changed by the admin's own actions, so the
-            // area re-reads it after every mutation and never polls.
+            // The list changes only by the admin's actions: re-read after each edit, never poll.
             SettingsMessage::CustomRolesMsg(msg) => self
                 .custom_roles_state
                 .update(msg)
                 .map(SettingsMessage::CustomRolesMsg),
 
-            // ── Model picker messages ─────────────────────────
             SettingsMessage::ModelPicker { target, action } => {
                 match (target, action) {
                     (t, ModelPickerAction::AddInput(action)) => {
                         apply_simple_editor_action(&mut self.model_picker_inputs[t.idx()], action)
                     }
                     (t, ModelPickerAction::AddModel) => match t {
-                        // Image-gen additions are validated against the catalog
-                        // (fail-open when it is unavailable) before the list is
-                        // mutated; the input buffer is kept on rejection so the
-                        // user can correct it.
+                        // Image-gen additions are validated against the catalog (fail-open when
+                        // it is unavailable); the input buffer is kept on rejection.
                         ModelPickerTarget::ImageGen => {
                             let model = self.model_picker_inputs[t.idx()].text().trim().to_string();
                             if model.is_empty() {
@@ -2021,18 +1704,14 @@ impl SettingsState {
 
             SettingsMessage::ModelPickerAddResult { target, model, ok } => match ok {
                 Ok(()) => {
-                    // Append the validated model directly — never route through
-                    // the input buffer, which may hold text the user typed while
-                    // the catalog validation was in flight.
+                    // Append directly — never via the input buffer, which may hold newer text.
                     let models = picker_list_field(&target, &mut self.config);
                     let mut list = parse_models(models.as_deref());
                     if !list.contains(&model) {
                         list.push(model.clone());
                         *models = Some(list.join("\n"));
                     }
-                    // Clear the input only when it still holds the added model
-                    // (modulo whitespace); anything the user typed meanwhile
-                    // must survive.
+                    // Clear the input only when it still holds the added model; newer typing stays.
                     if self.model_picker_inputs[target.idx()].text().trim() == model {
                         self.model_picker_inputs[target.idx()].clear();
                     }
@@ -2040,9 +1719,7 @@ impl SettingsState {
                     self.persist_picker_list(target)
                 }
                 Err(e) => {
-                    // Inline error on the picker — no toast (silent success /
-                    // inline rejection for config validation). The popup it
-                    // belongs to reopens if it was closed meanwhile.
+                    // Inline error on the picker, no toast; its popup reopens if it was closed.
                     let key = picker_list_key(target);
                     self.field_errors
                         .insert(key.to_string(), format!("Model `{model}` rejected: {e}"));
@@ -2072,11 +1749,8 @@ impl SettingsState {
                 } else if self.models_popup_open {
                     self.models_popup_open = false;
                 } else {
-                    // The last tier, matching render_modal_overlay: the
-                    // custom-tools details window, the custom-roles editor and
-                    // delete dialogs, the workspace rules and contexts popups,
-                    // and the delete-confirm and diagnostics modals are all
-                    // dismissed here (each only if it is the open one).
+                    // The last tier, matching render_modal_overlay: the custom-tools details
+                    // window, the custom-roles editor and its delete dialog, and the modals.
                     self.custom_tools_state.close_details();
                     self.custom_roles_state.close_dialogs();
                     return Task::batch([
@@ -2093,23 +1767,17 @@ impl SettingsState {
         }
     }
 
-    // ── View ─────────────────────────────────────────────────────
-
     pub fn view<'a>(
         &'a self,
         workspace_map_error: Option<&'a str>,
     ) -> Element<'a, SettingsMessage> {
-        // Workspace management section (right column).
         let ws_section = self.workspaces_section(workspace_map_error);
 
-        // Custom tools area (right column, below workspaces)
         let tools_section = self.custom_tools_section();
 
-        // Custom roles area (right column, below the custom tools)
         let roles_section = self.custom_roles_section();
 
-        // Existing config sections (left column). The Application section leads
-        // when this copy offers either of its switches.
+        // Existing config sections (left column), Application first when it is offered.
         let mut config_sections = Column::new();
         if let Some(application) = self.application_section() {
             config_sections = config_sections
@@ -2146,8 +1814,7 @@ impl SettingsState {
         // Two strict 50/50 columns sharing ONE outer vertical scroll (`vscroll`
         // below). Both columns are `FillPortion(1)` inside a single row, so the
         // taller column naturally defines the page length; column separation
-        // comes only from the right column's internal left padding (no spacer
-        // element).
+        // comes only from the right column's internal left padding (no spacer element).
         let left_col = config_sections;
         let right_col = column![
             ws_section,
@@ -2159,7 +1826,7 @@ impl SettingsState {
 
         let mut content = column![];
 
-        // Page-level error banner — a full-width band above both columns.
+        // Page-level error banner, above both columns.
         if let Some(ref err) = self.error {
             content = content.push(widgets::error_banner_fill(err));
             content = content.push(Space::new().height(8));
@@ -2177,20 +1844,13 @@ impl SettingsState {
 
         let scroll = widgets::vscroll(content);
 
-        // The dialog layer sits above the padded page, so its backdrop dims the
-        // whole page area. Every change here persists automatically — hence no
-        // floating Save button.
+        // The dialog layer sits above the padded page, so its backdrop dims the whole page area.
+        // Every change persists automatically — hence no floating Save button.
         widgets::page_with_dialog(scroll, self.render_modal_overlay())
     }
 
-    // ── Workspace management section ──────────────────────────
-
-    /// Render the workspaces section for the Settings page. No inner
-    /// scrollable — rows expand the outer Settings scrollable naturally.
-    ///
-    /// `map_error` is the Dashboard's workspace-map read failure, passed in so
-    /// the footer picker and this list render one state bit rather than two
-    /// copies of it.
+    /// The workspaces section; rows expand the outer Settings scrollable naturally. `map_error`
+    /// is the Dashboard's workspace-map read failure, so both render one state bit.
     #[expect(clippy::too_many_lines)]
     fn workspaces_section<'a>(
         &'a self,
@@ -2203,8 +1863,7 @@ impl SettingsState {
         rows = widgets::push_error_banner(rows, map_error);
 
         if ws.workspaces.is_empty() {
-            // A failed map read is not an empty installation — the banner above
-            // stands in for the "add one below" empty state.
+            // A failed map read is not an empty installation — the banner above stands in.
             if map_error.is_none() {
                 rows = rows.push(
                     text("No workspaces configured. Add one below.")
@@ -2216,8 +1875,7 @@ impl SettingsState {
             for ws_item in &ws.workspaces {
                 let ws_row = container(
                     column![
-                        // Line 1 — name, status pill, and path on one row.
-                        // Maintainer/pause toggles live in the footer only.
+                        // Line 1 — name, status pill, path; maintainer/pause toggles live below.
                         row![
                             text(&ws_item.name)
                                 .size(theme::TEXT_14)
@@ -2249,8 +1907,7 @@ impl SettingsState {
                         ]
                         .spacing(theme::SPACE_10)
                         .align_y(Alignment::Center),
-                        // Line 2 — per-role context icons, general context,
-                        // Diag, Rules.
+                        // Line 2 — per-role context icons, general context, Diag, Rules.
                         {
                             let mut left = Row::new()
                                 .spacing(theme::SPACE_4)
@@ -2270,9 +1927,7 @@ impl SettingsState {
                                             name.to_string(),
                                         ),
                                     )),
-                                    // Halve the default 10px horizontal
-                                    // padding so adjacent role icons sit
-                                    // closer; vertical stays at 5px.
+                                    // Half the 10px horizontal pad so role icons sit closer.
                                     [theme::PAD_5, theme::PAD_5],
                                     theme::button_text,
                                     tooltip::Position::Top,
@@ -2325,9 +1980,8 @@ impl SettingsState {
                 .padding(theme::PAD_8)
                 .style(theme::surface_card_style);
 
-                // Right-click context menu (Re-analyze / Delete). The card's
-                // own buttons still work: ContextMenu forwards all events to
-                // the underlay first; only right-clicks open the menu.
+                // Right-click context menu (Re-analyze / Delete). The card's buttons still work:
+                // ContextMenu forwards all events to the underlay first; only right-clicks open it.
                 let ws_row: Element<'_, SettingsMessage> = ContextMenu::new(
                     ws_row,
                     vec![
@@ -2352,9 +2006,8 @@ impl SettingsState {
                 .into();
                 rows = rows.push(ws_row);
 
-                // Inline two-step delete confirmation — armed by the context menu's
-                // "Delete" item (the menu closes after firing); lives below the card,
-                // reusing the delete_confirm_button machinery.
+                // Inline two-step delete confirmation, armed by the context menu's "Delete" item.
+                // It lives below the card and reuses the delete_confirm_button machinery.
                 if ws.delete_target.as_ref() == Some(&ws_item.name) {
                     let confirm = delete_confirm_button(
                         SettingsMessage::WorkspaceMsg(
@@ -2379,7 +2032,6 @@ impl SettingsState {
         section_with_header_action("Workspaces", plus_btn, section_content)
     }
 
-    /// Render the users section for the Settings page.
     #[expect(clippy::too_many_lines)]
     fn users_section(&self) -> Element<'_, SettingsMessage> {
         let us = &self.users_state;
@@ -2389,8 +2041,7 @@ impl SettingsState {
         rows = widgets::push_error_banner(rows, us.load_state.error());
 
         if us.users.is_empty() {
-            // A failed read is not an installation with no users: the banner
-            // above is the surface for it, not this empty state.
+            // A failed read is not an installation with no users: the banner above is its surface.
             if us.load_state.error().is_none() {
                 rows = rows.push(
                     text("No users configured. Add one below.")
@@ -2406,12 +2057,9 @@ impl SettingsState {
                 let telegram_binding = user.channels.iter().find(|c| c.channel == "telegram");
                 let telegram_elem: Element<'_, SettingsMessage> =
                     if let Some(err) = &entry.channels_error {
-                        // The channel read failed — surface it instead of the
-                        // "Bind Telegram" affordance, which would falsely imply
-                        // the user has no binding.
+                        // The channel read failed — surface it instead of "Bind Telegram".
                         widgets::error_banner(err)
                     } else if us.bind_target.as_deref() == Some(&user.name) {
-                        // Inline binding input open
                         let mut row_elements: Vec<Element<'_, SettingsMessage>> = vec![
                             text("Telegram:")
                                 .size(theme::TEXT_12)
@@ -2422,9 +2070,7 @@ impl SettingsState {
                                 &us.bind_input.buffer,
                                 "@username or id",
                                 false,
-                                // Fills the left segment so the editor spans
-                                // the row; the fixed-size label and
-                                // Bind/Cancel buttons floor it.
+                                // Fills the left segment; the label and Cancel button floor it.
                                 Length::Fill,
                                 Some(Id::from(format!("bind_input:{}", user.name))),
                                 |action| {
@@ -2463,9 +2109,7 @@ impl SettingsState {
                             .align_y(Alignment::Center)
                             .into()
                     } else if let Some(binding) = telegram_binding {
-                        // Bound — a passive label: a muted send icon, then the
-                        // identifier as stored (a nickname as is, a numeric
-                        // binding as `id <digits>`), then the unbind control.
+                        // Bound — a passive label: muted send icon, the identifier as stored.
                         let display = crate::users::settings_binding_label(&binding.identifier);
                         row![
                             lucide::send::<iced::Theme, iced::Renderer>()
@@ -2500,7 +2144,6 @@ impl SettingsState {
                         .align_y(Alignment::Center)
                         .into()
                     } else {
-                        // No Telegram binding — show bind button
                         button(
                             row![
                                 lucide::link::<iced::Theme, iced::Renderer>()
@@ -2528,9 +2171,8 @@ impl SettingsState {
                 .align_y(Alignment::Center);
 
                 let mut card_body = Column::new().spacing(theme::SPACE_2).push(segment);
-                // The admin holds the whole tool catalogue implicitly, so a
-                // grant line on the card would misstate what they can call; a
-                // user granted nothing gets no line at all.
+                // The admin holds the whole catalogue implicitly, so a grant line would misstate
+                // what they can call; a user granted nothing gets no line at all.
                 if !is_admin && !user.granted_tools.is_empty() {
                     card_body = card_body.push(
                         text(format!(
@@ -2549,11 +2191,9 @@ impl SettingsState {
                     .padding(theme::PAD_8)
                     .style(theme::surface_card_style);
 
-                // Right-click context menu (Delete). The card's own controls
-                // still work: ContextMenu forwards all events to the underlay
-                // first; only right-clicks open the menu. The admin is exempt
-                // — no context menu at all (an empty menu would render a hollow
-                // box).
+                // Right-click context menu (Delete). The card's controls still work: ContextMenu
+                // forwards events to the underlay first; only right-clicks open it. The admin is
+                // exempt — an empty menu would render a hollow box.
                 let user_row: Element<'_, SettingsMessage> = if is_admin {
                     user_row.into()
                 } else {
@@ -2578,16 +2218,13 @@ impl SettingsState {
         section_with_header_action("Users", plus_btn, column![rows])
     }
 
-    /// Render the custom tools area for the Settings page.
     fn custom_tools_section(&self) -> Element<'_, SettingsMessage> {
         let tools = &self.custom_tools_state;
 
         let mut rows = Column::new().spacing(theme::SPACE_4);
         rows = widgets::push_error_banner(rows, tools.list.error());
 
-        // The empty line stands in only for a successfully read, genuinely
-        // empty folder: a failed read keeps its banner and its last list, and
-        // before the first read lands nothing is shown for the empty case.
+        // The empty line stands in only for a successfully read, genuinely empty folder.
         if tools.list.entries().is_empty() && tools.list.loaded() && tools.list.error().is_none() {
             rows = rows.push(
                 text("No custom tools.")
@@ -2603,9 +2240,8 @@ impl SettingsState {
         section("Custom Tools", rows)
     }
 
-    /// One custom tool as the area lists it: a small card carrying the tool's
-    /// name, plus a warning glyph when its file cannot be read or parsed. The
-    /// card itself is the click target — it carries no separate button or link.
+    /// One custom tool: a small card with the tool's name, plus a warning glyph when its file
+    /// cannot be read or parsed. The card is the click target.
     fn custom_tool_card(listing: &ToolListing) -> Element<'_, SettingsMessage> {
         let mut label = Row::new()
             .spacing(theme::SPACE_4)
@@ -2638,10 +2274,8 @@ impl SettingsState {
         .into()
     }
 
-    /// The read-only details window for one tool: its name, its description and
-    /// every parameter (name, type, required/optional, description) — or, for a
-    /// file that cannot be read or parsed, the "not usable" statement in place
-    /// of them. Nothing is actioned here but closing the window.
+    /// The read-only details window for one tool: name, description and every parameter, or
+    /// the "not usable" statement. Nothing is actioned here but closing the window.
     fn custom_tool_dialog(tool: &ToolListing) -> Element<'_, SettingsMessage> {
         let mut body = Column::new().spacing(theme::SPACE_6);
         match tool {
@@ -2700,8 +2334,7 @@ impl SettingsState {
                     SettingsMessage::CustomToolsMsg(custom_tools::CustomToolsMessage::CloseDetails),
                 ),
                 Space::new().height(16),
-                // Sized to the details and capped, so a long description or
-                // many parameters stay readable by scrolling inside the window.
+                // Sized to the details and capped; longer content scrolls inside the window.
                 container(widgets::vscroll_sized(body, Length::Fill, Length::Shrink))
                     .max_height(320.0),
             ]
@@ -2745,10 +2378,8 @@ impl SettingsState {
         )
     }
 
-    /// One custom role as the area lists it: its name, its behaviour's label and
-    /// how many tools it holds, with the two actions that act on it. The
-    /// prompt is deliberately absent — it is the whole definition of a role and
-    /// belongs in the editor, not on a card.
+    /// One custom role: its name, behaviour label and tool count, with its two actions. The
+    /// prompt is deliberately absent — it belongs in the editor, not on a card.
     fn custom_role_card(role: &CustomRole) -> Element<'_, SettingsMessage> {
         let card_body = Column::new()
             .spacing(theme::SPACE_2)
@@ -2793,16 +2424,16 @@ impl SettingsState {
         .into()
     }
 
-    /// The custom-role create/edit window: the name field, the prompt editor,
-    /// the branching picker, the tool picker and the window's own error line.
+    /// The custom-role create/edit window: name, prompt editor, branching picker, tool picker
+    /// and the window's own error line.
     fn custom_role_editor_window(
         editor: &custom_roles::RoleEditor,
     ) -> Element<'_, SettingsMessage> {
         let is_new = editor.original.is_none();
         let mut middle = Column::new().spacing(theme::SPACE_8);
 
-        // Editing never renames: the name is shown as a static row and the
-        // submit targets the record by the name it was opened on.
+        // Editing never renames: the name is a static row and submit targets the record by the
+        // name it was opened on.
         if let Some(original) = &editor.original {
             middle = middle.push(field_row(
                 "Name",
@@ -2811,9 +2442,8 @@ impl SettingsState {
             ));
         }
 
-        // The body gets the room between the fields and the footer, so the list runs
-        // down to the submit button; `Shrink` keeps the dialog at the body's own
-        // height instead of stretching it. The reported size still has the footer in it.
+        // The body gets the room between the fields and the footer; `Shrink` keeps the dialog at
+        // the body's own height. The reported size still has the footer in it.
         middle = middle.push(
             responsive(move |size| Self::custom_role_body(editor, size.height))
                 .height(Length::Shrink),
@@ -2853,32 +2483,27 @@ impl SettingsState {
         )
     }
 
-    /// One line of `size`px text as iced's `text` lays it out.
     fn text_line_height(size: f32) -> f32 {
         iced::advanced::text::LineHeight::default()
             .to_absolute(iced::Pixels(size))
             .0
     }
 
-    /// What [`modal_dialog`] lays out under its middle slot: the 16px gap and the
-    /// footer's button row, a 13px label plus the button's own vertical padding.
+    /// What [`modal_dialog`] lays out under its middle slot: a 16px gap and the footer's row.
     fn dialog_footer_height() -> f32 {
         theme::SPACE_16
             + Self::text_line_height(theme::TEXT_13)
             + 2.0 * iced::widget::button::DEFAULT_PADDING.y()
     }
 
-    /// The room the window's error line takes under the body when a failed save
-    /// shows one: the 8px gap and two lines of its 12px text, since save errors
-    /// are sentences that wrap at the dialog's width.
+    /// The room a failed save's error line takes under the body: the 8px gap and two lines of
+    /// its 12px text, since save errors are sentences that wrap.
     fn custom_role_error_height() -> f32 {
         theme::SPACE_8 + 2.0 * Self::text_line_height(theme::TEXT_12)
     }
 
-    /// The custom-role window's body, no taller than its content and never past
-    /// the room `reported` measures: the prompt editor, the branching picker and
-    /// the tool list, sized so the list runs down to the footer button and
-    /// scrolls inside itself when its rows do not fit.
+    /// The custom-role window's body: no taller than its content and never past the room
+    /// `reported` measures, with the tool list scrolling inside itself when its rows do not fit.
     fn custom_role_body(
         editor: &custom_roles::RoleEditor,
         reported: f32,
@@ -2913,8 +2538,7 @@ impl SettingsState {
             .into()
     }
 
-    /// The prompt editor: the administrator's instructions, the whole definition
-    /// of the role (the same multi-line editor frame the rules popup uses),
+    /// The prompt editor: the administrator's instructions, the whole definition of the role,
     /// grown to `max_height`.
     fn custom_role_prompt(
         editor: &custom_roles::RoleEditor,
@@ -2939,16 +2563,9 @@ impl SettingsState {
         .into()
     }
 
-    /// The custom-role tool list under its label: the window's catalogue plus any
-    /// stored name this installation cannot serve right now, marked and labelled
-    /// as unavailable. A catalog tool that has a kind vocabulary
-    /// ([`crate::tools::grants::kinds_of`]) renders one checkbox per
-    /// kind — the tool is granted iff at least one kind is checked — while a
-    /// kindless tool keeps its single checkbox. The record's validators re-check
-    /// a newly marked entry on save, so "validated while marking" is structural —
-    /// what can be marked is what a role may be given; an unserviceable name is
-    /// still offered because the launch omits it and the record keeps it, so it
-    /// must be visible to be removable.
+    /// The custom-role tool list: the window's catalogue plus any stored name this installation
+    /// cannot serve right now, marked unavailable. A tool with a kind vocabulary renders one
+    /// checkbox per kind (granted iff one is checked); an unserviceable name stays offered.
     fn custom_role_tool_picker(editor: &custom_roles::RoleEditor) -> Element<'_, SettingsMessage> {
         let mut tool_rows = Column::new().spacing(theme::SPACE_2);
 
@@ -2974,8 +2591,7 @@ impl SettingsState {
                 .then(|| crate::tools::grants::kinds_of(&label))
                 .flatten()
             {
-                // A tool with a kind vocabulary: one checkbox per kind, the tool
-                // granted iff at least one kind is checked.
+                // A tool with a kind vocabulary: one checkbox per kind, granted iff one is checked.
                 Some(vocab) => {
                     let held = editor.held_kinds(&label);
                     tool_rows = tool_rows.push(
@@ -3032,8 +2648,7 @@ impl SettingsState {
         .into()
     }
 
-    /// The custom-role delete confirmation: what the record's removal takes
-    /// with it.
+    /// The custom-role delete confirmation: what the record's removal takes with it.
     fn custom_role_delete_dialog(name: &str) -> Element<'_, SettingsMessage> {
         dialog::confirm_dialog(
             dialog::dialog_title(format!("Delete custom role {name}?")),
@@ -3059,9 +2674,8 @@ impl SettingsState {
         .into()
     }
 
-    /// The overlay the custom roles area owns — the create/edit window, the
-    /// delete confirmation, or nothing. The settings page's overlay chain takes
-    /// `Option`s, so the closed state is `None` rather than a placeholder.
+    /// The overlay the custom roles area owns — the create/edit window or the delete
+    /// confirmation. The overlay chain takes `Option`s, so closed is `None`.
     fn custom_roles_modal(&self) -> Option<Element<'_, SettingsMessage>> {
         if let Some(editor) = &self.custom_roles_state.editor {
             let dialog = Self::custom_role_editor_window(editor);
@@ -3082,10 +2696,8 @@ impl SettingsState {
         None
     }
 
-    /// The workspace rules popup: the editor, its counter and Save, and a
-    /// failed save reported in place. The corner cross discards the buffer; its
-    /// backdrop cannot dismiss it while there is unsaved text — see
-    /// `WorkspacesMessage::RulesDismiss`.
+    /// The workspace rules popup: editor, counter, Save and a failed save reported in place.
+    /// The corner cross discards the buffer; its backdrop cannot — see `RulesDismiss`.
     fn rules_dialog(rules: &workspaces::RulesEditor) -> Element<'_, SettingsMessage> {
         let char_count = rules.buffer.text().chars().count();
         let editor: Element<'_, SettingsMessage> = container(
@@ -3149,8 +2761,7 @@ impl SettingsState {
         .into()
     }
 
-    /// The read-only workspace context popup: one role's discovered context or
-    /// the workspace's general context, as markdown.
+    /// The read-only workspace context popup: one role's context or the general one, as markdown.
     fn contexts_dialog<'a>(
         context: &'a (
             String,
@@ -3224,11 +2835,8 @@ impl SettingsState {
         .into()
     }
 
-    /// Render the Settings modal overlay: whichever of the add-workspace,
-    /// add-user, user delete-confirm, workspace diagnostics, workspace rules,
-    /// workspace contexts, custom-tool details, custom-role editor /
-    /// delete-confirm and Models settings windows is open, or a type-stable
-    /// placeholder when none is.
+    /// The Settings modal overlay: whichever dialog is open, or a type-stable placeholder.
+    /// Escape dismisses them in this order of precedence.
     fn render_modal_overlay(&self) -> Element<'_, SettingsMessage> {
         if self.show_add_workspace_modal {
             let dialog = self.add_workspace_dialog();
@@ -3286,12 +2894,8 @@ impl SettingsState {
         }
     }
 
-    /// Build the user-deletion confirmation modal.
-    ///
-    /// The text truthfully states what [`users::UserStore::delete_user`]
-    /// does — removes the user row and all channel bindings (access cut
-    /// immediately) — and what it preserves (sessions, chat history,
-    /// userspace files).
+    /// The user-deletion confirmation. Its text states what the delete removes (the user row
+    /// and all channel bindings) and what it preserves (sessions, chat history, files).
     fn user_delete_dialog(user_name: &str) -> Element<'_, SettingsMessage> {
         dialog::confirm_dialog(
             dialog::dialog_title(format!("Delete user {user_name}?")),
@@ -3315,7 +2919,6 @@ impl SettingsState {
         .into()
     }
 
-    /// Build the add-workspace modal dialog content.
     fn add_workspace_dialog(&self) -> Element<'_, SettingsMessage> {
         modal_dialog(
             "Add Workspace".to_string(),
@@ -3345,10 +2948,8 @@ impl SettingsState {
         )
     }
 
-    /// Build the add-user modal dialog. The account name becomes that account's
-    /// personal-workspace folder, so a name the product cannot use is refused
-    /// right under the field, in one line — the reserved slot it always occupies
-    /// keeps the dialog from jumping as the line comes and goes.
+    /// The add-user modal. The account name becomes that account's personal-workspace folder,
+    /// so an unusable name is refused right under the field.
     fn add_user_dialog(&self) -> Element<'_, SettingsMessage> {
         let name = self.add_user_sender.text();
         let problem = if name.is_empty() {
@@ -3363,8 +2964,7 @@ impl SettingsState {
             )
         };
         let submit_enabled = !name.is_empty() && problem.is_none();
-        // The slot is always filled: a lone space lays out at exactly the height
-        // of a one-line message, so nothing moves as the red line comes and goes.
+        // The slot is always filled: a lone space lays out at a one-line message's height.
         let line = problem.unwrap_or_else(|| " ".to_string());
         modal_dialog(
             "Add User".to_string(),
@@ -3389,7 +2989,6 @@ impl SettingsState {
         )
     }
 
-    /// Build the diagnostics modal dialog content for the given workspace.
     fn diagnostics_dialog(&self, diag_ws_name: &str) -> Element<'_, SettingsMessage> {
         let ws_name = diag_ws_name.to_string();
         let ws_state = &self.workspaces_state;
@@ -3397,20 +2996,17 @@ impl SettingsState {
         let is_busy = ws_state.diagnostics_busy;
         let error = ws_state.diagnostics_error.as_deref();
 
-        // Get the edit buffers — if modal is open they should exist (they are
-        // inserted by ShowDiagnostics before the modal is flagged open).
+        // The buffers exist whenever the modal is open (inserted before it is flagged).
         let buffers: &[SingleLineEditorState; crate::DiagnosticsCommands::COMMAND_COUNT] = ws_state
             .diagnostics_edit_buffers
             .get(&ws_name)
             .expect("diagnostics edit buffers inserted when the modal opens");
 
-        // Use static labels from DiagnosticsCommands to avoid duplicating
-        // the label-to-field mapping in two places.
+        // Static labels from DiagnosticsCommands, so the mapping lives in one place.
         let labels = &crate::DiagnosticsCommands::COMMAND_LABELS;
 
         let mut rows_col = Column::new().spacing(theme::SPACE_8);
 
-        // Error banner
         if let Some(err) = error {
             rows_col = rows_col.push(widgets::error_banner(err));
         }
@@ -3503,11 +3099,7 @@ impl SettingsState {
         )
         .into()
     }
-    // ── Config-field builders ────────────────────────────────────
-    //
-    // The field id is always `config:<key>` derived from the `CONFIG_KEY_*`
-    // const — `stringify!` of the snake_case field name — no per-call
-    // literal ids.
+    // Field ids are always `config:<key>`, derived from the `CONFIG_KEY_*` const.
 
     /// A single inline-editable text config field row (with error placement).
     fn config_text_field<'a>(
@@ -3526,8 +3118,7 @@ impl SettingsState {
         )
     }
 
-    /// The editor of a plain-text config field, without the label row — for a
-    /// field whose call site lays it out itself.
+    /// A plain-text config field's editor without the label row, for self-laid-out fields.
     fn config_text_editor<'a>(
         &'a self,
         placeholder: &'static str,
@@ -3544,8 +3135,8 @@ impl SettingsState {
         )
     }
 
-    /// A model-slot config field: the field takes the whole column width and
-    /// the group's role list is its hint ABOVE it, at the field's left edge.
+    /// A model-slot config field: it takes the whole column width, with the group's role list
+    /// as its hint above it, at the field's left edge.
     fn config_model_slot_field<'a>(
         &'a self,
         placeholder: &'static str,
@@ -3594,19 +3185,13 @@ impl SettingsState {
         )
     }
 
-    // ── Section helpers ──────────────────────────────────────────
-
-    /// The Application section: what the product does for itself — start with the
-    /// login, and update by itself. Each row is offered only where it can do
-    /// something: only a published copy is the login target, and only a copy that
-    /// downloads its own releases has an update policy to switch. No row at all
-    /// means no section.
+    /// The Application section: start with the login and update by itself. Each row is offered
+    /// only where it can do something; no row at all means no section.
     fn application_section(&self) -> Option<Element<'_, SettingsMessage>> {
         let mut rows: Vec<Element<'_, SettingsMessage>> = Vec::new();
         if crate::self_update::is_published_copy() {
-            // The switch reports the system and nothing else, so a state that is
-            // not known yet (or again, after a failed apply or read) says so
-            // instead of asserting "off".
+            // The switch reports the system and nothing else, so an unknown state says so instead
+            // of asserting "off".
             let control: Element<'_, SettingsMessage> = match self.autolaunch {
                 Some(state) => {
                     let switch = toggler(state).style(theme::toggler_style);
@@ -3650,13 +3235,9 @@ impl SettingsState {
     }
 
     fn provider_section(&self) -> Element<'_, SettingsMessage> {
-        // The API key field is highlighted until a valid (trimmed non-empty)
-        // key is present. Computed per-render from the editable snapshot, so
-        // the highlight clears on the first typed character and re-arms when
-        // the field is cleared to empty/whitespace. With a genuinely custom
-        // endpoint active the OpenRouter key is only needed for
-        // media, so a keyless custom endpoint user's key field is not
-        // highlighted.
+        // The API key field is highlighted until a valid key is present, computed per render from
+        // the editable snapshot. With a genuinely custom endpoint active the key is only needed
+        // for media, so the field is not highlighted.
         let custom_active = self.custom_endpoint_active_ui();
         let api_key_unset = !custom_active
             && self
@@ -3664,11 +3245,8 @@ impl SettingsState {
                 .provider_key
                 .as_deref()
                 .is_none_or(|key| key.trim().is_empty());
-        // The custom-endpoint section is open when a custom endpoint is active
-        // OR the user revealed it this session. The toggle reflects this —
-        // OFF means default mode with the section closed, so the toggle state
-        // tracks the section's visibility and never implies a custom endpoint
-        // is configured when only the normalized predicate says otherwise.
+        // Open when a custom endpoint is active OR the user revealed it this session. The toggle
+        // tracks the section's visibility, so OFF means default mode with the section closed.
         let custom_section_open = custom_active || self.custom_revealed;
 
         let mut rows: Vec<Element<'_, SettingsMessage>> = vec![
@@ -3730,9 +3308,8 @@ impl SettingsState {
         )
     }
 
-    /// The model settings: the two model slots and the two model lists, with
-    /// their add/remove controls and inline errors. Rendered only inside the
-    /// Models settings popup — the page keeps no copy of them.
+    /// The model settings: the two model slots and the two model lists, with their add/remove
+    /// controls and inline errors. Rendered only inside the Models settings popup.
     fn models_body(&self) -> Column<'_, SettingsMessage> {
         column![
             self.config_model_slot_field(
@@ -3773,10 +3350,8 @@ impl SettingsState {
         .spacing(theme::SPACE_4)
     }
 
-    /// The Models settings popup: the model body, kept within the room the
-    /// window leaves under the heading — minus a margin, so the bubble never
-    /// spans the window — and scrolled inside itself past that, so the unbounded
-    /// lists can never grow it past the window.
+    /// The Models settings popup: the model body kept within the room the window leaves under
+    /// the heading and scrolled inside itself past that, so the lists cannot grow it.
     fn models_dialog(&self) -> Element<'_, SettingsMessage> {
         let body = responsive(|size| {
             container(widgets::vscroll_sized(
@@ -3804,14 +3379,9 @@ impl SettingsState {
         .into()
     }
 
-    // ── Audio section (macOS only) ───────────────
-    //
-    // One 'Audio' section with exactly three rows — Transcription, Wake Word
-    // Detection, Text to Speech — each with the toggle and an inline status in
-    // the same row, and its explanation as a hover hint over the whole row. The
-    // wake-word enrollment UI (Enroll button, multi-line progress/Cancel) sits
-    // below the three rows. The section does not exist off macOS, where there
-    // is no audio subsystem at all.
+    // One 'Audio' section with three rows — Transcription, Wake Word Detection, Text to
+    // Speech — each with its toggle, inline status and a hover hint, plus the wake-word
+    // enrollment controls below. The section does not exist off macOS.
 
     #[cfg(target_os = "macos")]
     #[expect(clippy::too_many_lines)]
@@ -3821,7 +3391,6 @@ impl SettingsState {
         let voice_enabled = self.config.voice_enabled.as_deref() == Some("true");
         let status = crate::audio::voice::get_status();
 
-        // ── Row 1: Transcription (toggle + inline status + Retry) ──
         let transcription_status: Element<'_, SettingsMessage> = if !transcription_enabled {
             disabled_status()
         } else if crate::audio::local_transcriber::is_loaded() {
@@ -3847,13 +3416,9 @@ impl SettingsState {
             "Voice message transcription",
         );
 
-        // ── Row 2: Wake Word Detection (toggle gated on Transcription + live status) ──
-        // Live status: voice status changes are broadcast as runtime-change
-        // events, so the rendered pipeline state (listening / enrolling /
-        // model error …) is current after each coalesced event.
-        // Transcription and the wake word share the loaded ASR model, so with it
-        // off the status says why the toggle is dead: a hover hint alone cannot
-        // explain a disabled control.
+        // Live status: voice status changes are broadcast as runtime-change events, so the
+        // rendered pipeline state is current after each one. With transcription off the status
+        // says why the toggle is dead — a hover hint cannot explain a disabled control.
         let wake_status: Element<'_, SettingsMessage> = if !transcription_enabled {
             status_label("Requires Transcription to be enabled")
         } else {
@@ -3889,8 +3454,7 @@ impl SettingsState {
                 crate::audio::voice::VoiceStatus::Error(msg) => status_label(msg),
             }
         };
-        // Gated: wake word can only be enabled while Transcription is ON (they
-        // share the loaded ASR model). Turning Transcription OFF cascades it off.
+        // Gated: wake word needs Transcription ON (they share the ASR model); OFF cascades it off.
         let wake_row = row_hint(
             field_row(
                 "Wake Word Detection",
@@ -3909,7 +3473,6 @@ impl SettingsState {
             "Listen for the command",
         );
 
-        // ── Row 3: Text to Speech (toggle + inline status in one row) ──
         let tts_enabled = self.config.tts_enabled.as_deref() == Some("true");
         let tts_ready = crate::audio::tts::models_ready();
         let tts_failed = crate::audio::tts::download_failed();
@@ -3944,7 +3507,6 @@ impl SettingsState {
             "Let assistant talk",
         );
 
-        // ── Wake-word enrollment controls (below the three rows) ──
         let enroll_btn: Element<'_, SettingsMessage> = if voice_enabled && transcription_enabled {
             container(
                 button(Text::new("Enroll Wake Word").size(theme::TEXT_13))
@@ -3957,8 +3519,7 @@ impl SettingsState {
             container(Text::new("")).into()
         };
 
-        // Multi-line enrollment progress + Cancel (shown during active
-        // enrollment; mirrors the previous status-row rendering).
+        // Multi-line enrollment progress plus Cancel during active enrollment.
         let enrollment_ui: Option<Element<'_, SettingsMessage>> = match status {
             crate::audio::voice::VoiceStatus::Enrolling {
                 sample,
@@ -4071,8 +3632,6 @@ impl SettingsState {
     }
 
     fn integrations_section(&self) -> Element<'_, SettingsMessage> {
-        // ── Web search provider pick list ──────────────────────────
-        // Three options: Auto (None), DeepSeek, Exa
         let current_display = match self.config.web_search_provider.as_deref() {
             Some("deepseek") => "DeepSeek",
             Some("exa") => "Exa",
@@ -4139,25 +3698,17 @@ impl SettingsState {
         section("Integrations", integrations)
     }
 
-    /// The Telegram Bot API mode area of the Integrations section: one line
-    /// carrying the mode serving the bot, what it is doing, and the controls this
-    /// state allows — or nothing at all: a healthy local server has nothing to
-    /// report, and without a bot token there is no bot to serve.
-    ///
-    /// The state is read at render time: every change of the feature publishes
-    /// [`crate::runtime_events::RuntimeEvent::TelegramLocal`], which the
-    /// dashboard turns into a repaint, so there is no poll loop here.
+    /// The Telegram Bot API mode area: one line carrying the mode serving the bot, what it is
+    /// doing and the controls this state allows — or nothing at all. The state is read at render
+    /// time; every change publishes a runtime event the dashboard repaints on.
     fn telegram_local_area(&self) -> Option<Element<'_, SettingsMessage>> {
         CONFIG.telegram_bot_token()?;
         let status = telegram_local::status();
-        // A switch actually in flight, or a request this page just started:
-        // `busy` disables the controls that would start a second switch. A switch
-        // waiting for the owner (blocked with a cause) is not busy by this
-        // definition.
+        // A switch in flight, or a request this page just started: `busy` disables the controls
+        // that would start a second one. A blocked switch is not busy by this definition.
         let busy = self.telegram_switch_busy || (status.migrating && status.blocked.is_none());
 
-        // Silence is the whole report of a working local setup: not even an empty
-        // row, which would leave a gap in the section.
+        // Silence is the whole report of a working local setup: not even an empty row.
         let state = telegram_line(&status)?;
 
         let mut summary = text(state).size(theme::TEXT_13).width(Length::Fill);
@@ -4171,26 +3722,21 @@ impl SettingsState {
             .width(Length::Fill)
             .push(summary);
         if busy {
-            // The switch reports progress through the same line, so the dot alone
-            // is enough: the text beside it already says where the bot is going.
+            // The line reports progress, so the dot alone is enough beside the text.
             line = line.push(super::activity_dot());
         }
         Some(line.push(self.telegram_line_controls(&status, busy)).into())
     }
 
-    /// The controls carried by the mode line. Every one of them stays on that
-    /// line, and each is rendered only in the states it resolves: the way into
-    /// the local mode, the repair a blocked switch needs, and the way back to the
-    /// cloud.
+    /// The controls carried by the mode line, each rendered only in the states it resolves:
+    /// the way into the local mode, the repair a blocked switch needs, the way back to cloud.
     fn telegram_line_controls(
         &self,
         status: &telegram_local::Status,
         busy: bool,
     ) -> Element<'static, SettingsMessage> {
-        // Telegram refused the pasted pair — the switch blocks on the same test,
-        // and only that outcome is fixed by entering the pair again. Only a switch
-        // towards the local server can block on the pair: the dialog's submit is
-        // what asks for that mode, so it would reverse any other direction.
+        // Telegram refused the pasted pair — the switch blocks on the same test, and only that
+        // outcome is fixed by entering the pair again.
         let rejected = status.target == Mode::Local
             && status
                 .last_error
@@ -4212,19 +3758,16 @@ impl SettingsState {
             .spacing(theme::SPACE_8)
             .align_y(Alignment::Center);
 
-        // The way in: nothing else in the product offers it, so it is always on
-        // the cloud line — disabled rather than removed while a switch is under
-        // way. A switch heading local carries its own retry instead of a second
-        // control that would ask for the same thing.
+        // The way in is always on the cloud line, disabled rather than removed while a switch is
+        // under way; a switch heading local carries its own retry instead.
         if status.serving == Mode::Cloud && !status.migrating {
             controls = controls.push(control(
                 "Use a local Bot API server",
                 (!busy).then_some(SettingsMessage::OpenTelegramCredentials),
             ));
         }
-        // The repair: a refused pair is re-entered through the same dialog, whose
-        // submit resumes the switch; every other cause is re-run as the direction
-        // the journal already holds.
+        // The repair: a refused pair goes through the same dialog, whose submit resumes the
+        // switch; every other cause is re-run as the direction the journal holds.
         if !busy && status.migrating {
             controls = controls.push(if rejected {
                 credentials_again()
@@ -4238,13 +3781,11 @@ impl SettingsState {
                 )
             });
         } else if !busy && status.serving == Mode::Local && (rejected || !status.credentials_set) {
-            // Settled on the local server with a pair that cannot work: the same
-            // dialog is the way on.
+            // Settled on the local server with a pair that cannot work: the dialog is the way on.
             controls = controls.push(credentials_again());
         }
-        // The way out is offered for a failure of the local server and nothing
-        // else: a working setup needs no way back, and neither does a switch that
-        // has not failed, however long it runs.
+        // The way out is offered for a local-server failure and nothing else: a working setup
+        // needs no way back, nor does a switch that has not failed.
         if telegram_escape(status) {
             controls = controls.push(control(
                 "Return to the cloud",
@@ -4254,18 +3795,14 @@ impl SettingsState {
         controls.into()
     }
 
-    /// Build the api_id/api_hash dialog.
-    ///
-    /// The body is passed as [`modal_dialog`]'s `middle` because each field
-    /// carries a hint and its validator's message, which the shared field rows
-    /// do not — [`credentials_dialog_field`] builds them.
+    /// The api_id/api_hash dialog. Its body is [`modal_dialog`]'s `middle` because each field
+    /// carries a hint and its validator's message, which [`credentials_dialog_field`] builds.
     fn telegram_credentials_dialog(&self) -> Element<'_, SettingsMessage> {
         let api_id = self.telegram_api_id_input.text();
         let api_hash = self.telegram_api_hash_input.text();
         let (id_error, hash_error) = telegram_local::credential_problems(&api_id, &api_hash);
         let busy = self.telegram_switch_busy;
-        // The shape check only gates the button: nothing is downloaded or
-        // started until the owner submits.
+        // The shape check only gates the button: nothing starts until the owner submits.
         let ready = !busy && id_error.is_none() && hash_error.is_none();
 
         // Both halves of the pair are secrets and are rendered masked: this
@@ -4336,8 +3873,7 @@ impl SettingsState {
         )
     }
 
-    /// The confirmation for giving up the local server — the one action here
-    /// that deletes something.
+    /// The confirmation for giving up the local server — the one action here that deletes.
     fn switch_to_cloud_dialog() -> Element<'static, SettingsMessage> {
         dialog::confirm_dialog(
             dialog::dialog_title("Switch back to the cloud Bot API?"),
@@ -4379,16 +3915,13 @@ impl SettingsState {
     }
 
     fn routing_section(&self) -> Element<'_, SettingsMessage> {
-        // The two routable model slots (manager and worker) — saved routing
-        // rows for models outside these slots are not rendered (they are inert
-        // orphans).
+        // Only the two model slots are routed; saved rows for other models are inert orphans.
         let model_names = routing_slots(&self.config);
 
         let mut rows: Vec<Element<'_, SettingsMessage>> = Vec::new();
         for (i, model_name) in model_names.iter().enumerate() {
-            // `section_impl` clamps the content spacing to 4px, so a 4px
-            // spacer row between pairs yields the 12px group gap while each
-            // label sits tight (2px) above its own input.
+            // `section_impl` clamps content spacing to 4px, so a 4px spacer row between pairs
+            // yields the 12px group gap while each label sits tight (2px) above its own input.
             if i > 0 {
                 rows.push(Space::new().height(4).into());
             }
@@ -4399,8 +3932,7 @@ impl SettingsState {
                 field: order_field.clone(),
             };
             let order_error = self.field_errors.get(&order_field).map(String::as_str);
-            // Placeholder is the provider an empty (unset/cleared) field falls
-            // back to — the same value the request will carry.
+            // Placeholder: the provider an empty field falls back to, as the request carries.
             let placeholder = crate::config::default_model_routing(model_name).unwrap_or("");
             let order_input: Element<'_, SettingsMessage> = widgets::single_line_editor(
                 &self.field_editor(&order_field).buffer,
@@ -4421,8 +3953,7 @@ impl SettingsState {
             );
 
             let row = column![
-                // Model name label (read-only) — the same face as the image and
-                // video model rows.
+                // Model name label (read-only), the same face as the image and video rows.
                 text(display_name).size(theme::TEXT_12),
                 order_input,
             ]
@@ -4441,8 +3972,6 @@ impl SettingsState {
     }
 }
 
-// ── Shared widgets ───────────────────────────────────────────────
-
 /// Section heading (secondary-colored monospace title above the content).
 fn section<'a>(
     title: &'static str,
@@ -4460,8 +3989,8 @@ fn section_with_header_action<'a>(
     section_impl(title, Some(action), content)
 }
 
-/// Shared implementation: renders a section header (plain text or text +
-/// right-aligned action), a spacer, and the content column.
+/// Renders a section header (plain text, or text with a right-aligned action), a spacer
+/// and the content column.
 fn section_impl<'a>(
     title: &'static str,
     action: Option<Element<'a, SettingsMessage>>,
@@ -4485,8 +4014,7 @@ fn section_impl<'a>(
     .into()
 }
 
-/// Left pad aligning inline messages/hints with a field row's input column:
-/// the fixed 180px label width plus the 8px row gap.
+/// Left pad aligning inline messages with a field row's input column (180px label + 8px).
 const FIELD_ROW_INLINE_PAD: f32 = 188.0;
 
 /// Label on the left, input on the right, optional hint below.
@@ -4498,9 +4026,8 @@ fn field_row<'a>(
     field_row_with_error(label, input, hint, None)
 }
 
-/// Small inline status label in the given color, indented `left_pad` px to
-/// align with the input column — shared body of [`inline_error`],
-/// [`inline_warning`] and the model-slot role-list hint above the input.
+/// Small inline status label in the given color, indented to align with the input column —
+/// the shared body of [`inline_error`], [`inline_warning`] and the role-list hint.
 fn inline_label<'a>(
     msg: impl IntoFragment<'a>,
     left_pad: f32,
@@ -4511,22 +4038,19 @@ fn inline_label<'a>(
         .into()
 }
 
-/// Plain-text inline status cell at the default text size — shared body of
-/// the audio-row status arms.
+/// Plain-text inline status cell at the default size: the audio-row status arms.
 #[cfg(target_os = "macos")]
 fn status_label<'a>(msg: impl IntoFragment<'a>) -> Element<'a, SettingsMessage> {
     Text::new(msg).size(theme::TEXT_13).into()
 }
 
-/// The inline error label rendered under a control, in the error color. Takes a
-/// borrowed or an owned message: a field's shape problem is computed at render
-/// time and cannot be borrowed from the page state.
+/// The inline error label under a control, in the error color. It takes a borrowed or an
+/// owned message: a field's shape problem is computed at render time.
 fn inline_error<'a>(err: impl IntoFragment<'a>, left_pad: f32) -> Element<'a, SettingsMessage> {
     inline_label(err, left_pad, theme::STATUS_ERROR)
 }
 
-/// The inline warning label rendered under a control, in the warning color.
-/// Non-fatal — the value was still saved (e.g. an unreachable custom endpoint).
+/// The inline warning label under a control: non-fatal, the value was still saved.
 fn inline_warning(msg: &str, left_pad: f32) -> Element<'_, SettingsMessage> {
     inline_label(msg, left_pad, theme::STATUS_WARNING)
 }
@@ -4540,9 +4064,8 @@ fn disabled_status() -> Element<'static, SettingsMessage> {
         .into()
 }
 
-/// A hover hint over the whole strip of a settings row: the row is stretched to
-/// the column so the hint answers the title, the toggle, the status and the empty
-/// tail alike, unlike a hint snug around the row's own content.
+/// A hover hint over the whole strip of a settings row: the row is stretched to the column
+/// so the hint answers the title, the toggle, the status and the empty tail alike.
 #[cfg(target_os = "macos")]
 fn row_hint<'a>(
     row: Element<'a, SettingsMessage>,
@@ -4551,8 +4074,7 @@ fn row_hint<'a>(
     widgets::tooltip_hint(container(row).width(Length::Fill), hint)
 }
 
-/// Toggle + inline status side by side — the shared frame of the three
-/// audio rows (Transcription / Wake Word / Text to Speech).
+/// Toggle plus inline status side by side: the frame of the three audio rows.
 #[cfg(target_os = "macos")]
 fn toggle_status_row<'a>(
     toggler: impl Into<Element<'a, SettingsMessage>>,
@@ -4585,8 +4107,7 @@ fn retry_status_row(
     .into()
 }
 
-/// Accent "+" header button shared by the Workspaces and Users section
-/// headers.
+/// Accent "+" header button shared by the Workspaces and Users section headers.
 fn section_plus_button(
     tooltip_text: &'static str,
     on_press: SettingsMessage,
@@ -4615,8 +4136,7 @@ fn cancel_enrollment_button() -> Element<'static, SettingsMessage> {
     .into()
 }
 
-/// Status text framed by vertical spacers above the Cancel button — the
-/// shared skeleton of the four active-enrollment status columns.
+/// Status text framed by spacers above the Cancel button: the enrollment status columns.
 #[cfg(target_os = "macos")]
 fn enrollment_status_column(status: String) -> Element<'static, SettingsMessage> {
     Column::new()
@@ -4657,8 +4177,7 @@ fn field_row_with_error<'a>(
     }
 }
 
-/// One field of the api_id/api_hash dialog: the shared label/input row, the
-/// hint under it, and the validator's message about this field below that.
+/// One api_id/api_hash dialog field: label/input row, hint, and the validator's message.
 fn credentials_dialog_field<'a>(
     label: &'static str,
     input: Element<'a, SettingsMessage>,
@@ -4677,8 +4196,7 @@ fn credentials_dialog_field<'a>(
     col.into()
 }
 
-/// Delete confirmation prompt — the inline "Delete? Yes / No" row shown
-/// below a workspace card when the row is the delete target.
+/// The inline "Delete? Yes / No" row shown below a workspace card that is the delete target.
 fn delete_confirm_button<'a>(
     on_confirm: SettingsMessage,
     on_cancel: SettingsMessage,
@@ -4699,8 +4217,7 @@ fn delete_confirm_button<'a>(
     .into()
 }
 
-/// Read the system's registration off the update thread. `None` when the read
-/// itself failed — unknown, which is not the same as "off".
+/// Read the system's registration off the update thread. `None` = unknown, not "off".
 async fn read_autolaunch() -> Option<bool> {
     tokio::task::spawn_blocking(crate::autostart::registered)
         .await
@@ -4708,9 +4225,8 @@ async fn read_autolaunch() -> Option<bool> {
         .flatten()
 }
 
-/// Persist the owner's Autolaunch decision and apply it to the system's own
-/// registration in one go: the decision first, so a registration failure never
-/// loses the choice. Returns what the system reports afterwards.
+/// Persist the Autolaunch decision and apply it to the system's registration in one go:
+/// the decision first, so a registration failure never loses the choice.
 async fn save_and_apply_autolaunch(enabled: bool) -> Result<Option<bool>, String> {
     let value = if enabled { "true" } else { "false" };
     crate::config::persist_settled_string_field(crate::config::CONFIG_KEY_AUTOLAUNCH, value)
@@ -4722,13 +4238,9 @@ async fn save_and_apply_autolaunch(enabled: bool) -> Result<Option<bool>, String
         .map_err(|e| format!("The login registration could not be changed: {e:#}"))
 }
 
-/// Dispatch a settled field value to its per-field persistence function.
-///
-/// Field ids (see [`SettingsMessage::ConfigFieldSettled`]):
-/// - `config:<key>` — string config fields
-/// - `routing_order:<model>` — per-model rows
-///
-/// Returns the canonical persisted value.
+/// Dispatch a settled field to its per-field persistence function, keyed by
+/// `config:<key>` (string fields) or `routing_order:<model>` (per-model rows). Returns
+/// the canonical persisted value.
 async fn persist_settled_field(
     field: &str,
     value: &str,
@@ -4746,15 +4258,11 @@ async fn persist_settled_field(
     anyhow::bail!("unknown settings field: {field}");
 }
 
-/// Save the pair the owner pasted, then ask for the switch to the local server.
-///
-/// api_id is written first and a failed save stops before the request, so a
-/// switch never starts against a half-saved pair; [`telegram_local`] itself
-/// re-checks the shape of both before it journals anything. The error names the
-/// field that failed and never carries a value.
+/// Save the pasted pair, then ask for the switch to the local server. api_id is written
+/// first and a failed save stops before the request; telegram_local re-checks both shapes
+/// before journaling. The error names the field that failed, never a value.
 async fn save_credentials_and_switch_local(api_id: String, api_hash: String) -> Result<(), String> {
-    // Saved as typed (trimmed): telegram_local::credentials is the one place that
-    // normalises what launches, so the pair has a single spelling there.
+    // Saved as typed (trimmed): telegram_local::credentials is the one normalising place.
     let api_id = api_id.trim();
     let api_hash = api_hash.trim();
     let previous_id = crate::config::CONFIG.telegram_api_id();
@@ -4764,9 +4272,8 @@ async fn save_credentials_and_switch_local(api_id: String, api_hash: String) -> 
     if let Err(e) =
         crate::config::persist_settled_string_field(CONFIG_KEY_TELEGRAM_API_HASH, api_hash).await
     {
-        // Half a pair is worse than none: the new id beside the old hash would be
-        // fingerprinted and launched as if it were the pair that was checked, so the
-        // id is put back before the error reaches the dialog.
+        // Half a pair is worse than none: the id is put back before the error reaches the dialog,
+        // so the old hash is never left beside a new id.
         let _ = crate::config::persist_settled_string_field(
             CONFIG_KEY_TELEGRAM_API_ID,
             previous_id.as_deref().unwrap_or_default(),
@@ -4779,8 +4286,7 @@ async fn save_credentials_and_switch_local(api_id: String, api_hash: String) -> 
         .map_err(|e| e.to_string())
 }
 
-/// The progress labels a dialog's submit button shows while its work is in flight:
-/// one spelling per family, so the button cannot drift from what is happening.
+/// The labels a dialog's submit button shows while its work is in flight.
 const BUSY_ADDING: &str = "Adding…";
 const BUSY_SAVING: &str = "Saving…";
 const BUSY_SWITCHING: &str = "Switching…";
@@ -4792,23 +4298,15 @@ struct DialogField<'a> {
     value: &'a super::editor_widget::EditorBuffer,
     /// Stable widget id for the field (unique across fields on the page).
     id: &'static str,
-    /// Function pointer for the shared-editor `on_action` handler.
-    ///
-    /// The fields of one dialog sit in a single `&[DialogField]`, so the
-    /// handler type cannot be a type parameter; a `fn` pointer keeps the slice
-    /// homogeneous without boxing. Message constructors and non-capturing
-    /// closures both coerce.
+    /// Function pointer for the shared-editor `on_action` handler: one `&[DialogField]` holds
+    /// fields with different handlers, and a `fn` pointer keeps the slice homogeneous.
     on_input: fn(EditorAction) -> SettingsMessage,
 }
 
-/// Build a reusable modal dialog: its heading with the corner close cross,
-/// optional field rows, optional `middle` content, and a submit footer. `busy`
-/// is the label the submit button shows while the action is in flight (`None`
-/// when it is idle); the button is disabled while `busy` is set or
-/// `submit_enabled` is false. The cross dismisses the dialog with `on_dismiss`.
-///
-/// Layout: heading, spacer(16), field rows (8 px between), spacer(16),
-/// middle (if any), spacer(16), footer.
+/// A reusable modal dialog: heading with the corner close cross, optional field rows,
+/// optional `middle` content, then a submit footer. `busy` is the label the submit button
+/// shows while the action is in flight (disabled while set or while `submit_enabled` is
+/// false). Layout: heading, spacer(16), rows (8px apart), spacer(16), middle, spacer(16), footer.
 #[expect(clippy::too_many_arguments)]
 fn modal_dialog<'a>(
     title: String,
@@ -4870,13 +4368,9 @@ fn modal_dialog<'a>(
     dialog::dialog_shell(col, 620.0, 24.0).into()
 }
 
-// ── Tests ─────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── Model list editing: parse_models / add_model_to_list / remove_model_from_list ──
 
     /// Parsing trims every line and skips blank or whitespace-only ones.
     #[test]
@@ -4970,13 +4464,10 @@ mod tests {
         }
     }
 
-    // ── Toggle generation counter & rollback (shared) ──────────────
-    // macOS-only: both toggles drive the audio pipeline.
-
-    /// Parameterised by message constructors and field accessors so the
-    /// same 7-scenario sequence (toggle ON, stale result, DB error revert,
-    /// re-toggle, successful persist, stale-old-gen, toggle OFF + revert)
-    /// is exercised exactly once per toggle without code duplication.
+    /// Parameterised by message constructors and field accessors so the same 7-scenario
+    /// sequence (toggle ON, stale result, DB error revert, re-toggle, successful persist,
+    /// stale-old-gen, toggle OFF + revert) runs once per toggle. macOS only: both toggles
+    /// drive the audio pipeline.
     #[cfg(target_os = "macos")]
     fn assert_toggle_gen_counter_and_rollback(
         toggle_on: impl Fn(bool) -> SettingsMessage,
@@ -4988,7 +4479,7 @@ mod tests {
         let mut state = SettingsState::new();
         setup(&mut state);
 
-        // ── Initial state ──
+        // Initial state
         assert_eq!(get_gen(&state), 0, "initial gen is 0");
         assert_eq!(
             get_enabled(&state.config).as_deref(),
@@ -4997,7 +4488,7 @@ mod tests {
         );
         assert!(state.error.is_none(), "no error initially");
 
-        // ── Toggle ON ──
+        // Toggle ON
         let _task = state.update(toggle_on(true));
         assert_eq!(get_gen(&state), 1, "gen incremented after toggle ON");
         assert_eq!(
@@ -5006,7 +4497,7 @@ mod tests {
             "enabled set to Some(\"true\") after toggle ON"
         );
 
-        // ── Stale result from previous generation must be ignored ──
+        // Stale result from previous generation must be ignored
         let _task = state.update(toggle_result(0, Err("stale result".into())));
         assert_eq!(
             get_enabled(&state.config).as_deref(),
@@ -5015,7 +4506,7 @@ mod tests {
         );
         assert_eq!(get_gen(&state), 1, "gen unchanged by stale result");
 
-        // ── Correct generation + DB error → rollback to disabled ──
+        // Correct generation + DB error → rollback to disabled
         let _task = state.update(toggle_result(1, Err("db write failed".into())));
         assert!(
             get_enabled(&state.config).as_deref() != Some("true"),
@@ -5028,7 +4519,7 @@ mod tests {
         );
         assert_eq!(get_gen(&state), 1, "gen unchanged after rollback");
 
-        // ── Toggle ON again, succeed this time ──
+        // Toggle ON again, succeed this time
         state.error = None; // clear previous error
         let _task = state.update(toggle_on(true));
         assert_eq!(get_gen(&state), 2, "gen incremented on second toggle");
@@ -5040,7 +4531,7 @@ mod tests {
         );
         assert!(state.error.is_none(), "no error after successful toggle");
 
-        // ── Stale result from old generation must also be ignored ──
+        // Stale result from old generation must also be ignored
         let _task = state.update(toggle_result(1, Err("stale from old gen".into())));
         assert_eq!(
             get_enabled(&state.config).as_deref(),
@@ -5049,7 +4540,7 @@ mod tests {
         );
         assert!(state.error.is_none(), "stale result must NOT set error");
 
-        // ── Toggle OFF with DB error → rollback back to enabled ──
+        // Toggle OFF with DB error → rollback back to enabled
         let _task = state.update(toggle_on(false));
         assert_eq!(get_gen(&state), 3, "gen incremented on toggle OFF");
         assert_eq!(
@@ -5114,8 +4605,6 @@ mod tests {
         );
     }
 
-    // ── Application: the Autolaunch switch's shown state ─────────────
-    //
     // The switch reports the system's answer and nothing else: it never asserts a
     // state it does not know, and an answer to a read the owner has already
     // clicked past is dropped instead of painting the state the click replaced.
@@ -5166,8 +4655,6 @@ mod tests {
         assert_eq!(state.error.as_deref(), Some("denied"));
     }
 
-    // ── Per-field autosave ────────────────────────────────────────
-    //
     // A dropped task never runs; no store is needed, so the state is the surface.
 
     /// One per-field autosave case: the field, the steps on it, and what it must show.
@@ -5447,7 +4934,7 @@ mod tests {
         state.field_editors = HashMap::new();
         state.resync_field_editors();
 
-        // ── Mid-edit window: a raw/partial model name must render its routing
+        // Mid-edit window: a raw/partial model name must render its routing
         // row (an empty field resolves to the model's default provider)
         // instead of panicking on a missing editor.
         let _ = state.update(SettingsMessage::ConfigField {
@@ -5464,7 +4951,7 @@ mod tests {
         );
         let _ = state.routing_section(); // must not panic
 
-        // ── Saved routing order is displayed, not replaced by empty.
+        // Saved routing order is displayed, not replaced by empty.
         let _ = state.update(SettingsMessage::ConfigField {
             key: "manager_model",
             value: "saved-routing-model".into(),
@@ -5479,7 +4966,7 @@ mod tests {
         );
         let _ = state.routing_section(); // must not panic
 
-        // ── Post-persist window: the injectable persist result applies the
+        // Post-persist window: the injectable persist result applies the
         // canonical value and the existing routing editor keeps its text/undo.
         let manager_gen = state
             .field_gen
@@ -5529,7 +5016,7 @@ mod tests {
         );
         let _ = state.routing_section(); // must not panic
 
-        // ── Clear-to-empty coercion: whitespace falls back to the default
+        // Clear-to-empty coercion: whitespace falls back to the default
         // manager model, whose routing row renders without a panic.
         let _ = state.update(SettingsMessage::ConfigField {
             key: "manager_model",
@@ -5542,7 +5029,7 @@ mod tests {
         );
         let _ = state.routing_section(); // must not panic
 
-        // ── Worker model edit seeds its own routing row; manager==worker
+        // Worker model edit seeds its own routing row; manager==worker
         // collapses into a single routing row (no duplicates).
         let _ = state.update(SettingsMessage::ConfigField {
             key: "worker_model",

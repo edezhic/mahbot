@@ -1,12 +1,10 @@
 //! Automations dashboard page — every active automation of every user.
 //!
-//! The page reads the active automations and renders them as cards, grouped by
-//! owner, with a live countdown. Its only action is deleting one automation from its
-//! card's context menu: the card leaves the page through the next refresh.
-//! Nothing here creates, edits or fires an automation. The page re-reads the list
-//! once a second while it is open; the countdown is rendered from the wall
-//! clock on every re-render, so a tick that starts no read still moves the
-//! digits.
+//! The page reads the active automations and renders them as cards, grouped by owner, with a
+//! live countdown. Its only action is deleting one automation from its card's context menu: the
+//! card leaves through the next refresh. Nothing here creates, edits or fires an automation. The
+//! page re-reads the list once a second while open; the countdown renders from the wall clock on
+//! every re-render, so a tick that starts no read still moves the digits.
 
 use std::collections::BTreeMap;
 
@@ -22,8 +20,8 @@ use super::common::PolledList;
 use super::menus::{ContextMenu, MenuItem};
 use super::{theme, widgets};
 
-/// The notice for an automation that was already gone when the delete ran — a
-/// one-shot that fired, or one removed elsewhere: no failure, but no success.
+/// The notice for an automation that was already gone when the delete ran — a one-shot that
+/// fired, or one removed elsewhere: no failure, but no success.
 const ALREADY_GONE: &str = "Automation was already gone";
 
 #[derive(Debug, Clone)]
@@ -32,9 +30,8 @@ pub(crate) enum AutomationsMessage {
     Tick,
     /// A read finished. `Err` keeps the last loaded list on screen.
     Refreshed(Result<Vec<Automation>, String>),
-    /// Delete the automation the context menu was opened on, identified by its own
-    /// row: another account's automation — or a gone account's — is deleted the same
-    /// way.
+    /// Delete the automation the context menu was opened on, identified by its own row: another
+    /// account's automation — or a gone account's — is deleted the same way.
     Delete { id: String, session_id: String },
     /// Outcome of an action, shown by the dashboard as a brief notice.
     Toast(ToastMessage),
@@ -51,8 +48,8 @@ impl AutomationsState {
         }
     }
 
-    /// Read the active automations now, unless a read is in flight. Called on
-    /// navigation, so opening the page always starts a fresh read.
+    /// Read the active automations now, unless a read is in flight. Called on navigation, so
+    /// opening the page always starts a fresh read.
     pub(crate) fn refresh(&mut self) -> Task<AutomationsMessage> {
         if !self.list.begin() {
             return Task::none();

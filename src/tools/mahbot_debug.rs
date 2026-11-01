@@ -1,8 +1,6 @@
-//! In-process read-only SQL query tool for the admin's Assistant — wraps
-//! the `mahbot debug` read-only query mechanism against the daemon's own live
-//! connections (the consolidated `core.db` via [`crate::db::DOMAIN_CONN`], the
-//! `logs.db` via [`crate::logs::LOG_STORE`]) so the admin's Assistant can
-//! query them without a subprocess or a second store instance.
+//! In-process read-only SQL query tool for the admin's Assistant — wraps the `mahbot debug`
+//! read-only query mechanism against the daemon's own live connections (the consolidated
+//! `core.db` and `logs.db`) so the Assistant can query them without a subprocess.
 
 use crate::db::debug;
 use crate::db::ipc;
@@ -70,9 +68,8 @@ impl Tool for MahbotDebugTool {
     }
 }
 
-/// Validate a read-only query and run it against `conn`, returning the result as
-/// pipe-delimited text (same format as `mahbot debug`). Rejects any mutating
-/// statement before touching the connection.
+/// Validate a read-only query and run it against `conn`, returning pipe-delimited text
+/// (same format as `mahbot debug`). A mutating statement is rejected before use.
 async fn run_read_only_query(conn: &crate::db::Connection, sql: &str) -> anyhow::Result<String> {
     debug::validate_read_only(sql)?;
     let rows = conn
@@ -82,9 +79,8 @@ async fn run_read_only_query(conn: &crate::db::Connection, sql: &str) -> anyhow:
     Ok(format_readonly_rows(&rows))
 }
 
-/// Render [`crate::db::ReadonlyRows`] as pipe-delimited text (same format as
-/// `mahbot debug`): a column-header line, one line per row, and a truncation
-/// sentinel line when the row limit was hit. Cells are spelled by
+/// Render [`crate::db::ReadonlyRows`] as pipe-delimited text (same format as `mahbot debug`):
+/// a column-header line, one row per line, and a truncation sentinel when the limit was hit.
 /// [`crate::db::format_cell`], the same rule the CLI prints by.
 fn format_readonly_rows(rows: &crate::db::ReadonlyRows) -> String {
     debug::render_pipe_table(

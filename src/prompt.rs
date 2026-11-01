@@ -1,11 +1,9 @@
-//! The embedded prompt assets and the one-pass machinery that fills them in:
-//! `rust_embed` over `src/prompt/`, the `\n---\n` section splitter, the
-//! `{{key}}` substituter, and the workspace and ticket context blocks
-//! installed into a call.
+//! The embedded prompt assets and the one-pass machinery that fills them in: `rust_embed`
+//! over `src/prompt/`, the `\n---\n` section splitter, the `{{key}}` substituter, and the
+//! workspace and ticket context blocks installed into a call.
 //!
-//! Not the prompts themselves — those are the `.md` files under `src/prompt/`,
-//! loaded by asset key — and not a template engine: substitution is one pass
-//! and never cascades.
+//! Not the prompts themselves — those are the `.md` files, loaded by asset key — and not a
+//! template engine: substitution is one pass and never cascades.
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -14,38 +12,29 @@ use std::path::Path;
 use regex::Regex;
 use std::sync::LazyLock;
 
-// ── Prompt Asset Loading ─────────────────────────────────────────────
-
 #[derive(rust_embed::RustEmbed)]
 #[folder = "src/prompt"]
 struct PromptAssets;
 
-/// Regex for single-pass template substitution.
-///
-/// Only matches keys consisting of word characters (`\w` = `[a-zA-Z0-9_]`).
-/// Future template keys must not contain hyphens, dots, or spaces.
-/// Uses `(?-u)` to enforce ASCII-only `\w` — without it, the regex crate
-/// defaults to Unicode-aware matching which would accept `{{résumé}}`.
+/// Regex for single-pass template substitution. Only word characters (`[a-zA-Z0-9_]`)
+/// match, so a future key must not contain hyphens, dots or spaces; `(?-u)` enforces
+/// ASCII-only `\w`, without which `{{résumé}}` would be accepted.
 pub(crate) static TEMPLATE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?-u)\{\{(\w+)\}\}").expect("TEMPLATE_RE must compile"));
 
-/// The text an embedded asset delivers: its bytes with the checkout's line
-/// endings normalised to LF.
+/// The text an embedded asset delivers: its bytes with the checkout's line endings
+/// normalised to LF.
 ///
-/// `rust_embed` embeds an asset exactly as the working copy holds it, and a
-/// checkout that rewrites line endings (Windows, `core.autocrlf`) hands the
-/// build CRLF — which would change the text a model is sent and, by hiding the
-/// `\n---\n` separator, collapse a variant asset into a single section. The
-/// repository pins LF for these files (`.gitattributes`), so this is a no-op on
-/// a correct checkout and a repair everywhere else.
+/// `rust_embed` embeds an asset as the working copy holds it, so a checkout that rewrites
+/// line endings (`core.autocrlf`) would hand the build CRLF — changing the text a model is
+/// sent and, by hiding the `\n---\n` separator, collapsing a variant asset into one section.
+/// The repository pins LF for these files, so this is a no-op on a correct checkout.
 fn asset_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).replace("\r\n", "\n")
 }
 
-/// Load a prompt template from embedded assets.
-///
-/// Panics if the asset is missing — prompt files are always present in the
-/// repo, so a missing asset is a stale/typo'd key or a partial checkout.
+/// Load a prompt template from embedded assets. Panics if the asset is missing — prompt
+/// files are always present, so that is a stale key or a partial checkout.
 #[must_use]
 pub(crate) fn load_prompt(asset_key: &str) -> String {
     let file = PromptAssets::get(asset_key).unwrap_or_else(|| {
@@ -57,18 +46,16 @@ pub(crate) fn load_prompt(asset_key: &str) -> String {
     asset_text(file.data.as_ref())
 }
 
-/// Load a prompt asset and split it into `---`-delimited sections (trimmed,
-/// empty sections dropped).
+/// Load a prompt asset and split it into `---`-delimited sections (trimmed, empty dropped).
 #[must_use]
 pub(crate) fn load_prompt_sections(asset_key: &str) -> Vec<String> {
     split_sections(&load_prompt(asset_key))
 }
 
-/// Deal a section list out strided across a cohort of `count` slots, rendered
-/// as the slot `k`'s own share. No section is left unhanded at any cohort size:
-/// the slots share the list in rotation, and the surplus stacks onto the leading
-/// slots when there are fewer slots than sections (a lone slot receives them
-/// all). Every section reaches exactly one slot.
+/// Deal a section list out strided across `count` slots, rendered as slot `k`'s own share.
+/// No section is left unhanded: the slots share the list in rotation and the surplus stacks
+/// onto the leading slots when there are fewer slots than sections. Every section reaches
+/// exactly one slot.
 #[must_use]
 pub(crate) fn deal_sections(sections: &[String], count: usize, k: usize) -> String {
     sections
@@ -80,8 +67,6 @@ pub(crate) fn deal_sections(sections: &[String], count: usize, k: usize) -> Stri
         .join("\n\n")
 }
 
-/// Split a prompt asset's text into `---`-delimited sections (trimmed, empty
-/// sections dropped).
 fn split_sections(text: &str) -> Vec<String> {
     text.split("\n---\n")
         .map(str::trim)
@@ -90,10 +75,8 @@ fn split_sections(text: &str) -> Vec<String> {
         .collect()
 }
 
-// Utils
-
-/// Append a named file section to the context string, with a markdown header
-/// and truncated content. Skips empty content.
+/// Append a named file section to the context string, with a markdown header and truncated
+/// content. Skips empty content.
 fn append_file_section(out: &mut String, name: &str, content: &str) {
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -103,15 +86,14 @@ fn append_file_section(out: &mut String, name: &str, content: &str) {
     push_truncated(out, trimmed);
 }
 
-/// The account's personal memory — a continuity record for its own Assistant
-/// only, never context for another role or another account.
+/// The account's personal memory — a continuity record for its own Assistant only, never
+/// context for another role or another account.
 pub(crate) const MEMORY_FILE: &str = "MEMORY.md";
 
-/// How much of one workspace file a context render keeps, counted in
-/// characters (Unicode scalar values), not bytes.
+/// How much of one workspace file a context render keeps, in characters (Unicode scalar
+/// values), not bytes.
 pub(crate) const MAX_WORKSPACE_FILE_CHARS: usize = 10_000;
 
-/// Workspace files rendered, in this order, into the workspace context.
 const WORKSPACE_FILES: &[&str] = &[
     "README.md",
     "BOOTSTRAP.md",
@@ -125,13 +107,9 @@ const WORKSPACE_FILES: &[&str] = &[
     ".github/copilot-instructions.md",
 ];
 
-/// Build workspace context content from workspace files.
-///
-/// `personal_memory` admits the [`MEMORY_FILE`] section. Only the Assistant of
-/// the account whose personal folder this is passes `true`; every other
-/// session — another role in that folder, any role in a managed workspace, and
-/// every non-agent model call — passes `false`, so this builder never renders
-/// an account's continuity record for anyone else.
+/// Build workspace context content from workspace files. `personal_memory` admits the
+/// [`MEMORY_FILE`] section: only the Assistant of the account whose personal folder this is
+/// passes `true`, so this builder never renders a continuity record for anyone else.
 pub(crate) async fn build_workspace_context(workspace: &Path, personal_memory: bool) -> String {
     let mut out = String::new();
     for &filename in WORKSPACE_FILES {
@@ -149,8 +127,8 @@ pub(crate) async fn build_workspace_context(workspace: &Path, personal_memory: b
     out
 }
 
-/// Wrap workspace context content in a stable `<workspace-context>` block.
-/// Returns an empty string when `content` is blank.
+/// Wrap workspace context content in a stable `<workspace-context>` block; empty when
+/// `content` is blank.
 pub(crate) fn wrap_workspace_context(content: &str) -> String {
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -159,18 +137,13 @@ pub(crate) fn wrap_workspace_context(content: &str) -> String {
     format!("\n<workspace-context>\n{trimmed}\n</workspace-context>\n")
 }
 
-/// Build the general (non-role) workspace context block for non-agent LLM
-/// calls, wrapped in a stable `<workspace-context>` block.
-///
-/// Uses the stored general context row (role = NULL) when discovery has
-/// produced one; otherwise falls back to the file-derived context builder
-/// (the same fallback role agents use, minus the personal memory — a non-agent
-/// call is nobody's Assistant session). The block is stable per workspace —
-/// it does not vary between requests. Returns an empty string when no
-/// context source has content (no stored row and no context files).
+/// The general (non-role) workspace context block for non-agent LLM calls. Uses the stored
+/// general context row (role = NULL) when discovery produced one, else the file-derived
+/// builder minus the personal memory (a non-agent call is nobody's Assistant session). Stable
+/// per workspace; empty when no source has content.
 async fn build_general_workspace_context(ws: &crate::Workspace) -> String {
-    // Degrade to the file-derived fallback when the store is uninitialized
-    // (e.g. early tests) — never panic on a missing global.
+    // Degrade to the file-derived fallback when the store is uninitialized (early tests) —
+    // never panic on a missing global.
     let stored = match crate::workspace::WORKSPACES.get() {
         Some(store) => store.get_general_context(&ws.name).await.ok().flatten(),
         None => None,
@@ -182,8 +155,8 @@ async fn build_general_workspace_context(ws: &crate::Workspace) -> String {
     wrap_workspace_context(&content)
 }
 
-/// Prepend the general workspace context to `messages` as the leading system
-/// message when a stored or file-derived context exists. No-op otherwise.
+/// Prepend the general workspace context to `messages` as the leading system message when a
+/// stored or file-derived context exists. No-op otherwise.
 pub(crate) async fn prepend_general_context(
     messages: &mut Vec<crate::ChatMessage>,
     ws: &crate::Workspace,
@@ -194,8 +167,8 @@ pub(crate) async fn prepend_general_context(
     }
 }
 
-/// Format a ticket as a `<current-ticket>` block for injection as a
-/// separate system message (after the workspace context, before user message).
+/// Format a ticket as a `<current-ticket>` block for injection as a separate system message
+/// (after the workspace context, before the user message).
 pub(crate) fn format_ticket_block(ticket: &crate::pipeline::board::Ticket) -> String {
     let mut comments = String::new();
     if !ticket.comments.is_empty() {
@@ -226,7 +199,6 @@ pub(crate) fn format_ticket_block(ticket: &crate::pipeline::board::Ticket) -> St
     )
 }
 
-/// Parse an ISO 8601 timestamp and format it as local date+time.
 fn format_local_timestamp(iso_str: &str) -> String {
     crate::db::parse_utc_timestamp(iso_str).map_or_else(
         |e| {
@@ -241,20 +213,16 @@ fn format_local_timestamp(iso_str: &str) -> String {
     )
 }
 
-/// The byte index where a context render cuts `text`, or `None` when the whole
-/// text fits.
 fn truncation_point(text: &str) -> Option<usize> {
     text.char_indices()
         .nth(MAX_WORKSPACE_FILE_CHARS)
         .map(|(idx, _)| idx)
 }
 
-/// Whether `text` is longer than a context render keeps of it.
 pub(crate) fn exceeds_workspace_file_limit(text: &str) -> bool {
     truncation_point(text).is_some()
 }
 
-/// Push `text` to `out`, truncating at [`MAX_WORKSPACE_FILE_CHARS`] if needed.
 fn push_truncated(out: &mut String, text: &str) {
     if let Some(idx) = truncation_point(text) {
         out.push_str(&text[..idx]);
@@ -272,13 +240,10 @@ fn push_truncated(out: &mut String, text: &str) {
     }
 }
 
-/// Discover `.claude/rules/*.md` files and return their relative paths + content.
-///
-/// Files are returned in deterministic raw file-name order (byte sort), not in
-/// `read_dir` enumeration order, so identical rules always render
-/// byte-identically — keeping the workspace-context block (and therefore the
-/// agent system prompt) stable across renders. File names within a single
-/// directory are unique, so the sort cannot tie.
+/// Discover `.claude/rules/*.md` files and return their relative paths with their content, in
+/// deterministic byte-sorted name order (not `read_dir` order), so identical rules render
+/// byte-identically and the workspace-context block stays stable across renders. Names within
+/// one directory are unique, so the sort cannot tie.
 async fn discover_claude_rules(workspace: &Path) -> Vec<(String, String)> {
     let rules_dir = workspace.join(".claude").join("rules");
 
@@ -309,27 +274,15 @@ async fn discover_claude_rules(workspace: &Path) -> Vec<(String, String)> {
     rules
 }
 
-/// Single-pass template substitution.
+/// Single-pass template substitution: all `{{key}}` patterns are replaced at once from
+/// `replacements`, so values are never re-substituted — a value containing a later key appears
+/// literally.
 ///
-/// All `{{key}}` patterns in the template are replaced with their corresponding
-/// values from `replacements`. The replacement uses a regex to match all keys
-/// at once, so values can never be re-substituted — a value containing a later
-/// key will appear literally, not as a replacement.
-///
-/// Placeholder keys (the text between `{{` and `}}`) must consist entirely
-/// of word characters (`[a-zA-Z0-9_]`). Keys with hyphens (`{{my-key}}`),
-/// dots (`{{config.key}}`), or other non‑word characters will remain in the
-/// output unexpanded.  The existing test `all_template_variables_are_word_chars`
-/// enforces this property across all embedded prompt assets.
-///
-/// If a `{{key}}` appears in the template but has no corresponding entry in
-/// `replacements`, a `tracing::warn!` is emitted at runtime and the literal
-/// `{{key}}` string is preserved in the output.  This means a typo in either
-/// the template or the replacement keys will produce a visible warning in the
-/// log rather than silently corrupting the prompt.
-///
-/// Callers must pass replacement map keys with the full `{{key}}` wrapper
-/// (e.g. `"{{ticket_id}}"`), not just the inner key name.
+/// Keys must be word characters (`[a-zA-Z0-9_]`); a key with hyphens or dots stays in the
+/// output unexpanded (`all_template_variables_are_word_chars` enforces this across the embedded
+/// assets). A key with no replacement is left literal and warns at runtime, so a typo shows up
+/// in the log instead of silently corrupting the prompt. Callers pass keys with the full
+/// wrapper (`"{{ticket_id}}"`).
 pub(crate) fn substitute(template: &str, replacements: &[(&str, &str)]) -> String {
     let map: HashMap<&str, &str> = replacements.iter().copied().collect();
     TEMPLATE_RE
@@ -358,12 +311,10 @@ pub(crate) fn substitute(template: &str, replacements: &[(&str, &str)]) -> Strin
 mod tests {
     use super::*;
 
-    /// One pass over the template with the replacements at hand: a key with no
-    /// replacement is left as the literal `{{key}}`, and a template with no
-    /// placeholders — not even an empty template — comes back unchanged.
+    /// One pass over the template with the replacements at hand: a key with no replacement is
+    /// left as the literal `{{key}}`, and a template with no placeholders comes back unchanged.
     #[test]
     fn substitute_cases() {
-        /// A replacement pair.
         type Pair = (&'static str, &'static str);
         /// Case name, template, replacements, expected output.
         type Case = (&'static str, &'static str, &'static [Pair], &'static str);
@@ -395,8 +346,8 @@ mod tests {
 
     #[test]
     fn substitute_no_cascade() {
-        // If a replacement value contains a later key pattern, it must NOT
-        // be re-substituted — the cascade bug from sequential str::replace().
+        // A replacement value containing a later key pattern must NOT be re-substituted —
+        // the cascade bug from sequential str::replace().
         let result = substitute(
             "First: {{a}}, Second: {{b}}",
             &[("{{a}}", "value-{{b}}"), ("{{b}}", "actual-b")],
@@ -404,8 +355,8 @@ mod tests {
         assert_eq!(result, "First: value-{{b}}, Second: actual-b");
     }
 
-    /// Only the `.md` rules are discovered, and a rule the loader cannot read
-    /// (a directory named `*.md`) is skipped rather than failing the scan.
+    /// Only the `.md` rules are discovered, and a rule the loader cannot read (a directory
+    /// named `*.md`) is skipped rather than failing the scan.
     #[tokio::test]
     async fn discover_claude_rules_finds_only_readable_md_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -413,9 +364,7 @@ mod tests {
         std::fs::create_dir_all(&rules_dir).unwrap();
         std::fs::write(rules_dir.join("testing.md"), "Test content").unwrap();
         std::fs::write(rules_dir.join("style.md"), "Style rules").unwrap();
-        // Non-markdown file should be ignored
         std::fs::write(rules_dir.join("notes.txt"), "irrelevant").unwrap();
-        // A directory named *.md fails read_to_string and is skipped
         std::fs::create_dir(rules_dir.join("broken.md")).unwrap();
 
         let rules = discover_claude_rules(dir.path()).await;
@@ -439,10 +388,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rules_dir = dir.path().join(".claude").join("rules");
         std::fs::create_dir_all(&rules_dir).unwrap();
-        // Scrambled creation order — `read_dir` order is not guaranteed, so the
-        // loader must return rules in deterministic byte-sorted name order for
-        // a stable render (a two-render byte-identity test would pass even
-        // pre-fix on APFS's stable-enough order).
+        // Scrambled creation order — `read_dir` order is not guaranteed, so the loader must
+        // return rules byte-sorted for a stable render.
         for name in ["zebra", "alpha", "middle"] {
             std::fs::write(
                 rules_dir.join(format!("{name}.md")),
@@ -465,11 +412,9 @@ mod tests {
 
     #[test]
     fn all_template_variables_are_word_chars() {
-        // Every {{...}} placeholder in embedded prompt assets must use
-        // \w+ keys (ASCII alphanumeric + underscore) so that TEMPLATE_RE
-        // can match and substitute them.  Non-conforming keys like
-        // {{role-name}} or {{my var}} would silently remain in the
-        // prompt output because the regex never matches them.
+        // Every {{...}} placeholder in the embedded assets must use \w+ keys (ASCII
+        // alphanumeric and underscore), or TEMPLATE_RE never matches and the placeholder
+        // silently reaches the prompt.
         let broad_re =
             regex::Regex::new(r"\{\{([^}]+)\}\}").expect("broad placeholder regex must compile");
         for asset_key in PromptAssets::iter() {
@@ -503,26 +448,24 @@ mod tests {
         }
     }
 
-    /// The assets the pipeline rotates through parallel agents, with the number
-    /// of variants each must yield. A collapse to one section silently hands
-    /// every analyst/reviewer the same variant instead of a decorrelated set.
+    /// The assets the pipeline rotates through parallel agents, with the number of variants
+    /// each must yield: a collapse to one section silently hands every analyst the same
+    /// variant instead of a decorrelated set.
     const VARIANT_ASSETS: &[(&str, usize)] = &[
         ("analyze/angles.md", 3),
         ("analyze/ticket_angles.md", 3),
         ("review_angles.md", 3),
         ("qa_angles.md", 3),
-        // Five framings plus the trailing order-contract comment section.
         ("synthesis/repair_framing.md", 6),
     ];
 
     #[test]
     fn embedded_assets_are_checked_out_with_lf() {
-        // `rust_embed` embeds the checkout's bytes, so CR bytes here mean the
-        // build would carry something other than the repository's text — the
-        // Windows build did exactly that before `.gitattributes` pinned LF.
+        // `rust_embed` embeds the checkout's bytes, so CR bytes here mean the build would
+        // carry something other than the repository's text — the Windows build did exactly
+        // that before `.gitattributes` pinned LF.
         let mut scanned = 0;
-        // The instruction texts are the `.md` assets (a stray `.DS_Store` that
-        // finds its way into the folder is not one of them).
+        // The instruction texts are the `.md` assets (a stray `.DS_Store` is not one).
         for asset_key in PromptAssets::iter().filter(|key| key.ends_with(".md")) {
             let asset =
                 PromptAssets::get(&asset_key).expect("asset disappeared between iter and get");
@@ -537,9 +480,8 @@ mod tests {
         assert!(scanned > 0, "no embedded prompt asset was inspected");
     }
 
-    /// The context cut is also the nightly inventory's trigger: 10,000
-    /// characters are rendered whole, 10,001 are not, and the count is in
-    /// characters — a multi-byte file is measured the same way.
+    /// The context cut is also the nightly inventory's trigger: 10,000 characters render
+    /// whole, 10,001 do not, and the count is characters — a multi-byte file measures the same.
     #[test]
     fn the_file_limit_counts_characters() {
         let fits = "ё".repeat(MAX_WORKSPACE_FILE_CHARS);
@@ -565,8 +507,8 @@ mod tests {
                  the `---` separators are a contract, not formatting",
             );
 
-            // A working copy checked out under the Windows convention hands the
-            // build the same file with CRLF endings.
+            // A working copy checked out under the Windows convention hands the build the
+            // same file with CRLF endings.
             let crlf = text.replace('\n', "\r\n");
             assert_ne!(crlf, text, "'{asset_key}' has no line endings to convert");
             assert_eq!(

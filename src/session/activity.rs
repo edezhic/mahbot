@@ -47,7 +47,6 @@ fn line(shown: Option<&str>, current: State, msg: &str) -> (String, Option<Locat
     (content, Some(current.location))
 }
 
-/// The line itself, as the assistant is sent it.
 fn render(state: State) -> String {
     substitute(
         &load_prompt("context/user_activity.md"),
@@ -84,8 +83,7 @@ mod tests {
     /// the location moved since the assistant was last shown one, ahead of
     /// everything else the turn carries and saying so when speech is what put
     /// the user there; the state is recorded whenever it is known — silently,
-    /// without a line, on the first message, and not at all when it did not
-    /// change.
+    /// without a line, on the first message, and not at all when it did not change.
     #[test]
     fn the_line_rides_a_change_and_the_reference_always_moves() {
         type Case = (
@@ -95,7 +93,6 @@ mod tests {
             Option<Location>,
         );
         let cases: [Case; 5] = [
-            // Nothing was ever shown: only what the assistant has seen is set.
             (None, at_computer(), None, Some(Location::AtComputer)),
             (
                 Some("absent"),
@@ -115,8 +112,6 @@ mod tests {
                 Some("<user-activity>active, by voice</user-activity>\n\n"),
                 Some(Location::AtComputer),
             ),
-            // A spoken message while the assistant already knows the user is
-            // present has nothing new to say.
             (Some("active"), spoken(), None, None),
         ];
         for (shown, current, head, recorded) in cases {

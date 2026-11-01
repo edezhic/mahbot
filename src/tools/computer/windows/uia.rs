@@ -1,27 +1,22 @@
-//! The accessibility half of the Windows backend: reading a window's UI Automation
-//! tree and acting on the element a ref points at.
+//! The accessibility half of the Windows backend: reading a window's UI Automation tree
+//! and acting on the element a ref points at. Runs on the apartment thread (see
+//! [`super::thread`]) and only ever holds platform handles inside one call.
 //!
-//! Runs on the apartment thread (see [`super::thread`]) and only ever holds
-//! platform handles inside one call.
-//!
-//! The tree is the CONTROL view (`ControlViewWalker`) — the structure an
-//! accessibility client is meant to consume: real controls, not the raw provider
+//! The tree is the CONTROL view (`ControlViewWalker`) — real controls, not the raw provider
 //! scaffolding. Roles are UIA control types mapped onto the shared vocabulary
-//! [`super::super::core::INTERACTIVE_ROLES`] already understands (`edit` →
-//! `textfield`, `hyperlink` → `link`, `tabitem` → `tab`), so a ref's role matches
-//! the same way on every platform. `actions` is derived from the control type as a
-//! hint for the model; the real pattern support is probed when an action runs.
+//! [`super::super::core::INTERACTIVE_ROLES`] already understands (`edit` → `textfield`,
+//! `hyperlink` → `link`, `tabitem` → `tab`), so a ref's role matches the same way on every
+//! platform. `actions` is a hint derived from the control type; the real pattern support is
+//! probed when an action runs.
 //!
-//! Reading is capped lower than on the other platforms (2000 nodes) because UIA
-//! charges one cross-process call per property. A node or depth cap stops the walk
-//! and is recorded in the observation's truncation, which the header names; a name or
-//! a value is kept to `core::MAX_NAME_CHARS` / `core::MAX_VALUE_CHARS` where the tree
-//! takes it, the cut stated in that same header, because a document-shaped field
-//! reports a whole file as its value. A provider that runs out of TIME is different
-//! and abandons the whole read with an honest `degraded` timeout rather than returning
-//! half of a tree. A provider that refuses a single child or property only ends that
-//! subtree or leaves one field absent, the way a broken accessibility attribute does
-//! on the other platforms.
+//! Reading is capped lower than the other platforms (2000 nodes) because UIA charges one
+//! cross-process call per property. A node or depth cap stops the walk and is recorded in
+//! the observation's truncation; a name or value is kept to `core::MAX_NAME_CHARS` /
+//! `core::MAX_VALUE_CHARS` where the tree takes it, the cut stated in the same header,
+//! because a document-shaped field reports a whole file as its value. A provider that runs
+//! out of TIME abandons the whole read with an honest `degraded` timeout rather than
+//! returning half a tree. A provider that refuses a single child or property only ends that
+//! subtree or leaves one field absent.
 
 use super::super::core::{
     self, ElementAct, Impact, Locator, Observation, SurfaceGeometry, TargetSpec, Truncation, UiNode,
@@ -56,16 +51,14 @@ use windows::Win32::UI::Accessibility::{
 use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor};
 use windows::core::BSTR;
 
-/// How long one walk may spend before it gives up — inside the caller's
-/// [`super::OBSERVE_TIMEOUT`], so a stuck provider still ends as a clean timeout. A UIA
-/// read is a cross-process property call under the apartment thread's transaction
-/// timeout, which is this same figure: one stalled read spends the whole walk, and the
-/// check before the next read is what stops it there instead of paying another.
+/// How long one walk may spend before it gives up — inside [`super::OBSERVE_TIMEOUT`], so a
+/// stuck provider still ends as a clean timeout. It equals the apartment thread's transaction
+/// timeout, so one stalled read spends the whole walk; the check before the next read stops it
+/// there instead of paying another.
 pub(super) const WALK_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Nodes per walk. UIA pays one cross-process read per property, so this is lower
-/// than the renderer's `core::MAX_TREE_NODES`; reaching it stops the walk and is
-/// recorded as the walk's own ceiling.
+/// Nodes per walk. UIA pays one cross-process read per property, so this is lower than
+/// `core::MAX_TREE_NODES`; reaching it stops the walk and is recorded as the walk's ceiling.
 const MAX_NODES: usize = 2000;
 
 /// Roles whose value is worth a second cross-process read.
@@ -78,15 +71,13 @@ const VALUE_ROLES: &[&str] = &[
     "slider",
 ];
 
-// ── Reading ─────────────────────────────────────────────────────────────
-
 pub(super) fn observe(uia: &IUIAutomation, target: &TargetSpec) -> anyhow::Result<Observation> {
     if matches!(target, TargetSpec::Screen) {
         return Err(core::screen_observe_error());
     }
     let resolved = window::resolve(target)?;
-    // The title is read before the walk: a walk that spends its budget has to name
-    // the window it abandoned, and this read is one it can no longer afford then.
+    // Read before the walk: a walk that spends its budget has to name the window it
+    // abandoned, and this read is one it can no longer afford then.
     let title = window::title_text(resolved.hwnd);
     let element = window_element(uia, &resolved)?;
     let budget = core::Budget::new(
@@ -96,8 +87,8 @@ pub(super) fn observe(uia: &IUIAutomation, target: &TargetSpec) -> anyhow::Resul
     );
     let tree = build_tree(uia, &element, resolved.surface, &budget)?;
     let mut truncation = tree.truncation;
-    // The header keeps the whole title to the same cap as a name and, unlike a
-    // listing's label, states the cut.
+    // The header keeps the whole title to the same cap as a name and, unlike a listing's
+    // label, states the cut.
     let window_title = Some(truncation.keep_name(&title));
     Ok(Observation {
         app_name: resolved.app_name,
@@ -118,16 +109,16 @@ pub(super) fn act_on_element(
     window::ensure_actuation_allowed(Some(resolved.hwnd))?;
     window::ensure_not_own_window(resolved.hwnd)?;
     let element = window_element(uia, &resolved)?;
-    // Resolution already read the title, so the walk's own bound is named from it
-    // rather than paying a second cross-process read.
+    // Resolution already read the title, so the walk's bound is named from it rather than
+    // paying a second cross-process read.
     let budget = core::Budget::new(
         WALK_DEADLINE,
         "tree walk",
         core::window_description(&resolved.app_name, &resolved.title),
     );
     let tree = build_tree(uia, &element, resolved.surface, &budget)?;
-    // The ref is acted on only if it is still what the caller saw: same kind, same name,
-    // same place on the surface. Nothing is sent otherwise.
+    // Acted on only if the ref is still what the caller saw: same kind, same name, same place
+    // on the surface. Nothing is sent otherwise.
     let (matched, confirmed) = core::resolve_locator_confirmed(&tree.root, locator)?;
     let index = core::pre_order_index(&tree.root, matched);
     let element = tree.handles.get(index).ok_or_else(|| {
@@ -143,16 +134,14 @@ pub(super) fn act_on_element(
     Ok(core::impact_note(impact, confirmed.note(locator)))
 }
 
-/// The element that holds the keyboard focus, attributed to the surface the call
-/// addressed when it can be: the element must belong to the resolved window's process (a
-/// different process is another application's focus, and the answer is `None`), and when
-/// it reports a non-NULL native window handle, that handle's root ancestor must be the
-/// resolved window. The handle alone cannot be compared with the top-level one: a classic
-/// Win32 control reports its own child handle there, and a WPF-style element reports NULL,
-/// so a NULL handle whose process matches is accepted — there is nothing further to
-/// compare. Best-effort throughout: a property that cannot be read answers `None` rather
-/// than an error, and the report then says the focus could not be read instead of naming a
-/// focus that is not this surface's.
+/// The element holding the keyboard focus, attributed to the surface the call addressed when
+/// it can be: it must belong to the resolved window's process (a different process is another
+/// application's focus, and the answer is `None`), and when it reports a non-NULL native
+/// window handle, that handle's root ancestor must be the resolved window. The handle alone
+/// cannot be compared with the top-level one — a classic Win32 control reports its own child
+/// handle and a WPF-style element reports NULL, so a NULL handle whose process matches is
+/// accepted. Best-effort: a property that cannot be read answers `None`, and the report then
+/// says the focus could not be read.
 pub(super) fn focused_element(
     uia: &IUIAutomation,
     target: Option<&TargetSpec>,
@@ -220,7 +209,7 @@ struct Tree {
 struct Walk<'a> {
     walker: IUIAutomationTreeWalker,
     origin: (f64, f64),
-    /// The walk's own bound, checked before every provider read it makes.
+    /// The walk's bound, checked before every provider read it makes.
     budget: &'a core::Budget,
     nodes: usize,
     handles: Vec<IUIAutomationElement>,
@@ -259,12 +248,12 @@ impl Walk<'_> {
         self.nodes += 1;
         self.handles.push(element.clone());
         let mut node = read_node(element, self.origin, &mut self.truncation, self.budget)?;
-        // The child probe below is another provider call, and so is every sibling read
-        // after it: none may start once the walk has spent its budget.
+        // The child probe and every sibling read after it are provider calls: none may start
+        // once the walk has spent its budget.
         self.budget.check()?;
         if depth >= core::MAX_TREE_DEPTH {
-            // The node's subtree is not read. Only a node that has one is a cut, so a
-            // leaf at the ceiling is not reported as a truncation.
+            // The node's subtree is not read. Only a node that has one is a cut, so a leaf at
+            // the ceiling is not a truncation.
             // SAFETY: `element` is a live element of this walk and `self.walker` is the
             // walker of the same client; the probe discards the child it returns.
             if unsafe { self.walker.GetFirstChildElement(element) }.is_ok() {
@@ -291,9 +280,8 @@ impl Walk<'_> {
     }
 }
 
-/// One node's own fields. Each provider read below is preceded by the budget check,
-/// so a target that stalls mid-node costs at most one transaction past the walk's
-/// bound instead of one per field.
+/// One node's own fields. Every provider read below is preceded by the budget check, so a
+/// target stalling mid-node costs at most one transaction past the bound, not one per field.
 fn read_node(
     element: &IUIAutomationElement,
     origin: (f64, f64),
@@ -336,10 +324,9 @@ fn read_node(
     })
 }
 
-/// One element's value, whole, as the marshaller handed it over — the caller keeps it
-/// through [`Truncation::keep_value`], where the read's cap applies and the cut is
-/// stated in the observation's header. `Err` is the walk's budget spent; an absent
-/// pattern or an unreadable value is `Ok(None)`.
+/// One element's value, whole, as the marshaller handed it over — the caller keeps it through
+/// [`Truncation::keep_value`], where the cap applies and the cut is stated in the header. `Err`
+/// is the walk's budget spent; an absent pattern or an unreadable value is `Ok(None)`.
 fn read_value(
     element: &IUIAutomationElement,
     budget: &core::Budget,
@@ -382,9 +369,8 @@ fn surface_frame(rect: RECT, origin: (f64, f64)) -> Option<(f64, f64, f64, f64)>
     ))
 }
 
-/// The role name and action hints for a UIA control type. Names that the shared
-/// interactive-role list knows keep its spelling (`edit` → `textfield`,
-/// `hyperlink` → `link`, `tabitem` → `tab`).
+/// The role name and action hints for a UIA control type, keeping the shared vocabulary's spelling
+/// where it knows the role (`edit` → `textfield`, `hyperlink` → `link`, `tabitem` → `tab`).
 fn role_and_actions(control_type: i32) -> (&'static str, &'static [&'static str]) {
     const PRESS: &[&str] = &["press"];
     const SELECT: &[&str] = &["select"];
@@ -423,8 +409,8 @@ fn role_and_actions(control_type: i32) -> (&'static str, &'static [&'static str]
         x if x == UIA_ThumbControlTypeId.0 => ("thumb", &[]),
         x if x == UIA_ImageControlTypeId.0 => ("image", &[]),
         x if x == UIA_TextControlTypeId.0 => ("text", &[]),
-        // A document is typed into like a text field (Windows 11 Notepad's editor is
-        // one), so it carries the action hint that gets it a ref.
+        // A document is typed into like a text field (Windows 11 Notepad's editor is one), so
+        // it carries the action hint that gets it a ref.
         x if x == UIA_DocumentControlTypeId.0 => ("document", VALUE),
         x if x == UIA_GroupControlTypeId.0 => ("group", &[]),
         x if x == UIA_PaneControlTypeId.0 => ("pane", &[]),
@@ -437,11 +423,9 @@ fn role_and_actions(control_type: i32) -> (&'static str, &'static [&'static str]
     }
 }
 
-// ── Acting ──────────────────────────────────────────────────────────────
-
-/// Press an element the way a user would: the first accessibility action it actually
-/// supports, in the order a screen reader tries them, and — only when it supports
-/// none at all — a click on its own point.
+/// Press an element the way a user would: the first accessibility action it actually supports,
+/// in the order a screen reader tries them, and — only when it supports none — a click on its
+/// own point.
 fn press(
     element: &IUIAutomationElement,
     resolved: &window::TargetWindow,
@@ -501,8 +485,8 @@ fn press(
              coordinates",
         )
     })?;
-    // A synthesised click is a point action, so the window it lands in must be in front;
-    // the answer then states where the point was put, in the surface's own pixels.
+    // A synthesised click is a point action, so its window must be in front; the answer then
+    // states where the point was put, in the surface's own pixels.
     window::activate(resolved.hwnd);
     window::ensure_foreground(resolved.hwnd)?;
     let impact = input::click_absolute(point.x, point.y)?;
@@ -518,11 +502,10 @@ fn press(
 
 /// One pattern's action, when the element supports the pattern.
 ///
-/// `None` means "try the next one": the pattern is absent, or the element reports
-/// the action itself as unsupported. A pattern that *fails* — a disabled control, a
-/// provider that ran out of time — is the element's own answer and comes back as
-/// `Some`, so it is reported instead of being replaced by a coordinate click that
-/// would claim a click the element never received.
+/// `None` means "try the next one": the pattern is absent, or the element reports the action
+/// itself as unsupported. A pattern that *fails* — a disabled control, a provider out of time —
+/// is the element's own answer and comes back as `Some`, so it is reported rather than replaced
+/// by a coordinate click claiming a click the element never received.
 fn attempt<T: windows::core::Interface>(
     element: &IUIAutomationElement,
     id: UIA_PATTERN_ID,
@@ -538,17 +521,16 @@ fn attempt<T: windows::core::Interface>(
     }
 }
 
-/// Whether a UIA call failed because the element does not support that action at
-/// all, rather than because it refused it.
+/// Whether a UIA call failed because the element does not support that action at all, rather
+/// than because it refused it.
 fn is_unsupported(error: &windows::core::Error) -> bool {
     let code = error.code().0.cast_unsigned();
     code == UIA_E_NOTSUPPORTED || code == E_NOTIMPL.0.cast_unsigned()
 }
 
-/// Whether the element is a control a person would type into: an edit field, a
-/// numeric spinner, or a document surface (Windows 11 Notepad exposes its editor as
-/// one). A combo box is deliberately absent — a dropdown-only one shows no text
-/// field, and typing into it would silently do nothing.
+/// Whether the element is a control a person would type into: an edit field, a numeric
+/// spinner, or a document surface. A combo box is deliberately absent — a dropdown-only one
+/// shows no text field, and typing into it would silently do nothing.
 fn is_editable(element: &IUIAutomationElement) -> bool {
     // SAFETY: `element` is live; the control type is returned by value.
     let control_type = unsafe { element.CurrentControlType() }.map_or(0, |id| id.0);
@@ -579,10 +561,9 @@ fn clickable_point(element: &IUIAutomationElement) -> Option<POINT> {
     })
 }
 
-/// Set an element's value: the value pattern when it is writable, otherwise — for
-/// an EDITABLE control only — focus the element and type over its selected
-/// contents, which is what a user does. Anything else is refused, like the other
-/// backends: typing into an arbitrary control is destructive, not helpful.
+/// Set an element's value: the value pattern when writable, otherwise — for an EDITABLE
+/// control only — focus it and type over its selected contents, which is what a user does.
+/// Anything else is refused: typing into an arbitrary control is destructive.
 fn set_value(element: &IUIAutomationElement, hwnd: HWND, text: &str) -> anyhow::Result<Impact> {
     // SAFETY: `element` is live; the password flag is returned by value.
     if unsafe { element.CurrentIsPassword() }.is_ok_and(windows::core::BOOL::as_bool) {
@@ -625,9 +606,9 @@ fn set_value(element: &IUIAutomationElement, hwnd: HWND, text: &str) -> anyhow::
     // SAFETY: `element` is live, and focusing it takes no pointer of ours; it runs on
     // the thread that owns the element.
     unsafe { element.SetFocus() }.map_err(|e| map_uia_error("focus the element", &e))?;
-    // A select-all that only partly landed leaves the field's old text in place and
-    // a selection nobody can vouch for, so the value is unchanged: that is a failure,
-    // not an unconfirmed set, and the text is deliberately not typed over it.
+    // A select-all that only partly landed leaves the old text and a selection nobody can
+    // vouch for, so the value is unchanged: that is a failure, not an unconfirmed set, and the
+    // text is deliberately not typed over it.
     if let Impact::Unconfirmed(detail) = input::select_all()? {
         return Err(core::taxonomy_error(
             core::ERR_DEGRADED,
@@ -641,12 +622,10 @@ fn set_value(element: &IUIAutomationElement, hwnd: HWND, text: &str) -> anyhow::
     input::type_text_into_focus(text)
 }
 
-// ── Errors ──────────────────────────────────────────────────────────────
-
-/// Map a UIA failure of an ACTUATING call. Everything [`map_uia_error`] classifies
-/// means the action was not performed, so it stays an error; a provider that ran out
-/// of time is the one case the element may have acted on anyway, and it answers
-/// [`Impact::Unconfirmed`] rather than inviting a second press.
+/// Map a UIA failure of an ACTUATING call. Everything [`map_uia_error`] classifies means the
+/// action was not performed, so it stays an error; a provider that ran out of time is the one
+/// case the element may have acted anyway, and it answers [`Impact::Unconfirmed`] rather than
+/// inviting a second press.
 fn map_uia_action_error(action: &str, error: &windows::core::Error) -> anyhow::Result<Impact> {
     if error.code().0.cast_unsigned() == UIA_E_TIMEOUT {
         return Ok(Impact::Unconfirmed(format!(
@@ -657,19 +636,17 @@ fn map_uia_action_error(action: &str, error: &windows::core::Error) -> anyhow::R
     Err(map_uia_error(action, error))
 }
 
-/// Map a UIA failure onto the shared taxonomy. The provider's own codes carry the
-/// distinction the model needs: an element that is gone and one that is disabled
-/// each call for a different next step; anything else — a provider that ran out of
-/// time, an unknown code — is `degraded`.
+/// Map a UIA failure onto the shared taxonomy: an element that is gone and one that is disabled
+/// each call for a different next step; anything else (a timeout, an unknown code) is `degraded`.
 fn map_uia_error(action: &str, error: &windows::core::Error) -> anyhow::Error {
-    // Access denied is the typed permission failure, so a caller that must branch
-    // on it (see `core::is_permission_denied`) does not read the text.
+    // Access denied is the typed permission failure, so a caller that must branch on it (see
+    // `core::is_permission_denied`) does not read the text.
     if error.code() == E_ACCESSDENIED {
         return core::permission_denied(format!("failed to {action}: {error}"));
     }
     match error.code().0.cast_unsigned() {
-        // The element is gone: its ref no longer resolves, so re-observing is the way
-        // back — the `stale-element` guidance.
+        // The element is gone: its ref no longer resolves, so re-observing is the way back —
+        // the `stale-element` guidance.
         UIA_E_ELEMENTNOTAVAILABLE => core::taxonomy_error(
             core::ERR_STALE_ELEMENT,
             format!(
@@ -677,8 +654,7 @@ fn map_uia_error(action: &str, error: &windows::core::Error) -> anyhow::Error {
                  element the tree shows now ({error})"
             ),
         ),
-        // The element is there but disabled: the action is not available for this
-        // target, so another element or a coordinate click is the way round it — the
+        // Disabled: another element or a coordinate click is the way round it — the
         // `unsupported` guidance, not a retry.
         UIA_E_ELEMENTNOTENABLED => core::taxonomy_error(
             core::ERR_UNSUPPORTED,

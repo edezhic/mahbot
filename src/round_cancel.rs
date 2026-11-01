@@ -1,17 +1,14 @@
-//! The in-process per-round cancel signals shared by every cancellable durable
-//! round — deep-research runs and the analyze tool's quick rounds — plus the
-//! RAII guard that keeps a round's entry alive for its lifetime.
+//! The in-process per-round cancel signals shared by every cancellable durable round —
+//! deep-research runs and the analyze tool's quick rounds — plus the RAII guard that keeps a
+//! round's entry alive for its lifetime.
 //!
-//! An entry exists from the moment a round starts (fresh dispatch or boot
-//! resume) until it exits (any exit — terminal, abort, cancel, panic — via the
-//! guard's drop). [`cancel`] FIRES the token but deliberately leaves the entry
-//! in place so [`is_cancelled`] keeps returning true for the round's boundary
-//! gates, its completion gate and its delivery path until the round actually
-//! stops. The entry also records the dispatching session's agent id when there
-//! is one ([`registered_caller`]), so a cancel action can prove ownership of a
-//! round whose jobs row the dispatch has not written yet. A [`cancel`] of an id
-//! nothing had registered leaves a bounded mark instead of being lost, so a
-//! registration racing that cancel is pre-fired — see [`CancelState::fired`].
+//! An entry exists from the moment a round starts until it exits (any exit, via the guard's
+//! drop). [`cancel`] FIRES the token but deliberately leaves the entry in place so
+//! [`is_cancelled`] keeps returning true for the round's boundary gates, its completion gate
+//! and its delivery path until the round actually stops. The entry records the dispatching
+//! session's agent id ([`registered_caller`]), so a cancel action can prove ownership of a round
+//! whose jobs row the dispatch has not written yet. A [`cancel`] of an unregistered id leaves a
+//! bounded mark so a racing registration starts pre-fired ([`CancelState::fired`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{LazyLock, Mutex};
@@ -35,18 +32,13 @@ struct CancelRegistry {
 struct CancelState {
     /// One entry per live invocation, keyed by round id.
     rounds: HashMap<String, Entry>,
-    /// Ids a cancel fired for while NOTHING was registered — the one window where
-    /// a canceller and a registrant cross: a boot resume registers only after the
-    /// scan that picked its round, so a cancel landing in between fires into
-    /// nothing. The registration it was waiting for picks the mark up and starts
-    /// pre-fired; the marks nothing claims (a cancel of a round that is already
-    /// gone and will never register again) expire by cap.
+    /// Ids a cancel fired for while NOTHING was registered — the one window where a canceller and a
+    /// registrant cross: a boot resume registers only after the scan that picked its round. The
+    /// registration that follows starts pre-fired; marks nothing claims expire by cap.
     fired: VecDeque<String>,
 }
 
-/// One round's registry entry.
 struct Entry {
-    /// The round's cancel signal.
     token: CancellationToken,
     /// The dispatching session's agent id, when the registration carried one.
     caller: Option<String>,
@@ -55,10 +47,9 @@ struct Entry {
 impl CancelRegistry {
     fn register(&self, job_id: &str, caller: Option<&str>) -> CancelGuard {
         let mut state = self.inner.lock().unwrap_poison();
-        // A cancel that fired while this id had no entry (a boot resume racing a
-        // cancel) is picked up here: the round starts pre-fired and observes it
-        // at its first boundary instead of running to a delivery its caller was
-        // told would not come.
+        // A cancel that fired while this id had no entry is picked up here: the round starts
+        // pre-fired and observes it at its first boundary instead of delivering to a caller told it
+        // would not come.
         let pre_fired = match state.fired.iter().position(|id| id == job_id) {
             Some(at) => {
                 state.fired.remove(at);
@@ -82,8 +73,8 @@ impl CancelRegistry {
         }
     }
 
-    /// Fire a round's cancel signal (the entry stays — see the module doc). An id
-    /// with no entry leaves a mark for the registration racing this cancel.
+    /// Fire a round's cancel signal (the entry stays — see the module doc). An id with no entry
+    /// leaves a mark for the registration racing this cancel.
     fn cancel(&self, job_id: &str) {
         let mut state = self.inner.lock().unwrap_poison();
         if let Some(entry) = state.rounds.get(job_id) {
@@ -108,8 +99,7 @@ impl CancelRegistry {
             .is_some_and(|entry| entry.token.is_cancelled())
     }
 
-    /// The round's cancel signal, for a caller that waits on it instead of
-    /// polling.
+    /// The round's cancel signal, for a caller that waits on it instead of polling.
     fn token(&self, job_id: &str) -> Option<CancellationToken> {
         self.inner
             .lock()
@@ -143,8 +133,8 @@ impl CancelRegistry {
     }
 }
 
-/// RAII guard: removes the round's cancel-signal entry when the invocation
-/// exits — on every path, including panics (Drop runs during unwind).
+/// RAII guard: removes the round's cancel-signal entry when the invocation exits — on every
+/// path, panics included.
 pub(crate) struct CancelGuard {
     job_id: String,
 }
@@ -155,33 +145,28 @@ impl Drop for CancelGuard {
     }
 }
 
-/// Register the round's cancel signal for the duration of one invocation
-/// (fresh dispatch or boot resume). `caller` is the dispatching session's
-/// agent id when there is one. Callers hold the returned guard for the whole
-/// invocation.
+/// Register the round's cancel signal for one invocation (fresh dispatch or boot resume); `caller`
+/// is the dispatching session's agent id. The caller holds the guard for the whole invocation.
 pub(crate) fn register(job_id: &str, caller: Option<&str>) -> CancelGuard {
     CANCELS.register(job_id, caller)
 }
 
-/// Fire the round's cancel signal — the user cancelled a research run from the
-/// Running Agents page, or an analyze round's caller cancelled it with the
-/// analyze tool's cancel action. Must be called BEFORE any row deletion so the
-/// invocation observes it at its next boundary and stops. An id whose invocation
-/// has not registered yet is marked, so the registration that follows starts
-/// cancelled ([`CancelState::fired`]).
+/// Fire the round's cancel signal — the user cancelled a research run from the Running Agents
+/// page, or an analyze round's caller cancelled it. Must be called BEFORE any row deletion so the
+/// invocation observes it at its next boundary. An id that has not registered yet is marked, so
+/// the registration that follows starts cancelled ([`CancelState::fired`]).
 pub(crate) fn cancel(job_id: &str) {
     CANCELS.cancel(job_id);
 }
 
-/// Whether the round's cancel signal has been fired. Consulted by the
-/// invocation's boundary gates, its completion gate and its delivery path.
+/// Whether the round's cancel signal has been fired — consulted by the boundary gates, the
+/// completion gate and the delivery path.
 pub(crate) fn is_cancelled(job_id: &str) -> bool {
     CANCELS.is_cancelled(job_id)
 }
 
-/// Resolve when the round's cancel signal fires — the phase-level stop for a
-/// round's own model calls. Never resolves for an id nothing registered: such an
-/// id is marked, not signalled ([`cancel`]), so nothing can complete that wait.
+/// Resolve when the round's cancel signal fires — the phase-level stop for a round's own model
+/// calls. Never resolves for an unregistered id: such an id is marked, not signalled.
 pub(crate) async fn cancelled(job_id: &str) {
     match CANCELS.token(job_id) {
         Some(token) => token.cancelled().await,
@@ -189,16 +174,14 @@ pub(crate) async fn cancelled(job_id: &str) {
     }
 }
 
-/// Whether a live invocation is registered for the round: a registered id means
-/// it is alive and will observe a fired signal at its next boundary, an
-/// unregistered one means nothing is running for it (or it has already exited).
+/// Whether a live invocation is registered for the round: registered means it is alive and will
+/// observe a fired signal at its next boundary.
 pub(crate) fn is_registered(job_id: &str) -> bool {
     CANCELS.is_registered(job_id)
 }
 
-/// The dispatching session's agent id recorded at [`register`] time, if any —
-/// lets a cancel action prove ownership of a round whose jobs row the dispatch
-/// has not written yet.
+/// The dispatching session's agent id recorded at [`register`] time — lets a cancel action prove
+/// ownership of a round whose jobs row the dispatch has not written yet.
 pub(crate) fn registered_caller(job_id: &str) -> Option<String> {
     CANCELS.registered_caller(job_id)
 }
@@ -207,12 +190,11 @@ pub(crate) fn registered_caller(job_id: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// The signal's lifecycle and the ownership accessor behind it: an
-    /// unregistered id reports no signal, a registered one reports its fired
-    /// signal until its guard drops, and the caller recorded at registration time
-    /// is readable back (so a cancel can prove ownership before the round's row
-    /// exists). A cancel of an unregistered id is not lost — the registration
-    /// racing it starts pre-fired.
+    /// The signal's lifecycle and the ownership accessor: an unregistered id reports no signal, a
+    /// registered one reports its signal until its guard drops, and the caller recorded at
+    /// registration time is readable back (so a cancel can prove ownership before the round's row
+    /// exists). A cancel of an unregistered id is not lost — the registration racing it starts
+    /// pre-fired.
     #[tokio::test]
     async fn cancel_fires_signal_and_guard_removes_entry_on_drop() {
         // Unregistered id: the cancel leaves a mark for a registration racing it
@@ -262,10 +244,9 @@ mod tests {
             "guard drop removes the entry"
         );
 
-        // A cancel of an id nothing registered is not lost: the registration
-        // that races it (a boot resume, which registers only after the scan that
-        // picked its round) starts pre-fired, so the round cannot run and
-        // deliver to a caller already answered as stopped.
+        // A cancel of an id nothing registered is not lost: the registration that races it (a boot
+        // resume, which registers only after the scan that picked its round) starts pre-fired, so
+        // the round cannot run and deliver to a caller already answered as stopped.
         assert!(!is_registered("run_late_register"));
         cancel("run_late_register");
         let late = register("run_late_register", None);

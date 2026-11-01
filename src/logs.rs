@@ -1,25 +1,20 @@
 //! Turso-backed log storage.
 //!
-//! Each log entry is inserted asynchronously via a background channel task.
-//! A broadcast channel feeds live log entries to the Iced native GUI dashboard.
+//! Each log entry is inserted asynchronously via a background channel task; a
+//! broadcast channel feeds live entries to the Iced dashboard.
 //!
 //! # Row scope
 //!
-//! A row's *scope* — the agent that produced it, that agent's role, the
-//! workspace the work belongs to and the ticket it works on — is a column of the
-//! row, never a field of the record: [`parse_tracing_json`] promotes every
-//! spelling of those values out of the record and its span chain and drops the
-//! record's own copy, so a value lives in the scope or in `fields`, never both.
-//! Promotion is what keeps the scope intact: a record that carries the value only
-//! as a field keeps it, now in the header; a record with no such context at all
-//! (a process-level line, a library message, a failure record written without a
-//! workspace on purpose) carries none, and nothing is invented for it.
+//! A row's *scope* — the agent, that agent's role, the workspace and the ticket — is a
+//! column of the row, never a field of the record: [`parse_tracing_json`] promotes every
+//! spelling of those values out of the record and its span chain and drops the record's
+//! own copy, so a value lives in the scope or in `fields`, never both. A record with no
+//! such context (a process-level line, a failure record written without a workspace on
+//! purpose) carries none, and nothing is invented for it.
 //!
-//! `workspace` is the workspace's own name — `personal:<user>` for an account's
-//! folder — never an absolute path: a path a span or field recorded is
-//! normalized to the name it stands for. This is write-time only. Rows written
-//! before the rule keep what they hold; they age out with retention, except the
-//! warnings, which are never pruned.
+//! `workspace` is the workspace's own name — `personal:<user>` for an account's folder —
+//! never an absolute path. Write-time only: rows written before the rule keep what they
+//! hold, and age out with retention except the warnings, which are never pruned.
 
 use crate::db;
 use crate::util::UnwrapPoison;
@@ -39,7 +34,6 @@ use tracing::level_filters::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt};
 
-/// Schema for a single log entry stored in Turso.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LogEntry {
     pub timestamp: String,
@@ -74,9 +68,8 @@ crate::columns! {
 }
 
 impl LogEntry {
-    /// Whether this row matches the Logs page's search text — the live stream's
-    /// half of the search, over the same parts as [`SEARCH_PARTS`]. An empty
-    /// query matches every row.
+    /// Whether this row matches the Logs page's search text, over the same parts as
+    /// [`SEARCH_PARTS`]. An empty query matches every row.
     #[must_use]
     pub fn matches_search(&self, query: &str) -> bool {
         let query = query.to_lowercase();
@@ -89,10 +82,8 @@ impl LogEntry {
 
 /// Turso-backed log store.
 ///
-/// NOTE: This store does NOT use `define_store!`, but does use `crate::columns!`.
-/// The store is opened manually inside [`init_tracing()`] because bootstrapping order
-/// requires logs to be available before other stores are initialized. See
-/// [`LOG_STORE`] for details.
+/// NOTE: opened manually inside [`init_tracing()`] rather than through `define_store!`, because
+/// bootstrapping order needs logs available before the other stores. See [`LOG_STORE`].
 #[derive(Clone, Debug)]
 pub struct LogStore {
     pub(crate) conn: crate::db::Connection,
@@ -100,35 +91,20 @@ pub struct LogStore {
 
 /// Global log store, set during [`init_tracing()`].
 ///
-/// # Access model
-///
-/// This store is initialized inside [`init_tracing()`] — it does NOT have an
-/// `init_global()` like other stores. Do NOT add one. A store file is opened
-/// once per process: the engine holds a whole-file lock on it for the process's
-/// life, and closing ANY descriptor for that file drops every record lock the
-/// process holds on it (see [`crate::db::wal_guard`]) — which is why the
-/// running service never opens a store file a second time. (Two connections to
-/// one open database do not conflict — one `Database` serves many, which is how
-/// the core store's readers work — but a second *open* of the file is what must
-/// not happen.) The log store keeps no reader connections of its own (unlike the
-/// core store) and serves the writes it has on its own writing connection: the
-/// tracing writer's batches, the telemetry drain's records
-/// ([`crate::telemetry`]), the retention pass and the views the Logs page runs. The
-/// only other connection it ever carries is the periodic round's maintenance one
-/// ([`crate::db::Maintenance`]).
-///
-/// In addition to this global, [`init_tracing()`] returns an `Arc<LogStore>` to
-/// its caller, and that store travels on with the boot result to the dashboard —
-/// so the logs page and the global share one connection (which is cheaply
-/// cloneable since `Connection` wraps an `Arc` internally).
+/// It does NOT have an `init_global()` like other stores, and must not get one: a store file is
+/// opened once per process, because closing ANY descriptor for it drops every record lock the
+/// process holds (see [`crate::db::wal_guard`]). One `Database` may serve many connections —
+/// which is how the core store's readers work — but a second *open* of the file must never
+/// happen. This store keeps no reader connections of its own and serves its writes on its own
+/// writing connection: the tracing writer's batches, the telemetry drain's records
+/// ([`crate::telemetry`]), the retention pass, the views the Logs page runs, and the periodic
+/// round's maintenance one ([`crate::db::Maintenance`]). [`init_tracing()`] also returns the
+/// store to its caller, and it travels on to the dashboard, so both share one connection.
 pub static LOG_STORE: OnceCell<LogStore> = OnceCell::const_new();
 
-/// One greppable shell call's grep-engine decision, persisted to the dedicated
-/// `grep_telemetry` table (self-contained — no tool_calls.id correlation).
-/// Owned and bundled into a struct so it can be handed to [`crate::telemetry`];
-/// the caller constructs the row from the serve outcomes + the runtime facts
-/// (actual apply, sentinel re-run, duration, exit). Every platform's grep engine
-/// reports telemetry (the interception runs on both shells).
+/// One greppable shell call's grep-engine decision, persisted to the dedicated `grep_telemetry`
+/// table (self-contained — no `tool_calls.id` correlation). The caller builds it from the serve
+/// outcomes and the runtime facts; every platform's grep engine reports.
 #[derive(Debug)]
 pub(crate) struct GrepTelemetryRow {
     pub command: String,
@@ -145,44 +121,29 @@ pub(crate) struct GrepTelemetryRow {
     pub skipped_count: usize,
     pub duration_ms: Option<i64>,
     pub exit_code: Option<i32>,
-    /// The instant the search ran — stamped where it ran, not where the row is
-    /// written.
+    /// The instant the search ran — stamped where it ran, not where the row is written.
     pub recorded_at: String,
 }
 
-/// The facts of one event that outlived the call that produced it — the process
-/// a command or a chrome-use call left running — recorded by
-/// [`record_stray_event`] as ONE row of its own in the log store.
-///
-/// A call that ran in a browser chrome-use started itself needs no record of its
-/// own: that call FAILS, so its failure text — the browser note the agent is
-/// shown — is already its own record.
+/// The facts of one event that outlived the call that produced it — the process a command or a
+/// chrome-use call left running — recorded by [`record_stray_event`] as ONE row of its own. A
+/// chrome-use call that started itself needs none: it fails, and its failure text is its record.
 pub(crate) struct StrayEvent<'a> {
-    /// The surface that reported it ([`STRAY_SOURCE_SHELL`],
-    /// [`STRAY_SOURCE_CHROME_TOOL`]) — the log entry's `target`.
+    /// The surface that reported it ([`STRAY_SOURCE_SHELL`], [`STRAY_SOURCE_CHROME_TOOL`]).
     pub source: &'a str,
-    /// What outlived the call, stated plainly — the row's `message`, so the row
-    /// says what happened rather than reading as a bare command. Metadata only as
-    /// far as shells are concerned: no raw command lines, no page content, no
-    /// credentials.
+    /// What outlived the call, stated plainly — the row's `message`. Metadata only: no raw
+    /// command lines, no page content, no credentials.
     pub message: &'a str,
-    /// The stop recipe for what was left running, carried verbatim into the row's
-    /// `fields` as `detail`. The record is a record: it carries the recipe even
-    /// where the call's own note offers none — a ReadOnly shell call records it
-    /// too, because it is the mode's own guard, not the recipe, that keeps it out
-    /// of that mode's note.
+    /// The stop recipe for what was left running, carried verbatim into `fields` as `detail` —
+    /// even where the call's own note offers none, because the mode's guard keeps it out there.
     pub recipe: &'a str,
-    /// What must be addressed to stop it (a shell leftover's process group /
-    /// process tree root, or the chrome-use session whose helper was left
-    /// behind); empty when unknown. For a chrome leftover it IS the session whose
-    /// helper was left behind — the same name the row's `session` below carries —
-    /// so that surface names both by definition.
+    /// What must be addressed to stop it (a leftover's process group root, or the chrome-use
+    /// session whose helper was left behind); empty when unknown.
     pub scope: &'a str,
     /// The physical chrome-use session driven; empty for the shell.
     pub session: &'a str,
-    /// The workspace the call ran in — empty only where the surface has none. A
-    /// path is accepted: the row's scope is the workspace's name, so
-    /// [`record_stray_event`] normalizes it.
+    /// The workspace the call ran in — empty only where the surface has none. A path is
+    /// accepted: [`record_stray_event`] normalizes it to the workspace's name.
     pub workspace: &'a str,
     /// How long the recorded call took, when the surface measured it.
     pub duration_ms: Option<i64>,
@@ -193,14 +154,9 @@ pub(crate) const STRAY_SOURCE_SHELL: &str = "shell";
 pub(crate) const STRAY_SOURCE_CHROME_TOOL: &str = "chrome-tool";
 
 impl LogStore {
-    /// Open (or create) the log database at `root/db/logs.db`.
-    ///
-    /// `pub(crate)` (matching every other store's generated `open`) so tests in
-    /// other modules can create a real log store via [`crate::open_test_store!`].
-    ///
-    /// An existing logs store must be usable — [`crate::db::open_store`] refuses
-    /// otherwise, exactly like the main store (the refusal covers both physical
-    /// stores). A missing file is a first launch and is created here.
+    /// Open (or create) the log database at `root/db/logs.db`. `pub(crate)` so tests elsewhere
+    /// can create a real store ([`crate::open_test_store!`]). An existing store must be usable
+    /// ([`crate::db::open_store`] refuses otherwise); a missing file is a first launch.
     pub(crate) async fn open(root: &Path) -> anyhow::Result<Self> {
         let conn = crate::db::open_store(root, "logs", "").await?;
         // The catalog owns the logs schema; a catalog failure is a hard boot failure.
@@ -208,15 +164,10 @@ impl LogStore {
         Ok(Self { conn })
     }
 
-    /// Insert a batch of log entries in a single transaction.
-    ///
-    /// Each entry would otherwise commit (and fsync the WAL) individually —
-    /// in WAL mode the per-commit fsync dominates the insert cost. Batching
-    /// the diagnostics logs into one transaction reduces N commits to one.
-    /// On failure the whole batch is dropped (the caller's [`spawn_log_writer`]
-    /// clears it regardless) — log entries are diagnostics, not durable state. A
-    /// caller that cannot lose a row — the partly-finished-update record
-    /// `self_update::record_update_unfinished` writes — inserts here directly instead.
+    /// Insert a batch of log entries in a single transaction: a per-entry commit would fsync the
+    /// WAL once each, which dominates the insert cost. On failure the whole batch is dropped —
+    /// log entries are diagnostics, not durable state. A caller that cannot lose a row inserts
+    /// here directly instead.
     pub(crate) async fn insert_batch(&self, entries: &[LogEntry]) -> anyhow::Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -251,21 +202,15 @@ impl LogStore {
         Ok(())
     }
 
-    /// Delete stored log records in one Logs view's scope, returning the number
-    /// of rows deleted. `level_filter` uses [`LogQuery::level`] syntax; `None`
-    /// means every level (the All Logs view).
+    /// Delete stored log records in one Logs view's scope, returning the number of rows deleted.
+    /// `level_filter` uses [`LogQuery::level`] syntax; `None` means every level (All Logs).
     ///
-    /// The predicate comes from the same [`build_where_clause`] as the view's
-    /// listing query and is built from the view's level filter alone — the view's
-    /// search text is deliberately never part of it, because the button empties
-    /// the whole view rather than the searched subset. A warning row the telemetry
-    /// queue still holds, at a level this scope covers, goes with it
-    /// ([`crate::telemetry::wipe`]) instead of landing behind the wipe.
-    ///
-    /// Only those rows are held off: the tracing writer's own batched lines and
-    /// [`write_warn_row`]'s straight-to-store row are not queued, so a line or a
-    /// fact produced around the wipe can still land after it — unchanged from
-    /// before, and out of this class's reach.
+    /// The predicate comes from the same [`build_where_clause`] as the listing query and holds
+    /// the level filter alone: the search text is deliberately never part of it, because the
+    /// button empties the whole view rather than the searched subset. A queued warning row at a
+    /// level this scope covers goes with it ([`crate::telemetry::wipe`]). The tracing writer's
+    /// batched lines and [`write_warn_row`] are not queued, so a line produced around the wipe
+    /// can still land after it.
     pub(crate) async fn clear_logs(&self, level_filter: Option<&str>) -> anyhow::Result<u64> {
         let filters = LogQuery {
             level: level_filter.map(str::to_owned),
@@ -291,11 +236,9 @@ impl LogStore {
         .await
     }
 
-    /// Whether any row carrying `message` holds `reason` in its `reason` field.
-    ///
-    /// The reader a caller dedupes against: the rows carrying one message are one
-    /// per distinct reason, so they are all read and parsed here rather than
-    /// matched in SQL against the JSON they store.
+    /// Whether any row carrying `message` holds `reason` in its `reason` field. The rows
+    /// carrying one message are one per distinct reason, so they are read and parsed here
+    /// rather than matched in SQL against the JSON they store.
     pub(crate) async fn has_reason(&self, message: &str, reason: &str) -> anyhow::Result<bool> {
         /// The `reason` field of a row's stored `fields`, or `None` when it holds none.
         fn reason_of(fields: &str) -> Option<String> {
@@ -322,14 +265,9 @@ impl LogStore {
         Ok(false)
     }
 
-    /// Query log entries with optional filters.
-    ///
-    /// Search is a plain substring match over the row's own readable parts — the
-    /// module, the message, the workspace and the ticket — see
-    /// [`build_where_clause`].
-    ///
-    /// Returns `(entries, total_count)` where `entries` respects pagination
-    /// and `total_count` is the total number of entries matching the same filters.
+    /// Query log entries with optional filters. Search is a plain substring match over the
+    /// row's readable parts — module, message, workspace, ticket ([`build_where_clause`]).
+    /// Returns `(entries, total_count)`, the count matching the same filters.
     pub async fn query(&self, filters: &LogQuery) -> anyhow::Result<(Vec<LogEntry>, usize)> {
         let (where_sql, values) = build_where_clause(filters);
 
@@ -368,10 +306,8 @@ impl LogStore {
         Ok((entries, total))
     }
 
-    /// Persist one greppable shell call's grep-engine decision to the dedicated
-    /// `grep_telemetry` table. Metadata only; the caller is the telemetry drain
-    /// task, which drops the row on a failure and notes it. Self-contained for
-    /// grep-specific analysis.
+    /// Persist one greppable shell call's grep-engine decision. Metadata only; the telemetry
+    /// drain task is the caller and drops the row on a failure.
     pub(crate) async fn record_grep_telemetry(&self, row: &GrepTelemetryRow) -> anyhow::Result<()> {
         self.conn
             .execute(
@@ -402,22 +338,14 @@ impl LogStore {
     }
 }
 
-/// Record one event that outlived its call as ONE row of its own in the log store:
-/// a `WARN` row, which the Issues view shows and the retention pass keeps — and
-/// which the tracing writer never carries, because that writer batches lines. The
-/// row says what happened and carries the recipe that stops it, so the occurrence
-/// stays readable after the fact; the agent's own note on the call is the
-/// caller-visible text, never a second record.
+/// Record one event that outlived its call as ONE row of its own: a `WARN` row, which the
+/// Issues view shows and retention keeps, and which the tracing writer never carries because
+/// that writer batches lines. The row says what happened and carries the recipe that stops it.
 ///
-/// The row is attributed to the calling agent from
-/// [`crate::agent::tool_record_attribution`] here, rather than from the caller:
-/// both call sites are tool calls, and that helper documents the attribution.
-///
-/// It is handed to [`crate::telemetry`] like the rest of the product's
-/// by-products: the row carries the instant it is reported, not the instant it is
-/// written, and a process with no logs store at all (the `mahbot chrome` CLI
-/// dispatches before [`init_tracing`] ever runs) records nothing — and builds
-/// nothing here.
+/// It is attributed to the calling agent here ([`crate::agent::tool_record_attribution`]) rather
+/// than by the caller, and handed to [`crate::telemetry`] like the rest of the by-products. A
+/// process with no logs store (the `mahbot chrome` CLI dispatches before [`init_tracing`] runs)
+/// records nothing.
 pub(crate) fn record_stray_event(event: &StrayEvent<'_>) {
     if !crate::telemetry::recording() {
         return;
@@ -441,29 +369,21 @@ pub(crate) fn record_stray_event(event: &StrayEvent<'_>) {
     }));
 }
 
-/// What became of one fact the Issues view is owed ([`record_issue_once`]): a row's own
-/// outcome, the fact already being in the view, and the one way no row carries it.
+/// What became of one fact the Issues view is owed ([`record_issue_once`]).
 pub(crate) enum IssueWrite {
     /// This call is what put the row in the store.
     Written,
-    /// The store already held the very fact: nothing was written now, and a caller that tells
-    /// the owner about every row it writes has already had its turn.
+    /// The store already held the fact: nothing was written now.
     AlreadyRecorded,
-    /// No row carries the fact: this process has no logs store (a caller that dispatched before
-    /// [`init_tracing`] ran, so [`LOG_STORE`] is unset), or the write was attempted and failed
-    /// ([`record_issue_once`] says what each caller does then).
+    /// No row carries the fact: this process has no logs store ([`LOG_STORE`] unset), or the
+    /// write was attempted and failed.
     NotRecorded,
 }
 
-/// Write one durable `WARN` row straight to the logs store — never through the tracing
-/// writer, which batches lines and may drop them. `WARN` is what the Issues view shows and
-/// what the retention pass keeps, so this is where a fact the product must not lose is made
-/// to outlive the process; [`record_issue_once`] is its one caller. (The warning row a
-/// leftover process leaves is the same shape but not that class: it is a by-product, and
-/// goes through [`crate::telemetry`] like the rest of them.)
-///
-/// Nothing is logged here: [`record_issue_once`] warns on a failed write, because its fact
-/// is what the Issues view is owed. Returns `Ok(())` when this call put the row in the
+/// Write one durable `WARN` row straight to the logs store — never through the tracing writer,
+/// which batches lines and may drop them. `WARN` is what the Issues view shows and retention
+/// keeps, so this is where a fact the product must not lose outlives the process;
+/// [`record_issue_once`] is its one caller. Returns `Ok(())` when this call put the row in the
 /// store, `Err` with the store's own error text when the write was attempted and failed.
 async fn write_warn_row(store: &LogStore, entry: LogEntry) -> Result<(), String> {
     let entry = LogEntry {
@@ -478,26 +398,18 @@ async fn write_warn_row(store: &LogStore, entry: LogEntry) -> Result<(), String>
 }
 
 /// Record one durable row for the product's own Issues view, at most once for a
-/// `(message, reason)` pair: the row is written straight to the store (never
-/// through the tracing writer, which batches and can drop lines) at `WARN`, which
-/// the Issues view shows and the retention pass never reaps — so a repeat is a
-/// duplicate, not news. A store read that fails records anyway, and says so at `WARN`:
-/// the dedupe was skipped, so the row is written without it. Fail-open: a process with no store set
-/// ([`LOG_STORE`]) gets [`IssueWrite::NotRecorded`].
+/// `(message, reason)` pair: written straight to the store at `WARN`, which the Issues view
+/// shows and retention never reaps, so a repeat is a duplicate rather than news. A store read
+/// that fails records anyway and says so at `WARN`. Fail-open: a process with no store gets
+/// [`IssueWrite::NotRecorded`].
 ///
-/// `fields` is the row's `fields` JSON object; `reason` is written into it here, so
-/// the dedupe key and the stored row can never disagree. The row has no tool
-/// attribution (empty agent and workspace): it is written from a background task,
-/// not a tool call.
+/// `fields` is the row's `fields` object; `reason` is written into it here, so the dedupe key
+/// and the stored row can never disagree. The row has no tool attribution (empty agent and
+/// workspace): it comes from a background task, not a tool call.
 ///
-/// Reports what became of the fact ([`IssueWrite`]): [`IssueWrite::Written`] for the row this
-/// call made, [`IssueWrite::AlreadyRecorded`] for a reason the Issues view already held, and
-/// [`IssueWrite::NotRecorded`] for the one way no row carries it — no store at all, or a write
-/// that was attempted and failed. A caller holding its OWN de-dupe may mark the reason as told on
-/// [`IssueWrite::Written`] or [`IssueWrite::AlreadyRecorded`]; on a failed write this function
-/// warns with the store's own error text — a warning about the store, not about what was lost —
-/// and a caller whose process exits immediately after ([`crate::self_update`]) adds its own line
-/// naming the fact, so the two are deliberately complementary rather than a repeat.
+/// Reports what became of the fact ([`IssueWrite`]). On a failed write this warns with the
+/// store's own error text — a warning about the store, not about what was lost — and a caller
+/// whose process exits immediately after adds its own line naming the fact.
 pub(crate) async fn record_issue_once(
     message: &str,
     reason: &str,
@@ -555,10 +467,7 @@ pub struct LogQuery {
     pub offset: Option<usize>,
 }
 
-// ── Shared helpers ───────────────────────────────────────────────────────────
-
-/// The level names a [`LogQuery::level`] filter holds, parsed exactly as the
-/// listing query's `WHERE level IN (…)` parses them.
+/// The level names a [`LogQuery::level`] filter holds, parsed as the listing query parses them.
 fn level_names(level_filter: &str) -> Vec<String> {
     level_filter
         .split(',')
@@ -568,20 +477,17 @@ fn level_names(level_filter: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether a row at `level` is inside a clear scope — the Rust side of the
-/// `level IN (…)` [`build_where_clause`] writes for the same filter, over the same
-/// [`level_names`] list. An empty scope is every level (the All Logs view).
+/// Whether a row at `level` is inside a clear scope — the Rust side of the `level IN (…)`
+/// [`build_where_clause`] writes. An empty scope is every level (All Logs).
 fn level_in_scope(levels: &[String], level: &str) -> bool {
     levels.is_empty() || levels.iter().any(|covered| covered == level)
 }
 
-/// One part of the Logs page's search: the `logs` column it is stored in, and
-/// where the entry holds it.
+/// One part of the Logs page's search: the column it is stored in, and where the entry holds it.
 type SearchPart = (&'static str, fn(&LogEntry) -> &str);
 
-/// The row's parts the Logs page's search covers: the module and the message,
-/// plus the two scope values a row is found by — its workspace and its ticket.
-/// Both halves of the search read this list, so neither can cover a different set.
+/// The row's parts the search covers: module and message, plus the two scope values —
+/// workspace and ticket. Both halves of the search read this list.
 const SEARCH_PARTS: [SearchPart; 4] = [
     ("target", |entry| &entry.target),
     ("message", |entry| &entry.message),
@@ -589,9 +495,8 @@ const SEARCH_PARTS: [SearchPart; 4] = [
     ("ticket", |entry| &entry.ticket),
 ];
 
-/// A `LIKE` pattern matching `text` literally anywhere inside a column: `%`, `_`
-/// and the escape character itself are escaped, so a wildcard typed into the
-/// search box is just that character.
+/// A `LIKE` pattern matching `text` literally anywhere inside a column: `%`, `_` and the escape
+/// character itself are escaped, so a wildcard typed into the box is that character.
 fn like_contains(text: &str) -> String {
     let mut pattern = String::with_capacity(text.len() + 2);
     pattern.push('%');
@@ -686,62 +591,38 @@ fn log_entry_from_row(row: &Row) -> anyhow::Result<LogEntry> {
     })
 }
 
-// ── Tracing initialization ──────────────────────────────────────────
-
-/// The default filter, applied as a LAYER filter on the JSON log layer — see
-/// [`log_layers`] for why it must not be a global subscriber filter. `tantivy`
-/// reports through the standard `log` interface, so its directive only ever
-/// matches records that arrive over the bridge [`install_log_bridge`] installs.
+/// The default filter, applied as a LAYER filter on the JSON log layer — see [`log_layers`] for
+/// why it must not be a global subscriber filter. `tantivy` reports through the standard `log`
+/// interface, so its directive only matches records that arrive over the bridge
+/// [`install_log_bridge`] installs.
 ///
-/// `fff` mutes the file-search library the tools and the editor search with —
-/// `fff_search`, `fff_grep`, `fff_query_parser` and `fff_notify_debouncer_full`,
-/// every module of each: EnvFilter matches a target directive as a raw prefix, so
-/// this one directive covers the whole family. It must stay `off`, with no
-/// narrower directive added for one of its modules — the most specific directive
-/// wins, so `fff_search::grep=error` would re-open that module. A level cut is not
-/// enough: it is the pre-existing `fff_search=error` that let the library's
-/// in-memory file table, once full after a burst of newly created files, write
-/// 24 473 identical ERROR rows in under two seconds — rows nothing reaps, which
-/// buried every real problem in the owner's view of the logs. The product's own
-/// record for that condition is the edit tool's notice that a written file could
-/// not be added to the search index (target `mahbot::tools::edit`), and it is
-/// unaffected.
+/// `fff` mutes the file-search library the tools and the editor search with — every module of
+/// the family, since EnvFilter matches a target as a raw prefix. It must stay `off` with no
+/// narrower directive: the most specific directive wins, so `fff_search::grep=error` would
+/// re-open that module. A level cut is not enough — the pre-existing `fff_search=error` let the
+/// library's in-memory file table, once full after a burst of new files, write 24 473 identical
+/// ERROR rows in under two seconds, which buried every real problem in the owner's view. The
+/// product's own record for that condition is the edit tool's notice that a written file could
+/// not be indexed (target `mahbot::tools::edit`), and it is unaffected.
 ///
-/// `pdf_extract` is the PDF text layer that [`crate::document`] converts with: on a
-/// font table whose glyphs and Unicode disagree it warns once per page, so a single
-/// document produces hundreds of near-identical records. The crate is held to ERROR
-/// for that reason — a genuine parse failure is still recorded, everything quieter is
-/// not.
+/// `pdf_extract` warns once per page on a font table whose glyphs and Unicode disagree, so a
+/// single document produces hundreds of near-identical records: it is held to ERROR.
 ///
-/// `usvg`/`resvg` are the vector renderer behind the `rasterize` tool. It
-/// complains per input — an unmatched font family, a reference it could not
-/// resolve, a span it had to fall back for — which is library noise about one
-/// caller's file rather than anything the product did or the owner must see. The
-/// quieter library levels are off entirely; a real refusal reaches the caller as
-/// that tool's own answer.
+/// `usvg`/`resvg` complain per input about one caller's file rather than anything the product
+/// did; their quieter levels are off entirely and a real refusal reaches the caller as that
+/// tool's own answer.
 ///
-/// `iced` is the GUI library the dashboard is built with, reporting through `log`
-/// like the crates above. Its warning channel is the noise here: the event loop
-/// warns when more than three consecutive `RedrawRequested` events in one frame
-/// still made progress — a published message, an invalidated widget or layout. The
-/// product's own redraw handlers invalidate nothing (every layout invalidation in the
-/// GUI sits on an input event) and there is no repaint loop behind it: the frame is
-/// drawn normally afterwards, and the check stays upstream's to keep. What reaches it
-/// is the composer rebuilding when a picture is attached or cleared — a couple of
-/// frames now and then. The family is therefore held to ERROR, like the PDF layer: a
-/// genuine library error still reaches the store, its warnings and quieter levels do
-/// not. One directive covers every `iced_*` crate, because EnvFilter matches a target
-/// as a raw prefix.
+/// `iced`'s warning channel reports recoverable progress (a published message, an invalidated
+/// widget) that the product's own handlers never produce: every layout invalidation sits on an
+/// input event and there is no repaint loop. It is held to ERROR too, and one directive covers
+/// every `iced_*` crate.
 pub(crate) const DEFAULT_LOG_FILTER: &str =
     "info,turso_core=warn,tantivy=warn,fff=off,pdf_extract=error,usvg=off,resvg=off,iced=error";
 
-/// The production layer stack: the JSON log layer, with the log filter applied
-/// PER LAYER, plus the engine-cause capture layer (see
-/// [`crate::db::checkpoint_cause`]). The filter must be a layer filter and never
-/// the subscriber's: installed globally it would drop the engine's DEBUG
-/// checkpoint-failure event and silently degrade the failure record to the
-/// product's constant text. Extracted from [`init_tracing`] so a test can
-/// install the real stack instead of a copy of it.
+/// The production layer stack: the JSON log layer, with the log filter applied PER LAYER, plus
+/// the engine-cause capture layer ([`crate::db::checkpoint_cause`]). The filter must be a layer
+/// filter and never the subscriber's: installed globally it would drop the engine's DEBUG
+/// checkpoint-failure event. Extracted from [`init_tracing`] so a test can install the real stack.
 pub(crate) fn log_layers<W>(
     writer: W,
     env_filter: EnvFilter,
@@ -763,20 +644,13 @@ where
         )
 }
 
-/// Install the `log` → `tracing` bridge: the libraries this product depends on
-/// report through the standard `log` interface, and without this bridge their
-/// records never reach the log store. MahBot requests the forwarding itself, and
-/// a failed install is a boot failure — a `log` logger some dependency installed
-/// before us included — because silently losing every dependency's records is
-/// the regression this bridge exists to prevent. Upstream's `init` provided it
-/// only through the `tracing-log` feature this manifest declares (see
-/// `Cargo.toml`).
+/// Install the `log` → `tracing` bridge: the libraries this product depends on report through
+/// the standard `log` interface, and without this bridge their records never reach the store. A
+/// failed install is a boot failure, because silently losing every dependency's records is the
+/// regression the bridge exists to prevent.
 ///
-/// `level` is what the `log` crate gates on, and it must be the log layer's own
-/// filter level ([`log_bridge_level`]) — never [`LevelFilter::current`], which
-/// the engine-cause capture layer raises to DEBUG process-wide; a higher level
-/// here would let every dependency's `log::debug!` through only to be dropped
-/// again one layer later.
+/// `level` must be the log layer's own filter level ([`log_bridge_level`]) — never
+/// [`LevelFilter::current`], which the engine-cause capture layer raises to DEBUG process-wide.
 fn install_log_bridge(level: LevelFilter) -> anyhow::Result<()> {
     use tracing_log::AsLog;
 
@@ -786,30 +660,23 @@ fn install_log_bridge(level: LevelFilter) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to install the log→tracing bridge: {e}"))
 }
 
-/// The level the `log` bridge gates on: the log layer's own filter's level, read
-/// before the filter moves into [`log_layers`] (see [`install_log_bridge`] for
-/// why the layer's level and not the subscriber's). A filter with no level hint
-/// leaves the bridge at `TRACE`: the layers still decide what is written, so the
-/// conservative side is to hand the `log` crate nothing it has to drop.
+/// The level the `log` bridge gates on: the log layer's own filter level, read before the filter
+/// moves into [`log_layers`]. A filter with no level hint leaves the bridge at `TRACE`: the
+/// layers still decide what is written.
 fn log_bridge_level(env_filter: &EnvFilter) -> LevelFilter {
     env_filter.max_level_hint().unwrap_or(LevelFilter::TRACE)
 }
 
-/// Initialize tracing: JSON to Turso store only (no terminal output).
-/// Returns the [`LogStore`] for querying and a broadcast sender
-/// for live streaming to the Iced native GUI dashboard.
-///
-/// Installs [`log_layers`] as the global subscriber and, for the same filter's
-/// level, the `log` bridge ([`install_log_bridge`]).
+/// Initialize tracing: JSON to the Turso store only (no terminal output). Returns the
+/// [`LogStore`] for querying and a broadcast sender for live streaming to the dashboard.
 pub async fn init_tracing(
     storage_root: &Path,
 ) -> anyhow::Result<(Arc<LogStore>, tokio::sync::broadcast::Sender<String>)> {
     let store = match LogStore::open(storage_root).await {
         Ok(store) => store,
         Err(e) => {
-            // The pre-tracing diagnostics were already handed to stderr (a
-            // best-effort channel, see `boot`); drop the buffer, since the
-            // logs-store replay can never run.
+            // The pre-tracing diagnostics were already handed to stderr; the logs-store replay
+            // can never run, so the buffer is dropped.
             crate::boot::clear_boot_diagnostics();
             return Err(e);
         }
@@ -817,9 +684,8 @@ pub async fn init_tracing(
     LOG_STORE
         .set(store.clone())
         .map_err(|_| anyhow::anyhow!("LOG_STORE already initialized"))?;
-    // The telemetry queue and its drain task start with the store they write to:
-    // a record produced before this has nowhere to go and is dropped without
-    // being counted ([`crate::telemetry`]).
+    // The telemetry queue and its drain task start with the store they write to: a record
+    // produced before this is dropped without being counted ([`crate::telemetry`]).
     crate::telemetry::start();
     let log_store = Arc::new(store);
     let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -835,14 +701,11 @@ pub async fn init_tracing(
     install_log_bridge(bridge_level)?;
     crate::boot::mark_tracing_initialized();
 
-    // Surface pre-tracing boot diagnostics (the pre-flight shape check) in the
-    // logs store so the GUI boot log shows them.
+    // Surface the pre-tracing boot diagnostics in the logs store for the GUI boot log.
     crate::boot::replay_boot_diagnostics();
 
     Ok((log_store, broadcast_tx))
 }
-
-// ── Tracing integration ──────────────────────────────────────────
 
 /// A [`MakeWriter`] that sends JSON log lines over an unbounded channel.
 const fn make_log_writer(tx: UnboundedSender<String>) -> LogWriter {
@@ -874,36 +737,24 @@ impl MakeWriter<'_> for LogWriter {
     }
 }
 
-/// Maximum number of log entries accumulated before a forced DB flush.
-///
-/// Bounds the write-lock hold: one flush inserts at most this many rows in a
-/// single transaction.
+/// Maximum number of log entries accumulated before a forced DB flush: one flush inserts at
+/// most this many rows in a single transaction.
 const LOG_BATCH_MAX: usize = 50;
 
-/// Maximum age of an accumulated batch before a timer flush.
-///
-/// Keeps the DB insert path fresh under low log volume while the GUI live
-/// broadcast (which stays per-message, unbuffered) is unaffected.
+/// Maximum age of an accumulated batch before a timer flush, so the insert path stays fresh
+/// under low log volume while the live broadcast stays per-message.
 const LOG_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Spawn a background task that receives JSON log lines and writes them to Turso
-/// and broadcasts them over the channel to the Iced GUI dashboard.
+/// Spawn a background task that receives JSON log lines and writes them to Turso and broadcasts
+/// them to the dashboard. Only the DB-insert path batches ([`LOG_BATCH_MAX`]-sized, or on the
+/// timer); the GUI broadcast stays per-message.
 ///
-/// The GUI live broadcast stays per-message (no GUI lag). Only the DB-insert
-/// path batches: entries accumulate in [`LOG_BATCH_MAX`]-sized batches flushed
-/// by [`LOG_FLUSH_INTERVAL`], on batch-cap, or on channel close (flush-before-
-/// shutdown). A crash mid-batch loses at most [`LOG_BATCH_MAX`] entries —
-/// acceptable, since DB log inserts are diagnostics, not durable state.
-///
-/// A storage-layer panic (e.g. the shared-WAL frame-index invariant violation)
-/// must not silently freeze persistence: the flush is panic-absorbed with a
-/// bounded number of restarts and backoff, recorded on the visible failure
-/// surface, and past the bound the writer stops flushing with a terminal banner
-/// instead of spinning on a broken connection. During backoff sleeps the writer
-/// is not polling the channel, so lines accumulate in the unbounded channel —
-/// bounded by the backoff schedule, drained once flushing resumes. In the
-/// terminal stopped state the writer keeps draining the channel (broadcast +
-/// drop), so the channel does not grow indefinitely.
+/// A storage-layer panic (e.g. the shared-WAL frame-index invariant violation) must not silently
+/// freeze persistence: the flush is panic-absorbed with a bounded number of restarts and
+/// backoff, recorded on the visible failure surface, and past the bound the writer stops
+/// flushing with a terminal banner instead of spinning on a broken connection. During backoff
+/// the writer is not polling, so lines accumulate in the unbounded channel — bounded by the
+/// backoff schedule. In the stopped state it keeps draining (broadcast + drop).
 fn spawn_log_writer(
     store: Arc<LogStore>,
     rx: UnboundedReceiver<String>,
@@ -912,9 +763,8 @@ fn spawn_log_writer(
     spawn_log_writer_with_interval(store, rx, broadcast, LOG_FLUSH_INTERVAL);
 }
 
-/// [`spawn_log_writer`] with an explicit flush interval — tests inject a
-/// non-production interval (very long, or very short) to exercise the
-/// batch-cap and timer flush paths without racing the production timer.
+/// [`spawn_log_writer`] with an explicit flush interval — tests inject a very long or very
+/// short one to exercise the batch-cap and timer paths without racing the production timer.
 fn spawn_log_writer_with_interval(
     store: Arc<LogStore>,
     mut rx: UnboundedReceiver<String>,
@@ -925,16 +775,15 @@ fn spawn_log_writer_with_interval(
         let mut batch: Vec<LogEntry> = Vec::new();
         let mut flush_timer = tokio::time::interval(flush_interval);
         flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // The first interval tick fires immediately — consume it so the timer
-        // only fires after the first full interval.
+        // The first interval tick fires immediately — consume it so the timer only fires after
+        // the first full interval.
         flush_timer.tick().await;
 
         loop {
             tokio::select! {
                 maybe_line = rx.recv() => {
                     let Some(line) = maybe_line else {
-                        // Channel closed (all senders dropped, e.g. tracing
-                        // teardown on shutdown) — flush remaining and exit.
+                        // Channel closed (tracing teardown on shutdown) — flush and exit.
                         if !log_writer_stopped() {
                             absorb_flush(&store, &mut batch).await;
                         }
@@ -956,9 +805,8 @@ fn spawn_log_writer_with_interval(
                     ));
 
                     if log_writer_stopped() {
-                        // Terminal state: keep draining + broadcasting, but drop
-                        // entries instead of pushing them onto a batch that will
-                        // never be flushed (prevents unbounded memory growth).
+                        // Terminal state: keep draining and broadcasting, but drop entries
+                        // instead of pushing them onto a batch that will never be flushed.
                         continue;
                     }
 
@@ -977,14 +825,10 @@ fn spawn_log_writer_with_interval(
     });
 }
 
-/// Flush the accumulated batch, absorbing storage-layer panics.
-///
-/// A panic here indicates a broken connection (e.g. the frame-index invariant
-/// violation); it is recorded on the failure surface, the batch is dropped, and
-/// the writer backs off before the next attempt. After
-/// [`LOG_WRITER_MAX_CONSECUTIVE_PANICS`] consecutive panics the writer enters
-/// the terminal stopped state (visible banner) rather than spinning forever.
-/// A successful flush resets the consecutive-panic counter.
+/// Flush the accumulated batch, absorbing storage-layer panics: a panic here means a broken
+/// connection, so it is recorded on the failure surface, the batch is dropped and the writer
+/// backs off. After [`LOG_WRITER_MAX_CONSECUTIVE_PANICS`] it enters the terminal stopped state;
+/// a successful flush resets the counter.
 async fn absorb_flush(store: &LogStore, batch: &mut Vec<LogEntry>) {
     let result = AssertUnwindSafe(flush_log_batch(store, batch))
         .catch_unwind()
@@ -1010,16 +854,11 @@ async fn absorb_flush(store: &LogStore, batch: &mut Vec<LogEntry>) {
     }
 }
 
-/// Insert all accumulated entries in one transaction and clear the batch.
-///
-/// On persistent failure the batch is still cleared (entries are dropped) —
-/// log entries are diagnostics, not durable state. Failures are **not**
-/// swallowed: they are recorded on the [`log_write_error_info`] surface
-/// (rendered on the GUI Logs page, which is the surface that always reaches the
-/// user) and reported to stderr at a bounded rate — a channel a launch with no
-/// console discards (see the `boot` module).
-/// No `tracing!` call is made from here — the writer task consumes the tracing
-/// channel, so tracing from inside it would recurse into itself.
+/// Insert all accumulated entries in one transaction and clear the batch. On persistent failure
+/// the batch is still cleared — log entries are diagnostics. Failures are **not** swallowed:
+/// they are recorded on the [`log_write_error_info`] surface (the GUI Logs page banner) and
+/// reported to stderr at a bounded rate. No `tracing!` call is made from here — the writer task
+/// consumes the tracing channel, so tracing from inside it would recurse.
 async fn flush_log_batch(store: &LogStore, batch: &mut Vec<LogEntry>) {
     if batch.is_empty() {
         return;
@@ -1045,13 +884,8 @@ async fn flush_log_batch(store: &LogStore, batch: &mut Vec<LogEntry>) {
     batch.clear();
 }
 
-// ── Log-writer error observability ──────────────────────────────────
-
-/// Maximum number of insert attempts (including the first) for one log batch.
-///
-/// Retrying inside the writer is safe: the batch is only dropped after all
-/// attempts fail. The total added latency is bounded by
-/// `(LOG_INSERT_MAX_ATTEMPTS - 1) × LOG_INSERT_RETRY_BACKOFF`.
+/// Maximum number of insert attempts (including the first) for one log batch. Retrying is safe:
+/// the batch is only dropped after all attempts fail.
 const LOG_INSERT_MAX_ATTEMPTS: usize = 3;
 
 /// Backoff between log-batch insert retry attempts.
@@ -1060,26 +894,20 @@ const LOG_INSERT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_
 /// Minimum interval between stderr warnings about log-write failures.
 const LOG_WRITE_STDERR_WARN_INTERVAL_MS: u64 = 60_000;
 
-/// Consecutive storage-panic restarts before the writer stops flushing
-/// permanently. A storage-layer panic indicates a broken connection (e.g. the
-/// shared-WAL frame-index invariant violation); retrying past this bound would
-/// spin forever on a connection that keeps panicking.
+/// Consecutive storage-panic restarts before the writer stops flushing permanently: retrying
+/// past this bound would spin forever on a connection that keeps panicking.
 const LOG_WRITER_MAX_CONSECUTIVE_PANICS: u32 = 5;
 
 /// Base backoff after a storage panic (doubles per consecutive panic, capped).
 const LOG_WRITER_PANIC_BACKOFF_MS: u64 = 500;
 
-/// Consecutive-panic restart state machine for the log writer.
-///
-/// Pure and unit-testable; the global writer state ([`LOG_WRITE_LAST_ERROR`])
-/// mirrors this struct.
+/// Consecutive-panic restart state machine for the log writer. Pure and unit-testable; the
+/// global writer state ([`LOG_WRITE_LAST_ERROR`]) mirrors it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LogWriterPanicState {
-    /// Consecutive storage-panic restarts in progress (0 when the last flush
-    /// succeeded).
+    /// Consecutive storage-panic restarts in progress (0 when the last flush succeeded).
     consecutive_panics: u32,
-    /// True once the writer stopped flushing permanently after exceeding
-    /// [`LOG_WRITER_MAX_CONSECUTIVE_PANICS`] — the terminal banner state.
+    /// True once the writer stopped flushing permanently — the terminal banner state.
     pub writer_stopped: bool,
 }
 
@@ -1094,9 +922,8 @@ impl LogWriterPanicState {
         self.consecutive_panics
     }
 
-    /// Reset the consecutive-panic counter after a successful flush. The
-    /// terminal stopped state is sticky — a stopped writer never flushes again
-    /// (the broken connection cannot be healed without reopening the store).
+    /// Reset the consecutive-panic counter after a successful flush. The terminal stopped state
+    /// is sticky: a stopped writer never flushes again.
     fn reset(&mut self) {
         self.consecutive_panics = 0;
     }
@@ -1105,12 +932,11 @@ impl LogWriterPanicState {
 /// Snapshot of the log-writer failure surface, for display and tests.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct LogWriteErrorInfo {
-    /// Total failures recorded since startup — batch insert failures, writer
-    /// panics, and panics out of one telemetry record's own write.
+    /// Total failures recorded since startup — batch insert failures, writer panics, and panics
+    /// out of one telemetry record's own write.
     pub count: u64,
-    /// Rows the telemetry queue dropped because it was full
-    /// ([`crate::telemetry`]), counted apart from write failures: a drop says the
-    /// queue had no room, which a perfectly healthy store can also cause.
+    /// Rows the telemetry queue dropped because it was full ([`crate::telemetry`]), counted
+    /// apart from write failures: a healthy store can also drop for want of room.
     pub dropped: u64,
     /// RFC 3339 timestamp of the most recent failure.
     pub last_timestamp: Option<String>,
@@ -1120,12 +946,8 @@ pub(crate) struct LogWriteErrorInfo {
     pub panic_state: LogWriterPanicState,
 }
 
-/// Most recent log-batch insert failure observed by the writer task.
-///
-/// Count, timestamp, and message live behind a single mutex so readers always
-/// observe a consistent triple — a torn pair (timestamp from one failure with
-/// the message from the next) would be misleading on the observability
-/// surface.
+/// Most recent log-batch insert failure observed by the writer task. Count, timestamp and
+/// message live behind one mutex so readers never observe a torn pair.
 static LOG_WRITE_LAST_ERROR: std::sync::Mutex<LogWriteErrorInfo> =
     std::sync::Mutex::new(LogWriteErrorInfo {
         count: 0,
@@ -1138,13 +960,10 @@ static LOG_WRITE_LAST_ERROR: std::sync::Mutex<LogWriteErrorInfo> =
         },
     });
 
-/// Rate-limited stderr reporting for this surface.
-///
-/// stderr is not routed through tracing, so this cannot recurse into the writer
-/// task — and it is best-effort delivery (see the `boot` module), which is why
-/// [`log_write_error_info`] is the surface a user can always read.
-///
-/// One reporter per kind of line: a burst of one kind must not hide the other.
+/// Rate-limited stderr reporting for this surface. stderr is not routed through tracing, so
+/// this cannot recurse into the writer task, and it is best-effort delivery — which is why
+/// [`log_write_error_info`] is the surface a user can always read. One reporter per kind of
+/// line: a burst of one kind must not hide the other.
 struct StderrReporter {
     last_ms: AtomicU64,
 }
@@ -1156,9 +975,8 @@ impl StderrReporter {
         }
     }
 
-    /// Print the line `line` builds unless this reporter's last one went out
-    /// within [`LOG_WRITE_STDERR_WARN_INTERVAL_MS`]. The line is built only when
-    /// it is going to be printed, so a suppressed report costs no allocation.
+    /// Print the line `line` builds unless this reporter's last one went out within
+    /// [`LOG_WRITE_STDERR_WARN_INTERVAL_MS`]. Built only when it will be printed.
     fn emit(&self, line: impl FnOnce() -> String) {
         let now_ms = crate::util::unix_millis();
         if now_ms.saturating_sub(self.last_ms.load(Ordering::SeqCst))
@@ -1176,15 +994,12 @@ static LOG_WRITE_STDERR: StderrReporter = StderrReporter::new();
 /// The line about telemetry records the queue dropped.
 static TELEMETRY_DROP_STDERR: StderrReporter = StderrReporter::new();
 
-/// Rows the telemetry queue dropped that no line has reported yet. The producing
-/// path only adds here; the drain task prints ([`report_telemetry_drops`]).
+/// Rows the telemetry queue dropped that no line has reported yet. The producing path only
+/// adds here; the drain task prints ([`report_telemetry_drops`]).
 static TELEMETRY_DROPS_UNREPORTED: AtomicU64 = AtomicU64::new(0);
 
-/// Read the log-writer failure surface.
-///
-/// This is the sanctioned surface for log-persistence outages: the GUI Logs
-/// page renders a warning banner from it. It is safe to call from anywhere
-/// (no tracing involved), including from inside the writer task itself.
+/// Read the log-writer failure surface — the sanctioned one, which the GUI Logs page renders a
+/// banner from. Safe to call from anywhere, including inside the writer task.
 #[must_use]
 pub(crate) fn log_write_error_info() -> LogWriteErrorInfo {
     LOG_WRITE_LAST_ERROR.lock().unwrap_poison().clone()
@@ -1199,31 +1014,27 @@ fn record_log_write_failure(error: Option<anyhow::Error>) {
     record_log_write_failure_impl(&message, LogFailureKind::Insert);
 }
 
-/// Record a storage-layer panic absorbed by the writer. Returns the updated
-/// consecutive-panic count. The terminal stopped state additionally gets an
-/// unconditional banner from the caller.
+/// Record a storage-layer panic absorbed by the writer. Returns the updated consecutive-panic
+/// count. The terminal stopped state additionally gets an unconditional banner from the caller.
 fn record_log_writer_panic(message: &str) -> u32 {
     record_log_write_failure_impl(message, LogFailureKind::WriterPanic)
 }
 
-/// Record a storage-layer panic absorbed by the telemetry drain task's own write
-/// of one record ([`crate::telemetry`]).
-///
-/// A broken connection is how the engine reports some failures, and it must not
-/// take the drain task with it: the record is dropped like any failed write, and
-/// the next one is still attempted.
+/// Record a storage-layer panic absorbed by the telemetry drain task's own write of one record
+/// ([`crate::telemetry`]). A broken connection must not take the drain task with it: the record
+/// is dropped like any failed write and the next one is still attempted.
 pub(crate) fn record_telemetry_write_panic(message: &str) {
     record_log_write_failure_impl(message, LogFailureKind::RecordPanic);
 }
 
-/// Which failure kind is being recorded — drives the stderr label and whether
-/// the storage-panic restart counter is bumped.
+/// Which failure kind is being recorded — drives the stderr label and whether the
+/// storage-panic restart counter is bumped.
 #[derive(Clone, Copy)]
 enum LogFailureKind {
     Insert,
     WriterPanic,
-    /// A panic out of one telemetry record's own write — the drain task's write,
-    /// not the log writer's batch, so it leaves the restart counter alone.
+    /// A panic out of one telemetry record's own write — the drain task's, so it leaves the
+    /// restart counter alone.
     RecordPanic,
 }
 
@@ -1241,24 +1052,18 @@ impl LogFailureKind {
     }
 }
 
-/// Record rows the telemetry queue dropped because it was full
-/// ([`crate::telemetry`]).
+/// Record rows the telemetry queue dropped because it was full ([`crate::telemetry`]).
 ///
-/// Not a write failure and deliberately not counted as one: the store may be
-/// perfectly healthy while a burst has nowhere to go, so the two numbers are kept
-/// apart and reported through the same surface — the GUI Logs page's banner, which
-/// reads this counter itself, and the line [`report_telemetry_drops`] prints.
-///
-/// The producing path only adds to two counters here; nothing about the records'
-/// fate is decided or printed on it.
+/// Not a write failure and deliberately not counted as one: the store may be perfectly healthy
+/// while a burst has nowhere to go, so the two numbers are kept apart and reported through the
+/// same surface — the GUI Logs page banner and the line [`report_telemetry_drops`] prints.
 pub(crate) fn record_telemetry_drop(rows: u64) {
     LOG_WRITE_LAST_ERROR.lock().unwrap_poison().dropped += rows;
     TELEMETRY_DROPS_UNREPORTED.fetch_add(rows, Ordering::Relaxed);
 }
 
-/// Print the line about the drops the producing path only counted — the drain
-/// task's job, so no thread doing the work ever writes to stderr about its own
-/// bookkeeping. Rate-limited like the write-failure line; a report the limiter
+/// Print the line about the drops the producing path only counted — the drain task's job, so no
+/// thread doing the work writes to stderr about its own bookkeeping. A report the limiter
 /// suppresses is still in the counter.
 pub(crate) fn report_telemetry_drops() {
     let rows = TELEMETRY_DROPS_UNREPORTED.swap(0, Ordering::Relaxed);
@@ -1270,10 +1075,8 @@ pub(crate) fn report_telemetry_drops() {
         .emit(|| format!("telemetry queue full: {rows} row(s) dropped, {total} in total"));
 }
 
-/// Shared failure-recording core: bumps the counter, stamps timestamp/message,
-/// optionally records a storage-panic restart, and emits a rate-limited stderr
-/// warning (`kind` labels the failure on the stderr line). stderr is not
-/// routed through tracing, so this cannot recurse into the writer task.
+/// Shared failure-recording core: bumps the counter, stamps timestamp and message, optionally
+/// records a storage-panic restart, and emits a rate-limited stderr warning.
 fn record_log_write_failure_impl(message: &str, kind: LogFailureKind) -> u32 {
     let (count, consecutive) = {
         let mut guard = LOG_WRITE_LAST_ERROR.lock().unwrap_poison();
@@ -1291,9 +1094,8 @@ fn record_log_write_failure_impl(message: &str, kind: LogFailureKind) -> u32 {
     consecutive
 }
 
-/// Reset the consecutive-panic counter after a successful flush. The terminal
-/// stopped state is sticky — only [`LogWriterPanicState::reset`]'s counter is
-/// cleared here, a stopped writer never flushes again.
+/// Reset the consecutive-panic counter after a successful flush. A stopped writer never flushes
+/// again, so only the counter is cleared.
 fn reset_log_writer_panic_state() {
     let mut guard = LOG_WRITE_LAST_ERROR.lock().unwrap_poison();
     guard.panic_state.reset();
@@ -1308,10 +1110,8 @@ fn log_writer_stopped() -> bool {
         .writer_stopped
 }
 
-/// Backoff after the `n`-th consecutive storage panic: 500ms, 1s, 2s, … capped
-/// at 30s. The terminal bound ([`LOG_WRITER_MAX_CONSECUTIVE_PANICS`]) ends the
-/// sequence before the cap engages today; the cap guards a future bound
-/// increase.
+/// Backoff after the `n`-th consecutive storage panic: 500ms, 1s, 2s, … capped at 30s. The terminal
+/// bound ends the sequence before the cap engages today; the cap guards a future bound increase.
 fn log_writer_panic_backoff(consecutive: u32) -> std::time::Duration {
     let shift = consecutive.saturating_sub(1).min(6);
     let ms = LOG_WRITER_PANIC_BACKOFF_MS.saturating_mul(1 << shift);
@@ -1323,8 +1123,8 @@ fn get_str_or_empty(val: &serde_json::Value, key: &str) -> String {
     json::get_opt_str(val, key).unwrap_or("").to_string()
 }
 
-/// Parse a tracing-subscriber JSON line into a `LogEntry`, promoting the row's
-/// scope out of the record and its span chain.
+/// Parse a tracing-subscriber JSON line into a `LogEntry`, promoting the row's scope out of the
+/// record and its span chain.
 fn parse_tracing_json(line: &str) -> Option<LogEntry> {
     let val: serde_json::Value = serde_json::from_str(line).ok()?;
 
@@ -1364,16 +1164,15 @@ fn parse_tracing_json(line: &str) -> Option<LogEntry> {
     })
 }
 
-/// The field names each scope value may be carried under, most specific first: a
-/// record's own copy of any of them is the value the row's column carries.
+/// The field names each scope value may be carried under, most specific first: a record's own
+/// copy of any of them is the value the row's column carries.
 const AGENT_ID_KEYS: &[&str] = &["agent_id"];
 const AGENT_ROLE_KEYS: &[&str] = &["role", "agent_role"];
 const WORKSPACE_KEYS: &[&str] = &["workspace", "workspace_name", "workspace_path"];
 const TICKET_KEYS: &[&str] = &["ticket", "ticket_id"];
 
-/// A row's scope: the agent that produced it, that agent's role, the workspace
-/// the work belongs to and the ticket it works on — the values the row carries
-/// itself and the Logs page shows as its context.
+/// A row's scope: the agent, its role, the workspace and the ticket — the values the row
+/// carries itself and the Logs page shows as its context.
 #[derive(Default)]
 struct LogScope {
     agent_id: String,
@@ -1383,8 +1182,7 @@ struct LogScope {
 }
 
 impl LogScope {
-    /// Fill whatever this scope does not hold yet from one source, leaving the
-    /// values it already holds alone.
+    /// Fill whatever this scope does not hold yet from one source, leaving the rest alone.
     fn promote(&mut self, source: &serde_json::Value) {
         fill(&mut self.agent_id, source, AGENT_ID_KEYS);
         fill(&mut self.agent_role, source, AGENT_ROLE_KEYS);
@@ -1410,15 +1208,10 @@ fn first_value<'a>(source: &'a serde_json::Value, keys: &[&str]) -> Option<&'a s
         .find_map(|key| json::get_opt_str(source, key).filter(|value| !value.is_empty()))
 }
 
-/// Promote the row's scope out of the record's own fields and its span chain.
-///
-/// The record's own fields win where present, then the spans from the innermost
-/// outwards — the agent that is running wins over the context it runs in, so a
-/// per-ticket span on a phase body scopes every line inside it while an agent's
-/// own span still names that agent. Each value is taken from the first source
-/// that carries it, so a record that states only its workspace keeps the agent,
-/// role and ticket of the span around it. `tracing-subscriber`'s JSON formatter
-/// writes both `span` (the innermost) and `spans` (root to leaf).
+/// Promote the row's scope out of the record's own fields and its span chain: the record's own
+/// fields win where present, then the spans innermost outwards, so the agent that is running
+/// wins over the context it runs in and each value is taken from the first source that carries
+/// it. `tracing-subscriber`'s JSON formatter writes both `span` and `spans` (root to leaf).
 fn extract_scope(val: &serde_json::Value) -> LogScope {
     let spans = val
         .get("spans")
@@ -1435,26 +1228,23 @@ fn extract_scope(val: &serde_json::Value) -> LogScope {
     scope
 }
 
-/// Whether `key` is one of the names a scope value is carried under — such a key
-/// is never a field of the record: the value lives in the row's scope.
+/// Whether `key` is one of the names a scope value is carried under — such a key is never a
+/// field of the record.
 fn is_scope_key(key: &str) -> bool {
     [AGENT_ID_KEYS, AGENT_ROLE_KEYS, WORKSPACE_KEYS, TICKET_KEYS]
         .iter()
         .any(|keys| keys.contains(&key))
 }
 
-/// Drop the record's own copy of every scope value: the row carries the value
-/// itself now, and a scope value is never also a field of the same record.
+/// Drop the record's own copy of every scope value: the row carries it now, and a scope value
+/// is never also a field of the same record.
 fn strip_scope_fields(fields: &mut serde_json::Map<String, serde_json::Value>) {
     fields.retain(|key, _| !is_scope_key(key));
 }
 
-/// The row's `workspace` value: the workspace's name, never a path.
-///
-/// A raw value is normalized to the name it stands for: a folder in the
-/// userspaces directory ([`crate::users::userspaces_root`]) is an account's
-/// personal workspace, and any other path's last component is the folder it
-/// points at.
+/// The row's `workspace` value: the workspace's name, never a path. A folder in the userspaces
+/// directory ([`crate::users::userspaces_root`]) is an account's personal workspace; any other
+/// path's last component is the folder it points at.
 fn workspace_name(value: &str) -> String {
     let mut parts = value.rsplit(['/', '\\']).filter(|part| !part.is_empty());
     let Some(last) = parts.next() else {
@@ -1471,16 +1261,11 @@ fn workspace_name(value: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The row a written line becomes, in the shapes the layer produces. A
-    /// record's scope is the row's, not the record's: every spelling of a scope
-    /// value is taken from the record's own fields where present, then from its
-    /// span chain — leaving the values the record does not state alone, and never
-    /// repeating a promoted value as a field. A workspace recorded as a path
-    /// becomes the workspace it names, and an account's personal folder keeps its
-    /// own spelling.
-    ///
-    /// Each case: name, line, the four scope columns, and the fields the row must
-    /// be left holding (`None` where the case makes no claim about them).
+    /// The row a written line becomes. A record's scope is the row's, not the record's: every
+    /// spelling is taken from the record's own fields where present, then from its span chain, and
+    /// never repeated as a field. A workspace recorded as a path becomes the name it stands for.
+    /// Each case: name, line, the four scope columns, and the fields the row must be left holding
+    /// (`None` where the case makes no claim).
     #[expect(clippy::too_many_lines)] // one table row per record shape
     #[test]
     fn parse_tracing_json_shapes_each_record() {
@@ -1593,8 +1378,7 @@ mod tests {
         }
     }
 
-    /// Create a temporary LogStore for tests.
-    /// Returns the store and a TempDir that must be held to prevent premature cleanup.
+    /// Create a temporary LogStore for tests. Returns the store and a TempDir that must be held.
     async fn test_store() -> (Arc<LogStore>, tempfile::TempDir) {
         let (store, dir) = crate::open_test_store!(LogStore, "log");
         (Arc::new(store), dir)
@@ -1605,9 +1389,8 @@ mod tests {
         store.insert_batch(entries).await.unwrap();
     }
 
-    /// The per-view clear scopes: the Issues scope deletes warnings and errors
-    /// only, the All Logs scope deletes every stored record (including the ones
-    /// the Issues view shows).
+    /// The per-view clear scopes: the Issues scope deletes warnings and errors only, the All
+    /// Logs scope deletes every stored record.
     #[tokio::test]
     // the clear drives a wipe, which purges the process-global telemetry queue
     #[serial_test::serial(provider)]
@@ -1643,9 +1426,8 @@ mod tests {
         assert_eq!(store.query(&LogQuery::default()).await.unwrap().1, 0);
     }
 
-    /// [`LogStore::has_reason`] finds a reason any row carrying a message holds, so
-    /// a reason already recorded is never recorded again — and a reason the store
-    /// has not been told is not found.
+    /// [`LogStore::has_reason`] finds a reason any row carrying a message holds, so a reason
+    /// already recorded is never recorded again.
     #[tokio::test]
     async fn a_reason_already_recorded_is_found_and_a_new_one_is_not() {
         let (store, _dir) = test_store().await;
@@ -1693,9 +1475,8 @@ mod tests {
         }
     }
 
-    /// Open a healthy store in a fresh temp dir, seed one entry, and checkpoint
-    /// so all pages land in the main DB file, then close it. Returns the dir —
-    /// it must be held for the lifetime of the reopened store.
+    /// Open a healthy store in a fresh temp dir, seed one entry, and checkpoint so all pages
+    /// land in the main DB file, then close it. Returns the dir, which must be held.
     async fn seeded_closed_store() -> tempfile::TempDir {
         let tmp = tempfile::TempDir::new().expect("temp dir for test");
         {
@@ -1722,10 +1503,8 @@ mod tests {
         tmp
     }
 
-    /// Poll `store.query` until the total entry count reaches `expected` or the
-    /// timeout elapses. Avoids the fixed-sleep races of the earlier version
-    /// (the writer and the test share a runtime, so wall-clock sleeps can be
-    /// skewed by writer-side DB work on loaded machines).
+    /// Poll `store.query` until the total entry count reaches `expected` or the timeout elapses,
+    /// rather than sleeping: the writer and the test share a runtime.
     async fn wait_for_total(store: &LogStore, expected: usize, timeout: std::time::Duration) {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -1741,12 +1520,9 @@ mod tests {
         }
     }
 
-    /// [`flush_log_batch`] on both outcomes: a healthy flush persists the batch's
-    /// rows and records no write failure; a batch the store refuses is dropped
-    /// all the same — entries are diagnostics — and the refusal is visible on the
-    /// sanctioned surface. The bounded-retry retry-then-succeed branch
-    /// (`LOG_INSERT_MAX_ATTEMPTS` loop) is deliberately left untested since
-    /// failure injection isn't worth the machinery.
+    /// [`flush_log_batch`] on both outcomes: a healthy flush persists the rows and records no
+    /// failure; a batch the store refuses is dropped all the same and the refusal is visible on
+    /// the sanctioned surface. The retry-then-succeed branch is deliberately untested.
     #[tokio::test]
     #[serial_test::serial(log_surface)] // serializes the process-global write-failure counter
     async fn flush_log_batch_persists_and_records_only_a_refused_batch() {
@@ -1772,8 +1548,7 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(entries[0].message, "persisted");
 
-        // Deterministic insert failure: drop the logs table through the store's
-        // own connection, so the batch INSERT fails at prepare time.
+        // Deterministic insert failure: drop the logs table through the store's own connection.
         let (store, _dir) = test_store().await;
         store
             .conn
@@ -1790,8 +1565,7 @@ mod tests {
         }];
         flush_log_batch(&store, &mut batch).await;
 
-        // The batch must be dropped and the failure must be visible on the
-        // sanctioned surface.
+        // The batch must be dropped and the failure visible on the sanctioned surface.
         assert!(batch.is_empty(), "failed batch must still be cleared");
         let info = log_write_error_info();
         assert!(
@@ -1805,13 +1579,11 @@ mod tests {
         );
     }
 
-    /// The writer's three ways into the store, one test each: closing the channel
-    /// flushes what is buffered (the rows landing newest first), a full batch
-    /// flushes at the cap while the timer holds the odd earlier entry, and the
-    /// timer flushes a lone buffered entry with neither cap nor close.
+    /// The writer's three ways into the store: closing the channel flushes what is buffered, a
+    /// full batch flushes at the cap while the timer holds the odd earlier entry, and the timer
+    /// flushes a lone buffered entry.
     #[tokio::test]
     async fn the_log_writer_flushes_on_close_the_batch_cap_and_the_timer() {
-        // Close: two records reach the store, parsed, newest first.
         let (store, _dir) = test_store().await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (broadcast_tx, _) = tokio::sync::broadcast::channel(256);
@@ -1829,8 +1601,6 @@ mod tests {
         )
         .unwrap();
 
-        // Poll instead of a fixed sleep: the writer shares this runtime and
-        // its DB work can lag under load (see `wait_for_total`).
         drop(tx);
         wait_for_total(&store, 2, std::time::Duration::from_secs(2)).await;
 
@@ -1840,8 +1610,8 @@ mod tests {
         assert_eq!(entries[0].message, "oh no");
         assert_eq!(entries[1].message, "hi");
 
-        // Writer 1: a flush interval long enough that the timer can never fire
-        // during the test — only the batch-cap path can insert rows.
+        // Writer 1: a flush interval long enough that the timer can never fire — only the
+        // batch-cap path can insert rows.
         let (store, _dir) = test_store().await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (broadcast_tx, _) = tokio::sync::broadcast::channel(256);
@@ -1852,15 +1622,14 @@ mod tests {
             std::time::Duration::from_mins(1),
         );
 
-        // One entry first — below the batch cap, so it stays buffered.
         tx.send(
             r#"{"timestamp":"2025-01-01T00:00:02Z","level":"INFO","target":"test","fields":{"message":"timer flush"}}"#
                 .to_string(),
         )
         .unwrap();
 
-        // Then LOG_BATCH_MAX more entries — the batch-cap flush fires as soon
-        // as the writer accumulates a full batch (the timer cannot fire here).
+        // Then LOG_BATCH_MAX more entries — the batch-cap flush fires as soon as a full batch
+        // accumulates (the timer cannot fire here).
         for i in 0..LOG_BATCH_MAX {
             tx.send(
                 format!(
@@ -1870,12 +1639,9 @@ mod tests {
             .unwrap();
         }
 
-        // The cap flush must insert exactly LOG_BATCH_MAX entries; the lone
-        // earlier entry is still buffered (60s timer never fired).
         wait_for_total(&store, LOG_BATCH_MAX, std::time::Duration::from_secs(10)).await;
 
-        // Writer 2: a very short flush interval — the timer path must flush a
-        // lone buffered entry without needing the cap or channel close.
+        // Writer 2: a very short flush interval — the timer path must flush a lone entry.
         let (store2, _dir2) = test_store().await;
         let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel();
         let (broadcast_tx2, _) = tokio::sync::broadcast::channel(256);
@@ -1897,14 +1663,12 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    /// What the search box reads over stored rows: a plain substring over the
-    /// message and the target, a wildcard character that is just that character
-    /// (an empty search returning every row), the row's own scope — workspace and
-    /// ticket — and the level, target and since filters it combines with.
+    /// What the search box reads over stored rows: a plain substring over the message and the
+    /// target, a wildcard character that is just that character (an empty search returning every
+    /// row), the row's own scope, and the level, target and since filters it combines with.
     #[expect(clippy::too_many_lines)] // four fixtures, one claim each
     #[tokio::test]
     async fn stored_search_matches_substrings_targets_scope_and_filters() {
-        // A plain substring over the message and the target.
         let (store, _dir) = test_store().await;
         seed_entries(
             &store,
@@ -1933,7 +1697,6 @@ mod tests {
             ],
         )
         .await;
-        // "proc" matches "processing" and "process"; the target is read too.
         for (search, total) in [("proc", 2), ("request", 1), ("module", 3)] {
             let (results, found) = store
                 .query(&LogQuery {
@@ -1949,7 +1712,6 @@ mod tests {
             }
         }
 
-        // The search combined with the level, target and since filters.
         let (store, _dir) = test_store().await;
         seed_entries(
             &store,
@@ -2008,10 +1770,6 @@ mod tests {
             .unwrap();
         assert_eq!(total, 1, "only entry after timestamp matching 'process'");
 
-        // The row's scope: a workspace or a ticket typed into the box finds the
-        // rows that belong to it, and a wildcard character is the character —
-        // the stored-row query reads exactly like the live filter's plain
-        // substring match.
         let (store, _dir) = test_store().await;
         seed_entries(
             &store,
@@ -2050,8 +1808,6 @@ mod tests {
             assert_eq!(found, total, "search {search:?}");
         }
 
-        // Characters the query language would treat as syntax are literal here,
-        // and no search at all is every row.
         let (store, _dir) = test_store().await;
         seed_entries(
             &store,
@@ -2095,9 +1851,8 @@ mod tests {
         assert_eq!(total, 2, "no search filter should return all entries");
     }
 
-    /// The live filter matches the same four parts the stored-row query binds, so
-    /// a ticket or a workspace typed into the box finds a live row exactly as it
-    /// finds a stored one.
+    /// The live filter matches the same four parts the stored-row query binds, so a ticket or a
+    /// workspace typed into the box finds a live row exactly as it finds a stored one.
     #[test]
     fn matches_search_covers_the_row_scope() {
         let entry = LogEntry {
@@ -2113,9 +1868,8 @@ mod tests {
         assert!(!entry.matches_search("mahbot_rlx"));
     }
 
-    /// The writer's panic-restart bound: after enough consecutive panics the
-    /// writer enters the terminal stopped state (banner), and a successful
-    /// flush resets the counter (the stopped state is sticky).
+    /// The writer's panic-restart bound: past it the writer enters the terminal stopped state
+    /// (banner), and a successful flush resets the counter.
     #[test]
     fn test_log_writer_panic_state_machine() {
         let mut state = LogWriterPanicState::default();
@@ -2136,16 +1890,11 @@ mod tests {
         );
     }
 
-    /// Boot-time refusal: a logs store whose main DB file is corrupt is never
-    /// quarantined or recreated — `LogStore::open` errors with a `StoreRefusal`
-    /// naming its integrity check and leaves the file byte-for-byte as it was.
-    ///
-    /// The open only scans when the start has a reason for it (see
-    /// `db::open_present_store`); here the reason is one catalog entry still to
-    /// apply — an install one migration behind — which is the deterministic
-    /// stand-in for a start that is not an ordinary clean one. The ledger keeps
-    /// its other rows, so the product-schema gate passes and the scan is what
-    /// refuses.
+    /// Boot-time refusal: a logs store whose main DB file is corrupt is never quarantined or
+    /// recreated — `LogStore::open` errors with a `StoreRefusal` naming its integrity check and
+    /// leaves the file byte for byte as it was. The open only scans when the start has a reason
+    /// for it (see `db::open_present_store`); here it is one catalog entry still to apply, the
+    /// deterministic stand-in for a start that is not an ordinary clean one.
     #[tokio::test]
     async fn test_log_store_open_refuses_corrupt_store() {
         let tmp = seeded_closed_store().await;
@@ -2157,9 +1906,8 @@ mod tests {
             .find(|migration| migration.target == crate::db::migrations::TargetDb::Logs)
             .expect("the logs catalog has entries")
             .id;
-        // Put the store one entry behind, then hand it off clean again (the
-        // checkpoint keeps the journal empty, so the pending catalog entry is the
-        // one reason left).
+        // Put the store one entry behind, then hand it off clean again (the checkpoint keeps the
+        // journal empty, so the pending catalog entry is the one reason left).
         {
             let store = LogStore::open(root).await.expect("reopen healthy store");
             store
@@ -2177,8 +1925,6 @@ mod tests {
                 .expect("checkpoint the fixture store");
         }
 
-        // Corrupt a b-tree page in the main DB file (zero page 2; the header
-        // page 1 stays intact so the file still passes the shape check).
         let db_path = db::store_db_path(root, "logs");
         let bytes = std::fs::read(&db_path).expect("read db file");
         assert!(bytes.len() > 8192, "test needs a multi-page db file");
@@ -2207,18 +1953,14 @@ mod tests {
         crate::db::test_support::assert_not_quarantined(&root.join("db"), "a refused logs store");
     }
 
-    /// A record written through the standard third-party `log` interface — how
-    /// every dependency of this product reports — reaches the log layer under its
-    /// real target, through the production stack and the production bridge, and
-    /// the line the layer wrote is a row the store's own parser accepts.
+    /// A record written through the standard third-party `log` interface reaches the log layer
+    /// under its real target, through the production stack and bridge, and the line the layer
+    /// wrote is a row the store's own parser accepts.
     ///
-    /// The bridge installs a process-global `log` logger, which is why the
-    /// production `install_log_bridge` treats a logger that is already there as a
-    /// failure; the stack itself goes on this thread's dispatcher, so the rest of
-    /// the suite sees no global subscriber change. The real `EnvFilter` is in the
-    /// stack, so the assertion on the record's `target` also pins the
-    /// `tracing-log` feature this manifest declares: without it the layer stores
-    /// the literal target `log` instead of the callsite's own.
+    /// The bridge installs a process-global `log` logger (which is why the production
+    /// [`install_log_bridge`] treats an existing one as a failure), while the stack goes on this
+    /// thread's dispatcher. The real `EnvFilter` is in the stack, so the assertion on the target
+    /// also pins the `tracing-log` feature: without it the layer stores the literal target `log`.
     #[test]
     fn dependency_log_records_reach_the_log_store() {
         const MESSAGE: &str = "a dependency record through the standard logging interface";
@@ -2256,11 +1998,10 @@ mod tests {
         );
     }
 
-    /// The line the layer really writes carries the row's scope: a record inside
-    /// the agent's span chain parses with the agent, its role, the workspace and
-    /// the ticket the spans carry, and the record's own copy of those values is
-    /// not repeated as a field. A record with no agent around it invents none of
-    /// them, and a workspace it states as a path becomes the name it stands for.
+    /// The line the layer really writes carries the row's scope: a record inside the agent's span
+    /// chain parses with the agent, role, workspace and ticket, and the record's own copy of
+    /// those values is not repeated as a field. A record with no agent invents none of them, and
+    /// a workspace stated as a path becomes the name it stands for.
     #[test]
     fn a_record_inside_the_agent_span_carries_the_rows_scope() {
         const WRITING: &str = "writing code";
@@ -2271,9 +2012,6 @@ mod tests {
             make_log_writer(tx),
             EnvFilter::new(DEFAULT_LOG_FILTER),
         ));
-        // The phase body's span, then the agent's own — the same field spellings
-        // the production spans use, including the ticket the agent records as an
-        // `Option` (which tracing omits entirely when the run has none).
         let phase = tracing::info_span!("ticket", ticket = %"mahbot-42", workspace = %"mahbot");
         let agent = tracing::info_span!(
             parent: &phase,
@@ -2329,12 +2067,9 @@ mod tests {
         assert_eq!(stage.fields, serde_json::json!({ "passed": 3 }));
     }
 
-    /// The level cut [`DEFAULT_LOG_FILTER`] applies to the PDF text layer the read
-    /// tool's document conversion runs: that dependency's warnings are dropped
-    /// before the store, its errors still reach it. The cut is the target's level,
-    /// not the target itself, and a document conversion is exactly what cannot be
-    /// driven hermetically, so the layer's view of the dependency is what is
-    /// asserted.
+    /// The level cut [`DEFAULT_LOG_FILTER`] applies to the PDF text layer: that dependency's
+    /// warnings are dropped before the store, its errors still reach it. A document conversion
+    /// cannot be driven hermetically, so the layer's view of the dependency is what is asserted.
     #[test]
     fn the_default_filter_holds_the_pdf_dependency_to_error() {
         const TARGET: &str = "pdf_extract";
@@ -2361,25 +2096,16 @@ mod tests {
         );
     }
 
-    /// The whole `fff_*` family — the file-search library the tools, the editor
-    /// and the read tool's path recovery search with — is muted outright: not one
-    /// of its targets reaches the log layer at any level, while records from
-    /// everywhere else do, including the product's own notice that a written file
-    /// could not be added to the search index.
+    /// The whole `fff_*` family is muted outright: not one of its targets reaches the log layer at
+    /// any level, while records from everywhere else do, including the product's own notice that a
+    /// written file could not be indexed.
     ///
-    /// The records are written with explicit targets on the tracing API rather
-    /// than through the `log` interface: the bridge is a process-global `log`
-    /// logger that only one test in this process can install, and it preserves the
-    /// record's real target — which
-    /// [`dependency_log_records_reach_the_log_store`] pins. What is asserted here
-    /// is the layer's own verdict, per target and per level.
+    /// Written with explicit targets on the tracing API rather than through `log`, because the
+    /// bridge is a process-global logger that only one test can install
+    /// ([`dependency_log_records_reach_the_log_store`] pins it). What is asserted here is the
+    /// layer's own verdict, per target and per level.
     #[test]
     fn the_default_filter_silences_the_search_library() {
-        // The burst that motivated the mute: the library's file table refusing to
-        // grow, one ERROR per file that does not fit. The other targets are the
-        // family's other crates and modules — the pre-existing filter held
-        // `fff_search` and `fff_search::grep` at ERROR, so a broader mute that
-        // leaves a narrower directive behind re-opens them.
         const BURST_TARGET: &str = "fff_search::stable_vec";
         const BURST: &str = "StableVec: capacity exhausted — dropping item to prevent reallocation";
         const GREP_TARGET: &str = "fff_search::grep";
@@ -2392,8 +2118,6 @@ mod tests {
         const PARSER: &str = "a record from the family's query parser";
         const DEBOUNCER_TARGET: &str = "fff_notify_debouncer_full";
         const DEBOUNCER: &str = "a record the family logs over the `log` interface";
-        // The product's own record for the same condition, and the workspace
-        // engine's own INFO — both emit under `mahbot::*` and must be unaffected.
         const NOTICE_TARGET: &str = "mahbot::tools::edit";
         const NOTICE: &str =
             "Search index capacity exhausted after file write — background rescan needed";

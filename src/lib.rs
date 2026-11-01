@@ -10,120 +10,80 @@
     clippy::doc_markdown
 )]
 
-// ── Agent and task orchestration ─────────────────────────────────────────
-// The execution engine for one agent: the work loop, tool rounds, role
-// metadata, the running-agent registry and the per-agent message router.
+// One agent's work loop, tool rounds, role metadata and running-agent registry.
 pub mod agent;
-// Automations that outlive the process, and who gets told when one fires.
+// Automations that outlive the process, and who is told when one fires.
 pub mod automations;
-// Admin-defined custom roles: the record, its validation and its granted
-// tool subset.
+// Admin-defined custom roles: the record, its validation, its tool subset.
 pub(crate) mod custom_role;
-// The durable rows behind async work, plus boot recovery and the shutdown
-// drain.
+// The durable rows behind async work, boot recovery and the shutdown drain.
 pub mod jobs;
-// Branch lifecycle for custom roles and worker branches: start, resume and
-// stop.
+// Branch lifecycle for custom roles and worker branches.
 pub(crate) mod launch;
 
-// ── Pipeline and tickets ─────────────────────────────────────────────────
-// Where parallel participants' answers are grouped and merged into one
-// verdict.
+// Where parallel participants' answers are merged into one verdict.
 pub(crate) mod consensus;
-// Ticket movement from backlog to done: claim, dispatch, phase bodies, bounce
-// handling and pause.
+// Tickets from backlog to done: claim, dispatch, bounce handling, pause.
 pub mod pipeline;
 
-// ── Workspaces, sessions and users ───────────────────────────────────────
-// Git command wrappers and diff parsing, shared by the pipeline's worktree
-// checks, the dashboard and nightly re-analysis.
+// Git wrappers and diff parsing, for the worktree checks, the dashboard and nightly runs.
 pub(crate) mod git;
-// Conversation persistence: the in-memory session, its store, summarization
-// and the live transcript snapshots.
+// Conversation persistence: the in-memory session, its store, the transcript snapshots.
 pub mod session;
-// The account row and what it binds: a preferred workspace and channel
-// recipients.
+// The account row: a preferred workspace and channel recipients.
 pub mod users;
-// Workspace records and discovery, workspace analysis, and the editor's open
-// tabs.
+// Workspace records, discovery and analysis, and the editor's open tabs.
 pub mod workspace;
-// The per-workspace file index shared by file search, read, edit, the editor,
-// the Git page and the lifecycle paths that release it.
+// The per-workspace file index shared by search, read, edit and the Git page.
 pub mod workspace_index;
 
-// ── Tools ────────────────────────────────────────────────────────────────
-// Every agent-callable tool, from the shell and browser to media generation
-// and document reading.
+// Every agent-callable tool.
 pub mod tools;
 
-// ── Documents and formats ────────────────────────────────────────────────
-// The embedded document kit, its `rules.json` vocabulary and the PDF font,
-// shared by the document readers and rasterization.
+// The embedded document kit, its `rules.json` vocabulary and the PDF font.
 pub(crate) mod docgen;
-// The one converter every document read passes through: the OOXML, legacy
-// Office and PDF arms behind a single entry point.
+// The one converter every document read passes through: OOXML, legacy and PDF.
 pub(crate) mod document;
 // The CFB reader for pre-OOXML Word, Excel and PowerPoint files.
 pub(crate) mod legacy;
 // The ZIP-package reader for `.docx`, `.xlsx` and `.pptx` parts.
 pub(crate) mod ooxml;
-// What a PDF says outside its page text: metadata, annotations and AcroForm
-// fields.
+// What a PDF says outside its page text: metadata, annotations, AcroForm fields.
 pub(crate) mod pdf_marks;
-// The printed shape of a converted document: block headers, unit marks and
-// story names.
+// The printed shape of a converted document: block headers, unit marks, stories.
 pub(crate) mod reader_output;
 
-// ── Video ────────────────────────────────────────────────────────────────
-// The product's own ffmpeg and ffprobe — installed from the product's own
-// release stream, never the owner's copy — and the three operations they serve:
-// probing, JPEG frames and 16 kHz mono WAV.
+// The product's own ffmpeg and ffprobe, never the owner's copy, for probing and frames.
 pub mod ffmpeg;
-// HyperFrames, the HTML-composition renderer: installed from the npm registry by
-// the product's managed bun, run with its own browser and ffmpeg, and never
-// handed a wall-clock ceiling on a render. Public only so the binary can start
-// its boot task; everything else in it is crate-internal.
+// HyperFrames, the HTML renderer: installed by the managed bun, run with its own browser.
 pub mod hyperframes;
 
-// ── Providers and model I/O ──────────────────────────────────────────────
 // A standalone benchmark for OpenRouter models, run outside the product.
 pub mod bench_openrouter;
-// Model providers: the OpenAI-compatible client, reasoning replay,
-// transcription and the error classification table.
+// Model providers: the OpenAI-compatible client, reasoning replay, error classes.
 pub mod providers;
-// The single retry authority for LLM calls: attempt schedules, backoff and the
-// per-attempt failure trail.
+// The single retry authority for LLM calls: attempt schedules and backoff.
 pub(crate) mod retry;
 
-// ── Channels ─────────────────────────────────────────────────────────────
-// The message plane: intake, enrichment, reply references, chat history and
-// the transport implementations.
+// The message plane: intake, enrichment, reply references, chat history, transports.
 pub mod channels;
 
-// ── Stores and observability ─────────────────────────────────────────────
 // The `config_kv` and model-routing rows in the domain store.
 pub mod config_db;
-// All persistence: the Turso connection layer, schema catalog, change capture,
-// checkpoints, store guards and the read-only debug surface.
+// All persistence: the Turso layer, schema catalog, change capture and the debug surface.
 pub mod db;
 // How long each by-product class lives, and the paced sweep that removes it.
 pub mod log_retention;
-// The logs store: tracing installation, the batched writer, issue records and
-// the GUI's live log feed. A row's scope — the agent, its role, the workspace and
-// the ticket — is promoted out of the record into the row itself (module docs).
+// The logs store: tracing installation, the batched writer and the GUI's live log feed.
 pub mod logs;
-// Two row families — one per tool call, one per LLM request — built for the
-// log store's writers.
+// Two row families — one per tool call, one per LLM request.
 pub(crate) mod stats;
-// Fire-and-forget rows about the product's own work, drained by a task of
-// their own.
+// Fire-and-forget rows about the product's own work, drained by their own task.
 pub(crate) mod telemetry;
 
-// ── GUI and desktop ──────────────────────────────────────────────────────
 // The product's artwork, and every surface outside the window that needs it.
 pub mod app_icon;
-// Spawning chrome-use and keeping its tolerant envelope, forms, action
-// registry and the command-line surface's session record in one place.
+// Spawning chrome-use and keeping its envelope, forms and action registry in one place.
 pub(crate) mod chrome;
 // Every page and widget of the dashboard, plus the iced application entry.
 pub mod gui;
@@ -131,69 +91,51 @@ pub mod gui;
 pub(crate) mod onboarding;
 // A broadcast that tells the dashboard an in-memory registry changed.
 pub(crate) mod runtime_events;
-// The tray icon where the platform has one: the macOS menu bar and the Windows
-// notification area, with the click that brings the window up and the menu that quits.
+// The macOS menu bar / Windows notification area icon, its click and quit menu.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod tray;
-// The ways into that window from outside it — the tray, a second launch, the Dock — and
-// the product's one in-app quit. Linux's window is never hidden, so it has none of them.
+// The ways into the window from outside it, and the product's one in-app quit.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod window_requests;
 
-// ── CLI and prompts ──────────────────────────────────────────────────────
-// The operation channel a `mahbot` command line carries into the live instance,
-// and the instance side that serves it.
+// The operation channel a `mahbot` command line carries into the live instance.
 pub mod cli;
-// Loading and substitution for the embedded prompt assets every LLM call is
-// built from.
+// Loading and substitution for the embedded prompt assets.
 pub(crate) mod prompt;
 
-// ── Media ────────────────────────────────────────────────────────────────
-// Microphone-to-meaning on macOS: wake word, voice commands, local
-// transcription, the `say` tool's speech output and cues.
+// Microphone-to-meaning on macOS: wake word, voice commands, local transcription.
 #[cfg(target_os = "macos")]
 pub mod audio;
-// The `mahbot audio` command line: a recording into text, text into a spoken
-// file, with no daemon involved.
+// The `mahbot audio` command line: a recording into text, text into a spoken file.
 pub(crate) mod audio_cli;
 // A hand-rolled ONNX executor sized for the four pinned TTS models.
 #[cfg(target_os = "macos")]
 pub(crate) mod onnx;
 
-// ── Lifecycle and platform support ───────────────────────────────────────
-// Handing the terminal back: a launch started from one is detached from it before
-// anything else the daemon does, and what it would have printed goes to `daemon.log`
-// in the storage root.
+// Handing the terminal back, with what it would have printed going to `daemon.log`.
 pub mod detach;
-// How the process comes up: one ordering for every store open, the sweep of the
-// retired model-cache files, plus the failure line before tracing exists.
+// How the process comes up: one ordering for every store open.
 pub mod boot;
 // Defaults, persisted overrides, model routing and the process-global handle.
 pub mod config;
-// The built-in low-disk notice: the admin assistant is told when free space on
-// the temp volume falls below 5%, on a widening reminder ladder.
+// The low-disk notice, raised when free space on the temp volume falls below 5%.
 pub mod disk_notice;
-// The nightly memory inventory: every account's assistant whose memory file no
-// longer fits into its context is asked, once a night, to clean up what it
-// keeps.
+// The nightly memory inventory: an assistant whose memory no longer fits is asked to trim.
 pub mod memory_inventory;
 // Asking the OS not to throttle a daemon whose window is never visible.
 pub mod power;
 // Start at login: the product's own registration with the operating system.
 pub mod autostart;
-// Downloading, verifying and swapping in a new version, under the instance
-// lock.
+// Downloading, verifying and swapping in a new version, under the instance lock.
 pub mod self_update;
-// The owner's own shell environment, re-read in the background for commands
-// that need it.
+// The owner's own shell environment, re-read in the background.
 pub mod shell_env;
-// Shutdown and drain: the token, the signal sources, the two-request protocol
-// and every path that skips it.
+// Shutdown and drain: the token, the signal sources and the two-request protocol.
 pub mod shutdown;
 // Ownership of the daemon's private temp directory, from creation to cleanup.
 pub mod temp;
-// Who is at the computer right now: the machine-wide active/absent state, its
-// operating-system input reader and the wake word's activity report.
+// Who is at the computer right now: the machine-wide active/absent state and its
+// input reader.
 #[cfg_attr(
     not(target_os = "macos"),
     allow(
@@ -203,23 +145,16 @@ pub mod temp;
 )]
 pub(crate) mod user_activity;
 
-// ── Cancellation and cleanup ─────────────────────────────────────────────
-// The cancel action behind the `analyze` tool, confined to the caller's own
-// dispatched runs.
+// The cancel action behind the `analyze` tool, confined to the caller's own runs.
 pub(crate) mod analyze_cancel;
-// Stopping a research run on request, and settling the rows of runs cancelled
-// earlier.
+// Stopping a research run on request, and settling runs cancelled earlier.
 pub(crate) mod research_cancel;
-// The single release point for a research run's folders, archive and command
-// dump.
+// The single release point for a research run's folders, archive and command dump.
 pub mod research_cleanup;
-// Stop flags for running deep-research and analyze rounds, and the guard that
-// keeps each entry alive.
+// Stop flags for running deep-research and analyze rounds.
 pub(crate) mod round_cancel;
 
-// ── Shared utilities ─────────────────────────────────────────────────────
-// Shared helpers: HTTP and TLS, locking, paths, managed binaries, media
-// markers, tree-sitter and test fixtures.
+// Shared helpers: HTTP and TLS, locking, paths, managed binaries, media markers, fixtures.
 pub mod util;
 
 /// Hidden grep-engine subcommand entry (dispatched from `main()` before the
@@ -247,38 +182,26 @@ use tokio_util::sync::CancellationToken;
 use crate::session::Session;
 use crate::util::UnwrapPoison;
 
-// Diagnostics commands — discovered dev tooling
-
-/// Discovered diagnostic commands for a workspace.
-///
-/// All fields are optional — `None` means no such tooling was detected.
+/// Discovered diagnostic commands for a workspace; `None` means the tooling was
+/// not detected.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct DiagnosticsCommands {
-    /// Auto-formatter command (e.g., `cargo fmt`)
     pub format: Option<String>,
-    /// Format check without changes (e.g., `cargo fmt -- --check`)
     pub format_check: Option<String>,
-    /// Linter, idempotent (e.g., `cargo clippy -- -D warnings`)
     pub lint: Option<String>,
-    /// Auto-fix lint issues (e.g., `cargo clippy --fix --allow-dirty`)
     pub lint_fix: Option<String>,
-    /// Type checking without full compilation (e.g., `cargo check`)
     pub type_check: Option<String>,
-    /// Full build command (e.g., `cargo build`)
     pub build: Option<String>,
-    /// Run unit tests, fast (e.g., `cargo test`)
     pub unit_test: Option<String>,
 }
 
 impl DiagnosticsCommands {
-    /// Number of command categories (must match the array length in [`Self::commands`]).
+    /// Must match the array length in [`Self::commands`].
     pub const COMMAND_COUNT: usize = 7;
 
-    /// Label of the `unit-test` slot. Spelled once so the label list and
-    /// [`Self::commands`] cannot drift.
+    /// Spelled once so the label list and [`Self::commands`] cannot drift.
     pub(crate) const UNIT_TEST_LABEL: &str = "unit-test";
 
-    /// Static labels for the 7 command categories, matching the order in [`Self::commands`].
     pub const COMMAND_LABELS: [&str; Self::COMMAND_COUNT] = [
         "format",
         "format-check",
@@ -289,7 +212,7 @@ impl DiagnosticsCommands {
         Self::UNIT_TEST_LABEL,
     ];
 
-    /// Ordered iterator of (label, command) pairs. `None` entries are undiscovered — skipped.
+    /// `None` entries are undiscovered — skipped.
     #[must_use]
     pub fn commands(&self) -> [(&'static str, Option<&str>); Self::COMMAND_COUNT] {
         [
@@ -303,8 +226,7 @@ impl DiagnosticsCommands {
         ]
     }
 
-    /// Build `DiagnosticsCommands` from an array of edit buffers (same ordering
-    /// as [`Self::commands`]). Empty strings become `None` — skip during execution.
+    /// Same ordering as [`Self::commands`]. Empty strings become `None`.
     #[must_use]
     pub fn from_buffers(buffers: &[String; Self::COMMAND_COUNT]) -> Self {
         Self {
@@ -318,19 +240,14 @@ impl DiagnosticsCommands {
         }
     }
 
-    /// True if no diagnostics commands were discovered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.commands().iter().all(|(_, cmd)| cmd.is_none())
     }
 }
 
-// Core type: Workspace
-
-/// Lifecycle status of a workspace.
-///
-/// Mirrors the `status` TEXT column in the workspaces database table.
-/// Conversion to/from strings happens at the DB boundary only.
+/// Lifecycle status of a workspace, mirroring the `status` TEXT column in the
+/// workspaces table; conversion to/from strings happens at the DB boundary only.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Default, strum::Display, strum::EnumString,
 )]
@@ -354,54 +271,29 @@ pub struct Workspace {
     pub name: String,
     pub path: String,
     pub status: WorkspaceStatus,
-    /// Whether the maintainer agent is enabled for this workspace.
-    ///
-    /// `true`  — the maintainer loop processes this workspace on each cycle.
-    /// `false` — the maintainer skips this workspace entirely (default).
-    ///
-    /// Unlike [`Self::paused`] (which freezes the whole pipeline — no stage
-    /// advances and its ticket agents stop at their next round boundary, until
-    /// manual resume), `maintenance_enabled` specifically controls only the
-    /// maintainer loop. A paused workspace can still be maintained if
-    /// `maintenance_enabled` is `true`, and vice versa. Disabling maintenance
-    /// does cancel a running maintainer outright, where pausing is cooperative.
-    ///
-    /// Persisted in the `workspaces` table with a `DEFAULT 0` schema default.
-    /// Toggled from the dashboard footer chrome.
+    /// Gates only the maintainer loop, unlike [`Self::paused`] (which freezes the
+    /// whole pipeline): a paused workspace can still be maintained, and disabling
+    /// maintenance cancels a running maintainer outright where pausing is
+    /// cooperative. Persisted with a `DEFAULT 0` schema default.
     pub maintenance_enabled: bool,
-    /// Whether automatic claim dispatch is paused for this workspace (a strict
-    /// freeze): NO pipeline stage advances — including the dispatcher
-    /// finalizers — and the agents working on its tickets freeze at their next
-    /// LLM round boundary, until the workspace is manually resumed. (The freeze
-    /// is cooperative: no cancel token is fired, so a round already in flight
-    /// finishes its current turn first.)
-    ///
-    /// Automatically set to `true` on technical/agent failures (dispatch panic,
-    /// agent run failure, all verifiers failing, user cancelling an in-flight
-    /// run) so queued development tickets aren't claimed and don't cascade, and
-    /// by a `mahbot paused` launch, which pauses every managed workspace
-    /// before the poll loop starts.
-    /// Lifted via the normal unpause path (GUI toggle, the admin's
-    /// `workspace` chat tool, or rediscovery; the nightly loop skips
-    /// paused workspaces). A discovery already in flight when the pause lands
-    /// clears it on completion without checking who set it: the round stopped by
-    /// that failure replays once and freezes the workspace again — see
+    /// A strict freeze: no pipeline stage advances — including the dispatcher
+    /// finalizers — and its agents freeze at their next LLM round boundary until
+    /// manual resume (no cancel token is fired, so a round in flight finishes its
+    /// turn first). Set automatically on technical failures, and by a
+    /// `mahbot paused` launch, so queued tickets aren't claimed and don't cascade;
+    /// lifted by the normal unpause path. A discovery in flight when the pause
+    /// lands clears it on completion without checking who set it — see
     /// `finalize_discovery`.
     pub paused: bool,
-    /// RFC 3339 timestamp of the last completed maintainer run.
-    /// `None` means the workspace has never been maintained.
+    /// RFC 3339 timestamp of the last completed maintainer run; `None` means never.
     pub maintainer_last_run_at: Option<String>,
-    /// JSON blob of discovered dev commands (format, lint, build, test, etc.).
-    /// `None` before the first diagnostics discovery run.
+    /// JSON blob of discovered dev commands; `None` before the first discovery run.
     pub diagnostics: Option<String>,
-    /// Freeform user-curated context notes appended to every agent's
-    /// system prompt. Empty by default. Max 4000 characters.
-    /// Persisted in the `workspaces.notes` column.
-    /// Survives `rediscover()` — never touched by automated analysis.
+    /// Freeform user-curated context notes appended to every agent's system prompt,
+    /// max 4000 characters. Survives `rediscover()` — never touched by analysis.
     pub notes: String,
-    /// The git HEAD commit hash captured after the last successful discovery.
-    /// `None` if the workspace is not a git repository or has no commits.
-    /// Used by the nightly re-analysis check to detect new commits.
+    /// The git HEAD commit captured after the last successful discovery, read by the
+    /// nightly re-analysis check; `None` if not a git repository or no commits.
     pub last_analyzed_commit: Option<String>,
 }
 
@@ -422,23 +314,16 @@ impl Default for Workspace {
 }
 
 impl Workspace {
-    /// Fixed scheduling gate between maintainer runs, in minutes. The former
-    /// per-workspace adaptive debounce (create_ticket-count escalation) was
-    /// removed; this constant is the only gate for fresh runs.
+    /// The only gate for fresh maintainer runs, in minutes.
     pub const MAINTAINER_DEBOUNCE_MINS: i64 = 5;
 
-    /// Return the workspace path as a `&Path`.
     #[must_use]
     pub fn as_path(&self) -> &Path {
         Path::new(&self.path)
     }
 
-    /// Create a minimal Workspace from a filesystem path.
-    ///
-    /// Used for test helpers, personal workspaces, and as a fallback when a
-    /// workspace is not found in the database.
-    ///
-    /// The name is derived from the last path component (directory name).
+    /// A minimal Workspace from a filesystem path, named after its last component.
+    /// Used by test helpers, personal workspaces and as the not-found fallback.
     #[must_use]
     pub fn from_path(path: &Path) -> Self {
         let stored = stored_workspace_path(path);
@@ -449,18 +334,15 @@ impl Workspace {
         }
     }
 
-    /// Return a human-readable display name derived from the workspace path.
-    ///
-    /// Uses the last path component (directory name).
+    /// The workspace path's last component, for display.
     #[must_use]
     pub fn display_name(&self) -> String {
         last_path_component(self.as_path())
     }
 
-    /// Create a per-run workspace (research run roots, the temp cleaner,
-    /// targeted delegation rounds). `name` becomes the search-engine registry
-    /// key (e.g. the research `job_id`); it has no `workspaces` row and its
-    /// lifetime is bounded by the run it serves.
+    /// A per-run workspace (research run roots, the temp cleaner, targeted
+    /// delegation rounds). `name` becomes the search-engine registry key (e.g. the
+    /// research `job_id`); it has no `workspaces` row and lives as long as its run.
     #[must_use]
     pub fn ephemeral_run(name: &str, path: &Path) -> Self {
         Self {
@@ -471,12 +353,11 @@ impl Workspace {
     }
 }
 
-/// The path a [`Workspace`] built from a filesystem path stores: canonicalized,
-/// so containment stays correct even when the base is behind a symlink (`/tmp` →
-/// `/private/tmp` on macOS), and with the platform's verbatim prefix dropped (see
-/// [`crate::util::strip_verbatim_prefix`]) — the spelling the shell, the prompts
-/// and [`crate::tools::path`] should not have to carry. Falls back to the raw path
-/// when the directory does not exist yet.
+/// The path a [`Workspace`] built from a filesystem path stores: canonicalized, so
+/// containment stays correct even when the base is behind a symlink (`/tmp` →
+/// `/private/tmp` on macOS), with the platform's verbatim prefix dropped (see
+/// [`crate::util::strip_verbatim_prefix`]). Falls back to the raw path when the
+/// directory does not exist yet.
 pub(crate) fn stored_workspace_path(path: &Path) -> PathBuf {
     crate::util::with_block_in_place(|| {
         std::fs::canonicalize(path).map_or_else(
@@ -486,7 +367,6 @@ pub(crate) fn stored_workspace_path(path: &Path) -> PathBuf {
     })
 }
 
-/// Extract the last component of a path as a string.
 fn last_path_component(path: &Path) -> String {
     path.file_name()
         .and_then(|s| s.to_str())
@@ -494,11 +374,9 @@ fn last_path_component(path: &Path) -> String {
         .to_string()
 }
 
-/// URL-safe NanoID alphabet (A-Z, a-z, 0-9, -, _).
 const NANOID_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
 
-/// Generate a NanoID of the given length using the URL-safe alphabet.
 #[must_use]
 fn generate_nanoid(length: usize) -> String {
     (0..length)
@@ -509,20 +387,17 @@ fn generate_nanoid(length: usize) -> String {
         .collect()
 }
 
-/// Generate a unique identifier (10-char NanoID, ~60 bits entropy).
+/// A 10-char NanoID, ~60 bits entropy.
 #[must_use]
 pub fn generate_id() -> String {
     generate_nanoid(10)
 }
 
-/// Generate a short unique suffix (6-char NanoID, ~36 bits entropy).
-/// Used to disambiguate retry cycles in parallel agent dispatches.
+/// A 6-char NanoID (~36 bits), disambiguating retry cycles in parallel dispatches.
 #[must_use]
 pub(crate) fn generate_suffix() -> String {
     generate_nanoid(6)
 }
-
-// ── Command predicates ─────────────────────────────────
 
 /// Represents a recognized Telegram bot text command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -539,19 +414,16 @@ pub enum BotCommand {
     Board,
     /// `/archive` — archive done & cancelled tickets from every workspace (admin).
     Archive,
-    /// `/update` — run a self-update and restart the daemon (admin, shown only
-    /// when the shared availability cache confirms an update is available).
+    /// `/update` — self-update and restart the daemon (admin, only offered when the
+    /// shared availability cache confirms an update).
     Update,
-    /// `/agents` — reply that there is nothing to switch. No longer in any
-    /// command menu; kept as a graceful reply for users who still type it.
+    /// `/agents` — replies that there is nothing to switch; no longer in any command
+    /// menu, kept as a graceful reply.
     Agents,
 }
 
-/// Parse a Telegram bot text command from message content.
-///
-/// Returns `Some(BotCommand)` if the content is a recognised command,
-/// case-insensitive. Returns `None` for all other content, including other
-/// `/`-prefixed text which is routed to the agent pipeline.
+/// Parse a Telegram bot text command, case-insensitively. `None` for anything else,
+/// including other `/`-prefixed text, which is routed to the agent pipeline.
 #[must_use]
 pub fn parse_bot_command(content: &str) -> Option<BotCommand> {
     let content = content.trim();
@@ -569,120 +441,85 @@ pub fn parse_bot_command(content: &str) -> Option<BotCommand> {
     }
 }
 
-// ── Channel trait + types ───────────────────────────────────────
-
-/// `Default` yields an **undeliverable** placeholder: all string fields empty.
-/// It exists only as a `..Default::default()` spread for local-source
-/// construction sites (voice, onboarding, GUI chat), keeping Telegram-only
-/// fields (`callback_query_id`, `chat_id`, `message_id`, and the other
-/// `Option`s) out of their literals. Never dispatch `ChannelMessage::default()`
-/// directly — an empty `channel`/`user_name`/`content` is not routable. The one
-/// shape that legitimately carries an empty `content` is a collected burst,
-/// whose text lives in its [`parts`](Self::parts).
-///
-/// When adding a new non-`Option` field, remember that spread sites will
-/// silently pick up its default instead of failing to compile.
+/// `Default` yields an **undeliverable** placeholder (all string fields empty): it
+/// exists only as a `..Default::default()` spread for local-source construction
+/// sites, keeping Telegram-only fields out of their literals. Never dispatch
+/// `ChannelMessage::default()` — an empty `channel`/`user_name`/`content` is not
+/// routable; the one shape that legitimately carries an empty `content` is a
+/// collected burst, whose text lives in its [`parts`](Self::parts). A new
+/// non-`Option` field is silently defaulted at every spread site.
 #[derive(Debug, Clone, Default)]
 pub struct ChannelMessage {
-    /// The user's canonical name — stable identifier resolved from channel
-    /// binding at auth time. Never derived from Telegram `@username` directly.
+    /// The user's canonical name, resolved from channel binding at auth time —
+    /// never derived from Telegram `@username`.
     pub user_name: String,
     pub reply_target: String,
     pub content: String,
     /// The channel this message originated from (e.g. `"telegram"`, `"gui"`).
-    /// Set by each channel's `listen()` loop when constructing the message.
     pub channel: String,
-    /// The workspace this message targets.
     pub workspace: String,
-    /// Optimistic message ID set by the GUI sender for deduplication in the
-    /// ChatEvent handler — `None` for non-GUI channels (Telegram, callbacks).
+    /// Set by the GUI sender for deduplication in the ChatEvent handler; `None` for
+    /// non-GUI channels.
     pub optimistic_id: Option<String>,
-    /// Callback query ID from Telegram inline keyboard interactions.
-    /// Only set for callback queries (`__act__` prefix),
-    /// used to acknowledge and dismiss the Telegram loading spinner.
+    /// Only set for Telegram callback queries (`__act__` prefix), to dismiss the
+    /// loading spinner.
     pub callback_query_id: Option<String>,
-    /// Reference to the message this message is replying to, used to render a
-    /// quote header. `None` for messages with no reply target.
+    /// The message this one replies to, for the quote header.
     pub reply_reference: Option<crate::channels::ReplyReference>,
-    /// Channel-side chat id of the message this message originated from.
-    /// Populated for Telegram messages and callback queries; `None` for
-    /// other channels. Used to address the source message in place (e.g.
-    /// editing a picker keyboard after a callback).
+    /// Channel-side chat id of the originating message, so it can be addressed in
+    /// place (e.g. editing a picker keyboard after a callback).
     pub chat_id: Option<String>,
     /// Channel-side message id of the originating message (see [`Self::chat_id`]).
     pub message_id: Option<i64>,
-    /// Names of the staging directories this message owns inbound attachments
-    /// for: one for a single message, several for an album merged into one
-    /// message. The producer — the Telegram receive path, or the desktop
-    /// composer — stages a message's attachments into directories named by
-    /// `util::telegram_staging_dir_name`, so this is the set of directories the
-    /// message may read, copy from and delete.
+    /// The staging directories this message owns inbound attachments for: one for a
+    /// single message, several for a merged album. The producer names them with
+    /// `util::telegram_staging_dir_name`, so this is the set the message may read,
+    /// copy from and delete.
     pub attachment_dirs: Vec<String>,
-    /// The individual messages a collected burst is composed of, in send order,
-    /// when the Telegram channel merged several into one request (see
-    /// `channels::telegram_group`). Empty for a message delivered on its own, the
-    /// envelope then being the message itself. One level deep — a part never
-    /// carries parts of its own. Set only by the Telegram burst collector.
+    /// The messages a collected burst is composed of, in send order, when the
+    /// Telegram channel merged several into one request (see
+    /// `channels::telegram_group`). Empty for a message delivered on its own. One
+    /// level deep — a part never carries parts.
     pub parts: Vec<ChannelMessage>,
-    /// Telegram's own time for the message this came from (`message.date`,
-    /// Unix seconds) — never this product's clock, which is what the burst
-    /// record needs it beside. `None` for every other channel and for an
-    /// update the platform sent without one.
+    /// Telegram's own `message.date` (Unix seconds), never this product's clock.
     pub update_date: Option<i64>,
-    /// True when this message came in as forwarded content, decided from
-    /// Telegram's own fields (`forward_origin`, or the older `forward_*` ones)
-    /// rather than from any rendered text: the burst collector gives a group
-    /// the longer window on the strength of this flag, and the intake's
-    /// `[Forwarded from …]` prefix is written from the same decision. A
-    /// message kind the product does not handle at all — a sticker, a poll, a
-    /// location — yields no message and so carries nothing, which is fine:
-    /// what never arrives needs no attribution.
+    /// Decided from Telegram's own fields (`forward_origin`, or the older
+    /// `forward_*`), never from rendered text: the burst collector gives a group its
+    /// longer window on this flag, and the intake's `[Forwarded from …]` prefix is
+    /// written from the same decision.
     pub forwarded: bool,
-    /// The Telegram intake's record entries this message stands for, one per
-    /// incoming update it carries (an album's merged message carries every
-    /// member's, and a burst envelope the union of its parts', which no longer
-    /// keep their own): the intake settles them once the message has been handed
-    /// to the pipeline, so an event it never handed on stays held for a later run
-    /// to take up. Empty for every other channel. One level deep, like `parts`.
+    /// The Telegram intake's record entries this message stands for, one per incoming
+    /// update it carries: the intake settles them once the message reaches the
+    /// pipeline, so one it never handed on stays held for a later run. Empty for
+    /// every other channel. One level deep, like `parts`.
     pub update_ids: Vec<i64>,
-    /// True when `content` carries a dictated part (a voice recording's
-    /// transcript, which leads the message). Everything treats the message as
-    /// any typed one; the only difference is the dispatch log line, which names
-    /// such a message without its content — spoken words stay out of the logs.
+    /// `content` leads with a voice recording's transcript. Only the dispatch log
+    /// line differs, naming such a message without its content — spoken words stay
+    /// out of the logs.
     pub dictated: bool,
-    /// True when the text the user typed for this message opened with the
-    /// urgent mark, which the surface consumed before composing `content` (see
-    /// `channels::take_urgent`). The message then cuts the Assistant's running
-    /// turn instead of waiting behind it. Only a surface a user types into can
-    /// set it: everything the product composes or routes — notices, command-line
-    /// hand-offs, automation and tool messages — leaves it `false`.
+    /// The user's text opened with the urgent mark, which the surface consumed before
+    /// composing `content` (see `channels::take_urgent`): the message cuts the
+    /// Assistant's running turn instead of waiting behind it. Only a surface a user
+    /// types into sets it; anything the product composes or routes leaves it `false`.
     pub urgent: bool,
 }
 
 /// An outbound message to deliver on a channel.
 ///
-/// ## Telegram-specific legacy
-///
-/// The `reply_markup` field carries Telegram inline_keyboard JSON. Non-Telegram
-/// channels ignore it. Inline keyboard construction happens in `main.rs`
-/// (e.g. `build_models_keyboard`) — other channels receive empty or harmless
-/// payloads. The self-update path stores `reply_target` (via
-/// `ChannelMessage::reply_target`) into `recipient` for admin Telegram
-/// notifications during the update process — see the channel's
-/// `resolve_recipient()` method which bridges the two fields.
+/// `reply_markup` is Telegram inline_keyboard JSON, built in `main.rs`
+/// (`build_models_keyboard`); other channels ignore it. The self-update path stores
+/// `reply_target` into `recipient` for admin notifications — see the channel's
+/// `resolve_recipient()`.
 #[derive(Debug, Clone)]
 pub struct SendMessage {
     pub content: String,
     pub recipient: String,
-    /// Optional inline keyboard markup to attach to the message.
     pub reply_markup: Option<serde_json::Value>,
-    /// Workspace roots that anchor outbound media markers: the workspace of the
-    /// agent that authored the message plus, for relayed content, the workspace
-    /// it originated in. A relative `[IMAGE:]`/`[AUDIO:]`/`[VIDEO:]`/`[FILE:]`
-    /// target names a file in the first root that has it; `[FILE:]` delivery is
-    /// additionally confined to these roots. Empty = no workspace: a relative
-    /// marker cannot be delivered ("the message's workspace is unknown.") and no
-    /// file is authorized.
+    /// Workspace roots anchoring outbound media markers: the authoring agent's
+    /// workspace plus, for relayed content, the one it originated in. A relative
+    /// `[IMAGE:]`/`[AUDIO:]`/`[VIDEO:]`/`[FILE:]` target names a file in the first
+    /// root that has it, and `[FILE:]` delivery is confined to these roots. Empty =
+    /// no workspace: no relative marker is deliverable and no file is authorized.
     pub file_roots: Vec<std::path::PathBuf>,
 }
 
@@ -692,33 +529,23 @@ pub trait Channel: Send + Sync {
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
     fn name(&self) -> &'static str;
 
-    /// Return a reference to `self` as `&dyn Any` for downcasting.
-    ///
-    /// Used by the Telegram channel hot-reload path (`restart_telegram_listener`)
-    /// to atomically swap the running channel without losing Telegram update
-    /// continuity.
+    /// As `&dyn Any`, so the Telegram hot-reload path can swap the running channel
+    /// without losing update continuity.
     fn as_any(&self) -> &dyn std::any::Any;
 
     async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
         Ok(())
     }
 
-    /// Resolve a recipient address for a known user on this channel.
-    ///
-    /// Given the user's canonical `user_name` and their stored `reply_target`,
-    /// returns `Some(address)` if the user is reachable on this channel,
-    /// or `None` if they are not.
-    ///
-    /// The default implementation returns `Some(reply_target.to_string())`,
-    /// which is correct for the Telegram channel (reply_target is the chat_id).
-    /// GUI channels override to return `Some(user_name.to_string())` since users
-    /// are addressed by user name on that channel.
+    /// The address a known user is reachable at on this channel, or `None` if they
+    /// are not. The default is `reply_target` (the Telegram chat_id); GUI channels
+    /// override it with the user name.
     fn resolve_recipient(&self, _user_name: &str, reply_target: &str) -> Option<String> {
         Some(reply_target.to_string())
     }
 }
 
-// ── Chat event broadcast (GUI live display) ─────────────────────
+// Chat event broadcast (GUI live display)
 
 /// Direction of a chat message: from the user or from an agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -726,8 +553,7 @@ pub trait Channel: Send + Sync {
 pub enum ChatDirection {
     User,
     Agent,
-    /// System-generated divider marker inserted when a user clears their
-    /// session. Rendered as a horizontal rule with a label in the GUI.
+    /// Inserted when a user clears their session; rendered as a labelled rule.
     Divider,
 }
 
@@ -736,68 +562,47 @@ pub enum ChatDirection {
 pub enum ChatEvent {
     /// A complete chat message (user or agent).
     Message {
-        /// NanoID for deduplication.
         message_id: String,
-        /// The user's canonical MahBot user name.
         user_name: String,
-        /// Full message content.
         content: String,
-        /// Whether this is from a user or an agent.
         direction: ChatDirection,
-        /// ISO-8601 timestamp.
+        /// ISO-8601.
         timestamp: String,
-        /// The channel this message was delivered on (e.g. "gui", "telegram", "voice", "cli").
         channel: String,
-        /// The agent's role (e.g. "manager", "engineer"), if from an agent.
+        /// The agent's role (e.g. "manager"), if from an agent.
         agent_role: Option<String>,
-        /// The workspace this message belongs to.
         workspace: String,
-        /// Optional ID the GUI sender generated (via `ChannelMessage::optimistic_id`) so
-        /// the Home page can replace its optimistic message with the confirmed one.
+        /// So the Home page can replace its optimistic message with the confirmed one.
         optimistic_id: Option<String>,
-        /// True when this event is intended for live GUI display only and is
-        /// deliberately NOT persisted to chat_history (e.g. the Phase-1
-        /// scripted onboarding exchange). Default false for all persisted paths.
+        /// Live GUI display only, deliberately NOT persisted to chat_history (e.g. the
+        /// scripted onboarding exchange).
         transient: bool,
-        /// Reference to the replied-to message for quote-header rendering.
         #[serde(default)]
         reply_reference: Option<crate::channels::ReplyReference>,
     },
     /// Typing indicator event.
     Typing {
-        /// The user's canonical MahBot user name.
         user_name: String,
-        /// Whether typing started (true) or stopped (false).
         is_typing: bool,
-        /// The workspace this typing indicator belongs to.
         workspace: String,
     },
 }
 
-/// Global broadcast channel for live chat events in the GUI.
-/// Set during `init_message_pipeline`. Capacity 256 to prevent
-/// `Lagged` errors in burst scenarios.
+/// Global broadcast for live chat events in the GUI, set by `init_message_pipeline`.
+/// Capacity 256 keeps `Lagged` errors out of burst scenarios.
 pub static CHAT_BROADCAST: OnceLock<broadcast::Sender<ChatEvent>> = OnceLock::new();
 
-/// Global sender for the pipeline message channel.
-/// Set during `init_message_pipeline`, used by `GuiChannel::listen()`
-/// to forward GUI-originated messages into the shared pipeline.
+/// Global sender for the pipeline message channel, set by `init_message_pipeline`;
+/// `GuiChannel::listen()` forwards GUI-originated messages through it.
 pub static MESSAGE_TX: OnceLock<tokio::sync::mpsc::Sender<ChannelMessage>> = OnceLock::new();
 
-/// Global sender for GUI-to-channel messages.
-/// The Iced UI pushes `ChannelMessage` values here; `GuiChannel::listen()`
-/// reads them from the paired receiver and forwards them into the pipeline.
+/// Global sender for GUI-to-channel messages: the Iced UI pushes `ChannelMessage`
+/// values here and `GuiChannel::listen()` drains them into the pipeline.
 pub static GUI_MESSAGE_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<ChannelMessage>> =
     OnceLock::new();
 
-// ── Channel registry ────────────────────────────────────────────
-
-/// Registry of all active channels, keyed by [`Channel::name()`].
-///
-/// Replaces the old single-channel `OnceCell` with a multi-channel
-/// `RwLock<HashMap>`. Channels register themselves during startup;
-/// lookups are used to route outbound replies, agent responses,
-/// and typing indicators.
+/// Registry of all active channels, keyed by [`Channel::name()`], routing outbound
+/// replies, agent responses and typing indicators.
 #[derive(Default)]
 pub struct ChannelRegistry {
     channels: RwLock<HashMap<String, Arc<dyn Channel>>>,
@@ -806,22 +611,15 @@ pub struct ChannelRegistry {
 }
 
 /// The channels a name's replaces have moved past and no replacement has confirmed
-/// stopped — what a replacement has to wait out before it takes over.
+/// stopped — what a replacement waits out before it takes over. Held per name by the
+/// registry, not by the channels: every replacement landing while an earlier one
+/// waits must wait for the same frames (see `channels::telegram`'s `stop_listeners`).
 ///
-/// Held per name by the registry rather than carried by the channels themselves: every
-/// replacement that lands while an earlier one is still waiting has to wait for the same
-/// frames (see `channels::telegram`'s `stop_listeners`).
-///
-/// An entry is kept alive by this list until [`Self::retire`] drops it. Nothing else
-/// clears the list, and the registry holds one `ReplacedChannels` per name for the
-/// process's life, so a recorded channel is pinned alive until the hand-over that owns
-/// the name retires it — for the telegram intake that is `channels::telegram`'s
-/// `stop_listeners`. A second user of [`ChannelRegistry::replaced`] that records without
-/// retiring would keep its channels alive forever.
-///
-/// The channel a hand-over is about to start is deliberately left in the list (see
-/// `stop_listeners`), so an entry may outlive the hand-over that first met it: the
-/// hand-over that displaces it next is what takes it out.
+/// An entry stays alive until [`Self::retire`] drops it, and the registry holds one
+/// per name for the process's life: a second user of [`ChannelRegistry::replaced`]
+/// that records without retiring would pin its channels alive forever. The channel a
+/// hand-over is about to start is deliberately left in the list, so an entry may
+/// outlive the hand-over that first met it.
 #[derive(Default)]
 pub(crate) struct ReplacedChannels {
     channels: Mutex<Vec<Arc<dyn Channel>>>,
@@ -834,11 +632,8 @@ impl ReplacedChannels {
         self.channels.lock().unwrap_poison().clone()
     }
 
-    /// Note a channel the registry has moved past — what a replacement waits out.
-    ///
-    /// Recording one twice is a no-op: a save and the teardown of a token cleared
-    /// meanwhile can both move past the same channel, and it must not be waited out
-    /// twice.
+    /// Note a channel the registry has moved past. Recording one twice is a no-op: a
+    /// save and a token teardown can both move past it, and it must not be waited out twice.
     pub(crate) fn record(&self, channel: Arc<dyn Channel>) {
         let mut held = self.channels.lock().unwrap_poison();
         if !held.iter().any(|held| Arc::ptr_eq(held, &channel)) {
@@ -856,8 +651,7 @@ impl ReplacedChannels {
 }
 
 impl ChannelRegistry {
-    /// Register a channel under its name. Duplicate names are silently skipped
-    /// with a warning logged.
+    /// Register a channel under its name; a duplicate name is skipped with a warning.
     pub fn register(&self, channel: Arc<dyn Channel>) {
         let name = channel.name().to_string();
         let mut map = self.channels.write().unwrap_poison();
@@ -868,19 +662,14 @@ impl ChannelRegistry {
         }
     }
 
-    /// Look up a channel by name. Returns `None` if not found.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Channel>> {
         self.channels.read().unwrap_poison().get(name).cloned()
     }
 
-    /// Replace a channel with a new instance, returning the previous one if any, and
-    /// recording it as a channel the new instance has to wait out (the name's
-    /// `ReplacedChannels`, reached through `Self::replaced`).
-    /// Unlike [`Self::register`], this **always** inserts — it replaces an existing
-    /// channel with the same name rather than silently skipping it.
-    ///
-    /// Used for hot-reloading channels (e.g. Telegram bot token change) without
-    /// a full application restart.
+    /// Replace a channel, returning the previous one if any and recording it as a
+    /// channel the new instance has to wait out (the name's `ReplacedChannels`, via
+    /// `Self::replaced`). Unlike [`Self::register`], this **always** inserts. Used to
+    /// hot-reload a channel (e.g. a Telegram bot token change) without a restart.
     pub fn replace(&self, channel: Arc<dyn Channel>) -> Option<Arc<dyn Channel>> {
         let name = channel.name().to_string();
         let previous = self
@@ -894,9 +683,9 @@ impl ChannelRegistry {
         previous
     }
 
-    /// What the replaces under `name` have moved past (`ReplacedChannels`). The same
-    /// handle every time, so a replacement that lands while an earlier one is still
-    /// waiting reads the same list — and records into it.
+    /// What the replaces under `name` have moved past. The same handle every time, so a
+    /// replacement landing while an earlier one waits reads — and records into — the
+    /// same list.
     #[must_use]
     pub(crate) fn replaced(&self, name: &str) -> Arc<ReplacedChannels> {
         if let Some(held) = self.replaced.read().unwrap_poison().get(name) {
@@ -909,14 +698,11 @@ impl ChannelRegistry {
         )
     }
 
-    /// Remove a channel, but only if it is still `expected` — the instance the caller
-    /// stopped — and report whether it was `expected` that came out.
-    ///
-    /// Used to tear down a channel that is no longer configured (e.g. Telegram token
-    /// cleared in Settings). A teardown that runs after the registry has moved on — a
-    /// new token saved while the old listener was still winding down — must leave the
-    /// channel that is live by then in place, or every outbound send loses its channel
-    /// and no later restart can reach the listener that is actually running.
+    /// Remove a channel only if it is still `expected` — the instance the caller
+    /// stopped — and report whether it was. A teardown that runs after the registry has
+    /// moved on (a new token saved while the old listener winds down) must leave the
+    /// live channel in place, or every outbound send loses its channel and no later
+    /// restart reaches the listener actually running.
     pub fn unregister_if(&self, expected: &Arc<dyn Channel>) -> bool {
         let name = expected.name().to_string();
         let mut map = self.channels.write().unwrap_poison();
@@ -931,7 +717,7 @@ impl ChannelRegistry {
         }
     }
 
-    /// Return a snapshot of all registered channels (name → Arc clone).
+    /// A snapshot of all registered channels (name → Arc clone).
     pub fn list(&self) -> Vec<(String, Arc<dyn Channel>)> {
         self.channels
             .read()
@@ -942,11 +728,9 @@ impl ChannelRegistry {
     }
 }
 
-/// Global channel registry — channels register during startup.
 pub static CHANNEL_REGISTRY: OnceLock<ChannelRegistry> = OnceLock::new();
 
-/// Shorthand to get the global channel registry.
-/// Panics if not initialized — call during startup after channels are set up.
+/// The global channel registry. Panics if not initialized — call after bootstrap.
 #[must_use]
 pub fn channel_registry() -> &'static ChannelRegistry {
     CHANNEL_REGISTRY
@@ -954,9 +738,6 @@ pub fn channel_registry() -> &'static ChannelRegistry {
         .expect("CHANNEL_REGISTRY not initialized — must be set during bootstrap")
 }
 
-// ── Role ────────────────────────────────────────────────────────
-
-/// Typed role identifier for agents.
 #[derive(
     Debug,
     Clone,
@@ -985,93 +766,78 @@ pub enum Role {
     Custom,
 }
 
-/// A launch: one continuable branch of a custom role, or a worker branch. For a
-/// custom role it carries the authorial definition as it stood when the launch
-/// was created — a later edit of the record takes effect on the NEXT launch —
-/// for a worker branch the definition fields are empty.
+/// A launch: one continuable branch of a custom role, or a worker branch. For a custom
+/// role it carries the authorial definition as it stood when the launch was created — a
+/// later edit of the record takes effect on the NEXT launch — for a worker branch the
+/// definition fields are empty.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Launch {
-    /// The role the branch runs as: `custom` for an administrator-defined role,
-    /// `worker` for a worker branch. Absent in envelopes stored before the field
-    /// existed — those can only be custom-role launches.
+    /// `custom` for an administrator-defined role, `worker` for a worker branch.
+    /// Envelopes stored before the field existed can only be custom-role launches.
     #[serde(default = "Launch::custom_role_default")]
     pub role: Role,
-    /// The custom role's name. Empty for a worker branch.
+    /// The custom role's name; empty for a worker branch.
     pub name: String,
-    /// The branch identifier this launch continues, when the branch was named.
-    /// `None` for an unnamed branch (the record's default branch or a one-off run).
+    /// The branch this launch continues; `None` for an unnamed branch (the record's
+    /// default branch or a one-off run).
     #[serde(default)]
     pub identifier: Option<String>,
-    /// The authorial prompt text, taken at launch. Empty for a worker branch.
+    /// The authorial prompt text, taken at launch; empty for a worker branch.
     pub prompt: String,
-    /// The chosen subset of the admin Assistant's tool names, taken at launch.
-    /// Empty for a worker branch.
+    /// The chosen subset of the admin Assistant's tool names, taken at launch; empty
+    /// for a worker branch.
     pub tools: Vec<String>,
     /// The resolved session/branch address (`role_{name}`, `role_{name}:{id}`,
     /// `rolerun_{name}:{suffix}` or `worker_{branch}`).
     pub agent_id: String,
-    /// The conversation that asked for this launch's work — the asking custom
-    /// role's branch, whose folder is `workspace`, so the report returns into
-    /// that branch instead of the admin's Assistant. It is PER-LAUNCH: each use
-    /// names its asker, so a later use with a different asker overrides it.
-    /// `None` for a launch the owner or an automation started. Boxed because the asker
-    /// itself holds a [`crate::Launch`] — the pair would otherwise be infinitely
-    /// sized. `#[serde(default)]` keeps envelopes stored before the field existed
-    /// decodable.
+    /// The conversation that asked for this launch's work, so the report returns into
+    /// that branch instead of the admin's Assistant. PER-LAUNCH: each use names its
+    /// asker, so a later use with a different asker overrides it; `None` for a launch
+    /// the owner or an automation started. Boxed because the asker itself holds a
+    /// [`crate::Launch`], and `#[serde(default)]` keeps older envelopes decodable.
     #[serde(default)]
     pub reply_to: Option<Box<crate::agent::message_router::Asker>>,
 }
 
 impl Launch {
-    /// The role of a launch stored before the `role` field existed: only a
-    /// custom-role launch could have written such an envelope.
+    /// The role of an envelope stored before the `role` field existed: only a
+    /// custom-role launch could have written one.
     fn custom_role_default() -> Role {
         Role::Custom
     }
 }
 
 impl Role {
-    /// The role a dispatched round belongs to: a round carrying a launch runs
-    /// as the launch's own role whatever the tool's construction role was — the
-    /// launch is the address authority, and the round's job row and result
-    /// envelope must say so.
+    /// The role a dispatched round belongs to: a round carrying a launch runs as the
+    /// launch's own role whatever the tool's construction role was — the launch is the
+    /// address authority, and the job row and result envelope must say so.
     #[must_use]
     pub(crate) fn for_launch(self, launch: Option<&Launch>) -> Self {
         launch.map_or(self, |launch| launch.role)
     }
 }
 
-// ── Agent ───────────────────────────────────────────────────────
-
-/// A single tool call record, stored per-call in the logs database.
-///
-/// Each tool invocation produces one record with its full serialized
-/// arguments, execution duration, and success/failure outcome.
-/// Records are accumulated in-memory in the agent and handed to the
-/// telemetry queue on session finalization.
+/// One tool invocation's record, handed to the telemetry queue on session finalization.
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCallRecord {
-    /// The tool's name.
     pub tool_name: String,
-    /// Serialized arguments as JSON string (credentials scrubbed).
+    /// Serialized arguments as JSON (credentials scrubbed).
     pub arguments: String,
-    /// Execution duration in milliseconds.
+    /// Milliseconds.
     pub duration_ms: i64,
-    /// Whether the tool call succeeded.
     pub success: bool,
-    /// Error message on failure (`None` on success).
+    /// `None` on success.
     pub error_message: Option<String>,
 }
 
 /// The per-turn verdict the post-delivery summarization gate reads:
-/// [`Agent::work`] fills `settled_tool_results` (and reads it for its own
-/// pre-turn gate), then the per-session consumer loop reads it once the reply has
-/// been delivered (see [`crate::agent::Agent::maybe_summarize_after_delivery`]).
+/// [`Agent::work`] fills `settled_tool_results` (and reads it for its own pre-turn
+/// gate), then the per-session consumer loop reads it once the reply is delivered
+/// (see [`crate::agent::Agent::maybe_summarize_after_delivery`]).
 #[derive(Default)]
 pub(crate) struct TurnState {
-    /// The turn settled previously dangling tool results (see
-    /// [`Agent::work`]) — the trail a resume is recovered from, which a
-    /// compaction's retention window would drop.
+    /// The turn settled previously dangling tool results — the trail a resume is
+    /// recovered from, which a compaction's retention window would drop.
     pub(crate) settled_tool_results: bool,
 }
 
@@ -1087,135 +853,109 @@ pub(crate) enum RunFailure {
 
 /// Running context for an agent turn.
 pub struct Agent {
-    /// Session persistence key; also serves as the registry agent ID.
-    /// Direct-chat agents use `{user}_{ws_name}_{role}` (or the deduped
-    /// `{user}_personal:{role}` for the user's own personal workspace) as the
-    /// key (stable across messages, channel-agnostic per user+workspace+role).
-    /// Sub-agents and ticket handlers use a fresh NanoID per invocation.
+    /// Session persistence key, also the registry agent ID: direct-chat agents use
+    /// `{user}_{ws_name}_{role}` (or the deduped `{user}_personal:{role}`), stable
+    /// per user+workspace+role; sub-agents and ticket handlers use a fresh NanoID.
     #[expect(clippy::struct_field_names)]
     pub(crate) agent_id: String,
-    /// The agent's role (Manager, Engineer, Analyst, etc.).
     role: Role,
-    /// Agent owns its session — all session methods take the key from `self.agent_id`.
+    /// The agent owns its session — every session method takes the key from
+    /// `self.agent_id`.
     pub(crate) session: Session,
-    /// Execution workspace for this agent.
     workspace: Arc<crate::Workspace>,
-    /// Agent-owned tool set.
     tools: Vec<Box<dyn crate::Tool>>,
-    /// Chrome sessions this run opened — closed through the browser's own
-    /// extension when the run ends.
+    /// Chrome sessions this run opened, closed through the browser's own extension.
     chrome_sessions: std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
-    /// Cached tool specs — computed once from `tools` at construction time.
+    /// Computed once from `tools` at construction time.
     pub(crate) tool_specs: Vec<ToolSpec>,
-    /// Cancellation token for cooperative mid-loop cancellation (a deliberate
-    /// stop — GUI cancel, re-dispatch, phase transition, or shutdown).
+    /// Cooperative mid-loop cancellation (a deliberate stop — GUI cancel, re-dispatch,
+    /// phase transition, or shutdown).
     cancel_token: CancellationToken,
-    /// Whether a workspace-pause (strict freeze) cancellation was requested
-    /// for this run. Set by `cancel_by_workspace_pause` when the agent's
-    /// workspace is paused mid-run — a FREEZE distinct from a code-driven
-    /// cancellation. Used by the pipeline failure classifier to leave the
-    /// ticket in its source phase for unpause.
+    /// A workspace-pause (strict freeze) cancellation was requested for this run, set
+    /// by `cancel_by_workspace_pause` — a FREEZE distinct from a code-driven
+    /// cancellation; the pipeline failure classifier leaves the ticket in its source
+    /// phase for unpause.
     pause_stop: Arc<std::sync::atomic::AtomicBool>,
-    /// IMMUTABLE bail-time snapshot of whether this agent's run was stopped at
-    /// a cooperative workspace-pause freeze — set once at the LLM-round
-    /// boundary, never cleared. Unlike the live `pause_stop` flag (set by
-    /// `cancel_by_workspace_pause`, cleared on unpause), this survives the
-    /// window where the agent is still registered and the workspace is resumed
-    /// between the bail and the pipeline finalizer reading it — so a frozen
-    /// run is never misrouted to the hard-failure/reset path.
+    /// IMMUTABLE bail-time snapshot of whether this run stopped at a cooperative
+    /// workspace-pause freeze — set once at the LLM-round boundary, never cleared.
+    /// Unlike the live `pause_stop` flag, it survives the window where the agent is
+    /// still registered and the workspace is resumed between the bail and the pipeline
+    /// finalizer reading it, so a frozen run is never misrouted to the hard-failure path.
     paused_frozen: std::sync::atomic::AtomicBool,
-    /// Board ticket this agent is currently working on (set for board-dispatched agents).
+    /// The board ticket this agent is working on (board-dispatched agents only).
     ticket: Option<crate::pipeline::board::Ticket>,
-    /// Generation counter from the agent registry — used in [`Drop`] for
-    /// safe deregistration. 0 means not registered (e.g. test agents).
+    /// Generation counter from the agent registry, for safe deregistration in [`Drop`];
+    /// 0 means not registered (e.g. test agents).
     generation: u64,
-    /// Per-call tool stats accumulated during this agent's work loop.
-    /// Enqueued for the log store on [`Agent::finalize_session`]; silently
-    /// lost if the agent is dropped without finalization.
+    /// Per-call tool stats, enqueued for the log store on
+    /// [`Agent::finalize_session`] — silently lost if the agent is dropped first.
     tool_stats: std::sync::Mutex<Vec<crate::ToolCallRecord>>,
-    /// The user who triggered this agent run — used by tools (e.g. AnalyzeTool)
-    /// to route async sub-agent results back to the correct user.
+    /// The user who triggered this run — tools route async sub-agent results back
+    /// through it.
     pub(crate) user_name: String,
-    /// Whether the triggering account is the admin — gates the Assistant's
-    /// widened toolset and role prompt.
+    /// Gates the Assistant's widened toolset and role prompt.
     pub(crate) is_admin: bool,
     /// The channel origin (gui, telegram, voice, cli) of the triggering message.
     pub(crate) channel: String,
-    /// DIRECT PARENT INVOCATION grouping key for the Running Agents view
-    /// (ticket / analyze round / research run). `None` for workspace singletons.
-    /// Propagated to sub-agents spawned by tools via
-    /// [`CURRENT_TOOL_PARENT_KEY`](crate::agent::CURRENT_TOOL_PARENT_KEY).
+    /// DIRECT PARENT INVOCATION grouping key for the Running Agents view (ticket /
+    /// analyze round / research run); `None` for workspace singletons. Propagated to
+    /// sub-agents via [`CURRENT_TOOL_PARENT_KEY`](crate::agent::CURRENT_TOOL_PARENT_KEY).
     pub(crate) parent_key: Option<crate::agent::registry::ParentKey>,
-    /// Human-readable label of the DIRECT PARENT INVOCATION (ticket title /
-    /// analyze question / research question) — shown on the Running Agents
-    /// group header. Purely presentational. Propagated to sub-agents spawned
-    /// by tools via
-    /// [`CURRENT_TOOL_PARENT_LABEL`](crate::agent::CURRENT_TOOL_PARENT_LABEL).
+    /// The DIRECT PARENT INVOCATION's label (ticket title / analyze or research
+    /// question), purely presentational for the group header. Propagated to sub-agents
+    /// via [`CURRENT_TOOL_PARENT_LABEL`](crate::agent::CURRENT_TOOL_PARENT_LABEL).
     pub(crate) parent_label: Option<String>,
-    /// Optional receiver for mid-work messages (e.g., ticket comments).
-    /// When set, the `llm_loop` drains this channel before each LLM call
-    /// and injects received messages into the session history.
+    /// Mid-work messages (e.g. ticket comments): `llm_loop` drains this channel before
+    /// each LLM call and injects what it finds into the session history.
     pub(crate) incoming_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<crate::agent::message_router::AgentJob>>,
-    /// Round-fixed timestamp for the first user message (one value per round
-    /// for byte-identical task messages across parallel members).
+    /// Round-fixed timestamp for the first user message, so parallel members send
+    /// byte-identical task messages.
     pub(crate) round_ts: Option<String>,
-    /// Leader-stagger signal: fired after the agent's first LLM call
-    /// completes (success or failure, full retry budget) or when the leader
-    /// bails at the phase gate before any LLM call; `None` for non-leader
-    /// members.
+    /// Leader-stagger signal, fired after the agent's first LLM call completes (success
+    /// or failure, full retry budget) or when the leader bails at the phase gate before
+    /// any LLM call; `None` for non-leader members.
     pub(crate) first_call_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
-    /// Raw failure detail from the last run — set by [`crate::agent::run_agent`]
-    /// on error, left `None` on success or cancellation (callers classify
-    /// cancellation via the cancel tokens).
+    /// Raw failure detail from the last run, set by [`crate::agent::run_agent`] on
+    /// error; `None` on success or cancellation (callers classify cancellation via the
+    /// cancel tokens).
     pub(crate) failure: Option<String>,
-    /// Typed provider failure classification from the last run — set by
-    /// [`crate::agent::run_agent`] alongside [`Self::failure`] when the error
-    /// chain carries a [`crate::retry::RetryExhausted`]; `None` for runtime
-    /// errors, cancellations, and successes. Consumed by workspace discovery
-    /// to distinguish provider-class failures (workspace returns to Pending)
-    /// from genuine failures (workspace goes Failed).
+    /// Typed provider failure classification, set alongside [`Self::failure`] when the
+    /// error chain carries a [`crate::retry::RetryExhausted`]; `None` for runtime
+    /// errors, cancellations and successes. Workspace discovery reads it to tell
+    /// provider-class failures (workspace returns to Pending) from genuine ones (Failed).
     pub(crate) failure_class: Option<crate::retry::FailureClass>,
-    /// The classification captured by [`crate::agent::run_agent`] in its `Err`
-    /// arm from `failure_classification`; `None` on success. Captured at failure
-    /// time (not re-derived), so a later process-global stop cannot reclassify
-    /// the run.
+    /// The classification captured at failure time (not re-derived), so a later
+    /// process-global stop cannot reclassify the run; `None` on success.
     pub(crate) run_failure: Option<RunFailure>,
     /// Whether the turn ended via a successful `sleep` call.
     pub(crate) sleep_ended: bool,
-    /// Whether this turn's user message was recorded (a non-empty message whose
-    /// append succeeded). The turn's personal-workspace change report rides that
-    /// message, so a turn that recorded none must not advance the folder's
-    /// baseline — its changes stay pending for the next recorded message. Read by
-    /// [`crate::agent::run_agent`], set in [`crate::Agent::work`].
+    /// Whether this turn's user message was recorded. The turn's personal-workspace
+    /// change report rides that message, so a turn that recorded none must not advance
+    /// the folder's baseline — its changes stay pending for the next recorded message.
+    /// Read by [`crate::agent::run_agent`], set in [`crate::Agent::work`].
     pub(crate) turn_recorded: bool,
     /// Per-turn state the post-delivery gate reads — see [`TurnState`].
     pub(crate) turn_state: TurnState,
-    /// Agent-scoped registry of background shell sessions (Full shell roles
-    /// only). Live sessions are force-killed on agent teardown ([`Drop`]) —
-    /// see [`crate::tools::shell::BackgroundSessions`]. Reachable from the
-    /// tool-batch context via
-    /// [`crate::agent::CURRENT_TOOL_BACKGROUND_SESSIONS`].
+    /// Background shell sessions (Full shell roles only), force-killed on teardown
+    /// ([`Drop`]) — see [`crate::tools::shell::BackgroundSessions`]. Reachable from the
+    /// tool-batch context via [`crate::agent::CURRENT_TOOL_BACKGROUND_SESSIONS`].
     background_sessions: std::sync::Arc<crate::tools::shell::BackgroundSessions>,
-    /// Fired by [`crate::agent::registry::AgentRegistry::interrupt`] when an
-    /// urgent user message arrives for this agent: the turn is cut where it
-    /// stands — a pending model request or tool call is dropped — and ends with
-    /// its interruption notice instead of an answer. Never a cancellation: it
-    /// leaves [`Self::cancel_token`] untouched, so the turn still settles its
-    /// tool results and finalizes its session. One token per turn (it dies with
-    /// the agent), so an urgent message interrupts at most the turn it cuts.
+    /// Fired by [`crate::agent::registry::AgentRegistry::interrupt`] on an urgent user
+    /// message: the turn is cut where it stands — a pending model request or tool call
+    /// is dropped — and ends with its interruption notice instead of an answer. Never a
+    /// cancellation: [`Self::cancel_token`] is untouched, so the turn still settles its
+    /// tool results and finalizes its session. One token per turn, so an urgent message
+    /// interrupts at most the turn it cuts.
     pub(crate) interrupt_token: CancellationToken,
 }
-
-// ── Verdict type ─────────────────────────────────────────────────
 
 /// Result of a single verification pass (code reviewer or functional tester).
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Verdict {
-    /// Quality score from 0 (worst) to 10 (best).
+    /// 0 (worst) to 10 (best).
     #[serde(deserialize_with = "de_verdict_score")]
     pub score: u8,
-    /// List of specific issues detected in the response.
     #[serde(rename = "issues")]
     pub issues_detected: Vec<String>,
 }
@@ -1230,7 +970,7 @@ pub(crate) enum IssueGrade {
 }
 
 impl IssueGrade {
-    /// Lowercase label used in the rendered comment ("minor"/"major"/"blocker").
+    /// Lowercase label used in the rendered comment.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -1248,8 +988,7 @@ pub(crate) struct AnalysisIssue {
     pub grade: IssueGrade,
 }
 
-/// Score-less analysis verdict: a list of individually-graded issues. Unlike
-/// the shared `Verdict` (the verification stage's score-based shape), analysis
+/// Unlike the shared `Verdict` (the verification stage's score-based shape), analysis
 /// drops the score and grades each issue minor/major/blocker.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct AnalysisVerdict {
@@ -1257,9 +996,8 @@ pub(crate) struct AnalysisVerdict {
     pub issues_detected: Vec<AnalysisIssue>,
 }
 
-/// Whether an aggregated blocker hinders the main implementation path or is a
-/// real but non-blocking risk/edge case. Stored as a snake_case enum; any
-/// human label is emitted only at render time.
+/// Whether an aggregated blocker hinders the main implementation path or is a real but
+/// non-blocking risk/edge case. Any human label is emitted only at render time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum BlockerKind {
@@ -1267,9 +1005,8 @@ pub(crate) enum BlockerKind {
     RiskEdgeCase,
 }
 
-/// Severity of an aggregated blocker if left unaddressed. `Ord` uses
-/// declaration order so the two-verifier merge can take the max
-/// (critical > high > medium > low).
+/// Severity of an aggregated blocker if left unaddressed. `Ord` uses declaration order
+/// so the two-verifier merge can take the max.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum BlockerSeverity {
@@ -1282,11 +1019,9 @@ pub(crate) enum BlockerSeverity {
 /// One blocker's substance outcome from an escalation analyst.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct BlockerVerificationItem {
-    /// 0-based index of the blocker in the injected list.
+    /// 0-based index in the injected list.
     pub index: usize,
-    /// Whether the blocker blocks the main path or is a risk/edge case.
     pub kind: BlockerKind,
-    /// Severity if left unaddressed.
     pub severity: BlockerSeverity,
     /// What the blocker affects / how it constrains the ticket (required).
     pub impact: String,
@@ -1302,13 +1037,11 @@ pub(crate) struct BlockerVerificationVerdict {
 }
 
 /// Deserialize a verdict score, self-healing common model emissions:
-/// - [0,10] values pass through; fractional values floor (8.5 → 8).
+/// - [0,10] passes through, fractional values floor (8.5 → 8).
 /// - [11,100] divides by 10 then floors (85 → 8, 11 → 1, 100 → 10).
-/// - Integers 101–255 pass through so downstream validation keeps
-///   classifying them as out-of-range (failure-class stability); the
-///   float spellings of that band (101.0, 255.0) fail closed.
-/// - Everything else (non-numeric, negative, the (10,11) gap, fractions
-///   outside the bands) fails closed — range checks precede any cast.
+/// - Integers 101–255 pass through so downstream validation keeps classifying them as
+///   out-of-range (failure-class stability); the float spellings fail closed.
+/// - Everything else fails closed — range checks precede any cast.
 #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn de_verdict_score<'de, D>(deserializer: D) -> Result<u8, D::Error>
 where
@@ -1327,9 +1060,8 @@ where
     } else if (11.0..=100.0).contains(&f) {
         Ok((f / 10.0).floor() as u8)
     } else if (101.0..=255.0).contains(&f) && n.is_i64() {
-        // Out-of-range integers pass through so downstream validation
-        // keeps their out-of-range classification (failure-class stability).
-        // Floats in this band (e.g. 255.0) fail closed.
+        // Out-of-range integers pass through for failure-class stability; floats in
+        // this band (e.g. 255.0) fail closed.
         Ok(f as u8)
     } else {
         Err(D::Error::custom("verdict score out of accepted ranges"))
@@ -1347,7 +1079,6 @@ mod verdict_score_tests {
             expected: Option<u8>,
         }
         let cases = [
-            // Native band [0,10]: integers unchanged, fractions floor.
             Case {
                 json: r#"{"score": 8, "issues": []}"#,
                 expected: Some(8),
@@ -1364,7 +1095,6 @@ mod verdict_score_tests {
                 json: r#"{"score": 10.0, "issues": []}"#,
                 expected: Some(10),
             },
-            // Percent band [11,100]: divide by 10, then floor.
             Case {
                 json: r#"{"score": 85, "issues": []}"#,
                 expected: Some(8),
@@ -1381,8 +1111,6 @@ mod verdict_score_tests {
                 json: r#"{"score": 85.5, "issues": []}"#,
                 expected: Some(8),
             },
-            // Integers 101–255 pass through for downstream out-of-range
-            // classification (failure-class stability).
             Case {
                 json: r#"{"score": 101, "issues": []}"#,
                 expected: Some(101),
@@ -1391,8 +1119,7 @@ mod verdict_score_tests {
                 json: r#"{"score": 255, "issues": []}"#,
                 expected: Some(255),
             },
-            // ...but the float spellings of that band fail closed, pinning
-            // the lexical-form distinction (255 accepted vs 255.0 rejected).
+            // The float spellings of that band fail closed — the lexical form decides.
             Case {
                 json: r#"{"score": 101.0, "issues": []}"#,
                 expected: None,
@@ -1401,7 +1128,6 @@ mod verdict_score_tests {
                 json: r#"{"score": 255.0, "issues": []}"#,
                 expected: None,
             },
-            // (10,11) gap and everything outside the bands fail closed.
             Case {
                 json: r#"{"score": 10.5, "issues": []}"#,
                 expected: None,
@@ -1449,20 +1175,19 @@ mod verdict_score_tests {
 /// Result of a sanitation agent's file inspection.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct SanitationVerdict {
-    /// Whether the ticket passes sanitation (`true` = clean, `false` = garbage detected).
+    /// `true` = clean, `false` = garbage detected.
     pub pass: bool,
-    /// List of garbage/unwanted files found (empty when `pass` is `true`).
+    /// Empty when `pass` is `true`.
     #[serde(default)]
     pub garbage_files: Vec<String>,
-    /// Rationale for the decision.
     pub rationale: String,
 }
 
-/// Concise structured summary of an engineer's completed work, extracted from
-/// the engineer's session for the ticket comment.
+/// Concise structured summary of an engineer's completed work, extracted from the
+/// engineer's session for the ticket comment.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct EngineerSummary {
-    /// Concise bullet points of what was implemented / fixed / executed.
+    /// What was implemented / fixed / executed.
     #[serde(default)]
     pub items: Vec<String>,
     /// Measurements or figures the ticket explicitly asked for.
@@ -1473,7 +1198,7 @@ pub(crate) struct EngineerSummary {
     pub summary: Option<String>,
 }
 
-// ── Tool trait + types ──────────────────────────────────────────
+// Tool trait + types
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ToolSpec {
@@ -1522,112 +1247,67 @@ pub(crate) trait Tool: Send + Sync {
         }
     }
 
-    /// Whether this tool's output should be scrubbed for credentials.
+    /// Whether this tool's output should be scrubbed for credentials. The default is
+    /// `true` (scrub-all, via `scrub_tool_output` in `tools/mod.rs`).
     ///
-    /// The call chain is (see `scrub_tool_output` in `tools/mod.rs`):
-    ///
-    /// ```text
-    /// agent::execute_tool
-    ///   └─ scrub_tool_output(tool, args, output)
-    ///        └─ tool.should_scrub_output(args)
-    ///             └─ (if true) scrub_credentials(output)
-    ///             └─ (if false) output as-is
-    /// ```
-    ///
-    /// There are three distinct policy patterns across the codebase:
-    ///
-    /// 1. **Scrub-all** (trait default: `true`) — chrome, edit, analyze, ticket,
-    ///    media-gen tools, and most others. The raw output may contain
-    ///    credentials, so it is always scrubbed before the LLM sees it.
-    ///    `web_search` is scrub-all too, except on a picture call from an
-    ///    instance that offers pictures (which scrubs its own text) — see its
-    ///    override.
-    ///
-    /// 2. **Skip scrubbing entirely** (`false`) — shell, search and debug tools.
-    ///    - The shell tool's internal `apply_profile_pipeline` already scrubs
-    ///      stdout and stderr once at pipeline entry; returning `false` avoids
-    ///      double-scrubbing. Implementers of tools that scrub internally **must**
-    ///      return `false` from this method to prevent redundant scrubbing.
-    ///    - The search tool returns source code content where credential patterns
-    ///      are harmless and should be shown accurately to the model.
-    ///    - The debug query tool returns stored cells verbatim: a value in a row
-    ///      is the answer, not something to rewrite.
-    ///
-    /// 3. **Context-sensitive** — read tool. The read tool scrubs internally in
-    ///    `read_resolved` based on the *resolved* path (see `scrub_if_sensitive`)
-    ///    and returns `false` here, because an args-only decision cannot see
-    ///    symlink targets or typo-recovered files (same pattern as shell).
-    ///
-    /// **If your tool performs internal credential scrubbing, or returns stored
-    /// text as it is**, override this method to return `false` so the agent-level
-    /// pass neither double-scrubs nor rewrites the answer.
+    /// **A tool that scrubs internally or returns stored text as it is must return
+    /// `false`**, so the agent-level pass neither double-scrubs nor rewrites the answer:
+    /// shell (`apply_profile_pipeline` already scrubs stdout and stderr once at pipeline
+    /// entry), search (source code, where credential patterns are harmless and should be
+    /// shown accurately), the debug query (a stored cell is the answer), and read (which
+    /// scrubs in `read_resolved` by the *resolved* path — an args-only decision cannot
+    /// see symlink targets or typo-recovered files). `web_search` scrubs its own picture
+    /// text on that call only.
     fn should_scrub_output(&self, _args: &serde_json::Value) -> bool {
         true
     }
 
-    /// Whether this tool has side effects that would conflict with parallel
-    /// execution of other tools.
-    ///
-    /// Returns `true` by default (conservative — assume mutating). Return
-    /// `false` only when a sibling running at the same time can neither change
-    /// what this call observes nor target what it writes: inspection tools (read,
-    /// search, web_search, ...) qualify, even when they write artifacts of their
-    /// own while reading (a shell spill, the read tool's converted-document
-    /// files) — each goes to a path unique to the call, so no sibling conflicts
-    /// with it. `false` groups the tool for parallel execution within a single
-    /// LLM turn.
+    /// Whether this tool has side effects that would conflict with parallel execution.
+    /// `true` by default (conservative — assume mutating). Return `false` only when a
+    /// sibling running at the same time can neither change what this call observes nor
+    /// target what it writes: inspection tools qualify, even when they write artifacts of
+    /// their own while reading (a shell spill, converted-document files), because each
+    /// goes to a path unique to the call. `false` groups the tool for parallel execution
+    /// within a single LLM turn.
     fn side_effects(&self) -> bool {
         true
     }
 
-    /// Whether a SUCCESSFUL execution ends the agent's run gracefully after the
-    /// current tool round commits (no further LLM call). Failed outcomes never
-    /// end the turn. This is the `sleep` tool's trigger.
+    /// Whether a SUCCESSFUL execution ends the run gracefully after the current tool
+    /// round commits (no further LLM call). Failed outcomes never end the turn. This is
+    /// the `sleep` tool's trigger.
     fn ends_turn_on_success(&self) -> bool {
         false
     }
 
-    /// Whether the tool should be advertised to the model right now.
+    /// Whether the tool should be advertised to the model right now; tools backed by an
+    /// external service override this to hide themselves while it is down, so the model
+    /// doesn't burn calls against a dead backend.
     ///
-    /// Returns `true` by default. Tools backed by an external daemon/service
-    /// override this to hide themselves while that service is down, so the
-    /// model doesn't burn calls against a dead backend (e.g. chrome when the
-    /// chrome-use daemon is unreachable).
-    ///
-    /// The result is read once when an agent is constructed and kept for the
-    /// agent's lifetime: an agent created during an outage permanently lacks
-    /// the tool even after recovery, and a long-lived agent keeps advertising
-    /// it after the backend dies (its runtime fail-fast then handles that).
-    /// This is deliberate — agents are short-lived per run, and re-checking
-    /// per turn would add latency and complexity.
+    /// Read once when an agent is constructed and kept for its lifetime: an agent
+    /// created during an outage permanently lacks the tool, and a long-lived agent keeps
+    /// advertising it after the backend dies (its runtime fail-fast then handles that).
+    /// Deliberate — agents are short-lived per run, and re-checking per turn would add latency.
     fn is_advertised(&self) -> bool {
         true
     }
 
-    /// Return the media marker prefix for this tool, if it generates media files.
-    ///
-    /// Returns the prefix string used to wrap a generated file path in the agent's
-    /// response content, e.g. `"[IMAGE:"` or `"[VIDEO:"`. The full marker
-    /// `"{prefix}path]"` is constructed by appending the path and a closing `]`.
-    ///
-    /// Tools that produce media (images, videos, audio) should override this to
-    /// return their marker prefix. Non-media tools should leave the default `None`.
-    /// The marker format is `[TYPE:path]` where `TYPE` is the uppercase media type.
+    /// The prefix wrapping a generated file path in the agent's response content, e.g.
+    /// `"[IMAGE:"`; the full marker `"{prefix}path]"` is built by `format_media_result`.
+    /// Non-media tools leave the default `None`.
     fn media_marker(&self) -> Option<&'static str> {
         None
     }
 
-    /// Whether every successful answer of this tool carries a media marker.
-    ///
-    /// `true` for a tool that exists to produce media. `false` for one that also
-    /// answers with text alone (the renderer returns documents and lint reports as
+    /// Whether every successful answer carries a media marker: `false` for a tool that
+    /// also answers with text alone (the renderer returns documents and lint reports as
     /// well as videos), so a marker-less answer is not a fault to report.
     fn media_marker_always(&self) -> bool {
         true
     }
 
-    /// Format the media output marker `[TYPE:path]` for a generated file.
-    /// Single source of the marker shape parsed by [`crate::util::MEDIA_MARKER_RE`].
+    /// Format the media output marker `[TYPE:path]` for a generated file. Single source
+    /// of the marker shape parsed by [`crate::util::MEDIA_MARKER_RE`].
     fn format_media_result(&self, output_path: &Path) -> String {
         let marker_prefix = self
             .media_marker()
@@ -1635,21 +1315,16 @@ pub(crate) trait Tool: Send + Sync {
         format!("{marker_prefix}{}]", output_path.to_string_lossy())
     }
 
-    /// Whether tool output must bypass the default ~5 KB tool-output
-    /// truncation (e.g. ticket details, search results, media markers the LLM
-    /// needs in full). Default: false — output is truncated.
+    /// Whether tool output must bypass the default ~5 KB truncation (e.g. ticket
+    /// details, search results, media markers the LLM needs in full).
     fn preserve_full_output(&self) -> bool {
         false
     }
 
-    /// Format tool output for LLM consumption.
-    ///
-    /// Called when tool results are embedded into the conversation history
-    /// (both in native tool-call mode and degraded text mode). The default
-    /// implementation uses head+tail truncation via [`crate::util::truncate_tool_output`]
-    /// (a ~5 KB trigger, with the omission marker additional to it); override to
-    /// produce a smarter summary (e.g. trim repetitive CLI output or extract key
-    /// facts from search results).
+    /// Format tool results for embedding into the conversation history (native tool-call
+    /// mode and degraded text mode alike). The default is head+tail truncation via
+    /// [`crate::util::truncate_tool_output`] (a ~5 KB trigger, with the omission marker
+    /// additional to it); override to summarize more smartly.
     fn format_output(&self, output: &str) -> String {
         if self.preserve_full_output() {
             output.to_string()
@@ -1658,22 +1333,17 @@ pub(crate) trait Tool: Send + Sync {
         }
     }
 
-    /// Build the image payload to be injected as a synthetic User-role message
-    /// after this tool's result block, so a vision-capable model can see an
-    /// on-disk image as a native image part.
+    /// The image payload injected as a synthetic User-role message after this tool's
+    /// result block, so a vision-capable model sees an on-disk image natively.
     ///
-    /// Default `None` — most tools produce no image. Overridden by the read tool
-    /// (a raster read) and by chrome (screenshots), each re-encoding an on-disk
-    /// raster (PNG/JPEG/WebP) into a bounded JPEG data-URI. For the read tool this
-    /// is the only decode of a NATIVE image file: `execute` only cheap-sniffs magic
-    /// bytes, so the decode happens here, once, guarded by a robust file-magic
-    /// check rather than by the annotation wording. A converted document's rasters
-    /// are not this path — they are decoded as it produces them. The computer tool
-    /// produces its capture through [`Tool::execute_with_payloads`] instead,
-    /// because its attachment can fail and the result must say so. Safety: the path
-    /// must obey the same workspace-boundary validation as [`Tool::execute`] — an
-    /// arbitrary `[IMAGE:/path]` reference embedded in model text is never resolved
-    /// here.
+    /// Overridden by read (a raster read) and chrome (screenshots), each re-encoding an
+    /// on-disk PNG/JPEG/WebP into a bounded JPEG data-URI; for read this is the only
+    /// decode of a native image file, guarded by a file-magic check rather than by the
+    /// annotation wording. A converted document's rasters are decoded as it produces
+    /// them, and the computer tool captures through [`Tool::execute_with_payloads`]
+    /// instead because its attachment can fail and the result must say so. Safety: the
+    /// path must obey the same workspace-boundary validation as [`Tool::execute`] — an
+    /// arbitrary `[IMAGE:/path]` reference embedded in model text is never resolved here.
     async fn image_payload(
         &self,
         _ws: &crate::Workspace,
@@ -1682,13 +1352,11 @@ pub(crate) trait Tool: Send + Sync {
         None
     }
 
-    /// Execute this tool and return its text together with any images it
-    /// produced — the agent loop's single entry point for a tool call.
-    ///
-    /// The default runs [`Tool::execute`] and then pairs the text with
-    /// [`Tool::image_payload`] (see [`crate::tools::with_image_payload`]). A tool
-    /// whose images are a by-product of its own execution overrides this, so one
-    /// execution yields both.
+    /// Execute this tool and return its text with any images it produced — the agent
+    /// loop's single entry point for a tool call. The default runs [`Tool::execute`] and
+    /// pairs the text with [`Tool::image_payload`] (see
+    /// [`crate::tools::with_image_payload`]); a tool whose images are a by-product of its
+    /// own execution overrides it, so one execution yields both.
     async fn execute_with_payloads(
         &self,
         ws: &crate::Workspace,
@@ -1699,29 +1367,17 @@ pub(crate) trait Tool: Send + Sync {
     }
 }
 
-// ── Chat role enum ─────────────────────────────────────────────
-
-/// Typed role for a [`ChatMessage`].
-///
-/// Replaces the previous `String`-based role to prevent typos and
-/// make the chat-role API self-documenting.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display, strum::EnumString,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "lowercase")]
 pub(crate) enum ChatRole {
-    /// System prompt message.
     System,
-    /// User (human) message.
     User,
-    /// Assistant (LLM) message.
     Assistant,
-    /// Tool result message.
     Tool,
 }
-
-// ── Provider trait + types ──────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ChatMessage {
@@ -1775,10 +1431,9 @@ pub(crate) struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
-/// Shared payload struct for tool-result messages.
-/// Ensures the writer (`ChatMessage::tool_result`) and reader
-/// (`decode_native_history_message`) stay in sync on field names,
-/// preventing silent field-name drift.
+/// The payload of a tool-result message, shared so the writer
+/// (`ChatMessage::tool_result`) and reader (`decode_native_history_message`) cannot
+/// drift on field names.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ToolResultPayload {
     pub tool_call_id: String,
@@ -1823,12 +1478,12 @@ pub(crate) struct ProviderUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
-    /// Prompt tokens not served from cache (prompt_tokens − cached when the
-    /// provider reports only the hit side).
+    /// Prompt tokens not served from cache (prompt_tokens − cached when the provider
+    /// reports only the hit side).
     pub cache_miss_tokens: Option<u64>,
     /// Billed cost from `usage.cost` — the invoice amount (OpenRouter-only).
     pub cost: Option<f64>,
-    /// Raw provider `usage.cost_details` breakdown (reference only).
+    /// Raw `usage.cost_details` breakdown (reference only).
     pub cost_details: Option<serde_json::Value>,
 }
 
@@ -1840,8 +1495,7 @@ pub(crate) struct ChatResponse {
     pub reasoning: Option<Reasoning>,
     /// `choices[0].finish_reason` from the provider envelope (stop/length/tool_calls/…).
     pub finish_reason: Option<String>,
-    /// Serving upstream provider — top-level OpenRouter response field
-    /// (undocumented in the API reference); NULL when omitted.
+    /// Top-level OpenRouter response field, undocumented in the API reference.
     pub upstream_provider: Option<String>,
     /// Provider `system_fingerprint` (eviction/backend-switch attribution).
     pub system_fingerprint: Option<String>,
@@ -1854,27 +1508,21 @@ impl ChatResponse {
     }
 }
 
-/// Default max tokens for LLM calls (32K output generation limit — NOT the context window
-/// size — this is the *generation limit* sent as `max_tokens` to the provider).
-/// Used as the fallback when callers don't explicitly set `max_tokens`.
+/// The fallback `max_tokens` when a caller sets none: the *generation* limit (32K
+/// output tokens), not the context window.
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 32_000;
 
-// ── Voice pipeline shared constants ─────────────────────────────────────────
-/// Operation metadata for per-request LLM stats logging (the `llm_requests`
-/// operation table and the `llm_failures` per-attempt failure trail in
-/// logs.db). Attached by call sites with agent/ticket context; requests
-/// without metadata (test doubles, ad-hoc calls) are not logged.
+/// Operation metadata for per-request LLM stats logging (the `llm_requests` table and
+/// the `llm_failures` per-attempt trail in logs.db). Requests without metadata (test
+/// doubles, ad-hoc calls) are not logged.
 #[derive(Debug, Clone)]
 pub(crate) struct ChatRequestMeta {
-    /// Purpose tag: "agent" (agent loop incl. direct chat / discovery /
-    /// sub-agents / maintainer), "extraction", "summarize", "consolidate",
-    /// "research_wrap_up" (deadline wrap-up extraction), "media_transcription"
-    /// (vision-model transcription of inbound videos / video tool results);
-    /// "agent-continuation" / "summarize-continuation" tag the operation-level
-    /// reasoning-only-stop recovery issued by
-    /// [`crate::agent::Agent::recover_reasoning_only_stop`] — one row per
-    /// continuation operation (success on resolution / failure on exhaustion;
-    /// `retry_attempts` carries the attempt count).
+    /// Purpose tag: "agent" (agent loop incl. direct chat / discovery / sub-agents /
+    /// maintainer), "extraction", "summarize", "consolidate", "research_wrap_up",
+    /// "media_transcription"; "agent-continuation" / "summarize-continuation" tag the
+    /// operation-level reasoning-only-stop recovery issued by
+    /// [`crate::agent::Agent::recover_reasoning_only_stop`] — one row per continuation
+    /// operation, with `retry_attempts` carrying the attempt count.
     pub purpose: &'static str,
     pub agent_id: String,
     pub role: String,
@@ -1887,46 +1535,36 @@ pub(crate) struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub tools: Option<Vec<ToolSpec>>,
     pub model: String,
-    /// Maximum tokens for the model to generate.
-    /// When `Some(n)`, sent as `max_tokens` in the API request body.
-    /// When `None`, the parameter is omitted (provider defaults apply).
+    /// Sent as `max_tokens`; omitted when `None` (provider defaults apply).
     pub max_tokens: Option<u32>,
-    /// Per-role reasoning effort (xhigh, high, medium, low, minimal).
-    /// When set, sent as `reasoning_effort` in the API request body.
-    /// When `None`, the parameter is omitted (model defaults apply).
+    /// Sent as `reasoning_effort` (xhigh, high, medium, low, minimal); omitted when
+    /// `None` (model defaults apply).
     pub reasoning_effort: Option<String>,
-    /// Provider routing: provider order list (comma-separated slugs).
-    /// When `Some` and non-empty, sent as the provider routing block.
-    /// When `None`, no provider routing is sent (OpenRouter defaults apply).
+    /// Comma-separated provider slugs, sent as the provider routing block when non-empty;
+    /// omitted when `None` (OpenRouter defaults apply).
     pub provider_order: Option<String>,
-    /// Optional operation metadata for per-request LLM stats logging.
+    /// Operation metadata for per-request LLM stats logging.
     pub meta: Option<ChatRequestMeta>,
 }
 
-/// Validator callback for scoped structured extraction: rejects
-/// a parsed value (e.g. verdict score ∉ [0,10]). A rejection is treated as a
-/// parse failure inside the extraction retry loop (re-prompted, fail-closed).
-/// Must be `Send + Sync` because extraction runs inside `join_all` futures.
+/// Validator for scoped structured extraction: rejecting a parsed value (e.g. a verdict
+/// score outside [0,10]) is treated as a parse failure inside the extraction retry loop
+/// (re-prompted, fail-closed). `Send + Sync` because extraction runs inside `join_all` futures.
 pub(crate) type ExtractionValidator<T> = dyn Fn(&T) -> Result<(), String> + Send + Sync;
 
 #[async_trait]
 pub(crate) trait Provider: Send + Sync {
-    /// Single-attempt chat for the outer retry paths.
+    /// Single-attempt chat for the outer retry loops in [`crate::retry`]. Contract:
     ///
-    /// Used by the outer retry loops in [`crate::retry`]. Contract:
-    ///
-    /// - **No provider-internal retries** — this call makes exactly one HTTP
-    ///   request; the outer loop is the single retry authority.
+    /// - **No provider-internal retries** — exactly one HTTP request; the outer loop is
+    ///   the single retry authority.
     /// - **Idle-timeout semantics** — the 600 s idle timeout
     ///   ([`crate::retry::DEFAULT_IDLE_TIMEOUT`]) bounds the TTFB wait and each
-    ///   body-read chunk wait, resetting while data flows; a stalled
-    ///   connection mid-body is the truncation signature this hardening
-    ///   targets. No total request timeout applies.
-    /// - On failure the returned [`ScopedCallError`] carries per-attempt
-    ///   diagnostics (classification, error chain, finish_reason) for the
-    ///   retry trail.
-    ///
-    /// All providers must implement this method.
+    ///   body-read chunk wait, resetting while data flows; a stalled connection
+    ///   mid-body is the truncation signature this hardening targets. No total request
+    ///   timeout applies.
+    /// - On failure the returned [`ScopedCallError`] carries per-attempt diagnostics
+    ///   (classification, error chain, finish_reason) for the retry trail.
     async fn chat_scoped(
         &self,
         request: ChatRequest,
@@ -1937,11 +1575,9 @@ pub(crate) trait Provider: Send + Sync {
     }
 }
 
-/// A skill is a user-defined or community-built capability.
-/// Skills live in `<workspace>/skills/<name>/` (also
-/// `<workspace>/.claude/skills/<name>/` and
-/// `<workspace>/.agents/skills/<name>/`) and are defined via `SKILL.md`.
-/// They provide instructions and context for the agent.
+/// A user-defined or community-built capability, defined by a `SKILL.md` in
+/// `<workspace>/skills/<name>/` (also `.claude/skills/<name>/` and
+/// `.agents/skills/<name>/`), providing instructions and context for the agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Skill {
     pub name: String,
@@ -1953,11 +1589,10 @@ pub(crate) struct Skill {
 mod tests {
     use super::*;
 
-    /// `commands()` and `from_buffers()` agree on field order: a mismatch would
-    /// silently swap one project command for another in the diagnostics editor.
+    /// A field-order mismatch would silently swap one project command for another in
+    /// the diagnostics editor.
     #[test]
     fn commands_and_from_buffers_are_consistent() {
-        // Verify that commands() and from_buffers() agree on field order.
         let original = DiagnosticsCommands {
             format: Some("fmt".into()),
             format_check: Some("fmt-check".into()),
@@ -1984,50 +1619,40 @@ mod tests {
     fn parse_bot_command_coverage() {
         use BotCommand::*;
         let cases: Vec<(&str, Option<BotCommand>)> = vec![
-            // Positive: exact match
             ("/start", Some(Start)),
-            // Positive: case-insensitive
             ("/STart", Some(Start)),
             ("/Start", Some(Start)),
             ("/START", Some(Start)),
-            // Positive: with args/trailing space
             ("/start foo", Some(Start)),
             ("/start   ", Some(Start)),
-            // Positive: leading/trailing whitespace
             ("  /start", Some(Start)),
             ("  /start  ", Some(Start)),
             ("  /start foo  ", Some(Start)),
-            // /clear
             ("/clear", Some(Clear)),
             ("/CLEAR", Some(Clear)),
             ("/clear session", Some(Clear)),
             ("  /clear  ", Some(Clear)),
-            // /image_models
             ("/image_models", Some(ImageModels)),
             ("/IMAGE_MODELS", Some(ImageModels)),
             ("/image_models foo", Some(ImageModels)),
             ("  /image_models  ", Some(ImageModels)),
-            // /video_models
             ("/video_models", Some(VideoModels)),
             ("/Video_Models", Some(VideoModels)),
             ("/video_models foo", Some(VideoModels)),
-            // admin commands
             ("/board", Some(Board)),
             ("/BOARD", Some(Board)),
             ("/board foo", Some(Board)),
             ("/archive", Some(Archive)),
             ("/archive foo", Some(Archive)),
-            // /update
             ("/update", Some(Update)),
             ("/UPDATE", Some(Update)),
             ("/update foo", Some(Update)),
             ("  /update  ", Some(Update)),
-            // /agents (replies "nothing to switch" — no picker anymore)
             ("/agents", Some(Agents)),
             ("/AGENTS", Some(Agents)),
             ("/agents foo", Some(Agents)),
             ("  /agents  ", Some(Agents)),
-            // Negative: partial /-prefix matches
+            // Partial /-prefix matches.
             ("/", None),
             ("/s", None),
             ("/stard", None),
@@ -2038,8 +1663,8 @@ mod tests {
             ("/image", None),
             ("/video", None),
             ("/boardx", None),
-            // The workspace switcher, pipeline freeze and maintenance toggle are
-            // no longer commands in any spelling — they route as ordinary chat.
+            // The workspace switcher, pipeline freeze and maintenance toggle are no longer
+            // commands in any spelling — they route as ordinary chat.
             ("/workspace", None),
             ("/WORKSPACE", None),
             ("/workspace foo", None),
@@ -2062,13 +1687,13 @@ mod tests {
             ("/engineerr", None),
             ("/managr", None),
             ("/artiste", None),
-            // Former per-role switch commands — removed, fall through
+            // Former per-role switch commands, removed.
             ("/manager", None),
             ("/engineer", None),
             ("/artist", None),
             ("/assistant", None),
             ("/ reset", None),
-            // Negative: missing slash or empty
+            // Missing slash or empty.
             ("start", None),
             ("clear", None),
             ("models", None),

@@ -1,25 +1,19 @@
-//! Shared LLM grouping/synthesis core for pipeline joint-verdict and analyze
-//! consolidation.
+//! Shared LLM grouping/synthesis core for pipeline joint-verdict and analyze consolidation.
+//! One LLM pass groups id-referenced items (pipeline issues; analyze claims) into thematic groups.
+//! Every item gets a stable numeric id assigned once per operation across the whole input; the LLM
+//! refers to items by id only, and the system resolves id → (agent, text) via [`ItemTable`] for
+//! rendering. The LLM never produces counts: brackets `[n/N]` and the DISPUTED marker are computed
+//! here from distinct cited agent ids — pure arithmetic.
 //!
-//! One LLM pass groups id-referenced items (pipeline issues; analyze claims)
-//! into thematic/semantic groups. Every item gets a stable numeric id,
-//! assigned once per operation across the whole input (global flat numbering);
-//! the LLM refers to items by id only, and the system resolves id → (agent,
-//! text) via [`ItemTable`] for rendering. The LLM never produces counts:
-//! brackets `[n/N]` and the DISPUTED marker are computed here from distinct
-//! cited agent ids — pure arithmetic.
+//! Validation is strictly structural: ids in range, no duplicate placement, set
+//! completeness (every item appears exactly once across placed ∪ pinned ∪ remainder), and
+//! a contradiction guardrail (contradiction:true requires ≥2 distinct cited agents).
+//! Text-based membership checks are gone everywhere — a wrong-but-valid id is accepted by
+//! design, since semantic judgment is the LLM's; the gate only catches structural lies.
 //!
-//! Validation is strictly structural: ids in range, no duplicate placement,
-//! set completeness (every item appears exactly once across placed ∪ pinned ∪
-//! remainder), and a contradiction guardrail (contradiction:true requires ≥2
-//! distinct cited agents). Text-based membership checks are gone everywhere —
-//! a wrong-but-valid id is accepted by design (semantic judgment is the LLM's;
-//! the gate only catches structural lies).
-//!
-//! The single retry mode is the progress-preserving repair
-//! ([`run_grouping_repair`]): accepted groups freeze, repair rounds propose
-//! deltas for the remainder only, and termination deterministically places
-//! every remaining item in the ungrouped section.
+//! The single retry mode is the progress-preserving repair ([`run_grouping_repair`]):
+//! accepted groups freeze, repair rounds propose deltas for the remainder only, and
+//! termination deterministically places every remaining item in the ungrouped section.
 
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -29,32 +23,26 @@ use std::time::Instant;
 use crate::retry::{FailureClass, RetryFailureRecord, RetryLoop, RetryPolicy};
 use crate::{ChatRequest, ChatRequestMeta, Workspace};
 
-// ── Schema (strict — unknown fields rejected) ──────────────────────────
-
-/// One member of a group: a flat global item id (matches the `{id}: {text}`
-/// input list numbering). The source (agent) and text are resolved by the
-/// system via the operation's [`ItemTable`] — never by the model.
+/// One member of a group: a flat global item id (matching the `{id}: {text}` input numbering),
+/// resolved to (agent, text) by the operation's [`ItemTable`], never by the model.
 ///
-/// A member is a REPRESENTATIVE for one distinct fact. When several same-fact
-/// item ids were raised, the group lists the first raised id as `id` and the
-/// duplicate same-fact ids in [`Self::collapsed_ids`]. The collapsed ids are
-/// placed by the group (removed from the remainder) but never rendered as
-/// their own members — the representative carries the fact.
+/// A member is a REPRESENTATIVE for one distinct fact: the first raised id is `id`, the duplicate
+/// same-fact ids go in [`Self::collapsed_ids`]. Collapsed ids are placed by the group but never
+/// rendered as members of their own.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GroupingMember {
     /// Flat global item id, 0-based across all sources combined.
     pub id: usize,
-    /// Duplicate same-fact item ids collapsed under this representative
-    /// (empty/omitted when there are no duplicates).
+    /// Duplicate same-fact ids collapsed under this representative.
     #[serde(default)]
     pub collapsed_ids: Vec<usize>,
 }
 
 impl GroupingMember {
-    /// The representative id followed by every collapsed id, in order — the
-    /// full set of item ids this member owns/places. Order is meaningful:
-    /// the representative id comes first (its text is preferred for display).
+    /// The representative id followed by every collapsed id, in order — the full set of
+    /// ids this member places. Order matters: the representative comes first (its text is
+    /// preferred for display).
     pub(crate) fn ids(&self) -> impl Iterator<Item = usize> + '_ {
         std::iter::once(self.id).chain(self.collapsed_ids.iter().copied())
     }
@@ -71,8 +59,8 @@ pub(crate) struct GroupingGroup {
     pub members: Vec<GroupingMember>,
 }
 
-/// The full grouping output: summary prose + groups + an explicit ungrouped
-/// list (a valid, visible destination — silent dropout is rejected).
+/// The full grouping output: summary prose, groups, and an explicit ungrouped list (a
+/// valid, visible destination — silent dropout is rejected).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GroupingOutput {
@@ -82,10 +70,9 @@ pub(crate) struct GroupingOutput {
     pub ungrouped: Vec<GroupingMember>,
 }
 
-/// A repair-round proposal: only new groups for REMAINING items, an explicit
-/// ungrouped list (satisfies the round's completeness declaration — never
-/// final), optional contradiction references from remainder items to frozen
-/// groups, and an optional summary (accepted only when none was yet).
+/// A repair-round proposal: only new groups for REMAINING items, an explicit ungrouped
+/// list (completeness, never final), optional contradiction references from remainder items
+/// to frozen groups, and an optional summary (accepted only when none was yet).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GroupingDelta {
@@ -99,26 +86,22 @@ struct GroupingDelta {
     pub references: Vec<GroupingReference>,
 }
 
-/// A remainder item that contradicts a frozen group: renders with DISPUTED
-/// and a code-computed cross-reference to that group — the frozen group
-/// itself never changes. The target group index is stable because frozen
-/// groups are append-only.
+/// A remainder item contradicting a frozen group: renders with DISPUTED and a
+/// code-computed cross-reference to it — the frozen group never changes. The group index is
+/// stable because frozen groups are append-only.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GroupingReference {
-    /// Index into the frozen-groups list (0-based, matches the prompt
-    /// skeletons).
+    /// Index into the frozen-groups list (0-based, matching the prompt skeletons).
     pub group: usize,
     /// The remainder item flagging the contradiction.
     pub member: GroupingMember,
 }
 
-/// Outcome of the repair-mode grouping pass (pipeline synthesis + analyze
-/// consolidation).
+/// Outcome of the repair-mode grouping pass (pipeline synthesis + analyze consolidation).
 pub(crate) enum RepairOutcome {
-    /// Frozen groups + first-accepted summary + a code-computed ungrouped
-    /// remainder. `references` attach DISPUTED cross-references from
-    /// remainder items to frozen groups (code-side dedupe already applied).
+    /// Frozen groups + first-accepted summary + a code-computed ungrouped remainder.
+    /// `references` attach DISPUTED cross-references from remainder items to frozen groups.
     Repaired {
         output: GroupingOutput,
         references: Vec<GroupingReference>,
@@ -126,18 +109,13 @@ pub(crate) enum RepairOutcome {
     Fallback,
 }
 
-// ── Item id table (global flat numbering) ──────────────────────────────
-
-/// Global flat id → (agent, item index) table for one grouping operation.
-/// Ids are assigned once per operation across the whole input: every item
-/// across all sources gets exactly one id, in (agent, item) order. The model
-/// refers to items by id only; the system resolves id → (agent, text) here
-/// for rendering and severity lookups.
+/// Global flat id → (agent, item index) for one grouping operation. Ids are assigned once
+/// per operation across the whole input, in (agent, item) order; the model refers to items
+/// by id only.
 ///
-/// A wrong-but-valid id is accepted by design: validation is structural only
-/// (range, duplicates, completeness, contradiction ≥2 agents), and the LLM's
-/// semantic judgment is the only correctness gate. Never re-add text-equality
-/// membership checks — they only create a false sense of safety.
+/// A wrong-but-valid id is accepted by design: validation is structural only, and the LLM's
+/// semantic judgment is the only correctness gate. Never re-add text-equality membership
+/// checks — they only create a false sense of safety.
 pub(crate) struct ItemTable<'a> {
     /// id → (agent index, item index within that agent's list).
     rows: Vec<(usize, usize)>,
@@ -173,8 +151,7 @@ impl<'a> ItemTable<'a> {
         Some((agent, text))
     }
 
-    /// Resolve an id to its (agent, per-agent item index) — `None` when out
-    /// of range.
+    /// Resolve an id to its (agent, per-agent item index) — `None` when out of range.
     #[must_use]
     pub(crate) fn resolve_index(&self, id: usize) -> Option<(usize, usize)> {
         self.rows.get(id).copied()
@@ -187,11 +164,8 @@ impl<'a> ItemTable<'a> {
     }
 }
 
-// ── Bracket arithmetic (pure code — never LLM-written counts) ───────────
-
-/// Distinct cited agent ids of a group, sorted (resolved via the item table;
-/// out-of-range ids are ignored — validation rejects them before rendering).
-/// Collapsed same-fact ids are counted too, so the bracket reflects every
+/// Distinct cited agent ids of a group, sorted (out-of-range ids are ignored — validation
+/// rejects them before rendering). Collapsed ids count too, so the bracket reflects every
 /// agent behind a representative.
 #[must_use]
 pub(crate) fn distinct_agents(group: &GroupingGroup, table: &ItemTable<'_>) -> Vec<usize> {
@@ -205,10 +179,8 @@ pub(crate) fn distinct_agents(group: &GroupingGroup, table: &ItemTable<'_>) -> V
     agents
 }
 
-/// Render the bracket for a group: `[n/N]`, with ` · DISPUTED` appended only
-/// when the group carries a genuine contradiction (contradiction:true — which
-/// validation guarantees implies ≥2 distinct cited agents). Solo `[1/N]`
-/// renders without DISPUTED.
+/// `[n/N]`, with ` · DISPUTED` appended only for a genuine contradiction (which validation
+/// guarantees implies ≥2 distinct cited agents). Solo `[1/N]` renders without it.
 #[must_use]
 pub(crate) fn bracket_label(n: usize, n_valid: usize, disputed: bool) -> String {
     if disputed {
@@ -218,10 +190,7 @@ pub(crate) fn bracket_label(n: usize, n_valid: usize, disputed: bool) -> String 
     }
 }
 
-// ── Rendering helpers (shared) ─────────────────────────────────────────
-
-/// Render one member line attributed to its source: `Agent N: text`
-/// (resolved via the item table).
+/// One member line attributed to its source: `Agent N: text`.
 #[must_use]
 pub(crate) fn render_member_line(member: &GroupingMember, table: &ItemTable<'_>) -> String {
     match table.resolve(member.id) {
@@ -230,9 +199,8 @@ pub(crate) fn render_member_line(member: &GroupingMember, table: &ItemTable<'_>)
     }
 }
 
-/// Render `Agent N:\n- id: text` input material for the grouping pass —
-/// global flat ids across all agents (id = (agent, item) order), matching the
-/// schema's `id` field. Empty agent slots are skipped.
+/// `Agent N:\n- id: text` input material for the grouping pass — global flat ids across all
+/// agents, matching the schema's `id` field.
 #[must_use]
 pub(crate) fn numbered_items_material(items_by_agent: &[Vec<String>]) -> String {
     let mut material = String::new();
@@ -250,9 +218,8 @@ pub(crate) fn numbered_items_material(items_by_agent: &[Vec<String>]) -> String 
     material
 }
 
-/// Render the ungrouped remainder section: header + per-member line with the
-/// code-computed DISPUTED cross-reference suffix ("" when none) handed to the renderer.
-/// Deterministic trailing section — every remaining item lands here exactly once.
+/// The ungrouped remainder section: header plus one member line each with the code-computed
+/// DISPUTED suffix. Every remaining item lands here exactly once.
 #[must_use]
 pub(crate) fn render_ungrouped_section(
     output: &GroupingOutput,
@@ -279,8 +246,6 @@ pub(crate) fn render_ungrouped_section(
     out
 }
 
-// ── Repair-mode grouping (pipeline synthesis + analyze consolidation) ───────
-
 /// Mutable state of the repair protocol across rounds.
 struct RepairState<'a> {
     /// Global flat id table for this operation (id → agent, text).
@@ -291,9 +256,8 @@ struct RepairState<'a> {
     placed: HashSet<usize>,
     /// Accepted contradiction references (remainder item id → frozen group idx).
     references: Vec<GroupingReference>,
-    /// Ids of items pinned to the remainder by an accepted reference — they
-    /// can never be placed in a group, so the DISPUTED render stays visible
-    /// and `accepted_refs` never goes stale.
+    /// Ids pinned to the remainder by an accepted reference — they can never be placed in
+    /// a group, so the DISPUTED render stays visible and `accepted_refs` never goes stale.
     pinned: HashSet<usize>,
     /// First accepted summary (never revised).
     summary: Option<String>,
@@ -319,17 +283,15 @@ impl<'a> RepairState<'a> {
             .collect()
     }
 
-    /// True when every non-placed item is pinned by an accepted contradiction
-    /// reference — nothing left to place (pinned items render in the ungrouped
-    /// section), so the run terminates without a redundant empty round.
+    /// True when every non-placed item is pinned by an accepted reference — nothing left to
+    /// place, so the run terminates without a redundant empty round.
     #[must_use]
     fn complete(&self) -> bool {
         (0..self.table.len()).all(|id| self.placed.contains(&id) || self.pinned.contains(&id))
     }
 }
 
-/// One round's proposal, parsed from the full schema (round 1) or the
-/// repair-delta schema (repair rounds).
+/// One round's proposal, parsed from the full schema (round 1) or the repair-delta one.
 struct RoundInput {
     pub summary: Option<String>,
     pub groups: Vec<GroupingGroup>,
@@ -342,8 +304,8 @@ struct RoundInput {
 struct RoundOutcome {
     /// Round-level rejection (incomplete coverage) — nothing froze this round.
     pub round_rejection: Option<String>,
-    /// Per-group/per-entry rejections fed to the next round, each with its
-    /// typed cause (no substring classification of message wording).
+    /// Per-group/per-entry rejections fed to the next round, each with its typed cause (no
+    /// substring classification of message wording).
     pub rejections: Vec<(FailureClass, String)>,
     /// Newly frozen groups.
     pub froze: usize,
@@ -353,8 +315,8 @@ struct RoundOutcome {
     pub accepted_summary: bool,
 }
 
-/// Id-range check for one member (no placement check). Text membership is
-/// deliberately NOT checked — ids are the only references (see [`ItemTable`]).
+/// Id-range check for one member. Text membership is deliberately NOT checked — ids are the
+/// only references (see [`ItemTable`]).
 fn member_range_error(member: &GroupingMember, table: &ItemTable<'_>) -> Option<String> {
     (member.id >= table.len()).then(|| format!("unknown item id {}", member.id))
 }
@@ -364,14 +326,10 @@ fn reject(outcome: &mut RoundOutcome, cause: FailureClass, msg: String) {
     outcome.rejections.push((cause, msg));
 }
 
-/// Process one round's proposal: global checks first (completeness on the raw
-/// proposal — silent dropout rejects the round), then the summary (first
-/// accepted wins), then per-group acceptance (id range, no already-placed
-/// member), then ungrouped entries and contradiction references. Rejected
-/// groups are dropped with per-group reasons; accepted groups freeze
-/// immediately. Validation is strictly structural — ids in range, no
-/// duplicate placement, set completeness, contradiction ≥2 distinct agents
-/// (see [`ItemTable`] for the accepted wrong-but-valid-id risk).
+/// Global completeness on the RAW proposal (silent dropout rejects the round), then the summary
+/// (first accepted wins), then per-group acceptance (id range, no already-placed member), then
+/// ungrouped entries and contradiction references. Rejected groups are dropped with reasons;
+/// accepted ones freeze immediately. Structural only — see [`ItemTable`].
 #[expect(clippy::too_many_lines)]
 fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome {
     let RoundInput {
@@ -382,16 +340,15 @@ fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome
     } = input;
     let mut outcome = RoundOutcome::default();
 
-    // Round-level completeness on the RAW proposal: every unfrozen item id
-    // must appear in a proposed group or the ungrouped list.
+    // Round-level completeness on the RAW proposal: every unfrozen item id must appear in a
+    // proposed group or the ungrouped list.
     let mut raw: HashSet<usize> = HashSet::new();
     for g in &groups {
         raw.extend(g.members.iter().flat_map(GroupingMember::ids));
     }
     raw.extend(ungrouped.iter().map(|m| m.id));
     for id in 0..state.table.len() {
-        // Placed (frozen-group) and pinned (accepted reference → committed
-        // to the remainder) items need not be re-proposed this round.
+        // Placed and pinned items need not be re-proposed this round.
         if state.placed.contains(&id) || state.pinned.contains(&id) {
             continue;
         }
@@ -403,8 +360,7 @@ fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome
         }
     }
 
-    // Summary: first accepted is final; repair rounds may supply one only when
-    // none was accepted yet.
+    // Summary: first accepted is final; repair rounds may supply one only when none was.
     if state.summary.is_none() {
         if let Some(s) = summary.as_deref().filter(|s| !s.trim().is_empty()) {
             state.summary = Some(s.trim().to_string());
@@ -418,9 +374,8 @@ fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome
         }
     }
 
-    // Per-group acceptance (in order; first placement wins within the round).
-    // The telemetry cause is first-wins: the first detected defect determines
-    // the class, so a multi-defect group never loses its primary cause.
+    // Per-group acceptance, first placement winning within the round. The telemetry cause is
+    // first-wins, so a multi-defect group never loses its primary cause.
     for (i, group) in groups.into_iter().enumerate() {
         let mut reasons: Vec<String> = Vec::new();
         let mut cause: Option<FailureClass> = None;
@@ -436,11 +391,9 @@ fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome
             reasons.push("contradiction without ≥2 distinct cited agents".to_string());
             cause.get_or_insert(FailureClass::ContradictionAgents);
         }
-        // Intra-group duplicate ids are rejected (a member may be placed only
-        // once per round; already-placed/pinned members are rejected below).
-        // A member's collapsed_ids are validated too: they are placed by the
-        // group but must be in range, unpinned, unplaced, and not duplicate
-        // any other id in the group.
+        // Intra-group duplicate ids are rejected (a member is placed once per round;
+        // already-placed/pinned ones are rejected below). A member's collapsed_ids are
+        // validated too: in range, unpinned, unplaced, and no duplicate of another group id.
         let mut seen: HashSet<usize> = HashSet::new();
         for member in &group.members {
             if !seen.insert(member.id) {
@@ -483,19 +436,18 @@ fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome
         } else {
             reject(
                 &mut outcome,
-                // Never None: the pre-member guards above set a cause
-                // directly, and every member/collapsed-id rejection is
-                // followed by a `get_or_insert(FailureClass::Membership)`
-                // in the member loops.
+                // Never None: the pre-member guards above set a cause directly, and every
+                // member/collapsed-id rejection is followed by a
+                // `get_or_insert(FailureClass::Membership)`.
                 cause.unwrap(),
                 format!("group {i}: {}", reasons.join("; ")),
             );
         }
     }
 
-    // Ungrouped entries: per-member id-range validation; invalid entries are
-    // dropped with reasons (the raw proposal already satisfied completeness).
-    // Already-placed entries are dropped silently — the placement wins.
+    // Ungrouped entries: per-member id-range validation, invalid ones dropped with reasons
+    // (completeness was already satisfied); an already-placed entry is dropped silently — the
+    // placement wins.
     for (i, member) in ungrouped.into_iter().enumerate() {
         if let Some(msg) = member_range_error(&member, &state.table) {
             reject(
@@ -566,28 +518,24 @@ fn process_round(input: RoundInput, state: &mut RepairState<'_>) -> RoundOutcome
     outcome
 }
 
-/// How the previous round ended — frames the next repair section honestly:
-/// a transport failure or parse error never claims the response was rejected;
-/// a fully-accepted round never claims a rejection; only mixed rounds are
-/// presented as partially accepted.
+/// How the previous round ended, so the next repair section is honest: a transport failure or parse
+/// error never claims the response was rejected, a fully-accepted round never claims a rejection.
 #[derive(Clone, Copy, Debug)]
 enum PrevRound {
-    /// Previous call did not complete (transport failure).
+    /// The previous call did not complete (transport failure).
     Transport,
-    /// Previous response could not be parsed.
+    /// The previous response could not be parsed.
     Parse,
-    /// Previous round parsed and processed.
+    /// The previous round parsed and processed.
     Processed {
-        /// Whether the round accepted anything (froze groups, accepted a
-        /// reference, or accepted the first summary) — distinguishes
-        /// "partially accepted" from "rejected".
+        /// Whether the round accepted anything (groups, a reference, the first summary) —
+        /// distinguishes "partially accepted" from "rejected".
         accepted: bool,
     },
 }
 
-/// In-Rust fallback framings, indexed by the [`PrevRound`] selection order
-/// below. Used only when `synthesis/repair_framing.md` is missing or
-/// truncated (degradation: warn + keep the literal — never panic).
+/// In-Rust fallback framings, indexed by the [`PrevRound`] selection order below. Used only
+/// when `synthesis/repair_framing.md` is missing or truncated (warn and keep the literal).
 const REPAIR_FRAMING_FALLBACK: [&str; 5] = [
     "The previous call did not complete (transport failure) — please respond now with the repair delta.",
     "Your previous response could not be parsed — please respond now with the repair delta.",
@@ -596,13 +544,12 @@ const REPAIR_FRAMING_FALLBACK: [&str; 5] = [
     "Your previous response was partially accepted; rejected proposals are listed below.",
 ];
 
-/// Framing sentence for `prev`, selected by index from
-/// `synthesis/repair_framing.md` (section order is a contract — see the
-/// asset's trailing comment; reordering silently misselects). The lookup is
-/// bounded to the framing sections so the trailing comment is never
-/// selectable. Degrades with a warning, never a panic — an unmatched variant
-/// yields an empty framing. A new variant must extend the match arm, the
-/// asset, the fallback consts, and the test tables.
+/// The framing sentence for `prev`, selected by index from `synthesis/repair_framing.md`
+/// (section order is a contract — see the asset's trailing comment; reordering silently
+/// misselects). The lookup is bounded to the framing sections, so the trailing comment is
+/// never selectable. Degrades with a warning, never a panic: an unmatched variant yields an
+/// empty framing. A new variant must extend the match arm, the asset, the fallback consts and
+/// the test tables.
 fn repair_framing(prev: PrevRound, rejections: &[String]) -> String {
     let idx = match prev {
         PrevRound::Transport => 0,
@@ -636,12 +583,9 @@ fn repair_framing(prev: PrevRound, rejections: &[String]) -> String {
         })
 }
 
-/// Append the repair-round instructions (delta schema, frozen skeletons,
-/// remainder list, previous-round feedback) to the last user message.
-/// Append-only: the message prefix stays byte-identical across rounds, so the
-/// KV prefix is preserved. The framing is honest about the previous round's
-/// disposition: a transport failure (no response at all) is not presented as
-/// a rejected response.
+/// Append the repair-round instructions (delta schema, frozen skeletons, remainder list,
+/// previous-round feedback) to the last user message. Append-only: the message prefix stays
+/// byte-identical across rounds, preserving the KV prefix.
 fn append_repair_instructions(
     request: &mut ChatRequest,
     round: u32,
@@ -650,14 +594,11 @@ fn append_repair_instructions(
     prev: PrevRound,
 ) {
     let framing = repair_framing(prev, rejections);
-    // Section bodies align with the template's newline structure: the
-    // rejections slot keeps its conditional leading separator (a static
-    // template separator would leave a stray blank line when empty) and its
-    // writeln trailing newlines; the frozen and remainder slots carry only
-    // writeln list lines — their headers are literal template text, and each
-    // slot's trailing newline plus the template's following newline supply
-    // the blank line between blocks (byte-identical assembly, pinned by the
-    // tests).
+    // Section bodies align with the template's newline structure: the rejections slot keeps
+    // its conditional leading separator (a static one would leave a stray blank line when
+    // empty); the frozen and remainder slots carry only writeln list lines, whose trailing
+    // newline plus the template's following newline supply the blank line between blocks
+    // (byte-identical assembly, pinned by the tests).
     let mut rejections_section = String::new();
     if !rejections.is_empty() {
         rejections_section.push_str("\nRejected proposals still outstanding (fix these):\n");
@@ -719,44 +660,24 @@ fn append_repair_instructions(
     }
 }
 
-/// Run the repair-mode grouping pass (pipeline synthesis + analyze
-/// consolidation): 1 full synthesis call + up to N-1 repair rounds (N =
-/// hardcoded `DEFAULT_SYNTHESIS_MAX_ATTEMPTS`, 3 = the lower edge of the
-/// approved 3–5 band). Accepted groups freeze; repair rounds propose deltas for the
-/// remainder only. Termination — zero-progress (a repair round freezing no new
-/// groups) or budget exhaustion — places every remaining item
-/// deterministically in the ungrouped section. Fail-open fires only on
-/// transport/parse/non-retryable exhaustion or an exhaustion with zero groups
-/// ever frozen.
+/// Run the repair-mode grouping pass: 1 full synthesis call + up to N-1 repair rounds (N = 3,
+/// the lower edge of the approved 3–5 band). Accepted groups freeze; repair rounds propose deltas
+/// for the remainder only. Termination — zero-progress or budget exhaustion — places every
+/// remaining item deterministically in the ungrouped section; fail-open fires only on
+/// transport/parse/non-retryable exhaustion, or an exhaustion with zero groups ever frozen.
 ///
-/// Validation and parse rejections consume a round immediately (no backoff);
-/// transport failures keep the synthesis backoff schedule (indexed by the
-/// transport-failure count, not the round number, so a validation-rejected
-/// round never advances the backoff slot). The synthesis schedule is bounded
-/// by attempts (3 total calls), not wall time.
+/// Validation and parse rejections consume a round immediately (no backoff); transport failures
+/// keep the synthesis schedule, indexed by the transport-failure count so a rejected round never
+/// advances the backoff slot. The schedule is bounded by attempts, not wall time. A round-1 parse
+/// failure permanently converts the run to the repair-delta schema.
 ///
-/// A round-1 parse failure permanently converts the run to the repair-delta
-/// schema — the model never gets a chance to emit a corrected full output.
-/// Consistent with the total-calls budget reinterpretation.
+/// Rejection feedback is one-shot for fully-rejected rounds: one failing completeness freezes zero
+/// groups and trips the zero-progress break before the fed-back reasons can be acted on.
 ///
-/// Rejection feedback is one-shot for fully-rejected rounds: a repair round
-/// that fails completeness (silent dropout) freezes zero groups and therefore
-/// triggers the zero-progress break before the fed-back reasons can be acted
-/// on. Only rounds that freeze at least one group consume feedback across
-/// rounds.
-///
-/// Telemetry: a round that accepts anything (froze groups, accepted a
-/// reference, or accepted the first summary) is recorded as a SUCCESS through
-/// the existing per-call recording path (per-round usage, the calibration
-/// signal). A parsed round that accepts nothing is a FAILURE recorded with a
-/// typed granular cause — including clean zero-progress rounds (valid
-/// ungrouped-only deltas), the most common terminal shape — keeping the
-/// failure trail non-empty on Fallback (no spurious
-/// `transport`/`retry_attempts=0` classification).
-/// Per-round exclusivity holds (a round is never both a success and a failure
-/// row), but a Fallback operation may still carry both an earlier
-/// summary-only round's success row and the operation-level failure row — the
-/// accepted summary is discarded by the fallback render.
+/// Telemetry: a round that accepts anything is a SUCCESS through the per-call path; one that
+/// accepts nothing is a FAILURE with a typed granular cause, including clean zero-progress rounds
+/// (the most common terminal shape), keeping the trail non-empty on Fallback. A Fallback may still
+/// carry an earlier summary-only round's success row beside the operation-level failure row.
 #[expect(clippy::too_many_lines)]
 pub(crate) async fn run_grouping_repair(
     ws: &Workspace,
@@ -778,13 +699,13 @@ pub(crate) async fn run_grouping_repair(
     let mut loop_state = RetryLoop::new_scoped(&policy, &request);
     let operation_started = Instant::now();
     let mut state = RepairState::new(items_by_agent);
-    // Rejection reasons fed to the next repair round; cleared only once a
-    // round responds, so feedback survives a mid-repair transport failure.
+    // Rejection reasons for the next repair round; cleared only once a round responds, so
+    // feedback survives a mid-repair transport failure.
     let mut rejections: Vec<String> = Vec::new();
     // How the previous round ended — frames the next repair section honestly.
     let mut prev_round = PrevRound::Processed { accepted: false };
-    // Transport-failure count — indexes the backoff schedule independently of
-    // the round number (validation rejections consume a round without a sleep).
+    // Transport-failure count — indexes the backoff schedule independently of the round
+    // number (validation rejections consume a round without a sleep).
     let mut transport_failures: u32 = 0;
 
     for round in 1..=policy.max_attempts {
@@ -813,8 +734,8 @@ pub(crate) async fn run_grouping_repair(
             }
         };
         let raw = resp.text_or_empty();
-        // A tool-call response parses as empty text — classify it explicitly
-        // so the retry trail distinguishes it (same taxonomy as extraction).
+        // A tool-call response parses as empty text — classify it explicitly so the retry
+        // trail distinguishes it (same taxonomy as extraction).
         if !resp.tool_calls.is_empty() {
             let rec = RetryFailureRecord::with_metadata(
                 FailureClass::Parse,
@@ -844,10 +765,9 @@ pub(crate) async fn run_grouping_repair(
         let outcome = match parsed {
             Ok(input) => {
                 let outcome = process_round(input, &mut state);
-                // Deliver the previous round's rejection feedback (appended
-                // above), then replace it with this round's rejections. A
-                // transport or parse failure never clears it, so feedback
-                // survives a mid-repair outage and the next section re-lists it.
+                // Deliver the previous round's rejection feedback (appended above), then
+                // replace it with this round's. A transport or parse failure never clears it,
+                // so feedback survives a mid-repair outage.
                 rejections.clear();
                 if let Some(msg) = &outcome.round_rejection {
                     rejections.push(msg.clone());
@@ -867,18 +787,15 @@ pub(crate) async fn run_grouping_repair(
                 continue;
             }
         };
-        // A round that accepted anything is a success — recorded per-round
-        // through the existing per-call recording path (usage tokens per
-        // round, the calibration signal). A round is never both a success row
-        // and a failure row in llm_requests; its rejections still feed the
-        // next round.
+        // A round that accepted anything is a success, recorded per-round through the
+        // per-call path (usage tokens, the calibration signal). A round is never both a
+        // success and a failure row in llm_requests.
         let accepted = outcome.froze > 0 || outcome.accepted_refs > 0 || outcome.accepted_summary;
         prev_round = PrevRound::Processed { accepted };
         if accepted {
             crate::stats::record_llm_success(&request, attempt_started, round, &resp);
         }
-        // Typed granular cause for the failure trail: completeness
-        // (round-level rejection) or the first per-group/per-entry cause.
+        // Typed granular cause: completeness (round-level) or the first per-group/per-entry cause.
         let cause = if outcome.round_rejection.is_some() {
             FailureClass::Completeness
         } else {
@@ -899,12 +816,10 @@ pub(crate) async fn run_grouping_repair(
             cause = cause.label(),
             "Grouping synthesis repair round",
         );
-        // A parsed-and-processed round that accepted NOTHING is a failure with
-        // the typed cause — including clean zero-progress rounds (a valid
-        // ungrouped-only delta): they are the most common terminal shape.
-        // Recording them also keeps the failure trail non-empty, so a
-        // subsequent Fallback never mislabels the operation as
-        // `transport`/`retry_attempts=0`.
+        // A parsed-and-processed round that accepted NOTHING is a failure with the typed
+        // cause, including clean zero-progress rounds (the most common terminal shape).
+        // Recording them keeps the trail non-empty, so a later Fallback never mislabels the
+        // operation as `transport`/`retry_attempts=0`.
         if !accepted {
             let detail = if rejections.is_empty() {
                 "round accepted nothing (zero-progress; no validation rejections)".to_string()
@@ -932,9 +847,8 @@ pub(crate) async fn run_grouping_repair(
             "Grouping synthesis exhausted — writing deterministic fail-open output",
         );
         // A Fallback with an empty failure trail (e.g. a summary-only round at
-        // max_attempts=1) would be classified `transport`/`retry_attempts=0`
-        // — spurious. Record the real cause so the operation-level row
-        // reflects what happened.
+        // max_attempts=1) would be classified `transport`/`retry_attempts=0` — spurious.
+        // Record the real cause.
         if !loop_state.has_failures() {
             let detail = if state.summary.is_some() {
                 "operation exhausted after accepting only a summary — no groups ever frozen"
@@ -983,12 +897,11 @@ pub(crate) async fn run_grouping_repair(
     }
 }
 
-/// Build a grouping request with the given system prompt, user material, and
-/// consumer-supplied model/effort/routing/max_tokens. The `meta` purpose and
-/// agent id are filled in here so the consumer (analyze consolidation) gets a
-/// uniform telemetry shape. The pipeline joint-verdict path deliberately builds
-/// its own `ChatRequest` instead (see `pipeline::verdict::synthesis_request`)
-/// — verdict telemetry (agent id, role string, max_tokens) differs on purpose.
+/// Grouping request with the consumer-supplied system prompt, user material,
+/// model/effort/routing/max_tokens. `meta` purpose and agent id are filled in here so the
+/// consumer gets a uniform telemetry shape. The pipeline joint-verdict path deliberately
+/// builds its own `ChatRequest` instead (`pipeline::verdict::synthesis_request`) — its
+/// telemetry differs on purpose.
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn grouping_request(
     ws: &Workspace,
@@ -1024,12 +937,10 @@ pub(crate) fn grouping_request(
 mod tests {
     use super::*;
 
-    /// Collapse semantics: a representative with `collapsed_ids` freezes and
-    /// places every collapsed id (so the remainder excludes them), the
-    /// distinct-agent count includes the collapsed agents, and a round is
-    /// complete when the only coverage of an id is via `collapsed_ids`. A
-    /// collapsed id that ALSO appears as an ungrouped entry is accepted —
-    /// placement wins and the duplicate is dropped silently.
+    /// Collapse semantics: a representative freezes and places every collapsed id (so the
+    /// remainder excludes them), the distinct-agent count includes the collapsed agents, and a
+    /// round is complete when an id's only coverage is via `collapsed_ids`. A collapsed id that
+    /// ALSO appears as an ungrouped entry is accepted — placement wins, the duplicate dropped.
     #[test]
     fn collapsed_ids_freeze_place_and_count() {
         // Three items across three agents: id → agent idx.
@@ -1040,8 +951,8 @@ mod tests {
         ];
         let mut state = RepairState::new(&items);
 
-        // Ids 1 and 2 are covered ONLY via collapsed_ids on representative 0 —
-        // the raw-proposal completeness check must accept the round.
+        // Ids 1 and 2 are covered ONLY via collapsed_ids on representative 0 — the
+        // raw-proposal completeness check must accept the round.
         let outcome = process_round(
             RoundInput {
                 summary: Some("s".to_string()),
@@ -1068,8 +979,8 @@ mod tests {
             vec![0, 1, 2]
         );
 
-        // A collapsed id that ALSO appears as an ungrouped entry: placement
-        // wins — the duplicate is dropped silently, never a rejection.
+        // A collapsed id that also appears as an ungrouped entry: placement wins, never a
+        // rejection.
         let items2 = vec![vec!["a".to_string()], vec!["b".to_string()]];
         let mut state2 = RepairState::new(&items2);
         let outcome = process_round(
@@ -1097,18 +1008,15 @@ mod tests {
         assert!(state2.remainder().is_empty());
     }
 
-    /// Byte-exact pin of the repair-instruction assembly for every PrevRound
-    /// framing: framing sentence, frozen/remainder headers, list lines, and
-    /// blank-line structure. Guards the framing-asset section order (a
-    /// reordered/rewrapped section silently misselects) and the template's
-    /// newline contract (a drifted separator breaks byte-identity).
+    /// Byte-exact pin of the repair-instruction assembly for every PrevRound framing:
+    /// framing sentence, headers, list lines and blank-line structure. Guards the asset's
+    /// section order (a reordered or rewrapped section silently misselects) and the template's
+    /// newline contract.
     ///
-    /// Only the region this migration changed is hardcoded — the framings
-    /// (via REPAIR_FRAMING_FALLBACK, parity-checked against the asset below),
-    /// the two moved headers, the list rendering, and the newline
-    /// coordination. Unchanged template regions (prefix, lead-in line, schema
-    /// tail) are derived from the asset so unrelated prompt edits don't force
-    /// syncing this test.
+    /// Only the region this migration changed is hardcoded — the framings, the two moved
+    /// headers, the list rendering and the newline coordination. Unchanged regions (prefix,
+    /// lead-in line, schema tail) are derived from the asset, so unrelated prompt edits don't
+    /// force syncing this test.
     #[expect(clippy::too_many_lines)] // 5 framings × scenarios: exhaustive byte pin of the moved prose
     #[test]
     fn repair_instructions_assembly_is_byte_exact() {
@@ -1140,10 +1048,8 @@ mod tests {
         let rejections =
             vec!["item 1 missing from every proposed group and the ungrouped list".to_string()];
 
-        // The in-Rust fallback (used only when the asset is missing/truncated)
-        // must mirror the asset sections — a reworded asset without a matching
-        // fallback update would silently change the degraded path. The +1 is
-        // the asset's trailing order-contract comment section.
+        // The in-Rust fallback must mirror the asset sections, or the degraded path changes
+        // silently. The +1 is the asset's trailing order-contract comment section.
         let asset_sections = crate::prompt::load_prompt_sections("synthesis/repair_framing.md");
         let fallback: Vec<String> = REPAIR_FRAMING_FALLBACK
             .iter()
@@ -1160,11 +1066,9 @@ mod tests {
             "fallback framings must mirror the asset sections"
         );
 
-        // Derived unchanged template regions: prefix (round substituted),
-        // lead-in line after {{framing}}, and the schema tail. Exactly one
-        // newline must follow {{remainder_lines}} — the slot's trailing
-        // writeln newline supplies the other half of the blank line before
-        // Respond (the empty-remainder edge: one blank line, never two).
+        // Derived unchanged regions: prefix, lead-in line after {{framing}}, schema tail.
+        // Exactly one newline follows {{remainder_lines}} — the slot's trailing writeln supplies
+        // the other half of the blank line before Respond (the empty-remainder edge).
         let template = crate::prompt::load_prompt("synthesis/repair_round.md");
         let (raw_prefix, after_framing) = template
             .split_once("{{framing}}")
@@ -1184,8 +1088,8 @@ mod tests {
             "repair_round.md must put exactly one newline after {{remainder_lines}}"
         );
 
-        // Headers that moved into the template — pinned so a reword in the
-        // asset breaks the test instead of silently changing the prompt.
+        // Headers that moved into the template — pinned so a reword in the asset breaks the
+        // test instead of silently changing the prompt.
         let frozen_header = "Frozen groups (skeletons — do NOT re-propose their members; references to a group flagged contradiction:true are ignored):\n";
         let remainder_header = "Remaining items (place EVERY un-pinned one in a proposed group or the ungrouped list; pinned items must NOT be placed in a group). Reference each item by its id:\n";
         let with_rejections = format!(
@@ -1202,8 +1106,8 @@ mod tests {
              \n{remainder_header}\
              - 1: Agent 1: second\n"
         );
-        // Variants in asset section order (0-4); the bool is "no outstanding
-        // rejections", which selects section 3 (accepted) vs 4 (partial).
+        // Variants in asset section order (0-4); the bool is "no outstanding rejections",
+        // selecting section 3 (accepted) vs 4 (partial).
         let variants: [(PrevRound, bool); 5] = [
             (PrevRound::Transport, false),
             (PrevRound::Parse, false),
@@ -1257,8 +1161,8 @@ mod tests {
             "empty-frozen: `- none` line or newline drift"
         );
 
-        // Pinned-marker path: an accepted contradiction reference pins item 1
-        // to the remainder (it must render with the marker, never in a group).
+        // Pinned-marker path: an accepted reference pins item 1 to the remainder (it must
+        // render with the marker, never in a group).
         let mut pinned_state = RepairState::new(&items);
         let outcome = process_round(
             RoundInput {
@@ -1304,8 +1208,8 @@ mod tests {
             "pinned-marker: marker text or newline drift"
         );
 
-        // Empty-remainder edge: all items frozen — the empty remainder slot
-        // must still yield exactly one blank line before Respond.
+        // Empty-remainder edge: all items frozen — the empty slot must still yield exactly one
+        // blank line before Respond.
         let mut all_frozen = RepairState::new(&items);
         let outcome = process_round(
             RoundInput {
@@ -1353,15 +1257,12 @@ mod tests {
         );
     }
 
-    /// Independent PrevRound → framing pin: each variant's sentence must keep
-    /// its marker, and the marker set pairwise-distinguishes the five framings
-    /// ("rejected" is shared with the partially-accepted sentence, but
-    /// "partially" still catches that swap), with pairwise distinctness
-    /// enforced too. A coordinated reorder of the asset and the fallback
-    /// consts (invisible to the byte compare above, which derives its
-    /// expectation from the consts) cannot silently swap which sentence
-    /// reaches the model. The markers are semantic invariants — dropping one
-    /// changes the framing's meaning.
+    /// Independent PrevRound → framing pin: each variant's sentence keeps its marker, and the
+    /// marker set pairwise-distinguishes the five framings ("rejected" is shared with the
+    /// partially-accepted sentence, but "partially" still catches that swap). A coordinated
+    /// reorder of the asset and the fallback consts (invisible to the byte compare, which
+    /// derives its expectation from the consts) cannot silently swap which sentence reaches the
+    /// model. The markers are semantic invariants — dropping one changes the framing's meaning.
     #[test]
     fn repair_framing_mapping_is_pinned() {
         let rejections =

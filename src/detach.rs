@@ -1,47 +1,37 @@
 //! Detaching the service from the terminal it was started from.
 //!
-//! A launch whose standard output is a terminal — a bare `mahbot`, `mahbot paused`, and
-//! the installer's own final `exec` — is not the service itself: it opens
-//! `<storage root>/daemon.log` and a readiness pipe, starts this same image again in a
-//! session of its own (`setsid`: no controlling terminal, none of the shell's streams,
-//! not a child of its session), then prints one line and exits. The prompt comes back at
-//! once while the service keeps running.
+//! A launch whose standard output is a terminal — a bare `mahbot`, `mahbot paused`, the
+//! installer's final `exec` — is not the service itself: it opens `<storage root>/daemon.log`
+//! and a readiness pipe, starts this same image again in a session of its own (`setsid`: no
+//! controlling terminal, none of the shell's streams, not a child of its session), prints one
+//! line and exits. The prompt comes back at once while the service keeps running.
 //!
-//! The word the child sends back is the instance lock: taken, the service is up; refused,
-//! the reason travels back and the launcher exits non-zero — or says the product is
-//! already running, where a copy that is up could be reached to raise its window. A child
-//! that dies before then closes the pipe, and the launcher points at the log either way.
+//! The child's word back is the instance lock: taken, the service is up; refused, the reason
+//! travels back and the launcher exits non-zero — or says the product is already running. A
+//! child that dies before then closes the pipe, and the launcher points at the log either way.
+//! Everything the service prints before the log store is running, a bootstrap failure and a
+//! panic message land in that file, beside `error.log` and `update.log`.
 //!
-//! Everything the service prints before the log store is running, a bootstrap failure and
-//! a panic message land in that file, which sits beside `error.log` and `update.log` —
-//! both keep their own roles.
-//!
-//! A launch that is not from a terminal is left exactly as it was: a pipe or a redirect,
-//! a supervisor, the login registration and the update hand-off all keep their streams
-//! and their exit code.
+//! A launch that is not from a terminal is left exactly as it was.
 
 use std::path::Path;
 
-/// Hand the terminal back when this launch came from one: the service is started again
-/// in a session of its own, the launcher prints one line and exits, and this function
-/// returns only in that service.
-///
-/// What it returns is the failure that leaves no child to report for itself — no log
-/// file, no pipe, no resolvable image, no child — and main's own error path prints it on
-/// the terminal the launch still holds, non-zero, never silently. A child that fails in
-/// its own start-up says so through the pipe instead, and the launcher prints that.
-///
-/// Windows is a no-op: that launch is built windowed and already starts console-free.
+/// Hand the terminal back when this launch came from one: the service is started again in a session
+/// of its own, the launcher prints one line and exits, and this returns only in that service. What
+/// it returns is the failure that leaves no child to report for itself — no log file, no pipe, no
+/// resolvable image, no child — printed by main's error path, non-zero, never silently. A child
+/// that fails in its own start-up says so through the pipe instead. Windows is a no-op: that launch
+/// is built windowed and already starts console-free.
 pub fn detach_from_terminal(root: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
-        // Standard output on a terminal is the launcher itself: it starts the service again
-        // and exits, and this process never goes on as the service.
+        // Standard output on a terminal is the launcher itself: it starts the service again and
+        // exits, and this process never goes on as the service.
         if std::io::stdout().is_terminal() {
             return relaunch(root);
         }
         // Otherwise this is the service the launcher started — no terminal, the log for its
-        // streams, its own session — and it keeps the pipe it reports through.
+        // streams — and it keeps the pipe it reports through.
         if let Some(pipe) = adopted_pipe() {
             *READY.lock().unwrap_poison() = Some(pipe);
         }
@@ -60,8 +50,8 @@ pub fn report_running() {
     send(RUNNING);
 }
 
-/// Tell the waiting launcher the product is already running, and that this launch did
-/// what it came to do.
+/// Tell the waiting launcher the product is already running, and that this launch did what
+/// it came to do.
 pub fn report_already_running() {
     send(ALREADY_RUNNING);
 }
@@ -81,7 +71,7 @@ const ALREADY_RUNNING: &str = "already running";
 /// The prefix of the word that carries a launch failure's reason.
 const FAILED_PREFIX: &str = "failed: ";
 
-// ── The launcher and the service ─────────────────────────────────────────
+// The launcher and the service
 
 #[cfg(unix)]
 use std::io::{IsTerminal as _, Read as _, Write as _};
@@ -96,25 +86,23 @@ use anyhow::{Context as _, anyhow};
 #[cfg(unix)]
 use crate::util::{UnwrapPoison as _, print_stderr, print_stdout};
 
-/// The file a detached service's own output goes to, beside `error.log` and
-/// `update.log` in the storage root.
+/// The file a detached service's own output goes to, beside `error.log` and `update.log` in
+/// the storage root.
 #[cfg(unix)]
 const DAEMON_LOG: &str = "daemon.log";
 
-/// The environment variable carrying the readiness pipe's descriptor into the service;
-/// read once there and removed, so nothing the service starts inherits a number that
-/// means nothing to it.
+/// The environment variable carrying the readiness pipe's descriptor into the service; read
+/// once there and removed, so nothing the service starts inherits a number meaningless to it.
 #[cfg(unix)]
 const READY_FD_ENV: &str = "MAHBOT_LAUNCH_READY_FD";
 
-/// How long the launcher waits for the service's word. It arrives when the instance lock
-/// does, a moment after the launch; the bound only keeps a start that never gets that far
-/// from holding the terminal.
+/// How long the launcher waits for the service's word: it arrives when the instance lock
+/// does, and the bound only keeps a start that never gets that far from holding the terminal.
 #[cfg(unix)]
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The readiness pipe's writing end, held by the service until it says how the launch
-/// went. `None` in a launch that was never detached.
+/// The readiness pipe's writing end, held by the service until it says how the launch went.
+/// `None` in a launch that was never detached.
 #[cfg(unix)]
 static READY: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
 
@@ -136,9 +124,8 @@ fn adopted_pipe() -> Option<std::fs::File> {
     // SAFETY: single-threaded start-up, before the runtime and before any child exists.
     unsafe { std::env::remove_var(READY_FD_ENV) };
     let fd: RawFd = value.parse().ok()?;
-    // A descriptor the launcher did not hand over has no business being adopted: a closed
-    // one must not be written to, a pipe is the only thing this reports through, and a
-    // number something else now holds is not ours.
+    // A descriptor the launcher did not hand over has no business being adopted: a closed one
+    // must not be written to, and a number something else now holds is not ours.
     // SAFETY: `fstat` on an open descriptor only fills the struct, and `fcntl` with F_GETFD
     // only asks whether it is open.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -194,19 +181,17 @@ fn relaunch(root: &Path) -> anyhow::Result<()> {
             Ok(())
         });
     }
-    // Nothing waits on it: the service is this launch's continuation, and this process's
-    // exit is what makes it nobody's child.
+    // Nothing waits on it: this process's exit is what makes the service nobody's child.
     command
         .spawn()
         .with_context(|| format!("could not start the service from {}", exe.display()))?;
-    // The writing end lives in the service now; this copy would keep the launcher from
-    // ever reading the end of the pipe.
+    // The writing end lives in the service now; this copy would keep the launcher from ever
+    // reading the end of the pipe.
     drop(writer);
     announce(read_word(reader), &log_path)
 }
 
-/// A pipe whose writing end survives the exec into the service and whose reading end does
-/// not.
+/// A pipe whose writing end survives the exec into the service and whose reading end does not.
 #[cfg(unix)]
 fn ready_pipe() -> anyhow::Result<(std::fs::File, std::fs::File)> {
     let mut fds = [0; 2];
@@ -247,8 +232,8 @@ fn read_word(mut reader: std::fs::File) -> Ready {
             return Ready::Silent;
         }
         if ready < 0 {
-            // A hangup or a suspend of this process landing mid-wait interrupts the call,
-            // and is neither an answer nor a reason to give up while the bound lasts.
+            // A hangup or a suspend landing mid-wait interrupts the call, and is neither an
+            // answer nor a reason to give up while the bound lasts.
             let interrupted =
                 std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
             if interrupted && std::time::Instant::now() < deadline {
@@ -293,9 +278,8 @@ fn announce(ready: Ready, log_path: &Path) -> ! {
             print_stderr(&format!("MahBot could not start: {reason}"));
             std::process::exit(1);
         }
-        // The bound passed with the pipe still open: it is alive but has not taken the lock
-        // yet, and a launcher cannot watch further — "starting" is all it can honestly say,
-        // and what the service does next is in the log.
+        // The bound passed with the pipe still open: it is alive but has not taken the lock, so
+        // "starting" is all a launcher can honestly say, and what it does next is in the log.
         Ready::Silent => print_stdout(&format!("MahBot is starting — its log is {path}")),
         Ready::Gone => {
             print_stderr(&format!("MahBot could not start — its log is {path}"));

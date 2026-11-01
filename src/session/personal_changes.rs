@@ -1,36 +1,28 @@
-//! Between-turns change report for a user's personal workspace: what was added,
-//! changed or removed there between turns, at the head of the message every
-//! Assistant turn answers ([`prepend_changes`]) — an automation's, a notice's or a
-//! delegation's turn included — so it never answers from stale knowledge.
+//! Between-turns change report for a user's personal workspace: what was added, changed
+//! or removed there between turns, at the head of the message every Assistant turn
+//! answers ([`prepend_changes`]) — an automation's, a notice's or a delegation's
+//! included — so it never answers from stale knowledge.
 //!
-//! The observed state lives in a row of its own — `session_personal_changes`, a
-//! child of the Assistant's `session_metadata` row
-//! ([`crate::session::assistant_agent_id`]), written there and only when it
-//! changes, and deleted with that row — never inside the watched folder, which
-//! stays the user's alone. [`refresh_after_turn`] rewrites it at the end of
-//! the Assistant's own turn, so what it absorbs is everything that moved during
-//! that turn: the product's own writes, and equally an edit the user made while
-//! the turn was running. Telling writers apart — a raw shell command included —
-//! would cost more than that window is worth, and the block never claims the user
-//! made a change; between turns the report is exact.
+//! The observed state is a row of its own, `session_personal_changes`, a child of the
+//! Assistant's `session_metadata` row ([`crate::session::assistant_agent_id`]), written
+//! only when it changes and deleted with that row — never inside the watched folder,
+//! which stays the user's alone. [`refresh_after_turn`] rewrites it at the end of the
+//! Assistant's own turn, so it absorbs everything that moved during that turn, the
+//! product's writes and equally a user edit made meanwhile. Telling writers apart would
+//! cost more than that window is worth, and the block never claims the user made a
+//! change; between turns the report is exact.
 //!
-//! Cost: one plain walk per observation, carrying size and mtime across turns so
-//! an unchanged file is never read ([`scan`] says what is read, [`diff`] what that
-//! decides). A walk of a personal folder holding tens of thousands of entries
-//! measures ~0.12–0.15 s, and a turn pays for one on the reply path plus one at
-//! its end; content is read only for the files whose stamp moved. The folder's
-//! first observation, which does read every file once, does not ([`establish`]),
-//! and while it runs the account gets no block at all.
+//! Cost: one plain walk per observation, carrying size and mtime so an unchanged file is
+//! never read ([`scan`] says what is read, [`diff`] what that decides). Tens of thousands
+//! of entries measure ~0.12–0.15 s; a turn pays one walk on the reply path and one at its
+//! end, reading content only for files whose stamp moved. The folder's first observation
+//! does read every file once ([`establish`]) and the account gets no block while it runs.
 //!
-//! What the folder's own git rules exclude is not the user's material at all:
-//! [`Rules`] answers that question while the change set is gathered, so an ignored
-//! path never enters the delta in the first place — and never reads as removed,
-//! however it came to be ignored.
-//!
-//! The session-start `<workspace-structure>` picture ([`personal_folder_picture`]) is
-//! built from the same walk predicate ([`is_skipped`]) and the same rules
-//! ([`Rules`]) as the report, so the two blocks can never describe different
-//! material; it costs one metadata-only walk and never reads a file's contents.
+//! What the folder's own git rules exclude is not the user's material: [`Rules`] answers
+//! that while the set is gathered, so an ignored path never enters the delta and never
+//! reads as removed. The session-start `<workspace-structure>` picture
+//! ([`personal_folder_picture`]) walks the same predicate ([`is_skipped`]) and rules, so
+//! the two blocks can never describe different material.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -46,10 +38,9 @@ use sha2::{Digest, Sha256};
 use crate::util::UnwrapPoison;
 use crate::{Role, Workspace};
 
-/// One entry's fingerprint. `digest` is `None` for an entry whose content was not
-/// read (a newly seen path on the report path) or could not be (above
-/// [`HASH_MAX_BYTES`], an I/O error, or an entry that is not a regular file);
-/// [`diff`] says what that means.
+/// One entry's fingerprint. `digest` is `None` when the content was not read (a newly
+/// seen path) or could not be (above [`HASH_MAX_BYTES`], an I/O error, not a regular
+/// file); [`diff`] says what that means.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileState {
     size: u64,
@@ -57,28 +48,25 @@ struct FileState {
     digest: Option<u64>,
 }
 
-/// Relative path → fingerprint. `BTreeMap` keeps the serialized JSON stable so
-/// "did anything move?" is a string comparison.
+/// Relative path → fingerprint. `BTreeMap` keeps the JSON stable, so "did anything move?"
+/// is a string comparison.
 type Snapshot = BTreeMap<String, FileState>;
 
-/// Files at or below this size are read and hashed whole; a larger one is judged
-/// by its stamp alone, so a folder's multi-gigabyte blobs are never read at all.
-/// The price is that a mere touch of such a file reports as a change — the
-/// lesser evil against never noticing a real edit deep inside one we never read.
+/// Files at or below this size are hashed whole; a larger one is judged by its stamp
+/// alone, so multi-gigabyte blobs are never read. The price: a mere touch of such a file
+/// reads as a change — the lesser evil against missing a real edit deep inside one.
 const HASH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Read buffer for streaming a file through the hasher.
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 
-/// A stamp the platform refused to report (a file older than the epoch, or one
-/// whose stamp does not fit). It is not a fact about the file, so it can never
+/// A stamp the platform refused to report. Not a fact about the file, so it can never
 /// decide a comparison: such a file is read and its content decides.
 const STAMP_UNKNOWN: i64 = i64::MIN;
 
-/// Hash the whole content of `path` — never the mtime or the size. The first 8
-/// bytes of SHA-256 are the digest: 64 bits tells one revision of a file from
-/// another far beyond what a folder can hold, and keeps the stored baseline
-/// small. `None` on any I/O error.
+/// Hash the whole content of `path` — never the mtime or size. The first 8 bytes of
+/// SHA-256 tell one revision from another far beyond what a folder can hold and keep the
+/// baseline small. `None` on any I/O error.
 fn digest_of(path: &Path) -> Option<u64> {
     let mut file = std::fs::File::open(path).ok()?;
     let mut hasher = Sha256::new();
@@ -96,8 +84,8 @@ fn digest_of(path: &Path) -> Option<u64> {
     Some(u64::from_be_bytes(head))
 }
 
-/// A file's mtime as nanoseconds since the epoch, or [`STAMP_UNKNOWN`] when the
-/// platform reports none (a stamp before 1970, or one outside `i64`).
+/// A file's mtime in nanoseconds since the epoch, or [`STAMP_UNKNOWN`] when the platform
+/// reports none (a stamp before 1970, or one outside `i64`).
 fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
         .ok()
@@ -106,27 +94,19 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(STAMP_UNKNOWN)
 }
 
-/// Whether the walker should skip `entry` (and, for a directory, its whole
-/// subtree). Only what the product or the OS keeps in the personal folder is
-/// pruned at any depth: the `.git` repository metadata, the `.compaction` store
-/// and macOS's `.DS_Store`. A user's own dotfile — `.env`, `.gitignore`,
-/// `.config/` — is the user's material and a hand edit to it must be reported
-/// unless the folder's own git rules hide it ([`Rules`], the other half of the
-/// walk predicate); the product's own things at the workspace root (`MEMORY.md`
-/// and the `generated/`, `uploads/`, `notes/` and `archive/` directories) are
-/// never watched either. `archive/` holds only what the assistant retired with
-/// its `archive` tool, so a move into it is the assistant's own bookkeeping
-/// rather than a change to the user's material — and the picture stays a sketch
-/// of what the user has, not of what was put aside.
+/// Whether the walker should skip `entry` and, for a directory, its whole subtree. Only
+/// what the product or the OS keeps there is pruned at any depth: `.git`, `.compaction` and
+/// macOS's `.DS_Store`. A user's dotfile (`.env`, `.gitignore`, `.config/`) is the user's
+/// material, reported unless the folder's git rules hide it ([`Rules`]); the product's own
+/// root items (`MEMORY.md`, `generated/`, `uploads/`, `notes/`, `archive/`) are never
+/// watched — `archive/` holds only what the assistant retired, so a move into it is
+/// bookkeeping, not a change.
 ///
-/// This predicate and [`Rules`] together are the definition of the user's file
-/// material inside a personal folder — the report ([`scan`]) and the session-start
-/// picture ([`personal_folder_picture`]) both walk through it, so the two can never
-/// describe different material. The `shared/` catalogue
-/// ([`is_owner_personal_folder`]) is product material only in the folder that
-/// holds it, and the sibling enumerations ([`crate::tools::custom`],
-/// `research_cleanup`) are named here so a new product-owned path lands in both
-/// places.
+/// This predicate and [`Rules`] together define the user's file material in a personal
+/// folder: [`scan`] and [`personal_folder_picture`] both walk through them. The `shared/`
+/// catalogue ([`is_owner_personal_folder`]) is product material only in the folder that
+/// holds it; the sibling enumerations ([`crate::tools::custom`], `research_cleanup`) are
+/// named here so a new product-owned path lands in both places.
 fn is_skipped(entry: &ignore::DirEntry, owner_folder: bool) -> bool {
     if entry.depth() == 0 {
         return false; // the watched root itself
@@ -148,9 +128,8 @@ fn is_skipped(entry: &ignore::DirEntry, owner_folder: bool) -> bool {
             if matches!(name, "generated" | "uploads" | "notes" | "archive") {
                 return true;
             }
-            // The product's custom-tool catalogue lives in the owner's own
-            // folder alone; in anyone else's personal folder the name `shared/`
-            // is that user's own material, whose edits must be reported.
+            // The custom-tool catalogue lives in the owner's folder alone; elsewhere
+            // `shared/` is that user's own material, whose edits must be reported.
             if name == "shared" && owner_folder {
                 return true;
             }
@@ -159,31 +138,26 @@ fn is_skipped(entry: &ignore::DirEntry, owner_folder: bool) -> bool {
     false
 }
 
-/// Hard cap on how many child folders the session-start picture names; the rest
-/// are summarized as a count, so the block never grows with the folder's size.
+/// Hard cap on how many child folders the picture names; the rest are summarized as a
+/// count, so the block never grows with the folder.
 const MAX_PICTURED_FOLDERS: usize = 40;
 
-/// A folder's own git ignore rules, for one observation — a cheap clonable handle,
-/// since [`scan`] hands a clone to its walk's entry filter (which must own what it
-/// captures) and still asks the same cached answers for the delta afterwards.
+/// A folder's own git ignore rules for one observation — a cheap clonable handle, since [`scan`]
+/// hands a clone to its walk's entry filter and still asks the same cached answers for the delta.
 ///
-/// What is hidden is what git itself would ignore inside this folder, judged by
-/// the rules that live in it: every repository the folder holds (itself included)
-/// contributes its `.gitignore` files and its `.git/info/exclude`, at the
-/// boundaries git applies them — a nested repository's rules replace the outer
-/// one's for the paths inside it, which is why each repository gets a matcher of
-/// its own rather than one rooted at the folder. Nothing above the folder is
-/// applied (no parent `.gitignore`, no `core.excludesFile`, no global or system
-/// excludes), `.ignore` files are not git rules, and hidden files are not an
-/// ignored class. A folder holding no repository therefore hides nothing.
+/// What is hidden is what git would ignore inside this folder, by the rules that live in it:
+/// every repository it holds contributes its `.gitignore` files and `.git/info/exclude` at the
+/// boundaries git applies — a nested repository's rules replace the outer one's inside it, so
+/// each gets a matcher of its own. Nothing above the folder applies (no parent `.gitignore`, no
+/// `core.excludesFile`, no global or system excludes); `.ignore` files are not git rules and
+/// hidden files are not an ignored class. A folder holding no repository hides nothing.
 ///
-/// The one thing that outranks a rule is the index: a path git still tracks is
-/// never hidden. Hiding also fails open — when the index cannot be read, the paths
-/// its rules would hide stay visible rather than risk dropping a tracked one. That
-/// index is the only git this module runs, and only for a path a rule would hide.
+/// The index outranks a rule: a path git still tracks is never hidden, and hiding fails open —
+/// an unreadable index leaves paths visible rather than risk dropping a tracked one. That index
+/// is the only git this module runs, and only for a path a rule would hide.
 ///
-/// Everything is built on first use and cached for this one observation: a matcher
-/// never notices an ignore file edited mid-observation, and the next starts clean.
+/// Everything is built on first use and cached for this observation: a matcher never notices an
+/// ignore file edited mid-observation; the next starts clean.
 #[derive(Clone)]
 struct Rules {
     root: PathBuf,
@@ -194,11 +168,11 @@ struct Rules {
 struct RulesState {
     /// Repository (folder-relative) → the matcher over its own rules.
     matchers: HashMap<PathBuf, IncrementalIgnore>,
-    /// Folder-relative directory → the repository governing it; `None` outside
-    /// every repository. A walk asks this once per directory, not per entry.
+    /// Directory → the repository governing it; `None` outside every repository. Asked once
+    /// per directory, not per entry.
     governing: HashMap<PathBuf, Option<PathBuf>>,
-    /// Repository → the paths its index tracks, repository-relative and
-    /// `/`-separated as git spells them. `None` when git could not answer.
+    /// Repository → the paths its index tracks, repository-relative as git spells them.
+    /// `None` when git could not answer.
     tracked: HashMap<PathBuf, Option<BTreeSet<String>>>,
 }
 
@@ -210,10 +184,9 @@ impl Rules {
         }
     }
 
-    /// Whether the walk should hide `entry` — [`RulesState::hidden`] on the
-    /// entry's folder-relative path. Every walk prunes through this, so the report
-    /// and the picture can never disagree about material. An entry outside the
-    /// folder (or the folder itself) is never hidden.
+    /// Whether the walk should hide `entry` — [`RulesState::hidden`] on its folder-relative
+    /// path. Every walk prunes through this, so the report and the picture cannot disagree.
+    /// An entry outside the folder (or the folder itself) is never hidden.
     fn hides(&self, entry: &ignore::DirEntry) -> bool {
         let Ok(rel) = entry.path().strip_prefix(&self.root) else {
             return false;
@@ -234,20 +207,16 @@ impl Rules {
 }
 
 impl RulesState {
-    /// Whether `rel` (folder-relative) is hidden: a path some repository's rules
-    /// exclude and git does not track. A path git could not be asked about stays
-    /// visible (see [`Rules`]).
+    /// A path some repository's rules exclude and git does not track. A path git could not
+    /// be asked about stays visible (see [`Rules`]).
     fn hidden(&mut self, root: &Path, rel: &Path, is_dir: bool) -> bool {
         if self.excluded(root, rel, is_dir) && self.tracked(root, rel, is_dir) == Some(false) {
             return true;
         }
-        // A directory above `rel` can be hidden by a different repository than the
-        // one governing `rel` — a nested repository inside a folder its enclosing
-        // repository ignores — and the walk prunes there, so everything below is
-        // gone from the change set for the same reason. Only a directory whose
-        // repository differs is asked: within one repository the matcher has
-        // already weighed every ancestor, and outside every repository there is
-        // nothing to ask.
+        // A directory above `rel` can be hidden by a different repository than the one
+        // governing `rel` (a nested repository inside a folder its enclosing one ignores),
+        // and the walk prunes there. Only a directory whose repository differs is asked:
+        // within one repository the matcher already weighed every ancestor.
         let Some(governing) = self.repository(root, rel) else {
             return false;
         };
@@ -264,8 +233,8 @@ impl RulesState {
         false
     }
 
-    /// Whether the rules alone exclude `rel` — no index consulted, so a path the
-    /// folder no longer holds is judged by the same rules that hid it.
+    /// Whether the rules alone exclude `rel` — no index consulted, so a path the folder no
+    /// longer holds is judged by the same rules that hid it.
     fn excluded(&mut self, root: &Path, rel: &Path, is_dir: bool) -> bool {
         let Some(repo) = self.repository(root, rel) else {
             return false;
@@ -278,8 +247,8 @@ impl RulesState {
             .is_ignore()
     }
 
-    /// Whether git tracks `rel` (or, for a directory, any path beneath it), or
-    /// `None` when the repository's index cannot be read.
+    /// Whether git tracks `rel` (or, for a directory, anything beneath it); `None` when the
+    /// index cannot be read.
     fn tracked(&mut self, root: &Path, rel: &Path, is_dir: bool) -> Option<bool> {
         let repo = self.repository(root, rel)?;
         let tracked = self
@@ -294,8 +263,8 @@ impl RulesState {
         if !is_dir {
             return Some(false);
         }
-        // A directory is kept when anything beneath it is tracked: its own entry
-        // is not in the index, the files under it are.
+        // A directory is kept when anything beneath it is tracked: its own entry is not in
+        // the index, the files under it are.
         let prefix = format!("{key}/");
         Some(
             tracked
@@ -305,10 +274,9 @@ impl RulesState {
         )
     }
 
-    /// The repository governing `rel` (folder-relative): the closest directory at
-    /// or above its parent that holds a `.git` entry, never above `root` itself —
-    /// `None` outside every repository. Each level's answer is cached, so the walk
-    /// asks once per directory it enters.
+    /// The closest directory at or above `rel`'s parent holding a `.git` entry, never above
+    /// `root` — `None` outside every repository. Cached per level, so the walk asks once per
+    /// directory it enters.
     fn repository(&mut self, root: &Path, rel: &Path) -> Option<PathBuf> {
         let dir = rel.parent().unwrap_or(Path::new("")).to_path_buf();
         if let Some(known) = self.governing.get(&dir) {
@@ -326,14 +294,9 @@ impl RulesState {
     }
 }
 
-/// The matcher for the rules in force inside one repository.
-///
-/// `standard_filters(false)` settles every default the walk needs — parents,
-/// global excludes, `.ignore` files and the hidden class are all off — and the
-/// two git sources of a repository's own rules are switched back on:
-/// `require_git` stays at its default, so `.gitignore` files and
-/// `.git/info/exclude` apply exactly where git applies them, a nested
-/// repository's rules replacing these for the paths inside that nested one.
+/// The matcher for the rules inside one repository: `standard_filters(false)` turns off parents,
+/// global excludes, `.ignore` files and the hidden class, while `require_git` stays at its
+/// default so `.gitignore` and `.git/info/exclude` apply exactly where git applies them.
 fn build_matcher(repo: &Path) -> IncrementalIgnore {
     let mut builder = WalkBuilder::new(repo);
     builder
@@ -346,8 +309,8 @@ fn build_matcher(repo: &Path) -> IncrementalIgnore {
         .expect("a walk root always yields its matcher")
 }
 
-/// The paths `repo`'s index tracks, repository-relative as git spells them, or
-/// `None` when git cannot answer (its own doc says what that covers).
+/// The paths `repo`'s index tracks, repository-relative as git spells them, or `None` when
+/// git cannot answer (its own doc says what that covers).
 fn load_tracked(repo: &Path) -> Option<BTreeSet<String>> {
     let Some(tracked) = crate::git::commands::tracked_paths(repo) else {
         tracing::debug!(
@@ -359,9 +322,8 @@ fn load_tracked(repo: &Path) -> Option<BTreeSet<String>> {
     Some(tracked.into_iter().collect())
 }
 
-/// `path`'s components joined by `/` — the spelling git prints and always uses,
-/// so a tracked set and a walked path compare the same on every platform.
-/// `None` for a path that is not UTF-8.
+/// `path`'s components joined by `/` — the spelling git prints and always uses, so a
+/// tracked set and a walked path compare the same on every platform. `None` for a non-UTF-8 path.
 fn slash_path(path: &Path) -> Option<String> {
     let mut out = String::new();
     for component in path.components() {
@@ -373,17 +335,14 @@ fn slash_path(path: &Path) -> Option<String> {
     Some(out)
 }
 
-/// The session-start picture of `root`: the folders sitting directly inside it,
-/// each with the number of files it holds at any depth, plus how many files sit
-/// directly in the folder itself. No path is ever named, and the walk reads no
-/// file's contents — metadata alone.
+/// The session-start picture of `root`: the folders directly inside it, each with the number
+/// of files it holds at any depth, plus how many files sit directly in the folder itself. No
+/// path is named and no contents are read — metadata alone.
 ///
-/// The material counted is exactly what the change report watches: the same
-/// walk, the same predicate ([`is_skipped`]) and the same rules ([`Rules`]) as
-/// [`scan`]. `None` when `root` does not exist yet (personal folders are created
-/// lazily), when it cannot be opened, or when it holds nothing of the user's — so
-/// the block is silent rather than empty. A walk error deeper inside warns and
-/// continues, leaving the counts what could be counted.
+/// The material counted is exactly what the report watches: the same walk, predicate and
+/// rules. `None` when `root` does not exist yet (personal folders are created lazily), cannot
+/// be opened, or holds nothing of the user's — silent rather than empty. A walk error deeper
+/// inside warns and continues, leaving the counts what could be counted.
 pub(crate) fn personal_folder_picture(root: &Path) -> Option<String> {
     if let Err(e) = std::fs::read_dir(root) {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -405,8 +364,8 @@ pub(crate) fn personal_folder_picture(root: &Path) -> Option<String> {
         let entry = match result {
             Ok(entry) => entry,
             Err(e) => {
-                // The folder itself was probed readable above, so an error here
-                // is about one path: the other folders are still pictured.
+                // The folder itself was probed readable above, so an error here is about one
+                // path: the other folders are still pictured.
                 tracing::warn!(error = %e, "personal-workspace walk error");
                 continue;
             }
@@ -425,9 +384,9 @@ pub(crate) fn personal_folder_picture(root: &Path) -> Option<String> {
             continue; // an entry whose metadata cannot be read is not counted
         };
         if meta.is_dir() {
-            // A real immediate child directory is the user's folder even when
-            // nothing countable sits inside it; a link to a directory is neither
-            // recorded nor descended into (the walk never follows one).
+            // A real immediate child directory is the user's folder even when nothing
+            // countable sits inside it; a link to a directory is neither recorded nor
+            // descended into.
             if entry.depth() == 1 && entry.file_type().is_some_and(|t| t.is_dir()) {
                 folders.entry(rel.to_string()).or_default();
             }
@@ -453,9 +412,9 @@ fn counted(n: usize, noun: &str) -> String {
     }
 }
 
-/// Render the picture: one `- <name>/ — <n> files` line per folder, name-sorted
-/// and at most [`MAX_PICTURED_FOLDERS`] of them, the folders left out summarized
-/// as a count, and finally how many files sit directly in the folder.
+/// One `- <name>/ — <n> files` line per folder, name-sorted and capped at
+/// [`MAX_PICTURED_FOLDERS`], the rest summarized as a count, then the files sitting directly
+/// in the folder.
 fn render_personal_folder_lines(folders: &BTreeMap<String, usize>, root_files: usize) -> String {
     let mut out = String::new();
     for (name, count) in folders.iter().take(MAX_PICTURED_FOLDERS) {
@@ -473,12 +432,9 @@ fn render_personal_folder_lines(folders: &BTreeMap<String, usize>, root_files: u
     out
 }
 
-/// The path below the userspaces root when `path` lies inside it, `None` when it
-/// does not. Both sides are compared canonically
-/// ([`crate::stored_workspace_path`]): this relates a [`Workspace`]'s stored path
-/// — canonical, and possibly behind a symlink — to the userspaces tree, and
-/// `Path::starts_with` is lexical, so a storage root behind a symlink (macOS's
-/// `/tmp` → `/private/tmp`, a symlinked `HOME`) would never match a raw prefix.
+/// The path below the userspaces root when `path` lies inside it. Both sides are compared
+/// canonically ([`crate::stored_workspace_path`]) because `Path::starts_with` is lexical and a
+/// storage root behind a symlink (macOS's `/tmp` → `/private/tmp`) would never match a raw prefix.
 fn under_userspaces(path: &Path) -> Option<PathBuf> {
     let root = crate::stored_workspace_path(&crate::users::userspaces_root());
     crate::stored_workspace_path(path)
@@ -487,12 +443,10 @@ fn under_userspaces(path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// The account whose personal folder `path` is or lies in — the folder itself or
-/// anything under it (a delegated round, a targeted project round and a
-/// custom-role launch all work below it, and a managed workspace placed inside
-/// one counts too): the first component below the userspaces root, which is the
-/// name [`crate::users::personal_workspace_path`] builds every personal folder
-/// from.
+/// The account whose personal folder `path` is or lies in — a delegated round, a targeted
+/// project round and a custom-role launch all work below it, and a managed workspace placed
+/// inside one counts: the first component below the userspaces root, which is the name
+/// [`crate::users::personal_workspace_path`] builds every folder from.
 fn personal_account_in(path: &Path) -> Option<String> {
     under_userspaces(path)?
         .components()
@@ -502,24 +456,18 @@ fn personal_account_in(path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Whether `root` is the owner's own personal folder — the one that holds the
-/// product's custom-tool catalogue ([`crate::tools::custom`]), so that its
-/// `shared/` is product material rather than the user's.
+/// Whether `root` is the owner's own personal folder — the one holding the product's custom-tool
+/// catalogue ([`crate::tools::custom`]), so its `shared/` is product material.
 ///
-/// [`crate::users::personal_workspace_path`] builds every personal folder by
-/// joining [`crate::users::userspaces_root`] with the account's name, and a walk's
-/// root is always what that join returned, so undoing the join names the account
-/// the walked folder belongs to. The comparison is component-wise
-/// ([`Path::strip_prefix`]) — a trailing separator or a `.` component decides
-/// nothing — and the account is tested with the product's single account test
-/// ([`crate::users::is_admin_name`]). Only the owner's own folder counts: no
-/// folder named after the owner anywhere else, and none below the real one, is
-/// the product's, and a guest's own `shared/` stays watched.
+/// A walk's root is always [`crate::users::userspaces_root`] joined with the account name, so
+/// undoing the join names the account; the comparison is component-wise
+/// ([`Path::strip_prefix`]) and the account is tested with [`crate::users::is_admin_name`]. Only
+/// the owner's own folder counts: no folder named after the owner anywhere else, or below the
+/// real one, is the product's, and a guest's own `shared/` stays watched.
 ///
-/// The path is taken as it stands rather than canonically
-/// ([`under_userspaces`]), and deliberately: canonicalizing moves an account
-/// folder that is itself a link out of the userspaces tree, which would stop
-/// pruning the catalogue that does live there (the walk follows such a root).
+/// The path is taken as it stands rather than canonically ([`under_userspaces`]) on purpose:
+/// canonicalizing moves an account folder that is itself a link out of the userspaces tree, which
+/// would stop pruning the catalogue that does live there (the walk follows such a root).
 fn is_owner_personal_folder(root: &Path) -> bool {
     let Ok(rel) = root.strip_prefix(crate::users::userspaces_root()) else {
         return false;
@@ -529,9 +477,8 @@ fn is_owner_personal_folder(root: &Path) -> bool {
     parts.next().is_none() && account.is_some_and(crate::users::is_admin_name)
 }
 
-/// Dig the offending path out of an `ignore` walk error. The path lives in the
-/// public `WithPath` variant, wrapped by `WithLineNumber`/`WithDepth`; `ignore`
-/// 0.4.33 exposes no `path()` accessor of its own.
+/// Dig the offending path out of an `ignore` walk error: it lives in the public `WithPath` variant,
+/// wrapped by `WithLineNumber`/`WithDepth`, as `ignore` 0.4.33 exposes no `path()` accessor.
 fn error_path(err: &ignore::Error) -> Option<&Path> {
     match err {
         ignore::Error::WithPath { path, .. } => Some(path),
@@ -542,12 +489,10 @@ fn error_path(err: &ignore::Error) -> Option<&Path> {
     }
 }
 
-/// Copy `rel`'s previous state — and, when it is a directory prefix, every
-/// previous entry beneath it — into `out`, unchanged. Used wherever the walk
-/// could not observe an entry at all, so a transient error can never read as the
-/// user deleting files, and a later successful observation still reports the real
-/// change. The snapshot is a sorted `BTreeMap`, so the `rel/` subtree is one
-/// contiguous `range`.
+/// Copy `rel`'s previous state — and, for a directory prefix, every previous entry beneath
+/// it — into `out`, so a transient error can never read as the user deleting files and a
+/// later successful observation still reports the real change. The snapshot is a sorted
+/// `BTreeMap`, so the `rel/` subtree is one contiguous `range`.
 fn freeze(previous: Option<&Snapshot>, rel: &str, out: &mut Snapshot) {
     let Some(previous) = previous else {
         return;
@@ -555,26 +500,15 @@ fn freeze(previous: Option<&Snapshot>, rel: &str, out: &mut Snapshot) {
     if let Some(state) = previous.get(rel) {
         out.insert(rel.to_string(), state.clone());
     }
-    // Keys beginning with `rel/` sort contiguously between `rel/` and `rel0`
-    // ('0' is the byte just past '/'), so the range cannot spill into a sibling
-    // like `rel.txt`.
+    // Keys beginning with `rel/` sort contiguously between `rel/` and `rel0` ('0' is the
+    // byte just past '/'), so the range cannot spill into a sibling like `rel.txt`.
     for (path, state) in previous.range(format!("{rel}/")..format!("{rel}0")) {
         out.insert(path.clone(), state.clone());
     }
 }
 
-/// `workspace`'s personal account, when the turn ran in a personal folder —
-/// the folder itself, or anything under it (a delegated round, a targeted
-/// project round and a custom-role launch all work under a path-derived
-/// workspace, and a managed workspace placed inside one counts too). `None`
-/// for a workspace that is neither inside the userspaces root nor named after a
-/// personal workspace, which is what leaves an ordinary managed workspace
-/// untouched.
-///
-/// Where the turn actually worked decides first — that is where its writes
-/// landed — and the personal name is the fallback, for a folder the product
-/// reaches through a symlink of its own. [`personal_account_of`] is what refuses
-/// a name that cannot address a folder.
+/// The owner of the personal folder the turn ran in ([`personal_user_of`]), refused when the name
+/// cannot address a folder. `None` for a turn in no personal folder.
 fn personal_user_of(workspace: &Workspace) -> Option<String> {
     personal_account_in(Path::new(&workspace.path))
         .or_else(|| crate::users::personal_user_name(&workspace.name).map(str::to_string))
@@ -585,14 +519,11 @@ fn personal_user_of(workspace: &Workspace) -> Option<String> {
 enum Scan {
     /// The turn's report: nothing is stored, so only what [`diff`] consults is read.
     Report,
-    /// A refresh: every entry it keeps is fingerprinted, so a later touch stays
-    /// decidable.
+    /// A refresh: every entry it keeps is fingerprinted, so a later touch stays decidable.
     Refresh,
-    /// The establishment's walk ([`establish`]). The same as [`Scan::Refresh`],
-    /// with the two liberties only a walk that is off the reply path may take: an
-    /// unreadable baseline is re-fingerprinted from scratch rather than handed
-    /// back, and the walk gives up on a forced stop instead of holding the exit
-    /// for a folder-wide read.
+    /// The establishment's walk ([`establish`]) — [`Scan::Refresh`] plus the two liberties a
+    /// walk off the reply path may take: an unreadable baseline is re-fingerprinted from
+    /// scratch, and a forced stop is honoured instead of holding the exit for a folder-wide read.
     Whole,
 }
 
@@ -603,24 +534,20 @@ impl Scan {
     }
 }
 
-/// Walk `root` and fingerprint every entry the folder holds, reusing a stored
-/// digest when the size and a reported stamp both match exactly. `None` when
-/// `root` is not a readable directory or a walk error's path cannot be recovered
-/// (fail-open); every other entry the walk could not observe keeps its previous
-/// state ([`freeze`]).
+/// Walk `root` and fingerprint every entry, reusing a stored digest when the size and a
+/// reported stamp both match exactly. `None` when `root` is not a readable directory or a walk
+/// error's path cannot be recovered (fail-open); every other entry the walk could not observe
+/// keeps its previous state ([`freeze`]).
 ///
-/// Directories are not entries of their own — a directory is implied by the paths
-/// below it — so an added empty directory is not reported. The walk never descends
-/// into a symlink either, which leaves the files behind a directory link out of
-/// the snapshot: replacing a real directory with a link to one therefore reports
-/// the files that were there as removed.
+/// Directories are not entries of their own — implied by the paths below them — so an added
+/// empty directory is not reported. The walk never descends into a symlink, so the files
+/// behind a directory link stay out of the snapshot: replacing a real directory with a link
+/// therefore reports those files as removed.
 ///
-/// Entries the walk must not see are pruned by its entry filter: the product's own
-/// material ([`is_skipped`]) and whatever the folder's own git rules hide
-/// ([`Rules`]) — the filter [`personal_folder_picture`] walks through too, so the
-/// two blocks describe the same material. Filtering there is what keeps an ignored
-/// path out of the delta instead of merely out of its rendering. `mode` decides what
-/// is read ([`Scan`]) and nothing else.
+/// The entry filter prunes the product's own material ([`is_skipped`]) and whatever the
+/// folder's git rules hide ([`Rules`]) — the filter [`personal_folder_picture`] walks through
+/// too. Filtering there keeps an ignored path out of the delta, not merely out of its
+/// rendering. `mode` decides what is read ([`Scan`]) and nothing else.
 fn scan(root: &Path, previous: Option<&Snapshot>, mode: Scan, rules: &Rules) -> Option<Snapshot> {
     let stores = mode.stores();
     if std::fs::read_dir(root).is_err() {
@@ -632,8 +559,8 @@ fn scan(root: &Path, previous: Option<&Snapshot>, mode: Scan, rules: &Rules) -> 
     let whole_walk = mode == Scan::Whole;
     let owner_folder = is_owner_personal_folder(root);
     let walk_rules = rules.clone();
-    // Cloned once: the loop below runs per entry, and a whole-folder walk on a
-    // large folder would clone the token tens of thousands of times.
+    // Cloned once: the loop runs per entry, and a large folder would clone the token tens of
+    // thousands of times.
     let stop = crate::shutdown::shutdown_token();
     for result in WalkBuilder::new(root)
         .standard_filters(false)
@@ -641,30 +568,27 @@ fn scan(root: &Path, previous: Option<&Snapshot>, mode: Scan, rules: &Rules) -> 
         .filter_entry(move |entry| !is_skipped(entry, owner_folder) && !walk_rules.hides(entry))
         .build()
     {
-        // A forced stop gives up a whole-folder walk rather than hold the exit for
-        // a folder-wide read. The token, not `aborting()`: a graceful drain exists
-        // to let in-flight work finish, and the drain's own watch fires the token
-        // as soon as the foreground work drains.
+        // A forced stop gives up a whole-folder walk rather than hold the exit for a
+        // folder-wide read. The token, not `aborting()`: a graceful drain lets in-flight work
+        // finish, and the drain's own watch fires the token when the foreground work drains.
         if whole_walk && stop.is_cancelled() {
             return None;
         }
         let entry = match result {
             Ok(entry) => entry,
             Err(e) => {
-                // A root-level walk error means the folder itself went
-                // unreadable after the probe — fail open (no report), not a
-                // half-walk that would look like mass deletion.
+                // A root-level walk error means the folder itself went unreadable after the
+                // probe — fail open, not a half-walk that would look like mass deletion.
                 if e.depth() == Some(0) {
                     return None;
                 }
-                // A deeper error misses that path (for a directory: its whole
-                // subtree) — freeze it.
+                // A deeper error misses that path (for a directory: its subtree) — freeze it.
                 let Some(rel) = error_path(&e)
                     .and_then(|path| path.strip_prefix(root).ok())
                     .and_then(Path::to_str)
                 else {
-                    // The path is unrecoverable, so what was missed is
-                    // unknowable — fail open rather than report a partial walk.
+                    // The path is unrecoverable, so what was missed is unknowable — fail open
+                    // rather than report a partial walk.
                     tracing::warn!(error = %e, "personal-workspace walk error without a path");
                     return None;
                 };
@@ -687,11 +611,10 @@ fn scan(root: &Path, previous: Option<&Snapshot>, mode: Scan, rules: &Rules) -> 
         let Some(rel) = rel.to_str() else {
             continue; // a non-UTF-8 path cannot be listed or diffed
         };
-        // `std::fs::metadata` follows symlinks (the walker does not descend
-        // into them), matching the read tool: a symlinked file is fingerprinted
-        // by what it points at. A symlink whose target is gone falls back to the
-        // link itself — the entry the folder now holds — so the user's
-        // replacement of a file is reported rather than silently missed.
+        // `std::fs::metadata` follows symlinks (the walker does not descend into them),
+        // matching the read tool: a symlinked file is fingerprinted by its target. A dangling
+        // one falls back to the link itself, so the user's replacement is reported rather than
+        // silently missed.
         let meta = std::fs::metadata(path).or_else(|_| std::fs::symlink_metadata(path));
         let Ok(meta) = meta else {
             tracing::warn!(
@@ -714,21 +637,19 @@ fn scan(root: &Path, previous: Option<&Snapshot>, mode: Scan, rules: &Rules) -> 
                 {
                     prev.digest
                 }
-                // A report keeps nothing, and `diff` consults no digest for a path
-                // it has never seen (`added`) or one whose size moved (`changed`).
+                // A report keeps nothing, and `diff` consults no digest for a path it has
+                // never seen (`added`) or whose size moved (`changed`).
                 None if !stores => None,
                 Some(prev) if !stores && prev.size != size => None,
                 // Above the cap the stamp is all there is to compare.
                 _ if size > HASH_MAX_BYTES => None,
-                // Everything else — a stamp that moved under an unchanged size, and
-                // a stamp the platform will not report at all — is decided by the
-                // content, the only thing here that can decide it.
+                // Everything else — a stamp that moved under an unchanged size, and a stamp
+                // the platform will not report — is decided by the content.
                 _ => digest_of(path),
             }
         } else {
-            // A FIFO, a device or a socket is never opened, hashed or waited on;
-            // its own stamp is all the walk has to offer, and recording it still
-            // reports the user replacing a file with one.
+            // A FIFO, device or socket is never opened, hashed or waited on; its stamp is all
+            // the walk has, and recording it still reports the user replacing a file with one.
             None
         };
         out.insert(
@@ -751,24 +672,19 @@ struct Changes {
     removed: Vec<String>,
 }
 
-/// Classify `current` against `previous`; a rename therefore shows as removed +
-/// added. A path present in both is `changed` when its size differs — airtight,
-/// no digest needed — or when it cannot be shown to hold the same bytes: its
-/// stamp moved, or the platform reports no stamp for it at all, and its digest
-/// says otherwise. Equal digests mean a touch (nothing reported); a digest
-/// missing on either side (above [`HASH_MAX_BYTES`], an entry that is not a
-/// regular file, or one that failed to read) cannot be compared, and such a file
-/// is reported rather than silently never — a stamp that moved is the most a
-/// stamp-only entry can offer. An entry above the cap under an unreportable stamp
-/// is the one case with neither evidence to compare, and it follows the same
-/// preference: reported, because missing a real edit is the worse failure.
-/// Iterating the `BTreeMap`s keeps each list sorted.
+/// Classify `current` against `previous` (a rename shows as removed + added). A path in both
+/// is `changed` when its size differs — airtight — or cannot be shown to hold the same bytes:
+/// its stamp moved, or the platform reports none, and its digest says otherwise. Equal digests
+/// mean a touch (not reported); a digest missing on either side (above [`HASH_MAX_BYTES`], not
+/// a regular file, read failure) cannot be compared, and such a file is reported rather than
+/// silently never. An entry above the cap under an unreportable stamp is the one case with no
+/// evidence at all, and follows the same preference: reported, because missing a real edit is
+/// the worse failure. Iterating the `BTreeMap`s keeps each list sorted.
 ///
-/// A recorded path the walk no longer produces is `removed` unless the folder's
-/// own rules hide it ([`Rules::hidden`]): an ignored path leaves the report
-/// silently, whether a rule was added since the baseline or the baseline itself
-/// predates this filtering. A tracked path is never hidden, so deleting one is
-/// still reported, and a path that stopped being ignored is absent from the
+/// A recorded path the walk no longer produces is `removed` unless the folder's rules hide it
+/// ([`Rules::hidden`]): an ignored path leaves the report silently, whether a rule was added
+/// since or the baseline itself predates this filtering. A tracked path is never hidden, so
+/// deleting one is still reported, and a path that stopped being ignored is absent from the
 /// baseline — it comes back as `added`.
 fn diff(previous: &Snapshot, current: &Snapshot, rules: &Rules) -> Changes {
     let mut changes = Changes::default();
@@ -803,9 +719,9 @@ const MAX_LISTED_ENTRIES: usize = 40;
 /// Secondary stop condition on the rendered block size, in bytes.
 const MAX_BLOCK_BYTES: usize = 2 * 1024;
 
-/// Render the change block, or `None` when nothing changed. Classes render in
-/// the order added → changed → removed, one per line, stopping at the entry or
-/// byte cap; everything left out is summarized by a final `…and N more` line.
+/// Render the change block, or `None` when nothing changed. Classes render added → changed →
+/// removed, one per line, stopping at the entry or byte cap; everything left out is summarized
+/// by a final `…and N more` line.
 fn render(changes: &Changes) -> Option<String> {
     let groups = [
         ("added: ", &changes.added),
@@ -912,16 +828,14 @@ pub(crate) async fn prepend_changes(msg: &str, workspace: &Workspace, role: &Rol
     }
 }
 
-/// Absorb into the baseline whatever the product itself did inside a personal
-/// workspace, so a later report cannot blame the user for it.
+/// Absorb into the baseline whatever the product itself did inside a personal workspace,
+/// so a later report cannot blame the user for it.
 ///
-/// Gated exactly like the report it serves: only the Assistant's own turn counts
-/// ([`Role::Assistant`]), only one whose user message was recorded (an
-/// undelivered report must leave its changes pending rather than swallow them),
-/// and only when the turn ran in that user's personal folder. A delegated round
-/// or a custom-role launch that happens to run in the folder therefore advances
-/// nothing — absorbing a hand edit the user made between messages would be
-/// worse than letting such a round's own writes surface in the next block.
+/// Gated like the report it serves: only the Assistant's own turn ([`Role::Assistant`]),
+/// only one whose user message was recorded (an undelivered report must leave its changes
+/// pending), and only when the turn ran in that user's personal folder. A delegated round
+/// or custom-role launch running there advances nothing — absorbing a hand edit the user
+/// made between messages would be worse than letting such a round's writes surface later.
 pub(crate) async fn refresh_after_turn(role: &Role, workspace: &Workspace, recorded: bool) {
     if !recorded || !matches!(role, Role::Assistant) {
         return;
@@ -932,38 +846,33 @@ pub(crate) async fn refresh_after_turn(role: &Role, workspace: &Workspace, recor
     refresh(&user_name).await;
 }
 
-/// The account a turn's change report and baseline concern: the owner of the
-/// personal folder that turn ran in ([`personal_user_of`]), refused when the name
-/// cannot address a folder. `None` for a turn that ran in no personal folder,
-/// which is what leaves an ordinary managed workspace untouched.
+/// The owner of the personal folder the turn ran in ([`personal_user_of`]), refused when
+/// the name cannot address a folder. `None` for a turn in no personal folder, which leaves
+/// an ordinary managed workspace untouched.
 fn personal_account_of(workspace: &Workspace) -> Option<String> {
     let user_name = personal_user_of(workspace)?;
     crate::users::is_valid_personal_user_name(&user_name).then_some(user_name)
 }
 
-/// Refresh the stored baseline for `user_name`'s personal workspace; the name
-/// comes from [`personal_account_of`], so it can address a folder. The write
-/// lands on the baseline's own child row, whose foreign key rejects it while the
-/// session's row is absent (`SessionStore::update_personal_changes`), so an
-/// account with no Assistant metadata row yet is never given a phantom one
-/// — and, since that write is what the walk exists for, such an account is not
-/// walked at all. An unwalkable folder is a silent no-op and the DB write is
-/// skipped when nothing moved. A baseline that is missing or unreadable is the
-/// case whose walk is not paid here: it hands off to [`establish`].
+/// Refresh the stored baseline for `user_name`'s personal workspace; the name comes from
+/// [`personal_account_of`], so it can address a folder. The write lands on the baseline's own
+/// child row, whose foreign key rejects it while the session's row is absent
+/// (`SessionStore::update_personal_changes`), so an account with no Assistant metadata row is
+/// never given a phantom one — and, since that write is what the walk exists for, such an
+/// account is not walked at all. An unwalkable folder is a silent no-op and the write is
+/// skipped when nothing moved. A baseline that is missing or unreadable hands off to [`establish`].
 ///
-/// Two turns in the same folder (an automation overlapping a user turn) can interleave
-/// their read-write here. Either write is a fresh observation of the same folder,
-/// so the loser costs a few milliseconds of staleness, not a wrong report.
+/// Two turns in the same folder (an automation overlapping a user turn) can interleave their
+/// read-write here; either write is a fresh observation, so the loser costs staleness, not a
+/// wrong report.
 async fn refresh(user_name: &str) {
-    // A turn ending while the folder's first observation is still running is
-    // absorbed by that observation's own next walk (see `establish`), so the walk
-    // is not paid for here as well.
+    // A turn ending while the folder's first observation still runs is absorbed by that
+    // observation's next walk (see `establish`).
     if request_another_walk(user_name) {
         return;
     }
     let agent_id = crate::session::assistant_agent_id(user_name);
-    // `None` is no session row at all: the baseline could never be recorded, so
-    // there is nothing to walk for.
+    // `None` is no session row at all: the baseline could never be recorded.
     let Some(stored) = crate::session::store()
         .personal_changes_baseline(&agent_id)
         .await
@@ -987,32 +896,28 @@ async fn refresh(user_name: &str) {
     }
 }
 
-/// Fingerprint `user_name`'s folder for the first time — the one observation
-/// that reads and hashes every file it keeps — off the reply path: the user
-/// never waits for it, and no block is rendered while it runs (see
-/// [`prepend_changes`]). A change made during that short window is absorbed
-/// silently, the same accepted class as the one an in-flight turn absorbs.
+/// Fingerprint `user_name`'s folder for the first time — the one observation that reads and
+/// hashes every file — off the reply path: the user never waits and no block is rendered while
+/// it runs ([`prepend_changes`]). A change during that short window is absorbed silently, the
+/// same accepted class as one an in-flight turn absorbs.
 ///
-/// [`ESTABLISHING`] carries that window: it marks the account as being observed,
-/// keeps a burst of turns from stacking identical whole-folder walks, and records
-/// that a turn ended since the last walk — such a turn's own writes are not in
-/// that observation, so one more (incremental) observation runs before the window
-/// closes, and the product's writes never reach the next block.
+/// [`ESTABLISHING`] carries the window: it marks the account as being observed, keeps a burst
+/// of turns from stacking identical whole-folder walks, and records that a turn ended since
+/// the last walk — those writes are not in the observation, so one more (incremental) walk
+/// runs before the window closes.
 ///
-/// A baseline write that keeps failing (a broken store) leaves no baseline stored,
-/// so every later turn retries this observation — off the reply path, logged, and
-/// still silent: the only price is a background walk per turn until a write
-/// lands, and recovery is automatic once one does.
+/// A baseline write that keeps failing (a broken store) leaves no baseline, so every later
+/// turn retries — off the reply path, logged, still silent, recovering automatically.
 fn establish(user_name: &str, agent_id: String) {
     let user_name = user_name.to_string();
     let root = crate::users::personal_workspace_path(&user_name);
-    // The guard is built here, next to the insert that sets the mark, and moved
-    // into the task below — see [`Establishing`] for what that guarantees.
+    // Built next to the insert that sets the mark and moved into the task below — see
+    // [`Establishing`].
     let establishing = {
         let mut establishing = ESTABLISHING.lock().unwrap_poison();
-        // Already observing: this turn's writes are not in the last walk, so ask
-        // for one more (see the loop below) instead of walking here as well. Both
-        // happen under one lock, so two turns cannot both start an observation.
+        // Already observing: this turn's writes are not in the last walk, so ask for one more
+        // (the loop below) rather than walking here too. Both under one lock, so two turns
+        // cannot both start an observation.
         if let Some(in_flight) = establishing.get_mut(&user_name) {
             in_flight.again = true;
             return;
@@ -1031,15 +936,13 @@ fn establish(user_name: &str, agent_id: String) {
         }
     };
     tokio::spawn(async move {
-        // Holding the guard for the task's lifetime keeps the mark set until this
-        // observation really ends, and its owner is the only mark this task may
-        // close.
+        // Holding the guard for the task's lifetime keeps the mark set until the observation
+        // really ends; its owner is the only mark this task may close.
         let owner = establishing.owner;
-        // What the caller read may have moved on since (a predecessor stored its
-        // observation, or another turn's establishment did): comparing against what
-        // is stored NOW keeps a folder already observed on the incremental walk and
-        // leaves the whole-folder read — through an unreadable baseline included —
-        // to the case it is for, a folder nobody has observed yet.
+        // What the caller read may have moved on (a predecessor stored its observation, or
+        // another turn's establishment did): comparing against what is stored NOW keeps a
+        // folder already observed on the incremental walk and leaves the whole-folder read to
+        // the folder nobody has observed yet.
         let Some(mut previous) = crate::session::store()
             .personal_changes_baseline(&agent_id)
             .await
@@ -1047,10 +950,8 @@ fn establish(user_name: &str, agent_id: String) {
             return; // no metadata row: there would be nothing to record
         };
         loop {
-            // A walk that stores nothing (an unwalkable folder, or one that moved in
-            // no way the baseline does not already record) still owes the window its
-            // last check: a turn that ended while it ran has writes this observation
-            // does not hold.
+            // A walk that stores nothing still owes the window its last check: a turn that
+            // ended while it ran has writes this observation does not hold.
             if let Observation::Fresh(json) =
                 observe(root.clone(), previous.clone(), Scan::Whole).await
             {
@@ -1064,9 +965,8 @@ fn establish(user_name: &str, agent_id: String) {
     });
 }
 
-/// An account's first observation being in flight, and whether a turn has ended
-/// since its last walk. While an account is in here the block stays silent for it
-/// (see [`prepend_changes`]).
+/// An account's first observation in flight, and whether a turn has ended since its last walk.
+/// While an account is in here the block stays silent for it ([`prepend_changes`]).
 struct InFlight {
     /// A turn ended since the last walk, so one more observation is owed.
     again: bool,
@@ -1081,9 +981,8 @@ static ESTABLISHING: std::sync::Mutex<BTreeMap<String, InFlight>> =
 /// Hands each observation the token that owns its [`ESTABLISHING`] mark.
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(0);
 
-/// Whether an observation of `user_name` is in flight; if it is, record that a
-/// turn has ended since its last walk — those writes are not in it, so it runs one
-/// more before the window closes.
+/// If an observation is in flight, record that a turn has ended since its last walk — those
+/// writes are not in it, so it runs one more before the window closes.
 fn request_another_walk(user_name: &str) -> bool {
     let mut establishing = ESTABLISHING.lock().unwrap_poison();
     match establishing.get_mut(user_name) {
@@ -1095,12 +994,10 @@ fn request_another_walk(user_name: &str) -> bool {
     }
 }
 
-/// Under one lock: `true` while `owner`'s observation must keep observing — a turn
-/// ended since its last walk, and the request is consumed — and `false` when the
-/// window can close, which also clears the mark so the block resumes for the
-/// account. Taking the request and clearing the mark together is what keeps a turn
-/// ending in between from being lost; a mark another observation owns is left
-/// alone, exactly as in [`Establishing`].
+/// Under one lock: `true` while `owner`'s observation must keep observing (a turn ended since
+/// its last walk, the request consumed), `false` when the window can close, which also clears
+/// the mark so the block resumes. Taking the request and clearing the mark together keeps a
+/// turn ending in between from being lost; a mark another observation owns is left alone.
 fn take_again_or_finish(user_name: &str, owner: u64) -> bool {
     let mut establishing = ESTABLISHING.lock().unwrap_poison();
     match establishing.get_mut(user_name) {
@@ -1117,10 +1014,9 @@ fn take_again_or_finish(user_name: &str, owner: u64) -> bool {
     }
 }
 
-/// Clears the [`ESTABLISHING`] mark it set however the observation ends — the
-/// window closing normally, an early return, a panic, or a runtime that drops the
-/// spawned future without ever polling it — or the account would stay silent and
-/// never get a baseline.
+/// Clears the [`ESTABLISHING`] mark it set however the observation ends — window closing, an
+/// early return, a panic, or a runtime that drops the spawned future — or the account would
+/// stay silent and never get a baseline.
 struct Establishing {
     user_name: String,
     owner: u64,
@@ -1129,8 +1025,8 @@ struct Establishing {
 impl Drop for Establishing {
     fn drop(&mut self) {
         let mut establishing = ESTABLISHING.lock().unwrap_poison();
-        // A later observation for the same account may already own a fresh mark
-        // by now: that one is not this guard's to clear.
+        // A later observation for the same account may already own a fresh mark: that one is
+        // not this guard's to clear.
         if establishing
             .get(&self.user_name)
             .is_some_and(|in_flight| in_flight.owner == self.owner)
@@ -1152,24 +1048,20 @@ enum Observation {
     Unusable,
 }
 
-/// Walk `root` and return the observation to store.
-///
-/// `stored` is the baseline the walk compares against; `None` is no stored
-/// baseline (a session predating the baseline), whose empty previous snapshot
-/// makes this the folder's first observation.
+/// `stored` is the baseline the walk compares against; `None` is none stored (a session
+/// predating the baseline), whose empty previous snapshot makes this the first observation.
 async fn observe(root: PathBuf, stored: Option<String>, mode: Scan) -> Observation {
-    // Decoding the baseline, walking the folder and re-encoding what the walk
-    // found all run on the blocking pool: the baseline is megabytes of JSON.
+    // Decoding the baseline, walking and re-encoding all run on the blocking pool: the
+    // baseline is megabytes of JSON.
     tokio::task::spawn_blocking(move || {
         let previous: Snapshot = match stored.as_deref() {
             None => Snapshot::new(),
             Some(stored) => match serde_json::from_str(stored) {
                 Ok(previous) => previous,
                 Err(e) => {
-                    // An unreadable baseline means the folder has to be
-                    // fingerprinted from scratch — which only the establishment's
-                    // walk may pay ([`Scan::Whole`]); a refresh hands the case back
-                    // to it instead of reading the whole folder on the reply path.
+                    // An unreadable baseline has to be re-fingerprinted from scratch — which
+                    // only the establishment's walk may pay ([`Scan::Whole`]); a refresh hands
+                    // the case back to it.
                     tracing::warn!(%e, "Unreadable personal-changes baseline");
                     if mode != Scan::Whole {
                         return Observation::Unusable;
@@ -1219,9 +1111,8 @@ mod tests {
     use crate::db::params;
     use crate::util::test::{init_git_repo, init_temp_repo};
 
-    /// The rendered picture read back: its folder counts and its direct-file count.
-    /// The parity test reads the block the assistant sees rather than the map behind
-    /// it.
+    /// The rendered picture read back — the block the assistant sees rather than the map
+    /// behind it.
     fn pictured_folders(picture: &str) -> (BTreeMap<String, usize>, usize) {
         let count_of = |rest: &str| {
             rest.split_once(' ')
@@ -1247,17 +1138,14 @@ mod tests {
         (folders, direct)
     }
 
-    /// The folder's first observation runs off the reply path, so its baseline
-    /// lands a moment after the refresh that started it returns — and until that
-    /// observation has closed, the block stays silent for the account. A walk a
-    /// forced stop abandoned leaves no baseline behind, and re-driving the refresh
-    /// once nothing is in flight is what the next turn does.
+    /// The first observation runs off the reply path, so its baseline lands a moment after the
+    /// refresh returns and the block stays silent until it closes. A walk a forced stop
+    /// abandoned leaves no baseline, and the next turn re-drives the refresh.
     async fn wait_for_baseline(user: &str) -> Option<String> {
         let agent_id = crate::session::assistant_agent_id(user);
         for _ in 0..200 {
-            // While the observation is in flight, waiting is all this may do: a
-            // refresh here would ask it for another walk and perturb the state
-            // under test.
+            // Waiting is all this may do while the observation is in flight: a refresh here
+            // would ask it for another walk and perturb the state under test.
             if ESTABLISHING.lock().unwrap_poison().contains_key(user) {
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                 continue;
@@ -1288,8 +1176,7 @@ mod tests {
         }
         let before = scan(root, None, Scan::Refresh, &Rules::new(root)).unwrap();
 
-        // Let the mtime clock advance so a rewrite is observable even on a
-        // coarse filesystem.
+        // Let the mtime clock advance so a rewrite is observable on a coarse filesystem.
         std::thread::sleep(std::time::Duration::from_millis(20));
 
         std::fs::write(root.join("a.txt"), "aaa-edited").unwrap(); // content changed
@@ -1310,9 +1197,8 @@ mod tests {
             vec!["c.txt".to_string(), "d.txt".to_string()]
         );
 
-        // The report's scan stores nothing, so it reads only what `diff`
-        // consults: a size change decides on the size alone, while the one
-        // identical-size rewrite (b.txt) is read to tell a touch from an edit.
+        // The report's scan stores nothing, so it reads only what `diff` consults: a size change
+        // decides on the size alone, while the one identical-size rewrite (b.txt) is read.
         let report = scan(root, Some(&before), Scan::Report, &Rules::new(root)).unwrap();
         let report_changes = diff(&before, &report, &Rules::new(root));
         assert_eq!(report_changes.changed, vec!["a.txt".to_string()]);
@@ -1325,8 +1211,8 @@ mod tests {
             "an identical-size rewrite must still be read"
         );
 
-        // A folder the walk cannot even open is fail-open: no report, no
-        // baseline, never a blocked turn.
+        // A folder the walk cannot even open is fail-open: no report, no baseline, never a
+        // blocked turn.
         assert!(
             scan(
                 &root.join("gone"),
@@ -1338,10 +1224,9 @@ mod tests {
         );
     }
 
-    /// A stamp the platform will not report can never decide a comparison, so
-    /// such a file is settled by its content: a same-size edit under one is
-    /// reported, and an untouched file is not — the sentinel is not a stamp that
-    /// "did not move".
+    /// A stamp the platform will not report can never decide a comparison, so such a file is
+    /// settled by its content: a same-size edit under one is reported and an untouched file is
+    /// not — the sentinel is not a stamp that "did not move".
     #[test]
     fn scan_reads_a_file_whose_stamp_the_platform_will_not_report() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1349,8 +1234,8 @@ mod tests {
         let file = root.join("old.txt");
         std::fs::write(&file, "one").unwrap();
 
-        // A stamp before the epoch is the one such mtime a filesystem will
-        // actually hold; where it refuses, there is nothing to exercise.
+        // A stamp before the epoch is the one such mtime a filesystem will hold; where it
+        // refuses, there is nothing to exercise.
         let before_epoch = std::time::UNIX_EPOCH
             .checked_sub(std::time::Duration::from_secs(60))
             .unwrap();
@@ -1402,9 +1287,8 @@ mod tests {
             ".DS_Store",
             "MEMORY.md",
         ];
-        // `shared/` belongs to the product in the owner's own folder alone: in any
-        // other root that name is the user's own material (see the dedicated
-        // catalogue test below).
+        // `shared/` belongs to the product in the owner's folder alone; in any other root that
+        // name is the user's material (see the dedicated catalogue test below).
         let watched = [
             ".env",
             ".gitignore",
@@ -1449,16 +1333,14 @@ mod tests {
         }
     }
 
-    /// The rules come from repositories inside the folder and nowhere else: the
-    /// folder's own `.gitignore` is inert while it holds no repository (even with
-    /// a repository above it), a nested repository's rules govern the paths inside
-    /// it, and no rule from above the folder reaches any of them.
+    /// The rules come from repositories inside the folder and nowhere else: the folder's own
+    /// `.gitignore` is inert while it holds no repository (even with one above it), a nested
+    /// repository's rules govern the paths inside it, and no rule from above reaches any.
     #[test]
     fn rules_come_from_repositories_inside_the_folder_only() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // An outer repository with its own rules: above the folder, so never
-        // applied — and its presence must not switch the folder's own
-        // `.gitignore` on either.
+        // An outer repository's rules are above the folder, so never applied — and its
+        // presence must not switch the folder's own `.gitignore` on either.
         let outer = tmp.path();
         init_git_repo(outer);
         std::fs::write(outer.join(".gitignore"), "*.log\n").unwrap();
@@ -1507,10 +1389,9 @@ mod tests {
         assert!(nested_repo.contains_key("a.log"), "{nested_repo:?}");
     }
 
-    /// A nested repository inside a folder its enclosing repository ignores is gone
-    /// as a whole: the walk prunes at the ignored folder, so nothing beneath it is
-    /// reported as removed even though the nested repository's own rules never hid
-    /// those paths.
+    /// A nested repository inside a folder its enclosing repository ignores is gone as a
+    /// whole: the walk prunes at the ignored folder, so nothing beneath it is reported as
+    /// removed even though the nested repository's own rules never hid those paths.
     #[test]
     fn a_nested_repository_inside_an_ignored_folder_is_not_reported_removed() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1532,9 +1413,8 @@ mod tests {
         );
     }
 
-    /// Adding an ignore rule is invisible: a recorded path the rules now exclude
-    /// is not reported as removed, and a path that stops being ignored comes back
-    /// as added — new to the world the report describes.
+    /// Adding an ignore rule is invisible: a recorded path the rules now exclude is not
+    /// reported as removed, and a path that stops being ignored comes back as added.
     #[test]
     fn a_new_ignore_rule_never_reports_a_removal() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1560,8 +1440,8 @@ mod tests {
             "an ignored path may never read as removed: {changes:?}"
         );
 
-        // A baseline recorded under the rule does not carry those paths, so
-        // lifting the rule reports them as new — never as a resurrection.
+        // A baseline recorded under the rule does not carry those paths, so lifting the rule
+        // reports them as new — never as a resurrection.
         let under_rule = scan(root, Some(&before), Scan::Refresh, &Rules::new(root)).unwrap();
         std::fs::write(root.join(".gitignore"), "# rule lifted\n").unwrap();
         let lifted = scan(root, Some(&under_rule), Scan::Report, &Rules::new(root)).unwrap();
@@ -1575,8 +1455,8 @@ mod tests {
         );
     }
 
-    /// A tracked path is never hidden by a pattern: the index is git's own answer
-    /// to the ignore question, and a tracked file keeps its directory in the walk.
+    /// A tracked path is never hidden by a pattern: the index is git's own answer to the
+    /// ignore question, and a tracked file keeps its directory in the walk.
     #[test]
     fn rules_never_hide_a_tracked_path() {
         let (_dir, root) = init_temp_repo();
@@ -1604,8 +1484,8 @@ mod tests {
         assert!(!snapshot.contains_key("skip.log"), "{snapshot:?}");
         assert!(!snapshot.contains_key("build/skip.txt"), "{snapshot:?}");
 
-        // A tracked file that is deleted is reported: it is not ignored, it is
-        // gone, and the pattern it matches never overrides the index.
+        // A tracked file that is deleted is reported: it is gone, and the pattern it matches
+        // never overrides the index.
         std::fs::remove_file(root.join("keep.log")).unwrap();
         let after = scan(&root, Some(&snapshot), Scan::Report, &Rules::new(&root)).unwrap();
         assert_eq!(
@@ -1614,18 +1494,15 @@ mod tests {
         );
     }
 
-    /// The catalogue decision ([`is_owner_personal_folder`]): `shared/` is product
-    /// material in the owner's own personal folder alone — the folder the product
-    /// resolves from the owner's account — so the product's writes into the
-    /// catalogue never reach the block, while a folder that merely carries the
-    /// owner's name (anywhere but the userspaces root, or below the real folder)
-    /// and a guest's own `shared/` stay the user's material.
+    /// `shared/` is product material in the owner's own personal folder alone — the folder the
+    /// product resolves from the owner's account — so writes into the catalogue never reach the
+    /// block, while a folder that merely carries the owner's name (anywhere but the userspaces
+    /// root, or below the real folder) and a guest's own `shared/` stay the user's material.
     #[test]
     fn scan_prunes_shared_in_the_owners_own_folder_alone() {
         let owner = crate::users::personal_workspace_path(crate::users::ADMIN_USER_NAME);
-        // The decision itself, on the shapes a walk's root can be: the owner's own
-        // folder — spelled as the product builds it, or with a `.` component
-        // appended, since the comparison is component-wise — and nothing else.
+        // The shapes a walk's root can be: the owner's own folder, spelled as the product
+        // builds it or with a `.` component appended (the comparison is component-wise).
         assert!(is_owner_personal_folder(&owner));
         assert!(is_owner_personal_folder(&owner.join(".")));
         assert!(!is_owner_personal_folder(&crate::users::userspaces_root()));
@@ -1636,8 +1513,8 @@ mod tests {
         // The owner's own folder: its `shared/` is the product's catalogue.
         let catalogue = owner.join("shared");
         std::fs::create_dir_all(&catalogue).unwrap();
-        // Non-runnable extensions: the probes must be invisible to the custom-tool
-        // discovery other tests run against this shared folder.
+        // Non-runnable extensions, so the probes stay invisible to the custom-tool discovery
+        // other tests run against this folder.
         let catalogue_probe = crate::util::test::ProbeFile(catalogue.join("installed_probe.txt"));
         let personal_probe = crate::util::test::ProbeFile(owner.join("personal_changes_probe.txt"));
         std::fs::write(&catalogue_probe.0, "one").unwrap();
@@ -1680,9 +1557,9 @@ mod tests {
         );
     }
 
-    /// An entry the walk cannot stat at all keeps its previous state instead of
-    /// reading as a deletion, and the `rel/` range copy takes its whole subtree
-    /// with it without spilling into a sibling that merely shares the prefix.
+    /// An entry the walk cannot stat keeps its previous state instead of reading as a
+    /// deletion, and the `rel/` range copy takes its whole subtree without spilling into a
+    /// sibling that merely shares the prefix.
     #[test]
     fn freeze_keeps_the_prefix_subtree_and_no_sibling() {
         let mut previous = Snapshot::new();
@@ -1723,10 +1600,9 @@ mod tests {
         let before = scan(root, None, Scan::Refresh, &Rules::new(root)).unwrap();
         assert!(before.contains_key("gone.txt"));
 
-        // Replaced by a dangling symlink: `metadata` (which follows the link)
-        // fails, so the link itself — the entry the folder now holds — is what the
-        // walk records. Never followed, and the replacement is reported rather
-        // than silently frozen away.
+        // Replaced by a dangling symlink: `metadata` (following the link) fails, so the link
+        // itself — the entry the folder now holds — is recorded. Never followed, and the
+        // replacement is reported rather than silently frozen away.
         std::fs::remove_file(root.join("gone.txt")).unwrap();
         std::os::unix::fs::symlink("x", root.join("gone.txt")).unwrap();
 
@@ -1751,8 +1627,8 @@ mod tests {
         // the node.
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
 
-        // A regression that opens the FIFO blocks in `File::open` forever; the
-        // timeout turns that hang into a failure instead of a stuck suite.
+        // A regression that opens the FIFO blocks in `File::open` forever; the timeout turns
+        // that hang into a failure instead of a stuck suite.
         let (tx, rx) = std::sync::mpsc::channel();
         let root = root.to_path_buf();
         std::thread::spawn(move || {
@@ -1814,8 +1690,7 @@ mod tests {
         .await
         .unwrap();
 
-        // The first refresh establishes the baseline silently, off the reply
-        // path.
+        // The first refresh establishes the baseline silently, off the reply path.
         refresh(user).await;
         assert_eq!(
             prepend_changes("hi", &personal, &Role::Assistant).await,
@@ -1841,8 +1716,8 @@ mod tests {
         assert!(msg.contains("changed: a.txt"), "missed change: {msg}");
         assert!(msg.contains("added: b.txt"), "missed addition: {msg}");
 
-        // The turn's own writes land after the report, so the refresh that
-        // closes the turn absorbs them and the next message carries nothing.
+        // The turn's writes land after the report, so the refresh closing the turn absorbs
+        // them and the next message carries nothing.
         std::fs::write(root.join("written-by-the-turn.md"), "product output").unwrap();
         refresh(user).await;
         assert_eq!(
@@ -1850,8 +1725,8 @@ mod tests {
             "hello"
         );
 
-        // A workspace in no personal folder (a project one), a name that cannot
-        // address a folder, and an account with no metadata row are all no-ops.
+        // A project workspace, a name that cannot address a folder and an account with no
+        // metadata row are all no-ops.
         let outside = std::env::temp_dir();
         let project = Workspace::ephemeral_run("project-ws", &outside);
         assert_eq!(prepend_changes("x", &project, &Role::Assistant).await, "x");
@@ -1861,8 +1736,8 @@ mod tests {
             prepend_changes("x", &unnameable, &Role::Assistant).await,
             "x"
         );
-        // The role gate is the module's, so a first turn and a later one cannot
-        // drift: only the Assistant's own turns carry the block.
+        // The module's gate, so a first turn and a later one cannot drift: only the
+        // Assistant's own turns carry the block.
         assert_eq!(
             prepend_changes("x", &personal, &Role::Manager).await,
             "x",
@@ -1887,8 +1762,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A file above the hash cap is decided by its stamp alone, so a same-size
-    /// edit deep inside it — both ends byte-identical — is still reported.
+    /// A file above the hash cap is decided by its stamp alone, so a same-size edit deep
+    /// inside it — both ends byte-identical — is still reported.
     #[test]
     fn diff_reports_an_oversized_file_by_its_stamp() {
         use std::io::{Seek, SeekFrom, Write as _};
@@ -1919,10 +1794,9 @@ mod tests {
         );
     }
 
-    /// The refresh gate: a turn's workspace resolves to the personal account
-    /// whose folder it ran in — by path for anything inside it, by the personal
-    /// name otherwise — and to nothing for a workspace outside the userspaces
-    /// root.
+    /// A turn's workspace resolves to the personal account whose folder it ran in — by path
+    /// for anything inside it, by the personal name otherwise — and to nothing outside the
+    /// userspaces root.
     #[tokio::test]
     #[serial_test::serial(personal_changes)]
     async fn refresh_after_turn_resolves_the_owned_personal_folder() {
@@ -1937,8 +1811,8 @@ mod tests {
         let own = crate::users::personal_workspace_struct("pc_gate_user");
         assert_eq!(personal_user_of(&own).as_deref(), Some("pc_gate_user"));
 
-        // Both sides are compared canonically, so a storage root behind a
-        // symlink (macOS temp dirs are) still resolves.
+        // Canonical on both sides, so a storage root behind a symlink (macOS temp dirs are)
+        // still resolves.
         let delegated = Workspace::ephemeral_run("dir-delegated-0", &inner);
         assert_eq!(
             personal_user_of(&delegated).as_deref(),
@@ -1951,14 +1825,13 @@ mod tests {
             "a managed workspace is not watched"
         );
 
-        // A personal workspace whose folder the product reaches through a
-        // symlink of its own falls back to the personal name.
+        // A folder the product reaches through its own symlink falls back to the personal name.
         let mut linked = Workspace::ephemeral_run("dir-linked-0", &project_dir);
         linked.name = crate::users::personal_workspace_name("pc_gate_user");
         assert_eq!(personal_user_of(&linked).as_deref(), Some("pc_gate_user"));
 
-        // The gate's effect: only a turn that ran in the folder advances its
-        // baseline, and the write lands on that folder's own account.
+        // Only a turn that ran in the folder advances its baseline, and the write lands on that
+        // folder's account.
         let agent_id = crate::session::assistant_agent_id("pc_gate_user");
         crate::session::store()
             .conn
@@ -1976,10 +1849,9 @@ mod tests {
             .expect("a turn inside the folder stores its baseline");
         assert!(stored.contains("delegated/hand.txt"), "{stored}");
 
-        // A round that ran in the folder but was not the Assistant's own
-        // recorded turn — a delegation or a custom-role launch — must advance
-        // nothing, or a hand edit would be swallowed for good; such a round's
-        // own writes surface in the next block instead.
+        // A round that ran in the folder but was not the Assistant's own recorded turn — a
+        // delegation or a custom-role launch — must advance nothing, or a hand edit would be
+        // swallowed for good; its own writes surface in the next block instead.
         std::fs::write(inner.join("hand.txt"), "hand edited again").unwrap();
         refresh_after_turn(&crate::Role::Custom, &delegated, true).await;
         refresh_after_turn(&crate::Role::Assistant, &delegated, false).await;
@@ -2011,17 +1883,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&project_dir);
     }
 
-    /// The session-start picture counts exactly the material the report watches:
-    /// a parallel [`scan`] of the same root names the same immediate-child
-    /// folders with the same counts, and the files it carries at the root are the
-    /// direct count — the block and the report can never describe different
-    /// material.
+    /// The picture counts exactly the material the report watches: a parallel [`scan`] of the
+    /// same root names the same child folders with the same counts, and the files at the root
+    /// are the direct count.
     #[test]
     fn personal_folder_picture_counts_exactly_what_the_report_watches() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
-        // Not the owner's own folder, so `shared/` here is the user's own
-        // material: the catalogue name is pruned in the owner's folder alone.
+        // Not the owner's folder, so `shared/` here is the user's material: the catalogue name
+        // is pruned in the owner's folder alone.
         assert!(!is_owner_personal_folder(root));
         init_git_repo(root);
         for dir in [
@@ -2054,9 +1924,9 @@ mod tests {
         ] {
             std::fs::write(root.join(path), "one").unwrap();
         }
-        // The user's own material — dotfiles included unless the folder's own
-        // rules exclude them: this is a repository, so `secret.txt` and the whole
-        // `cache/` folder are gone from both blocks, while `.env` stays.
+        // The user's own material, dotfiles included unless the folder's rules exclude them:
+        // this is a repository, so `secret.txt` and `cache/` are gone from both blocks while
+        // `.env` stays.
         std::fs::write(root.join(".gitignore"), "secret.txt\ncache/\n").unwrap();
         for path in [
             "album/one.jpg",
@@ -2070,8 +1940,8 @@ mod tests {
         ] {
             std::fs::write(root.join(path), "one").unwrap();
         }
-        // A link to a directory is neither named nor descended into — the report
-        // records no material behind one either.
+        // A link to a directory is neither named nor descended into — the report records no
+        // material behind one either.
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("album"), root.join("linked")).unwrap();
 
@@ -2093,8 +1963,8 @@ mod tests {
         assert!(!snapshot.contains_key("secret.txt"), "{snapshot:?}");
         assert!(snapshot.contains_key(".env"), "{snapshot:?}");
         assert_eq!(pictured_direct, watched_direct);
-        // The empty folder is the user's folder although the report records no
-        // material in it (directories are implied by the paths below them).
+        // The empty folder is the user's folder although the report records no material in it
+        // (directories are implied by the paths below them).
         assert_eq!(pictured.get("empty"), Some(&0));
         assert_eq!(pictured.len(), watched.len() + 1);
         for (folder, count) in &watched {
@@ -2115,10 +1985,9 @@ mod tests {
         }
     }
 
-    /// No material of the user's means no block: a folder that does not exist yet
-    /// (personal folders are created lazily), one holding only kept-aside areas,
-    /// and — unlike those — a folder holding only an empty child folder, which is
-    /// still the user's own and is pictured at zero.
+    /// No material of the user's means no block: a folder that does not exist yet, one holding
+    /// only kept-aside areas, and — unlike those — one holding only an empty child folder,
+    /// which is pictured at zero.
     #[test]
     fn personal_folder_picture_is_absent_without_user_material() {
         let tmp = tempfile::TempDir::new().unwrap();

@@ -33,12 +33,9 @@ pub async fn get_by_name(name: &str) -> Result<Option<Workspace>> {
     store().get_by_name(name).await
 }
 
-// Column definitions for workspace SELECT queries.
-// Note: `discovery_generation` and `diagnostics_generation` are intentionally
-// excluded from this column list and are never part of a workspace struct query.
-// Reads go through [`WorkspaceStore::get_generation`]'s single-column SELECT
-// (plus `WorkspaceStore::claim_pending_for_discovery`'s `UPDATE .. RETURNING`
-// for `discovery_generation`).
+// `discovery_generation` and `diagnostics_generation` are deliberately excluded from
+// this list: they are read through [`WorkspaceStore::get_generation`]'s single-column
+// SELECT (plus `claim_pending_for_discovery`'s `UPDATE .. RETURNING`).
 crate::columns! {
     WORKSPACE_COLUMNS [WS] {
         NAME                  => "name",
@@ -52,8 +49,6 @@ crate::columns! {
         LAST_ANALYZED_COMMIT   => "last_analyzed_commit",
     }
 }
-
-// ── Editor tab column constants ───────────────────────────────────────
 
 crate::columns! {
     EDITOR_TAB_COLUMNS [ET] {
@@ -113,14 +108,10 @@ async fn check_generation(
     true
 }
 
-/// Run workspace discovery for a single role, returning the result.
-///
-/// `discovery_generation` is the generation counter captured at spawn time.
-/// Before writing the context, we re-read the current generation from the DB;
-/// if it no longer matches, a newer [`WorkspaceStore::rediscover`] call has been made and this
-/// task's result is stale — the write is skipped silently.
-///
-/// Returns `Ok(())` on success, or a classified [`DiscoveryRunError`].
+/// Run workspace discovery for a single role. `discovery_generation` is the counter
+/// captured at spawn time: before writing, the current generation is re-read and a
+/// mismatch means a newer [`WorkspaceStore::rediscover`] made this result stale, so the
+/// write is skipped silently.
 async fn run_workspace_discovery(
     ws: &Workspace,
     role: Role,
@@ -168,7 +159,7 @@ async fn run_discovery_task(
 
     tracing::info!(workspace_name = ws.name, role = %label, "Starting workspace discovery");
 
-    // Create a Discovery agent pointed at the workspace
+    // Create a Discovery agent for this role and run it with the role's own prompt.
     let agent_id = discovery_agent_id(&ws.name, label);
     let (agent, response) = run_default_agent(
         &agent_id,
@@ -219,18 +210,11 @@ async fn run_discovery_task(
     Ok(())
 }
 
-/// Run diagnostics discovery — scan the workspace for dev tooling commands.
-///
-/// Runs a Discovery agent (using `Role::Discovery`'s tools: shell, read, search)
-/// to scan build files and identify commands for format, lint, type-check, build,
-/// and unit-test categories. Extracts structured output via the agent's scoped
-/// extraction ([`crate::agent::Agent::extract_verdict`] with no validation).
-///
-/// `diagnostics_generation` guards against stale writes — if a newer
+/// Run diagnostics discovery: a Discovery agent scans build files for the format, lint,
+/// type-check, build and unit-test commands, and its scoped extraction yields the
+/// structured result. `diagnostics_generation` guards against stale writes — a newer
 /// [`WorkspaceStore::rediscover_diagnostics`] or [`WorkspaceStore::set_diagnostics`]
-/// was triggered while diagnostics were being computed, the write is skipped.
-///
-/// On failure, existing diagnostics data is left untouched.
+/// skips the write — and on failure the existing data is left untouched.
 async fn run_workspace_diagnostics(
     ws: &Workspace,
     diagnostics_generation: i64,
@@ -302,48 +286,23 @@ async fn run_workspace_diagnostics(
     Ok(())
 }
 
-// ── Discovery completion finalizer ────────────────────────────────
-
-/// Apply the final status and pause state after a discovery run completes.
+/// Apply the final status and pause state after a discovery run completes, once all role
+/// discoveries and diagnostics have finished. Separate so tests can check the
+/// paused-behaviour invariants without running real agents.
 ///
-/// This is called from [`spawn_workspace_discovery`] after all role discoveries
-/// and diagnostics have finished.  Extracted as a separate function so unit tests
-/// can verify the paused-behavior invariants without running real agents.
+/// `AllOk` sets `ready` and unpauses — rediscovery is the documented unpause path, and
+/// the poll step holds every claim while the workspace is not ready, so queued work is
+/// picked up on the next cycle. `Fatal` sets `failed` (terminal, manual Re-analyze as
+/// before) and leaves `paused`; `Transient` sets `pending` and arms the pickup cooldown,
+/// leaving the analysis pause armed. Panics never reach here — they abort the spawned
+/// task and boot reclassification recovers the row (see [`spawn_panic_guarded`]). Every
+/// write is skipped when a newer [`WorkspaceStore::rediscover`] bumped the generation
+/// while discovery was in flight.
 ///
-/// ## Invariants
-///
-/// - [`DiscoveryOutcome::AllOk`]: sets status to `ready` and unpauses the
-///   workspace. The discovery flow itself set the analysis pause
-///   (`add` writes `paused = 1` alongside `status = Pending`; rediscover
-///   and pickup — `claim_pending_for_discovery` — write it alongside
-///   `status = Analyzing`), and rediscovery is the documented unpause path —
-///   so a successful discovery clears it. Since the poll step's gate also holds
-///   every claim and phase-job creation while the workspace is not ready (its
-///   analysis pause included), automatic Backlog→Analysis and
-///   Queued→InDevelopment claims wait out the discovery and are picked up on the
-///   next poll cycle after this unpause.
-/// - [`DiscoveryOutcome::Fatal`] (at least one non-provider failure — runtime
-///   errors, parse failures): sets status to `failed` (terminal, manual
-///   Re-analyze as before) and leaves `paused` untouched. Panics never reach
-///   this branch — they abort the spawned task and are recovered by boot
-///   reclassification to `pending` (see [`spawn_panic_guarded`]).
-/// - [`DiscoveryOutcome::Transient`] (every failure is provider-class —
-///   auth/quota/transport/5xx/shutdown): sets status to `pending` and arms
-///   the in-memory pickup cooldown, so the management poll's pickup step
-///   retries the workspace once the provider is available again (no retry
-///   storm). `paused` stays 1 (the analysis pause).
-/// - Before any write, checks the generation guard: if a newer [`WorkspaceStore::rediscover`]
-///   bumped the generation while discovery was in flight, the writes are skipped.
-///
-/// ## Known limitation
-///
-/// This unpause does not check who set the pause: a failure/operator pause that
-/// landed while the discovery was in flight is cleared together with the
-/// discovery's own analysis pause (the `paused` column carries no owner or
-/// timestamp). A round stopped by such a failure therefore replays once after
-/// the discovery completes, fails again and freezes the workspace on its own
-/// `set_paused` — bounded, not a loop. The nightly loop skips paused
-/// workspaces, which closes the scheduled path.
+/// Known limitation: the unpause does not check who set the pause, so a failure or
+/// operator pause that landed mid-discovery is cleared with it — the stopped round
+/// replays once, fails again and freezes the workspace on its own `set_paused`. Bounded,
+/// not a loop, and the nightly loop skips paused workspaces.
 async fn finalize_discovery(
     storage: &WorkspaceStore,
     ws_name: &str,
@@ -420,15 +379,10 @@ async fn finalize_discovery(
             tracing::warn!(workspace_name = ws_name, error = %msg, "Workspace analysis failed");
         }
         DiscoveryOutcome::Transient => {
-            // Every failure was provider-class: return to pending. The pickup step
-            // retries after the in-memory cooldown — the workspace waits for the
-            // provider (or a key fix) without burning retry budgets repeatedly.
-            //
-            // Arm the cooldown BEFORE the status write: while the row is still
-            // `analyzing` the pickup step cannot claim it, so there is no window
-            // where a poll round sees `pending` with no cooldown armed and spawns
-            // a duplicate discovery run (arming after the await would leave a
-            // TOCTOU gap that defeats the cooldown for this cycle).
+            // Every failure was provider-class: return to pending and let the pickup
+            // step retry after the cooldown. The cooldown is armed BEFORE the status
+            // write: while the row is still `analyzing` nothing can claim it, so no poll
+            // round sees `pending` with no cooldown armed and spawns a duplicate run.
             record_pending_pickup_cooldown(ws_name);
             if let Err(e) = storage.set_status(ws_name, &WorkspaceStatus::Pending).await {
                 // A failed write strands the workspace in `analyzing` with the
@@ -448,20 +402,12 @@ async fn finalize_discovery(
     }
 }
 
-// ── Discovery failure classification ──────────────────────────────
-
-/// Two-bucket classification of a discovery failure.
-///
-/// * [`DiscoveryFailureKind::Transient`] — provider-class (auth 401/403,
-///   quota/insufficient balance, transport/unreachable/5xx, shutdown/cancel):
-///   the workspace returns to Pending and the pickup step retries it after an
-///   in-memory cooldown.
-/// * [`DiscoveryFailureKind::Fatal`] — genuine failure (internal runtime
-///   errors, parse failures): the workspace goes Failed, terminal (manual
-///   Re-analyze as before). Panics never reach this classifier — they abort
-///   the spawned discovery task and strand the workspace in `analyzing` until
-///   the boot reclassification reclasses it to `pending` (a retryable
-///   treatment, not terminal Failed).
+/// Two-bucket classification of a discovery failure. `Transient` is provider-class (auth
+/// 401/403, quota, transport/5xx, shutdown/cancel): the workspace returns to Pending and
+/// the pickup step retries it after an in-memory cooldown. `Fatal` is genuine (internal
+/// runtime errors, parse failures): the workspace goes Failed, terminal. Panics never
+/// reach this classifier — they strand the row in `analyzing` until boot reclassifies it
+/// to `pending`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum DiscoveryFailureKind {
     Transient,
@@ -511,46 +457,27 @@ impl std::fmt::Display for DiscoveryRunError {
     }
 }
 
-/// Default conversion for `?` propagation: an unclassified plain error (DB
-/// failure, missing global, ...) is a genuine runtime failure — fatal.
-/// Agent-run failures must NOT use this conversion: they go through
-/// [`DiscoveryRunError::classified`], which buckets the typed
-/// [`crate::retry::FailureClass`] — that is the only path that yields
-/// [`DiscoveryRunError::transient`].
+/// Default `?` conversion: an unclassified plain error (DB failure, missing global) is a
+/// genuine runtime failure. Agent-run failures must go through
+/// [`DiscoveryRunError::classified`] instead — the only path yielding `transient`.
 impl From<anyhow::Error> for DiscoveryRunError {
     fn from(error: anyhow::Error) -> Self {
         Self::fatal(error)
     }
 }
 
-/// Classify a failed discovery agent run into the two-bucket scheme.
+/// Classify a failed discovery run into the two-bucket scheme, mirroring
+/// [`crate::agent::failure_classification`]'s ordering: drain/shutdown/cancellation are
+/// transient (the run was cut short, not a genuine failure — a cancelled discovery
+/// returns to Pending rather than the historical terminal Failed). A typed
+/// [`crate::retry::RetryExhausted`] class decides provider-vs-genuine; everything else is
+/// fatal. Panics never reach here (see [`spawn_panic_guarded`]).
 ///
-/// Mirrors [`crate::agent::failure_classification`] ordering: drain/shutdown/
-/// cancellation are treated as transient (the run was cut short, not a genuine
-/// failure — the workspace retries after restart/cooldown; a cancelled
-/// discovery deliberately returns to Pending instead of the historical
-/// terminal Failed, since cancellation is not a workspace defect). A typed
-/// [`crate::retry::RetryExhausted`] class decides provider-vs-genuine for
-/// retry-loop terminations; everything else (untyped runtime errors) is
-/// fatal. Panics never reach the classifier — they abort the spawned task
-/// and strand the workspace in `analyzing` until boot reclassifies it to
-/// `pending` (see [`spawn_panic_guarded`]).
-///
-/// ## Deliberate bucket decisions
-///
-/// * **`NonRetryable` → Transient** — the class covers auth 401/403 (the
-///   ticket's primary "bad or missing key" case) as well as invalid-model and
-///   tool-schema 400s. All of these are *config*-fixable — the workspace must
-///   wait in Pending for the user to correct the settings rather than go
-///   terminal Failed. The escalating cooldown bounds the retry rate, so a
-///   permanently-wrong config cannot burn unbounded tokens.
-/// * **`Parse`/validation classes → Fatal** — the provider answered, so the
-///   failure is a genuine pipeline/format defect; retrying later would not
-///   help.
-///
-/// `error` is the raw error when one is available at the call site (e.g. a
-/// failed `extract_verdict`); the typed class captured by `run_agent` on the
-/// agent takes precedence (it is the original error of the agent loop).
+/// `NonRetryable` is transient because it covers auth 401/403, invalid-model and
+/// tool-schema 400s — all config-fixable, so the workspace must wait in Pending for the
+/// user rather than go terminal, and the escalating cooldown bounds the retry rate.
+/// `Parse`/validation is fatal: the provider answered, so the defect is ours. `error` is
+/// the raw error when the call site has one; the typed class `run_agent` captured takes precedence.
 fn classify_discovery_failure(
     agent: &crate::Agent,
     error: Option<&anyhow::Error>,
@@ -596,14 +523,10 @@ enum DiscoveryOutcome {
     Transient,
 }
 
-/// Fold one discovery sub-run result into the aggregate outcome shared by the
-/// role/general/diagnostics sites in [`spawn_workspace_discovery`]: degrades
-/// [`DiscoveryOutcome::AllOk`] on any error, forces
-/// [`DiscoveryOutcome::Fatal`] on fatal errors ("any fatal → Failed"
-/// precedence), and records the error string (with `prefix`) for the finalize
-/// message. Error strings are scrubbed here so agent failure chains (which
-/// may embed provider error bodies) never reach the finalize logs
-/// unscrubbed.
+/// Fold one discovery sub-run result into the aggregate outcome shared by the role,
+/// general and diagnostics sites: any error degrades `AllOk`, any fatal forces `Fatal`,
+/// and the error string is recorded (with `prefix`) for the finalize message. Scrubbed
+/// here, so agent failure chains never reach the finalize logs unscrubbed.
 fn fold_discovery_result(
     outcome: &mut DiscoveryOutcome,
     errors: &mut Vec<String>,
@@ -620,9 +543,8 @@ fn fold_discovery_result(
     }
 }
 
-/// Build the classified error for an agent run that produced no response.
-/// Shared by [`run_discovery_task`] and [`run_workspace_diagnostics`] — the
-/// only difference between the two sites is the task label in the message.
+/// The classified error for an agent run that produced no response — shared by
+/// [`run_discovery_task`] and [`run_workspace_diagnostics`], which differ only in the task label.
 fn discovery_no_response_error(agent: &crate::Agent, task_label: &str) -> DiscoveryRunError {
     DiscoveryRunError::classified(
         agent,
@@ -633,21 +555,15 @@ fn discovery_no_response_error(agent: &crate::Agent, task_label: &str) -> Discov
     )
 }
 
-// ── Pending-pickup cooldown (in-memory) ───────────────────────────
-
 /// Base cooldown for the first provider-class discovery failure (15 min).
 const PENDING_PICKUP_COOLDOWN_BASE_MINS: u64 = 15;
 /// Ceiling for the escalating pickup cooldown (4 h).
 const PENDING_PICKUP_COOLDOWN_MAX_MINS: u64 = 240;
 
-/// Escalating cooldown for the `attempts`-th consecutive provider-class
-/// discovery failure: 15 min, 30 min, 1 h, 2 h, then 4 h forever.
-///
-/// Memory-only by design: no DB writes, no new columns; after a
-/// restart a pending workspace may be retried once immediately (acceptable).
-/// Escalation bounds the long-run retry duty cycle of a persistently-down
-/// provider — the full LLM retry budget no longer burns every 15 minutes
-/// forever.
+/// Escalating cooldown for the `attempts`-th consecutive provider-class failure: 15 min,
+/// 30 min, 1 h, 2 h, then 4 h forever. Memory-only by design: after a restart a pending
+/// workspace may be retried once immediately, and escalation keeps a persistently-down
+/// provider from burning the full LLM retry budget every 15 minutes forever.
 fn pending_pickup_cooldown_duration(attempts: u32) -> Duration {
     let exponent = attempts.saturating_sub(1).min(4);
     let minutes = (PENDING_PICKUP_COOLDOWN_BASE_MINS * 2u64.pow(exponent))
@@ -660,14 +576,13 @@ fn pending_pickup_cooldown_duration(attempts: u32) -> Duration {
 struct PickupCooldown {
     /// Instant before which the pickup step must not claim the workspace.
     deadline: Instant,
-    /// Consecutive provider-class discovery failures since the last success
-    /// or manual reset — drives the escalating cooldown duration.
+    /// Consecutive provider-class discovery failures since the last success or manual reset —
+    /// drives the escalating cooldown duration.
     attempts: u32,
 }
 
-/// In-memory cooldown map: workspace name → cooldown state. Written by
-/// [`finalize_discovery`] on provider-class failure; cleared on successful
-/// discovery, manual rediscover, workspace delete, and re-add.
+/// In-memory cooldown map: workspace name → state. Written by [`finalize_discovery`] on
+/// provider-class failure; cleared on successful discovery, manual rediscover, delete and re-add.
 static PENDING_PICKUP_COOLDOWNS: OnceLock<std::sync::Mutex<HashMap<String, PickupCooldown>>> =
     OnceLock::new();
 
@@ -675,14 +590,10 @@ fn pending_pickup_cooldowns() -> &'static std::sync::Mutex<HashMap<String, Picku
     PENDING_PICKUP_COOLDOWNS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-/// Arm the (escalating) cooldown for a provider-class discovery failure: the
-/// pending pickup for `ws_name` waits before claiming it again. Each
-/// consecutive failure lengthens the wait (see
-/// [`pending_pickup_cooldown_duration`]); success, manual rediscover, delete,
-/// and re-add reset it via [`clear_pending_pickup_cooldown`].
-///
-/// In the rare race where a transient finalize lands after a concurrent
-/// delete's clear, the re-armed entry is stale — harmless (the map is bounded
+/// Arm the escalating cooldown for a provider-class failure, so the pending pickup for
+/// `ws_name` waits before claiming it again (see [`pending_pickup_cooldown_duration`]).
+/// Success, manual rediscover, delete and re-add reset it. A transient finalize landing
+/// after a concurrent delete's clear leaves a stale entry — harmless (the map is bounded
 /// by workspace count) and cleared again on re-add.
 fn record_pending_pickup_cooldown(ws_name: &str) {
     let mut map = pending_pickup_cooldowns().lock().unwrap_poison();
@@ -691,8 +602,8 @@ fn record_pending_pickup_cooldown(ws_name: &str) {
     map.insert(ws_name.to_string(), PickupCooldown { deadline, attempts });
 }
 
-/// Arm the cooldown with an explicit deadline (test hook; production callers
-/// use [`record_pending_pickup_cooldown`]).
+/// Arm the cooldown with an explicit deadline (test hook; production callers use
+/// [`record_pending_pickup_cooldown`]).
 #[cfg(test)]
 fn record_pending_pickup_cooldown_until(ws_name: &str, deadline: Instant) {
     let mut map = pending_pickup_cooldowns().lock().unwrap_poison();
@@ -705,8 +616,7 @@ fn record_pending_pickup_cooldown_until(ws_name: &str, deadline: Instant) {
     );
 }
 
-/// Clear the cooldown for a workspace (successful discovery, manual
-/// rediscover, delete, re-add) — also resets the escalation counter.
+/// Clear the cooldown for a workspace — also resets the escalation counter.
 fn clear_pending_pickup_cooldown(ws_name: &str) {
     pending_pickup_cooldowns()
         .lock()
@@ -714,29 +624,20 @@ fn clear_pending_pickup_cooldown(ws_name: &str) {
         .remove(ws_name);
 }
 
-/// Whether the pickup step must wait out a cooldown for `ws_name` before
-/// claiming its pending workspace.
-///
-/// Expired entries are deliberately retained (the map is bounded by workspace
-/// count): the `attempts` escalation counter must survive expiry so the next
-/// provider-class failure arms a *longer* cooldown rather than restarting at
-/// the 15-minute base — pruning here would reset the escalation on every
-/// pickup cycle. Entries are removed by [`clear_pending_pickup_cooldown`] on
-/// success, manual rediscover, delete, and re-add.
+/// Whether the pickup step must wait out a cooldown before claiming `ws_name`. Expired
+/// entries are deliberately retained (the map is bounded by workspace count): the
+/// `attempts` escalation counter must survive expiry, or pruning here would reset the
+/// escalation on every pickup cycle.
 pub(crate) fn pending_pickup_cooldown_active(ws_name: &str) -> bool {
     let map = pending_pickup_cooldowns().lock().unwrap_poison();
     map.get(ws_name)
         .is_some_and(|c| Instant::now() < c.deadline)
 }
 
-/// Spawn `future` in a panic-guarded sub-task and await it, logging a
-/// workspace-level error if the task panics or is cancelled.
-///
-/// NOTE: Unlike the ticket-dispatch panic recovery (which transitions the
-/// ticket to Failed), this guard only logs and does NOT transition the
-/// workspace to "failed". A non-prompt panic leaves the workspace in
-/// "analyzing" — visible in logs; the boot reclassification
-/// (`reclassify_analyzing_to_pending`) recovers it at the next startup.
+/// Spawn `future` in a panic-guarded sub-task and await it, logging a workspace-level
+/// error if it panics or is cancelled. Unlike the ticket-dispatch panic recovery, this
+/// only logs: a non-prompt panic leaves the workspace in `analyzing`, which
+/// `reclassify_analyzing_to_pending` recovers at the next startup.
 async fn spawn_panic_guarded(
     ws_name: &str,
     task: &str,
@@ -754,16 +655,10 @@ async fn spawn_panic_guarded(
     }
 }
 
-/// Spawn a background task that runs workspace discovery (per-role and
-/// general non-role context generation) and optionally diagnostics discovery.
-///
-/// `discovery_generation` is the generation counter captured at spawn time.
-/// The discovery functions use it to guard against stale writes.
-///
-/// When `discover_diagnostics` is `false` (e.g. during a re-analysis via
-/// [`WorkspaceStore::rediscover`], or a pickup that found existing
-/// diagnostics), diagnostics discovery is skipped so that user-managed
-/// diagnostics survive re-analysis.
+/// Spawn a background task running per-role and general context discovery, and
+/// diagnostics discovery unless `discover_diagnostics` is `false` (a re-analysis, or a
+/// pickup that found existing diagnostics) — user-managed diagnostics survive.
+/// `discovery_generation` is captured at spawn time and guards against stale writes.
 pub fn spawn_workspace_discovery(
     ws: &Workspace,
     discovery_generation: i64,
@@ -775,8 +670,8 @@ pub fn spawn_workspace_discovery(
         let inner_ws_name = ws_name.clone();
         let inner_ws_path = ws.path.clone();
         let inner = async move {
-            // Build role discovery futures (always needed). The general
-            // (non-role) project overview discovery runs alongside them.
+            // Build role discovery futures (always needed); the general (non-role) project
+            // overview discovery runs alongside them.
             let role_futures: Vec<_> = Role::iter()
                 .filter(|r| crate::agent::role::role_info(r).has_discovery)
                 .map(|role| {
@@ -785,12 +680,10 @@ pub fn spawn_workspace_discovery(
                 })
                 .collect();
 
-            // Run role discovery + general discovery always, optionally with diagnostics.
             let (role_results, general_result, diagnostics_result) = if discover_diagnostics {
-                // Read diagnostics generation from DB for the generation guard.
-                // Separate from discovery_generation: both counters are independent
-                // (diagnostics is bumped by set_diagnostics/rediscover_diagnostics,
-                // discovery is bumped by rediscover).
+                // Read the diagnostics generation for the guard. Separate from
+                // discovery_generation: both counters are independent (diagnostics is bumped by
+                // set_diagnostics/rediscover_diagnostics, discovery by rediscover).
                 let diag_gen = match WORKSPACES.get() {
                     Some(s) => s
                         .get_generation(&inner_ws_name, GenerationColumn::DIAGNOSTICS)
@@ -818,10 +711,8 @@ pub fn spawn_workspace_discovery(
                 fold_discovery_result(&mut outcome, &mut errors, result, "");
             }
 
-            // General/diagnostics failures fail the run; the failure kind
-            // decides whether the workspace returns to Pending (provider-class)
-            // or goes Failed (genuine). Transient diagnostics failures are
-            // retried via the pickup step, not terminal.
+            // General/diagnostics failures fail the run; the failure kind decides whether the
+            // workspace returns to Pending (provider-class) or goes Failed (genuine).
             fold_discovery_result(&mut outcome, &mut errors, general_result, "");
             fold_discovery_result(
                 &mut outcome,
@@ -846,23 +737,15 @@ pub fn spawn_workspace_discovery(
             .await;
         };
 
-        // Box the discovery payload: it embeds role/general/diagnostics
-        // futures (incl. ChatResponse-sized structs) and exceeds the
-        // 16 KB large_futures threshold as an inline async-block.
+        // Box the discovery payload: it embeds role/general/diagnostics futures and exceeds
+        // the 16 KB large_futures threshold as an inline async-block.
         spawn_panic_guarded(&ws_name, "spawn_workspace_discovery", Box::pin(inner)).await;
     });
 }
 
-/// Spawn a background task that runs diagnostics discovery only.
-///
-/// Unlike [`spawn_workspace_discovery`], this does **not** run per-role
-/// context discovery — it only re-discovers diagnostics commands.
-/// Used by [`WorkspaceStore::rediscover_diagnostics`] for the "Re-discover
-/// diagnostics" button in the GUI.
-///
-/// `diagnostics_generation` is the generation counter captured at spawn time.
-/// [`run_workspace_diagnostics`] uses it to guard against stale writes via
-/// [`check_generation`].
+/// Spawn a background task running diagnostics discovery only — no per-role context
+/// discovery. Used by the GUI's "Re-discover diagnostics"; `diagnostics_generation`
+/// guards against stale writes via [`check_generation`].
 fn spawn_diagnostics_discovery(ws: &Workspace, diagnostics_generation: i64) {
     let ws = ws.clone();
     tokio::spawn(async move {
@@ -885,12 +768,8 @@ fn spawn_diagnostics_discovery(ws: &Workspace, diagnostics_generation: i64) {
 /// The longest workspace name [`validate_name`] admits.
 pub(crate) const MAX_NAME_LEN: usize = 40;
 
-/// Validate a workspace name against the naming rules.
-///
-/// Rules:
-/// - ASCII letters (a-z, A-Z) and underscores only
-/// - Must start with a letter — no leading underscore
-/// - Maximum [`MAX_NAME_LEN`] characters
+/// Validate a workspace name: ASCII letters and underscores only, starting with a letter,
+/// at most [`MAX_NAME_LEN`] characters.
 fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() {
         anyhow::bail!("Workspace name must not be empty");
@@ -918,15 +797,10 @@ fn ensure_trailing_separator(mut path: String) -> String {
     path
 }
 
-/// Canonicalize a user-provided path for workspace storage.
-///
-/// Expands `~` to the user's home directory, resolves the path with
-/// [`std::fs::canonicalize`] (relative segments and symlinks), drops the
-/// platform's verbatim prefix via [`crate::util::strip_verbatim_prefix`], and
-/// appends the trailing separator a managed workspace's root has always been
-/// shown with.
-/// Returns a clear error message on failure so callers can surface it
-/// to the user (e.g. "Path does not exist" or "Not a directory").
+/// Canonicalize a user-provided path for workspace storage: expand `~`, resolve it
+/// ([`std::fs::canonicalize`]), drop the platform's verbatim prefix
+/// ([`crate::util::strip_verbatim_prefix`]) and append the trailing separator a managed
+/// root is shown with. The error message is meant for the user.
 fn canonicalize_workspace_path(raw: &str) -> Result<String, String> {
     let expanded = crate::util::expand_tilde(raw);
 
@@ -951,21 +825,14 @@ fn canonicalize_workspace_path(raw: &str) -> Result<String, String> {
     ))
 }
 
-/// Synthesize a workspace from an absolute path to an existing directory — the
-/// way a custom-role launch can name *any* folder on the machine as its
-/// workspace, without it being a managed workspace.
-///
-/// `None` unless `name` is an absolute path that exists and is a directory (the
-/// two syscalls run on the blocking-friendly path, like the delegation target
-/// resolution). The synthesized workspace's `name` is the canonical path itself
-/// — NOT the `dir-…` short key a targeted delegation round uses: the name is
-/// the durable key a launch is recorded under
-/// (`session_metadata.workspace_name`, `jobs.workspace_name`, the sub-round
-/// envelopes), and [`crate::users::resolve_workspace`] accepts an absolute
-/// path, so the address must be the folder itself for the launch to resolve
-/// back after a restart. A managed workspace with that name is resolved by
-/// the caller first and still wins — as does the managed workspace whose
-/// folder this path is (`WorkspaceStore::get_by_path`).
+/// Synthesize a workspace from an absolute path to an existing directory, so a
+/// custom-role launch can name *any* folder as its workspace. `None` unless `name` is an
+/// absolute path that exists and is a directory. The name is the canonical path itself,
+/// NOT the `dir-…` short key a delegation round uses: it is the durable key a launch is
+/// recorded under, and [`crate::users::resolve_workspace`] accepts an absolute path, so
+/// the address must be the folder itself for the launch to resolve after a restart. A
+/// managed workspace with that name (or that folder — `WorkspaceStore::get_by_path`) is
+/// resolved by the caller first and still wins.
 #[must_use]
 pub(crate) fn synthesize_from_path(name: &str) -> Option<Workspace> {
     let path = Path::new(name);
@@ -1009,14 +876,10 @@ pub(crate) fn truncate_workspace_notes(s: &str) -> String {
 }
 
 impl WorkspaceStore {
-    /// Run an UPDATE on `workspaces` that sets `set_clause` plus
-    /// `updated_at = now` for a single named row — mirrors the ticket-update
-    /// helper in `board.rs` to keep placeholder numbering uniform.
-    ///
-    /// Returns the affected-row count, so a caller that reports the write as
-    /// applied can refuse `0` (no such workspace) instead of reporting a write
-    /// that never happened — see [`Self::set_paused`]. Callers that only need
-    /// the write map it away.
+    /// UPDATE `workspaces` setting `set_clause` plus `updated_at = now` for one named
+    /// row. Returns the affected-row count, so a caller can refuse `0` (no such
+    /// workspace) instead of reporting a write that never happened — see
+    /// [`Self::set_paused`].
     async fn exec_update_with_updated_at(
         &self,
         set_clause: &str,
@@ -1030,14 +893,10 @@ impl WorkspaceStore {
         Ok(self.conn.execute(&sql, params).await?)
     }
 
-    /// Insert a new workspace and mark it for analysis.
-    ///
-    /// The workspace is written with status `pending` (paused=1) and the
-    /// discovery spawn is deferred to the management poll's pickup step:
-    /// discovery starts automatically once the LLM provider is configured, so
-    /// a first-run "workspace added before the key" no longer flips to Failed
-    /// seconds later. Manual Re-analyze and the nightly rediscovery path are
-    /// unaffected.
+    /// Insert a new workspace with status `pending` (paused=1); the discovery spawn is
+    /// deferred to the management poll's pickup step, so a first-run "workspace added
+    /// before the key" no longer flips to Failed seconds later. Manual Re-analyze and
+    /// the nightly rediscovery path are unaffected.
     pub async fn add(&self, name: &str, path: &str) -> Result<Workspace> {
         // Validate the workspace name.
         validate_name(name)?;
@@ -1093,12 +952,9 @@ impl WorkspaceStore {
             .await
     }
 
-    /// Look up the managed workspace whose folder is `path` — a caller may
-    /// name a managed workspace by its path instead of its name
-    /// ([`crate::users::resolve_workspace`]). Managed rows store the
-    /// canonical path with a trailing separator
-    /// ([`canonicalize_workspace_path`]), so the candidate is normalized the
-    /// same way before the comparison.
+    /// The managed workspace whose folder is `path` — a caller may name a workspace by
+    /// path instead of name ([`crate::users::resolve_workspace`]). Rows store the
+    /// canonical path with a trailing separator, so the candidate is normalized the same way.
     pub async fn get_by_path(&self, path: &str) -> Result<Option<Workspace>> {
         let canonical = ensure_trailing_separator(
             crate::stored_workspace_path(std::path::Path::new(path))
@@ -1126,8 +982,7 @@ impl WorkspaceStore {
     /// The workspace's research runs are cancelled and swept first (releasing run
     /// folders + archives), and the remaining job rows are deleted IN the
     /// workspace-row transaction so the jobs/workspace deletion commits
-    /// atomically. The associated search engine is removed from the in-memory
-    /// registry.
+    /// atomically. The associated search engine is removed from the in-memory registry.
     ///
     /// Returns the admin's active project after the deletion (`None` = the
     /// personal workspace) — read back through the same transaction, so the
@@ -1141,15 +996,14 @@ impl WorkspaceStore {
         let tx = self.conn.begin_tx().await?;
         tx.execute("DELETE FROM workspaces WHERE name = ?1", db::params![name])
             .await?;
-        // Every selection naming the deleted workspace is cleared here; the
-        // admin's is resolved onto the fallback by the statement below.
+        // Every selection naming the deleted workspace is cleared here; the admin's is
+        // resolved onto the fallback below.
         tx.execute(
             "UPDATE users SET selected_workspace = NULL WHERE selected_workspace = ?1",
             db::params![name],
         )
         .await?;
-        // The projects left — read through the transaction, so the deletion above
-        // is visible to it.
+        // The projects left — read through the transaction, so the deletion above is visible.
         let surviving = tx
             .query_map_strict("SELECT name FROM workspaces", db::params![], |row| {
                 row.get::<String>(0)
@@ -1173,9 +1027,8 @@ impl WorkspaceStore {
             .into_iter()
             .next()
             .flatten();
-        // Remaining job rows (ticket phases, sync jobs, cancelled-run leftovers)
-        // go with the workspace row in ONE atomic commit; CASCADE removes their
-        // rosters.
+        // Remaining job rows go with the workspace row in ONE atomic commit; CASCADE removes
+        // their rosters.
         let remaining = tx
             .execute(
                 "DELETE FROM jobs WHERE workspace_name = ?1",
@@ -1196,22 +1049,17 @@ impl WorkspaceStore {
         Ok(active_now)
     }
 
-    /// Update the status of a workspace.
     pub async fn set_status(&self, name: &str, status: &WorkspaceStatus) -> Result<()> {
         self.exec_update_with_updated_at("status = ?", vec![Value::from(status.to_string())], name)
             .await
             .map(|_| ())
     }
 
-    /// Atomically claim a pending workspace for its first discovery:
-    /// transitions status `pending` → `analyzing` (with the analysis pause)
-    /// and returns the row's live `discovery_generation`, captured in the same
-    /// statement so a concurrent `rediscover` generation bump cannot race the
-    /// read.
-    ///
-    /// Returns `Ok(None)` when the row was no longer pending — a concurrent
-    /// pickup, GUI Re-analyze, or delete won the race; the caller must not
-    /// spawn.
+    /// Atomically claim a pending workspace for its first discovery: `pending` →
+    /// `analyzing` (with the analysis pause), returning the row's live
+    /// `discovery_generation` captured in the same statement so a concurrent `rediscover`
+    /// cannot race the read. `Ok(None)` when the row was no longer pending — a concurrent
+    /// pickup, GUI Re-analyze or delete won the race, and the caller must not spawn.
     pub(crate) async fn claim_pending_for_discovery(&self, name: &str) -> Result<Option<i64>> {
         self.conn
             .execute_optional(
@@ -1228,11 +1076,9 @@ impl WorkspaceStore {
             .await
     }
 
-    /// Boot recovery: discovery leaves no job rows, so a workspace still in
-    /// `analyzing` at startup means a crashed/panicked mid-discovery run.
-    /// Reclassify it to `pending` so the management poll's pickup step retries
-    /// it (or waits for the provider). Returns the number of reclassified
-    /// workspaces.
+    /// Boot recovery: discovery leaves no job rows, so a workspace still in `analyzing` at
+    /// startup means a crashed mid-discovery run. Reclassify it to `pending` so the pickup step
+    /// retries it. Returns the number reclassified.
     pub async fn reclassify_analyzing_to_pending(&self) -> Result<u64> {
         let affected = self
             .conn
@@ -1254,15 +1100,12 @@ impl WorkspaceStore {
         Ok(affected)
     }
 
-    /// Set or clear the maintenance toggle for a workspace.
-    ///
-    /// A name with no row is an error rather than a silent no-op (see
-    /// [`Self::set_paused`]).
+    /// Set or clear the maintenance toggle for a workspace. A name with no row is an error
+    /// rather than a silent no-op (see [`Self::set_paused`]).
     pub async fn set_maintenance_enabled(&self, name: &str, enabled: bool) -> Result<()> {
         let val: i64 = i64::from(enabled);
-        // Enabling clears last_run_at so the maintainer runs on the very next
-        // 1-minute poll cycle; a kept interrupted session resumes regardless
-        // (resume bypasses the debounce gate).
+        // Enabling clears last_run_at so the maintainer runs on the very next poll cycle; a kept
+        // interrupted session resumes regardless (resume bypasses the debounce gate).
         let set_clause = if enabled {
             "maintenance = ?, maintainer_last_run_at = NULL"
         } else {
@@ -1278,8 +1121,8 @@ impl WorkspaceStore {
         if enabled {
             tracing::info!(workspace = name, "Maintainer enabled");
         } else {
-            // Cancel any running maintainer agent for this workspace so it
-            // doesn't continue creating tickets after maintenance was disabled.
+            // Cancel any running maintainer agent for this workspace so it doesn't keep creating
+            // tickets after maintenance was disabled.
             if let Some(ws) = self.get_by_name(name).await? {
                 crate::agent::registry::AGENT_REGISTRY
                     .cancel_by_role_and_workspace_path(Role::Maintainer.as_str(), &ws.path);
@@ -1289,11 +1132,9 @@ impl WorkspaceStore {
         Ok(())
     }
 
-    /// Set or clear the pipeline pause toggle for a workspace.
-    ///
-    /// A name with no row is an error rather than a silent no-op: every caller
-    /// reports the toggle as applied (a toast, a chat reply, a model-facing
-    /// tool result), so a pause that wrote nothing would be reported as one.
+    /// Set or clear the pipeline pause toggle for a workspace. A name with no row is an error
+    /// rather than a silent no-op: every caller reports the toggle as applied, so a pause that
+    /// wrote nothing would be reported as one.
     pub async fn set_paused(&self, name: &str, paused: bool) -> Result<()> {
         let val: i64 = i64::from(paused);
         let affected = self
@@ -1304,24 +1145,14 @@ impl WorkspaceStore {
             "No managed workspace exists under the name '{name}'."
         );
         if paused {
-            // Keyed to the user/operator/failure pause — the one place that
-            // sets `paused` via this method. The discovery "analysis-pause"
-            // writes `paused` via DIRECT SQL in `add`/`claim_pending_for_discovery`/
-            // `rediscover`, NOT via `set_paused`, so it does NOT trigger this
-            // cancel and must not cancel the in-flight discovery agents.
-            //
-            // The store→registry call mirrors `set_maintenance_enabled` above (which
-            // cancels Maintainer agents): this method is the choke point for every
-            // pause entry point (GUI, the `mahbot paused` startup mode, and the
-            // failure freeze), so the cancel is guaranteed rather than left to
-            // each caller. The one caller that signals the registry itself is
-            // `pause_workspace_on_failure` finding the flag already set — it has no
-            // write to piggyback on.
+            // The user/operator/failure pause — the one pause set through this method. The
+            // discovery analysis-pause writes `paused` via DIRECT SQL, so it does not trigger this
+            // cancel. Every pause entry point funnels through here, so the cancel is guaranteed.
             crate::agent::registry::AGENT_REGISTRY.cancel_by_workspace_pause(name);
             tracing::info!(workspace = name, "Workspace pipeline paused");
         } else {
-            // Clear the cooperative pause-stop flags left on any in-flight
-            // agents so a resumed workspace does not freeze them at their next
+            // Clear the cooperative pause-stop flags left on in-flight agents so a resumed
+            // workspace does not freeze them at their next LLM round boundary.
             // LLM round boundary.
             crate::agent::registry::AGENT_REGISTRY.clear_workspace_pause(name);
             tracing::info!(workspace = name, "Workspace pipeline resumed");
@@ -1329,13 +1160,10 @@ impl WorkspaceStore {
         Ok(())
     }
 
-    /// Pause every managed workspace — the `mahbot paused` startup mode,
-    /// which must leave no workspace able to pick work up. Each row goes through
-    /// [`Self::set_paused`], so the pause is the ordinary one. Rows already
-    /// paused (a `pending`/`analyzing` one already carries the discovery
-    /// analysis-pause) are left untouched rather than rewritten. Returns the
-    /// number of managed workspaces, all of them now paused. Personal
-    /// workspaces have no row here.
+    /// Pause every managed workspace — the `mahbot paused` startup mode. Each row goes
+    /// through [`Self::set_paused`], so the pause is the ordinary one; rows already
+    /// paused are left untouched. Returns the number of managed workspaces, all of them
+    /// now paused. Personal workspaces have no row here.
     pub async fn pause_all(&self) -> Result<usize> {
         let workspaces = self.list().await?;
         for ws in &workspaces {
@@ -1472,20 +1300,13 @@ impl WorkspaceStore {
             .map_err(Into::into)
     }
 
-    /// Trigger re-analysis of an existing workspace.
-    /// Resets status to "analyzing", clears stale per-role contexts, and
-    /// spawns analysis with a fresh generation counter.
-    ///
-    /// Unlike [`Self::rediscover_diagnostics`], this does **not** clear
-    /// diagnostics — user-managed diagnostics survive re-analysis. Diagnostics
-    /// discovery runs only when none exist yet (a never-analyzed `Pending`
-    /// workspace re-analyzed manually would otherwise reach Ready with no
-    /// diagnostics ever discovered, since `add()` no longer spawns discovery);
-    /// when diagnostics are present they are preserved untouched.
-    ///
-    /// Manual Re-analyze bypasses the pending-pickup cooldown by design: it
-    /// spawns discovery immediately, so any in-memory cooldown is cleared
-    /// here (a later provider-class failure re-arms it).
+    /// Trigger re-analysis: status back to `analyzing`, stale per-role contexts cleared,
+    /// and analysis spawned with a fresh generation counter. Unlike
+    /// [`Self::rediscover_diagnostics`] this does **not** clear diagnostics — they are
+    /// preserved untouched, and diagnostics discovery runs only when none exist yet (a
+    /// never-analyzed `Pending` workspace re-analyzed manually would otherwise reach
+    /// Ready with none). Manual Re-analyze bypasses the pending-pickup cooldown by
+    /// design, so any in-memory cooldown is cleared here.
     pub async fn rediscover(&self, name: &str) -> Result<()> {
         let ws = self
             .get_by_name(name)
@@ -1612,8 +1433,6 @@ impl WorkspaceStore {
         Ok(())
     }
 
-    // ── Editor tab persistence ─────────────────────────────────
-
     /// Save the current set of open editor tabs for a workspace.
     /// Replaces all existing records for this workspace.
     pub async fn save_editor_tabs(&self, name: &str, tabs: &[EditorTabRecord]) -> Result<()> {
@@ -1703,15 +1522,10 @@ pub struct EditorTabRecord {
     pub dirty_content: Option<String>,
 }
 
-/// `config_kv` key holding the RFC 3339 UTC timestamp of the last nightly
-/// rediscovery pass start.
-///
-/// Deliberately stored in `config_kv` (in the consolidated `core.db`) rather
-/// than in the workspaces table: workspace rows are deleted during
-/// rediscovery, so the timestamp must live in a table that outlives workspace
-/// churn (the append-only migration catalog supports column deltas, but a
-/// deleted row loses all of its columns). Unknown `config_kv` keys are purged
-/// on reload, except the preserved shared namespace of this key.
+/// `config_kv` key holding the RFC 3339 UTC timestamp of the last nightly rediscovery
+/// pass start. Deliberately not a `workspaces` column: rows are deleted during
+/// rediscovery, so the timestamp must outlive workspace churn. It sits in the preserved
+/// shared namespace, which reload does not purge.
 pub(crate) const NIGHTLY_DISCOVERY_LAST_PASS_KV_KEY: &str = "nightly_discovery_last_pass_at";
 
 /// Returns `true` when the given local hour falls within the nightly
@@ -1720,19 +1534,12 @@ fn is_nightly_check_hour(local_hour: u32) -> bool {
     (2..3).contains(&local_hour)
 }
 
-/// Returns `true` when the rolling 7-day frequency gate allows a nightly pass.
-///
-/// A pass is allowed when no pass has been recorded yet (`None` — first night
-/// ever), when the stored timestamp is unparseable (fail-open, mirroring the
-/// maintainer-debounce precedent; the pass-start write then records a fresh
-/// timestamp and self-heals the stored state), or when at least 7 × 24 h
-/// (wall-clock duration, DST-safe, no fixed weekday pinning) have elapsed
-/// since the recorded pass start.
-///
-/// A well-formed timestamp less than 7 days old blocks the pass — including
-/// a future timestamp (clock skew → negative elapsed), which stays blocked
-/// until 7 days after that timestamp — so per-workspace regeneration happens
-/// at most once per 7 days.
+/// Whether the rolling 7-day frequency gate allows a nightly pass: no pass recorded yet
+/// (`None`), an unparseable timestamp (fail-open — the pass-start write self-heals the
+/// stored state), or at least 7 × 24 h of wall-clock time elapsed since the recorded
+/// pass start (DST-safe, no fixed weekday). A well-formed timestamp less than 7 days old
+/// blocks the pass, including a future one (clock skew), so regeneration happens at most
+/// once per 7 days.
 fn nightly_gate_allows(last_pass_at: Option<&str>, now: DateTime<Utc>) -> bool {
     match last_pass_at {
         None => true,
@@ -1750,19 +1557,11 @@ fn nightly_gate_allows(last_pass_at: Option<&str>, now: DateTime<Utc>) -> bool {
     }
 }
 
-/// Evaluate the rolling 7-day frequency gate and, when the pass is allowed,
-/// record the pass start in `config_kv` BEFORE any workspace processing: a
-/// pass that starts counts as the last pass even if it finds zero eligible
-/// workspaces or is interrupted mid-way.
-///
-/// Returns `true` when the nightly pass should run. Failure policy:
-///
-/// * **Read** (missing store, read error, unparseable stored value):
-///   fail-open — the pass runs and the pass-start write records a fresh
-///   timestamp, self-healing the state (maintainer-debounce precedent).
-/// * **Pass-start write failure**: fail-closed — the pass is skipped so the
-///   at-most-once-per-7-days invariant holds (running without recording would
-///   allow a second pass within the same 7-day window on a later night).
+/// Evaluate the 7-day gate and, when the pass is allowed, record the pass start in
+/// `config_kv` BEFORE any workspace processing: a pass that starts counts even if it
+/// finds nothing or is interrupted. A read failure (missing store, read error,
+/// unparseable value) fails open and the write self-heals the state; a pass-start write
+/// failure fails closed, so the at-most-once-per-7-days invariant holds.
 async fn nightly_gate_should_run(config_store: Option<&ConfigStore>) -> bool {
     // Fail-open on read.
     let last_pass_at = if let Some(store) = config_store {
@@ -1814,43 +1613,17 @@ fn has_new_commits(last_analyzed_commit: Option<&str>, current_hash: &str) -> bo
     }
 }
 
-/// Run the nightly re-analysis loop.
+/// Run the nightly re-analysis loop: wake every 30 minutes and, inside the 2:00–3:00 AM
+/// local window, run one discovery pass — each Ready workspace whose HEAD differs from
+/// the stored analysis commit is rediscovered. The pass is gated to at most one per 7
+/// days (see [`nightly_gate_should_run`]); missed windows do not accumulate.
 ///
-/// Wakes every 30 minutes. During the 2:00–3:00 AM local time window, runs a
-/// single discovery pass: each Ready workspace is checked for new git commits
-/// and rediscovered when its HEAD differs from the stored analysis commit.
-/// The pass is gated by a rolling 7-day frequency limit — a pass runs only if
-/// the previous pass started at least 7 days ago (timestamp recorded in
-/// `config_kv` at pass start), so per-workspace regeneration happens at most
-/// once per 7 days. Missed windows do not accumulate: the next eligible night
-/// simply runs the pass (no fixed weekday pinning).
-///
-/// Workspaces are processed sequentially — each discovery must complete
-/// before the next workspace is checked, avoiding resource spikes.
-///
-/// ## Edge-case handling
-///
-/// * **First run / no stored timestamp**: the gate lets the first pass
-///   through; the pass-start timestamp is then recorded in `config_kv`.
-/// * **Empty pass (all workspaces paused / no new commits)**: still counts as
-///   a pass — the timestamp is written before any workspace is inspected, so
-///   an unpause right after an empty pass waits for the next eligible night
-///   (manual Reanalyze stays available and ungated).
-/// * **Pass-start timestamp write failure**: fail-closed — the pass is
-///   skipped so the at-most-once-per-7-days invariant holds; the next
-///   eligible night retries.
-/// * **Unparseable timestamp / config store read failure**: fail-open — the
-///   pass runs and the pass-start write self-heals the stored value
-///   (maintainer-debounce precedent).
-/// * **Non-git workspaces / no commits**: `git rev-parse HEAD` fails,
-///   these workspaces are skipped with a warning. No infinite re-discovery
-///   loop because `last_analyzed_commit` stays NULL and git keeps failing.
-/// * **Mid-window processing**: if the machine wakes at 2:55 and processing
-///   extends past 3:00, all workspaces in the current batch are still
-///   processed (the time window is checked once per 30-minute wake cycle).
-///   No new processing starts in subsequent wake cycles outside the window.
-/// * **Workspace path gone / git missing**: logged as a warning, the
-///   workspace is skipped.
+/// Workspaces are processed sequentially, so each discovery completes before the next is
+/// checked. Edge cases: an empty pass still counts (the timestamp is written first, so an
+/// unpause right after waits for the next eligible night — manual Re-analyze stays
+/// available); a non-git workspace or one whose path is gone is skipped with a warning,
+/// and since `last_analyzed_commit` stays NULL there is no re-discovery loop; a batch
+/// that starts before 3:00 is finished, as the window is checked once per wake cycle.
 pub async fn run_nightly_check_loop() {
     let interval = Duration::from_mins(30);
     let shutdown = crate::shutdown::shutdown_token();
@@ -2048,7 +1821,7 @@ mod tests {
         }
     }
 
-    // ── Schema / struct consistency ─────────────────────────────
+    // Schema / struct consistency
 
     #[tokio::test]
     async fn schema_default_is_paused() {
@@ -2259,7 +2032,7 @@ mod tests {
         );
     }
 
-    // ── finalize_discovery — auto-unpause invariants ─────────────
+    // finalize_discovery — auto-unpause invariants
 
     #[tokio::test]
     async fn finalize_discovery_success_auto_unpauses() {
@@ -2477,7 +2250,7 @@ mod tests {
         );
     }
 
-    // ── Integration: add() persists and returns the workspace row ─
+    // Integration: add() persists and returns the workspace row
 
     #[tokio::test]
     #[serial_test::serial(config_persist)] // swaps the process-global CONFIG
@@ -2516,12 +2289,9 @@ mod tests {
             "add() must return a Workspace with maintenance_enabled = false"
         );
 
-        // Judged through the OS, not against the constructor that produced it:
-        // the platform must resolve the stored root back to the managed
-        // directory, keep the separator a managed root is shown with, and
-        // never hand a consumer the verbatim form. Only the no-verbatim check
-        // needs a Windows host to fail: a verbatim root still resolves, separator
-        // and all, so the other two see nothing there.
+        // Judged through the OS, not against the constructor that produced it. Only the
+        // no-verbatim check needs a Windows host to fail: a verbatim root still resolves,
+        // separator and all.
         assert_eq!(
             std::fs::canonicalize(&ws.path).expect("the platform must resolve the stored root"),
             std::fs::canonicalize(dir.path()).expect("canonicalize the managed dir"),
@@ -2556,7 +2326,7 @@ mod tests {
         );
     }
 
-    // ── Pending-pickup: atomic claim + boot reclassification ──────
+    // Pending-pickup: atomic claim + boot reclassification
 
     #[tokio::test]
     async fn claim_pending_for_discovery_is_atomic_and_returns_live_generation() {
@@ -2643,7 +2413,7 @@ mod tests {
         );
     }
 
-    // ── Discovery failure classification taxonomy ─────────────────
+    // Discovery failure classification taxonomy
 
     /// Build an agent with a preset typed failure class (simulating a failed
     /// run_agent) and classify it.
@@ -2789,7 +2559,7 @@ mod tests {
         );
     }
 
-    // ── Diagnostics API tests ─────────────────────────────────────
+    // Diagnostics API tests
 
     #[tokio::test]
     async fn rediscover_diagnostics_clears_and_bumps() {
@@ -2857,7 +2627,7 @@ mod tests {
         );
     }
 
-    // ── General (non-role) context tests ──────────────────────────
+    // General (non-role) context tests
 
     #[tokio::test]
     async fn general_context_roundtrip_single_row_per_workspace() {
@@ -2919,7 +2689,7 @@ mod tests {
         );
     }
 
-    // ── is_nightly_check_hour — time-window boundary tests ────────
+    // is_nightly_check_hour — time-window boundary tests
 
     #[test]
     fn nightly_check_hour_window_boundaries() {
@@ -2937,7 +2707,7 @@ mod tests {
         }
     }
 
-    // ── nightly_gate_allows — rolling 7-day frequency gate tests ──
+    // nightly_gate_allows — rolling 7-day frequency gate tests
 
     #[test]
     fn nightly_gate_allows_table() {
@@ -2993,7 +2763,7 @@ mod tests {
         }
     }
 
-    // ── nightly_gate_should_run — end-to-end config_kv behaviour ──
+    // nightly_gate_should_run — end-to-end config_kv behaviour
 
     #[tokio::test]
     async fn nightly_gate_records_pass_start_and_blocks() {
@@ -3040,16 +2810,14 @@ mod tests {
         );
     }
 
-    // ── delete — dangling user-selection cleanup ──────────────
+    // delete — dangling user-selection cleanup
 
     #[tokio::test]
     async fn delete_resolves_the_admin_selection_and_clears_guests() {
-        // delete() now abandons the workspace's jobs via the jobs layer, which
-        // reads the shared session store — initialize all stores first. NOTE:
-        // the workspace store under test uses its own temp DB, so the abandon
-        // inside delete() runs against the GLOBAL session store and is a no-op
-        // here (this test exercises the selection cleanup only; the abandon
-        // integration is covered by jobs::workspace_delete_abandons_all_jobs).
+        // delete() abandons the workspace's jobs through the jobs layer, which reads the
+        // shared session store — initialize all stores first. That abandon runs against
+        // the GLOBAL store and is a no-op here: this test exercises the selection cleanup
+        // only (see jobs::workspace_delete_abandons_all_jobs).
         crate::util::test::init_test_stores().await;
         let (store, _tmp) = test_store().await;
         // delete() removes the workspace's search engine from the global
@@ -3165,7 +2933,7 @@ mod tests {
             .flatten()
     }
 
-    // ── has_new_commits — commit comparison tests ────────────────
+    // has_new_commits — commit comparison tests
 
     #[test]
     fn new_commits_table() {

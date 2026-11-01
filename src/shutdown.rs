@@ -1,56 +1,43 @@
-//! Global shutdown infrastructure.
+//! Global shutdown infrastructure: the shutdown token, the graceful-drain flag and the
+//! platform's stop-request sources, used to race futures against shutdown.
 //!
-//! Provides a global shutdown token and signal handling for graceful daemon
-//! shutdown. Used by provider, agent, management, storage, and channel
-//! code to race futures against shutdown signals.
+//! # Exits that run none of the closing path
 //!
-//! Extracted from `self_update` where it was a layer violation — shutdown
-//! coordination is not self-update.
+//! The closing path is the library's `gui::Dashboard::save_and_exit` (draft flush, window
+//! state, the token fired before the iced runtime drops) plus the binary's
+//! `shutdown_after_dashboard` (browser release, background-task join, store checkpoint, the
+//! stop of the supervised Telegram Bot API server child). These exits run none of it, listed
+//! here once so the rest of the tree points at this list:
 //!
-//! # The exits that run none of the closing path
+//! - a platform-forced termination (Force Quit, `SIGKILL`): nothing can intercept it; a plain
+//!   `kill` is SIGTERM, which is handled once the signal task is installed;
+//! - the self-update tail (its own drain and `exit(0)` after its checkpoint);
+//! - the fatal-signal and abort paths (`install_fatal_signal_handlers`, the panic hook);
+//! - an iced `run()` that returns an error;
+//! - macOS log-out, restart or shut-down: the quit hook hands the platform's ask back and
+//!   AppKit ends the process, losing the last moment of typing, the exit-time tidying (the
+//!   next start is slower) and the browser release (which the next start does anyway);
+//! - an ordinary macOS quit the hook does not take over (the interface is already past its
+//!   exit, or the interception could not be installed);
+//! - a SIGTERM arriving before the signal task exists;
+//! - the exit bound `macos_quit` arms for a taken-over quit: a hard `_exit` when the closing
+//!   path overruns it — the same class as a force quit.
 //!
-//! The product's closing path is the library's `gui::Dashboard::save_and_exit` (draft flush,
-//! window state, the token fired before the iced runtime drops) and the binary's
-//! `shutdown_after_dashboard` (browser release, background-task join, store checkpoint, the stop of
-//! the supervised Telegram Bot API server child). The exits below run none of it, and are listed
-//! here once so that the rest of the tree points at this list instead of restating it:
+//! Since none of them runs the closing path, the Telegram Bot API server child is left
+//! running; the next start adopts or reaps it by verifying the recorded process, never by
+//! signalling a pid it cannot verify.
 //!
-//! - a platform-forced termination (Force Quit, a `SIGKILL`): nothing can intercept it; a plain
-//!   `kill` is SIGTERM, which the product handles once its signal task is installed;
-//! - the self-update tail (its own drain and its own exit, `exit(0)` after its checkpoint), which
-//!   never reaches `save_and_exit` or `shutdown_after_dashboard`;
-//! - the fatal-signal and abort paths (`install_fatal_signal_handlers`, the panic hook): an
-//!   `_exit` from the handler, or an unwind that never reaches the teardown;
-//! - an iced `run()` that returns an error: the process ends with that error before the teardown
-//!   is reached at all;
-//! - the system's own log-out, restart or shut-down on macOS: the quit hook hands the platform's
-//!   ask straight back and AppKit ends the process inside its run loop (see `macos_quit`), with
-//!   the losses that route always had — the last moment of typing, the exit-time tidying that
-//!   leaves the next start slower, and the browser release, which the next start performs anyway;
-//! - an ordinary macOS quit the hook does not take over — the interface is already past its exit,
-//!   or the interception could not be installed: the platform's own handling ends the process
-//!   (both are accepted in `macos_quit`'s "Accepted" section);
-//! - a SIGTERM that arrives before the signal task exists: the platform's own handling ends the
-//!   process the same way;
-//! - the exit bound `macos_quit` arms for a taken-over quit: a hard `_exit` with no closing steps
-//!   after the closing path has failed to finish within it, the same class as a force quit.
+//! A Windows session end is not on the list: the listener stops the daemon like any other
+//! stop request, so the closing path runs within the platform's deadline — unless the
+//! notification arrives before the dashboard subscribes. The CLI subcommands and a launch
+//! the instance lock turns away reach none of the closing path either, having exited before
+//! the runtime exists. A new exit path that drops the runtime without firing the token
+//! belongs on this list.
 //!
-//! The closing path stops the supervised Telegram Bot API server child. The exits listed above run
-//! none of that path, so they leave the child running; the next start adopts or reaps it — by
-//! verifying the process it recorded, never by signalling a pid it cannot verify — so nothing is
-//! left serving beside a new one.
-//!
-//! A Windows session end is not on that list: the listener stops the daemon like any other stop
-//! request, so the closing path runs, bounded by the deadline the platform gave it — except for a
-//! notification that arrives before the dashboard subscribes, where the forced stop has no
-//! consumer. The CLI subcommands and a launch the instance lock turns away reach none of the
-//! closing path either, having exited before the runtime exists. A new exit path that drops the
-//! runtime without firing the token belongs on this list.
-//!
-//! Two signals are not stop requests at all and never end the daemon: a hangup, and the catchable
-//! suspending signals ([`install_ignored_signals`] takes them out of play from the daemon's first
-//! instructions, and [`wait_for_shutdown_signal`] drops a hangup ever after). An uncatchable stop
-//! (`SIGKILL`, `SIGSTOP`) is nobody's to refuse and stays as the platform has it.
+//! A hangup and the catchable suspending signals are not stop requests at all and never end
+//! the daemon ([`install_ignored_signals`] takes them out of play from the first
+//! instructions, and [`wait_for_shutdown_signal`] drops a hangup ever after).
+//! `SIGKILL`/`SIGSTOP` are nobody's to refuse.
 
 use crate::util::UnwrapPoison;
 use std::sync::{Mutex, OnceLock};
@@ -58,30 +45,25 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-// ── Global shutdown token ─────────────────────────────────────────────────
-
 static GLOBAL_SHUTDOWN: OnceLock<CancellationToken> = OnceLock::new();
 
 fn global_shutdown() -> &'static CancellationToken {
     GLOBAL_SHUTDOWN.get_or_init(CancellationToken::new)
 }
 
-/// Global graceful-drain state: a `watch` channel of `bool` set by the first
-/// shutdown signal (SIGINT / a close that could not hide / a quit / self-update). Distinct from the
-/// cancellation token — during the drain the token is NOT fired, so in-flight
-/// LLM calls (which race the token around the HTTP send) survive to complete
-/// their current round. Background loops fold this flag into their
-/// sleep/shutdown races; the second signal maps to force-cancel.
+/// Graceful-drain state: a `watch` channel of `bool` set by the first shutdown signal
+/// (SIGINT, a close that could not hide, a quit, self-update). Distinct from the token —
+/// during the drain the token is NOT fired, so in-flight LLM calls racing the token around
+/// the HTTP send complete their round. Background loops fold the flag into their races; the
+/// second signal maps to force-cancel.
 static DRAIN: OnceLock<tokio::sync::watch::Sender<bool>> = OnceLock::new();
 
-/// The process-lifetime drain sender.
 fn drain_sender() -> &'static tokio::sync::watch::Sender<bool> {
     DRAIN.get_or_init(|| tokio::sync::watch::channel(false).0)
 }
 
-/// A receiver tracking the current drain value. Each call subscribes fresh, so
-/// a waiter that registers before a drain begins is notified the instant it
-/// flips; one that registers after reads the current value immediately.
+/// Each call subscribes fresh: a waiter registered before a drain begins is notified the
+/// instant it flips, one registered after reads the current value.
 fn drain_receiver() -> tokio::sync::watch::Receiver<bool> {
     drain_sender().subscribe()
 }
@@ -105,41 +87,33 @@ pub fn is_draining() -> bool {
 pub fn aborting() -> bool {
     shutdown_token().is_cancelled() || is_draining()
 }
-
-/// Force-cancel the drain: fire the global token immediately (in-flight
-/// agents are cancelled and boot-resume via status='launched'), then the normal
-/// exit path (checkpoint + join + exit) runs.
+/// Fire the global token immediately (in-flight agents are cancelled and boot-resume via
+/// status='launched'), then the normal exit path (checkpoint + join + exit) runs.
 pub fn force_cancel() {
     global_shutdown().cancel();
 }
 
-/// Clear the drain flag. Production code never clears it (drains are
-/// one-way); tests use this to restore isolation after asserting drain
-/// behavior.
+/// Production never clears it (drains are one-way); tests restore isolation with it.
 pub fn drain_clear() {
     drain_sender().send_replace(false);
 }
 
-/// Get a clone of the global shutdown token.
 #[must_use]
 pub fn shutdown_token() -> CancellationToken {
     global_shutdown().clone()
 }
 
-/// Clean-drain-completion trigger: fires the global token once the drain-watch
-/// sees no in-flight work, ending the graceful-drain window. Gracefulness comes
-/// from [`drain_begin`] — this does not start a drain (if the token already
-/// fired, the watch returns before reaching this). Contrast [`force_cancel`],
-/// the abort path that fires the token mid-drain to cancel in-flight work.
+/// Fires the global token once the drain-watch sees no in-flight work, ending the drain
+/// window. Gracefulness comes from [`drain_begin`] — this starts no drain. Contrast
+/// [`force_cancel`], which fires the token mid-drain to cancel in-flight work.
 pub fn shutdown() {
     global_shutdown().cancel();
 }
 
-/// Error returned by [`race_shutdown`] when the global shutdown token fires.
+/// When the global shutdown token fires.
 pub struct Shutdown;
 
-/// Race a future against the global shutdown token.
-/// Returns `Ok(T)` if the future completes first, `Err(Shutdown)` if shutdown is signaled.
+/// `Ok(T)` if the future completes first, `Err(Shutdown)` if shutdown is signalled.
 pub async fn race_shutdown<F, T>(fut: F) -> Result<T, Shutdown>
 where
     F: std::future::Future<Output = T>,
@@ -151,18 +125,14 @@ where
     }
 }
 
-/// Sleep for the given duration, or return early if shutdown is signaled.
-/// Returns `true` if the sleep completed normally, `false` if shutdown was signaled.
+/// `true` if the sleep completed, `false` if shutdown was signalled.
 #[must_use]
 pub async fn sleep_or_shutdown(duration: Duration) -> bool {
     race_shutdown(tokio::time::sleep(duration)).await.is_ok()
 }
 
-/// Sleep for the given duration, breaking early on the shutdown token OR the
-/// graceful-drain flag. Background loops fold the drain into their sleep
-/// cycles so they stop spawning new work when the drain begins.
-/// Returns `true` if the sleep completed normally, `false` if shutdown or
-/// draining was signaled.
+/// Breaks early on the shutdown token OR the graceful-drain flag, so a background loop stops
+/// spawning new work when the drain begins. `true` if the sleep completed.
 #[must_use]
 pub async fn sleep_or_shutdown_or_drain(duration: Duration) -> bool {
     let token = shutdown_token();
@@ -175,10 +145,9 @@ pub async fn sleep_or_shutdown_or_drain(duration: Duration) -> bool {
     }
 }
 
-/// Completes when the drain flag flips. Event-driven: waits on the drain watch
-/// channel rather than polling. Borrowing before awaiting makes it race-free —
-/// a drain that began before this waiter registered resolves immediately, and
-/// it is cancel-safe for `select!` use.
+/// Completes when the drain flag flips, waiting on the watch channel rather than polling.
+/// Borrowing before awaiting makes it race-free (a drain that began earlier resolves at once)
+/// and cancel-safe for `select!`.
 pub(crate) async fn drain_wait() {
     let mut rx = drain_receiver();
     while !*rx.borrow_and_update() {
@@ -188,17 +157,11 @@ pub(crate) async fn drain_wait() {
     }
 }
 
-// ── Stop requests ─────────────────────────────────────────────────────────
-
-/// A stop request the platform delivered to the daemon.
-///
-/// Unix has two, on an async signal stream. Windows has three, from the console
-/// control handler below, and they are not the same request: only Ctrl+C is the
-/// platform's "wind down" gesture. A launch with no console — the windowed product's
-/// normal one — receives none of them: the platform delivers no console control event
-/// to a process that has no console (see the `console` module). A session end
-/// (log-off, shutdown, restart) is a stop request too, but not one of these and not a
-/// drain: it comes from the window listener ([`install_session_end_listener`]).
+/// Unix has two, on an async signal stream; Windows has three, from the console control
+/// handler below, and only Ctrl+C is the platform's "wind down" gesture. A launch with no
+/// console — the windowed product's normal one — receives none of them. A session end
+/// (log-off, shutdown, restart) is a stop request too, but not one of these and not a drain:
+/// it comes from the window listener ([`install_session_end_listener`]).
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StopRequest {
@@ -206,15 +169,14 @@ enum StopRequest {
     Interrupt,
     /// Ctrl+Break — terminates the process by default, with no timeout.
     Break,
-    /// The console window is closing, so only a launch that has a console can receive
-    /// it; the task manager's "end task" raises the same event. The platform kills the
-    /// process when its grace elapses.
+    /// Only a launch with a console can receive it; the task manager's "end task" raises the
+    /// same event. The platform kills the process when its grace elapses.
     ConsoleClose,
 }
 
 #[cfg(windows)]
 impl StopRequest {
-    /// The name the request is logged and recorded under.
+    /// The name it is logged and recorded under.
     #[must_use]
     fn label(self) -> &'static str {
         match self {
@@ -230,16 +192,16 @@ impl StopRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StopAction {
     /// Begin the graceful drain: in-flight work finishes its current round.
+    /// Abandon the drain and run the exit path now.
     Drain,
     /// Abandon the drain and run the exit path now.
     ForceCancel,
 }
 
-/// The request→action rule — the Windows half of the protocol Unix gets from
-/// SIGINT/SIGTERM. Ctrl+C drains, unless a drain is already running: then it is
-/// the "second request" that force-cancels. Ctrl+Break is that same hard stop in
-/// its own right, and a console close is one the platform's kill deadline may cut
-/// off — so neither begins a drain.
+/// The Windows half of the protocol Unix gets from SIGINT/SIGTERM. Ctrl+C drains, unless a
+/// drain is already running — then it is the second request that force-cancels. Ctrl+Break is
+/// that hard stop in its own right, and a console close may be cut off by the platform's kill
+/// deadline, so neither begins a drain.
 #[cfg(any(windows, test))]
 #[must_use]
 fn stop_action(request: StopRequest, draining: bool) -> StopAction {
@@ -250,19 +212,16 @@ fn stop_action(request: StopRequest, draining: bool) -> StopAction {
     }
 }
 
-/// The instant the platform's stop deadline expires: when a stop that carries a grace
-/// arrived (a Windows console close or session end) plus the grace it grants. `None`
-/// until such a stop arrives.
+/// Set when a stop carrying a grace arrived (a Windows console close or session end), plus the
+/// grace granted; `None` until then.
 static STOP_DEADLINE: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// The grace assumed for a stop whose own value cannot be read: the documented default of
-/// `SPI_GETHUNGAPPTIMEOUT`, the user-settable parameter behind a console close. A session
-/// end has no readable equivalent, so it takes the same conservative bound.
+/// The documented default of `SPI_GETHUNGAPPTIMEOUT`, the user-settable parameter behind a
+/// console close. A session end has no readable equivalent and takes the same bound.
 #[cfg(windows)]
 const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(5);
 
-/// Record the deadline a stop has to finish before, for the exit path's budget. The
-/// earliest one wins: that is the kill the process must beat.
+/// The earliest one wins: that is the kill the process must beat.
 #[cfg(windows)]
 fn record_stop_deadline(deadline: Instant) {
     let mut recorded = STOP_DEADLINE.lock().unwrap_poison();
@@ -271,27 +230,24 @@ fn record_stop_deadline(deadline: Instant) {
     }
 }
 
-/// The exit path's budget from the platform's stop deadline and the moment a stage
-/// starts: half the grace still left, so the checkpoint keeps the rest. A deadline that
-/// has passed leaves nothing.
+/// Half the grace still left, so the checkpoint keeps the rest; a deadline that has passed
+/// leaves nothing.
 #[must_use]
 fn stage_budget(deadline: Instant, now: Instant) -> Duration {
     deadline.saturating_duration_since(now) / 2
 }
 
-/// The bound on the exit path's stage before the store checkpoint, for a stop that
-/// runs under the platform's own kill deadline (a Windows console close or session
-/// end): `None` for every other stop, which no platform deadline bounds (the tray's
-/// quit, a close that could not hide, a first Ctrl+C, a macOS quit).
+/// The bound on the exit path's stage before the store checkpoint, for a stop that runs under the
+/// platform's own kill deadline (a Windows console close or session end): `None` for every other
+/// stop, which no platform deadline bounds (the tray's quit, a close that could not hide, a first
+/// Ctrl+C, a macOS quit).
 ///
 /// Sampled once, when that stage starts, from the deadline the platform's stops recorded
-/// (`record_stop_deadline` keeps the earliest — the kill the process must beat);
-/// [`stage_budget`] then takes half of what is still left of it, so the later in the exit
-/// path the stage starts, the less it gets. The checkpoint that follows is never bounded —
-/// it is the durable step the exit path exists for — so the rest of the grace is left for
-/// it. What the bound cuts loses nothing durable: the browser releases a cut flush did not
-/// settle are durable records retried at boot, and the flush itself is best-effort by
-/// design.
+/// (`record_stop_deadline` keeps the earliest — the kill the process must beat); [`stage_budget`]
+/// takes half of what is still left, so the later in the exit path the stage starts the less it
+/// gets. The checkpoint that follows is never bounded — it is the durable step the exit path
+/// exists for. A cut loses nothing durable: an unsettled browser release is retried at boot, and
+/// the flush is best-effort.
 #[must_use]
 pub fn urgent_release_budget() -> Option<Duration> {
     STOP_DEADLINE
@@ -300,45 +256,35 @@ pub fn urgent_release_budget() -> Option<Duration> {
         .map(|deadline| stage_budget(deadline, Instant::now()))
 }
 
-/// The last stop request the platform delivered, for the exit path to name: the Windows stop
-/// deliveries (the console protocol loop and the session-end listener), a macOS quit and the tray
-/// menu's quit write one — the macOS and tray routes only where that request is what drives the
-/// exit, so a repeat gesture leaves the record to the request that caused it. `None` when
-/// nothing was recorded: a close that could not hide and a Unix signal record nothing, and the
-/// exit line then keeps the wording it always had. A `Mutex`, not a `OnceLock`: a later request takes
-/// the record over from the one before it.
+/// Written by the Windows stop deliveries (the console protocol loop and the session-end
+/// listener), a macOS quit and the tray menu's quit — the last two only where that request
+/// drives the exit, so a repeat gesture leaves the record to the request that caused it. `None`
+/// when nothing was recorded (a close that could not hide, a Unix signal), and the exit line
+/// then keeps its old wording. A `Mutex`, not a `OnceLock`: a later request takes over.
 ///
-/// The exit line itself is dropped outright — it runs after the iced runtime whose log writer
-/// batches — so this makes a stop's reason nameable by that line, not visible: a stop's reason
-/// reaches the logs store only where an earlier line named it.
+/// The exit line is dropped outright — it runs after the iced runtime whose log writer batches
+/// — so this makes a stop's reason nameable by that line, not visible.
 static EXIT_TRIGGER: Mutex<Option<&'static str>> = Mutex::new(None);
 
-/// Record the stop request the exit path is running for, so the exit path can name it.
+/// So the exit path can name it.
 pub(crate) fn record_exit_trigger(label: &'static str) {
     *EXIT_TRIGGER.lock().unwrap_poison() = Some(label);
 }
 
-/// The last recorded stop request, if any was recorded — `EXIT_TRIGGER` above says what writes one.
+/// `EXIT_TRIGGER` above says what writes one.
 #[must_use]
 pub fn exit_trigger() -> Option<&'static str> {
     *EXIT_TRIGGER.lock().unwrap_poison()
 }
 
-// ── Windows session end (log-off, shutdown, restart) ──────────────────────
-
-/// The name of the session end a `WM_ENDSESSION` notification reports — `None` for a
-/// notification this daemon must not act on.
-///
-/// The platform announces a session end twice: first the preliminary question
-/// (`WM_QUERYENDSESSION`), which is answered affirmatively and never acted on, then the
-/// final notification. `ending` is that notification's `wParam`: it is false when a
-/// shutdown that had started is cancelled, so only a true one may stop the daemon.
-/// `closes_app_only` is its `lParam`'s `ENDSESSION_CLOSEAPP` bit — the platform asking this
-/// application alone to close so that an update can proceed, which ends no session and
-/// whose stop would leave the daemon down on a session that continues — and `log_off` is
-/// its `ENDSESSION_LOGOFF` bit; without it the end is a machine shutdown or restart, which
-/// the flags do not tell apart. The critical end sets neither bit and is a session end like
-/// any other.
+/// `None` for a notification this daemon must not act on.
+/// The platform asks twice: `WM_QUERYENDSESSION` (answered affirmatively, never acted on),
+/// then the final notification. `ending` is its `wParam` — false when a started shutdown is
+/// cancelled, so only a true one may stop the daemon. `closes_app_only` is the `lParam`'s
+/// `ENDSESSION_CLOSEAPP` bit, the platform closing this application alone for an update: it
+/// ends no session, and stopping would leave the daemon down on a continuing one. `log_off` is
+/// the `ENDSESSION_LOGOFF` bit; without it the end is a shutdown or restart. The critical end
+/// sets neither bit and is a session end like any other.
 #[cfg(any(windows, test))]
 #[must_use]
 fn session_end_label(ending: bool, closes_app_only: bool, log_off: bool) -> Option<&'static str> {
@@ -352,17 +298,13 @@ fn session_end_label(ending: bool, closes_app_only: bool, log_off: bool) -> Opti
     })
 }
 
-/// Act on a session end: name it for the exit path, bound the stages before the exit-time
-/// checkpoint, and force the stop.
+/// Name it for the exit path, bound the stages before the exit-time checkpoint, and force the stop.
 ///
-/// Forced, not drained: the seconds the platform allows cannot hold the graceful drain, so
-/// waiting would leave the stop unfinished when the platform ends the process. Nothing is
-/// waited for either, and nothing is asked of the platform (no shutdown-blocking reason is
-/// declared, which is the one way to ask for more time): this runs on the listener's own
-/// thread and returns at once, so the shutdown is never slowed down and no "this program is
-/// preventing shutdown" surface can appear. The stop sequence itself (the dashboard's draft
-/// and geometry flush, the browser release, the journal checkpoint) then runs where it always
-/// does, inside the time the platform already grants.
+/// Forced, not drained: the platform's seconds cannot hold the graceful drain, so waiting would
+/// leave the stop unfinished. It waits for nothing and asks the platform for nothing (no
+/// shutdown-blocking reason, the one way to gain time), running on the listener's thread and
+/// returning at once — no "preventing shutdown" surface can appear. The stop sequence (draft and
+/// geometry flush, browser release, journal checkpoint) still runs, inside the granted time.
 #[cfg(windows)]
 fn stop_for_session_end(label: &'static str) {
     record_exit_trigger(label);
@@ -371,42 +313,23 @@ fn stop_for_session_end(label: &'static str) {
     force_cancel();
 }
 
-// ── Signal handling ───────────────────────────────────────────────────────
-
-/// Wait for stop requests, then drive the two-request drain protocol.
+/// Unix: the first SIGINT or SIGTERM begins the graceful drain via [`drain_begin`] — the token is
+/// NOT fired, so in-flight LLM calls and tool groups complete. The streams stay alive, so a SECOND
+/// signal maps to [`force_cancel`]. SIGHUP is ignored so the daemon survives terminal/SSH
+/// disconnects.
 ///
-/// Unix: first signal (SIGINT or SIGTERM) begins the graceful drain via
-/// [`drain_begin`] — the global token is NOT fired, so in-flight LLM calls
-/// and tool groups complete. Background loops break on the drain flag.
-/// The signal streams stay alive (never dropped) so a SECOND signal during
-/// the drain maps to [`force_cancel`] — abort the drain, checkpoint, exit.
-/// SIGHUP is explicitly ignored so the daemon survives terminal/SSH disconnects —
-/// [`install_ignored_signals`] already covered the window before this task exists, and
-/// the catchable suspending signals it ignores stay ignored (a service has nothing to
-/// stop for).
+/// Windows: the same protocol, fed by `install_console_stop_handler` (each event arrives on a
+/// fresh OS thread, so it is queued here and, for a closing console, that thread is held).
+/// Ctrl+C drains, a second Ctrl+C force-cancels, and Ctrl+Break and a console close are
+/// force-cancel class outright. A session end arrives through `install_session_end_listener`.
 ///
-/// Windows: the same protocol, fed by the console control handler installed by
-/// `install_console_stop_handler` (each event arrives on a fresh OS thread, so
-/// the handler queues it here and, for a closing console, holds that thread; the
-/// `console` module documents the platform rules and what start-up does before this
-/// loop exists — and why a launch with no console has no events to feed it). Ctrl+C
-/// is the drain request, a second Ctrl+C force-cancels, and
-/// Ctrl+Break and a console close are force-cancel class outright. The session end
-/// (log-off, shutdown, restart) is not a console event and does not come through here at
-/// all — it is force-cancel class on its own terms, in `install_session_end_listener`.
+/// The "second request" comes from the global drain flag, not a per-source count, so a Ctrl+C
+/// after a drain begun elsewhere (a quit, a close that could not hide, a self-update drain)
+/// force-cancels where on Unix a first SIGINT is a no-op — matching
+/// `gui::Dashboard::request_exit`.
 ///
-/// The "second request" is read off the global drain flag rather than a per-source
-/// count, so a first Ctrl+C that follows a drain begun elsewhere — a quit, a close that
-/// could not hide, a self-update's finalizing drain — force-cancels,
-/// where on Unix a first SIGINT after those is a no-op. The dashboard's own exit
-/// requests read the same flag (see `gui::Dashboard::request_exit`), so this is
-/// deliberate and not a defect.
-///
-/// Returns only when the drain must be abandoned (a force-cancel-class request), naming that
-/// request where the platform names it — a Windows console request does, while a Unix signal is
-/// named in its own line locally and returns none, leaving the caller's line the fallback it always
-/// carried; the clean-drain exit path is driven by the drain-watch task in the binary (fires the
-/// token when no in-flight agents or orchestrator calls remain).
+/// Returns only when the drain must be abandoned, naming that request where the platform names
+/// it. The clean-drain exit is driven by the binary's drain-watch task.
 pub async fn wait_for_shutdown_signal() -> anyhow::Result<Option<&'static str>> {
     #[cfg(unix)]
     {
@@ -449,34 +372,28 @@ pub async fn wait_for_shutdown_signal() -> anyhow::Result<Option<&'static str>> 
                     info!("Received {label} — draining (a second request force-cancels)");
                     drain_begin();
                 }
-                // The caller's signal task logs this one, naming the request returned here.
+                // The caller's signal task logs it, naming the request returned here.
                 StopAction::ForceCancel => return Ok(Some(label)),
             }
         }
     }
 }
 
-// ── Stop-request sources ──────────────────────────────────────────────────
-
-/// Unix: take the terminal's own signals out of play for the daemon's whole life, from
-/// its first instructions — the hangup, and every suspending signal a process can refuse
-/// (Ctrl+Z's `SIGTSTP`, `SIGTTIN`, `SIGTTOU`; an uncatchable stop is not a process's to
-/// refuse, and is not claimed here).
+/// Unix: take the terminal's own signals out of play for the daemon's whole life, from its
+/// first instructions — the hangup and every suspending signal it can refuse (Ctrl+Z's
+/// `SIGTSTP`, `SIGTTIN`, `SIGTTOU`).
 ///
-/// The disposition is a *caught* handler that does nothing, not `SIG_IGN`: an ignored
-/// signal stays ignored across `exec`, while a caught one is reset to the default by it —
-/// so the agent shells, the browser, the Telegram helper and the command-line subcommands
-/// keep the behaviour they have. This covers the window before [`wait_for_shutdown_signal`]
-/// exists, which is where a hangup used to end the daemon; once that task is up it drops a
-/// hangup as well. `SIGINT`/`SIGTERM` stay default here: a plain kill still stops the
-/// service, and the drain is what it starts.
+/// The disposition is a *caught* handler that does nothing, not `SIG_IGN`: an ignored signal
+/// stays ignored across `exec`, a caught one is reset — so the agent shells, the browser, the
+/// Telegram helper and the CLI subcommands keep their behaviour. This covers the window before
+/// [`wait_for_shutdown_signal`] exists, where a hangup used to end the daemon. `SIGINT`/
+/// `SIGTERM` stay default here: a plain kill still stops the service.
 ///
 /// A no-op where the platform has no such signals.
 pub fn install_ignored_signals() {
     #[cfg(unix)]
     {
-        /// Do nothing, for a signal the daemon must survive: the handler's existence is
-        /// the point, so it must never allocate or lock.
+        /// Do nothing: the handler's existence is the point, so it must never allocate or lock.
         extern "C" fn ignore(_signal: libc::c_int) {}
 
         use std::sync::Once;
@@ -492,131 +409,92 @@ pub fn install_ignored_signals() {
     }
 }
 
-/// Subscribe the process to every stop request the platform can deliver, before boot and before
-/// the interface exists: the two Windows sources below and the quit source, the only one of the
-/// three that is not platform-gated (the `install_quit_requests` call below states it).
-///
-/// They have to be up this early because the platform may deliver a stop the moment the window is
-/// up — before boot has finished — and the request has to survive until the dashboard subscribes
-/// to it.
+/// Before boot and before the interface exists: the two Windows sources below and the quit
+/// source. They must be up this early because the platform may deliver a stop the moment the
+/// window is up, and the request has to survive until the dashboard subscribes.
 pub fn install_stop_request_sources() {
     install_console_stop_handler();
     install_session_end_listener();
     install_quit_requests();
 }
 
-// ── Windows console control handler ───────────────────────────────────────
-
-/// Install the console stop-request handler — a no-op on macOS/Linux.
-///
 /// Called from [`install_stop_request_sources`] before boot: the handler needs no runtime (it
-/// queues for the async protocol loop, see the `console` module), so the subscription is never
-/// what a stop request goes missing on. A registration failure is reported where
-/// there is a console (see the `console` module) and never fails a launch — the
-/// fallback it costs is the tokio Ctrl+C handler, which (like this one) can only
-/// ever fire where a console exists to deliver the event, so a console-less launch
-/// loses nothing it had.
+/// queues for the async protocol loop), so a stop request never goes missing on the
+/// subscription. A registration failure is reported where there is a console and never fails a
+/// launch — the fallback it costs is tokio's Ctrl+C handler, which also fires only where a
+/// console exists, so a console-less launch loses nothing.
 fn install_console_stop_handler() {
     #[cfg(windows)]
     console::install();
 }
 
-/// Install the Windows session-end listener (log-off, shutdown, restart) — a no-op on
-/// macOS/Linux.
-///
 /// Called from [`install_stop_request_sources`] before boot, next to
-/// [`install_console_stop_handler`]: the platform
-/// may end the session at any time, and the listener needs no runtime (it forces the stop
-/// synchronously, see the `session_end` module). A failure to bring it up is reported, never
-/// fatal: the daemon then keeps exactly the stop requests it had.
+/// [`install_console_stop_handler`]: the platform may end the session at any time, and the
+/// listener needs no runtime (it forces the stop synchronously). A failure to bring it up is
+/// reported, never fatal: the daemon keeps exactly the stop requests it had.
 fn install_session_end_listener() {
     #[cfg(windows)]
     session_end::install();
 }
 
-/// The Windows console control handler — the platform's stop-request source
-/// wherever a console exists.
-///
-/// Ctrl+C, Ctrl+Break and the console window closing arrive as console control
-/// events, each on a **new OS thread the system creates in this process**. That
-/// thread has no async context and a closing console must not be left to a task the
-/// console might kill first, so the handler queues the request for
-/// [`wait_for_shutdown_signal`] instead of serving it. That loop is spawned only
-/// after a successful boot: while it does not exist, a request carrying a platform
-/// deadline (the close) is still queued and one that carries none keeps the
-/// platform's default handling (see the dead ends below).
+/// Ctrl+C, Ctrl+Break and the console window closing arrive as console control events, each on
+/// a **new OS thread the system creates in this process**. That thread has no async context and
+/// a closing console must not wait on a task the console might kill first, so the handler queues
+/// the request for [`wait_for_shutdown_signal`]. While that loop does not exist (it is spawned
+/// only after a successful boot), a request carrying a platform deadline is still queued and one
+/// that carries none keeps the platform's default handling (see the dead ends below).
 ///
 /// # The platform's rules, and what they force
 ///
-/// - A close event brings a grace the system starts counting down on delivery, from
-///   the user-settable `SPI_GETHUNGAPPTIMEOUT` parameter (5000 ms by default, so it
-///   is read here and never assumed). The system kills the process when it elapses,
-///   and that grace is the only window a close leaves for an exit.
-/// - The grace is usable only by NOT returning: the contract is "return TRUE and the
-///   system terminates the process". So the close handler holds its thread while the
-///   async side runs the exit path, and the system kills the process if that path
-///   does not finish — the accepted hard death. Holding the full grace is
-///   deliberate: returning sooner only kills the process sooner than the platform
-///   would, and the hold ends at the deadline the platform is already charging for.
-/// - Ctrl+C and Ctrl+Break have no timeout, and returning TRUE leaves the process
-///   running, so once the loop exists they queue and return immediately.
-/// - Two rapid requests may reach the process as one, because the console can
-///   collapse them before the handler runs (as Unix may) — so a "second request"
-///   that is never observed is not a defect. Every event the handler does receive is
-///   queued on its own.
+/// - A close brings a grace counted down from delivery, taken from the user-settable
+///   `SPI_GETHUNGAPPTIMEOUT` (5000 ms by default, so it is read and never assumed); the system
+///   kills the process when it elapses, and that grace is the only window a close leaves.
+/// - The grace is usable only by NOT returning: the contract is "return TRUE and the system
+///   terminates the process". So the close handler holds its thread while the async side runs
+///   the exit path, and the system's kill is the accepted hard death. Holding the full grace is
+///   deliberate: returning sooner only kills the process sooner.
+/// - Ctrl+C and Ctrl+Break have no timeout, and returning TRUE leaves the process running, so
+///   once the loop exists they queue and return immediately.
+/// - Two rapid requests may reach the process as one (the console can collapse them), so an
+///   unseen "second request" is not a defect; every event received is queued on its own.
 ///
 /// # Session end is not a console event
 ///
-/// `CTRL_LOGOFF_EVENT` and `CTRL_SHUTDOWN_EVENT` are not delivered to a console
-/// application that loads the GUI libraries (user32 and gdi32, as this one does for its
-/// dashboard): once user32 is loaded, the platform treats the process as one that owns a
-/// window and tells it about a log-off, shutdown or restart through window messages
-/// instead. This handler therefore declines both events, and the daemon hears a session
-/// end through its own hidden window — the `session_end` module below.
+/// `CTRL_LOGOFF_EVENT` and `CTRL_SHUTDOWN_EVENT` are not delivered to a console application that
+/// loads user32/gdi32, as this one does for its dashboard: once user32 is loaded the process is
+/// treated as owning a window, and the log-off, shutdown or restart arrives as window messages.
+/// This handler declines both, and the daemon hears a session end through its own hidden window.
 ///
-/// # Accepted dead ends (documented, deliberately not fixed)
+/// # Accepted dead ends (deliberately not fixed)
 ///
-/// - External termination (the task manager's "end process", `TerminateProcess`): no
-///   process can intercept it. Its "end task" is a different command, raises the
-///   close event, and does become graceful here.
-/// - Process-tree containment: a stop that ends the daemon takes the command trees
-///   it started with it — a job object's handles go with the process
-///   (`tools::shell::tree`) — while the launches it detaches on purpose (the
-///   browser, the browser-automation CLI, the replacement instance of a
-///   self-update) survive it. That boundary belongs to those subsystems, not to
-///   termination, and is left alone.
-/// - Ctrl+C and Ctrl+Break before the loop exists: nothing can act on them, so they
-///   keep today's platform default handling, as macOS/Linux does before its signal
-///   task registers its streams. Swallowing them instead would make Ctrl+C a dead key
-///   wherever boot never reaches the loop — the start-failure screen, which answers its
-///   own window's close but has no consumer for a console event at all.
-/// - Once the loop exists the handler suppresses the default handling for Ctrl+C and
-///   Ctrl+Break, so those would be inert if that loop died while the process lived. Unix
-///   is no better: tokio keeps its handler installed for the whole process even once the
-///   signal streams are dropped, so a died-out signal task there swallows the signal the
-///   same way. No machinery is warranted: the console close and the tray menu's quit
-///   remain as escapes.
-/// - A kill mid-exit, when a close's grace expires first: what the bound cuts is
-///   covered by the durability note on [`urgent_release_budget`], and a kill that lands
-///   mid-checkpoint cuts only hygiene — committed work is durable on disk. Whatever
-///   state that leaves the store in is the next start's to sort out, through the same
-///   bring-up gate as any other hard death here: `db::open_store` shape-checks the file
-///   and then runs its data-preserving repairs.
+/// - External termination (`TerminateProcess`): no process can intercept it. The task manager's
+///   "end task" is a different command, raises the close event, and is graceful here.
+/// - Process-tree containment: a stop that ends the daemon takes the command trees it started
+///   (a job object's handles go with the process, `tools::shell::tree`), while the launches it
+///   detaches on purpose (browser, browser-automation CLI, the self-update replacement) survive.
+///   That boundary belongs to those subsystems, not to termination.
+/// - Ctrl+C and Ctrl+Break before the loop exists: nothing can act on them, so they keep the
+///   platform's default handling, as macOS/Linux does before its signal task registers.
+///   Swallowing them would make Ctrl+C a dead key wherever boot never reaches the loop — the
+///   start-failure screen answers its own window's close but has no console-event consumer.
+/// - Once the loop exists the handler suppresses the default for Ctrl+C and Ctrl+Break, so those
+///   would be inert if that loop died while the process lived. Unix is no better: tokio keeps
+///   its handler installed for the whole process, so a died-out signal task swallows the signal
+///   the same way. The console close and the tray menu's quit remain as escapes.
+/// - A kill mid-exit, when a close's grace expires first: what the bound cuts is covered by
+///   the durability note on [`urgent_release_budget`], and a kill mid-checkpoint cuts only
+///   hygiene — committed work is durable on disk. The store's state is the next start's to sort
+///   out through the usual bring-up gate (`db::open_store` shape-checks and repairs).
 ///
 /// # Remaining silent hard deaths
 ///
-/// Those the dead ends above name, plus a stop request that arrives with the handler
-/// unregistered, and a console close during a start-up that never reached the loop — a
-/// console event has no consumer while that loop does not exist, and none is added for
-/// it. Both of those are console events, so both need a launch that has a console to
-/// arise at all; there, and only there, Ctrl+C still reaches tokio's own handler, whose
-/// `ctrl_c()` is itself a `SetConsoleCtrlHandler` registration. The dashboard's own close is not
-/// among them: the dashboard consumes it in every state, whether or not boot finished — and on
-/// this platform it hides the window rather than ending the process, unless there is nothing
-/// left to keep running or no tray to come back from. A session end is not among them: it
-/// reaches the process through its own window whether or not this handler is registered — the
-/// instance a self-update leaves behind owns no console at all, so no console close can reach
-/// it, but it owns a window just the same.
+/// Those above, plus a stop request arriving with the handler unregistered, and a console close
+/// during a start-up that never reached the loop — a console event has no consumer while the
+/// loop does not exist. Both need a launch with a console to arise, and there Ctrl+C still
+/// reaches tokio's own handler. The dashboard's close is not among them (it is consumed in every
+/// state, and hides the window unless nothing is left to keep running or no tray exists), and
+/// neither is a session end, which reaches the process through its own window whether or not
+/// this handler is registered.
 #[cfg(windows)]
 mod console {
     use super::{DEFAULT_STOP_GRACE, StopRequest, record_stop_deadline};
@@ -634,29 +512,24 @@ mod console {
         SPI_GETHUNGAPPTIMEOUT, SystemParametersInfoW,
     };
 
-    /// Requests queued by handler threads, drained in order by the protocol loop.
+    /// Drained in order by the protocol loop.
     static REQUESTS: Mutex<VecDeque<StopRequest>> = Mutex::new(VecDeque::new());
 
-    /// Wakes the protocol loop. `notify_one` keeps its permit, so a request
-    /// queued before the loop waits is never lost.
+    /// `notify_one` keeps its permit, so a request queued before the loop waits is never lost.
     static QUEUED: Notify = Notify::const_new();
 
-    /// Whether the handler is registered. The protocol loop falls back to tokio's
-    /// Ctrl+C when it is not, so a failed registration cannot cost a launch that has a
-    /// console the stop request it had before; a launch without one receives no
-    /// console event either way, which is why the failure is not diagnosed there (see
-    /// [`attached_to_console`]). The handler is registered on every launch regardless
-    /// — it costs nothing, and a console-subsystem build (the binary's own test
-    /// harness) does have a console to serve.
+    /// Whether the handler is registered. The protocol loop falls back to tokio's Ctrl+C when it
+    /// is not, so a failed registration cannot cost a launch that has a console the stop request
+    /// it had; a launch without one receives no console event either way, which is why the failure
+    /// is not diagnosed there ([`attached_to_console`]). It is registered on every launch
+    /// regardless: it costs nothing, and a console-subsystem build has a console to serve.
     static INSTALLED: AtomicBool = AtomicBool::new(false);
 
-    /// Whether the protocol loop has started, i.e. whether the queue has a consumer
-    /// (see the module docs).
+    /// Whether the queue has a consumer.
     static LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
 
-    /// Whether this process is attached to a console: without one the platform
-    /// delivers no console control event, so a registration that failed has
-    /// nothing to lose and is not worth a standing diagnostic.
+    /// Without a console the platform delivers no console control event, so a failed registration
+    /// has nothing to lose and is not worth a standing diagnostic.
     fn attached_to_console() -> bool {
         // SAFETY: `GetConsoleCP` only reads the calling process's console input
         // code page. The platform documents zero as the failure value, not "no
@@ -666,12 +539,10 @@ mod console {
         unsafe { GetConsoleCP() != 0 }
     }
 
-    /// Register the console control handler for this process.
     pub(super) fn install() {
         // SAFETY: `SetConsoleCtrlHandler` only records the function pointer in
         // this process's handler list; `handler` has the required
-        // `extern "system" fn(u32) -> i32` signature and lives for the process's
-        // lifetime.
+        // `extern "system" fn(u32) -> i32` signature and lives for the process's lifetime.
         let installed = unsafe { SetConsoleCtrlHandler(Some(handler), TRUE) != 0 };
         INSTALLED.store(installed, Ordering::SeqCst);
         if !installed && attached_to_console() {
@@ -687,56 +558,45 @@ mod console {
         }
     }
 
-    /// The console control handler: queues the request for the async protocol loop
-    /// and, for a close, holds this thread (see the module docs).
+    /// Queues the request for the async protocol loop and, for a close, holds this thread.
     extern "system" fn handler(event: u32) -> i32 {
         let Some(request) = request_for(event) else {
-            // CTRL_LOGOFF_EVENT / CTRL_SHUTDOWN_EVENT: not ours (see the section above — a
-            // session end arrives as a window message, which the `session_end` module takes),
-            // so the default handler's termination stands.
+            // CTRL_LOGOFF_EVENT / CTRL_SHUTDOWN_EVENT: not ours (a session end arrives as a window
+            // message), so the default handler's termination stands.
             return FALSE;
         };
-        // A close event starts the platform's countdown now, so its grace is read here
-        // rather than by the async side, and this thread holds until then.
+        // A close starts the platform's countdown now, so its grace is read here rather than by
+        // the async side, and this thread holds until then.
         let close = request == StopRequest::ConsoleClose;
         let deadline = close.then(close_deadline);
-        // A close brings a deadline the platform charges for either way, so it is
-        // queued even before the loop exists; a request that carries none is left to
-        // the platform (see the dead ends on this module).
+        // A close brings a deadline the platform charges for either way, so it is queued even
+        // before the loop exists; a request carrying none is left to the platform.
         if !close && !LOOP_RUNNING.load(Ordering::SeqCst) {
             return FALSE;
         }
-        // `unwrap_poison` rather than a panic: a panic on a control-handler thread
-        // aborts the process instead of shutting it down.
+        // `unwrap_poison` rather than a panic: a panic on a control-handler thread aborts the
+        // process instead of shutting it down.
         REQUESTS.lock().unwrap_poison().push_back(request);
         QUEUED.notify_one();
         if let Some(deadline) = deadline {
-            // Hold this thread for the grace the platform is counting down (the module
-            // docs say why returning is not an option).
+            // Hold this thread for the grace being counted down (returning is not an option).
             std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
         }
         TRUE
     }
 
-    /// The next queued request, awaiting one when the queue is empty.
-    ///
-    /// With no handler registered, Ctrl+C through tokio's own handler is the only
-    /// request source left — today's behaviour, kept so a failed registration cannot
-    /// cost a launch that has a console the stop request it had. (tokio subscribes
-    /// through the same `SetConsoleCtrlHandler`, so this fallback reaches exactly the
-    /// launches the handler above would have.) Its failure to subscribe is a real
-    /// error, so the caller's signal task reports it rather than inventing a request
-    /// — except on a launch with no console, which can receive no console control
-    /// event at all and waits forever instead of subscribing.
+    /// With no handler registered, Ctrl+C through tokio's own handler is the only source left —
+    /// kept so a failed registration cannot cost a launch that has a console the request it had
+    /// (tokio subscribes through the same `SetConsoleCtrlHandler`). Its failure to subscribe is a
+    /// real error the caller reports, except on a launch with no console, which can receive no
+    /// console event and waits forever instead.
     pub(super) async fn next_request() -> anyhow::Result<StopRequest> {
         LOOP_RUNNING.store(true, Ordering::SeqCst);
         if !INSTALLED.load(Ordering::SeqCst) {
             if !attached_to_console() {
-                // A launch with no console receives no console event at all, so there is
-                // nothing to subscribe to: subscribing (tokio's `ctrl_c`) would only turn
-                // that into a standing `Signal handler failed to set up` error. The stop
-                // sources such a launch really has are the window and the session-end
-                // listener.
+                // With no console there is nothing to subscribe to: `ctrl_c` would only turn it
+                // into a standing "Signal handler failed to set up" error. Such a launch's stop
+                // sources are the window and the session-end listener.
                 return std::future::pending().await;
             }
             tokio::signal::ctrl_c().await?;
@@ -751,8 +611,7 @@ mod console {
         }
     }
 
-    /// Map a console event onto the request class it belongs to, `None` for the
-    /// events this handler deliberately leaves to the default handler.
+    /// `None` for the events this handler deliberately leaves to the default handler.
     fn request_for(event: u32) -> Option<StopRequest> {
         match event {
             CTRL_C_EVENT => Some(StopRequest::Interrupt),
@@ -762,18 +621,16 @@ mod console {
         }
     }
 
-    /// The instant this process's closing console stops granting time: the grace read now
-    /// (see the module docs), recorded for the exit path's budget and held by this handler
-    /// thread until it.
+    /// The grace read now (see the module docs), recorded for the exit path's budget and held by
+    /// this handler thread until it.
     fn close_deadline() -> Instant {
         let deadline = Instant::now() + close_grace();
         record_stop_deadline(deadline);
         deadline
     }
 
-    /// The grace this process's closing console grants (see the module docs). A stored
-    /// `0` is taken at face value — no grace at all, i.e. today's hard kill — so the
-    /// exit path cannot run past a deadline that has already passed.
+    /// A stored `0` is taken at face value — no grace, today's hard kill — so the exit path
+    /// cannot run past a deadline that has already passed.
     fn close_grace() -> Duration {
         let mut millis: u32 = 0;
         // SAFETY: `SPI_GETHUNGAPPTIMEOUT` writes a single `u32` through `pvparam`;
@@ -788,64 +645,52 @@ mod console {
     }
 }
 
-// ── Windows session-end listener ──────────────────────────────────────────
-
-/// The session-end listener — the platform's stop request for a log-off, shutdown or
-/// restart, delivered to a window of this daemon's own.
+/// The platform's stop request for a log-off, shutdown or restart, delivered to a window of
+/// this daemon's own.
 ///
 /// # Why a window of its own
 ///
-/// Windows announces a session end through a process's top-level windows, with
-/// `WM_QUERYENDSESSION` and then `WM_ENDSESSION` (see the section on the console module
-/// above for why the console events do not carry this news here). Nothing in the windowing
-/// stack this daemon draws with handles either message and neither offers a hook to borrow
-/// the dashboard window's procedure — winit, which iced draws with, sends both to the
-/// default procedure, which answers the question with "yes" and ignores the end, leaving
-/// the process to be terminated silently. So the daemon creates its own window: hidden, on
-/// its own thread, but a real top-level window — which is what the platform's broadcast
-/// reaches. A message-only window (`HWND_MESSAGE`) is not a candidate: the broadcast never
-/// reaches one.
+/// Windows announces a session end through a process's top-level windows (`WM_QUERYENDSESSION`,
+/// then `WM_ENDSESSION`). Nothing in the windowing stack this daemon draws with handles either
+/// message: winit sends both to the default procedure, which answers "yes" and ignores the end,
+/// leaving the process to be terminated silently. So the daemon creates its own window — hidden,
+/// on its own thread, but a real top-level window, which is what the broadcast reaches. A
+/// message-only window (`HWND_MESSAGE`) would never receive it.
 ///
 /// # What it does
 ///
-/// - Answers the preliminary question with "go ahead" (a true `BOOL`) and does nothing else
-///   with it — [`session_end_label`] says why acting there would be wrong.
-/// - On the final notification for a session that really is ending, forces the stop and
-///   returns — [`stop_for_session_end`], which owns the platform rules this must respect.
-/// - Hands every other message to `DefWindowProcW`: a window procedure that swallowed
-///   messages would fail window creation (the window has to answer messages of its own to
-///   be created at all) and would refuse the shutdown by answering the question with "no".
+/// - Answers the preliminary question with "go ahead" and nothing else — [`session_end_label`]
+///   says why acting there would be wrong.
+/// - On the final notification for a session that really is ending, forces the stop and returns
+///   ([`stop_for_session_end`] owns the platform rules).
+/// - Hands every other message to `DefWindowProcW`: swallowing one would fail window creation,
+///   and answering the question with "no" would refuse the shutdown.
 ///
 /// # The time available
 ///
-/// The platform allows seconds — fewer during a critical shutdown — before it ends a process
-/// that has not finished, so the stop steps can still be cut off mid-way, the exit-time
-/// checkpoint that runs last most of all. What the bound cuts loses nothing durable (see
-/// [`urgent_release_budget`]) and in-flight agent work is cut exactly as it is on the other
-/// platforms; a process ended by the platform at its deadline is the same class as today's
-/// silent hard death.
+/// The platform allows seconds — fewer during a critical shutdown — before ending a process
+/// that has not finished, so the stop steps can still be cut off, the exit-time checkpoint most
+/// of all. What the bound cuts loses nothing durable (see [`urgent_release_budget`]) and in-flight
+/// agent work is cut as on the other platforms; a process ended at the deadline is the same class
+/// as today's silent hard death.
 ///
 /// # Accepted, deliberately not fixed
 ///
-/// - A session end before the dashboard is ready: the dashboard subscribes to shutdown only
-///   once boot has succeeded and nothing else consumes the forced stop, so the platform ends
-///   the process as today — and with nothing hidden before boot finished, a close during the
-///   grace runs the exit path the dashboard consumes in every state. A boot that
-///   finishes inside the platform's grace does exit properly (the token stays fired for the
-///   subscription that then appears); one that fails never does.
+/// - A session end before the dashboard is ready: the dashboard subscribes only once boot has
+///   succeeded and nothing else consumes the forced stop, so the platform ends the process as
+///   today. A boot that finishes inside the grace does exit properly (the token stays fired for
+///   the subscription that then appears); one that fails never does.
 /// - A session end while a self-update is finalizing: the update's exit path wins, spawn
 ///   included. The replacement it starts into a session that is ending is cut off with the
 ///   session like any other in-flight work, and the next start recovers. Deliberately no guard
 ///   against that spawn.
 /// - Bringing the listener up can fail (the window class cannot be registered, the window
-///   cannot be created, the thread cannot be spawned). It is reported through the boot
-///   diagnostics and the daemon starts and runs with the stop requests it always had; it
-///   must never be fatal.
-/// - Fast user switching: it ends no session and sends no notification, so nothing here
-///   runs for it and the daemon is meant to keep running.
-/// - The stop trace: best-effort, not a durable record — this route forces the stop at once and
-///   the exit burst lasts milliseconds, so the listener's own line is dropped with the runtime
-///   exactly as the exit path's line is (see `EXIT_TRIGGER`).
+///   cannot be created, the thread cannot be spawned). Reported through the boot diagnostics;
+///   the daemon runs with the stop requests it always had, and it must never be fatal.
+/// - Fast user switching ends no session and sends no notification, so the daemon keeps running.
+/// - The stop trace is best-effort, not a durable record: this route forces the stop at once and
+///   the exit burst lasts milliseconds, so the listener's line is dropped with the runtime as the
+///   exit path's is (see `EXIT_TRIGGER`).
 #[cfg(windows)]
 mod session_end {
     use super::{session_end_label, stop_for_session_end};
@@ -859,12 +704,11 @@ mod session_end {
     };
     use windows_sys::w;
 
-    /// The window class this listener registers. Nothing looks it up by name: a class needs one.
+    /// Nothing looks it up by name: a class needs one.
     const WINDOW_CLASS: windows_sys::core::PCWSTR = w!("MahBotSessionEnd");
 
-    /// Bring the listener up on a thread of its own, which is never joined: a window's
-    /// messages are dispatched to the thread that created it, and none of this may run on
-    /// the dashboard's thread. A failure is reported, never fatal (see the module docs).
+    /// On a thread of its own, never joined: a window's messages go to the thread that created
+    /// it, and none of this may run on the dashboard's thread.
     pub(super) fn install() {
         if let Err(e) = std::thread::Builder::new()
             .name("session-end-listener".to_string())
@@ -874,8 +718,7 @@ mod session_end {
         }
     }
 
-    /// The listener thread: create the window, then pump its messages for the life of the
-    /// process.
+    /// Create the window, then pump its messages for the life of the process.
     fn listen() {
         // SAFETY: a null module name asks for this process's own module, which every
         // process has; the window class below needs an instance to own its procedure.
@@ -884,9 +727,8 @@ mod session_end {
         // for the fields set here, and the class is fully described for its `cbSize` by
         // the assignments.
         let mut class: WNDCLASSEXW = unsafe { zeroed() };
-        // `cbSize` must report this structure's size: that is how the platform tells which
-        // of the two structures it is being handed. `allow`, not `expect` — the cast cannot
-        // truncate on a 32-bit target, and an unfired expectation is itself a warning.
+        // `cbSize` must report this structure's size: that is how the platform tells which of the
+        // two it is handed. `allow`, not `expect` — an unfired expectation is itself a warning.
         #[allow(clippy::cast_possible_truncation)]
         let class_size = size_of::<WNDCLASSEXW>() as u32;
         class.cbSize = class_size;
@@ -901,10 +743,9 @@ mod session_end {
             return;
         }
         // SAFETY: the class is registered to this module, the style is "nothing", the caption
-        // is null (never shown), and the parent is null — which is what makes this a hidden
-        // *top-level* window, the kind the session-end broadcast reaches (a message-only parent
-        // would exclude it). The window is never shown, moved or resized, and it is never
-        // destroyed: it lasts as long as the process.
+        // and parent are null — which is what makes this a hidden *top-level* window, the kind
+        // the session-end broadcast reaches (a message-only parent would exclude it). It is never
+        // shown, moved, resized or destroyed.
         let window = unsafe {
             CreateWindowExW(
                 0,
@@ -925,14 +766,13 @@ mod session_end {
             report("window not created", &Error::last_os_error());
             return;
         }
-        // SAFETY: zeroed is a valid initial `MSG`; every field is written by the call
-        // below.
+        // SAFETY: zeroed is a valid initial `MSG`; every field is written by the call below.
         let mut message: MSG = unsafe { zeroed() };
         loop {
-            // SAFETY: the buffer is `MSG`-sized and lives on this thread's stack; the
-            // filter arguments ask for every message of this thread. The retrieval is also
-            // what dispatches messages *sent* to the window from another thread — which is
-            // how the platform delivers the two this listener exists for.
+            // SAFETY: the buffer is `MSG`-sized on this thread's stack and the filter arguments
+            // ask for every message of this thread. The retrieval also dispatches messages *sent*
+            // from another thread, which is how the platform delivers the two this listener
+            // exists for.
             let retrieved = unsafe { GetMessageW(&raw mut message, 0, 0, 0) };
             if retrieved == 0 {
                 // `WM_QUIT` — nothing posts one to this thread.
@@ -942,14 +782,13 @@ mod session_end {
                 report("message loop failed", &Error::last_os_error());
                 break;
             }
-            // SAFETY: `message` was filled by the call above; the two notifications arrive
-            // sent, not queued, so this serves whatever else the window is posted.
+            // SAFETY: `message` was filled above; the notifications arrive sent, not queued.
             unsafe { DispatchMessageW(&raw const message) };
         }
     }
 
-    /// The listener window's procedure: the two session-end notifications, and the default
-    /// handling for everything else (see the module docs for why that is not optional).
+    /// The two session-end notifications, and the default handling for everything else (see the
+    /// module docs for why that is not optional).
     extern "system" fn window_proc(
         window: HWND,
         message: u32,
@@ -957,15 +796,12 @@ mod session_end {
         lparam: LPARAM,
     ) -> LRESULT {
         match message {
-            // The preliminary question, always answered "go ahead" (a true `BOOL`): this
-            // daemon never holds up the platform. Never acted on — see the module docs.
+            // The preliminary question, always answered "go ahead": this daemon never holds up the
+            // platform, and the answer is never acted on.
             WM_QUERYENDSESSION => LRESULT::from(true),
             WM_ENDSESSION => {
-                // The flags are a 32-bit field in the parameter's low half, which the
-                // platform may have sign-extended into the parameter's own width. `allow`,
-                // not `expect`: the sign-loss lint fires on every target but the truncation
-                // one only where the parameter is wider than the field, and an unfired
-                // expectation is itself a warning.
+                // The flags are a 32-bit field in the parameter's low half, which the platform
+                // may have sign-extended. `allow`, not `expect` — an unfired expectation warns.
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let flags = lparam as u32;
                 let ending = wparam != 0;
@@ -982,9 +818,8 @@ mod session_end {
         }
     }
 
-    /// Report a failure to bring the listener up. Through the boot diagnostic rather than
-    /// `warn!`, because this may run before boot opens the stores: it reaches stderr now
-    /// and the logs store once tracing exists.
+    /// Through the boot diagnostic rather than `warn!`, because this may run before boot opens
+    /// the stores: stderr now, the logs store once tracing exists.
     fn report(what: &str, detail: &Error) {
         crate::boot::boot_diagnostic(format!(
             "session-end listener: {what}: {detail} — a Windows log-off, shutdown or restart \
@@ -993,126 +828,102 @@ mod session_end {
     }
 }
 
-// ── Application-machinery quit (macOS) ────────────────────────────────────
-
 /// The wording the macOS quit route records for itself in [`EXIT_TRIGGER`]: every ordinary quit
-/// ask — ⌘Q, the application menu's Quit item, the Dock's Quit — arrives as the one AppleEvent
-/// `macos_quit` takes over, so they share one label.
+/// ask — ⌘Q, the menu's Quit, the Dock's Quit — arrives as the one AppleEvent `macos_quit`
+/// takes over, so they share one label.
 pub(crate) const MACOS_QUIT_TRIGGER: &str = "macOS quit";
 
-/// The wording the tray menu's one item records for itself in [`EXIT_TRIGGER`]: its own ask, on
-/// either platform that has a tray, is neither the platform's quit nor a close.
+/// The tray menu's one item records its own ask, which on either platform that has a tray is
+/// neither the platform's quit nor a close.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) const TRAY_QUIT_TRIGGER: &str = "tray quit";
 
-/// Install the source of the platform's quit requests: the quit channel, and on macOS the
-/// interception of the platform's own asks.
-///
-/// Called from [`install_stop_request_sources`] before the interface starts, next to the Windows
-/// installers there. The channel is created on every platform so the dashboard's subscription
-/// always has a source, but only macOS sends on it — and only the interception is macOS-only.
+/// The quit channel, and on macOS the interception of the platform's own asks. Called from
+/// [`install_stop_request_sources`] before the interface starts. The channel exists on every
+/// platform so the dashboard's subscription always has a source, but only macOS sends on it.
 fn install_quit_requests() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     // The receiving half first, so a quit the platform delivers before the dashboard subscribes
     // waits here instead of being lost.
     *QUIT_REQUESTS.lock().unwrap_poison() = Some(rx);
-    // The channel exists on every platform so the dashboard's subscription always has a source;
-    // only macOS sends, so everywhere else the sender is dropped here and the source stays empty.
+    // Only macOS sends, so everywhere else the sender is dropped here and the source stays empty.
     #[cfg(target_os = "macos")]
     macos_quit::install(tx);
     #[cfg(not(target_os = "macos"))]
     drop(tx);
 }
 
-/// The receiving half: the dashboard's subscription takes it once, and a quit that arrives
-/// before anything has subscribed waits here instead of being lost — the platform asks whether
-/// or not the interface is ready for it.
+/// The dashboard's subscription takes it once, and a quit arriving before anything subscribes
+/// waits here instead of being lost — the platform asks whether or not the interface is ready.
 static QUIT_REQUESTS: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<()>>> = Mutex::new(None);
 
-/// Take the quit-request receiver, for the dashboard's subscription. `None` before
-/// [`install_quit_requests`] ran, or once the receiver has been taken: iced spawns a
-/// `Subscription::run` recipe — identified by its function pointer — once per process, so the
-/// subscriber takes it exactly once.
+/// `None` before [`install_quit_requests`] ran, or once taken: iced spawns a
+/// `Subscription::run` recipe — identified by its function pointer — once per process.
 pub(crate) fn take_quit_requests() -> Option<tokio::sync::mpsc::UnboundedReceiver<()>> {
     QUIT_REQUESTS.lock().unwrap_poison().take()
 }
 
-/// The macOS quit interception, and the Dock's reopen hook, on winit's application delegate: the
-/// platform's own ordinary quit asks, brought into the product's closing path, and the Dock
-/// click that brings a hidden window back.
+/// The platform's ordinary quit asks, brought into the closing path, and the Dock click that
+/// brings a hidden window back.
 ///
 /// # Why it exists
 ///
-/// macOS ends an application through its own machinery: its ordinary quit asks — the ones
-/// [`crate::gui::Message::QuitRequested`] receives — reach AppKit's `terminate:`, which asks the
-/// application delegate (`applicationShouldTerminate:`) whether it may terminate and then
-/// terminates the process itself. winit, which iced draws with, installs that delegate and
-/// implements no `applicationShouldTerminate:`, so AppKit's default answer stands: the asks never
-/// reach the closing path, the window's state is never recorded, the exit-time checkpoint never
-/// runs, the browser release is deferred to the next start, and in-flight work is cut off hard.
-/// The system's own asks during a log-out, restart or shut-down travel the same route and are
-/// deliberately left alone (see below).
+/// macOS ends an application through its own machinery: an ordinary quit ask (the ones
+/// [`crate::gui::Message::QuitRequested`] receives) reaches AppKit's `terminate:`, which asks the
+/// application delegate whether it may terminate and then terminates the process itself. winit
+/// installs that delegate but implements no `applicationShouldTerminate:`, so AppKit's default
+/// answer stands: the asks never reach the closing path, the window state is never recorded, the
+/// checkpoint never runs, the browser release is deferred and in-flight work is cut off hard.
 ///
 /// # The hook
 ///
 /// The method is added to winit's delegate class at run time (`class_addMethod`), which leaves
-/// winit's delegate object untouched — it has to, because winit panics unless the application's
-/// delegate is the one it registered itself (`ApplicationDelegate::get`), so the delegate cannot
-/// be replaced. The class does not exist before the event loop is built (iced builds it inside
-/// `run`, after `main`'s install call), so a thread of its own waits for it and gives up after
-/// `INSTALL_WAIT` — the fallback named under "Accepted" below.
+/// winit's delegate object untouched — it has to, because winit panics unless the delegate is the
+/// one it registered. The class does not exist before the event loop is built, so a thread of its
+/// own waits for it and gives up after `INSTALL_WAIT`.
 ///
 /// # The Dock's reopen
 ///
-/// The same class carries one method more: `applicationShouldHandleReopen:hasVisibleWindows:`.
-/// A click on the Dock icon is one of the ways back to a window a close hid — and to one the
-/// application hid itself with ⌘H — so the method hands a show request to the dashboard (see
-/// [`crate::window_requests`]) and answers `YES`, which leaves the platform's own reopen
-/// (unhiding the application) to run. The same waiter installs it, and before boot finishes
-/// rather than after, so the Dock works from the moment the window exists — the launch the
-/// updater restarted hidden included.
+/// The same class carries `applicationShouldHandleReopen:hasVisibleWindows:`, which hands a show
+/// request to the dashboard (see [`crate::window_requests`]) and answers `YES`, leaving the
+/// platform's own unhiding to run. The same waiter installs it — before boot finishes, so the
+/// Dock works from the moment the window exists, the launch the updater restarted hidden included.
 ///
 /// # Which ask it is
 ///
 /// `kAEQuitReason` on the Quit AppleEvent names why the quit was sent; an ordinary quit carries no
-/// reason at all. The delegate's `sender` cannot tell them apart — it is the application itself
-/// for every AppleEvent-driven route, the Dock's Quit included. The two are answered differently:
+/// reason. The delegate's `sender` cannot tell them apart — for every AppleEvent-driven route
+/// it is the application itself, the Dock's Quit included. The asks are answered differently:
 ///
-/// - An ordinary quit is answered `NSTerminateCancel`: the platform's termination is refused and
-///   the closing path takes over, exactly as the tray menu's quit does (winit answers
-///   `windowShouldClose:` with "no" for the same reason, so a close is the app's to answer).
-///   Nothing stays pending on the platform's side, so a **second** quit during
-///   the graceful drain reaches this hook again and forces that drain, except while a
-///   self-update's own drain owns the exit.
-/// - A session end — a log-out, restart or shut-down — is not the product's to handle: the ask is
-///   answered `NSTerminateNow`, the answer an application that does not implement this method at
-///   all gets, and the platform ends the process at once. That exit and its accepted losses are on
-///   the list above.
+/// - An ordinary quit is answered `NSTerminateCancel`: termination is refused and the closing path
+///   takes over, as with the tray menu's quit (winit answers `windowShouldClose:` with "no" for the
+///   same reason). A **second** quit during the graceful drain reaches this hook again and forces
+///   that drain, except while a self-update's drain owns the exit.
+/// - A session end (log-out, restart, shut-down) is not the product's: answered
+///   `NSTerminateNow`, what an application without this method gets, and the platform ends the
+///   process at once — those losses are on the list above.
 ///
 /// # The bound
 ///
-/// An ordinary quit is refused at the platform level, so no platform deadline is left to end the
-/// process — the product's own has to, or a wedged closing path would leave it running. It cannot
-/// live inside the machinery the closing path tears down, so `arm_exit_bound` puts it on a thread
-/// that outlives the interface, armed the moment a quit is taken over: `EXIT_BOUND`, the drain cap
-/// plus an allowance for the closing steps after it — the last resort that makes "never left
-/// running" true.
+/// An ordinary quit is refused at the platform level, so the product's own bound must end the
+/// process or a wedged closing path would leave it running. It cannot live in the machinery the
+/// closing path tears down, so `arm_exit_bound` runs it on a thread outliving the interface,
+/// armed as the quit is taken over: `EXIT_BOUND`, the drain cap plus an allowance for the
+/// closing steps after it.
 ///
 /// # Accepted, deliberately not fixed
 ///
-/// The platform-forced termination and the session end are on the `shutdown` module's list of the
-/// exits that run none of the closing path; nothing here changes either. What this module accepts
-/// on its own terms, the canonical list naming where each of them ends the process:
+/// The platform-forced termination and the session end are on the `shutdown` module's list. What
+/// this module accepts on its own terms:
 ///
-/// - A quit that arrives with nothing left to act on it — the dashboard's subscription gone
-///   because the interface is already past its exit: it is handed back (`NSTerminateNow`), which
-///   keeps a quit from being a dead key and the platform from waiting on an answer nothing can
-///   give.
+/// - A quit with nothing left to act on it (the dashboard's subscription gone, the interface
+///   past its exit) is handed back (`NSTerminateNow`), so a quit is never a dead key and the
+///   platform never waits on an answer nothing can give.
 /// - A failure to install (the delegate class never appears, a future winit renames it, the
 ///   class already implements the method, the thread cannot be spawned): an ordinary quit keeps
-///   today's behaviour — the platform ends the process — reported, never fatal. The same failure
-///   leaves the Dock's reopen uninstalled, which costs that way back and nothing else: the tray
-///   and a second launch still bring the window up.
+///   today's behaviour — the platform ends the process — reported, never fatal. The same
+///   failure leaves the Dock's reopen uninstalled, which costs that way back and nothing else:
+///   the tray and a second launch still bring the window up.
 /// - The exit bound firing: a hard end with no closing steps, the same class as a force quit. A
 ///   quit arriving while a self-update is finalizing is armed like any other, so the bound can cut
 ///   that hand-off where the exit path would otherwise wait for it: a tail outrunning the
@@ -1133,40 +944,37 @@ mod macos_quit {
     use std::time::{Duration, Instant};
     use tracing::{info, warn};
 
-    /// The sending half of the quit channel; this module is its only producer, and what a quit
-    /// carries says nothing — every one of them arrives by the same route.
+    /// The sending half of the quit channel; this module is its only producer, and a quit's value
+    /// says nothing — every one arrives by the same route.
     static QUIT_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<()>> = OnceLock::new();
 
-    /// Hand a quit to the dashboard. `false` when nothing will consume it — the subscription is
-    /// gone — so the caller has to fall back on the platform ending the process.
+    /// `false` when nothing will consume it (the subscription is gone), so the caller falls back
+    /// on the platform ending the process.
     fn queue_quit() -> bool {
         QUIT_TX.get().is_some_and(|tx| tx.send(()).is_ok())
     }
 
-    /// The delegate class winit registers for its event loop, and the one AppKit asks about a
-    /// termination and a Dock reopen; a rename in a future winit costs the interception and the
-    /// Dock's way back, and nothing else.
+    /// The class winit registers for its event loop, and the one AppKit asks about a termination
+    /// and a Dock reopen; a rename in a future winit costs the interception and nothing else.
     const DELEGATE_CLASS: &CStr = c"WinitApplicationDelegate";
 
-    /// `applicationShouldTerminate:`'s type encoding: the reply (`NSUInteger`), the receiver,
-    /// the selector, the sender.
+    /// `applicationShouldTerminate:`'s encoding: reply (`NSUInteger`), receiver, selector, sender.
     const SHOULD_TERMINATE_TYPES: &CStr = c"Q@:@";
 
-    /// `applicationShouldHandleReopen:hasVisibleWindows:`'s type encoding: the answer (`BOOL`),
-    /// the receiver, the selector, the application and the visible-windows flag.
+    /// `applicationShouldHandleReopen:hasVisibleWindows:`'s encoding: `BOOL`, receiver, selector,
+    /// application, visible-windows flag.
     const SHOULD_REOPEN_TYPES: &CStr = c"c@:@c";
 
-    /// How long the installer waits for winit's delegate class to be registered.
+    /// The wait for winit's delegate class, polled every [`INSTALL_POLL`].
     const INSTALL_WAIT: Duration = Duration::from_secs(60);
-    /// How often it looks while waiting.
     const INSTALL_POLL: Duration = Duration::from_millis(5);
 
     /// The last-resort bound on a quit's exit: the drain cap plus an allowance for the closing
-    /// steps that follow it (see the module's bound note).
+    /// steps that follow it.
     const EXIT_BOUND: Duration = Duration::from_secs(crate::jobs::DRAIN_CAP_SECS + 300);
 
-    /// Bring the interception and the Dock's reopen up on a thread of its own, never joined: a
-    /// failure is reported and never fatal — an ordinary quit keeps today's behaviour.
+    /// On a thread of its own, never joined: a failure is reported and never fatal — an ordinary
+    /// quit then keeps today's behaviour.
     pub(super) fn install(tx: tokio::sync::mpsc::UnboundedSender<()>) {
         let _ = QUIT_TX.set(tx);
         if let Err(e) = std::thread::Builder::new()
@@ -1177,7 +985,6 @@ mod macos_quit {
         }
     }
 
-    /// Wait for winit's delegate class, then add the delegate methods to it.
     fn install_when_registered() {
         let give_up = Instant::now() + INSTALL_WAIT;
         loop {
@@ -1234,9 +1041,9 @@ mod macos_quit {
                     );
                 }
                 // Success is silent, as the Windows installers are: the class appears inside
-                // `run`, before boot opens the stores, so nothing would carry a line here — and a
-                // takeover is not reported to the owner either (`EXIT_TRIGGER` says what becomes
-                // of the exit path's line). What it produces is the closing path itself.
+                // `run`, before boot opens the stores, so nothing would carry a line — and a
+                // takeover is not reported to the owner either. What it produces is the closing
+                // path itself.
                 return;
             }
             if Instant::now() >= give_up {
@@ -1250,8 +1057,7 @@ mod macos_quit {
         }
     }
 
-    /// The delegate method AppKit asks about termination: an ordinary quit is handed to the
-    /// product's closing path, a session end is left to the platform (see the module docs).
+    /// An ordinary quit is handed to the closing path, a session end left to the platform.
     ///
     /// # Safety
     ///
@@ -1299,7 +1105,7 @@ mod macos_quit {
     /// Quit AppleEvent names a session end with `kAEQuitReason`, and an ordinary quit carries no
     /// reason at all.
     ///
-    /// A reason this build does not know — and a session end whose reason the system leaves out —
+    /// A reason this build does not know — and a session end whose reason the system omits —
     /// is read as an ordinary quit. The asymmetry is deliberate: a session end read as an ordinary
     /// one only starts a closing path the platform's own deadline then cuts, while an ordinary
     /// quit read as a session end would leave a quit the user is watching to the platform — the
@@ -1348,8 +1154,6 @@ mod macos_quit {
         crate::boot::boot_diagnostic(format!("macOS delegate hooks: {what}"));
     }
 }
-
-// ── Fatal signal handlers ─────────────────────────────────────────────────
 
 /// Install bare-metal signal handlers for fatal signals (SIGBUS, SIGABRT).
 ///
@@ -1414,8 +1218,6 @@ pub fn install_fatal_signal_handlers() {
     // No-op on non-Unix platforms.
 }
 
-// ── Panic hook ────────────────────────────────────────────────────────────
-
 thread_local! {
     /// Set while a contained pass ([`contain_panics`]) runs on this thread.
     static CONTAINED_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1450,8 +1252,6 @@ pub fn install_panic_hook() {
         default_hook(info);
     }));
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

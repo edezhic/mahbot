@@ -1,21 +1,14 @@
-//! Automation persistence and fire routing for the Assistant session.
+//! Automation persistence and fire routing for the Assistant session: the
+//! `add_automation` / `list_automations` / `remove_automation` tools and the periodic sweep that
+//! routes due automations back into the Assistant's own session as user-role messages.
 //!
-//! Backs the `add_automation` / `list_automations` / `remove_automation` tools
-//! and the periodic background sweep that routes due automations back into the
-//! Assistant's own personal session as user-role messages.
-//!
-//! An automation optionally carries a [`StoredTrigger`] — one custom tool plus its
-//! arguments, stored in the `trigger` column. At fire time the tool runs as the
-//! automation's owner in the owner's personal workspace, and only what the check
-//! reported decides whether the Assistant is woken at all.
-//!
-//! A check stopped by its time limit is not a verdict about the automation: nothing
-//! is delivered for that attempt, the occurrence stays pending and is retried
-//! after a short cool-down. Every other non-clean outcome — a non-zero exit, the
-//! memory ceiling, a check that could not run at all — is a broken check and takes the
-//! automation with it. A check whose own process exited is judged by the status it
-//! gave, even when something it left behind held its output. A stored check that cannot
-//! be read is a check that cannot run, and is treated as one.
+//! An automation optionally carries a [`StoredTrigger`] — one custom tool plus its arguments —
+//! which at fire time runs as the automation's owner in the owner's personal workspace, and only
+//! what the check reported decides whether the Assistant is woken at all. A check stopped by its
+//! time limit is not a verdict: nothing is delivered and the occurrence is retried after a
+//! cool-down. Every other non-clean outcome is a broken check and takes the automation with it.
+//! A check whose own process exited is judged by the status it gave, and a stored check that
+//! cannot be read is a check that cannot run.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -37,8 +30,6 @@ crate::define_store! {
     expect = "AUTOMATIONS not initialized — call init_all_stores() first",
 }
 
-// ── Column index constants ────────────────────────────────────────────────
-
 crate::columns! {
     AUTOMATION_COLUMNS [AUTOMATION] {
         ID                  => "id",
@@ -56,43 +47,32 @@ crate::columns! {
     }
 }
 
-/// A single stored automation row.
 #[derive(Debug, Clone)]
 pub(crate) struct Automation {
     pub id: String,
     pub session_id: String,
     /// The raw (un-escaped) user the automation belongs to.
     pub user_name: String,
-    /// `"one-shot"` or `"periodic"`.
     pub kind: String,
-    /// The message the automation fires or launches with — the card's description.
     pub text: String,
-    /// Optional custom-tool check to run at fire time (triggered automation).
     pub trigger: Option<StoredTrigger>,
-    /// The custom role this automation wakes; `None` wakes the Assistant.
     pub role: Option<String>,
-    /// The custom role branch identifier, when one was given.
     pub identifier: Option<String>,
-    /// The folder the role's launch runs in (a managed workspace name, a
-    /// `personal:{user}` key, or an absolute path); `None` = the owner's
-    /// personal folder.
+    /// The folder the role's launch runs in (a managed workspace name, a `personal:{user}` key,
+    /// or an absolute path); `None` = the owner's personal folder.
     pub workspace: Option<String>,
-    /// Periodic interval in seconds.
     pub interval_seconds: Option<i64>,
-    /// RFC3339 UTC next fire time: the moment the pending occurrence is due for.
-    /// A retry of an attempt that did not finish in time never moves it.
+    /// RFC3339 UTC next fire time: the moment the pending occurrence is due for. A retry never
+    /// moves it.
     pub next_fire_at: String,
-    /// Attempts in a row that did not finish in time since the last completed
-    /// attempt; drives the one-time "not producing a result" notice and the
-    /// LATE note of the report that finally arrives.
+    /// Attempts in a row that did not finish in time; drives the one-time "not producing a
+    /// result" notice and the LATE note of the report that finally arrives.
     pub unfinished_attempts: i64,
 }
 
 impl Automation {
-    /// The automation's custom-role target as the listing surfaces show it —
-    /// `addressed to custom role "analyst" (branch "daily") in my-workspace`,
-    /// with the branch and folder only when recorded. `None` for an automation that
-    /// wakes the Assistant.
+    /// The automation's custom-role target as the listing surfaces show it, with the branch and
+    /// folder only when recorded. `None` for an automation that wakes the Assistant.
     pub(crate) fn role_target(&self) -> Option<String> {
         let role = self.role.as_deref()?;
         let mut out = format!("addressed to custom role \"{role}\"");
@@ -106,36 +86,33 @@ impl Automation {
     }
 }
 
-/// The custom role an automation is addressed to (an automation with no target wakes the
-/// Assistant, as before).
+/// The custom role an automation is addressed to (none wakes the Assistant, as before).
 pub(crate) struct AutomationTarget {
     pub role: String,
     pub identifier: Option<String>,
     pub workspace: Option<String>,
 }
 
-/// An automation's trigger: one custom tool, plus the arguments that tool receives.
+/// An automation's trigger: one custom tool plus the arguments it receives.
 ///
-/// The tool is named exactly as a `custom` call names it and must be one the
-/// automation's owner can call; one tool per automation — no chains. Arguments are stored
-/// as the tool's declared parameters, already coerced to their declared types.
+/// The tool is named exactly as a `custom` call names it and must be one the owner can call; one
+/// tool per automation — no chains. Arguments are stored as the tool's declared parameters,
+/// already coerced to their declared types.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Trigger {
     pub tool: String,
-    /// Defaulted so a row written without the key still decodes; the product
-    /// always stores the object.
+    /// Defaulted so a row written without the key still decodes; the product always stores it.
     #[serde(default)]
     pub args: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Trigger {
-    /// The stored form: `{"tool": <name>, "args": {…}}`.
     fn encode(&self) -> String {
         serde_json::to_string(self).expect("a trigger is always serializable")
     }
 
-    /// The trigger as the assistant sees it — the tool's name followed by its
-    /// arguments as compact JSON, nothing but the name when it has none.
+    /// The trigger as the assistant sees it — the tool's name and its arguments as compact
+    /// JSON, nothing but the name when it has none.
     fn render(&self) -> String {
         if self.args.is_empty() {
             return self.tool.clone();
@@ -146,12 +123,10 @@ impl Trigger {
     }
 }
 
-/// The `trigger` column's content for one automation: the check that was stored
-/// there, or a value that cannot be read as one.
-///
-/// A stored check that cannot be read is a check that cannot run — it wakes the
-/// assistant with the reason and takes the automation with it, rather than quietly
-/// becoming a plain automation that keeps firing with its check dropped.
+/// The `trigger` column's content for one automation: the check that was stored there, or a
+/// value that cannot be read as one. A stored check that cannot be read is a check that cannot
+/// run — it wakes the assistant with the reason and takes the automation with it, rather than
+/// quietly becoming a plain automation that keeps firing with its check dropped.
 #[derive(Debug, Clone)]
 pub(crate) enum StoredTrigger {
     /// The decoded check: the tool to run and the arguments it receives.
@@ -160,16 +135,14 @@ pub(crate) enum StoredTrigger {
     Unreadable,
 }
 
-/// What the notice and the `<user-automations>` summary show in place of a stored
-/// check that cannot be read: there is no tool name to print.
+/// What the notice and the `<user-automations>` summary show in place of a stored check that
+/// cannot be read.
 const UNREADABLE_TRIGGER: &str = "(unreadable stored check)";
 
 impl StoredTrigger {
-    /// Decode a stored `trigger` column value. Only this module writes the
-    /// column, so a value that does not decode is not a state the product
-    /// produces — it reads as [`Self::Unreadable`] all the same, because the
-    /// fire path's rule is about what can be read, not about how the row came
-    /// to hold what it holds.
+    /// Decode a stored `trigger` column value. Only this module writes the column, so a value
+    /// that does not decode is not a state the product produces — it reads as
+    /// [`Self::Unreadable`] all the same, because the fire path's rule is about what can be read.
     fn decode(raw: &str) -> Self {
         match serde_json::from_str(raw) {
             Ok(trigger) => Self::Tool(trigger),
@@ -177,14 +150,12 @@ impl StoredTrigger {
         }
     }
 
-    /// How a stored trigger is shown to the assistant — the confirmation when
-    /// it is armed, the `list_automations` line and the `<user-automations>` summary:
-    /// the tool's name followed by its arguments, nothing but the name when it
-    /// has none, and a marker when there is nothing readable to show.
-    ///
-    /// The two tool-output surfaces are ordinary tool results, so the
-    /// agent-level pass scrubs them like any other; the `<user-automations>` summary
-    /// and the fired notice carry the automation's own wording and are not scrubbed.
+    /// How a stored trigger is shown to the assistant — the confirmation when it is armed, the
+    /// `list_automations` line and the `<user-automations>` summary: the tool's name followed by
+    /// its arguments, nothing but the name when it has none, and a marker when there is nothing
+    /// readable to show.
+    /// The two tool-output surfaces are ordinary tool results, so the agent-level pass scrubs them;
+    /// the summary and the fired notice carry the automation's own wording and are not scrubbed.
     pub(crate) fn render(&self) -> String {
         match self {
             Self::Tool(trigger) => trigger.render(),
@@ -192,8 +163,7 @@ impl StoredTrigger {
         }
     }
 
-    /// The check's tool name alone — the automation card's headline — or the marker
-    /// when there is nothing readable to name.
+    /// The check's tool name alone — the automation card's headline — or the marker.
     pub(crate) fn name(&self) -> &str {
         match self {
             Self::Tool(trigger) => &trigger.tool,
@@ -219,11 +189,10 @@ fn automation_from_row(row: &db::Row) -> Result<Automation, ::turso::Error> {
     })
 }
 
-/// Read a row's `trigger` column: `None` when it is NULL, otherwise the stored
-/// check. Only text can be the stored check this product writes, so a row that
-/// holds anything else reads as [`StoredTrigger::Unreadable`] — a check that
-/// cannot be read is a check that cannot run either, and must not fail the
-/// sweep or leave the automation firing with its check dropped.
+/// Read a row's `trigger` column: `None` when it is NULL, otherwise the stored check. Only text
+/// can be the stored check this product writes, so anything else reads as
+/// [`StoredTrigger::Unreadable`] — which must not fail the sweep or leave the automation firing
+/// with its check dropped.
 fn stored_trigger(row: &db::Row) -> Result<Option<StoredTrigger>, ::turso::Error> {
     match row.get_value(COL_AUTOMATION_TRIGGER)? {
         db::Value::Null => Ok(None),
@@ -235,47 +204,41 @@ fn stored_trigger(row: &db::Row) -> Result<Option<StoredTrigger>, ::turso::Error
 /// Maximum number of active automations allowed per session.
 const MAX_ACTIVE_AUTOMATIONS: i64 = 50;
 
-/// Upper bound on an automation's whole stored trigger — the tool's name together
-/// with its arguments — in characters. Keeps an over-eagerly-large trigger from
-/// bloating the notification envelope or the `<user-automations>` prompt summary.
+/// Upper bound on an automation's whole stored trigger, in characters. Keeps an over-large
+/// trigger from bloating the notification envelope or the `<user-automations>` summary.
 const MAX_AUTOMATION_TRIGGER_CHARS: usize = 2000;
 
-/// Upper bound on a periodic interval (~292 years): keeps the total swept
-/// advance (interval × skipped whole periods) within a representable
-/// [`DateTime`] range, so the O(1) periodic skip saturates instead of
-/// overflowing. Also rejects absurd intervals as caller errors at creation.
+/// Upper bound on a periodic interval (~292 years): keeps the total swept advance within a
+/// representable [`DateTime`] range, so the O(1) periodic skip saturates instead of overflowing.
+/// Also rejects absurd intervals as caller errors at creation.
 const MAX_PERIOD_SECS: i64 = i64::MAX / 1_000_000_000;
 
-/// The automation sweep's tick: how long the loop waits between passes over due
-/// automations. The first tick after start is also the overdue scan.
+/// The sweep's tick: how long the loop waits between passes. The first tick after start is also
+/// the overdue scan.
 const SWEEP_TICK: Duration = Duration::from_secs(1);
 
-/// A firing later than its scheduled time by more than this is MISSED, and its
-/// notice says so: 30 sweep ticks. One tick can overrun — its due batch is fired
-/// one automation at a time, each with a durable write — so a firing past the bound
-/// did not come from a routine tick.
+/// A firing later than its scheduled time by more than this is MISSED, and its notice says so:
+/// 30 sweep ticks. One tick can overrun (its due batch is fired one automation at a time, each
+/// with a durable write), so a firing past the bound did not come from a routine tick.
 #[expect(clippy::cast_possible_wrap)] // 30 ticks fit i64 by many orders
 const MISSED_FIRING_TOLERANCE: ChronoDuration =
     ChronoDuration::seconds(30 * SWEEP_TICK.as_secs() as i64);
 
-/// Cool-down before an occurrence whose attempt did not finish in time is tried
-/// again: short enough that a starved machine gets the check back quickly, long
-/// enough that retries cannot pile up into a burst.
+/// Cool-down before an occurrence whose attempt did not finish in time is tried again: short
+/// enough that a starved machine gets the check back quickly, long enough that retries cannot
+/// pile up into a burst.
 const RETRY_COOLDOWN_SECS: i64 = 60;
 
-/// Consecutive attempts that did not finish in time before the assistant is told
-/// — once — that the check is not producing a result: about half an hour with
-/// the attempt ceiling and the cool-down.
+/// Consecutive attempts that did not finish in time before the assistant is told — once — that
+/// the check is not producing a result.
 const UNFINISHED_NOTICE_ATTEMPTS: i64 = 3;
 
-/// Whether a firing at `now` was MISSED — the automation's scheduled time had
-/// already passed by more than [`MISSED_FIRING_TOLERANCE`] when it fired.
-/// `scheduled` is the time the firing belongs to: the value as it stood before
-/// the state advance, never a periodic automation's next occurrence.
+/// Whether a firing at `now` was MISSED — the scheduled time had already passed by more than
+/// [`MISSED_FIRING_TOLERANCE`] when it fired. `scheduled` is the time the firing belongs to: the
+/// value as it stood before the state advance.
 ///
-/// Fail-soft: a scheduled time that cannot be read as a time is not a missed
-/// firing, and neither is one still in the future — a firing error would leave
-/// a due automation re-firing on every tick.
+/// Fail-soft: a scheduled time that cannot be read as a time is not a missed firing, and neither
+/// is one still in the future — a firing error would leave a due automation re-firing every tick.
 fn is_missed_firing(now: &str, scheduled: &str) -> bool {
     let (Ok(now), Ok(scheduled)) = (
         db::parse_utc_timestamp(now),
@@ -292,17 +255,15 @@ enum Timing {
     Due,
     /// Fired long after the automation was due — the product was not running then.
     Missed,
-    /// Earlier attempts at this occurrence did not finish and the report that
-    /// finally arrived is late for it.
+    /// Earlier attempts at this occurrence did not finish and the report that finally arrived
+    /// is late for it.
     Late,
 }
 
-/// The opening line of the notices that carry the automation's own text — the
-/// plain automation's and the triggered check's: what the automation is, and how the
-/// firing it belongs to was timed. Exactly one timing statement, so a report
-/// that arrives after retries is announced as late instead of stacking a second
-/// lateness note on top of the missed-firing one. Every timing names the
-/// occurrence's own due moment, which no retry moves.
+/// The opening line of the notices that carry the automation's own text: what the automation is
+/// and how its firing was timed. Exactly one timing statement, so a report that arrives after
+/// retries is announced as late instead of stacking a second lateness note. Every timing names
+/// the occurrence's own due moment, which no retry moves.
 fn automation_line(automation: &Automation, timing: &Timing) -> String {
     let asset = match timing {
         Timing::Due => "automation_due.md",
@@ -341,14 +302,13 @@ pub(crate) fn format_fire_time(timestamp: &str) -> Result<String> {
     Ok(format!("{local} local time ({utc} UTC)"))
 }
 
-// ── Automation CRUD ──────────────────────────────────────────────────────────
+// Automation CRUD
 
 /// Validate an automation's optional custom-role target before it is stored: only the
-/// administrator may address an automation to a custom role, the role must exist, the
-/// branch identifier and folder must resolve to what will be stored, and a role-
-/// addressed automation's text is the launch message so it must not be empty and
-/// cannot also carry a check. Returns the role, branch identifier and folder
-/// address to store.
+/// administrator may address an automation to a custom role, the role must exist, the branch
+/// identifier and folder must resolve to what will be stored, and a role-addressed automation's
+/// text is the launch message — so it must not be empty and cannot carry a check. Returns the
+/// role, branch identifier and folder address to store.
 async fn validate_automation_target(
     user_name: &str,
     text: &str,
@@ -402,11 +362,10 @@ async fn validate_automation_target(
 
 /// The session an automation call actually acts on: a custom-role caller's automations
 /// live on the owner's Assistant session, the caller's own id otherwise.
-///
-/// A custom role runs at the owner's strength, and a plain automation it arms is
-/// still an owner automation delivered to the assistant — so `add`/`list`/`remove`
-/// all resolve the owner's assistant session for such a caller, never the role's
-/// own branch (which would hold an automation it could never see or cancel).
+/// A custom role runs at the owner's strength, and a plain automation it arms is still an owner
+/// automation delivered to the assistant — so `add`/`list`/`remove` resolve the owner's assistant
+/// session for such a caller, never the role's own branch (which would hold an automation it
+/// could never see or cancel).
 #[must_use]
 pub(crate) fn owner_automation_session(agent_id: &str, user_name: &str) -> String {
     if crate::session::is_custom_role_agent_id(agent_id) {
@@ -418,14 +377,14 @@ pub(crate) fn owner_automation_session(agent_id: &str, user_name: &str) -> Strin
 
 /// Create a new automation for a session.
 ///
-/// Exactly one of `fire_at` (one-shot) or `interval_seconds` (periodic) must be
-/// provided. One-shot fire times are normalized to RFC3339 UTC and must be in
-/// the future; periodic intervals must be at least 5 seconds. At most
-/// [`MAX_ACTIVE_AUTOMATIONS`] active automations may exist per session.
+/// Exactly one of `fire_at` (one-shot) or `interval_seconds` (periodic) must be provided.
+/// One-shot fire times are normalized to RFC3339 UTC and must be in the future; periodic
+/// intervals must be at least 5 seconds. At most [`MAX_ACTIVE_AUTOMATIONS`] active automations
+/// may exist per session.
 ///
-/// `target` addresses the automation to a custom role instead of the Assistant: only
-/// the administrator may do that, the role must exist, and the automation carries no
-/// trigger — its text IS the role's launch message.
+/// `target` addresses the automation to a custom role instead of the Assistant: only the
+/// administrator may do that, the role must exist, and the automation carries no trigger — its
+/// text IS the role's launch message.
 pub(crate) async fn add_automation(
     session_id: &str,
     user_name: &str,
@@ -435,9 +394,9 @@ pub(crate) async fn add_automation(
     trigger: Option<Trigger>,
     target: Option<AutomationTarget>,
 ) -> Result<Automation> {
-    // A role-addressed automation the owner's own Assistant never sees belongs on
-    // the assistant's session: a custom role may hold the automation tools, but a
-    // plain automation it arms is still an owner automation.
+    // A role-addressed automation the owner's own Assistant never sees belongs on the
+    // assistant's session: a custom role may hold the automation tools, but a plain automation
+    // it arms is still an owner automation.
     let session_id = owner_automation_session(session_id, user_name);
 
     // Validate the target before touching the DB: a broken target must never be
@@ -465,8 +424,7 @@ pub(crate) async fn add_automation(
         })
         .transpose()?;
 
-    // Exactly one of fire_at / interval_seconds; a one-shot must be in the
-    // future (a past timestamp is a caller error, never a fire-on-next-sweep).
+    // Exactly one of fire_at / interval_seconds; a one-shot must be in the future.
     let (kind, interval_secs, next_fire_at) = match (&normalized_fire_at, interval_seconds) {
         (Some(fire), None) => {
             anyhow::ensure!(
@@ -484,10 +442,9 @@ pub(crate) async fn add_automation(
                 .ok()
                 .filter(|v| *v <= MAX_PERIOD_SECS)
                 .with_context(|| "Period must be at most 292 years")?;
-            // Periodic: first fire one interval from now (no immediate fire, no
-            // backlog payout — the sweep skips missed whole periods thereafter).
-            // Saturate an absurd interval to a far-future fire time rather than
-            // panicking the caller on a DateTime overflow.
+            // Periodic: first fire one interval from now (no immediate fire, no backlog
+            // payout). An absurd interval saturates to a far-future time rather than panicking
+            // on a DateTime overflow.
             let start = db::parse_utc_timestamp(&db::now())?;
             let next = start
                 .checked_add_signed(ChronoDuration::seconds(interval_secs))
@@ -499,7 +456,6 @@ pub(crate) async fn add_automation(
         ),
     };
 
-    // Enforce the per-session active cap.
     let rows = store()
         .conn
         .query(
@@ -555,7 +511,6 @@ pub(crate) async fn add_automation(
     })
 }
 
-/// List the active automations for a session, ordered by next fire time.
 pub(crate) async fn list_automations(session_id: &str) -> Result<Vec<Automation>> {
     let sql = format!(
         "SELECT {AUTOMATION_COLUMNS} FROM automations \
@@ -569,9 +524,8 @@ pub(crate) async fn list_automations(session_id: &str) -> Result<Vec<Automation>
         .collect::<Result<_, _>>()?)
 }
 
-/// List the active automations for a user across all their sessions, ordered by
-/// next fire time. Unlike [`list_automations`] (session-scoped) this is the
-/// user-wide view backing the Assistant's system-prompt automation snapshot.
+/// List the active automations for a user across all their sessions, ordered by next fire time
+/// — the user-wide view backing the Assistant's system-prompt automation snapshot.
 pub(crate) async fn list_user_automations(user_name: &str) -> Result<Vec<Automation>> {
     let sql = format!(
         "SELECT {AUTOMATION_COLUMNS} FROM automations \
@@ -585,11 +539,9 @@ pub(crate) async fn list_user_automations(user_name: &str) -> Result<Vec<Automat
         .collect::<Result<_, _>>()?)
 }
 
-/// Every active automation of every owner, ordered by owner name, then next fire
-/// time, then id — the read backing the automations page. The id settles ties, so
-/// rows sharing an owner and a fire time keep the same order from read to read.
-/// The page groups by the name recorded on the automation itself, so an automation whose
-/// account is gone is still listed under it.
+/// Every active automation of every owner, ordered by owner name, then next fire time, then id
+/// — the read backing the automations page. The id settles ties, so rows sharing an owner and a
+/// fire time keep the same order from read to read.
 pub(crate) async fn list_all_active_automations() -> Result<Vec<Automation>> {
     let sql = format!(
         "SELECT {AUTOMATION_COLUMNS} FROM automations \
@@ -603,7 +555,6 @@ pub(crate) async fn list_all_active_automations() -> Result<Vec<Automation>> {
         .collect::<Result<_, _>>()?)
 }
 
-/// Mark an active automation as removed; returns the removed automation or `None`.
 pub(crate) async fn remove_automation(session_id: &str, id: &str) -> Result<Option<Automation>> {
     let sql = format!(
         "SELECT {AUTOMATION_COLUMNS} FROM automations \
@@ -617,10 +568,9 @@ pub(crate) async fn remove_automation(session_id: &str, id: &str) -> Result<Opti
         return Ok(None);
     };
     let automation = automation_from_row(row)?;
-    // The SELECT and the UPDATE are separate statements, so a concurrent second
-    // removal of this automation can pass the SELECT too and report it twice; the
-    // UPDATE is idempotent (status stays 'removed'), so the duplicate report is
-    // not a wrong outcome, and the automation is removed exactly once.
+    // The SELECT and the UPDATE are separate statements, so a concurrent second removal can
+    // pass the SELECT too and report it twice; the UPDATE is idempotent, so the duplicate report
+    // is not a wrong outcome.
     store()
         .conn
         .execute(
@@ -631,8 +581,8 @@ pub(crate) async fn remove_automation(session_id: &str, id: &str) -> Result<Opti
     Ok(Some(automation))
 }
 
-/// Mark every ACTIVE automation addressed to `role_name` as `'removed'` (soft
-/// delete, consistent with the rest of the module); returns the number changed.
+/// Mark every ACTIVE automation addressed to `role_name` as `'removed'`; returns the number
+/// changed.
 #[expect(clippy::cast_possible_truncation)] // u64 row count fits usize on all supported targets
 pub(crate) async fn delete_automations_for_role(role_name: &str) -> Result<usize> {
     let changed = store()
@@ -645,12 +595,10 @@ pub(crate) async fn delete_automations_for_role(role_name: &str) -> Result<usize
     Ok(changed as usize)
 }
 
-/// Soft-delete an automation regardless of its current status (idempotent).
-///
-/// Unlike [`remove_automation`] this has no `status = 'active'` gate, so it also
-/// deletes an already-fired one-shot. Used whenever a check is broken — a run
-/// that failed and one that could not run alike, never one that merely ran past
-/// its time limit — so a broken automation can never re-fire.
+/// Soft-delete an automation regardless of its status (idempotent). Unlike
+/// [`remove_automation`] this has no `status = 'active'` gate, so it also deletes an
+/// already-fired one-shot. Used whenever a check is broken — a run that failed and one that
+/// could not run alike, never one that merely ran past its time limit.
 async fn delete_automation_after_run(automation: &Automation) -> Result<()> {
     store()
         .conn
@@ -662,16 +610,13 @@ async fn delete_automation_after_run(automation: &Automation) -> Result<()> {
     Ok(())
 }
 
-/// The due automations at `now` (RFC3339 UTC), ordered by next fire time: every
-/// occurrence that is due and whose retry cool-down, if it is waiting for one,
-/// has passed. A waiting automation is not due before its `retry_at` — and no other
-/// automation's wait holds it back.
+/// The due automations at `now`, ordered by next fire time: every occurrence that is due and
+/// whose retry cool-down, if it is waiting for one, has passed. A waiting automation is not due
+/// before its `retry_at`, and no other automation's wait holds it back.
 ///
-/// The read here and each automation's later state advance are separate statements,
-/// so a second sweep overlapping this one can fire the same automation twice; the
-/// sweep runs in one background loop, and a triggered automation's attempt slot
-/// ([`claim_attempt_slot`]) makes a repeated firing of the same occurrence a
-/// no-op.
+/// The read and each automation's later state advance are separate statements, so a second sweep
+/// overlapping this one can fire the same automation twice; a triggered automation's attempt slot
+/// ([`claim_attempt_slot`]) makes a repeated firing of the same occurrence a no-op.
 async fn due_automations(now: &str) -> Result<Vec<Automation>> {
     let sql = format!(
         "SELECT {AUTOMATION_COLUMNS} FROM automations \
@@ -686,29 +631,22 @@ async fn due_automations(now: &str) -> Result<Vec<Automation>> {
         .collect::<Result<_, _>>()?)
 }
 
-// ── Fire / sweep ────────────────────────────────────────────────────────
-
 /// Route a due automation into the Assistant's own session and settle it.
 ///
-/// A role-addressed automation (`role` set) wakes that custom role instead; the
-/// Assistant wakes otherwise — a triggered automation (`trigger` set) takes its
-/// attempt slot and runs its custom tool (see [`fire_trigger_automation`]); a plain
-/// automation delivers its text as the notice. The notification is delivered as a
-/// user-role message into the calling assistant's own session
-/// (`automation.session_id`, resolved directly — never re-derived from the id, which
-/// would double-escape colliding user names). A plain or role-addressed one-shot
-/// is terminalized (`status='fired'`) and a periodic one advances `next_fire_at`
-/// past every missed whole period; a triggered one settles the same way once its
-/// check completes. A firing later than its scheduled time by more than
-/// [`MISSED_FIRING_TOLERANCE`] says so in its notice (see [`automation_line`]).
+/// A role-addressed automation wakes that custom role instead; the Assistant wakes otherwise — a
+/// triggered automation takes its attempt slot and runs its custom tool (see
+/// [`fire_trigger_automation`]); a plain one delivers its text as the notice. The notice is a
+/// user-role message into the calling assistant's own session (`automation.session_id`, resolved
+/// directly — never re-derived from the id, which would double-escape colliding user names). A
+/// plain or role-addressed one-shot is terminalized (`status='fired'`) and a periodic one advances
+/// `next_fire_at` past every missed whole period.
 async fn fire_automation(automation: &Automation) -> Result<()> {
     if automation.role.is_some() {
         return fire_custom_role_automation(automation).await;
     }
-    // Judged at the firing instant — the scheduled time as it stands before the
-    // firing moves anything — never when the notice is composed: a slow check, or
-    // a notice delivered late although the firing happened on time, is not a
-    // missed firing.
+    // Judged at the firing instant — the scheduled time before the firing moves anything —
+    // never when the notice is composed: a slow check, or a notice delivered late although the
+    // firing was on time, is not a missed firing.
     let missed = is_missed_firing(&db::now(), &automation.next_fire_at);
     match &automation.trigger {
         Some(trigger) => {
@@ -719,27 +657,21 @@ async fn fire_automation(automation: &Automation) -> Result<()> {
     }
 }
 
-/// Wake the custom role an automation is addressed to, with the automation's text as the
-/// launch message. A role that has since been deleted removes the automation and
-/// tells the owner through his Assistant: a broken automation must never keep
-/// firing. A store failure is not a verdict about the role — the automation stays
-/// armed and the next sweep retries.
+/// Wake the custom role an automation is addressed to, with the automation's text as the launch
+/// message. A role that has since been deleted removes the automation and tells the owner through
+/// his Assistant: a broken automation must never keep firing. A store failure is not a verdict
+/// about the role — the automation stays armed and the next sweep retries.
 ///
-/// Any other launch failure of a ONE-SHOT automation is terminal: the automation is
-/// removed and the owner is told the reason. A PERIODIC automation instead advances
-/// its state like a completed fire and stays armed, so a transient failure (e.g.
-/// a launch folder on a temporarily unavailable mount) loses no automation and
-/// retries at its next scheduled time rather than every sweep tick. The notice
-/// names the reason and lets the owner re-arm once the cause is fixed.
+/// Any other launch failure of a ONE-SHOT automation is terminal: it is removed and the owner is
+/// told why. A PERIODIC automation instead advances its state like a completed fire and stays
+/// armed, so a transient failure loses no automation and retries at its next scheduled time.
 async fn fire_custom_role_automation(automation: &Automation) -> Result<()> {
     let role = automation.role.as_deref().unwrap_or_default();
-    // `removed` = this failure disarms the automation; a periodic launch failure
-    // keeps it armed (see below).
     let (reason, removed) = if crate::custom_role::get(role).await?.is_none() {
         ("the custom role no longer exists".to_string(), true)
     } else {
-        // The launch runs in the folder the automation was armed for; a folder that
-        // no longer resolves is a launch failure like any other.
+        // The launch runs in the folder the automation was armed for; one that no longer
+        // resolves is a launch failure like any other.
         let launched = async {
             let workspace =
                 crate::launch::launch_workspace(automation.workspace.as_deref()).await?;
@@ -755,16 +687,14 @@ async fn fire_custom_role_automation(automation: &Automation) -> Result<()> {
         .await;
         match launched {
             Ok(_) => {
-                // The launch is already persisted durably before it is routed
-                // (see `launch::custom_role`), so the state advance runs after,
-                // exactly as on the plain path.
+                // The launch is already persisted durably before it is routed (see
+                // `launch::custom_role`), so the state advance runs after, as on the plain path.
                 advance_automation_state(automation, &db::now()).await?;
                 return Ok(());
             }
             Err(e) if crate::db::is_store_error(&e) => {
-                // A store failure says nothing about the role: leave the automation
-                // armed and let the next sweep retry, instead of disarming a
-                // working automation on a transient read/write error.
+                // A store failure says nothing about the role: leave the automation armed and let
+                // the next sweep retry, instead of disarming a working one on a transient error.
                 tracing::warn!(
                     automation = %automation.id,
                     role = %role,
@@ -783,10 +713,9 @@ async fn fire_custom_role_automation(automation: &Automation) -> Result<()> {
                 if automation.kind == "one-shot" {
                     (e.to_string(), true)
                 } else {
-                    // A periodic automation must survive a transient launch
-                    // failure: advance its state like a completed fire so it
-                    // retries at its next scheduled time instead of every sweep
-                    // tick (the sweep re-selects due automations once a second).
+                    // A periodic automation must survive a transient launch failure: advance
+                    // its state like a completed fire so it retries at its next scheduled time
+                    // instead of every sweep tick.
                     advance_automation_state(automation, &db::now()).await?;
                     (e.to_string(), false)
                 }
@@ -796,7 +725,6 @@ async fn fire_custom_role_automation(automation: &Automation) -> Result<()> {
     if removed {
         delete_automation_after_run(automation).await?;
     }
-    // The notice goes to the owner (the assistant), never to the role.
     let workspace_line = match &automation.workspace {
         Some(workspace) => format!(" in {workspace}"),
         None => String::new(),
@@ -820,12 +748,9 @@ async fn fire_custom_role_automation(automation: &Automation) -> Result<()> {
     Ok(())
 }
 
-/// Deliver a plain (untriggered) automation notice and advance its state.
-///
-/// The durable envelope is persisted BEFORE advancing state (see
-/// [`deliver_automation_notification`]): a crash after persisting but before the
-/// state advance replays the notice at boot and leaves the automation due, so the
-/// automation is never lost.
+/// Deliver a plain (untriggered) automation notice and advance its state. The durable envelope
+/// is persisted BEFORE advancing state (see [`deliver_automation_notification`]): a crash between
+/// the two replays the notice at boot and leaves the automation due, so it is never lost.
 async fn fire_plain_automation(automation: &Automation, missed: bool) -> Result<()> {
     let now = db::now();
     let content = crate::prompt::substitute(
@@ -840,12 +765,11 @@ async fn fire_plain_automation(automation: &Automation, missed: bool) -> Result<
     Ok(())
 }
 
-/// Deliver an automation's notice into the calling assistant's session, logging a
-/// lost durable copy against the automation it came from.
+/// Deliver an automation's notice into the calling assistant's session, logging a lost durable
+/// copy against the automation it came from.
 ///
-/// Delivery is sourced from the stored raw user and session id so the notice
-/// targets the right personal session regardless of agent-ID escaping — never
-/// re-derived from the id, which would double-escape colliding user names.
+/// Delivery is sourced from the stored raw user and session id, so the notice targets the right
+/// personal session regardless of agent-ID escaping.
 async fn deliver_automation_notification(automation: &Automation, content: String) {
     if let Err(e) = crate::agent::message_router::deliver_assistant_notice(
         &automation.session_id,
@@ -862,12 +786,11 @@ async fn deliver_automation_notification(automation: &Automation, content: Strin
     }
 }
 
-/// Advance an automation's stored state past `now`: one-shot → `status='fired'`;
-/// periodic → `next_fire_at` past every missed whole period, so a schedule that
-/// waited out retries resumes on its own grid instead of replaying them. The
-/// retry state goes with it: the attempt that got here completed. Both writes
-/// take an active row only, so an automation removed while its check ran stays
-/// removed.
+/// Advance an automation's stored state past `now`: one-shot → `status='fired'`; periodic →
+/// `next_fire_at` past every missed whole period, so a schedule that waited out retries resumes
+/// on its own grid instead of replaying them. The retry state goes with it: the attempt that got
+/// here completed. Both writes take an active row only, so an automation removed while its check
+/// ran stays removed.
 async fn advance_automation_state(automation: &Automation, now: &str) -> Result<()> {
     if automation.kind == "one-shot" {
         store()
@@ -896,8 +819,7 @@ async fn advance_automation_state(automation: &Automation, now: &str) -> Result<
     Ok(())
 }
 
-/// The interval a periodic automation advances by, refusing a stored row that has no
-/// valid one instead of looping on it forever.
+/// The interval a periodic automation advances by, refusing a stored row with no valid one.
 fn periodic_interval(automation: &Automation) -> Result<i64> {
     let interval = automation.interval_seconds.unwrap_or(0);
     anyhow::ensure!(
@@ -908,16 +830,15 @@ fn periodic_interval(automation: &Automation) -> Result<i64> {
     Ok(interval)
 }
 
-/// Automations whose check is running in this process, keyed by automation id — the guard
-/// that keeps an automation to one attempt at a time.
+/// Automations whose check is running in this process, keyed by id — the guard keeping one
+/// attempt at a time.
 static ATTEMPTS_IN_FLIGHT: LazyLock<std::sync::Mutex<HashSet<String>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 
-/// Take the automation's one in-process attempt slot. `None` while a previous attempt
-/// of the same automation is still running; the returned slot frees it on drop —
-/// including when a spawned task is dropped without ever having been polled,
-/// because the slot is taken before the spawn. Nothing about it is durable: a
-/// restarted process has no attempt in flight, so the automation is simply due again.
+/// Take the automation's one in-process attempt slot. `None` while a previous attempt is still
+/// running; the returned slot frees it on drop, including when a spawned task is dropped
+/// unpolled, because the slot is taken before the spawn. Nothing here is durable: a restarted
+/// process has no attempt in flight, so the automation is simply due again.
 fn claim_attempt_slot(automation_id: &str) -> Option<AttemptSlot> {
     let inserted = ATTEMPTS_IN_FLIGHT
         .lock()
@@ -926,7 +847,6 @@ fn claim_attempt_slot(automation_id: &str) -> Option<AttemptSlot> {
     inserted.then(|| AttemptSlot(automation_id.to_string()))
 }
 
-/// Whether the automation's check is running in this process.
 fn attempt_in_flight(automation_id: &str) -> bool {
     ATTEMPTS_IN_FLIGHT
         .lock()
@@ -934,7 +854,6 @@ fn attempt_in_flight(automation_id: &str) -> bool {
         .contains(automation_id)
 }
 
-/// RAII guard for an automation's in-process attempt slot.
 struct AttemptSlot(String);
 
 impl Drop for AttemptSlot {
@@ -943,16 +862,14 @@ impl Drop for AttemptSlot {
     }
 }
 
-/// Fire a triggered automation: take the automation's attempt slot and spawn a detached
-/// task that runs the stored check and settles the attempt.
+/// Fire a triggered automation: take its attempt slot and spawn a detached task that runs the
+/// stored check and settles the attempt.
 ///
-/// The slot is taken before the spawn, so however slow the check is — and
-/// whether or not the task ever gets polled — the sweep cannot start a second
-/// attempt for the same automation. The rest of the sweep is unaffected: a waiting
-/// automation holds back nothing but itself.
+/// The slot is taken before the spawn, so however slow the check is — and whether or not the task
+/// is ever polled — the sweep cannot start a second attempt for the same automation. The rest of
+/// the sweep is unaffected: a waiting automation holds back nothing but itself.
 ///
-/// `missed` is the firing's lateness, decided before the check starts and
-/// carried into the notice the finished run produces: how long the check itself
+/// `missed` is the firing's lateness, decided before the check starts: how long the check itself
 /// takes is not lateness.
 fn fire_trigger_automation(automation: &Automation, trigger: &StoredTrigger, missed: bool) {
     let Some(slot) = claim_attempt_slot(&automation.id) else {
@@ -966,28 +883,24 @@ fn fire_trigger_automation(automation: &Automation, trigger: &StoredTrigger, mis
     ));
 }
 
-/// What one trigger evaluation produced, as the notification and the automation's
-/// state see it.
+/// What one trigger evaluation produced, as the notification and the automation's state see it.
 enum TriggerOutcome {
-    /// The check ran and reported nothing at all — the automation stays armed and
-    /// nothing is delivered.
+    /// The check ran and reported nothing at all — the automation stays armed, nothing is
+    /// delivered.
     Silent,
     /// The check ran and reported something: the run's own outcome.
     Ran(ProgramOutcome),
-    /// The check could not run at all: the reason the assistant is shown. The
-    /// automation goes either way.
+    /// The check could not run at all: the reason the assistant is shown.
     CouldNotRun(String),
-    /// The check was still running when its own time limit stopped it. That is
-    /// not a verdict about the check: nothing is delivered for the attempt, and
-    /// the occurrence stays pending to be retried.
+    /// The check was still running when its time limit stopped it: not a verdict about the
+    /// check, so nothing is delivered and the occurrence stays pending.
     Unfinished,
 }
 
 impl TriggerOutcome {
-    /// The wake decision over one finished run: only a clean run that reported
-    /// nothing at all stays silent. Everything else wakes the assistant — a run
-    /// that failed, and output of any kind, whatever it looks like — except a run
-    /// the ceiling stopped, which is settled by the retry rule instead.
+    /// The wake decision over one finished run: only a clean run that reported nothing stays
+    /// silent. Everything else wakes the assistant — except a run the ceiling stopped, which the
+    /// retry rule settles.
     fn from_run(outcome: ProgramOutcome) -> Self {
         if outcome.timed_out() {
             return Self::Unfinished;
@@ -1000,16 +913,13 @@ impl TriggerOutcome {
     }
 }
 
-/// Run one trigger: resolve the named custom tool for the automation's owner — the
-/// same availability rule, catalogue lookup and argument contract a normal
-/// `custom` call applies, with the strict rule that arguments the tool does not
-/// declare are refused rather than ignored — then run it in the owner's
+/// Run one trigger: resolve the named custom tool for the automation's owner — the same
+/// availability rule, catalogue lookup and argument contract a normal `custom` call applies, with
+/// arguments the tool does not declare refused rather than ignored — then run it in the owner's
 /// personal workspace through the managed runtime.
 ///
-/// Nothing is credential-scrubbed here: what the check produced is what the
-/// assistant is shown, and the run's own outcome — what it reported, and whether
-/// the ceiling stopped it — alone drives the verdict
-/// ([`TriggerOutcome::from_run`]).
+/// Nothing is credential-scrubbed here: what the check produced is what the assistant is shown,
+/// and the run's own outcome alone drives the verdict ([`TriggerOutcome::from_run`]).
 async fn run_trigger(ws: &Workspace, user: &str, trigger: &Trigger) -> TriggerOutcome {
     let call =
         match crate::tools::custom::resolve_tool_call(user, &trigger.tool, &trigger.args, true)
@@ -1049,9 +959,8 @@ async fn run_trigger(ws: &Workspace, user: &str, trigger: &Trigger) -> TriggerOu
     )
 }
 
-/// Run a triggered automation's stored check in the owner's personal workspace and
-/// settle the attempt (see [`settle_trigger_attempt`]). The attempt's slot is
-/// held until this task finishes, however it finishes.
+/// Run a triggered automation's stored check in the owner's personal workspace and settle the
+/// attempt (see [`settle_trigger_attempt`]). The slot is held until this task finishes.
 async fn run_automation_trigger_task(
     _slot: AttemptSlot,
     automation: Automation,
@@ -1063,26 +972,24 @@ async fn run_automation_trigger_task(
             let ws = crate::users::personal_workspace_struct(&automation.user_name);
             run_trigger(&ws, &automation.user_name, check).await
         }
-        // A stored check that cannot be read is a check that cannot run:
-        // nothing is run, and the reason goes to the assistant with the automation.
+        // A stored check that cannot be read is a check that cannot run: nothing is run, and
+        // the reason goes to the assistant with the automation.
         StoredTrigger::Unreadable => {
             TriggerOutcome::CouldNotRun("the stored check cannot be read".to_string())
         }
     };
 
     if let Err(e) = settle_trigger_attempt(&automation, &trigger, outcome, missed).await {
-        // The occurrence is untouched: its due time still stands and no retry
-        // cool-down was set, so the next sweep runs the check again.
+        // The occurrence is untouched: its due time stands and no cool-down was set, so the
+        // next sweep runs the check again.
         tracing::warn!(automation = %automation.id, error = %e, "Failed to settle an automation check");
     }
 }
 
-/// Settle one finished attempt against its automation.
-///
-/// A check that reported — or ran cleanly and said nothing — delivers what it
-/// produced and lets the automation resume its normal schedule. A broken check
-/// soft-deletes the automation and delivers why. An attempt that did not finish in
-/// time delivers nothing and keeps the occurrence pending for a retry.
+/// Settle one finished attempt against its automation. A check that reported — or ran cleanly and
+/// said nothing — delivers what it produced and lets the automation resume its normal schedule. A
+/// broken check soft-deletes the automation and delivers why. An attempt that did not finish in
+/// time delivers nothing and keeps the occurrence pending.
 async fn settle_trigger_attempt(
     automation: &Automation,
     trigger: &StoredTrigger,
@@ -1093,42 +1000,37 @@ async fn settle_trigger_attempt(
         TriggerOutcome::Unfinished => return defer_trigger_attempt(automation, trigger).await,
         TriggerOutcome::Silent | TriggerOutcome::Ran(ProgramOutcome { success: true, .. }) => {}
         TriggerOutcome::Ran(_) | TriggerOutcome::CouldNotRun(_) => {
-            // Track whether the delete actually committed — the notification
-            // must not claim a deletion that didn't happen.
+            // Track whether the delete actually committed — the notification must not claim a
+            // deletion that didn't happen.
             let deletion = delete_automation_after_run(automation).await;
             if let Some(content) =
                 trigger_notification(automation, trigger, &outcome, Some(&deletion), missed)
             {
                 deliver_automation_notification(automation, content).await;
             }
-            // A deletion that did not commit leaves the automation due: the broken
-            // check would run and notify again on every sweep. Advancing bounds
-            // it to one more firing per scheduled occurrence, as every fire was
-            // bounded before.
+            // A deletion that did not commit leaves the automation due, so the broken check would
+            // notify on every sweep. Advancing bounds it to one more firing per occurrence.
             if deletion.is_err() {
                 advance_automation_state(automation, &db::now()).await?;
             }
             return Ok(());
         }
     }
-    // Delivered before the state advance, so a crash in between replays the
-    // report rather than losing it.
+    // Delivered before the state advance, so a crash in between replays the report rather than
+    // losing it.
     if let Some(content) = trigger_notification(automation, trigger, &outcome, None, missed) {
         deliver_automation_notification(automation, content).await;
     }
     advance_automation_state(automation, &db::now()).await
 }
 
-/// Keep the occurrence pending after an attempt that did not finish in time:
-/// nothing is delivered for the attempt, the check is retried after the
-/// cool-down, and the third attempt in a row says once that the check is not
-/// producing a result.
+/// Keep the occurrence pending after an attempt that did not finish in time: nothing is
+/// delivered, the check is retried after the cool-down, and the third attempt in a row says once
+/// that the check is not producing a result.
 ///
-/// `next_fire_at` is left alone — it is the occurrence's own due moment, which a
-/// late report is announced with — so the wait lives in the row's `retry_at`. The
-/// write is guarded on the occurrence the attempt ran for, so a concurrent
-/// reschedule is never overwritten; the count is written as this attempt's own
-/// value, which is the row's because an automation has only one attempt in flight.
+/// `next_fire_at` is left alone — it is the occurrence's own due moment, which a late report is
+/// announced with — so the wait lives in `retry_at`. The write is guarded on the occurrence the
+/// attempt ran for, so a concurrent reschedule is never overwritten.
 async fn defer_trigger_attempt(automation: &Automation, trigger: &StoredTrigger) -> Result<()> {
     let attempt = automation.unfinished_attempts + 1;
     let retry_at = (db::parse_utc_timestamp(&db::now())?
@@ -1151,9 +1053,8 @@ async fn defer_trigger_attempt(automation: &Automation, trigger: &StoredTrigger)
     if changed == 0 {
         return Ok(());
     }
-    // The counter is what makes the notice one-time, so it is written before the
-    // notice goes out: a crash in the gap loses one notice rather than repeating
-    // it on every later unfinished attempt.
+    // The counter is what makes the notice one-time, so it is written before the notice goes
+    // out: a crash in the gap loses one notice rather than repeating it.
     if attempt == UNFINISHED_NOTICE_ATTEMPTS {
         let content = crate::prompt::substitute(
             &crate::prompt::load_prompt("automation_trigger_unfinished.md"),
@@ -1167,13 +1068,11 @@ async fn defer_trigger_attempt(automation: &Automation, trigger: &StoredTrigger)
     Ok(())
 }
 
-/// Decide the delivery for a finished trigger evaluation: `None` stays silent
-/// (the check reported nothing at all, or did not finish in time); `Some` is the
-/// rendered `<automation-notification>` with the automation's text, the trigger, the status
-/// line, the deletion note (on a broken check) and the check's output.
-/// `deletion` carries the result of [`delete_automation_after_run`], `None` when no
-/// deletion was attempted; `missed` is the firing's lateness, decided when the
-/// firing happened.
+/// Decide the delivery for a finished trigger evaluation: `None` stays silent (the check reported
+/// nothing, or did not finish in time); `Some` is the rendered `<automation-notification>` with the
+/// automation's text, the trigger, the status line, the deletion note and the check's output.
+/// `deletion` carries the result of [`delete_automation_after_run`], `None` when none was
+/// attempted; `missed` is the firing's lateness.
 fn trigger_notification(
     automation: &Automation,
     trigger: &StoredTrigger,
@@ -1196,9 +1095,8 @@ fn trigger_notification(
                     "check output",
                 )
             } else if outcome.has_output {
-                // Escape-only output: reported, so it woke the assistant, but
-                // nothing readable survives the ANSI strip — the notice must not
-                // call that "no output".
+                // Escape-only output: reported, so it woke the assistant, but nothing readable
+                // survives the ANSI strip — the notice must not call that "no output".
                 "(output was not printable)".to_string()
             } else {
                 "(no output)".to_string()
@@ -1214,8 +1112,8 @@ fn trigger_notification(
         Some(Ok(())) => crate::prompt::load_prompt("automation_trigger_deletion.md"),
         Some(Err(_)) => crate::prompt::load_prompt("automation_trigger_deletion_failed.md"),
     };
-    // Only a delivered result can be late for its occurrence — a broken check's
-    // notice reads as it always has.
+    // Only a delivered result can be late for its occurrence — a broken check's notice reads
+    // as it always has.
     let reported = matches!(outcome, TriggerOutcome::Ran(run) if run.success);
     let timing = trigger_timing(automation, missed, reported);
     Some(crate::prompt::substitute(
@@ -1322,8 +1220,7 @@ mod tests {
     /// The opening line is what the notice says about its own timing: today's
     /// wording when the firing happened on time, the missed statement with the
     /// scheduled time when it fired late, and the late statement — one of the
-    /// two, never both — naming the occurrence when a retried check finally
-    /// reported.
+    /// two, never both — naming the occurrence when a retried check finally reported.
     #[test]
     fn automation_line_states_exactly_one_timing() {
         let automation = trigger_automation();
@@ -1558,12 +1455,10 @@ mod tests {
         }
     }
 
-    /// One notice per outcome, and every notch of its wording: a clean run's
-    /// success line with its output and today's due-now line, escape-only output
-    /// reported as reported (never as "no output"), a check that could not run —
-    /// its reason reaching the assistant, the deletion note, and no FAILED it
-    /// never earned — and a late firing announced as missed, naming the time it
-    /// was scheduled for, on every outcome a firing produces.
+    /// One notice per outcome, and every notch of its wording: a clean run's success line with
+    /// its output and today's due-now line, escape-only output reported as reported, a check that
+    /// could not run with its reason and the deletion note, and a late firing announced as missed
+    /// on every outcome a firing produces.
     #[test]
     fn trigger_notification_renders_each_outcome() {
         let automation = trigger_automation();
@@ -1591,8 +1486,8 @@ mod tests {
             "a firing on time keeps today's wording: {content}"
         );
 
-        // Output that strips away to nothing is still reported, so the notice
-        // must not label it "no output".
+        // Output that strips away to nothing is still reported, so the notice must not label
+        // it "no output".
         let content = trigger_notification(
             &automation,
             &trigger,
@@ -1639,8 +1534,7 @@ mod tests {
         }
     }
 
-    /// The reversal the trigger exists for: only a clean run that reported
-    /// nothing at all stays silent — nothing about the content is examined.
+    /// The reversal the trigger exists for: only a clean run that reported nothing stays silent.
     #[test]
     fn wake_decision_reads_only_whether_the_run_reported_anything() {
         let silent = |outcome| matches!(outcome, TriggerOutcome::Silent);
@@ -1653,22 +1547,19 @@ mod tests {
             ))),
             "a clean run that said nothing must not wake"
         );
-        // Any output wakes — including output that merely resembles a
-        // credential, which is reported rather than suppressed.
+        // Any output wakes — including output that merely resembles a credential.
         assert!(!silent(TriggerOutcome::from_run(ran(
             true,
             "exit status 0",
             "key: sk-live-1234",
             true
         ))));
-        // Escape-only output strips to nothing readable but is still output.
         assert!(!silent(TriggerOutcome::from_run(ran(
             true,
             "exit status 0",
             "",
             true
         ))));
-        // A failed run wakes even when it said nothing.
         assert!(!silent(TriggerOutcome::from_run(ran(
             false,
             "exit status 2",
@@ -1677,10 +1568,9 @@ mod tests {
         ))));
     }
 
-    /// A broken check's notice reads as it always has, even when it settles an
-    /// occurrence that waited through retries: no lateness note — only a report
-    /// can be late — and the moment it names is the occurrence's own scheduled
-    /// time, never the retry instant the notice is composed at.
+    /// A broken check's notice reads as it always has, even when it settles an occurrence that
+    /// waited through retries: no lateness note. Only a delivered result can be late, and the
+    /// moment it names is the occurrence's own scheduled time, never the retry instant.
     #[test]
     fn a_broken_check_after_retries_is_not_late_and_names_its_scheduled_time() {
         let automation = Automation {

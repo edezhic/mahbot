@@ -1,28 +1,19 @@
 //! What a browser step leaves behind in Chrome's tab groups: the agent's group is named and
 //! collapsed, and the command line's own tabs are kept out of it.
 //!
-//! chrome-use opens every tab it creates in the browser's tab group for that session's project
-//! (`✦ <project>`, one group shared by the sessions of the project), and adding a tab to a group
-//! expands it. Each frontend leaves its groups collapsed afterwards:
+//! chrome-use opens every tab it creates in the browser's tab group for that session's
+//! project (`✦ <project>`), and adding a tab to a group expands it. Each frontend leaves its
+//! groups collapsed afterwards: [`settle`] after an agent's step (collapse, then name the
+//! group through chrome-use's own `session name` — the one naming path, because it moves the
+//! project record the next agent tab is placed by), [`leave_command_line_tabs`] after a
+//! command-line step that created a tab (taken out of the group before the result is out),
+//! and [`collapse_own_groups`] after any other command-line step.
 //!
-//! - [`settle`], after an agent's step: the groups the session's own tabs sit in are collapsed, and
-//!   the group chrome-use placed them in is named [`AGENT_GROUP_TITLE`] through chrome-use's own
-//!   `session name` — the one naming path, because it moves the project record the next agent tab is
-//!   placed by along with the live group ([`nameable`] and [`name_group`] own the gates).
-//! - [`leave_command_line_tabs`], after a command-line step that created a tab: that tab is taken
-//!   out of chrome-use's group before the result is out, so the owner can work in it beside their
-//!   own automation, and the groups this session's tabs sit in are collapsed.
-//! - [`collapse_own_groups`], after any other command-line step in a named session: the groups its
-//!   tabs sit in are collapsed, as this command always has after its envelope.
+//! The command line's tails report nothing: whatever a leg did not manage is silent, because
+//! the condition has no effect on the next step. Only [`settle`] answers a [`Note`].
 //!
-//! The command line's tails report nothing: whatever a leg did not manage is silent, because the
-//! condition has no effect on the next step (a tab left in the group is closed with the group's
-//! sessions later). Only [`settle`] answers a [`Note`], and its caller is the agent's own tool.
-//!
-//! The verbs covered are the ones whose opened tab can be established: `open`, whose reply names no
-//! tab, by the caller reading the session's tabs before the step ([`created_tabs`]), and `click`,
-//! whose reply names it. A tab another verb opens (`eval`'s `window.open`, a `press` on a targeted
-//! link) is not named by its reply, so it is not moved.
+//! The verbs covered are the ones whose opened tab can be established: `open` (by reading the
+//! session's tabs before the step) and `click` (whose reply names it).
 
 use super::chrome_daemon::{NoVerdict, run_cli_json_at};
 use serde_json::{Value, json};
@@ -30,25 +21,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// The label the agent's tab group is named with, the mark included: the group is named by
-/// chrome-use's own `session name`, which may append a suffix, so a title that starts with this
-/// string reads the name.
+/// The label the agent's tab group is named with, the mark included: chrome-use may append a
+/// suffix, so a title that starts with this string reads the name.
 const AGENT_GROUP_TITLE: &str = "✦ agents";
 
 /// The mark chrome-use puts in front of a project group's title: what tells a group it minted from
 /// one the owner made.
 const PROJECT_MARK: &str = "✦ ";
 
-/// The budget one stage of a tail's chrome-use calls shares: cosmetic work riding a step's return
-/// costs a bounded wait, never the step, and no stage spends another stage's budget.
+/// The budget one stage of a tail's chrome-use calls shares: cosmetic work riding a step's
+/// return costs a bounded wait, never the step.
 const TAIL_BUDGET: Duration = Duration::from_secs(5);
 
 /// Bound on one call within a stage.
 const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// A tail's trouble as the Issues view keys it: the failing leg's own reason — a distinct cause is a
-/// distinct row — and the line the owner reads. Only [`settle`] answers one, and its caller is the
-/// agent's tool, which files it in its own process.
+/// A tail's trouble as the Issues view keys it — the failing leg's own reason plus the line
+/// the owner reads. Only [`settle`] answers one.
 pub(crate) struct Note {
     pub(crate) reason: &'static str,
     pub(crate) detail: String,
@@ -61,24 +50,22 @@ const GROUP_NOT_NAMED_REASON: &str = "chrome-tabs:agent-group-not-named";
 
 /// What a command-line step hands its tail about the tab it created.
 pub(crate) enum Opened<'a> {
-    /// `open` names no tab in its reply: the tabs the step created are the session's created tabs
-    /// that were not there when the step started, which the caller read first ([`created_tabs`]).
+    /// `open` names no tab in its reply: the tabs it created are the session's created tabs that
+    /// were not there when the step started.
     Baseline(&'a BTreeSet<i64>),
     /// `click` names the tab the page opened, by the session's own tab id.
     Tab(&'a str),
 }
 
-/// Leave the agent's tab group named and collapsed after one step. Answers the first leg that did
-/// not work; the caller files it as the product's once-only issue, and a step's own result never
-/// carries it.
+/// Leave the agent's tab group named and collapsed after one step. Answers the first leg that
+/// did not work; a step's own result never carries it.
 pub(crate) async fn settle(cli: &Path, session: &str) -> Option<Note> {
     let tabs = match own_rows(cli, session).await {
         Ok(tabs) => tabs,
         Err(reason) => return answered(cli, session, Some(unread(&reason))).await,
     };
-    // The collapse comes first and on its own budget: it is what the owner sees, so a naming stage
-    // that is slow or refused can never cost it. The naming decision reads the placement group's
-    // state from this pass instead of asking the browser the same question twice.
+    // The collapse comes first and on its own budget: it is what the owner sees, so a slow or
+    // refused naming stage can never cost it.
     let (mut trouble, states) = collapse_each(cli, session, groups_of(&tabs)).await;
     if let Some(group) = placement_group(&tabs)
         && let Some(state) = states.get(&group)
@@ -93,15 +80,14 @@ pub(crate) async fn settle(cli: &Path, session: &str) -> Option<Note> {
     answered(cli, session, trouble).await
 }
 
-/// Leave a command-line step's own tab as an ordinary tab: taken out of the group chrome-use put it
-/// in, before the caller sees the result, with the groups this session's tabs sit in collapsed again.
-/// Silent by design: a leg that did not manage is not reported anywhere (see the module docs).
+/// Leave a command-line step's own tab as an ordinary tab: taken out of the group chrome-use
+/// put it in, with this session's groups collapsed again. Silent by design.
 pub(crate) async fn leave_command_line_tabs(cli: &Path, session: &str, opened: Opened<'_>) {
     let Ok(tabs) = own_rows(cli, session).await else {
         return;
     };
-    // The collapse only needs the listing; the move needs the created-row decision too, so an answer
-    // that refuses that decision costs the move and never the collapse.
+    // The collapse only needs the listing; the move needs the created-row decision too, so an
+    // answer that refuses that decision costs the move and never the collapse.
     let groups = groups_of(&tabs);
     let targets: Vec<OwnTab> = match opened {
         Opened::Baseline(before) => created_of(tabs)
@@ -109,9 +95,8 @@ pub(crate) async fn leave_command_line_tabs(cli: &Path, session: &str, opened: O
             .into_iter()
             .filter(|tab| tab.group.is_some() && !before.contains(&tab.tab))
             .collect(),
-        // The reply names the tab, so this leg needs no ownership answer: a row that does not say
-        // how the session came by the tab is still the one the reply just named, and only the
-        // relay's own word that it was adopted (the owner's) keeps it where it is.
+        // The reply names the tab, so this leg needs no ownership answer: only the relay's word
+        // that it was adopted (the owner's) keeps it where it is.
         Opened::Tab(id) => tabs
             .into_iter()
             .filter(|tab| tab.group.is_some() && tab.session_tab.as_deref() == Some(id))
@@ -124,9 +109,9 @@ pub(crate) async fn leave_command_line_tabs(cli: &Path, session: &str, opened: O
     collapse_each(cli, session, groups).await;
 }
 
-/// Leave the groups of a named-session command-line step collapsed, as the command always has: every
-/// group this session's own tabs sit in. Runs after the envelope, so its reads cost the caller
-/// nothing.
+/// Leave the groups of a named-session command-line step collapsed, as the command always has:
+/// every group this session's own tabs sit in. Runs after the envelope, so its reads cost the
+/// caller nothing.
 pub(crate) async fn collapse_own_groups(cli: &Path, session: &str) {
     let Ok(tabs) = own_rows(cli, session).await else {
         return;
@@ -148,8 +133,8 @@ pub(crate) async fn created_tabs(cli: &Path, session: &str) -> Option<BTreeSet<i
     )
 }
 
-/// This session's own tabs by `tab list --all`, or the answer the tail could not read — the prologue
-/// every tail starts with.
+/// This session's own tabs by `tab list --all`, or the answer the tail could not read — the
+/// prologue every tail starts with.
 async fn own_rows(cli: &Path, session: &str) -> Result<Vec<OwnTab>, NoVerdict> {
     list(cli, session, Instant::now() + TAIL_BUDGET).await
 }
@@ -179,10 +164,8 @@ async fn answered(cli: &Path, session: &str, trouble: Option<Note>) -> Option<No
 }
 
 /// Collapse every group in `groups` that is not collapsed, reading each one first so a group the
-/// browser no longer has is nothing to do. Its own stage budget, so the collapse the owner sees
-/// always gets a slot of its own. Answers the first trouble and the live state read for every group
-/// still there, so [`settle`] — the one caller that reports — does not ask again; the command line's
-/// tails discard both.
+/// browser no longer has is nothing to do. Its own stage budget. Answers the first trouble and
+/// the live state read for every remaining group.
 async fn collapse_each(
     cli: &Path,
     session: &str,
@@ -194,8 +177,7 @@ async fn collapse_each(
     for group in groups {
         let state = match group_state(cli, session, group, deadline).await {
             Ok(Some(state)) => state,
-            // The group is gone from the browser — the tabs this step took out were its last:
-            // there is nothing left in the tab strip to collapse.
+            // The group is gone from the browser — the tabs this step took out were its last.
             Ok(None) => continue,
             Err(detail) => {
                 trouble.get_or_insert(Note {
@@ -218,27 +200,23 @@ async fn collapse_each(
     (trouble, states)
 }
 
-/// Whether the group still needs the name. Only a group chrome-use minted is renamed — its project
-/// groups carry the [`PROJECT_MARK`], while a group the owner made keeps whatever title they gave
-/// it, even when the session's own tabs were dragged into it. chrome-use may append a suffix to a
-/// label, so a title that starts with the name counts as named and a later step does not ask again;
-/// a group titled after its session is older chrome-use's per-session group, whose title is the
-/// identity this product's close and reclaim match by ([`crate::tools::chrome_tabs`]' honest
-/// limits), and carries no mark, so it is left titled too.
+/// Whether the group still needs the name. Only a group chrome-use minted is renamed — its
+/// project groups carry [`PROJECT_MARK`], while a group the owner made keeps its title. A title
+/// starting with the name counts as named (chrome-use may append a suffix); a group titled
+/// after its session is older chrome-use's per-session group and is left titled too.
 fn nameable(state: &GroupState) -> bool {
     match state.title.as_deref() {
         Some(title) => title.starts_with(PROJECT_MARK) && !title.starts_with(AGENT_GROUP_TITLE),
-        // No title in the answer: nothing to compare, so the name is attempted — and a group that
-        // already reads it is chrome-use's own verdict to give, not this gate's to guess.
+        // No title in the answer: nothing to compare, so the name is attempted — a group that
+        // already reads it is chrome-use's verdict to give.
         None => true,
     }
 }
 
-/// Name the agent's group through chrome-use's own `session name` — the only naming path, because
-/// it moves the project record the next agent tab is placed by along with the live group. Its own
-/// stage budget: the stage makes one call. The call's own verdict is read too: a browser side whose
-/// extension cannot retitle an open group accepts the label without renaming anything, and a group
-/// still reading its project's name is answered as trouble rather than passed off as named.
+/// Name the agent's group through chrome-use's own `session name` — the only naming path,
+/// because it moves the project record the next agent tab is placed by. Its own stage budget.
+/// The call's verdict is read too: a browser side whose extension cannot retitle an open group
+/// accepts the label without renaming, which is answered as trouble.
 async fn name_group(cli: &Path, session: &str) -> Option<String> {
     match call(
         cli,
@@ -250,8 +228,8 @@ async fn name_group(cli: &Path, session: &str) -> Option<String> {
     {
         Ok(answer) => match renamed(&answer) {
             Some(true) => None,
-            // chrome-use's own verdict: a browser side whose extension cannot retitle an open group
-            // answers this, and the group still reads its project's name.
+            // chrome-use's own verdict: an extension that cannot retitle an open group answers
+            // this, and the group still reads its project's name.
             Some(false) => Some(format!(
                 "the browser did not rename the agent group to {AGENT_GROUP_TITLE}"
             )),
@@ -276,9 +254,8 @@ fn renamed(answer: &Value) -> Option<bool> {
         .and_then(Value::as_bool)
 }
 
-/// Write `collapsed: true` on `group` through the extension's own door and answer the first reason
-/// the write did not take — `None` when the group reports itself collapsed. A refusal (a group
-/// holding a tab the relay did not create is the expected one) is answered, never raised.
+/// Write `collapsed: true` on `group` and answer the first reason the write did not take. A
+/// refusal is answered, never raised.
 async fn write_collapsed(
     cli: &Path,
     session: &str,
@@ -314,8 +291,8 @@ async fn write_collapsed(
     }
 }
 
-/// Take the tabs a step created out of their groups through the extension's own door. Best-effort
-/// and silent: a refusal leaves the tab in its group until the session is closed.
+/// Take the tabs a step created out of their groups. Best-effort and silent: a refusal leaves
+/// the tab in its group until the session is closed.
 async fn ungroup(cli: &Path, session: &str, opened: &[OwnTab], deadline: Instant) {
     let ids: Vec<i64> = opened.iter().map(|tab| tab.tab).collect();
     let args = json!([ids]).to_string();
@@ -328,10 +305,8 @@ async fn ungroup(cli: &Path, session: &str, opened: &[OwnTab], deadline: Instant
     .await;
 }
 
-/// One `tab list --all` row this session owns: the Chrome tab id the extension's door takes, the
-/// session's own id for it (`t1` — what a `click` reply calls the tab it opened), the group it sits
-/// in when it sits in one, and the relay's word for how the session came by it (`None` when the
-/// answer does not say — only the tail that needs the distinction refuses).
+/// One `tab list --all` row this session owns: the Chrome tab id, the session's own id (`t1`),
+/// its group, and the relay's word for how the session came by it.
 struct OwnTab {
     tab: i64,
     session_tab: Option<String>,
@@ -339,10 +314,8 @@ struct OwnTab {
     created: Option<bool>,
 }
 
-/// The rows of a `tab list --all` answer that belong to THIS session (`owner.kind == "self"`): the
-/// owner's tabs and other sessions' tabs are never part of a tail's decision. An owned row the
-/// answer cannot place refuses the whole answer — a dropped row would hide a tab or a group of
-/// ours from the tail.
+/// The rows of an answer that belong to THIS session: the owner's tabs and other sessions' are
+/// never part of a tail's decision. An owned row the answer cannot place refuses the answer.
 fn own_tabs(envelope: &Value) -> Result<Vec<OwnTab>, NoVerdict> {
     envelope
         .pointer("/data/browserTabs")
@@ -354,9 +327,8 @@ fn own_tabs(envelope: &Value) -> Result<Vec<OwnTab>, NoVerdict> {
         .collect()
 }
 
-/// One owned row: the id the door takes (`chromeTabId`, or the relay's `handle`), the group it
-/// sits in — `groupId` absent, null or `-1` is Chrome's own spelling of an ungrouped tab — and
-/// whether the relay says this session created it.
+/// One owned row: the id the door takes, the group it sits in (`-1` is Chrome's ungrouped
+/// spelling), and whether the relay says this session created it.
 fn own_tab(row: &Value) -> Result<OwnTab, NoVerdict> {
     let tab = tab_id_of(row).ok_or(NoVerdict::Unreadable)?;
     let group = match row.get("groupId") {
@@ -377,10 +349,8 @@ fn own_tab(row: &Value) -> Result<OwnTab, NoVerdict> {
     })
 }
 
-/// The tabs a `tab list --all` row set says this session created. An adopted tab is the session's
-/// to drive but not to move, and a row that does not say how the session came by it refuses the
-/// whole answer — a dropped row would leave a tab of this step's inside the group the command line
-/// exists to keep it out of.
+/// The tabs a row set says this session created. An adopted tab is the session's to drive but
+/// not to move, and a row that does not say refuses the whole answer.
 fn created_of(tabs: Vec<OwnTab>) -> Result<Vec<OwnTab>, NoVerdict> {
     let mut created = Vec::new();
     for tab in tabs {
@@ -393,10 +363,8 @@ fn created_of(tabs: Vec<OwnTab>) -> Result<Vec<OwnTab>, NoVerdict> {
     Ok(created)
 }
 
-/// The group chrome-use placed this session in: the one most of the tabs the answer says the
-/// session created sit in. A tab the owner later drags into a group of their own does not move that
-/// decision, so a group that is not the placement group is never named. An answer that names no
-/// created tab (an older relay) is read as every tab of the session's own.
+/// The group chrome-use placed this session in: the one most of its created tabs sit in. A tab
+/// the owner later drags into their own group does not move that decision.
 fn placement_group(tabs: &[OwnTab]) -> Option<i64> {
     let says_created = tabs.iter().any(|tab| tab.created == Some(true));
     let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
@@ -579,11 +547,8 @@ mod tests {
         }
     }
 
-    /// The rows a command-line tail may move are exactly the tabs THIS session created: a tab the
-    /// session adopted is the owner's, another session's and the owner's own rows are never looked
-    /// at, and a created row with no id the door could take — or a self row that does not say how
-    /// it came to be the session's — refuses the answer rather than leave a tab of this step's in
-    /// the group.
+    /// The rows a command-line tail may move are exactly the tabs THIS session created: an adopted
+    /// tab is the owner's, and a created row with no usable id refuses the answer.
     #[test]
     fn created_rows_are_this_sessions_own_and_nothing_else() {
         let envelope = json!({
@@ -618,10 +583,8 @@ mod tests {
         }
     }
 
-    /// A placement is where most of the session's created tabs sit: a tab the owner dragged into a
-    /// group of their own does not move it, a tie goes to the lower id, an answer naming no created
-    /// tab falls back to every tab of the session's own, and a session with no grouped tab has no
-    /// placement at all.
+    /// A placement is where most of the session's created tabs sit: a tie goes to the lower id, and
+    /// an answer naming no created tab falls back to every tab of the session's own.
     #[test]
     fn a_sessions_placement_is_the_group_most_created_tabs_sit_in() {
         let tabs = [
@@ -645,9 +608,8 @@ mod tests {
         assert_eq!(placement_group(&[own(1, None, Some(true))]), None);
     }
 
-    /// A group's live state is decided by its `collapsed` flag alone: a title this answer does not
-    /// carry is no title to compare (the rename then takes that leg), while a flag that cannot be
-    /// read is an answer the tail cannot decide a write from.
+    /// A group's live state is decided by its `collapsed` flag alone: a flag that cannot be read is
+    /// an answer the tail cannot decide a write from.
     #[test]
     fn group_state_needs_a_collapsed_flag() {
         let state = group_state_of(

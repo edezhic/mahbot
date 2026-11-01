@@ -1,108 +1,81 @@
 //! Self-update logic — single-instance guarding, obtaining the new version,
 //! putting it in place, and restart.
 //!
-//! Two update modes are supported, selected at runtime by [`update_mode`]:
+//! Two modes, chosen at runtime by [`update_mode`]. A **downloaded copy**
+//! ([`UpdateMode::Downloaded`]) — a published release file, the package
+//! registry's source cache, a moved copy, or a copy whose build source is gone —
+//! downloads this system's ready-made release file, extracts it, puts it at the
+//! standard per-user location (swapping the working file in place when that is
+//! already where the copy runs from, else placing it there and taking the working
+//! file away) and restarts. A **source tree** ([`UpdateMode::SourceTree`]) runs
+//! `cargo install --path <tree> --root <temp_install> --locked --target-dir
+//! <temp_build>`, swaps, and restarts.
 //!
-//! * **A downloaded copy** ([`UpdateMode::Downloaded`]): this binary is one of the
-//!   product's own published files — the package registry's source cache, a moved
-//!   copy, or a copy whose build source is gone. Update = download this system's
-//!   ready-made release file → extract → put it at the standard per-user location
-//!   (in place of the working file when that location is already where this copy
-//!   runs from; when it is not, the working file is taken away afterwards) →
-//!   restart.
-//! * **A copy built from sources** ([`UpdateMode::SourceTree`]): this binary has
-//!   its own working tree at `CARGO_MANIFEST_DIR`. Update = `cargo install --path
-//!   <tree> --root <temp_install> --locked --target-dir <temp_build>` → swap →
-//!   restart.
+//! Both converge on one tail: the new file becomes the one the replacement runs
+//! from, the admin is notified, in-flight work is drained, the databases are
+//! checkpointed, and a replacement is started from that file before `exit(0)`. A
+//! running executable cannot be replaced in place on Windows, so the source-tree
+//! build lands in a temp root and is swapped in via `self_replace` (rename-aside
+//! of the running exe, copy in, deferred deletion) — the product no longer copies
+//! itself into any toolchain's directory, in either mode.
 //!
-//! Both modes converge on the same tail: the new file becomes the one the
-//! replacement instance runs from (the running file itself when it is already the
-//! standard location, a placement at the standard location otherwise), the admin is
-//! notified, in-flight work is drained, the databases are checkpointed, and a
-//! replacement instance is started from that file before `exit(0)`. The running
-//! executable cannot be replaced in place on Windows, so the source-tree build lands
-//! in a temp root first and is swapped in via `self_replace` (which rename-asides the
-//! running exe, copies the new one in, and schedules deferred deletion) — the product
-//! no longer copies itself into any toolchain's directory, in either mode.
-//!
-//! ## Which copies update themselves
-//!
-//! A copy that updates by downloading also updates *itself*: the periodic release
-//! check ([`run_update_availability_refresh`]) starts the very same update with no
-//! prompt — no new surface, no confirmation, and no waiting for a quiet moment; a
-//! round the restart cuts is re-driven after the boot, like the round of any other
-//! update. Which copies update themselves, and for which release, is the whole of
-//! [`auto_update_target`]. A downloaded copy updates itself only while the owner's
-//! Autoupdate switch is on; with it off the release check still runs and the update
-//! is offered by the button instead.
-//!
-//! ## Where the new file comes from
+//! A downloaded copy also updates *itself*: the periodic release check
+//! ([`run_update_availability_refresh`]) starts the very same update with no
+//! prompt while the owner's Autoupdate switch is on, and a round the restart cuts
+//! is re-driven after the boot. With the switch off the check still runs and the
+//! button offers the update. Which copies update themselves, and for which
+//! release, is the whole of [`auto_update_target`].
 //!
 //! The product is its own release host: [`RELEASE_REPO`] (`CARGO_PKG_REPOSITORY`)
 //! holds one release per version, and the release workflow, the install scripts
-//! and this file mirror one contract:
+//! and this file mirror one contract — the newest release's version file is
+//! `{base}/releases/latest/download/version.txt` and holds `<version>\n`; a
+//! version's archive is `{base}/releases/download/v{version}/{name}`, `{name}`
+//! being `mahbot-<version>-<os>-<arch>.<ext>` with the (`os`, `arch`) pair
+//! [`crate::util::managed_bin::host_os_arch`] returns and `tar.gz` on macOS/Linux,
+//! `zip` on Windows, holding exactly one file at its root; every release whose
+//! body lists changes carries that same text as `changelog.txt` under
+//! `releases/download/v{version}/`, and its release page
+//! (`releases/tag/v{version}`) carries it too. No hosting-service API is called —
+//! only those download URLs.
 //!
-//! * the newest release's tiny version file is
-//!   `{base}/releases/latest/download/version.txt` and holds `<version>\n`;
-//! * an exact version's archive is `{base}/releases/download/v{version}/{name}`;
-//! * `{name}` is `mahbot-<version>-<os>-<arch>.<ext>`, with the `(os, arch)` pair
-//!   [`crate::util::managed_bin::host_os_arch`] returns and `tar.gz` on
-//!   macOS/Linux, `zip` on Windows;
-//! * the archive holds exactly one file, `mahbot` (`mahbot.exe` on Windows), at
-//!   its root;
-//! * every release whose body lists changes also carries `changelog.txt` — the
-//!   same text — at `{base}/releases/download/v{version}/changelog.txt`, so an
-//!   update can take the list down with itself; the release page for the same tag
-//!   (`{base}/releases/tag/v{version}`) carries it too, and is what the notice
-//!   names when it could not be carried.
-//!
-//! No hosting-service API call is made anywhere — only those download URLs.
-//!
-//! ## Telling the admin's assistant what changed
-//!
-//! A downloaded update takes the release's change list down with itself, before
-//! the restart ([`capture_update_announcement`]), and the first start of the new
-//! version hands it to the admin's assistant as one tagged message in its
-//! ordinary queue ([`announce_update_to_assistant`]). An update that brought no
-//! usable list — a failed fetch, one made by the install scripts, a release
-//! published before the list travelled with it — is answered from the release of
-//! the running version while the notice is composed; only when that also yields
-//! nothing does the notice say the list is unavailable, and it names the release
-//! page the list can be read on.
-//!
-//! The captured list is kept until a notice has actually been handed over, so a
-//! start that does not announce — a build from source, an unfinished setup, a
-//! process that stops early — still announces it later. A first install and a
-//! restart of the same version with nothing owed say nothing.
+//! A downloaded update takes that change list down with itself
+//! ([`capture_update_announcement`]), and the first start of the new version hands
+//! it to the admin's assistant as one tagged message in its ordinary queue
+//! ([`announce_update_to_assistant`]). An update that brought no usable list — a
+//! failed fetch, one made by the install scripts, a release published before the
+//! list travelled with it — is answered from the running version's release while
+//! the notice is composed; failing that too, the notice says the list is
+//! unavailable and names the release page. The captured list is kept until a
+//! notice has actually been handed over, so a start that does not announce — a
+//! build from source, an unfinished setup, a process that stops early — still
+//! announces it later. A first install and a restart of the same version with
+//! nothing owed say nothing.
 //!
 //! ## Test-only hooks
 //!
-//! [`RELEASE_BASE_URL_ENV`] and [`UPDATE_TO_VERSION_ENV`] drive a whole update of
-//! this machinery with no window at all, from a release host other than the
-//! product's own (see [`run_env_named_update`]): the first moves the
-//! release base, the second names the version to move to — a test release is
-//! deliberately undiscoverable, so the one being driven must be named outright.
-//! Both are unset in every ordinary run, where the release base is [`RELEASE_REPO`]
-//! and the version to move to is the newest published one. Moving only the base
+//! [`RELEASE_BASE_URL_ENV`] and [`UPDATE_TO_VERSION_ENV`] drive a whole update
+//! with no window, from a release host other than the product's own
+//! ([`run_env_named_update`]): the version must be named outright, because a test
+//! release is published with a pre-release tag and is deliberately
+//! undiscoverable. Both are unset in every ordinary run. Moving only the base
 //! leaves the hook inert (it drives an update only for a named version) while the
-//! check — and with it the unattended trigger — reads the newest release from that
-//! other host, which is how an update against a stand-in host is exercised.
+//! check — and with it the unattended trigger — reads that other host.
 //!
 //! Single-instance enforcement is an exclusive whole-file lock on `mahbot.lock`,
 //! released explicitly before the hand-off spawn — see [`acquire_lock`] and
 //! [`crate::util::lock`]. The WAL checkpoint before `exit(0)` is a clean store
 //! handoff: `std::process::exit(0)` bypasses all Rust destructors, so Turso
-//! connections are never properly closed. The TRUNCATE leaves an empty WAL;
+//! connections are never properly closed; the TRUNCATE leaves an empty WAL, and
 //! committed data is already fsync-durable at COMMIT.
 //!
 //! ## macOS Gatekeeper safety
 //!
-//! Spawning a binary triggers async Gatekeeper code-signing validation; deleting the
-//! spawn target during validation produces empty stderr (SIGKILL by
-//! `syspolicyd`). The spawn target is always the working file the update left in
-//! place — never a temp root — and the temp roots are removed before the lock
-//! release and spawn (see [`finalize_update_and_restart`]), so the spawn target is
-//! never deleted in its startup window.
+//! Spawning a binary triggers async code-signing validation; deleting the spawn
+//! target during it produces empty stderr (SIGKILL by `syspolicyd`). The spawn
+//! target is always the working file the update left in place — never a temp
+//! root — and the temp roots are removed before the lock release and spawn (see
+//! [`finalize_update_and_restart`]).
 
 use crate::ChannelMessage;
 use crate::util::UnwrapPoison;
@@ -117,85 +90,54 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-/// The embedded package version, stamped at build time from `CARGO_PKG_VERSION`.
-///
-/// Cargo sets this from the `version` field in `Cargo.toml` for every build, so it
-/// is the authoritative version of the running binary. The GUI surfaces it on the
-/// Settings page, the binary's own start-up log line names it, a downloaded copy's
-/// self-update compares the release host's version against it, and the start-up
-/// message tells the owner what is running.
+/// The embedded package version (`CARGO_PKG_VERSION`): authoritative for the
+/// running binary, and what a downloaded copy's self-update compares the release
+/// host's version against.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// ── File-lock based single-instance guard ─────────────────────────────────
-
 /// Environment marker the updating parent sets (to `"1"`) on the replacement
-/// instance it spawns; [`acquire_lock`] owns what it does. Nothing else sets it,
-/// and it is inherited only where the environment is:
-///
-/// - git children run with a cleared environment (`tools::shell::internal_env_pairs`);
-/// - an agent's shell command is handed the owner's own environment, which
-///   carries this marker on an instance the updater started — on unix, where that
-///   shell's environment is the process's; on Windows the environment is
-///   assembled from the account instead, so the marker does not reach it;
-/// - the GUI Shell tab's PTY does not clear it either.
-///
-/// So a `mahbot` launched from the replacement instance's own terminal takes the
-/// hand-off wait once before the ordinary refusal.
+/// instance it spawns; [`acquire_lock`] owns what it does. It reaches an agent's
+/// unix shell (that shell's environment is the process's) and the GUI Shell tab's
+/// PTY, but not git children (cleared environment) nor Windows (environment
+/// assembled from the account), so a `mahbot` launched from the replacement's own
+/// terminal takes the hand-off wait once before the ordinary refusal.
 const HANDOFF_ENV: &str = "MAHBOT_UPDATE_HANDOFF";
 
-/// Environment marker the updating parent sets on the replacement instance it spawns — `"1"`
-/// when the window it replaces was hidden, `"0"` otherwise — so that instance opens its window
-/// the way the old one was left, instead of a window popping up over whatever the owner is
-/// doing (see `gui::app_window`). Written on every spawn rather than only for a hidden window:
-/// the parent may itself have come back hidden, and what it inherited must never decide.
-///
-/// Every launch the updater makes carries it, and a `mahbot` launched from the replacement
-/// instance's own shell inherits it — where it can decide nothing: that launch never gets past
-/// the instance lock (see `main`), while a cold start from the shell or Finder has no marker at
-/// all.
+/// Environment marker the updating parent sets on the replacement instance it
+/// spawns — `"1"` when the window it replaces was hidden, `"0"` otherwise — so the
+/// window opens as it was left (see `gui::app_window`). Written on every spawn,
+/// never left to inheritance: the parent may itself have come back hidden.
 const START_HIDDEN_ENV: &str = "MAHBOT_START_HIDDEN";
 
-/// Whether this launch is the updater's replacement of a window that was hidden (see
-/// [`START_HIDDEN_ENV`]): the one launch whose window opens hidden.
+/// The one launch whose window opens hidden: the updater's replacement of a hidden
+/// window (see [`START_HIDDEN_ENV`]).
 #[must_use]
 pub fn starts_hidden() -> bool {
     std::env::var(START_HIDDEN_ENV).is_ok_and(|value| value == "1")
 }
 
-/// How long a hand-off-marked instance waits for the previous instance to
-/// release the location before refusing ([`acquire_lock`]).
+/// How long a hand-off-marked instance waits for the previous instance to release
+/// the location before refusing ([`acquire_lock`]).
 const HANDOFF_LOCK_WAIT: Duration = Duration::from_secs(10);
 
-/// Poll interval of the hand-off wait ([`acquire_lock`]).
+/// Poll interval of the hand-off wait.
 const HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Acquire an exclusive whole-file lock on `mahbot.lock`, returning an error if
-/// another instance holds it.
+/// Acquire an exclusive whole-file lock on `mahbot.lock` in `storage_root` (typically
+/// [`crate::config::default_config_dir`]), refusing if another instance holds it. The
+/// guard lives in `INSTANCE_LOCK` for the process lifetime and is released on termination
+/// (`exit(0)` included) unless [`FlockGuard::release`] did so first — `util::lock` owns
+/// that story.
 ///
-/// `storage_root` is the directory where `mahbot.lock` is created — typically
-/// [`crate::config::default_config_dir`].
-///
-/// The returned guard is stored in `INSTANCE_LOCK` for the process lifetime,
-/// and released on process termination (`exit(0)` included) unless
-/// [`FlockGuard::release`] did so first — `util::lock` owns that story.
-///
-/// # Update hand-off
-///
-/// The updating parent marks the replacement instance it spawns with
-/// [`HANDOFF_ENV`], and this function then *waits* for a held location instead
-/// of refusing: the parent releases the lock before spawning, but the child can
-/// reach this point before that release is visible, and refusing there would
-/// abandon a completed update's restart. The wait is bounded by
-/// [`HANDOFF_LOCK_WAIT`] and falls through to the ordinary refusal. An unmarked
-/// process (a genuine second launch) is refused immediately — no sleeps.
-///
-/// # Panics
-///
-/// Panics if called more than once (only called from `main()` at startup).
+/// A hand-off-marked instance (see [`HANDOFF_ENV`]) *waits* instead: the parent releases
+/// the lock before spawning, but the child can reach this point before that release is
+/// visible, and refusing would abandon a completed update's restart. The wait is bounded
+/// by [`HANDOFF_LOCK_WAIT`], then falls through to the ordinary refusal; an unmarked
+/// process is refused at once, with no sleeps. Panics if called more than once (only
+/// `main` at startup calls it).
 pub fn acquire_lock(storage_root: &Path) -> Result<()> {
     let lock_path = crate::util::lock::lock_file_path(storage_root);
 
-    // Ensure parent directory exists.
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
@@ -227,10 +169,8 @@ pub fn acquire_lock(storage_root: &Path) -> Result<()> {
 }
 
 /// Poll for the previous instance's release until [`HANDOFF_LOCK_WAIT`] expires,
-/// then fall back to the ordinary second-instance refusal.
-///
-/// Only reached by a hand-off-marked instance (see [`HANDOFF_ENV`]) whose
-/// immediate attempt already failed.
+/// then fall back to the ordinary refusal. Reached only by a hand-off-marked
+/// instance whose immediate attempt already failed.
 fn wait_for_handoff(lock_path: &Path) -> Result<File> {
     let deadline = std::time::Instant::now() + HANDOFF_LOCK_WAIT;
     while std::time::Instant::now() < deadline {
@@ -242,8 +182,9 @@ fn wait_for_handoff(lock_path: &Path) -> Result<File> {
     Err(second_instance_refusal(lock_path))
 }
 
-/// Whether this launch is the updater's replacement of a previous instance ([`HANDOFF_ENV`]),
-/// which takes the location over rather than being a second launch of the product.
+/// Whether this launch is the updater's replacement of a previous instance
+/// ([`HANDOFF_ENV`]), which takes the location over rather than being a second
+/// launch of the product.
 #[must_use]
 pub fn is_handoff() -> bool {
     std::env::var(HANDOFF_ENV).is_ok_and(|value| value == "1")
@@ -263,45 +204,22 @@ fn second_instance_refusal(lock_path: &Path) -> anyhow::Error {
     )
 }
 
-/// Whether `error` is [`acquire_lock`]'s "another instance is running" refusal, as
-/// opposed to a failure of the lock itself (an unreadable directory, an OS error).
+/// Whether `error` is [`acquire_lock`]'s refusal rather than a failure of the lock
+/// itself (an unreadable directory, an OS error).
 #[must_use]
 pub fn is_instance_refusal(error: &anyhow::Error) -> bool {
     error.to_string().starts_with(INSTANCE_REFUSAL_PREFIX)
 }
 
-/// Attempt to acquire an exclusive lock on the given file path.
+/// Open the file (creating it if needed) and take an exclusive whole-file lock
+/// without blocking. `Ok(Some(file))` holds the lock — the caller must keep the
+/// `File` alive for its lifetime; `Ok(None)` means another handle holds it (another
+/// process, or a second descriptor here, which the kernel treats as independent);
+/// `Err` is a non-retryable OS error. A second acquisition on a path is refused
+/// here rather than waited for.
 ///
-/// Opens the file (creating it if necessary) and calls [`try_flock`], which takes
-/// an exclusive whole-file lock without blocking. Returns immediately if the lock
-/// is held.
-///
-/// # Returns
-///
-/// - `Ok(Some(file))` — lock acquired successfully. **The caller must keep the
-///   returned `File` alive for the lifetime of the lock.**
-/// - `Ok(None)` — another handle holds the lock: another process, or a second
-///   descriptor in this process, which the kernel treats as independent.
-/// - `Err(...)` — a non-retryable OS error occurred (propagated from [`try_flock`]
-///   or file open).
-///
-/// # Caller responsibilities
-///
-/// The production callers are [`acquire_lock`] (sync, at startup),
-/// [`wait_for_handoff`] (the hand-off poll) and [`reacquire_instance_lock`]
-/// (async, after a failed spawn); tests call it directly as well.
-///
-/// - **Refusal**: a second acquisition on a path is refused by this helper
-///   itself — it returns `Ok(None)` rather than waiting. Only
-///   [`reacquire_instance_lock`] checks its own guard and returns early when it
-///   already holds the lock; the other two calls each attempt a lock the process
-///   does not hold.
-/// - **Directory creation**: [`acquire_lock`] ensures the parent directory exists
-///   before calling this helper.
-/// - **Messages**: [`acquire_lock`] logs the success — including a file the poll
-///   obtained — and the poll's failure is the same [`second_instance_refusal`] the
-///   immediate attempt returns; only [`reacquire_instance_lock`] has its own
-///   failure wording.
+/// Callers: [`acquire_lock`], which creates the directory first, the hand-off poll,
+/// and [`reacquire_instance_lock`], which returns early while it still holds its own guard.
 fn try_acquire_lock(path: &Path) -> Result<Option<File>> {
     let file = open_lock_file(path)
         .with_context(|| format!("failed to open lock file {}", path.display()))?;
@@ -315,10 +233,8 @@ fn try_acquire_lock(path: &Path) -> Result<Option<File>> {
     }
 }
 
-/// Open (or create) the lock file with the standard set of options.
-///
-/// Extracted from [`try_acquire_lock`] so the same builder pattern is available
-/// to both production code and tests.
+/// Open (or create) the lock file with the standard options, for production and
+/// tests alike.
 fn open_lock_file(path: &Path) -> std::io::Result<File> {
     OpenOptions::new()
         .read(true)
@@ -328,15 +244,9 @@ fn open_lock_file(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
-// ── FlockGuard: releasable instance lock ─────────────────────────────────
-
-/// A guard holding the instance lock file.
-///
-/// The lock is released via [`release`](FlockGuard::release) — an explicit
-/// unlock of the file, then closing the handle — or, at the latest, when the
-/// guard is dropped. Re-acquisition after release is handled by
-/// [`reacquire_instance_lock`] — needed when a self-update spawn fails and the
-/// current process stays alive.
+/// A guard holding the instance lock file. [`release`](FlockGuard::release) unlocks
+/// explicitly and then closes the handle; the drop does the same at the latest.
+/// [`reacquire_instance_lock`] covers a failed spawn that leaves this process alive.
 struct FlockGuard {
     file: Option<File>,
     lock_path: PathBuf,
@@ -352,10 +262,8 @@ impl std::fmt::Debug for FlockGuard {
 }
 
 impl FlockGuard {
-    /// Release the lock: explicitly unlock the file, then close the handle.
-    /// Idempotent — no-op if already released.
-    ///
-    /// The explicit unlock is what the update hand-off relies on — see
+    /// Release the lock: unlock the file explicitly, then close the handle.
+    /// Idempotent. The explicit unlock is what the update hand-off relies on — see
     /// `util::lock`'s module doc for why the close-time release is not enough. A
     /// failed unlock only warns: the close still releases the lock.
     fn release(&mut self) {
@@ -372,14 +280,12 @@ impl FlockGuard {
     }
 }
 
-/// Global instance lock, held for the process lifetime.
-/// Stored in a static so [`execute_update`] can release and re-acquire it.
+/// Global instance lock, held for the process lifetime so [`execute_update`] can
+/// release and re-acquire it.
 static INSTANCE_LOCK: OnceLock<Mutex<FlockGuard>> = OnceLock::new();
 
-/// Release the instance lock so a child process can acquire it on startup.
-///
-/// Called just before spawning the new instance during self-update. No-op if the
-/// lock is not initialized or already released.
+/// Release the instance lock so a child process can acquire it on startup: called
+/// just before spawning the replacement. No-op if unset or already released.
 async fn release_instance_lock() {
     if let Some(mutex) = INSTANCE_LOCK.get() {
         let mut guard = mutex.lock().await;
@@ -387,15 +293,11 @@ async fn release_instance_lock() {
     }
 }
 
-/// Re-acquire the instance lock after a failed spawn.
-///
-/// Called when [`spawn_new_instance_from`] fails — the current process stays
-/// alive and must re-claim the lock.
-///
-/// This is a recoverable path: it runs during self-update after all agents
-/// have been cancelled and shutdown signaled — no browser session is closed on the way
-/// out (a session ends by its own lifetime or an explicit `session stop`; see
-/// [`crate::chrome::cli_sessions`]).
+/// Re-acquire the instance lock after a failed spawn: [`spawn_new_instance_from`]
+/// failed, the process stays alive, and it must re-claim the location. A recoverable
+/// path — it runs after every agent was cancelled and shutdown signalled, and no
+/// browser session is closed on the way out (a session ends by its own lifetime or
+/// an explicit `session stop`; see [`crate::chrome::cli_sessions`]).
 async fn reacquire_instance_lock() -> Result<()> {
     let mutex = INSTANCE_LOCK
         .get()
@@ -425,11 +327,9 @@ async fn reacquire_instance_lock() -> Result<()> {
     }
 }
 
-// ── The product's own release files ───────────────────────────────────────
-
-/// Where the product's own releases live: this crate's repository, one release
-/// per version. The release workflow publishes to it and the install scripts
-/// download from it, so this is the single source of truth for all three.
+/// Where the product's own releases live: this crate's repository, one release per
+/// version — published by the release workflow, downloaded by the install scripts
+/// and by this file, so it is the single source of truth for all three.
 pub(crate) const RELEASE_REPO: &str = env!("CARGO_PKG_REPOSITORY");
 
 /// Test-only: the release base a driven update downloads from, in place of
@@ -437,17 +337,16 @@ pub(crate) const RELEASE_REPO: &str = env!("CARGO_PKG_REPOSITORY");
 const RELEASE_BASE_URL_ENV: &str = "MAHBOT_RELEASE_BASE_URL";
 
 /// Test-only: the version a driven update moves to, named outright so no
-/// newest-release lookup (and no published newest release) is needed.
+/// newest-release lookup is needed.
 const UPDATE_TO_VERSION_ENV: &str = "MAHBOT_UPDATE_TO_VERSION";
 
-/// How long downloading this system's archive may take. Generous on purpose: the
-/// file is tens of megabytes and the connection may be slow, but it is still a
-/// hard deadline so a stalled transfer cannot leave the update hanging forever.
+/// How long downloading this system's archive may take. Generous on purpose — tens
+/// of megabytes over a slow link — but still a hard deadline, so a stalled transfer
+/// cannot hang the update.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(30);
-/// How long the host's own `sw_vers`/`getconf` answer may take, when the floor
-/// check asks it one ([`host_probe`]). Both answer at once, and the wait is bounded
-/// like every other one on this path: a probe still running after this much is read
-/// as one that answered nothing, which refuses nothing.
+/// How long the host's own `sw_vers`/`getconf` answer may take ([`host_probe`]).
+/// A probe still running after this is read as one that answered nothing, which
+/// refuses nothing.
 const HOST_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The release base every download is built from — [`RELEASE_REPO`] unless
@@ -478,18 +377,13 @@ fn asset_url(base: &str, version: &semver::Version, os: &str, arch: &str) -> Str
     )
 }
 
-// ── The floors a published file is built against ──────────────────────────
-
 /// The floors the published files are built against: the deployment target both
-/// macOS legs pass to the compiler, the glibc of the Linux base they are built on,
-/// and the Windows build each Windows file is for (Windows 10 version 1809 on
-/// x86_64, and Windows 11 on ARM — every Windows 10 on ARM is below the ARM64
-/// file). A system below its floor has no file that can load, so it has no file for
-/// it at all — the same refusal as an os/arch with no file published.
-///
-/// The macOS and Linux floors are shared with every other prebuilt artifact the
-/// product ships (`ffmpeg`), because a checksum-correct archive that needs a newer
-/// system still cannot start.
+/// macOS legs pass to the compiler, the glibc of the Linux base, and the Windows
+/// build each Windows file is for (1809 on x86_64, Windows 11 on ARM — every Windows
+/// 10 on ARM is below the ARM64 file). A system below its floor has no file that can
+/// load, so it is refused like an os/arch with none published. The macOS and Linux
+/// floors are shared with every other prebuilt artifact (`ffmpeg`), because a
+/// checksum-correct archive that needs a newer system still cannot start.
 pub(crate) const MACOS_FLOOR: (u32, u32) = (14, 0);
 pub(crate) const GLIBC_FLOOR: (u32, u32) = (2, 35);
 const WINDOWS_X86_64_FLOOR: u32 = 17_763;
@@ -500,20 +394,15 @@ const WINDOWS_ARM64_FLOOR: u32 = 22_000;
 const NO_RELEASE_FILE: &str = "MahBot has no file for this system";
 
 /// The refusal for a Linux host with no glibc at all: a file built for glibc has
-/// nothing to load against there. `install.sh` prints these words too; the Windows
-/// script has no glibc refusal to print.
+/// nothing to load against there. `install.sh` prints these words too.
 const NO_GLIBC_FOUND: &str =
     "the released Linux files are built for glibc, and no glibc was found on this system";
 
 /// The plain reason this system has no published release file for it, or `None`
-/// when it has one.
-///
-/// The floors above and, on Linux, the musl loader
-/// ([`crate::util::managed_bin::linux_host_is_musl`]) are the whole of it, and only
-/// what can actually be read is consulted: a host that does not answer is not
-/// refused for that, while a host that answers with a glibc below its floor is. The
-/// install scripts refuse the same systems, so no file is ever put in place that
-/// cannot load — which would leave the machine with no working copy at all.
+/// when it has one: the floors above and, on Linux, the musl loader
+/// ([`crate::util::managed_bin::linux_host_is_musl`]). Only what the host actually
+/// answers is consulted — one that does not answer is not refused — and the install
+/// scripts refuse the same systems, so no file is ever put in place that cannot load.
 async fn absent_release_file() -> Option<String> {
     if cfg!(target_os = "linux") {
         let report = host_probe("getconf", &["GNU_LIBC_VERSION"]).await;
@@ -554,12 +443,10 @@ async fn absent_release_file() -> Option<String> {
     None
 }
 
-/// The Windows build this host runs, when it can be read.
-///
-/// `RtlGetVersion` rather than `GetVersionExW`: the latter reports Windows 8's
-/// version for an image that carries no compatibility manifest, which this one does
-/// not, and every published Windows file is newer than that. `None` when it cannot
-/// be read at all — nothing is refused on a guess.
+/// The Windows build this host runs, when it can be read: `RtlGetVersion`, not
+/// `GetVersionExW`, which reports Windows 8's version for an image carrying no
+/// compatibility manifest (this one does not), and every published Windows file is
+/// newer than that. `None` when it cannot be read — nothing is refused on a guess.
 #[cfg(windows)]
 fn windows_build() -> Option<u32> {
     use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
@@ -582,10 +469,9 @@ fn windows_build() -> Option<u32> {
     None
 }
 
-/// Ask the host what it is, the way the install scripts ask it (`sw_vers`,
-/// `getconf`): a program's trimmed stdout when it exits successfully, and nothing
-/// at all otherwise — including when it does not answer in time, so a host that
-/// never answers cannot hold the update open.
+/// Ask the host what it is the way the install scripts ask it (`sw_vers`,
+/// `getconf`): the trimmed stdout when it exits successfully, and nothing at all
+/// otherwise — including when it does not answer in time.
 async fn host_probe(program: &str, args: &[&str]) -> Option<String> {
     let mut cmd = tokio::process::Command::new(program);
     #[cfg(windows)]
@@ -598,11 +484,10 @@ async fn host_probe(program: &str, args: &[&str]) -> Option<String> {
     (output.status.success() && !text.is_empty()).then_some(text)
 }
 
-/// Whether `version` (`major[.minor[…]]`) is below `floor`. Each part is compared
-/// as a whole number — a minor of 4 is not four tenths of 2.35 — a version with no
-/// minor part counts as zero, and a part that is not a whole number is a version
-/// this cannot compare: below the floor rather than accepted, exactly as the
-/// install script's own check refuses it.
+/// Whether `version` (`major[.minor[…]]`) is below `floor`. Parts are whole numbers —
+/// a minor of 4 is not four tenths of 2.35 — a missing minor counts as zero, and a
+/// part that is not a whole number is a version this cannot compare: below the floor,
+/// as the install script's own check refuses it.
 fn version_below_floor(version: &str, floor: (u32, u32)) -> bool {
     let mut parts = version.trim().split('.');
     let major = parts.next().and_then(|part| part.parse::<u32>().ok());
@@ -617,7 +502,7 @@ fn version_below_floor(version: &str, floor: (u32, u32)) -> bool {
 }
 
 /// Whether a `getconf GNU_LIBC_VERSION` report names glibc at all: another libc's
-/// own report names none, and neither does no report.
+/// report names none, and neither does no report.
 fn names_glibc(report: &str) -> bool {
     report.starts_with("glibc ")
 }
@@ -626,23 +511,15 @@ fn names_glibc(report: &str) -> bool {
 /// amount to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinuxRefusal {
-    /// A glibc below the floor the Linux files are built against.
     GlibcBelowFloor,
-    /// No glibc was found, with musl's loader present: nothing to load a file built
-    /// for glibc with.
     NoGlibc,
 }
 
 /// The refusal a Linux host's own answers amount to, or `None` when the published
-/// file is one it can load.
-///
-/// What the host answers with decides when it answers with a glibc: at or above the
-/// floor ([`GLIBC_FLOOR`]) the file loads and below it there is none for this system.
-/// A host that names no glibc — another libc's own report, or no answer at all — is
-/// then judged by musl's loader being there, the check the vendor installers make:
-/// musl installed beside glibc is not a musl system, while a host that names no glibc
-/// has none of its own to load the file with. A host with neither answers nothing
-/// this can refuse on, and is not refused.
+/// file is one it can load: a glibc at or above [`GLIBC_FLOOR`] loads, one below it
+/// does not. A host naming no glibc — another libc's report, or no answer at all — is
+/// judged by musl's loader being there, the check the vendor installers make: musl
+/// beside glibc is not a musl system. A host with neither is not refused.
 fn linux_refusal(report: Option<&str>, musl_loader: bool) -> Option<LinuxRefusal> {
     if report.is_some_and(glibc_below_floor) {
         return Some(LinuxRefusal::GlibcBelowFloor);
@@ -650,9 +527,8 @@ fn linux_refusal(report: Option<&str>, musl_loader: bool) -> Option<LinuxRefusal
     (!report.is_some_and(names_glibc) && musl_loader).then_some(LinuxRefusal::NoGlibc)
 }
 
-/// Whether a `getconf GNU_LIBC_VERSION` report names a glibc below the floor.
-/// A report this does not recognise — a `getconf` that answers something else,
-/// or does not answer at all — is not a refusal.
+/// Whether a `getconf GNU_LIBC_VERSION` report names a glibc below the floor. A
+/// report this does not recognise is not a refusal.
 fn glibc_below_floor(report: &str) -> bool {
     report
         .strip_prefix("glibc ")
@@ -665,13 +541,11 @@ fn current_version() -> Result<semver::Version> {
         .with_context(|| format!("embedded version {VERSION} is not valid semver"))
 }
 
-/// The version a driven update was told to move to, when it named one other than
-/// the running version — `None` in every ordinary run.
-///
-/// Read by both the availability check and the update itself, so a driven update
-/// cannot be shown one version and given another. The version is named by hand, so
-/// it is taken in either spelling: the release's own mark carries the `v`
-/// (`v0.7.0`), while the version itself — and every URL built from it — does not.
+/// The version a driven update was told to move to, when it named one other than the
+/// running version — `None` in every ordinary run. Read by both the availability
+/// check and the update itself, so a driven update cannot be shown one version and
+/// given another. Taken in either spelling: the release's mark carries the `v`
+/// (`v0.7.0`), the version itself and every URL built from it do not.
 #[must_use]
 fn update_target_override() -> Option<semver::Version> {
     let named = std::env::var(UPDATE_TO_VERSION_ENV).ok()?;
@@ -681,13 +555,10 @@ fn update_target_override() -> Option<semver::Version> {
     (named != current).then_some(named)
 }
 
-/// HTTP client for the release check, with a descriptive User-Agent and a short
-/// timeout so a hung network never stalls the refresh loop for long.
-///
-/// Build failure surfaces as `Err` (the builder has no reason to fail in
-/// practice — fixed config, no env interaction). Both the background
-/// availability-refresh task and the update's own newest-release lookup tolerate
-/// the failure and report it; the periodic one retries on its next tick.
+/// HTTP client for the release check: a descriptive User-Agent and a short timeout so
+/// a hung network never stalls the refresh loop for long. A build failure surfaces as
+/// `Err`; both callers tolerate it and report it, and the periodic one retries on its
+/// next tick.
 fn release_http_client() -> Result<&'static reqwest::Client> {
     /// Short: this is a check, and the tick retries anyway.
     const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
@@ -705,13 +576,10 @@ fn release_http_client() -> Result<&'static reqwest::Client> {
         .map_err(|e| anyhow!("{e}"))
 }
 
-/// The newest published version held by the release host's version file.
-///
-/// A version carrying a pre-release part is ignored (reported as `Ok(None)`): a
-/// test release is published that way and must never be discovered by an ordinary
-/// copy — only named outright through [`UPDATE_TO_VERSION_ENV`]. A malformed body
-/// and a network failure both surface as `Err`; callers tolerate them silently and
-/// retry on the next tick.
+/// The newest published version held by the release host's version file. A version
+/// carrying a pre-release part is ignored (`Ok(None)`): a test release is published
+/// that way and must never be discovered by an ordinary copy. A malformed body and a
+/// network failure both surface as `Err`, which callers tolerate silently.
 async fn fetch_latest_release_version() -> Result<Option<semver::Version>> {
     let url = latest_version_url(&release_base_url());
     let response = release_http_client()?
@@ -732,23 +600,20 @@ async fn fetch_latest_release_version() -> Result<Option<semver::Version>> {
     discoverable_version(&body)
 }
 
-/// The version a version file's body names, or `None` when it names a test
-/// release: a version carrying a pre-release part is never offered to an ordinary
-/// copy, which is what keeps test releases from reaching anybody who did not ask
-/// for one (a driven update names the version outright through
-/// [`UPDATE_TO_VERSION_ENV`] instead).
+/// The version a version file's body names, or `None` when it names a test release: a
+/// pre-release is never offered to an ordinary copy, which keeps test releases from
+/// reaching anybody who did not ask for one (a driven update names it outright
+/// through [`UPDATE_TO_VERSION_ENV`]).
 fn discoverable_version(body: &str) -> Result<Option<semver::Version>> {
     let version = semver::Version::parse(body.trim())
         .context("the newest release version file does not hold a version")?;
     Ok(version.pre.is_empty().then_some(version))
 }
 
-/// Check the product's own release host for a newer version of itself.
-///
-/// Returns `Ok(Some(latest))` when a newer version is published, `Ok(None)` when
-/// up to date, and `Err` on a failed check (the caller retries later — never a
-/// user-visible error for a failed check). A version named through
-/// [`UPDATE_TO_VERSION_ENV`] is reported as-is, with no lookup at all.
+/// Check the product's own release host for a newer version of itself: `Ok(Some)` when
+/// one is published, `Ok(None)` when up to date, `Err` on a failed check (the caller
+/// retries later — a failed check is never a user-visible error). A version named
+/// through [`UPDATE_TO_VERSION_ENV`] is reported as-is, with no lookup at all.
 async fn check_download_update() -> Result<Option<semver::Version>> {
     if let Some(named) = update_target_override() {
         return Ok(Some(named));
@@ -759,50 +624,31 @@ async fn check_download_update() -> Result<Option<semver::Version>> {
     Ok((latest > current_version()?).then_some(latest))
 }
 
-// ── Update availability ───────────────────────────────────────────────────
-
 /// How the running binary was obtained — selects the self-update strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UpdateMode {
-    /// Built from a working tree (a checkout): the update rebuilds from that tree.
     SourceTree,
-    /// A copy obtained as a ready-made published file: the update downloads the
-    /// ready-made file for this system and puts it at the standard per-user
-    /// location — the working file itself when that is already where this copy runs
-    /// from, and a placement at that location (the working file taken away
-    /// afterwards) when it is not.
     Downloaded,
 }
 
-/// Classify the update mode from a manifest-directory probe.
+/// Classify the update mode from a manifest-directory probe (`CARGO_MANIFEST_DIR`).
 ///
-/// The manifest dir is the compile-time `CARGO_MANIFEST_DIR`. A copy that arrived
-/// as a ready-made file keeps no working tree to rebuild from, but the probe
-/// cannot simply look for `Cargo.toml`: the package registry extracts its crates
-/// into `$CARGO_HOME/registry/src` and `$CARGO_HOME/git/checkouts`, both of which
-/// contain one. So the discriminator:
-///
-/// 1. The path contains the package registry's source-cache layout (`registry/src`
-///    or `git/checkouts` as path segments — CARGO_HOME may be custom, so the
-///    `.cargo` prefix is not required) → a downloaded copy. This is checked
-///    FIRST, before the `.git` heuristic, because cargo `git/checkouts` entries
-///    are full non-bare clones and contain a real `.git` directory.
-/// 2. `.git` at the manifest dir → a real working tree.
-/// 3. Otherwise a reachable `Cargo.toml` → treat as a working tree (a source
-///    tarball extract or a moved checkout still rebuilds fine).
-/// 4. No source at all → a downloaded copy: its build source is gone, so the
-///    ready-made file is the only way forward.
+/// The probe cannot simply look for `Cargo.toml`: the package registry extracts its
+/// crates into `$CARGO_HOME/registry/src` and `$CARGO_HOME/git/checkouts`, both of
+/// which contain one. So: the registry's source-cache layout (`registry/src` or
+/// `git/checkouts` as path segments; CARGO_HOME may be custom, so no `.cargo` prefix
+/// is required) means a downloaded copy, and is checked *first* because cargo's
+/// `git/checkouts` entries are full non-bare clones with a real `.git` directory;
+/// then `.git` at the manifest dir, or a reachable `Cargo.toml` (a source-tarball
+/// extract or a moved checkout still rebuilds fine), means a working tree; with no
+/// source at all the build source is gone, so the ready-made file is the only way forward.
 fn classify_update_mode(manifest_dir: &Path) -> UpdateMode {
-    // 1. The package registry's source cache (registry src or git checkouts), as
-    //    adjacent path segments — separator-agnostic (Windows uses backslashes).
     if is_registry_source_cache(manifest_dir) {
         return UpdateMode::Downloaded;
     }
-    // 2. Real working tree: git metadata present.
     if manifest_dir.join(".git").exists() {
         return UpdateMode::SourceTree;
     }
-    // 3/4. Reachable Cargo.toml → working tree; otherwise a downloaded copy.
     if manifest_dir.join("Cargo.toml").is_file() {
         UpdateMode::SourceTree
     } else {
@@ -810,8 +656,9 @@ fn classify_update_mode(manifest_dir: &Path) -> UpdateMode {
     }
 }
 
-/// Whether `manifest_dir` is the package registry's own source cache — a build
-/// from source whose update strategy is nonetheless "download".
+/// Whether `manifest_dir` is the package registry's own source cache — a build from
+/// source whose update strategy is nonetheless "download". The layout is matched as
+/// adjacent path segments, separator-agnostic (Windows uses backslashes).
 fn is_registry_source_cache(manifest_dir: &Path) -> bool {
     let mut prev: Option<&std::ffi::OsStr> = None;
     for component in manifest_dir.components() {
@@ -828,79 +675,62 @@ fn is_registry_source_cache(manifest_dir: &Path) -> bool {
     false
 }
 
-/// Whether this binary is one of the product's ready-made published files, as
-/// opposed to a build from source. A checkout, a source-tarball extract and the
-/// package registry's source cache all keep a build source, and none of them was
-/// delivered by the release pipeline — even though the registry cache updates by
-/// downloading (see [`UpdateMode`]). Bound once: the Settings page asks on every
-/// frame, and what the answer describes cannot change while the process runs.
+/// Whether this binary is one of the product's ready-made published files. A
+/// checkout, a source-tarball extract and the package registry's source cache all
+/// keep a build source and none was delivered by the release pipeline — even though
+/// the registry cache updates by downloading. Bound once: the Settings page asks on
+/// every frame and the answer cannot change while the process runs.
 pub(crate) fn is_published_copy() -> bool {
     static PUBLISHED: OnceLock<bool> = OnceLock::new();
     *PUBLISHED.get_or_init(|| is_published_copy_at(Path::new(env!("CARGO_MANIFEST_DIR"))))
 }
 
-/// [`is_published_copy`] for a manifest-directory probe: the mode says the file
-/// was downloaded, and the one source build that also downloads — the package
-/// registry's cache — is excluded.
+/// [`is_published_copy`] for a manifest-directory probe: the mode says the file was
+/// downloaded, minus the one source build that also downloads — the registry cache.
 fn is_published_copy_at(manifest_dir: &Path) -> bool {
     classify_update_mode(manifest_dir) == UpdateMode::Downloaded
         && !is_registry_source_cache(manifest_dir)
 }
 
-/// Determine how the running binary was installed — see [`UpdateMode`]. Bound
-/// once, for the same reason as [`is_published_copy`].
+/// How the running binary was installed — see [`UpdateMode`]. Bound once, for the
+/// same reason as [`is_published_copy`].
 #[must_use]
 pub(crate) fn update_mode() -> UpdateMode {
     static MODE: OnceLock<UpdateMode> = OnceLock::new();
     *MODE.get_or_init(|| classify_update_mode(Path::new(env!("CARGO_MANIFEST_DIR"))))
 }
 
-// ── Shared update availability cache ──────────────────────────────────────
-
-/// A point-in-time snapshot of the shared self-update availability cache.
-///
-/// Passed by value to pure predicates like [`should_show_update`] so they read
-/// a consistent two-field view instead of observing intermediate cache writes.
+/// A point-in-time snapshot of the shared availability cache, passed by value to pure
+/// predicates like [`should_show_update`] so they read a consistent view instead of
+/// observing intermediate writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct UpdateAvailability {
-    /// Whether an update is available (mode-aware: a copy built from sources
-    /// always; a downloaded copy only when the release host has a newer version).
+    /// Mode-aware: always true for a source copy, true for a downloaded one only once
+    /// the release host has a newer version.
     pub(crate) available: bool,
-    /// Whether an update is currently in flight (download/build running, and
-    /// the finalizing window inclusive).
     pub(crate) in_progress: bool,
 }
 
-/// Process-local, single-source-of-truth cache of self-update availability
-/// and progress. Both the GUI (button visibility, tooltip, finalize guards)
-/// and the Telegram command menu (`/update` visibility + dispatch gate) read
-/// this, so the two surfaces cannot diverge. Writers: `available` is
-/// boot-seeded by [`update_cache`] and updated by [`refresh_update_cache`], which
-/// never writes `in_progress`; `in_progress` is written by [`execute_update`] and
-/// claimed atomically by the triggers — the window's button, the `/update`
-/// command, and the unattended one the periodic task drives (see
-/// [`claim_update_start`] and [`start_automatic_update_if_found`]); `auto_failed`
-/// is written by the unattended trigger alone. Reset implicitly on boot — a fresh
-/// process has no stale `available` state from a previous run, so an
-/// already-installed update is never advertised across a restart, and a release
-/// whose unattended attempt failed is tried once more by that fresh process.
+/// Process-local, single-source-of-truth cache of self-update availability and
+/// progress, read by the GUI (button, tooltip, finalize guards) and the Telegram menu
+/// so the surfaces cannot diverge. Reset implicitly on boot, so an already-installed
+/// update is never advertised across a restart and a release whose unattended attempt
+/// failed is tried once more by the fresh process.
 struct UpdateCache {
-    /// Whether an update is available. A copy built from sources: statically
-    /// true (its working tree is reachable). A downloaded copy: derived from the
-    /// periodic release check, boot-seeded false until the first refresh tick.
+    /// Seeded by [`update_cache`], then written by [`refresh_update_cache`], which
+    /// never touches `in_progress`.
     available: AtomicBool,
-    /// The newest published version a downloaded copy found — drives the GUI
-    /// "Update MahBot to vX" tooltip. `None` for a copy built from sources, and
-    /// for a downloaded copy that is up to date or not yet checked.
+    /// The newest published version a downloaded copy found — the GUI's "Update MahBot
+    /// to vX" tooltip. `None` for a source copy, and for a downloaded one that is up to
+    /// date or not yet checked.
     latest: std::sync::Mutex<Option<semver::Version>>,
-    /// Whether an update is currently in flight. Set at [`execute_update`]
-    /// entry, cleared on failure; a successful update exits the process.
+    /// Claimed atomically by the triggers (see [`claim_update_start`]), kept set by
+    /// [`execute_update`] and cleared by it on failure; a successful update exits.
     in_progress: AtomicBool,
-    /// The release whose own unattended attempt failed, if any — no later check
-    /// attempts it again, nor anything not strictly newer than it (a strictly
-    /// newer release still is), which is what keeps a release that downloads but
-    /// does not install from re-draining the product on every tick. See
-    /// [`auto_update_target`].
+    /// The release whose own unattended attempt failed, written by that trigger alone:
+    /// no later check attempts it again nor anything not strictly newer, which keeps a
+    /// release that downloads but does not install from re-draining the product on
+    /// every tick (see [`auto_update_target`]).
     auto_failed: std::sync::Mutex<Option<semver::Version>>,
 }
 
@@ -908,9 +738,6 @@ static UPDATE_CACHE: OnceLock<UpdateCache> = OnceLock::new();
 
 fn update_cache() -> &'static UpdateCache {
     UPDATE_CACHE.get_or_init(|| UpdateCache {
-        // Boot-seed mode-aware: a copy built from sources is always available
-        // without a network call; a downloaded copy starts unknown until the
-        // first refresh tick.
         available: AtomicBool::new(update_mode() == UpdateMode::SourceTree),
         latest: std::sync::Mutex::new(None),
         in_progress: AtomicBool::new(false),
@@ -929,47 +756,38 @@ pub(crate) fn update_availability() -> UpdateAvailability {
 }
 
 /// The newest published version a downloaded copy found (see
-/// [`refresh_update_cache`]). `None` for a copy built from sources, and for a
-/// downloaded copy that is up to date or has not been checked yet.
+/// [`refresh_update_cache`]).
 #[must_use]
 pub(crate) fn update_latest() -> Option<semver::Version> {
     update_cache().latest.lock().unwrap_poison().clone()
 }
 
-/// Whether an update is currently in flight (download/build running, and the
-/// finalizing window inclusive).
+/// Whether an update is currently in flight (download/build running, the finalizing
+/// window inclusive).
 #[must_use]
 pub(crate) fn update_in_progress() -> bool {
     update_availability().in_progress
 }
 
 /// The release whose own unattended attempt failed, if any (see
-/// [`auto_update_target`]). `None` when no unattended attempt has failed in this
-/// process, and for every release a *manual* attempt failed for — only the
-/// unattended trigger's own failures are remembered.
+/// [`auto_update_target`]): `None` for every release a *manual* attempt failed for —
+/// only the unattended trigger's own failures are remembered.
 #[must_use]
 fn auto_failed_version() -> Option<semver::Version> {
     update_cache().auto_failed.lock().unwrap_poison().clone()
 }
 
-/// Remember the release the unattended trigger's attempt went after and failed
-/// for, so no later check in this process retries it (see [`auto_update_target`]).
-/// Called by [`execute_update`] for that trigger's own attempt, and only there.
+/// Remember the release the unattended trigger's own attempt failed for, so no later
+/// check in this process retries it (see [`auto_update_target`]).
 fn record_auto_update_failure(version: &semver::Version) {
     *update_cache().auto_failed.lock().unwrap_poison() = Some(version.clone());
 }
 
-/// Claim the shared in-progress flag for an update this caller is about to run,
-/// returning `false` when one is already running.
-///
-/// Every trigger a person or the release check can start — the window's button,
-/// the `/update` command and the unattended one — claims here before running
-/// [`execute_update`], so an update can never start twice: neither from two of
-/// the same kind nor from two different ones. The claim is what lets a trigger
-/// tell "an update is already running" apart *before* it becomes the contention
-/// error [`execute_update`] returns, so the loser simply stands down instead of
-/// reporting a collision as a failure. [`execute_update`] keeps the flag set and
-/// clears it on failure.
+/// Claim the shared in-progress flag for an update about to run, `false` when one
+/// already runs. Every trigger claims here before [`execute_update`], so an update can
+/// never start twice — neither from two of the same kind nor from two different ones —
+/// and the loser stands down instead of reporting the collision [`execute_update`]
+/// would return. [`execute_update`] keeps the flag set and clears it on failure.
 pub(crate) fn claim_update_start() -> bool {
     update_cache()
         .in_progress
@@ -977,19 +795,16 @@ pub(crate) fn claim_update_start() -> bool {
         .is_ok()
 }
 
-/// Pure visibility predicate for the `/update` menu entry in Telegram: the
-/// entry is offered when the shared availability cache reports an update.
-/// The menu reflects the cached state — it does NOT issue a network request
-/// per refresh. (The GUI update button reads [`update_availability`] directly
-/// and does not go through this predicate.)
+/// Pure visibility predicate for the `/update` menu entry: offered when the cached
+/// availability says so. The menu reflects the cache and issues no request per
+/// refresh; the GUI button reads [`update_availability`] directly.
 #[must_use]
 pub(crate) fn should_show_update(availability: UpdateAvailability) -> bool {
     availability.available
 }
 
-/// RAII guard returned by [`set_update_cache_for_test`] that restores the
-/// cache to its prior state on drop, so a panicking test cannot leak a
-/// mutated `available`/`in_progress` into later tests.
+/// RAII guard from [`set_update_cache_for_test`]: restores the prior state on drop, so
+/// a panicking test cannot leak a mutation into later tests.
 #[cfg(test)]
 pub(crate) struct UpdateCacheTestGuard {
     previous: UpdateAvailability,
@@ -1008,8 +823,7 @@ impl Drop for UpdateCacheTestGuard {
     }
 }
 
-/// Set the shared update-availability cache for a test's duration and return a
-/// guard that restores the prior state on drop.
+/// Set the shared update-availability cache for a test's duration.
 #[cfg(test)]
 pub(crate) fn set_update_cache_for_test(
     available: bool,
@@ -1022,11 +836,9 @@ pub(crate) fn set_update_cache_for_test(
     UpdateCacheTestGuard { previous }
 }
 
-// ── Update availability refresh ──────────────────────────────────────────
-
-/// Write the release check's finding into the shared cache and tell the GUI when
-/// it changed — the update button must appear when the check finds a release,
-/// not at the next unrelated repaint.
+/// Write the release check's finding into the shared cache and tell the GUI when it
+/// changed — the update button must appear when the check finds a release, not at the
+/// next unrelated repaint.
 fn set_availability(latest: Option<semver::Version>) {
     let cache = update_cache();
     let available = latest.is_some();
@@ -1044,16 +856,12 @@ fn set_availability(latest: Option<semver::Version>) {
     }
 }
 
-/// Refresh the shared update-availability cache once.
-///
-/// A copy built from sources seeds `available = true` (idempotent, no network).
-/// A downloaded copy performs the release check, preserving the last-known
-/// availability on a transient check failure so a network blip never hides a
-/// previously discovered update. While an update is in flight the check is
-/// skipped entirely (not just the write) — a long download would otherwise waste
-/// a request per tick, and the InProgress status must never be clobbered. The
-/// `in_progress` flag is re-checked after the network await so an update that
-/// starts while the check is in flight cannot be clobbered by its result.
+/// Refresh the shared update-availability cache once. A source copy seeds
+/// `available = true` (idempotent, no network). A downloaded copy runs the release
+/// check, keeping the last-known availability on a transient failure so a network blip
+/// never hides a discovered update. While an update is in flight the check is skipped
+/// outright — a long download would otherwise waste a request per tick — and
+/// `in_progress` is re-checked after the await so the result cannot clobber it.
 async fn refresh_update_cache() {
     let cache = update_cache();
     match update_mode() {
@@ -1065,10 +873,6 @@ async fn refresh_update_cache() {
                 return;
             }
             let result = check_download_update().await;
-            // Re-check after the await: an update may have started while this
-            // network request was in flight, and the write must not clobber
-            // the in-progress state (which would hide the "Updating…" UI and
-            // the `/update` command mid-update).
             if cache.in_progress.load(Ordering::SeqCst) {
                 return;
             }
@@ -1083,33 +887,27 @@ async fn refresh_update_cache() {
     }
 }
 
-/// Wakes [`run_update_availability_refresh`] for a tick now. A nudge that arrives
-/// before the loop waits is kept until it does.
+/// Wakes [`run_update_availability_refresh`] for a tick now. A nudge arriving before
+/// the loop waits is kept until it does.
 static TICK_NOW: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
-/// Run an availability tick now instead of at the next interval: what re-enabling
-/// the Autoupdate switch does, so its promise holds without a restart.
+/// Run an availability tick now instead of at the next interval: what re-enabling the
+/// Autoupdate switch does, so its promise holds without a restart.
 pub(crate) fn nudge_update_tick() {
     TICK_NOW.notify_one();
 }
 
-/// Periodic refresh of the shared update-availability cache, and the unattended
-/// update of a downloaded copy.
-///
-/// Spawned from the binary's background task set (cancellable via the global
-/// shutdown token). Ticks immediately so a fresh downloaded copy isn't hidden
-/// until the first 10-minute interval elapses, then every 10 minutes — or at once
-/// when [`nudge_update_tick`] asks. Runs on all platforms/modes to keep the
-/// contract uniform — a copy built from sources is a no-op network-wise but keeps
-/// `available` seeded. Every tick is also what gives
+/// Periodic refresh of the shared update-availability cache, and the unattended update
+/// of a downloaded copy. Spawned from the background task set (cancellable via the
+/// global shutdown token), it ticks at once — so a fresh downloaded copy is not hidden
+/// until the first interval — then every 10 minutes, or at once when
+/// [`nudge_update_tick`] asks. Every tick is also what gives
 /// [`start_automatic_update_if_found`] the finding it decides on.
 pub async fn run_update_availability_refresh() {
     loop {
         refresh_update_cache().await;
         start_automatic_update_if_found().await;
         tokio::select! {
-            // The owner switched Autoupdate back on: today's behaviour returns
-            // now, not up to ten minutes from now.
             () = TICK_NOW.notified() => {}
             alive = crate::shutdown::sleep_or_shutdown_or_drain(Duration::from_mins(10)) => {
                 if !alive {
@@ -1120,30 +918,21 @@ pub async fn run_update_availability_refresh() {
     }
 }
 
-/// How long an unattended update — the automatic one and the environment-driven
-/// hook — waits for the product to come fully up: the stores, the channels and the
-/// notification path. An attempt that fails in that window would otherwise have
-/// nowhere to report it.
+/// How long an unattended update waits for the product to come fully up — the stores,
+/// the channels and the notification path — so an early failure is reportable.
 const UNATTENDED_SETTLE: Duration = Duration::from_secs(15);
 
 /// The release this copy must move to by itself, if any — the whole rule of the
 /// unattended trigger, pure so it can be read and tested as one thing.
 ///
-/// Never a trigger:
-///
-/// * a copy built from a working tree ([`UpdateMode::SourceTree`]): installing
-///   there means rebuilding that tree, which must not run on its own — possibly
-///   from half-finished edits, and again on every check for as long as the tree
-///   is there. Such a copy updates only when it is asked to.
-/// * a version named through [`UPDATE_TO_VERSION_ENV`] (`named`): that update is
-///   the hook's own, and it must not be raced by this trigger.
-/// * a release the shared availability flag offers that is not newer than the
-///   running version: the flag is permanently true on a source copy and a named
-///   version may be older, so the flag alone is not a trigger.
-/// * a release no newer than one whose own unattended attempt already failed
-///   (`failed`): a release that downloads but does not install must not be
-///   re-fetched and the product re-drained for it on every check, and a stale
-///   availability state must not re-offer it either.
+/// Never a trigger: a copy built from a working tree ([`UpdateMode::SourceTree`]),
+/// since installing there rebuilds that tree — possibly from half-finished edits, and
+/// again on every check while the tree is there; a version named through
+/// [`UPDATE_TO_VERSION_ENV`] (`named`), which is the hook's own update and must not be
+/// raced; a release the availability flag offers that is not newer than the running
+/// version, the flag being permanently true on a source copy; and a release no newer
+/// than one whose own attempt already failed (`failed`), which keeps a release that
+/// downloads but does not install from re-draining the product on every tick.
 fn auto_update_target(
     mode: UpdateMode,
     named: bool,
@@ -1163,21 +952,15 @@ fn autoupdate_enabled() -> bool {
     crate::config::flag_on(crate::config::CONFIG.autoupdate().as_deref())
 }
 
-/// The unattended trigger: run the release check's finding by itself.
-///
-/// Called after every availability refresh. The update it starts is the ordinary
-/// one, in full: the same download, the same drain (with its hard cap), the same
-/// checkpoint, restart and recovery of interrupted work — nobody pressed
-/// anything, and nothing else about it differs.
+/// The unattended trigger: run the release check's finding by itself, after every
+/// availability refresh. The update it starts is the ordinary one in full — same
+/// download, drain, checkpoint, restart and recovery — nobody pressed anything.
 async fn start_automatic_update_if_found() {
-    // The owner's Autoupdate switch: off means nothing installs itself. The
-    // check keeps running, so the button still reports the release, and an
-    // update already in flight is never cancelled here.
+    // Off means nothing installs itself; the check keeps running, so the button still
+    // reports the release, and an update in flight is never cancelled here.
     if !autoupdate_enabled() {
         return;
     }
-    // An update in flight owns the flag, and the refresh skipped its check with
-    // it — so the cached finding is the one that started it, not a new one.
     if update_in_progress() {
         return;
     }
@@ -1194,27 +977,22 @@ async fn start_automatic_update_if_found() {
         return;
     };
 
-    // The product must be fully up before an unattended attempt starts, so an
-    // early failure is reportable rather than lost.
+    // The product must be fully up before an unattended attempt starts, so an early
+    // failure is reportable rather than lost.
     if !crate::shutdown::sleep_or_shutdown_or_drain(UNATTENDED_SETTLE).await {
         return;
     }
-    // Claim the update atomically, exactly as the manual triggers do. An update
-    // that started while this waited — manual or automatic — wins, and losing
-    // the claim is not a failure: nothing is reported and the release is not
-    // remembered as failed.
+    // Losing the claim to an update that started meanwhile is not a failure: nothing
+    // is reported and the release is not remembered as failed.
     if !claim_update_start() {
         return;
     }
-    // Detached, like the environment-driven hook: the update owns the drain
-    // hand-off and must outlive the shutdown token it triggers itself, while
-    // this loop is cancelled by exactly that token. The attempt is pinned to
-    // `target` and its failure is remembered as `target` before the in-progress
-    // flag is cleared (see [`execute_update`]), so the next check can neither
-    // retry the release nor start another attempt in the window before the
-    // memory lands. The failure is then told the way every caller tells it — the
-    // ordinary admin line, plus the process's own log line, since an unattended
-    // attempt with no admin bound has no other surface.
+    // Detached, like the environment-driven hook: the update owns the drain hand-off
+    // and must outlive the shutdown token it triggers itself, while this loop is
+    // cancelled by exactly that token. The attempt is pinned to `target`, and
+    // [`execute_update`] remembers that release as failed before clearing the
+    // in-progress flag, so the next check can neither retry it nor start another
+    // attempt in between.
     tokio::spawn(async move {
         if let Err(e) = execute_update(Some(&target)).await {
             error!(error = %e, "The automatic update did not complete");
@@ -1223,14 +1001,9 @@ async fn start_automatic_update_if_found() {
     });
 }
 
-// ── Update mutex ──────────────────────────────────────────────────────────
-
-/// Global mutex ensuring only one update runs at a time.
-/// A second trigger while an update is in progress gets an immediate error
-/// via [`try_lock`](Mutex::try_lock).
+/// Global mutex ensuring only one update runs at a time: a second trigger gets an
+/// immediate error via [`try_lock`](Mutex::try_lock).
 static UPDATE_MUTEX: Mutex<()> = Mutex::const_new(());
-
-// ── Telegram update notifications ─────────────────────────────────────────
 
 /// The build from this working tree is done; the restart is reported by
 /// [`UPDATE_RESTART_MSG`].
@@ -1240,15 +1013,12 @@ pub(crate) const UPDATE_BUILD_COMPLETE_MSG: &str = "✅ Build complete.";
 /// [`UPDATE_RESTART_MSG`].
 pub(crate) const UPDATE_DOWNLOAD_COMPLETE_MSG: &str = "✅ Update downloaded and put in place.";
 
-/// Sent as the restart phase begins — nothing has restarted yet when this goes
-/// out.
+/// Sent as the restart phase begins — nothing has restarted yet when this goes out.
 pub(crate) const UPDATE_RESTART_MSG: &str =
     "🔄 Waiting for work in progress to finish before the restart…";
 
-// ── The update notice the admin assistant receives ────────────────────────
-
-/// `config_kv` keys of the update notice's durable state. Owned by this
-/// subsystem — preserved by the config store's orphan purge.
+/// `config_kv` keys of the update notice's durable state. Owned by this subsystem —
+/// preserved by the config store's orphan purge.
 pub(crate) const UPDATE_LAST_RUN_VERSION_KV_KEY: &str = "update_last_run_version";
 pub(crate) const UPDATE_PENDING_CHANGELOG_KV_KEY: &str = "update_pending_changelog";
 
@@ -1257,35 +1027,29 @@ pub(crate) const UPDATE_PENDING_CHANGELOG_KV_KEY: &str = "update_pending_changel
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct PendingChangelog {
     version: String,
-    /// `None` when the update could not take the list down: the start asks the
-    /// release for it again while composing the notice.
+    /// `None` when the update could not take the list down: the start asks the release
+    /// for it again while composing the notice.
     changes: Option<String>,
 }
 
 /// What a start must do about the update notice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdateNotice {
-    /// Settle nothing: the same version started again, or an owed list that waits
-    /// for setup to finish.
     Unchanged,
-    /// Record this start as the last run, telling no one.
     RecordSilently,
-    /// Hand the notice over, then record the version and drop the list.
     Announce,
 }
 
 /// The whole rule of which starts produce an update notice.
 ///
-/// A restart of the same version says nothing — unless the update left a list
-/// for it, so a start that stopped between composing the notice and handing it
-/// over is repeated rather than silenced. A build from source never announces,
-/// whatever its version string says, and keeps what the update left behind for a
-/// copy that can show it. An installation that has not finished setup records the
-/// version of a first install, because there is no assistant to tell, but an
-/// update it was *given* waits: neither the version nor the list is touched, so
-/// the first start after setup announces it. A published copy with finished setup
-/// announces — including over a version record an older build wrote, which is a
-/// version installed by a build that predates the list travelling with it.
+/// A restart of the same version says nothing — unless the update left a list for it,
+/// so a start that stopped between composing the notice and handing it over is
+/// repeated rather than silenced. A build from source never announces, whatever its
+/// version string says, and keeps what the update left for a copy that can show it. An
+/// installation that has not finished setup records a first install, because there is
+/// no assistant to tell, but an update it was *given* waits — neither version nor list
+/// is touched, so the first start after setup announces it. A published copy with
+/// finished setup announces, including over a version record an older build wrote.
 fn update_notice_action(
     last_run: Option<&str>,
     current: &str,
@@ -1316,8 +1080,8 @@ fn update_notice_action(
     }
 }
 
-/// Write the version this start runs from, reporting a failed write rather than
-/// hiding it: the caller decides whether its own contract can go on.
+/// Write the version this start runs from, reporting a failed write rather than hiding
+/// it: the caller decides whether its own contract can go on.
 async fn record_notice_state(store: &crate::config_db::ConfigStore, version: &str) -> bool {
     match store.set_kv(UPDATE_LAST_RUN_VERSION_KV_KEY, version).await {
         Ok(()) => true,
@@ -1328,8 +1092,8 @@ async fn record_notice_state(store: &crate::config_db::ConfigStore, version: &st
     }
 }
 
-/// The change list captured for `version`, when the record belongs to it. Only
-/// one that cannot be parsed is treated as absent.
+/// The change list captured for `version`, when the record belongs to it: an
+/// unparseable one is the only case treated as absent.
 fn pending_changelog_from_str(raw: &str, version: &str) -> Option<PendingChangelog> {
     let pending: PendingChangelog = match serde_json::from_str(raw) {
         Ok(pending) => pending,
@@ -1341,10 +1105,9 @@ fn pending_changelog_from_str(raw: &str, version: &str) -> Option<PendingChangel
     (pending.version == version).then_some(pending)
 }
 
-/// The change list captured for `version`, when the record belongs to it. A
-/// record of another version is left in place: it belongs to a release that may
-/// still start. A failed read is an error, so the caller settles nothing on this
-/// start and decides again at the next one.
+/// The change list captured for `version`, when the record belongs to it; one of
+/// another version is left in place for a release that may still start. A failed read
+/// is an error, so the caller settles nothing on this start.
 async fn pending_changelog(
     store: &crate::config_db::ConfigStore,
     version: &str,
@@ -1355,9 +1118,9 @@ async fn pending_changelog(
     Ok(pending_changelog_from_str(&raw, version))
 }
 
-/// The notice itself: one self-contained, tagged block carrying the version and
-/// the release's change list, or — when there is no list to carry — the plain
-/// statement that it is unavailable and the release page it can be read on.
+/// The notice itself: one self-contained, tagged block carrying the version and the
+/// release's change list, or — with no list to carry — the plain statement that it is
+/// unavailable and the release page it can be read on.
 fn update_notice_text(version: &str, changes: Option<&str>, release_page: &str) -> String {
     match changes {
         Some(changes) => crate::prompt::substitute(
@@ -1372,12 +1135,10 @@ fn update_notice_text(version: &str, changes: Option<&str>, release_page: &str) 
 }
 
 /// Tell the admin's assistant once that the product was updated to this version,
-/// carrying that release's change list.
-///
-/// Called once at daemon start, after the message pipeline is up: the notice
-/// enters the assistant's ordinary queue exactly as a message from the owner
-/// does, so it needs no special surface. See [`settle_update_notice`] for what
-/// this start may and may not settle.
+/// carrying that release's change list. Called once at daemon start, after the message
+/// pipeline is up: the notice enters the assistant's ordinary queue exactly as a
+/// message from the owner does. See [`settle_update_notice`] for what this start may
+/// and may not settle.
 pub async fn announce_update_to_assistant() {
     settle_update_notice(
         crate::config_db::store(),
@@ -1396,13 +1157,10 @@ pub async fn announce_update_to_assistant() {
     .await;
 }
 
-/// One start's whole notice flow: read the durable state, decide what this start
-/// owes, obtain the change list the update did not bring, hand the notice over,
-/// and only then record the version and drop the list.
-///
-/// The store, the release fetch and the delivery are supplied by the caller so
-/// the flow can be exercised without the process-global store, the network and
-/// the assistant's queue.
+/// One start's whole notice flow: read the durable state, decide what this start owes,
+/// obtain the change list the update did not bring, hand the notice over, and only then
+/// record the version and drop the list. Store, fetch and delivery come from the caller
+/// so the flow is exercisable without the global store, the network and the queue.
 async fn settle_update_notice(
     store: &crate::config_db::ConfigStore,
     version: &str,
@@ -1411,9 +1169,8 @@ async fn settle_update_notice(
     fetch_changes: impl AsyncFnOnce(&str) -> Option<String>,
     deliver: impl FnOnce(String),
 ) {
-    // Both reads settle what this start owes, so a failed one must not settle
-    // anything: nothing is recorded and nothing is dropped, and the next start
-    // decides again.
+    // Both reads settle what this start owes, so a failed one settles nothing: nothing
+    // recorded, nothing dropped, and the next start decides again.
     let last_run = match store.get_kv(UPDATE_LAST_RUN_VERSION_KV_KEY).await {
         Ok(last_run) => last_run,
         Err(e) => {
@@ -1440,19 +1197,16 @@ async fn settle_update_notice(
     ) {
         UpdateNotice::Unchanged => {}
         UpdateNotice::RecordSilently => {
-            // Its outcome is only load-bearing where a notice follows the record;
-            // a failed write here is simply retried at the next start.
+            // Its outcome is only load-bearing where a notice follows; a failed write
+            // is retried at the next start.
             record_notice_state(store, version).await;
         }
         UpdateNotice::Announce => {
             let release_page = release_page_url(&release_base_url(), version);
-            // Only a record that belongs to this version is spent at the end: one
-            // captured for another release is left for that release's start.
+            // Only a record belonging to this version is spent at the end.
             let captured = pending.is_some();
             let changes = match pending.and_then(|pending| pending.changes) {
                 Some(changes) => Some(changes),
-                // Nothing usable travelled with the update: ask the release of
-                // the running version now, while the notice is composed.
                 None => fetch_changes(version).await,
             };
             if changes.is_none() {
@@ -1468,9 +1222,9 @@ async fn settle_update_notice(
                 &release_page,
             ));
             info!(version, "Told the admin assistant about the update");
-            // The once-only record goes down only after the hand-over, and the
-            // list only after the record: a start that stops in between repeats
-            // the notice, which is the lesser fault than silence.
+            // The once-only record goes down only after the hand-over, and the list
+            // only after the record: a start stopping in between repeats the notice,
+            // the lesser fault than silence.
             if !record_notice_state(store, version).await {
                 return;
             }
@@ -1481,12 +1235,12 @@ async fn settle_update_notice(
     }
 }
 
-/// The release's change list, read while the notice is composed: the second and
-/// last time it is asked for, so a fetch that failed before the restart does not
-/// decide what the notice says.
+/// The release's change list, read while the notice is composed: the second and last
+/// time it is asked for, so a fetch that failed before the restart does not decide what
+/// the notice says.
 async fn changelog_at_notice_time(version: &str) -> Option<String> {
-    // The client's own deadline is the update transport's generous one; what
-    // bounds this read is [`CHANGELOG_TIMEOUT`] inside the fetch.
+    // The client's own deadline is the update transport's generous one; what bounds
+    // this read is [`CHANGELOG_TIMEOUT`] inside the fetch.
     let client = match crate::util::http::build_download_client(DOWNLOAD_TIMEOUT) {
         Ok(client) => client,
         Err(e) => {
@@ -1497,29 +1251,27 @@ async fn changelog_at_notice_time(version: &str) -> Option<String> {
     fetch_release_changelog(&client, version).await
 }
 
-/// The URL of a release's change list — the release body's own text, published
-/// as an asset so an update can take it down before the restart and a start that
-/// has none can still read it.
+/// The URL of a release's change list — the release body's own text, published as an
+/// asset so an update can take it down before the restart and a start that has none can
+/// still read it.
 fn changelog_url(base: &str, version: &str) -> String {
     format!("{base}/releases/download/v{version}/changelog.txt")
 }
 
-/// The release page of `version` — where the same change list is published for a
-/// person to read, and what the notice names when it cannot carry the list.
+/// The release page of `version` — where the same change list is published for a person
+/// to read, and what the notice names when it cannot carry the list.
 fn release_page_url(base: &str, version: &str) -> String {
     format!("{base}/releases/tag/v{version}")
 }
 
-/// How long the release's change list may take before the update or the notice
-/// goes on without it. It is the real cap on both attempts: the HTTP client it is
-/// given outlives it, and this deadline fires first.
+/// How long the release's change list may take before the update or the notice goes on
+/// without it: the real cap on both attempts, since the client outlives it.
 const CHANGELOG_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Read a release's change list, if it carries one. A missing asset (a release
 /// published before the list travelled with the build) and an empty one are both
-/// `None`. Asked once beside the archive download and again while the notice is
-/// composed, and nothing but `None` is remembered, so a failure here never marks
-/// the list unavailable for good.
+/// `None`, and nothing but `None` is remembered, so a failure here never marks the list
+/// unavailable for good.
 async fn fetch_release_changelog(client: &reqwest::Client, version: &str) -> Option<String> {
     let url = changelog_url(&release_base_url(), version);
     let fetch = async {
@@ -1552,24 +1304,18 @@ async fn fetch_release_changelog(client: &reqwest::Client, version: &str) -> Opt
     }
 }
 
-/// Record the release's change list for the first start of `target`, while the
-/// update is still running: that start may be offline, and asks the release
-/// again rather than announcing "unavailable" while the list exists.
-///
-/// Only the download path captures, and the archive it installs is a release
-/// file with no build source on the owner's machine — a published copy — so the
-/// notice this record waits for is one that will actually be sent. What is
-/// recorded here survives until that notice has been handed over; see
-/// [`settle_update_notice`].
+/// Record the release's change list for the first start of `version`, while the update
+/// still runs: that start may be offline, and would otherwise announce "unavailable"
+/// while the list exists. Only the download path captures, and the file it installs is
+/// a published copy, so the notice this record waits for will actually be sent.
 async fn capture_update_announcement(
     store: &crate::config_db::ConfigStore,
     version: &str,
     changes: Option<String>,
 ) {
-    // A list already recorded for this version is never replaced, and a record
-    // that cannot be read is never written over: an update whose list came down
-    // the first time must not lose it to a second attempt whose fetch came back
-    // empty.
+    // A list already recorded for this version is never replaced, and an unreadable
+    // record is never written over: a list that came down the first time must not be
+    // lost to a later attempt whose fetch came back empty.
     match pending_changelog(store, version).await {
         Ok(Some(pending)) if pending.changes.is_some() => {
             debug!(version, "The release's change list is already captured");
@@ -1597,63 +1343,51 @@ async fn capture_update_announcement(
     }
 }
 
-// ── The durable record of a partly-finished update ────────────────────────
-
-/// The target every partly-finished update is recorded under, and the message it
-/// is recorded with. Durable rather than a tracing line because the process
-/// restarts moments later, and one row per distinct reason because it must not
-/// repeat — see [`record_update_unfinished`].
+/// The target every partly-finished update is recorded under, and the message it is
+/// recorded with. Durable rather than a tracing line because the process restarts
+/// moments later, and one row per distinct reason so it never repeats.
 const UPDATE_UNFINISHED_TARGET: &str = "mahbot::self_update";
 const UPDATE_UNFINISHED_MESSAGE: &str = "the update could not be completed in full";
 
-/// A step of an update that could not be done, as it is recorded durably and told
-/// to the admin.
+/// A step of an update that could not be done, as it is recorded durably and told to
+/// the admin.
 struct UnfinishedStep {
-    /// The step that failed — the whole of what is recorded, and never a path or
-    /// anything else taken from the owner's environment.
+    /// The whole of what is recorded — never a path or anything taken from the owner's environment.
     reason: &'static str,
-    /// Whether the update stops here. A step that stops the update is already
-    /// reported to the admin by the ordinary failure line, so its record raises no
-    /// second sentence on the phone about the same fact; a step the update goes on
-    /// past would otherwise be told to him nowhere.
+    /// A step that stops the update is already reported by the ordinary failure line, so
+    /// its record raises no second sentence about the same fact; a step the update goes
+    /// on past would otherwise be told nowhere.
     stops_update: bool,
 }
 
-/// The standard per-user programs directory could not be written to, so the new
-/// version could not be put where the install scripts put it. The update stops here
-/// and the copy that is already there keeps working.
+/// The standard per-user programs directory could not be written to, so the new version
+/// could not be put where the install scripts put it. The update stops here and the copy
+/// already there keeps working.
 const STANDARD_DIR_UNUSABLE: UnfinishedStep = UnfinishedStep {
     reason: "the standard per-user programs directory could not be written to",
     stops_update: true,
 };
 
-/// A second copy of the product — the one this instance came from when it moved
-/// itself, or the one the old way of installing left in the toolchain's own
-/// directory — could not be removed, so it stays on the disk beside the running
-/// one. One reason for both, because they are the same failing step on the same kind
-/// of file: a second sentence for it would be one fact told twice. The update goes
-/// through, so this is the only word the admin gets about it.
+/// A second copy of the product — the one this instance came from when it moved itself,
+/// or the one the old way of installing left in the toolchain's directory — could not be
+/// removed. One reason for both, because they are the same failing step on the same kind
+/// of file; the update goes through, so this is the only word the admin gets about it.
 const SECOND_COPY_REMAINS: UnfinishedStep = UnfinishedStep {
     reason: "a second copy of the product could not be taken away",
     stops_update: false,
 };
 
 /// Record a partly-finished update durably, and tell the admin about it once — when this
-/// call is what recorded the row, and when the ordinary failure line is not already telling
-/// him about the same failing step (see [`UnfinishedStep::stops_update`]).
+/// call is what recorded the row, and when the ordinary failure line does not already
+/// name the same failing step (see [`UnfinishedStep::stops_update`]).
 ///
-/// The record is the shared Issues-view one ([`crate::logs::record_issue_once`]),
-/// which writes straight into the logs store — the update path calls `exit(0)`, so a
-/// `tracing::warn!` alone would be lost with the process — and never writes a reason
-/// the store already holds. It names only the step that failed, never a path and
-/// never a value read from the owner or his environment.
-///
-/// Which shape warns: a fact no row carries
-/// ([`crate::logs::IssueWrite::NotRecorded`] — no store, or a write the shared writer warned
-/// about itself) is warned here, because this path exits right after. Which shape notifies: only
-/// a row this call wrote ([`crate::logs::IssueWrite::Written`]). A reason the store already holds
-/// ([`crate::logs::IssueWrite::AlreadyRecorded`]) was told by the run that recorded it and earns
-/// no line here; the non-fatal steps below get their line only on the run that does record them.
+/// The record is the shared Issues-view one ([`crate::logs::record_issue_once`]), which
+/// writes straight into the logs store — the update path calls `exit(0)`, so a
+/// `tracing::warn!` alone would be lost — and never writes a reason the store already
+/// holds. Which shape warns: a fact no row carries
+/// ([`crate::logs::IssueWrite::NotRecorded`]), because this path exits right after.
+/// Which notifies: only a row this call wrote; one the store already holds was told by
+/// the run that recorded it.
 async fn record_update_unfinished(admin_target: Option<&str>, step: UnfinishedStep) {
     let recorded = crate::logs::record_issue_once(
         UPDATE_UNFINISHED_MESSAGE,
@@ -1663,14 +1397,11 @@ async fn record_update_unfinished(admin_target: Option<&str>, step: UnfinishedSt
     )
     .await;
     match recorded {
-        // This call is what recorded the row: fall through and let the non-fatal steps below
-        // tell the admin, since the ordinary failure line does not mention them.
+        // Fall through: the ordinary failure line does not mention the non-fatal steps.
         crate::logs::IssueWrite::Written => {}
-        // A reason the store already holds was told by the run that recorded it.
         crate::logs::IssueWrite::AlreadyRecorded => return,
-        // No row carries the fact, and this path exits right after: the process's own output is
-        // the last place it can be seen. The shared writer's warning is about the store, not
-        // about what was lost, so this line names the fact itself.
+        // This path exits right after, and the shared writer's warning is about the
+        // store, not about what was lost — so this line names the fact itself.
         crate::logs::IssueWrite::NotRecorded => {
             warn!(
                 reason = step.reason,
@@ -1679,8 +1410,7 @@ async fn record_update_unfinished(admin_target: Option<&str>, step: UnfinishedSt
             return;
         }
     }
-    // The row above is the whole of what a fatal step adds: the ordinary failure
-    // line already tells him which step failed.
+    // A fatal step adds nothing: the ordinary failure line already names it.
     if step.stops_update {
         return;
     }
@@ -1688,26 +1418,21 @@ async fn record_update_unfinished(admin_target: Option<&str>, step: UnfinishedSt
     notify_admin(&message, admin_target).await;
 }
 
-// ── Execute update ────────────────────────────────────────────────────────
-
-/// Set while [`execute_update`] runs its finalizing window (drain through
-/// `exit(0)`). During this window the update path owns the process:
-/// the GUI exit path waits ([`update_is_finalizing`]) instead of exiting, so a
-/// platform quit, a close or SIGINT cannot abort the update's checkpoint
-/// on the iced runtime and leave the instance down without a replacement.
+/// Set while [`execute_update`] runs its finalizing window (drain through `exit(0)`).
+/// The update path owns the process then: the GUI exit path waits
+/// ([`update_is_finalizing`]) instead of exiting, so a platform quit, a close or SIGINT
+/// cannot abort the checkpoint and leave the instance down without a replacement.
 static UPDATE_FINALIZING: AtomicBool = AtomicBool::new(false);
 
-/// True while [`execute_update`] is in its finalizing window (the instance is
-/// shut down; checkpoint, temp-root cleanup, lock release, spawn, and `exit(0)`
-/// pending).
+/// True while [`execute_update`] is finalizing: the instance is shut down, with the
+/// checkpoint, temp-root cleanup, lock release, spawn and `exit(0)` pending.
 #[must_use]
 pub fn update_is_finalizing() -> bool {
     UPDATE_FINALIZING.load(Ordering::SeqCst)
 }
 
-/// Verify `cargo` is on PATH, returning an error with a mode-appropriate
-/// message otherwise. The build-from-sources path only: updating a downloaded
-/// copy never runs cargo.
+/// Verify `cargo` is on PATH, with an error naming what it was needed for. The
+/// build-from-sources path only: updating a downloaded copy never runs cargo.
 async fn verify_cargo_on_path(action: &str) -> Result<()> {
     let mut cmd = tokio::process::Command::new("cargo");
     #[cfg(windows)]
@@ -1725,13 +1450,11 @@ async fn verify_cargo_on_path(action: &str) -> Result<()> {
     }
 }
 
-/// Resolve the admin Telegram reply target for update notifications, logging
-/// the rationale (info/warn) when notifications cannot be sent. Resolution is
-/// per-call — a DB round trip to find the admin and its channel bindings.
-/// Shared by both update paths.
+/// Resolve the admin Telegram reply target, logging why when notifications cannot be
+/// sent. Per call — a DB round trip to find the admin and its channel bindings — and
+/// shared by both update paths.
 async fn resolve_update_admin_target() -> Option<String> {
     let admin_target = resolve_admin_telegram_target().await;
-    // Log info-level rationale when notifications cannot be sent.
     if admin_target.is_none() {
         if crate::config::CONFIG.telegram_bot_token().is_none() {
             info!("No Telegram bot token configured — skipping update notifications");
@@ -1746,50 +1469,34 @@ async fn resolve_update_admin_target() -> Option<String> {
     admin_target
 }
 
-/// Execute a self-update, dispatching on the update mode:
+/// Execute a self-update, dispatching on the update mode: a source tree builds into a
+/// temp root, swaps and restarts; a downloaded copy fetches this system's release file,
+/// puts it at the standard per-user location and restarts.
 ///
-/// - [`UpdateMode::SourceTree`]: build from this working tree into a temp root,
-///   swap the binary, restart.
-/// - [`UpdateMode::Downloaded`]: download this system's ready-made release file,
-///   put it at the standard per-user location, restart.
+/// The GUI button, the Telegram `/update` command and the unattended trigger claim the
+/// shared in-progress flag ([`claim_update_start`]) before they get here, so only one
+/// update runs at a time; the environment-driven hook does not claim — it can never run
+/// beside the unattended trigger, so `UPDATE_MUTEX` alone serializes it.
 ///
-/// Called from the GUI update button, the Telegram `/update` command, and the
-/// unattended trigger of a downloaded copy ([`start_automatic_update_if_found`]);
-/// those three claim the shared in-progress flag ([`claim_update_start`]) before
-/// they get here, so only one update runs at a time. The environment-driven hook
-/// is the one caller that does not claim — it can never run beside the unattended
-/// trigger, so `UPDATE_MUTEX` alone serializes it.
+/// `auto_target` is the release the unattended trigger's own attempt is pinned to, and
+/// on failure that same release is remembered as failed *before* the in-progress flag
+/// is cleared. Every other caller passes `None`, so no check can start another attempt
+/// for the release in between.
 ///
-/// `auto_target` is the release the unattended trigger decided its own attempt
-/// goes after: the attempt is pinned to exactly that release, and on failure the
-/// same release is remembered as failed *before* the in-progress flag is cleared.
-/// Every other caller passes `None`, so only the unattended trigger's own
-/// failures are ever remembered, and no check can start another attempt for the
-/// release in the window between the attempt ending and the memory landing.
-///
-/// On success, this function never returns (`std::process::exit(0)`).
-/// On failure, returns an error.
+/// On success this never returns (`std::process::exit(0)`); on failure it returns an error.
 pub(crate) async fn execute_update(auto_target: Option<&semver::Version>) -> Result<()> {
-    // Concurrent guard — only one update at a time. A second trigger while an
-    // update is in progress gets an immediate error.
     let Some(_guard) = UPDATE_MUTEX.try_lock().ok() else {
         anyhow::bail!("{UPDATE_IN_PROGRESS_MSG}");
     };
-    // Mark the shared in-progress state (already claimed by the caller, and
-    // idempotent here) so both the GUI and the Telegram `/update` gate report
-    // the update, and the GUI's exit-request/finalize guards key off it (a
-    // Telegram-initiated update must also protect the finalize/checkpoint
-    // window). Cleared on failure; a successful update exits the process.
+    // Already claimed by the caller; set here too so the GUI and the `/update` gate
+    // report the update and the exit-request/finalize guards key off it.
     update_cache().in_progress.store(true, Ordering::SeqCst);
     let result = match update_mode() {
         UpdateMode::SourceTree => execute_source_tree_update().await,
         UpdateMode::Downloaded => execute_downloaded_update(auto_target).await,
     };
     if result.is_err() {
-        // The unattended trigger's own attempt is remembered while the flag is
-        // still held, so the next check cannot start another attempt for the
-        // release in the window before it clears. A failed manual attempt is
-        // never remembered.
+        // Remembered while the flag is still held; a failed manual attempt never is.
         if let Some(target) = auto_target {
             record_auto_update_failure(target);
         }
@@ -1799,17 +1506,11 @@ pub(crate) async fn execute_update(auto_target: Option<&semver::Version>) -> Res
 }
 
 /// Drive a whole update with no window at all, when a version was named through
-/// [`UPDATE_TO_VERSION_ENV`]: wait for the stores and channels, then run
-/// [`execute_update`].
-///
-/// Returns immediately unless the version named through [`UPDATE_TO_VERSION_ENV`]
-/// differs from the running one *and* this copy updates by downloading — an
-/// ordinary copy (no named version) never reaches the update here. It then waits
-/// for the stores and the channels to come up before running [`execute_update`],
-/// and reports a failure instead of restarting anything. The hook terminates by
-/// itself: after the restart, the replacement instance sees the named version as
-/// its own and does nothing. See the module doc — this and
-/// [`RELEASE_BASE_URL_ENV`] are the only test-only paths in this file.
+/// [`UPDATE_TO_VERSION_ENV`]: returns immediately unless that version differs from the
+/// running one *and* this copy updates by downloading, then waits for the stores and
+/// channels before running [`execute_update`], reporting a failure instead of
+/// restarting anything. The hook terminates by itself — the replacement sees the named
+/// version as its own and does nothing.
 pub async fn run_env_named_update() {
     if update_target_override().is_none() || update_mode() != UpdateMode::Downloaded {
         return;
@@ -1822,11 +1523,9 @@ pub async fn run_env_named_update() {
     }
 }
 
-/// The build-from-sources self-update: build from this working tree into a temp
-/// root via `cargo install --path`, swap the running binary, and restart. See
-/// [`execute_update`] for the concurrent-guard and exit contracts.
+/// The build-from-sources self-update: `cargo install --path` into a temp root, swap the
+/// running binary, restart. See [`execute_update`] for the concurrent-guard and exit contracts.
 async fn execute_source_tree_update() -> Result<()> {
-    // 1. Validate prerequisites.
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let cargo_toml = manifest_dir.join("Cargo.toml");
     if !cargo_toml.is_file() {
@@ -1838,26 +1537,20 @@ async fn execute_source_tree_update() -> Result<()> {
         );
     }
 
-    // Verify cargo is on PATH.
     verify_cargo_on_path("build from source").await?;
 
-    // 2. Look up admin Telegram reply_target.
     let admin_target = resolve_update_admin_target().await;
 
-    // 3. Notify: build started.
     notify_admin(
         "🔄 Update started — building from source…",
         admin_target.as_deref(),
     )
     .await;
 
-    // 4. Create temp roots for the install and the cargo build. Held in scope
-    //    for the whole update so an install/spawn failure RAII-cleans them; on
-    //    success `std::process::exit(0)` bypasses RAII, so the finalize tail
-    //    removes them explicitly before the lock release and spawn. The cold
-    //    release rebuild of the heavy dep tree can be several-GB; the temp
-    //    roots land under the (pinned) system temp dir, which on macOS is the
-    //    boot volume with the repo, so no cross-volume fallback is warranted.
+    // Held in scope so an install/spawn failure RAII-cleans them; `exit(0)` on success
+    // bypasses RAII, so the finalize tail removes them before the lock release and
+    // spawn. The cold release rebuild is several-GB, and the temp roots land on the
+    // boot volume with the repo, so no cross-volume fallback is warranted.
     let temp_install_root =
         tempfile::tempdir().context("Failed to create temp install root for self-update")?;
     let temp_build_dir =
@@ -1865,11 +1558,9 @@ async fn execute_source_tree_update() -> Result<()> {
     let install_root = temp_install_root.path().to_path_buf();
     let build_dir = temp_build_dir.path().to_path_buf();
 
-    // 5. Run `cargo install --path <repo> --root <temp_install> --locked
-    //    --target-dir <temp_build>` so the build never touches the repo's
-    //    `target/` (which would overwrite a running `target/release` artifact)
-    //    and the install lands in the temp root. cwd is the storage root (it is
-    //    guaranteed writable and exists, unlike the launch dir).
+    // The build never touches the repo's `target/` (which would overwrite a running
+    // `target/release` artifact), and cwd is the storage root — guaranteed writable,
+    // unlike the launch dir.
     run_cargo_with_timeout(
         &[
             OsStr::new("install"),
@@ -1891,7 +1582,6 @@ async fn execute_source_tree_update() -> Result<()> {
     )
     .await?;
 
-    // 6. Tail: validate, swap the running binary, notify, drain, restart.
     let fresh_binary = temp_bin_path(&install_root);
     finalize_source_tree_update(
         &fresh_binary,
@@ -1901,33 +1591,27 @@ async fn execute_source_tree_update() -> Result<()> {
     .await
 }
 
-/// The downloaded-copy self-update: fetch this system's ready-made release file,
-/// extract it, put it at the standard per-user location, and restart. See
-/// [`execute_update`] for the concurrent-guard and exit contracts.
+/// The downloaded-copy self-update: fetch this system's ready-made release file, extract
+/// it, put it at the standard per-user location, and restart. See [`execute_update`] for
+/// the concurrent-guard and exit contracts.
 ///
-/// `pinned` is the release the unattended trigger decided this attempt goes
-/// after, when this is that trigger's own call — the attempt is bound to exactly
-/// that release instead of re-deriving one here, so the release attempted and the
-/// release remembered on failure are the same one. Every other caller passes
-/// `None` (the environment hook's named version is taken from
-/// [`update_target_override`] instead, and the two are never set together).
+/// `pinned` is the release the unattended trigger's own attempt goes after, so the
+/// release attempted and the release remembered on failure are the same one. Every other
+/// caller passes `None`; the environment hook's named version comes from
+/// [`update_target_override`] instead, and the two are never set together.
 async fn execute_downloaded_update(pinned: Option<&semver::Version>) -> Result<()> {
-    // 1. A system with no published file for it is refused before anything happens
-    //    at all: downloading one and putting it in place would leave this copy
-    //    replaced by a file that cannot load — no working copy, the one state an
-    //    update must never produce. The install scripts refuse the same systems.
+    // A system with no published file for it is refused before anything happens: a file
+    // that cannot load would leave no working copy, the one state an update must never
+    // produce. The install scripts refuse the same systems.
     if let Some(reason) = absent_release_file().await {
         anyhow::bail!("{reason} — no update was made.");
     }
 
-    // 2. The version to move to. The unattended trigger's pinned release is taken
-    //    outright — the check that offered it already proved it strictly newer than
-    //    the running version. A version named through [`UPDATE_TO_VERSION_ENV`] is
-    //    taken outright too — any version other than the running one is a step it
-    //    deliberately asked for; the ordinary path reads the newest published
-    //    release and only ever moves forward, so a published release is never a
-    //    step back. Nothing at all is installed when the version cannot be
-    //    determined.
+    // The pinned release is taken outright — the check that offered it proved it newer.
+    // A version named through [`UPDATE_TO_VERSION_ENV`] is taken outright too, any
+    // version being a deliberate step. The ordinary path reads the newest published
+    // release and only ever moves forward, and nothing is installed when the version
+    // cannot be determined.
     let target = if let Some(pinned) = pinned {
         pinned.clone()
     } else if let Some(named) = update_target_override() {
@@ -1945,12 +1629,10 @@ async fn execute_downloaded_update(pinned: Option<&semver::Version>) -> Result<(
         latest
     };
 
-    // 3. The admin every notification goes to, and the file the new version goes
-    //    in place of — or is placed at, for a copy whose own file sits elsewhere:
-    //    the standard per-user programs location the install scripts use. A location
-    //    that cannot be resolved cannot be written to either, so it is the same
-    //    failing step as a placement that fails — recorded and reported the same way
-    //    — and nothing is downloaded.
+    // The admin every notification goes to, and the file the new version goes in place
+    // of — or is placed at: the standard per-user programs location the install scripts
+    // use. A location that cannot be resolved cannot be written to either, so it is the
+    // same failing step as a placement that fails, and nothing is downloaded.
     let admin_target = resolve_update_admin_target().await;
     let Some(dest) = crate::util::managed_bin::mahbot_install_dir()
         .map(|dir| dir.join(crate::util::managed_bin::product_file_name()))
@@ -1959,17 +1641,14 @@ async fn execute_downloaded_update(pinned: Option<&semver::Version>) -> Result<(
         anyhow::bail!("The standard install location could not be resolved — no update was made.");
     };
 
-    // 4. Notify: download started (the Telegram channel must still be live for
-    //    every notification in this function).
     notify_admin(
         "🔄 Update started — downloading the new version…",
         admin_target.as_deref(),
     )
     .await;
 
-    // 5. Download this system's archive and extract the single file from it. The
-    //    temp dir is held in scope for the whole update (RAII on error; explicit
-    //    removal in the finalize tail, before the lock release and spawn).
+    // The temp dir is held in scope for the whole update (RAII on error; removed in the
+    // finalize tail, before the lock release and spawn).
     let temp_dir = tempfile::tempdir().context("Failed to create temp dir for self-update")?;
     let (os, arch) = crate::util::managed_bin::host_os_arch().map_err(|e| anyhow!("{e}"))?;
     let name = asset_name(&target, os, arch);
@@ -1978,17 +1657,16 @@ async fn execute_downloaded_update(pinned: Option<&semver::Version>) -> Result<(
     let client = crate::util::http::build_download_client(DOWNLOAD_TIMEOUT)
         .context("Failed to build the download client for self-update")?;
     let archive = temp_dir.path().join(&name);
-    // The release's change list is taken down alongside the archive, so the start
-    // after the restart — which may be offline — still has it. Both run together;
-    // the list request is capped at [`CHANGELOG_TIMEOUT`], so a slow or missing
-    // asset costs the update at most that but never the update itself.
+    // The change list comes down alongside the archive so the start after the restart —
+    // which may be offline — still has it; its request is capped at [`CHANGELOG_TIMEOUT`],
+    // so a slow or missing asset never costs the update itself.
     let (downloaded, changes) = tokio::join!(
         crate::util::http::download_verified(
             &client,
             &url,
             &archive,
-            // The product's own file: it is published beside the version that names
-            // it, so there is deliberately no checksum to verify it against.
+            // The product's own file: published beside the version that names it, so
+            // there is deliberately no checksum to verify it against.
             "",
             Some(DOWNLOAD_TIMEOUT),
             crate::util::http::DownloadSizeCheck::Exact,
@@ -1997,8 +1675,6 @@ async fn execute_downloaded_update(pinned: Option<&semver::Version>) -> Result<(
         fetch_release_changelog(&client, &version),
     );
     downloaded.with_context(|| format!("Failed to download {name}"))?;
-    // The archive runs a zip for Windows and a tar.gz everywhere else — the
-    // platform split [`asset_name`] owns.
     let extract = if os == "windows" {
         crate::util::managed_bin::extract_single_file_zip
     } else {
@@ -2011,16 +1687,12 @@ async fn execute_downloaded_update(pinned: Option<&semver::Version>) -> Result<(
     )
     .map_err(|e| anyhow!("Failed to extract {name}: {e}"))?;
 
-    // 6. Put it in place. When the running file IS the standard location, the
-    //    swap rewrites that file in place and the restart target is that same
-    //    path. Otherwise this is a ready-made copy whose file sits outside the
-    //    standard location (it "moves itself" there): the new file is placed at
-    //    the standard location and the restart target is that new copy.
+    // When the running file IS the standard location the swap rewrites it in place and
+    // the restart target is that same path; otherwise this copy "moves itself" there —
+    // the new file is placed at the standard location, which becomes the restart target.
     let current_exe = std::env::current_exe().context("Failed to resolve current_exe()")?;
     let (spawn_path, relocated) = if canonicalize_safe(&current_exe) == canonicalize_safe(&dest) {
-        // The running file IS the standard location, so the swap rewrites it in
-        // place. A swap that fails leaves the copy that is there working, and the
-        // step that failed is recorded durably like every other.
+        // A swap that fails leaves the copy that is there working.
         if let Err(e) = self_replace::self_replace(&fresh) {
             record_update_unfinished(admin_target.as_deref(), STANDARD_DIR_UNUSABLE).await;
             return Err(e).with_context(|| format!("Failed to swap binary at {}", fresh.display()));
@@ -2034,19 +1706,13 @@ async fn execute_downloaded_update(pinned: Option<&semver::Version>) -> Result<(
         (dest.clone(), true)
     };
 
-    // 7. Take away the copies a working installation must not leave behind: the one
-    //    this instance came from, when this copy moved itself, and the one the old
-    //    way of installing (`cargo install mahbot`) left in the toolchain's own
-    //    directory — a removal an earlier update may have failed to make, tried
-    //    again here because this runs at every update. The running image itself needs
-    //    the platform's own way of getting rid of it — `self_delete` unlinks the
-    //    file on unix and, on Windows, where a running image cannot be unlinked,
-    //    renames it aside and schedules the deletion. The update goes through either
-    //    way: a leftover is recorded durably, never fatal.
-    //
-    //    The failure itself is a developer's line (it carries the platform's own
-    //    error, path and all) and so is logged below the owner's view: what he sees
-    //    of this step is the durable record, one row per distinct reason.
+    // Take away the copies a working installation must not leave behind: the one this
+    // instance came from when this copy moved itself, and the one `cargo install mahbot`
+    // left in the toolchain's directory — retried at every update, in case an earlier one
+    // failed. The running image needs the platform's own removal: `self_delete` unlinks
+    // it on unix and, on Windows, renames it aside and schedules the deletion. A leftover
+    // is recorded durably, never fatal, and logged below the owner's view since the
+    // failure carries the platform's own path and all.
     if relocated && let Err(e) = self_replace::self_delete() {
         debug!(error = %e, "Could not remove the copy this instance came from");
         record_update_unfinished(admin_target.as_deref(), SECOND_COPY_REMAINS).await;
@@ -2058,47 +1724,34 @@ async fn execute_downloaded_update(pinned: Option<&semver::Version>) -> Result<(
         record_update_unfinished(admin_target.as_deref(), SECOND_COPY_REMAINS).await;
     }
 
-    // 8. Record the release's change list for the first start of the new version
-    //    — the list was taken down with the archive above, before the restart. A
-    //    release that carries none is recorded without one, and that start asks
-    //    the release again; neither case can fail the update.
+    // Recorded for the first start of the new version; a release carrying no list is
+    // recorded without one, and that start asks again. Neither case can fail the update.
     capture_update_announcement(crate::config_db::store(), &version, changes).await;
 
-    // 9. Notify: in place, then wrapping up before the restart (MUST be before
-    //    the shutdown in finalize_update_and_restart — the Telegram channel must
-    //    still be live).
+    // Before the shutdown in [`finalize_update_and_restart`]: the Telegram channel must
+    // still be live.
     notify_admin(UPDATE_DOWNLOAD_COMPLETE_MSG, admin_target.as_deref()).await;
     notify_admin(UPDATE_RESTART_MSG, admin_target.as_deref()).await;
 
-    // 10. Shared finalize tail. The temp dir is never the spawn target (that is
-    //     always the file the update left in place).
+    // The temp dir is never the spawn target: that is always the file the update left in place.
     finalize_update_and_restart(&spawn_path, vec![temp_dir.path().to_path_buf()]).await
 }
 
 /// The copy the old way of installing leaves behind — the product's own file in the
-/// toolchain's binary directory (`$CARGO_HOME/bin`, else `~/.cargo/bin`) — when one
-/// is there that is neither the file this instance is running from nor the file this
-/// update has just put in place. `None` otherwise.
+/// toolchain's binary directory (`$CARGO_HOME/bin`, else `~/.cargo/bin`) — when one is
+/// there that is neither the running file nor the file this update just put in place.
 ///
-/// A downloaded copy is updated at the standard per-user programs directory from the
-/// second update on, so without this the leftover of a failed move would never be
-/// looked at again. It is computed fresh — from the toolchain's own convention, which
-/// is where `cargo install` puts a command and where the install scripts look for it
-/// too — rather than remembered, and the path is never part of what gets recorded.
-///
-/// `dest` is excluded because a `CARGO_HOME` can name the install directory itself
-/// (`~/.local` on unix), where the toolchain's binary directory *is* the standard
-/// per-user programs directory: removing that would take away the file the update
-/// just put there, leaving nothing to start.
+/// Computed fresh from the toolchain's convention rather than remembered, so the leftover
+/// of a failed move is still found by later updates; the path is never part of what gets
+/// recorded. `dest` is excluded because a `CARGO_HOME` can name the install directory
+/// itself (`~/.local` on unix), whose binary directory *is* the standard location:
+/// removing that would take away the file just placed.
 fn legacy_copy(dest: &Path) -> Option<PathBuf> {
     let path = crate::util::cargo_bin_dir()?.join(crate::util::managed_bin::product_file_name());
     if !path.is_file() {
         return None;
     }
     let path = canonicalize_safe(&path);
-    // The file this instance is running from is the move's business, not this one's,
-    // and the destination is what this update placed: only a copy that is neither is
-    // removed here.
     if path == canonicalize_safe(&std::env::current_exe().ok()?) || path == canonicalize_safe(dest)
     {
         return None;
@@ -2106,9 +1759,7 @@ fn legacy_copy(dest: &Path) -> Option<PathBuf> {
     Some(path)
 }
 
-/// Path to the freshly built `mahbot` binary inside a cargo install temp root.
-///
-/// `cargo install --root <install_root>` places the produced binary at
+/// Path to the freshly built binary inside a cargo install temp root:
 /// `<install_root>/bin/mahbot` (`.exe` on Windows).
 fn temp_bin_path(install_root: &Path) -> PathBuf {
     install_root
@@ -2116,32 +1767,21 @@ fn temp_bin_path(install_root: &Path) -> PathBuf {
         .join(crate::util::managed_bin::product_file_name())
 }
 
-/// The build-from-sources tail, after `cargo install --path` produced the fresh
-/// binary at `<temp_install>/bin/mahbot`.
+/// The build-from-sources tail, after `cargo install --path` produced the fresh binary
+/// at `<temp_install>/bin/mahbot`: validate it exists and is non-empty (a silent empty
+/// swap would strand the instance), capture `current_exe()` BEFORE the swap — it is the
+/// restart target — swap via `self_replace` (the fresh file differs from the running exe,
+/// which self-replace requires on Windows), notify, then hand off to
+/// [`finalize_update_and_restart`].
 ///
-/// 1. Validate that the fresh binary exists and is non-empty (bail otherwise —
-///    a silent empty swap would strand the instance).
-/// 2. Capture `current_exe()` BEFORE the swap — it is the restart target
-///    (self_replace rewrites it in place, wherever it lives).
-/// 3. Swap the running binary with the fresh one via `self_replace`. The source
-///    differs from the running exe (it lives in the temp root), which
-///    self-replace requires on Windows.
-/// 4. Notify [`UPDATE_BUILD_COMPLETE_MSG`], then [`UPDATE_RESTART_MSG`] (the
-///    Telegram channel must still be live for both).
-/// 5. Hand off to [`finalize_update_and_restart`] for the drain → checkpoint →
-///    temp-root removal → unlock → spawn-from-`current_exe` → exit.
-///
-/// `cleanup_paths` are the temp roots to remove before the instance-lock release
-/// and spawn. On any error return the caller keeps the `TempDir` values in
-/// scope, so their RAII drops clean them up; `std::process::exit(0)` bypasses
-/// RAII, so the success path removes them in [`finalize_update_and_restart`]
-/// instead.
+/// `cleanup_paths` are removed at the end of that tail: on any error the caller's
+/// `TempDir` values are still in scope and clean themselves up, while `exit(0)` bypasses
+/// RAII on the success path.
 async fn finalize_source_tree_update(
     fresh_binary: &Path,
     admin_target: Option<&str>,
     cleanup_paths: Vec<PathBuf>,
 ) -> Result<()> {
-    // 1. Validate the freshly built binary.
     let len = fs::metadata(fresh_binary)
         .with_context(|| format!("Freshly built binary missing at {}", fresh_binary.display()))?
         .len();
@@ -2152,103 +1792,67 @@ async fn finalize_source_tree_update(
         );
     }
 
-    // 2. Capture the running exe before the swap — the restart target.
     let current_exe = std::env::current_exe().context("Failed to resolve current_exe()")?;
 
-    // 3. Swap the running binary with the fresh one.
     self_replace::self_replace(fresh_binary)
         .with_context(|| format!("Failed to swap binary at {}", fresh_binary.display()))?;
 
-    // 4. Notify: build complete (swap succeeded), then wrapping up before the
-    //    restart (MUST be before the shutdown in finalize_update_and_restart —
-    //    the Telegram channel must still be live).
+    // Both before the shutdown in [`finalize_update_and_restart`]: the Telegram channel
+    // must still be live.
     notify_admin(UPDATE_BUILD_COMPLETE_MSG, admin_target).await;
     notify_admin(UPDATE_RESTART_MSG, admin_target).await;
 
-    // 5. Shared finalize tail. The temp roots are removed in the tail (before
-    //    the instance-lock release and spawn) rather than by RAII: `exit(0)`
-    //    bypasses destructors, and they are never the spawn target (which is
-    //    always `current_exe`), so removal cannot race macOS Gatekeeper
-    //    validation of the child.
     finalize_update_and_restart(&current_exe, cleanup_paths).await
 }
 
-/// Shared finalize tail for both update paths: graceful drain, the final
-/// checkpoint, temp-dir removal, instance-lock release, independent spawn of the
-/// replacement, and `exit(0)`.
+/// Shared finalize tail for both update paths: graceful drain, the final checkpoint,
+/// temp-dir removal, instance-lock release, independent spawn of the replacement, and
+/// `exit(0)`. `spawn_path` is the working file the update left in place. The ordering is
+/// load-bearing and MUST NOT be rearranged:
 ///
-/// `spawn_path` is the file the update left in place — the working file the
-/// replacement instance runs from. The ordering is load-bearing and MUST NOT be
-/// rearranged:
-///
-/// 1. Graceful drain (the FULL drain, same as the tray's quit or ⌘Q — NOT
-///    fast-cancel). In-flight agents complete their current round; the
-///    drain-watch task fires the global token when no in-flight agents or
-///    orchestrator calls remain (or force-cancels at the 10-min cap). The GUI
-///    stays up with input disabled; the GUI exit path waits
-///    ([`update_is_finalizing`]) instead of exiting, so this sequence cannot be
-///    aborted by an exit request — a close, a platform quit or SIGINT — racing
-///    the checkpoint. No failure transitions with 'service
-///    shutting down' comments fire — agents that cannot finish stay
-///    status='launched' and boot-resume. The drain semantics are unchanged; then
-///    `crate::tools::chrome_release::flush_ended_run_chrome_releases` releases
-///    the sessions ended runs left queued.
-/// 2. Checkpoint all databases BEFORE releasing the instance lock and spawning
-///    the replacement. The round releases each store's reader connections first
-///    (see `checkpoint_all_databases`); `exit(0)` below bypasses Rust
-///    destructors, so the writing connections themselves are never formally
-///    closed. With the lock still held this is
-///    the last checkpoint the retiring process issues: no checkpoint runs after
-///    the replacement is live (the GUI exit path waits while the update is
-///    finalizing — see `save_and_exit` / `update_is_finalizing`). No writer can
-///    be in flight either — the drain stopped them all — but a periodic round's
-///    statement is not a writer and runs in a detached task, so one can outlive a
-///    cancelled round and answer this TRUNCATE blocked: a warn, and the
-///    replacement replays the journal (src/db/checkpoint.rs states the same for
-///    the round).
-/// 3. Remove the temp update roots BEFORE releasing the instance lock or
-///    spawning: `exit(0)` below bypasses Rust destructors, so the (potentially
-///    multi-GB) deletion must complete here while the old process still holds
-///    Turso's exclusive open-time fcntl locks on the store files (the writing
-///    connections are never formally closed). If the child booted while they were held, its
-///    store open would fail on the lock — boot has only a bounded retry, not
-///    immunity. Keeping the instance flock held during cleanup also prevents a
-///    manually started second instance from sneaking in. Safe to delete before
-///    spawn because the spawn target is ALWAYS the working file the update put in
-///    place — never a temp root — so cleanup can never delete the binary the
-///    child is validating; macOS syspolicyd SIGKILLs children whose binary is
-///    deleted during async code-signature validation, and that invariant must
-///    hold. In the build-from-sources path the working file is `current_exe()`
-///    (in-place `self_replace`); in the downloaded-copy path it is the standard
-///    location the new file was placed at.
+/// 1. The FULL drain (like the tray's quit or ⌘Q, not fast-cancel): in-flight agents
+///    finish their round, the drain-watch fires the global token when none remain (or
+///    force-cancels at the 10-min cap), and the GUI stays up with input disabled. Its
+///    exit path waits ([`update_is_finalizing`]) instead of exiting, so no close, quit
+///    or SIGINT can abort this at the checkpoint. No failure transitions fire — agents
+///    that cannot finish stay `status='launched'` and boot-resume — and
+///    `chrome_release::flush_ended_run_chrome_releases` releases what ended runs left queued.
+/// 2. Checkpoint all databases BEFORE releasing the lock or spawning: each store's
+///    reader connections are released first (see `checkpoint_all_databases`), but
+///    `exit(0)` bypasses destructors, so the writing connections are never formally
+///    closed. This is the last checkpoint the retiring process issues — none runs after
+///    the replacement is live, and the GUI exit path waits while finalizing
+///    (`save_and_exit`). No writer can be in flight, the drain stopped them all, but a
+///    periodic round's statement is not a writer and runs detached, so one can outlive a
+///    cancelled round and answer this TRUNCATE blocked: a warn, and the replacement
+///    replays the journal (`src/db/checkpoint.rs` states the same for the round).
+/// 3. Remove the temp update roots BEFORE releasing the lock or spawning: `exit(0)`
+///    bypasses destructors, so the (potentially multi-GB) deletion completes here while
+///    the old process still holds Turso's exclusive open-time fcntl locks — a child
+///    booting while they were held would fail its store open, boot having only a bounded
+///    retry. Holding the instance flock during cleanup also keeps a second instance from
+///    sneaking in. Deleting before the spawn is safe because the spawn target is ALWAYS
+///    the working file the update put in place — `current_exe()` when self-replaced in
+///    place, the standard location when placed there — never a temp root, so cleanup
+///    cannot delete the binary the child is validating (macOS syspolicyd SIGKILLs a
+///    child whose binary is deleted during validation).
 /// 4. Release the instance lock so the child can acquire it.
-/// 5. Spawn the new instance, marked as the update hand-off ([`HANDOFF_ENV`] —
-///    see [`acquire_lock`]). On macOS, the spawn triggers asynchronous
-///    Gatekeeper code signature validation. The spawn target is never a temp
-///    root (see step 3), so the cleanup cannot race the validation.
+/// 5. Spawn the new instance marked as the update hand-off ([`HANDOFF_ENV`] — see
+///    [`acquire_lock`]).
 /// 6. `exit(0)`.
 ///
-/// On spawn failure (step 5) the process stays alive and the update returns
-/// `Err`, having already removed its temp roots — acceptable, since they are
-/// transient update artifacts (the caller keeps the `TempDir` values in scope
-/// and RAII cleans any leftover).
+/// On spawn failure the process stays alive and returns `Err`, its temp roots already
+/// gone — acceptable, since they are transient update artifacts.
 async fn finalize_update_and_restart(spawn_path: &Path, cleanup_paths: Vec<PathBuf>) -> Result<()> {
-    // 1. Begin the graceful drain.
     UPDATE_FINALIZING.store(true, Ordering::SeqCst);
     crate::shutdown::drain_begin();
     let token = crate::shutdown::shutdown_token();
     token.cancelled().await;
     crate::tools::chrome_release::flush_ended_run_chrome_releases().await;
 
-    // 2. Checkpoint all databases BEFORE releasing the instance lock and
-    //    spawning the replacement (see doc comment above).
     crate::db::checkpoint::checkpoint_all_databases().await;
 
-    // 3. Remove the temp update roots BEFORE releasing the instance lock and
-    //    spawning (see doc comment above): `exit(0)` bypasses destructors, so
-    //    the multi-GB deletion must complete here while the old process still
-    //    holds Turso's exclusive open-time locks. Best-effort — a failure to
-    //    remove a stale root must not abort the update.
+    // Best-effort: a stale root left behind must not abort the update.
     for path in &cleanup_paths {
         if let Err(e) = fs::remove_dir_all(path) {
             warn!(
@@ -2259,51 +1863,41 @@ async fn finalize_update_and_restart(spawn_path: &Path, cleanup_paths: Vec<PathB
         }
     }
 
-    // 4. The local Bot API server is a child of this process and this exit runs
-    //    no destructors: it is stopped BEFORE the lock is released, so the
-    //    replacement start cannot adopt a server this process is about to kill.
+    // The local Bot API server is a child of this process and this exit runs no
+    // destructors: stopped BEFORE the lock is released, so the replacement cannot adopt
+    // a server this process is about to kill.
     crate::channels::stop_telegram_server().await;
 
-    // 5. Release the instance lock so the child can acquire it on startup.
     release_instance_lock().await;
 
-    // 6. Spawn the new instance from the determined spawn path, marked as the
-    //    update hand-off.
     if let Err(e) = spawn_new_instance_from(spawn_path) {
-        // Spawn failed — the process stays alive (unless an exit request — a
-        // close, a platform quit — arrived during the finalizing window, in which
-        // case the GUI honors it with its own checkpoint + exit via UpdateResult).
-        // Clear the finalizing flag and re-acquire the lock.
+        // The process stays alive unless an exit request arrived during the finalizing
+        // window (the GUI then honors it with its own checkpoint and exit via
+        // UpdateResult), so the flag is cleared and the lock re-acquired.
         UPDATE_FINALIZING.store(false, Ordering::SeqCst);
-        // Re-acquire the lock since the process stays alive.
         if let Err(lock_err) = reacquire_instance_lock().await {
             error!(%lock_err, "Failed to re-acquire instance lock after spawn failure");
         }
         return Err(e);
     }
 
-    // 7. Exit — spawn succeeded. The tray icon is taken out before it: `exit(0)` runs no
-    //    destructors, and a Windows notification-area icon its owner never removed stays
-    //    behind as a stale one. The removal is bounded, so a platform that cannot answer
-    //    in time delays this exit by seconds rather than holding it.
+    // `exit(0)` runs no destructors, and a Windows notification-area icon its owner never
+    // removed stays behind as a stale one. The removal is bounded, so a platform that
+    // cannot answer delays this exit by seconds rather than holding it.
     crate::channels::chat_draft::flush_global();
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     crate::tray::remove();
     std::process::exit(0);
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────
-
-/// The two heads a cargo step's failure is reported under; see
-/// [`CargoStepFailure`].
+/// The two heads a cargo step's failure is reported under; see [`CargoStepFailure`].
 struct CargoStep {
     toast_head: &'static str,
     admin_head: &'static str,
 }
 
 impl CargoStep {
-    /// The failure for a step that reported `body` — the text after the head,
-    /// separator included.
+    /// The failure for a step that reported `body` — the text after the head, separator included.
     fn failure(&self, body: String) -> anyhow::Error {
         anyhow::Error::new(CargoStepFailure {
             toast_head: self.toast_head,
@@ -2314,10 +1908,9 @@ impl CargoStep {
 }
 
 /// A failed cargo step of an update: one `body`, rendered under two heads.
-///
-/// [`Display`](std::fmt::Display) is the text the desktop toast has always
-/// shown; [`update_failure_notification`] composes the Telegram line, whose
-/// head names the step that failed.
+/// [`Display`](std::fmt::Display) is the desktop toast's text;
+/// [`update_failure_notification`] composes the Telegram line, whose head names the step
+/// that failed.
 #[derive(Debug)]
 struct CargoStepFailure {
     toast_head: &'static str,
@@ -2334,24 +1927,18 @@ impl std::fmt::Display for CargoStepFailure {
 
 impl std::error::Error for CargoStepFailure {}
 
-/// Run a long-running cargo subcommand with a timeout — the build-from-sources
-/// update path's only cargo runner.
+/// Run a long-running cargo subcommand with a timeout — the build-from-sources path's
+/// only cargo runner. `args` exclude the `cargo` binary itself and are `&OsStr` so paths
+/// and flags pass through without a Unicode assumption; `label` names the step in logs
+/// and error messages, `step` the heads a failure is reported under.
 ///
-/// `args` are the cargo arguments (excluding the `cargo` binary itself, each
-/// as `&OsStr` so paths and flags pass through without Unicode assumption),
-/// `cwd` the working directory, `timeout` the hard deadline, `label` a
-/// short human-readable description used in logs and error messages (e.g.
-/// "cargo install --path --locked"), and `step` the two heads a failure of this
-/// step is reported under.
+/// The caller passes `--target-dir` explicitly, and inherited `CARGO_TARGET_DIR` is
+/// stripped anyway, so no stray value can redirect the build out of the tree the update
+/// cleans up after itself. `CARGO_HOME` is NOT stripped — the child needs it for the
+/// toolchain and registry cache.
 ///
-/// The caller passes `--target-dir` explicitly, which takes precedence over any
-/// inherited `CARGO_TARGET_DIR` — that variable is stripped anyway, so no stray
-/// value can redirect the build out of the tree the update cleans up after
-/// itself. `CARGO_HOME` is NOT stripped — the child needs it for the
-/// toolchain/registry cache.
-///
-/// On failure the error is returned (no admin notification — the caller owns
-/// failure reporting via the single [`handle_update_command`]/GUI path).
+/// On failure the error is returned with no admin notification: the caller owns failure
+/// reporting via the single [`handle_update_command`]/GUI path.
 async fn run_cargo_with_timeout(
     args: &[&OsStr],
     cwd: &Path,
@@ -2368,14 +1955,12 @@ async fn run_cargo_with_timeout(
         timeout,
         cmd.args(args)
             .current_dir(cwd)
-            // Strip any inherited CARGO_TARGET_DIR so a stray value can never
-            // redirect the build out of the tree this update cleans up.
+            // Strip any inherited CARGO_TARGET_DIR so a stray value can never redirect
+            // the build out of the tree this update cleans up.
             .env_remove("CARGO_TARGET_DIR")
-            // kill_on_drop: if the timeout fires, the cargo child must die
-            // too rather than keep compiling in the background. For
-            // `cargo install` an orphaned child could even complete and swap
-            // the binary after the instance reported "timed out", racing a
-            // user retry.
+            // kill_on_drop: a timed-out cargo child must die rather than keep compiling,
+            // and an orphaned `cargo install` could even complete and swap the binary
+            // after the instance reported "timed out", racing a user retry.
             .kill_on_drop(true)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -2404,11 +1989,8 @@ async fn run_cargo_with_timeout(
     }
 }
 
-/// Look up the admin's Telegram reply target.
-///
-/// Returns `Some(reply_target)` if the admin account has a Telegram channel
-/// binding with a non-null `reply_target` and a bot token is configured.
-/// Returns `None` otherwise.
+/// The admin's Telegram reply target: `Some` only when a bot token is configured and the
+/// admin account has a Telegram binding with a non-null `reply_target`.
 pub async fn resolve_admin_telegram_target() -> Option<String> {
     let _ = crate::config::CONFIG.telegram_bot_token()?;
 
@@ -2423,14 +2005,11 @@ pub async fn resolve_admin_telegram_target() -> Option<String> {
         .and_then(|b| b.reply_target)
 }
 
-/// Send a notification to the admin via Telegram.
-///
-/// Delivery does not depend on a registered listener: the transport send falls
-/// back to a one-off channel on the base the current mode serves when none is
-/// registered, which is exactly the case of a switch having taken the listener
-/// away. A send that fails is logged and otherwise left alone, and this never
-/// waits: a base the local mode has not published yet fails it like any other
-/// send, so the one notice that must arrive waits for the transport itself (see
+/// Send a notification to the admin via Telegram. Delivery does not depend on a
+/// registered listener: the transport falls back to a one-off channel on the base the
+/// current mode serves when none is registered, which is the case of a switch having
+/// taken the listener away. A failed send is logged and left alone, and this never waits
+/// — the one notice that must arrive waits for the transport itself (see
 /// [`announce_startup`]).
 pub async fn notify_admin(message: &str, target: Option<&str>) {
     let Some(recipient) = target else {
@@ -2444,14 +2023,11 @@ pub async fn notify_admin(message: &str, target: Option<&str>) {
     }
 }
 
-/// Compose the Telegram failure text: the marker plus one plain statement of
-/// what failed. A failed cargo step names itself (see [`CargoStepFailure`]);
-/// every other failure reports its own error text.
-///
-/// Shared by the three user-facing entry points, so the `/update` command, the
-/// window's Update button and the unattended trigger report the same line. The
-/// desktop toast composes its own (see the error's
-/// [`Display`](std::fmt::Display)).
+/// Compose the Telegram failure text: the marker plus one plain statement of what failed.
+/// A failed cargo step names itself (see [`CargoStepFailure`]); every other failure
+/// reports its own error text. Shared by the three user-facing entry points, so the
+/// `/update` command, the window's button and the unattended trigger report the same
+/// line; the desktop toast composes its own.
 pub(crate) fn update_failure_notification(err: &anyhow::Error) -> String {
     let statement = match err.downcast_ref::<CargoStepFailure>() {
         Some(failure) => format!("{}{}", failure.admin_head, failure.body),
@@ -2460,24 +2036,19 @@ pub(crate) fn update_failure_notification(err: &anyhow::Error) -> String {
     format!("❌ {statement}")
 }
 
-/// Report a failed update to the admin exactly as the manual callers do — the
-/// shared failure line, to the admin's bound Telegram target.
-///
-/// Used by the callers with no surface of their own beyond that line: the
-/// unattended trigger and the window's own error toast. A failure is never
-/// silent, and a caller that reported here never composes a second sentence
-/// about the same attempt.
+/// Report a failed update to the admin exactly as the manual callers do: the shared
+/// failure line, to the admin's bound Telegram target. For the callers with no surface
+/// of their own — the unattended trigger and the window's error toast — so a failure is
+/// never silent, and a caller that reports here composes no second sentence about it.
 pub(crate) async fn report_update_failure(err: &anyhow::Error) {
     let admin_target = resolve_update_admin_target().await;
     notify_admin(&update_failure_notification(err), admin_target.as_deref()).await;
 }
 
-/// The start-up message the owner is told what is running by — the ordinary
-/// "back online" line, which now names the running version's build. An unattended
-/// update reports itself through the same lines a manual one does; this is what
+/// The ordinary "back online" start-up line, naming the running version's build — what
 /// says the version that came up is the new one, with no additional surface.
-/// `started_paused` (`mahbot paused`) adds that mode's state, so the owner is told
-/// that the workspaces standing still are the mode's doing and not a fault.
+/// `started_paused` (`mahbot paused`) adds that mode's state, so the owner is told the
+/// workspaces standing still are the mode's doing and not a fault.
 #[must_use]
 pub fn back_online_message(started_paused: bool) -> String {
     let message = format!("✅ MahBot is back online — running v{VERSION}");
@@ -2488,15 +2059,12 @@ pub fn back_online_message(started_paused: bool) -> String {
     }
 }
 
-/// Tell the owner this process is up, with the start-up line above.
-///
-/// The notice waits for the transport first: the self-hosted mode is stored
-/// configuration, while the address it needs is published only once the server
-/// this same process starts has answered, so a self-hosted start always opens a
-/// window in which nothing can be sent. The wait is this notice's own — the shared
-/// [`notify_admin`] serves the whole update flow, which must not wait — and only
-/// shutdown ends it, so a server slow to come up delays the notice rather than
-/// losing it.
+/// Tell the owner this process is up, with the start-up line above. The notice waits for
+/// the transport first: the self-hosted address is published only once the server this
+/// same process starts has answered, so such a start always opens a window in which
+/// nothing can be sent. That wait is this notice's own — [`notify_admin`] serves the
+/// whole update flow and must not wait — and only shutdown ends it, so a slow server
+/// delays the notice rather than losing it.
 pub async fn announce_startup(started_paused: bool) {
     let Some(target) = resolve_admin_telegram_target().await else {
         return;
@@ -2508,29 +2076,23 @@ pub async fn announce_startup(started_paused: bool) {
     notify_admin(&back_online_message(started_paused), Some(&target)).await;
 }
 
-/// Reply used when a command requires the admin. Used by both
-/// the Telegram command dispatch (binary) and the `/update` handler (library)
-/// so the denial wording stays consistent.
+/// Reply used when a command requires the admin, shared by the bin's dispatch and the
+/// `/update` handler so the denial wording stays consistent.
 pub const ADMIN_ONLY_CMD_MSG: &str = "This command is only available to the admin.";
 
-/// Reply for concurrent `/update` attempts — used both in the fast pre-check
-/// and the atomic claim below, and as the `execute_update` contention error.
+/// Reply for concurrent `/update` attempts — the fast pre-check, the atomic claim, and
+/// the `execute_update` contention error.
 const UPDATE_IN_PROGRESS_MSG: &str =
     "An update is already in progress. Please wait for it to complete.";
 
 /// Handle a Telegram `/update` command.
 ///
-/// Gated on the shared availability cache (admin + update available), with a
-/// synchronous reply for the early-failure cases (not an admin / already in
-/// progress / no update / cargo not on PATH — the last only when this copy's
-/// update has to build, so a downloaded copy is never held up by a toolchain it
-/// does not use). The actual update runs as a
-/// spawned async task so it does not block the Telegram message dispatch loop.
-/// Progress notifications route via the normal update notification path (the
-/// admin's Telegram binding); a failure is also reported directly to the
-/// invoking admin.
-/// There is NO confirmation modal — an admin invoking `/update` from Telegram
-/// is itself sufficient confirmation.
+/// Gated on the shared availability cache (admin + update available), with a synchronous
+/// reply for the early failures — not an admin, already in progress, no update, cargo not
+/// on PATH (the last only for a copy that has to build). The update itself runs as a
+/// spawned task so it does not block the dispatch loop; progress goes to the admin's
+/// Telegram binding and a failure is also reported straight to the invoker. There is NO
+/// confirmation modal — invoking `/update` from Telegram is itself sufficient.
 pub async fn handle_update_command(msg: &ChannelMessage) {
     if !crate::users::is_admin(&msg.user_name).await {
         crate::channels::telegram::send_reply(&msg.reply_target, ADMIN_ONLY_CMD_MSG).await;
@@ -2569,12 +2131,9 @@ pub async fn handle_update_command(msg: &ChannelMessage) {
         return;
     }
 
-    // Claim the in-progress flag before spawning. This closes the TOCTOU where
-    // a concurrent trigger (another `/update`, the window's button, or the
-    // unattended one) could pass the pre-check above, then lose
-    // `UPDATE_MUTEX.try_lock` inside `execute_update` and be reported through
-    // the failure message as "An update is already in progress."
-    // `execute_update` keeps the flag set and clears it on failure.
+    // Claimed before spawning, closing the TOCTOU where a concurrent trigger could pass
+    // the pre-check above and then lose `UPDATE_MUTEX.try_lock` inside `execute_update`,
+    // reported as "An update is already in progress."
     if !claim_update_start() {
         crate::channels::telegram::send_reply(&msg.reply_target, UPDATE_IN_PROGRESS_MSG).await;
         return;
@@ -2605,65 +2164,45 @@ pub async fn handle_update_command(msg: &ChannelMessage) {
     });
 }
 
-/// Canonicalize a path, falling back to the lexical path on failure.
-///
-/// Used for canonicalized-path comparisons where the file may not exist yet or
-/// where canonicalization may fail for other reasons (e.g., broken symlinks,
-/// permission denied).
+/// Canonicalize a path, falling back to the lexical path when the file does not exist yet
+/// or canonicalization fails (a broken symlink, permission denied).
 fn canonicalize_safe(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Spawn the new mahbot instance as an independent child process from the given
-/// path.
-///
-/// The `binary_path` must point to an existing, executable binary — always the
-/// working file the update left in place, and never a temp root (see
+/// Spawn the new mahbot instance as an independent child from `binary_path` — always the
+/// working file the update left in place, never a temp root (see
 /// [`finalize_update_and_restart`]).
 ///
-/// The child is marked as the update hand-off ([`HANDOFF_ENV`] — see
-/// [`acquire_lock`]), and as the replacement of a hidden window when the one it
-/// replaces was hidden ([`START_HIDDEN_ENV`]).
+/// The child is marked as the update hand-off ([`HANDOFF_ENV`] — see [`acquire_lock`]) and
+/// as the replacement of a hidden window when the one it replaces was hidden
+/// ([`START_HIDDEN_ENV`]). It inherits the launcher's mode — `paused` when the old process
+/// was started paused — and never the old process's argv: a word this binary has no entry
+/// point for would be refused and the service would not come back.
 ///
-/// The replacement inherits the daemon's launch mode — `paused` when the old
-/// process was started paused, nothing otherwise — and never the old process's own
-/// argv: a word this binary has no entry point for (an older build launched the
-/// daemon through one) would be refused by the replacement, and the service would
-/// not come back.
+/// Both platforms get null stdin/stdout and stderr into update.log; Unix adds `setsid`, so
+/// a hangup aimed at the replaced instance's session cannot reach the replacement, and
+/// Windows adds `CREATE_NO_WINDOW`.
 ///
-/// On Unix: null stdin/stdout, stderr → update.log, and a session of its own (`setsid`),
-/// so a hangup aimed at the session the replaced instance ran in cannot reach the
-/// replacement. On Windows: the same streams, plus `CREATE_NO_WINDOW`.
+/// `CREATE_NO_WINDOW` is inert here: the binary is built windowed (its crate root declares
+/// `windows_subsystem = "windows"`), so the instance owns no console and the platform
+/// documents the flag as ignored for a non-console application. It stays because it is
+/// right for a console-subsystem build and because the shell module's spawn tripwire
+/// requires it at every production spawn site.
 ///
-/// `CREATE_NO_WINDOW` is inert on this product's replacement instance: the binary
-/// is built windowed (its crate root declares `windows_subsystem = "windows"`), so
-/// the instance owns no console and the platform documents the flag as ignored for
-/// a non-console application. It stays because it remains correct for a
-/// console-subsystem build, and because the shell module's own spawn tripwire
-/// requires the flag at every production spawn site. Every child the service
-/// starts is flagged at that module's spawn sites, not here.
+/// `DETACHED_PROCESS` is deliberately *not* set: there is no console for this windowed
+/// image to inherit and none would be created, so the flag would change nothing. (A
+/// console-subsystem child from a console-less parent does get one; the shell module's
+/// spawn sites carry `CREATE_NO_WINDOW` for those.)
 ///
-/// `DETACHED_PROCESS` is deliberately *not* set: the instance is this same windowed
-/// image, so there is no console for it to inherit and none would be created for it —
-/// the flag would change nothing. (A console-subsystem child started without creation
-/// flags from a console-less parent does get a console of its own; the shell module's
-/// spawn sites carry `CREATE_NO_WINDOW` to keep that one windowless, and
-/// `tools::shell::tree` names them.)
+/// A spawn failure is returned without an admin notification — the caller owns failure
+/// reporting — and the process keeps running: the null stdin/stdout and the stderr
+/// redirection to update.log matter, since update.log is a real file handle, so the
+/// replacement's printing works with no console in sight.
 ///
-/// The null stdin/stdout and the stderr → update.log redirection still matter: on
-/// either platform update.log is a real file handle, so the replacement's printing
-/// works with no console in sight.
-///
-/// On spawn failure the error is returned (no admin notification — the caller
-/// [`finalize_update_and_restart`] owns failure reporting); the process keeps
-/// running (does NOT exit).
-///
-/// ## macOS Gatekeeper safety
-///
-/// The caller guarantees that `binary_path` is never deleted before or during
-/// the child's startup window (see the temp-root cleanup rationale in
-/// [`finalize_update_and_restart`]). Deleting the spawn target while Gatekeeper
-/// is validating its code signature causes `syspolicyd` to SIGKILL the child.
+/// The caller guarantees `binary_path` is never deleted before or during the child's
+/// startup window (see [`finalize_update_and_restart`]): deleting the spawn target while
+/// Gatekeeper validates its signature makes `syspolicyd` SIGKILL the child.
 fn spawn_new_instance_from(binary_path: &Path) -> Result<()> {
     let launch = std::env::args_os().nth(1);
     let args: Vec<std::ffi::OsString> =
@@ -2680,11 +2219,9 @@ fn spawn_new_instance_from(binary_path: &Path) -> Result<()> {
 
     let mut cmd = std::process::Command::new(binary_path);
     cmd.args(&args);
-    // The update hand-off mark — see `acquire_lock`.
     cmd.env(HANDOFF_ENV, "1");
-    // The window comes back as it was left: hidden when it was hidden. Written on every
-    // spawn, never left to inheritance — the parent may itself have come back hidden from an
-    // earlier restart, and the marker must describe THIS window (see `START_HIDDEN_ENV`).
+    // Written on every spawn, never left to inheritance: the parent may itself have come
+    // back hidden, and the marker must describe THIS window.
     cmd.env(
         START_HIDDEN_ENV,
         if crate::gui::app_window::hidden() {
@@ -2715,9 +2252,8 @@ fn spawn_new_instance_from(binary_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // A session of its own, so a hangup aimed at the session of the instance this
-        // replaces cannot reach the replacement — the same reason the Telegram helper has
-        // one. Its stderr still goes to update.log, which the redirection below pins.
+        // A session of its own, so a hangup aimed at the replaced instance's session
+        // cannot reach the replacement — the same reason the Telegram helper has one.
         //
         // SAFETY: `setsid` is async-signal-safe and is the only thing run between the fork
         // and the exec; the child is freshly forked, so it is not a group leader.
@@ -2736,7 +2272,6 @@ fn spawn_new_instance_from(binary_path: &Path) -> Result<()> {
     match cmd.spawn() {
         Ok(child) => {
             info!(pid = child.id(), "Spawned new mahbot instance");
-            // Nothing waits on the child — it runs independently.
             Ok(())
         }
         Err(e) => {
@@ -2763,8 +2298,6 @@ fn truncate_to_last_64k(s: &str) -> String {
     )
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2775,8 +2308,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = lock_file_path(dir.path());
 
-        // Direct primitives (open_lock_file + try_flock): hold the lock, then
-        // verify a second fd on the same file cannot flock while it is held.
         let holder = open_lock_file(&lock_path).unwrap();
         assert!(try_flock(&holder).unwrap(), "First flock should succeed");
         let contender = open_lock_file(&lock_path).unwrap();
@@ -2785,22 +2316,19 @@ mod tests {
             "Second flock should fail (already locked)"
         );
 
-        // While the lock is held, try_acquire_lock should return None.
         assert!(
             try_acquire_lock(&lock_path).unwrap().is_none(),
             "Should return None when lock is held"
         );
 
-        // The explicit release (what the update hand-off relies on) frees the
-        // lock while the holder's handle is still open.
+        // The explicit release the update hand-off relies on frees the lock while the
+        // holder's handle is still open.
         holder.unlock().expect("unlock the held lock file");
         assert!(
             try_flock(&contender).unwrap(),
             "After the explicit unlock, the contender must acquire the lock"
         );
 
-        // Dropping the handles must release the lock — through the production
-        // helper, which opens the file the same way.
         drop(holder);
         drop(contender);
         assert!(
@@ -2809,11 +2337,8 @@ mod tests {
         );
     }
 
-    /// The update hand-off wait: a marked instance must take the location once
-    /// the outgoing instance releases it, and the release it waits for is the
-    /// explicit `unlock` with the handle still open — exactly what
-    /// [`FlockGuard::release`] does, and the reason it does not rely on the
-    /// close.
+    /// The hand-off wait takes the location on the explicit `unlock` with the handle still
+    /// open — what [`FlockGuard::release`] does, and why it does not rely on the close.
     #[test]
     fn wait_for_handoff_takes_the_released_location() {
         let dir = tempfile::tempdir().unwrap();
@@ -2837,8 +2362,8 @@ mod tests {
             "the wait must leave the location held"
         );
 
-        // The outgoing handle is closed only now: the lock the wait took is on
-        // its own handle and must survive that close.
+        // The outgoing handle is closed only now: the wait's own handle holds the lock
+        // and must survive that close.
         drop(releaser.join().unwrap());
         assert!(
             location_is_held(&path),
@@ -2852,14 +2377,10 @@ mod tests {
         !try_flock(&open_lock_file(path).unwrap()).unwrap()
     }
 
-    /// Poll for `path` to become lockable again, for up to ~2s.
-    ///
-    /// The release is polled rather than read once because every `Command::spawn`
-    /// in the suite forks: until the child execs it still carries this process's
-    /// open file description, and the kernel holds a flock for as long as any
-    /// description of the file exists — so a release can look held for a moment.
-    /// A lock that is never released (the regression this test exists for) comes
-    /// back `Ok(false)`; an OS error comes back as it is, never polled away.
+    /// Poll for `path` to become lockable again, for up to ~2s: every `Command::spawn` in
+    /// the suite forks and carries this process's open file description until the child
+    /// execs, so a release can look held for a moment. A lock never released (the
+    /// regression this test exists for) comes back `Ok(false)`; an OS error as it is.
     fn lock_becomes_free(path: &Path) -> Result<bool> {
         for _ in 0..100 {
             match try_acquire_lock(path) {
@@ -2881,8 +2402,8 @@ mod tests {
         std::fs::write(checkout.join("Cargo.toml"), "").unwrap();
         assert_eq!(classify_update_mode(&checkout), UpdateMode::SourceTree);
 
-        // Registry src cache: `registry/src` segment → Downloaded even with
-        // Cargo.toml (the cargo-installed trap the probe used to misclassify).
+        // Registry src cache: `registry/src` → Downloaded even with Cargo.toml (the
+        // cargo-installed trap the probe used to misclassify).
         let registry = dir
             .path()
             .join(".cargo")
@@ -2894,10 +2415,8 @@ mod tests {
         std::fs::write(registry.join("Cargo.toml"), "").unwrap();
         assert_eq!(classify_update_mode(&registry), UpdateMode::Downloaded);
 
-        // Git checkouts cache: `git/checkouts` segment → Downloaded. Cargo git
-        // checkouts are full non-bare clones and contain a real `.git`
-        // directory — the source-cache scan must win over the `.git`
-        // heuristic (regression guard for that ordering).
+        // Git checkouts are full non-bare clones with a real `.git`, so `git/checkouts`
+        // must win over the `.git` heuristic (regression guard for that ordering).
         let git_checkout = dir
             .path()
             .join(".cargo")
@@ -2909,8 +2428,7 @@ mod tests {
         std::fs::write(git_checkout.join("Cargo.toml"), "").unwrap();
         assert_eq!(classify_update_mode(&git_checkout), UpdateMode::Downloaded);
 
-        // Custom CARGO_HOME layout (no `.cargo` prefix): `registry/src` segment
-        // still detected.
+        // Custom CARGO_HOME (no `.cargo` prefix) is still detected.
         let custom = dir
             .path()
             .join("custom-cargo")
@@ -2922,30 +2440,27 @@ mod tests {
         std::fs::write(custom.join("Cargo.toml"), "").unwrap();
         assert_eq!(classify_update_mode(&custom), UpdateMode::Downloaded);
 
-        // Plain source tree (no .git, no cargo cache): Cargo.toml → SourceTree.
+        // Plain source tree: Cargo.toml → SourceTree; no source at all → Downloaded.
         let plain = dir.path().join("plain-src");
         std::fs::create_dir_all(&plain).unwrap();
         std::fs::write(plain.join("Cargo.toml"), "").unwrap();
         assert_eq!(classify_update_mode(&plain), UpdateMode::SourceTree);
 
-        // No source at all → Downloaded (a ready-made copy is the only way
-        // forward).
         let bare = dir.path().join("bare");
         std::fs::create_dir_all(&bare).unwrap();
         assert_eq!(classify_update_mode(&bare), UpdateMode::Downloaded);
 
-        // The registry cache downloads but is still a build from source, so only
-        // the copy with no build source was delivered by the release pipeline.
+        // The registry cache downloads but is still a build from source, so only the copy
+        // with no build source came from the release pipeline.
         for source in [&checkout, &registry, &git_checkout, &custom, &plain] {
             assert!(!is_published_copy_at(source), "{}", source.display());
         }
         assert!(is_published_copy_at(&bare));
     }
 
-    /// The unattended trigger's whole rule, one case per clause: only a
-    /// downloaded copy, only when no version was named for it by the environment
-    /// hook, only for a strictly newer release, and never for a release no newer
-    /// than one whose own attempt already failed.
+    /// The unattended trigger's whole rule, one case per clause: only a downloaded copy,
+    /// only with no version named for it by the environment hook, only for a strictly
+    /// newer release, and never for a release no newer than one whose attempt failed.
     #[test]
     fn test_auto_update_target() {
         let v = |s: &str| semver::Version::parse(s).unwrap();
@@ -2978,17 +2493,15 @@ mod tests {
             None
         );
 
-        // A copy built from a working tree never fires by itself — its
-        // availability is true by construction, which is exactly why the flag
-        // alone is not the trigger.
+        // A copy built from a working tree never fires by itself: its availability is true
+        // by construction, which is why the flag alone is not the trigger.
         assert_eq!(is(UpdateMode::SourceTree, false, Some(&newer), None), None);
         assert_eq!(is(UpdateMode::SourceTree, false, None, None), None);
 
         // A version named through the environment hook is that hook's update.
         assert_eq!(is(UpdateMode::Downloaded, true, Some(&newer), None), None);
 
-        // A release whose own unattended attempt failed is not tried again; a
-        // strictly newer one still is.
+        // A release whose own attempt failed is not retried; a strictly newer one still is.
         assert_eq!(
             is(UpdateMode::Downloaded, false, Some(&newer), Some(&newer)),
             None
@@ -2998,21 +2511,18 @@ mod tests {
             Some(newest.clone())
         );
 
-        // A stale advertisement — one older than the release whose attempt
-        // failed — re-offers nothing either: only a strictly newer release passes
-        // a remembered failure, never whatever was cached before it.
+        // A stale advertisement — older than the release whose attempt failed — re-offers
+        // nothing either.
         assert_eq!(
             is(UpdateMode::Downloaded, false, Some(&newer), Some(&newest)),
             None
         );
     }
 
-    /// The notice's whole rule: a restart of the same version, a build from
-    /// source and a first install during setup say nothing; a published copy on a
-    /// different version — or the first start of one installed by a build that
-    /// predates the record — announces; a list the update left behind is
-    /// announced even over a version already recorded, and waits while setup is
-    /// unfinished.
+    /// A restart of the same version, a build from source and a first install during setup
+    /// say nothing; a published copy on a different version — or the first start of one
+    /// installed by a build that predates the record — announces; a list the update left is
+    /// announced even over a version already recorded, and waits while setup is unfinished.
     #[test]
     fn test_the_update_notice_is_only_for_a_downloaded_version_change() {
         let current = "1.2.3";
@@ -3034,10 +2544,9 @@ mod tests {
             case(Some("1.2.2"), false, true, false),
             UpdateNotice::RecordSilently
         );
-        // A published copy with finished setup on a new version — including the
-        // first start of one installed by a build that predates the record —
-        // announces; a first install during setup and a new version during setup
-        // record only.
+        // A published copy with finished setup on a new version — including the first start
+        // of one installed by a build that predates the record — announces; during setup
+        // either case only records.
         assert_eq!(case(None, true, true, false), UpdateNotice::Announce);
         assert_eq!(
             case(Some("1.2.2"), true, true, false),
@@ -3048,17 +2557,14 @@ mod tests {
             case(Some("1.2.2"), true, false, false),
             UpdateNotice::RecordSilently
         );
-        // The list the update brought is announced even over a version this
-        // installation already recorded — a start that stopped before the
-        // hand-over is repeated — and it waits, unspent, while setup is
-        // unfinished.
+        // A brought list is announced even over a recorded version — a start that stopped
+        // before the hand-over is repeated — and waits unspent while setup is unfinished.
         assert_eq!(
             case(Some(current), true, true, true),
             UpdateNotice::Announce
         );
         assert_eq!(case(None, true, true, true), UpdateNotice::Announce);
-        // An owed list waits, unspent, while setup is unfinished: nothing is
-        // recorded and nothing is dropped.
+        // An owed list waits unspent while setup is unfinished.
         assert_eq!(
             case(Some("1.2.2"), true, false, true),
             UpdateNotice::Unchanged
@@ -3078,9 +2584,8 @@ mod tests {
         );
     }
 
-    /// A list already captured for a version is never replaced by an attempt whose
-    /// fetch came back empty, and a record captured without one is filled in by a
-    /// later attempt that got it.
+    /// A list already captured for a version is never replaced by an attempt whose fetch
+    /// came back empty, and a record captured without one is filled in by a later attempt.
     #[tokio::test]
     async fn test_a_captured_list_is_never_replaced_by_an_empty_one() {
         let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
@@ -3105,14 +2610,11 @@ mod tests {
         assert_eq!(pending.changes.as_deref(), Some("* filled in"));
     }
 
-    /// The reported failure: an update that brought no list — one made by a build
-    /// that predates the capture, by the install scripts, or by an update whose own
-    /// fetch failed — still announces the release's change list, read at the moment
-    /// the notice is composed.
+    /// An update that brought no list — made by a build predating the capture, by the
+    /// install scripts, or with its own fetch failed — still announces the release's list,
+    /// read while the notice is composed.
     #[tokio::test]
     async fn test_a_notice_without_a_carried_list_reads_the_releases_own() {
-        // Nothing captured at all: the version record is the only trace of the
-        // update that installed this copy.
         let (bare, _bare_dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
         bare.set_kv(UPDATE_LAST_RUN_VERSION_KV_KEY, "1.2.2")
             .await
@@ -3139,8 +2641,8 @@ mod tests {
             Some("1.2.3")
         );
 
-        // A capture whose own fetch failed carries no list; the read at notice time
-        // is what fills it in.
+        // A capture whose own fetch failed carries no list; the read at notice time fills
+        // it in.
         let (failed, _failed_dir) =
             crate::open_test_store!(crate::config_db::ConfigStore, "config");
         failed
@@ -3170,9 +2672,8 @@ mod tests {
         assert!(delivered[0].contains("* a change the fetch missed"));
     }
 
-    /// A list the update captured outlives a start that does not announce: an
-    /// unfinished setup records nothing and drops nothing, and the next start of
-    /// the same version announces it.
+    /// A captured list outlives a start that does not announce: an unfinished setup
+    /// records nothing and drops nothing, and the next start of the same version announces it.
     #[tokio::test]
     async fn test_a_start_that_does_not_announce_keeps_the_captured_list() {
         let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
@@ -3242,9 +2743,9 @@ mod tests {
         );
     }
 
-    /// A list that cannot be obtained at all is named as unavailable with the
-    /// release page it can be read on, and the failure is not remembered: a record
-    /// captured for another version is left for that version's own start.
+    /// A list that cannot be obtained at all is named unavailable with the release page it
+    /// can be read on, and a record captured for another version is left for that version's
+    /// own start.
     #[tokio::test]
     async fn test_an_unobtainable_list_names_the_release_page() {
         let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
@@ -3282,9 +2783,8 @@ mod tests {
         );
     }
 
-    /// The captured list is used only for the version it was taken for: a record
-    /// belonging to another release is left alone, and an unreadable one is
-    /// treated as absent.
+    /// The captured list is used only for the version it was taken for: one belonging to
+    /// another release is left alone, an unreadable one treated as absent.
     #[test]
     fn test_the_captured_changelog_belongs_to_its_version() {
         let recorded = r#"{"version":"1.2.3","changes":"* a change"}"#;
@@ -3295,9 +2795,8 @@ mod tests {
         assert!(pending_changelog_from_str("not a record", "1.2.3").is_none());
     }
 
-    /// The version file's own rule: an ordinary copy is never offered a test
-    /// release, and a file that holds no version is an error rather than an
-    /// absence.
+    /// An ordinary copy is never offered a test release, and a version file holding none is
+    /// an error rather than an absence.
     #[test]
     fn test_a_test_release_is_never_discovered() {
         let stable = semver::Version::new(1, 2, 3);
@@ -3309,23 +2808,19 @@ mod tests {
     }
 
     /// The install scripts download what this file publishes and the release workflow
-    /// builds it, so one contract is spelled in four files and only comments tie them
-    /// together. Drift in any of them would otherwise be invisible: nothing else in
-    /// the tree reads them, and the cross-checks only compile. Pinned here are the
-    /// repository the releases live in, the two URL shapes, the asset name
-    /// [`asset_name`] builds — against the workflow's own list of the six files, and
-    /// the scripts' own spellings — the install location all three share, and the
-    /// version file's location.
+    /// builds it, so one contract is spelled in four files that nothing else in the tree
+    /// reads — drift would otherwise be invisible. Pinned: the repository, the two URL
+    /// shapes, the asset name [`asset_name`] builds against the workflow's own list of six
+    /// files, the install location all three share, and the version file's location.
     #[test]
     fn test_the_release_contract_is_spelled_the_same_everywhere() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let read = |name: &str| std::fs::read_to_string(root.join(name)).expect("part of the tree");
         let (sh, ps1) = (read("install.sh"), read("install.ps1"));
 
-        // The two URLs, each as this file builds it, with the base and the version
-        // left as the variables the script sets them from: a path that changes on one
-        // side fails here instead of leaving the scripts downloading nothing. The base
-        // is the constant, not the test hook that can override it.
+        // Each URL as this file builds it, with the base and version left as the variables
+        // the script sets them from — and the base the constant, not the test hook that can
+        // override it.
         for (name, script, base_var, version_var) in [
             ("install.sh", &sh, "$RELEASE_BASE", "$VERSION"),
             ("install.ps1", &ps1, "$ReleaseBase", "$Version"),
@@ -3350,18 +2845,15 @@ mod tests {
                 "{name} must download a version from {version_dir}"
             );
         }
-        // The scripts build an asset's name from their own variables, so what is
-        // pinned there is the shape: `mahbot-<version>-<os>-<arch>.<ext>`.
+        // An asset's name is built from the scripts' own variables, so what is pinned is the shape.
         assert!(sh.contains(r#"ASSET="mahbot-$VERSION-$OS-$ARCH.tar.gz""#));
         assert!(ps1.contains(r#"$Asset = "mahbot-$Version-windows-$Arch.zip""#));
 
-        // One install location for all three: the scripts put the ready-made file
-        // there, the product moves itself there when its working file is elsewhere
-        // (a downloaded copy that is not in the standard location moves itself in at
-        // its next update), and the product's own search-path edit points at it. A
-        // drift would leave exactly the second copy the whole arrangement prevents.
-        // Each script's own literal is checked wherever this runs; the comparison
-        // against the location this product computes only where it can be asked.
+        // One install location for all three — the scripts put the ready-made file there,
+        // the product moves itself there when its working file is elsewhere, and its
+        // search-path edit points at it — since a drift would leave exactly the second copy
+        // the arrangement prevents. Each script's literal is checked wherever this runs; the
+        // comparison against the location this product computes only where it can be asked.
         assert!(sh.contains(r#"INSTALL_DIR="$HOME/.local/bin""#));
         assert!(ps1.contains(r"'Programs\MahBot'"));
         let install = crate::util::managed_bin::mahbot_install_dir().expect("a home directory");
@@ -3378,8 +2870,8 @@ mod tests {
             install.display()
         );
 
-        // The workflow builds one file per system and publishes the release only once
-        // all six are attached, so its own list of them is the release's definition.
+        // The workflow builds one file per system and publishes only once all six are
+        // attached, so its own list of them is the release's definition.
         let workflow = read(".github/workflows/release.yml");
         floors_are_spelled_the_same(&sh, &ps1, &workflow);
         assert!(
@@ -3387,9 +2879,8 @@ mod tests {
             "release.yml must attach the change list the updater takes down"
         );
 
-        // The words the owner is refused with are one fact too: the scripts begin
-        // their refusals with this file's own opening, and name the same requirement
-        // for a Linux host with no glibc at all.
+        // The refusal words are one fact too: both scripts begin with this file's own
+        // opening, and name the same requirement for a Linux host with no glibc.
         assert!(sh.contains(&format!("NO_FILE_PREFIX='{NO_RELEASE_FILE}'")));
         assert!(ps1.contains(&format!("$NoFilePrefix = '{NO_RELEASE_FILE}'")));
         assert!(sh.contains(NO_GLIBC_FOUND));
@@ -3411,10 +2902,9 @@ mod tests {
         }
     }
 
-    /// The changelog's filter as it ships — the awk program is read out of the
-    /// workflow — keeps every subject except version bumps, blank titles and
-    /// `[maint] ` commits; the sample subjects are built from the same label
-    /// tokens the commit path writes.
+    /// The changelog's filter as it ships — the awk program read out of the workflow — keeps
+    /// every subject except version bumps, blank titles and `[maint] ` commits; the samples
+    /// are built from the same label tokens the commit path writes.
     #[cfg(unix)]
     #[test]
     fn test_the_changelog_skips_maint_commits() {
@@ -3463,12 +2953,10 @@ mod tests {
         );
     }
 
-    /// The floors a published file is built against are one fact told by the machinery
-    /// that has to agree on them: the install command refuses below them, the update
-    /// path refuses below them, and the workflow builds the files against them. A
-    /// drift offers a file to a system it cannot load on, which is the one outcome the
-    /// whole arrangement exists to prevent. What the README claims in prose is not
-    /// pinned here: a rewording of it is not a drift in any of these.
+    /// The floors are one fact told by machinery that must agree: the install command, the
+    /// update path and the workflow all refuse or build below them, and a drift offers a
+    /// file to a system it cannot load on. The README's prose is not pinned — a rewording
+    /// is not a drift in any of these.
     fn floors_are_spelled_the_same(sh: &str, ps1: &str, workflow: &str) {
         assert!(sh.contains(&format!("MACOS_FLOOR_MAJOR={}", MACOS_FLOOR.0)));
         assert!(sh.contains(&format!("MACOS_FLOOR_MINOR={}", MACOS_FLOOR.1)));
@@ -3504,18 +2992,16 @@ mod tests {
         // A minor part is not a decimal: 2.4 is below 2.35, while 2.39 is not.
         assert!(version_below_floor("2.4", GLIBC_FLOOR));
         assert!(!version_below_floor("2.39", GLIBC_FLOOR));
-        // A version with no minor part counts as zero (14 is not below 14.0), and a
-        // trailing part is not part of the comparison.
+        // A missing minor counts as zero, and a trailing part is not compared.
         assert!(!version_below_floor("14", MACOS_FLOOR));
         assert!(!version_below_floor("14.0", MACOS_FLOOR));
         assert!(!version_below_floor("14.0.1", MACOS_FLOOR));
-        // A part that is not there or not a whole number is not a version to accept,
-        // in either position: the install script's check refuses both.
+        // A missing or non-numeric part is not a version to accept, in either position —
+        // as the install script's check refuses it.
         assert!(version_below_floor("", MACOS_FLOOR));
         assert!(version_below_floor("14.", MACOS_FLOOR));
         assert!(version_below_floor("13.x", MACOS_FLOOR));
-        // The glibc report is read the same way, and a report this does not
-        // recognise is not a refusal.
+        // The glibc report is read the same way; an unrecognised one is not a refusal.
         assert!(glibc_below_floor("glibc 2.31"));
         assert!(!glibc_below_floor("glibc 2.35"));
         assert!(!glibc_below_floor("musl libc (x86_64)"));
@@ -3533,9 +3019,8 @@ mod tests {
             linux_refusal(Some("glibc 2.31"), true),
             Some(GlibcBelowFloor)
         );
-        // At or above it there is a file to load: musl's loader being there as well —
-        // it is under a symlinked `/lib` on Debian, where musl can be installed
-        // beside glibc — is not a refusal.
+        // At or above the floor there is a file to load: musl's loader being there as well
+        // — under a symlinked `/lib` on Debian, musl installs beside glibc — is no refusal.
         assert_eq!(linux_refusal(Some("glibc 2.35"), true), None);
         assert_eq!(linux_refusal(Some("glibc 2.39"), true), None);
         // A host that names no glibc is judged by the loader it has.
@@ -3556,8 +3041,8 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         let copy = bin.join(crate::util::managed_bin::product_file_name());
         std::fs::write(&copy, b"a copy").unwrap();
-        // A `CARGO_HOME` whose binary directory is the install directory itself, so
-        // the toolchain's own convention names the file the update has just placed.
+        // A `CARGO_HOME` whose binary directory is the install directory itself, so the
+        // toolchain's convention names the file the update just placed.
         let _cargo_home = crate::util::test::set_env_var(
             "CARGO_HOME",
             Some(dir.path().to_str().expect("a UTF-8 temp path")),

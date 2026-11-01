@@ -35,7 +35,6 @@ use std::sync::Arc;
 use crate::db;
 
 crate::define_store! {
-    /// Global Telegram intake store.
     pub(crate) static TELEGRAM_INTAKE: TelegramIntakeStore,
     expect = "TELEGRAM_INTAKE not initialized — call init_all_stores() first",
 }
@@ -51,8 +50,7 @@ crate::define_store! {
 ///
 /// That bound is the one way an accepted event still goes unhandled: a row left
 /// held past it — one no run could decide about, or one held through a wind-down —
-/// is swept with the rest, so the event is dropped if no listener is rebuilt inside
-/// the window.
+/// is swept with the rest, so the event is dropped if no listener is rebuilt inside the window.
 pub(crate) const RETENTION_HOURS: i64 = 48;
 
 /// The `telegram_intake.state` value of an event that is held and not settled.
@@ -62,8 +60,6 @@ pub(crate) const IN_PROGRESS: &str = "in_progress";
 /// on, or deliberately not answered.
 const DONE: &str = "done";
 
-/// How long a released burst is kept, in days: a complaint about a split burst
-/// arrives days after the fact (see [`BurstRecord`]).
 const BURST_RETENTION_DAYS: i64 = 30;
 
 /// One released burst as the durable record keeps it: who sent it, where, how
@@ -139,7 +135,6 @@ impl TelegramIntakeStore {
         Ok(events + bursts)
     }
 
-    /// Record one released burst of `account_id` (see [`BurstRecord`]).
     pub(crate) async fn record_burst(&self, account_id: &str, record: &BurstRecord) -> Result<()> {
         #[expect(clippy::cast_possible_wrap)] // a released group holds at most `MAX_PARTS` parts
         let parts = record.parts as i64;
@@ -163,14 +158,10 @@ impl TelegramIntakeStore {
     }
 }
 
-/// Delete the whole record: nothing a previous Bot API server gave the intake can
-/// stand in for the next one's events.
 pub(crate) async fn purge_all() -> Result<()> {
     store().purge_all().await
 }
 
-/// The intake's durable record as one listener sees it: where the record lives,
-/// the run its rows are claimed under, and the account whose events are its own.
 #[derive(Clone)]
 pub(crate) struct Intake {
     store: TelegramIntakeStore,
@@ -326,16 +317,12 @@ impl Intake {
             }
         }
         // The rows come back in no guaranteed order; the platform orders by
-        // `update_id`, and an album's members must regroup in the user's send
-        // order.
+        // `update_id`, and an album's members must regroup in the user's send order.
         events.sort_by_key(|update: &Value| update["update_id"].as_i64());
         Ok(events)
     }
 }
 
-/// A claim for a listener of its own: what one listener records and takes over is
-/// claimed under this, so a listener rebuilt inside the same process is a different
-/// run from the one it replaced and can take over what that one left held.
 pub(crate) fn listener_claim() -> String {
     format!("run-{}", crate::generate_id())
 }
@@ -350,12 +337,10 @@ mod tests {
         crate::open_test_store!(TelegramIntakeStore, "telegram_intake")
     }
 
-    /// A run's own handle onto `store`, claiming under `claim` and keyed by `account`.
     fn intake(store: &TelegramIntakeStore, claim: &str, account: &str) -> Intake {
         Intake::new(store.clone(), Arc::from(claim), account)
     }
 
-    /// A held event is visible through `take_over()`; resolving it leaves `take_over()`.
     #[tokio::test]
     async fn hold_then_resolve_moves_event_out_of_take_over() {
         let (store, _tmp) = test_store().await;
@@ -383,9 +368,6 @@ mod tests {
         );
     }
 
-    /// A claim is scoped to the run that took the event up: the run that holds
-    /// it does not take it up again, while another run does — in the platform's
-    /// own `update_id` order, whatever order the rows come back in.
     #[tokio::test]
     async fn take_over_claims_only_what_this_run_does_not_hold() {
         let (store, _tmp) = test_store().await;
@@ -408,10 +390,6 @@ mod tests {
             .filter_map(|update| update["update_id"].as_i64())
             .collect();
         assert_eq!(ids, vec![1, 2]);
-        // The take-over is also where the claim is written: run-b, which just
-        // claimed both rows, takes up nothing further, while run-a — whose claim
-        // run-b has replaced — finds them takeable again, exactly as it would a
-        // dead run's.
         assert!(
             intake(&store, "run-b", "1")
                 .take_over()
@@ -454,7 +432,6 @@ mod tests {
                 .is_empty(),
             "a second hold must report that the record already holds the event"
         );
-        // Both are events of the record's own, so a later run takes up both.
         let recovered: Vec<i64> = intake(&store, "run-b", "1")
             .take_over()
             .await
@@ -464,7 +441,6 @@ mod tests {
             .collect();
         assert_eq!(recovered, vec![9, 10]);
 
-        // The same id under another account is another event.
         intake(&store, "run-a", "2")
             .hold(&[&json!({ "update_id": 9 })])
             .await
@@ -504,8 +480,6 @@ mod tests {
             .hold(&[&first, &unidentified])
             .await
             .expect_err("an update without an id cannot be recorded");
-        // A writer that recorded the unit's members one at a time would leave
-        // `first` in the record, where another run finds it.
         assert!(
             intake(&store, "run-b", "1")
                 .take_over()
@@ -572,7 +546,6 @@ mod tests {
             .await
             .expect("age the held row");
 
-        // Two aged events and one aged burst go; the fresh of each stays.
         assert_eq!(store.age_out().await.expect("age_out"), 3);
         // Only the freshly held row survives.
         let held: Vec<i64> = intake(&store, "run-b", "1")

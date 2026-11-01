@@ -1,12 +1,9 @@
-//! Local files at the edge of the browser surfaces: the paths a caller hands a
-//! page (`upload`) and the picture a capture writes back (`screenshot`).
-//!
-//! Path rules are the surface's own (the command line resolves against the
-//! directory it was run in, the agent tool against its workspace), so the ONE
-//! resolution here takes that root as an operand. There is deliberately no access
-//! level and no allowlist: any file the caller can read may be attached. The one
-//! refusal beyond ordinary file correctness is the product's own store rule — its
-//! live database files are never opened, by anything.
+//! Local files at the edge of the browser surfaces: the paths a caller hands a page (`upload`) and
+//! the picture a capture writes back (`screenshot`). Path rules are the surface's own (the command
+//! line resolves against its own directory, the agent tool against its workspace), so the ONE
+//! resolution here takes that root as an operand. No access level and no allowlist: any file the
+//! caller can read may be attached. The one refusal beyond ordinary file correctness is the
+//! product's own store rule — its live database files are never opened by anything.
 
 use std::path::{Path, PathBuf};
 
@@ -15,13 +12,12 @@ use serde_json::Value;
 
 use crate::chrome::contract::{ChromeResponse, eval_result};
 
-/// Resolve one local file a caller named for an attach, against the root its
-/// surface resolves relative paths from. `~` is expanded; the answer is the
-/// absolute, symlink-resolved path the browser is handed — and the one the
-/// result reports, so a same-named file elsewhere can never be a silent
-/// substitute. A refusal names the reason: missing, not a regular file, or
-/// unreadable. The product's own live stores are refused by location, spelled
-/// directly or through a link.
+/// Resolve one local file a caller named for an attach against the root its surface resolves
+/// relative paths
+/// from. `~` is expanded; the answer is the absolute, symlink-resolved path the browser is handed
+/// and the
+/// result reports, so a same-named file elsewhere can never be a silent substitute. A refusal names
+/// the reason: missing, not a regular file, or unreadable — the product's own live stores included.
 pub(crate) fn resolve_local_file(raw: &str, base: &Path) -> Result<PathBuf, String> {
     if raw.trim().is_empty() {
         return Err("empty file path".to_string());
@@ -33,14 +29,14 @@ pub(crate) fn resolve_local_file(raw: &str, base: &Path) -> Result<PathBuf, Stri
         base.join(expanded)
     };
     let display = candidate.display();
-    // Resolve first, so a symlinked spelling of a store file meets the same
-    // refusal — `realpath` holds no descriptor, so it cannot touch the store's lock.
+    // Resolve first, so a symlinked spelling of a store file meets the same refusal (`realpath`
+    // takes no descriptor, so it cannot touch the store's lock).
     let resolved = std::fs::canonicalize(&candidate)
         .map(|path| crate::util::strip_verbatim_prefix(&path))
         .map_err(|e| format!("{}: {display}", reason(&e)))?;
     let display = resolved.display();
-    // The product's own live stores are refused by location: the service holds
-    // whole-file locks on them, and opening one from inside it releases those locks.
+    // The service holds whole-file locks on its stores; opening one from inside it releases those
+    // locks.
     if let Some(denial) = crate::tools::path::live_store_denial(&resolved, "attach") {
         return Err(denial.to_string());
     }
@@ -49,9 +45,8 @@ pub(crate) fn resolve_local_file(raw: &str, base: &Path) -> Result<PathBuf, Stri
         Ok(_) => {}
         Err(e) => return Err(format!("{}: {display}", reason(&e))),
     }
-    // Metadata can succeed where reading does not (a file with no read
-    // permission), and that is the caller's own operand to fix rather than a
-    // failure for chrome-use to discover mid-stream.
+    // Metadata can succeed where reading does not, and that is the caller's own operand to fix
+    // rather than a failure for chrome-use to discover mid-stream.
     std::fs::File::open(&resolved).map_err(|e| format!("{}: {display}", reason(&e)))?;
     Ok(resolved)
 }
@@ -65,14 +60,12 @@ fn reason(e: &std::io::Error) -> String {
     }
 }
 
-/// Validate a capture is a real PNG: magic bytes + IHDR dimensions (bytes
-/// 16..24, big-endian). chrome-use can report success yet write a
-/// corrupt/truncated file, and the tool's image payload fails open on
-/// undecodable rasters — so this gates the `[IMAGE:…]` marker (and the CLI's
-/// reported picture) instead of passing a phantom image on.
+/// Validate a capture is a real PNG: magic bytes + IHDR dimensions (bytes 16..24, big-endian).
+/// chrome-use can
+/// report success yet write a corrupt or truncated file, and the image payload fails open on
+/// undecodable rasters, so this gates the `[IMAGE:…]` marker instead of passing a phantom image on.
 pub(crate) fn validate_png(path: &Path) -> anyhow::Result<(u32, u32)> {
     const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-    // Only the header is needed — magic bytes + IHDR dimensions (bytes 16..24).
     let mut header = [0u8; 24];
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("Failed to read screenshot {}", path.display()))?;
@@ -101,10 +94,9 @@ pub(crate) fn validate_png(path: &Path) -> anyhow::Result<(u32, u32)> {
     Ok((width, height))
 }
 
-/// The counts chrome-use's `upload` reply carries: the files streamed into the
-/// page (`uploaded`) and the ones still on its input afterwards (`attached`).
-/// `None` means the browser side did not state it — a fact of its own, never a
-/// zero.
+/// The counts chrome-use's `upload` reply carries: the files streamed into the page (`uploaded`)
+/// and the ones
+/// still on its input (`attached`). `None` means the browser side did not state it, never a zero.
 pub(crate) fn upload_counts(resp: &ChromeResponse) -> (Option<u64>, Option<u64>) {
     let count = |key: &str| {
         resp.data
@@ -115,16 +107,13 @@ pub(crate) fn upload_counts(resp: &ChromeResponse) -> (Option<u64>, Option<u64>)
     (count("uploaded"), count("attached"))
 }
 
-/// JS answering `true` when the files a caller names would land in a file input
-/// that takes one at a time (`input[type=file]` without `multiple`), `false` for
-/// a multi-file input, and `null` when the target cannot be judged from the page.
-///
-/// The target shapes chrome-use resolves are resolved here too: the input itself,
-/// the label that pairs with it, the container that holds it (the element and up
-/// to eight ancestors, open shadow roots included). A ref (`@e1`) is chrome-use's
-/// own handle and invisible to the page, so it is judged only when the page
-/// offers exactly one file input; anything ambiguous answers `null` and never
-/// refuses the attach.
+/// JS answering `true` when the files a caller names would land in a one-at-a-time file input
+/// (`input[type=file]` without `multiple`), `false` for a multi-file input, and `null` when the
+/// target cannot be judged from the page. The shapes chrome-use resolves are resolved here too: the
+/// input, the label that pairs with it, the container that holds it (up to eight ancestors, open
+/// shadow roots included). A ref (`@e1`) is chrome-use's own handle, invisible to the page, so it
+/// is judged only when the page offers exactly one file input; anything ambiguous answers `null`
+/// and never refuses the attach.
 #[must_use]
 pub(crate) fn single_file_input_probe(selector: &str) -> String {
     format!(
@@ -155,16 +144,15 @@ pub(crate) fn single_file_input_probe(selector: &str) -> String {
     )
 }
 
-/// `Some(true)` when [`single_file_input_probe`] answered "a one-file input";
-/// `None` when the answer could not be read (a failed step, an ambiguous target,
-/// a page that no longer answers) — an unreadable answer never refuses the attach.
+/// `Some(true)` when [`single_file_input_probe`] answered "a one-file input"; `None` when the
+/// answer could not
+/// be read (a failed step, an ambiguous target, a page that no longer answers) — never a refusal.
 pub(crate) fn single_file_input(resp: &ChromeResponse) -> Option<bool> {
     eval_result(resp)?.as_bool()
 }
 
-/// The one-file question a several-file attach must ask before sending: the probe
-/// script, or `None` when there is nothing to ask — one file makes no list a real
-/// selection could not have produced.
+/// The one-file question a several-file attach must ask before sending — or `None` when there is
+/// nothing to ask (one file, or no file at all).
 #[must_use]
 pub(crate) fn one_file_probe(selector: &str, files: usize) -> Option<String> {
     (files > 1).then(|| single_file_input_probe(selector))
@@ -172,11 +160,9 @@ pub(crate) fn one_file_probe(selector: &str, files: usize) -> Option<String> {
 
 /// What the one-file question answered about a several-file attach.
 pub(crate) enum OneFileTarget {
-    /// Nothing stands in the way: the target takes several files, or there was
-    /// nothing to ask (one file, or no file at all).
+    /// Nothing stands in the way: the target takes several files, or there was nothing to ask.
     Proceed,
-    /// The target's shape could not be judged: send the files and say the check
-    /// was skipped.
+    /// The target's shape could not be judged: send the files and say the check was skipped.
     Unjudged,
     /// The target is a one-file input: the refusal to print, nothing attached.
     Refused(String),
@@ -196,19 +182,18 @@ pub(crate) fn judge_one_file_target(selector: &str, probe: Option<bool>) -> OneF
     }
 }
 
-/// What a several-file attach says when the target's shape could not be judged: the
-/// files were sent, but the one-file check was skipped. The shapes the probe cannot
-/// judge: a ref on a page with more than one file input, an input held by an
-/// ancestor more than eight levels above the named element, or one behind a closed
-/// shadow root.
+/// What a several-file attach says when the target's shape could not be judged — the files were
+/// sent, but the
+/// one-file check was skipped. The shapes the probe cannot judge: a ref on a page with more than
+/// one file input, an input more than eight levels down, or one behind a closed shadow root.
 #[must_use]
 pub(crate) fn unchecked_several_files_note() -> &'static str {
     "the target's file-input shape could not be judged from the page, so several files were sent \
      without the one-file check"
 }
 
-/// The chrome-use `upload` argv for an attach whose paths are resolved: the verb,
-/// the target, and the absolute files it is handed.
+/// The chrome-use `upload` argv for an attach whose paths are resolved: verb, target, absolute
+/// files.
 #[must_use]
 pub(crate) fn upload_argv(selector: &str, files: &[PathBuf]) -> Vec<String> {
     let mut argv = vec!["upload".to_string(), selector.to_string()];
@@ -232,8 +217,7 @@ mod tests {
         let dir = fixture("chrome-files-resolve");
         std::fs::write(dir.join("a.txt"), b"x").unwrap();
 
-        // Relative paths resolve against the surface's own root, and the answer is
-        // the absolute file — the one the result reports.
+        // Relative paths resolve against the surface's own root; the answer is the absolute file.
         let resolved = resolve_local_file("a.txt", &dir).expect("a real file resolves");
         assert!(resolved.is_absolute());
         assert!(resolved.ends_with("a.txt"));

@@ -1,9 +1,6 @@
-//! The `video_edit` tool: an existing clip plus an instruction becomes one
-//! edited clip through OpenRouter's async videos API, with local files
-//! uploaded to the ephemeral host at job time.
-//!
-//! Not video generation (`video_gen`) and not local encoding — this tool only
-//! submits one edit job, polls and downloads the result.
+//! The `video_edit` tool: an existing clip plus an instruction becomes one edited clip
+//! through OpenRouter's async videos API, with local files uploaded to the ephemeral host
+//! at job time. Not video generation (`video_gen`) and not local encoding.
 
 use crate::Tool;
 use anyhow::Context;
@@ -11,36 +8,32 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::io::{Read, Seek, SeekFrom};
 
-/// Maximum length of the edit instruction in characters (tool-level ceiling;
-/// per-model native limits lower than this surface via the model nuances).
+/// Maximum length of the edit instruction in characters (per-model limits surface via
+/// the model nuances).
 const MAX_INSTRUCTION_CHARS: usize = 5000;
 
-/// Input clip size cap for every video_edit model. Guards the local-file
-/// upload path against unbounded reads (hailuo-3's own model bound is 50 MB).
+/// Input clip size cap for every video_edit model: guards the local-file upload path
+/// against unbounded reads.
 const MAX_INPUT_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Input image size cap (provider-declared 30 MB bound for hailuo-3).
 const MAX_IMAGE_BYTES: u64 = 30 * 1024 * 1024;
 
-/// Maximum reference images per request: hailuo-3 natively allows 9;
-/// seedance-2.0-mini documents 9 (BytePlus/mirrors; Cloudflare's relay
-/// schema says 4 — not adopted). Applied uniformly.
+/// Maximum reference images per request: hailuo-3 allows 9, seedance-2.0-mini documents 9
+/// (Cloudflare's relay schema says 4 — not adopted). Applied uniformly.
 const MAX_REFERENCE_IMAGES: usize = 9;
 
-/// Per-model video edit capability classification, driving validation and the
-/// tool description. The active model is user-switchable via the per-user
-/// Telegram `/video_models` picker (see `crate::users::resolve_video_model`).
+/// Per-model video edit capability classification, driving validation and the description.
+/// The active model is user-switchable via `/video_models`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VideoEditModel {
     /// minimax/hailuo-3 (default): 5-15s output, 2K fixed, always audio, no seed.
     Hailuo3,
     /// runway/aleph-2: output mirrors input, preserves audio, seed best-effort.
     Aleph2,
-    /// bytedance/seedance-2.5: whole-frame restyle, 480p/720p via OpenRouter;
-    /// edit tasks require duration 'auto' (integer durations rejected).
+    /// bytedance/seedance-2.5: whole-frame restyle, 480p/720p; edits require duration 'auto'.
     Seedance,
-    /// bytedance/seedance-2.0-mini: whole-frame restyle, 480p/720p via OpenRouter;
-    /// edit tasks accept explicit 4-15s durations (unlike 2.5's auto-only).
+    /// bytedance/seedance-2.0-mini: whole-frame restyle; edits accept explicit 4-15s durations.
     SeedanceMini,
     /// Any other configured model — permissive validation.
     Unknown,
@@ -48,11 +41,8 @@ enum VideoEditModel {
 
 fn classify_model(model: &str) -> VideoEditModel {
     let m = model.to_ascii_lowercase();
-    // Substring match (not exact) so vendor-prefixed IDs like
-    // "minimax/hailuo-3" keep resolving; Unknown covers every other model
-    // permissively. seedance-2.5 keeps its auto-duration edit rule;
-    // seedance-2.0-mini gets explicit-duration edits; seedance-2.0/2.0-fast/
-    // 1.5-pro stay Unknown.
+    // Substring match (not exact) so vendor-prefixed IDs like "minimax/hailuo-3" resolve;
+    // Unknown covers every other model permissively.
     if m.contains("hailuo") {
         VideoEditModel::Hailuo3
     } else if m.contains("aleph") {
@@ -67,22 +57,18 @@ fn classify_model(model: &str) -> VideoEditModel {
 }
 
 impl VideoEditModel {
-    /// The input-clip duration bounds in milliseconds — the single per-model table
-    /// backing the pre-flight local-clip check.
+    /// The input-clip duration bounds in milliseconds — the single table backing the pre-flight
+    /// local-clip check.
     ///
-    /// `None` fails open (no check): no bound is held for this model — the seedance
-    /// family trims over-long inputs instead of rejecting them, and a model the
-    /// classifier does not recognise lands on the same arm. Deleting a row here
-    /// removes the check everywhere — no other copy of a limit exists.
+    /// `None` fails open: the seedance family trims over-long inputs instead of rejecting them,
+    /// and an unrecognised model lands on the same arm.
     fn input_duration_limit_ms(self) -> Option<std::ops::RangeInclusive<i64>> {
         match self {
-            // minimax/hailuo-3: 2000–15000 ms per clip ("expected [2000, 15000] ms"
-            // from the provider, and MiniMax's own docs); the same bound behind the
-            // 50 MB input cap.
+            // minimax/hailuo-3: 2000–15000 ms per clip (provider and MiniMax docs); the same bound
+            // behind the 50 MB input cap.
             VideoEditModel::Hailuo3 => Some(2_000..=15_000),
-            // aleph-2 mirrors its input clip's duration, so it has no bound here;
-            // seedance-2.5/2.0-mini TRIM over-long inputs — never hard-reject; and an
-            // unrecognised model has no bound to apply.
+            // aleph-2 mirrors its input's duration; the seedance models TRIM over-long inputs —
+            // never hard-reject; an unrecognised model has no bound.
             VideoEditModel::Aleph2
             | VideoEditModel::Seedance
             | VideoEditModel::SeedanceMini
@@ -91,11 +77,9 @@ impl VideoEditModel {
     }
 }
 
-/// Static per-model video-editing nuances for the `<active-models-opts>`
-/// block (surfaced on session start and on model switch). Informational
-/// facts only — never parameter-style: `video_edit` accepts no resolution or
-/// editing-mode argument, and the block is shared with `video_gen`. Keyed via
-/// [`classify_model`] so rendering can never drift from validation.
+/// Static per-model editing nuances for the `<active-models-opts>` block: informational
+/// facts only — `video_edit` accepts no resolution or editing-mode argument. Keyed via
+/// [`classify_model`] so rendering cannot drift from validation.
 pub(crate) fn video_edit_nuances(model: &str) -> Option<&'static str> {
     match classify_model(model) {
         VideoEditModel::Hailuo3 => Some(
@@ -115,12 +99,9 @@ pub(crate) fn video_edit_nuances(model: &str) -> Option<&'static str> {
     }
 }
 
-/// Whether the request body must omit `duration`: seedance-2.5 edit-classified
-/// (video-reference) tasks natively require duration 'auto', and forwarding an
-/// explicit integer is provider-rejected. Omission is schema-valid and lets
-/// the provider default to 'auto'. Image-to-video (frame-anchor) keeps the
-/// catalog duration range. seedance-2.0-mini edit tasks accept explicit
-/// 4-15s durations, so it never omits.
+/// Whether the request body must omit `duration`: seedance-2.5 edit-classified tasks
+/// require 'auto' and an explicit integer is provider-rejected (omission is schema-valid).
+/// Image-to-video keeps the catalog range; seedance-2.0-mini accepts 4-15s, so it never omits.
 fn omit_duration(spec: VideoEditModel, mode: EditMode) -> bool {
     matches!((spec, mode), (VideoEditModel::Seedance, EditMode::VideoRef))
 }
@@ -143,9 +124,8 @@ fn ensure_duration_in(
     Ok(())
 }
 
-/// Per-model parameter validation, run before any upload or billing. The
-/// seedance-2.5 duration rule is mode-dependent, so this runs after
-/// [`validate_mode`].
+/// Per-model parameter validation, run before any upload or billing. The seedance-2.5
+/// duration rule is mode-dependent, so this runs after [`validate_mode`].
 fn validate_params(
     spec: VideoEditModel,
     mode: EditMode,
@@ -164,8 +144,8 @@ fn validate_params(
             }
         }
         VideoEditModel::SeedanceMini => {
-            // Explicit 4-15s edit duration per native docs/catalog; the check here
-            // is what refuses anything outside it.
+            // Explicit 4-15s edit duration per native docs/catalog; the check here refuses anything
+            // outside it.
             ensure_duration_in(duration, 4..=15, "seedance-2.0-mini duration")?;
         }
         VideoEditModel::Seedance => match mode {
@@ -192,8 +172,8 @@ fn validate_params(
 enum EditMode {
     /// Video clip edit, optionally guided by reference images.
     VideoRef,
-    /// Image-to-video from first/last frame anchors (no video or reference
-    /// images — frame and reference roles are mutually exclusive).
+    /// Image-to-video from first/last frame anchors (frame and reference roles are mutually
+    /// exclusive).
     FrameAnchor,
 }
 
@@ -249,14 +229,12 @@ fn validate_mode(
     }
 }
 
-/// Pre-flight input-duration gate for a local clip, run after containment,
-/// extension, and size validation and before any upload or job submission.
+/// Pre-flight input-duration gate for a local clip, run after containment, extension and size
+/// validation and before any upload.
 ///
-/// Hard-rejects only when the active model has a verified input-duration
-/// limit AND the parsed MP4/MOV container duration falls outside it. Fails
-/// open for everything uncertain: non-MP4/MOV containers (webm/mkv/avi),
-/// fragmented or corrupt files, unreadable metadata, and models without a
-/// verified limit.
+/// Hard-rejects only when the active model has a verified input-duration limit AND the parsed
+/// MP4/MOV duration falls outside it. Fails open for everything uncertain: other containers,
+/// fragmented or corrupt files, unreadable metadata, and models without a verified limit.
 fn check_local_input_duration(
     canonical: &std::path::Path,
     model: &str,
@@ -265,8 +243,8 @@ fn check_local_input_duration(
     let Some(limit_ms) = spec.input_duration_limit_ms() else {
         return Ok(());
     };
-    // Only ISO-BMFF containers carry a readable mvhd duration — the other
-    // accepted local extensions (webm/mkv/avi) are skipped by design.
+    // Only ISO-BMFF containers carry a readable mvhd duration; the other accepted extensions
+    // (webm/mkv/avi) are skipped by design.
     if !crate::util::has_extension(canonical, &["mp4", "mov"]) {
         return Ok(());
     }
@@ -315,10 +293,9 @@ struct BoxSpan {
     payload_end: u64,
 }
 
-/// Read a box header at `offset` and return its payload span, bounded by
-/// `parent_end` (a size==0 box runs to the end of its containing scope).
-/// size==1 boxes carry a 64-bit largesize. Returns `None` on any malformed
-/// header: undersized size, overflow, or a span outside the parent.
+/// Read a box header at `offset` and return its payload span, bounded by `parent_end` (a
+/// size==0 box runs to the end of its scope; size==1 carries a 64-bit largesize). `None` on
+/// any malformed header.
 fn read_box(file: &mut std::fs::File, offset: u64, parent_end: u64) -> Option<BoxSpan> {
     let mut header = [0u8; 8];
     file.seek(SeekFrom::Start(offset)).ok()?;
@@ -348,21 +325,16 @@ fn read_box(file: &mut std::fs::File, offset: u64, parent_end: u64) -> Option<Bo
     })
 }
 
-/// Read an MP4/MOV file's duration in milliseconds from its `mvhd` metadata
-/// box, using only the standard library.
-///
-/// The `moov` box may sit anywhere in the file — end-of-file for iPhone
-/// MOVs — so top-level boxes are walked by seek rather than reading a fixed
-/// header window. Returns `None` (fail-open) for anything untrustworthy:
-/// non-ISO-BMFF data, fragmented files (`moof`/`mvex` — mvhd duration does
-/// not cover fragments), a zero or missing/unreadable `mvhd` duration, and
-/// I/O errors.
+/// Read an MP4/MOV file's duration in milliseconds from its `mvhd` box, using only the
+/// standard library. The `moov` box may sit anywhere (end-of-file for iPhone MOVs), so
+/// top-level boxes are walked by seek rather than from a fixed header window. `None`
+/// (fail-open) for non-ISO-BMFF data, fragmented files (`moof`/`mvex` — mvhd does not cover
+/// fragments), a zero or unreadable duration, and I/O errors.
 fn mp4_duration_ms(path: &std::path::Path) -> Option<i64> {
     let mut file = std::fs::File::open(path).ok()?;
     let file_len = file.metadata().ok()?.len();
-    // Pass 1: scan the full top-level layout for fragmentation. A moof AFTER
-    // moov (a non-conformant fragmented layout without mvex) must fail open
-    // too, so no moov is parsed until the whole file is confirmed unfragmented.
+    // Pass 1: scan the full top-level layout for fragmentation. A moof AFTER moov must fail
+    // open too, so no moov is parsed until the whole file is confirmed unfragmented.
     let mut offset: u64 = 0;
     while offset.checked_add(8).is_some_and(|o| o <= file_len) {
         let span = read_box(&mut file, offset, file_len)?;
@@ -386,11 +358,9 @@ fn mp4_duration_ms(path: &std::path::Path) -> Option<i64> {
     None
 }
 
-/// Walk the children of a `moov` box looking for a usable `mvhd`; `mvex`
-/// marks a fragmented movie (fail-open). The whole payload is scanned before
-/// returning because `mvex` typically sits AFTER `mvhd` in a fragmented moov
-/// — returning on the first mvhd would trust a duration that does not cover
-/// the fragments. `None` when no usable mvhd is found.
+/// Walk the children of a `moov` box looking for a usable `mvhd`; `mvex` marks a fragmented
+/// movie. The whole payload is scanned before returning, because `mvex` typically sits AFTER
+/// `mvhd` — returning on the first mvhd would trust a duration that does not cover the fragments.
 fn parse_moov_duration(
     file: &mut std::fs::File,
     moov_payload_start: u64,
@@ -414,12 +384,9 @@ fn parse_moov_duration(
     mvhd
 }
 
-/// Parse an `mvhd` payload into a duration in milliseconds
-/// (`duration * 1000 / timescale` — the exact value the provider validates
-/// against). Supports mvhd version 0 (32-bit fields) and version 1 (64-bit).
-/// A zero duration is indistinguishable from 'unknown' (live/streamed or
-/// broken encoders) and returns `None` — the gate must fail open rather than
-/// hard-reject on metadata it cannot trust.
+/// Parse an `mvhd` payload into milliseconds (`duration * 1000 / timescale`, the exact value
+/// the provider validates), versions 0 and 1. A zero duration is indistinguishable from
+/// 'unknown' and returns `None` — the gate must fail open.
 fn parse_mvhd_duration(
     file: &mut std::fs::File,
     payload_start: u64,
@@ -464,9 +431,8 @@ fn parse_mvhd_duration(
     i64::try_from(ms).ok()
 }
 
-/// Resolve the video reference: public URL as-is, local file → pre-flight
-/// validation (containment, extension, size, input-duration gate) → upload
-/// bridge. `model`/`spec` drive the duration gate's per-model limit.
+/// Resolve the video reference: public URL as-is, local file → pre-flight validation
+/// (containment, extension, size, duration gate) → upload bridge.
 async fn resolve_video_source(
     video_url: &str,
     ws: &crate::Workspace,
@@ -476,8 +442,8 @@ async fn resolve_video_source(
     if crate::util::is_http_url(video_url) {
         return Ok(video_url.to_string());
     }
-    // Only clips already inside the workspace media dirs may be uploaded —
-    // arbitrary local files are an exfiltration risk.
+    // Only clips already inside the workspace media dirs may be uploaded — arbitrary local files
+    // are an exfiltration risk.
     let canonical = super::resolve_local_media_path(video_url, ws, "clip").await?;
     if !crate::util::is_video_extension(&canonical) {
         anyhow::bail!(
@@ -489,17 +455,14 @@ async fn resolve_video_source(
     if len > MAX_INPUT_BYTES {
         anyhow::bail!("Source clip is limited to 50 MB, got {len} bytes. Trim the clip and retry.");
     }
-    // Pre-flight duration gate: reject clips the active model would reject
-    // (hailuo-3: 2000–15000 ms) before any upload or billable submission —
-    // a doomed clip otherwise costs an upload, a job, and a retry round-trip.
+    // Pre-flight duration gate: reject clips the active model would reject before any upload or
+    // billable submission — a doomed clip otherwise costs an upload, a job, and a retry.
     check_local_input_duration(&canonical, model, spec)?;
     crate::util::upload_bridge::upload_video_ephemeral(&canonical).await
 }
 
-/// Resolve an image input: public URL (GET-validated — a broken image
-/// reference bills anyway on the provider) or a local file in workspace
-/// uploads or generated (uploaded to an ephemeral host). `label` names the
-/// input in error messages ("reference image", "first-frame anchor", ...).
+/// Resolve an image input: public URL (GET-validated — a broken reference bills anyway) or a
+/// local file in workspace uploads or generated. `label` names the input in error messages.
 async fn resolve_image_input(
     input: &str,
     ws: &crate::Workspace,
@@ -530,12 +493,10 @@ async fn resolve_image_input(
 
 /// Tool for editing an existing video clip via OpenRouter's async videos API.
 ///
-/// Accepts a public source clip URL or a local file path (which local paths a
-/// caller may name is [`crate::tools::resolve_local_media_path`]'s rule —
-/// confined to the workspace for an agent, any file for the command line), and
-/// uploads it to an ephemeral anonymous host at job time; submits exactly one
-/// video edit job, polls for completion, downloads the edited clip, and
-/// returns its path so the agent can send it via `[VIDEO:path]` in its reply.
+/// Accepts a public clip URL or a local file path (which paths a caller may name is
+/// [`crate::tools::resolve_local_media_path`]'s rule), uploads it to an ephemeral anonymous
+/// host at job time, submits exactly one edit job, polls, downloads the result and returns
+/// its path so the agent can send it via `[VIDEO:path]`.
 pub struct VideoEditTool;
 
 #[async_trait]
@@ -633,15 +594,11 @@ impl Tool for VideoEditTool {
             );
         }
 
-        // ── Mode validation: frame anchors vs references, model image gate ──
         let mode = validate_mode(spec, video_url, &images, first_frame, last_frame)?;
 
-        // ── Per-model parameter validation (fail fast, before any upload) ──
-        // Runs after mode validation — the seedance-2.5 duration rule is
-        // mode-dependent (edit vs image-to-video).
+        // Runs after mode validation — the seedance-2.5 duration rule is mode-dependent.
         validate_params(spec, mode, duration)?;
 
-        // ── Resolve sources and build the request body ────────────────────
         let mut body = json!({
             "model": model,
             "prompt": instruction,
@@ -692,8 +649,7 @@ impl Tool for VideoEditTool {
             }
         }
 
-        // seedance-2.5 edit tasks natively require duration 'auto' — omit the
-        // field (schema-valid; provider defaults to auto) instead of
+        // seedance-2.5 edit tasks require 'auto' — omit the field (schema-valid) instead of
         // forwarding a provider-rejected integer.
         if let Some(d) = duration
             && !omit_duration(spec, mode)
@@ -708,10 +664,8 @@ impl Tool for VideoEditTool {
         let video_bytes =
             super::fetch_async_video(&api_base, &body, super::VideoJobLabels::EDIT).await?;
 
-        // Save to the caller's output directory and format the media marker. The
-        // marker stays first; the transcription is appended for the Assistant to
-        // reason about its own output (fail-open: marker-only on transcription
-        // failure).
+        // Save to the caller's output directory and format the media marker. The marker stays
+        // first; the transcription is appended for the Assistant to reason about its own output.
         let output_path = super::save_generated_file(ws, &video_bytes, "video", "mp4").await?;
         let marker = self.format_media_result(&output_path);
         Ok(super::format_video_result(marker, &output_path).await)
@@ -731,9 +685,8 @@ mod tests {
             classify_model("runway/aleph-2-20260729"),
             VideoEditModel::Aleph2
         );
-        // seedance-2.5 keeps its auto-duration edit rule; seedance-2.0-mini
-        // gets explicit-duration edits; seedance-2.0/2.0-fast/1.5-pro stay
-        // permissive (Unknown) so they never inherit either rule.
+        // seedance-2.5 keeps its auto-duration edit rule; seedance-2.0-mini gets explicit-duration
+        // edits; the rest stay permissive (Unknown).
         assert_eq!(
             classify_model("bytedance/seedance-2.5"),
             VideoEditModel::Seedance
@@ -882,9 +835,6 @@ mod tests {
         assert!(validate_mode(VideoEditModel::Hailuo3, None, &none, None, None).is_err());
     }
 
-    // ── Pre-flight input-duration gate ────────────────────────────────
-
-    /// Build one ISO-BMFF box: big-endian 32-bit size + 4-cc type + payload.
     fn box_bytes(box_type: [u8; 4], payload: &[u8]) -> Vec<u8> {
         let size = u32::try_from(8 + payload.len()).unwrap();
         let mut v = Vec::with_capacity(8 + payload.len());
@@ -894,8 +844,6 @@ mod tests {
         v
     }
 
-    /// Build an `mvhd` payload for the given version (0: 32-bit, 1: 64-bit
-    /// timescale/duration fields).
     fn mvhd_payload(version: u8, timescale: u32, duration: u64) -> Vec<u8> {
         let mut payload = vec![version, 0, 0, 0]; // version + flags
         match version {
@@ -916,8 +864,6 @@ mod tests {
         payload
     }
 
-    /// Minimal mp4 byte layout: ftyp + mdat, then moov with the given children
-    /// appended last — the iPhone-MOV end-of-file layout the parser must walk.
     fn mp4_bytes(moov_children: &[Vec<u8>]) -> Vec<u8> {
         let moov_payload: Vec<u8> = moov_children.iter().flatten().copied().collect();
         let mut bytes = box_bytes(*b"ftyp", b"isom");
@@ -926,9 +872,6 @@ mod tests {
         bytes
     }
 
-    /// A fragmented mp4 layout: ftyp, a top-level moof, mdat, then moov with
-    /// an over-long mvhd. Shared by the parser- and gate-level tests so the
-    /// byte construction lives in exactly one place.
     fn fragmented_mp4_bytes() -> Vec<u8> {
         let mut bytes = box_bytes(*b"ftyp", b"isom");
         bytes.extend_from_slice(&box_bytes(*b"moof", &[]));
@@ -940,8 +883,6 @@ mod tests {
         bytes
     }
 
-    /// Write an mp4 built from `moov_children` to a temp file; returns the
-    /// tempdir (kept alive) and the file path.
     fn write_mp4(moov_children: &[Vec<u8>]) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("clip.mp4");
@@ -949,7 +890,6 @@ mod tests {
         (dir, path)
     }
 
-    /// Write raw bytes as `clip.mp4` under the given tempdir.
     fn write_raw(dir: &tempfile::TempDir, bytes: &[u8]) -> std::path::PathBuf {
         let path = dir.path().join("clip.mp4");
         std::fs::write(&path, bytes).unwrap();
@@ -973,8 +913,8 @@ mod tests {
 
     #[test]
     fn mp4_duration_reads_mvhd_in_end_of_file_moov() {
-        // iPhone-MOV layout: moov (with mvhd) sits at the very end of the
-        // file, after mdat — the parser must seek, not read a header window.
+        // iPhone-MOV layout: moov (with mvhd) sits at the very end, after mdat — the parser must
+        // seek, not read a header window.
         let (_dir, path) = write_mp4(&[box_bytes(*b"mvhd", &mvhd_payload(0, 1000, 35_167))]);
         assert_eq!(mp4_duration_ms(&path), Some(35_167));
         // Non-1000 timescale: 9760 ticks @ 600/s = 16.266 s → 16266 ms.
@@ -993,8 +933,8 @@ mod tests {
 
     #[test]
     fn mp4_duration_fails_open_on_fragmented_files() {
-        // Any top-level moof marks the file fragmented — mvhd duration does
-        // not cover fragments, so the check must fail open.
+        // Any top-level moof marks the file fragmented — mvhd does not cover fragments, so the
+        // check must fail open.
         let dir = tempfile::tempdir().unwrap();
         let path = write_raw(&dir, &fragmented_mp4_bytes());
         assert_eq!(mp4_duration_ms(&path), None);
@@ -1004,9 +944,6 @@ mod tests {
             box_bytes(*b"mvex", &box_bytes(*b"trex", &[0u8; 24])),
         ]);
         assert_eq!(mp4_duration_ms(&path), None);
-        // Non-conformant fragmented layout: moov WITHOUT mvex, then a moof
-        // later in the file. The deferred top-level scan still detects the
-        // fragment and fails open instead of trusting the mvhd duration.
         let mut bytes = box_bytes(*b"ftyp", b"isom");
         bytes.extend_from_slice(&box_bytes(
             *b"moov",
@@ -1043,8 +980,7 @@ mod tests {
         // Zero timescale is unreadable (fail-open).
         let (_dir, path) = write_mp4(&[box_bytes(*b"mvhd", &mvhd_payload(0, 0, 35_000))]);
         assert_eq!(mp4_duration_ms(&path), None);
-        // Zero duration is indistinguishable from 'unknown' (live/streamed or
-        // broken encoders) — fail open, never a hard-reject below the floor.
+        // Zero duration is indistinguishable from 'unknown' — fail open, never a hard-reject.
         let (_dir, path) = write_mp4(&[box_bytes(*b"mvhd", &mvhd_payload(0, 1000, 0))]);
         assert_eq!(mp4_duration_ms(&path), None);
         // Missing file.

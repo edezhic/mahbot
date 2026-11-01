@@ -1,8 +1,7 @@
 //! Session persistence — Turso-backed store + native history decoding.
 //!
-//! Also hosts the lock-free live transcript snapshot accessor
-//! ([`transcript`]) that the Running Agents GUI reads to show a running
-//! agent's in-memory conversation including the unpersisted tail.
+//! Also hosts the lock-free live transcript snapshot ([`transcript`]) the Running Agents GUI
+//! reads to show a running agent's in-memory conversation including the unpersisted tail.
 
 mod activity;
 mod compaction_dump;
@@ -22,51 +21,30 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::borrow::Cow;
 
-// The summarization LLM call lives in `crate::Agent::summarize` so that all
-// parameters (model, reasoning_effort, tools, provider routing)
-// are byte-identical to the agent's work loop.
+// The summarization LLM call lives in `crate::Agent::summarize` so its parameters (model,
+// reasoning_effort, tools, provider routing) stay byte-identical to the work loop's.
 
-/// History-length threshold (in REAL provider-reported tokens) that triggers
-/// summarization.
-///
-/// The session's current length in tokens is the input + output tokens of the
-/// most recent successful agent LLM call (see
-/// [`crate::Agent::record_session_usage`]), persisted per session in
-/// `session_metadata.token_length` and loaded at session init. `None` — no
-/// successful usage-bearing call ever recorded a value (new sessions,
-/// pre-migration sessions; approved no-backfill semantics) or the last
-/// compaction cleared it — only disables this token trigger; the
-/// image-accumulation trigger ([`SUMMARIZATION_IMAGE_COUNT`]) still applies.
-///
-/// **200,000** is a conservative default chosen to work across models with
-/// varying context window sizes (250K–1M).
+/// Token threshold (REAL provider-reported input + output of the last successful agent call,
+/// persisted in `session_metadata.token_length`) that triggers summarization. `None` — never
+/// recorded (new/pre-migration sessions; no backfill) or cleared by the last compaction — disables
+/// this trigger only; [`SUMMARIZATION_IMAGE_COUNT`] still applies. 200k is a conservative default
+/// across the 250K–1M windows models ship with.
 pub(crate) const SUMMARIZATION_THRESHOLD: u64 = 200_000;
 
-/// Summarization also fires on image accumulation: when the session's user
-/// messages carry at least this many DISTINCT data-URI image markers. The
-/// count is a prefix-gate superset of the markers promoted to provider
-/// vision parts — it never undercounts, but a malformed `data:image/*`
-/// payload may be counted too. `>=` deliberately differs from the strict
-/// token threshold: images are a hard floor on context quality regardless
-/// of how a provider tokenizes them.
+/// Image-accumulation trigger: DISTINCT `data:image/*` markers in user messages. The count is a
+/// prefix-gate superset of the markers promoted to provider vision parts — never undercounts, but
+/// a malformed payload may count. `>=` (unlike the strict token threshold) because images are a
+/// hard floor on context quality regardless of how a provider tokenizes them.
 pub(crate) const SUMMARIZATION_IMAGE_COUNT: usize = 20;
 
-/// Number of latest user messages / assistant answers retained per side
-/// after summarization compaction.
+/// Latest user messages / assistant answers kept per side after compaction.
 const RETENTION_PER_SIDE: usize = 3;
 
-/// Decode the tool-call payload of a native assistant history frame — the one
-/// calls-only view of [`decode_native_history_message`].
-///
-/// Returns `Some(calls)` only when the message decodes as an assistant frame
-/// carrying a tool-call payload; `None` covers non-assistant frames, decode
-/// failures, and frames without a payload. `Some([])` (payload present but
-/// empty) stays distinguishable from `None` — a present-but-empty call list is
-/// a tool-call frame with nothing to run, not an absence of one.
-///
-/// Callers span unrelated concerns — retention-window selection, dead-session
-/// dangling-tail detection, tool-result settling, and query/command telemetry
-/// over persisted history — so a semantic change here reaches all of them.
+/// Tool calls of a native assistant history frame — the calls-only view of
+/// [`decode_native_history_message`]. `Some([])` (present-but-empty payload) stays distinct from
+/// `None` (not an assistant frame, decode failure, no payload). Callers span retention-window
+/// selection, dead-session dangling-tail detection, tool-result settling and history telemetry, so
+/// a semantic change here reaches all of them.
 pub(crate) fn decoded_tool_calls(msg: &ChatMessage) -> Option<Vec<ToolCall>> {
     match decode_native_history_message(msg) {
         Some(DecodedNativeHistoryMessage::Assistant { tool_calls, .. }) => tool_calls,
@@ -74,18 +52,15 @@ pub(crate) fn decoded_tool_calls(msg: &ChatMessage) -> Option<Vec<ToolCall>> {
     }
 }
 
-/// Assistant messages carrying tool-call payloads are tool traffic — never
-/// counted toward the retention window. Mirrors the app-wide history-rendering
-/// discriminator ([`decode_native_history_message`]).
+/// Tool-call payload frames are tool traffic — never counted toward the retention window.
+/// Mirrors the app-wide history-rendering discriminator ([`decode_native_history_message`]).
 fn is_tool_call_frame(msg: &ChatMessage) -> bool {
     decoded_tool_calls(msg).is_some()
 }
 
-/// True when the message decodes as a native assistant tool-call frame
-/// carrying at least one tool call — the dangling-tail signal used by the
-/// dead-session recovery poller. Mirrors [`Session::pending_tool_frame`]:
-/// a frame that is the session TAIL can have no following result rows, so
-/// non-empty calls there means unresolved calls.
+/// Native assistant tool-call frame carrying at least one call — the dangling-tail signal for the
+/// dead-session poller: a frame that is the session TAIL has no following result rows, so
+/// non-empty calls mean unresolved calls ([`Session::pending_tool_frame`]).
 fn is_dangling_tool_call_frame(role: ChatRole, content: &str) -> bool {
     decoded_tool_calls(&ChatMessage {
         role,
@@ -94,14 +69,11 @@ fn is_dangling_tool_call_frame(role: ChatRole, content: &str) -> bool {
     .is_some_and(|calls| !calls.is_empty())
 }
 
-/// Select the latest [`RETENTION_PER_SIDE`] user messages and assistant answers
-/// from `history`, merged in chronological order, plus everything from
-/// `keep_from` on. Tool-call frames and tool results are excluded from both
-/// sides. The newest user message is always among them — callers must not
-/// re-append it separately. `keep_from` is the index the turn in flight starts
-/// at: a turn answering several messages reaches the model in full, so nothing
-/// it carries is summarised away before it is read. Pass `history.len()` when no
-/// turn is in flight.
+/// Latest [`RETENTION_PER_SIDE`] user messages and assistant answers from `history`, merged
+/// chronologically, plus everything from `keep_from` on — the index the in-flight turn starts at,
+/// so nothing a multi-message turn carries is summarised away before it is read (pass
+/// `history.len()` when idle). Tool frames and results are excluded from both sides; the newest
+/// user message is always among them, so callers must not re-append it.
 #[must_use]
 fn select_retention_window(history: &[ChatMessage], keep_from: usize) -> Vec<ChatMessage> {
     let mut users: Vec<(usize, &ChatMessage)> = Vec::new();
@@ -134,10 +106,9 @@ pub(crate) fn render_timestamp() -> String {
     format!("{} ({})", now.format("%Y-%m-%d %H:%M:%S"), now.format("%Z"))
 }
 
-/// Build a user message with a `<timestamp>` block appended. `round_ts`
-/// (pre-rendered via [`render_timestamp`]) pins one value per round so
-/// parallel members share a byte-identical first message; `None` stamps now
-/// (mid-round injected content).
+/// User message with a `<timestamp>` block appended. `round_ts` (pre-rendered via
+/// [`render_timestamp`]) pins one value per round so parallel members share a byte-identical first
+/// message; `None` stamps now (mid-round injected content).
 #[must_use]
 pub(crate) fn user_msg_with_ts(content: &str, round_ts: Option<&str>) -> ChatMessage {
     let ts = round_ts.map_or_else(render_timestamp, str::to_string);
@@ -150,7 +121,6 @@ crate::define_store! {
     expect = "SESSIONS not initialized — call init_all_stores() first",
 }
 
-// ── Column index constants ──────────────────────────────────
 crate::columns! {
     SESSION_MESSAGE_COLUMNS [SM] {
         ROLE    => "role",
@@ -158,16 +128,12 @@ crate::columns! {
     }
 }
 
-// Session list with metadata (10-column SELECT: sm.agent_id, sm.last_activity,
-// sm.message_count, sm.token_length, sm.role, sm.user_name, sm.workspace_name,
-// sm.custom_role, sm.custom_identifier, sm.launch_stopped).
-// Counts are read from the denormalized metadata column — NOT from a JOIN over
-// the `sessions` message table (the list re-reads on every runtime tick while
-// the Sessions page is open, and from the dead-session recovery poller; scanning
-// the full message table per refresh was the largest repeated query in the
-// system). The count is maintained in the same transaction as message writes
-// (see `insert_messages_in_transaction`). It is NOT backfilled: sessions that
-// predate the metadata column default to 0. Schema: `db/migrations.rs`.
+// Session list metadata (10-column SELECT). Counts come from the denormalized metadata column —
+// NOT a JOIN over `sessions`: the list re-reads on every runtime tick while the Sessions page is
+// open and from the dead-session poller, and scanning the message table per refresh was the
+// largest repeated query in the system. Maintained in the same transaction as message writes
+// (`insert_messages_in_transaction`), never backfilled — pre-metadata sessions default to 0.
+// Schema: `db/migrations.rs`.
 crate::columns! {
     SESSION_LIST_COLUMNS [SL] {
         AGENT_ID          => "sm.agent_id",
@@ -183,27 +149,16 @@ crate::columns! {
     }
 }
 
-/// Agent ID prefixes for transient (background-only, non-user-facing) agent sessions.
-///
-/// These agents are created automatically (analysts, engineers, maintainer,
-/// discovery, etc.) and their sessions are cleaned up periodically by
+/// Agent ID prefixes for transient (background-only, non-user-facing) sessions — auto-created
+/// analysts, engineers, maintainer, discovery, etc., cleaned up by
 /// [`cleanup_old_transient_sessions`].
 ///
-/// User-facing agents — those the user can directly converse with — persist
-/// indefinitely and are intentionally excluded:
-/// - Direct chat: `{user}_{ws_name}_{role}` (or the deduped
-///   `{user}_personal:{role}` for the user's own personal workspace) — a real
-///   user whose name collides with a reserved prefix is escaped with a `user_`
-///   prefix (see [`safe_user_segment`]).
-/// - Manager: `manager_{ws_name}` — the Manager session carries both chat conversation
-///   and notification context and must never be added here.
-/// - A custom role's continuable branch: `role_{name}` / `role_{name}:{identifier}`
-///   ([`custom_role_agent_id`]) — an administrator-defined conversation the user
-///   comes back to, so it persists like a direct one. Only its one-off siblings
-///   (`rolerun_`, [`custom_role_run_agent_id`]) are transient.
-///
-/// If a new agent role is added that can talk to users directly, its agent ID prefix
-/// must also be excluded from this list.
+/// User-facing agents persist indefinitely and are deliberately excluded: direct chat
+/// `{user}_{ws_name}_{role}` (or deduped `{user}_personal:{role}`, a colliding user escaped with a
+/// `user_` prefix — [`safe_user_segment`]); `manager_{ws_name}`, which carries chat conversation
+/// and notification context; and a custom role's continuable branch `role_{name}[:{identifier}]`
+/// ([`custom_role_agent_id`]), where only the `rolerun_` siblings are transient. A new role that
+/// can talk to users directly must be excluded here too.
 const TRANSIENT_AGENT_ID_PREFIXES: &[&str] = &[
     "ticket_",
     "analyze_",
@@ -214,34 +169,25 @@ const TRANSIENT_AGENT_ID_PREFIXES: &[&str] = &[
     "rolerun_",
 ];
 
-/// Agent-id prefix of a custom role's continuable branch — `role_{name}` (the
-/// record's default branch) or `role_{name}:{identifier}` (a named branch). The
-/// `:` separator is what makes the two forms injective: names and identifiers
-/// may both contain `_`, so a `_` separator would alias `(a_b, None)` with
-/// `(a, Some(b))` — the `personal:{user}` workspace key already establishes `:`
-/// in agent ids.
+/// Agent-id prefix of a custom role's continuable branch — `role_{name}` (the record's default
+/// branch) or `role_{name}:{identifier}`. The `:` separator keeps the two forms injective: names
+/// and identifiers may both contain `_`, so `_` would alias `(a_b, None)` with `(a, Some(b))` —
+/// and `personal:{user}` already establishes `:` in agent ids.
 ///
-/// Deliberately NOT in [`TRANSIENT_AGENT_ID_PREFIXES`]: the branch is a
-/// user-facing conversation the administrator defined and comes back to, so it
-/// is never TTL-purged and is eligible for dead-session recovery. It is in the
-/// wider [`reserved_agent_id_prefixes`] union, so no direct user id can start
-/// with it (a user literally named `role` is escaped to `user_role`).
+/// Deliberately NOT in [`TRANSIENT_AGENT_ID_PREFIXES`]: it is a user-facing conversation, never
+/// TTL-purged and eligible for dead-session recovery. It is in the wider
+/// [`reserved_agent_id_prefixes`] union, so a user literally named `role` becomes `user_role`.
 pub(crate) const CUSTOM_ROLE_AGENT_ID_PREFIX: &str = "role_";
 
-/// Agent-id prefix of a custom role's ONE-OFF run — `rolerun_{name}:{suffix}`.
-/// The same `:` separator, and the same injectivity rule, as
-/// [`CUSTOM_ROLE_AGENT_ID_PREFIX`] — here the [`crate::generate_suffix`] NanoID
-/// suffix itself may contain `_`, which is exactly why that rule applies too.
-/// Registered in [`TRANSIENT_AGENT_ID_PREFIXES`] so it expires with the
-/// ordinary session lifetime.
+/// Agent-id prefix of a custom role's ONE-OFF run — `rolerun_{name}:{suffix}`. Same `:` injectivity
+/// rule as [`CUSTOM_ROLE_AGENT_ID_PREFIX`]: the [`crate::generate_suffix`] NanoID may itself
+/// contain `_`. Transient, so it expires with the ordinary session lifetime.
 pub(crate) const CUSTOM_ROLE_RUN_AGENT_ID_PREFIX: &str = "rolerun_";
 
-/// Agent-id prefix of a worker branch — `worker_{branch}`. A worker branch is a
-/// continuable conversation like a custom role's branch: it is deliberately NOT
-/// in [`TRANSIENT_AGENT_ID_PREFIXES`] (never TTL-purged) and IS recovered by the
-/// dead-session poller, but it is in the wider [`reserved_agent_id_prefixes`]
-/// union so no direct user id can shadow it. It is NOT in
-/// [`non_user_facing_agent_id_prefixes`]: the branch is user-facing.
+/// Agent-id prefix of a worker branch — `worker_{branch}`, a continuable conversation like a custom
+/// role's branch: deliberately NOT in [`TRANSIENT_AGENT_ID_PREFIXES`] (never TTL-purged), IS
+/// recovered by the dead-session poller, and IS in [`reserved_agent_id_prefixes`] so no direct user
+/// id can shadow it. Not in [`non_user_facing_agent_id_prefixes`]: the branch is user-facing.
 pub(crate) const WORKER_BRANCH_AGENT_ID_PREFIX: &str = "worker_";
 
 #[derive(Debug, Clone)]
@@ -249,41 +195,31 @@ pub(crate) struct SessionMetadata {
     pub agent_id: String,
     pub last_activity: DateTime<Utc>,
     pub message_count: usize,
-    /// Real provider-reported session length (input + output tokens of the
-    /// last successful agent LLM call), if ever recorded. Older sessions are
-    /// intentionally never backfilled — `None` renders no token value.
+    /// Real provider-reported session length (input + output tokens of the last successful agent
+    /// call), if ever recorded. Older sessions are intentionally never backfilled — `None` renders
+    /// no token value.
     pub token_length: Option<u64>,
-    /// Session context columns (see `SessionContext`); `None` when the row was
-    /// written without context (transient/background sessions).
+    /// Session context columns (see `SessionContext`); `None` for transient/background sessions.
     pub role: Option<String>,
     pub user_name: Option<String>,
     pub workspace_name: Option<String>,
-    /// The custom role this session belongs to, when it is a custom-role
-    /// session; `None` for a worker branch (whose branch name is in
-    /// `custom_identifier`).
+    /// The custom role this session belongs to; `None` for a worker branch (whose branch name is
+    /// in `custom_identifier`).
     pub custom_role: Option<String>,
-    /// The named branch this continuable session continues, when the branch was
-    /// named — a custom role's identifier, or a worker branch's name.
+    /// The named branch this continuable session continues, when named — a custom role's
+    /// identifier, or a worker branch's name.
     pub custom_identifier: Option<String>,
     /// Whether the launch was stopped before it produced anything.
     pub launch_stopped: bool,
 }
 
-/// Context data stored alongside a session for recovery purposes.
-///
-/// Written on every non-empty turn for all roles (see
-/// [`Session::append_turn_message`](crate::session::Session::append_turn_message)),
-/// so the dead-session recovery poller can always reconstruct an
-/// [`AgentJob`](crate::agent::message_router::AgentJob) without parsing the
-/// agent ID string.
-///
-/// # Column naming note
-///
-/// The `role` field is persisted in the `session_metadata.role` column, which
-/// stores the **agent role** (e.g. `"engineer"`, `"analyst"`, `"reviewer"`).
-/// This is semantically distinct from the `sessions.role` column, which stores
-/// the **message role** (`"user"`, `"assistant"`, `"tool"`, `"system"`) — even
-/// though both columns happen to share the name `role` in different tables.
+/// Context stored alongside a session so the dead-session recovery poller can reconstruct an
+/// [`AgentJob`](crate::agent::message_router::AgentJob) without parsing the agent ID string.
+/// Written on every non-empty turn for all roles
+/// ([`Session::append_turn_message`](crate::session::Session::append_turn_message)).
+/// `session_metadata.role` stores the **agent role** (`"engineer"`, `"analyst"`, `"reviewer"`),
+/// semantically distinct from `sessions.role`'s **message role** — same column name, different
+/// tables.
 #[derive(Debug, Clone)]
 pub(crate) struct SessionContext {
     pub channel: String,
@@ -291,18 +227,15 @@ pub(crate) struct SessionContext {
     pub workspace_name: String,
     /// Agent role (e.g. `"engineer"`, `"analyst"`, `"reviewer"`).
     pub role: String,
-    /// The custom role this session belongs to, when it is a custom-role
-    /// session; `None` for a worker branch (whose branch name is in
-    /// `custom_identifier`).
+    /// The custom role this session belongs to; `None` for a worker branch.
     pub custom_role: Option<String>,
-    /// The named branch this continuable session continues, when the branch was
-    /// named — a custom role's identifier, or a worker branch's name.
+    /// The named branch this continuable session continues, when named — a custom role's
+    /// identifier, or a worker branch's name.
     pub custom_identifier: Option<String>,
-    /// The conversation that asked for this branch's launch, when one did — the
-    /// asking custom role's branch and the folder its turn ran in, so a worker
-    /// branch's report returns there (see [`crate::Launch::reply_to`]). `None`
-    /// for an owner- or automation-started launch, and for every session recorded
-    /// before the `reply_to` column existed.
+    /// The conversation that asked for this branch's launch, when one did — the asking custom
+    /// role's branch and the folder its turn ran in, so a worker branch's report returns there
+    /// ([`crate::Launch::reply_to`]). `None` for owner- or automation-started launches, and for
+    /// rows predating the `reply_to` column.
     pub reply_to: Option<crate::agent::message_router::Asker>,
 }
 
@@ -336,21 +269,19 @@ fn session_metadata_from_row(
     })
 }
 
-/// Row insert shared by the append and settle paths — the only two writers of
-/// `sessions` rows.
+/// Row insert shared by the append and settle paths — the only two writers of `sessions` rows.
 const INSERT_SESSION_ROW: &str =
     "INSERT INTO sessions (agent_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)";
 
-/// The session metadata a message batch writes in the SAME transaction as its
-/// rows: the describing columns (only a batch that also sets them — a session's
-/// first turn) and the leading context block's length (only the batch that wrote
-/// the block).
+/// Session metadata a message batch writes in the SAME transaction as its rows: the describing
+/// columns (only a batch that also sets them — a session's first turn) and the leading context
+/// block's length (only the batch that wrote the block).
 #[derive(Clone, Copy, Default)]
 struct BatchMetadata<'a> {
     context: Option<(&'a str, &'a str, &'a str, &'a str)>,
     block_len: Option<usize>,
-    /// Clear the recorded provider length in this same transaction — the
-    /// compaction rewrite, see [`SessionStore::replace_messages`].
+    /// Clear the recorded provider length in this same transaction — the compaction rewrite, see
+    /// [`SessionStore::replace_messages`].
     clear_token_length: bool,
 }
 
@@ -369,8 +300,8 @@ impl<'a> BatchMetadata<'a> {
         }
     }
 
-    /// The length of the leading context block this same batch wrote — `Some`
-    /// only for the batch that wrote the block.
+    /// The length of the leading context block this same batch wrote — `Some` only for the batch
+    /// that wrote the block.
     const fn block_len(self, len: Option<usize>) -> Self {
         Self {
             block_len: len,
@@ -379,20 +310,13 @@ impl<'a> BatchMetadata<'a> {
     }
 }
 
-/// Insert messages into `sessions` and upsert `session_metadata` within an existing transaction.
-/// Shared helper used by [`SessionStore::append_messages`].
+/// Insert messages into `sessions` and upsert `session_metadata` within an existing transaction
+/// (shared by [`SessionStore::append_messages`]).
 ///
-/// When `meta.context` is `Some((channel, user_name, workspace_name, role))`, the context columns
-/// are set atomically alongside the messages — closing the atomicity gap of separate
-/// context writes.  This is the preferred path for new sessions
-/// and subsequent turns. `meta.block_len` records the leading context block's
-/// length in that same transaction when the batch wrote the block.
-///
-/// `replace` selects the denormalized `session_metadata.message_count`
-/// semantics: `false` (append) increments the stored count by the batch
-/// length; `true` (replace — summarization compaction deletes then inserts)
-/// SETs it to the batch length. A naive shared increment would double-count
-/// the replace path, since the old rows are gone before the insert.
+/// `meta.context` set means the describing columns are written atomically with the messages,
+/// closing the atomicity gap of separate context writes. `replace` picks the message_count
+/// semantics: `false` increments by the batch length, `true` SETs it — a shared increment would
+/// double-count the compaction path, whose old rows are gone before the insert.
 async fn insert_messages_in_transaction(
     tx: &TxGuard<'_>,
     agent_id: &str,
@@ -413,19 +337,14 @@ async fn insert_messages_in_transaction(
         )
         .await?;
     }
-    // Message count = the number of `sessions` rows for this agent (system
-    // prompts, tool-call frames, and tool results all count — one row per
-    // message, matching the historical COUNT(s.id) list semantics). On a
-    // fresh metadata row the INSERT branch carries the batch length directly;
-    // on an existing row the update branch adds (append) or overwrites
-    // (replace). The INSERT branches rely on the `NOT NULL DEFAULT 0`
-    // declaration for rows created by other paths (e.g. `set_token_length`).
+    // Message count = the number of `sessions` rows for this agent (system prompts, tool-call
+    // frames and tool results all count — one row per message, matching the historical COUNT
+    // semantics). The INSERT branches rely on `NOT NULL DEFAULT 0` for rows created elsewhere.
     let count = i64::try_from(messages.len()).context("message batch exceeds i64")?;
     match meta.context {
         Some((channel, user_name, workspace_name, role)) => {
-            // `created_at` stamps the session_metadata row only on creation
-            // (the session's creation timestamp); the update branch below must
-            // never touch it.
+            // `created_at` stamps the session_metadata row only on creation; the update branch
+            // below must never touch it.
             let created_at = now.clone();
             let count_clause = message_count_clause(replace);
             tx.upsert_row(
@@ -464,9 +383,8 @@ async fn insert_messages_in_transaction(
         }
         None => upsert_message_count(tx, agent_id, count, &now, replace).await?,
     }
-    // A batch that wrote the session's leading context block records its length
-    // in the SAME transaction: a failed write can then never leave a recorded
-    // length that disagrees with the block it describes.
+    // A batch that wrote the leading context block records its length in the SAME transaction, so
+    // a failed write can never leave a recorded length that disagrees with the block.
     if let Some(len) = meta.block_len {
         let len = i64::try_from(len).context("context block length exceeds i64")?;
         set_metadata_value_in_tx(
@@ -477,22 +395,19 @@ async fn insert_messages_in_transaction(
         )
         .await?;
     }
-    // A compaction rewrite clears the recorded provider length in the SAME
-    // transaction, for the same reason: the value described the history this
-    // batch replaces, and one left behind would re-fire the compaction on the
-    // session's next turn.
+    // A compaction rewrite clears the recorded provider length in the SAME transaction: the value
+    // described the history this batch replaces, and one left behind would re-fire compaction on
+    // the next turn.
     if meta.clear_token_length {
         set_metadata_value_in_tx(tx, agent_id, MetadataColumn::TokenLength, Value::Null).await?;
     }
     Ok(())
 }
 
-/// The message-count clause shared by both `session_metadata` write paths:
-/// `replace=true` overwrites (the old rows were already deleted, so
-/// a shared increment would double-count), `replace=false` appends. The batch
-/// length is bound as `?3` on both paths. This must
-/// stay separate from the [`SessionStore::set_metadata_value`] write, which deliberately
-/// never touches `last_activity`.
+/// The message-count clause shared by both `session_metadata` write paths: `replace=true`
+/// overwrites (the old rows were already deleted, so a shared increment would double-count),
+/// `replace=false` appends. The batch length is bound as `?3` on both. Kept separate from
+/// [`SessionStore::set_metadata_value`], which deliberately never touches `last_activity`.
 fn message_count_clause(replace: bool) -> &'static str {
     if replace {
         "message_count = ?3"
@@ -501,8 +416,8 @@ fn message_count_clause(replace: bool) -> &'static str {
     }
 }
 
-/// Upsert one `session_metadata` column inside a caller-owned transaction.
-/// `created_at` is stamped only on row creation (never on an existing row).
+/// Upsert one `session_metadata` column inside a caller-owned transaction. `created_at` is stamped
+/// only on row creation (never on an existing row).
 async fn set_metadata_value_in_tx(
     tx: &TxGuard<'_>,
     agent_id: &str,
@@ -525,11 +440,10 @@ async fn set_metadata_value_in_tx(
     Ok(())
 }
 
-/// Upsert the context-free `session_metadata` count row: `last_activity` is
-/// stamped, `message_count` is added on append/settle (`replace=false`) or
-/// overwritten on the replace path (`replace=true`). `created_at` is
-/// INSERT-only: it stamps the session's creation time and is never touched
-/// by the update.
+/// Upsert the context-free `session_metadata` count row: `last_activity` is stamped,
+/// `message_count` is added on append/settle (`replace=false`) or overwritten on the replace path.
+/// `created_at` is INSERT-only — it stamps the session's creation time and the update never
+/// touches it.
 async fn upsert_message_count(
     tx: &TxGuard<'_>,
     agent_id: &str,
@@ -553,11 +467,8 @@ async fn upsert_message_count(
     Ok(())
 }
 
-/// Execute a `query_map`, logging warnings on failure and skipping unparseable rows.
-/// Returns an empty [`Vec`] on query error.
-///
-/// `agent_id` is passed as a structured tracing field; when `None`, tracing
-/// automatically suppresses it from the output.
+/// Execute a `query_map`, logging warnings on failure and skipping unparseable rows. Returns an
+/// empty [`Vec`] on query error. `agent_id` is a structured tracing field; `None` suppresses it.
 async fn query_map_collect<T, E>(
     conn: &db::Connection,
     sql: &str,
@@ -588,8 +499,8 @@ where
         .collect()
 }
 
-/// The session-list SQL with an optional `WHERE` fragment. Shared by the
-/// infallible and checked session-list readers.
+/// The session-list SQL with an optional `WHERE` fragment — shared by the infallible and checked
+/// session-list readers.
 fn sessions_list_sql(where_clause: &str) -> String {
     format!(
         "SELECT {SESSION_LIST_COLUMNS} \
@@ -599,16 +510,13 @@ fn sessions_list_sql(where_clause: &str) -> String {
     )
 }
 
-/// The session-transcript SQL for one agent, oldest message first. Shared by
-/// the infallible [`SessionStore::load`] and strict
-/// [`SessionStore::load_checked`] readers, so the two read contracts cannot
-/// read different statements.
+/// The session-transcript SQL for one agent, oldest first — shared by [`SessionStore::load`] and
+/// [`SessionStore::load_checked`], so the two read contracts cannot diverge.
 fn session_messages_sql() -> String {
     format!("SELECT {SESSION_MESSAGE_COLUMNS} FROM sessions WHERE agent_id = ?1 ORDER BY id ASC")
 }
 
-/// Decode one [`SESSION_LIST_COLUMNS`] row. Shared by the infallible and
-/// checked session-list readers.
+/// Decode one [`SESSION_LIST_COLUMNS`] row — shared by the infallible and checked list readers.
 fn session_metadata_row(row: &Row) -> Result<SessionMetadata> {
     session_metadata_from_row(
         &row.get::<String>(COL_SL_AGENT_ID)?,
@@ -624,18 +532,10 @@ fn session_metadata_row(row: &Row) -> Result<SessionMetadata> {
     )
 }
 
-/// Run the session-listing query body (metadata columns only, no message-table
-/// join) with an optional `WHERE` fragment. Shared by
-/// [`SessionStore::list_sessions_with_metadata`] and
-/// [`SessionStore::list_sessions_with_metadata_excluding`].
-///
-/// The message count is read from the denormalized `session_metadata.message_count`
-/// column (maintained in the same transaction as message writes; NOT backfilled —
-/// sessions predating the metadata column default to 0). The historical
-/// LEFT JOIN + GROUP BY over the full `sessions`
-/// table was the largest repeated query in the system (this list re-reads on
-/// every runtime tick while the Sessions page is open, and from the dead-session
-/// recovery poller) and has been removed. Ordering and filtering are unchanged.
+/// Run the session-listing query body (metadata columns only, no message-table join) with an
+/// optional `WHERE` fragment. The count comes from the denormalized column (same transaction as
+/// message writes, never backfilled); the historical LEFT JOIN + GROUP BY over `sessions` was the
+/// largest repeated query in the system and is gone.
 async fn list_sessions_where(
     conn: &db::Connection,
     where_clause: &str,
@@ -653,9 +553,8 @@ async fn list_sessions_where(
     .await
 }
 
-/// Decode one [`SESSION_MESSAGE_COLUMNS`] row into a [`ChatMessage`]. Shared
-/// by the infallible [`SessionStore::load`] and strict
-/// [`SessionStore::load_checked`] reads.
+/// Decode one [`SESSION_MESSAGE_COLUMNS`] row into a [`ChatMessage`] — shared by the infallible
+/// [`SessionStore::load`] and strict [`SessionStore::load_checked`] reads.
 fn session_message_from_row(row: &Row) -> Result<ChatMessage> {
     Ok(ChatMessage {
         role: row
@@ -666,8 +565,8 @@ fn session_message_from_row(row: &Row) -> Result<ChatMessage> {
     })
 }
 
-/// A `session_metadata` column the read/write helpers may target; the closed
-/// enum makes the `format!` interpolation compile-time safe.
+/// A `session_metadata` column the read/write helpers may target; the closed enum makes the
+/// `format!` interpolation compile-time safe.
 enum MetadataColumn {
     ActiveModels,
     UserActivity,
@@ -698,12 +597,9 @@ impl MetadataColumn {
     }
 }
 
-// ── Methods — callable on the static ──────────────────────────
-
 /// One row of the final post-frame sequence returned by
-/// [`SessionStore::settle_tool_results`] — freshly settled results, follow-up
-/// rows and previously captured rows in their final order; the caller replays
-/// it verbatim into memory.
+/// [`SessionStore::settle_tool_results`] — freshly settled results, follow-up rows and previously
+/// captured rows in their final order; the caller replays it verbatim into memory.
 #[derive(Debug, Clone)]
 pub(crate) struct SettledRow {
     pub role: String,
@@ -711,19 +607,13 @@ pub(crate) struct SettledRow {
     pub created_at: String,
 }
 
-/// Build the final post-frame session-row sequence for a settle. The last
-/// tool-call frame's tool results must appear in FRAME CALL ORDER (provider
-/// validity), so:
-///
-/// 1. Captured tool rows are keyed by their decoded `tool_call_id`.
-/// 2. For each frame call id IN ORDER: the new result for that id if present,
-///    else the captured tool row for that id if present.
-/// 3. Then the `follow_up` rows (synthetic user image messages).
-///
-/// The frame-order interleaving (steps 1–2) is the contract. The only
-/// production caller runs before `append_turn_message`, so the dangling frame
-/// is always the session tail and captured rows are only frame sibling tool
-/// rows — each is either consumed in step 2 or dropped by the post-frame
+/// Build the final post-frame session-row sequence for a settle. The last tool-call frame's tool
+/// results must appear in FRAME CALL ORDER (provider validity), so: captured tool rows are keyed
+/// by decoded `tool_call_id`; for each frame call id in order take the new result else the captured
+/// row; then append the `follow_up` rows (synthetic user image messages).
+/// The frame-order interleaving is the contract. The only production caller runs before
+/// `append_turn_message`, so the dangling frame is always the session tail and captured rows are
+/// only frame sibling tool rows — each is either consumed above or dropped by the post-frame
 /// rewrite.
 fn build_settle_sequence(
     captured: &[SettledRow],
@@ -786,12 +676,11 @@ impl SessionStore {
         .await
     }
 
-    /// Strict [`Self::load`]: a query error or the first undecodable row is
-    /// returned as an `Err`. Used by the Sessions transcript, which must render
-    /// a failed read as an error rather than as an empty transcript. The trade
-    /// is deliberate and total: one undecodable row replaces the whole read, so
-    /// the rows that were readable are not shown either — skipping it would
-    /// render a transcript that silently omits what the store holds.
+    /// Strict [`Self::load`]: a query error or the first undecodable row is returned as an `Err`.
+    /// Used by the Sessions transcript, which must render a failed read as an error rather than as
+    /// an empty transcript. The trade is deliberate and total: one undecodable row replaces the
+    /// whole read, so the readable rows are not shown either — skipping it would render a
+    /// transcript that silently omits what the store holds.
     pub(crate) async fn load_checked(&self, agent_id: &str) -> Result<Vec<ChatMessage>> {
         self.conn
             .query_map_strict(
@@ -802,10 +691,9 @@ impl SessionStore {
             .await
     }
 
-    /// Session-non-emptiness check (resume dispatch rule): true when the
-    /// agent has at least one non-empty message row. Avoids materializing the
-    /// full history just to test `.is_empty()` — the engineer's accumulated
-    /// session can exceed 200k tokens.
+    /// Session-non-emptiness check (resume dispatch rule): true when the agent has at least one
+    /// non-empty message row. Avoids materializing the full history just to test `.is_empty()` —
+    /// the engineer's accumulated session can exceed 200k tokens.
     pub(crate) async fn has_content(&self, agent_id: &str) -> bool {
         self.conn
             .query_optional(
@@ -819,12 +707,10 @@ impl SessionStore {
             .is_some()
     }
 
-    /// `created_at` of the session's last assistant message row.
-    ///
-    /// That row is the session's dangling tool-call frame whenever one exists:
-    /// the frame is persisted BEFORE its calls run (emission-time durability)
-    /// and the agent cannot emit another assistant message past an unsettled
-    /// frame. `None` when the session has no assistant row at all.
+    /// `created_at` of the session's last assistant message row — the dangling tool-call frame
+    /// whenever one exists, since the frame is persisted BEFORE its calls run (emission-time
+    /// durability) and the agent cannot emit another assistant message past an unsettled frame.
+    /// `None` when the session has no assistant row at all.
     pub(crate) async fn last_assistant_created_at(&self, agent_id: &str) -> Result<Option<String>> {
         self.conn
             .query_optional(
@@ -862,9 +748,8 @@ impl SessionStore {
             .await
     }
 
-    /// Like [`batch_append`], but writes `meta` in the same transaction as the
-    /// message insert, eliminating the atomicity gap between the rows and the
-    /// session metadata they belong to.
+    /// Like [`batch_append`], but writes `meta` in the same transaction as the message insert,
+    /// eliminating the atomicity gap between the rows and their session metadata.
     async fn batch_append_with_context(
         &self,
         agent_id: &str,
@@ -885,13 +770,12 @@ impl SessionStore {
             .await
     }
 
-    /// Rewrite the whole history, recording the leading context block's length in
-    /// the same transaction when this rewrite wrote the block (see
-    /// [`crate::session::Session::refresh_context_block`]).
-    ///
+    /// Rewrite the whole history, recording the leading context block's length in the same
+    /// transaction when this rewrite wrote the block
+    /// ([`crate::session::Session::refresh_context_block`]).
     /// `clear_token_length` is set by the compaction rewrite
-    /// ([`crate::session::Session::apply_summary`]); the recorded length went with
-    /// the history it described.
+    /// ([`crate::session::Session::apply_summary`]): the recorded length went with the history it
+    /// described.
     async fn replace_messages(
         &self,
         agent_id: &str,
@@ -912,15 +796,14 @@ impl SessionStore {
         .await
     }
 
-    /// Rewrite the content of the most recent `user`-role message row for the
-    /// agent — the durable half of the input-image-rejection strip (see
-    /// [`crate::session::image_strip`]). A single-row positional UPDATE: the caller's
-    /// in-memory "most recent User-role message" corresponds to this row only
-    /// while that message is within the persisted prefix; the in-memory guard
-    /// lives in [`crate::session::Session::rewrite_last_user_message`].
+    /// Rewrite the content of the most recent `user`-role message row — the durable half of the
+    /// input-image-rejection strip ([`crate::session::image_strip`]). A single-row positional
+    /// UPDATE: the caller's in-memory "most recent user message" corresponds to this row only while
+    /// that message is within the persisted prefix; the in-memory guard lives in
+    /// [`crate::session::Session::rewrite_last_user_message`].
     ///
-    /// Returns an error when no `user`-role row exists (0 rows affected), so
-    /// a caller that believes it found one learns the write did not land.
+    /// Errors when no `user`-role row exists (0 rows affected), so a caller that believes it found
+    /// one learns the write did not land.
     pub(crate) async fn rewrite_last_user_message(
         &self,
         agent_id: &str,
@@ -942,9 +825,8 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Test-only thin wrapper: begin a transaction, run the tx-core settle, and
-    /// commit. Production uses [`Self::settle_tool_results_tx`] inside the
-    /// agent's atomic settle+terminalize transaction.
+    /// Test-only thin wrapper: begin a transaction, run the tx-core settle, commit. Production uses
+    /// [`Self::settle_tool_results_tx`] inside the agent's atomic settle+terminalize transaction.
     #[cfg(test)]
     pub(crate) async fn settle_tool_results(
         &self,
@@ -960,28 +842,16 @@ impl SessionStore {
         Ok(rows)
     }
 
-    /// Settle (re-)persisted tool results directly after the session's last
-    /// tool-call frame, in one transaction: the rows that follow that frame are
-    /// captured and deleted, the new tool results are inserted at the frame
-    /// boundary in frame call order (preserving any captured sibling tool
-    /// rows), then the follow-up rows (synthetic user image messages).
-    /// `session_metadata.message_count` is bumped by
-    /// `results.len() + follow_up.len()` — exact only because a call with a
-    /// committed result is never pending (the pending scan is the single settle
-    /// source), so no captured frame sibling is ever superseded here; a
-    /// double-settle of the same frame would drift the count and is out of
-    /// contract. Returns the full final post-frame sequence so the caller can
-    /// mirror the rewrite in memory. A no-op (warn + empty) when no tool-call
-    /// frame exists.
-    ///
-    /// The production caller runs before `append_turn_message`, so the dangling
-    /// frame is always the session tail and the captured rows are only the
-    /// frame's sibling tool rows; the frame-order interleaving is the contract
-    /// (see [`build_settle_sequence`]).
-    ///
-    /// The frame-locate SELECTs run on the SAME tx as the delete/rebuild so the
-    /// locate+write is one unit — a crash (or concurrent writer) can never
-    /// observe a half-settled frame. The caller owns `commit`/`rollback`.
+    /// Settle (re-)persisted tool results directly after the session's last tool-call frame, in one
+    /// transaction: rows following that frame are captured and deleted, the new results are
+    /// inserted at the frame boundary in frame call order (preserving captured sibling tool rows),
+    /// then the follow-up rows. `message_count` is bumped by `results.len() + follow_up.len()` —
+    /// exact only because a call with a committed result is never pending, so no captured sibling
+    /// is superseded; a double-settle would drift the count and is out of contract. Returns the
+    /// final post-frame sequence so the caller can mirror it in memory; a no-op (warn + empty) when
+    /// no tool-call frame exists. The frame-locate SELECTs run on the SAME tx as the
+    /// delete/rebuild, so a crash or concurrent writer can never observe a half-settled frame. The
+    /// caller owns `commit`/`rollback`.
     pub(crate) async fn settle_tool_results_tx(
         &self,
         tx: &TxGuard<'_>,
@@ -989,13 +859,11 @@ impl SessionStore {
         results: &[(String, String)],
         follow_up: &[ChatMessage],
     ) -> Result<Vec<SettledRow>> {
-        // Frame location: scan assistant rows carrying the tool-call marker
-        // newest-first and pick the FIRST that structurally decodes as a
-        // tool-call frame. A later assistant text row may merely contain the
-        // substring — skip it. Tool results carry "tool_call_id", never
-        // "tool_calls" — the role filter already excludes them. Content is
-        // fetched in the same scan so the frame's ordered calls can be decoded
-        // without a second SELECT.
+        // Frame location: scan assistant rows carrying the tool-call marker newest-first and pick
+        // the FIRST that structurally decodes as a tool-call frame — a later assistant text row may
+        // merely contain the substring. Tool results carry "tool_call_id", never "tool_calls", so
+        // the role filter already excludes them. Content is fetched in the same scan so the frame's
+        // ordered calls decode without a second SELECT.
         let candidates: Vec<(i64, String)> = tx
             .query(
                 "SELECT id, content FROM sessions \
@@ -1031,9 +899,8 @@ impl SessionStore {
         };
 
         let captured: Vec<SettledRow> = tx
-            // Raw column indices: `created_at` has no COL_SM_* constant (it is
-            // not part of SESSION_MESSAGE_COLUMNS), so the row mapping cannot
-            // go through the shared column list.
+            // Raw column indices: `created_at` has no COL_SM_* constant (it is not part of
+            // SESSION_MESSAGE_COLUMNS), so the mapping cannot use the shared column list.
             .query_map_strict(
                 "SELECT role, content, created_at FROM sessions WHERE agent_id = ?1 AND id > ?2 ORDER BY id",
                 params![agent_id, frame_row_id],
@@ -1048,8 +915,8 @@ impl SessionStore {
             .await
             .context("capture rows after tool-call frame")?;
 
-        // Delete the rows that follow the frame (the frame itself stays). The
-        // sequence below replaces them.
+        // Delete the rows that follow the frame (the frame itself stays); the sequence below
+        // replaces them.
         tx.execute(
             "DELETE FROM sessions WHERE agent_id = ?1 AND id > ?2",
             params![agent_id, frame_row_id],
@@ -1073,9 +940,8 @@ impl SessionStore {
             .context("insert settled session row")?;
         }
 
-        // Message count: the captured rows were deleted + re-inserted (net
-        // zero); the new results and follow-up rows add exactly `results.len()
-        // + follow_up.len()`.
+        // Message count: the captured rows were deleted and re-inserted (net zero); the new results
+        // and follow-up rows add exactly `results.len() + follow_up.len()`.
         let count = i64::try_from(results.len() + follow_up.len())
             .context("settle result count exceeds i64")?;
         upsert_message_count(tx, agent_id, count, &now, false)
@@ -1086,16 +952,11 @@ impl SessionStore {
     }
 
     pub(crate) async fn delete(&self, agent_id: &str) -> Result<bool> {
-        // Every deletion path (the `/clear` command, the Sessions page, the
-        // maintainer's self-cleanup) goes through here, so this is where a
-        // launch folder's search engine — held for the session's lifetime and
-        // referenced by nothing else (see `workspace_index::release_path_named_engine`)
-        // is released, and where the computer tool's session ends: the conversation
-        // this id addressed is gone, so the application/window ids minted under it are
-        // too (see `tools::computer::end_session`). Read the recorded folder before the
-        // rows go. The ids go even when the conversation had no row to delete — a
-        // reset is what it is, whether or not the session had stored a message — while
-        // the engine is released only for a real removal.
+        // Every deletion path (`/clear`, the Sessions page, the maintainer's self-cleanup) goes
+        // through here, so this is where a launch folder's search engine is released
+        // (`workspace_index::release_path_named_engine`) and where the computer tool's session ends
+        // (`tools::computer::end_session`). Read the recorded folder before the rows go; the engine
+        // is released only for a real removal.
         let workspace = self.session_workspace_name(agent_id).await;
         let tx = self.conn.begin_tx().await?;
         let deleted = tx
@@ -1119,20 +980,14 @@ impl SessionStore {
         Ok(deleted > 0)
     }
 
-    /// Delete the `index`-th message row (0-based row ordinal in `id` order —
-    /// the order [`Self::load_checked`] returns) and every later row for
-    /// `agent_id`: the Sessions page's manual truncate. The cut is inclusive;
-    /// an index past the end deletes nothing. Returns the number of rows
-    /// removed.
+    /// Delete the `index`-th message row (0-based in `id` order — the order [`Self::load_checked`]
+    /// returns) and every later row: the Sessions page's manual truncate. The cut is inclusive; an
+    /// index past the end deletes nothing.
     ///
-    /// Deliberately unguarded — no coordination with a running agent. Accepted
-    /// consequences: a cut can leave an in-flight round committing tool results
-    /// without their tool-call frame row, and can leave a tail the dead-session
-    /// recovery poller treats as resumable — `last_activity` is deliberately
-    /// untouched, since bumping it would suppress exactly that recovery.
-    /// `token_length` is left stale: a recount is not free, and summarization
-    /// firing early is intended. `message_count` is adjusted from this DELETE's
-    /// own row count.
+    /// Deliberately unguarded — no coordination with a running agent. Accepted: a cut can leave an
+    /// in-flight round committing tool results without their frame row, and a tail the dead-session
+    /// poller treats as resumable (`last_activity` is untouched on purpose). `token_length` is left
+    /// stale — a recount is not free and summarizing early is intended.
     pub(crate) async fn truncate_from(&self, agent_id: &str, index: usize) -> Result<usize> {
         let offset = i64::try_from(index).context("truncate index exceeds i64")?;
         let tx = self.conn.begin_tx().await?;
@@ -1157,33 +1012,28 @@ impl SessionStore {
         Ok(removed)
     }
 
-    /// The full session list, infallible by contract: whatever could be read is
-    /// returned (a query error yields an empty list). Kept for readers with no
-    /// person in front of them — the exclusion helper's no-prefix case, where an
-    /// empty list is a safe input — and for tests; the Sessions page reads
-    /// [`Self::list_sessions_with_metadata_checked`], which renders a failed read
-    /// as a failure rather than as an empty list.
+    /// The full session list, infallible by contract: whatever could be read is returned (a query
+    /// error yields an empty list). For readers with no person in front of them — the exclusion
+    /// helper's no-prefix case, where an empty list is a safe input — and for tests; the Sessions
+    /// page reads [`Self::list_sessions_with_metadata_checked`], which renders a failed read as a
+    /// failure.
     pub(crate) async fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
         list_sessions_where(&self.conn, "", (), "list sessions").await
     }
 
-    /// Strict [`Self::list_sessions_with_metadata`]: a query error or the first
-    /// undecodable row is returned as an `Err`. Used by the Sessions list,
-    /// which must render a failed read as a failure rather than as an empty
-    /// list. The trade is deliberate and total: one undecodable row replaces
-    /// the whole read rather than silently shortening the list.
+    /// Strict [`Self::list_sessions_with_metadata`]: a query error or the first undecodable row is
+    /// returned as an `Err`, because the Sessions list must render a failed read as a failure. The
+    /// trade is deliberate and total: one undecodable row replaces the whole read rather than
+    /// silently shortening the list.
     pub(crate) async fn list_sessions_with_metadata_checked(&self) -> Result<Vec<SessionMetadata>> {
         self.conn
             .query_map_strict(&sessions_list_sql(""), (), session_metadata_row)
             .await
     }
 
-    /// Like [`list_sessions_with_metadata`], but excludes sessions whose
-    /// `agent_id` starts with any of the given prefixes by adding a `WHERE`
-    /// clause (e.g., `"manager_"`, `"ticket_"`).
-    ///
-    /// Uses parameterised `NOT LIKE ?N` placeholders with the prefix patterns
-    /// passed as query parameters — no string interpolation into SQL.
+    /// Like [`list_sessions_with_metadata`], but excludes sessions whose `agent_id` starts with any
+    /// of the given prefixes (`"manager_"`, `"ticket_"`, …) via parameterised `NOT LIKE ?N`
+    /// placeholders — no string interpolation into SQL.
     async fn list_sessions_with_metadata_excluding(
         &self,
         exclude_prefixes: &[&str],
@@ -1213,9 +1063,9 @@ impl SessionStore {
         .await
     }
 
-    /// Lightweight query: role and raw content of the session's last message
-    /// row (`None` for an empty session). Powers content-aware tail
-    /// classification (the dead-session poller's dangling-frame check).
+    /// Lightweight query: role and raw content of the session's last message row (`None` for an
+    /// empty session). Powers content-aware tail classification (the dead-session poller's
+    /// dangling-frame check).
     pub(crate) async fn get_last_message_tail(&self, agent_id: &str) -> Option<(ChatRole, String)> {
         let rows = self
             .conn
@@ -1235,8 +1085,7 @@ impl SessionStore {
         })
     }
 
-    /// Retrieve stored session context for a given agent ID.
-    /// Returns `None` if the session has no metadata or the context columns
+    /// Stored session context, or `None` when the session has no metadata or the context columns
     /// are null.
     async fn get_session_context(&self, agent_id: &str) -> Option<SessionContext> {
         let rows = self
@@ -1272,9 +1121,8 @@ impl SessionStore {
         })
     }
 
-    /// Upsert one `session_metadata` column for `agent_id`; `last_activity` is
-    /// stamped only when the row is first created (the TTL key), never on an
-    /// existing row.
+    /// Upsert one `session_metadata` column for `agent_id`; `last_activity` is stamped only when
+    /// the row is first created (the TTL key), never on an existing row.
     async fn set_metadata_value(
         &self,
         agent_id: &str,
@@ -1287,11 +1135,10 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Run one `agent_id`-keyed read that keeps the three-way contract — `None`
-    /// is a missing row, `Some(None)` a row without the value, `Some(Some(_))` a
-    /// value — and fails open: a read error is logged with `warn_context` and
-    /// reads as `None`, so a caller that establishes missing state retries it
-    /// rather than acting on a half-read value.
+    /// Run one `agent_id`-keyed read keeping the three-way contract — `None` is a missing row,
+    /// `Some(None)` a row without the value, `Some(Some(_))` a value — and fail open: a read error
+    /// is logged with `warn_context` and reads as `None`, so a caller that establishes missing
+    /// state retries it rather than acting on a half-read value.
     async fn read_optional_row<X>(
         &self,
         sql: &str,
@@ -1311,8 +1158,8 @@ impl SessionStore {
         }
     }
 
-    /// Read one `session_metadata` column via `map`. `None` if the row is
-    /// missing, the column is NULL, or the read fails (logged via `warn_context`).
+    /// Read one `session_metadata` column via `map`. `None` if the row is missing, the column is
+    /// NULL, or the read fails (logged via `warn_context`).
     async fn get_metadata_value<X>(
         &self,
         agent_id: &str,
@@ -1332,18 +1179,16 @@ impl SessionStore {
             .flatten()
     }
 
-    /// Persist the `<active-models-opts>` snapshot (rendered model ids) for
-    /// mid-session change detection; `None` clears the baseline (no block
-    /// rendered — fail-open). Upserts so a missing metadata row (e.g. a
-    /// session without a preceding message append) still records the baseline.
+    /// Persist the `<active-models-opts>` snapshot (rendered model ids) for mid-session change
+    /// detection; `None` clears the baseline (no block rendered — fail-open). Upserts so a missing
+    /// metadata row still records the baseline.
     async fn set_active_models(&self, agent_id: &str, snapshot: Option<&str>) -> Result<()> {
         self.set_metadata_value(agent_id, MetadataColumn::ActiveModels, snapshot.into())
             .await
     }
 
-    /// Read the last persisted `<active-models-opts>` snapshot, if any.
-    /// Returns `None` when no baseline exists (no block rendered, or a
-    /// session started before this feature).
+    /// Read the last persisted `<active-models-opts>` snapshot. `None` when no baseline exists (no
+    /// block rendered, or a session started before this feature).
     async fn get_active_models(&self, agent_id: &str) -> Option<String> {
         self.get_metadata_value(
             agent_id,
@@ -1354,17 +1199,16 @@ impl SessionStore {
         .await
     }
 
-    /// Record the user-activity state the admin Assistant was last shown, so the
-    /// next message reports a change against what was actually seen. Upserts, like
-    /// the snapshot above.
+    /// Record the user-activity state the admin Assistant was last shown, so the next message
+    /// reports a change against what was actually seen. Upserts, like the snapshot above.
     pub(crate) async fn set_user_activity(&self, agent_id: &str, location: &str) -> Result<()> {
         self.set_metadata_value(agent_id, MetadataColumn::UserActivity, location.into())
             .await
     }
 
-    /// The user-activity state the admin Assistant was last shown; `None` when the
-    /// session has none recorded yet (nothing shown, a read error, or no session
-    /// row) — the next known state is then set silently instead of being reported.
+    /// The user-activity state the admin Assistant was last shown; `None` when none is recorded yet
+    /// (nothing shown, a read error, or no session row) — the next known state is then set silently
+    /// instead of being reported.
     pub(crate) async fn user_activity(&self, agent_id: &str) -> Option<String> {
         self.get_metadata_value(
             agent_id,
@@ -1378,13 +1222,12 @@ impl SessionStore {
     /// Persist the personal-workspace change baseline (JSON: relative path →
     /// size/mtime/content-digest) for the Assistant's session.
     ///
-    /// The baseline is a row of its own table, a child of the session's own
-    /// `session_metadata` row (`ON DELETE CASCADE`), split out by migration `62`
-    /// so a bookkeeping update of that row no longer rewrites it. The update
-    /// branch runs first and the insert is reached only when the session has no
-    /// baseline yet; the engine rejects the insert when the session row is gone
-    /// (a `/clear` landing between the refresh's read and this write), so a
-    /// deleted session's identifier can never be handed a stale baseline.
+    /// The baseline lives in its own table, a child of the session's `session_metadata` row
+    /// (`ON DELETE CASCADE`), split out by migration `62` so a bookkeeping update of that row no
+    /// longer rewrites it. The update branch runs first, the insert only when the session has no
+    /// baseline yet; the engine rejects the insert when the session row is gone (a `/clear` landing
+    /// between the refresh's read and this write), so a deleted session's identifier can never be
+    /// handed a stale baseline.
     pub(crate) async fn update_personal_changes(&self, agent_id: &str, state: &str) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
         tx.upsert_row(
@@ -1400,15 +1243,14 @@ impl SessionStore {
     }
 
     /// Read the personal-workspace change baseline (JSON: relative path →
-    /// size/mtime/content-digest) for the Assistant's session.
+    /// size/mtime/content-digest).
     ///
-    /// `None` means there is no session row at all — nothing could be recorded
-    /// for it, so a refresh must not walk the folder. `Some(None)` is a session
-    /// row whose baseline is not recorded yet — a new session, or one whose
-    /// baseline the `/clear` race never wrote — and `Some(Some(…))` a stored
-    /// one; both mean "no block to render". The session's own row is what the
-    /// join is anchored on precisely so the two cases stay distinguishable. A
-    /// read error reads as `None` after a warning, failing the block open.
+    /// `None` means there is no session row at all — nothing could be recorded for it, so a refresh
+    /// must not walk the folder. `Some(None)` is a session row without a baseline yet (a new
+    /// session, or one whose baseline the `/clear` race never wrote) and `Some(Some(…))` a stored
+    /// one; both mean "no block to render", and the join is anchored on the session's own row
+    /// precisely so the two stay distinguishable. A read error reads as `None` after a warning,
+    /// failing the block open.
     pub(crate) async fn personal_changes_baseline(&self, agent_id: &str) -> Option<Option<String>> {
         self.read_optional_row(
             "SELECT spc.baseline FROM session_metadata sm \
@@ -1421,11 +1263,10 @@ impl SessionStore {
         .await
     }
 
-    /// Persist the real provider-reported session length (input + output
-    /// tokens of the last successful agent LLM call). `None` clears the
-    /// value — the column stays empty for sessions that never recorded usage
-    /// (approved no-backfill semantics for pre-migration sessions). Upserts
-    /// so a missing metadata row still records the length.
+    /// Persist the real provider-reported session length (input + output tokens of the last
+    /// successful agent call). `None` clears the value — the column stays empty for sessions that
+    /// never recorded usage (approved no-backfill semantics). Upserts so a missing metadata row
+    /// still records the length.
     pub(crate) async fn set_token_length(
         &self,
         agent_id: &str,
@@ -1437,10 +1278,8 @@ impl SessionStore {
             .await
     }
 
-    /// Read the last persisted provider-reported session length, if any.
-    /// `None` when the session never recorded a successful usage-bearing
-    /// agent call (new sessions, pre-migration sessions — approved
-    /// no-backfill semantics) or the value was explicitly cleared.
+    /// Read the last persisted provider-reported session length. `None` when the session never
+    /// recorded a usage-bearing call (no backfill) or the value was explicitly cleared.
     async fn get_token_length(&self, agent_id: &str) -> Option<u64> {
         self.get_metadata_value(
             agent_id,
@@ -1454,9 +1293,9 @@ impl SessionStore {
         .await
     }
 
-    /// Persist the sleep-ended marker (`"1"`) or clear it (`"0"`) for a session
-    /// that ended its turn via the `sleep` tool. Read by the dead-session
-    /// recovery poller to exclude intentional turn-ends.
+    /// Persist the sleep-ended marker (`"1"`) or clear it (`"0"`) for a session that ended its turn
+    /// via the `sleep` tool. The dead-session recovery poller reads it to exclude intentional
+    /// turn-ends.
     pub(crate) async fn set_sleep_ended(&self, agent_id: &str, ended: bool) -> Result<()> {
         let flag = if ended { "1" } else { "0" };
         self.set_metadata_value(
@@ -1479,16 +1318,14 @@ impl SessionStore {
         .is_some_and(|flag| flag == "1")
     }
 
-    /// Record this session's branch kind and address — a custom role's name and
-    /// the named branch it continues, or a worker branch's `None` role name and
-    /// its branch name — plus the conversation that asked for it, so the session
-    /// can be resumed as the same branch without parsing the agent ID. All three
-    /// columns are written in ONE upsert, on every appending turn of a branch
-    /// session, so a single failed write cannot leave the branch without a
-    /// recorded role.
+    /// Record this session's branch kind and address — a custom role's name plus the named branch
+    /// it continues, or a worker branch's `None` role name plus its branch name — and the
+    /// conversation that asked for it, so the session can be resumed as the same branch without
+    /// parsing the agent ID. All three columns are written in ONE upsert on every appending turn of
+    /// a branch session, so a single failed write cannot leave the branch without a recorded role.
     ///
     /// `reply_to` is the asking conversation this launch's work reports back to
-    /// (see [`crate::Launch::reply_to`]); it is stored as JSON, `None` as NULL.
+    /// ([`crate::Launch::reply_to`]); stored as JSON, `None` as NULL.
     pub(crate) async fn set_branch(
         &self,
         agent_id: &str,
@@ -1531,8 +1368,8 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Persist the launch-stopped marker (`"1"`) or clear it (`"0"`) for a branch
-    /// session whose launch was stopped before it produced anything.
+    /// Persist the launch-stopped marker (`"1"`) or clear it (`"0"`) for a branch session whose
+    /// launch was stopped before it produced anything.
     pub(crate) async fn set_launch_stopped(&self, agent_id: &str, stopped: bool) -> Result<()> {
         let flag = if stopped { "1" } else { "0" };
         self.set_metadata_value(
@@ -1543,8 +1380,7 @@ impl SessionStore {
         .await
     }
 
-    /// Whether a branch session's launch was stopped before it produced
-    /// anything.
+    /// Whether a branch session's launch was stopped before it produced anything.
     pub(crate) async fn get_launch_stopped(&self, agent_id: &str) -> bool {
         self.get_metadata_value(
             agent_id,
@@ -1556,9 +1392,9 @@ impl SessionStore {
         .is_some_and(|flag| flag == "1")
     }
 
-    /// The workspace address recorded for a session, if any — used to release a
-    /// stopped branch's launch-folder engine. Best-effort: a failed
-    /// read returns `None` (the engine simply stays registered).
+    /// The workspace address recorded for a session, if any — used to release a stopped branch's
+    /// launch-folder engine. Best-effort: a failed read returns `None` (the engine stays
+    /// registered).
     pub(crate) async fn session_workspace_name(&self, agent_id: &str) -> Option<String> {
         self.get_metadata_value(
             agent_id,
@@ -1569,10 +1405,10 @@ impl SessionStore {
         .await
     }
 
-    /// The length of the leading context block recorded for a launch session,
-    /// if any — what was WRITTEN when the block was cached. `None` when the
-    /// session predates the column; a failed read or a negative/garbage value
-    /// also returns `None` (the caller falls back to the pre-pinning re-render).
+    /// The leading context block length recorded for a launch session, if any — what was WRITTEN
+    /// when the block was cached. `None` when the session predates the column; a failed read or a
+    /// negative/garbage value also yields `None` (the caller falls back to the pre-pinning
+    /// re-render).
     pub(crate) async fn context_block_len(&self, agent_id: &str) -> Option<usize> {
         self.get_metadata_value(
             agent_id,
@@ -1584,9 +1420,8 @@ impl SessionStore {
         .and_then(|len| usize::try_from(len).ok())
     }
 
-    /// The branch list of one custom role: every session (`agent_id`) whose
-    /// metadata records `custom_role = name`. Used by
-    /// [`crate::custom_role::delete`] to stop them all.
+    /// The branch list of one custom role: every session whose metadata records `custom_role =
+    /// name`. Used by [`crate::custom_role::delete`] to stop them all.
     pub(crate) async fn custom_role_sessions(&self, name: &str) -> Result<Vec<String>> {
         let rows = self
             .conn
@@ -1603,28 +1438,20 @@ impl SessionStore {
     }
 }
 
-/// Inactivity window of a transient session: one silent for longer than this
-/// is removed by [`cleanup_old_transient_sessions`] on the next pass.
+/// Inactivity window of a transient session: one silent for longer than this is removed by
+/// [`cleanup_old_transient_sessions`] on the next pass.
 ///
-/// The clock is `session_metadata.last_activity` — bumped by message traffic
-/// only, so metadata-only work does not extend a session's life.
-///
-/// Deliberately independent of the windows around it: the stale-job purge
-/// keeps [`crate::jobs::PURGE_CUTOFF_HOURS`] and the log store keeps its own,
-/// and neither follows this one.
+/// The clock is `session_metadata.last_activity`, bumped by message traffic only, so metadata-only
+/// work does not extend a session's life. Deliberately independent of the neighbouring windows —
+/// the stale-job purge keeps [`crate::jobs::PURGE_CUTOFF_HOURS`] and the log store its own.
 const TRANSIENT_SESSION_TTL_HOURS: i64 = 2;
 
 /// Delete all transient (background-only) sessions inactive for longer than
-/// [`TRANSIENT_SESSION_TTL_HOURS`]. Returns the number of deleted session
-/// metadata rows.
+/// [`TRANSIENT_SESSION_TTL_HOURS`]. Returns the number of deleted metadata rows.
 ///
-/// Transient agent IDs start with the prefixes listed in
-/// `TRANSIENT_AGENT_ID_PREFIXES`.
-///
-/// Both `sessions` and `session_metadata` tables are cleaned up in a single transaction.
-/// The launch folders of the purged rows are released with them — this is where a
-/// one-off custom-role run's search engine dies (see
-/// [`crate::workspace_index::release_path_named_engine`]).
+/// Both `sessions` and `session_metadata` are cleaned up in a single transaction, and the purged
+/// rows' launch folders are released with them — this is where a one-off custom-role run's search
+/// engine dies ([`crate::workspace_index::release_path_named_engine`]).
 pub async fn cleanup_old_transient_sessions() -> Result<u64> {
     let cutoff = (Utc::now() - ChronoDuration::hours(TRANSIENT_SESSION_TTL_HOURS)).to_rfc3339();
     let session_store = store();
@@ -1644,21 +1471,19 @@ pub async fn cleanup_old_transient_sessions() -> Result<u64> {
             .map(|prefix| Value::Text(format!("{prefix}%"))),
     );
 
-    // Safety-critical predicate shared by both DELETEs. The agents table IS
-    // the protection marker: a session referenced by any agents row is never
-    // purged. For ticket-phase jobs that protection ends when the phase purge
-    // removes the job row; launched non-phase jobs are never time-deleted, so
-    // their protection is indefinite by design (released by completion or
-    // explicit abandon).
+    // Safety-critical predicate shared by both DELETEs. The agents table IS the protection marker:
+    // a session referenced by any agents row is never purged. For ticket-phase jobs that protection
+    // ends when the phase purge removes the job row; launched non-phase jobs are never
+    // time-deleted, so their protection is indefinite by design (released by completion or explicit
+    // abandon).
     let safety_predicate = format!(
         "last_activity < ? AND {prefix_patterns} \
          AND agent_id NOT IN (SELECT agent_id FROM agents)"
     );
 
-    // The launch folders of the rows about to go: a one-off custom-role run's
-    // engine is held for the run and referenced by nothing else (see
-    // `workspace_index::release_path_named_engine`), and this bulk purge is the one
-    // path that ends such a session without going through `delete`.
+    // The launch folders of the rows about to go: a one-off custom-role run's engine is held for
+    // the run and referenced by nothing else (`workspace_index::release_path_named_engine`), and
+    // this bulk purge is the one path that ends such a session without going through `delete`.
     let purged_folders: Vec<String> = tx
         .query(
             &format!("SELECT workspace_name FROM session_metadata WHERE {safety_predicate}"),
@@ -1688,8 +1513,8 @@ pub async fn cleanup_old_transient_sessions() -> Result<u64> {
 
     tx.commit().await?;
 
-    // After the commit: the purged sessions are gone, so the launch folders they
-    // named are no longer referenced by anything.
+    // After the commit: the purged sessions are gone, so the launch folders they named are no
+    // longer referenced by anything.
     for workspace in purged_folders {
         crate::workspace_index::release_path_named_engine(&workspace);
     }
@@ -1700,11 +1525,10 @@ pub async fn cleanup_old_transient_sessions() -> Result<u64> {
 /// The prefixes of every non-user-facing agent id: `manager_` plus every
 /// [`TRANSIENT_AGENT_ID_PREFIXES`] entry.
 ///
-/// These identify session keys a user never talks to directly (Manager /
-/// transient / background). The dead-session poller excludes this whole union,
-/// while [`cleanup_old_transient_sessions`] purges only the transient entries
-/// (`manager_` is intentionally excluded there). Both match via SQL
-/// `LIKE 'prefix_%'`, which Turso applies case-insensitively for ASCII.
+/// These identify session keys a user never talks to directly. The dead-session poller excludes
+/// this whole union, while [`cleanup_old_transient_sessions`] purges only the transient entries
+/// (`manager_` is intentionally excluded there). Both match via SQL `LIKE 'prefix_%'`, which Turso
+/// applies case-insensitively for ASCII.
 pub(crate) fn non_user_facing_agent_id_prefixes() -> impl Iterator<Item = &'static str> {
     std::iter::once("manager_").chain(TRANSIENT_AGENT_ID_PREFIXES.iter().copied())
 }
@@ -1754,8 +1578,7 @@ pub(crate) fn normalize_user_name<'a>(user_name: &'a str, context: &str) -> &'a 
 /// leading segment of a direct agent ID? Such a name would otherwise be purged by
 /// the SQL exclusion `LIKE 'prefix_%'` (case-insensitive for ASCII, `_` = any one
 /// char), so `ticket`, `ticketx`, and `TicketBob` all collide. Names already
-/// starting with `user_` are also treated as colliding to keep [`safe_user_segment`]
-/// injective.
+/// starting with `user_` are also treated as colliding to keep [`safe_user_segment`] injective.
 #[must_use]
 fn user_segment_collides(user_name: &str) -> bool {
     let touches_reserved = reserved_agent_id_prefixes()
@@ -1763,12 +1586,11 @@ fn user_segment_collides(user_name: &str) -> bool {
     touches_reserved || starts_with_ignore_ascii_case(user_name, "user_")
 }
 
-/// Escape a user name for the leading segment of a direct agent ID by prefixing
-/// colliding names ([`user_segment_collides`]) with `user_`, so their session is
-/// never mistaken for a transient/background one. The escape is injective: a name
-/// already starting with `user_` is ALSO escaped (`user_ticket` →
-/// `user_user_ticket`), so `ticket` → `user_ticket` can never collide with a
-/// distinct real user named `user_ticket`.
+/// Escape a user name for the leading segment of a direct agent ID by prefixing colliding names
+/// ([`user_segment_collides`]) with `user_`, so their session is never mistaken for a
+/// transient/background one. The escape is injective: a name already starting with `user_` is ALSO
+/// escaped (`user_ticket` → `user_user_ticket`), so `ticket` → `user_ticket` can never collide with
+/// a distinct real user named `user_ticket`.
 #[must_use]
 fn safe_user_segment(user_name: &str) -> Cow<'_, str> {
     if user_segment_collides(user_name) {
@@ -1778,94 +1600,58 @@ fn safe_user_segment(user_name: &str) -> Cow<'_, str> {
     }
 }
 
-/// Construct an agent ID for direct user-to-agent chat.
+/// Construct an agent ID for direct user-to-agent chat: `{user}_{ws_name}_{role}`, channel-agnostic
+/// — one conversation per (user + workspace + role) whatever the originating channel. For the
+/// user's OWN personal workspace (`personal:{user}`) the duplicated user segment is dropped, giving
+/// `{user}_personal:{role}`. Role last for consistent identification in logs and debugging, and
+/// immune to underscores in the other segments; the router no longer parses these strings (the role
+/// is carried by [`AgentJob`](crate::agent::message_router::AgentJob)). Stable across messages, so
+/// the conversation accumulates in a single session.
 ///
-/// Format: `{user}_{ws_name}_{role}` — channel-agnostic: one conversation per
-/// (user + workspace + role) regardless of the originating channel. For the
-/// user's OWN personal workspace (`personal:{user}`) the duplicated user
-/// segment is dropped, producing `{user}_personal:{role}` (the role is
-/// `:`-delimited after the `personal` marker).
-/// Role is the last segment for consistent identification in logs and
-/// debugging. The role-last format is immune to underscores in user/workspace
-/// names since the role is always the final `_`-delimited (or `:`-delimited for
-/// a personal workspace) segment, but note that the router no longer parses
-/// agent ID strings — the role is embedded directly in
-/// [`AgentJob`](crate::agent::message_router::AgentJob).
-/// This ID is stable across messages — the same ID is used for every message
-/// in the same user/role/workspace combination, accumulating conversation
-/// history within a single session.
-///
-/// A real user whose name collides with a reserved transient/manager prefix is
-/// escaped with a `user_` prefix (see [`safe_user_segment`]) so their
-/// conversation is never mistaken for a transient/background agent.
+/// A real user whose name collides with a reserved transient/manager prefix is escaped with a
+/// `user_` prefix ([`safe_user_segment`]).
 #[must_use]
 fn direct_agent_id(user_name: &str, role: &str, ws_name: &str) -> String {
-    // Invariant: the routed user identity is never an empty string
-    // ([`normalize_user_name`]). Guard the ID itself so no bare "_ws_role" key
-    // can ever be produced — the single chokepoint for every direct ID builder
-    // (resolve_agent_id, envelope_target). route_user_message also normalizes
-    // the delivery payload; the two layers are complementary (that one feeds
-    // `job.user_name`, this one the ID key), not redundant.
+    // Invariant: the routed user identity is never empty ([`normalize_user_name`]). Guard the ID
+    // itself so no bare "_ws_role" key can be produced — the single chokepoint for every direct ID
+    // builder (resolve_agent_id, envelope_target). route_user_message normalizes the delivery
+    // payload too; the layers are complementary (that one feeds `job.user_name`, this one the ID
+    // key), not redundant.
     let user_name = normalize_user_name(user_name, "direct_agent_id");
-    // Dedup the user for the user's OWN personal workspace (`personal:{user}`)
-    // so the ID reads `{user}_personal:{role}`. Key strictly on the `personal:`
-    // prefix AND the embedded user matching the routed raw user — a project
-    // named `personal_work` or another user's personal workspace keeps the
-    // full `{user}_{ws_name}_{role}` form. The leading segment stays escaped
-    // (`safe_user_segment`), comparing the embedded user raw so reserved names
-    // like `manager` yield `user_manager_personal:{role}`.
+    // Dedup the user for the user's OWN personal workspace so the ID reads
+    // `{user}_personal:{role}`.
+    // Key strictly on the `personal:` prefix AND the embedded user matching the routed raw user — a
+    // project named `personal_work` or another user's personal workspace keeps the full
+    // `{user}_{ws_name}_{role}` form. The leading segment stays escaped, comparing the embedded
+    // user raw so reserved names like `manager` yield `user_manager_personal:{role}`.
     //
-    // Orphaned persisted sessions keyed `{user}_personal:support` are
-    // intentionally NOT migrated or cleaned up — the Support role is gone and
-    // those rows are dead weight by design.
+    // Orphaned sessions keyed `{user}_personal:support` are intentionally NOT migrated — the
+    // Support role is gone and those rows are dead weight by design.
     if ws_name.strip_prefix("personal:") == Some(user_name) {
         return format!("{}_personal:{role}", safe_user_segment(user_name));
     }
     format!("{}_{}_{}", safe_user_segment(user_name), ws_name, role)
 }
 
-/// Construct a base agent ID for ticket-driven agent work.
+/// Construct a base agent ID for ticket-driven agent work: `ticket_{ticket_id}_{role}`.
 ///
-/// The base ID format is `ticket_{ticket_id}_{role}`.
-///
-/// ## Usage
-///
-/// * **Singular dispatch** (e.g., Engineer at `dispatch_engineer`): the base
-///   ID is used directly — no suffix is appended.
-///
-/// * **Parallel agents** (analysts, reviewers, QA via
-///   `run_parallel_agents`): the caller appends `_{index}_{suffix}`
-///   for disambiguation, producing IDs like
-///   `ticket_{ticket_id}_0_nano_{role}` (role last).
+/// Singular dispatch (e.g. Engineer at `dispatch_engineer`) uses it directly; parallel agents
+/// (analysts, reviewers, QA via `run_parallel_agents`) append `_{index}_{suffix}`, producing IDs
+/// like `ticket_{ticket_id}_0_nano_{role}` (role last).
 #[must_use]
 pub(crate) fn ticket_agent_id(ticket_id: &str, role: &str) -> String {
     format!("ticket_{ticket_id}_{role}")
 }
 
-/// Construct an agent ID for Manager agents (workspace-scoped).
-///
-/// Format: `manager_{ws_name}`
+/// Construct an agent ID for Manager agents (workspace-scoped): `manager_{ws_name}`.
 #[must_use]
 pub(crate) fn manager_agent_id(ws_name: &str) -> String {
     format!("manager_{ws_name}")
 }
 
-/// Construct an agent ID for a user message, dispatching to the appropriate
-/// format based on role.
-///
-/// - **Manager** agents use workspace-scoped IDs (`manager_{ws_name}`).
-/// - **Non-Manager** agents use channel-agnostic per (user + workspace + role)
-///   IDs (`{user}_{ws_name}_{role}`, or the deduped `{user}_personal:{role}`
-///   for the user's own personal workspace).
-///
-/// This is a convenience wrapper around [`manager_agent_id`] and
-/// [`direct_agent_id`] that selects the right format based on
-/// whether `role` is `"manager"`.
-///
-/// # Parameter order
-///
-/// Matches [`direct_agent_id`]: `user_name` first, then `role`,
-/// and `ws_name` last.
+/// Construct an agent ID for a user message, dispatching on role: Manager agents get the
+/// workspace-scoped `manager_{ws_name}`, everyone else the channel-agnostic [`direct_agent_id`]
+/// form. Parameter order matches [`direct_agent_id`] — `user_name`, `role`, `ws_name`.
 #[must_use]
 pub(crate) fn resolve_agent_id(user_name: &str, role: &str, ws_name: &str) -> String {
     if role == "manager" {
@@ -1875,10 +1661,8 @@ pub(crate) fn resolve_agent_id(user_name: &str, role: &str, ws_name: &str) -> St
     }
 }
 
-/// The agent address of `user_name`'s Assistant session.
-///
-/// The single source of the owner's Assistant address — used by automation arming
-/// and by notices addressed to the assistant, never re-derived ad hoc.
+/// The agent address of `user_name`'s Assistant session — the single source of the owner's
+/// Assistant address, used by automation arming and by notices addressed to the assistant.
 #[must_use]
 pub(crate) fn assistant_agent_id(user_name: &str) -> String {
     resolve_agent_id(
@@ -1889,21 +1673,18 @@ pub(crate) fn assistant_agent_id(user_name: &str) -> String {
 }
 
 /// Whether `agent_id` addresses a custom-role session: a continuable branch
-/// ([`CUSTOM_ROLE_AGENT_ID_PREFIX`]) or a one-off run
-/// ([`CUSTOM_ROLE_RUN_AGENT_ID_PREFIX`]).
+/// ([`CUSTOM_ROLE_AGENT_ID_PREFIX`]) or a one-off run ([`CUSTOM_ROLE_RUN_AGENT_ID_PREFIX`]).
 #[must_use]
 pub(crate) fn is_custom_role_agent_id(agent_id: &str) -> bool {
     agent_id.starts_with(CUSTOM_ROLE_AGENT_ID_PREFIX)
         || agent_id.starts_with(CUSTOM_ROLE_RUN_AGENT_ID_PREFIX)
 }
 
-/// Clear the session for a user/role/workspace, returning the confirmation
-/// message. Fail-closed: the session's unfinished sync jobs are abandoned
-/// FIRST, and a failed abandon aborts the clear so the caller can surface the
-/// error — deleting the session rows despite a failed abandon would orphan the
-/// jobs with no caller session left to resume them. Internal cleanup paths
-/// (maintainer self-cleanup) call `store().delete` directly, and the transient
-/// TTL cleanup issues a bulk SQL DELETE — all deliberately skip the abandon.
+/// Clear the session for a user/role/workspace, returning the confirmation message. Fail-closed:
+/// the session's unfinished sync jobs are abandoned FIRST, and a failed abandon aborts the clear so
+/// the caller can surface the error — deleting the rows anyway would orphan the jobs with no caller
+/// session left to resume them. Internal cleanup paths (maintainer self-cleanup, the transient TTL
+/// bulk DELETE) deliberately skip the abandon.
 pub async fn clear_session(user_name: &str, role: &str, ws_name: &str) -> anyhow::Result<String> {
     let agent_id = resolve_agent_id(user_name, role, ws_name);
     crate::jobs::abandon_session_jobs(&agent_id).await?;
@@ -1911,64 +1692,52 @@ pub async fn clear_session(user_name: &str, role: &str, ws_name: &str) -> anyhow
     Ok("Session cleared. Starting fresh.".to_string())
 }
 
-/// Build a transient agent ID shared by the suffixed builder family
-/// (`analyze_`, `research_`, `discovery_`).
-///
-/// Format: `{prefix}{ws_name}_{suffix}_{label}`. The `prefix` must carry its
-/// trailing underscore (as stored in [`TRANSIENT_AGENT_ID_PREFIXES`]) so the
-/// result stays byte-identical to the historical literal builders — a bare
-/// prefix plus an inserted separator would emit a double underscore.
+/// Build a transient agent ID shared by the suffixed builder family (`analyze_`, `research_`,
+/// `discovery_`): `{prefix}{ws_name}_{suffix}_{label}`. `prefix` must carry its trailing underscore
+/// (as stored in [`TRANSIENT_AGENT_ID_PREFIXES`]) so the result stays byte-identical to the
+/// historical literal builders — a bare prefix plus an inserted separator would emit a double
+/// underscore.
 #[must_use]
 fn transient_agent_id(prefix: &str, ws_name: &str, label: &str) -> String {
     let suffix = crate::generate_suffix();
     format!("{prefix}{ws_name}_{suffix}_{label}")
 }
 
-/// Construct the Maintainer agent ID for a workspace (deterministic, workspace-scoped).
-///
-/// Format: `maintainer_{ws_name}` — same stable-ID precedent as `manager_{ws_name}`.
-/// A stable ID makes runs resumable: the next maintainer cycle (including after a
-/// daemon restart) picks up the interrupted session instead of restarting from
-/// scratch. Keep `maintainer_` registered in [`TRANSIENT_AGENT_ID_PREFIXES`] so the
-/// transient TTL purge still applies to stale maintainer sessions.
+/// Construct the Maintainer agent ID for a workspace (deterministic, workspace-scoped):
+/// `maintainer_{ws_name}`, the same stable-ID precedent as `manager_{ws_name}`. A stable ID makes
+/// runs resumable — the next cycle, including after a daemon restart, picks up the interrupted
+/// session instead of restarting. Keep `maintainer_` registered in
+/// [`TRANSIENT_AGENT_ID_PREFIXES`] so the TTL purge still applies to stale sessions.
 #[must_use]
 pub(crate) fn maintainer_agent_id(ws_name: &str) -> String {
     format!("maintainer_{ws_name}")
 }
 
-/// Construct an agent ID for sub-agent analyze rounds (Engineer/Maintainer → sub-agent).
-///
-/// Format: `analyze_{ws_name}_{suffix}_{role}`
-/// Role is the LAST segment — see [`direct_agent_id`] for rationale.
+/// Construct an agent ID for sub-agent analyze rounds (Engineer/Maintainer → sub-agent):
+/// `analyze_{ws_name}_{suffix}_{role}`, role LAST ([`direct_agent_id`]).
 #[must_use]
 pub(crate) fn analyze_agent_id(ws_name: &str, role: &str) -> String {
     transient_agent_id("analyze_", ws_name, role)
 }
 
-/// Construct an agent ID for a deep-research sub-agent (decomposers,
-/// round-1 researchers, gap-round analysts, verification analysts).
-///
-/// Format: `research_{ws_name}_{suffix}_{label}`
+/// Construct an agent ID for a deep-research sub-agent (decomposers, round-1 researchers,
+/// gap-round analysts, verification analysts): `research_{ws_name}_{suffix}_{label}`.
 #[must_use]
 pub(crate) fn research_agent_id(ws_name: &str, label: &str) -> String {
     transient_agent_id("research_", ws_name, label)
 }
 
-/// Construct an agent ID for workspace role discovery.
-///
-/// Format: `discovery_{ws_name}_{suffix}_{role}`
-/// Role is the LAST segment — see [`direct_agent_id`] for rationale.
+/// Construct an agent ID for workspace role discovery: `discovery_{ws_name}_{suffix}_{role}`,
+/// role LAST ([`direct_agent_id`]).
 #[must_use]
 pub(crate) fn discovery_agent_id(ws_name: &str, role: &str) -> String {
     transient_agent_id("discovery_", ws_name, role)
 }
 
-/// Construct the agent ID of a custom role's continuable branch.
-///
-/// Format: `role_{name}` for the record's default branch, or
-/// `role_{name}:{identifier}` for a named branch. Deterministic, so the next
-/// message on the same branch resumes the same session; the branch persists
-/// like a direct conversation (see [`CUSTOM_ROLE_AGENT_ID_PREFIX`]).
+/// Construct the agent ID of a custom role's continuable branch: `role_{name}` for the record's
+/// default branch, `role_{name}:{identifier}` for a named one. Deterministic, so the next message
+/// on the branch resumes the same session, which persists like a direct conversation
+/// ([`CUSTOM_ROLE_AGENT_ID_PREFIX`]).
 #[must_use]
 pub(crate) fn custom_role_agent_id(name: &str, identifier: Option<&str>) -> String {
     match identifier {
@@ -1977,10 +1746,8 @@ pub(crate) fn custom_role_agent_id(name: &str, identifier: Option<&str>) -> Stri
     }
 }
 
-/// Construct the agent ID of a custom role's ONE-OFF run.
-///
-/// Format: `rolerun_{name}:{suffix}` — fresh per launch and registered as
-/// transient (see [`CUSTOM_ROLE_RUN_AGENT_ID_PREFIX`]).
+/// Construct the agent ID of a custom role's ONE-OFF run: `rolerun_{name}:{suffix}` — fresh per
+/// launch and transient ([`CUSTOM_ROLE_RUN_AGENT_ID_PREFIX`]).
 #[must_use]
 pub(crate) fn custom_role_run_agent_id(name: &str) -> String {
     format!(
@@ -1989,11 +1756,9 @@ pub(crate) fn custom_role_run_agent_id(name: &str) -> String {
     )
 }
 
-/// Construct the agent ID of a worker branch.
-///
-/// Format: `worker_{branch}` — deterministic, so the next message on the same
-/// branch resumes the same session; the branch persists like a direct
-/// conversation (see [`WORKER_BRANCH_AGENT_ID_PREFIX`]).
+/// Construct the agent ID of a worker branch: `worker_{branch}` — deterministic, so the next
+/// message on the branch resumes the same session, which persists like a direct conversation
+/// ([`WORKER_BRANCH_AGENT_ID_PREFIX`]).
 #[must_use]
 pub(crate) fn worker_branch_agent_id(branch: &str) -> String {
     format!("{WORKER_BRANCH_AGENT_ID_PREFIX}{branch}")
@@ -2011,16 +1776,13 @@ pub(crate) fn worker_branch_name(agent_id: &str) -> Option<&str> {
     agent_id.strip_prefix(WORKER_BRANCH_AGENT_ID_PREFIX)
 }
 
-/// Whether a custom role's `name` may not be used: it IS a built-in
-/// agent-address namespace word, or it begins that namespace's address family
-/// (the namespace prefix including its `_`), so the role's id
-/// ([`custom_role_agent_id`] / [`custom_role_run_agent_id`]) cannot read as a
-/// built-in one.
+/// Whether a custom role's `name` may not be used: it IS a built-in agent-address namespace word,
+/// or it begins that namespace's address family (the prefix including its `_`), so the role's id
+/// ([`custom_role_agent_id`] / [`custom_role_run_agent_id`]) cannot read as a built-in one.
 ///
-/// The `_` is part of an address, not the SQL `LIKE` wildcard the user-name
-/// escaper ([`user_segment_collides`]) must defend against: `ticket`, `role`
-/// and the `ticket_*` / `role_*` families are refused, while `ticketx`,
-/// `rolex` and `roleplay` shadow nothing and are allowed.
+/// The `_` is part of an address, not the SQL `LIKE` wildcard the user-name escaper
+/// ([`user_segment_collides`]) must defend against: `ticket`, `role` and the `ticket_*` / `role_*`
+/// families are refused, while `ticketx`, `rolex` and `roleplay` shadow nothing.
 #[must_use]
 pub(crate) fn custom_role_name_is_reserved(name: &str) -> bool {
     reserved_custom_role_prefixes().any(|prefix| {
@@ -2029,17 +1791,15 @@ pub(crate) fn custom_role_name_is_reserved(name: &str) -> bool {
     })
 }
 
-/// Every agent-id prefix a custom role name must not shadow, with its `_` — the
-/// set [`custom_role_name_is_reserved`] tests and the one its refusal names.
-/// Deduped: `rolerun_` is both a transient prefix and a custom-role one.
+/// Every agent-id prefix a custom role name must not shadow, with its `_` — the set
+/// [`custom_role_name_is_reserved`] tests and the one its refusal names. Deduped: `rolerun_` is
+/// both a transient prefix and a custom-role one.
 pub(crate) fn reserved_custom_role_prefixes() -> impl Iterator<Item = &'static str> {
     let mut seen = std::collections::BTreeSet::new();
     non_user_facing_agent_id_prefixes()
         .chain([CUSTOM_ROLE_AGENT_ID_PREFIX, CUSTOM_ROLE_RUN_AGENT_ID_PREFIX])
         .filter(move |prefix| seen.insert(*prefix))
 }
-
-// ── Existing tests ──────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -2052,11 +1812,10 @@ mod tests {
         format!("s{}", TEST_ID.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Build a freshly-initialized [`Session`] with the fixed test arguments
-    /// (Assistant role, no ticket, "gui"/"tester" channel/user, no round_ts).
-    /// Message may be empty (recovery-retry semantics) or a real user turn —
-    /// appended via `append_turn_message` after `init` (the split mirrors
-    /// `Agent::work`).
+    /// Build a freshly-initialized [`Session`] with the fixed test arguments (Assistant role, no
+    /// ticket, "gui"/"tester" channel/user, no round_ts). `msg` may be empty (recovery-retry
+    /// semantics) or a real user turn, appended via `append_turn_message` after `init` — the split
+    /// mirrors `Agent::work`.
     async fn session_with_init(agent_id: &str, msg: &str, ws: &crate::Workspace) -> Session {
         let mut session = Session::default();
         session.init(agent_id).await.unwrap();
@@ -2078,9 +1837,9 @@ mod tests {
         session
     }
 
-    /// The checked readers back the person-facing GUI: a query/decode failure
-    /// must be an `Err` (rendered as a failure) while the infallible readers
-    /// keep their degrade-and-skip contract for non-GUI callers.
+    /// The checked readers back the person-facing GUI: a query/decode failure must be an `Err`
+    /// (rendered as a failure) while the infallible readers keep their degrade-and-skip contract
+    /// for non-GUI callers.
     #[tokio::test]
     async fn checked_readers_propagate_undecodable_rows() {
         crate::util::test::init_test_stores().await;
@@ -2090,16 +1849,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Happy paths: both checked readers return the same data as the
-        // infallible ones.
+        // Happy paths: both checked readers return the same data as the infallible ones.
         let checked = store().load_checked(&k).await.unwrap();
         assert_eq!(checked.len(), 1);
         assert_eq!(checked[0].content, "hello");
         let listed = store().list_sessions_with_metadata_checked().await.unwrap();
         assert!(listed.iter().any(|s| s.agent_id == k));
 
-        // A row with an unknown role is undecodable: the strict reader
-        // surfaces it, the infallible reader skips just that row.
+        // A row with an unknown role is undecodable: the strict reader surfaces it, the infallible
+        // reader skips just that row.
         store()
             .conn
             .execute(
@@ -2153,11 +1911,9 @@ mod tests {
         assert_eq!(msgs[3].content, "last row is assistant");
     }
 
-    /// The baseline lives and dies with its session: a written row reads back
-    /// verbatim, the session's delete cascades to it (leaving no orphan, invisible
-    /// or otherwise), and a refresh racing that delete cannot insert one back —
-    /// the child insert has no parent key to satisfy — so a later session reusing
-    /// the identifier inherits nothing.
+    /// The baseline lives and dies with its session: it reads back verbatim, the session's delete
+    /// cascades to it, and a refresh racing that delete cannot insert one back (the child insert
+    /// has no parent key to satisfy) — so a later session reusing the identifier inherits nothing.
     #[tokio::test]
     async fn delete_takes_the_personal_changes_baseline_with_it() {
         crate::util::test::init_test_stores().await;
@@ -2340,7 +2096,7 @@ mod tests {
         ));
     }
 
-    // ── Denormalized message_count consistency ─────────────────────────
+    // Denormalized message_count consistency
     //
     // The Sessions page list reads counts from `session_metadata.message_count`
     // instead of scanning the `sessions` table. The counter must match the
@@ -2430,8 +2186,8 @@ mod tests {
         };
         assert_eq!(count(&k).await, 3);
 
-        // Summarization compaction: delete-then-insert. The count must be SET
-        // to the new batch length (2), never incremented to 3 + 2 = 5.
+        // Summarization compaction: delete-then-insert. The count must be SET to the new batch
+        // length (2), never incremented to 3 + 2 = 5.
         store()
             .replace_messages(
                 &k,
@@ -2467,8 +2223,8 @@ mod tests {
     async fn message_count_ttl_cleanup_and_delete_remove_counts_with_sessions() {
         crate::util::test::init_test_stores().await;
 
-        // Delete path (e.g. `/new`): messages and metadata go in one
-        // transaction — the count vanishes with them, nothing to drift.
+        // Delete path (e.g. `/new`): messages and metadata go in one transaction — the count
+        // vanishes with them, nothing to drift.
         let transient = format!("ticket_{}", unique_key());
         store()
             .append_with_context(
@@ -2492,9 +2248,8 @@ mod tests {
             "deleted session (and its count) must leave the list"
         );
 
-        // TTL cleanup: a stale transient session is removed entirely — its
-        // count cannot linger because the metadata row goes in the same
-        // transaction as the messages.
+        // TTL cleanup: a stale transient session is removed entirely — its count cannot linger
+        // because the metadata row goes in the same transaction as the messages.
         let stale = format!("ticket_{}", unique_key());
         store()
             .append_with_context(
@@ -2511,8 +2266,8 @@ mod tests {
             )
             .await
             .unwrap();
-        // Backdate past the TTL window — the literal is deliberate, so a window
-        // widened back to the old eight hours fails here.
+        // Backdate past the TTL window — the literal is deliberate, so a window widened back to
+        // the old eight hours fails here.
         let past = (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
         store()
             .conn
@@ -2523,8 +2278,8 @@ mod tests {
             .await
             .unwrap();
 
-        // A transient session still inside the window must survive: the reaper
-        // removes what is older than the window, not whatever is transient.
+        // A transient session still inside the window must survive: the reaper removes what is
+        // older than the window, not whatever is transient.
         let fresh = format!("ticket_{}", unique_key());
         store()
             .append_with_context(
@@ -2556,33 +2311,30 @@ mod tests {
         store().set_token_length(&k, Some(123_456)).await.unwrap();
         let ws = crate::workspace::test_ws_named("/_test_token_length", "token_length");
         let session = session_with_init(&k, "", &ws).await;
-        // The persisted real length is loaded so `maybe_summarize` and the
-        // Running Agents card see it from the very start of the turn.
+        // The persisted real length is loaded so `maybe_summarize` and the Running Agents card
+        // see it from the very start of the turn.
         assert_eq!(session.token_length(), Some(123_456));
     }
 
     #[tokio::test]
     async fn session_list_excluding_prefixes() {
-        // Use an ISOLATED store (not the shared `store()` backed by
-        // `test_root()`): the shared global DB is mutated by parallel tests
-        // (e.g. management/jobs purging `ticket_`/`analyze_`/`research_`
-        // session metadata), which deletes this test's just-appended rows and
-        // makes exact-set assertions flaky under high test-thread counts.
+        // Use an ISOLATED store (not the shared `store()`): the shared global DB is mutated by
+        // parallel tests (management/jobs purging `ticket_`/`analyze_`/`research_` metadata), which
+        // deletes this test's just-appended rows and makes exact-set assertions flaky.
         let (store, _dir) = crate::open_test_store!(crate::session::SessionStore, "session");
 
-        // Direct session plus one session per excluded prefix — the union of
-        // `manager_` and [`TRANSIENT_AGENT_ID_PREFIXES`], plus the custom-role
-        // continuable `role_` branch the wider reserved set adds.
+        // Direct session plus one per excluded prefix — the union of `manager_` and
+        // [`TRANSIENT_AGENT_ID_PREFIXES`], plus the custom-role `role_` branch the reserved set
+        // adds.
         let direct_id = unique_key();
         let excluded_prefixes: Vec<&str> = reserved_agent_id_prefixes().collect();
         let prefixed_ids: Vec<String> = excluded_prefixes
             .iter()
             .map(|p| format!("{p}{}", unique_key()))
             .collect();
-        // The SQL exclusion is `NOT LIKE 'prefix_%'`, and LIKE is ASCII
-        // case-insensitive — so case-variants of reserved words are excluded
-        // too.  These runtime-built rows keep the case-insensitivity of the
-        // live SQL path covered.
+        // The SQL exclusion is `NOT LIKE 'prefix_%'`, and LIKE is ASCII case-insensitive — so
+        // case-variants of reserved words are excluded too. These runtime-built rows keep that
+        // covered.
         let case_variant_ids: Vec<String> = ["Manager_", "Ticket_", "tIcKeT_"]
             .iter()
             .map(|p| format!("{p}{}", unique_key()))
@@ -2592,9 +2344,8 @@ mod tests {
             .chain(prefixed_ids.iter())
             .chain(case_variant_ids.iter())
         {
-            // list_sessions_with_metadata reads FROM session_metadata directly;
-            // the append path upserts the row (context columns stay NULL
-            // when context is None).
+            // list_sessions_with_metadata reads FROM session_metadata directly; the append path
+            // upserts the row.
             store
                 .append_with_context(
                     id,
@@ -2674,7 +2425,7 @@ mod tests {
         );
     }
 
-    // ── Retention-window selection ───────────────────────────────────
+    // Retention-window selection
 
     fn tool_call_frame() -> ChatMessage {
         let tc = ToolCall {
@@ -2845,8 +2596,8 @@ mod tests {
     async fn finalize_appends_only_new_assistant_answer() {
         crate::util::test::init_test_stores().await;
         let k = unique_key();
-        // Persisted history ending with an assistant answer (e.g. a compacted
-        // session whose retained window ends with one).
+        // Persisted history ending with an assistant answer (e.g. a compacted session whose
+        // retained window ends with one).
         store()
             .batch_append(
                 &k,
@@ -2861,8 +2612,8 @@ mod tests {
         let ws = crate::workspace::test_ws_named("/_test_finalize_guard", "finalize_test");
         let mut session = session_with_init(&k, "", &ws).await;
 
-        // No new assistant output this turn → the persisted trailing answer
-        // must not be re-appended; the empty-tail no-op is reported.
+        // No new assistant output this turn → the persisted trailing answer must not be
+        // re-appended; the empty-tail no-op is reported.
         assert_eq!(
             session.finalize(&k).await.unwrap(),
             FinalizeOutcome::NoUnpersistedTail
@@ -2880,11 +2631,10 @@ mod tests {
         assert_eq!(msgs[3].content, "a2");
     }
 
-    /// A failed incoming-message persist queues the gap; the next successful
-    /// persist (tool round) flushes it ahead of its own batch — no loss, no
-    /// duplicate frames — and an aborted turn (no final answer) still flushes it
-    /// at the turn end, so delivered comments survive in the DB for a recovery
-    /// retry.
+    /// A failed incoming-message persist queues the gap; the next successful persist (tool round)
+    /// flushes it ahead of its own batch — no loss, no duplicate frames — and an aborted turn (no
+    /// final answer) still flushes it at the turn end, so delivered comments survive in the DB for
+    /// a recovery retry.
     #[tokio::test]
     async fn failed_drain_gap_flushed_by_later_persist() {
         crate::util::test::init_test_stores().await;
@@ -2937,8 +2687,8 @@ mod tests {
             ]
         );
 
-        // The same gap on a turn that ends without a final answer: the turn-end
-        // flush still lands it.
+        // The same gap on a turn that ends without a final answer: the turn-end flush still lands
+        // it.
         let aborted = unique_key();
         store()
             .batch_append(
@@ -2961,29 +2711,15 @@ mod tests {
     }
 }
 
-// ── TRANSIENT AGENT ID PREFIX GUARDS ──────────────────────────
+// [`TRANSIENT_AGENT_ID_PREFIXES`] controls which sessions [`cleanup_old_transient_sessions`]
+// purges (SQL `LIKE '{prefix}%'`). Two invariants:
 //
-// [`TRANSIENT_AGENT_ID_PREFIXES`] controls which sessions are cleaned up by
-// [`cleanup_old_transient_sessions`] (SQL `LIKE '{prefix}%'`, equivalent to
-// `key.starts_with(prefix)`).
-//
-// Two invariants:
-// 1. **Forward (no collision)**: User-facing agent IDs must never start with
-//    a transient prefix or the periodic cleanup would silently delete user history.
-// 2. **Reverse (inclusion)**: Transient agent ID builders must produce IDs
-//    starting with a prefix registered in [`TRANSIENT_AGENT_ID_PREFIXES`];
-//    an unregistered prefix means transient sessions never get cleaned up (leak).
-//
-// Limitations: `forward_no_collision_with_user_facing_agent_ids` covers
-// `direct_agent_id()` and `manager_agent_id()` patterns. Direct IDs start with
-// the user segment, so a user name that collides with a reserved prefix
-// (`manager_` or any transient prefix) is escaped by [`safe_user_segment`].
-// `reverse_transient_builders_use_registered_prefixes` covers all transient
-// builders (one per prefix in TRANSIENT_AGENT_ID_PREFIXES). If a new transient
-// role adds an agent ID builder, add it to the reverse test.
-//
-// All builders are pure string functions — these are cheap synchronous tests.
-// Assertion `Fix:` messages guide corrective action when an invariant breaks.
+// 1. **Forward (no collision)**: user-facing agent IDs must never start with a transient prefix,
+//    or the cleanup would silently delete user history — a colliding name is escaped by
+//    [`safe_user_segment`].
+// 2. **Reverse (inclusion)**: every transient builder must produce an ID whose prefix is
+//    registered, or those sessions never get cleaned up (a leak). A new transient role must add
+//    its builder to the reverse test.
 
 #[cfg(test)]
 mod transient_prefix_tests {
@@ -3073,8 +2809,7 @@ mod transient_prefix_tests {
         );
 
         // A bare reserved word IS escaped with a `user_` prefix so its session
-        // is never mistaken for the manager/transient session with the same
-        // prefix.
+        // is never mistaken for the manager/transient session with the same prefix.
         for prefix in &reserved_prefixes {
             let bare_word = prefix.trim_end_matches('_');
             let key = direct_agent_id(bare_word, "analyst", "test-ws");
@@ -3102,8 +2837,8 @@ mod transient_prefix_tests {
 
     #[test]
     fn reverse_transient_builders_use_registered_prefixes() {
-        // Each transient agent ID builder must produce IDs starting with a
-        // prefix that is actually registered in TRANSIENT_AGENT_ID_PREFIXES.
+        // Each transient agent ID builder must produce IDs starting with a prefix registered in
+        // TRANSIENT_AGENT_ID_PREFIXES.
         assert_transient_key(
             &ticket_agent_id("abc123", "analyst"),
             "ticket_",
@@ -3119,11 +2854,10 @@ mod transient_prefix_tests {
             "research_",
             "research_agent_id('ws', 'decomposer')",
         );
-        // The research-cleanup Sanitation agent id is built by the shared
-        // `cleanup_agent_id` builder in research_cleanup.rs (used by both the
-        // fresh dispatch and the boot-resume path) — asserting the REAL builder
-        // keeps the transient-prefix invariant honest (a literal would silently
-        // pass if the builder changed, leaking one session per research run).
+        // The research-cleanup Sanitation id is built by the shared `cleanup_agent_id` builder in
+        // research_cleanup.rs (fresh dispatch and boot-resume) — asserting the REAL builder keeps
+        // the invariant honest; a literal would silently pass if the builder changed, leaking one
+        // session per research run.
         assert_transient_key(
             &crate::research_cleanup::cleanup_agent_id("run_abc123"),
             "cleanup_",
@@ -3146,9 +2880,9 @@ mod transient_prefix_tests {
         );
     }
 
-    /// A one-off run's address must keep its role name recoverable: with a `_`
-    /// separator, a role named `a_b` and the NanoID suffix's own `_` would make
-    /// role `a_b` + suffix `c` and role `a` + suffix `b_c` one identical id.
+    /// A one-off run's address must keep its role name recoverable: with a `_` separator, a role
+    /// named `a_b` and the NanoID suffix's own `_` would make role `a_b` + suffix `c` and role `a`
+    /// + suffix `b_c` one identical id.
     #[test]
     fn one_off_run_address_separates_the_name_from_its_suffix() {
         let id = custom_role_run_agent_id("a_b");
@@ -3161,10 +2895,9 @@ mod transient_prefix_tests {
         assert!(!suffix.is_empty(), "the suffix must survive the separator");
     }
 
-    /// Dispatch is on the role string, matched exactly as [`crate::Role`]
-    /// spells it: lowercase `manager` addresses the workspace's Manager, while
-    /// every other role — a capital-M `Manager` included — is a direct,
-    /// channel-agnostic id with the role as its LAST segment.
+    /// Dispatch is on the role string, matched exactly as [`crate::Role`] spells it: lowercase
+    /// `manager` addresses the workspace's Manager, while every other role — a capital-M `Manager`
+    /// included — is a direct, channel-agnostic id with the role as its LAST segment.
     #[test]
     fn resolve_agent_id_dispatches_on_the_lowercase_manager_role() {
         let cases = [
@@ -3189,8 +2922,8 @@ mod transient_prefix_tests {
 
     #[test]
     fn direct_agent_id_personal_workspace_dedup() {
-        // A user's OWN personal workspace (`personal:{user}`) dedups the
-        // duplicated user segment, so role is `:`-delimited after the marker.
+        // A user's OWN personal workspace dedups the duplicated user segment, so role is
+        // `:`-delimited after the marker.
         assert_eq!(
             direct_agent_id("alice", "assistant", "personal:alice"),
             "alice_personal:assistant",
@@ -3202,8 +2935,7 @@ mod transient_prefix_tests {
             "bob_personal:admin_assistant",
         );
 
-        // A project named `personal_work` (no `personal:` prefix) is NOT
-        // deduped.
+        // A project named `personal_work` (no `personal:` prefix) is NOT deduped.
         assert_eq!(
             direct_agent_id("alice", "analyst", "personal_work"),
             "alice_personal_work_analyst",
@@ -3225,7 +2957,7 @@ mod transient_prefix_tests {
     }
 }
 
-// ── Native history decoding ────────────────────────────────────
+// Native history decoding
 
 #[derive(Debug)]
 pub(crate) enum DecodedNativeHistoryMessage {
@@ -3240,8 +2972,8 @@ pub(crate) enum DecodedNativeHistoryMessage {
     },
 }
 
-/// Decode a `ChatMessage` whose `content` is a JSON-wrapped native message.
-/// Returns `None` if the message doesn't look like a native/session-persisted message.
+/// Decode a `ChatMessage` whose `content` is a JSON-wrapped native message. `None` when the
+/// message does not look like a native/session-persisted one.
 pub(crate) fn decode_native_history_message(
     message: &ChatMessage,
 ) -> Option<DecodedNativeHistoryMessage> {
@@ -3249,8 +2981,8 @@ pub(crate) fn decode_native_history_message(
 
     if message.role == ChatRole::Assistant
         && let Some(value) = parsed.as_ref()
-        // Native-frame gate: producers always emit a "content" or "tool_calls"
-        // key; bare JSON answers carry neither and stay plain text.
+        // Native-frame gate: producers always emit a "content" or "tool_calls" key; bare JSON
+        // answers carry neither and stay plain text.
         && (value.get("content").is_some() || value.get("tool_calls").is_some())
     {
         let content = value

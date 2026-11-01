@@ -1,12 +1,10 @@
-//! The shared middle of every conversation: the helpers that move a message
-//! between a transport, the persistence layer and the GUI, plus the pieces
-//! every transport shares.
+//! The shared middle of every conversation: the helpers that move a message between a
+//! transport, the persistence layer and the GUI, plus the pieces every transport shares.
 //!
-//! Owns broadcast-and-persist fan-out, link enrichment, reply references, GUI
-//! chat history and drafts, and the Telegram transport and its intake ledger
-//! under `telegram*`. Not the message routing into an agent (that is
-//! `crate::agent::message_router`) and not the Telegram command handlers,
-//! which stay in the binary.
+//! Owns broadcast-and-persist fan-out, link enrichment, reply references, GUI chat history and
+//! drafts, and the Telegram transport and its intake ledger under `telegram*`. Not the message
+//! routing into an agent (`crate::agent::message_router`) and not the Telegram command
+//! handlers, which stay in the binary.
 
 pub(crate) mod chat_draft;
 pub(crate) mod chat_history;
@@ -39,15 +37,14 @@ use tokio_util::sync::CancellationToken;
 
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 
-/// Take the urgent mark off the text a user typed: a leading `!`, after any
-/// spaces, tabs and blank lines, marks the message urgent and is consumed with
-/// that leading whitespace; every other message is returned exactly as written.
+/// Take the urgent mark off the text a user typed: a leading `!`, after any spaces, tabs and
+/// blank lines, marks the message urgent and is consumed with that whitespace; every other
+/// message is returned exactly as written.
 ///
-/// Read on the text the user typed and nothing else — a caption rather than the
-/// attachment markers the surface composes around it, never a transcript or a
-/// forward prefix — so no product-added text can make a message urgent or make
-/// an urgent one ordinary. There is no escape: an ordinary message that opens
-/// with the mark is urgent, and loses its `!`.
+/// Read on the typed text and nothing else — a caption rather than the attachment markers the
+/// surface composes around it, never a transcript or a forward prefix — so no product-added text
+/// can make a message urgent or an urgent one ordinary. There is no escape: an ordinary message
+/// opening with the mark is urgent, and loses its `!`.
 #[must_use]
 pub(crate) fn take_urgent(typed: &str) -> (Cow<'_, str>, bool) {
     let rest = typed.trim_start();
@@ -57,31 +54,26 @@ pub(crate) fn take_urgent(typed: &str) -> (Cow<'_, str>, bool) {
     }
 }
 
-/// Keep the optional self-hosted Telegram Bot API server alive, updated and
-/// clean, and finish any switch a crash interrupted. A no-op in the cloud mode
-/// beyond one cheap check a minute.
+/// Keep the self-hosted Telegram Bot API server alive, updated and clean, and finish any switch
+/// a crash interrupted. A no-op in cloud mode beyond one cheap check a minute.
 pub async fn run_telegram_server_supervisor() {
     telegram_local::run_supervisor().await;
 }
 
-/// Stop the self-hosted Telegram Bot API server, if this process runs one. Called
-/// from the exits that skip destructors as well as the ordinary shutdown.
+/// Called from the exits that skip destructors as well as the ordinary shutdown.
 pub async fn stop_telegram_server() {
     telegram_local::stop_for_exit().await;
 }
 
-/// Broadcast an agent response to CHAT_BROADCAST for live GUI display and
-/// persist it to chat_history. This is the canonical entry point for all
-/// agent responses: the delivery paths in [`crate::agent::message_router`]
-/// (registered users and raw reply targets) and the macOS voice notice in
-/// `crate::audio::voice`.
+/// Broadcast an agent response to CHAT_BROADCAST for live GUI display and persist it to
+/// chat_history. The canonical entry point for all agent responses: the delivery paths in
+/// [`crate::agent::message_router`] and the macOS voice notice in `crate::audio::voice`.
 ///
-/// No speech happens here or on any event this function broadcasts: the only
-/// way the product speaks is the admin Assistant's `say` tool, which calls into
-/// `crate::audio::tts` itself.
+/// No speech happens here or on any event this broadcasts: the only way the product speaks is
+/// the admin Assistant's `say` tool, which calls `crate::audio::tts` itself.
 ///
-/// Takes primitive fields rather than [`crate::SendMessage`], so the per-agent
-/// consumer loop can call it with a [`crate::users::UserRecord`].
+/// Primitive fields rather than [`crate::SendMessage`], so the per-agent consumer loop can call
+/// it with a [`crate::users::UserRecord`].
 pub(crate) async fn broadcast_and_persist_agent_response(
     user_name: &str,
     channel: &str,
@@ -123,18 +115,13 @@ pub(crate) async fn broadcast_and_persist_agent_response(
         .await;
 }
 
-/// Send a [`ChatEvent::Message`] to the broadcast channel.
+/// Send a [`ChatEvent::Message`] to the broadcast channel — the single shared entry point for
+/// every message broadcast (typing indicators go straight to the channel), so construction stays
+/// consistent. The caller generates a stable [`message_id`] and [`timestamp`] if it must
+/// correlate the broadcast with a persist.
 ///
-/// This is the single shared entry point for every message broadcast (typing
-/// indicators go straight to the channel), ensuring consistent message
-/// construction across user messages, agent responses, and any future message
-/// types.  The caller is responsible for generating a stable [`message_id`]
-/// and [`timestamp`] if they need to correlate the broadcast event with a
-/// persist operation.
-///
-/// `transient` marks an event destined for live GUI display only: it is
-/// never persisted to chat_history (e.g. the Phase-1 scripted onboarding
-/// exchange). Pass `false` for every persisted path.
+/// `transient` marks an event for live GUI display only: it is never persisted to chat_history
+/// (e.g. the Phase-1 scripted onboarding exchange). Pass `false` for every persisted path.
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn broadcast_chat_event(
     message_id: &str,
@@ -168,14 +155,11 @@ pub(crate) fn broadcast_chat_event(
     }
 }
 
-/// Chat-history content for an inbound message: normally the pre-enrichment
-/// `original` text (which avoids storing the large data URIs image enrichment
-/// produces), but the data-URI-stripped `enriched` content when the original
-/// carried a marker for an inbound attachment — those raw markers name temp
-/// files the daemon deletes right after enrichment and must never be persisted.
+/// Normally the pre-enrichment `original` text (avoiding the large data URIs image enrichment
+/// produces), but the data-URI-stripped `enriched` content when the original carried a marker for
+/// an inbound attachment — those markers name temp files the daemon deletes right after enrichment.
 ///
-/// A hand-typed audio marker names no inbound attachment, so it is kept as
-/// written rather than replaced by the annotation it enriches to.
+/// A hand-typed audio marker names no inbound attachment, so it is kept as written.
 #[must_use]
 pub fn persist_content(original: &str, enriched: &str) -> String {
     if has_inbound_temp_marker(original) {
@@ -185,16 +169,12 @@ pub fn persist_content(original: &str, enriched: &str) -> String {
     }
 }
 
-/// Broadcast an incoming user message to the GUI and persist it to chat_history,
-/// mirroring it to Telegram in parallel. `broadcast_content` is the enriched text
-/// sent to the GUI (e.g. audio transcriptions, renderable data URIs);
+/// Broadcast an incoming user message to the GUI and persist it to chat_history, mirroring it to
+/// Telegram in parallel. `broadcast_content` is the enriched text sent to the GUI;
 /// `content_for_history` is what is stored and mirrored — callers derive it with
-/// [`persist_content`].
-/// The GUI bubble is broadcast synchronously before the async persist + mirror
-/// join begins.
-///
-/// Forwards [`ChannelMessage::optimistic_id`] so the GUI can replace its optimistic
-/// bubble with the real one.
+/// [`persist_content`]. The GUI bubble is broadcast synchronously before the async persist +
+/// mirror join begins. Forwards [`ChannelMessage::optimistic_id`] so the GUI can replace its
+/// optimistic bubble with the real one.
 pub async fn broadcast_and_persist_incoming_message(
     msg: &ChannelMessage,
     broadcast_content: &str,
@@ -273,39 +253,29 @@ pub fn spawn_scoped_typing_task(
     })
 }
 
-/// Await a typing task's shutdown, logging a crash. Cancellation belongs to the
-/// caller: cancel the token the task was spawned with, then await this.
+/// Log a typing task's crash. Cancellation belongs to the caller: cancel the token the task was
+/// spawned with, then await this.
 pub async fn stop_typing(handle: tokio::task::JoinHandle<()>) {
     if let Err(error) = handle.await {
         tracing::error!("Typing task crashed: {error}");
     }
 }
 
-// ── GuiChannel ────────────────────────────────────────────
-
 /// The GUI channel — always registered, even in dashboard-only mode.
 ///
-/// Unlike Telegram which has its own async listener loop, the GUI channel uses
-/// an internal mpsc pair: the Iced UI pushes `ChannelMessage` values into
-/// `GUI_MESSAGE_TX`, and `listen()` reads them from the paired receiver,
-/// forwarding each one into the shared pipeline `tx`.
-///
-/// Outgoing agent responses are broadcast to the GUI dashboard and persisted
-/// to chat_history centrally via [`broadcast_and_persist_agent_response`].
-/// `GuiChannel::send()` is pure transport (no-op) — all broadcast+persist
-/// happens in the canonical function so every path gets consistent treatment.
+/// Unlike Telegram's async listener loop, this uses an internal mpsc pair: the Iced UI pushes
+/// `ChannelMessage` values into `GUI_MESSAGE_TX`, and `listen()` reads them from the paired
+/// receiver, forwarding each into the shared pipeline `tx`. `send()` is pure transport (a no-op):
+/// outgoing responses are broadcast and persisted centrally by
+/// [`broadcast_and_persist_agent_response`].
 pub struct GuiChannel {
     /// The internal receiver, stored so `listen()` can consume it.
     gui_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<ChannelMessage>>>,
 }
 
 impl GuiChannel {
-    /// Create a new GuiChannel with an internal mpsc pair.
-    ///
-    /// Returns `(Self, gui_tx)`. The caller must:
-    /// 1. Store `gui_tx` in `GUI_MESSAGE_TX` globally
-    /// 2. Register this channel in the channel registry
-    /// 3. Call `listen(tx)` to start consuming from the internal receiver
+    /// Returns `(Self, gui_tx)`. The caller must store `gui_tx` in `GUI_MESSAGE_TX`, register this
+    /// channel in the registry, and call `listen(tx)`.
     #[must_use]
     pub fn new() -> (Self, mpsc::UnboundedSender<ChannelMessage>) {
         let (gui_tx, gui_rx) = mpsc::unbounded_channel::<ChannelMessage>();
@@ -318,15 +288,15 @@ impl GuiChannel {
 
 #[async_trait]
 impl Channel for GuiChannel {
-    /// Pure transport — broadcast and persistence are handled centrally
-    /// by [`broadcast_and_persist_agent_response`].
+    /// Pure transport — broadcast and persistence are handled centrally by
+    /// [`broadcast_and_persist_agent_response`].
     async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
         Ok(())
     }
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        // Take the receiver from the internal mutex. After this, we own it
-        // and can drop the &self reference.
+        // Take the receiver from the internal mutex: after this we own it and can drop the &self
+        // reference.
         let mut gui_rx = self
             .gui_rx
             .lock()
@@ -336,7 +306,6 @@ impl Channel for GuiChannel {
         // Mutex guard is dropped here.
 
         // Forward each GUI-originated message into the shared pipeline.
-        // Broadcast+persist is handled centrally in process_channel_message().
         while let Some(msg) = gui_rx.recv().await {
             if tx.send(msg).await.is_err() {
                 tracing::info!("GuiChannel: pipeline closed — shutting down listener");
@@ -362,32 +331,23 @@ impl Channel for GuiChannel {
     }
 }
 
-// ── VoiceChannel (macOS-only) ─────────────────────────────
-// The voice channel is the transport for the macOS-only voice pipeline, which
-// is its only producer, so nothing resolves the `"voice"` channel name off
-// macOS — the whole section is gated with the audio subsystem it serves.
+// VoiceChannel (macOS-only): the transport for the macOS-only voice pipeline, its only producer,
+// so nothing resolves the `"voice"` channel name off macOS — the section is gated with the audio
+// subsystem it serves.
 
-/// The voice channel — registered so the message routing system can
-/// resolve the `"voice"` channel name when delivering agent responses.
+/// Registered so routing can resolve the `"voice"` channel name when delivering agent responses.
 ///
-/// There is no outbound voice transport — agent responses are broadcast
-/// to the GUI and persisted to chat_history by the standard response
-/// delivery path. The `send()` method is a no-op, matching the pattern
-/// used by [`GuiChannel`].
-///
-/// The voice pipeline runs its own mic-capture loop independently;
-/// `listen()` is a no-op because a recording's transcript never arrives through
-/// a channel listener: it joins the Home composer's message, which is delivered
-/// on the GUI channel like any typed one.
+/// There is no outbound voice transport: responses are broadcast to the GUI and persisted by the
+/// standard delivery path, so `send()` is a no-op like [`GuiChannel`]. The voice pipeline runs
+/// its own mic-capture loop, and a recording's transcript never arrives through a channel
+/// listener: it joins the Home composer's message, delivered on the GUI channel.
 #[cfg(target_os = "macos")]
 struct VoiceChannel;
 
 #[cfg(target_os = "macos")]
 #[async_trait]
 impl Channel for VoiceChannel {
-    /// No-op — voice has no outbound transport. Agent responses are
-    /// broadcast to the GUI and persisted to chat_history by
-    /// [`broadcast_and_persist_agent_response`].
+    /// No-op — voice has no outbound transport.
     async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
         Ok(())
     }
@@ -406,11 +366,8 @@ impl Channel for VoiceChannel {
     }
 }
 
-/// Register the voice channel in the global channel registry.
-///
-/// Called during bootstrap from `init_message_pipeline`. The channel
-/// registry must already be initialised — callers should ensure
-/// [`crate::CHANNEL_REGISTRY`] has been set before invoking this.
+/// Called during bootstrap from `init_message_pipeline`; [`crate::CHANNEL_REGISTRY`] must
+/// already be set.
 #[cfg(target_os = "macos")]
 pub fn register_global() {
     let channel: Arc<dyn Channel> = Arc::new(VoiceChannel);
@@ -423,8 +380,7 @@ mod tests {
     use super::*;
     use crate::{CHANNEL_REGISTRY, ChannelRegistry, channel_registry};
 
-    /// The bootstrap registration the message pipeline calls must leave the
-    /// voice channel findable by its name.
+    /// The bootstrap registration must leave the voice channel findable by its name.
     #[test]
     fn test_voice_channel_registration() {
         CHANNEL_REGISTRY.get_or_init(ChannelRegistry::default);
@@ -440,8 +396,7 @@ mod tests {
 mod urgent_tests {
     use super::take_urgent;
 
-    /// Only a `!` opening the typed text — after spaces, tabs and blank lines —
-    /// is the mark; it is consumed and everything else is left as written.
+    /// Only a `!` opening the typed text — after spaces, tabs and blank lines — is the mark.
     #[test]
     fn take_urgent_reads_only_the_leading_mark() {
         let bare_spaces = "   \t\n  !foo";

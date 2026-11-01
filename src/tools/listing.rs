@@ -6,15 +6,12 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-/// One entry of a directory listing.
 pub(crate) struct ListingEntry {
-    /// Entry name, without the directory mark and without any link target.
+    /// Without the directory mark and without any link target.
     pub name: String,
-    /// Directories are grouped first and rendered with a trailing `/`.
     pub is_dir: bool,
-    /// Display size of a file entry, or `None` when the platform could not
-    /// measure it — rendered as `?`, the size `ls` itself prints for a file it
-    /// cannot stat. Directories carry none: their size is not rendered.
+    /// `None` when the platform could not measure it — rendered as `?`, the size
+    /// `ls` prints for a file it cannot stat. Directories carry none.
     pub size: Option<String>,
 }
 
@@ -33,11 +30,9 @@ pub(crate) fn human_readable_size(bytes: u64) -> String {
 }
 
 /// Render the compact listing: directories first (each with a trailing `/`),
-/// then files with their size, then a summary line carrying the file/directory
-/// counts and the entry counts of the five commonest extensions.
-///
-/// The order the caller supplies is preserved within each group. An empty
-/// listing renders as `(empty)`.
+/// then files with their size, then a summary line with file/dir counts and the
+/// five commonest extensions. Caller order is preserved within each group; an
+/// empty listing renders as `(empty)`.
 pub(crate) fn format_listing(entries: &[ListingEntry]) -> String {
     let mut dirs: Vec<&str> = Vec::new();
     let mut files: Vec<(&str, &str)> = Vec::new();
@@ -78,9 +73,8 @@ pub(crate) fn format_listing(entries: &[ListingEntry]) -> String {
     );
     if !ext_counts.is_empty() {
         let mut sorted: Vec<_> = ext_counts.iter().collect();
-        // Equally common extensions break by name: `HashMap` iteration order is
-        // arbitrary, which would make both the order and *which* extensions reach
-        // the five shown unstable, and the listing must be byte-stable.
+        // Ties break by name: `HashMap` order is arbitrary, which would make both
+        // the order and *which* extensions reach the five shown unstable.
         sorted.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
         let parts: Vec<String> = sorted
             .iter()

@@ -1,36 +1,26 @@
-//! Per-account identity, workspace preference, and channel bindings.
+//! Per-account identity, workspace preference, and channel bindings, in two tables of the
+//! consolidated domain database (`core.db`): `users` (canonical identity — `name`,
+//! `selected_workspace`, `granted_tools`) and `user_channels` (bindings mapping a
+//! channel+identifier to an account, with that channel's `reply_target` routing address).
+//! A Telegram identifier is either a nickname or a numeric id; an account holds at most
+//! one Telegram binding, so the two are alternatives.
 //!
-//! Two tables in the consolidated domain database (`core.db`):
-//! - `users` — canonical account identity: `name`, `selected_workspace`,
-//!   `granted_tools` (the per-account custom-tool grants).
-//! - `user_channels` — channel bindings: maps a channel+identifier to an
-//!   account. The `reply_target` is stored here (per-channel routing address).
-//!   A Telegram identifier is either a nickname or a person's numeric id — an
-//!   account holds at most one Telegram binding, so the two are alternatives.
+//! Account identity is independent of any external channel: changing a Telegram
+//! `@username` changes nothing. Accounts come from Settings → Users or the assistant's
+//! `mahbot_config` tool, and channels are bound explicitly.
 //!
-//! Account identity is independent of any external channel. Changing a Telegram
-//! `@username` does not affect the account's identity. Accounts are created from
-//! the desktop's Settings → Users page or by the assistant's `mahbot_config`
-//! tool, and channels are bound explicitly.
+//! The admin is the one account named [`ADMIN_USER_NAME`] ([`is_admin_name`]); every other
+//! account is a guest. Every account routes to the single Assistant, so no account stores
+//! a role selection.
 //!
-//! ## Accounts
+//! A name is the account's identity AND its personal-workspace folder, so a name about to
+//! become a new account is refused when an existing account's or the admin's name is the
+//! same once case and Unicode composition are ignored ([`NAME_COLLISION_RULE`]). Only a
+//! genuinely new name is judged; a stored account keeps its name.
 //!
-//! The admin is the one account named [`ADMIN_USER_NAME`] ([`is_admin_name`]);
-//! every other account is a guest. Every account routes to the single
-//! Assistant, so no account stores an agent-role selection.
-//!
-//! A name is the account's identity AND the name of its personal-workspace
-//! folder, so a name about to become a new account is refused when an existing
-//! account's or the admin's name is the same once case and Unicode composition
-//! are ignored ([`NAME_COLLISION_RULE`]). Only a genuinely new name is judged —
-//! an account that is already stored keeps its name.
-//!
-//! ## Personal workspaces
-//!
-//! When `selected_workspace` is NULL, the account has a personal workspace at
-//! `~/.mahbot/userspaces/<name>/`. It has no `workspaces` row — it is
-//! computed on the fly. Personal workspaces have no board pipeline, no
-//! maintainer, no diagnostics discovery.
+//! A NULL `selected_workspace` means a personal workspace at `~/.mahbot/userspaces/<name>/`
+//! — computed on the fly, no `workspaces` row, no board pipeline, maintainer or
+//! diagnostics discovery.
 
 use crate::Role;
 use crate::Workspace;
@@ -46,28 +36,25 @@ use tracing::{error, warn};
 use unicase::UniCase;
 use unicode_normalization::UnicodeNormalization;
 
-/// Sentinel that `extract_sender_user_name` (src/channels/telegram.rs)
-/// substitutes for Telegram senders without an @username. It is no nickname
-/// anyone can hold: binding it is refused, and it never matches a sender — a
-/// sender without a nickname is matched by their numeric id, or not at all.
+/// Sentinel that `extract_sender_user_name` substitutes for senders without an @username.
+/// Nobody can hold it: binding it is refused and it never matches a sender (such a sender
+/// is matched by numeric id, or not at all).
 pub(crate) const TELEGRAM_UNKNOWN_SENTINEL: &str = "unknown";
 
-/// Telegram's own non-person identities, refused both as bindings and as
-/// senders: the anonymous group administrator (1087968824), a message
-/// attributed to a channel (136817688), and a channel post auto-forwarded into
-/// a linked discussion group (777000) — the same number as Telegram's own
-/// service account.
+/// Telegram's own non-person identities, refused as bindings and as senders: the anonymous
+/// group administrator (1087968824), a message attributed to a channel (136817688), and a
+/// channel post auto-forwarded into a linked discussion group (777000) — the same number as
+/// Telegram's own service account.
 const TELEGRAM_SERVICE_IDS: [&str; 3] = ["1087968824", "136817688", "777000"];
 
-/// The nicknames those identities carry (777000 has none). Telegram usernames
-/// are case-insensitive, so the comparison is too.
+/// The nicknames those identities carry (777000 has none), compared case-insensitively.
 const TELEGRAM_SERVICE_NICKNAMES: [&str; 2] = ["groupanonymousbot", "channel_bot"];
 
-/// The app's own admin account — the single owner identity the desktop GUI
-/// always acts as. Seeded idempotently by [`UserStore::ensure_admin_user`].
+/// The single owner identity the desktop GUI always acts as, seeded idempotently by
+/// [`UserStore::ensure_admin_user`].
 pub(crate) const ADMIN_USER_NAME: &str = "admin";
 
-/// How a Telegram binding identifier is written: as a number or as a nickname.
+/// How a Telegram binding identifier is written.
 enum TelegramKey {
     /// Canonical form: digits, no leading `+`, no leading zeros.
     Number(String),
@@ -75,21 +62,17 @@ enum TelegramKey {
     Nickname(String),
 }
 
-/// The digits of a number-shaped value: after trimming, a single optional
-/// leading `+`, nothing but digits.
+/// After trimming, a single optional leading `+`, nothing but digits.
 fn telegram_digits(value: &str) -> Option<&str> {
     let digits = value.trim();
     let digits = digits.strip_prefix('+').unwrap_or(digits);
     (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(digits)
 }
 
-/// Classify a Telegram binding identifier by its shape.
-///
-/// A Telegram nickname can never be a bare number, so the shape decides: a
-/// number-shaped value is a numeric id, canonicalized here so the same number
-/// written differently is one and the same value. Anything else keeps its
-/// nickname meaning. `None` only for a value that is number-shaped yet nothing
-/// but zeros: no person's number.
+/// A nickname is never a bare number, so the shape decides: a number-shaped value is a
+/// numeric id, canonicalised here so the same number written differently is one value.
+/// Anything else keeps its nickname meaning. `None` only for a value that is number-shaped
+/// yet nothing but zeros: no person's number.
 fn telegram_key(value: &str) -> Option<TelegramKey> {
     let Some(digits) = telegram_digits(value) else {
         return Some(TelegramKey::Nickname(value.to_string()));
@@ -98,7 +81,6 @@ fn telegram_key(value: &str) -> Option<TelegramKey> {
     (!canonical.is_empty()).then(|| TelegramKey::Number(canonical.to_string()))
 }
 
-/// The canonical form of a numeric id — digits with the leading zeros removed.
 /// `None` when the value is not number-shaped or is nothing but zeros.
 fn canonical_telegram_number(value: &str) -> Option<String> {
     match telegram_key(value) {
@@ -107,11 +89,9 @@ fn canonical_telegram_number(value: &str) -> Option<String> {
     }
 }
 
-/// Normalize a value entered as a Telegram binding and refuse what can never
-/// belong to a person: the reserved `unknown` sentinel, Telegram's own service
-/// identities under either spelling, and a value that is nothing but zeros.
-/// A single leading `@` is stripped as it always has been; what remains decides
-/// the kind, and a number is kept as the number itself.
+/// Refuses what can never belong to a person: the reserved `unknown` sentinel, Telegram's
+/// own service identities under either spelling, and a value of nothing but zeros. A single
+/// leading `@` is stripped as it always has been; what remains decides the kind.
 fn normalize_telegram_binding(value: &str) -> anyhow::Result<String> {
     let trimmed = value.trim();
     let trimmed = trimmed.strip_prefix('@').unwrap_or(trimmed).trim();
@@ -152,28 +132,22 @@ fn normalize_telegram_binding(value: &str) -> anyhow::Result<String> {
     }
 }
 
-/// Whether a canonical numeric id is one of Telegram's own service identities.
 pub(crate) fn is_telegram_service_id(id: &str) -> bool {
     TELEGRAM_SERVICE_IDS.contains(&id)
 }
 
-/// Whether a nickname is the one a Telegram service identity carries.
 fn is_telegram_service_nickname(nickname: &str) -> bool {
     let lowercase = nickname.to_ascii_lowercase();
     TELEGRAM_SERVICE_NICKNAMES.contains(&lowercase.as_str())
 }
 
-/// Whether a stored Telegram identifier is written as a number — digits alone,
-/// however spelled — rather than as a nickname. A stored value that is
-/// number-shaped but nothing but zeros is no person's number and binds nobody;
-/// it is still written as a number, so it is shown as an id and never as `@0`.
+/// Digits alone, however spelled. A stored value that is number-shaped but nothing but
+/// zeros binds nobody; it is still written as a number, so it shows as an id, never `@0`.
 fn telegram_identifier_is_number(identifier: &str) -> bool {
     telegram_digits(identifier).is_some()
 }
 
-/// Name a Telegram binding in a message a person reads: a nickname keeps the
-/// `@` it is entered with, a number is labelled as an id — never in nickname
-/// form.
+/// A nickname keeps the `@` it is entered with; a number is labelled as an id.
 pub(crate) fn describe_telegram_binding(identifier: &str) -> String {
     if telegram_identifier_is_number(identifier) {
         format!("id {}", identifier.trim())
@@ -182,9 +156,8 @@ pub(crate) fn describe_telegram_binding(identifier: &str) -> String {
     }
 }
 
-/// The Settings → Users row's label for an account's Telegram binding: the
-/// nickname exactly as it has always been shown, a number labelled as an id so
-/// it can never read as a nickname.
+/// The nickname exactly as it has always been shown, a number labelled as an id so it can
+/// never read as a nickname.
 pub(crate) fn settings_binding_label(identifier: &str) -> String {
     if telegram_identifier_is_number(identifier) {
         describe_telegram_binding(identifier)
@@ -199,8 +172,6 @@ crate::define_store! {
     post_open = ensure_admin_user,
     expect = "USER_STORE not initialized — call init_all_stores() first",
 }
-
-// ── Column index constants ──────────────────────────────────
 
 // users table (3-column SELECT: name, selected_workspace, granted_tools)
 crate::columns! {
@@ -220,29 +191,23 @@ crate::columns! {
     }
 }
 
-/// What creating an account actually produced.
-///
-/// The account row is always in place when [`UserStore::add_user`] returns
-/// `Ok`; the account's personal workspace folder is a second thing that call
-/// tries to create, and the name rule or the platform can refuse it. Callers
-/// report both halves, so a partly carried-out creation is never answered as a
-/// whole success.
+/// The row is in place when [`UserStore::add_user`] returns `Ok`; its personal workspace folder is
+/// a second thing that call tries to create, and the name rule or the platform can refuse it.
+/// Callers report both halves, so a partial creation is never answered as a whole success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddUserOutcome {
     /// The account and its personal workspace folder are both in place.
     Complete,
-    /// The account is in place, but its personal workspace folder could not be
-    /// created — the failure is also reported out of band.
+    /// In place, but its folder could not be created — also reported out of band.
     WithoutPersonalWorkspace,
 }
 
 impl UserStore {
     /// Auto-create the admin account if this is a fresh database.
     ///
-    /// Runs idempotently from both [`crate::db::init_all_stores`] (production,
-    /// on the shared consolidated connection) and each isolated user store open.
-    /// This is the ONLY path that may create the reserved admin name; every
-    /// user-facing path refuses it ([`refuse_admin_name`]).
+    /// Runs idempotently from [`crate::db::init_all_stores`] and each isolated user store
+    /// open, and is the ONLY path that may create the reserved admin name; every user-facing
+    /// path refuses it ([`refuse_admin_name`]).
     pub(crate) async fn ensure_admin_user(&self) -> Result<()> {
         if !self.user_exists(ADMIN_USER_NAME).await? {
             self.add_user(ADMIN_USER_NAME).await?;
@@ -250,29 +215,20 @@ impl UserStore {
         Ok(())
     }
 
-    // ── Account CRUD ─────────────────────────────────────────────
-
-    /// Create an account: the seeding path for the admin, and the path
-    /// user-facing callers use for guests — those must refuse the reserved
-    /// admin name first ([`refuse_admin_name`]). A name about to become a new
-    /// account must also pass the collision rule
-    /// ([`UserStore::refuse_colliding_name`]) — the reserved admin name itself
-    /// is exempt. Also creates the personal workspace directory under
-    /// `~/.mahbot/userspaces/<name>/` with `git init`; a failure there is
-    /// reported out of band and named by the returned [`AddUserOutcome`], never
-    /// by an `Err` — the account exists whatever happened. Idempotent —
-    /// re-adding an existing account preserves its stored preferences.
+    /// The seeding path for the admin and for guest callers, who must refuse the reserved
+    /// admin name first ([`refuse_admin_name`]) and pass the collision rule
+    /// ([`UserStore::refuse_colliding_name`]). Also creates the personal workspace directory
+    /// under `~/.mahbot/userspaces/<name>/` with `git init`; a failure there is reported out
+    /// of band and named by the returned [`AddUserOutcome`], never by an `Err` — the account
+    /// exists whatever happened. Idempotent: re-adding preserves stored preferences.
     pub async fn add_user(&self, name: &str) -> Result<AddUserOutcome> {
-        // Only a name that becomes a new account's own folder has to satisfy
-        // the folder rule: an account that is already stored keeps the name it
-        // has — it is never re-judged — and its folder, when it does not exist
-        // yet, is created by [`ensure_personal_workspace`], which applies the
-        // rule the moment it is about to create one.
+        // Only a name that becomes a new account's folder must satisfy the folder rule: a
+        // stored account is never re-judged, and its missing folder is created by
+        // [`ensure_personal_workspace`], which applies the rule when it does.
         if !self.user_exists(name).await? {
             validate_folder_name(name)?;
-            // The admin's own name is exempt: bootstrapping the owner account
-            // must never fail, and every user-facing path refuses that name
-            // before reaching the store ([`refuse_admin_name`]).
+            // The admin's own name is exempt: bootstrapping the owner account must never
+            // fail, and every user-facing path refuses that name first.
             if !is_admin_name(name) {
                 self.refuse_colliding_name(name).await?;
             }
@@ -283,10 +239,9 @@ impl UserStore {
                 db::params![name],
             )
             .await?;
-        // A failure to put the folder there (the rule refusing the name, or the
-        // platform refusing the directory) is reported out of band, never
-        // silently skipped — the account still exists either way, and which of
-        // the two the caller got is what it is told.
+        // A failed folder creation (the rule refusing the name, or the platform the
+        // directory) is reported out of band, never silently skipped — the account exists
+        // either way, and the caller is told which half it got.
         if let Err(e) = ensure_personal_workspace(name).await {
             self.report_personal_workspace_failure(name, &e).await;
             return Ok(AddUserOutcome::WithoutPersonalWorkspace);
@@ -294,17 +249,14 @@ impl UserStore {
         Ok(AddUserOutcome::Complete)
     }
 
-    /// Refuse a name about to become a NEW account when, with case and Unicode
-    /// composition ignored ([`collides_with_existing`]), it is an existing
-    /// account's or the admin's name: macOS resolves such spellings to one and
-    /// the same personal-workspace folder, and Windows — case-insensitive by
-    /// default — the case difference alone, so the new account would read and
-    /// write the other's files.
+    /// Refuse a name about to become a NEW account when, with case and Unicode composition
+    /// ignored ([`collides_with_existing`]), it is an existing account's or the admin's name:
+    /// macOS resolves such spellings to one folder, and Windows (case-insensitive by default)
+    /// the case difference alone, so the new account would read and write the other's files.
     ///
-    /// The comparison covers every stored name plus the reserved admin name,
-    /// whose row [`UserStore::ensure_admin_user`] may not have seeded yet. The
-    /// rule is the same on every platform — it is about which account is meant,
-    /// not about the volume this process happens to run on.
+    /// The comparison covers every stored name plus the reserved admin name, whose row
+    /// [`UserStore::ensure_admin_user`] may not have seeded yet. The rule is the same on
+    /// every platform — it is about which account is meant, not the volume this process runs on.
     async fn refuse_colliding_name(&self, name: &str) -> Result<()> {
         let names = self.user_names().await?;
         // A stored name byte-identical to this one is the idempotent re-add of
@@ -328,8 +280,8 @@ impl UserStore {
     ///
     /// The search tool retries its account's folder on every call, so each of
     /// the two reports is claimed once per process; the owner's message is
-    /// claimed only where a send is actually attempted, so a failure that had
-    /// nowhere to go still reaches the owner once there is a transport.
+    /// claimed only where a send is actually attempted, so a failure with nowhere to go still
+    /// reaches the owner once there is a transport.
     pub(crate) async fn report_personal_workspace_failure(
         &self,
         name: &str,
@@ -343,11 +295,9 @@ impl UserStore {
                 "Personal workspace folder could not be created"
             );
         }
-        // The folder failure is reported through Telegram, and a report that has
-        // nowhere to go must not spend the owner's one message: the account
-        // seeding path runs inside USER_STORE's own bring-up, where
-        // `channel_registry()` panics rather than reporting no channels, and the
-        // channel itself may not be registered even once the registry is.
+        // A report with nowhere to go must not spend the owner's one message: this runs
+        // inside USER_STORE's own bring-up, where `channel_registry()` panics rather than
+        // reporting no channels, and the channel may not be registered even then.
         if crate::CHANNEL_REGISTRY
             .get()
             .and_then(|registry| registry.get("telegram"))
@@ -355,8 +305,8 @@ impl UserStore {
         {
             return;
         }
-        // Read the bindings through `self`, never the global store: this can run
-        // inside USER_STORE's own bring-up, where `store()` would panic.
+        // Through `self`, never the global store: this can run inside USER_STORE's own
+        // bring-up, where `store()` would panic.
         let mut targets =
             telegram_reply_targets(self.get_user_channels(name).await.unwrap_or_default());
         if targets.is_empty() && name != ADMIN_USER_NAME {
@@ -366,8 +316,8 @@ impl UserStore {
                     .unwrap_or_default(),
             );
         }
-        // Nothing to send through, so the message is not claimed — a later
-        // attempt (once the account has a binding) still reaches the owner.
+        // Nothing to send through, so the message is not claimed — a later attempt (once the
+        // account has a binding) still reaches the owner.
         if targets.is_empty() || !claim_report(name, error, "owner") {
             return;
         }
@@ -377,9 +327,7 @@ impl UserStore {
         }
     }
 
-    /// Delete an account and all their child rows (channel bindings). Channel
-    /// bindings are an account's only child rows, so nothing else needs a
-    /// cascade.
+    /// Bindings are an account's only child rows, so nothing else needs a cascade.
     pub async fn delete_user(&self, name: &str) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
         tx.execute(
@@ -393,8 +341,6 @@ impl UserStore {
         Ok(())
     }
 
-    /// Fetch a single nullable column from the account's row, if it exists.
-    ///
     /// A NULL column and a missing row both yield `None`.
     async fn user_column(&self, column: &str, user_name: &str) -> Result<Option<String>> {
         self.conn
@@ -407,12 +353,9 @@ impl UserStore {
             .map(Option::flatten)
     }
 
-    /// Get the selected workspace name for an account, if any.
     async fn get_selected_workspace_name(&self, user_name: &str) -> Result<Option<String>> {
         self.user_column("selected_workspace", user_name).await
     }
-
-    /// Whether an account row with this name exists.
     pub async fn user_exists(&self, name: &str) -> Result<bool> {
         let rows = self
             .conn
@@ -435,15 +378,10 @@ impl UserStore {
         Ok(names)
     }
 
-    // ── Channel bindings ──────────────────────────────────────
-
-    /// Low-level upsert binding a `(channel, identifier)` pair to a user.
-    /// `channel` is e.g. `"telegram"`, `identifier` is the channel-specific
-    /// identifier (a Telegram nickname or canonical numeric id). Uses
-    /// INSERT OR REPLACE — a `(channel, identifier)` pair already bound to
-    /// another user is silently reassigned. User-facing Telegram bind paths go
-    /// through [`UserStore::bind_telegram`], which validates first (reserved
-    /// sentinel + service identities + at-most-one + anti-steal guards).
+    /// `(channel, identifier)` with, say, channel `"telegram"` and a nickname or canonical
+    /// numeric id. INSERT OR REPLACE, so a pair already bound to another user is silently
+    /// reassigned; user-facing Telegram paths go through [`UserStore::bind_telegram`], which
+    /// validates first (sentinel, service identities, at-most-one, anti-steal).
     pub async fn bind_channel(
         &self,
         user_name: &str,
@@ -460,17 +398,11 @@ impl UserStore {
         Ok(())
     }
 
-    /// Validate a Telegram binding value on a user-facing path and return the
-    /// normalized identifier ready for [`UserStore::bind_channel`].
-    ///
-    /// Refuses, in order: a value that can never belong to a person
-    /// ([`normalize_telegram_binding`]); an account that already holds a
-    /// Telegram binding (an account holds at most one, so switching ways is
-    /// remove-then-attach — re-attaching even the identical value is refused
-    /// like any other attach); and a value already bound to another account
-    /// (anti-steal: `bind_channel` is INSERT OR REPLACE and would silently
-    /// reassign it). The at-most-one rule is Telegram-only — other channels
-    /// keep storing what they store today.
+    /// Ready for [`UserStore::bind_channel`]. Refuses, in order: a value that can never
+    /// belong to a person ([`normalize_telegram_binding`]); an account that already holds a
+    /// Telegram binding (at most one — switching ways is remove-then-attach, so re-attaching
+    /// even the same value is refused); and a value bound to another account (anti-steal:
+    /// `bind_channel` would silently reassign it). The at-most-one rule is Telegram-only.
     pub async fn validate_telegram_bind(&self, user_name: &str, value: &str) -> Result<String> {
         let identifier = normalize_telegram_binding(value)?;
         if let Some(existing) = self.telegram_binding(user_name).await? {
@@ -480,8 +412,8 @@ impl UserStore {
                 describe_telegram_binding(&existing)
             );
         }
-        // The at-most-one check above proved this account holds no Telegram row
-        // at all, so an owner found here is always someone else.
+        // The at-most-one check above proved this account holds no Telegram row, so an owner
+        // found here is always someone else.
         if let Some(owner) = self.telegram_binding_owner(&identifier).await? {
             anyhow::bail!(
                 "{} is already bound to user '{owner}' — remove that binding on the \
@@ -492,20 +424,18 @@ impl UserStore {
         Ok(identifier)
     }
 
-    /// Attach a Telegram binding to an account: validate, then record it.
-    /// Returns the normalized identifier (the number itself for a numeric id).
+    /// Validate, then record. Returns the normalized identifier (the number itself for a
+    /// numeric id).
     pub async fn bind_telegram(&self, user_name: &str, value: &str) -> Result<String> {
         let identifier = self.validate_telegram_bind(user_name, value).await?;
         self.attach_telegram_binding(user_name, &identifier).await?;
         Ok(identifier)
     }
 
-    /// [`UserStore::bind_telegram`] for the admin, whose own bind has always
-    /// also recorded a nickname as its starting address — kept for
-    /// compatibility with how that address has always been stored, not because
-    /// a nickname is sendable (it is not a Telegram chat id, so it only starts
-    /// working once the admin writes to the bot). A number is a real address on
-    /// every path; no other path records a nickname address.
+    /// For the admin alone, whose bind has always also recorded a nickname as its starting
+    /// address — kept for compatibility with how that address has always been stored, not
+    /// because a nickname is sendable (it only starts working once the admin writes to the
+    /// bot). A number is a real address on every path.
     pub async fn bind_telegram_for_admin(&self, value: &str) -> Result<String> {
         let identifier = self.bind_telegram(ADMIN_USER_NAME, value).await?;
         if !telegram_identifier_is_number(&identifier) {
@@ -515,12 +445,10 @@ impl UserStore {
         Ok(identifier)
     }
 
-    /// Record an already-validated Telegram `identifier` as `user_name`'s
-    /// binding, and — when it is a number — that number as the binding's own
-    /// delivery address. A number is a valid private-chat address, so it is
-    /// known from the start (Telegram still forbids a bot to open the
-    /// conversation until that person writes); a nickname has no address until
-    /// its owner writes, so nothing is recorded for it here.
+    /// When `identifier` is a number, that number is also the binding's delivery address: a
+    /// valid private-chat address from the start (Telegram still forbids a bot to open the
+    /// conversation until that person writes). A nickname has no address yet, so nothing is
+    /// recorded for it.
     pub async fn attach_telegram_binding(&self, user_name: &str, identifier: &str) -> Result<()> {
         self.bind_channel(user_name, "telegram", identifier).await?;
         if telegram_identifier_is_number(identifier) {
@@ -530,8 +458,7 @@ impl UserStore {
         Ok(())
     }
 
-    /// The account's Telegram binding identifier, if it holds one. An account
-    /// holds at most one; a legacy account with several reports the first.
+    /// An account holds at most one; a legacy account with several reports the first.
     pub(crate) async fn telegram_binding(&self, user_name: &str) -> Result<Option<String>> {
         Ok(self
             .get_user_channels(user_name)
@@ -541,9 +468,7 @@ impl UserStore {
             .map(|c| c.identifier))
     }
 
-    /// The account that already holds `identifier` — under any spelling of the
-    /// same number — if any. Uses the same matching as the sender path, so a
-    /// value that differs only in spelling is recognised as the same value.
+    /// Under any spelling of the same number, matched as on the sender path.
     async fn telegram_binding_owner(&self, identifier: &str) -> Result<Option<String>> {
         let matched = match telegram_key(identifier) {
             Some(TelegramKey::Number(number)) => {
@@ -554,18 +479,15 @@ impl UserStore {
         Ok(matched.map(|matched| matched.user_name))
     }
 
-    /// Resolve a Telegram sender to the account that owns them, by the sender's
-    /// OWN identity — never by the conversation the event arrived in: the
-    /// numeric id first (a number belongs to that one person and survives a
-    /// rename or a dropped nickname), then the nickname, which decides only
-    /// when no number matches. `nickname` is `None` for a sender Telegram
-    /// reports without one. Returns the matched binding's stored identifier
-    /// alongside the account, so the caller refreshes the address of the
-    /// binding that actually matched.
+    /// By the sender's OWN identity, never by the conversation the event arrived in: the
+    /// numeric id first (it belongs to that one person and survives a rename or a dropped
+    /// nickname), then the nickname, which decides only when no number matches. `nickname` is
+    /// `None` for a sender Telegram reports without one. The matched binding's stored
+    /// identifier comes back alongside the account, so the caller refreshes the address that
+    /// actually matched.
     ///
-    /// A stored value is matched by the shape it was always meant to have, so
-    /// an existing binding spelled `00123` is the number 123; one that equals a
-    /// service identity authorizes nobody.
+    /// A stored value is matched by the shape it was meant to have (`00123` is the number
+    /// 123); one equal to a service identity authorizes nobody.
     pub async fn resolve_telegram_user(
         &self,
         numeric_id: Option<&str>,
@@ -611,7 +533,6 @@ impl UserStore {
         Ok(nickname_match)
     }
 
-    /// Unbind a channel from a user.
     pub async fn unbind_channel(
         &self,
         user_name: &str,
@@ -627,7 +548,6 @@ impl UserStore {
         Ok(())
     }
 
-    /// Update the reply_target for a channel binding (called on every incoming message).
     pub async fn update_channel_contact(
         &self,
         channel: &str,
@@ -644,7 +564,6 @@ impl UserStore {
         Ok(())
     }
 
-    /// Get all channel bindings for a user.
     pub async fn get_user_channels(&self, user_name: &str) -> Result<Vec<ChannelBinding>> {
         self.conn
             .query_map_strict(
@@ -661,13 +580,10 @@ impl UserStore {
             .await
     }
 
-    /// Convert a `users` table row into a [`UserRecordEntry`], loading channel
-    /// bindings.
     async fn user_entry_from_row(&self, row: &db::Row) -> Result<UserRecordEntry> {
         let name: String = row.get(COL_USERS_NAME)?;
-        // A failed channel read must not render as "no binding": carry the
-        // failure beside the record so the GUI can surface it instead of
-        // offering to bind.
+        // A failed channel read must not render as "no binding": carry the failure beside the
+        // record so the GUI can surface it instead of offering to bind.
         let (channels, channels_error) = match self.get_user_channels(&name).await {
             Ok(channels) => (channels, None),
             Err(e) => (Vec::new(), Some(e.to_string())),
@@ -683,10 +599,8 @@ impl UserStore {
         })
     }
 
-    // ── Lookup / listing ──────────────────────────────────────
-
-    /// Shared listing body: run `suffix` (everything after `FROM users`) and
-    /// collect one [`UserRecordEntry`] per row with channel bindings.
+    /// Run `suffix` (everything after `FROM users`) and collect one [`UserRecordEntry`] per
+    /// row with channel bindings.
     async fn list_users_where(
         &self,
         suffix: &str,
@@ -701,22 +615,18 @@ impl UserStore {
         Ok(users)
     }
 
-    /// Find a single account by exact name, returning their full record with
-    /// channel bindings. Returns `None` if no such account exists.
+    /// `None` if no such account exists.
     pub async fn find_by_name(&self, user_name: &str) -> Result<Option<UserRecord>> {
         self.list_users_where("WHERE name = ?1", db::params![user_name])
             .await
             .map(|users| users.into_iter().next().map(|entry| entry.record))
     }
 
-    /// List every account with the outcome of each account's channel-binding read.
     pub async fn list_users(&self) -> Result<Vec<UserRecordEntry>> {
         self.list_users_where("", db::params![]).await
     }
 
-    /// Set the account's selected managed workspace, beside
-    /// [`Self::set_image_gen_model`] / [`Self::set_video_model`]. `None` clears
-    /// the column — the account's personal workspace (computed on the fly);
+    /// `None` clears the column (the account's personal workspace, computed on the fly);
     /// `Some(name)` selects that managed workspace.
     pub(crate) async fn set_selected_workspace(
         &self,
@@ -729,8 +639,7 @@ impl UserStore {
         Ok(())
     }
 
-    /// Set the user's active image-generation model (their Telegram picker
-    /// choice). An empty/whitespace value resolves to the default at read time.
+    /// An empty/whitespace value resolves to the default at read time.
     pub async fn set_image_gen_model(&self, name: &str, model: &str) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
         upsert_user_column(&tx, name, "image_gen_model", Some(model)).await?;
@@ -738,7 +647,6 @@ impl UserStore {
         Ok(())
     }
 
-    /// Set the user's active video model (their Telegram picker choice).
     /// An empty/whitespace value resolves to the default at read time.
     pub async fn set_video_model(&self, name: &str, model: &str) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
@@ -747,8 +655,7 @@ impl UserStore {
         Ok(())
     }
 
-    /// The local day (`YYYY-MM-DD`) on which the nightly memory inventory last
-    /// asked this account's assistant, if it ever has.
+    /// The local day (`YYYY-MM-DD`) of the last nightly memory inventory ask, if any.
     pub(crate) async fn memory_inventory_day(&self, name: &str) -> Result<Option<String>> {
         self.user_column("memory_inventory_day", name).await
     }
@@ -762,19 +669,15 @@ impl UserStore {
         Ok(())
     }
 
-    // ── Custom tool grants ────────────────────────────────────
-
-    /// The custom tools granted to `user_name`, byte-sorted; empty when the
-    /// user has no grants or no row.
+    /// Byte-sorted; empty when the user has no grants or no row.
     pub(crate) async fn get_grants(&self, user_name: &str) -> Result<Vec<String>> {
         Ok(parse_grants(
             self.user_column("granted_tools", user_name).await?,
         ))
     }
 
-    /// Grant the custom tool `tool` to `user_name`. Granting is idempotent, and
-    /// a grant never inserts a users row (a ghost user would appear in the GUI),
-    /// so the caller reports the missing user itself.
+    /// Idempotent, and a grant never inserts a users row (a ghost user would appear in the
+    /// GUI), so the caller reports the missing user itself.
     pub(crate) async fn add_grant(&self, user_name: &str, tool: &str) -> Result<GrantChange> {
         self.update_grants(user_name, |grants| {
             if grants.iter().any(|g| g == tool) {
@@ -786,10 +689,9 @@ impl UserStore {
         .await
     }
 
-    /// Revoke the custom tool `tool` from `user_name`. Idempotent: an absent
-    /// grant is a silent no-op. The result tells the caller which of the three
-    /// cases it hit, so it can report a missing user instead of a false
-    /// confirmation — a revoke never inserts a row either.
+    /// Idempotent: an absent grant is a silent no-op. The result tells the caller which of the
+    /// three cases it hit, so it can report a missing user instead of a false confirmation — a
+    /// revoke never inserts a row either.
     pub(crate) async fn remove_grant(&self, user_name: &str, tool: &str) -> Result<GrantChange> {
         self.update_grants(user_name, |grants| {
             let before = grants.len();
@@ -799,8 +701,7 @@ impl UserStore {
         .await
     }
 
-    /// Every user with at least one granted custom tool, ordered by user name.
-    /// The empty-list filter runs in Rust rather than SQL: `[]` and an
+    /// Ordered by user name. The empty-list filter runs in Rust rather than SQL: `[]` and an
     /// unparseable value are both empty sets, and the users table is tiny.
     pub(crate) async fn list_grants(&self) -> Result<Vec<(String, Vec<String>)>> {
         let rows = self
@@ -822,11 +723,9 @@ impl UserStore {
             .collect())
     }
 
-    /// Read-modify-write the `users.granted_tools` set for `user_name` in one
-    /// transaction. `mutate` edits the parsed, sorted set; returning `false`
-    /// skips the write (the caller's idempotent no-op). A missing row is left
-    /// untouched, never inserted — the caller reports that from the returned
-    /// [`GrantChange`] instead.
+    /// In one transaction. `mutate` edits the parsed, sorted set; returning `false` skips the
+    /// write (the caller's idempotent no-op). A missing row is left untouched, never inserted —
+    /// the caller reports that from the returned [`GrantChange`].
     async fn update_grants(
         &self,
         user_name: &str,
@@ -848,8 +747,8 @@ impl UserStore {
             tx.rollback().await?;
             return Ok(GrantChange::Unchanged);
         }
-        // The closures only add or remove one name, so a push is the one thing
-        // that can break the parsed set's sorted order.
+        // The closures only add or remove one name, so a push is the one thing that can break
+        // the parsed set's sorted order.
         grants.sort();
         tx.execute(
             "UPDATE users SET granted_tools = ?1 WHERE name = ?2",
@@ -861,10 +760,8 @@ impl UserStore {
     }
 }
 
-/// What the owner is told when their account's folder cannot be created: the
-/// cause, and the single remedy that exists for it. An account whose name the
-/// rule refuses keeps its name — there is no rename — so it has to be removed
-/// and added again.
+/// The cause, and the single remedy: an account whose name the rule refuses keeps its name —
+/// there is no rename — so it has to be removed and added again.
 fn owner_message(name: &str, error: &anyhow::Error) -> String {
     let cause = if let Some(problem) = crate::util::folder_name::folder_name_problem(name) {
         format!(
@@ -885,9 +782,8 @@ fn owner_message(name: &str, error: &anyhow::Error) -> String {
     )
 }
 
-/// What a caller's answer says about an account whose personal workspace folder
-/// could not be created: the part that did not happen, and nothing more — no
-/// cause and no remedy, because another writer can create the folder later.
+/// The part that did not happen, and nothing more — no cause and no remedy, because another
+/// writer can create the folder later.
 #[must_use]
 pub(crate) fn missing_personal_workspace_note(name: &str) -> String {
     format!(
@@ -896,16 +792,14 @@ pub(crate) fn missing_personal_workspace_note(name: &str) -> String {
     )
 }
 
-/// The reports a folder failure produces, claimed once per process and
-/// separately — so a report with no way to go out does not spend the other's —
-/// under one key per medium, account and cause. `"log"` and `"owner"` are the
-/// two media, both claimed in [`UserStore::report_personal_workspace_failure`].
+/// Claimed once per process and separately per medium, so a report with no way to go out does
+/// not spend the other's; the key is per medium, account and cause. `"log"` and `"owner"` are
+/// the two media.
 static REPORTED_WORKSPACE_FAILURES: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// Whether this report has not gone out yet in this process, claiming it for
-/// `medium` if so. Called only where the report is actually made, so a claim is
-/// never spent on an attempt that had nowhere to go.
+/// Whether this report has not gone out yet, claiming it for `medium` if so. Called only where
+/// the report is actually made, so a claim is never spent on an attempt with nowhere to go.
 fn claim_report(name: &str, error: &anyhow::Error, medium: &str) -> bool {
     REPORTED_WORKSPACE_FAILURES
         .lock()
@@ -913,8 +807,7 @@ fn claim_report(name: &str, error: &anyhow::Error, medium: &str) -> bool {
         .insert(format!("{medium}\u{0}{name}\u{0}{error}"))
 }
 
-/// The Telegram reply targets among a channel-binding read. A failed read
-/// yields no targets — never a partial send list.
+/// A failed read yields no targets — never a partial send list.
 fn telegram_reply_targets(bindings: Vec<ChannelBinding>) -> Vec<String> {
     bindings
         .into_iter()
@@ -923,20 +816,18 @@ fn telegram_reply_targets(bindings: Vec<ChannelBinding>) -> Vec<String> {
         .collect()
 }
 
-/// What a grants read-modify-write did.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum GrantChange {
-    /// No such `users` row — nothing was written, and none is inserted.
+    /// Nothing was written, and none is inserted.
     NoUser,
-    /// The row exists and already held the requested state — nothing written.
+    /// Already held the requested state — nothing written.
     Unchanged,
-    /// The row exists and its grant set changed.
+    /// Its grant set changed.
     Changed,
 }
 
-/// Parse the `users.granted_tools` JSON array column. A NULL, empty or
-/// unparseable value yields an empty list (fail-closed: unknown grants are
-/// no grants).
+/// A NULL, empty or unparseable value yields an empty list (fail-closed: unknown grants are no
+/// grants).
 fn parse_grants(raw: Option<String>) -> Vec<String> {
     let mut grants = raw
         .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
@@ -946,9 +837,7 @@ fn parse_grants(raw: Option<String>) -> Vec<String> {
     grants
 }
 
-/// Upsert a single user column within an existing transaction.
-///
-/// The `field` parameter MUST be a compile-time string literal to prevent SQL injection.
+/// `field` MUST be a compile-time string literal to prevent SQL injection.
 async fn upsert_user_column(
     tx: &TxGuard<'_>,
     name: &str,
@@ -968,53 +857,41 @@ async fn upsert_user_column(
     Ok(())
 }
 
-// ── UserRecord ────────────────────────────────────────────────
-
-/// A full account row, e.g. returned by [`UserStore::find_by_name`].
 #[derive(Debug, Clone)]
 pub struct UserRecord {
-    /// The canonical account name. When it is [`ADMIN_USER_NAME`], this is the
-    /// admin account.
+    /// When it is [`ADMIN_USER_NAME`], this is the admin account.
     pub name: String,
     /// Selected managed workspace name, NULL = personal workspace.
     pub selected_workspace: Option<String>,
-    /// The custom tools granted to this account (the `users.granted_tools` JSON
-    /// array column), byte-sorted; empty when none. A grant recorded for the
-    /// admin is carried and listed like any other; only the account-management
-    /// card omits it, since the whole catalogue is implicitly available to the
-    /// admin.
+    /// The `users.granted_tools` JSON array, byte-sorted; empty when none. A grant recorded for
+    /// the admin is carried and listed like any other; only the account-management card omits it,
+    /// the whole catalogue being implicitly available to the admin.
     pub granted_tools: Vec<String>,
     /// Channel bindings for this account (Telegram, etc.).
     pub channels: Vec<ChannelBinding>,
 }
 
-/// One `users` row together with the outcome of its channel-binding read. The
-/// domain [`UserRecord`] is channel-empty both when the account has no bindings
-/// and when the read failed, so a surface that renders bindings needs the
-/// outcome to tell the two apart; it travels beside the record, not inside it.
+/// [`UserRecord`] is channel-empty both when the account has no bindings and when the read
+/// failed, so a surface that renders bindings needs the outcome to tell the two apart; it
+/// travels beside the record, not inside it.
 #[derive(Debug, Clone)]
 pub struct UserRecordEntry {
     pub record: UserRecord,
-    /// `Some` when the channel-binding read failed; `record.channels` is then
-    /// empty.
+    /// `Some` when the read failed; `record.channels` is then empty.
     pub channels_error: Option<String>,
 }
 
-/// The one admin test: an account is the admin exactly when its name is
-/// [`ADMIN_USER_NAME`] — no stored token, flag or kind ever marks one. Callers
-/// in a sync context (GUI state) apply it to a name they already hold; a bare,
-/// untrusted name goes through [`is_admin`], which backs the same test with the
-/// account's row.
+/// An account is the admin exactly when its name is [`ADMIN_USER_NAME`] — no stored token, flag
+/// or kind ever marks one. Sync callers (GUI state) apply it to a name they hold; a bare,
+/// untrusted name goes through [`is_admin`], which backs the same test with the row.
 #[must_use]
 pub(crate) fn is_admin_name(name: &str) -> bool {
     name == ADMIN_USER_NAME
 }
 
-/// Refuse the reserved admin name on a user-facing account path: only
-/// [`UserStore::ensure_admin_user`] may create the admin account, and the name
-/// IS the admin marker, so binding a channel to it would address the admin.
-/// [`UserStore::add_user`] exempts the same name from the collision rule, for
-/// that one seeding path.
+/// Only [`UserStore::ensure_admin_user`] may create the admin account, and the name IS the admin
+/// marker, so binding a channel to it would address the admin. [`UserStore::add_user`] exempts
+/// the same name from the collision rule for that one seeding path.
 pub(crate) fn refuse_admin_name(name: &str) -> Result<()> {
     if is_admin_name(name) {
         anyhow::bail!(
@@ -1024,37 +901,31 @@ pub(crate) fn refuse_admin_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// The other half of the account-name rule, in the words the account-adding
-/// tool's schema answers with: the name of a new account is refused when another
-/// account or the admin already holds it once case and Unicode composition are
-/// ignored.
+/// The other half of the account-name rule, in the words the account-adding tool's schema
+/// answers with: a new account's name is refused when another account or the admin already holds
+/// it once case and Unicode composition are ignored.
 pub(crate) const NAME_COLLISION_RULE: &str = "A new account's name is also refused when another \
      account or the admin already has it, ignoring case and Unicode composition — on macOS those \
      spellings are one folder, on Windows a case difference alone already is.";
 
-/// The message every taken-name refusal carries — the exact duplicate and the
-/// case/composition collision alike, so a surface reports both the same way.
+/// The exact duplicate and the case/composition collision alike, so a surface reports both the
+/// same way.
 pub(crate) fn name_taken_message(name: &str) -> String {
     format!("A user named '{name}' already exists")
 }
 
-/// The form two account names collide in: `NFD(toCasefold(NFD(name)))`, the
-/// canonical caseless matching of the Unicode standard — what
-/// [`collides_with_existing`] judges by. Folding is the *full* one, so `ß` and
-/// `ss` (and a three-character `ﬃ` and `ffi`) are one key; decomposition is
-/// canonical, so composed and decomposed accents are one key.
+/// `NFD(toCasefold(NFD(name)))`, the Unicode canonical caseless matching: the full fold, so `ß`
+/// and `ss` (and `ﬃ` and `ffi`) are one key, and canonical decomposition, so composed and
+/// decomposed accents are one key.
 fn caseless_name_key(name: &str) -> String {
     let decomposed: String = name.nfd().collect();
     UniCase::new(decomposed).to_folded_case().nfd().collect()
 }
 
-/// Whether `name` is one an existing account or the admin already holds, once
-/// case and Unicode composition are ignored — the one place the collision rule
-/// lives, judged by both [`UserStore::add_user`] and the desktop's add-user
-/// dialog. `existing` is the caller's reading of the stored names; the reserved
-/// admin name counts whether or not its row is in that reading. A byte-identical
-/// name collides here too: the store's exemption of the idempotent re-add is its
-/// own policy, applied at its call site.
+/// The one place the collision rule lives, judged by [`UserStore::add_user`] and the desktop's
+/// add-user dialog. `existing` is the caller's reading of the stored names; the reserved admin name
+/// counts whether or not its row is in that reading. A byte-identical name collides here too — the
+/// store's exemption of the idempotent re-add is its own policy, applied at its call site.
 pub(crate) fn collides_with_existing<'a>(
     name: &str,
     existing: impl IntoIterator<Item = &'a str>,
@@ -1065,13 +936,10 @@ pub(crate) fn collides_with_existing<'a>(
         .any(|existing| caseless_name_key(existing) == key)
 }
 
-/// Characters of a typed name the taken-name line spells out before it is
-/// tapered: the name is the only unbounded part of that line, so this is what
-/// keeps it one line.
+/// The name is the only unbounded part of the taken-name line, so this keeps it one line.
 const MAX_NAME_IN_REFUSAL_CHARS: usize = 24;
 
-/// `name` as the taken-name line may spell it: its first
-/// [`MAX_NAME_IN_REFUSAL_CHARS`] characters, then an ellipsis if there were more.
+/// Its first [`MAX_NAME_IN_REFUSAL_CHARS`] characters, then an ellipsis if there were more.
 fn one_line_name(name: &str) -> String {
     match name.char_indices().nth(MAX_NAME_IN_REFUSAL_CHARS) {
         Some((end, _)) => format!("{}…", &name[..end]),
@@ -1079,13 +947,10 @@ fn one_line_name(name: &str) -> String {
     }
 }
 
-/// Why the desktop's add-user dialog cannot create an account called `name`, as
-/// the single line it shows under its field: the refusals the creation path
-/// applies, in its order — the reserved admin name and the folder rule
-/// ([`validate_new_user_name`]), then the collision
-/// ([`collides_with_existing`]) — so a name the dialog judges unusable never
-/// reaches the store. `existing` is the caller's reading of the stored names.
-/// `None` exactly when the name is one to create a new account with.
+/// The refusals the creation path applies, in order — the reserved admin name and the folder
+/// rule ([`validate_new_user_name`]), then the collision ([`collides_with_existing`]) — so a
+/// name the dialog judges unusable never reaches the store. `None` exactly when the name is one
+/// to create a new account with.
 pub(crate) fn new_account_name_problem<'a>(
     name: &str,
     existing: impl IntoIterator<Item = &'a str>,
@@ -1104,9 +969,8 @@ pub(crate) fn new_account_name_problem<'a>(
     None
 }
 
-/// Refuse a name the account's personal-workspace folder cannot be built from.
-/// The name is used verbatim as that folder's name, so it must be creatable on
-/// every platform the product runs on (see [`crate::util::folder_name`]).
+/// The name is the folder's name verbatim, so it must be creatable on every platform the
+/// product runs on (see [`crate::util::folder_name`]).
 fn validate_folder_name(name: &str) -> Result<()> {
     let Some(problem) = crate::util::folder_name::folder_name_problem(name) else {
         return Ok(());
@@ -1118,17 +982,14 @@ fn validate_folder_name(name: &str) -> Result<()> {
     );
 }
 
-/// Both guards, for a name that is about to become a new account: the reserved
-/// admin name ([`refuse_admin_name`]) and the folder rule
-/// ([`validate_folder_name`]). The third — the collision with an existing name
-/// ([`NAME_COLLISION_RULE`]) — needs the store, and lives in
-/// [`UserStore::add_user`], the funnel every creation path goes through.
+/// The reserved admin name ([`refuse_admin_name`]) and the folder rule
+/// ([`validate_folder_name`]). The third — collision with an existing name — needs the store
+/// and lives in [`UserStore::add_user`], the funnel every creation path goes through.
 pub(crate) fn validate_new_user_name(name: &str) -> Result<()> {
     refuse_admin_name(name)?;
     validate_folder_name(name)
 }
 
-/// A single channel binding for an account.
 #[derive(Debug, Clone)]
 pub struct ChannelBinding {
     /// The channel type (e.g. "telegram").
@@ -1139,30 +1000,19 @@ pub struct ChannelBinding {
     pub reply_target: Option<String>,
 }
 
-/// The account a Telegram sender belongs to, with the binding that matched it.
 #[derive(Debug, Clone)]
 pub struct TelegramMatch {
-    /// The account's canonical name.
     pub user_name: String,
-    /// The stored identifier of the binding that matched — the binding whose
-    /// delivery address follows this sender's conversation.
+    /// The stored identifier of the binding that matched — whose delivery address follows this
+    /// sender's conversation.
     pub identifier: String,
 }
 
-// ── Personal workspace path helper ────────────────────────────
-
-/// The userspaces root: `<storage_root>/userspaces`.
+/// The userspaces root, `<storage_root>/userspaces`: the single resolution point, shared by
+/// [`personal_workspace_path`] and `research_cleanup::sweep_media` so both always agree.
 ///
-/// This is the single resolution point for where user workspaces live — shared
-/// by [`personal_workspace_path`] and `research_cleanup::sweep_media` so both
-/// always agree.
-///
-/// Resolves under the CONFIG storage root when it is set (production:
-/// `~/.mahbot`, set at startup; tests: the shared test root, set by
-/// `crate::util::test::init_test_stores`). Otherwise it falls back to
-/// [`fallback_storage_root`] — production uses the default config directory,
-/// tests the shared test root — so a test reaching this fallback (e.g.
-/// `add_user` without `init_test_stores`) still stays inside test-owned
+/// Resolves under the CONFIG storage root when set, else [`fallback_storage_root`] — so a test
+/// reaching the fallback (`add_user` without `init_test_stores`) still stays inside test-owned
 /// storage, never the real user config directory.
 #[must_use]
 pub(crate) fn userspaces_root() -> PathBuf {
@@ -1172,11 +1022,8 @@ pub(crate) fn userspaces_root() -> PathBuf {
     storage_root.join("userspaces")
 }
 
-/// Storage root used when CONFIG has none set yet.
-///
-/// Production: the default config directory (`~/.mahbot`). Tests: the shared
-/// test root — a test that reaches this fallback must never write into the
-/// real user config directory. Production always has the storage root set at
+/// Production: the default config directory. Tests: the shared test root, so a test reaching this
+/// fallback never writes into the real config directory; production always sets the root at
 /// startup, so the divergence is unobservable in the shipped binary.
 #[cfg(test)]
 fn fallback_storage_root() -> PathBuf {
@@ -1189,15 +1036,11 @@ fn fallback_storage_root() -> PathBuf {
         .unwrap_or_else(|_| std::env::temp_dir().join("mahbot_userspaces"))
 }
 
-/// Whether `user_name` may be used to resolve a personal-workspace path:
-/// non-empty, no path separators, not a dot entry. Containment, on both sides
-/// of the filesystem: the read-side callers (the session-start `<workspace-structure>`
-/// picture, the compaction dump and the personal-workspace change report) apply it
-/// before touching an existing account's folder, and [`ensure_personal_workspace`]
-/// applies it before creating one, so a stored name can never address the
-/// userspaces root or another account's directory. A name coming in for a new
-/// account is refused outright by [`validate_folder_name`], which is the
-/// stricter cross-platform rule.
+/// Non-empty, no path separators, not a dot entry. Applied on both sides: the read-side callers
+/// (the `<workspace-structure>` picture, the compaction dump, the change report) before touching
+/// an existing folder, and [`ensure_personal_workspace`] before creating one, so a stored name
+/// can never address the userspaces root or another account's directory. A new account's name is
+/// refused outright by [`validate_folder_name`], the stricter cross-platform rule.
 #[must_use]
 pub(crate) fn is_valid_personal_user_name(user_name: &str) -> bool {
     !user_name.trim().is_empty()
@@ -1205,59 +1048,45 @@ pub(crate) fn is_valid_personal_user_name(user_name: &str) -> bool {
         && !matches!(user_name, "." | "..")
 }
 
-/// Return the filesystem path for a user's personal workspace:
-/// `<storage_root>/userspaces/<name>/`.
-///
-/// This path is computed on the fly — personal workspaces have no `workspaces`
-/// row.
+/// `<storage_root>/userspaces/<name>/`, computed on the fly — personal workspaces have no
+/// `workspaces` row.
 #[must_use]
 pub fn personal_workspace_path(user_name: &str) -> PathBuf {
     userspaces_root().join(user_name)
 }
 
-/// The prefix of a personal workspace's synthetic name (`personal:{user}`).
-/// Personal workspaces are not `workspaces` rows, so a row carrying this prefix
-/// is a legacy leftover rather than a managed workspace.
+/// Personal workspaces are not `workspaces` rows, so a row carrying this prefix is a legacy
+/// leftover rather than a managed workspace.
 const PERSONAL_WORKSPACE_PREFIX: &str = "personal:";
 
-/// The canonical GUI-wide workspace name for a user's personal workspace:
-/// `personal:{user_name}`. This is the single search-engine key shared by the
-/// agent side and the dashboard.
+/// `personal:{user_name}`: the single search-engine key shared by agent side and dashboard.
 #[must_use]
 pub fn personal_workspace_name(user_name: &str) -> String {
     format!("{PERSONAL_WORKSPACE_PREFIX}{user_name}")
 }
 
-/// Ensure the personal workspace directory for a user exists and is
-/// git-initialized. Creates the directory if it's missing and runs `git init`
-/// only when no repo is present yet (idempotent otherwise).
+/// Creates the directory if missing and runs `git init` only when no repo is present yet
+/// (idempotent otherwise).
 ///
-/// `Err` when the name cannot be a folder name on every platform the product
-/// runs on, or when the platform refuses to create the directory. Nothing is
-/// ever created outside `userspaces/`: the caller reports the failure
-/// ([`UserStore::report_personal_workspace_failure`] on the creation path, the
-/// search tool on its lazy retry). A `git init` failure stays a warning — it
-/// leaves a usable directory behind.
+/// `Err` when the name cannot be a folder name on every platform, or the platform refuses to
+/// create the directory. Nothing is ever created outside `userspaces/`; the caller reports the
+/// failure. A `git init` failure stays a warning — it leaves a usable directory behind.
 pub(crate) async fn ensure_personal_workspace(name: &str) -> Result<()> {
-    // Containment, whoever stored the name: a name that would resolve outside
-    // its own folder never reaches the filesystem at all.
+    // Containment: a name resolving outside its own folder never reaches the filesystem.
     if !is_valid_personal_user_name(name) {
         anyhow::bail!("'{name}' is not a usable personal-workspace name");
     }
     let path = personal_workspace_path(name);
     if !path.is_dir() {
-        // The one cross-platform rule, applied where this function is about to
-        // create a folder: a stored name that only THIS platform would accept
-        // keeps the folder it already has. The parts that write *inside* an
-        // account's folder (a generated file, an upload) bring it into being
-        // with their own `create_dir_all`, so a stored name's folder can also
-        // appear there.
+        // The cross-platform rule, applied where a folder is about to be created: a stored name
+        // only THIS platform would accept keeps the folder it already has. Writers inside an
+        // account's folder bring it into being with their own `create_dir_all`.
         validate_folder_name(name)?;
         tokio::fs::create_dir_all(&path)
             .await
             .with_context(|| format!("create the folder {}", path.display()))?;
     }
-    // Try git init only when there is no repo yet; non-fatal on failure.
+    // `git init` only when there is no repo yet; non-fatal on failure.
     if path.join(".git").exists() {
         return Ok(());
     }
@@ -1276,28 +1105,24 @@ pub(crate) async fn ensure_personal_workspace(name: &str) -> Result<()> {
     Ok(())
 }
 
-// ── Free functions ──────────────────────────────────────────────
-
-/// Active image-gen model for `user_name`: the user's explicit Telegram
-/// picker choice, or the hardcoded default when unset/unresolvable.
+/// Active image-gen model for `user_name`: the user's explicit Telegram picker choice, or the
+/// hardcoded default when unset/unresolvable.
 pub async fn resolve_image_gen_model(user_name: &str) -> String {
     resolve_user_model_column(user_name, "image_gen_model")
         .await
         .unwrap_or_else(|| crate::config::DEFAULT_IMAGE_GEN_MODEL.to_string())
 }
 
-/// Active video model for `user_name`: the user's explicit Telegram
-/// picker choice, or the hardcoded default when unset/unresolvable.
+/// Active video model for `user_name`: the user's explicit Telegram picker choice, or the hardcoded
+/// default when unset/unresolvable.
 pub async fn resolve_video_model(user_name: &str) -> String {
     resolve_user_model_column(user_name, "video_model")
         .await
         .unwrap_or_else(|| crate::config::DEFAULT_VIDEO_MODEL.to_string())
 }
 
-/// Read a user's model column via a single-column SELECT (this is a
-/// per-tool-call/per-Assistant-turn hot path, so no full `UserRecord` load).
-/// `None` — user missing, column unset/empty, or a DB error (logged; fail-open
-/// to the default, matching the generation tools' semantics).
+/// A single-column SELECT, because this is a per-tool-call hot path (no full `UserRecord` load).
+/// `None` — user missing, column unset, or a DB error (logged; fail-open to the default).
 async fn resolve_user_model_column(user_name: &str, column: &str) -> Option<String> {
     match store().user_column(column, user_name).await {
         Ok(value) => value
@@ -1310,18 +1135,15 @@ async fn resolve_user_model_column(user_name: &str, column: &str) -> Option<Stri
     }
 }
 
-/// Resolve the account's admin-aware selected workspace name — THE single
-/// admin-aware resolution primitive, shared by message routing and the GUI
-/// (boot restore, reverse-sync).
+/// THE single admin-aware resolution primitive, shared by message routing and the GUI (boot
+/// restore, reverse-sync).
 ///
-/// Workspace membership is admin-only: the admin gets their stored selection
-/// (a legacy stored personal value normalizes to the canonical
-/// `personal:{user}` name); a guest ALWAYS yields their `personal:{user}`
-/// name, never a managed workspace (a managed selection is clamped, with a
-/// warning — defense in depth against rogue re-attachment). A NULL
-/// `selected_workspace` and a missing account row both yield the canonical
-/// `personal:{user}` name; `None` is reserved for a failed read (warned) — the
-/// caller then applies its own answer, without writing one back.
+/// Workspace membership is admin-only: the admin gets their stored selection (a legacy personal
+/// value normalizes to `personal:{user}`); a guest ALWAYS gets their `personal:{user}` name,
+/// never a managed workspace (a managed selection is clamped with a warning — defence in depth
+/// against rogue re-attachment). A NULL `selected_workspace` and a missing row both yield
+/// `personal:{user}`; `None` is reserved for a failed read (warned), and the caller then applies
+/// its own answer without writing one back.
 pub(crate) async fn resolve_selected_workspace_name(user_name: &str) -> Option<String> {
     let stored = match store().get_selected_workspace_name(user_name).await {
         Ok(stored) => stored,
@@ -1348,11 +1170,9 @@ pub(crate) async fn resolve_selected_workspace_name(user_name: &str) -> Option<S
     Some(personal_workspace_name(user_name))
 }
 
-/// The project the desktop falls back to whenever the active selection names
-/// none that exists: the first managed name in the order the footer picker
-/// lists the projects (`workspaces.name`, ascending). Start-up and a deletion
-/// share this one rule, so a restart never changes which project is active. A
-/// personal workspace is never a candidate.
+/// The first managed name in the footer picker's order (`workspaces.name`, ascending). Start-up
+/// and a deletion share this one rule, so a restart never changes the active project. A personal
+/// workspace is never a candidate.
 #[must_use]
 pub(crate) fn fallback_workspace_name<'a>(
     names: impl IntoIterator<Item = &'a str>,
@@ -1363,16 +1183,13 @@ pub(crate) fn fallback_workspace_name<'a>(
         .min()
 }
 
-/// The managed workspaces — every `workspaces` row except a personal space,
-/// in the order the desktop footer picker lists them (`workspaces.name`, already
-/// ordered by the store). A personal workspace is never included: those are not
-/// `workspaces` rows, and a legacy row carrying a `personal:{user}` name is
-/// filtered out.
+/// Every `workspaces` row except a personal space, in the footer picker's order
+/// (`workspaces.name`, already ordered by the store). A personal workspace is never included:
+/// those are not `workspaces` rows, and a legacy row named `personal:{user}` is filtered out.
 ///
-/// Two consumers: the Assistant's `workspace` tool (the whole set for `list`
-/// / `board` / `pause` / `resume`, and the set a ticket id's workspace prefix
-/// must belong to), and the path tool's admin write policy, which refuses a
-/// write inside any managed workspace.
+/// Two consumers: the Assistant's `workspace` tool (the whole set for `list`/`board`/`pause`/
+/// `resume`, and the set a ticket id's workspace prefix must belong to), and the path tool's
+/// admin write policy, which refuses a write inside any managed workspace.
 pub async fn managed_workspaces() -> Result<Vec<Workspace>> {
     let store = crate::workspace::WORKSPACES
         .get()
@@ -1385,11 +1202,9 @@ pub async fn managed_workspaces() -> Result<Vec<Workspace>> {
         .collect())
 }
 
-/// Get the current active workspace for an account, admin-aware.
-///
-/// Resolves through [`resolve_selected_workspace_name`]: the admin gets their
-/// stored workspace (managed or personal), a guest always resolves to their
-/// personal workspace. `None` (a read failure) yields the personal workspace.
+/// Resolves through [`resolve_selected_workspace_name`]: the admin gets their stored workspace
+/// (managed or personal), a guest always their personal one. `None` (a read failure) yields the
+/// personal workspace.
 async fn get_workspace(user_name: &str) -> Result<Option<Workspace>> {
     match resolve_selected_workspace_name(user_name).await {
         Some(ws_name) => resolve_workspace(&ws_name).await,
@@ -1397,34 +1212,25 @@ async fn get_workspace(user_name: &str) -> Result<Option<Workspace>> {
     }
 }
 
-/// Resolve a workspace by name, synthesizing a personal workspace
-/// (`personal:{user}`) when the name is not in the `workspaces` table.
+/// Synthesizing a personal workspace (`personal:{user}`) when the name is not in the
+/// `workspaces` table: personal workspaces are NOT stored there — they live at
+/// `~/.mahbot/userspaces/<user>/` as ephemeral [`Workspace`] structs.
 ///
-/// Personal workspaces are NOT stored in the table — they live at
-/// `~/.mahbot/userspaces/<user>/` and are constructed on the fly as ephemeral
-/// [`Workspace`] structs.
+/// An absolute path to an existing directory is also a legal name
+/// (`crate::workspace::synthesize_from_path`): a custom-role launch may name any folder. A path
+/// that is a *managed* workspace's own folder resolves to that workspace, so the launch runs
+/// with its notes, pause state and search engine instead of a second, path-named area over the
+/// same tree. Any other path is addressed by the canonical path itself; a managed workspace with
+/// that name (checked first) still wins.
 ///
-/// An absolute path to an existing directory is also a legal workspace name
-/// (`crate::workspace::synthesize_from_path`): a custom-role launch may name
-/// any folder on the machine. A path that is a *managed* workspace's own
-/// folder resolves to that managed workspace, so the launch runs with its
-/// notes, its pause state and its search engine instead of a second, path-named
-/// area over the same tree. Any other path is addressed by the canonical path
-/// itself (its `name` and `path` are the same string); a managed workspace
-/// with that name (checked first) still wins.
-///
-/// Returns `Ok(Some(ws))` when the workspace is found or constructed,
-/// `Ok(None)` when the workspace genuinely does not exist (and is not a
-/// personal or directory workspace), `Err` on database errors.
-///
-/// Shared by the message router and the boot resume path so both treat
-/// synthetic personal workspaces identically.
+/// `Ok(None)` when the workspace genuinely does not exist (and is not a personal or directory
+/// workspace), `Err` on database errors. Shared by the message router and the boot resume path
+/// so both treat synthetic personal workspaces identically.
 pub async fn resolve_workspace(workspace_name: &str) -> Result<Option<Workspace>> {
     if let Some(ws) = crate::workspace::get_by_name(workspace_name).await? {
-        // A managed workspace row whose name looks like a personal workspace can
-        // only be a legacy row (validate_name rejects ':'), so `personal:{user}`
-        // shadows the personal-workspace key. Log it so the operator can clean
-        // it up — the personal key wins the registry elsewhere.
+        // A managed row whose name looks personal can only be a legacy row (`validate_name`
+        // rejects ':'), so `personal:{user}` shadows the key; log it so the operator can clean
+        // it up.
         if is_personal_workspace(&ws.name) {
             warn!(
                 workspace_name = %ws.name,
@@ -1446,7 +1252,6 @@ pub async fn resolve_workspace(workspace_name: &str) -> Result<Option<Workspace>
     }
 }
 
-/// Build a `Workspace` struct for a personal workspace.
 /// Has no diagnostics, no maintenance, no discovery — minimal defaults.
 #[must_use]
 pub(crate) fn personal_workspace_struct(user_name: &str) -> Workspace {
@@ -1456,8 +1261,7 @@ pub(crate) fn personal_workspace_struct(user_name: &str) -> Workspace {
     ws
 }
 
-/// Resolve the workspace for a user, falling back to a personal workspace
-/// if `get_workspace` fails or returns `None`.
+/// Falling back to a personal workspace if `get_workspace` fails or returns `None`.
 pub async fn resolve_workspace_for_user_name(user_name: &str) -> Workspace {
     match get_workspace(user_name).await {
         Ok(Some(ws)) => ws,
@@ -1480,21 +1284,16 @@ pub async fn resolve_workspace_for_user_name(user_name: &str) -> Workspace {
     }
 }
 
-/// The user-facing role pinned to the account's personal workspace.
 #[must_use]
 fn is_pinned_role(role: Role) -> bool {
     matches!(role, Role::Assistant)
 }
 
-/// Execution-time invariant enforcer: a pinned role (Assistant) must never
-/// run outside the envelope user's OWN personal workspace, regardless of what
-/// a producer stored — a non-personal workspace is re-pinned to
-/// `personal:{user}`, and a personal workspace belonging to a different user
-/// is re-pinned to the envelope user's own. Returns `None` when the routing
-/// must be refused outright: a pinned role with an empty `user_name` has no
-/// personal identity to pin to, and running it unpinned is never acceptable,
-/// so callers reject the job loudly instead. Non-pinned roles pass through
-/// unchanged.
+/// A pinned role (Assistant) must never run outside the envelope user's OWN personal
+/// workspace, whatever a producer stored: a non-personal workspace is re-pinned to
+/// `personal:{user}`, and another user's personal workspace to the envelope user's own. `None`
+/// means the routing must be refused outright — a pinned role with an empty `user_name` has no
+/// identity to pin to, and running it unpinned is never acceptable. Non-pinned roles pass through.
 #[must_use]
 pub(crate) fn enforce_personal_pinning(
     role: Role,
@@ -1510,25 +1309,20 @@ pub(crate) fn enforce_personal_pinning(
     Some(personal_workspace_name(user_name))
 }
 
-/// Resolve the [`Workspace`] an agent role actually operates in: the Assistant
-/// always works in the user's personal workspace regardless of the selected
-/// workspace, giving path-dependent callers (enrichment uploads,
-/// generated-media writes) the personal workspace's filesystem path. Other
-/// roles pass through unchanged.
-/// An empty `user_name` disables pinning (no personal identity to pin to),
-/// so callers must pass a resolvable user (the voice path passes
-/// [`ADMIN_USER_NAME`]).
-/// Accepted user decision (no migration): media written before pinning to a
-/// managed workspace's `uploads/`/`generated/` stays there and is no longer
-/// reachable by Assistant tools (e.g. video_edit path confinement).
+/// The Assistant always works in the user's personal workspace regardless of the selected one,
+/// giving path-dependent callers (enrichment uploads, generated-media writes) its filesystem
+/// path; other roles pass through. An empty `user_name` disables pinning, so callers must pass a
+/// resolvable user (the voice path passes [`ADMIN_USER_NAME`]).
+///
+/// Accepted (no migration): media written before pinning to a managed workspace's
+/// `uploads/`/`generated/` stays there and is no longer reachable by Assistant tools.
 #[must_use]
 pub fn effective_workspace_for_role(role: Role, ws: Workspace, user_name: &str) -> Workspace {
     if !is_pinned_role(role) {
         return ws;
     }
-    // Pass-through asymmetry with `enforce_personal_pinning`: an already-personal
-    // name stays as-is, even when it names another user, whereas the enforcer
-    // re-pins that case to the envelope user's own workspace.
+    // Asymmetric with `enforce_personal_pinning`: an already-personal name stays as-is, even
+    // when it names another user, where the enforcer re-pins it.
     if is_personal_workspace(&ws.name) {
         return ws;
     }
@@ -1543,11 +1337,9 @@ pub fn effective_workspace_for_role(role: Role, ws: Workspace, user_name: &str) 
     personal_workspace_struct(user_name)
 }
 
-/// Resolve the (role, workspace) an account's messages route to and their
-/// session lives in — the same resolution as routing, so ClearChat and
-/// Telegram /clear always clear the actual recipient: the account's selected
-/// workspace with Assistant pinning applied, and the Assistant role, every
-/// account's only role, which the session-key builders consume alongside it.
+/// The same resolution as routing, so ClearChat and Telegram /clear always clear the actual
+/// recipient: the account's selected workspace with Assistant pinning applied, and the Assistant
+/// role (every account's only role), which the session-key builders consume alongside it.
 pub async fn resolve_session_target(user_name: &str) -> (Role, Workspace) {
     let ws = resolve_workspace_for_user_name(user_name).await;
     (
@@ -1556,9 +1348,8 @@ pub async fn resolve_session_target(user_name: &str) -> (Role, Workspace) {
     )
 }
 
-/// Resolve the canonical user name whose channel binding's `reply_target`
-/// matches the given outbound recipient (exact or `target:thread`).
-/// First match wins for group chats shared by multiple users.
+/// Matched exactly, or as `target:thread`. First match wins for group chats shared by several
+/// users.
 pub async fn resolve_user_by_reply_target(channel: &str, target: &str) -> Option<String> {
     let store = USER_STORE.get()?;
     store
@@ -1587,10 +1378,8 @@ pub async fn resolve_user_by_reply_target(channel: &str, target: &str) -> Option
         })
 }
 
-/// The admin test backed by an account store: `user_name` is the admin exactly
-/// when it is the admin's name ([`is_admin_name`]) AND `store` holds its row.
-/// `None` (no store) and a failed row read both answer false, so the answer
-/// never defaults to admin rights.
+/// Exactly when the name is the admin's ([`is_admin_name`]) AND `store` holds its row. `None`
+/// (no store) and a failed read both answer false, so the answer never defaults to admin rights.
 async fn is_admin_in(store: Option<&UserStore>, user_name: &str) -> bool {
     if !is_admin_name(user_name) {
         return false;
@@ -1604,14 +1393,12 @@ async fn is_admin_in(store: Option<&UserStore>, user_name: &str) -> bool {
     })
 }
 
-/// Whether `user_name` is the admin account — [`is_admin_in`] bound to the
-/// process-global account store.
+/// [`is_admin_in`] bound to the process-global account store.
 pub async fn is_admin(user_name: &str) -> bool {
     is_admin_in(USER_STORE.get(), user_name).await
 }
 
-/// The custom tools granted to `user_name`, byte-sorted. A read that fails
-/// yields no grants, which fails every access decision closed.
+/// A failed read yields no grants, which fails every access decision closed.
 pub(crate) async fn granted_tools(user_name: &str) -> Vec<String> {
     match USER_STORE.get() {
         Some(store) => match store.get_grants(user_name).await {
@@ -1635,7 +1422,7 @@ pub(crate) fn format_grants(grants: &[String]) -> String {
     }
 }
 
-/// Update reply_target for a channel binding (called on every incoming message).
+/// Called on every incoming message.
 pub async fn update_channel_contact(
     channel: &str,
     identifier: &str,
@@ -1646,15 +1433,13 @@ pub async fn update_channel_contact(
         .await
 }
 
-/// The user name for a `personal:` workspace name (`personal:{user}`), or
-/// `None` when the name is not a personal workspace.
+/// `personal:{user}`, or `None` when the name is not a personal workspace.
 #[must_use]
 pub fn personal_user_name(workspace_name: &str) -> Option<&str> {
     workspace_name.strip_prefix(PERSONAL_WORKSPACE_PREFIX)
 }
 
-/// Check whether a workspace name refers to a personal workspace
-/// (prefix `personal:`).
+/// A personal workspace's name carries the `personal:` prefix.
 #[must_use]
 pub fn is_personal_workspace(workspace_name: &str) -> bool {
     personal_user_name(workspace_name).is_some()
@@ -1664,12 +1449,10 @@ pub fn is_personal_workspace(workspace_name: &str) -> bool {
 pub(crate) mod test_util {
     use super::*;
 
-    /// Initialize a test account store with known accounts and channel bindings.
-    /// Safe to call multiple times — delegates to [`init_test_stores`] to
-    /// ensure all global stores are initialized, then supplements
-    /// USER_STORE with telegram-specific accounts and channel bindings.
+    /// Safe to call multiple times: [`init_test_stores`] initializes every global store, and
+    /// this supplements USER_STORE with telegram-specific accounts and bindings.
     pub(crate) async fn init_test_store() {
-        // Ensure all global stores are initialized (idempotent OnceCell).
+        // Initialize every global store (idempotent OnceCell).
         crate::util::test::init_test_stores().await;
 
         // Supplement USER_STORE with telegram-specific test accounts and
@@ -1763,8 +1546,7 @@ mod tests {
     use super::*;
 
     /// The admin test is the account's name, backed by the account's own row:
-    /// a guest name, a name with no row, and a missing store are never the
-    /// admin.
+    /// a guest name, a name with no row, and a missing store are never the admin.
     #[tokio::test]
     async fn admin_test_is_the_account_name_backed_by_its_row() {
         let (store, _dir) = crate::open_test_store!(UserStore, "user");
@@ -1897,8 +1679,7 @@ mod tests {
     /// re-judged: the reserved name is refused for a case variant that is not
     /// the owner even with no row of its own to compare against, bootstrapping
     /// the owner succeeds beside a guest holding such a variant, and completing
-    /// that stored guest is accepted — the rule judges only names it is about to
-    /// create.
+    /// that stored guest is accepted — the rule judges only names it is about to create.
     #[tokio::test]
     async fn add_user_never_refuses_the_admin_or_a_stored_name() {
         let (store, _dir) = crate::open_test_store!(UserStore, "user");
@@ -1966,8 +1747,7 @@ mod tests {
         let store = store();
         // The name holds a separator-free illegal character, so the rule refuses
         // it while every platform this test runs on can still create a folder
-        // called that — which is what makes the folder assertion below a real
-        // one.
+        // called that — which is what makes the folder assertion below a real one.
         let legacy = "legacy:name";
         store
             .conn

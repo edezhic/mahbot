@@ -1,44 +1,25 @@
-//! The Excel (`.xlsx`/`.xlsm`) reader: the workbook part, its shared-string
-//! table and the worksheet parts, the cell comments and hyperlinks they name and
-//! the workbook's defined names, plus the embedded media and charts.
-//!
-//! [`super`] owns the ZIP plumbing and the other two OOXML families; this
-//! module is the whole Excel half, built on the package helpers there.
-//! [`crate::document`] routes `.xlsx`/`.xlsm` files here.
+//! The Excel (`.xlsx`/`.xlsm`) reader: the workbook part, its shared-string table and the
+//! worksheet parts, the cell comments and hyperlinks they name and the workbook's defined
+//! names, plus the embedded media and charts. [`super`] owns the ZIP plumbing; this module is
+//! the whole Excel half, built on the package helpers there.
 //!
 //! # Invariants
 //!
-//! - **A value is shown the way Excel shows it, or not at all.** A cell's number
-//!   format decides what is printed ([`numfmt`]), so a date reads as a date and
-//!   a percentage as a percentage; a format this reader cannot read, cannot
-//!   reproduce, or that has no display for the value prints the stored value under
-//!   its mark ([`MARK_STORED`]) — a raw number is never passed off as the display,
-//!   and a wrong one is never invented. One exception is stated rather than marked:
-//!   a `t="d"` cell holds its date as ISO text, shown as the workbook wrote it
-//!   rather than through its number format.
-//! - **A part the package left incomplete is never passed off as a whole one.** The
-//!   workbook part's own walk still yields the sheets and names it got to, with the
-//!   rest said not read ([`WORKBOOK_CUT_NOTE`]); a sheet, styles or comments part cut
-//!   short is declined whole rather than delivered by halves; a string table cut short
-//!   leaves the strings it did not reach counted as lost; and a workbook whose
-//!   relationship list could not be read is read by its parts' conventional names, so
-//!   a table named only there is never found and a cell naming a format past the
-//!   schema's default entry 0 carries the number that table does not describe
-//!   ([`WORKBOOK_RELS_NOTE`]). A part holding no element of its own kind (no
-//!   workbook, no sheet, no comments element) is read like one the package does not
-//!   carry; an entry the package left empty, for its part, declares nothing.
-//! - **Structure is marked, never silently dropped.** Hidden sheets, hidden rows
-//!   and columns, merged ranges, cell comments, hyperlinks and defined names all
-//!   reach the answer, and the marks are by range rather than by cell, so a
-//!   hidden block costs one line rather than one per cell in it. The merge and
-//!   link lists are swept down the sheet's rows ([`RowSweep`]), so a cell is only
-//!   tested against a range spanning its own row and each range costs one push and
-//!   one pop to track; the tests themselves are bounded by [`MAX_RANGE_PROBES`],
-//!   past which the rest of the marks are reported rather than worked through — as
-//!   is a marker the sheet's own declaration does not let this reader place (a
-//!   `<col>` range past the grid, a merged range or link naming no range).
-//! - **The notation the model reads is documented in
-//!   `src/prompt/tool/read.md`** — a mark this module adds belongs there too.
+//! - **A value is shown the way Excel shows it, or not at all.** A cell's number format
+//!   decides what is printed ([`numfmt`]); a format this reader cannot read, reproduce or
+//!   display prints the stored value under its mark ([`MARK_STORED`]) — a raw number is never
+//!   passed off as the display, and a wrong one is never invented. The one exception, stated
+//!   rather than marked: a `t="d"` cell holds ISO text and is shown as the workbook wrote it.
+//! - **A part the package left incomplete is never passed off as a whole one.** A cut
+//!   workbook part still yields the sheets and names it got to ([`WORKBOOK_CUT_NOTE`]); a cut
+//!   sheet, styles or comments part is declined whole; a cut string table leaves its
+//!   unreached strings counted as lost; an unreadable relationship list falls back to the
+//!   parts' conventional names ([`WORKBOOK_RELS_NOTE`]).
+//! - **Structure is marked, never silently dropped**, by range rather than by cell. The merge
+//!   and link lists are swept down the sheet's rows ([`RowSweep`]), and the tests are bounded
+//!   by [`MAX_RANGE_PROBES`], past which the rest of the marks are reported, not worked through.
+//! - **The notation the model reads is documented in `src/prompt/tool/read.md`** — a mark this
+//!   module adds belongs there too.
 
 use super::chart;
 use super::{
@@ -60,8 +41,6 @@ use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 use zip::ZipArchive;
 
-// ── Part names ──────────────────────────────────────────────────
-
 /// Part holding the workbook's sheet names and their relationship ids.
 pub(crate) const WORKBOOK_PART: &str = "xl/workbook.xml";
 /// Relationships of the workbook part: sheet relationship id -> sheet part.
@@ -73,80 +52,55 @@ const STYLES_PART: &str = "xl/styles.xml";
 /// Note pushed when the workbook declares cell formats this reader cannot read.
 const STYLES_NOTE: &str =
     "the workbook's cell formats could not be read, so values are shown as stored";
-/// Note pushed when the workbook's relationships part is there and cannot be read:
-/// its parts are then read by their conventional names, and its sheet parts are
-/// matched to their entries by position. A part named only there may be missed
-/// altogether, which leaves the cells of that part showing the value as stored —
-/// the one loss this note stands for, which is why it says so.
+/// Note pushed when the relationships part is there and cannot be read: its parts are then
+/// read by their conventional names and its sheets matched by position, so a part named only
+/// there may be missed altogether — the loss this note stands for.
 const WORKBOOK_RELS_NOTE: &str = "the workbook's relationships could not be read, so its parts are read by their conventional names and one named only there may be missed, leaving its cells showing the value as stored";
-/// Note pushed when the workbook part is cut short: the sheets and defined names it
-/// declares after that point were not read, and cannot be named from what is left, so
-/// the ones read before it are delivered with the loss said rather than passed off as
-/// the whole list.
+/// Note pushed when the workbook part is cut short: the sheets and defined names declared
+/// after that point were not read, so the ones before it are delivered with the loss said.
 const WORKBOOK_CUT_NOTE: &str = "the workbook part is cut short, so the sheets and names it declares after that point are not read";
-/// Note pushed when the workbook part carries a workbook element declaring no sheet:
-/// there is nothing in it to read, and the generic "no text" the delivery layer
-/// answers with would leave the cause unnamed.
+/// Note pushed when the workbook element declares no sheet: the generic "no text" would
+/// leave the cause unnamed.
 const WORKBOOK_NO_SHEETS_NOTE: &str = "the workbook declares no sheets";
-/// Base a worksheet's own relationships resolve against: a comments or
-/// threaded-comment target is relative to the sheet part's directory.
+/// Base a worksheet's relationships resolve against: a comment target is relative to it.
 const SHEET_BASE: &str = "xl/worksheets/";
 /// Prefix of the embedded-media parts in an Excel package.
 const XLSX_MEDIA_PREFIX: &str = "xl/media/";
 /// Charts in an Excel package: `xl/charts/chart<N>.xml`.
 const XLSX_CHARTS_PREFIX: &str = "xl/charts/";
-/// The data part of each SmartArt diagram a workbook holds
-/// (`xl/diagrams/data<N>.xml`), which no reading reaches.
+/// The data part of each SmartArt diagram (`xl/diagrams/data<N>.xml`), never read.
 const XLSX_DIAGRAMS_PREFIX: &str = "xl/diagrams/";
-/// The objects a workbook embeds (`xl/embeddings/`) — an object's own bytes,
-/// which the reading never opens.
+/// The objects a workbook embeds (`xl/embeddings/`), whose bytes are never opened.
 const XLSX_EMBEDDINGS_PREFIX: &str = "xl/embeddings/";
-/// The directory a workbook puts chart sheets in: where a sheet's part is found,
-/// the sheet is one chart over its whole tab rather than a grid of cells.
+/// The directory chart sheets live in: such a sheet is one chart over its whole tab.
 const XLSX_CHARTSHEETS_PREFIX: &str = "xl/chartsheets/";
-/// The tail of the relationship kind by which a workbook names a chart sheet
-/// (`…/relationships/chartsheet`).
+/// The tail of the relationship kind naming a chart sheet (`…/relationships/chartsheet`).
 const CHART_SHEET_REL: &str = "/chartsheet";
 
-// ── Excel ───────────────────────────────────────────────────────
-
-/// Extract sheet text and embedded images from an `.xlsx`/`.xlsm` package.
-///
-/// Every sheet the workbook names is walked in workbook order and rendered as
-/// `Sheet "<name>":` plus one indented line per valued cell. A cell shows the
-/// value its number format displays, each sheet's hidden rows and columns are
-/// annotated, merged ranges are marked against the cells they cover, and a
-/// hyperlink is marked on the cell it covers. A sheet's cell comments follow its
-/// cells, the workbook's defined names follow the last sheet, and a sheet whose
-/// part is missing costs only itself and a note.
+/// Extract sheet text and embedded images from an `.xlsx`/`.xlsm` package: every sheet in
+/// workbook order as `Sheet "<name>":` plus one indented line per valued cell, with hidden
+/// geometry, merged ranges and hyperlinks marked, comments and defined names following, and a
+/// sheet whose part is missing costing only itself and a note.
 #[must_use]
 pub(crate) fn convert_xlsx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
         return unreadable(Family::Xlsx);
     };
-    // The workbook part is read in one walk: its sheets, its date system and its
-    // defined names come out of the same pass, which also says whether the part was
-    // cut short. A part carrying no workbook element is read like one the package
-    // does not carry; one cut short still yields the sheets and names it got to.
+    // The workbook part is read in one walk: sheets, date system and defined names come out
+    // of it, along with whether the part was cut short.
     let Some(workbook) = read_zip_entry(&mut archive, WORKBOOK_PART)
         .bytes()
         .and_then(|xml| workbook(&xml))
     else {
         return unreadable(Family::Xlsx);
     };
-    // The workbook relationships are read once: the sheet parts resolve through
-    // them, the shared-string table, the styles part and the persons part are
-    // named by kind, and the sheet parts then resolve their own comments through
-    // their own rels. One that is there and cannot be read leaves every part at its
-    // conventional name and every sheet matched to its entry by position, which
-    // `rels_lost` says once rather than letting each part read as one the workbook
-    // never declared.
+    // The relationships are read once: sheet parts, the shared-string table, styles and
+    // persons are named by kind, and each sheet then resolves its own comments. An unreadable
+    // list leaves every part at its conventional name, which `rels_lost` says once.
     let workbook_rels = read_relationships(&mut archive, WORKBOOK_RELS_PART);
     let rels_lost = workbook_rels.is_none();
     let rels = workbook_rels.unwrap_or_default();
-    // The shared-string table is named by kind like the styles part, so a
-    // producer that lays it out elsewhere still has its strings read; only the
-    // conventional name is a fallback.
+    // Named by kind like the styles part, so a producer laying it out elsewhere is read.
     let shared_part = related_part(&rels, "/sharedStrings", "xl/")
         .unwrap_or_else(|| SHARED_STRINGS_PART.to_owned());
     let shared = read_zip_entry(&mut archive, &shared_part)
@@ -193,9 +147,8 @@ pub(crate) fn convert_xlsx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         &mut unshown,
         &charts,
     );
-    // The census of chart parts comes after the sheets are walked: a chart sheet
-    // draws one of them, and the sheet is what names it; a chart whose content a
-    // sheet printed where it sits is no longer a loss.
+    // Census after the sheets: a chart sheet draws one of its charts, and a chart printed
+    // where it sits is no longer a loss.
     unshown.merge(&unopened_parts(
         &mut archive,
         XLSX_CHARTS_PREFIX,
@@ -204,18 +157,15 @@ pub(crate) fn convert_xlsx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
         Some(&chart_sheets),
         &described,
     ));
-    // Defined names are workbook-level, so they follow every sheet rather than
-    // being repeated into the sheet whose cells they point at.
+    // Defined names are workbook-level: they follow every sheet, never repeated into one.
     if !workbook.defined_names.is_empty() {
         blocks.push(text_lines(
             "Defined names:",
             &defined_name_lines(&workbook.defined_names, &workbook.sheets),
         ));
     }
-    // A workbook whose string table is absent, truncated or partly unreadable
-    // leaves every cell that indexes into it empty — for an Excel/Sheets/
-    // LibreOffice-authored file that is all of its text, so it is said out loud
-    // rather than read as a workbook with blank cells.
+    // A missing, truncated or partly unreadable string table leaves every cell indexing into
+    // it empty — all of the text of a spreadsheet-authored file, so it is said out loud.
     if lost > 0 {
         notes.push(format!(
             "{lost} cell(s) left out: the shared string table does not provide their text"
@@ -226,12 +176,9 @@ pub(crate) fn convert_xlsx(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     DocOutcome::text(text, images, notes, unshown)
 }
 
-/// Walk every sheet the workbook declares, in workbook order: their blocks, the
-/// shared-string cells they lose between them, the chart parts the package's chart
-/// sheets draw — which the caller's census excludes so a sheet's chart is not named
-/// twice — and the chart parts whose content was printed where the chart sits. Each
-/// sheet's own losses go into `notes` and each chart sheet into `unshown` as the
-/// walk meets them.
+/// Walk every sheet the workbook declares, in workbook order: their blocks, the shared-string
+/// cells they lose between them, the chart parts the chart sheets draw — excluded from the
+/// caller's census so no chart is named twice — and those printed where they sit.
 #[expect(clippy::too_many_arguments)] // one parameter per part the walk threads through
 fn sheet_blocks<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
@@ -250,14 +197,13 @@ fn sheet_blocks<R: Read + Seek>(
     for (index, entry) in workbook.sheets.iter().enumerate() {
         let name = entry.name.as_str();
         let (part, chart_sheet) = resolve_sheet(rels, entry, index);
-        // The sheet's own relationships name its comments and its hyperlink
-        // targets; the list is kept for the parts named by kind, and the link
-        // targets resolve through the shared id -> target map.
+        // The sheet's own relationships name its comments and hyperlink targets, the latter
+        // resolving through the shared id -> target map.
         let sheet_rels = sheet_relationships(archive, &part, name, notes);
         let charts_here = sheet_charts(archive, &part, &sheet_rels);
         let (mut chart_lines, chart_described) = chart::lines(charts, &charts_here);
-        // A chart sheet's chart belongs to the sheet, so the package's chart
-        // census leaves it out; the sheet's loss is said unless every chart it
+        // A chart sheet's chart belongs to the sheet, so the census leaves it out; the
+        // sheet's loss is said unless every chart it
         // draws was described where it sits. The tab always says what it is, and
         // its chart follows under that line.
         if chart_sheet {
@@ -310,16 +256,11 @@ fn sheet_block(entry: &SheetEntry, lines: &[String]) -> String {
     )
 }
 
-/// Resolve one `<sheet>` entry: the part it names — what the entry's relationship
-/// points at, or the conventional name for the entry's position when the package
-/// declares no relationship, so such a sheet still yields its cells instead of
-/// nothing — and whether the workbook declares the sheet a chart sheet, one chart
-/// over a whole tab rather than a grid of cells.
-///
-/// The workbook says so two ways: the relationship's own kind (the statement the
-/// standard requires) and the `chartsheets/` directory Excel's targets name. A
-/// sheet is named a chart sheet rather than one that could not be read, because
-/// there were never cells to read.
+/// Resolve one `<sheet>` entry: the part it names — its relationship's target, or the
+/// conventional name for its position when the package declares none — and whether the
+/// workbook declares it a chart sheet. The workbook says so two ways: the relationship's kind
+/// and the `chartsheets/` directory Excel's targets name; such a sheet is named a chart sheet
+/// rather than one that could not be read, since there were never cells to read.
 fn resolve_sheet(rels: &[Relationship], entry: &SheetEntry, index: usize) -> (String, bool) {
     let rel = rels.iter().find(|rel| rel.id == entry.id);
     let part = rel.map_or_else(
@@ -398,10 +339,8 @@ struct Workbook {
 
 /// One `<sheet>` entry of the workbook.
 struct SheetEntry {
-    /// The sheet's name, one line by construction ([`one_line`]): a name reaches
-    /// the sheet header, the notes naming the sheet and the defined-names block,
-    /// each of which is a line of its own, so a break in it must not become a line
-    /// there.
+    /// The sheet's name, one line by construction ([`one_line`]): it reaches the sheet header,
+    /// the notes naming the sheet and the defined-names block, each a line of its own.
     name: String,
     /// The relationship id naming the sheet's part.
     id: String,
@@ -409,14 +348,10 @@ struct SheetEntry {
     state: Option<String>,
 }
 
-/// The workbook part, or `None` when it carries no workbook element — an entry the
-/// package left empty, an error page in its place, or one whose bytes are no
-/// document are all read like a part the package does not carry, rather than as a
-/// workbook declaring no sheet. Every `<sheet>` element is kept, the ones this
-/// reader cannot fully place included: a sheet whose relationship the workbook does
-/// not name still has a part the caller reads by its position, and a sheet that
-/// vanished here would both lose its cells and shift the position every later
-/// sheet's scoped defined name is matched by.
+/// The workbook part, or `None` when it carries no workbook element (an empty entry, an error
+/// page, bytes that are no document). Every `<sheet>` element is kept, even one this reader
+/// cannot fully place: a sheet that vanished here would lose its cells and shift the position
+/// every later sheet's scoped defined name is matched by.
 fn workbook(xml: &[u8]) -> Option<Workbook> {
     let mut part = Part::new(xml);
     let mut reader = Reader::from_reader(xml);
@@ -428,9 +363,7 @@ fn workbook(xml: &[u8]) -> Option<Workbook> {
     let mut current: Option<DefinedName> = None;
     let mut text = String::new();
     // The walk ends where the part does, so the sheets and names read before a cut are
-    // delivered rather than the whole workbook being declined; whether the part counts
-    // as cut — and so carries [`WORKBOOK_CUT_NOTE`] — is what its own open elements
-    // say ([`Part::cut`]).
+    // delivered; whether it counts as cut ([`Part::cut`]) is what its open elements say.
     while let Ok(event) = reader.read_event_into(&mut buffer) {
         part.note(&event);
         match event {
@@ -491,11 +424,8 @@ fn workbook(xml: &[u8]) -> Option<Workbook> {
         }
         buffer.clear();
     }
-    // A part carrying no workbook element — an entry the package left empty, an
-    // error page in its place, or one whose bytes are no document — is read like a
-    // part the package does not carry rather than as a workbook declaring no sheet.
-    // A part cut short still yields the sheets and names it got to, with `cut` saying
-    // the list after that point was not read.
+    // A part carrying no workbook element is read like one the package does not carry; a part
+    // cut short still yields the sheets and names it got to, with `cut` saying so.
     if !read_workbook {
         return None;
     }
@@ -522,8 +452,6 @@ fn is_true(value: &str) -> bool {
     value == "1" || value.eq_ignore_ascii_case("true")
 }
 
-// ── Defined names ───────────────────────────────────────────────
-
 /// One workbook `<definedName>`: its name, the sheet its `localSheetId` names
 /// (a zero-based index into the workbook's sheets), and its text.
 struct DefinedName {
@@ -532,11 +460,8 @@ struct DefinedName {
     text: String,
 }
 
-/// One `<definedName .../>` element as a name, or `None` when it carries no
-/// `name` or is a service name Excel writes for itself (`_xlnm.…`: print areas,
-/// print titles, `_FilterDatabase`, …), which the workbook's own UI never shows.
-/// The name is one line by construction ([`one_line`]): it is printed as part of
-/// the defined-names block, a line of its own.
+/// One `<definedName .../>` as a name, or `None` when it carries no `name` or is a service name
+/// Excel writes for itself (`_xlnm.…`: print areas, `_FilterDatabase`, …) and never shows.
 fn defined_name(event: &BytesStart<'_>) -> Option<DefinedName> {
     let name = attr(event, b"name")?;
     if name.to_ascii_lowercase().starts_with("_xlnm.") {
@@ -549,10 +474,8 @@ fn defined_name(event: &BytesStart<'_>) -> Option<DefinedName> {
     })
 }
 
-/// One line per defined name: a sheet-local one names the sheet its
-/// `localSheetId` indexes, a workbook-level one (or one whose index resolves to
-/// no sheet) is bare. A name whose element carries no text names nothing, so it is
-/// left out rather than printed as a bare name and a colon.
+/// One line per defined name: a sheet-local one names the sheet its `localSheetId` indexes, a
+/// workbook-level one is bare. A name carrying no text is left out rather than printed bare.
 fn defined_name_lines(names: &[DefinedName], sheets: &[SheetEntry]) -> Vec<String> {
     names
         .iter()
@@ -569,11 +492,8 @@ fn defined_name_lines(names: &[DefinedName], sheets: &[SheetEntry]) -> Vec<Strin
         .collect()
 }
 
-// ── Shared strings ──────────────────────────────────────────────
-
-/// Read `xl/sharedStrings.xml` into the strings a `t="s"` cell's index refers
-/// to: each `<si>` is the concatenation of its `<t>` texts, rich-text runs
-/// included.
+/// Read `xl/sharedStrings.xml` into the strings a `t="s"` cell indexes: each `<si>` is the
+/// concatenation of its `<t>` texts, rich-text runs included.
 fn shared_strings(xml: &[u8]) -> Vec<String> {
     let mut reader = Reader::from_reader(xml);
     let mut buffer = Vec::new();
@@ -611,46 +531,34 @@ fn shared_strings(xml: &[u8]) -> Vec<String> {
     strings
 }
 
-// ── Formats ─────────────────────────────────────────────────────
-
 /// The workbook's cell formats.
 #[derive(Default)]
 struct Styles {
     /// Declared `numFmt` code by id.
     num_fmts: HashMap<u32, String>,
-    /// The `numFmtId` of each `cellXfs` entry, in order: a cell's `s` indexes
-    /// this for the format it shows, and `None` is an entry whose own declaration
-    /// this reader could not read — the cell then shows its stored value, marked.
+    /// The `numFmtId` of each `cellXfs` entry, in order: a cell's `s` indexes this, and `None`
+    /// is an entry this reader could not read — the cell then shows its stored value, marked.
     cell_xfs: Vec<Option<u32>>,
-    /// Whether the workbook's formats were there to read and no table came back: the
-    /// styles part the workbook declares and the package does not carry, one that is
-    /// there and will not parse, or one that declares a format but no cell format to
-    /// name any of them — a `numFmt` a malformed entry included, a base-style list,
-    /// or a `cellXfs` holding no entry. Every cell then shows its stored text marked
-    /// as stored, whatever format it names, rather than being read as one of a
-    /// workbook that declares no format at all.
+    /// Whether the workbook's formats were there to read and no table came back: the part is
+    /// missing, will not parse, or declares a format but no cell format to name it from. Every
+    /// cell then shows its stored text marked, not one of a workbook declaring no format.
     lost: bool,
 }
 
-/// Parse `xl/styles.xml`. `None` when the part cannot be read as XML, is cut short,
-/// or carries anything but a stylesheet element — an error page or a text body left
-/// in the part's place parses as XML just as happily, and a workbook whose formats
-/// were not read is not one to pass its cells off as unformatted. An entry the
-/// package left empty declares no format for any cell, which is the value a
-/// stylesheet declaring no format also reads as.
+/// Parse `xl/styles.xml`. `None` when it cannot be read as XML, is cut short, or carries
+/// anything but a stylesheet element — an error page parses as XML just as happily, and a
+/// workbook whose formats were not read is not one to pass its cells off as unformatted.
 fn styles(xml: &[u8]) -> Option<Styles> {
     let mut part = Part::new(xml);
     let mut reader = Reader::from_reader(xml);
     let mut buffer = Vec::new();
     let mut num_fmts = HashMap::new();
-    // The base styles a cell format may inherit its number format from, and the
-    // cell formats as the three things each declares: its own `numFmtId`, the base
-    // style it names and whether it applies its declaration.
+    // The base styles a cell format may inherit from, and the cell formats as the three things
+    // each declares: its own `numFmtId`, the base style it names, whether it applies it.
     let mut base_xfs: Vec<Option<u32>> = Vec::new();
     let mut cell_xfs: Vec<(Option<u32>, Base, bool)> = Vec::new();
-    // Whether the stylesheet declares any format at all — a `numFmt` element (a
-    // malformed one included: it is still a format the workbook claims to hold), a
-    // cell-format list, or a base-style list, whether or not it holds an entry.
+    // Whether the stylesheet declares any format at all — a `numFmt` (a malformed one is still
+    // a format the workbook claims), a cell-format list, or a base-style list.
     let mut declares_formats = false;
     let (mut in_cell_xfs, mut in_base_xfs) = (false, false);
     loop {
@@ -700,30 +608,23 @@ fn styles(xml: &[u8]) -> Option<Styles> {
         }
         buffer.clear();
     }
-    // A styles part cut short — or one carrying anything but a stylesheet element —
-    // reads as a stylesheet declaring no cell format, which would leave every cell of
-    // the workbook at the schema's default with nothing said.
+    // A cut styles part, or one carrying anything but a stylesheet element, would otherwise
+    // leave every cell at the schema's default with nothing said.
     if part.unreadable() {
         return None;
     }
-    // A stylesheet that declares a format but no cell format to name it from is one
-    // this reader cannot derive any cell's format from: the formats it names are lost
-    // rather than read as a workbook that declares no format for any cell.
+    // A stylesheet declaring a format but no cell format to name it from loses its formats
+    // rather than reading as a workbook that declares no format for any cell.
     if cell_xfs.is_empty() && declares_formats {
         return None;
     }
-    // A cell format that declares no format of its own and does not apply it shows
-    // the one the base style it names holds — how a workbook that leaves its number
-    // format to a named style writes it. Resolving here keeps every cell lookup a
-    // plain index into `cell_xfs`: `None` is an entry whose format cannot be derived,
-    // so the cell that shows it carries its stored value under the mark.
+    // A cell format declaring no format of its own and not applying it shows the one its base
+    // style holds. Resolving here keeps every cell lookup a plain index into `cell_xfs`.
     let cell_xfs = cell_xfs
         .into_iter()
         .map(|(own, base, applies)| match (own, base) {
-            // The format the entry would inherit is one this reader cannot read (the
-            // base style's own declaration is unreadable, or its `xfId` is not one to
-            // place), so the entry is read like one whose own declaration is
-            // unreadable rather than as a format declaring nothing.
+            // The inherited format cannot be read (the base style's declaration is unreadable,
+            // or its `xfId` is not one to place), so the entry reads as underivable.
             (Some(0), Base::Unread) if !applies => None,
             (Some(0), Base::Index(base)) if !applies => base_xfs
                 .get(base as usize)
@@ -792,9 +693,7 @@ fn xf_num_fmt_id(event: &BytesStart<'_>) -> Option<u32> {
 /// where it declares none of its own and does not apply it.
 #[derive(Clone, Copy)]
 enum Base {
-    /// The entry names no base style.
     None,
-    /// The base style the entry names, by the index of its `cellStyleXfs` entry.
     Index(u32),
     /// The entry names a base style this reader cannot read.
     Unread,
@@ -814,14 +713,10 @@ fn styles_part(rels: &[Relationship]) -> String {
     related_part(rels, "/styles", "xl/").unwrap_or_else(|| STYLES_PART.to_owned())
 }
 
-/// The workbook's cell formats, read from the part its `/styles` relationship names
-/// (the conventional one as a fallback): the schema default when the workbook
-/// carries no such part, plus a note when a part that was there to read yielded no
-/// table — one the workbook declares through its relationships and the package does
-/// not carry, or one that will not parse. A workbook that declares no styles part,
-/// and carries none, declares no format for any cell: nothing is lost, nothing is
-/// said, and the cells show the schema's default — bar the cell that names a format
-/// the missing table would have held, which shows its stored number under the mark.
+/// The workbook's cell formats, read from the part its `/styles` relationship names (the
+/// conventional one as a fallback): the schema default when the workbook carries no such part,
+/// plus a note when a part that was there to read yielded no table. Such a workbook declares no
+/// format for any cell — bar one naming a format the missing table would have held.
 fn read_styles<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     rels: &[Relationship],
@@ -831,8 +726,7 @@ fn read_styles<R: Read + Seek>(
     let read = match read_zip_entry(archive, &styles_part(rels)) {
         ZipEntry::Bytes(xml) => styles(&xml),
         ZipEntry::Missing if !declared => return Styles::default(),
-        // A part the workbook says it carries and the package does not is as much of
-        // a loss as one that will not parse.
+        // A part the workbook says it carries and the package does not is as much a loss.
         ZipEntry::Missing | ZipEntry::Unreadable => None,
     };
     let Some(styles) = read else {
@@ -844,8 +738,6 @@ fn read_styles<R: Read + Seek>(
     };
     styles
 }
-
-// ── Sheet relationships, comments and links ─────────────────────
 
 /// A sheet's own relationships, and the note a part that is there and cannot be
 /// read is said in rather than passed off as a sheet with none.
@@ -872,18 +764,15 @@ fn relationship_target<'a>(rels: &'a [Relationship], suffix: &str) -> Option<&'a
         .map(|rel| rel.target.as_str())
 }
 
-/// The package part of `base` that the first relationship of `rels` whose kind
-/// names `suffix` points at, or `None` when no relationship names one. A
-/// relative target is resolved against `base`, an absolute one is already a
-/// package path.
+/// The package part of `base` the first relationship whose kind names `suffix` points at: a
+/// relative target is resolved against `base`, an absolute one is already a package path.
 fn related_part(rels: &[Relationship], suffix: &str, base: &str) -> Option<String> {
     relationship_target(rels, suffix).map(|target| resolve_part(base, target))
 }
 
-/// The chart parts a sheet draws, in the order it draws them: a chart sheet's
-/// own chart, named by the sheet's own relationships or by the drawing part it
-/// references (what Excel writes), and a worksheet's charts, named by its
-/// drawing — which may hold several.
+/// The chart parts a sheet draws, in order: a chart sheet's own chart, named by its
+/// relationships or by the drawing it references (what Excel writes), and a worksheet's
+/// charts, named by its drawing — which may hold several.
 fn sheet_charts<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     part: &str,
@@ -915,11 +804,9 @@ fn sheet_charts<R: Read + Seek>(
     charts
 }
 
-/// The workbook's person names, read from the part the workbook's `/person`
-/// relationship names: a `personId` a thread names resolves here, and one it does
-/// not — the part absent, unreadable, holding no `person`, or the workbook's
-/// relationships unreadable in the first place — leaves that thread's author
-/// unresolved, which its sheet says.
+/// The workbook's person names, from the part its `/person` relationship names: a `personId`
+/// the part does not hold — absent, unreadable, or no relationship list at all — leaves that
+/// thread's author unresolved, which its sheet says.
 fn read_persons<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     rels: &[Relationship],
@@ -944,22 +831,18 @@ fn person_entry(event: &BytesStart<'_>) -> Option<(String, String)> {
     Some((id, name))
 }
 
-/// One cell comment: the cell it is attached to, its author and its text as the
-/// part wrote it. The text keeps its lines — a threaded discussion's legacy stub
-/// leads each of its entries with a line of its own, which is what tells it from a
-/// comment written by a person — and the line the comment is shown on collapses
-/// them.
+/// One cell comment: the cell it is attached to, its author and its text as the part wrote it.
+/// The text keeps its lines — a threaded discussion's legacy stub leads each entry with a line,
+/// which is what tells it from a comment written by a person — and its shown line collapses them.
 struct Comment {
     reference: String,
     author: Author,
     text: String,
 }
 
-/// A comment's author: none named by the workbook, one this reader resolved, or
-/// one the workbook names and this reader could not resolve — a `personId` the
-/// person names hold no entry for, an `authorId` past its authors list. An author
-/// that is in the file but not in this answer is said per sheet rather than passed
-/// off as a comment by nobody.
+/// A comment's author: none named, one this reader resolved, or one the workbook names and
+/// this reader could not — a `personId` the person names do not hold, an `authorId` past its
+/// authors list. Such an author is said per sheet, never passed off as a comment by nobody.
 #[derive(PartialEq)]
 enum Author {
     None,
@@ -1000,11 +883,9 @@ impl Comment {
     }
 }
 
-/// The comments in a legacy `xl/comments<N>.xml` part: its `commentList` entries,
-/// each with the name its `authorId` indexes into the part's `authors` list.
-/// The text is the nested character data of the entry's `<text>` element, so a
-/// plain string, a `<t>` run and a run inside a rich `<r>` all read the same.
-/// `None` when the part cannot be read as XML.
+/// The comments in a legacy `xl/comments<N>.xml` part: its `commentList` entries, each with the
+/// name its `authorId` indexes into the part's `authors`. The text is the nested character data
+/// of `<text>`, so a plain string, a `<t>` run and a rich `<r>` all read the same.
 fn legacy_comments(xml: &[u8]) -> Option<Vec<Comment>> {
     let mut part = Part::new(xml);
     let mut reader = Reader::from_reader(xml);
@@ -1065,9 +946,7 @@ fn legacy_comments(xml: &[u8]) -> Option<Vec<Comment>> {
             Event::End(event) => match event.local_name().as_ref() {
                 b"author" => {
                     in_author = false;
-                    // The author is one line by construction ([`one_line`]): the name
-                    // stands inside the comment's line, so a break in it must not
-                    // become a line there.
+                    // The author is one line ([`one_line`]): it stands inside the comment's line.
                     authors.push(one_line(std::mem::take(&mut author_text)));
                 }
                 b"text" => in_text = false,
@@ -1105,10 +984,8 @@ fn legacy_comments(xml: &[u8]) -> Option<Vec<Comment>> {
     Some(comments)
 }
 
-/// The comments in a modern `xl/threadedComments/threadedComment<N>.xml` part,
-/// each with the name its `personId` maps to — [`Author::Lost`] when it names a
-/// person the workbook's person names do not hold. `None` when the part cannot be
-/// read as XML.
+/// The comments in a modern `xl/threadedComments/threadedComment<N>.xml` part, each with the
+/// name its `personId` maps to — [`Author::Lost`] when the person names do not hold it.
 fn threaded_comments(xml: &[u8], persons: &HashMap<String, String>) -> Option<Vec<Comment>> {
     let mut part = Part::new(xml);
     let mut reader = Reader::from_reader(xml);
@@ -1172,10 +1049,8 @@ fn threaded_comments(xml: &[u8], persons: &HashMap<String, String>) -> Option<Ve
     Some(comments)
 }
 
-/// The sheet's cell comments: its modern threaded comments and its legacy ones,
-/// with a thread replacing the legacy stub of its own discussion. Each part the
-/// sheet names that is there but cannot be read is said in a note of its own,
-/// since either can be lost without the other.
+/// The sheet's cell comments: its threaded comments and its legacy ones, a thread replacing
+/// the legacy stub of its own discussion. Each unreadable part gets a note of its own.
 fn cell_comments<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     rels: &[Relationship],
@@ -1234,17 +1109,12 @@ fn cell_comments<R: Read + Seek>(
     by_cell.into_values().flatten().collect()
 }
 
-/// Whether a legacy comment on a cell is the stub of the threaded discussion on
-/// it — the same discussion written twice, and so shown once.
-///
-/// Excel keeps a copy of a discussion in the legacy part for readers without
-/// threaded comments: a `[Threaded comment]` preamble, a note to the reader, and
-/// then each entry's text behind a `Comment:` (or `Reply:`) lead of its own, in
-/// thread order. That copy is what this reader recognizes — the texts the leads
-/// carry, in their own places, are the thread's own texts. A legacy comment
-/// carrying no lead at all, or carrying texts that are not the thread's, is a
-/// comment of its own and keeps its line, since dropping it would lose a person's
-/// words on a guess.
+/// Whether a legacy comment on a cell is the stub of the threaded discussion on it — the same
+/// discussion written twice, shown once. Excel keeps such a copy for readers without threaded
+/// comments: a `[Threaded comment]` preamble, a note to the reader, then each entry's text
+/// behind a `Comment:` (or `Reply:`) lead in thread order. A legacy comment carrying no lead,
+/// or texts that are not the thread's, is a comment of its own and keeps its line — dropping it
+/// would lose a person's words on a guess.
 fn is_the_stub_of(comment: &Comment, thread: &[Comment]) -> bool {
     let entries = stub_entries(&comment.text);
     !entries.is_empty()
@@ -1255,11 +1125,9 @@ fn is_the_stub_of(comment: &Comment, thread: &[Comment]) -> bool {
             .all(|(entry, comment)| flatten(entry) == flatten(&comment.text))
 }
 
-/// The entries a legacy comment's text carries as a threaded stub: the text behind
-/// each `Comment:`/`Reply:` lead, up to the next lead, with everything before the
-/// first lead — the `[Threaded comment]` preamble and the note to the reader Excel
-/// writes ahead of them — dropped. Empty when the text carries no lead at all,
-/// which is a comment of its own rather than a copy of a discussion.
+/// The entries a legacy comment's text carries as a threaded stub: the text behind each
+/// `Comment:`/`Reply:` lead up to the next, everything before the first lead dropped. Empty
+/// when there is no lead at all — a comment of its own rather than a copy of a discussion.
 fn stub_entries(text: &str) -> Vec<String> {
     let mut entries: Vec<String> = Vec::new();
     let mut current: Option<String> = None;
@@ -1292,10 +1160,9 @@ fn stub_lead(line: &str) -> Option<&str> {
         .then(|| rest.trim())
 }
 
-/// The sheet's comment lines, one per comment, sorted by the (row, column) of the
-/// cell they are attached to. A comment whose cell reference this reader cannot
-/// parse names no cell a line could be attached to, so it is left out and counted
-/// rather than printed under an address that is not one.
+/// The sheet's comment lines, one per comment, sorted by the (row, column) of their cell. A
+/// comment whose cell reference cannot be parsed is left out and counted rather than printed
+/// under an address that is not one.
 fn comment_lines(comments: Vec<Comment>, name: &str, notes: &mut Vec<String>) -> Vec<String> {
     let total = comments.len();
     let mut placed: Vec<((u32, u32), Comment)> = comments
@@ -1326,8 +1193,6 @@ fn comment_lines(comments: Vec<Comment>, name: &str, notes: &mut Vec<String>) ->
         .collect()
 }
 
-// ── Worksheet pass ──────────────────────────────────────────────
-
 /// What a cell needs to render: the workbook's shared strings, its formats and
 /// its date system.
 #[derive(Clone, Copy)]
@@ -1337,12 +1202,9 @@ struct Book<'a> {
     date1904: bool,
 }
 
-/// What one worksheet pass yields: its rendered lines, how many cells held a
-/// `t="s"` string the table does not provide, how many hyperlinks were lost — a
-/// link is lost when its `r:id` is not declared, its `ref` is missing, or its
-/// `ref` is not a range this reader can parse — and how many merges were lost —
-/// a merge is lost when its `ref` is missing or is not a range this reader can
-/// mark; all are reported by the caller as notes.
+/// What one worksheet pass yields: its rendered lines, and how many `t="s"` strings, hyperlinks
+/// and merges were lost — a link or merge whose `r:id`/`ref` is not declared, missing, or not a
+/// range this reader can parse. All are reported by the caller as notes.
 struct SheetRead {
     lines: Vec<String>,
     lost_strings: usize,
@@ -1362,11 +1224,9 @@ struct SheetRead {
     dropped_marks: bool,
 }
 
-/// The lines of one worksheet: the hidden-geometry annotations first, then one
-/// line per valued cell, then a line per hyperlink its cells do not show.
-///
-/// `None` on any XML error — a sheet part that cannot be read as XML is
-/// reported like a missing one.
+/// The lines of one worksheet: hidden-geometry annotations first, then one line per valued
+/// cell, then a line per hyperlink its cells do not show. `None` on any XML error — a sheet
+/// part that cannot be read as XML is reported like a missing one.
 #[expect(clippy::too_many_lines)] // one arm per worksheet element, in a single streaming pass
 fn sheet_rows(
     xml: &[u8],
@@ -1379,8 +1239,7 @@ fn sheet_rows(
     let mut cells: Vec<CellLine> = Vec::new();
     let mut lost = 0usize;
     let mut row_number = 0u32;
-    // Column of the next cell that carries no `r`: real files omit `r` on
-    // cells that follow one another, and the addresses still count distance.
+    // Column of the next cell carrying no `r`: real files omit it on runs of cells.
     let mut next_column = 0u32;
     let mut cell: Option<Cell> = None;
     let mut shared_formulas: HashMap<String, String> = HashMap::new();
@@ -1389,8 +1248,7 @@ fn sheet_rows(
     let mut hidden_rows = BTreeSet::new();
     let mut column_ranges: Vec<ColumnRange> = Vec::new();
     let mut columns: Option<Columns> = None;
-    // How many `<col>` definitions the sheet had written when its first cell
-    // settled them; the ones written after that reach no cell of it.
+    // How many `<col>` definitions were written when the first cell settled them.
     let mut settled_columns: Option<usize> = None;
     let mut row_style: Option<Style> = None;
     let mut merges = Vec::new();
@@ -1426,14 +1284,12 @@ fn sheet_rows(
                 b"mergeCell" if in_merges => {
                     collect_merge(&event, &mut merges, &mut lost_merges);
                 }
-                // `<hyperlinks>` follows `<sheetData>`, so it is collected in
-                // this same pass and applied once the cells are rendered.
+                // `<hyperlinks>` follows `<sheetData>`: collected here, applied after render.
                 b"hyperlinks" => in_hyperlinks = true,
                 b"hyperlink" if in_hyperlinks => {
                     collect_link(&event, link_targets, &mut links, &mut lost_links);
                 }
-                // `<cols>` precedes `<sheetData>` in the schema, so the ranges
-                // read so far are settled the first time a cell asks for them.
+                // `<cols>` precedes `<sheetData>`: the ranges are settled when a cell asks.
                 b"c" => {
                     let columns = columns.get_or_insert_with(|| {
                         settled_columns = Some(column_ranges.len());
@@ -1543,10 +1399,8 @@ fn sheet_rows(
         }
         buffer.clear();
     }
-    // A sheet part the package left half written reads as one whose data simply
-    // ends, so its later rows would be passed off as rows the sheet never had: it is
-    // declined whole, as is a part that is no sheet document, while an entry the
-    // package left empty ([`blank`]) declares a sheet with no values.
+    // A half-written sheet part would read as one whose data simply ends, passing its later rows
+    // off as rows the sheet never had: it is declined whole, as is a part that is no sheet.
     if part.unreadable() {
         return None;
     }
@@ -1576,12 +1430,9 @@ fn next_row_number(event: &BytesStart<'_>, previous: u32) -> u32 {
         .unwrap_or(previous.saturating_add(1))
 }
 
-/// The style a row gives its own cells: `<row s customFormat="1"/>` styles every
-/// cell of the row that declares no style of its own, and it wins over a covering
-/// `<col>` — a row that marks its format custom but names no `s` takes the
-/// schema's default entry 0 rather than the column's style, and a row naming an `s`
-/// this reader cannot read gives its cells a format it cannot show. A row that does
-/// not mark the style custom gives its cells none.
+/// The style a row gives its own cells: `<row s customFormat="1"/>` styles every cell of the row
+/// declaring none, and wins over a covering `<col>` — a row marking it custom but naming no `s`
+/// takes the schema's entry 0, and one naming an unreadable `s` gives a format it cannot show.
 fn row_default_style(event: &BytesStart<'_>) -> Option<Style> {
     if !attr(event, b"customFormat").as_deref().is_some_and(is_true) {
         return None;
@@ -1603,10 +1454,8 @@ enum Style {
     /// The cell format a cell shows: the index its own `s` names, else the one its
     /// row or its column gives it.
     Index(usize),
-    /// The cell, its row or its column names a style this reader cannot read: no
-    /// table holds an entry at it, not even one declaring nothing at all, so the
-    /// cell's stored text is shown marked as stored rather than read as one showing
-    /// the schema's default.
+    /// The cell, its row or its column names a style this reader cannot read: no table holds an
+    /// entry at it, so the cell's stored text is marked rather than shown as the schema default.
     Unread,
     /// The cell names no style of its own and neither its row nor its column gives
     /// it one.
@@ -1614,9 +1463,8 @@ enum Style {
     None,
 }
 
-/// One `<col>` element as the sheet writes it: the columns it covers, whether it
-/// hides them, and the cell format a cell of those columns shows when it declares
-/// no style of its own.
+/// One `<col>` element: the columns it covers, whether it hides them, and the cell format a
+/// cell of those columns shows when it declares no style of its own.
 struct ColumnRange {
     min: u32,
     max: u32,
@@ -1624,26 +1472,19 @@ struct ColumnRange {
     style: Option<Style>,
 }
 
-/// A sheet's `<col>` elements once resolved: the columns they hide, and every
-/// column's default cell format by its zero-based index — `None` where the sheet
-/// gives that column none.
+/// A sheet's `<col>` elements once resolved: the columns hidden, and every column's default
+/// cell format by index — `None` where the sheet gives that column none.
 #[derive(Default)]
 struct Columns {
     hidden: BTreeSet<u32>,
     styles: Vec<Option<Style>>,
 }
 
-/// Record a `<col min max hidden="1" style="2"/>`: the 1-based columns it covers and
-/// the style (if any) it gives them; `min` alone means a single column. An element
-/// that neither hides its columns nor styles them says nothing, so nothing of it can
-/// be lost; one that does and whose range this reader cannot place — a `min` missing,
-/// unparsable or outside the grid, or a `max` that does not read — leaves the columns
-/// it hides or styles unmarked, so it is counted as a loss. The two ways of losing
-/// are counted apart: an element whose `min` it cannot place is applied to no column
-/// at all, while one whose `max` does not read still hides or styles the column it
-/// starts at. A `style` it names that this reader cannot read is a format the
-/// column's cells show and it cannot name, so those cells are marked as stored rather
-/// than read as unformatted.
+/// Record a `<col min max hidden="1" style="2"/>`: the 1-based columns it covers and the style
+/// it gives them; `min` alone means one column. An element that neither hides nor styles says
+/// nothing and loses nothing. One whose `min` cannot be placed is applied to no column at all;
+/// one whose `max` does not read still hides or styles the column it starts at — the two losses
+/// are counted apart. A `style` this reader cannot read marks those cells as stored.
 fn collect_columns(
     event: &BytesStart<'_>,
     ranges: &mut Vec<ColumnRange>,
@@ -1669,10 +1510,8 @@ fn collect_columns(
             if let Ok(max) = value.trim().parse::<u32>() {
                 max.clamp(min, MAX_COLUMNS)
             } else {
-                // The element's own `min` is one this reader can place, so that
-                // column is hidden or styled as the element asks; only its range's
-                // end — and the columns it would have covered beyond `min` — is
-                // left out.
+                // `min` is placeable, so that column is hidden or styled; only the range's end,
+                // and the columns it would have covered beyond `min`, is left out.
                 *partial += 1;
                 min
             }
@@ -1686,11 +1525,9 @@ fn collect_columns(
     });
 }
 
-/// Resolve a sheet's `<col>` elements into the columns they hide and every
-/// column's default style. Every element may name the grid's whole width, so a
-/// column is settled once and never looked at again: a hidden element hides the
-/// columns it names, and a column's style is the one of the last element naming
-/// it, so the elements are walked backwards for that.
+/// Resolve a sheet's `<col>` elements into the columns they hide and every column's default style.
+/// Every element may name the grid's whole width, so a column is settled once: a hidden element
+/// hides what it names, and a column's style is the last element's, hence the walk backwards.
 fn resolve_columns(ranges: &[ColumnRange]) -> Columns {
     // A sheet with no `<col>` element hides nothing and styles nothing, which is
     // the shape most sheets have.
@@ -1730,10 +1567,9 @@ fn column_style(columns: &Columns, reference: &str) -> Option<Style> {
     *columns.styles.get(column as usize)?
 }
 
-/// Record a `<mergeCell ref="A1:C1"/>`. A merge is sheet structure, so one whose
-/// ref is missing or is an address this reader cannot parse (an inverted `C3:A1`
-/// included) is counted as lost rather than dropped in silence — while a ref
-/// naming one cell covers nothing to mark and is no loss at all.
+/// Record a `<mergeCell ref="A1:C1"/>`. A merge is sheet structure, so one whose ref is missing
+/// or unparsable (an inverted `C3:A1` included) is counted as lost; a ref naming one cell
+/// covers nothing to mark and is no loss.
 fn collect_merge(event: &BytesStart<'_>, merges: &mut Vec<Merge>, lost: &mut usize) {
     let Some(reference) = attr(event, b"ref") else {
         *lost += 1;
@@ -1748,10 +1584,9 @@ fn collect_merge(event: &BytesStart<'_>, merges: &mut Vec<Merge>, lost: &mut usi
     }
 }
 
-/// Record a `<hyperlink ref="A1" r:id="rId1" location="…" display="…"/>`: a link
-/// whose `r:id` the sheet's relationships do not declare, whose `ref` is missing
-/// or is not a range this reader can parse, is counted as lost rather than
-/// rendered pointing nowhere.
+/// Record a `<hyperlink ref="A1" r:id="rId1" location="…" display="…"/>`: a link whose `r:id`
+/// the sheet does not declare, or whose `ref` is missing or unparsable, is counted as lost
+/// rather than rendered pointing nowhere.
 fn collect_link(
     event: &BytesStart<'_>,
     targets: &HashMap<String, String>,
@@ -1764,14 +1599,10 @@ fn collect_link(
     }
 }
 
-/// A cell's address: its own `r` attribute, or one synthesised from `row` and
-/// the running column counter. Either way the counter is left on the column
-/// after this cell — a cell with no address still occupies its column. An `r`
-/// this reader cannot parse is kept as the workbook wrote it: a value is never
-/// dropped for its address (a comment, which is only ever an annotation, is left
-/// out and counted instead), it just carries no merge or link mark. It is one line
-/// by construction ([`one_line`]): it is printed at the head of the cell's own
-/// line, so a break in it must not become a line there.
+/// A cell's address: its own `r`, or one synthesised from `row` and the running column counter,
+/// which is left on the column after this cell either way. An unparsable `r` is kept as the
+/// workbook wrote it — a value is never dropped for its address, it just carries no merge or
+/// link mark — and made one line ([`one_line`]), since it heads the cell's own line.
 fn cell_reference(event: &BytesStart<'_>, row: u32, next_column: &mut u32) -> String {
     let Some(reference) = attr(event, b"r") else {
         let reference = format!("{}{}", column_letters(*next_column), row);
@@ -1786,17 +1617,12 @@ fn cell_reference(event: &BytesStart<'_>, row: u32, next_column: &mut u32) -> St
 }
 
 /// The rectangle a `ref` covers. Both a merge and a hyperlink are one, so the
-/// containment test and the parse live here once. A column is zero-based, a row
-/// one-based.
+/// containment test and the parse live here once. A column is zero-based, a row one-based.
 #[derive(Clone, Copy)]
 struct Rect {
-    /// The rectangle's leftmost column, zero-based.
     min_col: u32,
-    /// The rectangle's top row, one-based.
     min_row: u32,
-    /// The rectangle's rightmost column, zero-based.
     max_col: u32,
-    /// The rectangle's bottom row, one-based.
     max_row: u32,
 }
 
@@ -1827,7 +1653,7 @@ impl Rect {
         })
     }
 
-    /// Whether `(column, row)` falls inside the rectangle.
+    /// Whether `(column, row)` falls inside it.
     fn holds(&self, column: u32, row: u32) -> bool {
         column >= self.min_col
             && column <= self.max_col
@@ -1849,11 +1675,9 @@ struct Merge {
     reference: String,
 }
 
-/// One `<hyperlink>`: the rectangle it covers, the ref and display text as the
-/// workbook wrote them, and the raw target it points at — a URL or a file path,
-/// never a package part, so it is kept exactly as the workbook wrote it. Display
-/// and target are one line by construction ([`one_line`]): they stand inside the
-/// cell's line, so a break in either must not become a line there.
+/// One `<hyperlink>`: the rectangle it covers, the ref and display text as the workbook wrote
+/// them, and the raw target — a URL or a file path, never a package part, kept verbatim.
+/// Display and target are one line ([`one_line`]), since they stand inside the cell's line.
 struct Link {
     rect: Rect,
     reference: String,
@@ -1862,9 +1686,8 @@ struct Link {
 }
 
 impl Link {
-    /// The link, or `None` when the workbook declares no target for it or its
-    /// `ref` is not a range this reader can parse — either way the link is lost
-    /// rather than rendered pointing nowhere.
+    /// The link, or `None` when no target is declared or its `ref` does not parse — the link is
+    /// then lost rather than rendered pointing nowhere.
     fn new(event: &BytesStart<'_>, targets: &HashMap<String, String>) -> Option<Self> {
         let reference = attr(event, b"ref")?;
         let rect = Rect::parse(&reference)?;
@@ -1891,9 +1714,8 @@ struct Shown {
 }
 
 impl Shown {
-    /// The value as the cell's own format displays it: a format code the workbook
-    /// wrote may carry a break of its own, so the display is made one line here
-    /// rather than promised at the call site.
+    /// The value as the cell's format displays it, made one line here: a format code the
+    /// workbook wrote may carry a break of its own.
     fn displayed(text: String) -> Self {
         Self {
             text: one_line(text),
@@ -1909,7 +1731,6 @@ impl Shown {
         }
     }
 
-    /// The mark the line carries after this value, empty when it is a display.
     fn mark(&self) -> &'static str {
         if self.stored { MARK_STORED } else { "" }
     }
@@ -1925,10 +1746,9 @@ enum Held {
     Formula(String),
 }
 
-/// One cell of a sheet, before the marks of the ranges holding it are known: the
-/// address as the workbook wrote it, what it holds, and that address as a position.
-/// The line the answer carries is built from these in [`render_lines`], where those
-/// marks — and the link a caption has to be weighed against — are known too.
+/// One cell of a sheet, before the marks of the ranges holding it are known: the address as the
+/// workbook wrote it, what it holds, and that address as a position. Its line is built in
+/// [`render_lines`], where those marks — and the link a caption is weighed against — are known.
 struct CellLine {
     /// The cell address, from `r` or synthesised from its row and column.
     reference: String,
@@ -1938,9 +1758,8 @@ struct CellLine {
 }
 
 impl CellLine {
-    /// The line before its range and link marks: the address, the value as shown
-    /// when the cell holds one — with the mark a value shown as stored carries — and
-    /// the formula when it holds one.
+    /// The line before its range and link marks: the address, the value as shown when the cell
+    /// holds one (with its stored mark), and the formula when it holds one.
     fn text(&self) -> String {
         match &self.held {
             Held::Value(shown) => format!("{}: {}{}", self.reference, shown.text, shown.mark()),
@@ -1974,12 +1793,10 @@ fn cell_position(reference: &str) -> Option<(u32, u32)> {
     Some((column, row))
 }
 
-/// The most range-to-cell tests one sheet's marks may cost. Both the ranges and
-/// the cells are document-controlled, and only the ranges spanning a cell's own
-/// row are ever tested against it, so an ordinary sheet — a handful of merges and
-/// links over many cells — cannot spend this; one crafted to put a million ranges
-/// over a million cells is marked up to here and the rest is reported, rather
-/// than stalling the conversion every reader shares.
+/// The most range-to-cell tests one sheet's marks may cost. Both ranges and cells are
+/// document-controlled: an ordinary sheet cannot spend this, while one crafted with a million
+/// ranges over a million cells is marked up to here and the rest reported, rather than stalling
+/// the conversion every reader shares.
 const MAX_RANGE_PROBES: usize = 1 << 24;
 
 /// What one sheet's range marks may spend, and whether they ran out.
@@ -2001,11 +1818,9 @@ impl ProbeBudget {
     }
 }
 
-/// The worksheet's lines: the hidden-geometry annotations first, then one line
-/// per valued cell — each carrying its merge mark, then its link mark, when it
-/// is part of one — and finally a line per link no cell shows. The flag says the
-/// sheet's later range marks were left out because marking them would cost more
-/// than [`MAX_RANGE_PROBES`].
+/// The worksheet's lines: hidden-geometry annotations first, then one line per valued cell —
+/// carrying its merge mark, then its link mark — and finally a line per link no cell shows. The
+/// flag says the sheet's later range marks were left out over [`MAX_RANGE_PROBES`].
 fn render_lines(
     cells: &[CellLine],
     hidden_rows: &BTreeSet<u32>,
@@ -2028,9 +1843,8 @@ fn render_lines(
             ))
         ));
     }
-    // The cells are marked in document order but swept in position order: a range
-    // is only ever tested against a cell on a row it spans, so the marks cost the
-    // ranges a cell is really in rather than every range declared before it.
+    // Cells are marked in document order but swept in position order, so a mark costs only the
+    // ranges a cell is really in, not every range declared before it.
     let mut order: Vec<(u32, u32, usize)> = Vec::with_capacity(cells.len());
     for (index, cell) in cells.iter().enumerate() {
         if let Some((column, row)) = cell.position {
@@ -2072,9 +1886,8 @@ fn render_lines(
             let link = &hyperlinks[link];
             text.push(' ');
             text.push_str(DOC_LINK);
-            // The caption a link carries is what it shows where the cell's own value
-            // does not: it is named in front of the target when the two differ, so a
-            // caption this reading would otherwise drop is still read.
+            // A caption is named in front of the target when the two differ, so a caption this
+            // reading would otherwise drop is still read.
             let caption = link.display.as_deref().filter(|caption| {
                 !caption.is_empty()
                     && cell.shown().map(|shown| shown.text.as_str()) != Some(*caption)
@@ -2106,12 +1919,9 @@ fn render_lines(
     (lines, budget.exhausted)
 }
 
-/// A sheet's ranges as a sweep down its rows: a range joins the candidates when
-/// the first row it spans is reached and leaves once its last row is passed, so a
-/// cell is only ever tested against a range that can actually hold it. A cell and
-/// a range are both document-controlled, and testing every cell against every
-/// range whose corner reaches it — what a sheet with a few dozen merges against a
-/// few hundred thousand cells needs — costs their product; the sweep costs each
+/// A sheet's ranges as a sweep down its rows: a range joins the candidates when its first row is
+/// reached and leaves once its last row is passed, so a cell is only tested against a range that
+/// can hold it. Testing every cell against every range costs their product; the sweep costs each
 /// cell the ranges over its own row, plus one push and one pop per range.
 struct RowSweep {
     /// Every range's rectangle, by its index in the sheet's own list.
@@ -2120,11 +1930,8 @@ struct RowSweep {
     pending: Vec<(u32, usize)>,
     /// How many of `pending` have been reached.
     reached: usize,
-    /// The ranges reached and not yet passed, read in the order they leave rather
-    /// than the order the sheet declares them: the soonest to expire is at the
-    /// front, so dropping the ones a row is past costs a pop each however many are
-    /// held — a sweep whose ranges end on different rows never re-reads the ones
-    /// that are still holding.
+    /// The ranges reached and not yet passed, in the order they leave: the soonest to expire at
+    /// the front, so dropping those a row is past costs a pop each however many are held.
     active: BinaryHeap<Reverse<(u32, usize)>>,
 }
 
@@ -2166,10 +1973,9 @@ impl RowSweep {
     }
 }
 
-/// The index of the first range in document order whose rectangle holds the cell
-/// its `holds` closure answers for — `covering` is the ranges spanning that cell's
-/// row — or `None`. Every rectangle actually tested spends one of the sheet's
-/// probes.
+/// The index of the first range in document order whose rectangle holds the cell its `holds`
+/// closure answers for — `covering` being the ranges spanning that cell's row — or `None`.
+/// Every rectangle tested spends one of the sheet's probes.
 fn first_holding(
     covering: impl Iterator<Item = usize>,
     budget: &mut ProbeBudget,
@@ -2243,29 +2049,23 @@ struct Cell {
     reference: String,
     /// The `t` attribute: how `value` is interpreted.
     kind: Option<String>,
-    /// Where this cell's number format comes from: its own `s`, else the default of
-    /// its row or of its column, else nothing — or [`Style::Unread`] when the cell
-    /// names a style this reader cannot read.
+    /// Where this cell's number format comes from: its own `s`, else its row's or column's
+    /// default, else nothing — or [`Style::Unread`] for a style this reader cannot read.
     style: Style,
     /// The `<v>`/inline `<t>` text, raw.
     value: String,
-    /// The `<f>` text.
     formula: String,
-    /// Whether a `<f>` element was seen.
     has_formula: bool,
     /// `si` of a shared formula definition/reference.
     formula_si: Option<String>,
-    /// Whether the `<f>` was `t="shared"`.
     formula_shared: bool,
-    /// The cell is a `t="s"` one whose string the shared-string table does not
-    /// hold, so its text is lost — reported as a note, never as content.
+    /// A `t="s"` cell whose string the table does not hold: its text is lost, reported as a note.
     shared_lost: bool,
 }
 
 impl Cell {
-    /// Start a cell from its `<c>` element. A cell with no `s` of its own shows
-    /// the default style of its row, else the one of its column, else none — so
-    /// its address is settled first, a cell with no `r` included.
+    /// Start a cell from its `<c>` element. A cell with no `s` shows the default style of its
+    /// row, else its column's, else none — so its address is settled first.
     fn start(
         event: &BytesStart<'_>,
         row: u32,
@@ -2292,9 +2092,8 @@ impl Cell {
         }
     }
 
-    /// On `<f ...>`: the formula this cell holds, and whether it is a shared
-    /// definition (whose text is kept for the references that follow) or one of
-    /// those references.
+    /// On `<f ...>`: the formula this cell holds, and whether it is a shared definition (whose
+    /// text is kept for the references that follow) or one of those references.
     fn start_formula(&mut self, event: &BytesStart<'_>) {
         self.has_formula = true;
         self.formula_si = attr(event, b"si");
@@ -2351,21 +2150,16 @@ impl Cell {
         })
     }
 
-    /// The cell's value as shown, resolved by the `t` attribute — `None` when the
-    /// cell holds none, or holds one that shows as nothing at all. A shared-string
-    /// or inline string keeps its own spacing; every other type is trimmed of the
-    /// indentation a pretty-printed part puts inside `<v>`. A value the workbook
-    /// wrote with a line break in it is shown as one line (`\n`), so no value can
-    /// stand where this reader's own lines do.
+    /// The cell's value as shown, resolved by the `t` attribute — `None` when it holds none, or
+    /// one that shows as nothing. A shared-string or inline string keeps its spacing; every other
+    /// type is trimmed of the indentation a pretty-printed part puts inside `<v>`. A line break
+    /// in a value becomes one line (`\n`), so no value can stand where the reader's lines do.
     fn value(&mut self, book: Book<'_>) -> Option<Shown> {
         let shown = match self.kind.as_deref() {
-            // A `t="s"` cell holds an index into the shared-string table, so one
-            // the table does not hold is text that was lost (a table that could
-            // not be read at all, or a truncated one, leaves every such cell
-            // here). The cell then reads empty and the loss is reported through
-            // the notes — the channel this module reports every unreadable part
-            // on — rather than as text that cannot be told from the workbook's
-            // own content.
+            // A `t="s"` cell holds an index into the table, so one it does not hold is text that
+            // was lost: the cell reads empty and the loss is reported through the notes — the
+            // channel every unreadable part is reported on — never as text indistinguishable from
+            // the workbook's own content.
             Some("s") => {
                 let text = self
                     .value
@@ -2397,9 +2191,8 @@ impl Cell {
     /// when no display of it was produced.
     fn number(&self, book: Book<'_>) -> Shown {
         let raw = self.value.trim().to_owned();
-        // A cell's own `s`, else the workbook's first cell format: `s` defaults to
-        // the first entry, so a cell naming none and one naming `0` are the same
-        // cell to Excel.
+        // `s` defaults to the first entry, so a cell naming none and one naming `0` are the
+        // same cell to Excel.
         let table = &book.styles.cell_xfs;
         let index = match self.style {
             Style::Unread => return Shown::stored(raw),
@@ -2437,14 +2230,11 @@ mod tests {
     use crate::ooxml::test_fixtures::{COLUMN_CHART, zip_fixture};
     use std::fmt::Write as _;
 
-    // ── Excel ───────────────────────────────────────────────────
-
     const WORKBOOK: &[u8] = br#"<workbook><sheets><sheet name="Data" sheetId="1" r:id="rId1"/><sheet name="More" sheetId="2" r:id="rId2"/></sheets></workbook>"#;
 
     const WORKBOOK_RELS: &[u8] = br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Target="/xl/worksheets/sheet2.xml"/></Relationships>"#;
-    /// One plain string, one rich-text one split across runs, and one written
-    /// as numeric character references — the shape a producer that escapes
-    /// non-ASCII writes (every Cyrillic letter becomes `&#NNNN;`).
+    /// One plain string, one rich-text split across runs, and one written as numeric character
+    /// references (every Cyrillic letter becomes `&#NNNN;`).
     const SHARED_STRINGS: &[u8] = br"<sst><si><t>hello</t></si><si><r><t>rich</t></r><r><t> text</t></r></si><si><t>&#1046;&#1091;&#1082;</t></si></sst>";
 
     const SHEET_WITH_CELLS: &[u8] = br#"<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1"><v>42</v></c></row><row r="2"><c r="A2"><f>SUM(B1:B2)</f></c><c r="B2" t="b"><v>1</v></c></row><row r="3"><c r="A3" t="inlineStr"><is><t>inline</t></is></c><c><v>7</v></c><c t="str"><f>B1&amp;1</f><v>jog</v></c></row><row r="4"><c r="A4" t="s"><v>1</v></c></row><row r="5"><c r="A5" t="s"><v>2</v></c><c r="B5" t="inlineStr"><is><t>&#1054;&#1090;&#1095;&#1105;&#1090;</t></is></c></row></sheetData></worksheet>"#;
@@ -2479,9 +2269,8 @@ mod tests {
         assert!(notes.is_empty(), "nothing was skipped: {notes:?}");
     }
 
-    /// A workbook whose relationship list cannot be read still yields its
-    /// sheets: the parts are conventionally numbered, so their names are the
-    /// order.
+    /// A workbook whose relationship list cannot be read still yields its sheets: the parts are
+    /// conventionally numbered, so their names are the order.
     #[test]
     fn xlsx_falls_back_to_conventional_sheet_parts() {
         let bytes = zip_fixture(&[
@@ -2503,12 +2292,10 @@ mod tests {
         assert!(notes.is_empty(), "nothing was skipped: {notes:?}");
     }
 
-    /// A part the package left absent or half written costs only what it stood
-    /// for: a workbook part costs the sheets and names declared after its cut,
-    /// while the sheets read before the cut are still delivered; a sheet part
-    /// costs its own sheet; and a cut relationships part costs the parts it would
-    /// have named. Every loss is said rather than passed off as a shorter
-    /// workbook.
+    /// A part the package left absent or half written costs only what it stood for: a cut
+    /// workbook part costs the sheets and names after the cut, a cut sheet part its own sheet, a
+    /// cut relationships part the parts it would have named — each loss said, never passed off as
+    /// a shorter workbook.
     #[test]
     fn xlsx_reads_parts_the_package_left_missing_or_cut() {
         let data: &[u8] =
@@ -2613,14 +2400,11 @@ mod tests {
         }
     }
 
-    /// A part that is well-formed XML but carries no element of its own kind — an
-    /// error page a producer left in its place — is read like a part the package
-    /// does not carry: a workbook part with no workbook element costs the whole
-    /// document, a sheet part is reported unread rather than read as a sheet with
-    /// no values, and a comments part is reported lost rather than read as a sheet
-    /// without comments. A `<workbook/>` declaring no sheet is a workbook still,
-    /// and an entry the package left empty declares a sheet with no values and a
-    /// comments part with no comments, so neither is a loss.
+    /// A part that is well-formed XML but carries no element of its own kind — an error page in
+    /// its place — is read like a part the package does not carry: no workbook element costs the
+    /// whole document, a sheet part is reported unread, a comments part reported lost. A
+    /// `<workbook/>` declaring no sheet is a workbook still, and an empty entry declares a sheet
+    /// with no values and a comments part with no comments, so neither is a loss.
     #[test]
     fn xlsx_reads_a_part_carrying_no_element_like_a_missing_one() {
         let error_page: &[u8] =
@@ -2770,15 +2554,11 @@ mod tests {
         );
     }
 
-    /// A chart sheet is one chart over a whole tab, and the tab is named for what
-    /// it is: the workbook says so through the relationship's kind and the
-    /// `chartsheets/` directory its part lives in, so a sheet nothing can be read
-    /// from is named a chart sheet rather than one that could not be read. The
-    /// chart it draws is resolved through the sheet's own relationships — directly,
-    /// or through the drawing part a chartsheet references, which is what Excel
-    /// writes — so the sheet's chart is not named a second time as a chart of its
-    /// own. Its content is printed under the tab's mark, a part the reading cannot
-    /// describe says so there, and the two losses are named once each.
+    /// A chart sheet is one chart over a whole tab, and the tab is named for what it is: the
+    /// workbook says so through the relationship's kind and the `chartsheets/` directory its part
+    /// lives in, so a sheet nothing can be read from is named a chart sheet rather than one that
+    /// could not be read. Its chart is resolved through the sheet's own relationships, so it is
+    /// not named twice, and its content is printed under the tab's mark.
     #[test]
     fn xlsx_names_a_chart_sheet_by_its_kind() {
         let cases = [
@@ -2861,10 +2641,9 @@ mod tests {
         }
     }
 
-    /// A workbook of one sheet — `name`, a chart sheet when `chart_sheet` — that
-    /// draws the `charts` given, each filed as `xl/charts/<part>` in the order the
-    /// drawing names them: the whole chain a sheet's charts are read through, so a
-    /// test names only the charts it is about.
+    /// A workbook of one sheet — a chart sheet when `chart_sheet` — drawing the `charts` given,
+    /// each filed as `xl/charts/<part>` in the order the drawing names them: the whole chain a
+    /// sheet's charts are read through.
     fn charted_workbook(name: &str, chart_sheet: bool, charts: &[(&str, &[u8])]) -> Vec<u8> {
         let (dir, kind) = if chart_sheet {
             ("chartsheets", "chartsheet")
@@ -2931,8 +2710,6 @@ mod tests {
         zip_fixture(&entries)
     }
 
-    /// A drawing's two charts are each read, in the order the drawing names them,
-    /// so one sheet holding several charts tells a model about every one of them.
     #[test]
     fn xlsx_describes_every_chart_a_drawing_holds() {
         let pie = br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:pieChart><c:ser><c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>Share</c:v></c:pt></c:strCache></c:strRef></c:tx><c:cat><c:strCache><c:pt idx="0"><c:v>East</c:v></c:pt></c:strCache></c:cat><c:val><c:numCache><c:pt idx="0"><c:v>7</c:v></c:pt></c:numCache></c:val></c:ser></c:pieChart></c:plotArea></c:chart></c:chartSpace>"#;
@@ -2961,13 +2738,10 @@ mod tests {
         );
     }
 
-    /// The shared-string table is named by a workbook relationship like the styles
-    /// part, so a producer that lays it out at a non-conventional path still has
-    /// its strings read — the conventional name is only the fallback. An index the
-    /// table does not hold — a table that stops mid-entry, an index past its end,
-    /// or no table at all — is text the workbook lost: the cell reads empty and the
-    /// loss is counted as a note, never passed off as text the reader cannot tell
-    /// from the workbook's own.
+    /// The shared-string table is named by a workbook relationship like the styles part, so a
+    /// producer laying it out at a non-conventional path still has its strings read. An index the
+    /// table does not hold — a table stopping mid-entry, an index past its end, or no table at
+    /// all — is text the workbook lost: the cell reads empty and the loss is counted as a note.
     #[test]
     fn xlsx_resolves_the_shared_string_table_through_the_workbook_rels() {
         let cases = [
@@ -3034,10 +2808,9 @@ mod tests {
         }
     }
 
-    /// A cell is shown the way its number format displays it: a date, a
-    /// percentage and a custom currency resolved through `numFmtId`s, and the
-    /// stored text (marked) for a format this reader cannot reproduce or one
-    /// that shows nothing.
+    /// A cell is shown the way its number format displays it — a date, a percentage and a custom
+    /// currency resolved through `numFmtId`s — and the stored text (marked) for a format this
+    /// reader cannot reproduce or one that shows nothing.
     #[test]
     fn xlsx_renders_cells_with_their_number_formats() {
         let bytes = zip_fixture(&[
@@ -3069,8 +2842,6 @@ mod tests {
         assert!(notes.is_empty(), "nothing was skipped: {notes:?}");
     }
 
-    /// A workbook in the 1904 date system shows its serial as a 1904-based
-    /// date.
     #[test]
     fn xlsx_reads_the_1904_date_system() {
         let bytes = zip_fixture(&[
@@ -3098,18 +2869,12 @@ mod tests {
         assert_eq!(text, "Sheet \"Data\":\n  A1: 1904-01-01");
     }
 
-    /// A cell shows the format its style gives it: a cell format declaring no
-    /// format of its own shows the one the base style it names holds — how a
-    /// workbook that leaves its number format to a named style writes it — so its
-    /// serial is never passed off as the display, while a format that applies its
-    /// own declaration keeps it, even when that declaration is `General`. A base
-    /// style whose declaration this reader cannot read, one it names by an `xfId`
-    /// that does not parse, and one past the entries the base-style list holds all
-    /// leave the format the entry would show unknown. A cell with no `s` of its own
-    /// shows the default style of its row — only when the row marks the style
-    /// custom — else the one of its column (a cell with no `r` included: its
-    /// synthesised address is what its column is read from); a cell that declares a
-    /// style keeps it, and a row or column that gives none leaves the stored number.
+    /// A cell shows the format its style gives it: a cell format declaring none of its own shows
+    /// the one its base style holds, while a format applying its own declaration keeps it, even
+    /// `General`. An unreadable base style, an `xfId` that does not parse or one past the
+    /// base-style list leaves the format unknown. A cell with no `s` shows its row's default
+    /// style — only when the row marks it custom — else its column's; a row or column giving
+    /// none leaves the stored number.
     #[test]
     fn xlsx_inherits_a_cell_format_from_its_base_style_or_its_row_or_column() {
         let base_styles: &[u8] = br#"<styleSheet><cellStyleXfs count="4"><xf numFmtId="0"/><xf numFmtId="14"/><xf numFmtId="9"/><xf numFmtId="bad"/></cellStyleXfs><cellXfs count="9"><xf numFmtId="0"/><xf numFmtId="0" xfId="1"/><xf numFmtId="0" xfId="2" applyNumberFormat="0"><alignment horizontal="center"/></xf><xf numFmtId="0" xfId="1" applyNumberFormat="1"/><xf numFmtId="0" xfId="3"/><xf numFmtId="0" xfId="9"/><xf numFmtId="14" xfId="bad"/><xf numFmtId="0" xfId="bad"/><xf numFmtId="0" xfId="bad" applyNumberFormat="1"/></cellXfs></styleSheet>"#;
@@ -3153,11 +2918,10 @@ mod tests {
         }
     }
 
-    /// A styles part the workbook declares and this reader gets no format table
-    /// out of — a mismatched end tag, a part that is no stylesheet at all (an error
-    /// page a producer left in the part's place parses as XML just as happily), or
-    /// one the package does not carry — costs every cell its format: the loss is
-    /// said out loud, and a cell naming a format then reads as its stored text.
+    /// A styles part the workbook declares and this reader gets no format table out of — a
+    /// mismatched end tag, a part that is no stylesheet at all, or one the package does not carry
+    /// — costs every cell its format: the loss is said out loud and a cell naming a format reads
+    /// as its stored text.
     #[test]
     fn xlsx_reports_styles_it_cannot_read() {
         for styles in [
@@ -3197,20 +2961,13 @@ mod tests {
         }
     }
 
-    /// A stylesheet that declares a format but no cell format to name it from — a
-    /// `numFmt` (readable or not), a base-style list, or a `cellXfs` list holding no
-    /// entry — is one this reader cannot derive any cell's format from: every cell —
-    /// a serial a date format would have shown included — comes back as the number
-    /// it stores, marked as stored, and the loss is said. A stylesheet declaring
-    /// nothing, like `<styleSheet/>`, declares no format for any cell: the cells all
-    /// show the default one, and nothing is lost. An `s` that is not even a number is
-    /// a different matter again: the workbook says the cell carries a format this
-    /// reader cannot read, so its stored value is marked as stored even in the
-    /// no-format shape — as is an `s` the empty table does not hold, since entry 0 is
-    /// the only one that stands for a cell naming no format. An entry the package
-    /// left empty declares nothing either, so the part it stands for has no loss to
-    /// report, while a part whose bytes are something other than a document — an
-    /// error page a producer left in its place — is a loss and is reported as one.
+    /// A stylesheet declaring a format but no cell format to name it from — a `numFmt`, a
+    /// base-style list, or a `cellXfs` holding no entry — is one this reader cannot derive any
+    /// cell's format from: every cell comes back as the number it stores, marked, and the loss is
+    /// said. A stylesheet declaring nothing, like `<styleSheet/>`, loses nothing. An `s` that is
+    /// not even a number, or one the empty table does not hold, marks the stored value as stored
+    /// even there. An entry the package left empty declares nothing and has no loss to report,
+    /// while a part whose bytes are not a document is a loss and is reported as one.
     #[test]
     fn xlsx_reads_a_stylesheet_declaring_no_cell_format() {
         let workbook: &[u8] =
@@ -3226,8 +2983,7 @@ mod tests {
              C1: 46300 (stored number, format not shown)\n  \
              D1: 46300 (stored number, format not shown)";
         let inline_text = "Sheet \"Data\":\n  A1: x";
-        // label, styles part, workbook relationships, comments part, sheet
-        // relationships, worksheet, expected text, expected notes.
+        // label, styles part, workbook relationships, comments part, sheet rels, expected text.
         for (label, styles, rels, comments, sheet_rels, sheet, expected_text, expected_notes) in [
             (
                 "a stylesheet declaring nothing",
@@ -3310,13 +3066,10 @@ mod tests {
         }
     }
 
-    /// A cell naming a format the workbook's table does not hold — an index past
-    /// its `cellXfs` entries, an entry whose own declaration does not parse, an entry
-    /// inheriting from a base style that does not parse either, a row or a column
-    /// naming an `s` this reader cannot read — shows its stored value marked as
-    /// stored: a serial the reader cannot resolve a format for is never passed off as
-    /// the display. A cell showing only its formula has no stored value to mark, and a
-    /// cell whose row and column declare no style keeps the schema's default.
+    /// A cell naming a format the workbook's table does not hold — an index past its `cellXfs`,
+    /// an entry whose declaration does not parse, an entry inheriting from a base style that does
+    /// not parse either, a row or column naming an unreadable `s` — shows its stored value
+    /// marked. A cell showing only its formula has no stored value to mark.
     #[test]
     fn xlsx_marks_a_cell_whose_format_the_table_does_not_hold() {
         let bytes = zip_fixture(&[
@@ -3391,12 +3144,10 @@ mod tests {
         );
     }
 
-    /// A `<cols>` section the sheet writes after its data reaches no cell of it —
-    /// the columns a cell shows are settled the first time a cell asks for them —
-    /// so it is counted and said rather than dropped in silence. A `<col>` whose
-    /// `min` this reader cannot place is applied to no column at all, and one whose
-    /// `max` does not read still hides or styles the column it starts at: the two
-    /// are counted and said apart.
+    /// A `<cols>` section written after the sheet's data reaches no cell of it — the columns are
+    /// settled when a cell first asks — so it is counted and said. A `<col>` whose `min` cannot
+    /// be placed is applied to no column, one whose `max` does not read still hides or styles the
+    /// column it starts at: the two are counted apart.
     #[test]
     fn xlsx_reports_late_and_unplaceable_column_definitions() {
         let bytes = zip_fixture(&[
@@ -3431,13 +3182,10 @@ mod tests {
         );
     }
 
-    /// A merge marks its top-left cell with the range, and a covered cell that kept
-    /// its own value with the range that holds it; a covered cell with no value
-    /// emits nothing, and a merge over a single cell covers nothing to mark and is
-    /// no loss at all. A merge is sheet structure, so one whose `ref` is missing or
-    /// is not a range this reader can mark is counted and reported rather than
-    /// dropped in silence — while the sheet's cells and the merges around it still
-    /// render.
+    /// A merge marks its top-left cell with the range, and a covered cell that kept its own value
+    /// with the range holding it; a covered cell with no value emits nothing, and a merge over
+    /// one cell is no loss. A merge whose `ref` is missing or unmarkable is counted and reported
+    /// rather than dropped in silence, while the rest of the sheet still renders.
     #[test]
     fn xlsx_marks_merged_ranges() {
         let cases = [
@@ -3516,11 +3264,9 @@ mod tests {
         );
     }
 
-    /// A legacy `comments.xml` comment is surfaced after the sheet's cells, its
-    /// author resolved through the part's `authorId` index and its rich text
-    /// flattened to one line — while an `authorId` the part's authors list does not
-    /// hold names an author that is in the file but not in this answer, so the
-    /// comment says so rather than reading as one by nobody.
+    /// A legacy `comments.xml` comment follows the sheet's cells, its author resolved through the
+    /// part's `authorId` index and its rich text flattened to one line — while an `authorId` the
+    /// authors list does not hold names an author in the file but not in this answer.
     #[test]
     fn xlsx_reads_a_legacy_cell_comment_with_its_author() {
         let bytes = zip_fixture(&[
@@ -3560,13 +3306,10 @@ mod tests {
         );
     }
 
-    /// A threaded discussion comes back whole, each entry with the name its person
-    /// resolves to through the workbook's persons part. The copy a real workbook
-    /// keeps in the legacy part as the discussion's stub — Excel's `[Threaded
-    /// comment]` preamble, its note to the reader, and each entry's text behind a
-    /// `Comment:`/`Reply:` lead of its own — is not repeated, while a legacy comment
-    /// that is a comment of its own keeps its line, even when its words stand inside
-    /// a threaded one, and a cell with no thread keeps its legacy comment.
+    /// A threaded discussion comes back whole, each entry named through the workbook's persons
+    /// part. The stub a real workbook keeps in the legacy part — Excel's `[Threaded comment]`
+    /// preamble and each entry behind a `Comment:`/`Reply:` lead — is not repeated, while a
+    /// legacy comment of its own keeps its line, and a cell with no thread keeps its legacy one.
     #[test]
     fn xlsx_reads_a_thread_without_repeating_its_legacy_stub() {
         let bytes = zip_fixture(&[
@@ -3586,10 +3329,8 @@ mod tests {
                 "xl/worksheets/_rels/sheet1.xml.rels",
                 br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments1.xml"/><Relationship Id="rId2" Type="http://schemas.microsoft.com/office/2017/10/relationships/threadedComment" Target="../threadedComments/threadedComment1.xml"/></Relationships>"#,
             ),
-            // The legacy part as Excel itself writes it for a threaded discussion:
-            // its own preamble and note to the reader, then each entry's text behind
-            // a `Comment:`/`Reply:` lead of its own — the shape the stub has to be
-            // recognized in, and the discussion then shown only once.
+            // The legacy part as Excel writes it for a threaded discussion: its preamble, then
+            // each entry behind a `Comment:`/`Reply:` lead — the shape the stub is recognized in.
             (
                 "xl/comments1.xml",
                 br#"<comments><authors><author>Old Author</author></authors><commentList><comment ref="A1" authorId="0"><text>[Threaded comment]
@@ -3626,11 +3367,9 @@ a reply</text></comment><comment ref="A2" authorId="0"><text>legacy two</text></
         assert!(notes.is_empty(), "nothing was skipped: {notes:?}");
     }
 
-    /// A comment that names an author this reader cannot resolve — a threaded one
-    /// whose `personId` the workbook's person names do not hold, whether the part is
-    /// declared and absent, declared and no person list, or not declared at all —
-    /// has an author that is in the file but not in this answer, which its sheet says
-    /// rather than passing the comment off as one by nobody.
+    /// A comment naming an author this reader cannot resolve — a `personId` the person names do
+    /// not hold, whether the part is absent, has no person list, or is not declared at all — has
+    /// an author in the file but not in this answer, which its sheet says.
     #[test]
     fn xlsx_reports_a_comment_author_it_cannot_resolve() {
         for (declared, persons) in [
@@ -3727,14 +3466,10 @@ a reply</text></comment><comment ref="A2" authorId="0"><text>legacy two</text></
         assert!(notes.is_empty(), "nothing was skipped: {notes:?}");
     }
 
-    /// A value the workbook (or another producer) wrote with a line break in it is
-    /// shown as one line, so no value can break the one-line-per-cell shape or stand
-    /// where this reader's own lines do. Every break a text stack may take is
-    /// collapsed — `\n` and `\r\n`, and the Unicode breaks a value may carry — and so
-    /// is a break in the text the workbook wrote for something other than a cell
-    /// value: a hyperlink's caption, a comment's author, a defined name, a sheet
-    /// name, a cell's formula and the display a cell's own number format produces
-    /// each keep their own place in the answer's shape.
+    /// A value written with a line break in it is shown as one line, so no value can break the
+    /// one-line-per-cell shape: `\n` and `\r\n` and the Unicode breaks are all collapsed — and so
+    /// is a break in a hyperlink's caption, a comment's author, a defined name, a sheet name, a
+    /// formula and a number-format display.
     #[test]
     fn xlsx_shows_a_break_in_a_value_or_a_document_text_as_one_line() {
         let wrapped: &[u8] = br#"<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="inlineStr"><is><t>one
@@ -3804,10 +3539,9 @@ two</t></is></c><c r="C1" t="inlineStr"><is><t>cr&#13;&#10;lf</t></is></c><c r="
         }
     }
 
-    /// A hyperlink the sheet cannot resolve — one whose `r:id` the sheet does not
-    /// declare, and one whose range has its minimum past its maximum (`C3:A1`), so
-    /// it names no cell — is dropped rather than rendered pointing nowhere, and the
-    /// loss is counted: an inverted link is not accepted as an empty rectangle.
+    /// A hyperlink the sheet cannot resolve — its `r:id` undeclared, or its range with the
+    /// minimum past the maximum (`C3:A1`) — is dropped rather than rendered pointing nowhere, and
+    /// the loss counted.
     #[test]
     fn xlsx_reports_links_it_cannot_resolve() {
         let declared: &[u8] = br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/a"/></Relationships>"#;
@@ -3853,10 +3587,8 @@ two</t></is></c><c r="C1" t="inlineStr"><is><t>cr&#13;&#10;lf</t></is></c><c r="
         }
     }
 
-    /// Defined names follow the last sheet: a workbook-level one is bare, a
-    /// sheet-local one names the sheet its `localSheetId` indexes (a CDATA text
-    /// reads the same as a plain one), and Excel's own `_xlnm.` names are left
-    /// out.
+    /// Defined names follow the last sheet: a workbook-level one is bare, a sheet-local one names
+    /// the sheet its `localSheetId` indexes, and Excel's own `_xlnm.` names are left out.
     #[test]
     fn xlsx_surfaces_defined_names_with_their_sheet() {
         let bytes = zip_fixture(&[
@@ -3889,10 +3621,9 @@ two</t></is></c><c r="C1" t="inlineStr"><is><t>cr&#13;&#10;lf</t></is></c><c r="
         assert!(notes.is_empty(), "nothing was skipped: {notes:?}");
     }
 
-    /// A working book with the pieces together: a date, a percentage, a
-    /// currency amount, a merged heading, a hidden service column, a comment, a
-    /// link and a named range — every value shown the way Excel shows it and
-    /// every piece of structure marked rather than dropped.
+    /// A working book with the pieces together — a date, a percentage, a currency, a merged
+    /// heading, a hidden column, a comment, a link and a named range — every value shown the way
+    /// Excel shows it and every piece of structure marked.
     #[test]
     fn xlsx_reads_a_working_book_end_to_end() {
         let bytes = zip_fixture(&[

@@ -1,20 +1,17 @@
 //! Reasoning / chain-of-thought plaintext extraction and OpenAI-compatible replay helpers.
 //!
-//! These functions process model-provided reasoning data — OpenRouter-style
-//! `reasoning_details` JSON, inline `<think>...</think>` tags, and merged
-//! `reasoning_content` / `reasoning` strings — into human-readable plaintext
-//! for display in the UI or for API roundtrip synthesis.
+//! These process model-provided reasoning data — OpenRouter-style `reasoning_details` JSON,
+//! inline `think` tags, and merged `reasoning_content` / `reasoning` strings — into
+//! human-readable plaintext for display or API roundtrip synthesis.
 //!
-//! Roundtrip helpers preserve thinking/reasoning across OpenAI-compatible APIs:
-//! `OpenRouter` uses `reasoning` and `reasoning_details`; DeepSeek-native uses `reasoning_content`.
+//! Roundtrip helpers preserve thinking across OpenAI-compatible APIs: `OpenRouter` uses
+//! `reasoning` and `reasoning_details`; DeepSeek-native uses `reasoning_content`.
 
 use regex::Regex;
 use serde_json::{Value, json};
 use std::sync::LazyLock;
 
 use crate::{Reasoning, ToolCall};
-
-// ── OpenRouter reasoning_details extraction ──────────────────────────────
 
 fn reasoning_detail_type(item: &Value) -> Option<&str> {
     item.get("type").and_then(Value::as_str)
@@ -52,8 +49,7 @@ fn append_plaintext_from_detail_item(out: &mut String, item: &Value) {
 }
 
 /// Extract human-readable chain-of-thought from OpenRouter-style `reasoning_details` JSON.
-///
-/// Handles `reasoning.text`, `reasoning.summary`, and similar `type` strings; skips encrypted blobs.
+/// Handles `reasoning.text`, `reasoning.summary` and similar `type` strings; skips encrypted blobs.
 #[must_use]
 fn plaintext_from_reasoning_details(details: &Value) -> String {
     let mut out = String::new();
@@ -69,16 +65,10 @@ fn plaintext_from_reasoning_details(details: &Value) -> String {
     out
 }
 
-// ── Inline think-tag stripping ──────────────────────────────────────────
-
-/// Strip `<think>...</think>` reasoning blocks from model output.
+/// Strip `think`-tag reasoning blocks from model output. Some models (e.g. `MiniMax`) embed
+/// their reasoning inline in `content` instead of the `reasoning_content` field.
 ///
-/// Some models (e.g. `MiniMax`) embed their reasoning inline in `content` using
-/// `<think>...</think>` tags instead of (or in addition to) the standard
-/// `reasoning_content` API field.
-///
-/// Returns `None` when stripping leaves an empty string (the model only emitted
-/// reasoning wrapped in think tags with no visible output).
+/// `None` when stripping leaves an empty string (the model emitted only wrapped reasoning).
 #[must_use]
 pub(crate) fn strip_think_tags(s: &str) -> Option<String> {
     static THINK_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -92,10 +82,8 @@ pub(crate) fn strip_think_tags(s: &str) -> Option<String> {
     }
 }
 
-// ── Merged reasoning string ─────────────────────────────────────────────
-
-/// Prefer `reasoning_content`, then `reasoning` (`OpenRouter`). **Display / effective text only**
-/// — never use for API replay fields.
+/// Prefer `reasoning_content`, then `reasoning`. **Display / effective text only** — never use
+/// for API replay fields.
 fn merged_reasoning_string(
     reasoning_content: Option<String>,
     reasoning: Option<String>,
@@ -104,8 +92,6 @@ fn merged_reasoning_string(
         .filter(|s| !s.trim().is_empty())
         .or_else(|| reasoning.filter(|s| !s.trim().is_empty()))
 }
-
-// ── Display-ready plaintext ─────────────────────────────────────────────
 
 /// Human-readable thinking line for UI (merges plaintext fields; extracts from details when needed).
 #[must_use]
@@ -130,10 +116,10 @@ fn details_has_preservable_blocks(details: &Value) -> bool {
 
 /// Plain `reasoning_content` string to store on assistant messages and send back to the API.
 ///
-/// When the model only streams structured `reasoning_details` (no `reasoning` / `reasoning_content`
-/// string), `DeepSeek` behind `OpenRouter` still expects a `reasoning_content` field on **tool-call**
-/// turns — derive text from details or send an empty string when details exist but are not textual,
-/// or when the API returns an **empty** `reasoning` string (schema placeholder with no `CoT` yet).
+/// When the model only streams structured `reasoning_details`, `DeepSeek` behind `OpenRouter`
+/// still expects a `reasoning_content` field on **tool-call** turns — derive text from details,
+/// or send an empty string when they exist but are not textual or when the API returned an
+/// **empty** `reasoning` placeholder.
 fn reasoning_plaintext_for_roundtrip(
     explicit: Option<&str>,
     details: Option<&Value>,
@@ -159,9 +145,8 @@ fn reasoning_plaintext_for_roundtrip(
 
 /// Augment reasoning fields for replay, filling `reasoning_content` when missing.
 ///
-/// `DeepSeek` (and some OpenRouter-routed thinking models) reject follow-up requests unless prior
-/// assistant turns echo chain-of-thought in `reasoning_content`. We derive it from `reasoning`
-/// and/or `reasoning_details` using [`reasoning_plaintext_for_roundtrip`].
+/// `DeepSeek` (and some OpenRouter-routed thinking models) reject follow-up requests unless
+/// prior assistant turns echo chain-of-thought in `reasoning_content`.
 pub(crate) fn native_reasoning_triple_for_replay(
     reasoning: Option<&Reasoning>,
     has_tool_calls: bool,
@@ -235,8 +220,8 @@ fn augment_replay_payload_reasoning_content(payload: &mut Value, has_tool_calls:
 
     let content = match reasoning_content {
         Some(s) => s,
-        // reasoning was entirely absent (no `reasoning` or `reasoning_details` fields in the
-        // payload) but tool calls exist → DeepSeek still expects `reasoning_content: ""` on the wire.
+        // reasoning was entirely absent but tool calls exist → DeepSeek still expects
+        // `reasoning_content: ""` on the wire.
         None if has_tool_calls && explicit.is_none() && details.is_none() => String::new(),
         None => return,
     };
@@ -285,8 +270,6 @@ pub(crate) fn assistant_replay_payload(
 
     payload
 }
-
-// ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod strip_think_tag_tests {
@@ -359,11 +342,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// What a replay carries as reasoning: the explicit `reasoning` field when
-    /// the upstream sent one, else the text of the `reasoning_details` blocks
-    /// (encrypted ones say nothing), and on a tool turn an empty string even
-    /// when there is nothing to say — OpenRouter sends `reasoning: ""` there and
-    /// a replayed tool call without the field is a shape its API rejects.
+    /// What a replay carries as reasoning: the explicit `reasoning` field when the upstream sent
+    /// one, else the text of the `reasoning_details` blocks (encrypted ones say nothing), and on a
+    /// tool turn an empty string even when there is nothing to say — OpenRouter rejects a replayed
+    /// tool call without the field.
     #[expect(clippy::type_complexity)] // (label, explicit, details, tool turn, expected)
     #[test]
     fn reasoning_plaintext_is_the_sent_text_and_a_tool_turn_always_replays() {
@@ -452,11 +434,9 @@ mod tests {
         }
     }
 
-    /// A replayed assistant turn with tool calls always carries
-    /// `reasoning_content`: synthesized from the details when there are any,
-    /// empty when there is nothing to say, and absent only when the reasoning
-    /// slot itself holds nothing textual — the triple handed to the wire is the
-    /// plaintext, the details, and the same plaintext as `reasoning_content`.
+    /// A replayed assistant turn with tool calls always carries `reasoning_content`: synthesized
+    /// from the details when there are any, empty when there is nothing to say, absent only when
+    /// the reasoning slot holds nothing textual.
     #[test]
     fn assistant_replay_carries_reasoning_content_for_tool_turns() {
         let tc = ToolCall {

@@ -1,39 +1,31 @@
-//! Provider selection for the OpenRouter benchmark: cost estimation + the
-//! selection rules (health gate, outlier filter, top-n, padding).
+//! Provider selection for the OpenRouter benchmark: cost estimation + the selection rules
+//! (health gate, outlier filter, top-n, padding).
 //!
-//! Pure math — no I/O. All functions here are unit-tested against synthetic
-//! inputs; the caller (dry-run orchestration) feeds live discovery data in.
+//! Pure math — no I/O. Every function is unit-tested against synthetic inputs; the caller
+//! (dry-run orchestration) feeds live discovery data in.
 //!
 //! # Selection rules
 //!
-//! 1. **Healthy** = status `"0"` AND `context_length >= min_context`
-//!    (default 128 000; `None` context → excluded as unknown) AND not a
-//!    `:free` variant AND (allowlist absent OR tag allowlisted).
-//! 2. An allowlist restricts the candidate pool to its tags first; allowlisted
-//!    endpoints that are unhealthy are still padding candidates, but only when
-//!    the allowlist itself has fewer than 3 healthy endpoints.
-//! 3. Excluded endpoints record the FIRST applicable reason in priority
-//!    order: `NotInAllowlist` > `FreeVariant` > `ContextTooSmall`/`ContextUnknown`
-//!    > `Status(raw)`.
-//! 4. Healthy set H is filtered by cost outlier: est > 3×median is dropped
-//!    (`Outlier`) unless dropping would leave fewer than 3 — then the cheapest
-//!    dropped outliers are re-admitted until the pool is >= 3.
-//! 5. Target count `n = max(3, ceil(0.8 × H.len()))`; the cheapest n of the
-//!    filtered pool are selected, the rest get `NotSelected`. When
-//!    `H.len() < 3` all of H is selected and padded with the cheapest excluded
-//!    candidates to exactly 3 (`Padding` — expected to fail, but measured).
-//!    When an allowlist restricts to exactly 1–2 endpoints those are
-//!    benchmarked as-is and NO padding happens (user intent wins over the
-//!    count rule).
-//! 6. `ceil(0.8H) <= H` for H >= 3 makes "never more than the healthy count"
-//!    automatic.
+//! 1. **Healthy** = status `"0"` AND `context_length >= min_context` (default 128 000; `None`
+//!    context is excluded as unknown) AND not a `:free` variant AND (allowlist absent OR tag
+//!    allowlisted).
+//! 2. An allowlist restricts the candidate pool to its tags first; allowlisted endpoints that are
+//!    unhealthy are still padding candidates, but only when the allowlist itself has fewer than 3
+//!    healthy endpoints.
+//! 3. Excluded endpoints record the FIRST applicable reason in priority order: `NotInAllowlist` >
+//!    `FreeVariant` > `ContextTooSmall`/`ContextUnknown` > `Status(raw)`.
+//! 4. Healthy set H is filtered by cost outlier: est > 3×median is dropped (`Outlier`) unless
+//!    dropping would leave fewer than 3 — then the cheapest dropped outliers are re-admitted.
+//! 5. Target count `n = max(3, ceil(0.8 × H.len()))`; the cheapest n of the filtered pool are
+//!    selected. When `H.len() < 3` all of H is selected and padded with the cheapest excluded
+//!    candidates to exactly 3 (`Padding`). When an allowlist restricts to exactly 1–2 endpoints
+//!    those are benchmarked as-is and NO padding happens.
+//! 6. `ceil(0.8H) <= H` for H >= 3 makes "never more than the healthy count" automatic.
 //! 7. The plan builder orders selected providers by est cost ascending.
 
 use std::fmt;
 
 use super::discovery::{EndpointInfo, Pricing, parse_price};
-
-// ── Validated token mix ────────────────────────────────────────────
 
 /// Fraction of total tokens served from the prompt cache (validated mix).
 pub(crate) const VALIDATED_MIX_CACHED: f64 = 0.977;
@@ -42,20 +34,11 @@ pub(crate) const VALIDATED_MIX_INPUT: f64 = 0.014;
 /// Fraction of total tokens billed as completion output.
 pub(crate) const VALIDATED_MIX_OUTPUT: f64 = 0.009;
 
-// ── Cost estimation ────────────────────────────────────────────────
-
-/// Blended per-provider cost estimate for a whole benchmark run.
-///
-/// The blended price is `cached_share×cache_read + input_share×prompt +
-/// output_share×completion`; the token volumes follow
-/// [`VALIDATED_MIX_CACHED`]/[`VALIDATED_MIX_INPUT`]/[`VALIDATED_MIX_OUTPUT`].
-/// Per-request fees (`pricing.request`) are added once per request. When the
-/// provider advertises no `input_cache_read` price the estimate assumes the
-/// full prompt price and records that assumption in `flags`.
-///
-/// Missing/unparseable price fields contribute 0. Market-level price
-/// reductions are already reflected in the listed prices and need no
-/// adjustment here.
+/// Blended per-provider cost estimate for a whole benchmark run: the blended price is
+/// `cached_share×cache_read + input_share×prompt + output_share×completion`, with per-request
+/// fees added once per request. A provider advertising no `input_cache_read` price is billed at
+/// the full prompt price and says so in `flags`. Missing price fields contribute 0; market-level
+/// reductions are already in the listed prices.
 #[must_use]
 // usize→f64 is exact for request counts far below 2^53; cost math needs floats.
 #[expect(clippy::cast_precision_loss)]
@@ -90,13 +73,8 @@ pub(crate) fn estimate_cost(
     blended * total_tokens + request * requests as f64
 }
 
-// ── Selection types ────────────────────────────────────────────────
-
-/// One candidate endpoint for selection, with its estimated run cost.
-///
-/// The endpoint and its estimated cost are the only inputs;
-/// `select_providers` derives health authoritatively from `endpoint` +
-/// `min_context` + `allowlist`.
+/// One candidate endpoint for selection, with its estimated run cost. `select_providers`
+/// derives health authoritatively from `endpoint` + `min_context` + `allowlist`.
 pub(crate) struct SelectionInput {
     pub endpoint: EndpointInfo,
     pub est_cost: f64,
@@ -145,8 +123,8 @@ pub(crate) struct SelectionDecision {
 }
 
 impl SelectionDecision {
-    /// Human-readable selection reason for the plan/report: the exclusion
-    /// reason when one is recorded, else "selected"/"not selected".
+    /// Human-readable reason for the plan/report: the exclusion reason, else "selected"/"not
+    /// selected".
     #[must_use]
     pub(crate) fn reason_text(&self) -> String {
         match (&self.reason, self.selected) {
@@ -156,10 +134,8 @@ impl SelectionDecision {
         }
     }
 
-    /// True iff the endpoint passed the health gate (independent of the cost
-    /// rules): selected with no reason, or dropped by a cost rule
-    /// (`NotSelected`/`Outlier`). Padding and gate-excluded endpoints are
-    /// not healthy.
+    /// True iff the endpoint passed the health gate, independent of the cost rules: selected with
+    /// no reason, or dropped by `NotSelected`/`Outlier`.
     #[must_use]
     pub(crate) fn is_healthy(&self) -> bool {
         matches!(
@@ -169,13 +145,8 @@ impl SelectionDecision {
     }
 }
 
-// ── Health classification ──────────────────────────────────────────
-
-/// True iff the raw OpenRouter endpoint status is the healthy `"0"`.
-///
-/// Refined bands (documented, not enforced here — the raw status is recorded
-/// verbatim elsewhere): `-1` unknown, `-2` verify-live, `-3` fallback-only,
-/// `-5`/`-10` exclude. None of them is healthy.
+/// True iff the raw OpenRouter endpoint status is the healthy `"0"`. The refined bands (`-1`
+/// unknown, `-2` verify-live, `-3` fallback-only, `-5`/`-10` exclude) are none of them healthy.
 #[must_use]
 pub(crate) fn is_healthy_status(s: Option<&str>) -> bool {
     s == Some("0")
@@ -187,11 +158,8 @@ fn is_free_variant(tag: &str) -> bool {
     tag.ends_with(":free")
 }
 
-/// Classify one endpoint against the health gate (rule 1) and produce the
-/// FIRST applicable exclusion reason (rule 3 priority: NotInAllowlist >
-/// FreeVariant > ContextTooSmall/ContextUnknown > Status).
-///
-/// Returns `(healthy, reason)`; `healthy` is `reason.is_none()`.
+/// Classify one endpoint against the health gate and produce the FIRST applicable exclusion
+/// reason. Returns `(healthy, reason)`; `healthy` is `reason.is_none()`.
 #[must_use]
 fn classify_endpoint(
     endpoint: &EndpointInfo,
@@ -216,12 +184,8 @@ fn classify_endpoint(
     (reason.is_none(), reason)
 }
 
-// ── Selection ──────────────────────────────────────────────────────
-
-/// Select benchmark providers per the selection rules (see module docs).
-///
-/// Returns one [`SelectionDecision`] per input (parallel). The plan builder
-/// orders the selected providers by est cost ascending for display.
+/// Select benchmark providers per the selection rules (see module docs): one
+/// [`SelectionDecision`] per input, in parallel.
 #[must_use]
 pub(crate) fn select_providers(
     input: &[SelectionInput],
@@ -230,15 +194,13 @@ pub(crate) fn select_providers(
 ) -> Vec<SelectionDecision> {
     let candidates = candidate_indices(input, allowlist);
 
-    // Allowlist with exactly 1–2 endpoints: benchmark exactly those, no
-    // padding beyond the allowlist — user intent wins over the count rule.
-    // Only applies when an allowlist was given: with no allowlist the
-    // candidate pool is all endpoints and the normal rules govern.
+    // An allowlist with exactly 1–2 endpoints: benchmark exactly those, no padding beyond it —
+    // user intent wins over the count rule.
     if allowlist.is_some() && !candidates.is_empty() && candidates.len() <= 2 {
         let mut decisions = base_decisions(input, min_context, allowlist);
         for &idx in &candidates {
-            // Keep the natural reason (e.g. "status -10") so the report can
-            // show "selected despite <reason>" — the run measures them anyway.
+            // Keep the natural reason (e.g. "status -10") so the report can show "selected
+            // despite <reason>" — the run measures them anyway.
             decisions[idx].selected = true;
         }
         return decisions;
@@ -257,8 +219,7 @@ pub(crate) fn select_providers(
         return decisions; // zero healthy → zero selected (no padding)
     }
 
-    // Rule 5 tail: H < 3 → select all of H, pad with the cheapest excluded
-    // candidates to exactly 3.
+    // Rule 5 tail: H < 3 → select all of H, pad with the cheapest excluded to exactly 3.
     if healthy.len() < 3 {
         pad_to_three(&mut decisions, &candidates, input);
         return decisions;
@@ -317,9 +278,8 @@ pub(crate) fn select_providers(
     decisions
 }
 
-/// Rule 2: candidate pool = allowlisted tags (when an allowlist is given),
-/// else every endpoint. The output stays parallel to `input`, so candidates
-/// carry their input index.
+/// Rule 2: candidate pool = allowlisted tags, else every endpoint. The output stays parallel to
+/// `input`, so candidates carry their input index.
 fn candidate_indices(input: &[SelectionInput], allowlist: Option<&[String]>) -> Vec<usize> {
     match allowlist {
         Some(wl) if !wl.is_empty() => input
@@ -333,8 +293,7 @@ fn candidate_indices(input: &[SelectionInput], allowlist: Option<&[String]>) -> 
     }
 }
 
-/// Initial per-endpoint classification: nothing selected, reason from the
-/// health gate (rule 1 + rule 3).
+/// Initial per-endpoint classification: nothing selected, reason from the health gate.
 fn base_decisions(
     input: &[SelectionInput],
     min_context: i64,
@@ -352,9 +311,8 @@ fn base_decisions(
         .collect()
 }
 
-/// Rule 5 tail: select all healthy candidates (reason `None`), then pad with
-/// the cheapest excluded candidates to exactly 3 ([`ExclusionReason::Padding`]
-/// — expected to fail, but measured).
+/// Rule 5 tail: select all healthy candidates, then pad with the cheapest excluded to exactly 3
+/// ([`ExclusionReason::Padding`] — expected to fail, but measured).
 fn pad_to_three(
     decisions: &mut [SelectionDecision],
     candidates: &[usize],
@@ -382,9 +340,8 @@ fn pad_to_three(
     }
 }
 
-/// Target selection count: `max(3, ceil(0.8 × healthy))`. For H >= 3 this is
-/// never more than the healthy count (`ceil(0.8H) <= H`); the plan builder
-/// special-cases H == 0 → 0 separately.
+/// Target selection count: `max(3, ceil(0.8 × healthy))`, never more than the healthy count for
+/// H >= 3. H == 0 → 0 is special-cased separately.
 #[must_use]
 #[expect(
     clippy::cast_possible_truncation,
@@ -395,9 +352,8 @@ fn selection_target(healthy_count: usize) -> usize {
     (3usize).max((healthy_count as f64 * 0.8).ceil() as usize)
 }
 
-/// Effective selection target: 0 when nothing is healthy; the allowlist size
-/// when a short (1-2 entry) allowlist is given (user intent wins); else the
-/// max(3, ceil(0.8 × healthy)) rule.
+/// Effective selection target: 0 when nothing is healthy, the allowlist size for a short (1-2
+/// entry) allowlist, else the count rule.
 #[must_use]
 pub(crate) fn effective_target_count(
     healthy_count: usize,
@@ -410,8 +366,7 @@ pub(crate) fn effective_target_count(
     }
 }
 
-/// Median of est costs over the given input indices (average of the two
-/// middle values for an even count).
+/// Median of est costs over the given input indices (the average of the two middle values).
 fn median_of(indices: &[usize], input: &[SelectionInput]) -> f64 {
     let mut costs: Vec<f64> = indices.iter().map(|&i| input[i].est_cost).collect();
     costs.sort_by(f64::total_cmp);
@@ -423,10 +378,9 @@ fn median_of(indices: &[usize], input: &[SelectionInput]) -> f64 {
     }
 }
 
-/// Total estimated cost of the selected providers and the per-provider spend
-/// guard: `cap × 2 / max(1, selected_count)`. The ×2 headroom lets a couple of
-/// padded (expected-to-fail) providers overshoot individually without burning
-/// the whole cap.
+/// Total estimated cost of the selected providers and the per-provider spend guard:
+/// `cap × 2 / max(1, selected_count)`. The ×2 headroom lets a couple of padded providers
+/// overshoot individually without burning the whole cap.
 #[must_use]
 // usize→f64 is exact for counts far below 2^53; the guard is a cost ratio.
 #[expect(clippy::cast_precision_loss)]
@@ -481,9 +435,8 @@ mod tests {
         }
     }
 
-    /// The health gate's two screening predicates: only the raw status `"0"` is
-    /// healthy (the refined bands `-1`…`-10` all are not, and neither is a
-    /// missing status), and only a `:free` suffix is the free variant.
+    /// The health gate's two screening predicates: only the raw status `"0"` is healthy, and only
+    /// a `:free` suffix is the free variant.
     #[test]
     fn exclusion_predicates() {
         assert!(is_healthy_status(Some("0")));
@@ -497,9 +450,8 @@ mod tests {
         assert!(!is_free_variant(""));
     }
 
-    /// The estimate blends the validated mix and adds the per-request fee; a
-    /// provider with no advertised cache-read price is billed at the full prompt
-    /// price for the cached share and says so in a flag.
+    /// The estimate blends the validated mix and adds the per-request fee; a provider with no
+    /// advertised cache-read price is billed at the full prompt price and flags it.
     #[test]
     fn estimate_cost_cases() {
         let priced = Pricing {
@@ -530,10 +482,8 @@ mod tests {
         assert!((est - expected).abs() < 1e-12);
     }
 
-    /// The gate and cost rules through `select_providers`: a cost outlier is
-    /// dropped while the rest are selected, a short healthy set is padded to
-    /// three from the cheapest excluded candidates, and context-excluded
-    /// endpoints stay out.
+    /// The gate and cost rules through `select_providers`: an outlier is dropped while the rest are
+    /// selected, a short healthy set is padded to three, and context-excluded endpoints stay out.
     #[test]
     fn selection_exclusions_and_padding() {
         struct Case {
@@ -602,10 +552,9 @@ mod tests {
         }
     }
 
-    /// The target count and the allowlist that overrides it: nothing healthy
-    /// means nothing selected, otherwise `max(3, ceil(0.8 × healthy))` — except
-    /// that a 1–2 entry allowlist is benchmarked as-is, while a 0-match
-    /// allowlist is not "short" and falls back to the count rule.
+    /// The target count and the allowlist that overrides it: nothing healthy means nothing
+    /// selected, otherwise `max(3, ceil(0.8 × healthy))` — except that a 1–2 entry allowlist is
+    /// benchmarked as-is, while a 0-match allowlist falls back to the count rule.
     #[test]
     fn allowlist_and_target_count() {
         assert_eq!(effective_target_count(0, None), 0);
@@ -632,8 +581,8 @@ mod tests {
         assert!(decisions[0].selected);
     }
 
-    /// The planned spend: the estimate sums every selected provider (padded ones
-    /// included) and the guard is `cap × 2 / selected`.
+    /// The planned spend: the estimate sums every selected provider (padded ones included) and
+    /// the guard is `cap × 2 / selected`.
     #[test]
     fn plan_cost_sums_selected_and_computes_guard() {
         let inputs = vec![

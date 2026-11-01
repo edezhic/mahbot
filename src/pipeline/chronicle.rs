@@ -43,9 +43,6 @@ fn attributed_actor(raw: Option<&str>) -> &str {
     raw.filter(|s| !s.trim().is_empty()).unwrap_or(SYSTEM_ROLE)
 }
 
-/// Read a TEXT column as a `String`, mapping NULL/type misses to an empty
-/// string (the empty value then falls back via [`attributed_actor`] where it
-/// matters).
 fn text_cell(row: &Row, idx: usize) -> String {
     row.get_value(idx)
         .ok()
@@ -59,7 +56,6 @@ fn text_cell(row: &Row, idx: usize) -> String {
 /// more precise than a timestamp and restart-safe.
 type Cursor = i64;
 
-/// Per-workspace delivery cursors.
 static CURSORS: OnceLock<Mutex<HashMap<String, Cursor>>> = OnceLock::new();
 
 /// Serializes [`drain`]'s cursor read + advance. Without it, two concurrent
@@ -116,8 +112,7 @@ pub fn start_subscriber() {
         let conn = conn.clone();
         Box::pin(async move {
             // Only prune when a transition was actually materialized, so the
-            // per-event DELETE below is skipped for tickets inserts/deletes and
-            // no-op updates.
+            // per-event DELETE below is skipped for tickets inserts/deletes and no-op updates.
             if apply_change(&conn, event).await? {
                 prune_acked(&conn).await?;
             }
@@ -129,8 +124,7 @@ pub fn start_subscriber() {
 /// Materialize one ticket change into a `ticket_chronicle` row when the phase
 /// changed. This is the only write path to the table. Returns whether a row was
 /// actually inserted (`false` for non-tickets events, non-update events, no
-/// phase change, an unreadable phase pair, or a duplicate that `INSERT OR
-/// IGNORE` skipped).
+/// phase change, an unreadable phase pair, or a duplicate that `INSERT OR IGNORE` skipped).
 async fn apply_change(
     conn: &Connection,
     event: &crate::db::cdc::ChangeEvent,
@@ -161,8 +155,7 @@ async fn apply_change(
     // on the way out, so any exit can leave one; this build's own migrations
     // produce none, running before capture is enabled). The row is dropped rather
     // than retried forever, because the parse can never succeed on a later drain
-    // and the drainer leaves a failed row un-pruned (stalling the whole ticket
-    // transport).
+    // and the drainer leaves a failed row un-pruned (stalling the whole ticket transport).
     let (Ok(source), Ok(target)) = (before.parse::<TicketPhase>(), after.parse::<TicketPhase>())
     else {
         tracing::warn!(
@@ -277,8 +270,6 @@ pub(crate) async fn drain(workspace_name: &str) -> String {
             .await
             .unwrap_or(0);
         cursor = seed;
-        // Persist the seed even when there are no rows, so the seed query is
-        // not re-run (and re-evaluated) on every subsequent drain.
         advance_cursor(workspace_name, seed);
     }
     let rows = match conn
@@ -320,15 +311,12 @@ pub(crate) async fn drain(workspace_name: &str) -> String {
         .unwrap_or(cursor);
     advance_cursor(workspace_name, last_id);
     drop(cursor_guard);
-    // Prune acked rows now so a workspace that drains and then goes quiet does
-    // not keep its delivered timeline rows until the next transition materializes.
     if let Err(e) = prune_acked(conn).await {
         tracing::warn!(error = %e, "chronicle prune after drain failed");
     }
     format_chronicle(&hops)
 }
 
-/// One rendered transition hop.
 #[derive(Debug, Clone)]
 struct Hop {
     id: String,
@@ -362,7 +350,6 @@ fn format_chronicle(hops: &[Hop]) -> String {
     out
 }
 
-/// Reset all cursors for test isolation.
 #[cfg(test)]
 pub fn reset() {
     init_global();
@@ -385,7 +372,6 @@ mod tests {
             actor: actor.into(),
         };
 
-        // Consecutive hops of one ticket share its header.
         let single = format_chronicle(&[
             hop(
                 "mahbot-1736",
@@ -418,7 +404,6 @@ mod tests {
             "got: {single}"
         );
 
-        // Interleaved tickets come out run-grouped, in the order the hops arrived.
         let interleaved = format_chronicle(&[
             hop(
                 "mahbot-A",
@@ -553,8 +538,7 @@ mod tests {
         // A pending CDC image carrying a phase string this binary cannot read (a
         // stage name retired since, as the older build that wrote it leaves in
         // `turso_cdc`) must neither materialize a hop nor wedge the drainer: the
-        // unreadable rows are skipped AND pruned, so the next readable hop still
-        // lands.
+        // unreadable rows are skipped AND pruned, so the next readable hop still lands.
         for phase in ["in_review", TicketPhase::Cancelled.as_ref()] {
             board
                 .conn

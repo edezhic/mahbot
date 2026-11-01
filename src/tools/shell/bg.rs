@@ -1,55 +1,38 @@
 //! Background shell sessions (Full shell roles only).
 //!
-//! An agent can launch a long-running non-interactive command that keeps
-//! running after the initiating tool call returns. Output is written RAW
-//! (no scrubbing, no profile transforms) to a file in the temp area's
-//! `.agent` directory; the agent reads progress with the read tool and stops
-//! the session via the shell tool's `stop` argument. The file holds a program's
-//! own bytes, so the read tool reads it the way the shell reads a program's
-//! output rather than as a file the agent chose ([`is_output_file`]).
-//!
-//! Sessions are strictly agent-scoped: the registry lives inside the
-//! [`crate::Agent`] and is force-killed on agent teardown ([`BackgroundSessions::terminate_all`]).
+//! An agent can launch a long-running non-interactive command that keeps running after the
+//! initiating tool call returns. Output is written RAW (no scrubbing, no profile transforms) to
+//! a file in the temp area's `.agent` directory; the agent reads progress with the read tool and
+//! stops the session via the shell tool's `stop` argument. The file holds a program's own bytes,
+//! so the read tool reads it the way the shell reads a program's output ([`is_output_file`]).
+//! Sessions are strictly agent-scoped: the registry lives inside the [`crate::Agent`] and is
+//! force-killed on agent teardown ([`BackgroundSessions::terminate_all`]).
 //!
 //! # Watchdog (Unix)
 //!
-//! A child-side watcher process keeps the process group alive only while the
-//! daemon is alive. A pipe is created with both ends `O_CLOEXEC`; the read
-//! end becomes the watcher's stdin and the write end is held by the daemon
-//! (in the session entry). The watcher blocks reading stdin; when the write
-//! end closes — daemon crash/kill/exit, or the session finishing — the
-//! watcher SIGKILLs the whole process group. The watcher is the group leader
-//! (`process_group(0)`); the launched command joins its group, so a single
-//! `kill(-pgid)` (or the watcher's `kill 0`) reaches the command and all its
-//! descendants. This guarantees no orphaned background processes even on a
-//! hard daemon crash, without any daemon-shutdown hook (destructors do not
-//! run on SIGKILL/SIGSEGV/OOM/`process::exit`, and the platform lacks
-//! parent-death signals).
-//!
-//! The same watchdog covers the launch window: if the launch future is
-//! aborted between process spawn and session registration, the write end
-//! (a local in the future) is closed on drop, the watcher fires, and the
-//! group dies — no dedicated kill-on-drop guard is needed.
+//! A child-side watcher process keeps the process group alive only while the daemon is. A pipe
+//! is created with both ends `O_CLOEXEC`; the read end becomes the watcher's stdin and the write
+//! end is held by the daemon. The watcher blocks reading stdin; when the write end closes —
+//! daemon crash, or the session finishing — it SIGKILLs the whole process group. The watcher is
+//! the group leader (`process_group(0)`) and the command joins its group, so one `kill(-pgid)`
+//! reaches every descendant. That guarantees no orphaned processes even on a hard daemon crash,
+//! with no shutdown hook (destructors do not run on SIGKILL/SIGSEGV/OOM/`process::exit`, and the
+//! platform lacks parent-death signals). The same watchdog covers the launch window: a launch
+//! future aborted between spawn and registration drops the write end, the watcher fires, and the
+//! group dies — no kill-on-drop guard is needed.
 //!
 //! # Windows
 //!
-//! There is no watchdog and no process group: a session's whole process tree is
-//! held in a job object instead ([`super::tree::Tree`]) — created at launch,
-//! inherited by every descendant, ended on stop and on teardown, and ended by
-//! the OS as well when the daemon dies abruptly, because the handle the job
-//! hangs on goes with the process (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`). The
-//! job also ends the tree when the command exits on its own, which is what the
-//! unix watcher's group kill at the end of a session does. A job that could not
-//! be created or assigned leaves the session with exactly the treatment it had
-//! before jobs existed — the direct child alone; `tree` records that fail-open
-//! policy and the accepted limitations.
+//! There is no watchdog and no process group: a session's whole process tree is held in a job
+//! object ([`super::tree::Tree`]) — created at launch, inherited by every descendant, ended on
+//! stop, on teardown, by the OS when the daemon dies (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), and
+//! when the command exits on its own, which is the unix watcher's counterpart. A job that could
+//! not be created or assigned leaves the session with exactly the treatment it had before jobs
+//! existed — the direct child alone; `tree` records that fail-open policy and its limits.
 //!
-//! The launch-failure probe is Unix-shell-specific as well: cmd.exe exits 1
-//! (not 126/127) for a missing or non-executable command, so on Windows a
-//! failed launch surfaces as a successful background session whose output
-//! file holds the cmd.exe error and `[exit status: 1]` — the 126/127 exit the probe
-//! keys on is Unix-shell-specific (accepted deviation from the launch-failure
-//! contract).
+//! The launch-failure probe is Unix-shell-specific: cmd.exe exits 1 (not 126/127) for a missing
+//! or non-executable command, so a failed launch there surfaces as a successful session whose
+//! output file holds the cmd.exe error and `[exit status: 1]` (accepted deviation).
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -67,18 +50,14 @@ use super::tree::{RunOwner, Tree};
 use super::windows_line::{Executed, Written};
 use crate::util::UnwrapPoison;
 
-/// Watcher script: ignore SIGTERM (the daemon owns the graceful two-stage
-/// stop), block on stdin until EOF, then SIGKILL the caller's process group
-/// (`kill -s KILL 0` targets the caller's own group — the watcher is the
-/// group leader, and the launched command joined its group).
+/// Watcher script: ignore SIGTERM (the daemon owns the graceful two-stage stop), block on
+/// stdin until EOF, then SIGKILL the caller's process group.
 #[cfg(unix)]
 const WATCHER_SCRIPT: &str = "trap '' TERM; cat >/dev/null; kill -s KILL 0";
 
-/// Bounded early-exit launch probe: command-not-found / not-executable exits
-/// (126/127) within this window are treated as synchronous launch failures.
-/// All other early exits — including legitimate non-zero exits (grep
-/// no-match, diff differences, test failures) and exit 0 — are successful
-/// launches surfaced via the unconditional exit-status annotation.
+/// Bounded early-exit launch probe: 126/127 exits within this window are synchronous launch
+/// failures. Every other early exit — a legitimate non-zero one included — is a successful
+/// launch surfaced via the exit-status annotation.
 const LAUNCH_PROBE: Duration = Duration::from_millis(250);
 /// Poll interval for the launch probe and the stop/teardown completion wait.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -87,14 +66,11 @@ const WAITER_POLL: Duration = Duration::from_millis(50);
 /// Grace between SIGTERM and SIGKILL in the two-stage stop.
 #[cfg_attr(not(unix), expect(dead_code))] // only the Unix two-stage stop has a grace
 const STOP_GRACE: Duration = Duration::from_secs(5);
-/// How long `stop()` waits for the waiter to append the exit annotation after
-/// the SIGKILL before returning (best-effort determinism for the follow-up
-/// read of the output file).
+/// How long `stop()` waits for the waiter to append the exit annotation after the SIGKILL.
 const STOP_ANNOTATION_WAIT: Duration = Duration::from_secs(2);
 /// Output-file name attempts before giving up (create_new never overwrites).
 const MAX_OUTPUT_NAME_ATTEMPTS: usize = 16;
-/// How many leading bytes of the output file are included in the synchronous
-/// launch-failure tool error (the shell's "command not found" message).
+/// How many leading bytes of the output file the launch-failure tool error quotes.
 const FAILURE_OUTPUT_PREFIX_BYTES: usize = 400;
 
 /// Result of [`BackgroundSessions::stop`].
@@ -106,11 +82,9 @@ pub(crate) enum StopResult {
     AlreadyFinished,
 }
 
-/// Agent-scoped registry of background shell sessions.
-///
-/// State is owned by the agent (dropped with it) and reachable from the
-/// synchronous teardown path for the teardown kill; the tool-batch context
-/// carries only an `Arc` handle, scoped once per tool batch.
+/// Agent-scoped registry of background shell sessions. State is owned by the agent (dropped
+/// with it) and reachable from the synchronous teardown path for the teardown kill; the
+/// tool-batch context carries only an `Arc` handle.
 pub(crate) struct BackgroundSessions {
     inner: std::sync::Mutex<HashMap<PathBuf, SessionEntry>>,
 }
@@ -125,63 +99,42 @@ impl Default for BackgroundSessions {
 
 /// One live (or finished) background session, keyed by its output-file path.
 struct SessionEntry {
-    /// The launched command child, shared with the waiter task (which reaps
-    /// it) and the stop/teardown paths (which signal it only as the fallback
-    /// for a session whose job did not end its tree). Never taken out after
-    /// launch — the waiter polls `try_wait` in place. A `std::sync::Mutex` is
-    /// sufficient: every critical section (try_wait, start_kill) is a short
-    /// synchronous call and is never held across an await, so blocking here
-    /// cannot stall the runtime (and makes the synchronous teardown kill
-    /// reliable — no try_lock to fail silently).
+    /// The launched command child, shared with the waiter task (which reaps it) and the
+    /// stop/teardown paths. Never taken out after launch — the waiter polls `try_wait` in place.
+    /// A `std::sync::Mutex` suffices: every critical section is a short synchronous call, never
+    /// held across an await, which also makes the synchronous teardown kill reliable.
     command: Arc<std::sync::Mutex<tokio::process::Child>>,
-    /// Windows: the job the session's whole process tree is in — ended on stop
-    /// and teardown, ended by the OS if the daemon dies, and ended by the waiter
-    /// when the command exits (the watcher's counterpart — see the module docs).
+    /// Windows: the job the session's whole process tree is in — ended on stop, on teardown, by
+    /// the OS if the daemon dies, and by the waiter when the command exits.
     #[cfg(not(unix))]
     tree: Tree,
     /// Watcher child (Unix), reaped by the waiter after the command exits.
     #[cfg(unix)]
     watcher: Option<tokio::process::Child>,
-    /// Write end of the daemon→watcher lifeline pipe. Closed (dropped) by
-    /// the waiter after the command exits, by teardown, or when the daemon
-    /// dies — EOF on the watcher's stdin is what makes it fire.
+    /// Write end of the daemon→watcher lifeline pipe. EOF on the watcher's stdin is what makes
+    /// it fire.
     #[cfg(unix)]
     write_end: Option<std::os::fd::OwnedFd>,
     /// Process-group id == the watcher's PID (Unix), used for group kills.
     #[cfg(unix)]
     pgid: u32,
-    /// The command already exited during the launch probe with a
-    /// non-launch-failure status; the waiter reuses this instead of waiting.
+    /// The command exited during the launch probe with a non-launch-failure status.
     early_status: Option<std::process::ExitStatus>,
-    /// Set by the waiter after the exit annotation is appended — the only
-    /// completion signal; guards stop/teardown against PID reuse.
+    /// Set by the waiter after the exit annotation is appended — the only completion signal.
     finished: Arc<AtomicBool>,
 }
 
-/// The command a background session runs: the shell, or this service's own image
-/// when the command is one call of it ([`super::plan::plan_for_command`]).
-///
-/// The image is spawned directly rather than through a shell, so the session waits
-/// for it and reports the child's own status and output ([`super::plan`]). `Err` is the
-/// launch error for a command that names the image in a shape the runner cannot
-/// wire as one command: a launcher spelling the planner refuses, and a line the
-/// planner read as a chain, whose members around the call are steps of their own.
-/// A background command must fail at launch, never report a false completion.
-///
-/// Only the shell's own arm measures anything: the text handed to the interpreter
-/// is this platform's one line, so a reading past the platform's command line is
-/// refused here rather than left to the interpreter's line-length error
-/// ([`super::windows_line::check_command_line`]) — the same measurement the
-/// foreground hands each of its own texts over under. A call of this service's own
-/// image is spawned from its own argv and hands no line to any interpreter, so
-/// nothing is measured for it.
-///
-/// The returned streams are the ones the command's own redirect tokens took over
-/// (applied here, exactly as the foreground runner applies them); the caller
-/// leaves those to it and wires the session's own stdio for the rest, which is
-/// also where a `2>&1` whose stdout the session still owns belongs: the session
-/// sends both of its streams to the one output file. A command that does not name
-/// the image is the shell's, and takes no stream over.
+/// The command a background session runs: the shell, or this service's own image when the command
+/// is one call of it ([`super::plan::plan_for_command`]). The image is spawned directly rather than
+/// through a shell, so the session waits for it and reports the child's own status and output.
+/// `Err` is the launch error for a command that names the image in a shape the runner cannot wire
+/// as one command: a background command must fail at launch, never report a false completion. Only
+/// the shell's arm measures anything: the text handed to the interpreter is this platform's one
+/// line, so a reading past the platform's command line is refused here
+/// ([`super::windows_line::check_command_line`]). A call of this service's own image is spawned
+/// from its own argv, so nothing is measured for it. The returned streams are the ones the
+/// command's own redirect tokens took over; the caller wires the session's own stdio for the rest,
+/// which is where a `2>&1` whose stdout the session still owns belongs.
 fn own_image_command(
     executed: Executed<'_>,
     written: Written<'_>,
@@ -198,10 +151,8 @@ fn own_image_command(
         }
         super::plan::OwnImage::Direct(plan) => {
             let Some((args, redirects, cwd)) = plan.direct_own() else {
-                // A line the runner's own decomposition read as a chain (the
-                // members around the call are steps of their own): a background
-                // session launches one command, so this fails the launch rather than
-                // report a completion the image never reached.
+                // A line the runner's decomposition read as a chain: a background session launches
+                // one command, so this fails the launch rather than report a false completion.
                 return Err(super::plan::refusal_message(
                     "the command could not be read as a single call of `mahbot`",
                 ));
@@ -222,24 +173,14 @@ fn own_image_command(
 impl BackgroundSessions {
     /// Launch `executed` in the background. Returns the output-file path.
     ///
-    /// `executed` is the text the platform will run and `written` the line the agent
-    /// wrote, which is what a launch failure and a refusal quote: the two are the same
-    /// string on every platform but Windows, where the reading may have respelled it
-    /// (see [`super::windows_line`]), and an agent is shown its own line rather than a
-    /// spelling of it. `mode` is the shell mode the session was started in — a
-    /// background session exists in full mode alone, and the mode decides the words of
-    /// the remedy a refusal ends with.
+    /// `executed` is the text the platform will run and `written` the line the agent wrote, which
+    /// is what a launch failure quotes — the two differ on Windows alone ([`super::windows_line`]).
+    /// `mode` decides the words of the remedy a refusal ends with.
     ///
-    /// The command is spawned detached from the tool call: stdout and stderr
-    /// are redirected (RAW) into the output file, stdin is null (strictly
-    /// non-interactive), and the command's whole process tree is contained —
-    /// in its own process group on Unix, whose lifetime is bounded by the agent
-    /// (teardown kill) and the watchdog, and in a job object on Windows (see
-    /// the module docs).
-    ///
-    /// Launch failures (command not found / not executable, detected via the
-    /// bounded early-exit probe) are returned as `Err` synchronously — never
-    /// a silent empty file.
+    /// The command is spawned detached from the tool call: stdout and stderr are redirected (RAW)
+    /// into the output file, stdin is null, and the whole process tree is contained — in its own
+    /// process group on Unix, in a job object on Windows. Launch failures are returned as `Err`
+    /// synchronously, never a silent empty file.
     pub(super) async fn launch(
         self: &Arc<Self>,
         executed: Executed<'_>,
@@ -247,21 +188,15 @@ impl BackgroundSessions {
         workspace_root: &Path,
         mode: ShellMode,
     ) -> Result<PathBuf, String> {
-        // ── Output file (create_new — never overwrite) ──
         let (output_path, out_file) = create_bg_output_file()
             .map_err(|e| format!("Failed to create background output file: {e}"))?;
-        // Owner-deletes-at-end: attribute the output file to the calling agent
-        // (the CURRENT_TOOL_AGENT_ID task-local is set during tool execution)
-        // so `run_agent`'s end-of-run cleanup removes it alongside the spill
-        // files — `terminate_all` kills the process tree but leaves the file.
+        // Owner-deletes-at-end: attribute the output file to the calling agent so `run_agent`'s
+        // end-of-run cleanup removes it — `terminate_all` kills the tree but leaves the file.
         super::record_spill_owner(output_path.clone());
 
-        // ── Command child ──
-        // A command that names this service's own image cannot be left to the shell
-        // ([`super::plan`]): a session must report the image's own status, and an
-        // output file claiming a completion the image never reached would be a lie.
-        // A lone own-image call is spawned directly instead, and any other shape that
-        // names the image fails at launch.
+        // A command that names this service's own image cannot be left to the shell: a session
+        // must report the image's own status, so a lone own-image call is spawned directly and any
+        // other shape that names the image fails at launch.
         let (mut cmd, taken) = match own_image_command(executed, written, workspace_root, mode) {
             Ok(command) => command,
             Err(reason) => {
@@ -277,8 +212,7 @@ impl BackgroundSessions {
             let _ = std::fs::remove_file(&output_path);
             format!("Failed to set up background output: {e}")
         })?;
-        // The session's own wiring, for the streams the command's redirect tokens
-        // did not take over (they are applied by [`own_image_command`]).
+        // The session's own wiring, for the streams the command's redirect tokens did not take.
         if !taken.contains(&super::Stream::Stdin) {
             cmd.stdin(Stdio::null());
         }
@@ -289,9 +223,8 @@ impl BackgroundSessions {
             cmd.stderr(Stdio::from(stderr_file));
         }
 
-        // Windows: the session's whole-tree containment, created before the
-        // spawn and dropped on every launch path that never registers the
-        // session — which ends whatever had already been started (`tree`).
+        // Windows: the session's whole-tree containment, created before the spawn and dropped on
+        // every launch path that never registers the session.
         #[cfg(not(unix))]
         let mut tree = Tree::new(RunOwner::Agent);
 
@@ -319,12 +252,8 @@ impl BackgroundSessions {
             tree.attach(pid);
         }
 
-        // ── Bounded early-exit launch probe ──
-        // Note: the 126/127 detection is Unix-shell-specific — cmd.exe on
-        // Windows exits 1 for a missing/non-executable command, so a failed
-        // launch there surfaces as a successful session whose file holds the
-        // cmd.exe error and `[exit status: 1]` (documented deviation, see the
-        // module docs).
+        // The 126/127 detection is Unix-shell-specific — cmd.exe exits 1 for a missing command,
+        // so a failed launch there surfaces as a session whose file holds the cmd.exe error.
         let early_status = match probe_command(&mut cmd_child).await {
             Ok(Some(status)) if matches!(status.code(), Some(126 | 127)) => {
                 let prefix = read_output_prefix(&output_path, FAILURE_OUTPUT_PREFIX_BYTES);
@@ -353,7 +282,6 @@ impl BackgroundSessions {
             }
         };
 
-        // ── Register the session and hand the reaping off to the waiter ──
         let entry = SessionEntry {
             command: Arc::new(std::sync::Mutex::new(cmd_child)),
             #[cfg(unix)]
@@ -375,11 +303,9 @@ impl BackgroundSessions {
         Ok(output_path)
     }
 
-    /// Stop the session whose output file is `output_path`. On Unix that is a
-    /// two-stage stop: SIGTERM → grace (~5s) → SIGKILL to the process group. On
-    /// Windows there is no graceful request to make — the stop ends the whole
-    /// process tree at once. Stopping an already-finished session is a no-op
-    /// guarded by the per-session finished flag (PID-reuse safety).
+    /// Stop the session whose output file is `output_path`. On Unix a two-stage stop: SIGTERM →
+    /// grace → SIGKILL to the process group; on Windows the whole tree ends at once. Stopping a
+    /// finished session is a no-op guarded by the finished flag (PID-reuse safety).
     pub(crate) async fn stop(self: &Arc<Self>, output_path: &Path) -> Result<StopResult, String> {
         #[cfg(unix)]
         {
@@ -398,13 +324,9 @@ impl BackgroundSessions {
             }
             super::kill_process_group(pgid, libc::SIGTERM);
             tokio::time::sleep(stop_grace()).await;
-            // Re-check `finished` before the second stage: if the command
-            // exited during the grace (e.g. it died from SIGTERM), the waiter
-            // has already appended the annotation and set `finished`, and is
-            // about to close the lifeline — the watcher (whose PID is the
-            // PGID) will then exit and its PID could be recycled before the
-            // SIGKILL lands. `finished == false` here implies the watcher is
-            // still alive, so the PGID is still valid.
+            // Re-check `finished` before the second stage: a command that died during the grace has
+            // already set it, and the watcher (whose PID is the PGID) is about to exit — its PID
+            // could be recycled before the SIGKILL lands.
             if !finished.load(Ordering::SeqCst) {
                 super::kill_process_group(pgid, libc::SIGKILL);
             }
@@ -430,12 +352,8 @@ impl BackgroundSessions {
             if finished.load(Ordering::SeqCst) {
                 return Ok(StopResult::AlreadyFinished);
             }
-            // Windows has no SIGTERM equivalent: a stop ends the whole tree at
-            // once and gives no grace. The direct child is the fallback for a
-            // session whose job did not end its tree — no job (the assignment was
-            // refused, see `tree`) or a failed termination — exactly as a stop
-            // worked before jobs existed. The scoped block keeps the `!Send`
-            // guard out of the await below.
+            // Windows has no SIGTERM equivalent: a stop ends the whole tree at once. The direct
+            // child is the fallback for a session whose job did not end its tree.
             if !tree.terminate() {
                 let mut g = command.lock().unwrap_poison();
                 let _ = g.start_kill();
@@ -445,10 +363,8 @@ impl BackgroundSessions {
         }
     }
 
-    /// Force-kill every live session (no grace). Called synchronously from
-    /// the agent teardown path ([`crate::Agent::drop`]) — the agent's
-    /// background processes must not outlive it. Finished sessions are
-    /// skipped; their waiters already reaped the processes.
+    /// Force-kill every live session (no grace), called synchronously from the agent teardown
+    /// path ([`crate::Agent::drop`]). Finished sessions are skipped; their waiters reaped them.
     pub(crate) fn terminate_all(&self) {
         let targets: Vec<_> = {
             let mut guard = self.inner.lock().unwrap_poison();
@@ -471,17 +387,13 @@ impl BackgroundSessions {
             #[cfg(unix)]
             {
                 super::kill_process_group(target.0, libc::SIGKILL);
-                // Closing the lifeline makes the watcher exit (it may already
-                // be dead from the group kill — closing is still harmless).
+                // Closing the lifeline makes the watcher exit.
                 drop(target.1);
             }
             #[cfg(not(unix))]
             {
-                // Blocking lock: every critical section on this mutex is a short
-                // synchronous try_wait/start_kill call (never held across an
-                // await), so this cannot deadlock — and a try_lock that fails
-                // while the waiter polls would silently leak the direct child of a
-                // session whose job did not end its tree.
+                // Blocking lock: every critical section on this mutex is a short synchronous call,
+                // so it cannot deadlock — and a failing try_lock would leak the direct child.
                 if !target.1.terminate() {
                     let mut g = target.0.lock().unwrap_poison();
                     let _ = g.start_kill();
@@ -490,15 +402,13 @@ impl BackgroundSessions {
         }
     }
 
-    /// Test/observability accessor: whether a session with this output-file
-    /// path is registered at all.
+    /// Test/observability accessor: whether a session with this output-file path is registered.
     #[cfg(test)]
     pub(crate) fn contains(&self, path: &Path) -> bool {
         self.inner.lock().unwrap_poison().contains_key(path)
     }
 
-    /// Test/observability accessor: whether a registered session has finished
-    /// (its exit annotation has been appended).
+    /// Test/observability accessor: whether a registered session has finished.
     #[cfg(test)]
     pub(crate) fn is_finished(&self, path: &Path) -> bool {
         self.inner
@@ -508,27 +418,19 @@ impl BackgroundSessions {
             .is_some_and(|e| e.finished.load(Ordering::SeqCst))
     }
 
-    /// Spawn the per-session waiter task: poll the command child until it
-    /// exits, append the unconditional exit-status annotation to the output
-    /// file, set the finished flag, end whatever the session left behind (the
-    /// Unix watcher, whose lifeline write end is closed here, kills the
-    /// leftover group members and exits; Windows ends the tree — see the module
-    /// docs), and reap the watcher child. Detached — it outlives the agent by a
-    /// few instants on teardown to reap the children the teardown kill just
-    /// signalled.
+    /// Spawn the per-session waiter task: poll the command child until it exits, append the
+    /// unconditional exit-status annotation, set the finished flag, end whatever the session left
+    /// behind (the Unix watcher, whose lifeline close kills the leftover group members; Windows
+    /// ends the tree), and reap the watcher child. Detached — it outlives the agent by a few
+    /// instants on teardown to reap the children the teardown kill signalled.
     fn spawn_waiter(self: &Arc<Self>, output_path: &Path) {
-        // The waiter outlives the agent on teardown (it still has to reap what
-        // the teardown kill signalled), so it holds its own handle on the
-        // registry — the unix arm needs it below, for the watcher and the lifeline.
+        // The waiter outlives the agent on teardown, so it holds its own handle on the registry.
         #[cfg(unix)]
         let sessions = self.clone();
         let output_path = output_path.to_path_buf();
-        // Everything the waiter needs up front: the shared command and finished
-        // handles, and — Windows — the job, which the waiter itself has to own,
-        // since terminating it is what ends whatever the session left behind when
-        // its command exits on its own (the watcher's counterpart, see the module
-        // docs). The unix arm takes the watcher and its lifeline from the entry
-        // later; nothing else is read from it again.
+        // Everything the waiter needs up front: the shared command and finished handles, and —
+        // Windows — the job, which the waiter owns, since terminating it is what ends whatever the
+        // session left behind. The unix arm takes the watcher and its lifeline later.
         let guard = self.inner.lock().unwrap_poison();
         let entry = guard.get(&output_path).expect("session just registered");
         let command = entry.command.clone();
@@ -556,8 +458,7 @@ impl BackgroundSessions {
             }
             let status = status.expect("background command status determined");
 
-            // The exit-status annotation is the only completion signal —
-            // append it unconditionally (including exit 0).
+            // The exit-status annotation is the only completion signal — appended unconditionally.
             append_exit_annotation(&output_path, status);
             finished.store(true, Ordering::SeqCst);
 
@@ -577,16 +478,12 @@ impl BackgroundSessions {
                 }
             }
 
-            // Windows: the command exited on its own, so — like the unix
-            // watcher's group kill when its lifeline closes — nothing the session
-            // left behind runs on.
+            // Windows: the command exited on its own, so nothing the session left behind runs on.
             #[cfg(not(unix))]
             tree.terminate();
         });
     }
 }
-
-// ── Unix watchdog setup ──────────────────────────────────────────────
 
 /// Spawned process-group topology for a background session (Unix):
 ///
@@ -597,8 +494,7 @@ impl BackgroundSessions {
 ///  │     └─ stdin = pipe read end (CLOEXEC); blocks until EOF, then SIGKILLs
 ///  │        the group via `kill -s KILL 0`
 ///  └── [command child] sh -c "command"        ← joins the watcher's group
-///        └─ stdout/stderr → output file; stdin → /dev/null
-/// ```
+/// └─ stdout/stderr → output file; stdin → /dev/null ```
 #[cfg(unix)]
 struct WatchdogSetup {
     watcher_child: tokio::process::Child,
@@ -608,8 +504,8 @@ struct WatchdogSetup {
 
 #[cfg(unix)]
 impl WatchdogSetup {
-    /// Create the lifeline pipe and spawn the watcher as the group leader,
-    /// then point `cmd` at the watcher's process group.
+    /// Create the lifeline pipe and spawn the watcher as group leader, then point `cmd` at the
+    /// watcher's process group.
     fn spawn(cmd: &mut tokio::process::Command, output_path: &Path) -> Result<Self, String> {
         let (read_end, write_end) = make_lifeline_pipe().map_err(|e| {
             let _ = std::fs::remove_file(output_path);
@@ -642,8 +538,7 @@ impl WatchdogSetup {
         })
     }
 
-    /// Kill the watcher's group, close the lifeline, and reap the watcher.
-    /// Used on launch-failure paths (command spawn failure, probe failure).
+    /// Kill the watcher's group, close the lifeline, and reap the watcher — launch-failure paths.
     async fn abort(self) {
         super::kill_process_group(self.pgid, libc::SIGKILL);
         drop(self.write_end);
@@ -652,9 +547,8 @@ impl WatchdogSetup {
     }
 }
 
-/// Create a pipe with both ends `O_CLOEXEC`. The pipe is the daemon→watcher
-/// lifeline: it must never leak into the command (or its descendants) or the
-/// watcher's own children, or EOF would never arrive.
+/// Create a pipe with both ends `O_CLOEXEC`: it must never leak into the command or the
+/// watcher's children, or EOF would never arrive.
 #[cfg(unix)]
 fn make_lifeline_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
     let mut fds = [0i32; 2];
@@ -683,17 +577,13 @@ fn make_lifeline_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::O
     })
 }
 
-// ── Shared helpers ───────────────────────────────────────────────────
-
-/// Grace between SIGTERM and SIGKILL in the two-stage stop. Env-overridable
-/// for tests.
+/// Grace between SIGTERM and SIGKILL in the two-stage stop. Env-overridable for tests.
 #[cfg_attr(not(unix), expect(dead_code))]
 fn stop_grace() -> Duration {
     crate::util::env_duration_secs("MAHBOT_BG_STOP_GRACE_SECS", STOP_GRACE.as_secs())
 }
 
-/// How long `stop()` waits for the waiter to append the exit annotation
-/// after the kill. Env-overridable for tests.
+/// How long `stop()` waits for the exit annotation after the kill. Env-overridable for tests.
 fn stop_annotation_wait() -> Duration {
     crate::util::env_duration_secs(
         "MAHBOT_BG_ANNOTATION_WAIT_SECS",
@@ -701,12 +591,9 @@ fn stop_annotation_wait() -> Duration {
     )
 }
 
-/// Create the output file with create_new semantics in the shared `.agent`
-/// temp directory. The name is a distinct `bg_*` shape (flat, outside the
-/// `spill_*` namespace) so spill detection never mistakes it for a spill
-/// file and the periodic temp cleaner or the OS temp sweep reclaims it like
-/// any other leftover. Returns the path and an open handle for the command's
-/// stdout/stderr.
+/// Create the output file with create_new semantics in the shared `.agent` temp directory. The
+/// `bg_*` name shape is flat and outside the `spill_*` namespace, so spill detection never
+/// mistakes it for a spill file and the temp cleaners reclaim it like any other leftover.
 fn create_bg_output_file() -> std::io::Result<(PathBuf, File)> {
     let dir = super::agent_temp_dir().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "agent temp dir unavailable")
@@ -729,21 +616,17 @@ fn create_bg_output_file() -> std::io::Result<(PathBuf, File)> {
     ))
 }
 
-// The name shape and directory [`create_bg_output_file`] puts a session's output
-// in: `bg_XXXX.out` (4 hex digits) directly inside the shared `.agent` temp
-// directory.
+// The name shape [`create_bg_output_file`] puts a session's output in: `bg_XXXX.out` (4 hex
+// digits) directly inside the shared `.agent` temp directory.
 const OUTPUT_FILE_PREFIX: &str = "bg_";
 const OUTPUT_FILE_SUFFIX: &str = ".out";
 const OUTPUT_DIR_NAME: &str = ".agent";
 
-/// Whether `path` is named like one of this module's own output files, by the
-/// shape the consts above state — the reason the read tool may read a background
-/// session's output as a program's output ([`super::decode_session_output`]).
+/// Whether `path` is named like one of this module's own output files — the reason the read tool
+/// may read a session's output as a program's output ([`super::decode_session_output`]).
 ///
-/// The names are the whole test: a file an agent creates at
-/// `<anywhere>/.agent/bg_1a2b.out` is read as a program's output too. The
-/// directory is deliberately not compared against the temp root, which would mean
-/// canonicalising both sides (the root reaches the read tool symlink-resolved).
+/// The names are the whole test, and the directory is deliberately not compared against the temp
+/// root, which would mean canonicalising both sides.
 pub(super) fn is_output_file(path: &Path) -> bool {
     let shaped = path
         .file_name()
@@ -759,9 +642,8 @@ pub(super) fn is_output_file(path: &Path) -> bool {
             .is_some_and(|dir| dir == OUTPUT_DIR_NAME)
 }
 
-/// Bounded early-exit probe: poll the command child for up to [`LAUNCH_PROBE`].
-/// `Ok(Some(status))` = the command exited within the window (already
-/// reaped); `Ok(None)` = still running after the window (normal launch).
+/// Bounded early-exit probe: `Ok(Some(status))` = the command exited within the window (already
+/// reaped); `Ok(None)` = still running after it.
 async fn probe_command(
     cmd_child: &mut tokio::process::Child,
 ) -> Result<Option<std::process::ExitStatus>, String> {
@@ -782,9 +664,8 @@ async fn probe_command(
     }
 }
 
-/// Append the unconditional exit-status annotation to the output file —
-/// the only completion signal for background sessions. Uses the shared
-/// foreground format from [`format_exit_status_note`].
+/// Append the unconditional exit-status annotation — the only completion signal for background
+/// sessions — in the shared foreground format ([`format_exit_status_note`]).
 fn append_exit_annotation(output_path: &Path, status: std::process::ExitStatus) {
     let note = super::format_exit_status_note(status.code());
     match OpenOptions::new().append(true).open(output_path) {
@@ -802,10 +683,8 @@ fn append_exit_annotation(output_path: &Path, status: std::process::ExitStatus) 
     }
 }
 
-/// Read up to `max_bytes` from the START of the output file (the shell's
-/// launch-error message lives at the start), read the way a program's output is
-/// read here ([`super::windows_text::decode`]), credential-scrubbed, for the
-/// synchronous launch-failure tool error.
+/// Read up to `max_bytes` from the START of the output file, decoded as a program's output
+/// ([`super::windows_text::decode`]) and scrubbed, for the launch-failure tool error.
 fn read_output_prefix(path: &Path, max_bytes: usize) -> Option<String> {
     use std::io::Read;
     let mut f = File::open(path).ok()?;
@@ -839,16 +718,14 @@ mod tests {
     use crate::workspace::test_ws;
     use tempfile::TempDir;
 
-    /// A command that runs until something stops it — the only kind of launch the
-    /// stop and teardown tests can end themselves.
+    /// A command that runs until something stops it — the only launch these tests can end.
     #[cfg(unix)]
     const LONG_RUNNING: &str = "sleep 30";
     #[cfg(not(unix))]
     const LONG_RUNNING: &str = "ping -n 30 127.0.0.1";
 
-    /// What a stopped session's output file ends with: unix kills the group with a
-    /// signal, Windows ends the tree and reports a plain non-zero code (see
-    /// `tree`).
+    /// What a stopped session's output file ends with: unix kills the group with a signal,
+    /// Windows ends the tree and reports a plain non-zero code.
     #[cfg(unix)]
     const STOPPED_ANNOTATION: &str = "[exit status: terminated by signal]";
     #[cfg(not(unix))]
@@ -875,12 +752,9 @@ mod tests {
         std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
-    /// The product's own output path is recognised wherever the read tool looks at
-    /// it, and the near misses are not: a lookalike name outside a `.agent`
-    /// directory, a non-hex identifier, a file an agent named itself and the
-    /// `.agent` directory without the name shape all stay the read tool's own file.
-    /// The read tool's reading of a session's output rests on this predicate alone
-    /// ([`super::super::decode_session_output`]).
+    /// The product's own output path is recognised wherever the read tool looks at it, and the
+    /// near misses are not — the read tool's reading of a session's output rests on this
+    /// predicate alone.
     #[test]
     fn only_the_products_own_output_path_is_recognised() {
         let temp = std::env::temp_dir();
@@ -901,15 +775,12 @@ mod tests {
         }
     }
 
-    /// Launch `command` in the mode every background session runs in, its own text
-    /// standing as the reading the platform runs — the two differ on Windows alone,
-    /// and no text here is a Windows multi-line shape.
+    /// Launch `command` in the mode every background session runs in, its own text standing as the
+    /// reading the platform runs.
     ///
-    /// The launch runs under an owner of its own: with no agent identity every
-    /// background output file is recorded under the diagnostics role
-    /// ([`crate::tools::shell::record_spill_owner`]), which a concurrently running
-    /// verification round's own cleanup drains — deleting the file the test is
-    /// about to read.
+    /// The launch runs under an owner of its own: with no agent identity every output file is
+    /// recorded under the diagnostics role, which a concurrently running verification round's
+    /// cleanup drains — deleting the file the test is about to read.
     async fn launch_command(
         sessions: &Arc<BackgroundSessions>,
         ws: &Path,
@@ -924,8 +795,7 @@ mod tests {
             .await
     }
 
-    /// A case for the finished-session annotation: the command, the text its output
-    /// file carries besides the status, and the status the annotation states.
+    /// A case for the finished-session annotation.
     struct LaunchExitCase {
         name: &'static str,
         command: &'static str,
@@ -933,9 +803,7 @@ mod tests {
         annotation: &'static str,
     }
 
-    /// A launch that exits quickly is a successful launch, its output file carrying
-    /// the product's own name shape and the command's own status as its annotation —
-    /// a legitimate non-zero exit (grep no-match semantics) included.
+    /// A launch that exits quickly is a successful launch, a legitimate non-zero exit included.
     #[tokio::test]
     async fn launch_finishes_with_its_own_status_annotation() {
         let cases = [

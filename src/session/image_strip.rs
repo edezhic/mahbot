@@ -1,90 +1,59 @@
 //! Provider input-image rejection: detection and durable strip.
 //!
-//! When a provider rejects an input image at its content-inspection stage
-//! (observed: OpenRouter HTTP 400 `data_inspection_failed` — "Input image data
-//! may contain inappropriate content."), the rejection happens pre-inference
-//! (no tokens billed) and is **sticky**: the rejected image stays in the
-//! session history and is re-sent on every later turn, so every subsequent
-//! message in that session fails the same way until the session is reset.
+//! When a provider rejects an input image at its content-inspection stage (observed: OpenRouter
+//! HTTP 400 `data_inspection_failed` — "Input image data may contain inappropriate content."), the
+//! rejection happens pre-inference (no tokens billed) and is **sticky**: the rejected image stays
+//! in the session history and is re-sent every later turn, so every subsequent message in that
+//! session fails the same way until the session is reset.
+//! This module detects that rejection from the retry trail and rewrites the most recent User-role
+//! message — durably, via the session store — replacing all its image markers with one explanatory
+//! phrase (authored in `src/prompt/context/image_rejected.md`; all LLM-sent text lives under
+//! `src/prompt/`). The run then continues through its normal loop; there is **no dedicated retry
+//! step**.
 //!
-//! This module detects that rejection from the retry trail and rewrites the
-//! most recent User-role message — durably, via the session store — replacing
-//! all of its image markers with a single explanatory phrase (authored in
-//! `src/prompt/context/image_rejected.md`; all LLM-sent text lives under
-//! `src/prompt/`). The agent run then continues through its normal loop with
-//! the corrected message; there is **no dedicated retry step**.
-//!
-//! Scope contract:
-//! - Only the most recent User-role message is touched; images in earlier
-//!   user messages are left alone.
-//! - The strip fires only on genuine input-image content rejections: the
-//!   full failure trail must contain the provider code AND an image-specific
-//!   message fragment. A text-content rejection with the same code (message
-//!   says "Input data ..." without "image") never triggers the strip.
-//! - Pre-existing sticky sessions (from before this fix) are **not** healed
-//!   retroactively: healing requires the image-bearing message to BE the most
-//!   recent User-role message when the rejection is detected.
-//! - If another User-role message was injected after the image-bearing one
-//!   (e.g. a ticket comment), the most recent message is that comment; with
-//!   no image markers it does not match, so the strip does not fire and the
-//!   normal failure path applies.
-//! - A later injected message that itself carries an `[IMAGE:` marker is
-//!   stripped instead of the earlier image-bearing one — an inherent
-//!   consequence of the "most recent User-role message" rule (accepted; a
-//!   ticket comment carrying an image marker is not a realistic Assistant-chat
-//!   scenario).
+//! Scope contract: only the most recent User-role message is touched; the strip fires only on
+//! genuine input-image content rejections (the failure trail must hold the provider code AND an
+//! image-specific message fragment — a text-content rejection with the same code never triggers);
+//! pre-existing sticky sessions are **not** healed retroactively; and when another User-role
+//! message was injected after the image-bearing one (e.g. a ticket comment) with no image markers,
+//! the strip does not fire and the normal failure path applies. Accepted: a LATER injected message
+//! that itself carries an `[IMAGE:` marker is stripped instead — a consequence of the "most recent"
+//! rule, and a ticket comment carrying an image marker is not a realistic Assistant-chat scenario.
 
 use crate::prompt::{load_prompt, substitute};
 use crate::retry::RetryExhausted;
 use crate::util::INJECTED_IMAGE_TAG;
 use crate::{ChatMessage, ChatRole};
 
-/// Provider content-inspection error code that identifies the rejection
-/// (case-insensitive substring match against the failure trail).
+/// Provider content-inspection error code (case-insensitive substring match on the failure trail).
 const INPUT_INSPECTION_CODE: &str = "data_inspection_failed";
 
-/// Stable core of the observed image-specific message fragment ("Input image
-/// data may contain inappropriate content."). Matched case-insensitively
-/// together with the word "image" within the same failure record — a
-/// text-content rejection ("Input data ...") lacks "image" and never matches.
-/// The literal observed sentence also matches this core; a provider rephrasing
-/// that drops either part silently disables detection (documented limitation —
-/// the strip never false-positives on text rejections).
+/// Stable core of the observed image-specific fragment ("Input image data may contain inappropriate
+/// content."), matched case-insensitively together with the word "image" in the same failure record
+/// — a text-content rejection ("Input data …") lacks "image" and never matches. A provider
+/// rephrasing that drops either part silently disables detection (documented limit — the strip
+/// never false-positives on text rejections).
 const INAPPROPRIATE_CONTENT_FRAGMENT: &str = "inappropriate content";
 
-/// Fallback reason embedded in the phrase when the trail yields no usable
-/// provider message.
+/// Fallback reason embedded in the phrase when the trail yields no usable provider message.
 const REASON_FALLBACK: &str = "no specific reason was provided";
 
 /// Char cap for the provider reason embedded in the phrase.
 const REASON_CAP: usize = 500;
 
-/// Phrase asset key (all LLM-sent text lives under `src/prompt/`).
 const PHRASE_ASSET: &str = "context/image_rejected.md";
 
-/// Detect a provider input-image content-inspection rejection on the failure
-/// trail, returning the index of the most recent User-role message when the
-/// strip should fire (`None` = no strip).
+/// Detect a provider input-image content-inspection rejection on the trail, returning the index of
+/// the most recent User-role message when the strip should fire (`None` = no strip).
 ///
-/// Detection contract (documented):
-/// - The **full** failure trail (all recorded attempts) must contain the
-///   provider content-inspection code AND the image-specific fragment. In
-///   practice a 400-class rejection is [`crate::retry::FailureClass::NonRetryable`],
-///   so the trail has exactly one record; scanning all records keeps the rule
-///   correct if a retryable attempt ever precedes the rejection.
-/// - The fragment is a stable core, not the full observed sentence: any
-///   provider wording containing "inappropriate content" together with
-///   "image" matches (case-insensitively); the literal observed string also
-///   matches. Provider rewording that drops either core disables detection
-///   (documented limitation — a false positive would strip a message whose
-///   image was never rejected).
-/// - The most recent User-role message must contain at least one IMAGE marker
-///   that [`strip_image_markers`] will actually strip — the two share one
-///   predicate ([`has_image_marker`]), so a detected rejection is guaranteed
-///   to change the content. Malformed/empty `[IMAGE:` fragments never match
-///   the marker regex and never trigger (matching the provider-layer marker
-///   parser); otherwise no strip (e.g. an injected ticket comment after the
-///   image-bearing message).
+/// The **full** trail (all recorded attempts) must contain the content-inspection code AND the
+/// image-specific fragment: a 400-class rejection is
+/// [`crate::failure_class::FailureClass::NonRetryable`] in practice, so there is usually one
+/// record, but scanning all of them keeps the rule correct if a retryable attempt ever precedes the
+/// rejection. The most recent User-role message must carry at least one IMAGE marker
+/// [`strip_image_markers`] will actually strip — the two share one predicate
+/// ([`has_image_marker`]), so a detected rejection is guaranteed to change the content, and
+/// malformed/empty `[IMAGE:` fragments never trigger.
 #[must_use]
 pub(crate) fn detect_input_image_rejection(
     exhausted: &RetryExhausted,
@@ -106,27 +75,23 @@ pub(crate) fn detect_input_image_rejection(
     has_image_marker(&history[idx].content).then_some(idx)
 }
 
-/// True when the content carries at least one IMAGE marker that
-/// [`strip_image_markers`] would strip — the SAME predicate the strip uses
-/// (`MEDIA_MARKER_RE`, IMAGE kind only). Keeping detection and strip on one
-/// predicate guarantees a detected rejection always changes the content: a
-/// no-change rewrite would report success and the caller's loop `continue`
-/// skips the iteration counter, risking an unbounded retry loop. Empty
-/// `[IMAGE:]` or unclosed `[IMAGE:...` fragments never match the regex and
-/// never trigger (the provider-layer marker parser ignores them the same way).
+/// True when the content carries at least one IMAGE marker [`strip_image_markers`] would strip —
+/// the SAME predicate (`MEDIA_MARKER_RE`, IMAGE kind only). One predicate guarantees a detected
+/// rejection always changes the content: a no-change rewrite would report success while the
+/// caller's loop `continue` skips the iteration counter, risking an unbounded retry loop. Empty
+/// `[IMAGE:]` or unclosed `[IMAGE:...` fragments never match (the provider-layer parser ignores
+/// them the same way).
 fn has_image_marker(content: &str) -> bool {
     crate::util::MEDIA_MARKER_RE
         .captures_iter(content)
         .any(|caps| crate::util::parse_media_marker(&caps).0 == crate::util::MediaMarkerKind::Image)
 }
 
-/// Extract the provider's reason from the failure trail, if any.
-///
-/// The trail's `error_chain` text carries the HttpError display
-/// (`"{context} API error ({status}): {body}"`); the body is the provider's
-/// JSON envelope. Extraction prefers the structured `error.message`, then the
-/// nested-envelope fields (see [`crate::util::extract_provider_error_detail`]);
-/// `None` means the caller substitutes [`REASON_FALLBACK`].
+/// Extract the provider's reason from the failure trail, if any. The trail's `error_chain` carries
+/// the HttpError display (`"{context} API error ({status}): {body}"`) whose body is the provider's
+/// JSON envelope; extraction prefers the structured `error.message`, then the nested fields (see
+/// [`crate::util::extract_provider_error_detail`]). `None` means the caller substitutes
+/// [`REASON_FALLBACK`].
 #[must_use]
 pub(crate) fn extract_provider_reason(exhausted: &RetryExhausted) -> Option<String> {
     exhausted
@@ -135,35 +100,30 @@ pub(crate) fn extract_provider_reason(exhausted: &RetryExhausted) -> Option<Stri
         .find_map(|f| reason_from_chain(&f.error_chain))
 }
 
-/// Pull the provider reason out of a single formatted error-chain string.
+/// Pull the provider reason out of one formatted error-chain string.
 fn reason_from_chain(chain: &str) -> Option<String> {
-    // HttpError displays as "{context} API error ({status}): {body}" — the
-    // body starts after the first "): " separator (provider names never
-    // contain it). Non-HttpError chains (timeouts, parse failures) lack the
-    // separator and yield None.
+    // HttpError displays as "{context} API error ({status}): {body}", so the body starts after
+    // the first "): " separator (provider names never contain it). Non-HttpError chains
+    // (timeouts, parse failures) lack it and yield None.
     let sep = chain.find("): ")?;
     let body = &chain[sep + 3..];
     let body_json = serde_json::from_str::<serde_json::Value>(body).ok()?;
     crate::util::extract_provider_error_detail(&body_json)
 }
 
-/// Build the corrected content of the rejected user message: all `[IMAGE:...]`
-/// markers are removed and replaced by a single explanatory phrase placed at
-/// the position of the first marker, with the user's accompanying text
-/// preserved around it. Non-image markers (`[AUDIO:` / `[VIDEO:`) are left
-/// untouched. Empty `[IMAGE:]` markers do not match the marker regex and are
-/// preserved verbatim (matching the provider-layer marker parser).
+/// Build the corrected content of the rejected user message: every `[IMAGE:...]` marker goes,
+/// replaced by one explanatory phrase at the position of the first, with the user's text preserved
+/// around it. Non-image markers (`[AUDIO:` / `[VIDEO:`) are untouched, and empty `[IMAGE:]` markers
+/// do not match the marker regex (matching the provider-layer parser).
 ///
-/// Literal replacement rule: the first image marker becomes the phrase, every
-/// later image marker is deleted (the provider error does not identify which
-/// image was rejected). A marker-separated sentence like
-/// `see [IMAGE:a] and [IMAGE:b] here` becomes `see <phrase> and  here` — the
-/// user's text is preserved verbatim; no separator trimming is attempted.
+/// The first image marker becomes the phrase and later ones are deleted (the provider error does
+/// not say which image was rejected), so `see [IMAGE:a] and [IMAGE:b] here` becomes `see <phrase>
+/// and here` — the user's text verbatim, with no separator trimming.
 #[must_use]
 pub(crate) fn strip_image_markers(content: &str, reason: Option<&str>) -> String {
     let reason = reason.unwrap_or(REASON_FALLBACK);
-    // Trim trailing punctuation from the embedded reason so a provider message
-    // ending in "." does not double up against the phrase's own period.
+    // Trim trailing punctuation from the reason so a provider message ending in "." does not
+    // double up against the phrase's own period.
     let sanitized = crate::util::truncate(&crate::util::scrub_credentials(reason), REASON_CAP);
     let sanitized = sanitized
         .trim_end_matches(|c: char| c == '.' || c.is_whitespace())
@@ -184,8 +144,8 @@ pub(crate) fn strip_image_markers(content: &str, reason: Option<&str>) -> String
         let whole = caps.get_match();
         if first {
             let seg = &content[last_end..whole.start()];
-            // A synthetic tool-injected image message carries a provenance
-            // tag that must not dangle next to the replacement phrase.
+            // A synthetic tool-injected image message carries a provenance tag that
+            // must not dangle next to the replacement phrase.
             if seg.contains(INJECTED_IMAGE_TAG) {
                 let cleaned = seg.replace(INJECTED_IMAGE_TAG, "").trim().to_string();
                 out.push_str(&cleaned);
@@ -242,14 +202,12 @@ mod tests {
         );
     }
 
-    /// Both halves of the gate — the inspection code and the image wording —
-    /// decide the strip, and both are matched case-insensitively: a
-    /// text-content rejection carrying the same code, that code on another
-    /// error, and the all-caps spelling of a genuine rejection.
+    /// Both halves of the gate — the inspection code and the image wording — decide the strip,
+    /// and both match case-insensitively: a text-content rejection with the same code, that
+    /// code on another error, and the all-caps spelling of a genuine rejection.
     #[test]
     fn detection_gate_keys_on_the_image_inspection_code_and_wording() {
         let cases: &[(&str, Option<usize>)] = &[
-            // Same code, message says "Input data ..." without "image".
             (
                 r#"OpenRouter API error (400): {"error":{"message":"Input data may contain inappropriate content.","code":"data_inspection_failed","type":"invalid_request_error"}}"#,
                 None,
@@ -274,8 +232,6 @@ mod tests {
 
     #[test]
     fn strip_targets_only_the_most_recent_user_message() {
-        // Markers in EARLIER user messages alone do not trigger: the most
-        // recent User-role message is a later injected text-only one.
         let history = vec![
             ChatMessage::system("role description"),
             ChatMessage::user("[IMAGE:/tmp/old.png] old image"),
@@ -285,8 +241,6 @@ mod tests {
             detect_input_image_rejection(&trail(REJECTION_CHAIN), &history),
             None
         );
-        // Markers in earlier messages do not prevent targeting the most
-        // recent user message when THAT one carries the image.
         let history = vec![
             ChatMessage::user("[IMAGE:/tmp/old.png] old"),
             ChatMessage::user("[IMAGE:/tmp/new.png] new"),
@@ -297,13 +251,11 @@ mod tests {
 
     #[test]
     fn malformed_or_empty_marker_does_not_trigger_strip() {
-        // Regression pinning the detection/strip gate: detection and the strip
-        // share ONE predicate (MEDIA_MARKER_RE, IMAGE kind). Fragments the
-        // marker regex leaves verbatim (empty `[IMAGE:]`, unclosed `[IMAGE:foo`,
-        // trailing `[IMAGE:`) or non-IMAGE markers (`[AUDIO:...]`) must NOT
-        // trigger — a detected rejection is guaranteed to change the content,
-        // so a no-op rewrite plus the caller's `continue` (which skips the
-        // iteration counter) cannot form an unbounded retry loop.
+        // Pins the detection/strip gate: both share ONE predicate (MEDIA_MARKER_RE, IMAGE
+        // kind). Fragments the regex leaves verbatim (empty `[IMAGE:]`, unclosed
+        // `[IMAGE:foo`, trailing `[IMAGE:`) or non-IMAGE markers (`[AUDIO:...]`) must NOT
+        // trigger — otherwise a no-op rewrite plus the caller's `continue` (which skips the
+        // iteration counter) forms an unbounded retry loop.
         for content in [
             "hello [IMAGE:] world",
             "unclosed [IMAGE:foo",
@@ -321,12 +273,10 @@ mod tests {
 
     #[test]
     fn malformed_latest_marker_with_earlier_image_is_conservative_noop() {
-        // Sticky-session shape from review: an earlier user message's
-        // well-formed marker keeps the provider rejecting, while the most
-        // recent message's malformed `[IMAGE:` text would (under a loose
-        // `contains("[IMAGE:")` gate) fire the strip as a no-op — the exact
-        // unbounded-loop shape. The aligned gate must not fire: no strip, the
-        // normal failure path applies.
+        // Sticky-session shape from review: an earlier message's well-formed marker keeps
+        // the provider rejecting while the most recent message's malformed `[IMAGE:` text
+        // would, under a loose `contains("[IMAGE:")` gate, strip to a no-op — the
+        // unbounded-loop shape. The aligned gate must not fire.
         let history = vec![
             ChatMessage::user("[IMAGE:/tmp/old.png] earlier image"),
             ChatMessage::user("see [IMAGE: here"),
@@ -337,10 +287,10 @@ mod tests {
         );
     }
 
-    /// One rewrite rule over the marker's shapes: every `[IMAGE:…]` becomes the
-    /// single explanatory phrase, the user's own text and non-image markers keep
-    /// their place (the inter-marker separator included), and the provenance tag
-    /// that wrapped an injected tool result goes with the marker it annotated.
+    /// One rewrite rule over the marker's shapes: every `[IMAGE:…]` becomes the explanatory
+    /// phrase, the user's own text and non-image markers keep their place (inter-marker
+    /// separator included), and the provenance tag wrapping an injected tool result goes with
+    /// the marker it annotated.
     #[test]
     fn strip_rewrites_image_markers_and_keeps_the_rest() {
         type Case<'a> = (&'a str, Option<&'a str>, &'a [&'a str], &'a [&'a str]);

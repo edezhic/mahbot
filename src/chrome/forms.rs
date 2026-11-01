@@ -1,16 +1,13 @@
-//! Safe chrome-use argv forms shared by the interactive `chrome` tool and
-//! the `mahbot chrome` CLI. The unsafe shapes are kept out at this shared
-//! layer: the numeric `wait <ms>` sleep form has no [`WaitTarget`] variant and
-//! [`wait_target`] rejects a numeric selector, and expect conditions are a
-//! validated allowlist ([`ExpectCond`] → [`expect_args`]).
+//! Safe chrome-use argv forms shared by the interactive `chrome` tool and the
+//! `mahbot chrome` CLI: the numeric `wait <ms>` sleep form has no [`WaitTarget`]
+//! variant, and expect conditions are a validated allowlist.
 
 use crate::chrome::escape_js_single_quoted;
 use serde_json::Value;
 
-/// The inline-text argv element for a `fill`/`type` value: a leading-dash
-/// text is shielded with the standard `--` end-of-options marker, which
-/// chrome-use's arg preprocessor drops and forwards the value verbatim
-/// (otherwise a global/known flag of the same name could swallow it).
+/// A leading-dash `fill`/`type` text is shielded with the `--` end-of-options
+/// marker, which chrome-use's arg preprocessor drops and forwards verbatim
+/// (otherwise a known flag of the same name could swallow it).
 pub(crate) fn text_value_argv(text: &str) -> Vec<String> {
     if text.starts_with('-') {
         vec!["--".to_string(), text.to_string()]
@@ -19,8 +16,8 @@ pub(crate) fn text_value_argv(text: &str) -> Vec<String> {
     }
 }
 
-/// What a `wait` waits for. The numeric sleep form (`wait 5000`) has no
-/// variant — [`wait_target`] rejects it before one can be built.
+/// The numeric sleep form (`wait 5000`) has no variant — [`wait_target`] rejects
+/// it before one can be built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WaitTarget {
     Selector(String),
@@ -29,7 +26,6 @@ pub(crate) enum WaitTarget {
 }
 
 impl WaitTarget {
-    /// Human-readable target for envelopes and tool output.
     pub(crate) fn describe(&self) -> String {
         match self {
             Self::Selector(s) => format!("selector '{s}'"),
@@ -39,9 +35,8 @@ impl WaitTarget {
     }
 }
 
-/// Build `wait` argv for a safe target. `--timeout <ms>` IS forwarded —
-/// chrome-use's wait forms honor it (verified against 1.5.101); callers
-/// additionally bound the spawned step mahbot-side.
+/// `--timeout <ms>` IS forwarded — chrome-use's wait forms honor it (verified
+/// against 1.5.101); callers additionally bound the spawned step mahbot-side.
 pub(crate) fn wait_args(target: &WaitTarget, timeout_ms: u128) -> Vec<String> {
     let mut args = match target {
         WaitTarget::Selector(s) => vec!["wait".to_string(), s.clone()],
@@ -53,9 +48,8 @@ pub(crate) fn wait_args(target: &WaitTarget, timeout_ms: u128) -> Vec<String> {
     args
 }
 
-/// An `expect` condition — the safe allowlist subset of chrome-use's grammar
-/// (gone/request/no-errors and the --not/--regex/--no-wait flags are not
-/// exposed).
+/// The safe allowlist subset of chrome-use's grammar (gone/request/no-errors and
+/// the --not/--regex/--no-wait flags are not exposed).
 pub(crate) enum ExpectCond {
     State {
         selector: String,
@@ -88,7 +82,6 @@ pub(crate) enum ExpectCond {
     },
 }
 
-/// Validate an element state word → the canonical form.
 pub(crate) fn parse_state(s: &str) -> Option<&'static str> {
     match s {
         "visible" => Some("visible"),
@@ -98,7 +91,6 @@ pub(crate) fn parse_state(s: &str) -> Option<&'static str> {
     }
 }
 
-/// Validate a comparison predicate word → the canonical form.
 pub(crate) fn parse_predicate(s: &str) -> Option<&'static str> {
     match s {
         "equals" => Some("equals"),
@@ -108,8 +100,7 @@ pub(crate) fn parse_predicate(s: &str) -> Option<&'static str> {
     }
 }
 
-/// Validate a count comparison operator (symbols or word forms); the word is
-/// forwarded verbatim to chrome-use.
+/// Accepts symbols or word forms; the word is forwarded verbatim to chrome-use.
 pub(crate) fn parse_count_op(s: &str) -> Option<String> {
     let valid = [
         "==", "!=", ">", "<", ">=", "<=", "eq", "ne", "gt", "lt", "ge", "le",
@@ -117,8 +108,7 @@ pub(crate) fn parse_count_op(s: &str) -> Option<String> {
     valid.contains(&s).then(|| s.to_string())
 }
 
-/// Build `expect` argv (selector-first, chrome-use 1.5.101 grammar) plus the
-/// forwarded `--timeout <ms>`.
+/// Selector-first, chrome-use 1.5.101 grammar, plus the forwarded `--timeout <ms>`.
 pub(crate) fn expect_args(cond: &ExpectCond, timeout_ms: u128) -> Vec<String> {
     let mut args = match cond {
         ExpectCond::State { selector, state } => {
@@ -178,7 +168,6 @@ pub(crate) fn expect_args(cond: &ExpectCond, timeout_ms: u128) -> Vec<String> {
     args
 }
 
-/// Human-readable condition description for envelopes and tool output.
 pub(crate) fn describe(cond: &ExpectCond) -> String {
     match cond {
         ExpectCond::State { selector, state } => format!("'{selector}' is {state}"),
@@ -203,9 +192,8 @@ pub(crate) fn describe(cond: &ExpectCond) -> String {
     }
 }
 
-/// Resolve the wait target from the caller-supplied parts — exactly one of
-/// selector/url/text, with one policy and one error text for both frontends.
-/// A numeric selector is chrome-use's silent-sleep form (rc 0 without
+/// Exactly one of selector/url/text, with one policy and one error text for both
+/// frontends. A numeric selector is chrome-use's silent-sleep form (rc 0 without
 /// waiting): rejected here, never forwarded.
 pub(crate) fn wait_target(
     selector: Option<&str>,
@@ -228,11 +216,10 @@ pub(crate) fn wait_target(
     }
 }
 
-/// Build eval JS that returns the count of elements matching `selector`
-/// (chrome-use has no standalone count verb reachable from the CLI grammar we
-/// use, so both frontends count via this eval shim). Top-document scope: the
-/// count gate diverges from chrome-use's frame-aware extract on iframed rows
-/// — an accepted heuristic, since the gate exists to keep phantom rows out.
+/// Eval JS counting elements matching `selector` — chrome-use has no standalone
+/// count verb in the grammar we use. Top-document scope, which diverges from
+/// chrome-use's frame-aware extract on iframed rows: an accepted heuristic, since
+/// the gate exists to keep phantom rows out.
 pub(crate) fn count_eval_js(selector: &str) -> String {
     format!(
         "document.querySelectorAll('{}').length",
@@ -240,22 +227,20 @@ pub(crate) fn count_eval_js(selector: &str) -> String {
     )
 }
 
-/// The extract honest-empty gate decision (see [`extract_gate`]).
 pub(crate) enum ExtractGate<E> {
-    /// 0 matches — report the empty region WITHOUT invoking extract:
-    /// chrome-use's rows-mode extract returns phantom rows on a 0-match, and
-    /// its invalid-CSS auto-detect fallback manufactures rows too.
+    /// 0 matches — report the empty region WITHOUT invoking extract: chrome-use's
+    /// rows-mode extract returns phantom rows on a 0-match, and its invalid-CSS
+    /// auto-detect fallback manufactures rows too.
     Empty,
-    /// Non-zero matches — safe to run the extract.
     Proceed,
-    /// The count eval failed (e.g. an invalid CSS rows selector threw) — an
-    /// explicit error, never a fallback to extract. Carries the caller's own
-    /// classified failure so each frontend renders it in its native channel.
+    /// The count eval failed (e.g. an invalid CSS rows selector threw) — an explicit
+    /// error, never a fallback to extract. Carries the caller's own classified
+    /// failure so each frontend renders it in its native channel.
     Fail(E),
 }
 
-/// The extract gate, shared by both frontends: count the rows selector
-/// ([`count_eval_js`]) and let [`ExtractGate`] decide.
+/// Shared by both frontends: count the rows selector ([`count_eval_js`]) and let
+/// [`ExtractGate`] decide.
 pub(crate) fn extract_gate<E>(count: Result<u64, E>) -> ExtractGate<E> {
     match count {
         Ok(0) => ExtractGate::Empty,
@@ -269,18 +254,14 @@ const GETTER_GRAMMAR: &str = "valid getters are \"text\" (default), \"html\", \"
      \"@<attribute>\" (e.g. \"@href\"); attributes require the \"@\" prefix — a bare \
      attribute name is not a getter";
 
-/// Validate the extract-schema getter vocabulary against chrome-use's
-/// documented grammar: `get` = "text" (default) | "@<attribute>" | "html" |
-/// "value". chrome-use silently falls back to textContent for unknown
-/// getters, which produced plausible-but-wrong `ok:true` extractions (rc 0,
-/// no signal) — mahbot rejects them loudly instead. Attributes require the
-/// "@" prefix (get "@href", not "href"); "@" alone is invalid. The allowlist
-/// is pinned to the documented chrome-use grammar (stable across 1.5.10x) —
-/// extend it if a future chrome-use release documents new getters.
+/// `get` must be "text" (default) | "@<attribute>" | "html" | "value", "@" alone is
+/// invalid. chrome-use silently falls back to textContent for unknown getters, which
+/// produced plausible-but-wrong `ok:true` extractions (rc 0, no signal) — mahbot
+/// rejects them loudly instead. The allowlist is pinned to the documented grammar
+/// (stable across 1.5.10x); extend it if a release documents new getters.
 pub(crate) fn validate_extract_getters(schema: &Value) -> Result<(), String> {
     let Some(fields) = schema.get("fields").and_then(Value::as_object) else {
-        // Missing or non-object "fields" is shape-checked elsewhere; getter
-        // validation only applies to the object form.
+        // Missing or non-object "fields" is shape-checked elsewhere.
         return Ok(());
     };
     for (name, field) in fields {
@@ -320,7 +301,6 @@ mod tests {
         args.iter().map(String::as_str).collect()
     }
 
-    /// The wait args forward the timeout for every target and the expect args cover every variant.
     #[test]
     fn wait_and_expect_args_carry_every_target() {
         {
@@ -420,8 +400,6 @@ mod tests {
         }
     }
 
-    /// The wait state, predicate and count operators each parse their documented
-    /// spellings and reject the rest.
     #[test]
     fn parse_each_wait_predicate_part_accepts_and_rejects() {
         {
@@ -485,8 +463,8 @@ mod tests {
         }
     }
 
-    /// The count verb's JS wrapper escapes the selector, so a quote or a
-    /// backslash in it can neither end nor alter the single-quoted literal.
+    /// The count verb's JS wrapper escapes the selector, so a quote or a backslash
+    /// in it can neither end nor alter the single-quoted literal.
     #[test]
     fn count_eval_js_escapes_single_quotes_and_backslashes() {
         for (name, selector, js) in [
@@ -508,7 +486,6 @@ mod tests {
 
     #[test]
     fn wait_target_rejects_numeric_and_multiple_targets() {
-        // Happy targets.
         assert_eq!(
             wait_target(Some("#x"), None, None),
             Ok(WaitTarget::Selector("#x".into()))
@@ -524,14 +501,12 @@ mod tests {
         // The numeric silent-sleep form is rejected, never forwarded.
         let err = wait_target(Some("5000"), None, None).unwrap_err();
         assert!(err.contains("silent sleep"), "err: {err}");
-        // Exactly-one policy.
         assert!(wait_target(Some("#x"), Some("dash"), None).is_err());
         assert!(wait_target(None, None, None).is_err());
         assert!(wait_target(Some("#x"), Some("d"), Some("t")).is_err());
     }
 
-    /// The `get:` grammar: `text`/`html`/`value` and `@<attribute>` pass,
-    /// everything else is refused.
+    /// `text`/`html`/`value` and `@<attribute>` pass, everything else is refused.
     #[test]
     fn validate_extract_getters_accepts_the_grammar_and_rejects_the_rest() {
         struct Case {
@@ -543,8 +518,6 @@ mod tests {
 
         let cases = [
             Case {
-                // accepts_documented_grammar: text/html/value and "@<attribute>"
-                // all pass, and a plain CSS-selector string field needs no getter.
                 name: "accepts_documented_grammar",
                 schema: serde_json::json!({
                     "rows": ".card",
@@ -559,19 +532,16 @@ mod tests {
                 refused: None,
             },
             Case {
-                // A field object with no "get" key is fine (defaults to text).
                 name: "field_object_without_get",
                 schema: serde_json::json!({"fields": {"title": {"sel": ".title"}}}),
                 refused: None,
             },
             Case {
-                // Plain string fields (CSS selectors) are fine.
                 name: "plain_string_fields",
                 schema: serde_json::json!({"fields": {"title": ".title", "url": "a"}}),
                 refused: None,
             },
             Case {
-                // Missing or non-object "fields" is shape-checked elsewhere — Ok here.
                 name: "missing_fields",
                 schema: serde_json::json!({"rows": ".card"}),
                 refused: None,
@@ -582,19 +552,16 @@ mod tests {
                 refused: None,
             },
             Case {
-                // Bare attribute name (no "@") is rejected with the convention taught.
                 name: "bare_attribute_name",
                 schema: serde_json::json!({"fields": {"link": {"sel": "a", "get": "href"}}}),
                 refused: Some(&["@", "getter", "href"]),
             },
             Case {
-                // Empty "@" is rejected.
                 name: "empty_getter",
                 schema: serde_json::json!({"fields": {"u": {"sel": "a", "get": "@"}}}),
                 refused: Some(&["empty getter"]),
             },
             Case {
-                // Non-string get is rejected.
                 name: "non_string_getter",
                 schema: serde_json::json!({"fields": {"u": {"sel": "a", "get": 42}}}),
                 refused: Some(&["non-string getter"]),

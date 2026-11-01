@@ -1,76 +1,40 @@
 //! Windows (`cmd.exe`) command model of the transparent grep interception.
 //!
 //! Compiled on every platform and driven by the runtime platform value
-//! ([`crate::tools::shell::SHELL_PLATFORM`] — one `if cfg!(windows)` constant
-//! that every consumer here takes as data, never as a `cfg` branch of its own),
-//! the way the read-only guard's own `windows` layer is: the parent reads a
-//! command string exactly the way `cmd.exe /C` would split, quote and dispatch
-//! it, so the whole model is unit-testable from any host.
+//! ([`crate::tools::shell::SHELL_PLATFORM`], one `if cfg!(windows)` constant every
+//! consumer takes as data), the way the read-only guard's `windows` layer is: the parent
+//! reads a command string exactly as `cmd.exe /C` would split, quote and dispatch it.
 //!
-//! `sh -c` and `cmd.exe /C` disagree on nearly every token. `&` separates
-//! commands for cmd and backgrounds a job for sh; `;` separates for sh and is
-//! ordinary text for cmd (several of its own internal commands take it as an
-//! argument delimiter); `^` escapes the next character and `(...)` groups
-//! commands for cmd; only `"` quotes, with `""` as a literal quote inside a
-//! quoted span, while `'` and `\` are ordinary characters. The unix segmenter,
-//! tokenizer and matcher are therefore never run on a Windows command string —
-//! every decision below is the cmd.exe reading, and everything the model cannot
-//! read is refused fail-closed.
+//! `sh -c` and `cmd.exe /C` disagree on nearly every token: `&` separates commands for
+//! cmd and backgrounds for sh; `;` separates for sh and is ordinary text for cmd; `^`
+//! escapes and `(...)` groups for cmd; only `"` quotes, `""` being a literal quote
+//! inside a span, while `'` and `\` are ordinary. No unix reading ever runs on a
+//! Windows string, and everything the model cannot read is refused fail-closed.
 //!
-//! # Spec hand-off
+//! The hand-off: cmd.exe caps its command line at 8191 UTF-16 code units and re-parses
+//! it before the program sees argv, so no quoting carries a 64 KiB JSON payload
+//! intact — a served member passes its spec through a scratch file under the private
+//! temp root ([`scratch_dir`]) named via [`SPEC_FILE_FLAG`], which the parent deletes
+//! when the call finishes (the temp cleaner is the backstop). The rewrite reaches
+//! cmd.exe as the `/C` argument in the extra quote pair it strips — `raw_arg`, not
+//! `arg`, since std's escaping is not cmd.exe's reading. [`cmd_quote`] refuses a `%`,
+//! `!` or `"` in a path this process did not choose (install path, scratch root), which
+//! cmd.exe rewrites even inside quotes: every search on such a machine then fails
+//! loudly. The narrower two-`%`-or-more reading ([`has_percent_expansion`]) covers the
+//! agent's own search text, which rides the spec file, never the command line.
 //!
-//! cmd.exe's command line is capped at 8191 UTF-16 code units (the unit
-//! `crate::tools::shell::windows_line` measures it in), and the shell re-parses
-//! the whole line (`%name%` expansion, separators, carets) before the program
-//! sees its argv, so no quoting carries a 64 KiB JSON payload intact. A served
-//! member therefore passes its spec through a scratch file under the daemon's
-//! private temp root ([`scratch_dir`], which is the process test root in the
-//! host lane) and hands the path over with [`SPEC_FILE_FLAG`]; the parent
-//! deletes the file when the call finishes and the temp cleaner is the backstop
-//! for a killed daemon.
+//! Tracked and engine cwds both go through [`super::canonical_or_lexical`], so the cwd
+//! gate only needs [`same_spelling`]'s case/separator/verbatim-insensitive comparison.
+//! `readonly/windows.rs` reads cmd.exe with its own reader and fail-closed policy, so a
+//! rule change belongs in both places.
 //!
-//! The rewrite reaches cmd.exe through the shell's own spawn
-//! (`crate::tools::shell::build_shell_command`), which passes it as the `/C`
-//! argument in the extra quote pair cmd.exe's own quote processing strips —
-//! `raw_arg`, not `arg`, because std's `CommandLineToArgvW`-style escaping is
-//! not cmd.exe's reading and would mangle the rewrite's own quotes.
-//!
-//! The one machine-wide limit this hand-off keeps: the rewrite names two paths
-//! this process did not choose — the running executable's installation path and,
-//! through it, the temp root the scratch file sits under. [`cmd_quote`] refuses
-//! a `%`, `!` or `"` in either: cmd.exe rewrites all three even inside quotes —
-//! `%` always, `!` wherever delayed expansion is on, and a quote by closing the
-//! quoting — and a mangled path breaks the hand-off itself, so every search on
-//! such a machine fails (loudly, never silently) until the path changes. The
-//! narrower reading applied to the agent's own search text (two or more `%`
-//! characters in one word, see [`has_percent_expansion`]) answers a different
-//! question: that text rides the spec file and never appears on the command line.
-//!
-//! # Path identity
-//!
-//! The parent's tracked cwd and the engine's own `current_dir()` both go
-//! through [`super::canonical_or_lexical`], so the cwd gate only then needs
-//! [`same_spelling`]'s case/separator/verbatim-insensitive comparison rather
-//! than byte equality; the same canonicalization keeps displayed and operand
-//! paths in the platform's natural spelling (it strips the verbatim prefix).
-//!
-//! `readonly/windows.rs` reads cmd.exe with its own reader and its own
-//! fail-closed policy, so a cmd.exe rule change belongs in both places.
-//!
-//! # The cmd.exe reading this model applies
-//!
-//! The model reads a line as cmd.exe does: its reading of a line ENDS at a bare
-//! line break — which is why the shell respells every plain break as `&` before
-//! any reader here sees the text ([`crate::tools::shell::windows_line`]) — and it
-//! splits the rest of a line on `&`/`|`, keeps a `>`-family redirect's own `&`
-//! inside the redirect (`2>&1`), treats `;`/`'`/`\` as ordinary characters, reads
-//! `""` inside a quoted span as a literal quote, dispatches verbs case-insensitively
-//! and extension-insensitively (`GREP.EXE`), changes nothing on a bare `cd` while
-//! recognising `/d` as its only switch, and keeps the directory stack `pushd` pushes
-//! and `popd` pops. Every refusal rests on that reading — as does the reading
-//! of the paths this layer joins and compares, and the `/C "…"` hand-off the
-//! shell spawns a rewrite with. [`fnmatch`] is pinned differentially against the
-//! host's own `fnmatch` by the parent module's `windows_fnmatch_parity` tests.
+//! The reading: a line ENDS at a bare break (hence the shell's `&` respelling —
+//! [`crate::tools::shell::windows_line`]); splits on `&`/`|`; keeps a `>`-family
+//! redirect's own `&` (`2>&1`); treats `;`/`'`/`\` as ordinary; reads `""` inside a
+//! span as a literal quote; dispatches verbs case- and extension-insensitively; changes
+//! nothing on a bare `cd` (`/d` is its only switch); keeps the `pushd`/`popd` stack.
+//! Every refusal rests on it. [`fnmatch`] is pinned differentially by
+//! `windows_fnmatch_parity`.
 
 use std::fs;
 use std::io::Write;
@@ -84,29 +48,20 @@ use super::GrepWord;
 /// The argument a served member receives its spec path through.
 pub(super) const SPEC_FILE_FLAG: &str = "--spec-file";
 
-/// Scratch directory (below the daemon's private temp root) holding the spec
-/// files of served Windows members.
+/// Scratch directory (below the daemon's private temp root) holding served members' specs.
 const SPEC_DIR: &str = "grep-engine";
 
-// ── Command splitting ────────────────────────────────────────────────────
-
-/// The `&` at the cursor belongs to the redirect token spelled just before it
-/// (`2>&1`, `>&2`, `>& file`): a `&` directly after `>` merges descriptors
-/// instead of chaining commands, so it never ends the member.
-///
-/// Reading the member's last character is a spelling test, not a token read: a
-/// word-glued redirect whose target meets the next command (`grep a>&echo done`)
-/// is one member here while cmd.exe sees a `>&` redirect plus `echo`. The glued
-/// word itself is then refused as unreadable ([`has_glued_redirect`]), so the
-/// divergence never produces a search of different text.
+/// True when the `&` at the cursor belongs to the redirect token before it (`2>&1`,
+/// `>& file`): a `&` directly after `>` merges descriptors, so it never ends the member.
+/// A word-glued redirect meeting the next command (`grep a>&echo done`) is one member
+/// here and is then refused as unreadable ([`has_glued_redirect`]).
 fn redirect_keeps_amp(before: &str) -> bool {
     before.ends_with('>')
 }
 
-/// Push the trimmed member of `current` onto `out` with its connector.
-/// `required` marks a member that must not be empty (one before a `&`/`|`/
-/// `&&`/`||` connector — a shape cmd.exe reads as an extra command, which
-/// dropping silently would turn into a valid single command).
+/// Push the trimmed member of `current` onto `out` with its connector. `required` marks a
+/// member that must not be empty (one before a `&`/`|`/`&&`/`||`), since dropping it
+/// silently would turn the line into a valid single command.
 fn flush(
     current: &mut String,
     out: &mut Vec<(String, String)>,
@@ -122,29 +77,13 @@ fn flush(
     true
 }
 
-/// Split a command line the way `cmd.exe /C` does: on `&`, `&&`, `|`, `||`,
-/// returning `(segment, following-connector)` pairs with `""` as the last
-/// connector. `None` for a line whose reading is not modelled:
-///
-/// - a `^`, a `(`/`)` or a line break outside double quotes: the caret escapes
-///   the next character and the parentheses group commands, so a member split at
-///   the wrong place could run a command the agent did not write, and a break is
-///   the same kind of unknown. A break *inside* a quoted span is no part of that
-///   test and would be carried into a member's own text — a step `cmd /C` then
-///   reads to its first line alone — so this model rests on the reading refusing
-///   that shape before any text reaches it: [`crate::tools::shell::windows_line`]
-///   refuses a break in the platform's `"` span (its `BREAK_IN_DOUBLE_QUOTES`
-///   cause) and respells or joins every other break, so a break that arrives here
-///   is one of the shapes the platform itself continues across — a caret, or a
-///   group — text this model cannot split into the members a rewrite needs, which
-///   is what the fail-closed answer below is for;
-/// - an unbalanced `"`;
-/// - an empty member before a connector (`&& a`) or a trailing connector with
-///   no member after it (`a &&`, `a |`) — the unix segmenter's fail-closed
-///   policy, mirrored.
-///
-/// `;` is ordinary text here (cmd.exe keeps one line) and is never a
-/// connector; the caller reads it through [`unquoted_semicolon`].
+/// Split a command line the way `cmd.exe /C` does: on `&`, `&&`, `|`, `||`, returning
+/// `(segment, following-connector)` pairs with `""` last. `None` for a reading this model
+/// does not have: a `^`, a `(`/`)` or a line break outside double quotes (the caret
+/// escapes, the parentheses group, and a break is the same kind of unknown — one that
+/// arrives here is a shape the platform itself continues across), an unbalanced `"`, or
+/// an empty member before a connector / a trailing connector with no member after it.
+/// `;` is ordinary text and never a connector; the caller reads it via [`unquoted_semicolon`].
 #[must_use]
 pub(in crate::tools::shell) fn segment_command(command: &str) -> Option<Vec<(String, String)>> {
     let chars: Vec<char> = command.chars().collect();
@@ -172,10 +111,8 @@ pub(in crate::tools::shell) fn segment_command(command: &str) -> Option<Vec<(Str
             continue;
         }
         match c {
-            // Unmodellable outside quotes (see the doc comment). A break is one
-            // of them: `windows_line` already respelled or deleted every break
-            // this platform can hand over, so one reaching here is a text the
-            // model cannot read.
+            // Unmodellable outside quotes (see the doc comment); a break reaching here is a
+            // text this model cannot read.
             '^' | '(' | ')' | '\n' => return None,
             '&' | '|' => {
                 if c == '&' && redirect_keeps_amp(&current) {
@@ -206,8 +143,7 @@ pub(in crate::tools::shell) fn segment_command(command: &str) -> Option<Vec<(Str
         return None;
     }
     flush(&mut current, &mut out, "", false);
-    // A trailing connector leaves cmd.exe with nothing after it — the same
-    // fail-closed policy as the unix segmenter's trailing-pipe check.
+    // A trailing connector leaves cmd.exe nothing after it: the unix segmenter's policy.
     if matches!(
         out.last().map(|(_, c)| c.as_str()),
         Some("&" | "&&" | "|" | "||")
@@ -217,9 +153,8 @@ pub(in crate::tools::shell) fn segment_command(command: &str) -> Option<Vec<(Str
     Some(out)
 }
 
-/// True when a `;` appears outside double quotes. cmd.exe does not split a
-/// command on it, so a caller must never read the fragments around one as
-/// separate commands.
+/// True when a `;` appears outside double quotes: cmd.exe never splits a command on it, so
+/// the fragments around one are not separate commands.
 #[must_use]
 pub(super) fn unquoted_semicolon(command: &str) -> bool {
     let mut in_double = false;
@@ -240,13 +175,9 @@ pub(super) fn unquoted_semicolon(command: &str) -> bool {
     false
 }
 
-// ── Verb and word reading ────────────────────────────────────────────────
-
-/// The delivered text of a word: the inner text of a balanced pair of
-/// surrounding double quotes, or the word itself when it carries no quote
-/// character at all. `None` for a spelling with an interior or unbalanced `"`
-/// — cmd reads those differently from the word as written, so callers fail
-/// closed rather than judge characters that are not the ones delivered.
+/// The delivered text of a word: the inner text of a balanced pair of surrounding double
+/// quotes, or the word itself without a quote character. `None` for an interior or
+/// unbalanced `"`, which cmd reads differently, so callers fail closed instead.
 fn strip_double_quotes(word: &str) -> Option<&str> {
     if let Some(inner) = word
         .strip_prefix('"')
@@ -257,15 +188,11 @@ fn strip_double_quotes(word: &str) -> Option<&str> {
     (!word.contains('"')).then_some(word)
 }
 
-/// The key cmd.exe's own dispatch matches a verb word on: its delivered text,
-/// lower-cased, with a trailing `.exe` folded away — `GREP`, `Grep.EXE` and
-/// `grep` are one verb. Every verb list in the engine (grep family, `cd`
-/// family, command introducers, the programs that own their search) is written
-/// in that spelling and read through this key, so a verb is classified
-/// identically however the interpreter and its switch are spelled. `None` for a
-/// spelling whose delivered text is not the word as written (an interior or
-/// unbalanced `"`): the shell would re-read it, so no list may be matched
-/// against it.
+/// The key cmd.exe's own dispatch matches a verb word on: its delivered text, lower-cased,
+/// with a trailing `.exe` folded away, so `GREP`, `Grep.EXE` and `grep` are one verb.
+/// Every verb list in the engine is written in that spelling and read through this key.
+/// `None` for a spelling whose delivered text is not the word as written (an interior or
+/// unbalanced `"`): the shell would re-read it, so no list may be matched against it.
 #[must_use]
 pub(in crate::tools::shell) fn verb_key(word: &str) -> Option<String> {
     let word = strip_double_quotes(word)?;
@@ -279,14 +206,11 @@ pub(in crate::tools::shell) fn verb_key(word: &str) -> Option<String> {
     Some(stem.to_ascii_lowercase())
 }
 
-/// The grep family a command word names, or `None` when it names something
-/// else. cmd.exe dispatches case-insensitively and through `PATHEXT`, so
-/// `GREP`, `Grep.EXE` and `grep` all run the same program; only `.exe` is
-/// folded, since the other executable extensions (`.com`, `.bat`, `.cmd`) name
-/// a program of their own rather than grep. A path-qualified word names a file
-/// rather than a shell dispatch, so it is not read as this platform's grep at
-/// all and the segment is left to the platform as written — the reading unix
-/// gives `./grep`, which is not the `grep` verb either.
+/// The grep family a command word names, or `None`. cmd.exe dispatches case-insensitively
+/// through `PATHEXT`, so `GREP`, `Grep.EXE` and `grep` run the same program; only `.exe` is
+/// folded, since `.com`/`.bat`/`.cmd` name programs of their own. A path-qualified word
+/// names a file rather than a dispatch, so it is left to the platform as written — as unix
+/// reads `./grep`.
 #[must_use]
 pub(super) fn grep_verb(word: &str) -> Option<&'static str> {
     let key = verb_key(word)?;
@@ -301,8 +225,7 @@ pub(super) fn grep_verb(word: &str) -> Option<&'static str> {
     }
 }
 
-/// Push the accumulated token onto `out`, classifying it through the shared
-/// redirect classifier (the single source of redirect-token semantics).
+/// Push the accumulated token onto `out` through the shared redirect classifier.
 fn flush_token(raw: &mut String, value: &mut String, out: &mut Vec<GrepWord>) {
     if raw.is_empty() {
         return;
@@ -319,15 +242,11 @@ fn flush_token(raw: &mut String, value: &mut String, out: &mut Vec<GrepWord>) {
     });
 }
 
-/// cmd.exe's own word splitting for one member: whitespace-separated,
-/// `"`-quoting with `""` as a literal quote inside a quoted span, and — unlike
-/// `sh` — no escape character at all, so a backslash is ordinary text and `'`
-/// does not quote. `None` on an unbalanced quote.
-///
-/// The value keeps `$` and backticks literal: cmd.exe expands neither, and `$`
-/// is a common ERE anchor. The `%` reading is not this function's: cmd.exe
-/// expands `%…%` before the program sees its argv, so the caller fails
-/// closed on the whole member (see [`has_percent_expansion`]).
+/// cmd.exe's word splitting for one member: whitespace-separated, `"`-quoting with `""` as
+/// a literal quote, and — unlike `sh` — no escape character, so `\` is ordinary text and
+/// `'` does not quote. `None` on an unbalanced quote. The value keeps `$` and backticks
+/// literal (cmd expands neither, and `$` is a common ERE anchor); `%…%` is the caller's to
+/// fail closed on ([`has_percent_expansion`]).
 #[must_use]
 pub(in crate::tools::shell) fn tokenize(segment: &str) -> Option<Vec<GrepWord>> {
     let mut out = Vec::new();
@@ -361,13 +280,9 @@ pub(in crate::tools::shell) fn tokenize(segment: &str) -> Option<Vec<GrepWord>> 
     Some(out)
 }
 
-/// True when `raw` carries an unquoted redirect operator after its first
-/// character — the glued spelling cmd.exe splits into an argument plus a
-/// redirect (`x>out.txt` is the argument `x` and a redirect to `out.txt`).
-/// Words that *open* with an operator are [`scan::classify_shell_token`]'s
-/// redirects already; this covers the form the shared classifier reads as one
-/// ordinary word, which the model here must not read differently from the
-/// interpreter (see `grep_tokenize`).
+/// True when `raw` carries an unquoted redirect operator after its first character — the
+/// glued spelling cmd.exe splits into an argument plus a redirect (`x>out.txt`). Words that
+/// *open* with an operator are [`scan::classify_shell_token`]'s redirects already.
 #[must_use]
 pub(super) fn has_glued_redirect(raw: &str) -> bool {
     let mut in_quotes = false;
@@ -381,10 +296,8 @@ pub(super) fn has_glued_redirect(raw: &str) -> bool {
     false
 }
 
-/// Unquote one raw word the way cmd.exe delivers it: balanced double quotes
-/// removed, `""` inside the quoted span read as a literal quote, and every
-/// other character literal — no expansion, no escape. Idempotent on the value
-/// [`tokenize`] produced, which is what the operand path passes here.
+/// Unquote one raw word the way cmd.exe delivers it: balanced double quotes removed, `""`
+/// inside the span a literal quote, every other character literal; idempotent on [`tokenize`].
 #[must_use]
 pub(in crate::tools::shell) fn unquote_word(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -405,20 +318,13 @@ pub(in crate::tools::shell) fn unquote_word(raw: &str) -> String {
     out
 }
 
-/// Quote one argument for a cmd.exe command line.
-///
-/// cmd.exe re-reads the whole line before the program sees its argv, but it
-/// stops treating `&`, `|`, `<`, `>`, `^`, `(`, `)`, `;` and `=` as anything
-/// but text inside a double-quoted argument — which is what makes a path like
-/// `C:\Program Files (x86)\…` servable at all. What cmd rewrites even inside
-/// quotes is `%` (always, before anything runs) and `!` (where delayed expansion
-/// is on — not in the interpreter this shell starts, which pins `/V:OFF`, but a
-/// nested one a command starts is not covered), plus the quote
-/// itself and a line terminator: those cannot be passed literally, so refusing
-/// the word is fail-closed. Both callers pass a path this process did not choose
-/// — the executable's installation path, and the scratch file under the temp
-/// root — so a path carrying one of them is the per-machine condition the module
-/// header states rather than a per-command one.
+/// Quote one argument for a cmd.exe command line. cmd.exe re-reads the whole line, but
+/// stops treating `&`, `|`, `<`, `>`, `^`, `(`, `)`, `;` and `=` as syntax inside a quoted
+/// argument — which is what makes `C:\Program Files (x86)\…` servable. What it rewrites
+/// even inside quotes is `%` (always) and `!` (where delayed expansion is on), plus the
+/// quote itself and a line terminator: those are refused fail-closed. Both callers pass a
+/// path this process did not choose, so such a path is the per-machine condition the
+/// module header states.
 pub(super) fn cmd_quote(text: &str) -> Result<String, String> {
     let forbidden = ['%', '!', '"', '\n', '\r'];
     if let Some(bad) = text.chars().find(|c| forbidden.contains(c)) {
@@ -428,13 +334,10 @@ pub(super) fn cmd_quote(text: &str) -> Result<String, String> {
 }
 
 /// Allocate the scratch path one served member's spec is written to:
-/// `<scratch dir>/<pid>-<n>.json`, the counter making the name unique within
-/// the process. Pure path arithmetic: the directory is [`write_spec_file`]'s to
-/// create and the file is the caller's to remove when the call finishes. The
-/// path is quoted before anything is written and goes onto that removal list
-/// before the write, so neither a refused argument nor a failed write leaves a
-/// file behind. See the module header for why the spec cannot ride on the
-/// command line.
+/// `<scratch dir>/<pid>-<n>.json`, the counter keeping it unique in the process. Pure path
+/// arithmetic: the directory is [`write_spec_file`]'s to create and the file the caller's
+/// to remove. The path is quoted and listed for removal before the write, so neither a
+/// refused argument nor a failed write leaves a file behind.
 pub(super) fn spec_file_path() -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     scratch_dir().join(format!(
@@ -444,14 +347,10 @@ pub(super) fn spec_file_path() -> PathBuf {
     ))
 }
 
-/// The directory [`spec_file_path`] allocates in: [`crate::temp::shell_tmpdir`]
-/// — the daemon's pinned private root — and, under `cfg(test)`, the
-/// process-level test root instead. A test run must never create or delete
-/// inside a temp root a running daemon owns (the lane inherits its environment),
-/// and the daemon's cleaner is not the test lane's backstop; that root is also
-/// the lane's fake storage root, so the scratch files sit in their own
-/// `grep-engine` subdirectory and go away with the root at process exit on unix
-/// (elsewhere the OS temp sweep reclaims them).
+/// The directory [`spec_file_path`] allocates in: [`crate::temp::shell_tmpdir`] — the
+/// daemon's pinned private root — and under `cfg(test)` the process test root instead (a
+/// test run must never touch a root the daemon owns). The lane's fake storage root is that
+/// same root, so the scratch files sit in their own `grep-engine` subdirectory.
 fn scratch_dir() -> PathBuf {
     #[cfg(test)]
     {
@@ -463,15 +362,11 @@ fn scratch_dir() -> PathBuf {
     }
 }
 
-/// Write one engine spec to its scratch path, creating the scratch directory if
-/// it is not there yet. The file is created fresh: `create_new` refuses to
-/// follow a symlink planted at the name, so a planted link cannot redirect this
-/// write; a leftover file from an earlier run is removed first so it cannot
-/// turn the write into a refusal, though an entry that cannot be removed at all
-/// (a directory, an ACL-locked file) does refuse the member. The error is a
-/// rendered location for the fallback reason, never an errno the caller matches
-/// on: the member is refused rather than run without a spec it cannot be served
-/// from.
+/// Write one engine spec to its scratch path, creating the scratch directory if needed.
+/// `create_new` refuses to follow a planted symlink; a leftover file from an earlier run
+/// is removed first so it cannot turn the write into a refusal, though an entry that cannot
+/// be removed at all (a directory, an ACL-locked file) does refuse the member. The error is
+/// a rendered location, never an errno the caller matches on.
 pub(super) fn write_spec_file(path: &Path, json: &str) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -486,20 +381,16 @@ pub(super) fn write_spec_file(path: &Path, json: &str) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-// ── Windows path reading ─────────────────────────────────────────────────
-
-/// True when `word` is an absolute Windows spelling: a drive root (`C:\`,
-/// `C:/`), a UNC server/share (`\\srv\share`, also `//srv/share`), or a
-/// separator-rooted path (`\x`, `/x`). A drive-RELATIVE spelling (`C:x`) is
-/// not absolute.
+/// True when `word` is an absolute Windows spelling: a drive root (`C:\`, `C:/`), a UNC
+/// server/share (`\\srv\share`, `//srv/share`), or a separator-rooted path. A
+/// drive-RELATIVE spelling (`C:x`) is not absolute.
 #[must_use]
 pub(super) fn is_absolute_word(word: &str) -> bool {
     word.starts_with(['\\', '/']) || drive_anchor(word).is_some()
 }
 
-/// Join a display path: with `\` when the prefix carries no trailing
-/// separator, directly when it does (the prefix of [`split_components`] always
-/// does, and keeps the spelling it was typed with).
+/// Join a display path: with `\` when the prefix carries no trailing separator, directly
+/// when it does (as [`split_components`]' prefix always does).
 #[must_use]
 pub(super) fn join_display(prefix: &str, name: &str) -> String {
     if prefix.is_empty() || prefix.ends_with(['\\', '/']) {
@@ -509,9 +400,8 @@ pub(super) fn join_display(prefix: &str, name: &str) -> String {
     }
 }
 
-/// The display path of a walked entry: the operand's own spelling with the
-/// entry's relative suffix [`join_display`]ed on. A root that is nothing but a
-/// separator (`\`, `/`) keeps exactly one, and an empty root contributes none.
+/// The display path of a walked entry: the operand's own spelling with the entry's relative
+/// suffix [`join_display`]ed on. A root that is one separator keeps one; an empty root, none.
 #[must_use]
 pub(super) fn traversal_display(root_display: &str, rel: &str) -> String {
     let root = root_display.trim_end_matches(['\\', '/']);
@@ -523,9 +413,8 @@ pub(super) fn traversal_display(root_display: &str, rel: &str) -> String {
     join_display(root, rel)
 }
 
-/// The `\\server\share\` anchor of a UNC pattern, including its trailing
-/// separator and in the spelling it was typed with. `None` when the pattern is
-/// not UNC or names no server/share (a degenerate anchor has no root to walk).
+/// The `\\server\share\` anchor of a UNC pattern. `None` when the pattern is not UNC or
+/// names no server/share (a degenerate anchor has no root to walk).
 fn unc_anchor(pattern: &str) -> Option<&str> {
     let rest = pattern
         .strip_prefix("\\\\")
@@ -539,17 +428,15 @@ fn unc_anchor(pattern: &str) -> Option<&str> {
     Some(&pattern[..len])
 }
 
-/// The `:` of a leading drive spelling (`C:`, `C:\`, `C:foo`) — the one place
-/// the drive-letter test lives, read by both the drive-rooted and the
-/// drive-relative reader below. `None` for a word that names no drive.
+/// The `:` of a leading drive spelling (`C:`, `C:\`, `C:foo`) — the one place the
+/// drive-letter test lives. `None` for a word that names no drive.
 fn drive_colon(word: &str) -> Option<usize> {
     let bytes = word.as_bytes();
     (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':').then_some(1)
 }
 
-/// The `C:\`/`C:/` anchor of a drive-rooted pattern, including its trailing
-/// separator. `None` for a drive-RELATIVE spelling (`C:foo`), which has no
-/// root to walk.
+/// The `C:\`/`C:/` anchor of a drive-rooted pattern. `None` for a drive-RELATIVE spelling
+/// (`C:foo`), which has no root to walk.
 fn drive_anchor(pattern: &str) -> Option<&str> {
     let colon = drive_colon(pattern)?;
     if !matches!(pattern.as_bytes().get(colon + 1), Some(b'\\' | b'/')) {
@@ -558,32 +445,26 @@ fn drive_anchor(pattern: &str) -> Option<&str> {
     Some(&pattern[..colon + 2])
 }
 
-/// True for a drive-relative spelling (`C:foo`): it names the cwd of ANOTHER
-/// drive, which nothing here keeps, so a caller must refuse it rather than resolve
-/// it against the cwd it happens to hold.
+/// True for a drive-relative spelling (`C:foo`): it names the cwd of ANOTHER drive, which
+/// nothing here keeps, so a caller must refuse it rather than resolve it against this cwd.
 #[must_use]
 pub(in crate::tools::shell) fn is_drive_relative(word: &str) -> bool {
     drive_colon(word).is_some() && drive_anchor(word).is_none()
 }
 
-/// Split a glob pattern into its walk-root prefix and the components below it,
-/// at `\` and `/` boundaries. The prefix keeps the anchor Windows resolves
-/// first — a drive (`C:\`), a UNC server/share (`\\srv\share\`) or a rooted
-/// separator (`\`, `/`) — and always ends with the separator it was typed with;
-/// every later separator is a component boundary. `None` for a spelling with no
-/// root to walk (a drive-relative `C:foo`, a server- or share-less `\\srv`) or
-/// with no component left to match.
+/// Split a glob pattern into its walk-root prefix and the components below it, at `\` and
+/// `/`. The prefix keeps the anchor Windows resolves first — a drive (`C:\`), a UNC
+/// server/share (`\\srv\share\`) or a rooted separator — and ends with the separator it was
+/// typed with. `None` for a spelling with no root to walk or no component left to match.
 #[must_use]
 pub(super) fn split_components(pattern: &str) -> Option<(String, Vec<String>)> {
-    // A drive-relative spelling (`C:foo`) names the cwd of ANOTHER drive: it has
-    // no root to walk, so it is refused rather than resolved against this one.
+    // A drive-relative spelling names the cwd of ANOTHER drive: no root to walk.
     if is_drive_relative(pattern) {
         return None;
     }
     let (prefix, rest) = if pattern.starts_with("\\\\") || pattern.starts_with("//") {
-        // A `\\`/`//`-leading spelling is a UNC (or device) path: without a
-        // readable server/share anchor there is no root to walk, and reading it
-        // as a rooted separator would resolve a different directory than cmd.
+        // A `\\`/`//`-leading spelling is UNC (or a device path): without a readable
+        // server/share anchor, reading it as a rooted separator resolves a different directory.
         let anchor = unc_anchor(pattern)?;
         (anchor.to_string(), &pattern[anchor.len()..])
     } else if pattern.starts_with(['\\', '/']) {
@@ -604,9 +485,8 @@ pub(super) fn split_components(pattern: &str) -> Option<(String, Vec<String>)> {
     Some((prefix, comps))
 }
 
-/// True when the token carries a glob metacharacter (`*`, `?`, `[`) outside
-/// double quotes — cmd.exe expands nothing, so an unquoted metacharacter is a
-/// glob the program reading the operand expands.
+/// True when the token carries a glob metacharacter (`*`, `?`, `[`) outside double quotes:
+/// cmd.exe expands nothing, so the program reading the operand expands it.
 #[must_use]
 pub(super) fn has_unquoted_glob(tok: &str) -> bool {
     let mut in_double = false;
@@ -627,39 +507,29 @@ pub(super) fn has_unquoted_glob(tok: &str) -> bool {
     false
 }
 
-/// True when the word holds two or more `%` characters — the reading both
-/// callers approximate cmd.exe's `%…%` expansion with. cmd.exe pairs its
-/// percents across the whole line, which this does not model: the test is
-/// per-word, and two `%` characters anywhere in one word are enough, so `100%%`
-/// is refused too. That is enough here because the served member's words never
-/// ride the command line — they go to the spec file — so the only expansion that
-/// can matter is one the engine would misread; a `cd` target does stay verbatim
-/// in the rewrite and is refused on the same approximation (over-refusing rather
-/// than mis-tracking). An undefined name expands to nothing, so the text between
-/// the percents is never what the program receives. A lone `%` is ordinary text,
-/// and so is every `!`: this process spawns `cmd /C` with `/V:OFF`, so delayed
-/// expansion is off whatever this machine's own settings say and `!name!` is
-/// delivered literally.
+/// True when the word holds two or more `%` characters — the per-word approximation of
+/// cmd.exe's line-wide `%…%` pairing, so `100%%` is refused too. Enough here because a
+/// served member's words ride the spec file, never the command line; a `cd` target does
+/// stay verbatim in the rewrite and is refused on the same (over-refusing) approximation.
+/// An undefined name expands to nothing. A lone `%` and every `!` are ordinary: `cmd /C`
+/// runs with `/V:OFF`, so delayed expansion is off whatever the machine's settings say.
 #[must_use]
 pub(in crate::tools::shell) fn has_percent_expansion(word: &str) -> bool {
     word.matches('%').count() >= 2
 }
 
-/// Windows identity of two paths — the engine's cwd gate reads *directories* with
-/// it and the runner reads whole file paths with it ([`plan`]'s
-/// `is_own_image_word`), which holds because the key is the entire spelling, not
-/// just its last component: case, separator spelling and a verbatim prefix are all
-/// insignificant — and so is a trailing separator, which is why a file path spelled
-/// with one compares equal to the same path without it. `cmd.exe` never spells a
-/// path the way `fs::canonicalize` does. Byte equality is deliberately not the test.
+/// Windows identity of two paths — the engine's cwd gate reads directories with it and the
+/// runner whole file paths ([`plan`]'s `is_own_image_word`), because the key is the entire
+/// spelling: case, separator spelling, verbatim prefix and a trailing separator are all
+/// insignificant. `cmd.exe` never spells a path the way `fs::canonicalize` does, so byte
+/// equality is deliberately not the test.
 #[must_use]
 pub(in crate::tools::shell) fn same_spelling(a: &Path, b: &Path) -> bool {
     spelling_key(a) == spelling_key(b)
 }
 
-/// [`same_spelling`]'s comparison form: verbatim prefix stripped, `/` folded
-/// to `\`, trailing separators trimmed, lowercased. A root (`C:\`, `\`) keeps
-/// its separator — trimming it would compare equal to the drive-relative `C:`.
+/// [`same_spelling`]'s comparison form: verbatim prefix stripped, `/` folded to `\`,
+/// trailing separators trimmed, lowercased. A root (`C:\`, `\`) keeps its separator.
 fn spelling_key(p: &Path) -> String {
     let stripped = crate::util::strip_verbatim_prefix(p);
     let folded = stripped.to_string_lossy().replace('/', "\\");
@@ -671,20 +541,12 @@ fn spelling_key(p: &Path) -> String {
     }
 }
 
-// ── cd grammar ───────────────────────────────────────────────────────────
-
-/// Scan a `cd` member's words (the verb excluded) under cmd.exe's grammar:
-/// `/d` — its only switch, changing the drive as well as the directory — is
-/// recognised case-insensitively and only immediately after the verb; a bare
-/// `cd` prints the cwd and changes nothing, so it is [`CdScan::Bare`]. `cmd`
-/// expands no `~` and has no `-` convention: `-`, `~` and `~/x` are ordinary
-/// directory names and resolve literally. Anything else switch-shaped (`/x`)
-/// is [`CdScan::BadOption`], as is a word whose quote characters cmd.exe would
-/// read differently than the spelling suggests.
-///
-/// `words` are the member's words as cmd.exe splits them — [`tokenize`]'s raw
-/// spellings, so a quoted target keeps its inner spaces and its quotes are
-/// judged rather than pre-stripped by the caller.
+/// Scan a `cd` member's words under cmd.exe's grammar: `/d` (its only switch, changing the
+/// drive too) is recognised case-insensitively only right after the verb; a bare `cd` is
+/// [`CdScan::Bare`]. cmd expands no `~` and has no `-` convention, so `-`, `~` and `~/x` are
+/// ordinary names. Any other switch-shaped word (`/x`) is [`CdScan::BadOption`], as is one
+/// whose quote characters cmd.exe would read differently. `words` are [`tokenize`]'s raw
+/// spellings, so a quoted target keeps its inner spaces and its quotes are judged here.
 #[must_use]
 pub(super) fn cd_scan<'a>(words: &[&'a str]) -> CdScan<'a> {
     let mut i = usize::from(words.first().is_some_and(|w| w.eq_ignore_ascii_case("/d")));
@@ -705,14 +567,9 @@ pub(super) fn cd_scan<'a>(words: &[&'a str]) -> CdScan<'a> {
     CdScan::Target(target, i)
 }
 
-// ── fnmatch ──────────────────────────────────────────────────────────────
-
-/// POSIX `fnmatch` without pathname semantics, for the Windows lane where no
-/// libc `fnmatch` exists: `*` (any run, `/` included), `?`, bracket expressions
-/// (`[abc]`, `[!abc]`, `[^abc]`, ranges `a-z`) and `\` escaping the next
-/// character. `period` implements `FNM_PERIOD`: a leading `.` in `name` is
-/// matched only by a literal `.` in the pattern. A malformed bracket
-/// expression (unterminated, empty, inverted range) matches nothing.
+/// POSIX `fnmatch` without pathname semantics, for the Windows lane with no libc: `*` (any
+/// run, `/` included), `?`, bracket expressions (`[abc]`, `[!abc]`, `[^abc]`, ranges) and `\`
+/// escaping. `period` implements `FNM_PERIOD`. A malformed bracket matches nothing.
 #[must_use]
 pub(super) fn fnmatch(pattern: &str, name: &str, period: bool) -> bool {
     let p: Vec<char> = pattern.chars().collect();
@@ -720,10 +577,8 @@ pub(super) fn fnmatch(pattern: &str, name: &str, period: bool) -> bool {
     matches_from(&p, 0, &n, 0, period)
 }
 
-/// The bracket expression at `p[i] == '['`: whether `c` is in the class, and
-/// the index just past the closing `]`. `None` for a malformed expression — an
-/// unterminated or empty class, or an inverted range (fail-closed: the host
-/// implementations match nothing there either).
+/// The bracket expression at `p[i] == '['`: whether `c` is in the class and the index past
+/// the closing `]`. `None` for a malformed expression (fail-closed, as the hosts do).
 fn bracket_match(p: &[char], i: usize, c: char) -> Option<(bool, usize)> {
     let mut j = i + 1;
     let negated = matches!(p.get(j), Some('!' | '^'));
@@ -768,8 +623,7 @@ fn bracket_match(p: &[char], i: usize, c: char) -> Option<(bool, usize)> {
 
 /// One step of [`fnmatch`]: compare `p` from `pi` against `n` from `ni`.
 fn matches_from(p: &[char], mut pi: usize, n: &[char], mut ni: usize, period: bool) -> bool {
-    // FNM_PERIOD: a leading dot is matched only by a literal dot in the
-    // pattern, never by a wildcard or a class.
+    // FNM_PERIOD: a leading dot is matched only by a literal dot, never by a wildcard or class.
     if period && ni == 0 && n.first() == Some(&'.') {
         let literal_dot =
             p.get(pi) == Some(&'.') || (p.get(pi) == Some(&'\\') && p.get(pi + 1) == Some(&'.'));
@@ -787,8 +641,7 @@ fn matches_from(p: &[char], mut pi: usize, n: &[char], mut ni: usize, period: bo
                     pi += 1;
                 }
                 if pi == p.len() {
-                    // A trailing `*` matches any remaining run, the empty one
-                    // included — the leading-dot rule was applied on entry.
+                    // A trailing `*` matches any remaining run (leading-dot ruled out on entry).
                     return true;
                 }
                 let mut k = ni;
@@ -823,8 +676,7 @@ fn matches_from(p: &[char], mut pi: usize, n: &[char], mut ni: usize, period: bo
                 ni += 1;
             }
             '\\' => {
-                // A trailing backslash stands for itself (there is no character
-                // left to escape), matching the host implementations.
+                // A trailing backslash stands for itself, matching the host implementations.
                 let (literal, step) = match p.get(pi + 1) {
                     Some(&next) => (next, 2),
                     None => ('\\', 1),
@@ -846,15 +698,13 @@ fn matches_from(p: &[char], mut pi: usize, n: &[char], mut ni: usize, period: bo
     }
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────
 // The whole model is pure string/path work driven by a runtime platform value.
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Assert the segmenter's `(segment, following-connector)` pairs for a line
-    /// it is expected to read.
+    /// Assert the segmenter's `(segment, following-connector)` pairs for a line it reads.
     fn assert_segments(command: &str, expected: &[(&str, &str)]) {
         let got = segment_command(command)
             .unwrap_or_else(|| panic!("{command:?}: expected a readable line"));
@@ -909,11 +759,9 @@ mod tests {
         assert!(segment_command("\"a & b").is_none());
     }
 
-    /// `windows_line` removed every break this model could read before it ever sees
-    /// the text: a plain break is respelled as `&` and an operator continuation is
-    /// joined. A break that reaches the segmenter is therefore one of the shapes the
-    /// platform itself continues across — a caret, or a group — which is a text this
-    /// model cannot read.
+    /// `windows_line` removed every break this model could read before it sees the text: a
+    /// plain break is respelled as `&` and an operator continuation is joined. A break
+    /// reaching the segmenter is therefore a caret or a group, which it cannot read.
     #[test]
     fn a_line_break_the_shell_still_hands_over_is_refused() {
         for text in ["a\nb", "a\r\nb", "a\n\nb", "a\n", "\n& a"] {
@@ -967,17 +815,15 @@ mod tests {
             .collect();
         assert_eq!(got, [("grep", "grep"), ("a b", "\"a b\""), ("c", "c")]);
 
-        // `""` inside a quoted span is a literal quote; an empty quoted word is
-        // one (empty) argument. `a""b` is outside any span — the first quote
-        // opens it and the second closes it — so cmd delivers the two letters.
+        // `""` inside a span is a literal quote; `a""b` is outside any span, so cmd delivers
+        // the two letters.
         let words = tokenize("grep \"a\"\"b\" \"\"").expect("balanced quotes");
         let got: Vec<&str> = words.iter().map(|w| w.value.as_str()).collect();
         assert_eq!(got, ["grep", "a\"b", ""]);
         let words = tokenize("grep a\"\"b").expect("balanced quotes");
         assert_eq!(words[1].value, "ab");
 
-        // `'` and `\` are ordinary characters, and `$` stays literal (cmd
-        // expands neither; `$` is an ERE anchor).
+        // `'` and `\` are ordinary, and `$` stays literal (cmd expands neither; `$` is an anchor).
         let words = tokenize("grep 'a\\b' ^$ f").expect("balanced quotes");
         let got: Vec<&str> = words.iter().map(|w| w.value.as_str()).collect();
         assert_eq!(got, ["grep", "'a\\b'", "^$", "f"]);
@@ -988,9 +834,8 @@ mod tests {
         assert_eq!(words[1].value, "a|b");
         assert!(!words[1].redirect);
 
-        // A redirect word is classified through the shared classifier: the
-        // descriptor merge is self-contained, a `>` or `<` is not.
-        // (command, index of the redirect word, needs a target word)
+        // A redirect word is classified through the shared classifier: a descriptor merge is
+        // self-contained, a `>` or `<` is not. (command, redirect word index, needs a target)
         let redirects = [
             ("grep x f 2>&1", 3, false),
             ("grep x f > out.txt", 3, true),
@@ -1008,9 +853,8 @@ mod tests {
         assert!(tokenize("grep \"a").is_none());
     }
 
-    /// [`unquote_word`] is handed token values as well as raw words, so it must
-    /// strip the quoting cmd.exe removed and nothing else: an unquoted `'`, `\`
-    /// or space stays as typed, and `""` inside a span is one literal quote.
+    /// [`unquote_word`] is handed token values as well as raw words: it must strip the
+    /// quoting cmd.exe removed and nothing else (`""` inside a span is one literal quote).
     #[test]
     fn unquote_word_is_idempotent_on_token_values() {
         // (token value, the word cmd delivers)
@@ -1027,8 +871,7 @@ mod tests {
         }
     }
 
-    /// A walked entry is displayed under the operand's own spelling: the Windows
-    /// separator, and a root that already ends in one keeps exactly that one.
+    /// A walked entry is displayed under the operand's own spelling, its separator included.
     #[test]
     fn traversal_display_joins_with_the_windows_separator() {
         // (a root, an entry's relative suffix, the display path)
@@ -1062,9 +905,8 @@ mod tests {
     fn cmd_quote_refuses_only_what_cmd_rewrites_inside_quotes() {
         assert_eq!(cmd_quote(r"C:\ws\a b.txt").unwrap(), "\"C:\\ws\\a b.txt\"");
         assert_eq!(cmd_quote("x").unwrap(), "\"x\"");
-        // Metacharacters cmd stops treating as syntax inside a double-quoted
-        // argument: quoting them is enough (this is what makes an install under
-        // `C:\Program Files (x86)` servable).
+        // Metacharacters cmd stops treating as syntax inside a quoted argument (this makes an
+        // install under `C:\Program Files (x86)` servable).
         for safe in ["a&b", "a|b", "a<b", "a>b", "a(b", "a;b", "a^b", "a=b"] {
             assert_eq!(cmd_quote(safe).unwrap(), format!("\"{safe}\""));
         }
@@ -1081,10 +923,8 @@ mod tests {
         assert_ne!(first, second, "every member gets its own file");
         assert_eq!(first.extension(), Some("json".as_ref()), "{first:?}");
 
-        // The writer owns the directory and the file: it creates the former and
-        // replaces the latter, so a leftover entry cannot turn a served member
-        // into a refusal. (A `TempDir` fixture, so the host lane leaves nothing
-        // of its own behind — the scratch directory itself is the daemon's.)
+        // The writer owns the directory and the file: it creates the former and replaces the
+        // latter, so a leftover entry cannot turn a served member into a refusal.
         let dir = tempfile::TempDir::new().expect("temp dir");
         let path = dir.path().join("nested").join("one.json");
         write_spec_file(&path, "{\"a\":1}").expect("write");
@@ -1092,14 +932,12 @@ mod tests {
         write_spec_file(&path, "{\"b\":2}").expect("rewrite");
         assert_eq!(fs::read_to_string(&path).expect("read"), "{\"b\":2}");
 
-        // A directory is not writable as a file: an error the caller refuses the
-        // member on, never a silent skip.
+        // A directory is not writable as a file: an error the caller refuses the member on.
         assert!(write_spec_file(dir.path(), "{}").is_err());
     }
 
-    /// Which spellings this platform reads as which: a word that names an absolute
-    /// path, an operand that carries a glob outside quotes, and two spellings of one
-    /// directory (its case, separators and verbatim prefix are the same directory).
+    /// Which spellings this platform reads as which: an absolute path, an operand carrying a
+    /// glob outside quotes, and two spellings of one directory.
     #[test]
     fn path_and_word_spellings_are_read_as_windows_writes_them() {
         // (word, is the word an absolute path)
@@ -1189,8 +1027,7 @@ mod tests {
         assert_eq!(join_display(r"C:\", "ws"), r"C:\ws");
         assert_eq!(join_display("", "ws"), "ws");
         assert_eq!(join_display("/", "ws"), "/ws");
-        // Round trip: every component joined back onto its prefix is a path
-        // spelled the way the operand was typed.
+        // Round trip: every component joined back onto its prefix spells the operand as typed.
         for (pattern, prefix, comps) in rows {
             let mut built = (*prefix).to_string();
             for c in *comps {

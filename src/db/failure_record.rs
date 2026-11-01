@@ -1,45 +1,31 @@
 //! The service's ONE durable failure record: `<root>/error.log`.
 //!
-//! Every severe failure the service survives — or refuses to survive — is
-//! appended here as a block: a start-up refusal, any other store bring-up
-//! failure, a launch failure, a persistent periodic checkpoint failure, an
-//! exit-time checkpoint failure, a runtime integrity failure, and a refused
-//! reclaiming-checkpoint shrink. [`record`] is the single write entry point, and
-//! the append is what makes a failure durable: with a resolvable storage root the
-//! block lands in the file, and without one (or when the write itself fails) the
-//! full block goes to stderr instead — a fallback a launch given no standard
-//! streams cannot observe (see [`crate::boot`]), so an unfiled block there is
-//! silent.
+//! Every severe failure the service survives — or refuses to survive — is appended here as a
+//! block: a start-up refusal, any other store bring-up failure, a launch failure, a persistent
+//! periodic or exit-time checkpoint failure, a runtime integrity failure, and a refused
+//! reclaiming-checkpoint shrink. [`record`] is the single write entry point: with a resolvable
+//! storage root the block lands in the file, and without one (or when the write fails) the full
+//! block goes to stderr — a fallback a launch given no standard streams cannot observe.
 //!
-//! Callers render a [`FailureReport`] and hand it to [`record`]; the raw append
-//! lives in [`append_failure_record`]. All of it is here so there is one file,
-//! one format, and one place that knows how to append a block without tearing.
+//! Callers render a [`FailureReport`] and hand it to [`record`]; the raw append lives in
+//! [`append_failure_record`]. One file, one format, one place that knows how to append a block
+//! without tearing.
 //!
-//! That one entry point is bounded: [`record`] appends the block only when the
-//! record does not already hold one for the same CONDITION — the block's identity
-//! lines ([`condition_lines`]), what it is about rather than what it says. Two
-//! occurrences of one condition worded differently (a size embedded in the reason,
-//! a localised engine or OS message) are therefore one block — and so is a second,
-//! genuinely different failure of the same kind on the same artifact, the price of
-//! a bound that does not hinge on wording — while a different store, step or cause
-//! class still files a block of its own. Because the bound lives in the writer, no
-//! caller can bypass it. It covers every block this record holds — the start-up
-//! refusal, the store bring-up failure, the launch failure, the checkpoint and
-//! exit-checkpoint failures, the runtime integrity failure and the shrink refusal —
-//! not only the repeated launch refusal it was first introduced for.
+//! That entry point is bounded: [`record`] appends only when the record does not already hold a
+//! block for the same CONDITION — the identity lines ([`condition_lines`]), what it is about
+//! rather than what it says. Two occurrences worded differently (a size in the reason, a localised
+//! engine message) are one block, and so is a second, genuinely different failure of the same kind
+//! on the same artifact — the price of a bound that does not hinge on wording — while a different
+//! store, step or cause class still files its own. Because the bound lives in the writer, no
+//! caller can bypass it.
 //!
-//! This is the durable half of the rule the repeating in-process kinds follow
-//! ([`RoundCounter`]: file the first round, then only count). A launch that exits
-//! has no process to count rounds in, so the record itself is the count, keyed on
-//! the kind and on the artifact or step the block names rather than on the
-//! reason's wording; the in-process counter still bounds the warnings within one
-//! process.
+//! This is the durable half of the rule the repeating in-process kinds follow ([`RoundCounter`]:
+//! file the first round, then only count). A launch that exits has no process to count in, so the
+//! record itself is the count, keyed on the kind and the artifact or step rather than the wording.
 //!
-//! A checkpoint failure's block carries the engine's own reason on its `reason:`
-//! line ([`crate::db::checkpoint_cause`]). The capture reads that reason from the
-//! engine's own event, and only the engine can fail the checkpoint: a store carries
-//! one serialised writing connection, and nothing in this process injects a failure
-//! into the engine.
+//! A checkpoint failure's block carries the engine's own reason on its `reason:` line
+//! ([`crate::db::checkpoint_cause`]): only the engine can fail the checkpoint, since a store
+//! carries one serialised writing connection.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -47,28 +33,24 @@ use std::sync::{LazyLock, Mutex};
 
 use crate::util::UnwrapPoison;
 
-/// The record's file name under a storage root.
 const ERROR_LOG_NAME: &str = "error.log";
 
-/// The two artifact lines a block that names no store renders: a config load, a
-/// provider or another global init has no store and no db path to name, and the
-/// block says so rather than omitting either line — a claim about what this block
-/// carries, never about the cause, since a panic inside a store bring-up reaches
-/// this shape too (the binary's `bootstrap` step). Every kind whose failure IS
-/// about a store fills both fields ([`FailureReport::store`] /
-/// [`FailureReport::db_path`]).
+/// The two artifact lines a block that names no store renders: a config load, a provider or another
+/// global init has no store and no db path to name, and the block says so rather than omitting
+/// either line — a claim about what this block carries, never about the cause, since a panic inside
+/// a store bring-up reaches this shape too (the binary's `bootstrap` step). Every kind whose failure
+/// IS about a store fills both fields ([`FailureReport::store`] / [`FailureReport::db_path`]).
 pub(crate) const NO_STORE: &str = "store: none (this block names no store)";
 pub(crate) const NO_DB_PATH: &str = "db path: none (this block names neither)";
 
-/// The artifact-state line's not-obtainable wording (see [`artifact_state_line`]).
-/// Kept neutral about who failed to measure: the callers that reach it are a
-/// failed stat and a probe that answered nothing at all.
+/// The artifact-state line's not-obtainable wording (see [`artifact_state_line`]). Kept neutral
+/// about who failed to measure: the callers that reach it are a failed stat and a probe that
+/// answered nothing at all.
 const ARTIFACT_STATE_UNAVAILABLE: &str = "artifact state: not obtainable (no -wal size measured)";
 
-/// The artifact state every per-store block reports: the size of the store's
-/// `-wal` file, read stat-only (wal_guard's lock rule), rendered here so every
-/// block spells that one fact the same way. `None` renders the explicit
-/// not-obtainable line instead of dropping the field.
+/// The artifact state every per-store block reports: the size of the store's `-wal` file, read
+/// stat-only (wal_guard's lock rule), rendered here so every block spells that one fact the same
+/// way. `None` renders the explicit not-obtainable line instead of dropping the field.
 pub(crate) fn artifact_state_line(wal_bytes: Option<u64>) -> String {
     match wal_bytes {
         Some(bytes) => format!("artifact state: wal_size={bytes}"),
@@ -76,40 +58,26 @@ pub(crate) fn artifact_state_line(wal_bytes: Option<u64>) -> String {
     }
 }
 
-/// The environment-cause marker: this failure is an external condition
-/// (permissions, resource exhaustion, lock contention), not evidence about a
-/// store's contents.
+/// The environment-cause marker: this failure is an external condition, not a defect.
 pub(crate) const ENVIRONMENT_CAUSE: &str = "cause: environment — not store damage";
 
-/// Which severe failure a block reports. The variant's header is the block's
-/// first line (followed by an RFC 3339 UTC timestamp) and is the stable identity
-/// incident review and tests match on.
+/// Which severe failure a block reports. The variant's header is the block's title.
 #[derive(Debug)]
 pub(crate) enum FailureKind {
-    /// A store exists but is not usable — the service refuses to start.
     StartUpRefusal,
-    /// A start-up step failed without a store refusal (a store bring-up error,
-    /// config, a provider or another global init).
+    /// A start-up step failed without a store refusal (a store bring-up error, a launch).
     StartUpFailure,
-    /// A store's periodic checkpoint failure window was exhausted — every round
-    /// in it ended with a genuine failure and no attempt completed a checkpoint,
-    /// across at least the window's rounds and span — so that round stops the
-    /// service (see [`crate::db::checkpoint`]). The failing rounds before the
-    /// terminal one warn only; this block is filed once, when the stop is decided.
+    /// A store's periodic checkpoint failure window was exhausted — every round in it failed.
     CheckpointFailure,
-    /// A checkpoint failed on the exit-time round.
     ExitCheckpointFailure,
     /// A store's periodic integrity check failed.
     RuntimeIntegrityFailure,
-    /// A reclaiming checkpoint was refused because the store's own page count
-    /// did not match its files (see [`crate::db::shrink_gate`]). Not a
-    /// failure: the service keeps serving.
+    /// A reclaiming checkpoint was refused because the store's own page count would not shrink.
     ShrinkRefused,
 }
 
 impl FailureKind {
-    /// The block's header prefix; [`FailureReport::render`] appends the
-    /// timestamp.
+    /// The block's header prefix; [`FailureReport::render`] appends the rest.
     fn header(&self) -> &'static str {
         match self {
             Self::StartUpRefusal => "MahBot start-up refusal — ",
@@ -122,18 +90,15 @@ impl FailureKind {
     }
 }
 
-/// One block of the durable failure record, built field by field.
 #[derive(Debug)]
 pub(crate) struct FailureReport {
     kind: FailureKind,
     store: Option<&'static str>,
     db_path: Option<PathBuf>,
-    /// The failing step, for a block that has no store to name (the pre-boot and
-    /// start-up steps). Rendered after the db-path line, before the cause.
+    /// The failing step, for a block that has no store to name (the pre-boot and launch kinds).
     step: Option<String>,
     reason: Option<String>,
     environment: bool,
-    /// Verbatim lines appended after the fixed fields.
     extra: Vec<String>,
 }
 
@@ -163,10 +128,7 @@ impl FailureReport {
         self
     }
 
-    /// Name the failing step for a block that has no store to name (a start-up or
-    /// pre-boot step). Rendered as its own `step:` line — identity, per
-    /// [`condition_lines`] — so the step is never merely a prefix of the reason,
-    /// which two occurrences of one condition may word differently.
+    /// Name the failing step for a block that has no store to name (a start-up or launch failure).
     #[must_use]
     pub(crate) fn step(mut self, step: &str) -> Self {
         self.step = Some(step.to_string());
@@ -185,15 +147,13 @@ impl FailureReport {
         self
     }
 
-    /// Append a verbatim line (e.g. a probe outcome or the stat-only artifact
-    /// state) after the fixed fields.
+    /// Append a verbatim line (e.g. a probe outcome or the stat-only artifact line).
     #[must_use]
     pub(crate) fn extra(mut self, line: impl Into<String>) -> Self {
         self.extra.push(line.into());
         self
     }
 
-    /// Render the block, terminated by a newline like every block in the file.
     #[must_use]
     pub(crate) fn render(&self) -> String {
         use std::fmt::Write;
@@ -236,14 +196,7 @@ impl FailureReport {
     }
 }
 
-/// One process-lifetime per-key round counter behind the "file the durable block
-/// on the first round, then only count" rule a repeating-but-survivable condition
-/// follows (a persistent condition must not append a block every round). One
-/// static per failure kind keeps their counts independent; the key names the
-/// artifact the condition is about (a store's db path for the shrink gate, the
-/// store's name for the runtime integrity check), so two different files never
-/// share a count. [`crate::db::checkpoint`]'s module header owns which kinds
-/// deliberately skip it and why.
+/// One process-lifetime per-key round counter behind the "file the durable block once" rule.
 pub(crate) struct RoundCounter(LazyLock<Mutex<HashMap<String, u64>>>);
 
 impl RoundCounter {
@@ -251,9 +204,7 @@ impl RoundCounter {
         Self(LazyLock::new(|| Mutex::new(HashMap::new())))
     }
 
-    /// Count a round for `key`: `0` on the key's first round in this process
-    /// (file the durable block), otherwise the number of rounds already counted
-    /// (only warn with the running count).
+    /// Count a round for `key`: `0` on the key's first round in this process, then 1, 2, …
     pub(crate) fn prior_rounds(&self, key: &str) -> u64 {
         let mut rounds = self.0.lock().unwrap_poison();
         let count = rounds.entry(key.to_string()).or_insert(0);
@@ -262,18 +213,12 @@ impl RoundCounter {
     }
 }
 
-/// A block's condition: the lines that say what the block is about rather than
-/// what it says — its header with the trailing timestamp dropped, then the
-/// `store:`, `db path:`, optional `step:` and cause lines, in that order. The
-/// reason line and the extra lines are deliberately none of it: two occurrences of
-/// one condition may word them differently (a size in the reason, a localised
-/// engine or OS message), and [`record`] must still file the condition once.
+/// A block's condition: the lines that say what the block is about rather than what it says.
 fn condition_lines(block: &str) -> String {
     let mut kept: Vec<&str> = Vec::new();
     for line in block.lines() {
         if line.starts_with("MahBot ") {
-            // The header: the one field two occurrences of a condition never
-            // share, so the timestamp is dropped from the identity.
+            // The header: the one field two occurrences of a condition never share.
             let head = match line.rsplit_once(' ') {
                 Some((head, stamp)) if stamp.contains('T') => head,
                 _ => line,
@@ -290,12 +235,7 @@ fn condition_lines(block: &str) -> String {
     kept.join("\n")
 }
 
-/// Whether the record at `path` provably holds a block for `block`'s condition —
-/// the presence check [`record`] bounds by. The file's blocks are separated by the
-/// blank-line terminator [`append_failure_record`] writes, and each is reduced to
-/// its [`condition_lines`] before the comparison, so nothing else about a block
-/// has to match. A file that cannot be read answers `false`: a failure is filed
-/// unless the record provably holds it already.
+/// Whether the record at `path` provably holds a block for `block`'s condition.
 fn condition_is_recorded(path: &Path, block: &str) -> bool {
     let Ok(existing) = std::fs::read_to_string(path) else {
         return false;
@@ -306,20 +246,10 @@ fn condition_is_recorded(path: &Path, block: &str) -> bool {
         .any(|held| condition_lines(held) == condition)
 }
 
-/// Raw append: `report` as a block to `<root>/error.log`, creating the root
-/// directory and the file if absent. Returns the log path. Pure `std::fs` — no
-/// async, never panics on the caller's behalf. The report + terminator go out as
-/// a single `write_all` (one O_APPEND write in practice); even if the libc layer
-/// splits a large buffer, each chunk is offset-atomic, so the worst case under
-/// concurrent store failures is interleaved chunks, never torn bytes.
+/// Raw append: `report` as a block to `<root>/error.log`, creating the root when needed.
 fn append_failure_record(root: &Path, report: &str) -> std::io::Result<std::path::PathBuf> {
     use std::io::Write;
-    // A launch failure can be the first thing that ever needs the root: the launch
-    // path records a `temp::init_temp_root` failure against a root resolved before
-    // config or self-update have created it. The record is the durable half of the
-    // policy, so it creates the directory rather than losing the record — the
-    // stderr fallback a launch given no standard streams loses (see `crate::boot`)
-    // is exactly what the file exists to avoid.
+    // A launch failure can be the first thing that ever needs the root: the launch creates it.
     std::fs::create_dir_all(root)?;
     let path = root.join(ERROR_LOG_NAME);
     let mut file = std::fs::OpenOptions::new()
@@ -330,30 +260,15 @@ fn append_failure_record(root: &Path, report: &str) -> std::io::Result<std::path
     Ok(path)
 }
 
-/// Where one [`record`] call left the caller's block: the file it is in, and
-/// whether this call is what put it there. The two are different facts to the
-/// operator — a condition the record already holds is deliberately not filed a
-/// second time — so the pointer each renders differs.
+/// Where one [`record`] call left the caller's block: the file it is in, and whether it was new.
 #[derive(Debug)]
 pub(crate) enum Filed {
-    /// This call appended the block.
     Appended(PathBuf),
-    /// The record already held a block for this condition; nothing was appended.
     Held(PathBuf),
 }
 
-/// The single write entry point: file `block` in `<root>/error.log` unless the
-/// record already holds a block for the same condition, and never let the failure
-/// go unrecorded. [`Filed`] names the file the block is in — appended now or
-/// already there, so the caller's pointer is true either way.
-///
-/// The bound lives here, not in a caller, so no writer can append a second block
-/// for a condition the record already carries: whether it does is the block's
-/// [`condition_lines`], checked over the record by [`condition_is_recorded`]. An
-/// unresolvable root or a failed write puts the FULL block on stderr instead, with
-/// the reason it could not be filed, and returns `None` — the fallback the file
-/// append exists to make unnecessary, and one a launch given no standard streams
-/// cannot observe (see [`crate::boot`]). Never panics — a
+/// The single write entry point: file `block` in `<root>/error.log` unless the record already
+/// holds a block for its condition, else report that it was already held. Never panics — a
 /// recorder that could fail its caller would hide the very failure it records.
 pub(crate) fn record(root: Option<&Path>, block: &str) -> Option<Filed> {
     let Some(root) = root else {
@@ -385,13 +300,10 @@ pub(crate) fn record(root: Option<&Path>, block: &str) -> Option<Filed> {
     }
 }
 
-/// The pointer an operator can follow to the record's block for this condition, or
-/// `None` when the write fell back to stderr — the fallback already carried the
-/// whole block, so there is nothing to point at. Every recorded kind prints this
-/// one sentence on the channel it has (the boot diagnostics channel before tracing
-/// is up, the log after), so the record is reachable from both. A condition the
-/// record already held says so: the same sentence would read as this launch's own
-/// filing on every launch that repeats it.
+/// The pointer an operator can follow to the record's block for this condition, or `None` when
+/// the write fell back to stderr (which already carried the whole block). Every recorded kind
+/// prints this one sentence on the channel it has, so the record is reachable from both. A
+/// condition the record already held says so rather than reading as this launch's own filing.
 pub(crate) fn recorded_pointer(what: &str, filed: Option<Filed>) -> Option<String> {
     filed.map(|filed| {
         let (verb, path) = match filed {

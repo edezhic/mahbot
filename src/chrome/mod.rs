@@ -1,81 +1,50 @@
-//! Shared chrome automation core: the chrome-use CLI spawn mechanics and the
-//! tolerant envelope contract that every chrome frontend needs.
+//! Shared chrome automation core: the chrome-use CLI spawn mechanics and the tolerant envelope
+//! contract every chrome frontend needs.
 //!
 //! Frontends own everything user-facing: the interactive `chrome` tool
-//! ([`crate::tools::chrome`]) owns its LLM-facing framing and error texts,
-//! and the `mahbot chrome` CLI ([`cli`]) owns its stdout/exit-code emission.
-//! The per-action descriptor registry ([`actions`]) is the ONE shared source
-//! of LLM-facing action descriptions, rendered by both frontends (the tool's
-//! parameter schema and the CLI help); the shared chrome-failure remediation
-//! notes ([`contract`]) are the one other agent-facing text owned here. It
-//! also holds the chrome-use CLI spawning
-//! ([`spawn`]), the tolerant `--json` response envelope parser ([`contract`]),
-//! and the session-name/URL rules the tool and CLI share. The command-line
-//! surface's own session record — its sessions' lifetime and keep mark — lives
-//! here too ([`cli_sessions`]).
+//! ([`crate::tools::chrome`]) owns its LLM-facing framing and error texts, and the `mahbot chrome`
+//! CLI ([`cli`]) its stdout/exit-code emission. The per-action descriptor registry ([`actions`]) is
+//! the ONE shared source of LLM-facing action descriptions, rendered by both frontends, and the
+//! chrome-failure remediation notes ([`contract`]) are the other agent-facing text owned here. The
+//! chrome-use spawn ([`spawn`]), the tolerant `--json` envelope parser, the session-name/URL rules
+//! and the CLI's own session record ([`cli_sessions`]) live here too.
 //!
 //! ## The two clocks
 //!
-//! Every call the product bounds runs to a clock chrome-use itself works to, and
-//! the product's own kill rides above it — save for the product's OWN bounded extra
-//! work below (a probe, or a composite operation's best-effort sub-step), which the
-//! product ends itself. That chrome-side clock is DECLARED to
-//! chrome-use up front (the `AGENT_BROWSER_DEFAULT_TIMEOUT` it is spawned with):
-//! the verb's own forwarded `--timeout` for the verbs chrome-use honours one on
-//! (`wait`, `expect`), and [`CHROME_USE_DECLARED_BUDGET`] for every verb the
-//! product forwards no deadline to (`open`'s navigate included, which chrome-use
-//! does not bound by the forwarded env value) — save for a probe, which declares a
-//! bound of its own ([`probe_clocks`]). No declaration may reach chrome-use's
-//! own client tolerance ([`CHROME_USE_OWN_BUDGET`]) — the clock the tool works
-//! to for a call it was given no deadline for: declared at the tolerance, it
-//! runs out of tolerance instead of reporting, and its session-unresponsive
-//! verdict (which stops the session and loses its tabs) replaces its honest one.
-//! [`CHROME_USE_DECLARED_BUDGET`] therefore sits one [`KILL_SLACK`] UNDER that
-//! tolerance, and the product's kill then rides [`KILL_SLACK`] above the
-//! declaration plus whatever relay self-heal the call may run: [`clocks`] builds
-//! that pair for a step that declares only its own clock, and a step whose kill
-//! must ride above a WIDER bound instead (a caller's `--timeout`, a product-side
-//! budget) is widened through [`kill_bound`] without re-adding the margin by hand.
-//! Declaring first is what makes chrome-use's own honest verdict (a structured
-//! timeout, with chrome-use's own reason) the one that normally reaches the
-//! caller: on every step whose outcome IS the caller's verdict, chrome-use must be
-//! the clock that gives up first, and a mahbot kill there means it did not answer
-//! at all.
+//! Chrome-use bounds each call it runs to a clock it works to, and the product's own kill rides
+//! above it — except for the product's OWN bounded extra work (a probe, or a composite operation's
+//! best-effort sub-step), which the product ends itself. That chrome-side clock is DECLARED to
+//! chrome-use up front (`AGENT_BROWSER_DEFAULT_TIMEOUT`): the verb's forwarded `--timeout` for the
+//! verbs chrome-use honours one on (`wait`, `expect`), and [`CHROME_USE_DECLARED_BUDGET`] for every
+//! verb the product forwards no deadline to — except a probe, which declares its own bound
+//! ([`probe_clocks`]). No declaration may reach chrome-use's client tolerance
+//! ([`CHROME_USE_OWN_BUDGET`]): declared at the tolerance, chrome-use runs out of tolerance instead
+//! of reporting, and its session-unresponsive verdict (which stops the session and loses its tabs)
+//! replaces its honest one. [`CHROME_USE_DECLARED_BUDGET`] therefore sits one [`KILL_SLACK`] under
+//! that tolerance, and the product's kill rides [`KILL_SLACK`] above the declaration plus whatever
+//! relay self-heal the call may run: [`clocks`] builds that pair, and a step whose kill must ride
+//! above a WIDER bound (a caller's `--timeout`, a product-side budget) is widened through
+//! [`kill_bound`] without re-adding the margin by hand. Declaring first is what keeps chrome-use's
+//! own honest structured timeout the verdict that normally reaches the caller: on every step whose
+//! outcome IS the caller's verdict, chrome-use must give up first, and a mahbot kill there means it
+//! did not answer at all.
 //!
-//! One deliberate exception covers both cases where the product must bound its
-//! OWN work instead of letting chrome-use run to its own clock — probes in
-//! everything but name:
+//! One deliberate exception covers both cases where the product must bound its OWN work — probes in
+//! everything but name. The product's probes (`session stop`, `session status`, the CLI's ephemeral
+//! close, the health/watchdog calls and their tab sweep) take the product's bound AS the kill, and
+//! [`probe_clocks`] declares that same bound to chrome-use, capped at
+//! [`CHROME_USE_DECLARED_BUDGET`]; relay self-heal is suppressed ([`CliRecovery::Suppressed`]) so
+//! an unanswered probe reports "the tool did not answer" instead of spending the recovery window.
+//! A composite operation's best-effort sub-steps (`open`'s error-page probe, the post-navigation
+//! settle and content capture) are also suppressed, with a kill resting [`KILL_SLACK`] above the
+//! bound the product declares for them; their failure never fails the operation, so they are
+//! bounded exactly like a probe — that product bound, not chrome-use's verdict, ends them.
 //!
-//! - The product's own probes (`session stop`, `session status`, the CLI's
-//!   ephemeral close, and the health/watchdog calls plus the tab sweep they drive):
-//!   the product's bound IS the kill, and [`probe_clocks`] declares that same bound
-//!   to chrome-use — capped at [`CHROME_USE_DECLARED_BUDGET`] for a probe whose own
-//!   bound sits above it. chrome-use's relay self-heal is suppressed
-//!   ([`CliRecovery::Suppressed`]), so an unanswered probe reports "the tool did
-//!   not answer" rather than spending the recovery window.
-//! - A composite operation's best-effort sub-steps (`open`'s error-page probe,
-//!   post-navigation settle and content capture): also
-//!   [`CliRecovery::Suppressed`], with a kill resting [`KILL_SLACK`] above the
-//!   bound the product declares for them. Their failure never fails the
-//!   operation — their result only refines or is discarded — so they are bounded
-//!   by the product exactly the way a probe is. The product-side bound of such a
-//!   sub-step may sit below chrome-use's own clock; that is the point, and a
-//!   product bound — not chrome-use's verdict — is what ends it.
-//!
-//! So the two named exceptions are really one rule: the product's OWN bounded
-//! extra work. Every step the caller's own action drives — the navigation included,
-//! and `open`'s `--expect` wait — runs to the clocks below, never to a product-side
-//! bound: a call must never fail because the product cut it off. The probes above
-//! are the product's own liveness checks rather than the caller's work, so a
-//! `session stop` / `session status` the caller ran by hand still takes the product
-//! bound above.
-//!
-//! [`KILL_SLACK`] is the product's margin wherever a kill rides above the clock
-//! a step runs to: above the declared chrome-side clock for a step the caller's
-//! action drives, and above the product's own bound for a best-effort sub-step,
-//! where that bound — not the declared clock — is what the
-//! kill follows. A probe takes NO margin: [`probe_clocks`] makes its bound its
-//! kill.
+//! So the two named exceptions are one rule: the product's OWN bounded extra work. Every step the
+//! caller's action drives — the navigation included, and `open`'s `--expect` wait — runs to the
+//! clocks here, never to a product-side bound, so a call never fails because the product cut it
+//! off. [`KILL_SLACK`] is the margin wherever a kill rides above the clock a step runs to, and a
+//! probe takes no margin at all: [`probe_clocks`] makes its bound its kill.
 
 use std::time::Duration;
 
@@ -87,88 +56,56 @@ pub(crate) mod files;
 pub(crate) mod forms;
 pub(crate) mod spawn;
 
-/// Name prefix of every session the `mahbot chrome` CLI creates (named and
-/// ephemeral). The interactive tool keeps `agent-tab-*`; link enrichment keeps
-/// `link-enricher-*`.
+/// Name prefix of every session the `mahbot chrome` CLI creates (named and ephemeral). The
+/// interactive tool keeps `agent-tab-*`; link enrichment keeps `link-enricher-*`.
 pub(crate) const CLI_SESSION_PREFIX: &str = "mahbot-chrome-";
 
-/// The margin by which the product's own kill rides above the clock a step runs
-/// to: that clock is the chrome-side deadline declared to chrome-use
-/// ([`CHROME_USE_DECLARED_BUDGET`] for every verb mahbot forwards no `--timeout`
-/// to, the forwarded deadline otherwise), or the product's own bound for a
-/// best-effort sub-step. It is what lets a child that
-/// answers at the very end of its own deadline be reaped rather than killed; the
-/// same margin is what holds every declaration one step below chrome-use's own
-/// client tolerance, which is how [`CHROME_USE_DECLARED_BUDGET`] is derived. It is
-/// the reap allowance only: the child's bytes are collected in their own bound,
-/// one [`spawn`] drain window covering both pipes, separate from this margin.
+/// The margin by which the product's own kill rides above the clock a step runs to: the declared
+/// chrome-side deadline ([`CHROME_USE_DECLARED_BUDGET`] for a verb mahbot forwards no `--timeout`
+/// to, the forwarded deadline otherwise), or the product's own bound for a best-effort sub-step. It
+/// lets a child answering at the very end of its deadline be reaped rather than killed, and it
+/// holds every declaration one step below chrome-use's client tolerance. Reap allowance only: the
+/// child's bytes are collected in their own [`spawn`] drain window.
 pub(crate) const KILL_SLACK: Duration = Duration::from_secs(2);
 
-/// chrome-use's own CLIENT TOLERANCE: its 30 s CDP command cap plus its 15 s
-/// socket-read margin — the clock it works to for a call it was given no
-/// deadline for. Never a declaration the product makes: a declaration AT the
-/// tolerance makes chrome-use run out of that tolerance instead of reporting, so
-/// its session-unresponsive verdict (which stops the session) replaces its honest
-/// one. Every declaration the product makes must stay strictly under it — this
-/// is what a forwarded `--timeout` is refused against (see
-/// [`crate::chrome::cli`]) — and the declaration for a verb the product forwards
-/// no `--timeout` to is [`CHROME_USE_DECLARED_BUDGET`]: the longest declaration
-/// mahbot itself makes (a verb that does forward a `--timeout` declares the
-/// caller's own value), with a probe's own bound at or below it ([`probe_clocks`]).
+/// chrome-use's own CLIENT TOLERANCE: its 30 s CDP command cap plus a 15 s socket-read margin — the
+/// clock it works to for a call given no deadline. Never a declaration the product makes: a
+/// declaration AT the tolerance makes chrome-use run out of tolerance instead of reporting, so its
+/// session-unresponsive verdict (which stops the session) replaces its honest one. Every
+/// declaration must stay strictly under it — that is what a forwarded `--timeout` is refused
+/// against (see [`crate::chrome::cli`]) — and the declaration for a verb with no `--timeout` is
+/// [`CHROME_USE_DECLARED_BUDGET`], with a probe's bound at or below it ([`probe_clocks`]).
 pub(crate) const CHROME_USE_OWN_BUDGET: Duration = Duration::from_secs(45);
 
-/// What the product DECLARES to chrome-use as the chrome-side deadline for a
-/// verb it forwards no `--timeout` to: [`CHROME_USE_OWN_BUDGET`] — the tool's own
-/// client tolerance — less one [`KILL_SLACK`], so the tool always gives up on its
-/// own declared deadline and reports its own verdict before the product's kill
-/// rides in.
+/// What the product DECLARES as the chrome-side deadline for a verb it forwards no `--timeout` to:
+/// [`CHROME_USE_OWN_BUDGET`] less one [`KILL_SLACK`], so the tool always gives up on its own
+/// declared deadline and reports its own verdict before the product's kill rides in.
 pub(crate) const CHROME_USE_DECLARED_BUDGET: Duration =
     CHROME_USE_OWN_BUDGET.saturating_sub(KILL_SLACK);
 
-/// One `session stop`'s bound: the session daemon's 8 s shutdown grace, then a
-/// reconnect that reclaims the session's tabs under chrome-use's own 20 s — the
-/// ≈28 s end to end the live-verified behaviours of [`crate::tools::chrome_daemon`]
-/// state. About twice that, so the estimate drifting with a chrome-use release
-/// cannot charge a working stop as a failure. Shared by the CLI's stop verbs and
-/// the ended-run release's own pass budget ([`crate::tools::chrome_release`]'s
-/// [`ATTEMPT_TIMEOUT`](crate::tools::chrome_release::ATTEMPT_TIMEOUT)), which holds
-/// it alongside one reserve for each phase of browser reads
-/// ([`crate::tools::chrome_tabs::READ_PHASE_RESERVE`] each). There the whole bound is
-/// reserved for the ended-run confirmation (`chrome_tabs::stop_budget`): a stop that
-/// pass can no longer hold in full is not spawned at all, its own bound is never cut,
-/// and the names such an unspawned stop would have covered stay retries for a later
-/// pass rather than being concluded by the reads, which only decide the names whose
-/// stops the pass held. The let-go stops take whatever the pass has left
-/// (`chrome_tabs::spawn_budget`) instead: [`release_own_session`]'s is the record-hygiene
-/// `--force` form — the ledger route is what closes the release module's own scratch group —
-/// and [`forget_settled_sessions`]' graceful stops are what close such a group, asking as many
-/// sessions to stop as the budget holds; the second charges only a stop that got the whole
-/// bound, so one this bound cut short is never read as a route that failed.
-///
-/// [`release_own_session`]: crate::tools::chrome_tabs::release_own_session
-/// [`forget_settled_sessions`]: crate::tools::chrome_tabs::forget_settled_sessions
+/// One `session stop`'s bound: the session daemon's 8 s shutdown grace, then a reconnect reclaiming
+/// the session's tabs under chrome-use's own 20 s — the ≈28 s end to end the live-verified
+/// behaviours of [`crate::tools::chrome_daemon`] state. About twice that, so an estimate drifting
+/// with a chrome-use release cannot charge a working stop as a failure. Shared by the CLI's stop
+/// verbs and by [`crate::tools::chrome_release`]'s `ATTEMPT_TIMEOUT`, which holds it alongside a
+/// reserve for each phase of browser reads: a stop the pass can no longer hold in full is not
+/// spawned at all, so its names stay retries for a later pass rather than being concluded by reads.
 pub(crate) const SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The relay self-heal chrome-use may run inside a call whose relay connection
-/// is gone: it kills the stale daemon, re-registers the native host, launches
-/// the owner's real Chrome when it is not running, and polls for up to its own
-/// `AGENT_BROWSER_RELAY_REVIVE_SECS` — 45 s by default, pinned to this number
-/// for a call that allows the self-heal, so the tool's clock and the product's
-/// kill ([`kill_bound`]) agree on the same recovery window.
+/// The relay self-heal chrome-use may run inside a call whose relay connection is gone: it kills
+/// the stale daemon, re-registers the native host, launches the owner's real Chrome when needed,
+/// and polls for up to its own `AGENT_BROWSER_RELAY_REVIVE_SECS` (45 s by default, pinned to this
+/// number for a call that allows the self-heal) so the tool's clock and the product's kill
+/// ([`kill_bound`]) agree on one recovery window.
 pub(crate) const RELAY_RECOVERY_BUDGET: Duration = Duration::from_secs(45);
 
 /// Whether a chrome-use call may run chrome-use's own relay self-heal.
 ///
-/// [`Allowed`](Self::Allowed) is the policy for every call that carries out
-/// work for the agent — the interactive tool's actions and the `mahbot chrome`
-/// CLI's steps — because that work must survive a relay hiccup exactly the way
-/// chrome-use intends (kill the stale daemon, re-register the native host,
-/// relaunch the owner's Chrome, retry). [`Suppressed`](Self::Suppressed) is
-/// ONLY for the product's own bounded extra work — the snapshot/probe calls
-/// (`status`, `extension status`, `agent-browser` daemon probes, session
-/// close/stop and the release path) and a composite operation's best-effort
-/// sub-steps, which are probes in everything but name (see the module doc's
-/// exception).
+/// [`Allowed`](Self::Allowed) for every call that carries out the agent's work — the tool's actions
+/// and the CLI's steps — which must survive a relay hiccup the way chrome-use intends.
+/// [`Suppressed`](Self::Suppressed) is ONLY for the product's own bounded extra work: the
+/// snapshot/probe calls (`status`, `extension status`, `agent-browser` daemon probes, session
+/// close/stop and the release path) and a composite operation's best-effort sub-steps.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CliRecovery {
     /// The call may run chrome-use's relay self-heal.
@@ -178,8 +115,7 @@ pub(crate) enum CliRecovery {
 }
 
 impl CliRecovery {
-    /// The recovery window the product's kill has to ride above under this
-    /// policy.
+    /// The recovery window the product's kill has to ride above under this policy.
     #[must_use]
     pub(crate) fn budget(self) -> Duration {
         match self {
@@ -189,12 +125,9 @@ impl CliRecovery {
     }
 }
 
-/// The ONE derivation of the product's kill for a chrome-use call: the clock the
-/// call runs to — the chrome-side deadline declared to chrome-use
-/// ([`CHROME_USE_DECLARED_BUDGET`] for every verb mahbot forwards no `--timeout`
-/// to), or a bound the product sets itself for a best-effort sub-step — plus
-/// whatever relay recovery the call is allowed to run, plus [`KILL_SLACK`]. A probe
-/// takes no margin at all ([`probe_clocks`]); see the module doc for both cases.
+/// The ONE derivation of the product's kill for a chrome-use call: the clock the call runs to (the
+/// declared chrome-side deadline, or a product-side bound for a best-effort sub-step) plus whatever
+/// relay recovery it may run plus [`KILL_SLACK`]. A probe takes no margin ([`probe_clocks`]).
 /// Saturating, so an absurd caller-supplied bound cannot overflow.
 #[must_use]
 pub(crate) fn kill_bound(chrome_side: Duration, recovery: CliRecovery) -> Duration {
@@ -203,25 +136,21 @@ pub(crate) fn kill_bound(chrome_side: Duration, recovery: CliRecovery) -> Durati
         .saturating_add(KILL_SLACK)
 }
 
-/// The two clocks of one chrome-use call, derived together by [`clocks`]: the
-/// deadline DECLARED to chrome-use and the product's own kill above it.
+/// The two clocks of one chrome-use call, derived together by [`clocks`]: the deadline DECLARED to
+/// chrome-use and the product's own kill above it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ChromeCallClocks {
-    /// The deadline this call declares to chrome-use (its
-    /// `AGENT_BROWSER_DEFAULT_TIMEOUT`) — the clock chrome-use works to.
+    /// The deadline declared to chrome-use (its `AGENT_BROWSER_DEFAULT_TIMEOUT`).
     pub(crate) chrome_side: Duration,
     /// The product's own kill for this call.
     pub(crate) kill: Duration,
 }
 
-/// Derive the two clocks of one chrome-use call from the command-level deadline
-/// the caller declares for the verb: `Some(d)` means the verb honours a deadline
-/// of `d` that the product forwards (`--timeout`), and that deadline IS the
-/// chrome-side clock; `None` means the verb has no command-level deadline at all
-/// — chrome-use neither accepts nor honours a `--timeout` for it — so the clock
-/// declared to chrome-use is [`CHROME_USE_DECLARED_BUDGET`], one [`KILL_SLACK`]
-/// under the tolerance the tool itself works to. The kill is [`kill_bound`] above
-/// whichever clock applies.
+/// Derive the two clocks of one chrome-use call from the deadline the caller declares for the verb:
+/// `Some(d)` means the verb honours a forwarded `--timeout` of `d`, and that deadline IS the
+/// chrome-side clock; `None` means the verb has no command-level deadline, so the declared clock is
+/// [`CHROME_USE_DECLARED_BUDGET`], one [`KILL_SLACK`] under the tool's own tolerance. The kill is
+/// [`kill_bound`] above whichever clock applies.
 #[must_use]
 pub(crate) fn clocks(declared: Option<Duration>, recovery: CliRecovery) -> ChromeCallClocks {
     let chrome_side = declared.unwrap_or(CHROME_USE_DECLARED_BUDGET);
@@ -231,15 +160,11 @@ pub(crate) fn clocks(declared: Option<Duration>, recovery: CliRecovery) -> Chrom
     }
 }
 
-/// The clocks of one of the product's own probes: the product's own `bound` IS the
-/// kill, so a probe that does not answer is reported as such instead of spending the
-/// recovery window, and that same bound is what is DECLARED to chrome-use — capped
-/// at [`CHROME_USE_DECLARED_BUDGET`], the longest declaration mahbot makes for a verb
-/// it forwards no `--timeout` to (see [`CHROME_USE_OWN_BUDGET`]). A deliberately
-/// short liveness probe therefore declares the bound it really runs to, never a
-/// longer one it would never let run; a probe whose own bound sits above the cap
-/// (the `session stop` paths) declares the cap. The ONE derivation of a probe's
-/// clocks, shared by the tool's probes and the CLI's.
+/// The clocks of one of the product's own probes: the product's `bound` IS the kill, so a probe
+/// that does not answer is reported as such instead of spending the recovery window, and that same
+/// bound is DECLARED to chrome-use, capped at [`CHROME_USE_DECLARED_BUDGET`]. A deliberately short
+/// liveness probe therefore declares the bound it really runs to; one whose bound sits above the
+/// cap (the `session stop` paths) declares the cap.
 #[must_use]
 pub(crate) fn probe_clocks(bound: Duration) -> ChromeCallClocks {
     ChromeCallClocks {
@@ -248,58 +173,44 @@ pub(crate) fn probe_clocks(bound: Duration) -> ChromeCallClocks {
     }
 }
 
-/// Default `open` operation budget (20 s), kept as the CLI's `open --timeout`
-/// default: it bounds the waits `open` drives — the error-page probe, the
-/// post-navigation settle / `--expect` wait, and the content capture. It is NOT
-/// a kill bound on the navigation, and not chrome-use's `open` deadline either:
-/// chrome-use neither forwards nor honours a timeout for `open`'s navigate, which
-/// runs to the clock the product declares for a verb it forwards no `--timeout`
-/// to ([`CHROME_USE_DECLARED_BUDGET`]) — so `open` may legitimately outlive this
-/// budget, and a navigation chrome-use is still working on is never cut off
-/// mid-report.
+/// Default `open` operation budget (20 s), kept as the CLI's `open --timeout` default: it bounds
+/// the waits `open` drives — the error-page probe, the post-navigation settle / `--expect` wait,
+/// and the content capture. NOT a kill bound on the navigation, and not chrome-use's `open`
+/// deadline either: the navigate runs to [`CHROME_USE_DECLARED_BUDGET`], so `open` may legitimately
+/// outlive this budget and a navigation still in progress is never cut off mid-report.
 pub(crate) const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Default condition deadline for `wait`/`expect` (8 s), the CLI's default when
-/// the caller gives no `--timeout` ([`crate::chrome::cli`] forwards it as the
-/// verb's `--timeout`); the tool's own `wait`/`expect` deadlines sit in the same
-/// range. Deliberately far below [`CHROME_USE_OWN_BUDGET`]: a forward declaring
-/// exactly chrome-use's own client tolerance makes chrome-use run out of that
-/// tolerance instead of answering, so its session-unresponsive classification —
-/// which costs the session its tabs — replaces its honest "condition was not
-/// met" verdict. A condition deadline must always leave the tool room to answer.
+/// Default condition deadline for `wait`/`expect` (8 s), the CLI's default when the caller gives no
+/// `--timeout`; the tool's own deadlines sit in the same range. Deliberately far below
+/// [`CHROME_USE_OWN_BUDGET`]: a forward declaring exactly chrome-use's client tolerance makes it
+/// run out of tolerance instead of answering, replacing its honest "condition was not met" verdict
+/// — which costs the session its tabs.
 pub(crate) const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Prefix of per-invocation ephemeral CLI sessions — the ONLY CLI prefix the
-/// daemon-side start-up sweep may close (orphan protection after crashes), and
-/// only for names [`cli_sessions`] does not hold: a recorded session belongs to
-/// its own lifetime. Named `mahbot-chrome-<name>` sessions are never swept
-/// (cookie persistence is a feature).
+/// Prefix of per-invocation ephemeral CLI sessions — the ONLY CLI prefix the daemon-side start-up
+/// sweep may close (orphan protection after crashes), and only for names [`cli_sessions`] does not
+/// hold. Named `mahbot-chrome-<name>` sessions are never swept (cookie persistence is a feature).
 pub(crate) const CLI_EPHEMERAL_PREFIX: &str = "mahbot-chrome-ephemeral-";
 
-/// A navigation that ends here never committed — the tab stayed on the scratch
-/// `about:blank` page (relay broken, navigation blocked, etc.). Keyed on the
-/// final URL only, so legitimately content-free pages (image URLs, PDFs, canvas
-/// shells) are not false-flagged by having zero extracted text.
+/// A navigation that ends here never committed — the tab stayed on the scratch `about:blank` page
+/// (relay broken, navigation blocked). Keyed on the final URL only, so legitimately content-free
+/// pages (image URLs, PDFs, canvas shells) are not false-flagged.
 pub(crate) fn is_blank_page_url(url: &str) -> bool {
     let url = url.trim();
     url.is_empty() || url.starts_with("about:blank")
 }
 
-/// chrome-use's scratch error-page URL (live-verified on 1.5.101 and
-/// reconfirmed on the installed 1.5.106; the installed copy is checked against the
-/// newest release on every product start and replaced only when the versions
-/// differ): DNS/refused/unsafe-port navigations
-/// return
-/// rc=0 with success:true and commit to `chrome-error://chromewebdata/`
-/// (prefix match — the trailing slash exists; no false positives on 404/5xx
-/// or real captive-portal pages). The only false positive is a
-/// TLS-intercepting portal with a fake certificate — accepted trade-off.
+/// chrome-use's scratch error-page URL (live-verified on 1.5.101, reconfirmed on 1.5.106):
+/// DNS/refused/unsafe-port navigations return rc=0 with success:true and commit to
+/// `chrome-error://chromewebdata/` (a prefix match — no false positives on 404/5xx or captive
+/// portals). The only false positive is a TLS-intercepting portal with a fake certificate — an
+/// accepted trade-off.
 pub(crate) fn is_chrome_error_page(url: &str) -> bool {
     url.trim().starts_with("chrome-error://")
 }
-/// How a navigation ended, read off the answer's committed URL: the tab never
-/// left its scratch page, or Chrome committed to its own error page. `None` when
-/// the answer carries no committed URL at all (nothing to judge).
+/// How a navigation ended, read off the answer's committed URL: the tab never left its scratch
+/// page, or Chrome committed to its own error page. `None` when the answer carries no committed
+/// URL.
 pub(crate) enum NavigationFailure {
     Blank,
     ErrorPage,
@@ -325,9 +236,9 @@ pub(crate) fn error_page_code(probe: &crate::chrome::contract::ChromeResponse) -
         .and_then(|probe| probe.code)
 }
 
-/// Escape a string for embedding in a single-quoted JavaScript literal.
-/// Shared by the CLI's count/eval shims and the interactive tool's
-/// `innerText` eval.
+/// Escape a string for a single-quoted JavaScript literal, shared by the CLI's count/eval shims and
+/// the tool's `innerText` eval: a backslash is doubled before the apostrophe it precedes is
+/// escaped, so text like `it\'s` can neither end the literal nor survive as an escape.
 #[must_use]
 pub(crate) fn escape_js_single_quoted(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")

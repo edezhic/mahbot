@@ -25,11 +25,6 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// An option for [`fn@iced::widget::pick_list`] with separate value and display label.
-///
-/// Equality is determined by `value` only — two `PickOption`s with the same
-/// `value` are considered equal regardless of label. This lets
-/// [`fn@iced::widget::pick_list`] highlight the correct option even when the
-/// selected value is constructed independently of the options list.
 #[derive(Debug, Clone)]
 pub struct PickOption {
     pub value: String,
@@ -50,11 +45,8 @@ impl std::fmt::Display for PickOption {
     }
 }
 
-// ── Page scaffold ────────────────────────────────────────────────────
-
-/// Standard full-area page/region chrome: the content wrapped in a
-/// Fill×Fill container with the shared [`theme::PAGE_PADDING`] inset and
-/// the base-page background style. Used for top-level page bodies.
+/// Standard full-area page/region chrome: the content in a Fill×Fill container with the shared
+/// [`theme::PAGE_PADDING`] inset and the base-page background. Used for top-level page bodies.
 #[must_use]
 pub fn page<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     container(content)
@@ -65,8 +57,8 @@ pub fn page<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Elemen
         .into()
 }
 
-/// [`page`] without the page padding — for nested full-area region containers
-/// (tab bodies, panels) that manage their own inner insets.
+/// [`page`] without the padding — for nested full-area region containers (tab bodies, panels) that
+/// manage their own inner insets.
 #[must_use]
 pub fn page_bare<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
@@ -78,11 +70,9 @@ pub fn page_bare<'a, Message: 'a>(
         .into()
 }
 
-/// [`page`] with a page-level dialog layer above it.
-///
-/// The dialog sits outside the page padding, so its backdrop dims the whole
-/// page area instead of stopping at the inset, while the padding stays around
-/// the content and nothing else moves.
+/// [`page`] with a page-level dialog layer above it: the dialog sits outside the page padding, so
+/// its backdrop dims the whole page area instead of stopping at the inset, while the padding stays
+/// around the content and nothing else moves.
 #[must_use]
 pub fn page_with_dialog<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
@@ -91,30 +81,26 @@ pub fn page_with_dialog<'a, Message: 'a>(
     stack([page(content), dialog]).into()
 }
 
-/// Closed [`page_with_dialog`] layer: zero-size and `Stack`-rooted like
-/// [`modal_backdrop`], so swapping in a real dialog keeps the page's widget
-/// state (scroll positions, caret).
+/// Closed [`page_with_dialog`] layer: zero-size and `Stack`-rooted like [`modal_backdrop`], so
+/// swapping in a real dialog keeps the page's widget state (scroll positions, caret).
 #[must_use]
 pub fn no_dialog<'a, Message: 'a>() -> Element<'a, Message> {
     stack([empty_stack_placeholder()]).into()
 }
 
-// ── Shared single-line editor field ──────────────────────────────────
+// Shared single-line editor field
 
-/// A single shared-editor field frame matching the app's `text_input` visual
-/// language (`BG_ELEVATED` fill, radius 4, hairline border).
+/// A single shared-editor field frame matching the app's `text_input` visual language
+/// (`BG_ELEVATED` fill, radius 4, hairline border).
 fn editor_field_style(border_color: Color) -> impl Fn(&iced::Theme) -> container::Style {
     move |_theme: &iced::Theme| theme::container_style(theme::BG_ELEVATED, 4.0, 1.0, border_color)
 }
 
-/// Build a single-line shared-editor field with the app's standard chrome.
-///
-/// Shared preamble of [`single_line_editor`] and [`password_field_editor`]: a
-/// single-line, non-gutter, non-code-mode [`super::editor_widget::EditorWidget`]
-/// with `masked` glyphs, a `placeholder`, `PAD_5` padding and the `BG_ELEVATED`
-/// background, wrapped in a width-`styled` container with `border_color`. The
-/// optional `id` makes the field click-to-focus and gates keyboard processing
-/// on focus.
+/// Build a single-line shared-editor field with the app's standard chrome — the shared preamble of
+/// [`single_line_editor`] and [`password_field_editor`]: a single-line, non-gutter, non-code-mode
+/// [`super::editor_widget::EditorWidget`] with `masked` glyphs, a `placeholder`, `PAD_5` padding
+/// and the `BG_ELEVATED` background, wrapped in a width-`styled` container with `border_color`. The
+/// optional `id` makes the field click-to-focus and gates keyboard processing on focus.
 #[expect(clippy::too_many_arguments)] // shared preamble: 8 config args by design
 fn editor_field<'a, M: 'a>(
     buffer: &'a super::editor_widget::EditorBuffer,
@@ -147,17 +133,6 @@ fn editor_field<'a, M: 'a>(
 }
 
 /// Render a single-line shared editor field, replacing iced `text_input`.
-///
-/// `submit_on_enter` selects the bare-Enter behavior: `true` submits the
-/// field's action, `false` leaves Enter a no-op. The buffer is owned by the
-/// caller; the caller applies [`super::editor_widget::EditorAction`] via
-/// [`super::common::apply_editor_action`] and reads `buffer.text()`.
-///
-/// `id` makes the field click-to-focus and gates keyboard processing on focus.
-/// Tab in a single-line field emits a focus action that the page maps to
-/// `operation::focus_next()` / `focus_previous()` (the code editor keeps
-/// Tab→Indent itself). Pass `None` when the field does not need its own focus
-/// id.
 #[must_use]
 pub fn single_line_editor<'a, M: 'a>(
     buffer: &'a super::editor_widget::EditorBuffer,
@@ -184,13 +159,12 @@ pub fn single_line_editor<'a, M: 'a>(
     )
 }
 
-/// Render a masked single-line shared editor field with a lucide show/hide
-/// toggle (the mismatched glyph button is replaced by `eye`/`eye_off`).
+/// Render a masked single-line shared editor field with a lucide show/hide toggle
+/// (`eye`/`eye_off`).
 ///
-/// Copy always returns the plaintext value; masking only affects rendering.
-/// `id` makes the field click-to-focus and gates keyboard processing on focus.
-/// Tab emits a focus action the page maps to `focus_next` / `focus_previous`
-/// (single-line fields never indent).
+/// Copy always returns the plaintext value; masking only affects rendering. `id` makes the field
+/// click-to-focus and gates keyboard processing on focus. Tab emits a focus action the page maps to
+/// `focus_next` / `focus_previous` (single-line fields never indent).
 #[must_use]
 #[expect(clippy::too_many_arguments)]
 pub fn password_field_editor<'a, M: Clone + 'a>(
@@ -240,15 +214,13 @@ pub fn password_field_editor<'a, M: Clone + 'a>(
         .into()
 }
 
-/// Shared body of [`error_banner`] / [`error_banner_fill`]: the pill-styled
-/// error text.
+/// Shared body of [`error_banner`] / [`error_banner_fill`]: the pill-styled error text.
 fn error_banner_body<'a, Message: 'a>(err: &'a str) -> container::Container<'a, Message> {
     container(text(err).size(theme::TEXT_13).color(theme::STATUS_ERROR))
         .padding(theme::PAD_8)
         .style(theme::pill_style(theme::STATUS_ERROR.scale_alpha(0.08)))
 }
 
-/// Render a styled error banner for dashboard panels.
 #[must_use]
 pub fn error_banner<'a, Message: 'a>(err: &'a str) -> Element<'a, Message> {
     error_banner_body(err).into()
@@ -260,7 +232,6 @@ pub fn error_banner_fill<'a, Message: 'a>(err: &'a str) -> Element<'a, Message> 
     error_banner_body(err).width(Length::Fill).into()
 }
 
-/// Standardized "Loading…" placeholder label for load-state scaffolding.
 #[must_use]
 pub fn loading_text<'a, Message: 'a>() -> Element<'a, Message> {
     text("Loading\u{2026}")
@@ -269,9 +240,9 @@ pub fn loading_text<'a, Message: 'a>() -> Element<'a, Message> {
         .into()
 }
 
-/// Push an [`error_banner`] plus trailing 8px spacer onto `col` when `err` is
-/// present. For columns rendered outside a [`vscroll`] body, use
-/// [`push_error_banner_inset`] so the banner aligns with the scrolled content.
+/// Push an [`error_banner`] plus a trailing 8px spacer onto `col` when `err` is present. For
+/// columns rendered outside a [`vscroll`] body use [`push_error_banner_inset`], so the banner
+/// aligns with the scrolled content.
 #[must_use]
 pub fn push_error_banner<'a, Message: 'a>(
     col: Column<'a, Message>,
@@ -280,8 +251,7 @@ pub fn push_error_banner<'a, Message: 'a>(
     push_banner(col, err, false)
 }
 
-/// [`push_error_banner`] with the banner inset to align with a sibling
-/// [`vscroll`] body — for banners rendered outside the scrollable itself.
+/// [`push_error_banner`] inset to align with a sibling [`vscroll`] body.
 #[must_use]
 pub fn push_error_banner_inset<'a, Message: 'a>(
     col: Column<'a, Message>,
@@ -307,9 +277,8 @@ fn push_banner<'a, Message: 'a>(
     col
 }
 
-/// Horizontal inset matching the vertical scrollable wrappers: wrap a
-/// non-scrollable sibling of a [`vscroll`] body (banner, loading label) so its
-/// left edge aligns with the scrolled content.
+/// Horizontal inset matching the vertical scrollable wrappers: wrap a non-scrollable sibling of a
+/// [`vscroll`] body (banner, loading label) so its left edge aligns with the scrolled content.
 #[must_use]
 pub fn scroll_h_inset<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
@@ -319,9 +288,8 @@ pub fn scroll_h_inset<'a, Message: 'a>(
         .into()
 }
 
-/// Render a centered empty-state placeholder with a lucide icon and label.
-/// `accent` colors both the icon and the label — [`theme::TEXT_MUTED`] for
-/// ordinary placeholders, [`theme::STATUS_ERROR`] for error states.
+/// Render a centered empty-state placeholder with a lucide icon and label. `accent` colors both —
+/// [`theme::TEXT_MUTED`] for ordinary placeholders, [`theme::STATUS_ERROR`] for error states.
 #[must_use]
 pub fn empty_state_placeholder<'a, Message: 'a>(
     icon: iced::widget::Text<'a, iced::Theme, iced::Renderer>,
@@ -343,15 +311,8 @@ pub fn empty_state_placeholder<'a, Message: 'a>(
     .into()
 }
 
-/// The body a paginated dashboard view renders: the error banner, the first-read
-/// loading line, the view's empty state, then its rows under one scroll.
-///
-/// The [`page`] wrapper belongs inside: the Logs page body sits in a
-/// [`page_bare`] chrome, so leaving it out would silently lose
-/// [`theme::PAGE_PADDING`]. A failed first read leaves `loading` and
-/// `has_loaded` false, so the body falls through to the empty state with the
-/// banner as the only error signal — the deliberate opposite of the
-/// Automations/Sessions lists, which suppress the placeholder on error.
+/// The body a paginated dashboard view renders: the error banner, the first-read loading line, the
+/// view's empty state, then its rows under one scroll.
 #[must_use]
 pub fn paginated_body<'a, T, Message: 'a>(
     state: &'a PaginatedViewState<T>,
@@ -396,8 +357,8 @@ pub const PILL_MODAL: PillMetrics = PillMetrics {
     padding: [theme::PAD_2, theme::PAD_8],
 };
 
-/// Badge pill with an opaque background; `colors` is a `(foreground, background)`
-/// tuple — the convention shared by all badge-color helpers in [`crate::gui::theme`].
+/// Badge pill with an opaque background; `colors` is a `(foreground, background)` tuple — the
+/// convention shared by all badge-color helpers in [`crate::gui::theme`].
 #[must_use]
 pub fn badge_pill<'a, Message: 'a>(
     label: String,
@@ -438,10 +399,9 @@ pub const ACTION_ICON_SIZE: f32 = theme::TEXT_16;
 /// Shared icon/action button wrapped in a tooltip.
 ///
 /// Replicates the `tooltip(button(icon).style(..).padding(..).on_press_maybe(..),
-/// text(..).size(11), pos)` idiom plus `theme::tooltip_style`. `padding` must
-/// mirror the original site exactly — pass [`iced::widget::button::DEFAULT_PADDING`]
-/// where there was no explicit `.padding()`. Full-width / container-wrapped
-/// variants keep their bespoke construction.
+/// text(..).size(11), pos)` idiom plus `theme::tooltip_style`. `padding` must mirror the original
+/// site exactly — pass [`iced::widget::button::DEFAULT_PADDING`] where there was no explicit
+/// `.padding()`. Full-width / container-wrapped variants keep their bespoke construction.
 #[must_use]
 pub fn icon_tooltip_button<'a, Message>(
     icon: impl Into<Element<'a, Message>>,
@@ -466,10 +426,9 @@ where
     .into()
 }
 
-/// Bare text-hint tooltip: wraps `content` in a top-positioned tooltip with a
-/// [`theme::TEXT_11`] label styled by [`theme::tooltip_style`]. Sites that
-/// chain extra `Tooltip` modifiers (`.delay`, `.gap`, other positions) or a
-/// non-default-size label keep their bespoke construction.
+/// Bare text-hint tooltip: wraps `content` in a top-positioned tooltip with a [`theme::TEXT_11`]
+/// label styled by [`theme::tooltip_style`]. Sites that chain extra `Tooltip` modifiers
+/// (`.delay`, `.gap`, other positions) or a non-default-size label keep their bespoke construction.
 #[must_use]
 pub(crate) fn tooltip_hint<'a, Message: Clone + 'a>(
     content: impl Into<Element<'a, Message>>,
@@ -484,22 +443,15 @@ pub(crate) fn tooltip_hint<'a, Message: Clone + 'a>(
     .into()
 }
 
-/// Compact X removal/cancel control: a [`lucide::x`] glyph at `size` in `color`
-/// on a transparent button that highlights on hover (like
-/// [`theme::button_text`]). The glyph is the button's only content and the
-/// button shrink-wraps it, so the glyph is centered in its hit zone by
-/// construction — the hit zone is the glyph plus the caller's `padding`, which
-/// is how call sites preserve their existing hit areas (e.g.
-/// `button::DEFAULT_PADDING`, or larger uniform padding for a bigger zone).
+/// Compact X removal/cancel control: a [`lucide::x`] glyph at `size` in `color` on a transparent
+/// button that highlights on hover (like [`theme::button_text`]). The glyph is the button's only
+/// content and the button shrink-wraps it, so it is centered in its hit zone — the glyph plus the
+/// caller's `padding`, which is how call sites preserve their hit areas.
 ///
-/// `color` is [`theme::TEXT_SECONDARY`] wherever the control sits on a page, and
-/// brighter where it sits on a dark scrim over arbitrary content (the composer's
-/// picture tile). `size` is [`theme::TEXT_12`] everywhere except the composer's
-/// attachment chips, which take [`theme::composer_icon`].
-///
-/// `on_press: None` disables the button and dims the glyph to
-/// [`theme::TEXT_MUTED`], matching the disabled-dim treatment of the
-/// surrounding icon-action buttons.
+/// `color` is [`theme::TEXT_SECONDARY`] on a page and brighter on a dark scrim over arbitrary
+/// content (the composer's picture tile); `size` is [`theme::TEXT_12`] except the composer's
+/// attachment chips, which take [`theme::composer_icon`]. `on_press: None` disables the button and
+/// dims the glyph to [`theme::TEXT_MUTED`], matching the surrounding icon-action buttons.
 #[must_use]
 pub fn compact_x_button<'a, Message: Clone + 'a>(
     color: Color,
@@ -533,14 +485,11 @@ pub fn compact_x_button<'a, Message: Clone + 'a>(
     }
 }
 
-/// Invisible, non-interactive, zero-width replica of an icon button:
-/// an [`iced_fonts::lucide`] icon at [`ACTION_ICON_SIZE`] inside a
-/// default-padded [`button`], clipped to zero width by its container.
-///
-/// Push it into an action-icon row whose real buttons are all
-/// conditionally absent (e.g. archived ticket cards): it contributes no
-/// width and paints nothing, but pins the row's height to whatever the
-/// real buttons produce, so the surrounding row never collapses.
+/// Invisible, non-interactive, zero-width replica of an icon button: an [`iced_fonts::lucide`] icon
+/// at [`ACTION_ICON_SIZE`] inside a default-padded [`button`], clipped to zero width by its
+/// container. For action-icon rows whose real buttons are all conditionally absent (e.g. archived
+/// ticket cards): it contributes no width and paints nothing, but pins the row's height to what the
+/// real buttons produce, so the row never collapses.
 #[must_use]
 pub fn ghost_icon_button<Message: 'static + Clone>() -> Element<'static, Message> {
     container(
@@ -552,9 +501,8 @@ pub fn ghost_icon_button<Message: 'static + Clone>() -> Element<'static, Message
     .into()
 }
 
-/// Create a selectable text widget with the given color.
-///
-/// Accepts both borrowed (`&str`) and owned (`String`) text content.
+/// Create a selectable text widget with the given color; accepts borrowed (`&str`) and owned
+/// (`String`) content.
 pub fn selectable_text<'a, Message: 'a>(
     content: impl IntoFragment<'a>,
     color: Color,
@@ -588,19 +536,14 @@ pub fn tab_close_button<'a, Message: Clone + 'a>(
     .padding(0)
 }
 
-/// Horizontal inset (per side) the shared vertical scrollable wrappers add
-/// around their content. Sites must trim their own horizontal padding by this
-/// amount so the effective content inset does not double.
+/// Horizontal inset (per side) the shared vertical scrollable wrappers add around their content.
+/// Sites trim their own horizontal padding by this amount so the effective inset does not double.
 pub const SCROLL_H_PAD: f32 = 8.0;
 
-/// Wrap a tab strip in the shared scrollable + surface-container chrome.
-/// The strip reserves no space under the tabs while they fit; the band with
-/// the scrollbar rail appears only once they overflow (see [`hscroll`]).
-/// `scroll_id` is optional — the editor passes one for scroll-to-active-tab.
-/// `on_scroll` is optional — the editor passes a closure tracking the
-/// [`scrollable::Viewport`] so its reveal logic can decide whether the
-/// active tab is visible; the shell passes `None` (its strip never needs
-/// programmatic reveal).
+/// Wrap a tab strip in the shared scrollable + surface-container chrome: no space under the tabs
+/// while they fit, and the scrollbar band appears only once they overflow (see [`hscroll`]).
+/// `scroll_id` and `on_scroll` are optional — the editor passes both for scroll-to-active-tab; the
+/// shell passes `None`.
 #[must_use]
 pub fn tab_scrollable<'a, Message: 'a>(
     tab_buttons: Vec<Element<'a, Message>>,
@@ -617,18 +560,17 @@ pub fn tab_scrollable<'a, Message: 'a>(
     .into()
 }
 
-/// Shared vertical [`scrollable`]: thin 6px scrollbar (see
-/// [`theme::vertical_scrollbar`]) plus an unconditional [`SCROLL_H_PAD`]
-/// horizontal content inset. Fill/Fill sized: the content container spans the
-/// viewport width, normalizing former shrink-width scrollables — rows keep
-/// their natural width unless they stretch themselves (`Fill`/`FillPortion`).
+/// Shared vertical [`scrollable`]: thin 6px scrollbar (see [`theme::vertical_scrollbar`]) plus an
+/// unconditional [`SCROLL_H_PAD`] horizontal content inset. Fill/Fill sized: the content container
+/// spans the viewport width, normalizing former shrink-width scrollables — rows keep their natural
+/// width unless they stretch themselves (`Fill`/`FillPortion`).
 #[must_use]
 pub fn vscroll<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     vscroll_sized(content, Length::Fill, Length::Fill)
 }
 
-/// [`vscroll`] with explicit width/height — fixed-height dropdown/result
-/// lists, shrink-height nested scrollables, fixed-width side lists.
+/// [`vscroll`] with explicit width/height — fixed-height dropdown/result lists, shrink-height
+/// nested scrollables, fixed-width side lists.
 #[must_use]
 pub fn vscroll_sized<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
@@ -638,9 +580,8 @@ pub fn vscroll_sized<'a, Message: 'a>(
     vscroll_base(content, width, height).into()
 }
 
-/// [`vscroll`] with explicit width/height plus scroll tracking: `id` +
-/// `on_scroll` fire on every viewport change so callers can keep scroll state
-/// (chat feeds, tree panels).
+/// [`vscroll`] with explicit width/height plus scroll tracking: `id` + `on_scroll` fire on every
+/// viewport change so callers can keep scroll state (chat feeds, tree panels).
 #[must_use]
 pub fn vscroll_tracked<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
@@ -655,8 +596,7 @@ pub fn vscroll_tracked<'a, Message: 'a>(
         .into()
 }
 
-/// The common vertical wrapper body: padded content inside a thin-rail
-/// [`scrollable`].
+/// The common vertical wrapper body: padded content inside a thin-rail [`scrollable`].
 fn vscroll_base<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
     width: Length,
@@ -674,10 +614,9 @@ fn vscroll_base<'a, Message: 'a>(
 }
 
 /// Shared horizontal [`scrollable`]: thin 6px scrollbar (see
-/// [`theme::horizontal_scrollbar`]) embedded, so the rail takes layout space
-/// under the content only while it overflows. Fill/Shrink sized. Consumed
-/// internally by [`tab_scrollable`]; make public when a standalone
-/// horizontal-scroll site appears.
+/// [`theme::horizontal_scrollbar`]) embedded, so the rail takes layout space under the content only
+/// while it overflows. Fill/Shrink sized. Consumed internally by [`tab_scrollable`]; make it public
+/// when a standalone horizontal-scroll site appears.
 fn hscroll<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
     id: Option<widget::Id>,
@@ -697,13 +636,11 @@ fn hscroll<'a, Message: 'a>(
     sc.into()
 }
 
-/// Unified chat vertical rhythm: the composer's horizontal inset, reused
-/// as the Home inter-bubble gap, the Home composer's bottom padding, and
-/// the Sessions transcript inter-entry spacing.
+/// Unified chat vertical rhythm: the composer's horizontal inset, reused as the Home inter-bubble
+/// gap, the Home composer's bottom padding, and the Sessions transcript inter-entry spacing.
 pub const CHAT_VERTICAL_RHYTHM: f32 = 8.0;
 
-/// Chat-bubble alignment polarity: user messages render **left**,
-/// agent/typing indicators render **right**.
+/// Chat-bubble alignment polarity: user messages render **left**, agent/typing indicators **right**.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BubbleSide {
     /// Bubble flush left, spacer right.
@@ -712,12 +649,9 @@ pub(crate) enum BubbleSide {
     Right,
 }
 
-/// Wrap a chat bubble (or label) in a 3:1 FillPortion row so it sits flush to
-/// `side` with a spacer on the opposite side, keeping it at ~75% width.
-///
-/// The element itself carries its own width (full bubbles set
-/// `.width(FillPortion(3))` before being passed in); this function only
-/// creates the spacer row.
+/// Wrap a chat bubble (or label) in a 3:1 FillPortion row so it sits flush to `side` with a spacer
+/// on the opposite side, keeping it at ~75% width. The element carries its own width (full bubbles
+/// set `.width(FillPortion(3))` first); this only creates the spacer row.
 #[must_use]
 pub(crate) fn align_bubble<'a, Msg: 'a>(
     element: impl Into<Element<'a, Msg>>,
@@ -730,9 +664,8 @@ pub(crate) fn align_bubble<'a, Msg: 'a>(
     }
 }
 
-/// Options for [`chat_composer`] that differ between the Home and Board
-/// pages. Bundled so the shared signature does not grow with page-specific
-/// knobs.
+/// Options for [`chat_composer`] that differ between the Home and Board pages — bundled so the
+/// shared signature does not grow with page-specific knobs.
 pub struct ChatComposerOptions<'a, M> {
     /// A send is in flight — button disabled.
     pub sending: bool,
@@ -740,13 +673,11 @@ pub struct ChatComposerOptions<'a, M> {
     pub min_height: f32,
     pub max_height: f32,
     /// Action toolbar controls rendered alongside the send button inside the
-    /// input surface (Home's composer controls; empty for the plain Board
-    /// composer).
+    /// input surface (Home's composer controls; empty for the plain Board composer).
     pub controls: Vec<Element<'a, M>>,
     /// Grey the send button while the surface has nothing to send. Home passes
     /// whether the field is empty of attachments and idle — an attachment or a
-    /// running recording sends on its own; Board keeps its legacy always-active
-    /// look.
+    /// running recording sends on its own; Board keeps its legacy always-active look.
     pub grey_on_empty: bool,
     /// Tooltip text for the send button — surface-specific wording
     /// ("send text message" on Home, "send comment" on the Board ticket
@@ -826,8 +757,8 @@ pub fn chat_composer<'a, M: Clone + 'a>(
         tooltip::Position::Top,
     );
 
-    // Right-aligned action toolbar inside the input surface: controls (Home's;
-    // empty for the plain Board composer) then the send button.
+    // Right-aligned action toolbar inside the input surface: controls (Home's; empty for the plain
+    // Board composer) then the send button.
     let mut toolbar = Row::new()
         .spacing(theme::SPACE_6)
         .align_y(Alignment::Center);
@@ -837,10 +768,10 @@ pub fn chat_composer<'a, M: Clone + 'a>(
     }
     toolbar = toolbar.push(send_btn);
 
-    // Bubble-styled input surface: editor above, action icons below-right,
-    // inside one container matching the user message bubble form, stretched to
-    // the full width of the chat pane. Callers inset the bubble (Home's black
-    // composer strip) to keep small side margins; Board's modal already pads it.
+    // Bubble-styled input surface: editor above, action icons below-right, inside one container
+    // matching the user message bubble form, stretched to the full width of the chat pane. Callers
+    // inset the bubble (Home's black composer strip) to keep small side margins; Board's modal
+    // already pads it.
     container(column![input_editor, toolbar].spacing(theme::SPACE_6))
         .padding(theme::PAD_10)
         .style(theme::bubble_style(
@@ -851,13 +782,9 @@ pub fn chat_composer<'a, M: Clone + 'a>(
         .into()
 }
 
-/// Render formatted diff stats (+X/−Y) matching ticket card style.
-///
-/// Returns a [`Row`] showing only non-zero sides with a `/` separator.
-/// Returns an empty [`Row`] when both `added` and `removed` are zero.
-///
-/// Callers typically wrap this in a styled [`button()`] with an appropriate
-/// action message.
+/// Render formatted diff stats (+X/−Y) matching ticket card style: a [`Row`] of the non-zero sides
+/// separated by `/`, or an empty [`Row`] when both `added` and `removed` are zero. Callers
+/// typically wrap it in a styled [`button()`] with an appropriate action message.
 #[must_use]
 pub fn diff_stats_row<'a, Message: 'a>(added: i64, removed: i64, size: f32) -> Row<'a, Message> {
     let mut parts: Vec<Element<'a, Message>> = Vec::new();
@@ -885,13 +812,12 @@ pub fn diff_stats_row<'a, Message: 'a>(added: i64, removed: i64, size: f32) -> R
         .align_y(Alignment::Center)
 }
 
-/// Build the git footer diff-stats content: `+X/−Y` (non-zero sides), an
-/// optional "N files" indicator for oversized/binary untracked files, and an
-/// optional "N left out" warning for files the worktree read cap skipped.
+/// Build the git footer diff-stats content: `+X/−Y` (non-zero sides), an optional "N files"
+/// indicator for oversized/binary untracked files, and an optional "N left out" warning for files
+/// the worktree read cap skipped.
 ///
-/// Returns `None` when there is nothing to show (all stats zero). The
-/// file-count and omission warning are shown even when both line counts are
-/// zero so those files are never silently dropped from the footer.
+/// `None` when there is nothing to show (all stats zero). The file-count and omission warning are
+/// shown even when both line counts are zero, so those files are never silently dropped.
 #[must_use]
 pub fn git_footer_stats<'a, Message: 'a>(
     added: i64,
@@ -942,20 +868,15 @@ pub fn git_footer_stats<'a, Message: 'a>(
     )
 }
 
-// ── Debounce helpers ───────────────────────────────────────────────
+// Debounce helpers
 
 /// Spawn a sleep task that returns `generation` after `ms` milliseconds.
-///
-/// Used by `DebounceState` to implement
-/// debounced refresh: increment a generation counter, spawn this task
-/// with the new generation, and check the returned generation against
-/// the current counter in the response handler.
 pub async fn debounce_sleep(ms: u64, generation: u64) -> u64 {
     tokio::time::sleep(Duration::from_millis(ms)).await;
     generation
 }
 
-// ── File tree ───────────────────────────────────────────────────────
+// File tree
 
 /// A node in a shared file-tree sidebar.
 #[derive(Debug, Clone)]
@@ -1091,11 +1012,8 @@ impl FileTree {
         }
     }
 
-    /// Set the focus index to the visible-tree position of `path`, if found.
-    ///
-    /// Returns the found position, or [`None`] if `path` is not in the visible tree.
-    /// The caller can use the returned position for additional logic (e.g. advancing
-    /// focus past a directory to its first child).
+    /// Set the focus index to the visible-tree position of `path` if found, returning that position
+    /// so the caller can build on it (e.g. advancing past a directory to its first child).
     pub fn focus_path(&mut self, path: &str) -> Option<usize> {
         let pos = self
             .visible_tree_nodes
@@ -1105,16 +1023,12 @@ impl FileTree {
         Some(pos)
     }
 
-    /// Expand a directory and move keyboard focus to its first child.
+    /// Expand a directory and move focus to its first child, returning a scroll-into-view task.
     ///
-    /// Caller must have already inserted `path` into [`expanded_dirs`](Self::expanded_dirs)
-    /// and updated [`nodes`](Self::nodes). This method rebuilds the visible tree, locates
-    /// the directory in the new flattened list via [`Self::focus_path`], advances focus
-    /// to the entry immediately after it (the first child), and returns a scroll-into-view
-    /// task.
-    ///
-    /// Returns [`Task::none()`] if the directory is no longer in the visible tree or has
-    /// no children — focus stays on the directory itself in that case.
+    /// The caller must already have inserted `path` into [`expanded_dirs`](Self::expanded_dirs) and
+    /// updated [`nodes`](Self::nodes); this rebuilds the visible tree, locates the directory via
+    /// [`Self::focus_path`] and advances focus to the entry after it. [`Task::none()`] when the
+    /// directory left the visible tree or has no children — focus stays on it then.
     pub fn expand_dir_and_focus_first_child<Message: 'static>(
         &mut self,
         path: &str,
@@ -1133,15 +1047,12 @@ impl FileTree {
         Task::none()
     }
 
-    /// Collapse an expanded directory and keep keyboard focus on it.
+    /// Collapse an expanded directory and keep focus on it, returning a scroll-into-view task.
     ///
-    /// Caller must have already removed `path` from [`expanded_dirs`](Self::expanded_dirs)
-    /// and updated [`nodes`](Self::nodes). This method rebuilds the visible tree,
-    /// re-focuses the now-collapsed directory via [`Self::focus_path`], and returns a
-    /// scroll-into-view task.
-    ///
-    /// Returns [`Task::none()`] if the directory is no longer in the visible tree —
-    /// focus is left at whatever position it ended up at after rebuilding.
+    /// The caller must already have removed `path` from [`expanded_dirs`](Self::expanded_dirs) and
+    /// updated [`nodes`](Self::nodes); this rebuilds the visible tree and re-focuses the collapsed
+    /// directory. [`Task::none()`] when the directory left the visible tree — focus stays wherever
+    /// the rebuild left it.
     pub fn collapse_dir_and_keep_focus<Message: 'static>(&mut self, path: &str) -> Task<Message> {
         debug_assert!(
             !self.expanded_dirs.contains(path),
@@ -1155,9 +1066,9 @@ impl FileTree {
         Task::none()
     }
 
-    /// Move focus to the parent of the focused node (ArrowLeft on a collapsed
-    /// directory or file). Returns a snap-to-top scroll task, or [`Task::none()`]
-    /// when the focused item has no parent in the visible tree.
+    /// Move focus to the parent of the focused node (ArrowLeft on a collapsed directory or file),
+    /// returning a snap-to-top scroll task, or [`Task::none()`] when the item has no visible
+    /// parent.
     pub fn focus_parent<Message: 'static>(&mut self) -> Task<Message> {
         match self.focused_parent_path() {
             Some(ref p) if self.focus_path(p).is_some() => {
@@ -1168,12 +1079,8 @@ impl FileTree {
         }
     }
 
-    /// Move focus to the row after `idx` (the first child of an expanded
-    /// directory), if it exists. Returns a snap-to-top scroll task.
-    ///
-    /// `idx` is the already-clamped focused index from [`Self::focused_tree_node`];
-    /// keeping it a parameter preserves the caller's bounds-check view even if a
-    /// tree rebuild re-clamped `tree_focus_index`.
+    /// Move focus to the row after `idx` (the first child of an expanded directory), if it exists,
+    /// returning a snap-to-top scroll task.
     pub fn focus_next_row<Message: 'static>(&mut self, idx: usize) -> Task<Message> {
         if idx + 1 < self.visible_tree_nodes.len() {
             self.tree_focus_index = idx + 1;
@@ -1183,10 +1090,8 @@ impl FileTree {
         }
     }
 
-    /// Move focus one visible node in `direction` and scroll it into view.
-    ///
-    /// Returns [`Task::none()`] when the tree is not focused or focus is already
-    /// at the boundary.
+    /// Move focus one visible node in `direction` and scroll it into view. [`Task::none()`] when
+    /// the tree is not focused or focus is already at the boundary.
     pub fn nav_and_scroll<Message: 'static>(
         &mut self,
         direction: TreeNavDirection,
@@ -1202,14 +1107,8 @@ impl FileTree {
         }
     }
 
-    /// Return the focused visible tree node, if the tree has focus and is non-empty.
-    ///
-    /// Returns `None` when the tree is not focused or there are no visible nodes.
-    /// Otherwise returns `(clamped_index, path, is_dir)` where `clamped_index` is
-    /// `tree_focus_index` clamped to `visible_tree_nodes.len() - 1`. The clamped
-    /// index is returned (rather than the raw `tree_focus_index`) so callers can
-    /// safely use it for subsequent adjacency checks (e.g. `idx + 1` bounds check
-    /// in `TreeNavRight`).
+    /// The focused visible tree node, if the tree has focus and is non-empty:
+    /// `(clamped_index, path, is_dir)`.
     #[must_use]
     pub fn focused_tree_node(&self) -> Option<(usize, String, bool)> {
         if !self.tree_focused || self.visible_tree_nodes.is_empty() {
@@ -1221,27 +1120,20 @@ impl FileTree {
         Some((idx, path, is_dir))
     }
 
-    /// Returns `true` when the focused node is a directory and is currently expanded.
-    ///
-    /// This is a read-only inspection helper that centralises the common
-    /// `is_dir && expanded_dirs.contains(path)` check that appears in tree-navigation
-    /// keyboard handlers.  Returns `false` when the tree is not focused, empty, or
-    /// the focused node is a file or a collapsed directory.
+    /// Whether the focused node is a directory and is currently expanded — the
+    /// `is_dir && expanded_dirs.contains(path)` check centralised for the tree-navigation keyboard
+    /// handlers. `false` when the tree is not focused or is empty, or the node is a file or a
+    /// collapsed directory.
     #[must_use]
     pub fn focused_is_expanded_dir(&self) -> bool {
         self.focused_tree_node()
             .is_some_and(|(_, ref path, is_dir)| is_dir && self.expanded_dirs.contains(path))
     }
 
-    /// Returns the parent path of the focused node, or [`None`] for root-level items.
-    ///
-    /// Computes the parent by calling [`std::path::Path::parent`] on the focused
-    /// node's full path.  Returns [`None`] when the tree is not focused, empty, or
-    /// the focused node is already at the root (no parent).
-    ///
-    /// This is a read-only helper that replaces the repeated
-    /// `Path::new(&path).parent().map(|p| p.to_string_lossy().to_string())`
-    /// pattern in tree-navigation keyboard handlers.
+    /// The parent path of the focused node, or [`None`] for root-level items — replacing the
+    /// repeated `Path::new(&path).parent().map(|p| p.to_string_lossy().to_string())` pattern in
+    /// tree-navigation keyboard handlers. [`None`] when the tree is not focused, is empty, or the
+    /// node is already at the root.
     #[must_use]
     fn focused_parent_path(&self) -> Option<String> {
         let (_idx, path, _is_dir) = self.focused_tree_node()?;
@@ -1258,63 +1150,40 @@ impl FileTree {
 /// Font size for file tree item labels and connector guides.
 pub const TREE_FONT_SIZE: f32 = 14.0;
 
-/// Icon size for all file-tree node icons (directories and files). Slightly
-/// larger than [`TREE_FONT_SIZE`] to compensate for lucide icons appearing
-/// smaller at the same nominal point size.
+/// Icon size for all file-tree node icons (directories and files) — slightly larger than
+/// [`TREE_FONT_SIZE`] because lucide icons appear smaller at the same nominal point size.
 pub const TREE_ICON_SIZE: f32 = 15.0;
 
-/// Minimum width of the auto-sizing file-tree panel — the tree never gets
-/// narrower than this (matches the previous fixed 260px width).
+/// Minimum width of the auto-sizing file-tree panel — it never gets narrower (the previous fixed
+/// 260px width).
 pub const TREE_MIN_WIDTH: f32 = 260.0;
 
-/// Maximum width cap of the auto-sizing file-tree panel. The cap guarantees
-/// sibling panels (editor content, diff content) keep a sane minimum width
-/// at the smallest supported window size.
+/// Maximum width cap of the auto-sizing file-tree panel: it guarantees sibling panels (editor
+/// content, diff content) keep a sane minimum width at the smallest supported window size.
 pub const TREE_MAX_WIDTH: f32 = 400.0;
 
-/// Glyph advance of JetBrains Mono as a fraction of em. Every glyph the tree
-/// rows render — ASCII, box-drawing (`│ ├ └`), `⚠`, `…`, `−` (U+2212), `/`,
-/// digits — measures exactly 0.6em in both the Regular and Bold faces
-/// (verified from the TTFs in `src/gui/`), so `chars × size × 0.6` is an exact
-/// width, not an estimate. The dashboard default font is JetBrains Mono
-/// (see [`super::JETBRAINS_MONO`]), so `text()` widgets without an explicit
-/// font (diff ± counts, `[⚠]` suffixes) use it too.
+/// Glyph advance of JetBrains Mono as a fraction of em. Every glyph the tree rows render — ASCII,
+/// box-drawing (`│ ├ └`), `⚠`, `…`, `−` (U+2212), `/`, digits — measures exactly 0.6em in both the
+/// Regular and Bold faces (verified from the TTFs in `src/gui/`), so `chars × size × 0.6` is an
+/// exact width, not an estimate. The dashboard default font is JetBrains Mono (see
+/// [`super::JETBRAINS_MONO`]), so `text()` widgets without an explicit font (diff ± counts, `[⚠]`
+/// suffixes) use it too.
 const JETBRAINS_MONO_ADVANCE: f32 = 0.6;
 
-/// Glyph advance of the lucide icon font as a fraction of em (verified from
-/// the lucide TTF). Every icon in the tree measures exactly 1.0em, so an
-/// icon rendered via `.size(s)` is `s` px wide.
+/// Glyph advance of the lucide icon font as a fraction of em (verified from the lucide TTF): every
+/// tree icon measures exactly 1.0em, so an icon rendered via `.size(s)` is `s` px wide.
 const LUCIDE_ADVANCE: f32 = 1.0;
 
-/// Width in px of `chars` glyphs of JetBrains Mono at `size` px.
-///
-/// Exact for every glyph the tree renders — see [`JETBRAINS_MONO_ADVANCE`].
+/// Width in px of `chars` glyphs of JetBrains Mono at `size` px — exact for every glyph the tree
+/// renders, see [`JETBRAINS_MONO_ADVANCE`].
 #[must_use]
 #[expect(clippy::cast_precision_loss)] // usize glyph count → px width
 fn mono_text_width(chars: usize, size: f32) -> f32 {
     chars as f32 * size * JETBRAINS_MONO_ADVANCE
 }
 
-/// Natural content width of a rendered tree row, excluding the scrollable
-/// wrapper's horizontal inset (added by [`tree_panel_width`]).
-///
-/// Replicates the exact row composition in the editor and diff renderers:
-/// `guide_chars` box-drawing guide glyphs (14px) + a lucide icon at
-/// `icon_size` px + a 4px gap + the name label at `name_size` px, an optional
-/// `name_suffix` segment preceded by another 4px gap (editor error file rows
-/// render `[⚠]` at 11px), and — for diff file rows — the ± change counts at
-/// 10px followed by a 6px trailing gap.
-///
-/// `counts` is `Some((add, remove))` for diff file rows (either string may be
-/// empty; the 6px trailing gap is part of the row either way) and `None` for
-/// every other row type. When both strings are non-empty they render as
-/// `"{add}/{remove}"` — a single `/` separator at 10px. The removed side uses
-/// the unicode minus U+2212, which occupies one monospace cell like ASCII, so
-/// the `add + 1 + rem` char arithmetic is unchanged.
-///
-/// JetBrains Mono is monospace with a single advance for all weights, so the
-/// bold name of selected rows and the regular name of unselected rows measure
-/// identically.
+/// Natural content width of a rendered tree row, excluding the scrollable wrapper's horizontal
+/// inset (added by [`tree_panel_width`]).
 #[must_use]
 pub fn tree_row_natural_width(
     guide_chars: usize,
@@ -1344,12 +1213,9 @@ pub fn tree_row_natural_width(
     w
 }
 
-/// Collect the natural content width of every rendered tree row, in render
-/// order (one entry per row — the same DFS order as the recursive node
-/// renderers, which may nest multiple rows per root element).
-///
-/// Mirrors the render walk: a directory row is followed by its children's
-/// rows when the directory is expanded. `row_width` computes one row's
+/// The natural content width of every rendered tree row, in render order (one entry per row — the
+/// same DFS order as the recursive node renderers, which may nest multiple rows per root element):
+/// a directory row is followed by its children's rows when expanded. `row_width` computes one row's
 /// width from the node and its nesting `depth` (0 = root).
 pub fn collect_tree_row_widths(
     nodes: &[TreeNode],
@@ -1375,26 +1241,19 @@ pub fn collect_tree_row_widths(
     out
 }
 
-/// Compute the auto-sized width of the tree panel from the natural content
-/// width of every rendered row (in render order — see
-/// [`collect_tree_row_widths`]).
+/// The auto-sized width of the tree panel from the natural content width of every rendered row (in
+/// render order — see [`collect_tree_row_widths`]).
 ///
-/// Only rows currently visible in the viewport are measured. The visible
-/// range is derived from [`FileTree::scroll_y`] / [`FileTree::viewport_h`]
-/// with [`ESTIMATED_TREE_ROW_HEIGHT`] row spacing, extended by one row on
-/// each side to absorb height-estimate drift (over-measuring is safe; the
-/// result is clamped either way).
+/// Only rows currently visible in the viewport are measured: the visible range comes from
+/// [`FileTree::scroll_y`] / [`FileTree::viewport_h`] with [`ESTIMATED_TREE_ROW_HEIGHT`] row
+/// spacing, extended by one row on each side to absorb height-estimate drift (over-measuring is
+/// safe — the result is clamped either way). Before the first scroll event — and for trees whose
+/// content fits without scrolling, where Iced never fires `on_scroll` (see
+/// [`FileTree::viewport_h`]) — `viewport_h` is `None` and all rows are measured.
 ///
-/// Before the first scroll event — and for trees whose content fits without
-/// scrolling, where Iced never fires `on_scroll` (see
-/// [`FileTree::viewport_h`]) — `viewport_h` is `None` and all rows are
-/// measured: the documented fallback.
-///
-/// The result is the widest measured row's natural content width plus the
-/// vertical scrollable wrapper's horizontal inset on both sides
-/// ([`SCROLL_H_PAD`], which also clears the 6px overlay scrollbar with 2px to
-/// spare), clamped to [`TREE_MIN_WIDTH`]..=[`TREE_MAX_WIDTH`]. A tree whose
-/// rows all fit at the minimum width stays at [`TREE_MIN_WIDTH`].
+/// The result is the widest measured row plus the vertical scrollable wrapper's horizontal inset on
+/// both sides ([`SCROLL_H_PAD`], which also clears the 6px overlay scrollbar with 2px to spare),
+/// clamped to [`TREE_MIN_WIDTH`]..=[`TREE_MAX_WIDTH`].
 #[must_use]
 #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // viewport px → row index
 fn tree_panel_width(file_tree: &FileTree, row_widths: &[f32]) -> f32 {
@@ -1411,53 +1270,39 @@ fn tree_panel_width(file_tree: &FileTree, row_widths: &[f32]) -> f32 {
                 .map(|(_, w)| *w)
                 .fold(0.0f32, f32::max)
         }
-        // Viewport unknown — measure everything (first frame / non-scrolling
-        // tree, where every row is visible anyway).
+        // Viewport unknown — measure everything (first frame / non-scrolling tree, where every row
+        // is visible anyway).
         _ => row_widths.iter().copied().fold(0.0f32, f32::max),
     };
     (widest + 2.0 * SCROLL_H_PAD).clamp(TREE_MIN_WIDTH, TREE_MAX_WIDTH)
 }
 
-/// Controls whether [`scroll_to_tree_focus`] snaps to the focused row or
-/// uses viewport-aware scroll-into-view logic.
+/// Controls whether [`scroll_to_tree_focus`] snaps to the focused row or uses viewport-aware
+/// scroll-into-view logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScrollMode {
     /// Scroll so that the focused row is at the top of the viewport.
     SnapToTop,
-    /// Only scroll when the focused row is outside the visible viewport.
-    /// Requires [`FileTree::viewport_h`] to be `Some`; falls back to
+    /// Only scroll when the focused row is outside the visible viewport. Requires
+    /// [`FileTree::viewport_h`] to be `Some`; falls back to
     /// [`SnapToTop`](ScrollMode::SnapToTop) when unknown.
     ScrollIntoView,
 }
 
-/// Estimated height per tree row for scroll-into-view on keyboard navigation.
-/// Derived from [`TREE_ICON_SIZE`] × Iced's default relative line height (1.3)
-/// for a close approximation of actual rendered row height. All tree rows
-/// (file and directory) are ~19.5 px because both render [`TREE_ICON_SIZE`]
-/// icons.
-///
-/// This constant is used directly by [`scroll_to_tree_focus`] to compute
-/// row positions for keyboard-navigation scroll-into-view logic.
+/// Estimated height per tree row for scroll-into-view on keyboard navigation, from
+/// [`TREE_ICON_SIZE`] × Iced's default relative line height (1.3); all rows are ~19.5 px
+/// because both file and directory rows render [`TREE_ICON_SIZE`] icons. Used directly by
+/// [`scroll_to_tree_focus`] to compute row positions.
 const ESTIMATED_TREE_ROW_HEIGHT: f32 = TREE_ICON_SIZE * 1.3;
 
-/// Scroll the tree panel to bring the focused row into view.
+/// Scroll the tree panel to bring the focused row into view. [`ScrollMode::SnapToTop`] jumps to
+/// `tree_focus_index * ESTIMATED_TREE_ROW_HEIGHT`; [`ScrollMode::ScrollIntoView`] scrolls only when
+/// the row is not fully visible — bringing a row above the viewport to the top, advancing by one
+/// row height for a row below it — and falls back to snap-to-top when [`FileTree::viewport_h`] is
+/// `None`. Rows are `ESTIMATED_TREE_ROW_HEIGHT` tall.
 ///
-/// Behaviour depends on [`ScrollMode`]:
-///
-/// * [`SnapToTop`](ScrollMode::SnapToTop): absolute offset to
-///   `tree_focus_index * ESTIMATED_TREE_ROW_HEIGHT`.
-/// * [`ScrollIntoView`](ScrollMode::ScrollIntoView): only scrolls when the
-///   focused row is not fully visible — for rows above the viewport the
-///   row is brought to the top, for rows below the viewport the view
-///   advances by one row height. Falls back to [`ScrollMode::SnapToTop`] when the
-///   viewport height is unknown ([`FileTree::viewport_h`] is `None`).
-///
-/// Row height is approximated by [`ESTIMATED_TREE_ROW_HEIGHT`], derived
-/// from [`TREE_ICON_SIZE`] × Iced's default relative line height (1.3).
-///
-/// This method updates [`FileTree::scroll_y`] directly so that consecutive
-/// calls during the same frame see an accurate scroll offset even before the
-/// `on_scroll` callback fires.
+/// [`FileTree::scroll_y`] is updated directly so consecutive calls in one frame see an accurate
+/// offset even before the `on_scroll` callback fires.
 #[expect(clippy::cast_precision_loss)]
 fn scroll_to_tree_focus<Message: 'static>(
     file_tree: &mut FileTree,
@@ -1477,10 +1322,9 @@ fn scroll_to_tree_focus<Message: 'static>(
                 absolute_scroll_to(file_tree, focus_y)
             }
             Some(viewport_h) => {
-                // A row is considered "above viewport" when the bottom edge
-                // of the row is above the viewport top. This avoids redundant
-                // scrolling when a row is partially visible at the top edge
-                // after non-row-aligned mouse-wheel scrolling.
+                // "Above viewport" means the row's bottom edge is above the viewport top: this
+                // avoids redundant scrolling when a row is partially visible at the top edge after
+                // non-row-aligned mouse-wheel scrolling.
                 let row_bottom = focus_y + ESTIMATED_TREE_ROW_HEIGHT;
                 let viewport_bottom = file_tree.scroll_y + viewport_h;
 
@@ -1488,9 +1332,9 @@ fn scroll_to_tree_focus<Message: 'static>(
                     // Focus is above the visible area — bring it to the top.
                     absolute_scroll_to(file_tree, focus_y)
                 } else if focus_y >= viewport_bottom {
-                    // Focus is below the visible area — advance by one row
-                    // and update scroll_y directly so the next key event
-                    // sees accurate state even before on_scroll fires.
+                    // Focus is below the visible area — advance by one row and update scroll_y
+                    // directly so the next key event sees accurate state even before on_scroll
+                    // fires.
                     file_tree.scroll_y = (file_tree.scroll_y + ESTIMATED_TREE_ROW_HEIGHT).max(0.0);
                     iced::widget::operation::scroll_by(
                         file_tree.tree_scroll_id.clone(),
@@ -1523,33 +1367,21 @@ fn absolute_scroll_to<Message: 'static>(file_tree: &mut FileTree, y: f32) -> Tas
     )
 }
 
-/// Build a file-tree panel widget.
+/// Build a file-tree panel widget: a scrollable, auto-width column over the pre-built `tree_rows`,
+/// sized to the widest currently visible row (see [`tree_panel_width`]) and bordered when
+/// `file_tree.tree_focused`.
 ///
-/// Renders a scrollable, auto-width column wrapping the pre-built
-/// `tree_rows` elements. The panel width adapts to the widest currently
-/// visible row (see [`tree_panel_width`]); a focus border is applied when
-/// `file_tree.tree_focused` is true.
+/// `row_widths` is the natural content width of every rendered row in render order — the DFS order
+/// of the recursive node renderers, see [`collect_tree_row_widths`]. `on_scroll` is attached to the
+/// inner [`vscroll_tracked`] wrapper and fires on every viewport change (scrollbar drag, wheel,
+/// programmatic scroll); the caller turns it into a message updating [`FileTree::scroll_y`] and
+/// [`FileTree::viewport_h`].
 ///
-/// `row_widths` holds the natural content width of every rendered row in
-/// render order — one entry per row, in the same DFS order as the recursive
-/// node renderers (which may nest multiple rows per root element). See
-/// [`collect_tree_row_widths`].
-///
-/// `on_scroll` is attached to the inner [`vscroll_tracked`] wrapper and fires
-/// whenever the viewport changes
-/// (scrollbar drag, mouse wheel, programmatic scroll). The caller should
-/// produce a message that updates [`FileTree::scroll_y`] and
-/// [`FileTree::viewport_h`] from the [`iced::widget::scrollable::Viewport`] data.
-///
-/// Rows render inside the wrapper's uniform [`SCROLL_H_PAD`] inset, so row
-/// hover/highlight backgrounds sit 8px inside the panel edges rather than
-/// touching them.
-///
-/// `top_inset` is the permanent gap between the panel's top edge and the first
-/// row. It pads the surface container above the scroll viewport, so the
-/// surface still reaches the panel's top while rows never touch the window
-/// edge, even while scrolling. Pass `0.0` for a tree that already sits below
-/// its own chrome (the diff view).
+/// Rows render inside the wrapper's uniform [`SCROLL_H_PAD`] inset, so hover/highlight backgrounds
+/// sit 8px inside the panel edges. `top_inset` is the permanent gap above the first row: it pads
+/// the surface container above the scroll viewport, so the surface reaches the panel's top while
+/// rows never touch the window edge even while scrolling. Pass `0.0` for a tree that already sits
+/// below its own chrome (the diff view).
 pub fn build_tree_panel<'a, Message: 'a>(
     file_tree: &'a FileTree,
     tree_rows: Vec<Element<'a, Message>>,
@@ -1590,30 +1422,9 @@ pub fn build_tree_panel<'a, Message: 'a>(
     }
 }
 
-// ── Tree node helpers ──────────────────────────────────────────────
-
-/// Build the guide-line prefix string for a tree node.
-///
-/// Returns box-drawing characters that visually connect tree siblings:
-///
-/// | Character | Meaning |
-/// |---|---|
-/// | `│` | Vertical continuation — the ancestor at this depth has more siblings below |
-/// | `├` | T-junction — this node has at least one more sibling after it |
-/// | `└` | Corner — this node is the last child of its parent |
-/// | ` `  | No continuation at this ancestor level |
-///
-/// Each depth level uses exactly two characters (guide char + one space), so
-/// the total visual width per level closely matches the existing 14 px indent.
-///
-/// `ancestor_mask` has bit `d` set iff the ancestor at depth `d` has more
-/// siblings after it (requiring a vertical continuation line at that column).
-/// `depth` is the current nesting depth (0 = root, which gets no prefix).
-/// `is_last` is true when this node is the last child of its parent.
-///
-/// # Panics
-///
-/// Panics in debug builds when `depth >= 64` (the u64 bitmask would overflow).
+/// `ancestor_mask` has bit `d` set iff the ancestor at depth `d` has more siblings after it
+/// (needing a continuation line at that column); `depth` is the nesting depth (0 = root, no
+/// prefix); `is_last` marks the last child of its parent.
 #[must_use]
 pub fn tree_guide_prefix(ancestor_mask: u64, depth: usize, is_last: bool) -> String {
     debug_assert!(
@@ -1640,15 +1451,10 @@ pub fn tree_guide_prefix(ancestor_mask: u64, depth: usize, is_last: bool) -> Str
     s
 }
 
-/// Recursively render children of a tree node, computing the correct
-/// continuation mask and `is_last` state for each child.
-///
-/// `render_node` is called for each child with `(child, depth+1, child_mask, child_is_last)`.
-/// The returned elements share the lifetime `'a` of the tree nodes.
-/// Returns a `Vec` of child elements, one per child, in order.
-///
-/// This exists to avoid duplicating the child-iteration + mask-computation
-/// logic across the two render paths (editor and diff file trees).
+/// Render a tree node's children in order, computing each child's continuation mask and `is_last`:
+/// `render_node` is called with `(child, depth+1, child_mask, child_is_last)` and the returned
+/// elements share the nodes' `'a`. One place for the child-iteration and mask logic, shared by the
+/// editor and diff file trees.
 pub fn render_tree_children<'a, Message>(
     children: &'a [TreeNode],
     depth: usize,
@@ -1669,10 +1475,8 @@ pub fn render_tree_children<'a, Message>(
         .collect()
 }
 
-/// Dispatch a file-tree node to its dir or file renderer.
-///
-/// Shared by the editor and diff file trees so the `is_dir` branching lives
-/// in one place; exactly one of the two closures is invoked.
+/// Dispatch a file-tree node to its dir or file renderer — one place for the `is_dir` branching,
+/// shared by the editor and diff trees; exactly one closure is invoked.
 pub fn render_tree_node<'a, Message>(
     is_dir: bool,
     render_dir: impl FnOnce() -> Element<'a, Message>,
@@ -1681,8 +1485,7 @@ pub fn render_tree_node<'a, Message>(
     if is_dir { render_dir() } else { render_file() }
 }
 
-/// Check whether a tree node at the given path is currently focused
-/// in the file tree's keyboard navigation.
+/// Whether the tree node at `node_path` is the focused one in keyboard navigation.
 #[must_use]
 pub fn tree_node_focused(tree: &FileTree, node_path: &str) -> bool {
     tree.tree_focused
@@ -1690,9 +1493,8 @@ pub fn tree_node_focused(tree: &FileTree, node_path: &str) -> bool {
         && tree.visible_tree_nodes[tree.tree_focus_index].0 == node_path
 }
 
-/// Return a button style closure for tree node entries.
-/// When `is_highlighted` is true, uses [`theme::HOVER_STRONG`]; otherwise
-/// hover gets [`theme::HOVER`], and default is transparent.
+/// A button style closure for tree node entries: `is_highlighted` gives [`theme::HOVER_STRONG`],
+/// otherwise hover is [`theme::HOVER`] and default is transparent.
 fn tree_node_button_style(
     is_highlighted: bool,
 ) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
@@ -1711,12 +1513,9 @@ fn tree_node_button_style(
     }
 }
 
-/// Build a tree-node button from a content row, highlight state, and
-/// optional press message. Uses `tree_node_button_style` internally
-/// and spans full width.
-///
-/// This returns only the button element — callers that need context menus
-/// (e.g., the editor page) must wrap the result themselves.
+/// Build a full-width tree-node button from a content row, highlight state and optional press
+/// message. Returns only the button element — callers needing context menus (e.g. the editor page)
+/// wrap the result themselves.
 pub fn tree_node_button<'a, Message: Clone + 'a>(
     content: impl Into<Element<'a, Message>>,
     is_highlighted: bool,
@@ -1732,11 +1531,10 @@ pub fn tree_node_button<'a, Message: Clone + 'a>(
     btn.into()
 }
 
-/// Shared tree-row scaffold for the editor and diff file trees: guide
-/// glyphs (TEXT_MUTED at [`TREE_FONT_SIZE`]) + icon + 4px gap + name +
-/// Fill spacer, plus the optional diff counts slot followed by a 6px
-/// trailing gap. This is the render-side counterpart of
-/// [`tree_row_natural_width`] — keep the two in lockstep.
+/// Shared tree-row scaffold for the editor and diff file trees: guide glyphs (TEXT_MUTED at
+/// [`TREE_FONT_SIZE`]) + icon + 4px gap + name + Fill spacer, plus the optional diff counts slot
+/// and its 6px trailing gap. The render-side counterpart of [`tree_row_natural_width`] — keep the
+/// two in lockstep.
 pub fn tree_row<'a, Message: 'a>(
     guide: String,
     icon: Element<'a, Message>,
@@ -1755,17 +1553,8 @@ pub fn tree_row<'a, Message: 'a>(
     row.align_y(Alignment::Center)
 }
 
-/// Build the semi-transparent click-to-dismiss backdrop layer shared by all
-/// modal overlays. The backdrop is a full-screen [`mouse_area`] that emits
-/// `on_backdrop` when clicked.
-///
-/// It reports [`iced::mouse::Interaction::Idle`] over its whole area, so the
-/// parent `Stack` levitates the cursor for the page below: nothing behind an
-/// open overlay reacts to the pointer — hover or wheel — while the overlay's
-/// own content is unaffected, levitation applying only to the layers under it.
-///
-/// Extracted from [`modal_backdrop`] so the 80%-width diff overlay can
-/// compose the same backdrop while claiming only its dialog rectangle.
+/// The semi-transparent click-to-dismiss backdrop layer shared by all modal overlays: a full-screen
+/// [`mouse_area`] emitting `on_backdrop` when clicked.
 pub(super) fn modal_backdrop_layer<'a, Message: 'a + Clone>(
     on_backdrop: Message,
     opacity: f32,
@@ -1786,15 +1575,11 @@ pub(super) fn modal_backdrop_layer<'a, Message: 'a + Clone>(
     .into()
 }
 
-/// Claim clicks over a dialog box so they do not fall through to the modal
-/// backdrop, while leaving the surrounding margin clickable.
-///
-/// The [`mouse_area`] reports [`iced::mouse::Interaction::Idle`] when the cursor
-/// is over the dialog and the content is non-interactive. That non-`None`
-/// interaction levitates the cursor in the parent `Stack`, so the backdrop sees
-/// a levitating cursor and bails instead of closing the modal. Interactive inner
-/// elements still capture their own events first, and the surrounding margin
-/// still reaches the backdrop.
+/// Claim clicks over a dialog box so they do not fall through to the modal backdrop, while leaving
+/// the surrounding margin clickable. The [`mouse_area`] reports [`iced::mouse::Interaction::Idle`]
+/// over a non-interactive dialog, and that non-`None` interaction levitates the cursor in the
+/// parent `Stack` so the backdrop bails instead of closing the modal. Interactive inner elements
+/// still capture their own events first.
 pub(super) fn dialog_click_guard<'a, Message: 'a + Clone>(
     content: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
@@ -1803,33 +1588,18 @@ pub(super) fn dialog_click_guard<'a, Message: 'a + Clone>(
         .into()
 }
 
-/// Wrap dialog content in a centered modal overlay with a semi-transparent
-/// backdrop that closes on click.
+/// Wrap dialog content in a centered modal overlay with a semi-transparent backdrop that closes on
+/// click — the shared helper for every modal backdrop pattern in the dashboard. It stacks a
+/// click-to-dismiss backdrop with a centered container for the content, wrapped in
+/// [`dialog_click_guard`] so clicks on non-interactive interior areas do not fall through and close
+/// the modal. It does **not** apply `dialog_container_style` or padding: callers style `content`
+/// themselves.
 ///
-/// This is the shared helper for all modal backdrop patterns across the
-/// dashboard. It creates a stack with a click-to-dismiss backdrop and a
-/// centered container for the dialog content, wrapped in [`dialog_click_guard`]
-/// so clicks on non-interactive interior areas do not fall through to the
-/// backdrop and close the modal.
-///
-/// This helper does **not** apply `dialog_container_style` or padding —
-/// callers are responsible for styling their content as needed before
-/// passing it in.
-///
-/// # Content contract
-/// `content` must be a bounded dialog bubble (not `Length::Fill` on the outer
-/// dimension). [`dialog_click_guard`] claims the content's whole rectangle, so
-/// full-window content would claim the screen and make the backdrop
-/// unreachable — silently breaking outside-click. The 80%-width diff
-/// overlay composes the backdrop directly via [`modal_backdrop_layer`] for
-/// exactly this reason.
-///
-/// # Parameters
-/// - `content`: The dialog body to overlay. Should already be styled
-///   (container, padding, etc.) by the caller as needed.
-/// - `on_backdrop`: Message to emit when the backdrop is clicked.
-/// - `opacity`: Opacity of the backdrop (e.g., `0.5` for standard
-///   semi-transparent black, `0.4` for lighter).
+/// `content` must be a bounded dialog bubble (not `Length::Fill` on the outer dimension) — the
+/// guard claims its whole rectangle, so full-window content would claim the screen and make the
+/// backdrop unreachable, silently breaking outside-click. The 80%-width diff overlay composes the
+/// backdrop directly via [`modal_backdrop_layer`] for exactly this reason. `on_backdrop` fires on a
+/// backdrop click; `opacity` is its alpha (`0.5` standard, `0.4` lighter).
 pub fn modal_backdrop<'a, Message: 'a + Clone>(
     content: impl Into<Element<'a, Message>>,
     on_backdrop: Message,
@@ -1846,12 +1616,11 @@ pub fn modal_backdrop<'a, Message: 'a + Clone>(
     stack([backdrop, centered.into()]).into()
 }
 
-/// Zero-size placeholder that keeps an overlay slot's widget type stable
-/// across show/hide transitions. Iced destroys widget state (scroll
-/// positions, open popovers) when the widget tree tag changes between
-/// frames, so the closed state must return the identical bare Container.
-/// Callers whose open state is a Stack wrap this in `iced::widget::stack([...])`;
-/// others pair it with a matching container-typed closed state.
+/// Zero-size placeholder that keeps an overlay slot's widget type stable across show/hide
+/// transitions: Iced destroys widget state (scroll positions, open popovers) when the widget tree
+/// tag changes between frames, so the closed state must return the identical bare Container.
+/// Callers whose open state is a Stack wrap this in `iced::widget::stack([...])`; others pair it
+/// with a matching container-typed closed state.
 pub fn empty_stack_placeholder<'a, Message: 'a>() -> Element<'a, Message> {
     container(text(""))
         .width(Length::Shrink)
@@ -1859,15 +1628,13 @@ pub fn empty_stack_placeholder<'a, Message: 'a>() -> Element<'a, Message> {
         .into()
 }
 
-/// Wrap `content` so a completed click (press+release without a selection
-/// drag) inside it publishes `on_click`, while selection gestures publish
-/// `on_cancel`: the second click of a multi-click sequence (a word/line
-/// selection), or a drag starting inside the content. `on_cancel` lets a
-/// consumer that defers its toggle past [`DOUBLE_CLICK_WINDOW`] drop it, so
-/// selection never fights a pending toggle; a third+ click publishes
-/// nothing. A click the child answers with a message of its own — e.g. a
-/// markdown link click — publishes `on_cancel` only when a click sequence
-/// was already in progress.
+/// Wrap `content` so a completed click (press+release without a selection drag) inside it publishes
+/// `on_click`, while selection gestures publish `on_cancel`: the second click of a multi-click
+/// sequence (word/line selection) or a drag starting inside the content. `on_cancel` lets a
+/// consumer that defers its toggle past [`DOUBLE_CLICK_WINDOW`] drop it, so selection never fights
+/// a pending toggle; a third+ click publishes nothing. A click the child answers with a message of
+/// its own (e.g. a markdown link) publishes `on_cancel` only when a click sequence was already in
+/// progress.
 #[must_use]
 pub fn click_to_toggle<'a, Message: Clone + 'a>(
     content: impl Into<Element<'a, Message>>,
@@ -1890,19 +1657,15 @@ enum ClickKind {
     MultiClick,
 }
 
-/// Max cursor travel (px) between press and release for the pair to count as
-/// a click rather than a drag. Shared with [`super::selectable`], so both read
-/// a sloppy press the same way.
+/// Max cursor travel (px) between press and release for the pair to count as a click rather than a
+/// drag. Shared with [`super::selectable`], so both read a sloppy press the same way.
 pub(crate) const CLICK_DRAG_MAX_DISTANCE: f32 = 6.0;
-/// Max gap between consecutive presses for the second+ one to be a
-/// double/triple click (word/line selection, not a toggle). Shared with
-/// [`super::selectable`].
+/// Max gap between consecutive presses for the second+ one to be a double/triple click (word/line
+/// selection, not a toggle). Shared with [`super::selectable`].
 pub(crate) const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(300);
 
-/// Classify a press+release pair by cursor travel and time since the last click.
-///
-/// The [`DOUBLE_CLICK_WINDOW`] boundary is inclusive: a gap of exactly 300 ms
-/// still counts as a multi-click.
+/// Classify a press+release pair by cursor travel and time since the last click. The
+/// [`DOUBLE_CLICK_WINDOW`] boundary is inclusive: exactly 300 ms still counts as a multi-click.
 fn classify_click(distance: f32, since_last_click: Option<Duration>) -> ClickKind {
     if distance > CLICK_DRAG_MAX_DISTANCE {
         return ClickKind::Drag;
@@ -2002,11 +1765,10 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        // Run the child with its own message buffer so we can tell whether the
-        // child produced a message of its own for this event (e.g. a markdown
-        // link click publishing `LinkClicked` on release) — such a click
-        // already carries meaning and must not ALSO toggle the block. Merging
-        // back preserves the child's capture/redraw/layout requests.
+        // Run the child with its own message buffer to see whether it produced a message for this
+        // event (e.g. a markdown link publishing `LinkClicked` on release) — such a click already
+        // carries meaning and must not ALSO toggle the block. Merging back preserves the child's
+        // capture/redraw/layout requests.
         let mut child_messages = Vec::new();
         let mut child_shell = Shell::new(&mut child_messages);
         self.content.as_widget_mut().update(
@@ -2108,9 +1870,8 @@ impl<Message: Clone, Theme, Renderer> ClickToggle<'_, Message, Theme, Renderer> 
                 }
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
-                // A drag starting inside the content is a selection gesture:
-                // cancel a deferred toggle before it could commit
-                // mid-selection.
+                // A drag starting inside the content is a selection gesture: cancel a deferred
+                // toggle before it could commit mid-selection.
                 if let (Some(press_position), Some(position)) = (state.press, cursor.position())
                     && position.distance(press_position) > CLICK_DRAG_MAX_DISTANCE
                 {
@@ -2130,17 +1891,16 @@ impl<Message: Clone, Theme, Renderer> ClickToggle<'_, Message, Theme, Renderer> 
                     state.last_click.map(|t| t.elapsed()),
                 );
 
-                // A drag means selection, not clicking: reset the multi-click
-                // sequence and cancel any deferred toggle.
+                // A drag means selection, not clicking: reset the multi-click sequence and cancel
+                // any deferred toggle.
                 if kind == ClickKind::Drag {
                     state.last_click = None;
                     state.click_count = 0;
                     self.publish_cancel_once(state, shell);
                     return;
                 }
-                // A click the child answered itself (e.g. a markdown link) is
-                // not part of our toggle sequence — but it still ends a
-                // pending toggle from an earlier click.
+                // A click the child answered itself (e.g. a markdown link) is not part of our
+                // toggle sequence — but it still ends a pending toggle from an earlier click.
                 if child_published {
                     if state.click_count > 0 {
                         shell.publish(self.on_cancel.clone());
@@ -2170,8 +1930,7 @@ impl<Message: Clone, Theme, Renderer> ClickToggle<'_, Message, Theme, Renderer> 
         }
     }
 
-    /// Publish `on_cancel` once per drag gesture (a deferred toggle must not
-    /// commit mid-selection).
+    /// Publish `on_cancel` once per drag gesture (a deferred toggle must not commit mid-selection).
     fn publish_cancel_once(&self, state: &mut ClickToggleState, shell: &mut Shell<'_, Message>) {
         if !state.drag_canceled {
             state.drag_canceled = true;

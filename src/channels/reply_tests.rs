@@ -70,9 +70,7 @@ fn apply_reply_marker_precedes_forwarded_prefix() {
 /// while the assertions only check marker ordering and hold with or without a
 /// browser. Run it explicitly with:
 ///
-/// ```sh
-/// cargo test marker_injection_follows_link_enrichment -- --ignored --nocapture
-/// ```
+/// ```sh cargo test marker_injection_follows_link_enrichment -- --ignored --nocapture ```
 #[ignore = "drives the owner's real Chrome session to fetch the link; runs only when explicitly invoked"]
 #[tokio::test]
 async fn marker_injection_follows_link_enrichment() {

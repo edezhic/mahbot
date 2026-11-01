@@ -1,5 +1,4 @@
-//! Launching and stopping a continuable branch: a custom role's, or a worker
-//! branch's.
+//! Launching and stopping a continuable branch: a custom role's, or a worker branch's.
 //!
 //! Both kinds are normal durable envelopes ([`crate::Launch`]) persisted BEFORE
 //! they are routed, so they survive a restart, and stopped through one path.
@@ -8,8 +7,6 @@
 
 use anyhow::Result;
 
-/// Build the durable launch envelope for a branch — the shape every launch path
-/// (a tool call, a user command, an automation) shares.
 fn launch_job(
     content: String,
     workspace_name: String,
@@ -58,7 +55,6 @@ pub(crate) async fn custom_role(
         .await?
         .ok_or_else(|| anyhow::anyhow!("no custom role named '{name}'"))?;
 
-    // An explicit empty/whitespace identifier counts as absent.
     let identifier = branch.map(str::trim).filter(|id| !id.is_empty());
     if let Some(id) = identifier {
         crate::custom_role::validate_identifier(id)?;
@@ -90,8 +86,6 @@ pub(crate) async fn custom_role(
     };
     let job = launch_job(message.to_string(), workspace.name.clone(), launch);
 
-    // Durable delivery: the envelope is persisted BEFORE it is routed, so a
-    // restart between the two replays it at boot.
     crate::agent::message_router::hand_over(job, &agent_id, "custom role launch", answered_for)
         .await?;
 
@@ -149,8 +143,7 @@ pub(crate) async fn worker_branch(
     // The report returns to the conversation that asked: this branch's own
     // address when a custom role asked (the launch carries the asker), the
     // admin's Assistant otherwise. The routed job's destination is read from the
-    // launch's own field, so the durable launch and the routing decision cannot
-    // drift.
+    // launch's own field, so the durable launch and the routing decision cannot drift.
     let reply_to = asker.map(|launch| crate::agent::message_router::Asker {
         launch,
         workspace: caller_ws.name.clone(),
@@ -167,14 +160,9 @@ pub(crate) async fn worker_branch(
 
     let job = launch_job(message.to_string(), workspace_name.clone(), launch);
 
-    // Durable delivery: the envelope is persisted BEFORE it is routed (and
-    // BEFORE any session write), so a restart between the two replays it at boot.
     crate::agent::message_router::hand_over(job, &agent_id, "worker branch launch", answered_for)
         .await?;
 
-    // The acknowledgement names the resolved folder path, exactly as the
-    // single-run worker's does (same trimmed spelling) — the branch's durable
-    // address stays in `workspace_name`.
     let folder = place.map_or_else(|| caller_ws.path.clone(), |ws| ws.path.clone());
     let folder = folder.trim_end_matches(std::path::MAIN_SEPARATOR);
     Ok(format!(
@@ -182,8 +170,6 @@ pub(crate) async fn worker_branch(
     ))
 }
 
-/// How a branch is named in the lists: a custom role's name (plus its branch
-/// identifier when it was named), or a worker branch's own label.
 #[must_use]
 pub(crate) fn display_label(launch: &crate::Launch) -> String {
     let identifier = launch.identifier.as_deref();
@@ -203,8 +189,7 @@ pub(crate) fn display_label(launch: &crate::Launch) -> String {
 /// [`crate::workspace_index::release_path_named_engine`]).
 ///
 /// The persisted mark — not the in-memory cancel signal — is what survives a
-/// restart; a later explicit launch of the same branch clears it
-/// (`Agent::work`).
+/// restart; a later explicit launch of the same branch clears it (`Agent::work`).
 ///
 /// A stop cancels the launch's own agent only: a durable round it had already
 /// dispatched (analyze/send) keeps running, and its result arrives later as a new
@@ -237,8 +222,7 @@ pub(crate) async fn stop(agent_id: &str) -> Result<()> {
 /// absolute path ([`crate::workspace::synthesize_from_path`] names a path
 /// workspace by the path itself, so all three are durable keys
 /// [`crate::users::resolve_workspace`] can resolve back). An absent, empty or
-/// whitespace `place` runs in the owner's personal folder, exactly as the
-/// owner's Assistant does.
+/// whitespace `place` runs in the owner's personal folder, exactly as the owner's Assistant does.
 pub(crate) async fn launch_workspace(place: Option<&str>) -> Result<crate::Workspace> {
     match place.map(str::trim).filter(|w| !w.is_empty()) {
         None => Ok(crate::users::personal_workspace_struct(

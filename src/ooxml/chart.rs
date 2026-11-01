@@ -1,27 +1,24 @@
 //! The content of a chart, as text, printed where the chart sits.
 //!
-//! A chart part carries the values its last rendering drew beside the table it
-//! points at: a classic chart (`c:chartSpace`) caches each series' name, its
-//! category labels and its numbers in `c:strCache`/`c:numCache`/`c:numLit`, with
-//! the number format the value was shown under. This module reads that content —
-//! the chart's kind, its title and other text, and one line per series of category
-//! and value — so a reading tells a model what a chart says instead of only that
-//! one is there. Nothing is drawn, and nothing beside the chart part is opened.
+//! A chart part carries the values its last rendering drew beside the table it points at: a classic
+//! chart (`c:chartSpace`) caches each series' name, its category labels and its numbers in
+//! `c:strCache`/`c:numCache`/`c:numLit`, with the number format the value was shown under. This
+//! module reads that content — the chart's kind, its title and other text, and one line per series
+//! of category and value — so a reading tells a model what a chart says instead of only that one is
+//! there. Nothing is drawn, and nothing beside the chart part is opened.
 //!
 //! # What is not described
+//! A chart part that carries only references to its attached table (no caches) says per series that
+//! its values are in that table, and a part that cannot be read says so: neither is passed off as a
+//! chart with no content, and both keep their place in the package's report
+//! ([`crate::reader_output::Unshown`]). The modern extended parts (`chartEx`) have a schema of
+//! their own — `cx:` rather than `c:` — which this reading does not parse, so they are that same
+//! case.
 //!
-//! A chart part that carries only references to its attached table (no caches)
-//! says per series that its values are in that table, and a part that cannot be
-//! read says so: neither is passed off as a chart with no content, and both keep
-//! their place in the package's report ([`crate::reader_output::Unshown`]). The
-//! modern extended parts (`chartEx`) have a schema of their own — `cx:` rather
-//! than `c:` — which this reading does not parse, so they are that same case.
-//!
-//! A chart whose values are printed is no longer a loss the report names; the
-//! readers exclude every part this module describes from their census. The parts
-//! read are the ones that census names — `charts/chart<N>.xml` and the
-//! `chartEx<N>.xml` beside them — so a part a producer files under another name is
-//! outside the reading and its report alike, as it was before this module.
+//! A chart whose values are printed is no longer a loss the report names; the readers exclude every
+//! part this module describes from their census. The parts read are the ones that census names —
+//! `charts/chart<N>.xml` and the `chartEx<N>.xml` beside them — so a part a producer files under
+//! another name is outside the reading and its report alike, as it was before this module.
 //!
 //! # Invariants
 //!
@@ -58,61 +55,40 @@ use std::fmt::Write as _;
 use std::io::{Read, Seek};
 use zip::ZipArchive;
 
-// ── Bounds ──────────────────────────────────────────────────────
-
-/// How many chart parts of one package are read. A package that holds more keeps
-/// the rest as a loss its census still names, so the number of parts a crafted
-/// package carries cannot decide the reading's cost.
+/// How many chart parts of one package are read. A package that holds more keeps the rest as a loss
+/// its census still names, so the number of parts a crafted package carries cannot decide the
+/// reading's cost.
 const MAX_CHARTS: usize = 64;
-/// How many series of one chart are read and printed.
 const MAX_SERIES: usize = 8;
-/// How many points of one cached list are read and printed.
 const MAX_POINTS: usize = 25;
-/// How many of a chart's other texts — an axis title and a data label alike — are
-/// printed, the two lists together.
 const MAX_TEXTS: usize = 6;
-/// How deep a part's elements may nest before it is read as unreadable: the walk
-/// keeps one stack entry per level, so a crafted part must not decide its size.
+/// How deep a part's elements may nest before it is read as unreadable: the walk keeps one stack
+/// entry per level, so a crafted part must not decide its size.
 const MAX_DEPTH: usize = 128;
 
-// ── What a reading prints ───────────────────────────────────────
-
-/// One chart part's content, as a reading prints it where the chart sits.
 #[derive(Debug)]
 pub(crate) enum ChartRead {
-    /// The part is a chart this reading read: its lines say what it carries —
-    /// its title, its other text and one line per series, ready to print.
     Content {
-        /// The chart's kind, as the part states it (`column chart`, `pie chart`,
-        /// `stacked line chart`), or `None` when the part names none.
         kind: Option<String>,
-        /// The `Title: …`, `Text: …`, `Label: …` and `Series …` lines,
-        /// unindented.
         body: Vec<String>,
-        /// Whether the part carried the values its lines show. When it did not,
-        /// each series' line says where its values are instead of printing
-        /// them, and the chart stays in the report because what it says did not
-        /// reach the answer.
+        /// Whether the part carried the values its lines show. When it did not, each series' line
+        /// says where its values are instead of printing them, and the chart stays in the report
+        /// because what it says did not reach the answer.
         values: bool,
     },
-    /// The part cannot be read, or is a kind whose own schema this reading does
-    /// not parse.
+    /// The part cannot be read, or is a kind whose own schema this reading does not parse.
     Unreadable(ChartLoss),
 }
 
 /// Why a chart part's content is not described.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ChartLoss {
-    /// The part is unreadable, cut short, nested past [`MAX_DEPTH`] or carries no
-    /// chart element.
     Part,
-    /// The part is a modern extended chart, whose `cx:` schema this reading does
-    /// not parse.
+    /// The part is a modern extended chart, whose `cx:` schema this reading does not parse.
     Extended,
 }
 
 impl ChartLoss {
-    /// The mark this loss prints in place of the chart's content.
     const fn mark(self) -> &'static str {
         match self {
             Self::Part => CHART_UNREADABLE,
@@ -122,14 +98,12 @@ impl ChartLoss {
 }
 
 impl ChartRead {
-    /// Whether the reading printed this chart's values — and so whether the chart
-    /// is no longer a loss the package's report names.
     pub(crate) fn described(&self) -> bool {
         matches!(self, Self::Content { values: true, .. })
     }
 
-    /// The chart's lines: a `Chart (<kind>):` header over its content indented by
-    /// two spaces — or the one line naming why there is no content.
+    /// The chart's lines: a `Chart (<kind>):` header over its content indented by two spaces — or
+    /// the one line naming why there is no content.
     pub(crate) fn lines(&self) -> Vec<String> {
         match self {
             Self::Content { kind, body, .. } => {
@@ -142,11 +116,9 @@ impl ChartRead {
     }
 }
 
-// ── Reading the package's chart parts ───────────────────────────
-
-/// Every chart part under `prefix` — the same parts the package's census counts —
-/// read into the content a reading prints where the chart sits. `date1904` is the
-/// workbook's date system, used for a part that does not state its own.
+/// Every chart part under `prefix` — the same parts the package's census counts — read into the
+/// content a reading prints where the chart sits. `date1904` is the workbook's date system, used
+/// for a part that does not state its own.
 pub(crate) fn read_charts<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     prefix: &str,
@@ -170,10 +142,9 @@ pub(crate) fn read_charts<R: Read + Seek>(
         .collect()
 }
 
-/// The chart parts `xml` names through `rels`, resolved against the part's own
-/// directory (`base`) — in the order the part draws them, and never the same part
-/// twice. The reference is the `chart` element of a slide, a worksheet's drawing
-/// or a Word body, whichever namespace wraps it.
+/// The chart parts `xml` names through `rels`, resolved against the part's own directory (`base`) —
+/// in the order the part draws them, and never the same part twice. The reference is the `chart`
+/// element of a slide, a worksheet's drawing or a Word body, whichever namespace wraps it.
 pub(crate) fn chart_parts(xml: &[u8], rels: &[Relationship], base: &str) -> Vec<String> {
     let mut parts = Vec::new();
     for id in scan_elements(xml, b"chart", rel_id).unwrap_or_default() {
@@ -188,11 +159,10 @@ pub(crate) fn chart_parts(xml: &[u8], rels: &[Relationship], base: &str) -> Vec<
     parts
 }
 
-/// The content of every chart among `parts` the package holds — printed lines,
-/// ready to place where the charts sit — and the parts whose content those lines
-/// are, which the package's census leaves out. A caller that does not deliver its
-/// block (a slide or a sheet it could not read) records none of them, so no chart
-/// leaves both the reading and the report.
+/// The content of every chart among `parts` the package holds — printed lines, ready to place where
+/// the charts sit — and the parts whose content those lines are, which the package's census leaves
+/// out. A caller that does not deliver its block (a slide or a sheet it could not read) records
+/// none of them, so no chart leaves both the reading and the report.
 pub(crate) fn lines(
     charts: &HashMap<String, ChartRead>,
     parts: &[String],
@@ -211,11 +181,8 @@ pub(crate) fn lines(
     (lines, described)
 }
 
-// ── The part's own walk ─────────────────────────────────────────
-
-/// Read one chart part's content. A part that is not a classic chart — an
-/// extended one, or one with no chart space at all — is [`ChartRead::Unreadable`],
-/// never a chart with no content.
+/// Read one chart part's content. A part that is not a classic chart — an extended one, or one with
+/// no chart space at all — is [`ChartRead::Unreadable`], never a chart with no content.
 fn read_part(xml: &[u8], date1904: bool) -> ChartRead {
     let mut parser = Parser::new(date1904);
     match parser.run(xml) {
@@ -224,30 +191,20 @@ fn read_part(xml: &[u8], date1904: bool) -> ChartRead {
     }
 }
 
-/// The cached points of one list: a series' values, one category level, or a
-/// bubble's sizes.
 #[derive(Default)]
 struct Cache {
-    /// Whether the points are numbers a format applies to (`numCache`/`numLit`).
     numeric: bool,
-    /// The number format the cache states, when it states one.
     format: Option<String>,
-    /// The points, by the index the part gives each.
     points: BTreeMap<usize, String>,
     /// How many points the cache held past [`MAX_POINTS`]: counted, never kept.
     more: usize,
 }
 
-/// One series while its element is open.
 #[derive(Default)]
 struct Series {
-    /// The series' name, when the part caches or states one.
     name: Option<String>,
-    /// Its category levels: one cache, or one per level of a multi-level list.
     categories: Vec<Cache>,
-    /// Its values.
     values: Vec<Cache>,
-    /// A bubble chart's sizes, aligned with the values by index.
     sizes: Vec<Cache>,
 }
 
@@ -261,7 +218,6 @@ impl Series {
     }
 }
 
-/// What a cached list being read belongs to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Slot {
     Category,
@@ -269,40 +225,28 @@ enum Slot {
     Size,
 }
 
-/// A run of text being collected: the chart's title, an axis title or a data
-/// label.
 struct Capture {
-    /// The stack depth the element was pushed at, so its end is recognised.
     depth: usize,
     kind: CaptureKind,
     text: String,
 }
 
-/// What a collected run of text is.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CaptureKind {
-    /// The chart's own title.
     Title,
-    /// An axis title — the chart's own text, printed with the title.
     Axis,
-    /// A data label's own text.
     Label,
 }
 
-/// The chart type element being read and the qualifiers its own children state.
 struct KindBuilder {
     depth: usize,
     kind: Kind,
-    /// A bar chart's direction (`bar` is horizontal, `col` vertical).
     bar_dir: Option<String>,
-    /// A bar, line or area chart's grouping (`stacked`, `percentStacked`).
     grouping: Option<String>,
-    /// A pie-of-pie chart's second form (`pie` or `bar`).
     of_pie: Option<String>,
 }
 
 impl KindBuilder {
-    /// The kind as a reading names it: the grouping leads, then the chart's form.
     fn name(&self) -> String {
         let grouping = match self.grouping.as_deref() {
             Some("stacked") => "stacked ",
@@ -345,7 +289,6 @@ impl KindBuilder {
     }
 }
 
-/// The classic chart kinds, each named by the element that declares it.
 #[derive(Clone, Copy)]
 enum Kind {
     Area,
@@ -366,7 +309,6 @@ enum Kind {
     Surface3D,
 }
 
-/// [`Kind`] for a plot area element's local name.
 fn kind_of(name: &[u8]) -> Option<Kind> {
     Some(match name {
         b"areaChart" => Kind::Area,
@@ -389,49 +331,29 @@ fn kind_of(name: &[u8]) -> Option<Kind> {
     })
 }
 
-/// The state of one chart part's walk.
 struct Parser {
     /// The workbook's date system, for a part that does not state its own.
     date1904: bool,
-    /// The part's own date system, when it states one.
     part_date1904: Option<bool>,
-    /// Whether the part's root was a chart space — a part that is no chart at all
-    /// is not a chart with no values.
+    /// Whether the part's root was a chart space — a part that is no chart at all is not a chart
+    /// with no values.
     root: bool,
-    /// The open elements' local names, outermost first.
     stack: Vec<Vec<u8>>,
-    /// The chart kinds the plot area declares, in part order and each named once:
-    /// a kind is collapsed as it is read, so a part repeating one element costs
-    /// nothing.
     kinds: Vec<String>,
-    /// The chart type element being read.
     kind: Option<KindBuilder>,
-    /// The title or other text being read.
     capture: Option<Capture>,
-    /// The chart's own title, once read.
     title: Option<String>,
-    /// The chart's axis titles, in part order.
     texts: Vec<String>,
-    /// The chart's data label texts, in part order.
     labels: Vec<String>,
-    /// How many of the chart's texts were past their cap.
     more_texts: usize,
-    /// The series whose element is open.
     series: Option<Series>,
-    /// The depth the open series element was pushed at.
     series_depth: Option<usize>,
-    /// The series completed, in part order — at most [`MAX_SERIES`] of them.
     series_done: Vec<Series>,
     /// How many series the part held past [`MAX_SERIES`]: counted, never kept.
     more_series: usize,
-    /// The series slot whose caches are being read, and the depth its element was
-    /// pushed at.
     slot: Option<(Slot, usize)>,
-    /// The point being read, and the depth its element was pushed at.
     point: Option<(usize, usize)>,
-    /// The depth a series' own name element was pushed at.
     tx_depth: Option<usize>,
-    /// Whether the part attaches the table its values live in.
     attached: bool,
 }
 
@@ -498,16 +420,14 @@ impl Parser {
             }
             buffer.clear();
         }
-        // A part that ended inside an element was cut short, and what it did not
-        // reach is a loss rather than a chart with nothing else.
+        // A part that ended inside an element was cut short, and what it did not reach is a loss
+        // rather than a chart with nothing else.
         if !self.root || !self.stack.is_empty() {
             return Err(ChartLoss::Part);
         }
         Ok(())
     }
 
-    /// The local name of the element `back` levels up (`2` is the parent of the
-    /// innermost open element).
     fn ancestor(&self, back: usize) -> Option<&[u8]> {
         let index = self.stack.len().checked_sub(back)?;
         self.stack.get(index).map(Vec::as_slice)
@@ -522,8 +442,8 @@ impl Parser {
             if name != b"chartSpace" {
                 return Err(ChartLoss::Part);
             }
-            // An extended chart's own root: a schema this reading does not parse,
-            // said plainly rather than read as a chart with none.
+            // An extended chart's own root: a schema this reading does not parse, said plainly
+            // rather than read as a chart with none.
             if event.name().prefix().is_some_and(|p| p.as_ref() == b"cx") {
                 return Err(ChartLoss::Extended);
             }
@@ -545,8 +465,8 @@ impl Parser {
                     });
                 }
             }
-            // A paragraph or a line break inside a captured run starts a new
-            // line of it: rich text is joined with a space, never glued.
+            // A paragraph or a line break inside a captured run starts a new line of it: rich text
+            // is joined with a space, never glued.
             b"p" | b"br" => self.separate(),
             b"ser" if self.series.is_none() => {
                 if self.series_done.len() < MAX_SERIES {
@@ -580,7 +500,6 @@ impl Parser {
             b"numCache" | b"strCache" | b"numLit" | b"strLit" => {
                 self.open_cache(matches!(name, b"numCache" | b"numLit"));
             }
-            // A multi-level category list states one cache per level.
             b"lvl" => self.open_cache(false),
             b"pt" => {
                 if self.slot.is_some()
@@ -594,7 +513,6 @@ impl Parser {
                 self.part_date1904 =
                     Some(matches!(attr(event, b"val").as_deref(), Some("1" | "true")));
             }
-            // A chart type's own qualifiers are attributes of its child elements.
             b"barDir" | b"grouping" | b"ofPieType" => {
                 if let Some(kind) = self.kind.as_mut() {
                     let value = attr(event, b"val");
@@ -622,8 +540,8 @@ impl Parser {
         Ok(())
     }
 
-    /// Open the next cache of the series slot being read; a cache outside one (a
-    /// series' own name, a title's) is not a value this reading prints.
+    /// Open the next cache of the series slot being read; a cache outside one (a series' own name,
+    /// a title's) is not a value this reading prints.
     fn open_cache(&mut self, numeric: bool) {
         let Some((slot, _)) = self.slot else {
             return;
@@ -637,10 +555,9 @@ impl Parser {
         });
     }
 
-    /// Keep the point at `index` of the cache now being read — unless the cache
-    /// already holds [`MAX_POINTS`] of them, which the cache counts instead of
-    /// allocating and formatting. A point past the cap is read but not kept, so
-    /// its value reaches nothing.
+    /// Keep the point at `index` of the cache now being read — unless the cache already holds
+    /// [`MAX_POINTS`] of them, which the cache counts instead of allocating and formatting. A point
+    /// past the cap is read but not kept, so its value reaches nothing.
     fn keep_point(&mut self, index: usize, depth: usize) {
         let Some((slot, _)) = self.slot else {
             return;
@@ -664,8 +581,8 @@ impl Parser {
         }
     }
 
-    /// Start a new line of a captured run of text: a rich-text paragraph and a
-    /// line break both separate what came before from what follows.
+    /// Start a new line of a captured run of text: a rich-text paragraph and a line break both
+    /// separate what came before from what follows.
     fn separate(&mut self) {
         if let Some(capture) = self.capture.as_mut() {
             push_break(&mut capture.text);
@@ -677,12 +594,11 @@ impl Parser {
         }
     }
 
-    /// The string the text at the current position is collected into, if any.
     fn target(&mut self) -> Option<&mut String> {
         let depth = self.stack.len();
         let leaf = self.stack.last()?.as_slice();
-        // A title, an axis title or a data label: its rich text runs and its
-        // cached string, never the reference it points at.
+        // A title, an axis title or a data label: its rich text runs and its cached string, never
+        // the reference it points at.
         if let Some(capture) = self.capture.as_mut()
             && capture.depth < depth
         {
@@ -721,9 +637,9 @@ impl Parser {
         }
     }
 
-    /// File one finished run of text: the title, an axis title or a data label.
-    /// The last two are bounded together, so a label per point cannot crowd the
-    /// axis titles out or grow the description without limit.
+    /// File one finished run of text: the title, an axis title or a data label. The last two are
+    /// bounded together, so a label per point cannot crowd the axis titles out or grow the
+    /// description without limit.
     fn text_read(&mut self, kind: CaptureKind, text: String) {
         if kind == CaptureKind::Title {
             self.title = Some(text);
@@ -796,9 +712,8 @@ impl Parser {
         }
     }
 
-    /// The part's content: the header's kind and the lines under it — its title,
-    /// its other text and one line per series, or the mark standing in for the
-    /// values a series does not carry.
+    /// The part's content: the header's kind and the lines under it — its title, its other text and
+    /// one line per series, or the mark standing in for the values a series does not carry.
     fn finish(self) -> ChartRead {
         let date1904 = self.part_date1904.unwrap_or(self.date1904);
         let kind = (!self.kinds.is_empty()).then(|| self.kinds.join(" + "));
@@ -825,8 +740,8 @@ impl Parser {
             body.push(chart_excess(self.more_series, "series"));
         }
         if self.series_done.is_empty() {
-            // A part naming no series at all says what it does not carry the way a
-            // series without values does.
+            // A part naming no series at all says what it does not carry the way a series without
+            // values does.
             body.push(note(self.attached).to_owned());
         }
         ChartRead::Content {
@@ -846,20 +761,18 @@ const fn note(attached: bool) -> &'static str {
     }
 }
 
-/// A break between two runs of a captured text, unless `text` is empty or already
-/// ends in one.
+/// A break between two runs of a captured text, unless `text` is empty or already ends in one.
 fn push_break(text: &mut String) {
     if !text.is_empty() && !text.ends_with(' ') {
         text.push(' ');
     }
 }
 
-/// One series' line: its label, then its categories and values — `Jan: 10` where
-/// the part carries a category label for the value, the value alone where it does
-/// not, and a bubble's size beside its value — or, when the part carries none of
-/// its values, the categories it does carry and the mark standing in for them.
-/// `index` numbers an unnamed series, and the second value says whether the part
-/// carried a value for it at all.
+/// One series' line: its label, then its categories and values — `Jan: 10` where the part carries a
+/// category label for the value, the value alone where it does not, and a bubble's size beside its
+/// value — or, when the part carries none of its values, the categories it does carry and the mark
+/// standing in for them. `index` numbers an unnamed series, and the second value says whether the
+/// part carried a value for it at all.
 fn series_line(index: usize, series: &Series, date1904: bool, attached: bool) -> (String, bool) {
     let label = chart_series(series.name.as_deref(), index);
     let mut stored = false;
@@ -868,8 +781,8 @@ fn series_line(index: usize, series: &Series, date1904: bool, attached: bool) ->
         .first()
         .filter(|cache| !cache.points.is_empty())
     else {
-        // The labels the missing values would be keyed by are the chart's own
-        // content, so the categories the part carries are still printed.
+        // The labels the missing values would be keyed by are the chart's own content, so the
+        // categories the part carries are still printed.
         let mut categories = Vec::new();
         for point_index in series
             .categories
@@ -926,9 +839,9 @@ fn series_line(index: usize, series: &Series, date1904: bool, attached: bool) ->
     (line, true)
 }
 
-/// One cached point as the reading shows it: a number through [`numfmt`] under
-/// the cache's own format — the stored text where that format cannot be
-/// reproduced, which the second value says — or the text the part wrote.
+/// One cached point as the reading shows it: a number through [`numfmt`] under the cache's own
+/// format — the stored text where that format cannot be reproduced, which the second value says —
+/// or the text the part wrote.
 fn point_text(cache: &Cache, index: usize, date1904: bool) -> Option<(String, bool)> {
     let stored = cache.points.get(&index)?;
     let written = || one_line(stored.trim().to_owned());
@@ -947,11 +860,10 @@ fn point_text(cache: &Cache, index: usize, date1904: bool) -> Option<(String, bo
     Some(display.map_or_else(|| (written(), true), |text| (text, false)))
 }
 
-/// The label of the point at `index`: the innermost level's own entry for it, with
-/// each coarser level's label — the last one at or before the index, since a group
-/// label spans the points under it — in front of it (`East / Q1`). A single level
-/// is just its own entry, and an empty label is no label. The second value says
-/// whether a label is shown as stored.
+/// The label of the point at `index`: the innermost level's own entry for it, with each coarser
+/// level's label — the last one at or before the index, since a group label spans the points under
+/// it — in front of it (`East / Q1`). A single level is just its own entry, and an empty label is
+/// no label. The second value says whether a label is shown as stored.
 fn category_label(levels: &[Cache], index: usize, date1904: bool) -> (Option<String>, bool) {
     let Some((innermost, coarse)) = levels.split_first() else {
         return (None, false);
@@ -984,15 +896,12 @@ fn category_label(levels: &[Cache], index: usize, date1904: bool) -> (Option<Str
 mod tests {
     use super::*;
 
-    /// A classic chart part around `plot`; `chart` sits inside `c:chart` ahead of
-    /// its plot area, `space` inside `c:chartSpace`.
     fn chart_space(plot: &str, chart: &str, space: &str) -> String {
         format!(
             r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">{space}<c:chart>{chart}<c:plotArea>{plot}</c:plotArea></c:chart></c:chartSpace>"#
         )
     }
 
-    /// One `c:ser` of a bar chart: its name, categories and values.
     fn series(name: &str, categories: &[&str], values: &[&str]) -> String {
         let categories = cache("strCache", None, categories);
         let values = cache("numCache", None, values);
@@ -1001,7 +910,6 @@ mod tests {
         )
     }
 
-    /// A `c:<kind>` cache over `points`, with `format` when one is given.
     fn cache(kind: &str, format: Option<&str>, points: &[&str]) -> String {
         let format = format.map_or_else(String::new, |format| {
             format!("<c:formatCode>{format}</c:formatCode>")
@@ -1013,15 +921,13 @@ mod tests {
         format!(r"<c:{kind}>{format}{cached}</c:{kind}>")
     }
 
-    /// The lines a chart part is read to.
     fn lines_of(xml: &str) -> Vec<String> {
         read_part(xml.as_bytes(), false).lines()
     }
 
-    /// A chart's content is printed as its kind, its title, its other text and one
-    /// line per series of category and value. A rich-text title keeps its
-    /// paragraphs apart, and a data label's own text prints under its own label, so
-    /// a model can tell it from an axis title.
+    /// A chart's content is printed as its kind, its title, its other text and one line per series
+    /// of category and value. A rich-text title keeps its paragraphs apart, and a data label's own
+    /// text prints under its own label, so a model can tell it from an axis title.
     #[test]
     fn a_chart_is_described_by_its_kind_title_and_series() {
         let plot = format!(
@@ -1063,9 +969,9 @@ mod tests {
         }
     }
 
-    /// The cache's own format decides how a value is shown, so a date reads as a
-    /// date; a format the reading cannot reproduce shows the stored number, under
-    /// the mark a spreadsheet cell carries, once for the series.
+    /// The cache's own format decides how a value is shown, so a date reads as a date; a format the
+    /// reading cannot reproduce shows the stored number, under the mark a spreadsheet cell carries,
+    /// once for the series.
     #[test]
     fn a_cached_value_keeps_its_own_number_format() {
         let dates = cache("numCache", Some("mmm-yy"), &["45200", "45231"]);
@@ -1099,11 +1005,11 @@ mod tests {
         }
     }
 
-    /// A series without a name is numbered, a chart without a plot type prints no
-    /// kind, several plot types are named together, and a scatter chart's x values
-    /// are the labels its y values are paired with. A multi-level category list
-    /// prints its levels root first, a group label stated once spanning every point
-    /// under it, and a bubble chart prints each value's size beside it.
+    /// A series without a name is numbered, a chart without a plot type prints no kind, several
+    /// plot types are named together, and a scatter chart's x values are the labels its y values
+    /// are paired with. A multi-level category list prints its levels root first, a group label
+    /// stated once spanning every point under it, and a bubble chart prints each value's size
+    /// beside it.
     #[test]
     fn kinds_names_and_scatter_are_all_printed() {
         let plot = format!(
@@ -1113,7 +1019,6 @@ mod tests {
             cache("numCache", None, &["1", "2"]),
             cache("numCache", None, &["10", "20"]),
         );
-        // The levels are stated innermost first, as a part writes them.
         let two_levels = format!(
             r"<c:multiLvlStrRef><c:multiLvlStrCache>{}{}</c:multiLvlStrCache></c:multiLvlStrRef>",
             cache("lvl", None, &["Q1", "Q2"]),
@@ -1167,9 +1072,9 @@ mod tests {
         }
     }
 
-    /// A cut chart part is a loss, not a chart whose content happens to end where
-    /// the package stopped — and so is a part nested past the depth bound, a walk
-    /// that would keep a stack entry per level for a document to decide.
+    /// A cut chart part is a loss, not a chart whose content happens to end where the package
+    /// stopped — and so is a part nested past the depth bound, a walk that would keep a stack entry
+    /// per level for a document to decide.
     #[test]
     fn a_cut_part_is_a_loss() {
         let cut = r#"<c:chartSpace xmlns:c="x"><c:chart><c:plotArea><c:barChart><c:ser><c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>Revenue</c:v>"#;
@@ -1190,9 +1095,9 @@ mod tests {
         }
     }
 
-    /// A chart whose values are only referenced states that for the series that
-    /// carries none, keeps the names the part does carry, and one whose table is
-    /// attached says where its values are instead of claiming the file holds none.
+    /// A chart whose values are only referenced states that for the series that carries none, keeps
+    /// the names the part does carry, and one whose table is attached says where its values are
+    /// instead of claiming the file holds none.
     #[test]
     fn a_chart_without_cached_values_says_where_its_numbers_are() {
         let plot = r#"<c:barChart><c:barDir val="col"/><c:ser><c:tx><c:strRef><c:f>Sheet1!$B$1</c:f></c:strRef></c:tx><c:val><c:numRef><c:f>Sheet1!$B$2:$B$3</c:f></c:numRef></c:val></c:ser></c:barChart>"#;
@@ -1260,8 +1165,8 @@ mod tests {
         );
     }
 
-    /// The description is bounded: the series, the points and the other texts past
-    /// their caps are counted, never silently dropped.
+    /// The description is bounded: the series, the points and the other texts past their caps are
+    /// counted, never silently dropped.
     #[test]
     fn the_description_is_bounded_and_says_what_it_left_out() {
         let values: Vec<String> = (0..(MAX_POINTS + 3)).map(|i| i.to_string()).collect();
@@ -1301,10 +1206,9 @@ mod tests {
         );
     }
 
-    /// The chart block's header, its series label and every mark and annotation a
-    /// chart's lines carry are names the document kit's refusals know, so a find
-    /// copied out of a reading that carries one is refused for what it is rather
-    /// than searched for as the document's own text.
+    /// The chart block's header, its series label and every mark and annotation a chart's lines
+    /// carry are names the document kit's refusals know, so a find copied out of a reading that
+    /// carries one is refused for what it is rather than searched for as the document's own text.
     #[test]
     fn the_marks_the_kit_refuses_are_the_ones_a_reading_prints() {
         let patterns: Vec<regex::Regex> = crate::docgen::docx_marks()
@@ -1330,8 +1234,6 @@ mod tests {
                  names — a mark the kit refuses belongs in assets/docgen/rules.json's docx_marks"
             );
         }
-        // The bare header a part naming no kind prints stays out: it is an
-        // ordinary word a document's own text opens a sentence with.
         assert!(
             !patterns
                 .iter()
@@ -1340,9 +1242,8 @@ mod tests {
         );
     }
 
-    /// The chart parts a part names are the `chart` elements' relationship
-    /// targets, in part order, without repeats, and only the ones the part's own
-    /// relationships resolve.
+    /// The chart parts a part names are the `chart` elements' relationship targets, in part order,
+    /// without repeats, and only the ones the part's own relationships resolve.
     #[test]
     fn chart_references_resolve_in_part_order() {
         let xml = br#"<p:sld><p:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rId2"/></a:graphicData></a:graphic></p:graphicFrame><p:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rId1"/></a:graphicData></a:graphic></p:graphicFrame><p:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rId2"/></a:graphicData></a:graphic></p:graphicFrame>"#;

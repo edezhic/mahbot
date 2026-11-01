@@ -1,19 +1,18 @@
 //! Start at login: the product's own registration with the operating system.
 //!
-//! The running app is the only writer of the system's startup state — the install
-//! scripts and the updater never touch it. Each platform keeps one fixed identity,
-//! so a start after an install, an update or a move re-points the same entry
-//! rather than adding a second one. The owner's decision to want it is
-//! `crate::config`'s (`autolaunch`), and it outlives installs and updates. A
-//! disable the owner made in the system's own settings is real state here: it
-//! reads as "not registered", and nothing in the product overrides it on its own.
+//! The running app is the only writer of the system's startup state — the install scripts and
+//! the updater never touch it. Each platform keeps one fixed identity, so a start after an
+//! install, an update or a move re-points the same entry rather than adding a second one. The
+//! owner's decision is `crate::config`'s (`autolaunch`), and it outlives installs. A disable
+//! made in the system's own settings is real state here: it reads as "not registered", and
+//! nothing in the product overrides it on its own.
 
 use std::path::Path;
 
 use anyhow::Context as _;
 
-/// Keep the system's registration true to the owner's decision and to the binary
-/// that is running. Called at every start; a no-op for a copy built from sources.
+/// Keep the system's registration true to the owner's decision and to the running binary.
+/// Called at every start; a no-op for a copy built from sources.
 pub fn reconcile() {
     if !crate::self_update::is_published_copy() {
         return;
@@ -30,15 +29,14 @@ pub fn reconcile() {
     }
 }
 
-/// Whether the system reports a registration that will start the product at login
-/// — an entry the owner disabled from the system's own settings reads as `false`,
-/// and a probe that could not run reads as `None`: unknown, which is not "off".
+/// Whether the system reports a registration that will start the product at login — an entry
+/// the owner disabled reads as `false`, and a probe that could not run as `None`.
 pub(crate) fn registered() -> Option<bool> {
     platform::registered()
 }
 
-/// Apply the owner's choice: remove everything, or (re)write the registration and
-/// clear a system-side disable. Returns what the system reports afterwards.
+/// Apply the owner's choice: remove everything, or (re)write the registration and clear a
+/// system-side disable. Returns what the system reports afterwards.
 pub(crate) fn set_enabled(enabled: bool) -> anyhow::Result<Option<bool>> {
     if enabled {
         let exe = std::env::current_exe().context("the running program's path is unknown")?;
@@ -54,10 +52,8 @@ fn decision() -> bool {
     crate::config::flag_on(crate::config::CONFIG.autolaunch().as_deref())
 }
 
-// ── The formats, shared by the platform arms and testable on any host ──────
-
-/// The one identity the registration has on macOS: the launchd label, and the
-/// name of the file that carries it.
+/// The one identity the registration has on macOS: the launchd label, and the name of the
+/// file that carries it.
 #[cfg_attr(not(any(test, target_os = "macos")), expect(dead_code))]
 const LABEL: &str = "com.mahbot.autostart";
 
@@ -104,9 +100,8 @@ fn plist_text(exe: &Path) -> String {
     )
 }
 
-/// Whether a `launchctl print-disabled` dump carries a disable for `label`. A
-/// line of the form `"<label>" => disabled` is a disable; `=> enabled` or no line
-/// at all is not.
+/// Whether a `launchctl print-disabled` dump carries a disable for `label`: a line of the form
+/// `"<label>" => disabled` is a disable; `=> enabled` or no line is not.
 #[cfg_attr(not(any(test, target_os = "macos")), expect(dead_code))]
 fn launchctl_override_disabled(dump: &str, label: &str) -> bool {
     let quoted = format!("\"{label}\"");
@@ -118,11 +113,8 @@ fn launchctl_override_disabled(dump: &str, label: &str) -> bool {
     })
 }
 
-/// The XDG autostart entry that starts `exe` at login.
-///
-/// A disabled entry carries both of the keys a desktop honours: `Hidden` is the
-/// desktop-agnostic one the specification defines, and `X-GNOME-Autostart-enabled`
-/// is GNOME's own.
+/// The XDG autostart entry that starts `exe` at login. A disabled entry carries both keys a
+/// desktop honours: `Hidden` (desktop-agnostic) and `X-GNOME-Autostart-enabled`.
 #[cfg_attr(not(any(test, all(unix, not(target_os = "macos")))), expect(dead_code))]
 fn desktop_entry_text(exe: &Path, enabled: bool) -> String {
     let mut text = format!(
@@ -137,9 +129,8 @@ fn desktop_entry_text(exe: &Path, enabled: bool) -> String {
     text
 }
 
-/// Whether a desktop entry carries the owner's system-side disable. The entry is a
-/// key file, so the spelling is free: the key and the value are trimmed, and the
-/// values a desktop honours for these keys are read case-insensitively.
+/// Whether a desktop entry carries the owner's system-side disable. The entry is a key file, so
+/// the spelling is free: key and value are trimmed, and the values read case-insensitively.
 #[cfg_attr(not(any(test, all(unix, not(target_os = "macos")))), expect(dead_code))]
 fn desktop_disabled(text: &str) -> bool {
     text.lines().any(|line| {
@@ -166,24 +157,22 @@ fn windows_command(exe: &Path) -> String {
     )
 }
 
-/// Whether the startup manager's record disables the entry: its first byte is
-/// odd when disabled (`0x03`, and `0x07` where the system marks a later change)
-/// and even when enabled (`0x02`, `0x06`). No value at all means enabled.
+/// Whether the startup manager's record disables the entry: its first byte is odd when disabled
+/// (`0x03`, `0x07`) and even when enabled (`0x02`, `0x06`). No value at all means enabled.
 #[cfg_attr(not(any(test, windows)), expect(dead_code))]
 fn startup_approved_disabled(record: &[u8]) -> bool {
     record.first().is_some_and(|flag| flag & 1 == 1)
 }
 
-/// The startup manager's record for an entry the owner has not disabled: the
-/// "enabled" flag followed by a zeroed `FILETIME`. The system stamps a time only
-/// when it disables an entry, and the product never disables one — it follows the
-/// owner and removes the entry instead.
+/// The startup manager's record for an entry the owner has not disabled: the "enabled" flag
+/// followed by a zeroed `FILETIME`. The system stamps a time only when it disables an entry,
+/// and the product never disables one — it removes it instead.
 #[cfg_attr(not(any(test, windows)), expect(dead_code))]
 const STARTUP_APPROVED_ENABLED: [u8; 12] = [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
-/// Write `text` to `path` through a temp file in the same directory and a rename,
-/// so a login never reads half a file. The mode is set explicitly: launchd refuses
-/// an agent its group and the world can write to.
+/// Write `text` to `path` through a temp file in the same directory and a rename, so a login
+/// never reads half a file. The mode is set explicitly: launchd refuses an agent its group and
+/// the world can write to.
 #[cfg(unix)]
 fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -203,8 +192,7 @@ fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
             .with_context(|| format!("{} could not be put in place", path.display()))
     })();
     if outcome.is_err() {
-        // Nothing sweeps this directory, so a failed write must not leave the
-        // temp file behind.
+        // Nothing sweeps this directory, so a failed write must not leave the temp file behind.
         let _ = std::fs::remove_file(&tmp);
     }
     outcome
@@ -220,8 +208,6 @@ fn remove_file_if_present(path: &Path) -> anyhow::Result<()> {
     }
 }
 
-// ── macOS: a launchd agent in the owner's own LaunchAgents ────────────────
-
 #[cfg(target_os = "macos")]
 mod platform {
     use std::path::{Path, PathBuf};
@@ -230,8 +216,7 @@ mod platform {
 
     use super::{LABEL, launchctl_override_disabled, plist_text, remove_file_if_present};
 
-    /// The owner's own uid: the per-user launchd domain and its override database
-    /// are keyed by it.
+    /// The owner's own uid: the per-user launchd domain and its override database are keyed by it.
     fn uid() -> u32 {
         // SAFETY: `getuid` takes no arguments and has no preconditions.
         unsafe { libc::getuid() }
@@ -253,21 +238,19 @@ mod platform {
         let path = plist_path().ok()?;
         match std::fs::metadata(&path) {
             Ok(metadata) if metadata.is_file() => {
-                // An entry whose disable cannot be read is not known to start
-                // anything.
+                // An entry whose disable cannot be read is not known to start anything.
                 Some(!disabled_by_system()?)
             }
             // Nothing launchd can load there.
             Ok(_) => Some(false),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
-            // A registration that cannot be inspected is not known to start
-            // anything.
+            // A registration that cannot be inspected is not known to start anything.
             Err(_) => None,
         }
     }
 
-    /// Write the agent unless it is already exactly right. The disable lives in
-    /// launchd's override database rather than in the file, so a rewrite keeps it.
+    /// Write the agent unless it is already exactly right. The disable lives in launchd's
+    /// override database rather than in the file, so a rewrite keeps it.
     pub(super) fn ensure(exe: &Path) -> anyhow::Result<()> {
         let path = plist_path()?;
         let text = plist_text(exe);
@@ -281,9 +264,9 @@ mod platform {
         let path = plist_path()?;
         super::write_atomic(&path, &plist_text(exe))?;
         clear_system_disable();
-        // The switch reports what the system holds, so the clear is judged by the
-        // database rather than by the command's own exit status. A database that
-        // cannot be read at all is not a refusal to allow the login item.
+        // The switch reports what the system holds, so the clear is judged by the database
+        // rather than by the exit status. An unreadable database is not a refusal to allow the
+        // login item.
         anyhow::ensure!(
             disabled_by_system() != Some(true),
             "macOS still has the login item disabled — allow MahBot in System Settings › General › Login Items"
@@ -295,11 +278,9 @@ mod platform {
         remove_file_if_present(&plist_path()?)
     }
 
-    /// Whether launchd's override database disables `LABEL` — the state System
-    /// Settings' "Allow in the Background" switch writes for a legacy agent. The
-    /// database is per-user, so it is the same list whichever domain is named; the
-    /// agent itself loads into the GUI one. `None` when the database cannot be
-    /// read, which is not the same as "not disabled".
+    /// Whether launchd's override database disables `LABEL` — the state System Settings'
+    /// "Allow in the Background" switch writes. The database is per-user, so it is the same
+    /// list whichever domain is named. `None` when it cannot be read, which is not "not disabled".
     fn disabled_by_system() -> Option<bool> {
         let output = std::process::Command::new("/bin/launchctl")
             .args(["print-disabled", &format!("gui/{}", uid())])
@@ -311,8 +292,8 @@ mod platform {
             .then(|| launchctl_override_disabled(&String::from_utf8_lossy(&output.stdout), LABEL))
     }
 
-    /// Clear the database's disable. Best effort: the caller judges the outcome by
-    /// what the database then holds.
+    /// Clear the database's disable. Best effort: the caller judges by what the database then
+    /// holds.
     fn clear_system_disable() {
         let result = std::process::Command::new("/bin/launchctl")
             .args(["enable", &format!("gui/{}/{LABEL}", uid())])
@@ -326,8 +307,6 @@ mod platform {
         }
     }
 }
-
-// ── Windows: the per-user Run value and the startup manager's record ──────
 
 #[cfg(windows)]
 mod platform {
@@ -345,8 +324,8 @@ mod platform {
 
     /// The per-user key the system starts a program from at login.
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-    /// The record the system's own startup manager reads and writes; the owner's
-    /// disable lives here.
+    /// The record the system's own startup manager reads and writes; the owner's disable lives
+    /// here.
     const APPROVED_KEY: &str =
         r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
     /// The one value name the product uses, on both keys.
@@ -355,16 +334,14 @@ mod platform {
     pub(super) fn registered() -> Option<bool> {
         match read(RUN_KEY, VALUE) {
             Ok(None) => Some(false),
-            // A registration whose disable cannot be read is not known to start
-            // anything.
+            // A registration whose disable cannot be read is not known to start anything.
             Ok(Some(_)) => disabled_by_system().ok().map(|disabled| !disabled),
             Err(_) => None,
         }
     }
 
-    /// Point the `Run` value at `exe` when it does not already say so. The
-    /// startup-manager record is not touched: that is where the owner's own
-    /// disable lives.
+    /// Point the `Run` value at `exe` when it does not already say so. The startup-manager
+    /// record is not touched: that is where the owner's own disable lives.
     pub(super) fn ensure(exe: &Path) -> anyhow::Result<()> {
         let want = windows_command(exe);
         if read_string(RUN_KEY, VALUE)?.as_deref() != Some(want.as_str()) {
@@ -373,16 +350,15 @@ mod platform {
         Ok(())
     }
 
-    /// Write the `Run` value and an enabled startup-manager record — re-adding
-    /// the value alone does not clear a disable made in Task Manager.
+    /// Write the `Run` value and an enabled startup-manager record — re-adding the value alone
+    /// does not clear a disable made in Task Manager.
     pub(super) fn enable(exe: &Path) -> anyhow::Result<()> {
         write(RUN_KEY, VALUE, REG_SZ, &utf16_bytes(&windows_command(exe)))?;
         write(APPROVED_KEY, VALUE, REG_BINARY, &STARTUP_APPROVED_ENABLED)
     }
 
-    /// Remove the `Run` value and the startup-manager record, so a later
-    /// re-registration is not silently disabled. A value that is not there is
-    /// not an error.
+    /// Remove the `Run` value and the startup-manager record, so a later re-registration is not
+    /// silently disabled. A value that is not there is not an error.
     pub(super) fn remove() -> anyhow::Result<()> {
         delete(RUN_KEY, VALUE)?;
         delete(APPROVED_KEY, VALUE)
@@ -549,8 +525,6 @@ mod platform {
     }
 }
 
-// ── Linux: an XDG autostart entry in the owner's config directory ─────────
-
 #[cfg(all(unix, not(target_os = "macos")))]
 mod platform {
     use std::path::{Path, PathBuf};
@@ -578,8 +552,7 @@ mod platform {
         }
     }
 
-    /// Point the entry at `exe`, preserving a disable the owner made in the
-    /// system's own settings.
+    /// Point the entry at `exe`, preserving a disable the owner made in the system's own settings.
     pub(super) fn ensure(exe: &Path) -> anyhow::Result<()> {
         let path = entry_path()?;
         let current = std::fs::read_to_string(&path).ok();
@@ -603,15 +576,13 @@ mod platform {
     }
 }
 
-// ── Tests for the formats, runnable on any host ───────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The two files that register the product with the system name the program
-    /// and the login word, and nothing a parser would misread: the escape each
-    /// format needs is applied to a path that needs every one of them.
+    /// The two files that register the product with the system name the program and the login
+    /// word, and nothing a parser would misread: the escape each format needs is applied to a
+    /// path that needs every one of them.
     #[test]
     fn the_platform_files_name_the_program_and_the_login_word() {
         let plist = plist_text(Path::new("/Applications/A & B/<mahbot>"));
@@ -630,21 +601,18 @@ mod tests {
                 .contains("Exec=\"/opt/100%%/mahbot\"")
         );
 
-        // The Windows `Run` value's data is the program path quoted, because a
-        // profile name and `%LOCALAPPDATA%` can contain spaces, and the login
-        // word after it.
+        // The Windows `Run` value's data is the program path quoted — a profile name and
+        // `%LOCALAPPDATA%` can contain spaces — and the login word after it.
         assert_eq!(
             windows_command(Path::new(r"C:\Program Files\MahBot\mahbot.exe")),
             r#""C:\Program Files\MahBot\mahbot.exe" __login-start"#
         );
     }
 
-    /// A registration the owner disabled in the system's own settings — the
-    /// desktop entry's disable keys, launchd's override dump, and the
-    /// startup-approved record — reads as disabled, and a plain enable, a
-    /// comment or no record at all does not. Each platform's own spelling is
-    /// what the product has to read back, since nothing in the product may
-    /// override the owner's decision.
+    /// A registration the owner disabled in the system's own settings — the desktop entry's
+    /// disable keys, launchd's override dump, and the startup-approved record — reads as
+    /// disabled, and a plain enable, a comment or no record does not. Each platform's own
+    /// spelling is what the product must read back.
     #[test]
     fn a_startup_entry_the_owner_disabled_reads_as_disabled() {
         let disabled_entry = desktop_entry_text(Path::new("/opt/mahbot"), false);
@@ -671,18 +639,16 @@ disabled services = {
         assert!(!launchctl_override_disabled(dump, "com.apple.other"));
         assert!(!launchctl_override_disabled(dump, "com.mahbot.absent"));
 
-        // The record this product writes is the enabled one; the flag the system
-        // writes when the owner disables the entry there, and the one it stamps
-        // on a later change, both read as disabled. No record at all means
-        // enabled.
+        // The record this product writes is the enabled one; the flag the system writes on a
+        // disable, and the one it stamps on a later change, both read as disabled. No record
+        // means enabled.
         assert!(!startup_approved_disabled(&STARTUP_APPROVED_ENABLED));
         assert!(startup_approved_disabled(&[0x03]));
         assert!(startup_approved_disabled(&[0x07]));
         assert!(!startup_approved_disabled(&[]));
     }
 
-    /// A failed rename must not leave the temp file behind in a directory nothing
-    /// sweeps.
+    /// A failed rename must not leave the temp file behind in a directory nothing sweeps.
     #[cfg(unix)]
     #[test]
     fn a_failed_write_leaves_no_temp_file() {

@@ -4,7 +4,6 @@ use super::*;
 
 #[test]
 fn test_buffer_construction_cursor_and_selection() {
-    // (name, text, move_to, expected cursor)
     let cases = [
         ("new_empty", "", None, Some((0, 0))),
         ("with_text", "hello\nworld", None, None),
@@ -21,8 +20,7 @@ fn test_buffer_construction_cursor_and_selection() {
         if let Some((line, col)) = move_to {
             buf.move_to(line, col);
         }
-        // Construction never rewrites the text, and the line count follows
-        // from it.
+        // Construction never rewrites the text, and the line count follows from it.
         assert_eq!(buf.text(), text, "case {name}: text");
         assert_eq!(
             buf.line_count(),
@@ -36,7 +34,6 @@ fn test_buffer_construction_cursor_and_selection() {
         }
     }
 
-    // (name, text, select_all, expected selection)
     let cases = [
         ("select_all", "hello\nworld", true, Some("hello\nworld")),
         ("no_selection", "hello", false, None),
@@ -63,7 +60,6 @@ fn test_buffer_construction_cursor_and_selection() {
 #[test]
 fn test_insert_paste_enter_cases() {
     use super::EditorAction::*;
-    // (name, action, input, cursor, expected text, expected cursor)
     let cases = [
         (
             "insert_character",
@@ -82,7 +78,6 @@ fn test_insert_paste_enter_cases() {
             None,
         ),
         ("paste", Paste("ll".into()), "heo", (0, 2), "hello", None),
-        // "hello world" has no leading whitespace, so auto-indent produces column 0.
         (
             "enter",
             Enter,
@@ -112,7 +107,6 @@ fn test_insert_paste_enter_cases() {
         }
     }
 
-    // (name, action, input, cursor, selection end, select all, expected text)
     let cases = [
         (
             "insert_with_selection_replaces",
@@ -158,37 +152,31 @@ fn test_insert_paste_enter_cases() {
 
 #[test]
 fn test_enter_at_end_of_highlighted_file_with_trailing_newline() {
-    // Regression test: Enter at end of a highlighted file
-    // that *has* a trailing newline must place cursor on a new blank line,
-    // not jump to the start of the last content line.
+    // Regression: Enter at the end of a highlighted file that *has* a trailing newline must place
+    // the cursor on a new blank line, not at the start of the last content line.
     let buf = EditorBuffer::with_text("fn main() {}\n", Some(HighlightLanguage::Rust));
-    // Buffer should have a trailing empty sentinel line (2 lines).
     assert_eq!(buf.line_count(), 2);
     let cursor_before = buf.cursor();
     assert_eq!(cursor_before.line, 0);
     assert_eq!(cursor_before.column, 0);
-    // Move cursor to end of the content line (right after '}').
     let content_len = "fn main() {}".chars().count();
     buf.move_to(0, content_len);
     buf.perform_action(EditorAction::Enter);
-    // Text should be: original line + inserted newline + trailing sentinel.
     assert_eq!(buf.text(), "fn main() {}\n\n");
     let cursor = buf.cursor();
-    // Cursor must be on the newly created blank line (line 1).
     assert_eq!(cursor.line, 1);
     assert_eq!(cursor.column, 0);
 }
 
 #[test]
 fn test_enter_at_end_of_highlighted_file_no_trailing_newline() {
-    // Same as above but the file has *no* trailing newline — the bug
-    // would clamp cursor to (line=0, col=0) instead of (line=1, col=0).
+    // Same as above but with *no* trailing newline — the bug would clamp the cursor to (line=0,
+    // col=0).
     let buf = EditorBuffer::with_text("fn main() {}", Some(HighlightLanguage::Rust));
     assert_eq!(buf.line_count(), 1);
     let content_len = "fn main() {}".chars().count();
     buf.move_to(0, content_len);
     buf.perform_action(EditorAction::Enter);
-    // Enter inserts \n; buffer_text now includes a trailing newline.
     assert_eq!(buf.text(), "fn main() {}\n");
     let cursor = buf.cursor();
     assert_eq!(cursor.line, 1);
@@ -197,7 +185,6 @@ fn test_enter_at_end_of_highlighted_file_no_trailing_newline() {
 
 #[test]
 fn test_backspace_delete_cases() {
-    // (name, input, cursor, expected text, expected cursor)
     let cases = [
         ("backspace", "hello", Some((0, 5)), "hell", Some((0, 4))),
         ("backspace_at_start", "hello", None, "hello", None),
@@ -223,7 +210,6 @@ fn test_backspace_delete_cases() {
         }
     }
 
-    // (name, input, cursor, expected text)
     let cases = [
         ("delete", "hello", None, "ello"),
         ("delete_at_end", "hello", Some((0, 5)), "hello"),
@@ -287,7 +273,6 @@ fn test_multiline_indent_preserves_selection() {
 #[test]
 fn test_indent_cases() {
     use super::EditorAction::*;
-    // (name, action, input, cursor, selection end, expected text)
     let cases = [
         ("indent", Indent, "hello", None, None, "\thello"),
         ("unindent", Unindent, "    hello", None, None, "   hello"),
@@ -331,7 +316,6 @@ fn test_line_col_roundtrip() {
             assert_eq!(rl, line, "line mismatch at ({line},{col})");
             assert_eq!(rc, col, "col mismatch at ({line},{col})");
         }
-        // End of line
         let col = line_text.chars().count();
         let offset = line_col_to_byte_offset(text, line, col);
         let (rl, rc) = byte_offset_to_line_col(text, offset);
@@ -342,7 +326,6 @@ fn test_line_col_roundtrip() {
 
 #[test]
 fn test_selection_normalization_cases() {
-    // (name, text, setup steps, expected cursor, expected selection text)
     type Setup = fn(&EditorBuffer);
     let cases = [
         (
@@ -378,7 +361,6 @@ fn test_selection_normalization_cases() {
             "select_to_then_move_clears_selection",
             "abcdef",
             (|buf| {
-                // Select "bcd"
                 buf.move_to(0, 1);
                 buf.perform_action(EditorAction::SelectTo { line: 0, col: 4 });
                 assert_eq!(
@@ -386,7 +368,6 @@ fn test_selection_normalization_cases() {
                     Some("bcd".to_string()),
                     "case select_to_then_move_clears_selection (selection before move)"
                 );
-                // Performing a move clears selection
                 buf.move_to(0, 0);
             }) as Setup,
             (0, 0),
@@ -426,7 +407,6 @@ fn test_line_comment_prefix() {
 #[test]
 fn test_toggle_line_comment() {
     use super::highlight::HighlightLanguage::*;
-    // (name, input, expected, cursor line)
     let cases = [
         ("add", "hello", "// hello", 0),
         ("remove", "// hello", "hello", 0),
@@ -441,7 +421,6 @@ fn test_toggle_line_comment() {
     ];
     for &(name, input, expected, cursor_line) in &cases {
         let buf = EditorBuffer::with_text(input, Some(Rust));
-        // The cursor column is always 0; only the line varies.
         if cursor_line != 0 {
             buf.move_to(cursor_line, 0);
         }
@@ -449,7 +428,6 @@ fn test_toggle_line_comment() {
         assert_eq!(buf.text(), expected, "case {name}: text");
     }
 
-    // (name, input, expected, language, file extension)
     let cases = [
         ("noop_unknown", "hello", "hello", None, None),
         ("rust_hash", "hello", "# hello", Some(Python), None),
@@ -474,7 +452,6 @@ fn test_toggle_line_comment() {
 
 #[test]
 fn test_jump_to_matching_bracket() {
-    // (name, input, cursor col, expected line, expected col)
     let cases = [
         ("forward_paren", "(hello)", 1, 0, 6),
         ("backward_paren", "(hello)", 6, 0, 1),
@@ -494,7 +471,6 @@ fn test_jump_to_matching_bracket() {
 
 #[test]
 fn test_delete_line_cases() {
-    // (name, input, cursor line, selection end, expected text)
     let lines = "line1\nline2\nline3";
     let cases = [
         ("current_line", lines, 1, None, "line1\nline3"),
@@ -511,8 +487,6 @@ fn test_delete_line_cases() {
         }
         buf.perform_action(EditorAction::DeleteLine);
         assert_eq!(buf.text(), expected, "case {name}: text");
-        // The cursor stays on its line index (clamped to the last remaining
-        // one), at column 0.
         let cursor = buf.cursor();
         let line = cursor_line.min(expected.split('\n').count() - 1);
         assert_eq!(cursor.line, line, "case {name}: line");
@@ -522,7 +496,6 @@ fn test_delete_line_cases() {
 
 #[test]
 fn test_duplicate_line_cases() {
-    // (name, input, cursor line, selection end, expected text)
     let lines = "hello\nworld";
     let cases = [
         ("current_line", lines, 0, None, "hello\nhello\nworld"),
@@ -543,8 +516,7 @@ fn test_duplicate_line_cases() {
         }
         buf.perform_action(EditorAction::DuplicateLine);
         assert_eq!(buf.text(), expected, "case {name}: text");
-        // The cursor lands on the last line of the duplicated block, at
-        // column 0.
+        // The cursor lands on the last line of the duplicated block, at column 0.
         let duplicated = select_to.map_or(1, |(end, _)| end - cursor_line + 1);
         let cursor = buf.cursor();
         assert_eq!(cursor.line, cursor_line + duplicated, "case {name}: line");
@@ -555,8 +527,6 @@ fn test_duplicate_line_cases() {
 #[test]
 fn test_move_line_cases() {
     use super::EditorAction::*;
-    // (name, action, input, cursor line, selection end, expected text, expected
-    //  line)
     let cases = [
         ("up", MoveLineUp, "a\nb\nc", 1, None, "b\na\nc", Some(0)),
         ("down", MoveLineDown, "a\nb\nc", 1, None, "a\nc\nb", Some(2)),
@@ -570,7 +540,6 @@ fn test_move_line_cases() {
             "a\nb",
             None,
         ),
-        // The cursor lands on the first line of the moved block.
         (
             "selected_down",
             MoveLineDown,
@@ -630,7 +599,6 @@ fn test_line_helpers_preserve_trailing_blank_line() {
 
 #[test]
 fn test_select_to_duplicate_endpoint_cases() {
-    // (name, text, start col, drag endpoint col, expected selection text)
     let cases = [
         ("duplicate_endpoint", "hello world", 0, 5, "hello"),
         ("same_endpoint", "hello", 2, 3, "l"),
@@ -646,8 +614,8 @@ fn test_select_to_duplicate_endpoint_cases() {
             buf.cursor().selection.is_some(),
             "case {name}: first SelectTo"
         );
-        // Repeated SelectTo at the drag endpoint (duplicate CursorMoved)
-        // must not collapse or clear an existing selection.
+        // Repeated SelectTo at the drag endpoint (duplicate CursorMoved) must not collapse an
+        // existing selection.
         buf.perform_action(EditorAction::SelectTo {
             line: 0,
             col: end_col,
@@ -692,26 +660,23 @@ fn test_single_line_strips_newlines_and_enter() {
 #[test]
 fn test_ime_surface_activation() {
     let buf = EditorBuffer::with_text("", None);
-    // Masked / password fields never activate IME.
     assert!(
         !EditorWidget::new(&buf)
             .masked(true)
             .is_active_surface(&EditorWidgetState::default())
     );
-    // The window must be focused.
     let unfocused = EditorWidgetState {
         is_window_focused: false,
         ..EditorWidgetState::default()
     };
     assert!(!EditorWidget::new(&buf).is_active_surface(&unfocused));
-    // A focus-id field activates only while focused.
     let field = EditorWidget::new(&buf).id("field");
     let mut focused = EditorWidgetState::default();
     assert!(!field.is_active_surface(&focused));
     focused.is_focused = true;
     assert!(field.is_active_surface(&focused));
-    // The full-page code editor (no focus id, code_mode) is active unless it
-    // ignores the keyboard; a focus-id-less *non-code* field is not active.
+    // The full-page code editor (no focus id, code_mode) is active unless it ignores the keyboard;
+    // a focus-id-less *non-code* field is not active.
     assert!(EditorWidget::new(&buf).is_active_surface(&EditorWidgetState::default()));
     assert!(
         !EditorWidget::new(&buf)
@@ -754,8 +719,8 @@ fn test_input_method_preedit_reported() {
 #[test]
 fn test_cursor_rect_selection_anchor() {
     let buf = EditorBuffer::with_text("hello\nworld", None);
-    // Cursor at (1,4), selection anchor at (0,3) — reversed selection so the
-    // IME must anchor at the selection start, not the drawn caret end.
+    // Cursor at (1,4), selection anchor at (0,3) — reversed, so the IME must anchor at the
+    // selection start.
     buf.move_to(0, 3);
     buf.perform_action(EditorAction::SelectTo { line: 1, col: 4 });
     let buffer = with_font_system(|font_sys| {
@@ -771,34 +736,29 @@ fn test_cursor_rect_selection_anchor() {
     let rect = ime_caret_rect(&buffer, &geo, &buf);
     let expected = cursor_rect(&buffer, &geo, 0, 3, geo.x);
     assert_eq!(rect, expected);
-    // The anchor (line 0) sits above the caret (line 1).
     assert!(rect.y < cursor_rect(&buffer, &geo, 1, 4, geo.x).y);
 }
 
 #[test]
 fn test_masked_render_buffer_builds_dots_without_reborrow() {
-    // Regression test for the Settings-page panic: `layout()` used to call
-    // `self.buffer.text()` (which re-borrows the RefCell via `borrow()`) while
-    // the `borrow_buffer_mut()` RefMut was still held, panicking on the masked
-    // (password) path with "already mutably borrowed". The masked render path
-    // must derive the text from the already-held RefMut instead.
+    // Regression for the Settings-page panic: `layout()` called `self.buffer.text()` (re-borrowing
+    // the RefCell via `borrow()`) while the `borrow_buffer_mut()` RefMut was held, panicking on the
+    // masked (password) path with "already mutably borrowed". The masked render path must derive
+    // the text from the already-held RefMut.
     let buf = EditorBuffer::with_text("secret\npassword", None);
     let mbuffer = with_font_system(|font_sys| {
         let buffer = buf.borrow_buffer_mut();
         let mb = build_masked_render_buffer(font_sys, &buffer, false, 0.0, 0.0, 300.0, 100.0);
-        // The RefMut is still live and readable after building the masked buffer.
         assert_eq!(buffer_text(&buffer), "secret\npassword");
         mb
     });
-    // Rendered text is fully masked, preserving character count and line structure.
     assert_eq!(buffer_text(&mbuffer), "••••••\n••••••••");
 }
 
 #[test]
 fn test_masked_render_buffer_single_line_does_not_wrap() {
-    // Password fields on the Settings page are single-line. The masked dots
-    // must not wrap (matching the real single-line buffer layout) — this is
-    // the exact widget configuration that triggered the original panic.
+    // Password fields are single-line: the masked dots must not wrap (matching the real single-line
+    // layout) — this is the exact widget configuration that triggered the original panic.
     let buf = EditorBuffer::with_text("hunter2", None);
     let mbuffer = with_font_system(|font_sys| {
         let buffer = buf.borrow_buffer_mut();
@@ -810,7 +770,6 @@ fn test_masked_render_buffer_single_line_does_not_wrap() {
 #[test]
 fn test_cursor_follows_focus_state() {
     let buf = EditorBuffer::with_text("", None);
-    // A focus-id field draws the caret only while focused.
     let field = EditorWidget::new(&buf).single_line(true).id("field");
     let state = EditorWidgetState::default();
     assert!(!field.should_draw_cursor(&state));
@@ -819,23 +778,19 @@ fn test_cursor_follows_focus_state() {
         ..EditorWidgetState::default()
     };
     assert!(field.should_draw_cursor(&focused));
-    // Masked / password fields still show the caret when focused (the IME
-    // `is_active_surface` predicate would suppress them, but the caret must
-    // not).
+    // Masked fields still show the caret when focused (the IME `is_active_surface` predicate would
+    // suppress them, but the caret must not be).
     let masked = EditorWidget::new(&buf)
         .single_line(true)
         .masked(true)
         .id("pw");
     assert!(masked.should_draw_cursor(&focused));
-    // Window blur suppresses the caret even while focused.
     let blurred = EditorWidgetState {
         is_focused: true,
         is_window_focused: false,
         ..EditorWidgetState::default()
     };
     assert!(!field.should_draw_cursor(&blurred));
-    // A focus-less field is always active (code editor) while the window is
-    // focused and it is not ignoring the keyboard.
     let code = EditorWidget::new(&buf);
     assert!(code.should_draw_cursor(&EditorWidgetState::default()));
     assert!(
@@ -843,8 +798,8 @@ fn test_cursor_follows_focus_state() {
             .ignore_keyboard(true)
             .should_draw_cursor(&EditorWidgetState::default())
     );
-    // A focus-less *non-code* field is not an active surface (matching
-    // `is_active_surface`), so it must not blink its caret either.
+    // A focus-less *non-code* field is not an active surface, so it must not blink its caret
+    // either.
     assert!(
         !EditorWidget::new(&buf)
             .code_mode(false)
@@ -854,11 +809,10 @@ fn test_cursor_follows_focus_state() {
 
 #[test]
 fn mouse_interaction_gated_on_cursor_bounds() {
-    // Regression for modal click-outside-to-close: the editor must report
-    // `Text` only while the cursor is over its own bounds. Reporting it
-    // unconditionally makes iced `Stack` levitate the cursor over a modal's
-    // backdrop `mouse_area`, which then bails on the now-Levitating cursor and
-    // never delivers the click — so embedding an editor broke click-outside.
+    // Regression for modal click-outside-to-close: the editor must report `Text` only while the
+    // cursor is over its own bounds. Reporting it unconditionally makes iced `Stack` levitate the
+    // cursor over a modal's backdrop `mouse_area`, which then bails on the Levitating cursor and
+    // never delivers the click.
     let bounds = Rectangle::new(Point::new(10.0, 10.0), Size::new(100.0, 40.0));
 
     // Cursor inside the editor bounds → the text-edit affordance.
@@ -868,16 +822,14 @@ fn mouse_interaction_gated_on_cursor_bounds() {
         mouse::Interaction::Text
     );
 
-    // Cursor outside the bounds → default (`None`), so the editor never
-    // claims the cursor beyond its field and the backdrop stays clickable.
+    // Cursor outside the bounds → default (`None`), so the editor never claims it beyond its field.
     let outside = mouse::Cursor::Available(Point::new(300.0, 300.0));
     assert_eq!(
         editor_mouse_interaction(outside, bounds),
         mouse::Interaction::default()
     );
 
-    // A levitating cursor (an overlay above already claimed it) is never
-    // "over" the editor, so it must not be re-claimed nor re-levitated.
+    // A levitating cursor (an overlay above already claimed it) is never "over" the editor.
     let levitating = mouse::Cursor::Levitating(Point::new(50.0, 30.0));
     assert_eq!(
         editor_mouse_interaction(levitating, bounds),

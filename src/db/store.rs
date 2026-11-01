@@ -1,19 +1,15 @@
-//! The connection layer of every store: the product's own use of the engine's
-//! SDK kit.
+//! The connection layer of every store: the product's own use of the engine's SDK kit.
 //!
-//! One statement may hold a store for at most [`statement_limit`]. The engine
-//! (turso_core) checks that limit as the statement steps and terminates it once
-//! the limit is reached, so the store answers the very next operation without a
-//! restart and the caller learns the statement was too heavy. The limit lives on
-//! the connection (`TursoConnection::set_query_timeout`) and the `turso` facade
-//! exposes neither it nor the connection it wraps, so the connections this
-//! product opens are created here, from the published `turso_sdk_kit` the
-//! facade itself is built on — pinned to the same version, the same engine.
+//! One statement may hold a store for at most [`statement_limit`]. The engine checks that
+//! limit as the statement steps and terminates it once reached, so the store answers the very
+//! next operation without a restart and the caller learns the statement was too heavy. The
+//! limit lives on the connection (`TursoConnection::set_query_timeout`), and the `turso`
+//! facade exposes neither it nor the connection it wraps, so the connections this product
+//! opens are created here from the published `turso_sdk_kit` — pinned to the same version,
+//! the same engine.
 //!
-//! Statement execution mirrors the facade: prepare, bind, step, and an IO step
-//! runs the engine's IO before the next step, which then yields to the runtime.
-//! What is not mirrored is the facade's statement/transaction plumbing the
-//! product does not use.
+//! Statement execution mirrors the facade: prepare, bind, step, and an IO step runs the
+//! engine's IO before the next step.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,33 +27,26 @@ use crate::util::UnwrapPoison;
 /// Default limit on how long one statement may hold a store, in seconds.
 const STATEMENT_LIMIT_DEFAULT_SECS: u64 = 180;
 
-/// Env override for [`STATEMENT_LIMIT_DEFAULT_SECS`], in seconds — the same
-/// env-override pattern the other bounded waits use, and what lets the limit's
-/// behaviour be exercised without waiting out the default. The limit it yields
-/// ([`statement_limit`]) is what every connection the product opens is armed
-/// with, the inspection clients' own direct read-only one included
-/// ([`crate::db::debug::connect_readonly`]); those clients carry their own
-/// command-wide read limit on top of it ([`crate::db::read_limit`]), which is a
-/// separate knob.
+/// Env override for [`STATEMENT_LIMIT_DEFAULT_SECS`], in seconds — the same pattern the other
+/// bounded waits use, and what lets the limit's behaviour be exercised without waiting out the
+/// default. The limit it yields arms every connection the product opens, the inspection
+/// clients' own direct read-only one included; those carry their own command-wide read limit on
+/// top of it ([`crate::db::read_limit`]).
 pub(crate) const STATEMENT_LIMIT_ENV: &str = "MAHBOT_STORE_STATEMENT_LIMIT_SECS";
 
-/// The longest one statement may hold a store.
-///
-/// The engine reads a zero duration as "no limit", which would disarm the guard
-/// this module exists to arm, so the override never drops below a second.
+/// The longest one statement may hold a store. The engine reads a zero duration as "no limit",
+/// which would disarm the guard this module exists to arm, so the override never drops below a
+/// second.
 #[must_use]
 pub(crate) fn statement_limit() -> Duration {
     crate::util::env_duration_secs(STATEMENT_LIMIT_ENV, STATEMENT_LIMIT_DEFAULT_SECS)
         .max(Duration::from_secs(1))
 }
 
-/// What a caller is told about a statement the limit terminated.
-///
-/// The engine's own wording for this outcome is "interrupted", which says
-/// nothing about why; every path out of the product — the debug CLI through the
-/// IPC answer, the in-process tool, the service's own log line — reads the same
-/// sentence, and it tells the caller the query is too heavy to run here and
-/// must be reformulated rather than sent again.
+/// What a caller is told about a statement the limit terminated. The engine's own wording is
+/// "interrupted", which says nothing about why: every path out of the product reads this one
+/// sentence, telling the caller the query is too heavy to run here and must be reformulated
+/// rather than sent again.
 #[must_use]
 pub(crate) fn too_heavy_message() -> String {
     format!(
@@ -68,12 +57,9 @@ pub(crate) fn too_heavy_message() -> String {
     )
 }
 
-/// Map an engine error to the error a caller sees.
-///
-/// An interrupt is always the limit terminating the statement: nothing else
-/// interrupts this product's connections, and the engine's own wording for it
-/// ("interrupted") does not say what happened. Every other error passes through
-/// unchanged, keeping its variant and its message.
+/// Map an engine error to the error a caller sees: an interrupt is always the limit terminating
+/// the statement (nothing else interrupts these connections), and every other error passes
+/// through unchanged.
 fn map_error(err: TursoError) -> turso::Error {
     match err {
         TursoError::Interrupt(_) => turso::Error::Interrupt(too_heavy_message()),
@@ -81,16 +67,15 @@ fn map_error(err: TursoError) -> turso::Error {
     }
 }
 
-/// The string form of [`crate::db::EXPERIMENTAL_FEATURES`], the single source for
-/// which features are active.
+/// The string form of [`crate::db::EXPERIMENTAL_FEATURES`], the single source for which
+/// features are active.
 fn experimental_features() -> Option<String> {
     (!crate::db::EXPERIMENTAL_FEATURES.is_empty())
         .then(|| crate::db::EXPERIMENTAL_FEATURES.join(","))
 }
 
-/// The engine config a store is opened with — the facade's `Builder::build`
-/// settings, in the one place that builds them (the test asserts the features
-/// they carry against the read-only path's typed opts).
+/// The engine config a store is opened with — the facade's `Builder::build` settings, in the
+/// one place that builds them.
 fn database_config(path: &str) -> TursoDatabaseConfig {
     TursoDatabaseConfig {
         path: path.to_owned(),
@@ -105,10 +90,8 @@ fn database_config(path: &str) -> TursoDatabaseConfig {
     }
 }
 
-/// The engine handle is not `Debug` and the facade's connection printed nothing
-/// but its type name; a store connection sits inside structs that derive `Debug`
-/// (the store structs and the persistence module's own `Connection`), so it
-/// renders that same name and leaves their log lines unchanged.
+/// The engine handle is not `Debug` and the facade's connection printed only its type name; a
+/// store connection sits inside structs that derive `Debug`, so it renders that same name.
 impl std::fmt::Debug for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Connection").finish()
@@ -128,11 +111,9 @@ impl std::fmt::Debug for Database {
 }
 
 impl Database {
-    /// Open the store at `path` for read-write use.
-    ///
-    /// `TursoDatabase` hands back the IO work of the open, so the open is
-    /// finished by driving it here — the same steps the facade's `Builder::build`
-    /// performs, with the same engine settings.
+    /// Open the store at `path` for read-write use. `TursoDatabase` hands back the IO work of
+    /// the open, so the open is finished by driving it here — the same steps the facade's
+    /// `Builder::build` performs, with the same engine settings.
     pub(crate) async fn open(path: &str) -> turso::Result<Self> {
         let db = TursoDatabase::new(database_config(path));
         loop {
@@ -155,8 +136,8 @@ impl Database {
         self.connect_with(statement_limit())
     }
 
-    /// [`Self::connect`] with an explicit limit, so a test can exercise the
-    /// limit without waiting out the default.
+    /// [`Self::connect`] with an explicit limit, so a test can exercise the limit without
+    /// waiting out the default.
     fn connect_with(&self, limit: Duration) -> turso::Result<Connection> {
         let conn = self.inner.connect().map_err(map_error)?;
         conn.set_query_timeout(limit);
@@ -170,26 +151,21 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
-    /// Prepare and bind `sql`, returning the rows it will produce.
-    ///
-    /// Preparing is all this call does; the rows come out of [`Rows::next`] as
-    /// it steps the statement.
+    /// Prepare and bind `sql`, returning the rows it will produce. Preparing is all this call
+    /// does; the rows come out of [`Rows::next`] as it steps the statement.
     pub(crate) fn query(&self, sql: &str, params: impl IntoParams) -> turso::Result<Rows> {
         self.prepare(sql)?.query(params)
     }
 
-    /// Execute a statement, returning how many rows it changed.
-    ///
-    /// The statement must not hand rows back; a change that reads its own
-    /// result back is driven through [`Self::query`] instead.
+    /// Execute a statement, returning how many rows it changed. The statement must not hand
+    /// rows back; a change that reads its own result is driven through [`Self::query`].
     pub(crate) async fn execute(&self, sql: &str, params: impl IntoParams) -> turso::Result<u64> {
         let mut stmt = self.prepare(sql)?;
         stmt.execute(params).await
     }
 
-    /// Execute every statement in `sql` in order, stopping at the first
-    /// failure; each statement runs in autocommit, so the ones before a failure
-    /// stay committed.
+    /// Execute every statement in `sql` in order, stopping at the first failure; each runs in
+    /// autocommit, so the ones before a failure stay committed.
     pub(crate) async fn execute_batch(&self, sql: &str) -> turso::Result<()> {
         let mut sql = sql;
         while let Some((stmt, offset)) = self.inner.prepare_first(sql).map_err(map_error)? {
@@ -200,9 +176,8 @@ impl Connection {
         Ok(())
     }
 
-    /// Prepare `sql` through the connection's own statement cache — for a
-    /// statement run in a loop, where re-parsing the text on every call would
-    /// be the cost.
+    /// Prepare `sql` through the connection's own statement cache — for a statement run in a
+    /// loop, where re-parsing on every call is the cost.
     pub(crate) fn prepare_cached(&self, sql: &str) -> turso::Result<Statement> {
         let inner = self.inner.prepare_cached(sql).map_err(map_error)?;
         Ok(statement(inner))
@@ -231,10 +206,8 @@ fn statement(inner: Box<TursoStatement>) -> Statement {
     }
 }
 
-/// One prepared statement, shared with the [`Rows`] a query hands back.
-///
-/// The engine's own statement holds the connection it was prepared on, so this
-/// needs no reference to it.
+/// One prepared statement, shared with the [`Rows`] a query hands back. The engine's statement
+/// holds the connection it was prepared on, so this needs no reference to it.
 #[derive(Clone)]
 pub(crate) struct Statement {
     inner: Arc<std::sync::Mutex<Box<TursoStatement>>>,
@@ -265,11 +238,9 @@ impl Statement {
 
     /// Step the statement until it hands back a row or finishes.
     ///
-    /// The engine reports [`TursoStatusCode::Io`] both for a step that needs IO
-    /// and for its own cooperative yield, so the IO is run and control returns to
-    /// the runtime before the next step: a long statement's steps never spin on
-    /// one worker. The connection opens the blocking default IO backend, so the
-    /// IO step completes inline and no waker is involved.
+    /// The engine reports [`TursoStatusCode::Io`] both for a step that needs IO and for its own
+    /// cooperative yield, so the IO is run and control returns to the runtime before the next
+    /// step: a long statement's steps never spin on one worker.
     async fn step(&self) -> turso::Result<TursoStatusCode> {
         loop {
             let status = self
@@ -403,10 +374,9 @@ impl Row {
 mod tests {
     use super::*;
 
-    /// The feature string this layer opens the engine with must produce exactly
-    /// the typed opts the read-only debug path opens with. `database_opts()`
-    /// silently ignores a name it does not know, so this also catches a typo in
-    /// [`crate::db::EXPERIMENTAL_FEATURES`].
+    /// The feature string this layer opens the engine with must produce exactly the typed opts
+    /// the read-only debug path opens with. `database_opts()` silently ignores a name it does
+    /// not know, so this also catches a typo in [`crate::db::EXPERIMENTAL_FEATURES`].
     #[test]
     fn feature_string_matches_the_debug_paths_typed_opts() {
         assert_eq!(
@@ -415,11 +385,9 @@ mod tests {
         );
     }
 
-    /// A statement that overruns the limit is terminated, the caller is told the
-    /// query is too heavy, and the store answers the very next operation on the
-    /// same connection; a cut write rolls its statement back instead of leaving
-    /// the store mid-write. This is the whole point of arming the limit: without
-    /// it a heavy statement holds the store for as long as it runs.
+    /// A statement that overruns the limit is terminated, the caller is told the query is too
+    /// heavy, and the store answers the very next operation on the same connection; a cut write
+    /// rolls its statement back. That is the whole point of the limit.
     #[tokio::test]
     async fn a_statement_past_the_limit_is_cut_and_the_store_stays_usable() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -438,10 +406,8 @@ mod tests {
             .await
             .expect("seed a row");
 
-        // A recursive count to a hundred million is a statement the engine
-        // cannot finish inside a second, and nothing predicts it beforehand —
-        // the limit cuts it as it runs. Rows are stepped by `next`, so that is
-        // where the cut surfaces.
+        // A recursive count to a hundred million is a statement the engine cannot finish inside
+        // a second: the limit cuts it as it runs, and `next` is where the cut surfaces.
         let mut cut = conn
             .query(&format!("{HEAVY}SELECT COUNT(*) FROM c"), ())
             .expect("prepare the heavy statement");
@@ -486,9 +452,8 @@ mod tests {
         assert_eq!(row.get::<i64>(0).expect("count"), 2);
     }
 
-    /// What every heavy statement here is built on: a recursive series to a
-    /// hundred million, far beyond a second's work, whose tail decides whether
-    /// the statement reads or writes.
+    /// What every heavy statement here is built on: a recursive series to a hundred million,
+    /// whose tail decides whether the statement reads or writes.
     const HEAVY: &str =
         "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < 100000000) ";
 }

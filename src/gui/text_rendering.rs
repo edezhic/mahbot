@@ -17,7 +17,7 @@ use crate::util::UnwrapPoison;
 
 use super::theme;
 
-// ── Constants ───────────────────────────────────────────────────────
+// Constants
 
 /// Font metrics used for text rendering (editor buffer, diff viewer).
 #[must_use]
@@ -41,11 +41,10 @@ pub(crate) const GUTTER_FONT_SIZE: f32 = theme::TEXT_11;
 /// pathological single lines (e.g. no-whitespace megabyte).
 pub(crate) const MAX_VISUAL_LINES_PER_SOURCE: usize = 10_000;
 
-// ── Font system access ───────────────────────────────────────────
+// Font system access
 
 /// Acquire the global font system and invoke the closure with a mutable
-/// reference to it. The font system guard is released after the closure
-/// completes.
+/// reference to it. The font system guard is released after the closure completes.
 ///
 /// This is the canonical way to access the font system for shaping,
 /// highlighting, and other text operations, extracted to eliminate
@@ -98,7 +97,7 @@ pub(crate) fn reshape_and_shape(
     buffer.shape_until_scroll(font_sys, false);
 }
 
-// ── Geometry helpers ────────────────────────────────────────────────
+// Geometry helpers
 
 /// Compute the total height of a cosmic_text buffer, accounting for wrapped
 /// lines. Each source line is capped at [`MAX_VISUAL_LINES_PER_SOURCE`]
@@ -206,7 +205,7 @@ pub(crate) fn gutter_clip_rect(
     }
 }
 
-// ── Highlight background rendering ────────────────────────────────
+// Highlight background rendering
 
 /// Draw a highlighted background rectangle for a [`LayoutRun`] behind text,
 /// clipped to the text area.  Used by both the editor and diff widgets for
@@ -343,7 +342,7 @@ pub(crate) fn draw_run_highlights<Renderer, F>(
     }
 }
 
-// ── Colour conversion ───────────────────────────────────────────────
+// Colour conversion
 
 /// Convert an [`iced::Color`] (f32 RGBA components, 0.0–1.0) to
 /// [`cosmic_text::Color`] (u8 RGB).
@@ -355,7 +354,7 @@ pub(crate) fn iced_color_to_cosmic(c: Color) -> cosmic_text::Color {
     cosmic_text::Color::rgb(r, g, b)
 }
 
-// ── Rich-span merging ───────────────────────────────────────────────
+// Rich-span merging
 
 /// Push a `(text, attrs)` span to `result`, merging it with the last entry
 /// if both the attributes match and the slices are **contiguous** in the

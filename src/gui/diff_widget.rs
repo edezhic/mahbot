@@ -1,36 +1,19 @@
-//! A [`cosmic_text::Buffer`]-backed widget for rendering diff file content
-//! with syntax highlighting, gutter line numbers, and per-line background tints.
+//! A [`cosmic_text::Buffer`]-backed widget for rendering diff file content with syntax
+//! highlighting, gutter line numbers and per-line background tints.
 //!
-//! Each diff file gets its own [`DiffBufferWidget`]. File headers, binary
-//! placeholders, and truncation warnings remain Iced widgets interleaved
-//! between per-file buffer widgets. The entire diff content panel is wrapped
+//! Each diff file gets its own [`DiffBufferWidget`]; file headers, binary placeholders and
+//! truncation warnings stay Iced widgets interleaved between them, and the whole panel is wrapped
 //! in an Iced scrollable — per-file buffers do NOT manage their own scroll.
 //!
-//! ## Buffer content format
+//! The buffer text excludes the gutter: each logical line is `"{prefix} {content}\n"` (`+`, `-` or
+//! ` ` in the prefix), and hunk headers are inserted as full text lines. The gutter is drawn
+//! entirely in `draw()` via `fill_text`, so it is never repeated on wrapped continuation lines.
 //!
-//! The buffer text string does NOT include the gutter. Each logical line:
-//! `"{prefix} {content}\n"` — e.g., `"+ let x = 42;\n"`. The prefix character
-//! (`+`, `-`, ` `) is part of the buffer text. Hunk headers are inserted as
-//! full text lines: `"@@ -10,7 +10,9 @@ fn main() {\n"`.
-//!
-//! ## Gutter rendering
-//!
-//! Gutter (old/new line numbers) is rendered entirely in `draw()` via
-//! `fill_text` — it is NOT part of the buffer text at all. This avoids the
-//! problem of gutter text being repeated on wrapped continuation lines.
-//!
-//! ## Shape cache and viewport culling
-//!
-//! Shaping a large diff is expensive, and the UI rebuilds on the diff
-//! modal's auto-refresh tick plus on many interactions. The shaped
-//! [`cosmic_text::Buffer`] is therefore cached in widget state, keyed on a
-//! content fingerprint plus the text-area width (see [`ShapeCacheKey`]);
-//! unchanged content reuses the cached buffer instead of re-shaping. `draw()`
-//! additionally processes only layout runs intersecting the visible
-//! viewport, so per-frame cost scales with the visible content rather than
-//! the whole diff. The cache key is content-derived so that iced's
-//! position-based state reuse (e.g. after a file-list reshuffle) can never
-//! display stale content.
+//! Shaping a large diff is expensive and the UI rebuilds on the modal's auto-refresh tick, so the
+//! shaped [`cosmic_text::Buffer`] is cached in widget state keyed on a content fingerprint plus the
+//! text-area width (see [`ShapeCacheKey`]); `draw()` processes only layout runs intersecting the
+//! visible viewport, so per-frame cost scales with visible content. The key is content-derived, so
+//! iced's position-based state reuse can never display stale content.
 
 use std::sync::Arc;
 
@@ -52,10 +35,8 @@ use super::text_rendering::{
 };
 use super::theme;
 
-// ── Constants ───────────────────────────────────────────────────────
-
-/// Hunk header text color — reuses the syntax-highlight palette entry for
-/// types ([`super::highlight::HighlightClass::Type`]).
+/// Hunk header text color — the syntax-highlight palette entry for types
+/// ([`super::highlight::HighlightClass::Type`]).
 const HUNK_HEADER_COLOR: Color = super::highlight::HighlightClass::Type.color();
 
 /// Added line foreground color.
@@ -73,42 +54,31 @@ const GUTTER_DIGIT_WIDTH: f32 = GUTTER_FONT_SIZE * 0.62;
 /// Selection highlight fill color.
 const SELECTION_COLOR: Color = theme::ACCENT_DIM;
 
-// ── Per-file buffer data (pre-computed in update) ───────────────────
-
-/// Pre-built data for rendering one diff file via [`DiffBufferWidget`].
-/// All string formatting and span computation happens when this struct
-/// is built (on diff load / file selection change), not per-frame.
+/// Pre-built data for rendering one diff file via [`DiffBufferWidget`]: all string formatting and
+/// span computation happens when this is built (on diff load / selection change), not per-frame.
 pub struct DiffFileBuffer {
     /// The full buffer text: hunk headers + prefixed diff lines, newline-terminated.
     pub text: String,
-    /// Per-span data: `(start_byte, end_byte, iced_color)` — covers the entire text.
-    /// Gaps between spans use `theme::TEXT_PRIMARY` as the default color.
+    /// Per-span data `(start_byte, end_byte, iced_color)` covering the entire text; gaps use
+    /// `theme::TEXT_PRIMARY`.
     pub span_data: Vec<(usize, usize, Color)>,
     /// Per-logical-line kind: `None` for hunk headers, `Some(kind)` for diff lines.
     pub line_kinds: Vec<Option<DiffLineKind>>,
-    /// Per-logical-line line numbers: `(old_num, new_num)`.
-    /// Both `None` for hunk headers and lines without line numbers.
+    /// Per-logical-line `(old_num, new_num)`; both `None` for hunk headers and unnumbered lines.
     pub line_numbers: Vec<(Option<usize>, Option<usize>)>,
     /// Digit count for the widest old/new line number (minimum 1).
     pub gutter_digits: usize,
-    /// Content fingerprint over every other field, computed once at build
-    /// time. Used as part of the shape-cache key so an unchanged diff
-    /// (e.g. after a 5-second auto-refresh rebuilt byte-identical buffers)
-    /// reuses the already-shaped layout, while any content change forces a
-    /// full re-shape — stale content must never be displayed.
+    /// Content fingerprint over every other field, computed once at build time and part of the
+    /// shape-cache key: an unchanged diff (a byte-identical rebuild on auto-refresh) reuses the
+    /// shaped layout, any change forces a full re-shape.
     pub content_fingerprint: u64,
 }
 
-// ── Shape cache ──────────────────────────────────────────────────────
-
-/// Cache key for a shaped [`cosmic_text::Buffer`].
-///
-/// The key covers every input to shaping: the diff content (via the
-/// content fingerprint), the content lengths (hash-collision hardening),
-/// and the shaping width (wrapping depends on it). If any of these change,
-/// the cached buffer is invalid and the full re-shape path runs — stale
-/// content must never be displayed, including when iced recycles widget
-/// state positionally after the file list changes.
+/// Cache key for a shaped [`cosmic_text::Buffer`], covering every input to shaping: the content
+/// fingerprint, the content lengths (hash-collision hardening) and the shaping width (wrapping
+/// depends on it). Any change invalidates the cache and runs the full re-shape — stale content must
+/// never be displayed, including when iced recycles widget state positionally after the file list
+/// changes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct ShapeCacheKey {
     content_fingerprint: u64,
@@ -138,7 +108,7 @@ struct ShapeCacheEntry {
     total_height: f32,
 }
 
-// ── Widget state ─────────────────────────────────────────────────────
+// Widget state
 
 /// Persistent state stored in `widget::Tree::State`.
 #[derive(Default)]
@@ -157,7 +127,7 @@ struct DiffBufferState {
     mouse_held: bool,
 }
 
-// ── Widget ───────────────────────────────────────────────────────────
+// Widget
 
 /// A custom Iced widget that renders a single diff file's content via
 /// [`cosmic_text::Buffer`], with gutter line numbers and per-line background
@@ -303,19 +273,9 @@ fn global_byte_to_cursor(buffer: &cosmic_text::Buffer, global: usize) -> cosmic_
     cosmic_text::Cursor::default()
 }
 
-/// Hit-test mouse position against the diff text area.
-///
-/// Returns the global byte offset into the buffer (as returned by
-/// [`hit_to_global_byte`]), or `None` if the cursor is outside the text
-/// area (gutter/padding).
-///
-/// # Coordinate system
-///
-/// The preamble (cursor → buffer-relative coordinates) is delegated to
-/// [`cursor_to_buffer_coords`]; see its docstring for the coordinate
-/// convention.  In particular, **do not subtract `bounds.x` / `bounds.y`
-/// again** after calling that helper — see [`cursor_to_buffer_coords`]
-/// for the rationale.
+/// The preamble (cursor → buffer-relative coordinates) is delegated to [`cursor_to_buffer_coords`];
+/// **do not subtract `bounds.x` / `bounds.y` again** after calling it — see its docstring for the
+/// coordinate convention and the rationale.
 fn hit_test(
     buffer: &cosmic_text::Buffer,
     layout: Layout<'_>,
@@ -330,7 +290,7 @@ fn hit_test(
     Some(hit_to_global_byte(buffer, hit.line, hit.index))
 }
 
-/// Extract selected text from global byte offsets (excludes gutter numbers).
+/// Extract selected text from global byte offsets (excluding gutter numbers).
 fn selection_text(text: &str, anchor: usize, cursor: usize) -> Option<String> {
     if anchor == cursor {
         return None;
@@ -353,8 +313,6 @@ fn has_selection(anchor: Option<usize>, cursor: Option<usize>) -> bool {
         _ => false,
     }
 }
-
-// ── Iced Widget impl ─────────────────────────────────────────────────
 
 impl<Theme, Renderer> Widget<super::diff::DiffMessage, Theme, Renderer> for DiffBufferWidget<'_>
 where
@@ -383,7 +341,6 @@ where
         let bounds = limits.max();
         let state = tree.state.downcast_mut::<DiffBufferState>();
 
-        // ── Gutter width ───────────────────────────────────────────
         let gutter_width = gutter_width_from_digits(self.data.gutter_digits);
         state.gutter_width = gutter_width;
 
@@ -395,8 +352,8 @@ where
         )
         .width;
 
-        // No content — collapse to zero height and drop any cached buffer
-        // so a recycled state slot can never draw stale content.
+        // No content: collapse to zero height and drop any cached buffer so a recycled
+        // state slot can never draw stale content.
         if self.data.text.is_empty() {
             state.shape_cache = None;
             return layout::Node::new(Size::new(bounds.width, 0.0));
@@ -404,12 +361,10 @@ where
 
         let cache_key = ShapeCacheKey::new(self.data, text_area_width);
 
-        // ── Shape-cache hit: content and width unchanged ─────────────
-        // Reuse the previously shaped buffer and its total height instead of
-        // re-shaping the whole diff. The key covers the content fingerprint,
-        // content lengths, and the text-area width, so any change to an
-        // input (diff data, wrapping width, file-list reshuffle that recycles
-        // this state slot) falls through to the full re-shape path below.
+        // Reuse the previously shaped buffer and its total height instead of re-shaping:
+        // the key covers fingerprint, lengths and width, so any change (diff data, wrapping
+        // width, a reshuffle that recycles this slot) falls through to the full re-shape
+        // below.
         if let Some(entry) = &state.shape_cache
             && entry.key == cache_key
         {
@@ -424,7 +379,6 @@ where
         let (buffer, total_height) = with_font_system(|font_sys| {
             let mut buffer = cosmic_text::Buffer::new(font_sys, font_metrics());
 
-            // ── Build rich spans from pre-computed span data ────────────
             let text = &self.data.text;
             let base_attrs = cosmic_text::Attrs::new()
                 .family(cosmic_text::Family::Name("JetBrains Mono"))
@@ -454,15 +408,14 @@ where
             buffer.set_size(font_sys, Some(text_area_width), None);
             buffer.shape_until_scroll(font_sys, false);
 
-            // ── Compute total height ────────────────────────────────────
-            // Cap each source line at MAX_VISUAL_LINES_PER_SOURCE visual lines
+            // Cap each source line at MAX_VISUAL_LINES_PER_SOURCE visual lines.
             let total_height: f32 = compute_total_height(&mut buffer, font_sys, metrics);
 
             (buffer, total_height)
         });
 
-        // Move the shaped buffer into an Arc and store with its cache key
-        // and total height for reuse on subsequent layouts.
+        // Store the shaped buffer with its cache key and total height for reuse on later
+        // layouts.
         let arc = Arc::new(buffer);
         state.shape_cache = Some(ShapeCacheEntry {
             key: cache_key,
@@ -488,19 +441,16 @@ where
         let bounds = layout.bounds();
         let gutter_width = state.gutter_width;
 
-        // ── Visible viewport (content coordinates) ──────────────────
-        // The scrollable passes its visible region translated into the same
-        // coordinate space as `bounds` (see scrollable's draw: the renderer
-        // is translated, the viewport is not). Only runs intersecting it are
-        // processed below, so per-frame cost scales with the visible content
-        // instead of the whole diff. Fully off-screen → nothing to draw.
+        // The scrollable passes its visible region in the same coordinate space as `bounds`
+        // (see its draw: the renderer is translated, the viewport is not). Only runs
+        // intersecting it are processed, so per-frame cost scales with visible content;
+        // fully off-screen → nothing.
         let Some(visible) = bounds.intersection(viewport) else {
             return;
         };
         let viewport_top = visible.y;
         let viewport_bottom = visible.y + visible.height;
 
-        // ── 0. Fill background ──
         draw_background(renderer, bounds, theme::BG_BASE);
 
         let text_rect = text_area_rect(bounds, self.h_padding, self.v_padding, gutter_width);
@@ -516,10 +466,8 @@ where
             None => return,
         };
 
-        // ── 1. Draw per-line background tints (behind text) ─────────
-        // Draw a background rectangle for every visual line, including
-        // wrapped continuation lines. (Unlike the gutter section below,
-        // backgrounds must cover the full visible span.)
+        // A background rectangle for every visual line, wrapped continuations included
+        // (unlike the gutter below, backgrounds cover the full visible span).
         for run in buffer_for_draw.layout_runs() {
             // Cull off-screen runs: layout_runs yields in ascending y order.
             let run_top = text_y + run.line_top;
@@ -555,7 +503,6 @@ where
             }
         }
 
-        // ── 2. Draw line numbers (gutter) ───────────────────────────
         let number_color = theme::TEXT_MUTED;
         let gutter_clip = gutter_clip_rect(
             bounds,
@@ -565,11 +512,10 @@ where
             text_area_height,
         );
 
-        // Only draw gutter for the first visual line of each logical line.
-        // `last_drawn_line` is updated for every run — including off-screen
-        // ones above the viewport — so a wrapped line whose first visual run
-        // is scrolled out never gets its number drawn on a visible
-        // continuation line (the number stays at the first visual run).
+        // Only the first visual run of each logical line gets its numbers.
+        // `last_drawn_line` updates for every run, including off-screen ones above the
+        // viewport, so a wrapped line whose first run is scrolled out never draws its
+        // number on a visible continuation.
         let mut last_drawn_line = usize::MAX;
         for run in buffer_for_draw.layout_runs() {
             if run.line_i == last_drawn_line {
@@ -642,7 +588,6 @@ where
             }
         }
 
-        // ── 3. Draw selection highlight (behind text) ───────────────
         if has_selection(state.sel_anchor, state.sel_cursor) {
             let (anchor, cursor) = (state.sel_anchor.unwrap(), state.sel_cursor.unwrap());
             let (start, end) = if anchor < cursor {
@@ -671,7 +616,6 @@ where
             );
         }
 
-        // ── 4. Draw text via fill_raw ───────────────────────────────
         draw_buffer_text(
             renderer,
             &buffer_for_draw,
@@ -782,15 +726,11 @@ where
     }
 }
 
-// ── Builder ──────────────────────────────────────────────────────────
-
-/// Build per-file [`DiffFileBuffer`] data from a slice of [`super::diff::DiffFile`]s.
+/// Build per-file [`DiffFileBuffer`] data from [`super::diff::DiffFile`]s, called in `update()`
+/// when diff data or file selection changes and consumed by [`DiffBufferWidget`] in `view()`.
 ///
-/// Called in `update()` when diff data or file selection changes.
-/// The resulting buffers are consumed by [`DiffBufferWidget`] in `view()`.
-///
-/// When `limits` is `Some((max_hunks, max_lines))`, stops building buffers once
-/// cumulative hunk/line counts would exceed the caps (matches view truncation).
+/// With `limits` as `Some((max_hunks, max_lines))`, building stops once cumulative hunk/line counts
+/// would exceed the caps (matching view truncation).
 #[must_use]
 pub fn build_file_buffers(
     diff_files: &[super::diff::DiffFile],
@@ -944,7 +884,7 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
     }
 }
 
-// ── Tests ───────────────────────────────────────────────────────────
+// Tests
 
 #[cfg(test)]
 mod tests {

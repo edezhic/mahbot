@@ -1,59 +1,41 @@
 //! Document conversion: turn a document's bytes into the text and image files
 //! an agent can read, and report a short user-facing reason when it cannot.
 //!
-//! Shared by the inbound attachment flow ([`crate::channels::enrichment`]), by
-//! the read tool and — through [`crate::tools::read_document`] — by the command
-//! line's document reader ([`crate::cli`]); nothing here touches channel state,
-//! the database, or the network. [`convert_document_file`] is the bounded async
-//! entry point every caller goes through, and [`needs_extraction`] tells a
-//! caller whether a file is one of the containers this module extracts from.
+//! Shared by the inbound attachment flow ([`crate::channels::enrichment`]), the
+//! read tool and the command line's document reader; nothing here touches channel
+//! state, the database, or the network. [`convert_document_file`] is the bounded
+//! async entry point every caller goes through.
 //!
-//! Format detection and the PDF arm live here; the ZIP-container OOXML formats
-//! (Word, Excel, PowerPoint) live in [`crate::ooxml`], their pre-OOXML binary
-//! ancestors (`.doc`/`.xls`/`.ppt`, a CFB container) in [`crate::legacy`], and
-//! everything a PDF says beside its page text — its own description, its
-//! annotations and its form fields — in [`crate::pdf_marks`].
+//! Format detection and the PDF arm live here; the OOXML formats in
+//! [`crate::ooxml`], their pre-OOXML ancestors in [`crate::legacy`], and what a
+//! PDF says beside its page text in [`crate::pdf_marks`].
 //!
 //! # Invariants
 //!
 //! - **Pure and CPU-bound.** No state but the shared conversion semaphore; the
 //!   only I/O is reading the input bytes and writing artifacts. Conversion is
 //!   synchronous on purpose: a slow rasterization never stalls an async task.
-//! - **No panics of its own**, for any input including empty or truncated
-//!   bytes: every fallible step degrades to a skipped artifact, a user-facing
-//!   note, or [`DocOutcome::Unreadable`]. The structure parse runs inside
+//! - **No panics of its own**, for any input including empty or truncated bytes:
+//!   every fallible step degrades to a skipped artifact, a note, or
+//!   [`DocOutcome::Unreadable`]. The structure parse runs inside
 //!   [`std::panic::catch_unwind`] and the `pdf-extract` text pass inside
-//!   [`crate::shutdown::contain_panics`], so a panic costs the pass it happens in
-//!   and nothing else: in the text pass it costs one page — the pages around it
-//!   keep theirs — unless it strikes while the reader is being opened, when it
-//!   costs the whole text pass and every page of the document is named as one
-//!   whose text failed. Neither is reported on stderr per page. The decoders
-//!   themselves are trusted, not hardened: a malicious PDF can overflow the stack
-//!   or exhaust memory inside a decoder and abort the process (the filter chain
-//!   inflates into an unbounded buffer), and a decoder that panics instead is
-//!   only contained at the caller's blocking boundary (as
-//!   [`DocOutcome::Unreadable`], losing the text pass with it). The bounds this
-//!   module declares are its own (see `embedded_image_jpeg`), not the decoders'.
+//!   [`crate::shutdown::contain_panics`], so a panic costs the pass it happens in:
+//!   in the text pass one page, unless it strikes while the reader is opened, when
+//!   it costs every page. The decoders are trusted, not hardened: a malicious PDF
+//!   can overflow the stack or exhaust memory inside one and abort the process.
 //! - **One page never costs another.** Every page that produced any text
 //!   contributes it, however short, and a page whose text could not be read is
-//!   named in a note; the pages without a usable text layer are rasterized so the
-//!   document is still delivered, because a page whose text could not be read is
-//!   not a page that has none.
-//! - **Content-first detection.** Magic bytes decide the format, and a shared
-//!   container is opened to read what it really holds: a CFB's own directory
-//!   tells a legacy `.doc`/`.xls`/`.ppt` from a genuinely encrypted package,
-//!   and a ZIP's own entries tell a `.docx`/`.xlsx`/`.pptx`. The name only
-//!   decides what the content cannot — a container that names no Office
-//!   document at all falls back to the name's claim, and plain text has no
-//!   container to read — so a renamed file is read — and reported — for what it
-//!   is. The gate that decides whether a file is converted at all has only its
-//!   head to read, so a ZIP is still a ZIP by name there: a real `.xlsx` named
-//!   `notes.bin` is read as the raw bytes that name claims.
+//!   named in a note; pages without a usable text layer are rasterized so the
+//!   document is still delivered.
+//! - **Content-first detection.** Magic bytes decide the format, and a container
+//!   is opened to read what it really holds: a CFB's directory tells a legacy
+//!   `.doc`/`.xls`/`.ppt` from an encrypted package, a ZIP's entries a
+//!   `.docx`/`.xlsx`/`.pptx`. The name decides only what the content cannot, so a
+//!   renamed file is read for what it is. The gate that decides whether a file is
+//!   converted at all has only its head to read, so a ZIP is still a ZIP by name.
 //! - **`out_dir` is created on demand** and is the only place artifacts are
 //!   written. No artifact name carries a path a file supplies: a package's media
-//!   entry contributes its base name rather than its full ZIP entry path, and a
-//!   legacy picture is named from its slot, so a crafted archive cannot write
-//!   outside `out_dir`.
+//!   entry contributes its base name, a legacy picture is named from its slot.
 
 use crate::reader_output::{Unshown, UnshownKind};
 use crate::util::media_target::{RASTER_DECODE_MAX_ALLOC_BYTES, RASTER_DECODE_MAX_DIMENSION_PX};
@@ -82,15 +64,12 @@ use zip::ZipArchive;
 /// Maximum extracted-text length (Unicode chars) inlined into the message.
 pub(crate) const INLINE_TEXT_MAX_CHARS: usize = 5000;
 
-/// Minimum text-layer length for a page to need no image of itself: at least this
-/// many characters. Shorter than this is page-number/decoration noise or
-/// whitespace, so such a page is rasterized as well — its text is delivered
-/// either way (see [`is_usable_page_text`]).
+/// Minimum text-layer length for a page to need no image of itself: shorter is
+/// page-number/decoration noise, so such a page is rasterized too (see [`is_usable_page_text`]).
 const MIN_PAGE_TEXT_CHARS: usize = 16;
 
-/// Slack, in points, on a page's crop box when deciding whether a character is
-/// visible: a character whose origin sits on the edge is text the page shows,
-/// and the box is compared after the reader's own rounding.
+/// Slack, in points, on a page's crop box when deciding whether a character is visible:
+/// a character whose origin sits on the edge is text the page shows.
 const CROP_EDGE_SLACK: f64 = 0.5;
 
 /// Target pixel size of the long side of a rasterized page.
@@ -99,18 +78,15 @@ const RASTER_LONG_SIDE_PX: f32 = 1600.0;
 /// Maximum rasterization scale, so a tiny page is not blown up past usefulness.
 const RASTER_MAX_SCALE: f32 = 3.0;
 
-/// JPEG quality for rasterized pages: high enough that small print stays
-/// legible, low enough that a full page stays a few hundred kilobytes.
+/// JPEG quality for rasterized pages: small print stays legible, a page stays a few hundred KB.
 const RASTER_JPEG_QUALITY: u8 = 90;
 
 /// Magic bytes at the start of every PDF.
 const PDF_MAGIC: &[u8] = b"%PDF-";
-/// Magic bytes at the start of a ZIP local file header — the OOXML packages
-/// (Word/Excel/PowerPoint) and plain archives alike.
+/// Magic bytes of a ZIP local file header — OOXML packages and plain archives alike.
 const ZIP_MAGIC: &[u8] = b"PK\x03\x04";
 /// CFB/OLE container magic — what a legacy `.doc`/`.xls`/`.ppt` and a genuinely
-/// encrypted OOXML package are both wrapped in. Shared with the `document`
-/// tool, which refuses such a container by what its own directory says it is.
+/// encrypted OOXML package are both wrapped in.
 pub(crate) const CFB_MAGIC: &[u8] = &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 /// Extensions treated as plain text regardless of content.
 const PLAIN_TEXT_EXTENSIONS: &[&str] = &[
@@ -118,37 +94,26 @@ const PLAIN_TEXT_EXTENSIONS: &[&str] = &[
     "log",
 ];
 
-/// Reason reported for a document whose bytes could not be read or whose
-/// conversion panicked.
+/// Reason reported for a document whose bytes could not be read or whose conversion panicked.
 const UNREADABLE_REASON: &str = "could not be read";
-/// Bound on the concurrent heavy document parses — a conversion, the deck walk a
-/// `pptx_edit` refusal's diagram text needs (see [`read_pptx_diagram_text`]), and
-/// the parse a container's own bytes need to name their family (see
-/// [`run_document_parse`]): each holds a whole document (plus, for a conversion,
-/// its decoded rasters), and every caller runs on its own task, so a burst would
-/// otherwise multiply peak memory.
+/// Bound on concurrent heavy document parses — a conversion, the deck walk a `pptx_edit`
+/// refusal needs, and the parse a container's bytes need to name their family: each holds a
+/// whole document, and a burst would otherwise multiply peak memory.
 static DOCUMENT_CONVERSIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
-// ── Delivery notes shared by both callers ───────────────────────
-//
-// The inbound attachment path and the read tool each wrap these bodies in their
-// own `[<source>: ...]` prefix (a file name and a path respectively), so the
-// sentence a model reads for the same situation cannot drift between them. The
-// report of what a reading found and did not show
-// ([`crate::reader_output::Unshown`]) leads them on both paths.
+// The inbound attachment path and the read tool each wrap these bodies in their own
+// `[<source>: ...]` prefix (a file name and a path respectively), so the sentence a model
+// reads for the same situation cannot drift between them.
 
-/// Body of the note shown when a reading produced no page text but delivered
-/// images of it.
+/// Body of the note shown when a reading produced no page text but delivered images of it.
 pub(crate) const NO_TEXT_LAYER_NOTE: &str =
     "no text could be extracted — the content was provided as images";
 
-/// Body of the note shown when a reading produced no page text and no image was
-/// delivered: the text it did return, if any, is only the document's own
-/// description or its form list.
+/// Body of the note shown when a reading produced no page text and no image: the text it
+/// did return is only the document's own description or form list.
 pub(crate) const NO_TEXT_NOTE: &str = "no text could be extracted";
 
-/// Body of the note pointing at the file `path` holding extracted text that was
-/// too long to inline.
+/// Body of the note pointing at the file `path` holding extracted text too long to inline.
 #[must_use]
 pub(crate) fn spilled_text_note(chars: usize, path: &Path) -> String {
     format!(
@@ -160,29 +125,21 @@ pub(crate) fn spilled_text_note(chars: usize, path: &Path) -> String {
 /// The result of converting one document.
 #[derive(Debug)]
 pub(crate) enum DocOutcome {
-    /// Text was extracted. `text` may be empty when the document has no text
-    /// layer; `images` are files written into `out_dir`, ready for the existing
-    /// inbound IMAGE pipeline; `notes` are non-fatal, already user-facing notes
-    /// (e.g. skipped undecodable embedded media, pages the reader could not
-    /// read); `unshown` is the report of the content the reading found and did
-    /// not show, which both callers deliver in the same place and the same words
-    /// ([`crate::reader_output::Unshown`]).
+    /// Text was extracted. `text` may be empty when the document has no text layer; `images`
+    /// are files written into `out_dir`; `notes` are non-fatal, already user-facing; `unshown`
+    /// is the report of the content the reading found and did not show.
     Text {
         text: String,
         images: Vec<PathBuf>,
         notes: Vec<String>,
         unshown: Unshown,
-        /// The reader failed on every page it was asked for, producing no text at
-        /// all: the document's text was lost, not absent, so a caller must not
-        /// report it as one that has no text. A page whose text survived — even
-        /// partially — and a page the reader read without producing text both clear
-        /// this.
+        /// The reader failed on every page it was asked for, producing no text at all: the
+        /// document's text was lost, not absent, so a caller must not report it as one that has
+        /// no text. A page whose text survived — even partially — clears this.
         all_page_text_lost: bool,
-        /// Whether the text the reading returned is the document's own content
-        /// rather than only its own description or form list. A PDF whose pages
-        /// yielded no text but whose Info dictionary or form did says false; every
-        /// other reading sets it through [`DocOutcome::text`]. A caller reporting
-        /// the absence of page text reads this flag, never `text.is_empty()`.
+        /// Whether the text the reading returned is the document's own content rather than only
+        /// its description or form list. A caller reporting the absence of page text reads this
+        /// flag, never `text.is_empty()`.
         page_text: bool,
     },
     /// A recognized format whose bytes could not be read (corrupt, or
@@ -193,10 +150,8 @@ pub(crate) enum DocOutcome {
 }
 
 impl DocOutcome {
-    /// A reading whose text is the document's own content: `page_text` is whether
-    /// it printed anything, and `all_page_text_lost` is false. The PDF reading
-    /// builds [`DocOutcome::Text`] directly instead — both flags are computed per
-    /// page there.
+    /// A reading whose text is the document's own content: `page_text` is whether it printed
+    /// anything, and `all_page_text_lost` is false. The PDF reading builds [`DocOutcome::Text`].
     pub(crate) fn text(
         text: String,
         images: Vec<PathBuf>,
@@ -214,13 +169,9 @@ impl DocOutcome {
     }
 }
 
-// ── What a file really is, from its own bytes ───────────────────
-//
-// Both callers of this module answer a file by its CONTENT: the name is only
-// what the user called it, and the formats that share a container (a CFB, a
-// ZIP) can be told apart no other way. The reading and writing halves of the
-// `document` tool therefore ask this one classifier, so the two paths cannot
-// disagree about what a file is.
+// Both callers answer a file by its CONTENT: the name is only what the user called it, and
+// the formats that share a container (a CFB, a ZIP) can be told apart no other way. The
+// reading and writing halves of the `document` tool ask this one classifier.
 
 /// What a file really is, decided from its bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -229,20 +180,14 @@ pub(crate) enum RealFamily {
     Docx,
     Xlsx,
     Pptx,
-    /// A pre-OOXML Word document (`.doc`, a CFB container).
     LegacyDoc,
-    /// A pre-OOXML Excel workbook (`.xls`, a CFB container).
     LegacyXls,
-    /// A pre-OOXML PowerPoint presentation (`.ppt`, a CFB container).
     LegacyPpt,
-    /// A genuinely encrypted document, which needs a password rather than a
-    /// reading: a CFB container holding `EncryptionInfo` and `EncryptedPackage`,
-    /// or one of the three old binary formats whose own reader reports a
-    /// password — the container alone cannot tell the two apart.
+    /// A genuinely encrypted document, which needs a password rather than a reading: a CFB
+    /// holding `EncryptionInfo` and `EncryptedPackage`, or an old binary format that says so.
     Encrypted,
-    /// None of the formats above — an OLE container that is not an Office
-    /// document (an Outlook `.msg`, say), a container too broken to open, or
-    /// bytes that are no document container at all.
+    /// None of the formats above — an OLE container that is not an Office document (an Outlook
+    /// `.msg`), a container too broken to open, or bytes that are no document container at all.
     Other,
 }
 
@@ -261,20 +206,15 @@ pub(crate) fn real_family(bytes: &[u8]) -> RealFamily {
     RealFamily::Other
 }
 
-/// A CFB container's family, from its own directory: the streams it declares are
-/// the only thing separating a legacy `.doc`/`.xls`/`.ppt` from a genuinely
-/// encrypted OOXML package from an OLE container that is neither. A container
-/// that is neither, or one this reader cannot open at all, has no family of its
-/// own — the caller falls back to the name's claim ([`named_container_kind`]),
-/// the only evidence such a file leaves.
+/// A CFB container's family, from its own directory: the streams it declares are the only
+/// thing separating a legacy `.doc`/`.xls`/`.ppt` from an encrypted OOXML package from an OLE
+/// container that is neither. A container with no family of its own falls back to its name.
 fn cfb_family(bytes: &[u8]) -> RealFamily {
     let Ok(reader) = CfbReader::new(Cursor::new(bytes)) else {
         return RealFamily::Other;
     };
-    // Genuine encryption wins over everything: a package encrypted this way
-    // carries these two streams and nothing a reader could read, so a stray
-    // `WordDocument` (or an OOXML name) must not talk the verdict out of the
-    // password prompt the file really is.
+    // Genuine encryption wins over everything: a package encrypted this way carries these two
+    // streams and nothing readable, so a stray `WordDocument` must not skip the password prompt.
     if reader.has_stream("EncryptionInfo") && reader.has_stream("EncryptedPackage") {
         return RealFamily::Encrypted;
     }
@@ -291,9 +231,8 @@ fn cfb_family(bytes: &[u8]) -> RealFamily {
     RealFamily::Other
 }
 
-/// A ZIP container's family, from the package's own entry names. Only the
-/// central directory is read — no entry is ever decompressed — so deciding a
-/// package's family cannot inflate anything.
+/// A ZIP container's family, from the package's own entry names. Only the central directory
+/// is read — no entry is ever decompressed — so deciding a family cannot inflate anything.
 fn zip_family(bytes: &[u8]) -> RealFamily {
     let Ok(archive) = ZipArchive::new(Cursor::new(bytes)) else {
         return RealFamily::Other;
@@ -310,51 +249,38 @@ fn zip_family(bytes: &[u8]) -> RealFamily {
     }
 }
 
-/// What [`convert_document`] found in `bytes`: the format its own container
-/// declares, or the extension's verdict where the container declares none.
+/// What [`convert_document`] found in `bytes`: the container's family, else the extension's word.
 enum DocumentKind {
     Pdf,
     Docx,
     Xlsx,
     Pptx,
-    /// A legacy binary Word document (`.doc`, a CFB container).
     LegacyDoc,
-    /// A legacy binary Excel workbook (`.xls`, a CFB container).
     LegacyXls,
-    /// A legacy binary PowerPoint presentation (`.ppt`, a CFB container).
     LegacyPpt,
-    /// A genuinely encrypted OOXML package, whatever the name claims: a CFB
-    /// container that needs a password rather than a conversion.
+    /// A genuinely encrypted OOXML package, whatever the name claims.
     Encrypted,
     PlainText,
     Unsupported,
 }
 
-/// Whether `head` opens a ZIP container — an OOXML package of the three families
-/// this module converts, or a plain archive. A head of magic alone cannot tell
-/// those apart, so this answers only "a ZIP"; [`real_family`] opens the central
-/// directory to say which family a package holds. The `document` tool's
-/// classifier asks this, so a file whose bytes are a package is read whole and
-/// described by them rather than by its name.
+/// Whether `head` opens a ZIP container — an OOXML package or a plain archive. A head of
+/// magic alone cannot tell those apart, so this answers only "a ZIP"; [`real_family`] opens
+/// the central directory to say which family a package holds.
 #[must_use]
 pub(crate) fn is_zip_container(head: &[u8]) -> bool {
     head.starts_with(ZIP_MAGIC)
 }
 
-/// Classify `bytes` named `path`: the container's own content first, the name
-/// only where the content cannot decide (a container that names no Office
-/// document) or there is no container to read (plain text). The single dispatch
-/// behind [`convert_document`] and [`needs_extraction`], so detection cannot
-/// drift between them.
+/// Classify `bytes` named `path`: the container's own content first, the name only where the
+/// content cannot decide or there is no container to read. The single dispatch behind
+/// [`convert_document`] and [`needs_extraction`], so detection cannot drift.
 fn classify(bytes: &[u8], path: &Path) -> DocumentKind {
     if bytes.starts_with(PDF_MAGIC) {
         return DocumentKind::Pdf;
     }
-    // Checked before the ZIP attempt: a legacy `.doc`/`.xls`/`.ppt`, an
-    // encrypted package and any other OLE container alike are CFB, and their
-    // bytes would otherwise look like corruption. The container's own directory
-    // decides first; a directory that names no Office document leaves the name's
-    // claim, the only evidence such a container has.
+    // Checked before the ZIP attempt: a legacy `.doc`/`.xls`/`.ppt`, an encrypted package and any
+    // other OLE container alike are CFB, and their bytes would otherwise look like corruption.
     if bytes.starts_with(CFB_MAGIC) {
         return match real_family(bytes) {
             RealFamily::Encrypted => DocumentKind::Encrypted,
@@ -365,11 +291,9 @@ fn classify(bytes: &[u8], path: &Path) -> DocumentKind {
         };
     }
     if bytes.starts_with(ZIP_MAGIC) {
-        // The package's own entries win where they name a family, so a real
-        // `.xlsx` named `.docx` reads as a spreadsheet. A ZIP that is no OOXML
-        // package at all keeps the name's verdict — a broken package named
-        // `.docx` is still a corrupt `.docx` — because a plain archive and a
-        // package sharing a name are told apart by nothing else.
+        // The package's own entries win where they name a family, so a real `.xlsx` named `.docx`
+        // reads as a spreadsheet. A ZIP that is no OOXML package keeps the name's verdict — a
+        // broken package named `.docx` is still a corrupt `.docx`.
         return match real_family(bytes) {
             RealFamily::Docx => DocumentKind::Docx,
             RealFamily::Xlsx => DocumentKind::Xlsx,
@@ -377,17 +301,15 @@ fn classify(bytes: &[u8], path: &Path) -> DocumentKind {
             _ => named_package_kind(path),
         };
     }
-    // A known text extension is decoded lossily; anything else must look like
-    // text (valid UTF-8, no NUL) to qualify.
+    // A known text extension is decoded lossily; anything else must look like text (UTF-8, no NUL).
     if crate::util::has_extension(path, PLAIN_TEXT_EXTENSIONS) || is_plain_utf8(bytes) {
         return DocumentKind::PlainText;
     }
     DocumentKind::Unsupported
 }
 
-/// The OOXML package family a name claims, or [`DocumentKind::Unsupported`] when
-/// the name is none of the three — the fallback for a ZIP whose own entries say
-/// nothing, and the verdict a file whose bytes changed under the caller gets.
+/// The OOXML package family a name claims, or [`DocumentKind::Unsupported`] — the fallback
+/// for a ZIP whose entries say nothing.
 fn named_package_kind(path: &Path) -> DocumentKind {
     match crate::ooxml::family_of(path) {
         Some(crate::ooxml::Family::Docx) => DocumentKind::Docx,
@@ -397,14 +319,10 @@ fn named_package_kind(path: &Path) -> DocumentKind {
     }
 }
 
-/// The kind a name claims for a container whose own bytes name no Office
-/// document: a package's name makes the file that package's own reading — a
-/// `.docx`-named container holding no package is read as a corrupt `.docx` —
-/// and an old format's name hands it to that family's reader, which answers a
-/// file it cannot read as a corrupt one of its own format. A name claiming
-/// neither leaves the file to the ordinary read, the way every other binary
-/// file is read. Only a CFB reaches this: an old binary format is always an OLE
-/// container, so an old name over ZIP bytes is a name with nothing behind it.
+/// The kind a name claims for a container whose bytes name no Office document: a package's
+/// name makes the file that package's own reading, and an old format's name hands it to that
+/// family's reader, which answers a file it cannot read as a corrupt one. A name claiming
+/// neither leaves the file to the ordinary read. Only a CFB reaches this.
 fn named_container_kind(path: &Path) -> DocumentKind {
     if crate::ooxml::family_of(path).is_some() {
         return named_package_kind(path);
@@ -417,14 +335,10 @@ fn named_container_kind(path: &Path) -> DocumentKind {
     }
 }
 
-/// Whether a document's leading bytes mark one of the containers this module
-/// extracts text and images from — the kinds that must be converted rather
-/// than read as bytes. Every arm but the CFB one is magic-local; a CFB's own
-/// directory lies past the head, so every CFB is sent to the full-bytes pass:
-/// a legacy `.doc` named `.docx` must reach its reader, and a container naming
-/// no Office document falls back to the name's claim, which — for a name
-/// claiming nothing — is the ordinary read. The text arm (plain UTF-8 / known
-/// text extension) is exactly the "no extraction needed" case.
+/// Whether a document's leading bytes mark one of the containers this module extracts from.
+/// Every arm but the CFB one is magic-local; a CFB's own directory lies past the head, so
+/// every CFB is sent to the full-bytes pass. The text arm is exactly the "no extraction
+/// needed" case.
 #[must_use]
 pub(crate) fn needs_extraction(head: &[u8], file_name: &str) -> bool {
     if head.starts_with(CFB_MAGIC) {
@@ -443,14 +357,9 @@ pub(crate) fn needs_extraction(head: &[u8], file_name: &str) -> bool {
     )
 }
 
-/// Convert `bytes` named `file_name`, writing extracted page/embedded images
-/// into `out_dir` (created if missing). Synchronous and CPU-bound — callers run
-/// it on a blocking thread. Format detection is content-first (the container's
-/// own content), with the file extension as a secondary signal.
-///
-/// Reached from the crate through [`convert_document_file`]; the tests in this
-/// module call it directly. `out_dir` is where every arm writes what it delivers
-/// — a rasterized page or an embedded picture.
+/// Convert `bytes` named `file_name`, writing extracted page/embedded images into `out_dir`
+/// (created if missing). Synchronous and CPU-bound — callers run it on a blocking thread;
+/// format detection is content-first, with the extension as a secondary signal.
 #[must_use]
 fn convert_document(bytes: &[u8], file_name: &str, out_dir: &Path) -> DocOutcome {
     match classify(bytes, Path::new(file_name)) {
@@ -478,27 +387,18 @@ fn convert_document(bytes: &[u8], file_name: &str, out_dir: &Path) -> DocOutcome
     }
 }
 
-/// Convert the document at `path`, named `file_name`, into text and images,
-/// writing extracted rasters into `out_dir`. The single bounded entry point
-/// shared by the inbound attachment path and the read tool.
-///
-/// `pdf-extract` panics on malformed input, so the conversion runs on a
-/// blocking thread and its panic is contained at that boundary: a
-/// [`tokio::task::JoinError`] degrades to an unreadable document instead of
-/// taking the caller's turn down with it. The conversion semaphore is
-/// deliberately shared by every caller, so peak concurrency stays at two
-/// daemon-wide and a local read can queue behind a busy inbound conversion —
-/// the accepted trade-off, since each holds a whole document plus its decoded
-/// rasters in memory.
+/// Convert the document at `path`, named `file_name`, into text and images, writing
+/// extracted rasters into `out_dir`. The single bounded entry point shared by the inbound
+/// attachment path and the read tool. `pdf-extract` panics on malformed input, so the
+/// conversion runs on a blocking thread and its panic is contained at that boundary. The
+/// semaphore is daemon-wide: peak concurrency stays at two, the accepted trade-off.
 pub(crate) async fn convert_document_file(
     path: &Path,
     file_name: &str,
     out_dir: &Path,
 ) -> DocOutcome {
-    // Held across the read and the conversion, covering the document bytes and
-    // the conversion's rasters (encoding the extracted pages into data URIs
-    // happens later, outside this bound). The semaphore is never closed, so
-    // acquisition cannot fail.
+    // Held across the read and the conversion, covering the document bytes and the conversion's
+    // rasters (encoding the pages into data URIs happens later, outside this bound).
     let _permit = DOCUMENT_CONVERSIONS.acquire().await;
     let bytes = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
@@ -526,12 +426,9 @@ pub(crate) async fn convert_document_file(
     }
 }
 
-/// Run a whole-file document parse off the async executor and under the
-/// document bound: the one way a caller runs a parse outside the conversion
-/// entry point, so a third-party reader's panic degrades to `None` instead of
-/// unwinding the caller's turn, a synchronous parse never stalls an async task,
-/// and a burst of callers cannot multiply peak memory. `None` means the parse
-/// panicked.
+/// Run a whole-file document parse off the async executor and under the document bound: a
+/// third-party reader's panic degrades to `None` instead of unwinding the caller's turn, and
+/// a burst of callers cannot multiply peak memory.
 pub(crate) async fn run_document_parse<T: Send + 'static>(
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
@@ -540,14 +437,9 @@ pub(crate) async fn run_document_parse<T: Send + 'static>(
 }
 
 /// The diagram text a presentation's slides show, keyed by slide part (see
-/// [`crate::ooxml::pptx_diagram_text`]), read the way every other heavy document
-/// operation is: the file's bytes are read and the slide, layout and diagram
-/// parts parsed from them through [`run_document_parse`], so both the read and
-/// the parse happen off the async executor and under [`DOCUMENT_CONVERSIONS`] —
-/// an edit cannot multiply peak memory or stall a task.
-///
-/// Best effort by design: a file that cannot be read yields an empty map, and the
-/// caller's refusal keeps its generic wording.
+/// [`crate::ooxml::pptx_diagram_text`]), read through [`run_document_parse`] so both the read
+/// and the parse happen off the async executor and under [`DOCUMENT_CONVERSIONS`]. Best
+/// effort: a file that cannot be read yields an empty map.
 pub(crate) async fn read_pptx_diagram_text(path: &Path) -> HashMap<String, Vec<String>> {
     let path = path.to_path_buf();
     run_document_parse(move || {
@@ -560,34 +452,21 @@ pub(crate) async fn read_pptx_diagram_text(path: &Path) -> HashMap<String, Vec<S
     .unwrap_or_default()
 }
 
-/// Extract text, page rasters and embedded images from a PDF: every page that
-/// produced any text comes back as a `Page <n>:` block, in page order, however
-/// short. A page whose text layer the reader can produce also has every image
-/// XObject that can be decoded from it inlined — and every inline image its
-/// content stream paints — while a page without a usable text layer is
-/// rasterized at the scale bounded by [`RASTER_LONG_SIDE_PX`] instead, which
-/// already carries its embedded images. The document's own `Description:` (its
-/// Info dictionary) leads the reading, and its annotations and form fields
-/// follow the pages, read by [`crate::pdf_marks`]. Whether any page produced text
-/// of its own is reported by `DocOutcome::Text.page_text`, so a caller can say
-/// that no page text was extracted even when the description or a form list
-/// carried the reading's text.
+/// Extract text, page rasters and embedded images from a PDF: every page that produced any
+/// text comes back as a `Page <n>:` block, in page order, however short. A page with a usable
+/// text layer also has its decodable image XObjects inlined, while a page without one is
+/// rasterized at [`RASTER_LONG_SIDE_PX`] instead, which already carries them. The document's
+/// own `Description:` leads the reading, and its annotations and form fields follow the pages
+/// ([`crate::pdf_marks`]). `page_text` says whether any page produced text of its own.
 ///
-/// The text pass is per page ([`PdfTextReader`]), so a page the reader cannot
-/// read costs that page and nothing else: the pages around it keep their text,
-/// the pages it costs are rasterized, and [`UnreadablePages`] names them. A
-/// page's text is limited to what its `/CropBox` shows — text the page crops
-/// out is not page content.
+/// The text pass is per page ([`PdfTextReader`]), so a page the reader cannot read costs that
+/// page and nothing else; [`UnreadablePages`] names them. A page's text is limited to what
+/// its `/CropBox` shows.
 fn convert_pdf(bytes: &[u8], out_dir: &Path) -> DocOutcome {
-    // The structure parse also settles encryption: it decrypts with the empty
-    // user password, so an owner-password-only document opens and is readable,
-    // while one that needs a password reports `Decryption`. hayro also supplies
-    // the page list the loop below indexes: its pages are in document order, the
-    // same order the reader's page numbers count in (see [`PdfTextReader::read_page`]).
-    //
-    // A panic in the parse is caught like one in the text pass below it: the
-    // document keeps whatever the other pass can read instead of reaching the
-    // caller's blocking boundary as an unreadable one.
+    // The structure parse also settles encryption: it decrypts with the empty user password, so
+    // an owner-password-only document opens, while one that needs a password reports
+    // `Decryption`. hayro also supplies the page list the loop indexes. A panic in the parse is
+    // caught like one in the text pass below it.
     let pdf = match std::panic::catch_unwind(|| Pdf::new(bytes.to_vec())) {
         Ok(Ok(pdf)) => Some(pdf),
         Ok(Err(LoadPdfError::Decryption(DecryptionError::PasswordProtected))) => {
@@ -604,9 +483,8 @@ fn convert_pdf(bytes: &[u8], out_dir: &Path) -> DocOutcome {
             reason: "could not be parsed".to_string(),
         };
     }
-    // Either list running short degrades safely: a page past the reader's list
-    // has no text to inline, and a page past the page tree has nothing to render
-    // or extract.
+    // Either list running short degrades safely: a page past the reader's list has no text to
+    // inline, and one past the page tree has nothing to render.
     let page_count = reader
         .page_count()
         .max(pdf.as_ref().map_or(0, |pdf| pdf.pages().len()));
@@ -614,18 +492,14 @@ fn convert_pdf(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     ensure_out_dir(out_dir);
 
     let pages = read_pdf_pages(&reader, pdf.as_ref(), out_dir, page_count);
-    // The marks the pages carry (the document's own description, comments, form
-    // fields) are document content too: the description leads, the page-named
-    // marks follow the pages, and none of them is gated on what happened to the
-    // page text. A document whose page structure could not be parsed at all has
-    // no marks to read.
+    // The marks the pages carry (description, comments, form fields) are document content too:
+    // the description leads, the page-named marks follow the pages, and none is gated on the
+    // page text.
     let mut marks = pdf.as_ref().map(crate::pdf_marks::read).unwrap_or_default();
     let mut unshown = pages.unshown;
     unshown.merge(&marks.unshown);
-    // Aggregated into one log line rather than one per page: a page the page tree
-    // does not hold, or one whose raster could not be built or written, is one
-    // degradation, and a long scanned document has many of them. The report is
-    // what the model is told; this is what a log reader is.
+    // Aggregated into one log line rather than one per page: a page the page tree does not hold,
+    // or one whose raster could not be built, is one degradation.
     let undelivered = unshown.count(UnshownKind::Page);
     if undelivered > 0 {
         tracing::warn!(
@@ -637,8 +511,7 @@ fn convert_pdf(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     let mut notes = pages.unread.notes();
     notes.extend(marks.notes);
     notes.extend(pages.skipped.notes());
-    // The description is the document's own statement about itself, so it leads
-    // the reading; the marks that name a page follow the pages.
+    // The description is the document's own statement about itself, so it leads the reading.
     let mut blocks = pages.blocks;
     if let Some(description) = marks.description.take() {
         blocks.insert(0, description);
@@ -655,14 +528,11 @@ fn convert_pdf(bytes: &[u8], out_dir: &Path) -> DocOutcome {
     }
 }
 
-/// What the page-by-page pass produced: the blocks it delivered, whether any page
-/// produced text of its own, the rasters it wrote, and what it could not show.
+/// What the page-by-page pass produced: its blocks, whether a page produced text, and what it lost.
 struct PdfPageReading {
     blocks: Vec<String>,
-    /// Whether a page produced usable text. It is not the text pass's only
-    /// product — a description or a form list can be all a reading says — so a
-    /// caller that wants to report the absence of page text reads this rather
-    /// than testing the assembled text for emptiness.
+    /// Whether a page produced usable text. A description or a form list can be all a reading
+    /// says, so a caller reporting no page text reads this rather than testing for emptiness.
     page_text: bool,
     images: Vec<PathBuf>,
     skipped: SkippedImages,
@@ -670,8 +540,7 @@ struct PdfPageReading {
     unread: UnreadablePages,
 }
 
-/// One page-by-page pass over `pdf`: each page's text, kept under its own label,
-/// and a raster of every page whose text is unusable or absent.
+/// One page-by-page pass over `pdf`: each page's text, and a raster of every page without text.
 fn read_pdf_pages(
     reader: &PdfTextReader,
     pdf: Option<&Pdf>,
@@ -689,24 +558,20 @@ fn read_pdf_pages(
             ..UnreadablePages::default()
         },
     };
-    // The images already written for the document, shared across pages (see
-    // [`write_embedded_images`]).
+    // The images already written for the document, shared across pages ([`write_embedded_images`]).
     let mut written = WrittenImages::default();
     for index in 0..page_count {
         let page_number = index + 1;
         let page = pdf.and_then(|pdf| pdf.pages().get(index));
-        // What the page shows is what it reads as: a crop box that hides part of
-        // the page hides its text too. A page with no crop of its own reads
-        // exactly as it did before, which `None` keeps it doing.
+        // What the page shows is what it reads as: a crop box that hides part of the page hides
+        // its text too.
         let visible = page.and_then(VisibleArea::of);
-        // `None` for a page outside the reader's page list — nothing to read for
-        // it, and nothing lost; a reader that could not be opened is a failure
-        // for every page of the document.
+        // `None` for a page outside the reader's page list — nothing to read and nothing lost;
+        // a reader that could not be opened fails every page.
         let read = reader.read_page(page_number, visible);
         if read.is_some() {
-            // The reader was asked for this page, so it is one whose text the
-            // reader could have produced: what [`UnreadablePages`] counts to tell
-            // a reader failure from a document with no text.
+            // The reader was asked for this page, so its text could have been produced: what
+            // [`UnreadablePages`] counts.
             reading.unread.attempted += 1;
         }
         // What the reader produced for this page, and whether it could finish it.
@@ -719,15 +584,13 @@ fn read_pdf_pages(
         // trailing whitespace.
         let text = text.trim();
         let has_text = !text.is_empty();
-        // Any text the page produced is content, however short and however the
-        // page ended: it is kept under the page's own label in every branch.
+        // Any text the page produced is content, however short: it is kept under the page's label.
         if has_text {
             reading.page_text = true;
             reading.blocks.push(page_block(page_number, text));
         }
         if failed {
-            // The page's text stops where the reader did, so an image carries the
-            // rest, and the page is named as one that could not be read.
+            // The page's text stops where the reader did, so an image carries the rest.
             if has_text {
                 reading.unread.partial.push(page_number);
             } else {
@@ -748,8 +611,7 @@ fn read_pdf_pages(
                 );
             }
         } else {
-            // No usable text layer, so the page is rendered exactly as before —
-            // and the text it does have is kept beside it.
+            // No usable text layer, so the page is rendered — its text kept beside it.
             if !rasterize_page(page, page_number, out_dir, &mut reading.images) {
                 reading.unshown.add(UnshownKind::Page, 1);
             }
@@ -760,46 +622,32 @@ fn read_pdf_pages(
 
 /// What the reader made of one page.
 enum PageText {
-    /// The page was read. The text is still empty for a page with no text layer,
-    /// which is the ordinary case rather than a failure.
+    /// The page was read. The text is still empty for a page with no text layer, which is ordinary.
     Read(String),
     /// The page could not be read; `text` holds whatever it produced first.
     Failed(String),
 }
 
-/// The pinned reader's per-page text pass over one document.
-///
-/// The reader's own whole-document entry points read the pages in a loop that
-/// stops at the first page that errors, which silently costs that page's text
-/// and every page after it; its page-level entry point is driven per page here
-/// instead, so one unreadable page costs that page alone. Each page-level call
-/// re-walks the reader's page tree and rebuilds the processor the whole-document
-/// entry point built once — the accepted price of the pages after a failing one.
+/// The pinned reader's per-page text pass over one document. The reader's whole-document entry
+/// points stop at the first page that errors, silently costing every page after it, so its
+/// page-level entry point is driven per page here. Each call re-walks the page tree and
+/// rebuilds the processor — the accepted price of the pages after a failing one.
 #[expect(clippy::large_enum_variant)] // the engine it holds is inherently large
 enum PdfTextReader {
-    /// The document opened: `doc` is the reader's engine and `pages` how many
-    /// pages its tree holds. The reader numbers tree pages `1..=pages` in
-    /// document order, so a page past the count is one it does not know — such a
-    /// page has no text to lose, and is never named as unread.
+    /// The document opened: `doc` is the reader's engine and `pages` how many its tree holds. A
+    /// page past the count is one the reader does not know, and is never named as unread.
     Open { doc: Document, pages: usize },
-    /// The document could not be opened at all, or holds no page: no page of
-    /// it has a text pass, so each of its pages counts as one whose text
-    /// failed.
+    /// The document could not be opened at all, or holds no page: each of its pages counts as
+    /// one whose text failed.
     Unavailable,
 }
 
 impl PdfTextReader {
-    /// Open `bytes` for reading: [`Self::Unavailable`] when the reader cannot
-    /// read the file at all, or finds no page in it — the text is then missing
-    /// for every page of a document that has pages, which is a text loss rather
-    /// than a document without text.
-    ///
-    /// Encrypted documents are decrypted with the empty user password, exactly
-    /// as the reader's own entry points do: an owner-password-only document is
-    /// readable, one that needs a password is not. A panic in either step is
-    /// caught like an error — both run before any page can be read, so they cost
-    /// the reader, not one page, and are reported once per conversion rather
-    /// than suppressed.
+    /// Open `bytes` for reading: [`Self::Unavailable`] when the reader cannot read the file at
+    /// all, or finds no page in it — the text is then missing for every page, which is a loss
+    /// rather than a document without text. Encrypted documents are decrypted with the empty user
+    /// password, so an owner-password-only one is readable. A panic in either step is caught like
+    /// an error and costs the reader, not one page.
     fn open(bytes: &[u8]) -> Self {
         let Ok(Ok(mut doc)) =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Document::load_mem(bytes)))
@@ -833,32 +681,23 @@ impl PdfTextReader {
         }
     }
 
-    /// The text of 1-based `page_number`, or `None` for a page the reader's page
-    /// tree does not hold — a page it does not know is not an unreadable one.
-    /// The reader numbers its pages by tree order, the order hayro's page list
-    /// indexes them in, which is what pairs one page's text with its raster.
-    ///
-    /// `visible` limits the text to the part of the page its crop box leaves
-    /// visible; `None` is a page that shows all of itself and reads exactly as
-    /// the reader's plain text output always did.
-    ///
-    /// A panic is contained like an error: the reader panics on some malformed
-    /// structures, and one page's panic must cost that page alone. Either way the
-    /// text produced before the failure is kept in [`PageText::Failed`].
+    /// The text of 1-based `page_number`, or `None` for a page the reader's page tree does not
+    /// hold — a page it does not know is not an unreadable one. The reader numbers its pages by
+    /// tree order, which is what pairs one page's text with its raster. `visible` limits the text
+    /// to the part the crop box leaves visible. A panic is contained like an error, and the text
+    /// produced before the failure is kept in [`PageText::Failed`].
     fn read_page(&self, page_number: usize, visible: Option<VisibleArea>) -> Option<PageText> {
         let Self::Open { doc, pages } = self else {
             // The reader never opened: nothing was produced and the read failed.
             return Some(PageText::Failed(String::new()));
         };
-        // The reader holds pages `1..=pages`, in its own `u32` numbering: a page
-        // outside that range is one it does not know, which is not an unreadable
-        // one.
+        // The reader holds pages `1..=pages` in its own `u32` numbering: a page outside that
+        // range is one it does not know.
         if !(1..=*pages).contains(&page_number) {
             return None;
         }
-        // Page numbers count in that same numbering and `pages` is its count, so
-        // the number fits a `u32`. `allow`, not `expect`: the cast cannot truncate
-        // on a 32-bit target, where an unfired expectation would itself warn.
+        // Page numbers count in that numbering and `pages` is its count, so the number fits a
+        // `u32`. `allow`, not `expect`: an unfired expectation would itself warn on 32-bit targets.
         #[allow(clippy::cast_possible_truncation)]
         let number = page_number as u32;
         let mut text = String::new();
@@ -879,12 +718,9 @@ impl PdfTextReader {
     }
 }
 
-/// The part of a page's media box its crop box leaves visible, in the page space
-/// hayro reports both boxes in.
-///
-/// A page reads as it is drawn: text a crop box hides is not page content, and a
-/// page that prints two variants of a line and crops one out must not deliver
-/// both as its text.
+/// The part of a page's media box its crop box leaves visible, in the page space hayro reports
+/// both boxes in. A page reads as it is drawn: text a crop box hides is not page content, and a
+/// page that prints two variants of a line and crops one out must not deliver both.
 #[derive(Clone, Copy)]
 struct VisibleArea {
     /// The crop box, already intersected with the media box.
@@ -892,13 +728,10 @@ struct VisibleArea {
 }
 
 impl VisibleArea {
-    /// The visible area of `page`, or `None` when its crop box leaves the whole
-    /// media box visible — the ordinary page, which then reads through the plain
-    /// text output untouched. The boxes are equal up to a tolerance: a producer
-    /// that writes both need not spell the same number identically. A crop box
-    /// the media box does not intersect at all leaves no area, and a page whose
-    /// crop leaves nothing visible is read as having no crop rather than as
-    /// having lost its text.
+    /// The visible area of `page`, or `None` when its crop box leaves the whole media box
+    /// visible — the ordinary page, which reads through the plain output untouched. The boxes
+    /// are equal up to a tolerance. A crop box the media box does not intersect, or one that
+    /// leaves nothing visible, is read as having no crop rather than as having lost its text.
     fn of(page: &Page<'_>) -> Option<Self> {
         /// Difference below which two box edges are the same edge, in points.
         const TOLERANCE: f64 = 1e-6;
@@ -914,15 +747,12 @@ impl VisibleArea {
         (!whole_page).then_some(Self { crop })
     }
 
-    /// Whether a character drawn at `trm`'s origin, whose glyph runs `width`
-    /// character-widths at `font_size`, is inside the visible area. Both points are
-    /// user-space ones — the frame the crop box itself is stated in, so no flip is
-    /// involved. A character on the edge is shown, within the reader's own
-    /// rounding, and so is one the crop cuts through: a glyph the box only half
-    /// hides is not text it hides.
+    /// Whether a character drawn at `trm`'s origin, whose glyph runs `width` character-widths at
+    /// `font_size`, is inside the visible area. Both points are user-space ones, so no flip is
+    /// involved. A character on the edge, or one the crop cuts through, is shown.
     fn shows(&self, trm: &Transform, width: f64, font_size: f64) -> bool {
-        // The far end of the glyph's advance, in the same frame: the origin alone
-        // would drop a glyph that starts just outside the box but reaches into it.
+        // The far end of the glyph's advance: the origin alone would drop a glyph that reaches
+        // into the box.
         let advance = width * font_size;
         self.contains(trm.m31, trm.m32)
             || self.contains(trm.m11 * advance + trm.m31, trm.m12 * advance + trm.m32)
@@ -937,10 +767,8 @@ impl VisibleArea {
     }
 }
 
-/// [`PlainTextOutput`] with the page's visible area applied: a character the crop
-/// box hides never reaches it, so hidden text can neither appear nor leave a gap
-/// or a line break behind, while everything the page does show is laid out by the
-/// reader's own word and line detection.
+/// [`PlainTextOutput`] with the page's visible area applied: a character the crop box hides
+/// never reaches it, so hidden text leaves no gap, while what the page shows is laid out as usual.
 struct CropTextOutput<'a> {
     inner: PlainTextOutput<&'a mut String>,
     visible: VisibleArea,
@@ -998,35 +826,28 @@ impl OutputDev for CropTextOutput<'_> {
     }
 }
 
-/// Pages whose text the reader could not read: what tells a document whose text
-/// is missing from one that has none. Delivered as a note, never as a log line.
+/// Pages whose text the reader could not read: missing text, as against a document with none.
 #[derive(Debug, Default)]
 struct UnreadablePages {
-    /// 1-based numbers of pages that produced no text that could be kept — a page
-    /// this holds is one whose text was lost, not one that has none.
+    /// 1-based numbers of pages that produced no text that could be kept — a loss, not an absence.
     lost: Vec<usize>,
     /// Those that produced text, kept for the delivery, and failed after it.
     partial: Vec<usize>,
-    /// How many pages the reader was asked for — every page it could read at
-    /// all. Together with `lost` this is what separates a document whose text
-    /// the reader failed on from one that has no text.
+    /// How many pages the reader was asked for — every page it could read at all. With `lost` it
+    /// separates a reader failure from a document with no text.
     attempted: usize,
     /// The document's page count, for the count in the note.
     total: usize,
 }
 
 impl UnreadablePages {
-    /// Whether the text of every page the reader was asked for was lost — the
-    /// case in which a document that delivered no text is not one that has none.
-    /// A page it read without producing text, and a page its page list does not
-    /// hold, are neither of them losses.
+    /// Whether the text of every page the reader was asked for was lost — the case in which a
+    /// document that delivered no text is not one that has none.
     fn lost_all_page_text(&self) -> bool {
         self.attempted > 0 && self.lost.len() == self.attempted
     }
 
-    /// One compact line per cause, the lost pages before the partial ones: page
-    /// ranges plus a count, so a long document whose reader failed everywhere
-    /// cannot turn one note into a page-by-page listing.
+    /// One compact line per cause, lost pages before partial ones: page ranges plus a count.
     fn notes(&self) -> Vec<String> {
         let mut notes = Vec::new();
         for (pages, suffix) in [(&self.lost, ""), (&self.partial, " in full")] {
@@ -1043,10 +864,8 @@ impl UnreadablePages {
     }
 }
 
-/// How many ranges a lost-text note names before it stops: the note shares the
-/// tool output budget with the delivered text. The number lives in the shared
-/// rules, so the kit's own placement notes name as many ranges as this reading
-/// does.
+/// How many ranges a lost-text note names before it stops: the note shares the tool output
+/// budget with the delivered text.
 fn max_note_ranges() -> usize {
     crate::docgen::rules()["note_page_ranges_max"]
         .as_u64()
@@ -1060,8 +879,7 @@ fn page_list(pages: &[usize]) -> String {
     format!("{noun} {}", page_ranges(pages))
 }
 
-/// `3, 7-9, 12` for the ascending `pages`: a run of three or more collapses to
-/// `first-last`, and at most [`max_note_ranges`] ranges are named.
+/// `3, 7-9, 12` for ascending `pages`: a run of three or more collapses, [`max_note_ranges`] bound.
 fn page_ranges(pages: &[usize]) -> String {
     let max = max_note_ranges();
     let mut ranges: Vec<String> = Vec::new();
@@ -1084,13 +902,10 @@ fn page_ranges(pages: &[usize]) -> String {
     ranges.join(", ")
 }
 
-/// Embedded images left out of the conversion, by cause: a picture this pipeline
-/// does not convert, one whose image could not be read or written, and one over
-/// the shared raster envelope. Content of a kind a reading does not show *at all*
-/// — a video, a drawing, an embedded object — is counted for the report instead
-/// ([`crate::reader_output::Unshown`]), which names the kind and nothing else;
-/// these notes are what tell the reason an image the pipeline meant to deliver is
-/// not there.
+/// Embedded images left out of the conversion, by cause: a format this pipeline does not
+/// convert, one whose image could not be read or written, and one over the shared raster
+/// envelope. Content of a kind a reading never shows — a video, a drawing — is counted for
+/// [`crate::reader_output::Unshown`] instead.
 #[derive(Default, Clone, Copy)]
 pub(crate) struct SkippedImages {
     /// Format, colour space or bit depth this module does not convert.
@@ -1110,8 +925,7 @@ impl SkippedImages {
         }
     }
 
-    /// One note per cause that happened, so a note never claims a decode
-    /// failure for an image this module simply does not convert.
+    /// One note per cause that happened: never a decode failure for a format not converted.
     pub(crate) fn notes(&self) -> Vec<String> {
         let mut notes = Vec::new();
         for (count, text) in [
@@ -1135,45 +949,31 @@ pub(crate) enum SkipReason {
     Oversized,
 }
 
-/// Extensions of the pictures this pipeline delivers: an embedded picture of one
-/// of these formats is written through to `out_dir` verbatim and attached to the
-/// conversation. Every other format would need a transcoding the readings avoid,
-/// and a reading names it instead — as a drawing in
-/// [`crate::reader_output::Unshown`], or in [`SkippedImages`]. The one owner of
-/// what a reading delivers, shared by the OOXML arms' media walk (a package names
-/// a picture by its media part's extension) and the legacy arms' picture list (the
-/// reader spells each BLIP record type's extension), so the two cannot drift.
+/// Extensions of the pictures this pipeline delivers: an embedded picture of one of these
+/// formats is written through to `out_dir` verbatim. Every other format would need a
+/// transcoding the readings avoid, and a reading names it instead. Shared by the OOXML arms'
+/// media walk and the legacy arms' picture list, so the two cannot drift.
 pub(crate) const DELIVERABLE_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
 
-/// Extensions of the embedded media that are vector drawings rather than pictures
-/// of pixels: a reading names them as the drawings they are instead of as images
-/// the pipeline cannot convert. Like [`DELIVERABLE_IMAGE_EXTENSIONS`] it is asked
-/// of a file name and shared by both readers, because both meet it — a package as
-/// a media part's name, a legacy file as a BLIP record type's — while the package
-/// reader's other media lists stay with the only reader that classifies a part by
-/// name at all.
+/// Extensions of the embedded media that are vector drawings rather than pixels: a reading
+/// names them as the drawings they are. Like [`DELIVERABLE_IMAGE_EXTENSIONS`] it is asked of a
+/// file name and shared by both readers, because both meet it — a package as a media part's
+/// name, a legacy file as a BLIP record type's.
 pub(crate) const DRAWING_EXTENSIONS: &[&str] = &["emf", "wmf", "svg", "pict"];
 
-/// The images already written for the document: image XObject identities, plus
-/// the form XObjects whose inline images have been collected. A producer
-/// references one image object from every page that shows it and paints the same
-/// header form on every page, and the model needs each picture once.
+/// The images already written for the document: image XObject identities plus the form
+/// XObjects whose inline images have been collected. A producer shows one image on many pages.
 #[derive(Default)]
 struct WrittenImages {
     x_objects: HashSet<ObjectIdentifier>,
     forms: HashSet<ObjectIdentifier>,
 }
 
-/// Write every image in scope for `page` — its image XObjects, plus the inline
-/// images its own content stream and those of the forms it paints through draw —
-/// into `out_dir` as `page_<n>_img_<k>.jpg` (`k` indexing the images this page
-/// wrote), pushing each path onto `images` and counting each one left out onto
-/// `skipped`. A page without a usable text layer is rasterized whole instead, so
-/// its embedded images are never collected here.
-///
-/// `written` carries what the document has already written: an image object is
-/// skipped when an earlier page wrote it, and a form when an earlier page
-/// collected its inline images. A form without an object id is not deduplicated.
+/// Write every image in scope for `page` — its image XObjects, plus the inline images its own
+/// content stream and those of the forms it paints through draw — into `out_dir` as
+/// `page_<n>_img_<k>.jpg`, pushing each path onto `images` and counting each one left out onto
+/// `skipped`. `written` carries what the document has already written: an image object is
+/// skipped when an earlier page wrote it, and a form when an earlier page collected its images.
 fn write_embedded_images(
     page: &Page<'_>,
     page_number: usize,
@@ -1211,9 +1011,8 @@ fn write_embedded_images(
     }
 }
 
-/// Write one decoded image as `page_<n>_img_<k>.jpg`, advancing `slot`. Reports
-/// why it is not in the conversion: an image that could not be written is as
-/// absent from `out_dir` as one that could not be decoded.
+/// Write one decoded image as `page_<n>_img_<k>.jpg`, advancing `slot`. An image that could
+/// not be written is as absent as one that could not be decoded.
 fn write_embedded_image(
     stream: &Stream<'_>,
     page_number: usize,
@@ -1239,10 +1038,8 @@ fn write_embedded_image(
     }
 }
 
-/// Write the inline images (`BI`/`ID`/`EI`) a content stream paints, counting
-/// each one left out onto `skipped`. They live in the content stream itself, so
-/// they carry no object identity to deduplicate by — and one is normally painted
-/// once.
+/// Write the inline images (`BI`/`ID`/`EI`) a content stream paints, counting each one left
+/// out onto `skipped`. They carry no object identity to deduplicate by, and are painted once.
 fn write_inline_images(
     content: &[u8],
     page_number: usize,
@@ -1261,16 +1058,13 @@ fn write_inline_images(
     }
 }
 
-/// The `(image XObjects, form XObjects)` in scope for `page`: those its own
-/// resources and the inherited page-tree resources name, plus those inside any
-/// form XObject reachable from either — a form is a container the page's content
-/// paints through, so its images are the page's images (and a page without a text
-/// layer shows them anyway, through its raster).
+/// The `(image XObjects, form XObjects)` in scope for `page`: those its own resources and the
+/// inherited page-tree resources name, plus those inside any form reachable from either — a
+/// form is a container the page paints through, so its images are the page's images.
 fn page_image_streams<'a>(page: &Page<'a>) -> (Vec<Stream<'a>>, Vec<Stream<'a>>) {
     let mut images = Vec::new();
     let mut forms = Vec::new();
-    // A form reachable down more than one path is entered once, which is also
-    // what bounds the walk when forms reference each other.
+    // A form reachable down more than one path is entered once, which also bounds the walk.
     let mut visited: HashSet<ObjectIdentifier> = HashSet::new();
     let mut pending: VecDeque<Stream<'a>> = page_x_objects(page).into();
     while let Some(stream) = pending.pop_front() {
@@ -1291,9 +1085,8 @@ fn page_image_streams<'a>(page: &Page<'a>) -> (Vec<Stream<'a>>, Vec<Stream<'a>>)
     (images, forms)
 }
 
-/// The XObjects the page's own resources name, followed by those inherited from
-/// the page-tree resources. A name defined at more than one level is taken from
-/// the most specific definition — the one the content stream paints.
+/// The XObjects the page's own resources name, then those inherited from the page-tree
+/// resources: a name defined twice is taken from the most specific definition.
 fn page_x_objects<'a>(page: &Page<'a>) -> Vec<Stream<'a>> {
     let mut seen: HashSet<Name<'a>> = HashSet::new();
     let mut streams = Vec::new();
@@ -1326,8 +1119,7 @@ fn form_x_objects<'a>(form: &Stream<'a>) -> Vec<Stream<'a>> {
         .collect()
 }
 
-/// What a `/XObject` entry holds: only images carry samples, and only forms
-/// nest further resources.
+/// What a `/XObject` entry holds: only images carry samples, only forms nest further resources.
 enum XObjectSubtype {
     Image,
     Form,
@@ -1342,12 +1134,10 @@ fn x_object_subtype(stream: &Stream<'_>) -> XObjectSubtype {
     }
 }
 
-/// The JPEG bytes of one image — an image XObject, or an inline image painted by
-/// a content stream: a lone `DCTDecode` stream is passed through verbatim,
-/// because its bytes already are a complete JPEG, and anything else goes through
-/// the filter chain and is converted to an 8-bit RGB raster at the bounded raster
-/// size. Every key is read in both spellings, because an inline image abbreviates
-/// all of them. `Err(reason)` when the image is not in the conversion.
+/// The JPEG bytes of one image — an image XObject, or an inline image painted by a content
+/// stream: a lone `DCTDecode` stream is passed through verbatim, and anything else goes through
+/// the filter chain into an 8-bit RGB raster at the bounded raster size. Every key is read in
+/// both spellings, because an inline image abbreviates all of them.
 fn embedded_image_jpeg(stream: &Stream<'_>) -> Result<Vec<u8>, SkipReason> {
     let dict = stream.dict();
     let width = dict
@@ -1360,14 +1150,13 @@ fn embedded_image_jpeg(stream: &Stream<'_>) -> Result<Vec<u8>, SkipReason> {
         .or_else(|| dict.get::<u32>(b"H"))
         .filter(|height| *height > 0)
         .ok_or(SkipReason::Unsupported)?;
-    // A declared size the inbound image pipeline could not decode itself is a
-    // header bomb rather than a big image. Checked before the passthrough below,
-    // so the bound covers every route.
+    // A declared size the inbound image pipeline could not decode itself is a header bomb rather
+    // than a big image, checked before the passthrough below.
     if width > RASTER_DECODE_MAX_DIMENSION_PX || height > RASTER_DECODE_MAX_DIMENSION_PX {
         return Err(SkipReason::Oversized);
     }
-    // Checked before the colour space and the bit depth: a JPEG whose dictionary
-    // omits or misnames either is still a complete JPEG.
+    // Checked before the colour space and bit depth: a JPEG whose dictionary misnames either is
+    // still a complete JPEG.
     if is_lone_dct(dict) {
         return Ok(stream.raw_data().into_owned());
     }
@@ -1393,10 +1182,8 @@ fn embedded_image_jpeg(stream: &Stream<'_>) -> Result<Vec<u8>, SkipReason> {
     if !matches!(bits_per_component, 1 | 2 | 4 | 8 | 16) {
         return Err(SkipReason::Unsupported);
     }
-    // The filter chain expands the samples at the declared size, so a declared
-    // buffer over the decode budget is refused rather than allocated. A stream
-    // whose real size comes from its bitstream (JBIG2) or `/DecodeParms` (CCITT
-    // `/Columns`/`/Rows`) is bounded by its decoder instead.
+    // The filter chain expands the samples at the declared size, so a declared buffer over the
+    // decode budget is refused rather than allocated.
     let declared_samples = u64::from(width)
         * u64::from(height)
         * u64::from(colour.components())
@@ -1415,18 +1202,15 @@ fn embedded_image_jpeg(stream: &Stream<'_>) -> Result<Vec<u8>, SkipReason> {
             height,
         })
         .map_err(|_| SkipReason::Failed)?;
-    // A filter chain that returns nothing for a non-empty image failed leniently
-    // (a lenient inflate reports an empty stream, not an error): the image is
+    // A filter chain that returns nothing for a non-empty image failed leniently: the image is
     // undecodable, not blank.
     if decoded.data.is_empty() {
         return Err(SkipReason::Failed);
     }
-    // What a decoder reports about its own output is authoritative over the
-    // dictionary: the two disagree in the wild.
+    // What a decoder reports about its own output is authoritative over the dictionary.
     let (width, height, bits_per_component, colour) = match &decoded.image_data {
         Some(data) => {
-            // An indexed image keeps its palette: the decoder reports only the
-            // component count of the palette's base space.
+            // An indexed image keeps its palette: the decoder reports only the base space's count.
             let colour = if matches!(colour, ColourSpace::Indexed(_)) {
                 colour
             } else {
@@ -1455,8 +1239,7 @@ fn embedded_image_jpeg(stream: &Stream<'_>) -> Result<Vec<u8>, SkipReason> {
     encode_jpeg(&raster).map_err(|()| SkipReason::Failed)
 }
 
-/// Whether `dict`'s only filter is `DCTDecode` (or its `DCT` abbreviation),
-/// i.e. the stream's raw bytes are already a complete JPEG.
+/// Whether `dict`'s only filter is `DCTDecode` (or `DCT`), i.e. the raw bytes are already a JPEG.
 fn is_lone_dct(dict: &Dict<'_>) -> bool {
     /// `DCT` is the abbreviation the spec allows for `/DCTDecode`.
     fn is_dct(name: &Name<'_>) -> bool {
@@ -1475,9 +1258,8 @@ fn is_lone_dct(dict: &Dict<'_>) -> bool {
     }
 }
 
-/// Map a decoder-reported colour space onto the shapes this module converts. A
-/// multi-band decoder whose colour space the dictionary did not describe cannot
-/// be converted from its components alone.
+/// Map a decoder-reported colour space onto the shapes this module converts. A multi-band
+/// decoder whose colour space the dictionary did not describe cannot be converted.
 fn colour_space_of(colour_space: Option<ImageColorSpace>) -> Result<ColourSpace, ()> {
     match colour_space {
         Some(ImageColorSpace::Gray) => Ok(ColourSpace::Gray),
@@ -1487,9 +1269,8 @@ fn colour_space_of(colour_space: Option<ImageColorSpace>) -> Result<ColourSpace,
     }
 }
 
-/// A colour space an image's samples can be converted from. Anything with a
-/// transform of its own — Lab, Separation, DeviceN, a pattern, an unknown ICC
-/// profile — is not one of these.
+/// A colour space an image's samples can be converted from. Anything with a transform of its
+/// own — Lab, Separation, DeviceN, a pattern, an unknown ICC profile — is not one of these.
 enum ColourSpace {
     Gray,
     Rgb,
@@ -1499,8 +1280,7 @@ enum ColourSpace {
 }
 
 impl ColourSpace {
-    /// Samples per pixel: the component count the filter chain packs its output
-    /// with.
+    /// Samples per pixel: the component count the filter chain packs its output with.
     fn components(&self) -> u8 {
         match self {
             Self::Gray | Self::Indexed(_) => 1,
@@ -1510,16 +1290,14 @@ impl ColourSpace {
     }
 }
 
-/// Parse an image XObject's `/ColorSpace`: a name, or a family array whose first
-/// entry is the family name. `None` for every colour space this module cannot
-/// convert.
+/// Parse an image XObject's `/ColorSpace`: a name, or a family array whose first entry is the
+/// family name.
 fn parse_colour_space(object: Object<'_>) -> Option<ColourSpace> {
     parse_colour_space_within(object, true)
 }
 
-/// [`parse_colour_space`] with `allow_indexed` cleared for the base of an
-/// `/Indexed` space, which is a device or ICC space and never another indexed
-/// one: a crafted chain of nested arrays cannot deepen the walk.
+/// [`parse_colour_space`] with `allow_indexed` cleared for the base of an `/Indexed` space: a
+/// crafted chain of nested arrays cannot deepen the walk.
 fn parse_colour_space_within(object: Object<'_>, allow_indexed: bool) -> Option<ColourSpace> {
     let name = match &object {
         Object::Name(name) => name.clone(),
@@ -1540,8 +1318,7 @@ fn parse_colour_space_within(object: Object<'_>, allow_indexed: bool) -> Option<
             if !allow_indexed {
                 return None;
             }
-            // `[/Indexed base hival lookup]`: the lookup holds `hival + 1`
-            // entries of the base space's components.
+            // `[/Indexed base hival lookup]`: `hival + 1` entries of the base space.
             let mut entries = object.into_array()?.iter::<Object<'_>>();
             let base = parse_colour_space_within(entries.nth(1)?, false)?;
             let hival = usize::try_from(entries.next()?.into_i32()?).ok()?;
@@ -1555,8 +1332,7 @@ fn parse_colour_space_within(object: Object<'_>, allow_indexed: bool) -> Option<
     }
 }
 
-/// The component count (`/N`) of an `/ICCBased` profile stream, limited to the
-/// gray/RGB/CMYK models this module converts.
+/// The component count (`/N`) of an `/ICCBased` profile stream, limited to the models converted.
 fn icc_components(profile: Object<'_>) -> Option<u8> {
     let components = match profile {
         Object::Stream(stream) => stream.dict().get::<u8>(b"N")?,
@@ -1566,9 +1342,8 @@ fn icc_components(profile: Object<'_>) -> Option<u8> {
     matches!(components, 1 | 3 | 4).then_some(components)
 }
 
-/// The RGB palette of an `/Indexed` colour space, from a string or a (filtered)
-/// stream lookup. Only a gray or RGB base converts — the two entry widths whose
-/// bytes map onto a channel count.
+/// The RGB palette of an `/Indexed` colour space, from a string or a (filtered) stream lookup.
+/// Only a gray or RGB base converts.
 fn palette_entries(base: &ColourSpace, hival: usize, lookup: Object<'_>) -> Option<Vec<[u8; 3]>> {
     let entry_len = match base {
         ColourSpace::Gray => 1,
@@ -1608,8 +1383,7 @@ struct ImageShape<'a> {
     alpha: Option<&'a [u8]>,
 }
 
-/// The `/Decode` ranges of an image, one per component; a component without one
-/// uses the default `(0, 1)`, a pure rescale onto the byte range.
+/// The `/Decode` ranges of an image, one per component; a missing one uses the default `(0, 1)`.
 fn decode_ranges(dict: &Dict<'_>, components: u8) -> Vec<(f32, f32)> {
     let declared: Vec<(f32, f32)> = dict
         .get::<Array<'_>>(b"Decode")
@@ -1626,13 +1400,10 @@ fn decode_ranges(dict: &Dict<'_>, components: u8) -> Vec<(f32, f32)> {
         .collect()
 }
 
-/// Convert decoded samples into an RGB raster, built directly at the bounded
-/// target size (see [`scaled_dimensions`]): a target pixel samples the source
-/// position scaled onto it, so the allocation is bounded for any declared
-/// geometry and no image is dropped for being large. Samples are packed
-/// big-endian at the shape's bit depth, with every row padded to a byte boundary
-/// — the layout each filter in the chain emits — and a short stream is padded
-/// with zeroes rather than rejected.
+/// Convert decoded samples into an RGB raster, built directly at the bounded target size (see
+/// [`scaled_dimensions`]): a target pixel samples the source position scaled onto it, so the
+/// allocation is bounded for any declared geometry. Samples are packed big-endian at the
+/// shape's bit depth, every row padded to a byte boundary, and a short stream padded with zeroes.
 fn samples_to_raster(shape: &ImageShape<'_>, data: &[u8]) -> Option<RgbImage> {
     let (width, height) = scaled_dimensions(shape.width, shape.height);
     let components = usize::from(shape.colour.components());
@@ -1645,8 +1416,7 @@ fn samples_to_raster(shape: &ImageShape<'_>, data: &[u8]) -> Option<RgbImage> {
             for (component, sample) in samples.iter_mut().take(components).enumerate() {
                 *sample = source_sample(shape, data, sx, sy, component);
             }
-            // The alpha channel is indexed by the *source* pixel, which is `sy`
-            // and `sx`, not the target position.
+            // The alpha channel is indexed by the *source* pixel (`sy`, `sx`), not the target.
             let pixel = pixel_rgb(shape, &samples, sy * shape.width as usize + sx);
             raster.extend_from_slice(&pixel);
         }
@@ -1654,18 +1424,15 @@ fn samples_to_raster(shape: &ImageShape<'_>, data: &[u8]) -> Option<RgbImage> {
     RgbImage::from_raw(width, height, raster)
 }
 
-/// The source index one target index samples — `target * source_len /
-/// target_len` — so that a target with the source's own length (every image
-/// within the raster bound) maps one-to-one.
+/// The source index one target index samples — `target * source_len / target_len` — so a
+/// target with the source's own length maps one-to-one.
 fn scaled_index(target: u32, source_len: u32, target_len: u32) -> usize {
     target as usize * source_len as usize / target_len as usize
 }
 
-/// One sample of the packed source samples at source position (`sx`, `sy`),
-/// component `component`: random access, because one target row can sample any
-/// source row. A row starts on a byte boundary — its last sample leaves the
-/// padding the packing adds — and a position past the end of `data` reads as
-/// zero, so a stream shorter than its own header claims still converts.
+/// One sample of the packed source samples at (`sx`, `sy`), component `component`: random
+/// access, because one target row can sample any source row. A position past the end of `data`
+/// reads as zero.
 fn source_sample(
     shape: &ImageShape<'_>,
     data: &[u8],
@@ -1682,34 +1449,28 @@ fn source_sample(
         // A 16-bit sample is two big-endian bytes.
         return u16::from(byte(bit / 8)) << 8 | u16::from(byte(bit / 8 + 1));
     }
-    // A sample is never split across two bytes, so it ends at a known distance
-    // from the end of its byte.
+    // A sample is never split across two bytes, so it ends at a known distance from its byte's end.
     let shift = 8 - bits - bit % 8;
     (u16::from(byte(bit / 8)) >> shift) & ((1 << bits) - 1)
 }
 
-/// The 8-bit RGB value of the pixel whose `components` samples were just read,
-/// composited over white when the image has an alpha channel. `source_pixel` is
-/// the pixel's linear position in the source image (`sy * width + sx`), which is
-/// where its alpha byte is — never a position in the target raster.
+/// The 8-bit RGB value of the pixel whose `components` samples were just read, composited over
+/// white when there is an alpha channel. `source_pixel` is its linear position in the source.
 fn pixel_rgb(shape: &ImageShape<'_>, samples: &[u16], source_pixel: usize) -> [u8; 3] {
-    // A `/Decode` entry maps the normalised sample through an affine range,
-    // which for almost every image is the default `(0, 1)`.
+    // A `/Decode` entry maps the normalised sample through an affine range, the default `(0, 1)`.
     let channel = |component: usize| {
         let range = shape.decode.get(component).copied().unwrap_or((0.0, 1.0));
         scale_sample(samples[component], shape.bits_per_component, range)
     };
     let rgb = match &shape.colour {
-        // An indexed sample is the palette index itself: this module applies no
-        // `/Decode` range to it.
+        // An indexed sample is the palette index itself: no `/Decode` range is applied to it.
         ColourSpace::Indexed(palette) => palette
             .get(usize::from(samples[0]))
             .copied()
             .unwrap_or([0, 0, 0]),
         ColourSpace::Gray => [channel(0); 3],
         ColourSpace::Rgb => [channel(0), channel(1), channel(2)],
-        // Ink is what a channel subtracts from white, the key channel from all
-        // three.
+        // Ink is what a channel subtracts from white, the key channel from all three.
         ColourSpace::Cmyk => {
             let key = channel(3);
             [
@@ -1720,21 +1481,18 @@ fn pixel_rgb(shape: &ImageShape<'_>, samples: &[u16], source_pixel: usize) -> [u
         }
     };
     match shape.alpha {
-        // JPEG has no alpha channel: a translucent pixel is composited over the
-        // white it would be painted on.
+        // JPEG has no alpha channel: a translucent pixel is composited over the white beneath it.
         Some(alpha) => over_white(rgb, alpha.get(source_pixel).copied().unwrap_or(u8::MAX)),
         None => rgb,
     }
 }
 
-/// One ink channel of a CMYK pixel: the ink and the key ink are what the channel
-/// takes away from white.
+/// One ink channel of a CMYK pixel: the ink and the key ink are what the channel takes from white.
 fn subtractive(ink: u8, key: u8) -> u8 {
     255 - ink.saturating_add(key)
 }
 
-/// Composite one opaque RGB pixel over white with `alpha` of 255 meaning fully
-/// opaque.
+/// Composite one opaque RGB pixel over white with `alpha` of 255 meaning fully opaque.
 fn over_white(rgb: [u8; 3], alpha: u8) -> [u8; 3] {
     rgb.map(|channel| {
         let alpha = u32::from(alpha);
@@ -1743,17 +1501,15 @@ fn over_white(rgb: [u8; 3], alpha: u8) -> [u8; 3] {
     })
 }
 
-/// One sample as a full 8-bit channel: the `/Decode` range is applied to the
-/// sample normalised to `0..=1`, so the default range is a rescale from the bit
-/// depth onto the byte range.
+/// One sample as a full 8-bit channel: the `/Decode` range is applied to the sample normalised
+/// to `0..=1`, so the default is a rescale onto the byte range.
 fn scale_sample(sample: u16, bits_per_component: u8, (min, max): (f32, f32)) -> u8 {
     let full = f32::from(u16::try_from((1u32 << bits_per_component) - 1).unwrap_or(u16::MAX));
     let decoded = min + (max - min) * (f32::from(sample) / full);
     to_byte(decoded)
 }
 
-/// A normalised channel value as a byte, clamped: a `/Decode` range can map
-/// outside `0..=1`.
+/// A normalised channel value as a byte, clamped: a `/Decode` range can map outside `0..=1`.
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -1763,8 +1519,7 @@ fn to_byte(value: f32) -> u8 {
     (value * 255.0 + 0.5).clamp(0.0, 255.0) as u8
 }
 
-/// The pixel size an image is written at: the long side bounded by
-/// [`RASTER_LONG_SIDE_PX`], exactly like a rasterized page.
+/// The pixel size an image is written at: the long side bounded by [`RASTER_LONG_SIDE_PX`].
 #[expect(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -1792,18 +1547,16 @@ fn encode_jpeg(image: &RgbImage) -> Result<Vec<u8>, ()> {
     Ok(jpeg)
 }
 
-/// Rasterize `page` into the pixels of its picture: its visible area on a white
-/// background, scaled so the long side is at most `long_side` pixels and never
-/// blown up past `max_scale`. `None` for a page whose pixels could not be laid
-/// out. The one page-to-pixels render the document readers and the `rasterize`
-/// tool share; the cap and the encoding each of them brings are their own.
+/// Rasterize `page` into the pixels of its picture: its visible area on white, scaled so the
+/// long side is at most `long_side` pixels and never blown up past `max_scale`. Shared with the
+/// `rasterize` tool; the cap and the encoding each caller brings are their own.
 pub(crate) fn render_page_image(
     page: &Page<'_>,
     long_side: f32,
     max_scale: f32,
 ) -> Option<RgbaImage> {
-    // `render_dimensions` clamps zero-area pages, so the page's long side is at
-    // least one and the scale stays finite.
+    // `render_dimensions` clamps zero-area pages, so the long side is at least one and the scale
+    // stays finite.
     let (width, height) = page.render_dimensions();
     let scale = (long_side / width.max(height)).min(max_scale);
     let settings = RenderSettings {
@@ -1827,11 +1580,9 @@ pub(crate) fn render_page_image(
     RgbaImage::from_raw(u32::from(pixel_width), u32::from(pixel_height), raw)
 }
 
-/// Rasterize `page` (1-based `page_number`) to `<out_dir>/page_<n>.jpg` and push
-/// the path onto `images`, saying whether the page ended up among them: `false`
-/// for a page the page tree has no entry for, and for one whose raster could not
-/// be built or written. A page that could not be delivered is one the report
-/// names, so it is never silently absent from the answer.
+/// Rasterize `page` (1-based `page_number`) to `<out_dir>/page_<n>.jpg` and push the path onto
+/// `images`, saying whether the page ended up among them: `false` for a page the page tree has
+/// no entry for, and for one whose raster could not be built.
 fn rasterize_page(
     page: Option<&Page<'_>>,
     page_number: usize,
@@ -1870,29 +1621,21 @@ fn rasterize_page(
     }
 }
 
-/// Create `out_dir` when missing. A failure is logged here and surfaces again
-/// as an individual artifact-write failure, which is already handled.
+/// Create `out_dir` when missing. A failure is logged here and surfaces as an artifact-write one.
 pub(crate) fn ensure_out_dir(out_dir: &Path) {
     if let Err(e) = std::fs::create_dir_all(out_dir) {
         tracing::warn!(path = %out_dir.display(), error = %e, "document: failed to create extraction output dir");
     }
 }
 
-/// Write one embedded picture into `out_dir` under the name the caller states —
-/// a package's media part by its own base name, a legacy BLIP by its slot in the
-/// reading — and return the path it landed at. A name already taken is suffixed
-/// `_2`, `_3`, … (see [`crate::util::suffixed_name`]); the check is against the
-/// directory rather than a counter because `out_dir` also holds the attachment
-/// itself: a package can hold one base name under two directories
-/// (`word/media/a.png` and `word/media/sub/a.png`), and without the suffix the
-/// earlier file would be overwritten and the survivor delivered twice.
-/// `next_suffix` memoizes the first suffix still worth trying per name, so a
-/// package of many entries sharing one base name does not rescan the names
-/// already taken.
+/// Write one embedded picture into `out_dir` under the name the caller states — a package's
+/// media part by its own base name, a legacy BLIP by its slot — and return the path it landed
+/// at. A name already taken is suffixed `_2`, `_3`, … ([`crate::util::suffixed_name`]); the
+/// check is against the directory because `out_dir` also holds the attachment, and a package
+/// can hold one base name under two directories. `next_suffix` memoizes the first suffix still
+/// worth trying per name.
 ///
-/// A write failure is counted into `skipped`, never raised: the document itself
-/// was read, so a picture that would not land is a note about what the reading
-/// did not deliver, not a failed call.
+/// A write failure is counted into `skipped`, never raised: the document itself was read.
 pub(crate) fn write_picture(
     out_dir: &Path,
     file_name: &str,
@@ -1918,47 +1661,36 @@ pub(crate) fn write_picture(
     }
 }
 
-/// Whether a page's text layer is long enough that the page needs no image of
-/// itself: at least [`MIN_PAGE_TEXT_CHARS`] characters of `text`, as the caller
-/// trimmed it. This is only the *rasterization* trigger — a page it rejects is
-/// delivered as an image, and the text that page produced is delivered beside it
-/// (see [`convert_pdf`]).
+/// Whether a page's text layer is long enough that the page needs no image of itself: at least
+/// [`MIN_PAGE_TEXT_CHARS`] characters of the trimmed `text`. Only the *rasterization* trigger —
+/// the text is delivered beside the image either way (see [`convert_pdf`]).
 fn is_usable_page_text(text: &str) -> bool {
     text.chars().count() >= MIN_PAGE_TEXT_CHARS
 }
 
-/// One page's block: the page's own physical number — the numbering the raster
-/// file names and the notes use — and the page's text. The text stays verbatim
-/// rather than indented under the label (as the OOXML arms' blocks indent
-/// theirs), because it is the document's own text and is copied out of the
-/// answer as often as it is read. Only a page that produced text gets a block: a
-/// page that produced none is delivered as an image and named by the notes, and
-/// a label for it would make a document without text look like one with some.
+/// One page's block: the page's own physical number — the numbering the raster file names and the
+/// notes use — and the page's text, kept verbatim rather than indented because it is the document's
+/// own text and is copied out of the answer. Only a page that produced text gets a block.
 fn page_block(page_number: usize, text: &str) -> String {
     format!("Page {page_number}:\n{text}")
 }
 
-/// Whether `bytes` are text-like with no container magic: valid UTF-8 and no
-/// NUL byte.
+/// Whether `bytes` are text-like with no container magic: valid UTF-8 and no NUL byte.
 fn is_plain_utf8(bytes: &[u8]) -> bool {
     !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
 }
 
-/// Builders shared by this module's tests, the read tool's document tests
-/// ([`crate::tools::read_document`]) and the inbound-attachment tests
-/// ([`crate::channels::enrichment`]), so every side converts the very same
-/// fixtures.
+/// Builders shared by this module's tests, the read tool's document tests and the
+/// inbound-attachment tests, so every side converts the very same fixtures.
 #[cfg(test)]
 pub(crate) mod test_fixtures {
-    /// Assemble numbered objects into a PDF with a valid xref table, computing
-    /// offsets as it writes.
+    /// Assemble numbered objects into a PDF with a valid xref table, computing offsets as it goes.
     pub(crate) fn assemble_pdf(objects: &[Vec<u8>]) -> Vec<u8> {
         assemble_pdf_with_trailer(objects, "")
     }
 
-    /// [`assemble_pdf`] with `trailer_extra` written into the trailer beside
-    /// `/Size` and `/Root` — the one hook a fixture has for `/Info`, which lives
-    /// in the trailer rather than the catalog.
+    /// [`assemble_pdf`] with `trailer_extra` written into the trailer — the one hook a fixture
+    /// has for `/Info`, which lives there rather than in the catalog.
     pub(crate) fn assemble_pdf_with_trailer(objects: &[Vec<u8>], trailer_extra: &str) -> Vec<u8> {
         let mut pdf = b"%PDF-1.4\n".to_vec();
         let mut offsets = Vec::new();
@@ -1985,8 +1717,8 @@ pub(crate) mod test_fixtures {
         pdf
     }
 
-    /// A multi-page PDF: one font, and for every entry a page dictionary
-    /// carrying `entries` plus its own content stream, in the order given.
+    /// A multi-page PDF: one font, and for every entry a page dictionary carrying `entries` plus
+    /// its own content stream.
     pub(crate) fn multi_page_pdf(pages: &[(&str, &[u8])]) -> Vec<u8> {
         let kids: Vec<String> = (0..pages.len())
             .map(|slot| format!("{} 0 R", 4 + 2 * slot))
@@ -2022,28 +1754,23 @@ pub(crate) mod test_fixtures {
         assemble_pdf(&objects)
     }
 
-    /// One page's text that ends where the reader gives up: it panics on an
-    /// operand it cannot show, without losing what it showed before it.
+    /// One page's text that ends where the reader gives up: it panics on an operand it cannot
+    /// show, keeping what it showed before.
     pub(crate) const PAGE_THAT_FAILS_MIDWAY: &[u8] =
         b"BT /F1 24 Tf 72 700 Td (Kept page text long enough) Tj ET BT /F1 24 Tf 72 600 Td 42 Tj ET";
 
-    /// A two-page PDF whose every page yields text and then fails the reader
-    /// part-way: not one page reads to the end, yet the document loses no text.
+    /// A two-page PDF whose every page yields text and then fails the reader part-way: no page
+    /// reads to the end, yet no text is lost.
     pub(crate) fn pdf_with_all_pages_failing_midway() -> Vec<u8> {
         let page = ("/MediaBox [0 0 612 792]", PAGE_THAT_FAILS_MIDWAY);
         multi_page_pdf(&[page, page])
     }
 
-    /// A PDF under construction, assembled by [`assemble_pdf`] (which numbers
-    /// objects from 1, so a body can reference any other by its number). Object 1
-    /// is reserved for the catalog [`build`](PdfFixture::build) writes last,
-    /// because the trailer's `/Root` must point at object 1 while the entries it
-    /// carries (a page tree, a form) are only known once the objects they name
-    /// exist.
-    ///
-    /// A fixture neither validates PDF syntax nor the references a body writes:
-    /// it only refuses a body set twice or left missing, so a typo in a test is
-    /// loud instead of a silently different PDF.
+    /// A PDF under construction, assembled by [`assemble_pdf`] (which numbers objects from 1).
+    /// Object 1 is reserved for the catalog [`build`](PdfFixture::build) writes last, because the
+    /// trailer's `/Root` must point at it while its entries are only known once the objects they
+    /// name exist. A fixture neither validates PDF syntax nor references: it only refuses a body
+    /// set twice or left missing.
     pub(crate) struct PdfFixture {
         /// One slot per object, index 0 holding object 1; `None` is reserved
         /// but not yet written.
@@ -2063,8 +1790,7 @@ pub(crate) mod test_fixtures {
             format!("{} 0 R", self.bodies.len())
         }
 
-        /// Write `body` as the body of the object `reference` names (which must
-        /// not already have one), so a page can name a page tree written after it.
+        /// Write `body` as the body of the object `reference` names (not already written).
         pub(crate) fn set(&mut self, reference: &str, body: String) {
             let number = reference
                 .split(' ')
@@ -2080,22 +1806,19 @@ pub(crate) mod test_fixtures {
             *slot = Some(body.into_bytes());
         }
 
-        /// Reserve, write and return a reference — [`reserve`](Self::reserve) +
-        /// [`set`](Self::set) in one.
+        /// Reserve, write and return a reference — [`reserve`](Self::reserve) + [`set`](Self::set).
         pub(crate) fn push(&mut self, body: String) -> String {
             let reference = self.reserve();
             self.set(&reference, body);
             reference
         }
 
-        /// Write the catalog as object 1 with `entries` (beside `/Type /Catalog`)
-        /// and assemble the PDF.
+        /// Write the catalog as object 1 with `entries` (beside `/Type /Catalog`) and build.
         pub(crate) fn build(self, entries: &str) -> Vec<u8> {
             self.build_with_trailer(entries, "")
         }
 
-        /// [`build`](Self::build) with `trailer_extra` written into the trailer
-        /// beside its `/Size` and `/Root`.
+        /// [`build`](Self::build) with `trailer_extra` written into the trailer.
         pub(crate) fn build_with_trailer(mut self, entries: &str, trailer_extra: &str) -> Vec<u8> {
             assert!(
                 self.bodies[0].is_none(),
@@ -2111,11 +1834,10 @@ pub(crate) mod test_fixtures {
         }
     }
 
-    /// A one-page PDF on `fixture` — whose already-pushed objects `page_entries`
-    /// and `catalog_extra` can name — with a Helvetica font resource, `content` as
-    /// the page's content stream, `page_entries` merged into the page dictionary
-    /// and `catalog_extra` into the catalog beside the page tree. The `/MediaBox`
-    /// is the caller's: a fixture whose page must fail the reader leaves it out.
+    /// A one-page PDF on `fixture` — whose already-pushed objects `page_entries` and
+    /// `catalog_extra` can name — with a Helvetica font resource, `content` as the content
+    /// stream, and the entries merged. The `/MediaBox` is the caller's: a page that must fail
+    /// the reader leaves it out.
     pub(crate) fn one_page_pdf(
         mut fixture: PdfFixture,
         content: &[u8],
@@ -2141,10 +1863,8 @@ pub(crate) mod test_fixtures {
         fixture.build(&format!("/Pages {pages}{catalog_extra}"))
     }
 
-    /// A PDF literal string holding `text`: hex-encoded UTF-16BE with a BOM,
-    /// which is how a producer writes text a reader must not have to guess the
-    /// encoding of — the shape every non-ASCII annotation and form value in the
-    /// tests takes.
+    /// A PDF literal string holding `text`: hex-encoded UTF-16BE with a BOM, the shape every
+    /// non-ASCII annotation and form value in the tests takes.
     pub(crate) fn pdf_text_string(text: &str) -> String {
         let mut bytes = vec![0xFE, 0xFF];
         for unit in text.encode_utf16() {
@@ -2158,8 +1878,7 @@ pub(crate) mod test_fixtures {
 mod tests {
     use super::test_fixtures::*;
     use super::*;
-    // The CFB container and `.doc` package recipes live with the readers that
-    // consume them, so a classification test and a reading test build one file.
+    // The CFB container and `.doc` package recipes live with the readers that consume them.
     use crate::legacy::test_fixtures::{cfb, doc_fixture};
     // The ZIP/OOXML fixtures live with the arm that reads them.
     use crate::ooxml::test_fixtures::zip_fixture;
@@ -2180,8 +1899,7 @@ mod tests {
         ));
     }
 
-    /// One embedded image XObject for [`pdf_fixture`]: dictionary entries are
-    /// written verbatim so a test can pick the filter chain and the colour space,
+    /// One embedded image XObject for [`pdf_fixture`]: dictionary entries are written verbatim,
     /// and the stream bytes are raw so real Flate streams can be built.
     struct ImageXObject {
         width: u32,
@@ -2194,8 +1912,7 @@ mod tests {
     }
 
     impl ImageXObject {
-        /// An 8-bit RGB image whose samples are `data`, already encoded by
-        /// `filter`.
+        /// An 8-bit RGB image whose samples are `data`, already encoded by `filter`.
         fn rgb(width: u32, height: u32, filter: Option<&'static str>, data: Vec<u8>) -> Self {
             Self {
                 width,
@@ -2245,8 +1962,7 @@ mod tests {
         encoder.finish().expect("finish flate stream")
     }
 
-    /// Build a one-page PDF from `content_stream` and `images` (one XObject per
-    /// entry, referenced by the page's resources as `/Im0`, `/Im1`, …).
+    /// Build a one-page PDF from `content_stream` and `images` (one XObject per entry, `/Im0`, …).
     fn pdf_fixture(content_stream: &[u8], images: &[ImageXObject]) -> Vec<u8> {
         // 1 catalog, 2 page tree, 3 font, 4 page, one object per image, then the
         // content stream.
@@ -2297,8 +2013,7 @@ mod tests {
         SOLID_RGB.repeat(8)
     }
 
-    /// An inline image (`BI`/`ID`/`EI`) painting the solid 4x2 RGB samples,
-    /// ASCIIHex-encoded so the assembled content stream stays printable.
+    /// An inline image (`BI`/`ID`/`EI`) painting the solid 4x2 RGB samples, ASCIIHex-encoded.
     fn solid_rgb_inline_image() -> String {
         let hex = crate::util::hex_string(&solid_rgb_samples());
         format!("BI /W 4 /H 2 /CS /RGB /BPC 8 /F /AHx ID {hex}> EI")
@@ -2311,10 +2026,9 @@ mod tests {
         pdf_fixture(b"0.1 0.5 0.9 rg 0 0 612 792 re f", &[image])
     }
 
-    /// A CFB container's own directory, never the file's name, decides what it
-    /// is — and a real legacy Word `.doc` is the very case the name gets wrong:
-    /// under a modern name it must still read with its own reader, not be called
-    /// a password-protected package.
+    /// A CFB container's own directory, never the file's name, decides what it is — and a real
+    /// legacy Word `.doc` is the case the name gets wrong: under a modern name it must still read
+    /// with its own reader, not be called a password-protected package.
     #[test]
     fn legacy_doc_named_docx_is_read_as_a_legacy_document() {
         let bytes = doc_fixture("Hello legacy doc", &[], false);
@@ -2335,9 +2049,8 @@ mod tests {
         }
     }
 
-    /// Genuine encryption is a password prompt under any name, a modern one or
-    /// an old one: the two streams an encrypted package declares are what
-    /// matters, so a legacy name cannot turn it into a legacy file.
+    /// Genuine encryption is a password prompt under any name: the two streams an encrypted
+    /// package declares are what matters.
     #[test]
     fn encrypted_cfb_is_password_protected_whatever_the_name() {
         let bytes = cfb(&[
@@ -2357,11 +2070,9 @@ mod tests {
         }
     }
 
-    /// The container's own streams name the legacy family, and a container whose
-    /// directory names no Office document is decided by its name: a `.docx`-named
-    /// one reaches the package reader as a corrupt `.docx`, a `.doc`-named one the
-    /// legacy reader as a corrupt old document, and a name claiming no document at
-    /// all leaves it to the ordinary read — never a password prompt.
+    /// The container's own streams name the legacy family, and a container whose directory names
+    /// no Office document is decided by its name: a `.docx`-named one reaches the package reader
+    /// as a corrupt `.docx`, and a name claiming no document leaves it to the ordinary read.
     #[test]
     fn a_cfb_is_classified_by_its_contents_then_its_name() {
         assert_eq!(
@@ -2424,9 +2135,8 @@ mod tests {
         );
     }
 
-    /// A ZIP holding no OOXML package at all keeps the name's verdict: only a
-    /// name of one of the three families is read, and a plain archive is a
-    /// format this project does not convert.
+    /// A ZIP holding no OOXML package keeps the name's verdict: only a name of one of the three
+    /// families is read, and a plain archive is not converted.
     #[test]
     fn zip_with_non_ooxml_extension_is_unsupported() {
         let bytes = zip_fixture(&[("readme.txt", b"plain archive contents")]);
@@ -2499,8 +2209,7 @@ mod tests {
         }
     }
 
-    /// Convert a text-layer page carrying `image` and decode the one image file
-    /// the page wrote.
+    /// Convert a text-layer page carrying `image` and decode the one image file the page wrote.
     fn decode_written_embedded_image(image: ImageXObject) -> image::RgbImage {
         let dir = tempfile::tempdir().expect("tempdir");
         let outcome = convert_document(&text_pdf(&[image]), "scan.pdf", dir.path());
@@ -2514,9 +2223,8 @@ mod tests {
             .to_rgb8()
     }
 
-    /// A text-layer page is never rasterized, so its embedded images have to be
-    /// decoded and written: without that pass a document reaches the model
-    /// without its figures.
+    /// A text-layer page is never rasterized, so its embedded images have to be decoded and
+    /// written: without that pass the model gets no figures.
     #[test]
     fn pdf_text_page_writes_embedded_flate_image() {
         let written = decode_written_embedded_image(ImageXObject::rgb(
@@ -2529,10 +2237,9 @@ mod tests {
         assert_solid_rgb(written.get_pixel(0, 0).0);
     }
 
-    /// A form XObject is a container the page's content paints through, so the
-    /// images in its own resources — and the inline images in its own content —
-    /// are the page's images. A text page is never rasterized, so both passes
-    /// have to walk the forms or the figure is lost.
+    /// A form XObject is a container the page paints through, so the images in its own resources
+    /// and content are the page's images; a text page is never rasterized, so both passes walk
+    /// the forms.
     #[test]
     fn a_form_xobject_hands_its_images_to_the_page() {
         let content = "BT /F1 24 Tf 72 700 Td (Hello PDF text layer) Tj ET";
@@ -2585,8 +2292,8 @@ mod tests {
         }
     }
 
-    /// An inline image lives in the content stream, not in the resources, so a
-    /// text page — which is never rasterized — needs this pass to show it.
+    /// An inline image lives in the content stream, not the resources, so a text page needs this
+    /// pass to show it.
     #[test]
     fn pdf_text_page_writes_inline_image() {
         let content = format!(
@@ -2611,12 +2318,11 @@ mod tests {
         assert_solid_rgb(written.get_pixel(0, 0).0);
     }
 
-    /// A PNG predictor in `/DecodeParms` is what most producers emit, and the
-    /// filter chain has to undo it before the samples can be converted.
+    /// A PNG predictor in `/DecodeParms` is what most producers emit, and the filter chain has to
+    /// undo it before the samples can be converted.
     #[test]
     fn pdf_text_page_writes_png_predictor_image() {
-        // A 4x2 image in PNG "Up" rows: the first row is subtracted from a zero
-        // row, so it is raw, and the second row's differences from it are zero.
+        // A 4x2 image in PNG "Up" rows: the first row is raw, the second row's deltas are zero.
         let mut encoded = vec![2];
         encoded.extend_from_slice(&SOLID_RGB.repeat(4));
         encoded.push(2);
@@ -2629,8 +2335,8 @@ mod tests {
         assert_solid_rgb(written.get_pixel(0, 0).0);
     }
 
-    /// An embedded image that cannot be decoded is skipped, and a text-layer
-    /// page is never rasterized — so without a note it would vanish silently.
+    /// An embedded image that cannot be decoded is skipped, and a text page is never rasterized —
+    /// without a note it vanishes.
     #[test]
     fn pdf_notes_embedded_images_that_cannot_be_decoded() {
         // JPEG 2000 bytes this module's decoder rejects outright.
@@ -2650,9 +2356,8 @@ mod tests {
         );
     }
 
-    /// The guard's own envelope: a declared geometry over it is refused before
-    /// any sample is decoded, so the note must say that rather than claim a
-    /// decode failure.
+    /// The guard's own envelope: a declared geometry over it is refused before any sample is
+    /// decoded, so the note must say that rather than claim a decode failure.
     #[test]
     fn pdf_notes_a_declared_geometry_over_the_raster_envelope() {
         let image = ImageXObject::rgb(20_000, 20_000, None, Vec::new());
@@ -2671,8 +2376,7 @@ mod tests {
         );
     }
 
-    /// A lone `DCTDecode` stream already is a complete JPEG: it is written
-    /// through verbatim rather than decoded and re-encoded.
+    /// A lone `DCTDecode` stream already is a complete JPEG: it is written through verbatim.
     #[test]
     fn pdf_text_page_passes_jpeg_through_verbatim() {
         let source = RgbImage::from_pixel(4, 2, image::Rgb(SOLID_RGB));
@@ -2724,13 +2428,10 @@ mod tests {
         );
     }
 
-    /// A page the reader cannot read costs that page and no other: the pages
-    /// around it keep their text and only it is delivered as an image, a page that
-    /// produced text before failing keeps that text under its own label, and the
-    /// note names the pages that were lost. A page whose text could not be read is
-    /// never confused with a page that has no text — the first is named and the
-    /// second is not — and only a document whose every page the reader failed on
-    /// reports that all of its text was lost.
+    /// A page the reader cannot read costs that page and no other: the pages around it keep their
+    /// text, a page that produced text before failing keeps it under its own label, and the note
+    /// names the lost pages. A page whose text could not be read is never confused with a page
+    /// that has none.
     #[expect(clippy::too_many_lines)] // the reader's failure modes, one fixture each
     #[test]
     fn pdf_keeps_what_the_reader_could_read_and_names_what_it_could_not() {
@@ -2797,9 +2498,8 @@ mod tests {
         );
         assert!(!all_page_text_lost);
 
-        // Every page yields text and then fails the reader part-way: all of it is
-        // kept and every page is rasterized, but a page that delivered text is not
-        // a loss — the flag must clear even though the reader failed on each page.
+        // Every page yields text and then fails part-way: all of it is kept, but a page that
+        // delivered text is not a loss — the flag must clear.
         let bytes = pdf_with_all_pages_failing_midway();
         let dir = tempfile::tempdir().expect("tempdir");
         let outcome = convert_document(&bytes, "report.pdf", dir.path());
@@ -2832,12 +2532,11 @@ mod tests {
             "no page's text was lost: both delivered what they produced"
         );
 
-        // The reader's page table cannot be followed at all while the pages
-        // themselves parse: the text of every page is lost, which the note says.
+        // The reader's page table cannot be followed at all while the pages parse: every page's
+        // text is lost, which the note says.
         let mut bytes = text_pdf(&[]);
-        // One byte inserted after the header: every xref offset is now one short
-        // of its object, so the reader cannot find a single page (hayro's own
-        // structure scan still finds the one the document has).
+        // One byte inserted after the header: every xref offset is one short, so the reader cannot
+        // find a page (hayro's structure scan still finds the one the document has).
         bytes.insert(b"%PDF-1.4\n".len(), b' ');
         let dir = tempfile::tempdir().expect("tempdir");
         let outcome = convert_document(&bytes, "report.pdf", dir.path());
@@ -2859,10 +2558,8 @@ mod tests {
         );
         assert!(all_page_text_lost);
 
-        // A text-free page beside one the reader could not read: only the second
-        // is named, and the document is not one whose text the reader failed on.
-        // Page 1 paints a rectangle and has no text at all; page 2 has no
-        // MediaBox, so the reader panics on it before reading anything.
+        // A text-free page beside one the reader could not read: only the second is named, and the
+        // document is not one whose text failed.
         let bytes = multi_page_pdf(&[
             (
                 "/MediaBox [0 0 612 792]",
@@ -2903,9 +2600,8 @@ mod tests {
         );
     }
 
-    /// The text of 1-based `page_number` as the reader's plain output produces
-    /// it: what every page was read as before crop handling, and what a page with
-    /// no crop box must still read as.
+    /// The text of 1-based `page_number` as the reader's plain output produces it: what a page
+    /// with no crop box must still read as.
     fn plain_page_text(bytes: &[u8], page_number: u32) -> String {
         let doc = Document::load_mem(bytes).expect("load the PDF");
         let mut text = String::new();
@@ -2922,10 +2618,8 @@ mod tests {
         VisibleArea::of(pdf.pages().get(page_number - 1)?)
     }
 
-    /// The text a page's crop box hides is not page content: the word the crop
-    /// cuts off is not delivered and leaves no gap in the text the page shows,
-    /// while a page beside it with no crop box still reads exactly as the plain
-    /// output reads it, and a glyph the crop cuts through is kept.
+    /// The text a page's crop box hides is not page content: the word the crop cuts off is not
+    /// delivered and leaves no gap, and a glyph the crop cuts through is kept.
     #[test]
     fn pdf_page_text_is_limited_to_its_crop_box() {
         // "Visible line of text" ends before x=320 and the second word starts at
@@ -2978,14 +2672,12 @@ mod tests {
         assert!(notes.is_empty(), "{notes:?}");
     }
 
-    /// A page that could not be delivered at all is not silently absent from the
-    /// answer: the report names it, so a reading whose pages could not be written
-    /// is never taken for one that delivered them.
+    /// A page that could not be delivered is not silently absent: the report names it.
     #[test]
     fn a_page_that_cannot_be_written_is_reported() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // A file where the artifact directory should be: no raster can be written,
-        // and the page is one the reading could not deliver.
+        // A file where the artifact directory should be: no raster can be written, and the page is
+        // one the reading could not deliver.
         let blocked = dir.path().join("not-a-directory");
         std::fs::write(&blocked, b"").expect("write the file standing in for the directory");
         // A text-free page, so the reading has to deliver it as a raster.
@@ -3004,9 +2696,8 @@ mod tests {
         assert_eq!(unshown.lines(), ["1 page(s) not shown"]);
     }
 
-    /// The note is a bounded contract: ranges, a count, and a stop — never one
-    /// number per lost page of a long document — and the "the reader failed"
-    /// flag only when no page the reader read produced text.
+    /// The note is a bounded contract: ranges, a count, and a stop — never one number per lost
+    /// page — and the "reader failed" flag only when no page the reader read produced text.
     #[test]
     fn unreadable_page_notes_name_ranges_within_a_bound() {
         let unread = UnreadablePages {
@@ -3056,10 +2747,8 @@ mod tests {
         );
     }
 
-    /// The only coverage of the rasterization path (render → unpremultiply →
-    /// JPEG), including the scale that bounds the rendered page's long side. A
-    /// page without a text layer is rendered whole, so its embedded image comes
-    /// along in the raster instead of as a file of its own.
+    /// The only coverage of the rasterization path (render → unpremultiply → JPEG), including the
+    /// scale that bounds the rendered page's long side.
     #[test]
     fn pdf_page_without_text_layer_is_rasterized() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3077,8 +2766,8 @@ mod tests {
         assert_eq!(images, vec![dir.path().join("page_1.jpg")]);
         assert!(notes.is_empty(), "nothing was skipped: {notes:?}");
         let page = image::open(&images[0]).expect("decode the rasterized page");
-        // The 792 px letter page is scaled onto the RASTER_LONG_SIDE_PX target,
-        // short of it by at most the pixel-grid rounding.
+        // The 792 px letter page is scaled onto the RASTER_LONG_SIDE_PX target, short of it by
+        // pixel-grid rounding.
         let long_side = f64::from(page.width().max(page.height()));
         let target = f64::from(RASTER_LONG_SIDE_PX);
         assert!(
@@ -3087,9 +2776,8 @@ mod tests {
         );
     }
 
-    /// Every page that produced text is labeled with its own physical number,
-    /// however short the text: a page below [`MIN_PAGE_TEXT_CHARS`] is still
-    /// rasterized exactly as before, and its text is kept beside the image.
+    /// Every page that produced text is labeled with its own physical number, however short: a
+    /// page below [`MIN_PAGE_TEXT_CHARS`] is still rasterized, its text kept beside the image.
     #[test]
     fn pdf_labels_each_page_that_produced_text_and_keeps_the_short_ones() {
         let bytes = multi_page_pdf(&[
@@ -3132,8 +2820,8 @@ mod tests {
         assert!(!all_page_text_lost);
     }
 
-    /// The marks a PDF carries are document content too: the annotations and the
-    /// filled form values follow the page blocks, each naming its own page.
+    /// The marks a PDF carries are document content too: annotations and filled form values
+    /// follow the page blocks, each naming its page.
     #[test]
     fn pdf_delivers_annotations_and_form_values_as_document_text() {
         const CONTENT: &[u8] = b"BT /F1 24 Tf 72 700 Td (Page one text long enough) Tj ET";
@@ -3177,16 +2865,9 @@ mod tests {
         assert!(notes.is_empty(), "{notes:?}");
     }
 
-    /// A page whose text layer is absent still delivers the form values it
-    /// carries: the marks are never gated on the page text, and nothing counts
-    /// as lost — the page simply has no text. The reading says so through
-    /// `page_text`; the note itself belongs to the caller, which knows what it
-    /// delivered.
-    /// The marks a PDF carries are document content even where there is no page
-    /// text: a text-free page still delivers its form values, the page is
-    /// rasterized, and the reading reports that no page text was produced. A
-    /// document's own description leads the reading when it has one, and a form
-    /// with no filled value still names its field.
+    /// A page whose text layer is absent still delivers the form values it carries: the marks are
+    /// never gated on the page text, and nothing counts as lost — the page simply has no text. The
+    /// reading says so through `page_text`, and a form with no filled value still names its field.
     #[test]
     fn pdf_delivers_its_marks_and_description_beside_the_page_text() {
         const CONTENT: &[u8] = b"0.1 0.5 0.9 rg 0 0 612 792 re f";

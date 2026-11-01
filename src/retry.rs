@@ -1,72 +1,46 @@
 //! Outer retry orchestration for LLM operations.
 //!
-//! The expensive LLM paths retry through this module — agent-loop chat calls,
-//! structured extraction (verdicts, diagnostics discovery, comment summaries,
-//! research orchestration), grouping repair (analyze consolidation, joint-verdict
-//! synthesis) and deep-research synthesis — so every chat/extraction retry
-//! budget lives in one place. The list is intentionally non-exhaustive:
-//! behavior is defined by the policy constructors, not by per-path
-//! documentation.
+//! The expensive LLM paths retry through this module — agent-loop chat calls, structured extraction
+//! (verdicts, diagnostics discovery, comment summaries, research orchestration), grouping repair
+//! and deep-research synthesis. The list is intentionally non-exhaustive: behaviour is defined by
+//! the policy constructors, not by per-path documentation.
 //!
-//! # Single retry authority
+//! This outer loop is the **single retry authority**: on these calls provider-internal retries are
+//! suppressed (see [`Provider::chat_scoped`]), so total provider HTTP calls per operation are
+//! bounded by the policy in effect.
 //!
-//! The outer loop in this module is the **single retry authority**: on these
-//! calls provider-internal retries are suppressed (see [`Provider::chat_scoped`]),
-//! so total provider HTTP calls per operation are explicitly bounded by the
-//! policy in effect (see "Schedules").
+//! All request parameters (model, messages, tools, max_tokens, reasoning_effort, provider routing)
+//! are byte-identical across ALL attempts — reasoning_effort is FIXED (prefix cache preservation,
+//! never lower it) and no escalation of any kind. The only permitted change is appended feedback on
+//! a failed attempt (the extraction re-prompt, repair-round instructions, synthesis feedback),
+//! which extends the cached prefix.
 //!
-//! # Byte-identical retry parameters
+//! Four policies, snapshotted once at operation start ([`RetryPolicy`]). All share the same
+//! mechanics: ±25% jitter on the SLEEP ONLY (never on request bytes); Retry-After honoured, clamped
+//! [5000 ms, 60000 ms]; shutdown-abortable. They differ only in attempt counts and backoff — no
+//! per-operation wall-clock cap exists; the only timing bound is the 600 s idle timeout
+//! ([`DEFAULT_IDLE_TIMEOUT`]), so worst case is roughly `attempts × 600 s + backoff` (a body that
+//! keeps trickling bytes is never cut):
 //!
-//! All request parameters (model, messages, tools, max_tokens, reasoning_effort,
-//! provider routing) are byte-identical across ALL attempts — reasoning_effort
-//! is FIXED (prefix cache preservation — never lower it), no escalation of any
-//! kind. The only permitted change is appended feedback on a failed attempt —
-//! the parse-failure re-prompt in the extraction path, repair-round
-//! instructions, synthesis feedback — which extends the cached prefix.
+//! - Default ([`RetryPolicy::current`]) — 13 attempts over a 5/10/20/40/60/60… s ladder (base
+//!   5000 ms, doubled to a 60000 ms cap; 555 s of sleep in total) to ride out a sustained 503.
+//! - Synthesis ([`RetryPolicy::synthesis`]) — 3 total attempts (1 synthesis + up to 2 repair
+//!   rounds), 30–45 s band, so a bad grouping degrades to the deterministic fallback after at most
+//!   3 calls.
+//! - Comment ([`RetryPolicy::comment`]) — 3 attempts on the default backoff, because a long retry
+//!   would stall the pipeline for a non-critical extraction.
+//! - Continuation ([`RetryPolicy::continuation`]) — 3 attempts with no inter-attempt sleep, the
+//!   reasoning-only-stop recovery budget (see
+//!   [`crate::agent::Agent::recover_reasoning_only_stop`]).
 //!
-//! # Schedules
+//! Per-attempt timeout semantics come from [`Provider::chat_scoped`]: the header wait (TTFB) and
+//! each body-read chunk wait are bounded by the 600 s idle timeout, resetting while data flows — a
+//! healthy-but-slow generation is never cut, a stalled attempt is aborted and retried.
 //!
-//! Four policies, snapshotted once at operation start ([`RetryPolicy`]). All
-//! share the same mechanics: ±25% jitter on the SLEEP ONLY (never on request
-//! bytes); Retry-After honored, clamped [5000 ms, 60000 ms];
-//! shutdown-abortable. They differ ONLY in attempt counts and backoff — no
-//! per-operation wall-clock cap exists; the only timing bound is the 600 s
-//! idle timeout ([`DEFAULT_IDLE_TIMEOUT`]). A stalled attempt is cut at
-//! 600 s, so worst case is roughly `attempts × 600 s + backoff` (a body that
-//! keeps trickling bytes is never cut).
-//!
-//! - **Default** ([`RetryPolicy::current`]) — 13 attempts, backoff
-//!   5/10/20/40/60/60… s (base 5000 ms, doubling capped at 60000 ms; total
-//!   sleep 555 s) — rides out sustained 503 outages before failing.
-//! - **Synthesis** ([`RetryPolicy::synthesis`]) — 3 total attempts (1
-//!   synthesis + up to 2 repair rounds), 30–45 s backoff band; bounded so a
-//!   bad grouping degrades to the deterministic fallback after at most 3
-//!   calls.
-//! - **Comment** ([`RetryPolicy::comment`]) — 3 attempts, default backoff;
-//!   for fail-open comment-only extraction, where a long retry would stall
-//!   the pipeline for a non-critical operation.
-//! - **Continuation** ([`RetryPolicy::continuation`]) — 3 attempts, no
-//!   inter-attempt sleep; the reasoning-only-stop recovery budget
-//!   (appended-only re-requests, see
-//!   [`crate::agent::Agent::recover_reasoning_only_stop`]). Retryable
-//!   transport errors re-send the byte-identical request; non-retryable
-//!   errors break immediately.
-//!
-//! Per-attempt timeout semantics come from [`Provider::chat_scoped`]: the
-//! header wait (TTFB) and each body-read chunk wait are bounded by the 600 s
-//! idle timeout, resetting while data flows — a healthy-but-slow generation
-//! with data flowing is never cut, but a stalled attempt (no bytes for 600 s)
-//! is aborted and retried per the policy in effect.
-//!
-//! # Telemetry
-//!
-//! Every failed attempt produces a [`RetryFailureRecord`] appended to the
-//! in-memory failure trail; terminal exhaustion surfaces it through
-//! [`RetryExhausted`], which feeds the live `llm_requests` stats rows
-//! (retry_attempts / finish_reason / failure_class). Every failed attempt of a
-//! metadata-carrying operation also persists one `llm_failures` row (attempt
-//! index, class, finish_reason, Retry-After, error chain) grouped by a
-//! per-operation id — see [`RetryLoop::record`].
+//! Every failed attempt produces a [`RetryFailureRecord`] appended to the in-memory failure trail;
+//! terminal exhaustion surfaces it through [`RetryExhausted`], which feeds the live `llm_requests`
+//! stats rows. Every failed attempt of a metadata-carrying operation also persists one
+//! `llm_failures` row, grouped by a per-operation id — see [`RetryLoop::record`].
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -75,16 +49,12 @@ use std::time::{Duration, Instant};
 use crate::util::UnwrapPoison;
 use crate::{ChatRequest, ChatResponse};
 
-// ── Hardcoded retry defaults (no config surface — fixed in code) ─────────
-
 pub(crate) const DEFAULT_RETRY_MAX_ATTEMPTS: u32 = 13;
 const DEFAULT_RETRY_BASE_BACKOFF_MS: u64 = 5_000;
 const DEFAULT_RETRY_MAX_BACKOFF_MS: u64 = 60_000;
 
-/// Dedicated joint-verdict synthesis retry schedule: total calls (1 full
-/// synthesis + up to N-1 repair rounds; default 3 = the lower edge of the
-/// approved 3–5 band), 30–45 s backoff band (base 30 s, cap 45 s, ±25%
-/// jitter on sleeps).
+/// Joint-verdict synthesis schedule: total calls (1 synthesis + up to N-1 repair rounds; default 3,
+/// the lower edge of the approved 3–5 band), 30–45 s backoff band (±25% jitter on sleeps).
 const DEFAULT_SYNTHESIS_MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_SYNTHESIS_BASE_BACKOFF_MS: u64 = 30_000;
 const DEFAULT_SYNTHESIS_MAX_BACKOFF_MS: u64 = 45_000;
@@ -92,38 +62,27 @@ const DEFAULT_SYNTHESIS_MAX_BACKOFF_MS: u64 = 45_000;
 /// Fail-open comment-extraction attempt budget — see [`RetryPolicy::comment`].
 const DEFAULT_COMMENT_MAX_ATTEMPTS: u32 = 3;
 
-/// Dedicated reasoning-only-stop continuation schedule: up to 3 appended-only
-/// continuation re-requests after the original in-class response, bounded by
-/// the attempt count (the [`RetryPolicy::comment`] precedent) so a stuck
-/// reasoning-only model fails the turn safely. Each continuation attempt is a
-/// single `chat_scoped` call (no inner transport retry — the appended tail
-/// makes every new reasoning state a fresh request; retryable transport errors
-/// re-send the identical bytes).
+/// Reasoning-only-stop continuation schedule: up to 3 appended-only re-requests after the original
+/// in-class response, so a stuck reasoning-only model fails the turn safely. Each attempt is a
+/// single `chat_scoped` call (no inner transport retry — the appended tail makes every new
+/// reasoning state a fresh request; retryable transport errors re-send the identical bytes).
 const DEFAULT_CONTINUATION_MAX_ATTEMPTS: u32 = 3;
 
-/// The single timeout governing every LLM chat request — bounds the
-/// response-header wait (TTFB) and each body-read chunk wait, resetting while
-/// data flows. A stalled attempt is aborted at 600 s and retried per the retry
-/// policy in effect; a healthy-but-slow generation with data flowing is never
-/// cut. No total request timeout applies to chat attempts.
+/// The single timeout governing every LLM chat request — the response-header wait (TTFB) and each
+/// body-read chunk wait, resetting while data flows. A stalled attempt is aborted at 600 s and
+/// retried; a healthy-but-slow generation is never cut. No total request timeout applies.
 pub(crate) const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Lower clamp for Retry-After honoring.
+/// Lower clamp for Retry-After honouring.
 const RETRY_AFTER_MIN_MS: u64 = 5_000;
-/// Upper clamp for Retry-After honoring — unified at 60 s across all scoped
-/// retry paths.
+/// Upper clamp for Retry-After honouring — 60 s across all scoped retry paths.
 pub(crate) const RETRY_AFTER_MAX_MS: u64 = 60_000;
 
-// ── RetryPolicy — snapshot of tunables at operation start ────────────────
-
-/// Snapshot of retry tunables taken at operation start.
-///
-/// Hot-reload mid-retry must not change the schedule — callers snapshot once
-/// and reuse. Invalid configured values fall back to defaults.
+// Retry tunables snapshotted at operation start. Hot-reload mid-retry must not change the schedule
+// — callers snapshot once and reuse. Invalid configured values fall back to defaults.
 #[derive(Debug, Clone)]
 pub(crate) struct RetryPolicy {
-    /// Total loop attempts (default 13). The operation makes at most this many
-    /// provider HTTP calls.
+    /// Total loop attempts (default 13). The operation makes at most this many provider HTTP calls.
     pub max_attempts: u32,
     /// Base backoff in milliseconds (default 5000).
     pub base_backoff_ms: u64,
@@ -132,7 +91,6 @@ pub(crate) struct RetryPolicy {
 }
 
 impl RetryPolicy {
-    /// Build the default policy from the hardcoded constants.
     #[must_use]
     fn default() -> Self {
         Self {
@@ -142,18 +100,14 @@ impl RetryPolicy {
         }
     }
 
-    /// Resolve the policy for a scoped operation.
     #[must_use]
     pub(crate) fn current() -> Self {
         Self::default().apply_test_override()
     }
 
-    /// Build the joint-verdict synthesis policy from the hardcoded constants.
-    /// `synthesis_max_attempts` is the TOTAL call count: 1 full
-    /// synthesis + up to N-1 repair rounds (default 3 — the lower edge of the
-    /// approved 3–5 band). The synthesis loop is deliberately bounded so a
-    /// bad grouping pass degrades to the deterministic fallback comment
-    /// after at most 3 calls.
+    /// The joint-verdict synthesis policy. `synthesis_max_attempts` is the TOTAL call count: 1
+    /// synthesis + up to N-1 repair rounds. Bounded so a bad grouping pass degrades to the
+    /// deterministic fallback comment after at most 3 calls.
     #[must_use]
     pub(crate) fn synthesis() -> Self {
         Self {
@@ -164,10 +118,9 @@ impl RetryPolicy {
         .apply_test_override()
     }
 
-    /// Build the comment-only extraction policy for fail-open callers: the
-    /// caller falls back to raw text on failure, so a bounded attempt count
-    /// avoids stalling the pipeline for a non-critical operation (the
-    /// 13-attempt budget is for verdict gates).
+    /// The comment-only extraction policy for fail-open callers: the caller falls back to raw text
+    /// on failure, so a bounded attempt count avoids stalling the pipeline for a non-critical
+    /// operation (the 13-attempt budget is for verdict gates).
     #[must_use]
     pub(crate) fn comment() -> Self {
         Self {
@@ -178,16 +131,11 @@ impl RetryPolicy {
         .apply_test_override()
     }
 
-    /// Build the reasoning-only-stop continuation policy: bounded recovery for
-    /// an empty-content/no-tool response (see
-    /// [`crate::agent::Agent::recover_reasoning_only_stop`]). Mirrors the
-    /// [`Self::comment`] budget — 3 attempts. No inter-attempt sleep: the
-    /// appended-only tail makes each new reasoning
-    /// state a fresh request with a byte-stable prefix (retryable transport
-    /// errors re-send the identical bytes; non-retryable errors break
-    /// immediately).
-    /// `base_backoff_ms`/`max_backoff_ms` are unused (the manual continuation
-    /// loop never sleeps between attempts).
+    /// The reasoning-only-stop continuation policy: bounded recovery for an empty-content/no-tool
+    /// response. Mirrors [`Self::comment`]'s 3 attempts. No inter-attempt sleep — the appended-only
+    /// tail makes each new reasoning state a fresh request with a byte-stable prefix (retryable
+    /// transport errors re-send the identical bytes; non-retryable ones break immediately). The
+    /// backoff fields are unused here.
     #[must_use]
     pub(crate) fn continuation() -> Self {
         Self {
@@ -198,11 +146,9 @@ impl RetryPolicy {
         .apply_test_override()
     }
 
-    /// Test seam: in tests, the override installed via
-    /// [`swap_test_retry_policy`] takes precedence over the hardcoded
-    /// schedule so retry-loop tests don't sleep for minutes; otherwise
-    /// `self` applies unchanged. Poison-tolerant: a failing test must not
-    /// cascade into later ones. A no-op outside tests.
+    /// Test seam: in tests the override installed via [`swap_test_retry_policy`] takes precedence
+    /// over the hardcoded schedule, so retry-loop tests don't sleep for minutes. Poison-tolerant: a
+    /// failing test must not cascade. A no-op outside tests.
     #[must_use]
     fn apply_test_override(self) -> Self {
         #[cfg(test)]
@@ -213,8 +159,6 @@ impl RetryPolicy {
     }
 }
 
-/// Test seam: install a tiny retry policy so scoped-retry tests run fast.
-/// Callers must be annotated `#[serial_test::serial(provider)]`.
 #[cfg(test)]
 static TEST_POLICY_OVERRIDE: std::sync::RwLock<Option<RetryPolicy>> = std::sync::RwLock::new(None);
 
@@ -225,10 +169,6 @@ fn test_override() -> Option<RetryPolicy> {
     guard.as_ref().cloned()
 }
 
-/// Swap the test retry-policy override, returning the previous value so an
-/// RAII guard (see `util::test::RetryPolicyGuard`) can restore it on drop —
-/// including during a panic. Mirrors
-/// [`crate::providers::swap_provider_for_test`].
 #[cfg(test)]
 pub(crate) fn swap_test_retry_policy(policy: RetryPolicy) -> Option<RetryPolicy> {
     let mut guard = TEST_POLICY_OVERRIDE.write().unwrap_poison();
@@ -253,11 +193,9 @@ pub(crate) fn tiny_test_policy() -> RetryPolicy {
     }
 }
 
-/// Compute the canonical backoff sleep sequence (ms) for a policy.
-///
-/// Pure doubling from `base_backoff_ms`, capped at `max_backoff_ms`. The
-/// hardcoded defaults (base 5000 / cap 60000) yield the binding agent-loop
-/// schedule 5/10/20/40/60/60… s — total sleep 555 s over 13 attempts.
+/// The canonical backoff sleep sequence (ms) for a policy: pure doubling from `base_backoff_ms`,
+/// capped at `max_backoff_ms`. The defaults (5000/60000) yield the agent-loop schedule
+/// 5/10/20/40/60/60… s — total sleep 555 s over 13 attempts.
 #[must_use]
 fn backoff_sequence(policy: &RetryPolicy) -> Vec<u64> {
     let sleeps = policy.max_attempts.saturating_sub(1) as usize;
@@ -269,20 +207,17 @@ fn backoff_sequence(policy: &RetryPolicy) -> Vec<u64> {
     seq
 }
 
-/// ±25% jitter around `base_ms`: random within [75%, 125%) of base so
-/// parallel agents retrying on the same transient error don't synchronize.
-/// Jitter touches the SLEEP ONLY, never the request bytes.
-/// The modulo guard keeps 0/1 ms schedules (test policies) division-safe.
+/// ±25% jitter around `base_ms`: random within [75%, 125%) so parallel agents retrying the same
+/// transient error don't synchronize. Jitter touches the SLEEP ONLY, never the request bytes. The
+/// modulo guard keeps 0/1 ms test schedules division-safe.
 #[must_use]
 fn jittered_backoff_ms(base_ms: u64) -> u64 {
     base_ms - base_ms / 4 + (rand::random::<u64>() % (base_ms / 2).max(1))
 }
 
-/// Compute the actual sleep for one inter-attempt gap.
-///
-/// Retry-After (when present) is authoritative and followed precisely, clamped
-/// to [5000 ms, 60000 ms]. Otherwise ±25% jitter is applied to the schedule
-/// backoff — jitter touches the SLEEP ONLY, never the request bytes.
+/// The actual sleep for one inter-attempt gap. Retry-After (when present) is authoritative and
+/// followed precisely, clamped to [5000 ms, 60000 ms]; otherwise ±25% jitter on the schedule
+/// backoff.
 #[must_use]
 fn compute_sleep_ms(schedule_ms: u64, retry_after_ms: Option<u64>) -> u64 {
     if let Some(ra) = retry_after_ms {
@@ -292,43 +227,34 @@ fn compute_sleep_ms(schedule_ms: u64, retry_after_ms: Option<u64>) -> u64 {
     }
 }
 
-// ── Failure classification ───────────────────────────────────────────────
+// Granular failure classification for the retry/error trail. `Membership`/`Completeness`/
+// `ContradictionAgents`/`ValidationOther` carry repair-validation semantics on the shared
+// provider-failure path: retryable, and only ever produced by the grouping core. `TruncatedOutput`
+// marks an output-token-limit truncation (finish_reason "length") — retryable with shorten
+// feedback.
 
-/// Granular failure classification for the retry/error trail.
-///
-/// The `Membership`/`Completeness`/`ContradictionAgents`/`ValidationOther`
-/// variants carry repair-validation semantics on the shared provider-failure
-/// path (granular causes ride the existing failure-cause field); they are
-/// retryable and only ever produced by the grouping core. `TruncatedOutput`
-/// marks a provider output-token-limit truncation (finish_reason "length") —
-/// retryable with shorten/compress feedback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FailureClass {
     /// Network/transport error (connection reset, timeouts, 5xx, 429).
     Transport,
-    /// Server truncated the response envelope: body-read error or
-    /// content-length mismatch (the "error reading response body" /
-    /// "EOF while parsing" defect class).
+    /// Server truncated the response envelope: body-read error or content-length mismatch (the
+    /// "error reading response body" / "EOF while parsing" defect class).
     TruncatedEnvelope,
-    /// Response body read fully but JSON did not parse (LLM format issue).
+    /// Body read fully but JSON did not parse (LLM format issue).
     Parse,
-    /// Parsed successfully but a validation hook rejected the value
-    /// (e.g. verdict score outside [0,10]).
+    /// Parsed, but a validation hook rejected the value (e.g. verdict score outside [0,10]).
     OutOfRangeScore,
-    /// Repair-round group rejected: a member's item id is out of range, or
-    /// the member was already placed in a frozen group / pinned by an
-    /// accepted contradiction reference.
+    /// Repair-round group rejected: a member's item id is out of range, or the member was already
+    /// placed in a frozen group / pinned by an accepted contradiction reference.
     Membership,
-    /// Repair-round proposal silently dropped unfrozen items (incomplete
-    /// coverage).
+    /// Repair-round proposal silently dropped unfrozen items (incomplete coverage).
     Completeness,
     /// A proposed contradiction/reference lacks ≥2 distinct cited agents.
     ContradictionAgents,
-    /// A validation rejection outside the granular categories (empty
-    /// heading/summary, malformed structure, out-of-range group reference).
+    /// A validation rejection outside the granular categories (empty heading/summary, malformed
+    /// structure, out-of-range group reference).
     ValidationOther,
-    /// Provider returned text cut at its output-token limit (finish_reason
-    /// "length").
+    /// Provider returned text cut at its output-token limit (finish_reason "length").
     TruncatedOutput,
     /// Provider returned an empty text response.
     NoResponse,
@@ -339,13 +265,11 @@ pub(crate) enum FailureClass {
 }
 
 impl FailureClass {
-    /// Whether the operation should keep retrying after this failure.
     #[must_use]
     pub(crate) const fn is_retryable(self) -> bool {
         !matches!(self, Self::NonRetryable | Self::Shutdown)
     }
 
-    /// Short stable label for logs / telemetry.
     #[must_use]
     pub(crate) const fn label(self) -> &'static str {
         match self {
@@ -365,9 +289,8 @@ impl FailureClass {
     }
 }
 
-// ── Per-attempt failure diagnostics ──────────────────────────────────────
+// Per-attempt failure diagnostics, carried in the in-memory retry trail.
 
-/// Per-attempt failure diagnostics, carried in the in-memory retry trail.
 #[derive(Debug, Clone)]
 pub(crate) struct RetryFailureRecord {
     /// Granular failure classification.
@@ -411,25 +334,18 @@ impl RetryFailureRecord {
     }
 }
 
-// ── RetryExhausted — terminal error carrying the full trail ──────────────
-
-/// Terminal failure of an outer retry loop.
-///
-/// Carries the per-attempt diagnostics trail plus the final classification so
-/// callers can (a) fail open with a useful reason (consolidation) or (b) write
-/// the last-attempt raw text into a ticket comment (verdict extraction).
-///
-/// `last_raw` is `Some(text)` when the last COMPLETED attempt produced
-/// assistant text (including `Some("")` for a tool-call final attempt) and
-/// `None` when that attempt died before producing text (transport /
-/// truncation / budget failure) — text from earlier attempts is never
-/// presented as the last attempt.
+// Terminal failure of an outer retry loop: the per-attempt diagnostics trail plus the final
+// classification, so callers can fail open with a useful reason (consolidation) or write the last
+// raw text into a ticket comment (verdict extraction). `last_raw` is `Some(text)` when the last
+// COMPLETED attempt produced assistant text (`Some("")` for a tool-call final attempt) and `None`
+// when that attempt died before producing text — text from earlier attempts is never presented as
+// the last one.
 #[derive(Debug, Clone)]
 pub(crate) struct RetryExhausted {
     pub failures: Vec<RetryFailureRecord>,
     pub final_class: FailureClass,
-    /// Last-attempt raw text (verdict-extraction ticket-comment dumps). See the
-    /// type docs for the precise "last completed attempt" semantics.
+    /// Last-attempt raw text (verdict-extraction ticket-comment dumps). See the type docs for the
+    /// precise "last completed attempt" semantics.
     pub last_raw: Option<String>,
     /// Human-readable terminal reason (identical to `Display`).
     pub detail: String,
@@ -465,7 +381,6 @@ impl RetryExhausted {
         Self::with_trail(failures, final_class, None)
     }
 
-    /// Terminal error carrying the last-attempt raw text (verdict extraction).
     #[must_use]
     pub(crate) fn with_last_raw(
         failures: Vec<RetryFailureRecord>,
@@ -489,10 +404,9 @@ impl fmt::Display for RetryExhausted {
 
 impl std::error::Error for RetryExhausted {}
 
-/// Record the failure telemetry and return the terminal `Err` — the shared
-/// hard-fail tail of every retry-loop exit. Fail-open loops (research
-/// synthesis partial output, consensus repair fallback) record then continue,
-/// so they deliberately bypass this helper.
+/// Record the failure telemetry and return the terminal `Err` — the shared hard-fail tail of every
+/// retry-loop exit. Fail-open loops (research synthesis partial output, consensus repair fallback)
+/// deliberately bypass this helper.
 pub(crate) fn fail_exhausted<T>(
     request: &ChatRequest,
     operation_started: Instant,
@@ -502,35 +416,27 @@ pub(crate) fn fail_exhausted<T>(
     Err(exhausted)
 }
 
-// ── Shared retry-loop state (schedule + failure trail) ───────────────────
-
-/// Mutable per-operation state shared by the outer retry loops.
-///
-/// Encapsulates the backoff schedule, the per-attempt failure trail, and
-/// Retry-After stickiness so all outer retry loops cannot drift — schedule and
-/// trail mechanics live in exactly one place.
+// Mutable per-operation state shared by the outer retry loops: the backoff schedule, the
+// per-attempt failure trail and Retry-After stickiness, so all loops cannot drift.
 pub(crate) struct RetryLoop {
     policy: RetryPolicy,
     backoffs: Vec<u64>,
     failures: Vec<RetryFailureRecord>,
     last_retry_after: Option<u64>,
-    /// 1-based index the NEXT recorded failure gets. Only real failed
-    /// attempts advance it — `record_trail_only` appends do not, so a
-    /// trail-only entry can never inflate a later row's attempt index.
+    /// 1-based index the NEXT recorded failure gets. Only real failed attempts advance it —
+    /// `record_trail_only` appends do not, so a trail-only entry cannot inflate a later row's
+    /// index.
     attempts_failed: u32,
-    /// `llm_failures` persistence context — `None` when the request carries
-    /// no metadata (the same gating as the `llm_requests` rows) or when the
-    /// loop was built without a request (tests).
+    /// `llm_failures` persistence context — `None` when the request carries no metadata (the gating
+    /// the `llm_requests` rows use) or when the loop was built without a request (tests).
     operation: Option<crate::stats::LlmOperationCtx>,
-    /// Start of the in-flight attempt — seeds the next failure row's
-    /// per-attempt duration.
+    /// Start of the in-flight attempt — seeds the next failure row's per-attempt duration.
     attempt_started: Option<Instant>,
 }
 
 impl RetryLoop {
-    /// Start a metadata-less operation (no `llm_failures` rows) — the pure
-    /// schedule/trail core behind [`RetryLoop::new_scoped`], also used
-    /// directly by the schedule/trail tests.
+    /// Start a metadata-less operation (no `llm_failures` rows) — the pure schedule/trail core
+    /// behind [`RetryLoop::new_scoped`], also used by the schedule/trail tests.
     #[must_use]
     fn new(policy: &RetryPolicy) -> Self {
         Self {
@@ -544,9 +450,8 @@ impl RetryLoop {
         }
     }
 
-    /// Start a scoped operation. Per-attempt failures persist to
-    /// `llm_failures` when the request carries metadata (same gating as the
-    /// `llm_requests` row).
+    /// Start a scoped operation: per-attempt failures persist to `llm_failures` when the request
+    /// carries metadata (the same gating as the `llm_requests` row).
     #[must_use]
     pub(crate) fn new_scoped(policy: &RetryPolicy, request: &ChatRequest) -> Self {
         Self {
@@ -555,30 +460,25 @@ impl RetryLoop {
         }
     }
 
-    /// Take ownership of the failure trail (terminal paths).
     #[must_use]
     pub(crate) fn into_failures(self) -> Vec<RetryFailureRecord> {
         self.failures
     }
 
-    /// True when at least one failure was recorded this operation.
     #[must_use]
     pub(crate) fn has_failures(&self) -> bool {
         !self.failures.is_empty()
     }
 
-    /// Mark the start of one attempt with the caller's attempt-start instant —
-    /// seeds the per-attempt duration recorded on the next failure row
-    /// (absent → NULL `attempt_duration_ms`).
+    /// Mark the start of one attempt with the caller's instant — seeds the duration on the next
+    /// failure row (absent → NULL `attempt_duration_ms`).
     pub(crate) fn begin_attempt(&mut self, started: Instant) {
         self.attempt_started = Some(started);
     }
 
-    /// Record a failed attempt, updating the sticky Retry-After and
-    /// persisting one `llm_failures` row (fail-open). A record without a
-    /// Retry-After (parse / NoResponse failures) clears any stale value from an
-    /// earlier attempt. `attempt` is the 1-based sequential failure index within
-    /// the operation.
+    /// Record a failed attempt: update the sticky Retry-After and persist one `llm_failures` row
+    /// (fail-open). A record without a Retry-After (parse / NoResponse) clears any stale value from
+    /// an earlier attempt. `attempt` is the 1-based sequential failure index within the operation.
     pub(crate) fn record(&mut self, rec: RetryFailureRecord) {
         self.last_retry_after = rec.retry_after_ms;
         self.attempts_failed = self.attempts_failed.saturating_add(1);
@@ -594,23 +494,19 @@ impl RetryLoop {
         self.failures.push(rec);
     }
 
-    /// Append a trail-only failure record — no `llm_failures` row. For
-    /// synthetic trail entries that do not correspond to a failed HTTP
-    /// attempt (the consensus fallback keeps its trail non-empty this way).
+    /// Append a trail-only failure record — no `llm_failures` row. For synthetic entries that do
+    /// not correspond to a failed HTTP attempt (the consensus fallback keeps its trail non-empty
+    /// this way).
     pub(crate) fn record_trail_only(&mut self, rec: RetryFailureRecord) {
         self.last_retry_after = rec.retry_after_ms;
         self.failures.push(rec);
     }
 
-    /// Sleep between attempts, honoring the schedule / Retry-After. Returns
-    /// `Err(FailureClass::Shutdown)` when the global shutdown token fires
-    /// during the sleep.
-    ///
-    /// `attempt` is the backoff-schedule index (`attempt - 1`) and the guard
-    /// trigger (no sleep when `attempt >= max_attempts`), normally the 1-based
-    /// index of the attempt that just completed. Callers indexing by a
-    /// separate counter (e.g. consecutive transport failures) must add their
-    /// own round-based guard — the final-attempt skip does not fire for them.
+    /// Sleep between attempts, honouring the schedule and Retry-After;
+    /// `Err(FailureClass::Shutdown)` when the global shutdown token fires during the sleep.
+    /// `attempt` is the backoff-schedule index (`attempt - 1`) and the guard trigger (no sleep when
+    /// `attempt >= max_attempts`). Callers indexing by a separate counter (e.g. consecutive
+    /// transport failures) must add their own round-based guard.
     pub(crate) async fn sleep_between(&self, attempt: u32) -> Result<(), FailureClass> {
         if attempt >= self.policy.max_attempts {
             return Ok(());
@@ -623,8 +519,8 @@ impl RetryLoop {
         Ok(())
     }
 
-    /// Final classification when attempts are exhausted: the last recorded
-    /// failure's class (or [`FailureClass::Transport`] if none was recorded).
+    /// Final classification when attempts are exhausted: the last recorded failure's class (or
+    /// [`FailureClass::Transport`] if none was recorded).
     #[must_use]
     pub(crate) fn final_class(&self) -> FailureClass {
         self.failures
@@ -633,17 +529,11 @@ impl RetryLoop {
     }
 }
 
-// ── The agent retry loop ────────────────────────────────────────────────
-
-/// Agent-loop LLM call with the outer retry loop.
-///
-/// Byte-identical request across ALL attempts; retries provider failures of
-/// any retryable class (the 600 s idle timeout is the only per-attempt bound).
-/// Any `Ok` response is accepted — empty text is a valid tool-call turn. A
-/// reasoning-only stop (empty text, no tool calls) is NOT handled here: the
-/// agent-loop caller classifies and recovers it via bounded continuation
-/// ([`crate::agent::Agent::recover_reasoning_only_stop`]) before any
-/// persistence/display.
+// The agent-loop LLM call with the outer retry loop. Byte-identical request across ALL attempts;
+// retries provider failures of any retryable class (the 600 s idle timeout is the only per-attempt
+// bound). Any `Ok` response is accepted — empty text is a valid tool-call turn. A reasoning-only
+// stop is NOT handled here: the caller classifies and recovers it via bounded continuation before
+// any persistence or display.
 pub(crate) async fn agent_chat(
     request: ChatRequest,
     policy: &RetryPolicy,
@@ -697,8 +587,8 @@ mod tests {
         );
     }
 
-    /// A `Retry-After` is followed within the policy's own window, and without
-    /// one the sleep jitters inside ±25% of the base.
+    /// A `Retry-After` is followed within the policy's own window, and without one the sleep
+    /// jitters inside ±25% of the base.
     #[test]
     fn compute_sleep_honors_retry_after_and_jitters_within_bounds() {
         assert_eq!(compute_sleep_ms(5_000, Some(7_000)), 7_000);
@@ -716,10 +606,9 @@ mod tests {
 
     #[tokio::test]
     async fn stale_retry_after_does_not_stick_across_failures() {
-        // A 429 Retry-After applies only to the sleep following the 429. A
-        // later non-429 failure (parse / NoResponse, no Retry-After) must
-        // clear it — otherwise a stale value wastes up to 60 s of the retry
-        // budget per occurrence (reviewer finding).
+        // A 429 Retry-After applies only to the sleep following the 429. A later failure without
+        // one must clear it — otherwise a stale value wastes up to 60 s of the retry budget per
+        // occurrence.
         let policy = tiny_test_policy();
         let mut loop_state = RetryLoop::new(&policy);
 
@@ -762,8 +651,8 @@ mod tests {
     #[test]
     #[serial_test::serial(provider)] // synthesis() applies the process-global test-policy override
     fn defaults_are_hardcoded() {
-        // No config surface exists — the policy must always be the
-        // hardcoded defaults regardless of any stray config_kv rows.
+        // No config surface exists — the policy must always be the hardcoded defaults, whatever
+        // stray `config_kv` rows say.
         let policy = RetryPolicy::default();
         assert_eq!(policy.max_attempts, DEFAULT_RETRY_MAX_ATTEMPTS);
         assert_eq!(policy.base_backoff_ms, DEFAULT_RETRY_BASE_BACKOFF_MS);
@@ -777,8 +666,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     async fn agent_chat_rides_out_sustained_outage_and_recovers() {
-        // The binding agent-loop budget (13 attempts): the first 12 attempts
-        // hit a sustained 503-style outage, the 13th recovers.
+        // The binding agent-loop budget (13 attempts): the first 12 attempts hit a sustained
+        // 503-style outage, the 13th recovers.
         let policy = RetryPolicy {
             max_attempts: 13,
             base_backoff_ms: 1,

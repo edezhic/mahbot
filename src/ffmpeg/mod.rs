@@ -1,35 +1,26 @@
-//! The product's own ffmpeg and ffprobe: the copy the product installs itself
-//! (`install`) and the three video operations that copy serves.
+//! The product's own ffmpeg and ffprobe: the copy the product installs itself (`install`) and
+//! the three video operations that copy serves.
 //!
-//! A copy the owner installed — a package manager's, a vendor download, anything
-//! on the search path — is never run: every command here is the absolute path of
-//! the product's own build, and no `PATH` lookup is ever made.
+//! A copy the owner installed — a package manager's, a vendor download, anything on the search
+//! path — is never run: every command here is the absolute path of the product's own build, and
+//! no `PATH` lookup is ever made.
 //!
-//! The operations are exactly three:
+//! The operations are exactly three: [`probe`] (duration, upright dimensions, audio presence),
+//! [`extract_frames`] (JPEG frames at a given rate, longest side and count bounded) and
+//! [`extract_audio`] (the track re-encoded to 16 kHz mono WAV, what the local transcriber takes).
 //!
-//! * [`probe`] — duration, upright dimensions, and whether the file carries an
-//!   audio track.
-//! * [`extract_frames`] — JPEG frames at a given rate, the longest side bounded,
-//!   the count bounded by the caller.
-//! * [`extract_audio`] — the audio track re-encoded to 16 kHz mono WAV, which is
-//!   what the local transcriber takes.
+//! Each runs under its own [`Duration`] — the wait for the copy included — and every output lands
+//! in a [`tempfile::TempDir`] under the product's private temp root, never in the owner's
+//! workspace, carried by the returned guard, so dropping the result removes the files.
 //!
-//! Each runs under its own [`Duration`] — the wait for the copy included — and every
-//! output lands in a [`tempfile::TempDir`] under the product's private temp root —
-//! never in the owner's workspace or library — carried by the returned guard, so
-//! dropping the result removes the files.
-//!
-//! Failures are typed and deliberately distinct: [`FfmpegError::Unavailable`] is
-//! the product's own half not being usable at all (with the reason), while
-//! [`FfmpegError::Undecodable`], [`FfmpegError::NoVideoTrack`] and
-//! [`FfmpegError::NoAudioTrack`] are facts about the file. None of that can be read
-//! off the tools' exit statuses — a decode that finds no audio stream and a file that
-//! cannot be decoded end the same way — so a failed decode is settled by asking the
-//! file again.
+//! Failures are typed and deliberately distinct: [`FfmpegError::Unavailable`] is the product's own
+//! half not being usable, while [`FfmpegError::Undecodable`], [`FfmpegError::NoVideoTrack`] and
+//! [`FfmpegError::NoAudioTrack`] are facts about the file. None of that can be read off the tools'
+//! exit statuses, so a failed decode is settled by asking the file again.
 
 // The items only this module's own operations use carry `expect(dead_code)` rather than a
-// module-wide `allow`: `expect` turns their first caller outside this module into a build
-// error that must remove the annotation with it.
+// module-wide `allow`: `expect` turns their first caller outside this module into a build error
+// that must remove the annotation with it.
 mod install;
 mod probe;
 
@@ -47,8 +38,7 @@ use install::Binaries;
 /// How long reading a file's facts may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long extracting frames may take: a bounded count out of a bounded side, so
-/// the work stays short even for a long clip.
+/// How long extracting frames may take: a bounded count out of a bounded side.
 const FRAMES_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long extracting the audio may take: a long recording is decoded in full.
@@ -63,31 +53,21 @@ const PROBE_ENTRIES: &str = "format=duration:stream=codec_type,width,height,dura
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClipInfo {
     pub(crate) duration: Duration,
-    /// The upright size of the first video stream — what a person watching the
-    /// file sees, so a rotated phone clip reports its portrait size — or `None`
-    /// when the file carries no video stream the probe could read extents from.
+    /// The upright size of the first video stream — what a person watching the file sees.
     pub(crate) dimensions: Option<(u32, u32)>,
-    /// Whether the file carries an audio stream.
     pub(crate) has_audio: bool,
 }
 
 /// Why a video operation could not answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FfmpegError {
-    /// The product's own half could not do it: its copy cannot be run (not
-    /// installed, not installable, or started and failed), or its scratch area
-    /// could not be created or read. The reason names the failing step and carries
-    /// no path and no URL.
+    /// The product's own half could not do it: its copy cannot be run (not installed, or a start
+    /// failure), with the reason.
     Unavailable(String),
-    /// The file carries no video stream to read frames from.
     NoVideoTrack,
-    /// The file carries no audio stream to extract.
     NoAudioTrack,
-    /// The file could not be decoded.
     Undecodable,
-    /// The operation outlived its own bound.
     TimedOut,
-    /// The caller asked for something the operation cannot be given.
     InvalidOptions(&'static str),
 }
 
@@ -95,7 +75,6 @@ pub(crate) enum FfmpegError {
 #[cfg_attr(not(test), expect(dead_code))]
 #[derive(Debug)]
 pub(crate) struct Frames {
-    /// Holds the directory the frames live in; never read.
     _dir: tempfile::TempDir,
     paths: Vec<PathBuf>,
 }
@@ -113,7 +92,6 @@ impl Frames {
 #[cfg_attr(not(test), expect(dead_code))]
 #[derive(Debug)]
 pub(crate) struct Audio {
-    /// Holds the directory the WAV lives in; never read.
     _dir: tempfile::TempDir,
     path: PathBuf,
 }
@@ -138,16 +116,12 @@ pub(crate) struct FrameOptions {
     pub(crate) max_frames: u32,
 }
 
-/// The product's own pair, installed on first use — the crate's one entry to the installer, so
-/// nothing outside this module names it. The reason names the failing step and carries no path;
-/// an operation turns it into its own [`FfmpegError::Unavailable`].
+/// The product's own pair, installed on first use — the crate's one entry to them.
 pub(crate) async fn binaries() -> Result<Binaries, String> {
     install::ensure_installed().await
 }
 
 /// Duration, upright dimensions and audio presence of one file.
-///
-/// [`FfmpegError::Undecodable`] when the tools cannot read the file at all.
 pub(crate) async fn probe(path: &Path) -> Result<ClipInfo, FfmpegError> {
     bounded(PROBE_TIMEOUT, async {
         let bin = binaries().await.map_err(FfmpegError::Unavailable)?;
@@ -156,8 +130,8 @@ pub(crate) async fn probe(path: &Path) -> Result<ClipInfo, FfmpegError> {
     .await
 }
 
-/// JPEG frames of `input` at [`FrameOptions::fps`], each fitting
-/// [`FrameOptions::max_side`], at most [`FrameOptions::max_frames`] of them.
+/// JPEG frames of `input` at [`FrameOptions::fps`], each fitting the bounded side, at most the
+/// requested count.
 #[cfg_attr(not(test), expect(dead_code))]
 pub(crate) async fn extract_frames(
     input: &Path,
@@ -210,9 +184,8 @@ pub(crate) async fn extract_audio(input: &Path) -> Result<Audio, FfmpegError> {
     .await
 }
 
-/// Run one operation under its own bound, the wait for its copy included: a first use
-/// that arrives while the release is still being installed waits no longer than the
-/// operation itself would have taken.
+/// Run one operation under its own bound, the wait for its copy included: a first call installs
+/// the pair, and a missing copy is [`FfmpegError::Unavailable`].
 async fn bounded<T, F>(bound: Duration, operation: F) -> Result<T, FfmpegError>
 where
     F: Future<Output = Result<T, FfmpegError>>,
@@ -222,9 +195,7 @@ where
         .map_err(|_| FfmpegError::TimedOut)?
 }
 
-/// `ffprobe`'s answer for one file, or [`FfmpegError::Undecodable`] when the file
-/// yields no streams and no duration — which is what a corrupt or foreign file
-/// produces, whatever the tool's exit status.
+/// `ffprobe`'s answer for one file, or [`FfmpegError::Undecodable`] when the file cannot be read.
 async fn probe_with(ffprobe: &Path, path: &Path) -> Result<ClipInfo, FfmpegError> {
     let output = run_tool(ffprobe, &probe_args(path), PROBE_TIMEOUT).await?;
     let Some(info) = probe::parse(&output.stdout) else {
@@ -241,14 +212,14 @@ enum Decode<'a> {
     Audio,
 }
 
-/// Why a decode failed: a file the tools cannot read at all is undecodable, a readable
-/// file that simply lacks the track the operation needed says so, and a file that
-/// decodes fine means the product's own output was what failed.
+/// Why a decode failed: a file the tools cannot read at all is undecodable, a readable file that
+/// simply lacks the track the operation needed says so, and a file that decodes fine means the
+/// product's own output was what failed.
 ///
-/// The order matters, and none of it can be read off `ffmpeg`'s exit status. The file
-/// is asked instead: its tracks first, then the operation's own decode replayed over
-/// the whole file with nowhere to write — so a file that survives exactly what just
-/// failed on it is one whose failure was on the product's own side.
+/// The order matters, and none of it can be read off `ffmpeg`'s exit status. The file is asked
+/// instead: its tracks first, then the operation's own decode replayed over the whole file with
+/// nowhere to write — so a file that survives exactly what just failed on it failed on the
+/// product's side.
 async fn classify(bin: &Binaries, input: &Path, decode: Decode<'_>) -> FfmpegError {
     let info = match probe_with(&bin.ffprobe, input).await {
         Err(error) => return error,
@@ -278,14 +249,13 @@ struct Output {
 
 /// Run one of the product's own tools to completion or to its bound.
 ///
-/// Nothing is inherited: stdin is null, so a tool can neither read the daemon's
-/// terminal nor wait on it, and its output is captured, so a decode can never print
-/// into the daemon's own streams. A child that outlives the bound is killed by
-/// dropping the future, which is why the command is built with `kill_on_drop`.
+/// Nothing is inherited: stdin is null, so a tool can neither read the daemon's terminal nor wait
+/// on it, and its output is captured, so a decode can never print into the daemon's streams. A
+/// child that outlives the bound is killed by dropping the future (`kill_on_drop`).
 ///
-/// A child killed by a signal says nothing about the file it was reading, so it is not
-/// reported as a finished run. Signals are a Unix notion — Windows reports a code for
-/// every death — so the check simply never fires there.
+/// A child killed by a signal says nothing about the file it was reading, so it is not reported
+/// as a finished run. Signals are a Unix notion — Windows reports a code for every death — so the
+/// check never fires there.
 async fn run_tool(
     program: &Path,
     args: &[OsString],
@@ -323,8 +293,8 @@ async fn run_tool(
     })
 }
 
-/// The tool's own name, for a reason a reader can act on: `ffprobe` failing to start
-/// is not `ffmpeg` failing to start.
+/// The tool's own name, for a reason a reader can act on: `ffprobe` failing to start is not
+/// `ffmpeg` failing to start.
 fn tool_name(program: &Path) -> String {
     program
         .file_stem()
@@ -332,8 +302,7 @@ fn tool_name(program: &Path) -> String {
         .map_or_else(|| "tool".to_string(), str::to_owned)
 }
 
-/// A directory under the product's private temp root, removed when the guard is
-/// dropped.
+/// A directory under the product's private temp root, removed when the guard is dropped.
 fn scratch() -> Result<tempfile::TempDir, FfmpegError> {
     tempfile::tempdir().map_err(|e| {
         FfmpegError::Unavailable(format!(
@@ -359,8 +328,7 @@ fn frames_in(dir: &Path) -> Result<Vec<PathBuf>, FfmpegError> {
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("jpg"))
         })
         .collect();
-    // `ffmpeg` numbers the files through the output pattern, so the names sort
-    // into playback order.
+    // `ffmpeg` numbers the files through the output pattern, so the names sort into playback order.
     paths.sort();
     Ok(paths)
 }
@@ -377,9 +345,9 @@ fn probe_args(input: &Path) -> Vec<OsString> {
     ]
 }
 
-/// `fps` first, so the rate is taken from the source timeline, then one fit into
-/// a square box, then the even sides the JPEG encoder needs. With `into` absent the
-/// same decode runs with nowhere to write — how [`classify`] replays one that failed.
+/// `fps` first, so the rate is taken from the source timeline, then one fit into a square box,
+/// then the even sides the JPEG encoder needs. With `into` absent the same decode runs with
+/// nowhere to write — how [`classify`] replays one that failed.
 fn frames_args(input: &Path, into: Option<&Path>, options: &FrameOptions) -> Vec<OsString> {
     let side = options.max_side;
     let filter = format!(
@@ -511,10 +479,8 @@ mod tests {
     /// files. It is opt-in because the product's own copy comes from a release
     /// stream, which no plain `cargo test` run carries:
     ///
-    /// ```text
-    /// MAHBOT_FFMPEG_LIVE_BIN=/opt/homebrew/bin \
-    ///     cargo test --lib ffmpeg::tests -- --ignored --test-threads=1
-    /// ```
+    /// ```text MAHBOT_FFMPEG_LIVE_BIN=/opt/homebrew/bin \ cargo test --lib ffmpeg::tests --
+    /// --ignored --test-threads=1 ```
     ///
     /// The named directory's `ffmpeg` and `ffprobe` stand in for the product's own
     /// pair under a throwaway `HOME`, which is why the run must be single-threaded:

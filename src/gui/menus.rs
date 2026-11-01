@@ -1,28 +1,18 @@
 //! Popup menus rendered as overlays: the chat context menu.
 //!
-//! It renders above the entire widget tree via [`Widget::overlay`] and the
-//! [`Overlay`] trait, avoiding clipping by parent containers. The menu is a
-//! contiguous right-click menu; its pure geometry helpers ([`item_index_from_y`],
-//! the menu item height, and the popup backdrop) and the overlay layering
-//! constants are module-local.
-//!
-//! ## Context menu
-//!
-//! Context menus rendered in the normal widget tree get clipped by parent
-//! containers. This widget uses [`Widget::overlay`] and the [`Overlay`]
-//! trait to render the menu above the entire widget tree, avoiding clipping.
-//!
-//! Right-clicking the underlay opens the menu at the cursor position.
-//! Clicking a menu item fires its action and dismisses the menu.
-//! Clicking outside or pressing Escape also dismisses the menu.
+//! Context menus rendered in the normal widget tree get clipped by parent containers, so this
+//! one uses [`Widget::overlay`] and the [`Overlay`] trait to render above the entire tree.
+//! Right-clicking the underlay opens it at the cursor position; clicking an item fires its
+//! action and dismisses it; clicking outside or pressing Escape also dismisses it. Its pure
+//! geometry helpers ([`item_index_from_y`], the menu item height, the popup backdrop) and the
+//! layering constants are module-local.
 //!
 //! [`Widget::overlay`]: iced::advanced::widget::Widget::overlay
 //! [`Overlay`]: iced::advanced::overlay::Overlay
 //! [`Overlay::index`]: iced::advanced::overlay::Overlay::index
 
-// Menu item counts are small (single digits to low double digits) — f32
-// precision loss on usize→f32 casts is not a concern for pixel layout.
-// f32→usize casts in update() are guarded by `rel_y >= 0.0` and `idx < len()` checks.
+// Menu item counts are small, so f32 precision loss on usize→f32 casts is not a concern;
+// f32→usize casts are guarded by `rel_y >= 0.0` and `idx < len()`.
 
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::overlay;
@@ -36,18 +26,13 @@ use iced::{Color, Element, Event, Length, Pixels, Point, Rectangle, Size, Vector
 
 use super::theme;
 
-// ── Shared geometry ─────────────────────────────────────────────────
-
 /// Menu item hit-target height.
 const MENU_ITEM_HEIGHT: f32 = 28.0;
 
-/// Overlay render index for the chat context menu.
-///
-/// Any future overlay should use a higher index than this.
+/// Overlay render index for the chat context menu; a future overlay should use a higher one.
 const CONTEXT_MENU_OVERLAY_INDEX: f32 = 2.0;
 
-/// Draw the popup backdrop: elevated surface with a 1px strong border and a
-/// 4px corner radius.
+/// Draw the popup backdrop: elevated surface, 1px strong border, 4px corner radius.
 fn draw_menu_backdrop<Renderer>(renderer: &mut Renderer, bounds: Rectangle)
 where
     Renderer: text::Renderer<Font = iced::Font>,
@@ -66,11 +51,9 @@ where
     );
 }
 
-/// Convert a y-offset (relative to the menu origin, minus menu padding)
-/// into a menu item index. The context menu's slots are contiguous, so
-/// every in-bounds offset maps to an item.
-///
-/// Returns None for negative offsets or past the last item.
+/// Convert a y-offset (relative to the menu origin, minus menu padding) into an item index. The
+/// slots are contiguous, so every in-bounds offset maps to an item; `None` for a negative offset
+/// or one past the last item.
 fn item_index_from_y(rel_y: f32, item_height: f32, item_count: usize) -> Option<usize> {
     if rel_y < 0.0 {
         return None;
@@ -79,8 +62,6 @@ fn item_index_from_y(rel_y: f32, item_height: f32, item_count: usize) -> Option<
     let idx = (rel_y / item_height) as usize;
     (idx < item_count).then_some(idx)
 }
-
-// ── Context menu item ──────────────────────────────────────────────
 
 /// A single item in a context menu.
 #[derive(Debug, Clone)]
@@ -104,11 +85,8 @@ impl<Message> MenuItem<Message> {
         }
     }
 
-    /// Create a menu item with a lucide icon glyph rendered left of the label.
-    ///
-    /// `icon` is an `iced_fonts::lucide::advanced_text::*` function; the single
-    /// codepoint it yields is extracted here. The overlay renders glyphs
-    /// manually with [`iced_fonts::LUCIDE_FONT`].
+    /// Create a menu item with a lucide icon glyph rendered left of the label. `icon` is an
+    /// `iced_fonts::lucide::advanced_text::*` function; the codepoint it yields is extracted here.
     #[must_use]
     pub fn with_icon(
         icon: fn() -> (String, iced::Font, text::Shaping),
@@ -124,10 +102,7 @@ impl<Message> MenuItem<Message> {
     }
 }
 
-// ── Context menu widget ────────────────────────────────────────────
-
-/// A widget that wraps an underlay element and shows a context menu
-/// overlay on right-click.
+/// A widget that wraps an underlay element and shows a context menu overlay on right-click.
 pub struct ContextMenu<'a, Message, Theme = iced::Theme, Renderer = iced::Renderer>
 where
     Message: Clone + 'a,
@@ -141,10 +116,7 @@ impl<'a, Message, Theme, Renderer> ContextMenu<'a, Message, Theme, Renderer>
 where
     Message: Clone + 'a,
 {
-    /// Creates a new [`ContextMenu`] widget.
-    ///
-    /// `underlay` — the widget that responds to right-click to open the menu.
-    /// `menu_items` — label/action pairs for menu items.
+    /// Creates a new [`ContextMenu`] widget around `underlay`, with its label/action items.
     #[must_use]
     pub fn new(
         underlay: impl Into<Element<'a, Message, Theme, Renderer>>,
@@ -157,13 +129,12 @@ where
         }
     }
 
-    /// Binds the menu to the entry it wraps, identified by `key` (a stable id
-    /// that survives a re-read of the list).
+    /// Binds the menu to the entry it wraps, identified by `key` (a stable id that survives a
+    /// re-read of the list).
     ///
-    /// The open state lives in the widget tree slot the menu was rendered at:
-    /// when that slot holds a different entry on a later frame — a polled list
-    /// that reordered underneath the open menu — the menu is dismissed instead
-    /// of firing its action against the new occupant.
+    /// The open state lives in the widget tree slot the menu was rendered at: when that slot
+    /// holds a different entry on a later frame, the menu is dismissed instead of firing its
+    /// action against the new occupant.
     #[must_use]
     pub fn key(mut self, key: &'a str) -> Self {
         self.key = Some(key);
@@ -176,8 +147,7 @@ where
 struct ContextMenuState {
     show: bool,
     position: Point,
-    /// Currently hovered menu item index, persisted across frames
-    /// so the highlight remains visible when the cursor is stationary.
+    /// Currently hovered menu item index, persisted across frames so the highlight stays visible.
     hovered: Option<usize>,
     /// The [`ContextMenu::key`] the open menu was opened on; `None` unkeyed.
     key: Option<String>,
@@ -288,10 +258,9 @@ where
     ) {
         let state = tree.state.downcast_mut::<ContextMenuState>();
 
-        // Always forward event to underlay first, so child widgets (including
-        // nested ContextMenus) process the event before we decide to capture it.
-        // This allows an outer ContextMenu to act as a fallback for empty-space
-        // right-clicks without overriding inner node-level ContextMenus.
+        // Always forward the event to the underlay first, so child widgets (nested ContextMenus
+        // included) process it before we decide to capture it — an outer menu can then be the
+        // fallback for empty-space right-clicks without overriding inner ones.
         self.underlay.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -344,10 +313,8 @@ where
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
-        // Always forward to the underlay's overlay so nested overlays
-        // (e.g., inner ContextMenus in a file tree) are rendered.
-        // The underlay's tree is tree.children[0], and ContextMenu's
-        // layout node IS the underlay's layout node (layout() delegates).
+        // Always forward to the underlay's overlay so nested overlays are rendered. The underlay's
+        // tree is tree.children[0], and ContextMenu's layout node IS the underlay's layout node.
         let underlay_overlay = self.underlay.as_widget_mut().overlay(
             &mut tree.children[0],
             layout,
@@ -362,10 +329,8 @@ where
                 // Not showing our menu — just return underlay's overlays.
                 return underlay_overlay;
             }
-            // `position` was captured in content coordinates (cursor is adjusted
-            // by the parent scrollable's offset). `translation` is the inverse of
-            // the scroll offset. Adding them converts to viewport coordinates,
-            // which is the space the overlay renders in.
+            // `position` was captured in content coordinates and `translation` is the inverse of
+            // the scroll offset, so adding them converts to viewport coordinates.
             state.position + translation
         };
 
@@ -378,10 +343,8 @@ where
             menu_items: &self.menu_items,
         }));
 
-        // Combine our overlay with any underlay overlays in a Group.
-        // The context menu overlay uses [`CONTEXT_MENU_OVERLAY_INDEX`] so it
-        // renders on top of inner overlays when both are visible
-        // simultaneously.
+        // Combine our overlay with any underlay overlays in a Group; ours uses
+        // [`CONTEXT_MENU_OVERLAY_INDEX`] so it renders on top when both are visible.
         let mut overlays = Vec::new();
         if let Some(underlay) = underlay_overlay {
             overlays.push(underlay);
@@ -415,8 +378,7 @@ where
     menu_items: &'a [MenuItem<Message>],
 }
 
-// Context-menu layout metrics: contiguous items (no inter-item spacing),
-// 8px panel padding, and its own width/icon/font dimensions.
+// Context-menu layout metrics: contiguous items, 8px panel padding, its own icon/font sizes.
 const CONTEXT_MENU_PADDING: f32 = 8.0;
 const CONTEXT_MENU_MIN_WIDTH: f32 = 140.0;
 const CONTEXT_MENU_FONT_SIZE: f32 = 14.0;
@@ -660,19 +622,14 @@ where
         }
     }
 
-    /// Renders above any inner overlays (e.g., nested ContextMenus in a
-    /// file tree) when both are visible simultaneously.
+    /// Renders above any inner overlays when both are visible simultaneously.
     fn index(&self) -> f32 {
         CONTEXT_MENU_OVERLAY_INDEX
     }
 }
 
-// ── Icon glyphs ─────────────────────────────────────────────────────
-
-/// The single character of an iced_fonts generated lucide icon.
-///
-/// `advanced_text::*` returns `(String, Font, Shaping)`; the string is
-/// the one codepoint iced_fonts_macros extracted from the font cmap.
+/// The single character of an iced_fonts generated lucide icon: `advanced_text::*` returns
+/// `(String, Font, Shaping)`, and the string is the one codepoint extracted from the font cmap.
 fn lucide_glyph(glyph: fn() -> (String, iced::Font, text::Shaping)) -> char {
     glyph()
         .0
@@ -687,8 +644,8 @@ mod tests {
 
     #[test]
     fn item_index_from_y_maps_offsets_to_items() {
-        // rel_y is relative to the menu origin (panel padding already
-        // subtracted by the caller). Slots are contiguous (no spacing).
+        // rel_y is relative to the menu origin (panel padding already subtracted); slots are
+        // contiguous, so there is no spacing to allow for.
         assert_eq!(item_index_from_y(0.0, MENU_ITEM_HEIGHT, 4), Some(0));
         assert_eq!(
             item_index_from_y(MENU_ITEM_HEIGHT - 1.0, MENU_ITEM_HEIGHT, 4),

@@ -1,45 +1,35 @@
 //! Session transcript message collapse measurement.
 //!
-//! The sessions page collapses messages that render more than
-//! [`MAX_PREVIEW_LINES`] wrapped lines into a short plain-text preview with
-//! an expand/collapse toggle. This module implements the line-count
-//! measurement: a flat wrapped-line count of the message's display text at body
-//! metrics and the actual transcript content width.
+//! The sessions page collapses messages that render more than [`MAX_PREVIEW_LINES`]
+//! wrapped lines into a short plain-text preview with an expand/collapse toggle. This
+//! module measures that: a flat wrapped-line count of the display text at body metrics and
+//! the actual transcript content width.
 //!
-//! The measurement intentionally errs toward collapsing:
-//! - a safety margin narrows the measured width so markdown structure the
-//!   flat model cannot see (list/quote indentation) forces an extra wrap
-//!   instead of slipping a 4-line message through;
-//! - heading lines (ATX and setext) are measured at their rendered heading
-//!   size;
-//! - fenced code-block lines count as one source line each (the renderer
-//!   places them unwrapped in a horizontally scrollable block); fence
-//!   delimiter lines count too — a 2-line code block with fences measures 4
-//!   and collapses, a deliberate over-collapse in the collapse direction;
-//! - a markdown body has its media markers and pictures extracted into their
-//!   attachments before measuring, and their labels measure in the place the
-//!   expanded body draws them (above the text), so a base64 data-URI blob
-//!   cannot skew the count; a body drawn as raw text measures that text
-//!   unchanged.
+//! The measurement errs toward collapsing:
+//! - a safety margin narrows the measured width, so markdown structure the flat model cannot
+//!   see (list/quote indentation) forces an extra wrap instead of slipping a 4-line message
+//!   through;
+//! - heading lines (ATX and setext) are measured at their rendered heading size;
+//! - fenced code-block lines count as one source line each (the renderer places them
+//!   unwrapped in a horizontally scrollable block), fence delimiters included — a 2-line code
+//!   block with fences measures 4 and collapses;
+//! - a markdown body has its media markers and pictures extracted into attachments before
+//!   measuring, their labels measuring where the expanded body draws them (above the text),
+//!   so a base64 data-URI cannot skew the count; a body drawn as raw text measures it unchanged.
 //!
-//! Preview extraction is BiDi-safe: cosmic-text lays glyphs out in visual
-//! order (L2 reordering), so an RTL run can appear with decreasing byte
-//! offsets. The preview segment of each wrapped line is therefore taken as
-//! the logical span (min start .. max end) of the line's glyphs — correct in
-//! every direction case, never a `start > end` slice.
+//! Preview extraction is BiDi-safe: cosmic-text lays glyphs out in visual order (L2
+//! reordering), so an RTL run can appear with decreasing byte offsets. Each wrapped line's
+//! preview segment is therefore the logical span (min start .. max end) of its glyphs — never
+//! a `start > end` slice.
 //!
-//! Shaping is chunked per source line with early exit once the line budget
-//! is exceeded, so a huge message (system prompts reach hundreds of KB)
-//! costs only a few shaped lines. A single source line longer than the
-//! worst-case budget is shaped as a bounded prefix; when the prefix proves
-//! the collapse its first lines come from true wrap points, and when it
-//! cannot (a giant unbreakable word overflowing one line) the count
-//! saturates past the budget — err toward collapsing. Every preview line is
-//! capped to the characters that fit the transcript width in the body font
-//! (fence/code lines and overflowing unbreakable words included), so the
-//! 3-line preview renders as at most 3 visual lines (an unbreakable word
-//! yields a single overflowing line). The result is cached per message and
-//! width by [`crate::gui::sessions::SessionsState`].
+//! Shaping is chunked per source line with early exit once the budget is exceeded, so a
+//! message of hundreds of KB costs a few shaped lines. A source line longer than the
+//! worst-case budget is shaped as a bounded prefix; when that proves the collapse its first
+//! lines come from true wrap points, and when it cannot (a giant unbreakable word) the count
+//! saturates past the budget. Every preview line is capped to the characters that fit the
+//! transcript width in the body font, so the 3-line preview renders as at most 3 visual
+//! lines. The result is cached per message and width by
+//! [`crate::gui::sessions::SessionsState`].
 
 use std::path::Path;
 use std::sync::Arc;
@@ -52,35 +42,30 @@ use crate::gui::text_rendering::with_font_system;
 #[cfg(test)]
 use crate::gui::theme::MARKDOWN_TEXT_SIZE;
 
-/// Line budget: any message rendering more than this many wrapped lines is
-/// collapsed to a [`MAX_PREVIEW_LINES`]-line preview by default.
+/// Line budget: a message rendering more wrapped lines than this collapses to a
+/// [`MAX_PREVIEW_LINES`]-line preview.
 pub(crate) const MAX_PREVIEW_LINES: u32 = 3;
 
 /// Safety margin (px) subtracted from the available width before measuring.
 ///
-/// The flat measurement cannot see markdown list/quote indentation, so lines
-/// sitting close to the width boundary wrap in the real render but not in
-/// the measurement. Narrowing the measured width forces those lines to wrap
-/// one line earlier — the design constraint is to err toward collapsing (never
-/// leave a message that renders longer than the budget expanded).
+/// The flat measurement cannot see markdown list/quote indentation, so lines close to the
+/// boundary wrap in the real render but not here. Narrowing the width forces them to wrap a
+/// line earlier — err toward collapsing, never leaving an over-budget message expanded.
 pub(crate) const WRAP_SAFETY_MARGIN_PX: f32 = 36.0;
 
 /// Maximum characters per preview line segment from a laid line.
 ///
-/// Laid lines that fit the transcript width are already bounded by it (~59
-/// mono chars at the body size), and even a pathological overflowing line
-/// (a giant unbreakable word) renders as a single non-wrapping line in the
-/// preview — so this is a hard safety bound only. The width-aware
-/// [`preview_line_char_budget`] cap applies separately to unwrapped
-/// fence/code lines (which wrap at spaces in the plain-text preview and
-/// would otherwise spill past the 3-line budget visually).
+/// Laid lines that fit are already bounded by the width (~59 mono chars), and even a giant
+/// unbreakable word renders as one overflowing line in the preview, so this is a hard safety
+/// bound only. The width-aware [`preview_line_char_budget`] cap applies separately to
+/// unwrapped fence/code lines, which wrap at spaces in the preview and would otherwise spill
+/// past the 3-line budget.
 const MAX_PREVIEW_LINE_CHARS: usize = 600;
 
-/// Markdown heading sizes relative to the measurement body size, matching
-/// iced 0.14's `markdown::Settings` scale exactly (h1 = 2.0×, h2 = 1.75×,
-/// h3 = 1.5×, h4 = 1.25×, h5/h6 = body). Derived from the caller's `font_size`
-/// so heading wrap stays in lockstep with the renderer's scaled headings
-/// (narration bodies scale from the larger narration size).
+/// Markdown heading sizes relative to the measurement body size, matching iced 0.14's
+/// `markdown::Settings` scale exactly (h1 = 2.0×, h2 = 1.75×, h3 = 1.5×, h4 = 1.25×, h5/h6 =
+/// body). Derived from the caller's `font_size` so heading wrap stays in lockstep with the
+/// renderer's scaled headings.
 const fn heading_sizes(font_size: f32) -> [f32; 6] {
     [
         font_size * 2.0,
@@ -95,31 +80,19 @@ const fn heading_sizes(font_size: f32) -> [f32; 6] {
 /// Tab width used when shaping (matches cosmic-text's default).
 const TAB_WIDTH: u16 = 4;
 
-/// Upper bound (bytes) on the shaped prefix of a single source line.
-///
-/// Each laid line holds at most `avail` characters (the absolute worst case
-/// is 1 px/char) and a UTF-8 character is at most 4 bytes, so
-/// `need * avail * 4` bytes of content cannot fit in fewer than `need` laid
-/// lines even before real glyph widths are considered — a line longer than
-/// this ceiling definitely wraps past the remaining budget, so shaping a
-/// bounded prefix is enough to prove the collapse. The +4 covers the UTF-8
-/// char-boundary floor of the prefix cut.
+/// Upper bound (bytes) on the shaped prefix of a single source line. A laid line holds at most
+/// `avail` characters (1 px/char worst case) and a character at most 4 bytes, so
+/// `need * avail * 4` bytes cannot fit in fewer than `need` lines — a longer line definitely
+/// wraps past the budget. The +4 covers the char-boundary floor of the cut.
 fn shape_ceiling(avail: f32, need: u32) -> usize {
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let per_line = (avail as usize).max(1) * 4;
     per_line.saturating_mul(need as usize).saturating_add(4)
 }
 
-/// Maximum characters per preview line.
-///
-/// Preview lines render in the same JetBrains Mono body font as the
-/// measurement, so a preview line longer than `avail / advance` would wrap
-/// in the preview — for unwrapped code/fence lines that would make the
-/// "3-line preview" render as many visual lines. The cap is measured from
-/// the body font's glyph advance (mono: uniform), not hardcoded, so it
-/// tracks the real rendered width. The truncate ellipsis counts inside the cap,
-/// so a capped line (content + ellipsis) never exceeds the transcript width and
-/// cannot wrap to a 4th visual line.
+/// Maximum characters per preview line, measured from the body font's glyph advance (mono:
+/// uniform) so it tracks the real rendered width. The truncate ellipsis counts inside the cap,
+/// so a capped line never exceeds the transcript width and cannot wrap to a 4th visual line.
 fn preview_line_char_budget(
     font_sys: &mut cosmic_text::FontSystem,
     attrs: &Attrs,
@@ -142,69 +115,55 @@ fn preview_line_char_budget(
     budget.max(1)
 }
 
-/// Per-message measurement result, cached in [`SessionsState`] keyed by
-/// (message index, width bucket).
-///
-/// [`SessionsState`]: crate::gui::sessions::SessionsState
+/// Per-message measurement result, cached in [`SessionsState`] keyed by (message index, width
+/// bucket). [`SessionsState`]: crate::gui::sessions::SessionsState
 pub(crate) struct MessageMeasure {
     /// Width bucket the measurement was computed for (see [`width_bucket`]).
     pub(crate) width_bucket: u32,
     /// Total wrapped line count of the display text.
     pub(crate) wrapped_lines: u32,
-    /// First [`MAX_PREVIEW_LINES`] wrapped lines as plain text — `Some` only
-    /// when the message exceeds the budget and therefore collapses.
+    /// First [`MAX_PREVIEW_LINES`] wrapped lines as plain text — `Some` only when the message
+    /// collapses.
     pub(crate) preview: Option<String>,
-    /// The display text this measurement was derived from, kept so a width
-    /// change can re-measure without re-decoding the message.
+    /// The display text this measurement came from, so a width change re-measures without
+    /// re-decoding the message.
     pub(crate) source: Arc<str>,
-    /// Media-placeholder-reduced display text the measurement was actually
-    /// computed from. Kept so a width-bucket change re-measures via
-    /// [`re_measure`] without re-running media preprocessing (two full
-    /// String copies + regex passes per message) on every window resize. A
-    /// [`BodyText::Plain`] body's processed text is its source, unchanged.
+    /// The media-placeholder-reduced text the measurement actually used, so a width-bucket
+    /// change re-measures via [`re_measure`] without re-running media preprocessing on every
+    /// resize. A [`BodyText::Plain`] body's processed text is its source.
     pub(crate) processed: Arc<str>,
-    /// Body font size (px) the measurement was computed at. A width-bucket
-    /// re-measure via [`re_measure`] carries it forward, so a narration body
-    /// measured at the narration size keeps that size on a resize.
+    /// Body font size (px) the measurement was computed at; carried forward by
+    /// [`re_measure`], so a narration body keeps the narration size on a resize.
     pub(crate) font_size: f32,
 }
 
-/// Quantize a text width into a bucket so sub-pixel layout jitter does not
-/// invalidate the per-message measurement cache; a real window resize moves
-/// the bucket and triggers re-measurement.
+/// Quantize a text width into a bucket so sub-pixel layout jitter does not invalidate the
+/// cache; a real resize moves the bucket and triggers re-measurement.
 #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn width_bucket(width: f32) -> u32 {
     (width.max(0.0) / 16.0) as u32
 }
 
-/// How a collapsible body draws its text, so the measurement matches what is
-/// drawn: a markdown body has its markers extracted into attachment labels,
-/// while a plain one (a tool result, a thinking block, promoted reasoning) shows
-/// the raw text.
+/// How a collapsible body draws its text, so the measurement matches what is drawn: a markdown
+/// body has its markers extracted into attachment labels, a plain one (a tool result, a thinking
+/// block) shows the raw text.
 #[derive(Clone, Copy)]
 pub(crate) enum BodyText<'a> {
-    /// A bubble body parsed as markdown; relative markers resolve against the
-    /// workspace.
+    /// A bubble body parsed as markdown; relative markers resolve against the workspace.
     Markdown(Option<&'a Path>),
     /// A body drawn as raw selectable text.
     Plain,
 }
 
-/// Measure the wrapped line count of a message body at `width`, producing a
-/// [`MAX_PREVIEW_LINES`]-line plain-text preview when the message exceeds
-/// the budget.
+/// Measure the wrapped line count of a body at `width`, producing a
+/// [`MAX_PREVIEW_LINES`]-line plain-text preview when the message exceeds the budget.
 ///
-/// `display_text` is the raw message body (the same text that the Sessions
-/// ledger's `parse_entry_bodies` feeds to `markdown::parse`); [`BodyText`] says
-/// how it is drawn, so the measured text is what the element shows — a markdown
-/// body measures [`media_markers::Preprocessed::display_text`] (the attachment
-/// labels above the text, the order the expanded body draws, so a base64 payload
-/// counts as one short label instead of a blob of characters), a plain one
-/// measures its own raw text. The source is owned as [`Arc<str>`] so a
-/// width-bucket change can re-measure without copying the (potentially hundreds
-/// of KB) display text again. `font_size` is the body size the text renders at
-/// (body or narration), used for wrap and preview-line-budget shaping and
-/// heading scaling.
+/// `display_text` is the raw body (the text the Sessions ledger's `parse_entry_bodies` feeds to
+/// `markdown::parse`); [`BodyText`] says how it is drawn, so a markdown body measures
+/// [`media_markers::Preprocessed::display_text`] (attachment labels above the text, the order
+/// the expanded body draws) and a plain one its raw text. The source is owned as [`Arc<str>`]
+/// so a width-bucket change re-measures without copying it. `font_size` is the body size the
+/// text renders at (body or narration), used for wrap and preview shaping and heading scaling.
 pub(crate) fn measure_message(
     display_text: impl Into<Arc<str>>,
     body: BodyText<'_>,
@@ -221,10 +180,8 @@ pub(crate) fn measure_message(
     measure_processed(source, processed, width, font_size)
 }
 
-/// Re-measure a cached entry at a new width, reusing the cached processed
-/// display text so a width-bucket change does not re-run media
-/// preprocessing (two full String copies + regex passes per message). The
-/// cached [`MessageMeasure::font_size`] is carried forward.
+/// Re-measure a cached entry at a new width, reusing the cached processed text and
+/// [`MessageMeasure::font_size`].
 pub(crate) fn re_measure(cached: &MessageMeasure, width: f32) -> MessageMeasure {
     measure_processed(
         cached.source.clone(),
@@ -234,8 +191,8 @@ pub(crate) fn re_measure(cached: &MessageMeasure, width: f32) -> MessageMeasure 
     )
 }
 
-/// Shared core of [`measure_message`] / [`re_measure`]: layout the already
-/// media-processed display text at `width` and count wrapped lines.
+/// Shared core of [`measure_message`] / [`re_measure`]: lay the already media-processed text at
+/// `width` and count wrapped lines.
 #[expect(clippy::too_many_lines)]
 fn measure_processed(
     source: Arc<str>,
@@ -247,8 +204,7 @@ fn measure_processed(
     let text = &processed;
     let avail = (width - WRAP_SAFETY_MARGIN_PX).max(1.0);
 
-    // Family-only attrs: italic shares the mono glyph advance, so a style
-    // change is unnecessary for measurement.
+    // Family-only attrs: italic shares the mono glyph advance, so no style change is needed.
     let attrs = Attrs::new().family(Family::Name("JetBrains Mono"));
     let mut total_lines = 0u32;
     let mut preview = String::new();
@@ -257,11 +213,8 @@ fn measure_processed(
     let mut fence: Option<(u8, usize)> = None;
 
     with_font_system(|font_sys| {
-        // Preview lines render in the same JetBrains Mono body font, so a
-        // preview line longer than `avail / advance` characters would wrap
-        // in the preview (or, for unwrapped code lines, spill past the
-        // 3-line budget visually). Measured from the body font's glyph
-        // advance rather than hardcoded.
+        // Measured from the body font's glyph advance rather than hardcoded: a longer preview
+        // line would wrap, or spill past the 3-line budget visually.
         let preview_line_chars = preview_line_char_budget(font_sys, &attrs, avail, font_size);
         let mut line = BufferLine::new(
             "",
@@ -270,23 +223,19 @@ fn measure_processed(
             Shaping::Advanced,
         );
 
-        // Peekable so a setext heading's size can look at the underline on
-        // the immediately following line.
+        // Peekable so a setext heading's size can look at the underline on the next line.
         let mut lines = text.split('\n').peekable();
         while let Some(src_line) = lines.next() {
             let next_line = lines.peek().copied();
-            // Early exit: once the budget is exceeded we already know the
-            // message collapses; the preview is complete, so stop shaping.
+            // Early exit: the budget is exceeded, so the message collapses — stop shaping.
             if total_lines > MAX_PREVIEW_LINES {
                 break;
             }
 
             match fence {
                 Some((open_ch, open_count)) => {
-                    // Inside a fenced code block: every source line counts
-                    // once (the renderer places code lines unwrapped in a
-                    // horizontally scrollable block). A matching delimiter
-                    // line closes the block.
+                    // Every source line counts once (the renderer places code lines unwrapped
+                    // in a scrollable block); a matching delimiter line closes the block.
                     let closing = fence_delimiter(src_line)
                         .is_some_and(|(ch, count)| ch == open_ch && count >= open_count)
                         && fence_has_only_trailing_whitespace(src_line);
@@ -313,24 +262,15 @@ fn measure_processed(
                             preview_line_chars,
                         );
                     } else {
-                        // Wrappable line: shape it and lay it out at its
-                        // rendered font size (headings render larger than
-                        // the body, so they are measured at their own size).
+                        // Wrappable line: shape and lay it at its rendered font size (headings
+                        // render larger than the body).
                         let size = heading_size(src_line, font_size)
                             .or_else(|| setext_heading_size(src_line, next_line, font_size))
                             .unwrap_or(font_size);
-                        // Bound the shaped text: a source line longer than
-                        // `shape_ceiling(avail, need)` bytes holds more than
-                        // `need * avail` characters (UTF-8 ≤ 4 bytes/char),
-                        // and even at the absolute worst 1 px/char each laid
-                        // line fits at most `avail` chars — such a line
-                        // definitely wraps past the remaining budget, so the
-                        // collapse is proven by shaping a bounded prefix
-                        // (when the prefix cannot prove it — a giant
-                        // unbreakable word — the count below saturates past
-                        // the budget instead). Shaping a 200KB single-line
-                        // tool result in full on the UI thread would jank
-                        // the transcript.
+                        // A source line over `shape_ceiling(avail, need)` bytes definitely wraps
+                        // past the budget, so a bounded prefix proves the collapse (a giant
+                        // unbreakable word saturates below). Shaping a 200KB single-line tool
+                        // result in full on the UI thread would jank the transcript.
                         let need = MAX_PREVIEW_LINES + 1 - total_lines;
                         let ceiling = shape_ceiling(avail, need);
                         let shaped_src = if src_line.len() > ceiling {
@@ -352,13 +292,8 @@ fn measure_processed(
                             None,
                         );
                         let truncated = src_line.len() > ceiling;
-                        // When the prefix alone does not prove the collapse
-                        // (fewer than `need` lines: the line starts with a
-                        // giant unbreakable word overflowing a single line),
-                        // the rest of the line can only add wrapped lines —
-                        // err toward collapsing. A single source line cannot
-                        // produce more wrapped lines than `u32::MAX` in
-                        // memory; saturate for the budget check.
+                        // The prefix did not prove the collapse (fewer than `need` lines), so the
+                        // rest can only add wrapped lines — err toward collapsing.
                         let line_count = if truncated && laid.len() < need as usize {
                             need
                         } else {
@@ -369,14 +304,11 @@ fn measure_processed(
                             if preview_lines >= MAX_PREVIEW_LINES {
                                 break;
                             }
-                            // Glyphs are laid out in visual (BiDi-reordered)
-                            // order: inside an RTL run byte offsets decrease,
-                            // so a wrapped line can begin after it ends —
-                            // `first().start` may exceed `last().end`, which
-                            // panicked the old first..last slice. Take the
-                            // logical span of the line's glyphs (min start ..
-                            // max end): it is the correct text of this wrapped
-                            // line in every direction case.
+                            // Glyphs are laid out in visual (BiDi-reordered) order: inside an
+                            // RTL run byte offsets decrease, so a wrapped line can begin after it
+                            // ends — `first().start` may exceed `last().end`, which panicked the
+                            // old first..last slice. Take the logical span (min start .. max
+                            // end): the correct text in every direction case.
                             let (glyph_start, glyph_end) = laid_line
                                 .glyphs
                                 .iter()
@@ -389,18 +321,11 @@ fn measure_processed(
                             if glyph_start <= glyph_end && glyph_start < shaped_src.len() {
                                 let start = glyph_start.min(shaped_src.len());
                                 let end = glyph_end.min(shaped_src.len());
-                                // A fitting laid line is already bounded by the
-                                // transcript width; only a line overflowing it
-                                // (w > avail) needs an extra cap. That cap is
-                                // applied to genuinely unbreakable words (e.g.
-                                // a minified JSON blob — no whitespace), which
-                                // would otherwise render as one overflowing
-                                // line far past the width; lines with break
-                                // opportunities wrap in the preview at their
-                                // spaces, and capping them would truncate
-                                // mid-word an RTL phrase that straddles the
-                                // wrap (the BiDi guard: every Hebrew char in
-                                // logical order).
+                                // A fitting laid line is already bounded by the width; only one
+                                // overflowing it needs a cap. That cap hits genuinely unbreakable
+                                // words (a minified JSON blob), which would otherwise render far
+                                // past the width; capping lines with break opportunities would
+                                // truncate mid-word an RTL phrase that straddles the wrap.
                                 let segment = &shaped_src[start..end];
                                 let cap = if laid_line.w > avail
                                     && !segment.chars().any(char::is_whitespace)
@@ -429,11 +354,9 @@ fn measure_processed(
     }
 }
 
-/// Append one source line to the running preview, counting it as a single
-/// rendered line (fence and in-fence code lines). `preview_line_chars` caps
-/// each preview line to what fits the transcript width in the body font —
-/// code lines render unwrapped in the transcript but are plain wrapping
-/// text in the preview, so an uncapped line would break the 3-line preview.
+/// Append one source line to the running preview, counting it as a single rendered line.
+/// `preview_line_chars` caps each preview line to what fits the width — code lines render
+/// unwrapped in the transcript but are plain wrapping text in the preview.
 fn count_source_line(
     src_line: &str,
     total_lines: &mut u32,
@@ -454,9 +377,8 @@ fn count_source_line(
     }
 }
 
-/// Detect a fenced code-block delimiter line (```` ``` ```` or `~~~`, at
-/// least 3 chars, optionally indented). Returns the delimiter char and run
-/// length.
+/// Detect a fenced code-block delimiter line (```` ``` ```` or `~~~`, at least 3 chars,
+/// optionally indented). Returns the delimiter char and run length.
 fn fence_delimiter(line: &str) -> Option<(u8, usize)> {
     let trimmed = line.trim_start();
     let ch = *trimmed.as_bytes().first()?;
@@ -467,8 +389,8 @@ fn fence_delimiter(line: &str) -> Option<(u8, usize)> {
     (count >= 3).then_some((ch, count))
 }
 
-/// A closing fence line may contain only the delimiter run plus trailing
-/// whitespace (pulldown-cmark rule).
+/// A closing fence line holds only the delimiter run plus trailing whitespace (pulldown-cmark
+/// rule).
 fn fence_has_only_trailing_whitespace(line: &str) -> bool {
     let trimmed = line.trim_start();
     let Some(&ch) = trimmed.as_bytes().first() else {
@@ -478,19 +400,16 @@ fn fence_has_only_trailing_whitespace(line: &str) -> bool {
     trimmed[run..].chars().all(char::is_whitespace)
 }
 
-/// ATX heading line → rendered font size (iced `markdown::Settings` sizes),
-/// scaled from the measurement's `font_size`. Returns `None` for non-heading
-/// lines.
+/// ATX heading line → rendered font size, scaled from the measurement's `font_size`. `None`
+/// for non-heading lines.
 ///
-/// CommonMark allows up to three spaces of indentation before an ATX
-/// heading; the indent is stripped before the `#` scan so `'  # heading'`
-/// (a valid heading) is measured at heading size. Measuring it at body size
-/// would under-count a long indented heading and could leave an over-budget
-/// message expanded — the one direction the collapse bias forbids.
+/// CommonMark allows up to three spaces of indentation, stripped before the `#` scan so `'  #
+/// heading'` measures at heading size — body size would under-count a long indented heading and
+/// could leave an over-budget message expanded.
 fn heading_size(line: &str, font_size: f32) -> Option<f32> {
     let trimmed = line.trim_start_matches(' ');
-    // CommonMark: at most three leading spaces; a tab (4 columns) already
-    // exceeds that and never starts an ATX heading.
+    // CommonMark: at most three leading spaces; a tab (4 columns) exceeds that and never
+    // starts an ATX heading.
     if line.len() - trimmed.len() > 3 {
         return None;
     }
@@ -502,22 +421,14 @@ fn heading_size(line: &str, font_size: f32) -> Option<f32> {
     (bytes.get(hashes) == Some(&b' ')).then(|| heading_sizes(font_size)[hashes - 1])
 }
 
-/// Setext heading line → rendered font size: a paragraph line immediately
-/// followed by a line of `=` (H1) or `-` (H2) characters. The underline is
-/// consumed by the parser (not a rendered line of its own), so the title is
-/// measured at its rendered heading size — measuring it at body size would
-/// under-count a long title and could leave an over-budget message expanded,
-/// the one direction the collapse bias forbids. The underline itself still
-/// counts as one flat source line, which over-counts and errs toward
-/// collapsing (the safe direction); a `-`/`=` line after a blank line is a
-/// thematic break / text, not an underline, and the immediate-next-line
-/// check handles that (an empty `current` can never be a heading).
+/// Setext heading line → rendered font size: a paragraph line immediately followed by a line of
+/// `=` (H1) or `-` (H2). The underline is consumed by the parser, so the title is measured at
+/// heading size — body size would under-count a long title. The underline itself still counts
+/// as one flat source line, which over-counts in the safe direction; a `-`/`=` line after a
+/// blank line is a thematic break, and the immediate-next-line check handles that.
 ///
-/// CommonMark allows up to three leading spaces on the underline (a tab is
-/// four columns and never starts one); they are stripped before the scan,
-/// symmetric with the ATX rule in [`heading_size`], so `'title\n  ==='` is a
-/// valid heading and must measure at heading size — body-size measurement
-/// would under-collapse a long indented title.
+/// Up to three leading spaces are allowed on the underline (a tab never starts one) and are
+/// stripped before the scan, symmetric with [`heading_size`].
 fn setext_heading_size(current: &str, next: Option<&str>, font_size: f32) -> Option<f32> {
     if current.is_empty() {
         return None;
@@ -534,14 +445,11 @@ fn setext_heading_size(current: &str, next: Option<&str>, font_size: f32) -> Opt
     if ch != b'=' && ch != b'-' {
         return None;
     }
-    // CommonMark (and pulldown-cmark's scan_setext_heading) maps `=` to H1
-    // and `-` to H2; `heading_sizes` is ordered H1..H6.
+    // pulldown-cmark maps `=` to H1 and `-` to H2; `heading_sizes` is ordered H1..H6.
     body.bytes()
         .all(|b| b == ch)
         .then(|| heading_sizes(font_size)[usize::from(ch == b'-')])
 }
-
-// ── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -566,7 +474,7 @@ mod tests {
         });
     }
 
-    /// Test width: 500px → ~59 body chars per wrapped line at 13px JetBrains Mono.
+    /// 500px → ~59 body chars per wrapped line at 13px JetBrains Mono.
     const TEST_WIDTH: f32 = 500.0;
 
     fn measure(text: &str) -> MessageMeasure {
@@ -637,7 +545,7 @@ mod tests {
         }
     }
 
-    /// Collapsing is the bias: past the budget a message collapses to its first lines, within it stays whole.
+    /// Past the budget a message collapses to its first lines, within it stays whole.
     #[test]
     fn wrapping_and_collapsing_cases() {
         run_measure_cases(&[
@@ -731,7 +639,7 @@ mod tests {
         assert_eq!(measured, "🖼️ image\nbefore after");
     }
 
-    /// Headings are measured at their own size: a flat body-size count under-counts a long heading.
+    /// Headings measure at their own size: a flat body-size count under-counts a long heading.
     #[test]
     fn heading_measurement_cases() {
         run_measure_cases(&[
@@ -903,8 +811,7 @@ mod tests {
 
     #[test]
     fn width_bucket_quantizes_for_cache_invalidation() {
-        // 16px buckets: sub-pixel jitter within a bucket keeps the cache
-        // valid; a real resize moves the bucket and triggers re-measurement.
+        // 16px buckets: sub-pixel jitter within one keeps the cache valid; a real resize moves it.
         assert_eq!(width_bucket(0.0), 0);
         assert_eq!(width_bucket(15.9), 0);
         assert_eq!(width_bucket(16.0), 1);
@@ -915,14 +822,12 @@ mod tests {
 
     #[test]
     fn mixed_direction_wrap_never_panics() {
-        // BLOCKER regression: when the wrap leaves a reversed RTL run alone
-        // on a wrapped line, cosmic-text stores its glyphs in visual
-        // (L2-reordered) order with decreasing byte offsets, and the old
-        // `first().start..last().end` preview slice panicked ("byte range
-        // starts at X but ends at Y") during layout inside the responsive
-        // closure, aborting the whole GUI. Scan a range of prefix lengths so
-        // at least one wrap lands on that position (the exact boundary
-        // depends on font metrics) — the measurement must not panic.
+        // BLOCKER regression: a reversed RTL run left alone on a wrapped line is stored in
+        // visual (L2-reordered) order with decreasing byte offsets, and the old
+        // `first().start..last().end` slice panicked ("byte range starts at X but ends at Y")
+        // during layout inside the responsive closure, aborting the whole GUI. Scanning a range
+        // of prefix lengths lands at least one wrap there (the exact boundary depends on
+        // metrics): the measurement must not panic.
         for n in 40..75 {
             let text = format!("{} שלום עולם", "x".repeat(n));
             let _ = measure(&text);

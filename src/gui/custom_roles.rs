@@ -1,9 +1,6 @@
-//! Custom roles area state: the admin-defined agent records — the list, the
-//! create/edit window's state and the pending deletion. The Settings page
-//! renders it (see [`super::settings`]).
-//!
-//! The list only ever changes through the admin's own actions, so it is read on
-//! navigation and after every mutation instead of being polled.
+//! Custom roles area state: the admin-defined agent records — the list, the create/edit window's
+//! state and the pending deletion (rendered by [`super::settings`]). The list only changes through
+//! the admin's own actions, so it is read on navigation and after every mutation, never polled.
 
 use crate::custom_role::{self, CustomRole, CustomRoleBehavior};
 
@@ -58,17 +55,15 @@ pub(crate) struct CustomRolesState {
 }
 
 pub(crate) struct RoleEditor {
-    /// `Some(name)` when editing an existing record (the name then cannot be
-    /// changed), `None` when creating.
+    /// `Some(name)` when editing an existing record (the name then cannot be changed).
     pub(crate) original: Option<String>,
     pub(crate) name: EditorBuffer,
     pub(crate) prompt: EditorBuffer,
     pub(crate) behavior: CustomRoleBehavior,
     /// The chosen tool names (the picker's marks).
     pub(crate) tools: Vec<String>,
-    /// The tool catalogue the picker offers, captured when the window opened —
-    /// it constructs the tool objects and reads CONFIG, so it must not be
-    /// rebuilt on every render pass.
+    /// The tool catalogue the picker offers, captured when the window opened: it constructs the
+    /// tool objects and reads CONFIG, so it must not be rebuilt on every render pass.
     pub(crate) catalog: Vec<&'static str>,
     pub(crate) in_flight: bool,
     pub(crate) error: Option<String>,
@@ -87,10 +82,9 @@ impl RoleEditor {
         let name_buffer = EditorBuffer::with_text(name, None);
         name_buffer.set_single_line(true);
         let catalog = crate::Role::custom_role_tool_catalog();
-        // The stored names are kept as they are: a name this installation cannot
-        // serve right now stays marked — the launch omits it and the record keeps
-        // it, so a mere open-and-save never drops it. The picker renders it too,
-        // marked and labelled unavailable, so it can still be removed deliberately.
+        // The stored names are kept as they are: a name this installation cannot serve right now
+        // stays marked, so a mere open-and-save never drops it, and the picker shows it as
+        // unavailable so it can still be removed deliberately.
         Self {
             original,
             name: name_buffer,
@@ -103,11 +97,9 @@ impl RoleEditor {
         }
     }
 
-    /// The kinds of `tool` the record currently holds, in interface order. A
-    /// bare entry holds the tool's narrowest kind, so the picker marks what the
-    /// role can actually call. The read is the same lenient one the launch path
-    /// uses ([`crate::tools::grants::parse_lossy`]): one unparsable entry drops
-    /// itself alone instead of unmarking every kind.
+    /// The kinds of `tool` the record currently holds, in interface order. A bare entry holds the
+    /// tool's narrowest kind. The read is the lenient one the launch path uses
+    /// ([`crate::tools::grants::parse_lossy`]): one unparsable entry drops itself alone.
     pub(crate) fn held_kinds(&self, tool: &str) -> Vec<String> {
         crate::tools::grants::parse_lossy(&self.tools)
             .into_iter()
@@ -117,8 +109,7 @@ impl RoleEditor {
     }
 
     /// Mark or unmark one kind of a tool with a kind vocabulary — a thin call to
-    /// [`crate::tools::grants::toggle`], which owns the grammar, the interface
-    /// order and the drop of an entry with its last kind.
+    /// [`crate::tools::grants::toggle`], which owns the grammar and the interface order.
     fn toggle_kind(&mut self, tool: &str, kind: &str) {
         self.tools = crate::tools::grants::toggle(&self.tools, tool, kind);
     }
@@ -174,8 +165,8 @@ impl CustomRolesState {
                 Task::none()
             }
             CustomRolesMessage::OpenEdit(name) => {
-                // The list is the source the window is filled from: a name it
-                // no longer holds opens nothing.
+                // The list is the source the window is filled from: a name it no longer holds
+                // opens nothing.
                 if let Some(role) = self.roles.iter().find(|r| r.name == name) {
                     self.editor = Some(RoleEditor::new(
                         Some(role.name.clone()),
@@ -193,8 +184,7 @@ impl CustomRolesState {
             }
             CustomRolesMessage::Name(action) => {
                 if let Some(editor) = &self.editor {
-                    // The window's buffers are their own state (it is
-                    // discarded on close), so an action applies directly.
+                    // The window's buffers are their own state, so an action applies directly.
                     editor.name.perform_action(action);
                 }
                 Task::none()
@@ -213,9 +203,8 @@ impl CustomRolesState {
             }
             CustomRolesMessage::ToggleTool(name) => {
                 if let Some(editor) = &mut self.editor {
-                    // An entry is identified by its tool name: a stored entry
-                    // this installation cannot serve may still carry kinds, and
-                    // unticking it must remove it rather than add a second entry.
+                    // An entry is identified by its tool name: unticking an entry this
+                    // installation cannot serve must remove it rather than add a second one.
                     match editor
                         .tools
                         .iter()
@@ -243,14 +232,12 @@ impl CustomRolesState {
                 if editor.in_flight {
                     return Task::none();
                 }
-                // Nothing is validated here: the record's own validators are
-                // the authority, and their errors land in the window.
+                // Nothing is validated here: the record's own validators are the authority.
                 let name = editor.name.text().trim().to_string();
                 let prompt = editor.prompt.text();
                 let tools = editor.tools.clone();
                 let behavior = editor.behavior;
-                // An edit addresses the record by the name it was opened on —
-                // the window edits a role, it never renames one.
+                // An edit addresses the record by the name it was opened on — it never renames.
                 let original = editor.original.clone();
                 editor.in_flight = true;
                 Task::perform(
@@ -275,8 +262,7 @@ impl CustomRolesState {
             CustomRolesMessage::SubmitResult(Ok(())) => {
                 self.editor = None;
                 self.error = None;
-                // The list the window was opened from is re-read, so the saved
-                // record shows what the store now holds.
+                // The list is re-read, so the saved record shows what the store now holds.
                 Task::done(CustomRolesMessage::Refresh)
             }
             CustomRolesMessage::SubmitResult(Err(e)) => {

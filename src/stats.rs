@@ -184,8 +184,7 @@ impl crate::logs::LogStore {
 ///
 /// One row per completed LLM operation (agent iteration, extraction,
 /// summarization, consolidation) — retry attempts are aggregated into
-/// [`LlmRequestRecord::retry_attempts`]. Metadata only: no request inputs or
-/// outputs.
+/// [`LlmRequestRecord::retry_attempts`]. Metadata only: no request inputs or outputs.
 #[derive(Debug, Clone)]
 pub(crate) struct LlmRequestRecord {
     pub purpose: &'static str,
@@ -371,8 +370,7 @@ fn record_llm_operation(
 /// retry pipeline (e.g. raw-HTTP media transcription), which carry no response
 /// envelope. `attempts` is supplied by the caller: the transcription paths
 /// always pass 1 (a single-shot fail-open call never retries). The row is handed
-/// to [`crate::telemetry`]: a write failure is noted by the drain task and never
-/// propagates.
+/// to [`crate::telemetry`]: a write failure is noted by the drain task and never propagates.
 pub(crate) fn record_llm_operation_meta(
     call: &LlmCallMeta,
     duration_ms: u64,

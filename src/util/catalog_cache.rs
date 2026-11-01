@@ -1,14 +1,12 @@
-//! Generic single-flight, endpoint-keyed, TTL-cached fetch for the OpenRouter
-//! model catalogs. Shared by the image and video catalog clients so their
-//! cache/backoff behavior cannot drift. Also hosts the shared envelope parser
-//! ([`parse_envelope`]) so the `{ "data": [...] }` contract is single-source.
+//! Generic single-flight, endpoint-keyed, TTL-cached fetch for the OpenRouter model catalogs,
+//! shared by the image and video catalog clients so their cache/backoff behavior cannot drift.
+//! Also hosts the shared envelope parser ([`parse_envelope`]).
 //!
-//! Fetched once per endpoint (single-flight) and reused for [`CATALOG_TTL`]. A
-//! failed fetch — including a timeout — is stored as a negative cache for
-//! [`CATALOG_RETRY_BACKOFF`] and degrades to fail-open: [`Catalog::get`] returns
-//! `None` and callers proceed without capability data. Capability checks can
-//! force a refresh on a membership miss via [`Catalog::refresh_for_miss`]
-//! (cooldown-bounded); a plain [`Catalog::get`] never refreshes.
+//! Fetched once per endpoint and reused for [`CATALOG_TTL`]. A failed fetch — including a
+//! timeout — is stored as a negative cache for [`CATALOG_RETRY_BACKOFF`] and degrades to
+//! fail-open: [`Catalog::get`] returns `None` and callers proceed without capability data. A
+//! capability check may force a refresh on a membership miss ([`Catalog::refresh_for_miss`],
+//! cooldown-bounded); a plain [`Catalog::get`] never refreshes.
 
 use crate::util::UnwrapPoison;
 use serde_json::Value;
@@ -23,22 +21,16 @@ const CATALOG_TTL: Duration = Duration::from_hours(24);
 /// Backoff before retrying a failed catalog fetch (negative cache).
 const CATALOG_RETRY_BACKOFF: Duration = Duration::from_mins(1);
 
-/// Bounds a single catalog fetch so a hung provider never stalls a caller
-/// (session start, change detection, per-execute validation) beyond this
-/// window. A timeout is recorded as a failure, so the negative-cache backoff
-/// applies instead of re-fetching on every call.
+/// Bounds a single catalog fetch so a hung provider never stalls a caller beyond this window. A
+/// timeout is recorded as a failure, so the negative-cache backoff applies.
 ///
-/// Note: this is also a fail-open cutoff for slow-but-working providers — a
-/// catalog that takes longer than 10s (previously bounded only by the media
-/// client's ~2-min request timeout) now consistently fails open and is
-/// retried only after the backoff window. Accepted: a bounded first-message
-/// latency is worth more than a slow catalog.
+/// This is also a fail-open cutoff for slow-but-working providers. Accepted: a bounded
+/// first-message latency is worth more than a slow catalog.
 const CATALOG_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A single catalog fetch: URL → response body. Production resolves to
-/// [`crate::util::http::get_json_from_provider`]; tests install a scripted
-/// fetch so refresh/cooldown behavior is hermetic. A fn pointer keeps
-/// `Catalog` const-constructible for the static catalog clients.
+/// [`crate::util::http::get_json_from_provider`]; tests install a scripted fetch. A fn pointer
+/// keeps `Catalog` const-constructible.
 pub(crate) type FetchFuture = Pin<Box<dyn Future<Output = anyhow::Result<Value>> + Send>>;
 pub(crate) type FetchFn = fn(url: &str, label: &str) -> FetchFuture;
 
@@ -48,11 +40,9 @@ fn fetch_from_provider(url: &str, label: &str) -> FetchFuture {
     Box::pin(async move { crate::util::http::get_json_from_provider(&url, &label).await })
 }
 
-/// Parse a `{ "data": [...] }` catalog envelope into a model map. The
-/// per-entry parser is supplied by each catalog client (field shapes differ).
-///
-/// `label` feeds the error strings and must match the client's [`Catalog::new`]
-/// label so parse errors stay consistent with log labels.
+/// Parse a `{ "data": [...] }` catalog envelope into a model map; the per-entry parser is
+/// supplied by each client (field shapes differ). `label` feeds the error strings and must match
+/// the client's [`Catalog::new`] label.
 ///
 /// # Errors
 ///
@@ -99,12 +89,10 @@ pub(crate) struct Catalog<T> {
     label: &'static str,
     /// Parses a fetched response body into the catalog type.
     parse: fn(&Value) -> anyhow::Result<T>,
-    /// Injected fetch transport — resolves to [`fetch_from_provider`] in
-    /// production; tests install a scripted fetch.
+    /// Injected fetch transport — [`fetch_from_provider`] in production, a scripted one in tests.
     fetch: FetchFn,
     cache: OnceLock<RwLock<Option<CacheEntry<T>>>>,
-    /// Serializes concurrent fetches — one network call regardless of how many
-    /// callers hit the catalog at once.
+    /// Serializes concurrent fetches — one network call however many callers arrive at once.
     fetch_lock: OnceLock<tokio::sync::Mutex<()>>,
     /// Per-endpoint timestamp of the last miss-triggered refresh attempt, for
     /// the cooldown.
@@ -135,9 +123,8 @@ impl<T> Catalog<T> {
         self
     }
 
-    /// Return the cached catalog for `endpoint` if fresh, otherwise fetch it
-    /// (single-flight). Returns `None` (fail-open) when the catalog is
-    /// unavailable — retried after a short negative-cache backoff.
+    /// The cached catalog for `endpoint` if fresh, otherwise fetch it (single-flight). `None`
+    /// (fail-open) when unavailable — retried after the negative-cache backoff.
     pub(crate) async fn get(&self, endpoint: &str) -> Option<Arc<T>> {
         let base = crate::providers::ensure_base_url(endpoint);
         match self.lookup(&base) {
@@ -154,9 +141,8 @@ impl<T> Catalog<T> {
         self.fetch_and_store(base).await
     }
 
-    /// Fetch the catalog for the already-normalized `base` (bypassing any cache
-    /// check) and store the outcome: fresh catalog on success, negative cache on
-    /// failure. Returns the fetched catalog, or `None` on any failure (fail-open).
+    /// Fetch the catalog for the already-normalized `base` (bypassing the cache check) and store
+    /// the outcome: fresh catalog on success, negative cache on failure.
     async fn fetch_and_store(&self, base: String) -> Option<Arc<T>> {
         let url = format!("{base}{}", self.path);
         let fetched =
@@ -194,15 +180,12 @@ impl<T> Catalog<T> {
         }
     }
 
-    /// Forced refresh for a capability-check membership miss: the model id is
-    /// absent from the cached snapshot, so the snapshot may predate the model's
-    /// OpenRouter listing. Atomic — acquires the fetch lock (single-flight),
-    /// bypasses the TTL check, fetches, stores. Bounded by a per-endpoint
-    /// cooldown ([`CATALOG_RETRY_BACKOFF`]): inside the window no refetch
-    /// happens and the last fetched snapshot is returned as-is, so absence
-    /// confirmed by a successful fresh fetch stands (the caller rejects).
-    /// Returns the refreshed/last snapshot, or `None` when the fetch failed
-    /// (fail-open — the caller must not reject on a stale/missing catalog).
+    /// Forced refresh for a capability-check membership miss: the model id is absent from the
+    /// cached snapshot, so the snapshot may predate the model's listing. Atomic (acquires the
+    /// fetch lock), bypasses the TTL check, and is bounded by a per-endpoint cooldown
+    /// ([`CATALOG_RETRY_BACKOFF`]): inside the window no refetch happens and the last snapshot is
+    /// returned as-is, so an absence confirmed by a fresh fetch stands. `None` when the fetch
+    /// failed (fail-open — the caller must not reject on a stale catalog).
     pub(crate) async fn refresh_for_miss(&self, endpoint: &str) -> Option<Arc<T>> {
         let base = crate::providers::ensure_base_url(endpoint);
         let _guard = self.fetch_lock().await;
@@ -276,8 +259,7 @@ impl<T> Catalog<T> {
         self.seed_at(endpoint, catalog, Instant::now());
     }
 
-    /// Test-only: seed the cache with an explicit fetch time (e.g. to simulate
-    /// an expired backoff window).
+    /// Test-only: seed the cache with an explicit fetch time (e.g. an expired backoff window).
     #[cfg(test)]
     pub(crate) fn seed_at(&self, endpoint: &str, catalog: Option<Arc<T>>, fetched_at: Instant) {
         *self.cache_lock().write().unwrap_poison() = Some(CacheEntry {

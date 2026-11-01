@@ -44,8 +44,7 @@ struct Artwork {
 }
 
 /// The decoded artwork. The file is compiled into the binary, so a decode failure
-/// is a broken build, not a runtime condition — the same rule the embedded prompts
-/// follow.
+/// is a broken build, not a runtime condition — the same rule the embedded prompts follow.
 fn artwork() -> &'static Artwork {
     static ARTWORK: LazyLock<Artwork> = LazyLock::new(|| {
         let decode = image::load_from_memory_with_format(ARTWORK_PNG, image::ImageFormat::Png)
@@ -63,8 +62,7 @@ fn artwork() -> &'static Artwork {
 /// The icon of the window itself, for [`iced::window::Settings::icon`] — the
 /// window's icon on X11; on Windows winit sets it as the *small* icon, and the
 /// Windows icon pass then replaces both with the executable's own. Wayland and macOS
-/// have no window icon at all and ignore it, which is what "degrade quietly" means
-/// here.
+/// have no window icon at all and ignore it, which is what "degrade quietly" means here.
 #[must_use]
 pub fn window_icon() -> Option<iced::window::Icon> {
     let artwork = artwork();
@@ -96,8 +94,7 @@ pub(crate) fn widget_image() -> iced::widget::image::Handle {
 /// Places the icon on the surfaces the platform keeps outside the window, once per
 /// start: the running application's Dock tile (macOS) and the launcher entry plus
 /// its icon-theme copies (Linux). A no-op on Windows, where the executable's own
-/// resource and the window's own handle carry it, and wherever there is no such
-/// surface.
+/// resource and the window's own handle carry it, and wherever there is no such surface.
 pub fn install_desktop_integration() {
     #[cfg(target_os = "macos")]
     set_dock_icon();
@@ -450,8 +447,7 @@ fn scaled_png(artwork: &Artwork, size: u32) -> Option<Vec<u8>> {
 }
 
 /// Writes `content` to `path` unless the file already holds exactly it, staging
-/// through a sibling name first so a reader (a desktop shell) never sees a partial
-/// file.
+/// through a sibling name first so a reader (a desktop shell) never sees a partial file.
 #[cfg(target_os = "linux")]
 fn write_if_changed(path: &Path, content: &[u8]) -> std::io::Result<()> {
     if std::fs::read(path).is_ok_and(|current| current == content) {

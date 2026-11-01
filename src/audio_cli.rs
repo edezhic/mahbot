@@ -1,54 +1,35 @@
 //! `mahbot audio` — the product's own speech engine on the command line.
 //!
-//! Two operations, both the product's own engine and nothing else: `transcribe`
-//! turns an existing recording into text on standard output, and `speak` turns
-//! text into a spoken WAV file. Neither needs the running product — this command
-//! line is dispatched before the instance lock — and neither touches its stores
-//! or its settings: the only thing either reads or writes is the speech model set
-//! under the product's own data folder, which it obtains the way the product does
-//! when it needs it — once, saying so on standard error, and no retry loop. The
-//! command compiles everywhere, and where the engine does not exist it refuses
-//! both operations, naming the platform.
+//! Two operations, both the product's own engine and nothing else: `transcribe` turns an existing
+//! recording into text on standard output, `speak` turns text into a spoken WAV file. Neither needs
+//! the running product — this command line is dispatched before the instance lock — and neither
+//! touches its stores or settings: the only thing either reads or writes is the speech model set
+//! under the product's own data folder, obtained the way the product obtains it (once, saying so on
+//! standard error, no retry loop). The command compiles everywhere and refuses both operations
+//! where the engine does not exist, naming the platform.
 //!
-//! The product's speech-output switch is not this command's: it governs what the
-//! app says aloud, while these operations are explicit requests carrying their
-//! own voice, language and destination (defaults and all) — nothing is read from
-//! the settings, and nothing is changed there. `speak` renders its file through
-//! the very path the app speaks a phrase through, so a file made here sounds like
-//! the product speaking; that path must also draw the same text, so a part of the
-//! text that fails to render fails the command rather than being left out of the
-//! file.
+//! The product's speech-output switch is not this command's: it governs what the app says aloud,
+//! while these operations are explicit requests carrying their own voice, language and destination
+//! — nothing is read from the settings and nothing changed there. `speak` renders through the very
+//! path the app speaks a phrase through, so a file made here sounds like the product speaking; that
+//! path must draw the same text, so a part that fails to render fails the command rather than being
+//! left out of the file.
+//! The four exit classes are the product's own ([`crate::cli::Exit`]), and what separates them is
+//! who judges. This command judges the words and the values they carry (a flag no operation takes,
+//! a recording the recogniser does not take, a value the engine has no such thing as, a destination
+//! it cannot write) — the caller's own misuse. What the ENGINE judges is a failed operation. What
+//! is missing to run at all — no engine here, or models that cannot be obtained — is the
+//! environment.
 //!
-//! The four exit classes are the product's own ([`crate::cli::Exit`]), and what
-//! separates them is who judges. This command judges the words it read and the
-//! values they carry — a flag no operation takes, a recording the recogniser
-//! does not take, a value the engine has no such thing as, a destination it
-//! cannot write — and those are the caller's own misuse. Everything the ENGINE
-//! judges is a failed operation instead: the work it could not do. What is
-//! missing to run at all — no engine on this platform, or models that cannot be
-//! obtained — is the environment. All four are stated wherever this command is
-//! listed, while only a platform that has the engine can report a failed one.
+//! The order is deliberate: the words first (an operation no word names, a flag this operation does
+//! not take, one given twice, one with no value), then the product's data folder, then what the
+//! values mean to the engine — because a typo must not cost a model download. The models are
+//! obtained only after all of that, the work is done, and only then is anything printed or written.
+//! Where there is no engine (everywhere but macOS) both operations are one refusal naming the
+//! platform and no VALUE is judged: the engine is what judges a value, and there is none to ask.
 //!
-//! The order the failures are answered in is deliberate, and it is the order the
-//! code has. The words come first, and only the words — an operation no word
-//! names, a flag this operation does not take, one given twice, one with no value
-//! — which is misuse read from the words alone. Then the product's own data
-//! folder, which is the environment's failure when it cannot be resolved. Then
-//! what the values mean to the engine: the recording and the format it comes in,
-//! a text that says nothing, a voice or a language the engine has no such thing
-//! as, a destination this command cannot write — because a typo must not cost a
-//! model download. The models are obtained only after all of that, the work is
-//! done, and only then is anything printed or written.
-//!
-//! Where there is no engine at all (everywhere but macOS) both operations are the
-//! same refusal naming the platform, and no VALUE is judged: the engine is what
-//! judges a value, and there is none to ask. The words are read the same way
-//! there as anywhere — they are this frontend's own grammar — and the help is
-//! where a caller finds how the two classes divide when they, too, are wrong.
-//!
-//! What a read-only shell must never admit is this whole family: `speak` writes a
-//! file at a path the caller names, so the guard the inspecting roles hold lists
-//! it among the refusals it spells out (`tool/shell_readonly_banner.md`).
+//! A read-only shell must never admit this family: `speak` writes a file at a path the caller
+//! names, so the guard the inspecting roles hold lists it among its refusals.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -56,14 +37,12 @@ use std::path::PathBuf;
 use crate::cli::{Exit, grammar};
 use crate::util::{print_stderr, print_stdout};
 
-// ── The operations and their flags ────────────────────────────────
-
-/// One flag of one operation: the value it carries and the line the help shows.
+// One flag of one operation: the value it carries and the line the help shows.
 struct Flag {
     /// The spelling without its dashes (`--voice` is `voice`).
     name: &'static str,
-    /// Whether the caller has to give it — the help says so beside the flag, and
-    /// [`parse`] refuses its absence before it reads the values.
+    /// Whether the caller has to give it — the help says so beside the flag, and [`parse`] refuses
+    /// its absence before reading any value.
     required: bool,
     /// One line for the operation's help.
     purpose: &'static str,
@@ -102,10 +81,8 @@ impl Operation {
         }
     }
 
-    /// The flags this operation takes — one list for the parser and the help
-    /// both, so the help can never name a flag the parser does not read, nor the
-    /// parser take one the help leaves out, nor the two disagree about which of
-    /// them is required.
+    /// The flags this operation takes — one list for the parser and the help both, so neither can
+    /// name a flag the other does not read, nor disagree about which are required.
     const fn flags(self) -> &'static [Flag] {
         match self {
             Self::Transcribe => &[Flag {
@@ -161,12 +138,10 @@ enum Invocation {
     Speak(Speak),
 }
 
-/// What `speak` carries. The values are kept as the caller spelled them: what
-/// they MEAN is the engine's own vocabulary, and it is read where the engine
-/// exists (see the module docs on the order the failures are answered in). Where
-/// there is none, the refusal is the platform's and none of this is read — the
-/// request is spelled the same way on every platform, and dropped unread where it
-/// cannot be carried out.
+/// What `speak` carries. The values are kept as the caller spelled them: what they MEAN is the
+/// engine's own vocabulary, read where the engine exists. Where there is none the refusal is the
+/// platform's and none of this is read — the request is spelled the same way everywhere and dropped
+/// unread.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct Speak {
     text: String,
@@ -175,9 +150,8 @@ struct Speak {
     output: PathBuf,
 }
 
-// ── Parsing ───────────────────────────────────────────────────────
+// One operation's flag tail, read.
 
-/// One operation's flag tail, read.
 enum Tail {
     /// A `-h`/`--help` stood where a flag could — that operation's help.
     Help,
@@ -185,14 +159,11 @@ enum Tail {
     Values(Vec<(&'static str, String)>),
 }
 
-/// Read one operation's flag tail — the tokens after the operation word.
-///
-/// The grammar is [`crate::cli::grammar`]'s, and a value is read VERBATIM: the
-/// very next token, whatever it looks like (`--text -h` is the text `-h`). What
-/// is this command's own is what it refuses — a token that is no flag at all, a
-/// flag this operation does not take, a flag given twice, a flag with no value —
-/// and that is misuse read from the words alone: it names the flag and never its
-/// value, because a value the caller mistyped is his business.
+/// Read one operation's flag tail — the tokens after the operation word. The grammar is
+/// [`crate::cli::grammar`]'s and a value is read VERBATIM: the very next token, whatever it looks
+/// like (`--text -h` is the text `-h`). This command refuses only what is its own — a token that is
+/// no flag, a flag this operation does not take, one given twice, one with no value — and names the
+/// flag, never its value: a mistyped value is the caller's business.
 fn parse_flags(operation: Operation, tokens: &[String]) -> Result<Tail, String> {
     let flags = operation.flags();
     let mut values: Vec<(&'static str, String)> = Vec::new();
@@ -243,11 +214,9 @@ fn parse(args: &[String]) -> Result<Invocation, String> {
             .find(|(given, _)| *given == name)
             .map(|(_, value)| value.clone())
     };
-    // The operation's own list is what says which flags are required, so the
-    // first one it calls required and the tail does not carry ends the parse
-    // here — which is also what makes the lookups below safe: every required
-    // value they take is guaranteed present by this check, while the optional
-    // ones stay `Option`.
+    // The operation's own list says which flags are required, so the first one it calls required
+    // and the tail lacks ends the parse here — which makes the lookups below safe: every required
+    // value is present.
     if let Some(flag) = operation
         .flags()
         .iter()
@@ -273,11 +242,8 @@ fn parse(args: &[String]) -> Result<Invocation, String> {
     }
 }
 
-// ── Help ──────────────────────────────────────────────────────────
-
-/// What these operations are — one block for both helps, so a caller entering
-/// through one operation's own help reads the same contract as one reading the
-/// family's.
+// What these operations are — one block for both helps, so a caller entering through one
+// operation's own help reads the same contract as one reading the family's.
 const ENGINE_HELP: &str = "\nA frontend onto the product's own speech engine: everything \
      happens on this machine and nothing is sent anywhere. The engine needs the speech models \
      under the product's own data folder and nothing else — not the product's settings, not its \
@@ -301,8 +267,8 @@ const OUTPUT_HELP: &str = "\nOutput:\n  stdout  transcribe: the recognised text,
      was a directory and this command named the file itself\n  stderr  everything this command \
      itself has to say\n";
 
-/// The one thing about this command that is not the same everywhere — and the
-/// only place two classes meet, so the order between them is said here too.
+/// The one thing about this command that is not the same everywhere — and the only place two
+/// classes meet, so the order between them is said here too.
 const PLATFORM_HELP: &str = "\nThe speech engine exists on macOS only: on a platform that has \
      none, both operations say so and name it as the reason.\n\
      \nThat is the one place where two of these classes meet, and which one is reported is \
@@ -400,13 +366,9 @@ fn operation_help(operation: Operation) -> String {
     out
 }
 
-// ── The run ───────────────────────────────────────────────────────
+// `mahbot audio` — the process exit code. Help goes to stdout and the caller's misuse is answered
+// from the words alone. The two operations themselves live in [`engine`], one arm per platform.
 
-/// `mahbot audio` — returns the process exit code.
-///
-/// Help goes to stdout and the caller's own misuse is answered from the words
-/// alone (see the module docs for the order the failures are answered in). The
-/// two operations themselves live in [`engine`], one arm per platform.
 pub async fn run(args: &[String]) -> i32 {
     match parse(args) {
         Ok(Invocation::Help) => {
@@ -423,21 +385,17 @@ pub async fn run(args: &[String]) -> i32 {
     }
 }
 
-/// Refuse what was asked for as the caller's own mistake: his own words cannot
-/// mean it, or what they ask for cannot be done as asked.
+/// Refuse what was asked for as the caller's own mistake: his words cannot mean it, or cannot be
+/// done as asked.
 fn misuse(reason: &str) -> i32 {
     print_stderr(&format!("mahbot audio: {reason}"));
     print_stderr("run 'mahbot audio -h' for usage.");
     Exit::Usage.code()
 }
 
-// ── The platform with no engine ───────────────────────────────────
-
-/// The speech engine is macOS-only, so everywhere else both operations are this
-/// one refusal. It is reached only through the two entry points below, and the
-/// words are read before they are — so a malformed invocation is answered as the
-/// caller's mistake here too, while no value is judged at all (the help puts the
-/// two classes in order).
+// The speech engine is macOS-only, so everywhere else both operations are this one refusal. The
+// words are read before it is — a malformed invocation is still the caller's mistake here — while
+// no value is judged at all.
 #[cfg(not(target_os = "macos"))]
 fn no_engine() -> i32 {
     print_stderr(&format!(
@@ -448,9 +406,8 @@ fn no_engine() -> i32 {
     Exit::Environment.code()
 }
 
-/// The two operations where there is no engine to run them: the same refusal,
-/// with the same entry points the arm below has, so the caller is one line
-/// either way and nothing about the request is judged here.
+/// The two operations where there is no engine to run them: the same refusal, with the same entry
+/// points the arm below has, so the caller is one line either way.
 #[cfg(not(target_os = "macos"))]
 mod engine {
     use super::{Speak, no_engine};
@@ -467,10 +424,8 @@ mod engine {
     }
 }
 
-// ── The two operations ────────────────────────────────────────────
-
-/// The operations themselves, on the one platform that has a speech engine:
-/// what the caller's values mean to it, and the work each operation asks for.
+// The operations themselves, on the one platform with a speech engine: what the caller's values
+// mean to it, and the work each operation asks for.
 #[cfg(target_os = "macos")]
 mod engine {
     use super::{Speak, misuse};
@@ -481,10 +436,9 @@ mod engine {
     use std::io::ErrorKind;
     use std::path::{Path, PathBuf};
 
-    /// How many names to try before giving up on picking a free one in a
-    /// directory: the chosen name is a fresh identifier, so the first is
-    /// already free for any practical purpose and the loop is only there to
-    /// make "never collides" true in principle too.
+    /// How many names to try before giving up on picking a free one: the chosen name is a fresh
+    /// identifier, so the first is free for any practical purpose — the loop makes "never collides"
+    /// true in principle too.
     const CHOSEN_NAME_TRIES: usize = 3;
 
     /// `transcribe`: the recording into text on standard output.
@@ -492,10 +446,9 @@ mod engine {
         if let Some(code) = prepare() {
             return code;
         }
-        // What the caller handed over, before anything is fetched: a typo must
-        // not cost a model download. The type is read before anything is opened,
-        // because opening is what waits: a FIFO named like a recording would hold
-        // it until somebody writes into it.
+        // What the caller handed over, before anything is fetched: a typo must not cost a model
+        // download. The type is read before anything is opened, because opening is what waits — a
+        // FIFO named like a recording would hold it until somebody writes into it.
         match std::fs::metadata(input) {
             Ok(metadata) if metadata.is_file() => {}
             // A directory has metadata too, and is not a recording either.
@@ -507,10 +460,9 @@ mod engine {
             }
             Err(e) => return misuse(&cannot_read(input, &e)),
         }
-        // The recogniser's own rule, asked of the recogniser itself: a name it
-        // knows, or content that begins with Ogg's magic. Opening the file is part
-        // of asking, so an input that cannot be read is refused as the caller's
-        // own mistake rather than as a failure of the work.
+        // The recogniser's own rule, asked of the recogniser itself: a name it knows, or content
+        // beginning with Ogg's magic. Opening is part of asking, so an unreadable input is the
+        // caller's mistake, not a failed operation.
         match local_transcriber::takes_audio(input) {
             Err(e) => return misuse(&cannot_read(input, &e)),
             Ok(true) => {}
@@ -543,17 +495,15 @@ mod engine {
             .await
         {
             Ok(text) => {
-                // A recording the engine found no speech in is an answer, not a
-                // failure: nothing at all on standard output, so a script can
-                // tell it from an empty line.
+                // No speech found is an answer, not a failure: nothing at all on stdout, so a
+                // script can tell it from an empty line.
                 let text = text.trim();
                 if !text.is_empty() {
                     print_stdout(text);
                 }
                 Exit::Ok.code()
             }
-            // The bound is told by the TYPE the failure carries and never by its
-            // wording: the recogniser reports that bound as this one error alone.
+            // The bound is told by the TYPE the failure carries, never by its wording.
             Err(e) if e.downcast_ref::<InferenceTimedOut>().is_some() => {
                 print_stderr(&format!(
                     "mahbot audio: the recording is longer than the local recogniser will take — \
@@ -600,9 +550,8 @@ mod engine {
             Err(reason) => return misuse(&reason),
         };
 
-        // The set is obtained and the voice that was asked for is loaded with it,
-        // in one step: what comes back is what the reading speaks with, and the
-        // style file is parsed once.
+        // The set is obtained and the asked-for voice loaded with it in one step: what comes back
+        // is what the reading speaks with, and the style file is parsed once.
         let voice = match tts::ensure_ready_once(&voice, |dir| {
             announce_fetch(dir, "speech synthesis");
         })
@@ -617,8 +566,8 @@ mod engine {
             }
         };
 
-        // The whole reading is rendered before anything is written, so a text
-        // that cannot be spoken in full leaves nothing at the destination.
+        // The whole reading is rendered before anything is written, so a text that cannot be spoken
+        // in full leaves nothing at the destination.
         let wav = match tts::render_speech_wav(&request.text, voice, &language).await {
             Ok(wav) => wav,
             Err(e) => {
@@ -639,13 +588,9 @@ mod engine {
         }
     }
 
-    /// Say on standard error that a model set is being fetched.
-    ///
-    /// The product's own daemon logs this and shows it in its window; a command
-    /// line has only its standard error. It is said as a fetch begins — before
-    /// the bytes of the first file that has to be fetched — and only when a fetch
-    /// begins at all, so a set already on disk is silent while a first use that
-    /// downloads gigabytes is not.
+    /// Say on standard error that a model set is being fetched — a command line has only its
+    /// standard error. Said as a fetch begins (before the first byte), and only when one begins at
+    /// all: a set already on disk is silent, a first use that downloads gigabytes is not.
     fn announce_fetch(dir: &Path, what: &str) {
         print_stderr(&format!(
             "mahbot audio: fetching the {what} model into {} — the product's own copy of it, \
@@ -654,19 +599,11 @@ mod engine {
         ));
     }
 
-    /// The first thing either operation does: point the product's own data folder
-    /// at the caller's home, the way the product resolves it at boot
-    /// ([`crate::config::default_config_dir`] reads `HOME`), because that is where
-    /// the speech models live.
-    ///
-    /// This is the ONE setting-side fact this command needs: no store is opened
-    /// and no config field is read. The root is process-global and immutable once
-    /// set, so the value resolved here is the only one that will ever be used —
-    /// which is also why it is set only when nothing has set it, since
-    /// `set_storage_root` panics on a second call.
-    ///
-    /// `Some` is the exit class to return immediately, with the reason already
-    /// told on standard error.
+    /// The first thing either operation does: point the product's own data folder at the caller's
+    /// home, the way the product resolves it at boot, because that is where the speech models live.
+    /// This is the ONE setting this command touches: no store is opened and no config field is
+    /// read. The root is process-global and it. `Some` is the exit class to return immediately, the
+    /// reason already told on standard error.
     fn prepare() -> Option<i32> {
         match crate::config::default_config_dir() {
             Ok(root) => {
@@ -684,21 +621,18 @@ mod engine {
         }
     }
 
-    /// The voice style file the caller's `--voice` names, or `None` when the
-    /// engine has no such voice.
-    ///
-    /// A voice is spelled the way the product spells it: the style file's own
-    /// name, as the settings list them (`M1.json`). One `.json` may be left off
-    /// and the case does not matter, so `M1`, `m1` and `M1.json` all name the same
-    /// voice — but nothing else is accepted, because a voice the engine does not
-    /// have must be refused rather than quietly replaced by another. An unnamed
-    /// voice is the product's own, never a setting of its.
+    /// The voice style file the caller's `--voice` names, or `None` when the engine has no such
+    /// voice. A voice is spelled the way the product spells it: the style file's own name
+    /// (`M1.json`). One `.json` may be left off and the case does not matter, so `M1`, `m1` and
+    /// `M1.json` are one voice — nothing else is accepted, because a voice the engine does not have
+    /// must be refused rather than quietly replaced. An unnamed voice is the product's own, never a
+    /// setting's.
     pub(super) fn resolve_voice(named: Option<&str>) -> Option<String> {
         let Some(named) = named else {
             return Some(tts::DEFAULT_VOICE_NAME.to_string());
         };
-        // Lower case first, then one `.json` off: what is left of `M1.JSON` is
-        // `m1`, and the style files are read the same way.
+        // Lower case first, then one `.json` off: `M1.JSON` leaves `m1`, and the style files are
+        // read the same way.
         let asked = named.trim().to_ascii_lowercase();
         let asked = bare_name(&asked);
         tts::ALL_VOICE_STYLE_NAMES
@@ -707,19 +641,16 @@ mod engine {
             .map(|style| (*style).to_string())
     }
 
-    /// A style file's name without its extension: the way both a caller and the
-    /// engine's own list spell the same voice (`M1.json` and `M1` are one voice).
+    /// A style file's name without its extension: the way a caller and the engine's own list spell
+    /// one voice.
     fn bare_name(style: &str) -> &str {
         style.strip_suffix(".json").unwrap_or(style)
     }
 
-    /// The language code the caller's `--language` names, or `None` when the
-    /// engine does not know it.
-    ///
-    /// The engine's own codes are the product's spelling of a language (the
-    /// speech-output setting's values), so a code is matched against them as it
-    /// stands; an unnamed language is the engine's language-agnostic default
-    /// ([`crate::config::DEFAULT_TTS_LANGUAGE`]), never the setting's value.
+    /// The language code the caller's `--language` names, or `None` when the engine does not know
+    /// it. The engine's codes are the product's spelling of a language, so a code is matched
+    /// against them as it stands; an unnamed language is the engine's language-agnostic default,
+    /// never the setting's value.
     pub(super) fn resolve_language(named: Option<&str>) -> Option<String> {
         let Some(named) = named else {
             return Some(crate::config::DEFAULT_TTS_LANGUAGE.to_string());
@@ -731,36 +662,33 @@ mod engine {
             .map(|code| (*code).to_string())
     }
 
-    /// The refusal for an input that cannot be read at all — said the same way
-    /// whether the check that found it out was the type probe or the open.
+    /// The refusal for an input that cannot be read at all — the same whether the type probe or the
+    /// open found it.
     fn cannot_read(path: &Path, e: &std::io::Error) -> String {
         format!("'{}' cannot be read: {e}", path.display())
     }
 
-    /// Where the spoken file goes: the path the caller named, or a fresh name
-    /// this command picks inside a directory he named.
+    /// Where the spoken file goes: the path the caller named, or a fresh name this command picks
+    /// inside a directory he named.
     pub(super) enum Destination {
         /// The caller named the file itself.
         Named(PathBuf),
-        /// The caller named a directory; the name is chosen when the file is
-        /// created, so it can never collide with what is already there.
+        /// The caller named a directory; the name is chosen when the file is created, so it cannot
+        /// collide.
         Chosen(PathBuf),
     }
 
-    /// Read what `--output` names, before anything is fetched or rendered.
-    ///
-    /// The name is also where the caller says which container he wants, and
-    /// uncompressed WAV is the only one the product writes. The destination
-    /// directory is the caller's to make: this command never creates one.
+    /// Read what `--output` names, before anything is fetched or rendered. The name is also where
+    /// the caller says which container he wants, and uncompressed WAV is the only one the product
+    /// writes. The destination directory is the caller's to make: this command never creates one.
     pub(super) fn resolve_destination(output: &Path) -> Result<Destination, String> {
         if output.is_dir() {
             return Ok(Destination::Chosen(output.to_path_buf()));
         }
-        // A name with an extension names a container, and the name is where the
-        // caller says which one: uncompressed WAV is the only one the product
-        // writes. Absence is not a reason here — every new destination is absent
-        // — so a container this command cannot write is refused for what it is,
-        // whether or not something of that name is already there.
+        // A name with an extension names a container, and uncompressed WAV is the only one the
+        // product writes. Absence is not a reason here — every new destination is absent — so a
+        // container this command cannot write is refused for what it is, whether or not something
+        // of that name is already there.
         if output
             .extension()
             .is_some_and(|extension| !extension.eq_ignore_ascii_case("wav"))
@@ -771,8 +699,8 @@ mod engine {
                 output.display()
             ));
         }
-        // Nothing after a dot and nothing at that path: the caller named the
-        // directory he expected to find, and this command creates none.
+        // Nothing after a dot and nothing at that path: the caller named the directory he expected
+        // to find, and this command creates none.
         if output.extension().is_none() && !output.exists() {
             return Err(format!(
                 "'{}' is not there — this command creates nothing, so name a '.wav' file in a \
@@ -785,8 +713,7 @@ mod engine {
             && !parent.as_os_str().is_empty()
             && !parent.is_dir()
         {
-            // Why it cannot be used is what the caller needs to hear: a parent
-            // that is there and is not a directory is not a missing one.
+            // A parent that is there and is not a directory is not a missing one.
             return Err(if parent.exists() {
                 format!(
                     "'{}' cannot be written: '{}' is not a directory, and this command does not \
@@ -807,9 +734,8 @@ mod engine {
         Ok(Destination::Named(output.to_path_buf()))
     }
 
-    /// The refusal for a destination that is already taken, said the same way
-    /// whether the name was checked before the work or lost the race at the
-    /// create.
+    /// The refusal for a destination already taken, said the same way whether the name was checked
+    /// before the work or lost the race at the create.
     fn already_exists(path: &Path) -> String {
         format!(
             "{} already exists — this command never overwrites a file",
@@ -817,14 +743,14 @@ mod engine {
         )
     }
 
-    /// The refusal for audio that could not be written, said the same way whether
-    /// the caller named the file or this command chose the name.
+    /// The refusal for audio that could not be written — the same whether the caller named the file
+    /// or this command chose the name.
     fn cannot_write(path: &Path, e: &std::io::Error) -> String {
         format!("{} could not be written: {e}", path.display())
     }
 
-    /// Write the rendered audio where the destination points, returning the path
-    /// when this command picked the name.
+    /// Write the rendered audio where the destination points, returning the path when this command
+    /// picked the name.
     fn write_audio(destination: &Destination, wav: &[u8]) -> Result<Option<PathBuf>, String> {
         match destination {
             Destination::Named(path) => match write_new(path, wav) {
@@ -837,8 +763,8 @@ mod engine {
                     let path = dir.join(format!("mahbot-speech-{}.wav", crate::generate_id()));
                     match write_new(&path, wav) {
                         Ok(()) => return Ok(Some(path)),
-                        // The name was taken in the moment between choosing and
-                        // creating: another name is one call away.
+                        // The name was taken between choosing and creating: another name is one
+                        // call away.
                         Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
                         Err(e) => return Err(cannot_write(&path, &e)),
                     }
@@ -848,11 +774,9 @@ mod engine {
         }
     }
 
-    /// Create `path` and write the audio into it.
-    ///
-    /// `create_new` is what makes "never overwritten" true even against a file
-    /// that appeared a moment ago, and a write that fails removes what it
-    /// created — a failure leaves nothing at the destination.
+    /// Create `path` and write the audio into it. `create_new` makes "never overwritten" true even
+    /// against a file that appeared a moment ago, and a failed write removes what it created — a
+    /// failure leaves nothing behind.
     fn write_new(path: &Path, wav: &[u8]) -> std::io::Result<()> {
         use std::io::Write as _;
         let mut file = std::fs::OpenOptions::new()
@@ -867,8 +791,7 @@ mod engine {
         Ok(())
     }
 
-    /// A list of names as a sentence reads them: `a, b or c`, and just `a` for
-    /// one.
+    /// A list of names as a sentence reads them: `a, b or c`, and just `a` for one.
     fn listed<I, S>(names: I) -> String
     where
         I: IntoIterator<Item = S>,
@@ -886,15 +809,12 @@ mod engine {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The grammar a caller meets before he hears anything: what a flag tail
-    /// means, what one that means nothing says, and which required flags the
-    /// operation's own list refuses by name.
+    /// The grammar a caller meets before he hears anything: what a flag tail means, what one that
+    /// means nothing says, and which required flags the operation's own list refuses by name.
     #[test]
     fn flag_tails_and_required_flags() {
         let values = |tokens: &[&str]| match parse_flags(Operation::Speak, &owned(tokens)) {
@@ -919,8 +839,8 @@ mod tests {
         assert!(values(&["text"]).is_err_and(|r| r.contains("--flag")));
         assert_eq!(values(&["--text", "hi", "-h"]).unwrap_err(), "help");
 
-        // A required flag that was left out is refused by name, and it is the
-        // operation's own list that says which those are.
+        // A required flag that was left out is refused by name, and the operation's own list says
+        // which those are.
         let invocation = |tokens: &[&str]| parse(&owned(tokens));
         assert!(invocation(&["speak", "--text", "hi"]).is_err_and(|r| r.contains("--output")));
         assert!(invocation(&["transcribe"]).is_err_and(|r| r.contains("--input")));
@@ -932,8 +852,6 @@ mod tests {
         tokens.iter().map(|token| (*token).to_string()).collect()
     }
 
-    /// The engine's own vocabulary: the names it takes, read the way a caller may
-    /// spell them, and nothing else.
     #[cfg(target_os = "macos")]
     #[test]
     fn voice_and_language_names() {
@@ -958,8 +876,6 @@ mod tests {
         assert_eq!(resolve_language(Some("xx")), None);
     }
 
-    /// Where the file may go: a name this command can write, or a directory it
-    /// picks one in — and every refusal the caller can act on.
     #[cfg(target_os = "macos")]
     #[test]
     fn destination_rules() {
@@ -978,9 +894,8 @@ mod tests {
             Ok(Destination::Named(_))
         ));
         assert!(resolve_destination(&existing).is_err_and(|r| r.contains("never overwrites")));
-        // A container this command cannot write is refused for THAT, whether or
-        // not something of the name is already there: every new destination is
-        // absent, so absence can never be the reason for it.
+        // A container this command cannot write is refused for THAT, whether or not the name is
+        // already there.
         std::fs::write(dir.path().join("taken.ogg"), b"x").unwrap();
         for unsupported in ["absent.ogg", "taken.ogg"] {
             assert!(
@@ -992,9 +907,8 @@ mod tests {
                  for that whether or not it is there"
             );
         }
-        // A name with nothing after a dot and nothing at that path is the
-        // directory the caller expected to find — refused for that, and told
-        // which names do work.
+        // A name with nothing after a dot and nothing at that path is the directory the caller
+        // expected to find.
         for absent_dir in ["no-such-dir", "no-extension"] {
             assert!(
                 resolve_destination(&dir.path().join(absent_dir)).is_err_and(|reason| {
@@ -1007,8 +921,7 @@ mod tests {
             resolve_destination(&dir.path().join("absent").join("out.wav"))
                 .is_err_and(|r| r.contains("does not exist"))
         );
-        // A parent that is there and is not a directory is refused for what it
-        // is, never as a missing directory.
+        // A parent that is there and is not a directory is refused for what it is.
         assert!(
             resolve_destination(&existing.join("out.wav")).is_err_and(|r| {
                 r.contains("is not a directory") && !r.contains("does not exist")

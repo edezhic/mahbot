@@ -1,22 +1,12 @@
-//! Live read-only transcript snapshots for running agents.
+//! Live read-only transcript snapshots for running agents: the in-memory `Session`
+//! conversation is not yet fully persisted, so in-process readers (the Running Agents GUI
+//! and the Sessions page's live view) load this snapshot on top of the durable rows.
 //!
-//! A running agent's in-memory `Session` conversation is not yet fully
-//! persisted (the unpersisted tail). This module exposes the live transcript
-//! as a lock-free, read-only, point-in-time snapshot that in-process readers —
-//! the Running Agents GUI and the Sessions page's live-session view — load on
-//! top of the durable DB rows.
-//!
-//! ## Mechanism
-//!
-//! Each running agent owns an [`ArcSwap<TranscriptSnapshot>`] holder. The
-//! `Session` is the SOLE writer: on every mutation of history or token count it
-//! copy-on-writes a fresh snapshot and `.store()`s it. Readers call
-//! `.load_full()` to get an owned `Arc<TranscriptSnapshot>` (a refcount bump,
-//! no data copy) they can hold across an `.await`.
-//!
-//! The holder is indexed globally by `agent_id` in [`TRANSCRIPT_REGISTRY`],
-//! generation-guarded so an `agent_id` reused by a replacement run never
-//! surfaces or mutates a stale run's snapshot.
+//! Each running agent owns an [`ArcSwap<TranscriptSnapshot>`] holder; the `Session` is the
+//! SOLE writer and copy-on-writes a fresh snapshot on every history or token-count mutation.
+//! Readers `.load_full()` (a refcount bump, no data copy) and hold it across an `.await`. The
+//! holder is indexed by `agent_id` in [`TRANSCRIPT_REGISTRY`], generation-guarded so a reused
+//! `agent_id` never surfaces or mutates a stale run's snapshot.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,12 +18,9 @@ use arc_swap::ArcSwap;
 use crate::ChatMessage;
 use crate::util::UnwrapPoison;
 
-/// A coherent read-only point-in-time view of a running agent's live session
-/// transcript.
-///
-/// `history` is the full in-memory conversation (system prompt → current
-/// unpersisted tail); `token_count` is the LIVE session length as currently
-/// recorded by the agent — not a finalized-only figure.
+/// A coherent read-only point-in-time view of a running agent's live transcript: `history`
+/// is the full in-memory conversation (system prompt → unpersisted tail), and `token_count`
+/// is the LIVE session length, not a finalized-only figure.
 #[derive(Debug, Default)]
 pub struct TranscriptSnapshot {
     pub history: Vec<ChatMessage>,
@@ -46,10 +33,8 @@ struct TranscriptEntry {
     holder: Arc<ArcSwap<TranscriptSnapshot>>,
 }
 
-/// Global keyed accessor for running-agent transcript snapshots.
-///
-/// Indexed by `agent_id`; each entry is generation-guarded so a replacement
-/// agent with the same `agent_id` gets a FRESH holder and a stale
+/// Global keyed accessor for running-agent snapshots, indexed by `agent_id`; each entry is
+/// generation-guarded so a replacement agent with the same id gets a FRESH holder and a stale
 /// deregistration can never remove the replacement's entry.
 #[derive(Default)]
 pub(crate) struct TranscriptRegistry {
@@ -57,12 +42,9 @@ pub(crate) struct TranscriptRegistry {
 }
 
 impl TranscriptRegistry {
-    /// Register a fresh snapshot holder for `agent_id` at the given registry
-    /// generation. Returns the holder the agent's `Session` publishes into.
-    ///
-    /// Registering over an existing `agent_id` (a replacement run) replaces the
-    /// old holder — a reader holding an old `Arc<TranscriptSnapshot>` keeps
-    /// that immutable snapshot, and the replacement writes into a fresh holder.
+    /// Register a fresh holder for `agent_id` at the given generation and return it.
+    /// Registering over an existing id replaces the old holder — a reader holding the old
+    /// `Arc<TranscriptSnapshot>` keeps that immutable snapshot.
     pub fn register(&self, agent_id: String, generation: u64) -> Arc<ArcSwap<TranscriptSnapshot>> {
         let holder = Arc::new(ArcSwap::from_pointee(TranscriptSnapshot::default()));
         let mut map = self.inner.lock().unwrap_poison();
@@ -76,9 +58,8 @@ impl TranscriptRegistry {
         holder
     }
 
-    /// Remove the entry only if its generation still matches — a stale
-    /// deregistration from a finished/restarted agent can never remove a
-    /// replacement run's snapshot holder.
+    /// Remove the entry only if its generation still matches, so a stale deregistration
+    /// cannot remove a replacement run's holder.
     pub fn deregister(&self, agent_id: &str, generation: u64) {
         let mut map = self.inner.lock().unwrap_poison();
         if let Some(entry) = map.get(agent_id)
@@ -88,8 +69,7 @@ impl TranscriptRegistry {
         }
     }
 
-    /// The current live snapshot for `agent_id`, if that agent has registered
-    /// one. Returns an owned `Arc` (refcount bump, no data copy) the caller
+    /// The current live snapshot for `agent_id`, if registered — an owned `Arc` the caller
     /// can hold across an `.await`.
     #[must_use]
     pub fn snapshot(&self, agent_id: &str) -> Option<Arc<TranscriptSnapshot>> {
@@ -118,25 +98,22 @@ mod tests {
         GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// The generation is the identity of a run: a deregister carrying any other
-    /// generation touches nothing, neither the entry it re-registered over nor
-    /// the fresh holder a replacement run registered, and only the matching
-    /// generation removes it.
+    /// The generation is the identity of a run: a deregister carrying any other generation
+    /// touches nothing, and only the matching one removes the entry.
     #[test]
     fn only_the_matching_generation_removes_an_entry() {
         let agent_id = format!("snap_dereg_{}", crate::generate_suffix());
         let generation = next_gen();
         let holder_a = TRANSCRIPT_REGISTRY.register(agent_id.clone(), generation);
 
-        // Stale (wrong-generation) deregister is a no-op.
         TRANSCRIPT_REGISTRY.deregister(&agent_id, generation + 1);
         assert!(
             TRANSCRIPT_REGISTRY.snapshot(&agent_id).is_some(),
             "stale deregister must not remove the entry"
         );
 
-        // Replacement run registers a fresh holder with a new generation; the
-        // old run's deregister (now stale) must NOT remove it.
+        // A replacement run registers a fresh holder with a new generation; the old run's
+        // deregister (now stale) must NOT remove it.
         let gen_b = next_gen();
         let holder_b = TRANSCRIPT_REGISTRY.register(agent_id.clone(), gen_b);
         TRANSCRIPT_REGISTRY.deregister(&agent_id, generation);
@@ -145,7 +122,6 @@ mod tests {
             "replacement entry survives the stale deregister"
         );
 
-        // Matching deregister removes it.
         TRANSCRIPT_REGISTRY.deregister(&agent_id, gen_b);
         assert!(
             TRANSCRIPT_REGISTRY.snapshot(&agent_id).is_none(),

@@ -1,10 +1,8 @@
-//! Merged admin config tool — one `mahbot_config` action dispatcher for the
-//! four setup actions previously exposed as separate Support tools
-//! (`setup_telegram_bot`, `bind_telegram`, `add_user`, `setup_web_search`) plus
-//! the per-user custom-tool grants (`grant_tool` / `revoke_tool` /
-//! `list_grants`). It is now the admin's Assistant's sole configuration surface
-//! (the Support role is gone). Adding a managed workspace is not one of its
-//! actions — that lives in the `workspace` tool.
+//! Merged admin config tool — one `mahbot_config` action dispatcher for the four setup actions
+//! that were separate Support tools (`setup_telegram_bot`, `bind_telegram`, `add_user`,
+//! `setup_web_search`) plus the per-user custom-tool grants (`grant_tool` / `revoke_tool` /
+//! `list_grants`). It is the admin's Assistant's sole configuration surface. Adding a managed
+//! workspace is not one of its actions — that lives in the `workspace` tool.
 use crate::config::{
     CONFIG_KEY_DEEPSEEK_KEY, CONFIG_KEY_EXA_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN,
     CONFIG_KEY_WEB_SEARCH_PROVIDER,
@@ -21,9 +19,8 @@ fn err(msg: impl Into<String>) -> anyhow::Error {
     anyhow!(msg.into())
 }
 
-/// Read a Telegram binding value: the @username or the numeric id arrives as a
-/// string, but a number passed as a bare JSON number is that person's id just
-/// the same, so it is accepted rather than refused.
+/// The @username or numeric id arrive as a string, but a number passed as a bare JSON number is
+/// that person's id just the same, so it is accepted rather than refused.
 fn get_binding_value(args: &serde_json::Value, key: &str) -> anyhow::Result<String> {
     match args.get(key) {
         Some(value) if value.is_i64() || value.is_u64() => Ok(value.to_string()),
@@ -33,8 +30,8 @@ fn get_binding_value(args: &serde_json::Value, key: &str) -> anyhow::Result<Stri
     }
 }
 
-/// Read the optional `tools` field as a name list; absent (or explicit null)
-/// yields [`Option::None`], a present value is validated as an array of strings.
+/// The `tools` name list: absent (or null) yields `None`, a present value must be an array of
+/// strings.
 fn optional_tools(args: &serde_json::Value) -> anyhow::Result<Option<Vec<String>>> {
     match args.get("tools") {
         None | Some(serde_json::Value::Null) => Ok(None),
@@ -42,8 +39,8 @@ fn optional_tools(args: &serde_json::Value) -> anyhow::Result<Option<Vec<String>
     }
 }
 
-/// Read the optional `behavior` field; absent (or explicit null) yields
-/// [`Option::None`], a present value must be `continuous` or `one_off`.
+/// The `behavior` field: absent (or null) yields `None`, a present value must be `continuous`
+/// or `one_off`.
 fn read_behavior(args: &serde_json::Value) -> anyhow::Result<Option<CustomRoleBehavior>> {
     match super::get_opt_str_strict(args, "behavior")? {
         None => Ok(None),
@@ -51,10 +48,9 @@ fn read_behavior(args: &serde_json::Value) -> anyhow::Result<Option<CustomRoleBe
     }
 }
 
-/// Render a custom role's chosen tool subset for a human: the entries joined, or
-/// "none" for the empty subset. Each entry is spelled with the kinds it holds
-/// ([`crate::tools::grants::describe_all`]), so a bare entry shows the narrowest
-/// kind it implies rather than nothing.
+/// Render a custom role's chosen tool subset for a human: the entries joined, or "none" for the
+/// empty subset. Each entry is spelled with the kinds it holds
+/// ([`crate::tools::grants::describe_all`]), so a bare entry shows the narrowest kind it implies.
 fn format_tools(tools: &[String]) -> String {
     let described = crate::tools::grants::describe_all(tools);
     if described.is_empty() {
@@ -172,15 +168,12 @@ impl Tool for MahbotConfigTool {
 }
 
 impl MahbotConfigTool {
-    /// The one action dispatch both faces of the tool go through: `execute`
-    /// renders it to its text (so an agent's view is unchanged) and
-    /// [`Tool::execute_answer`] hands it over with the partiality flag a
-    /// command-line caller reads.
+    /// The one dispatch both faces of the tool go through: `execute` renders it to its text and
+    /// [`Tool::execute_answer`] hands it over with the partiality flag a command-line caller reads.
     ///
-    /// `add_user` is the one action that can be carried out in part — the
-    /// account is created whatever happens, and that account's personal
-    /// workspace folder separately — so it builds its own answer; every other
-    /// action either happens in full or fails.
+    /// `add_user` alone can half-succeed — the account is created whatever happens, and its
+    /// personal workspace folder separately — so it builds its own answer; every other action
+    /// happens in full or fails.
     async fn answer(&self, args: serde_json::Value) -> anyhow::Result<ToolAnswer> {
         match super::get_str(&args, "action")? {
             "add_user" => self.answer_add_user(args).await,
@@ -228,28 +221,23 @@ impl MahbotConfigTool {
         ))
     }
 
-    /// Create guest account `name` and bind `telegram` to them, reporting the
-    /// two things the action does — the account, and that account's personal
-    /// workspace folder — truthfully: the folder can be refused while the
-    /// account is still created, and then the answer says what did not happen
-    /// and is partial rather than a whole success.
+    /// Create guest account `name` and bind `telegram` to it, reporting both halves truthfully:
+    /// the folder can be refused while the account is still created, and the answer is then
+    /// partial rather than a whole success.
     async fn answer_add_user(&self, args: serde_json::Value) -> anyhow::Result<ToolAnswer> {
         let name = super::get_str(&args, "name")?;
         let value = get_binding_value(&args, "telegram")?;
 
-        // The name IS the admin marker, so the reserved admin name is refused
-        // before any store access — whether this action creates the account or
-        // only finishes binding one. A name that would become a new account's
-        // folder is checked by `add_user`, which refuses it before its row
-        // exists — the folder rule and the case/composition collision alike; a
-        // name that already identifies one is never re-judged there.
+        // The name IS the admin marker, so the reserved admin name is refused before any store
+        // access. A name that would become a new account's folder is checked by `add_user`, which
+        // refuses it before its row exists — the folder rule and the case/composition collision
+        // alike; a name that already identifies one is never re-judged there.
         crate::users::refuse_admin_name(name)?;
 
         let store = crate::users::store();
         let exists = store.user_exists(name).await?;
-        // A name that already exists and already holds a Telegram binding is a
-        // duplicate account, and the retry cannot complete it: say what is
-        // actually there, and how to free it for a different binding.
+        // A name that already exists and already holds a Telegram binding is a duplicate account
+        // the retry cannot complete: say what is there, and how to free it.
         if exists && let Some(existing) = store.telegram_binding(name).await? {
             return Err(err(format!(
                 "A user named '{name}' already exists, with the Telegram binding {} — remove \
@@ -257,10 +245,9 @@ impl MahbotConfigTool {
                 crate::users::describe_telegram_binding(&existing)
             )));
         }
-        // Guard the value: the reserved sentinel, the service identities, an
-        // existing binding of this account, and a value owned by another
-        // account. After that, `exists` only decides what is reported, since a
-        // row holding no Telegram binding is a half-finished earlier run.
+        // Guard the reserved sentinel, the service identities, an existing binding of this
+        // account, and a value owned by another account. `exists` then only decides what is
+        // reported, since a row holding no binding is a half-finished earlier run.
         let identifier = store.validate_telegram_bind(name, &value).await?;
 
         let outcome = store.add_user(name).await?;
@@ -274,9 +261,8 @@ impl MahbotConfigTool {
         };
         let answer =
             format!("{account} They are a guest — they chat with the Assistant agent only.");
-        // The account half is always true — the row exists either way; the
-        // folder half is stated only when it did not happen, and then the answer
-        // is partial.
+        // The account half is always true — the row exists either way; the folder half is
+        // stated only when it did not happen, and then the answer is partial.
         match outcome {
             AddUserOutcome::Complete => Ok(ToolAnswer::done(answer)),
             AddUserOutcome::WithoutPersonalWorkspace => Ok(ToolAnswer::partial(format!(
@@ -315,10 +301,9 @@ impl MahbotConfigTool {
     async fn exec_grant_tool(&self, args: serde_json::Value) -> anyhow::Result<String> {
         let user = super::get_str(&args, "user")?;
         let tool = super::get_str(&args, "tool")?;
-        // A grant is recorded whatever the catalogue holds — it does not depend
-        // on the file — but a name that could never be a tool name (a path, a
-        // dot-file, empty) is a typo worth reporting now rather than storing a
-        // grant that shows on the user's card and can never resolve.
+        // A grant is recorded whatever the catalogue holds, but a name that could never be a
+        // tool name (a path, a dot-file, empty) is a typo worth reporting now rather than storing
+        // a grant that can never resolve.
         if !crate::tools::custom::is_tool_name(tool) {
             return Err(err(format!(
                 "usage: '{tool}' cannot be a custom tool name — hint: a tool's name is its \
@@ -334,8 +319,8 @@ impl MahbotConfigTool {
                      them first"
                 )));
             }
-            // An idempotent re-grant changes nothing, so there is nothing to
-            // announce; only a real change wakes the account's Assistant.
+            // An idempotent re-grant changes nothing to announce; only a real change wakes the
+            // account's Assistant.
             GrantChange::Unchanged => {}
             GrantChange::Changed => {
                 crate::tools::custom::notify_grant_change(user, tool, true).await;
@@ -354,8 +339,8 @@ impl MahbotConfigTool {
 
         let store = crate::users::store();
         match store.remove_grant(user, tool).await? {
-            // A missing user is not an error, but reporting a revoke that
-            // touched nothing would be a false confirmation.
+            // A missing user is not an error, but reporting a revoke that touched nothing would
+            // be a false confirmation.
             GrantChange::NoUser => {
                 return Ok(format!("No user '{user}' — nothing was revoked."));
             }
@@ -373,8 +358,7 @@ impl MahbotConfigTool {
     }
 
     async fn exec_list_grants(&self, args: serde_json::Value) -> anyhow::Result<String> {
-        // Refuse a wrong-typed user before the store is touched, like the other
-        // argument checks.
+        // Refuse a wrong-typed user before the store is touched, like the other argument checks.
         let user = super::get_opt_str_strict(&args, "user")?;
         let store = crate::users::store();
         let Some(user) = user else {
@@ -390,9 +374,8 @@ impl MahbotConfigTool {
         };
         let grants = store.get_grants(user).await?;
         if grants.is_empty() {
-            // "No grants" and "no such user" read the same out of the store,
-            // and reporting the first for a name that does not exist would be a
-            // false confirmation — as `revoke_tool` avoids too.
+            // "No grants" and "no such user" read the same out of the store, and the first would
+            // be a false confirmation — as `revoke_tool` avoids too.
             if !store.user_exists(user).await? {
                 return Ok(format!("No user '{user}' — nothing to list."));
             }
@@ -464,18 +447,16 @@ mod tests {
     use crate::workspace::test_ws;
     use serde_json::json;
 
-    /// The merged tool's error paths that fire before any store/persist access
-    /// (action dispatch, unknown action, and per-action required-field and
-    /// provider validation) are pure and cheaply testable.
+    /// The error paths that fire before any store access (action dispatch, unknown action,
+    /// per-action required-field and provider validation) are pure and cheaply testable.
     #[tokio::test]
     async fn action_dispatch_and_unknown_action() {
         let tool = MahbotConfigTool;
         let ws = test_ws("/tmp/test_ws");
 
-        // `list_grants` and `list_custom_roles` are absent: neither has a
-        // required field, so they would legitimately succeed with these args —
-        // their names are pinned by the unknown-action message asserted below
-        // instead.
+        // `list_grants` and `list_custom_roles` are absent: neither has a required field, so
+        // they would succeed with these args — their names are pinned by the unknown-action
+        // message below.
         for action in [
             "setup_telegram_bot",
             "bind_telegram",
@@ -488,8 +469,8 @@ mod tests {
             "delete_custom_role",
         ] {
             let args = json!({ "action": action });
-            // Each action reports its own missing required field, proving the
-            // dispatcher routes to the right handler.
+            // Each action reports its own missing required field, proving the dispatcher routes
+            // correctly.
             let err = tool.execute(&ws, args).await.unwrap_err().to_string();
             assert!(
                 err.contains("usage: missing required argument"),
@@ -497,9 +478,8 @@ mod tests {
             );
         }
 
-        // A present but wrong-typed `user` must not silently read as "every
-        // user" — the one argument check `list_grants` performs before touching
-        // any store.
+        // A present but wrong-typed `user` must not read as "every user" — the one argument check
+        // `list_grants` makes before touching a store.
         let err = tool
             .execute(&ws, json!({ "action": "list_grants", "user": 5 }))
             .await
@@ -507,8 +487,8 @@ mod tests {
             .to_string();
         assert!(err.contains("must be a string"), "got: {err}");
 
-        // A grant names a tool the way a call does: a name that could never be
-        // one is rejected instead of being recorded.
+        // A grant names a tool the way a call does: a name that could never be one is rejected
+        // instead of recorded.
         let err = tool
             .execute(
                 &ws,
@@ -584,9 +564,8 @@ mod tests {
             );
         }
 
-        // A name with nothing to change is not a missing required argument but
-        // a usage error of its own: `update_custom_role` must be told what to
-        // update.
+        // Not a missing argument but a usage error of its own: `update_custom_role` must be told
+        // what to update.
         let err = tool
             .execute(&ws, json!({ "action": "update_custom_role", "name": "a" }))
             .await
@@ -685,9 +664,8 @@ mod tests {
         }
     }
 
-    /// The assistant's config surface prints a role's kind grants: a bare entry
-    /// is spelled with the narrowest kind it implies, and an explicit
-    /// `tool:k1,k2` entry reads back exactly as it is stored.
+    /// A bare entry is spelled with the narrowest kind it implies, and an explicit
+    /// `tool:k1,k2` entry reads back as stored.
     #[tokio::test]
     async fn list_custom_roles_shows_the_kinds_a_role_holds() {
         crate::util::test::init_test_stores().await;
@@ -714,8 +692,7 @@ mod tests {
         );
     }
 
-    /// A created account whose personal workspace folder is in place answers
-    /// exactly as it always has, and is not partial.
+    /// Answers exactly as it always has, and is not partial.
     #[tokio::test]
     async fn add_user_answers_a_whole_success_when_the_folder_is_created() {
         crate::util::test::init_test_stores().await;
@@ -746,16 +723,14 @@ mod tests {
         );
     }
 
-    /// A personal workspace folder that cannot be created is reported as the
-    /// part that did not happen: the account is still created and the answer
-    /// says so, and the answer is partial rather than a whole success.
+    /// The account is still created and the answer says so, partial rather than a whole success.
     #[tokio::test]
     async fn add_user_answers_a_partial_result_when_the_folder_cannot_be_created() {
         crate::util::test::init_test_stores().await;
         let tool = MahbotConfigTool;
         let ws = test_ws("/tmp/test_ws");
-        // A file where the folder must go makes `create_dir_all` fail
-        // deterministically on every platform.
+        // A file where the folder must go makes `create_dir_all` fail deterministically on
+        // every platform.
         let name = "FolderRefusedGuest";
         let marker = crate::users::personal_workspace_path(name);
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();

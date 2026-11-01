@@ -1,18 +1,15 @@
 //! The `rasterize` tool: a file or a page in, an ordinary picture out.
 //!
-//! An SVG is markup, a PDF is a container, and an HTML file or a web address is
-//! a page: the product could only read them as text or as extracted pages. This
-//! renders them into a PNG, the product's usual picture format: the assistant
-//! sees it through the ordinary tool-result payload, sends it to the user
-//! through the ordinary `[IMAGE:path]` marker, and the file itself is a picture
-//! like any other. Nothing about the way pictures are shown or delivered
-//! changes, and neither does the document pipeline this action deliberately sits
-//! outside of.
+//! An SVG is markup, a PDF is a container, and an HTML file or a web address is a page: the product
+//! could only read them as text or as extracted pages. This renders them into a PNG, the product's
+//! usual picture format: the assistant sees it through the ordinary tool-result payload, sends it
+//! to the user through the ordinary `[IMAGE:path]` marker, and the file itself is a picture like
+//! any other. Nothing about the way pictures are shown or delivered changes, and neither does the
+//! document pipeline this action deliberately sits outside of.
 //!
-//! SVG, one page of a PDF, a local HTML file and an http(s) address are the
-//! inputs accepted today. The tool is named and described by the action rather
-//! than by those formats, so a further one is a further input rather than a new
-//! tool.
+//! SVG, one page of a PDF, a local HTML file and an http(s) address are the inputs accepted today.
+//! The tool is named and described by the action rather than by those formats, so a further one is
+//! a further input rather than a new tool.
 //!
 //! Four rules the implementation exists to hold:
 //!
@@ -38,8 +35,8 @@
 //!   pages there are when `page` is missing or past the end, and nothing
 //!   interactive — form values, comments, links — in the picture.
 //!
-//! A browser capture never shares the in-process renders' permit pool, so it
-//! cannot delay one; the capture's own rules live with it.
+//! A browser capture never shares the in-process renders' permit pool, so it cannot delay one; the
+//! capture's own rules live with it.
 
 use std::borrow::Cow;
 use std::io::Cursor;
@@ -59,57 +56,42 @@ use tokio::sync::Semaphore;
 use super::path::PathAccess;
 use crate::{Tool, Workspace};
 
-/// The longest side of a produced picture, in pixels: a drawing or page larger
-/// than it is scaled down to it with its aspect ratio kept, and one already
-/// smaller is left at its own size; an HTML page is captured at the fixed
-/// viewport and then fitted down to it. 2048 is the same order as the page
-/// rasters the document readers produce, and bounds one render at 16 MB of
-/// pixels.
+/// The longest side of a produced picture, in pixels: a drawing or page larger than it is scaled
+/// down to it with its aspect ratio kept, and one already smaller is left at its own size; an HTML
+/// page is captured at the fixed viewport and then fitted down to it. 2048 is the same order as the
+/// page rasters the document readers produce, and bounds one render at 16 MB of pixels.
 pub(super) const MAX_LONG_SIDE_PX: u32 = 2048;
 
-/// The first two bytes of a gzip stream — how a compressed drawing is told from
-/// markup without parsing it.
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
-/// The first five bytes of a PDF — how a PDF is told from SVG markup without
-/// parsing it.
 const PDF_MAGIC: &[u8; 5] = b"%PDF-";
 
-/// How many in-process renders may run at once, process-wide. The engine is
-/// synchronous and one render holds a whole picture's worth of pixels for as
-/// long as it runs, so this bounds the work the action can put on the machine
-/// at once. HTML renders take [`HTML_RENDERS`] instead: a browser capture must
-/// never delay an in-process one.
+/// How many in-process renders may run at once, process-wide. The engine is synchronous and one
+/// render holds a whole picture's worth of pixels for as long as it runs, so this bounds the work
+/// the action can put on the machine at once. HTML renders take [`HTML_RENDERS`] instead: a browser
+/// capture must never delay an in-process one.
 static RENDERS: Semaphore = Semaphore::const_new(2);
 
-/// How many browser captures may run at once, process-wide — one browser session
-/// each, so this bounds the tabs the action can open on the owner's Chrome. A
-/// separate permit pool from [`RENDERS`], so an HTML render never delays an
-/// in-process one.
+/// How many browser captures may run at once, process-wide — one browser session each, so this
+/// bounds the tabs the action can open on the owner's Chrome. A separate permit pool from
+/// [`RENDERS`], so an HTML render never delays an in-process one.
 static HTML_RENDERS: Semaphore = Semaphore::const_new(2);
 
-/// Which renderer an input is handed to, from its bytes and its name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenderKind {
-    /// One page of a PDF, rendered in process.
     Pdf,
-    /// SVG markup, plain or gzip-compressed, rendered in process.
     Svg,
-    /// A page captured through the product's connected browser.
     Html,
 }
 
-/// The `rasterize` tool. `access` is the caller's [`PathAccess`], fixed when the
-/// role's toolset is built: the input, the resources a drawing refers to and
-/// every file the page server hands out are read under it exactly as a `read` of
-/// them would be.
+/// The `rasterize` tool. `access` is the caller's [`PathAccess`], fixed when the role's toolset is
+/// built: the input, the resources a drawing refers to and every file the page server hands out are
+/// read under it exactly as a `read` of them would be.
 pub(crate) struct RasterizeTool {
     access: PathAccess,
 }
 
 impl RasterizeTool {
-    /// The tool's own name: what [`Tool::name`] reports, the prompt asset that
-    /// describes it, and the tool a command-line family fronts.
     const NAME: &'static str = "rasterize";
 
     #[must_use]
@@ -146,26 +128,21 @@ impl Tool for RasterizeTool {
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
-        // The picture travels as the tool's `[IMAGE:...]` marker, the shape every
-        // produced picture uses: the marker delivers the file to the user, and the
-        // agent loop derives the assistant's own bounded copy of it in this same
-        // step (`Agent::tool_result_content`).
+        // The picture travels as the tool's `[IMAGE:...]` marker, the shape every produced picture
+        // uses: the marker delivers the file to the user, and the agent loop derives the
+        // assistant's own bounded copy of it in this same step (`Agent::tool_result_content`).
         Ok(self.format_media_result(&self.rasterize(ws, &args).await?))
     }
 }
 
 impl RasterizeTool {
-    /// Render the file or address one call names, and answer the picture the
-    /// product wrote.
     async fn rasterize(&self, ws: &Workspace, args: &serde_json::Value) -> anyhow::Result<PathBuf> {
         let requested = super::get_str(args, "path")?;
         let page = super::get_opt_u64(args, "page")?;
-        // An address is never resolved as a file: the page it names is fetched by
-        // the product's own browser, under the URL policy a navigation obeys. Any
-        // other address scheme is refused as one — `file://` included — rather
-        // than looked up as a file path it cannot be.
+        // An address is never resolved as a file: the page it names is fetched by the product's own
+        // browser, under the URL policy a navigation obeys. Any other address scheme is refused as
+        // one — `file://` included — rather than looked up as a file path it cannot be.
         if let Some(url) = as_render_url(requested) {
-            // A page names one page of a PDF, and a page has no pages to choose from.
             if page.is_some() {
                 return Err(page_is_for_pdf(requested));
             }
@@ -182,9 +159,9 @@ impl RasterizeTool {
                  this one uses {scheme}"
             );
         }
-        // The input is resolved through the read gate before anything else, so a
-        // path the caller may not read is never even stat'ed — and the boundary
-        // every resource a drawing refers to is held to is this same one.
+        // The input is resolved through the read gate before anything else, so a path the caller
+        // may not read is never even stat'ed — and the boundary every resource a drawing refers to
+        // is held to is this same one.
         let drawing =
             super::path::resolve_read_target(ws.as_path(), requested, self.access).await?;
         let unreadable = |error: std::io::Error| {
@@ -211,9 +188,8 @@ impl RasterizeTool {
         }
 
         let kind = classify(&data, &drawing);
-        // A page names one page of a PDF; any other file is a single picture with
-        // no pages to choose from, so naming one there is refused rather than
-        // silently ignored.
+        // A page names one page of a PDF; any other file is a single picture with no pages to
+        // choose from, so naming one there is refused rather than silently ignored.
         if page.is_some() && kind != RenderKind::Pdf {
             return Err(page_is_for_pdf(requested));
         }
@@ -241,9 +217,9 @@ impl RasterizeTool {
         super::save_generated_file(ws, &picture, "rasterized", "png").await
     }
 
-    /// Render a local HTML page out of the caller's personal workspace: the page
-    /// server only ever hands out files from under that root, so a file outside
-    /// it is refused before anything is started.
+    /// Render a local HTML page out of the caller's personal workspace: the page server only ever
+    /// hands out files from under that root, so a file outside it is refused before anything is
+    /// started.
     async fn html_picture(
         &self,
         ws: &Workspace,
@@ -277,8 +253,8 @@ impl RasterizeTool {
     }
 }
 
-/// One browser-capture permit, process-wide: a capture never takes one of the
-/// in-process renders' permits and so never delays one.
+/// One browser-capture permit, process-wide: a capture never takes one of the in-process renders'
+/// permits and so never delays one.
 async fn capture_permit() -> tokio::sync::SemaphorePermit<'static> {
     HTML_RENDERS
         .acquire()
@@ -286,23 +262,20 @@ async fn capture_permit() -> tokio::sync::SemaphorePermit<'static> {
         .expect("the browser-capture semaphore is never closed")
 }
 
-/// The one refusal for naming a page where there are none to choose from: only a
-/// PDF has pages, and neither an address nor a single picture has any.
+/// The one refusal for naming a page where there are none to choose from: only a PDF has pages, and
+/// neither an address nor a single picture has any.
 fn page_is_for_pdf(name: &str) -> anyhow::Error {
     anyhow::anyhow!("cannot render {name}: naming a page is for a PDF — only a PDF has pages")
 }
 
-/// The address a call names, when what it names is one: a trimmed `http`/`https`
-/// URL with a host. Anything else is a local path, resolved as a file.
 fn as_render_url(requested: &str) -> Option<&str> {
     let trimmed = requested.trim();
     let url = url::Url::parse(trimmed).ok()?;
     (matches!(url.scheme(), "http" | "https") && url.host().is_some()).then_some(trimmed)
 }
 
-/// The scheme of an address that is not http(s) — a `file://` a caller may try,
-/// or any other scheme that carries a host (a single-letter drive prefix does
-/// not, so a Windows path stays a path).
+/// The scheme of an address that is not http(s) — a `file://` a caller may try, or any other scheme
+/// that carries a host (a single-letter drive prefix does not, so a Windows path stays a path).
 fn non_http_address(requested: &str) -> Option<String> {
     let trimmed = requested.trim();
     if trimmed.to_ascii_lowercase().starts_with("file://") {
@@ -313,20 +286,17 @@ fn non_http_address(requested: &str) -> Option<String> {
         .then(|| url.scheme().to_string())
 }
 
-/// The root an HTML input must live under: the caller's personal workspace,
-/// built from the caller's name only when it is a name the product itself builds
-/// a workspace path from. No valid user identity — none bound, or a stored name
-/// that is not a user name — means no personal workspace, and the hard boundary
-/// refuses rather than widening to whatever workspace the call happens to run in.
+/// The root an HTML input must live under: the caller's personal workspace, built from the caller's
+/// name only when it is a name the product itself builds a workspace path from. No valid user
+/// identity — none bound, or a stored name that is not a user name — means no personal workspace,
+/// and the hard boundary refuses rather than widening to whatever workspace the call happens to run
+/// in.
 fn personal_root() -> Option<PathBuf> {
     let user = crate::agent::tool_user_name();
     crate::users::is_valid_personal_user_name(&user)
         .then(|| crate::users::personal_workspace_path(&user))
 }
 
-/// Which renderer an input's bytes and name select: a PDF by its magic, a
-/// compressed drawing by its gzip magic, then HTML by its markup or its name —
-/// and SVG for everything else.
 fn classify(data: &[u8], path: &Path) -> RenderKind {
     if data.starts_with(PDF_MAGIC) {
         RenderKind::Pdf
@@ -339,8 +309,6 @@ fn classify(data: &[u8], path: &Path) -> RenderKind {
     }
 }
 
-/// Whether an input is an HTML page: what it opens with decides, and a file whose
-/// name says `.html`/`.htm` is a page whatever its markup is.
 fn is_html_document(data: &[u8], path: &Path) -> bool {
     let markup = data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(data);
     if opens_as_html(markup) {
@@ -355,9 +323,9 @@ fn is_html_document(data: &[u8], path: &Path) -> bool {
     )
 }
 
-/// Whether the markup opens as an HTML document, past the comments, processing
-/// instructions and declarations a page may put before its doctype or root
-/// element: an HTML doctype, or the first element being `<html`.
+/// Whether the markup opens as an HTML document, past the comments, processing instructions and
+/// declarations a page may put before its doctype or root element: an HTML doctype, or the first
+/// element being `<html`.
 fn opens_as_html(markup: &[u8]) -> bool {
     let mut rest = markup;
     loop {
@@ -400,9 +368,8 @@ fn opens_as_html(markup: &[u8]) -> bool {
             .is_some_and(|next| next.is_ascii_whitespace() || *next == b'>' || *next == b'/')
 }
 
-/// Run one in-process render under the shared permit, on a blocking thread,
-/// turning a panic in the engine into this tool's own refusal rather than the
-/// process's end.
+/// Run one in-process render under the shared permit, on a blocking thread, turning a panic in the
+/// engine into this tool's own refusal rather than the process's end.
 async fn in_process_render(
     name: &str,
     render: impl FnOnce() -> anyhow::Result<Vec<u8>> + Send + 'static,
@@ -419,17 +386,15 @@ async fn in_process_render(
     }
 }
 
-/// Render one page of a PDF into a PNG picture: parse it, choose the page, size
-/// the render, rasterize it, encode it. Synchronous, and run on a blocking
-/// thread (see [`RasterizeTool::rasterize`]). `name` is the caller's own spelling
-/// of the input, which every refusal quotes back, and `page_arg` is the page the
-/// call named, if any.
+/// Render one page of a PDF into a PNG picture: parse it, choose the page, size the render,
+/// rasterize it, encode it. Synchronous, and run on a blocking thread (see
+/// [`RasterizeTool::rasterize`]). `name` is the caller's own spelling of the input, which every
+/// refusal quotes back, and `page_arg` is the page the call named, if any.
 #[expect(clippy::cast_precision_loss)] // the cap is 2048, exactly an f32
 fn render_pdf_page_png(data: &[u8], name: &str, page_arg: Option<u64>) -> anyhow::Result<Vec<u8>> {
-    // The structure parse also settles encryption: hayro decrypts with the empty
-    // user password, so an owner-password-only document opens, while one that
-    // needs a password is refused. A panic in the parse is this tool's own
-    // unreadable-input refusal rather than the process's end.
+    // The structure parse also settles encryption: hayro decrypts with the empty user password, so
+    // an owner-password-only document opens, while one that needs a password is refused. A panic in
+    // the parse is this tool's own unreadable-input refusal rather than the process's end.
     let pdf = match std::panic::catch_unwind(|| Pdf::new(data.to_vec())) {
         Ok(Ok(pdf)) => pdf,
         Ok(Err(LoadPdfError::Decryption(DecryptionError::PasswordProtected))) => anyhow::bail!(
@@ -440,14 +405,13 @@ fn render_pdf_page_png(data: &[u8], name: &str, page_arg: Option<u64>) -> anyhow
         }
     };
     let count = pdf.pages().len();
-    // No page is named or chosen in a document that has none.
     if count == 0 {
         anyhow::bail!("cannot render {name}: this PDF has no pages");
     }
     let page_number = match page_arg {
         Some(page) => {
-            // A page argument the platform cannot index is past any document's
-            // end, and is refused the same way.
+            // A page argument the platform cannot index is past any document's end, and is refused
+            // the same way.
             let page = usize::try_from(page).unwrap_or(usize::MAX);
             if page == 0 || page > count {
                 anyhow::bail!(
@@ -464,15 +428,14 @@ fn render_pdf_page_png(data: &[u8], name: &str, page_arg: Option<u64>) -> anyhow
             ),
         },
     };
-    // The number was checked against the length of this same page tree, so the
-    // lookup cannot miss.
+    // The number was checked against the length of this same page tree, so the lookup cannot miss.
     let page = pdf
         .pages()
         .get(page_number - 1)
         .expect("the page number was checked against this page tree");
-    // A page is never enlarged past its own size — the cap only brings a large
-    // one down — and its pixels come from the one page-to-pixels render the
-    // document readings share; the cap and the PNG encoding are this tool's own.
+    // A page is never enlarged past its own size — the cap only brings a large one down — and its
+    // pixels come from the one page-to-pixels render the document readings share; the cap and the
+    // PNG encoding are this tool's own.
     let Some(image) = crate::document::render_page_image(page, MAX_LONG_SIDE_PX as f32, 1.0) else {
         anyhow::bail!(
             "cannot render {name}: the page produced no pixels — hint: try a different page or \
@@ -488,10 +451,9 @@ fn render_pdf_page_png(data: &[u8], name: &str, page_arg: Option<u64>) -> anyhow
     Ok(png)
 }
 
-/// Render one drawing into a PNG picture: parse it, size it, rasterize it, encode
-/// it. Synchronous, and run on a blocking thread (see
-/// [`RasterizeTool::rasterize`]). `dir` is the drawing's own directory, so a
-/// relative reference resolves beside it, and `name` is the caller's own spelling
+/// Render one drawing into a PNG picture: parse it, size it, rasterize it, encode it. Synchronous,
+/// and run on a blocking thread (see [`RasterizeTool::rasterize`]). `dir` is the drawing's own
+/// directory, so a relative reference resolves beside it, and `name` is the caller's own spelling
 /// of the input, which every refusal quotes back.
 fn render_png(
     data: &[u8],
@@ -502,16 +464,16 @@ fn render_png(
 ) -> anyhow::Result<Vec<u8>> {
     let markup = markup(data, name)?;
     let fonts = fonts();
-    // A referenced file is loaded by the engine's own resolver — its format
-    // handling (raster magics, nested SVG) is not restated here — once
-    // `resolve_reference_target` has put the caller's own gate in front of it.
+    // A referenced file is loaded by the engine's own resolver — its format handling (raster
+    // magics, nested SVG) is not restated here — once `resolve_reference_target` has put the
+    // caller's own gate in front of it.
     let load_reference = usvg::ImageHrefResolver::default_string_resolver();
 
     let render_options = usvg::Options {
         resources_dir: Some(dir.to_path_buf()),
-        // The engine's own font selection, on the database `fonts` built: the
-        // machine's faces, with the shipped font answering what they cannot (and
-        // answering the text that names no family, through the family below).
+        // The engine's own font selection, on the database `fonts` built: the machine's faces, with
+        // the shipped font answering what they cannot (and answering the text that names no family,
+        // through the family below).
         font_family: fonts.family.clone(),
         fontdb: Arc::clone(&fonts.db),
         image_href_resolver: usvg::ImageHrefResolver {
@@ -552,15 +514,14 @@ fn render_png(
     })
 }
 
-/// The scale factor one drawing is rendered at: its own size, or the cap when it
-/// is larger — and never more than one, so a small drawing stays crisp.
+/// The scale factor one drawing is rendered at: its own size, or the cap when it is larger — and
+/// never more than one, so a small drawing stays crisp.
 #[expect(clippy::cast_precision_loss)] // the cap is 2048, exactly an f32
 fn render_scale(size: usvg::Size) -> f32 {
     (MAX_LONG_SIDE_PX as f32 / size.width().max(size.height())).min(1.0)
 }
 
-/// One axis of the produced picture, in pixels: rounded, at least one, and never
-/// past the cap.
+/// One axis of the produced picture, in pixels: rounded, at least one, and never past the cap.
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -570,13 +531,10 @@ fn pixels(value: f32) -> u32 {
     value.round().clamp(1.0, MAX_LONG_SIDE_PX as f32) as u32
 }
 
-/// The drawing's own markup: the bytes as they are, or the gzip stream they are
-/// wrapped in, unwrapped.
-///
-/// The unwrapping is this tool's own rather than the engine's, whose `svgz`
-/// feature is deliberately not enabled: the engine's path reads a whole stream
-/// into memory with no bound, while the file it was handed is already bounded —
-/// and stays bounded here, by that same limit.
+/// The drawing's own markup: the bytes as they are, or the gzip stream they are wrapped in,
+/// unwrapped. The unwrapping is this tool's own rather than the engine's, whose `svgz` feature is
+/// deliberately not enabled: the engine's path reads a whole stream into memory with no bound,
+/// while the file it was handed is already bounded — and stays bounded here, by that same limit.
 fn markup<'a>(data: &'a [u8], name: &str) -> anyhow::Result<Cow<'a, [u8]>> {
     if !data.starts_with(&GZIP_MAGIC) {
         return Ok(Cow::Borrowed(data));
@@ -611,8 +569,6 @@ fn refusal(name: &str, error: &usvg::Error) -> anyhow::Error {
         }
         usvg::Error::ElementsLimitReached => "it has more elements than the renderer accepts",
         usvg::Error::MalformedGZip => "its gzip stream is malformed",
-        // What is left of a compressed input: the engine's own `svgz` path is off,
-        // so this is a stream that is compressed inside a stream already unwrapped.
         usvg::Error::SvgzFeatureNotEnabled => "its compressed form could not be unwrapped",
     };
     anyhow::anyhow!(
@@ -621,18 +577,13 @@ fn refusal(name: &str, error: &usvg::Error) -> anyhow::Error {
     )
 }
 
-/// The fonts one render draws text with: this machine's own collection with the
-/// font the product ships registered in it, and the family that font declares.
 struct Fonts {
-    /// Every face the machine has, the shipped font among them.
     db: Arc<fontdb::Database>,
-    /// The shipped font's family name — what a file naming no family resolves
-    /// under, and what the generic `serif` answers with.
     family: String,
 }
 
-/// The process's font set, built once: finding the machine's fonts walks its font
-/// directories and maps every face, which a conversion must not repeat.
+/// The process's font set, built once: finding the machine's fonts walks its font directories and
+/// maps every face, which a conversion must not repeat.
 fn fonts() -> &'static Fonts {
     static FONTS: OnceLock<Fonts> = OnceLock::new();
     FONTS.get_or_init(|| {
@@ -649,10 +600,10 @@ fn fonts() -> &'static Fonts {
             .face(bundled)
             .and_then(|face| face.families.first().map(|(name, _)| name.clone()))
             .unwrap_or_default();
-        // What answers a family the machine cannot supply: the engine's selector
-        // ends every family list with its generic `serif`, and answers with what
-        // that names — the machine's own serif, where the machine has one — so
-        // this environment's generic is pointed at the font the product ships.
+        // What answers a family the machine cannot supply: the engine's selector ends every family
+        // list with its generic `serif`, and answers with what that names — the machine's own
+        // serif, where the machine has one — so this environment's generic is pointed at the font
+        // the product ships.
         db.set_serif_family(family.clone());
         Fonts {
             db: Arc::new(db),
@@ -668,11 +619,9 @@ mod tests {
     use std::io::Write as _;
     use tempfile::TempDir;
 
-    /// A 40x20 drawing: a 20x20 red square at the left, nothing at the right.
     const RED_HALF: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20">
             <rect width="20" height="20" fill="#ff0000"/></svg>"##;
 
-    /// A temporary workspace directory holding `files` (name, bytes).
     fn workspace(files: &[(&str, &[u8])]) -> (TempDir, Workspace) {
         let dir = TempDir::new().unwrap();
         for (name, bytes) in files {
@@ -682,8 +631,6 @@ mod tests {
         (dir, ws)
     }
 
-    /// The picture one successful call produced: the path its delivery marker
-    /// names, and its bytes.
     async fn produced(
         access: PathAccess,
         ws: &Workspace,
@@ -703,18 +650,15 @@ mod tests {
         )
     }
 
-    /// The bytes of the picture one call produces.
     async fn rendered_png(access: PathAccess, ws: &Workspace, args: serde_json::Value) -> Vec<u8> {
         produced(access, ws, args).await.1
     }
 
-    /// Render `name` out of `ws` and answer the picture the tool produced.
     async fn rendered(access: PathAccess, ws: &Workspace, name: &str) -> RgbaImage {
         let bytes = rendered_png(access, ws, json!({ "path": name })).await;
         image::load_from_memory(&bytes).unwrap().to_rgba8()
     }
 
-    /// A PDF of `pages` pages, each a red rectangle of its `(width, height)`.
     fn pdf_with_pages(pages: &[(u32, u32)]) -> Vec<u8> {
         let entries: Vec<String> = pages
             .iter()
@@ -732,15 +676,14 @@ mod tests {
         crate::document::test_fixtures::multi_page_pdf(&fixtures)
     }
 
-    /// A solid 20x20 red PNG, for a drawing that refers to a picture.
     fn red_png(path: &Path) {
         RgbaImage::from_pixel(20, 20, image::Rgba([255, 0, 0, 255]))
             .save(path)
             .unwrap();
     }
 
-    /// One drawing's rendered picture: the drawing, its own size, and the ink
-    /// and transparency it must show at the given points.
+    /// One drawing's rendered picture: the drawing, its own size, and the ink and transparency it
+    /// must show at the given points.
     struct DrawingCase {
         name: &'static str,
         file: &'static str,
@@ -808,11 +751,10 @@ mod tests {
 
     #[tokio::test]
     async fn text_without_a_usable_machine_family_is_drawn_in_the_products_own_font() {
-        // The same text three times: naming a family no machine has, naming none at
-        // all, and naming the family the product's own font declares. All three
-        // coming out identical is what says the first two were answered by the
-        // shipped font — the machine's own serif (the engine's own answer) or no
-        // face at all both look different, the last one by leaving the text out,
+        // The same text three times: naming a family no machine has, naming none at all, and naming
+        // the family the product's own font declares. All three coming out identical is what says
+        // the first two were answered by the shipped font — the machine's own serif (the engine's
+        // own answer) or no face at all both look different, the last one by leaving the text out,
         // which the reference is checked for ink against.
         let drawing = |attributes: &str| {
             format!(
@@ -854,9 +796,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_resource_the_caller_could_not_read_is_not_drawn() {
-        // Two pictures the drawing refers to the same way: one beside it, one
-        // outside the workspace entirely (the reference rules themselves are
-        // `path::resolve_reference_target`'s own test).
         let outside = TempDir::new().unwrap();
         let outside_path = outside.path().join("outside.png");
         red_png(&outside_path);
@@ -912,9 +851,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_pdf_page_becomes_a_picture_of_the_page() {
-        // One small landscape page and one tall page past the cap: the first
-        // keeps its own size and aspect ratio, the second is scaled down with its
-        // long side capped and its portrait orientation kept.
+        // One small landscape page and one tall page past the cap: the first keeps its own size and
+        // aspect ratio, the second is scaled down with its long side capped and its portrait
+        // orientation kept.
         let small = pdf_with_pages(&[(200, 100)]);
         let large = pdf_with_pages(&[(100, 4000)]);
         let (_dir, ws) = workspace(&[("small.pdf", &small), ("large.pdf", &large)]);
@@ -949,8 +888,8 @@ mod tests {
         );
     }
 
-    /// The page picture shows the page's visible area: a CropBox narrower than
-    /// the page is what the picture measures, not the whole MediaBox.
+    /// The page picture shows the page's visible area: a CropBox narrower than the page is what the
+    /// picture measures, not the whole MediaBox.
     #[tokio::test]
     async fn a_pdf_pages_picture_honours_its_crop_box() {
         let cropped = crate::document::test_fixtures::multi_page_pdf(&[(
@@ -1020,7 +959,6 @@ mod tests {
         );
     }
 
-    /// A tiny valid PNG, which the capture stand-in answers with.
     fn tiny_png() -> Vec<u8> {
         let mut bytes = Vec::new();
         image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]))
@@ -1029,8 +967,6 @@ mod tests {
         bytes
     }
 
-    /// A user's personal workspace — the live `<storage>/userspaces/<user>` root,
-    /// the shared test root here — with `files` written into it.
     fn personal_workspace(user: &str, files: &[(&str, &[u8])]) -> PathBuf {
         let personal = crate::users::personal_workspace_path(user);
         std::fs::create_dir_all(&personal).unwrap();
@@ -1182,8 +1118,7 @@ mod tests {
         assert_eq!(bytes, png, "the capture's bytes are the picture written");
     }
 
-    /// One address call: what it renders (the captured URL) or the refusal it
-    /// must produce.
+    /// One address call: what it renders (the captured URL) or the refusal it must produce.
     struct AddressCase {
         name: &'static str,
         path: &'static str,

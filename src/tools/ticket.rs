@@ -1,7 +1,4 @@
-//! Ticket management tools for the Manager role.
-//!
-//! These tools allow the Manager to create tickets on the board,
-//! update their phase, list them, and inspect individual tickets.
+//! Ticket management tools for the Manager role: create, update, list, inspect.
 
 use crate::Role;
 use crate::Workspace;
@@ -17,13 +14,8 @@ pub(crate) const GET_TICKET_DESC_MAX: usize = 500;
 pub(crate) const GET_TICKET_COMMENT_MAX: usize = 200;
 pub(crate) const GET_TICKET_LAST_N_FULL: usize = 3;
 
-// ── Ticket ID resolution ─────────────────────────────────────────
-
-/// Resolve a raw ticket ID argument against the tool's bound workspace.
-///
-/// Accepts either a bare number (resolved to `{ws}-{number}`) or the fully
-/// prefixed form for the bound workspace. Prefixed IDs from any other
-/// workspace are rejected with a clear error.
+/// Accepts a bare number (resolved to `{ws}-{number}`) or the fully prefixed form
+/// for the bound workspace; a prefix from any other workspace is rejected.
 fn resolve_ticket_id(ws_name: &str, raw: &str) -> Result<String> {
     let (prefix, id) = parse_ticket_id(raw)?;
     match prefix {
@@ -36,10 +28,9 @@ fn resolve_ticket_id(ws_name: &str, raw: &str) -> Result<String> {
     }
 }
 
-/// Like [`resolve_ticket_id`], but a well-formed prefixed ID from any
-/// workspace is taken as written. Used by the read-only [`GetTicketTool`]:
-/// the archive search spans the installation, and a hit is useless if the
-/// ticket cannot be opened wherever it was filed.
+/// Like [`resolve_ticket_id`], but a well-formed prefixed ID from any workspace is
+/// taken as written — the archive search spans the installation, and a hit is
+/// useless if the ticket cannot be opened wherever it was filed.
 fn resolve_any_ticket_id(ws_name: &str, raw: &str) -> Result<String> {
     let (prefix, id) = parse_ticket_id(raw)?;
     match prefix {
@@ -48,14 +39,13 @@ fn resolve_any_ticket_id(ws_name: &str, raw: &str) -> Result<String> {
     }
 }
 
-/// Split `raw` into `(workspace prefix, id)`: the prefix is `None` for a bare
-/// number — which the caller resolves against its bound workspace — and
-/// `Some(prefix)` for a well-formed `{prefix}-{seq}` argument, in which case
-/// `id` is `raw` trimmed, i.e. the full prefixed ticket ID. The prefix shape
-/// mirrors `workspace::validate_name` ([a-zA-Z_]+ starting with a letter).
+/// The prefix is `None` for a bare number — resolved against the bound workspace —
+/// and `Some(prefix)` for a well-formed `{prefix}-{seq}`, where `id` is the trimmed
+/// raw, i.e. the full prefixed ticket ID. The prefix shape mirrors
+/// `workspace::validate_name` ([a-zA-Z_]+ starting with a letter).
 ///
 /// Shared with the admin's `workspace` tool, which accepts only the full
-/// `<workspace>-<number>` spelling and refuses every other one.
+/// `<workspace>-<number>` spelling.
 pub(crate) fn parse_ticket_id(raw: &str) -> Result<(Option<&str>, &str)> {
     let id = raw.trim();
     anyhow::ensure!(!id.is_empty(), "Ticket ID must not be empty");
@@ -73,11 +63,8 @@ pub(crate) fn parse_ticket_id(raw: &str) -> Result<(Option<&str>, &str)> {
     anyhow::bail!("Invalid ticket ID '{id}' — expected a bare number or '<workspace>-<number>'")
 }
 
-// ── CreateTicketTool ─────────────────────────────────────────────
-
-/// Tool for creating tickets. The `reporter` field is set at construction
-/// time based on which role is using the tool — invisible to the agent,
-/// no parameter to pass. Bound to a single workspace at construction time.
+/// The `reporter` is fixed at construction from the using role — invisible to the
+/// agent, no parameter to pass. Bound to one workspace at construction time.
 pub struct CreateTicketTool {
     reporter: String,
     ws_name: String,
@@ -91,14 +78,12 @@ impl CreateTicketTool {
         }
     }
 
-    /// Whether this holder states the management arguments — `priority` and
-    /// `label`. Only the Manager does; every other creator gets the fixed
-    /// defaults.
+    /// Only the Manager states `priority` and `label`; every other creator gets
+    /// the fixed defaults.
     fn is_manager(&self) -> bool {
         self.reporter == crate::Role::Manager.as_str()
     }
 
-    /// Build a [`TicketParams`] from the shared fields used by both creation branches.
     fn build_params(
         &self,
         title: &str,
@@ -126,9 +111,8 @@ impl Tool for CreateTicketTool {
         "create_ticket"
     }
 
-    /// The shared instructions, plus the Manager-only fragment for the
-    /// arguments only the Manager states. A holder without them never learns
-    /// they exist.
+    /// The shared instructions plus the Manager-only fragment, so a holder
+    /// without those arguments never learns they exist.
     fn description(&self) -> String {
         let mut parts = vec![crate::prompt::load_prompt("tool/create_ticket.md")];
         if self.is_manager() {
@@ -172,8 +156,7 @@ impl Tool for CreateTicketTool {
         );
 
         // The two management arguments belong to the Manager alone: the
-        // Maintainer's priority is a hardcoded value and every ticket it files
-        // is `maint`, so neither argument exists for it.
+        // Maintainer's priority is hardcoded and every ticket it files is `maint`.
         let mut required = vec!["title", "description"];
         if self.is_manager() {
             props.insert(
@@ -210,18 +193,17 @@ impl Tool for CreateTicketTool {
             .map(|s| resolve_ticket_id(&self.ws_name, s))
             .transpose()?;
 
-        // Label: the Manager states it and a value outside the three is
-        // refused here; every other creator files a maintenance ticket. Set
-        // once at creation — nothing writes it again, and a superseding
-        // ticket states its own.
+        // A value outside the three is refused; every other creator files a
+        // maintenance ticket. Set once at creation — never written again; a
+        // superseding ticket states its own.
         let label = if self.is_manager() {
             super::get_str(&args, "label")?.parse::<TicketLabel>()?
         } else {
             TicketLabel::Maint
         };
 
-        // Priority: Manager can set explicitly; otherwise inherit from the
-        // superseded ticket (if superseding) or use the role default.
+        // Manager may set it explicitly; otherwise inherit from the superseded
+        // ticket, else the role default.
         let explicit_priority = if self.is_manager() {
             super::get_opt_i64(&args, "priority")?
         } else {
@@ -249,8 +231,7 @@ impl Tool for CreateTicketTool {
                 }
             }
             (_, Some(p)) => p,
-            // No explicit priority: maintainer gets 3, while the manager
-            // (and every other reporter) intentionally defaults to 1.
+            // Maintainer gets 3; the manager and every other reporter default to 1.
             (None, None) => {
                 if self.reporter == "maintainer" {
                     3
@@ -276,8 +257,6 @@ impl Tool for CreateTicketTool {
         }
     }
 }
-
-// ── UpdateTicketTool ─────────────────────────────────────────────
 
 pub struct UpdateTicketTool {
     ws_name: String,
@@ -321,7 +300,6 @@ impl Tool for UpdateTicketTool {
 
         let store = board_store();
 
-        // Guard: refuse to update a ticket that is in a pipeline-occupied phase.
         guard_not_pipeline_occupied(store, &ticket_id).await?;
 
         store
@@ -331,8 +309,6 @@ impl Tool for UpdateTicketTool {
         Ok(format!("Ticket {ticket_id} phase updated to '{new_phase}'"))
     }
 }
-
-// ── ListTicketsTool ─────────────────────────────────────────────
 
 pub struct ListTicketsTool {
     ws_name: String,
@@ -371,7 +347,7 @@ impl Tool for ListTicketsTool {
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> Result<String> {
         let raw_phase = super::get_opt_str(&args, "phase");
 
-        // "archived" is no longer a phase — redirect to search_archived_tickets
+        // "archived" is no longer a phase — redirect to search_archived_tickets.
         if let Some(s) = raw_phase
             && s.eq_ignore_ascii_case("archived")
         {
@@ -395,8 +371,8 @@ impl Tool for ListTicketsTool {
             .list_all_tickets(Some(&self.ws_name), phase_filter)
             .await?;
 
-        // Default: exclude unblocking phases. When an explicit phase filter
-        // is provided, respect it as-is.
+        // Without a filter, unblocking phases are excluded; an explicit filter is
+        // respected as-is.
         if phase_filter.is_none() {
             tickets.retain(|t| !t.phase.is_unblocking());
         }
@@ -414,14 +390,10 @@ impl Tool for ListTicketsTool {
     }
 }
 
-// ── GetTicketTool ───────────────────────────────────────────────
-
-/// Read one ticket by ID. Unlike the write tools it is not confined to its
-/// bound workspace: a fully prefixed ID from any workspace is accepted, while a
-/// bare number still resolves against the bound workspace.
-///
-/// The archive search spans the installation, so `get_ticket` must be able to
-/// open its hits wherever they were filed.
+/// Unlike the write tools, not confined to its bound workspace: a fully prefixed
+/// ID from any workspace is accepted (the archive search spans the installation,
+/// so its hits must open wherever they were filed), while a bare number still
+/// resolves against the bound workspace.
 pub struct GetTicketTool {
     reporter: String,
     ws_name: String,
@@ -463,8 +435,8 @@ impl Tool for GetTicketTool {
     }
 
     fn preserve_full_output(&self) -> bool {
-        // Ticket content (descriptions, comments) can exceed the ~5 KB
-        // tool-output trigger — the LLM needs it in full.
+        // Ticket content can exceed the ~5 KB tool-output trigger — the LLM needs
+        // it in full.
         true
     }
 
@@ -489,8 +461,6 @@ impl Tool for GetTicketTool {
         }
     }
 }
-
-// ── AddCommentTool ──────────────────────────────────────────────
 
 pub struct AddCommentTool {
     ws_name: String,
@@ -540,12 +510,10 @@ impl Tool for AddCommentTool {
     }
 }
 
-/// Guard: refuse to proceed if the ticket is in a pipeline-occupied phase.
-/// The create-ticket tool (when superseding an existing ticket) and the
-/// update-ticket tool use this to prevent modifications to in-flight tickets
-/// during automated pipeline processing. `add_comment` deliberately bypasses
-/// it — comments are allowed mid-pipeline and are delivered to running agents
-/// as soft deferred messages.
+/// Refuses a ticket in a pipeline-occupied phase. Used by create-ticket (when
+/// superseding) and update-ticket to keep in-flight tickets unmodified during
+/// automated processing. `add_comment` deliberately bypasses it — comments are
+/// allowed mid-pipeline and reach running agents as soft deferred messages.
 async fn guard_not_pipeline_occupied(
     store: &crate::pipeline::board::BoardStore,
     ticket_id: &str,
@@ -609,8 +577,7 @@ mod tests {
                     r#"argument "prerequisites" must be an array of strings"#,
                 ]),
             },
-            // The created ticket answers with its own name, and an argument given as
-            // null is absent rather than spelled out.
+            // An argument given as null is absent rather than spelled out.
             CreateArgsCase {
                 name: "null optional arguments are absent",
                 role: "manager",
@@ -688,9 +655,8 @@ mod tests {
         }
     }
 
-    /// The label is the Manager's to state: required, refused outside the three
-    /// values, and never offered to a creator that does not state it — whose
-    /// tickets are `maint`.
+    /// Required of the Manager, refused outside the three values, and never offered
+    /// to a creator that does not state it — whose tickets are `maint`.
     #[tokio::test]
     async fn create_ticket_labels() {
         crate::util::test::init_test_stores().await;
@@ -739,8 +705,7 @@ mod tests {
             TicketLabel::Fix
         );
 
-        // A holder that never states the label does not learn the argument
-        // exists, and files `maint`.
+        // A holder that never states the label does not learn it exists, and files `maint`.
         let maintainer = CreateTicketTool::new("maintainer", &ws);
         assert!(
             maintainer.parameters_schema()["properties"]
@@ -815,7 +780,6 @@ mod tests {
             crate::pipeline::board::TicketPhase::Backlog,
         )
         .await;
-        // Transition C to 'done' and B to 'cancelled'
         store
             .transition_to(&id_c, Some(TicketPhase::Backlog), TicketPhase::Done, "test")
             .await
@@ -832,7 +796,6 @@ mod tests {
 
         let tool = ListTicketsTool::new(&ws);
 
-        // Default (no filter): excludes done and cancelled — only A should appear
         let args = json!({});
         let result = tool.execute(&ws, args).await.expect("execute");
         assert!(
@@ -848,7 +811,6 @@ mod tests {
             "Default listing should exclude done ticket C"
         );
 
-        // Explicit filter for 'done': includes done tickets
         let args = json!({"phase": "done"});
         let result = tool.execute(&ws, args).await.expect("execute");
         assert!(
@@ -860,7 +822,6 @@ mod tests {
             "Explicit 'done' filter should exclude active ticket A"
         );
 
-        // Explicit filter for 'cancelled': includes cancelled tickets
         let args = json!({"phase": "cancelled"});
         let result = tool.execute(&ws, args).await.expect("execute");
         assert!(
@@ -868,7 +829,6 @@ mod tests {
             "Explicit 'cancelled' filter should include cancelled ticket B"
         );
 
-        // Filter for an active phase that ticket A is actually in
         let args = json!({"phase": "backlog"});
         let result = tool.execute(&ws, args).await.expect("execute");
         assert!(
@@ -877,8 +837,7 @@ mod tests {
         );
     }
 
-    /// One add-comment call: the phase the ticket is in, and the comment the
-    /// ticket must carry afterwards.
+    /// The phase the ticket is in, and the comment it must carry afterwards.
     struct AddCommentCase {
         name: &'static str,
         phase: TicketPhase,
@@ -897,8 +856,7 @@ mod tests {
                 phase: TicketPhase::Backlog,
                 content: "This is a test comment",
             },
-            // A pipeline-occupied ticket may not be mutated, but commenting on it
-            // is not a mutation.
+            // Commenting on a pipeline-occupied ticket is not a mutation.
             AddCommentCase {
                 name: "a comment on a pipeline-occupied ticket is allowed",
                 phase: TicketPhase::InDevelopment,
@@ -984,8 +942,6 @@ mod tests {
         }
     }
 
-    // ── Pipeline-occupied guard tests ────────────────────────────
-
     #[tokio::test]
     #[serial_test::serial(reset_inflight)] // shared global board — a concurrent boot reset would clobber the InDevelopment fixture
     async fn test_guard_not_pipeline_occupied_cases() {
@@ -1021,7 +977,7 @@ mod tests {
         let result = guard_not_pipeline_occupied(store, &unoccupied_id).await;
         assert!(result.is_ok(), "Unoccupied ticket should pass the guard");
 
-        // Non-existent ticket silently passes (nothing to block)
+        // Nothing to block on a non-existent ticket.
         let result = guard_not_pipeline_occupied(store, "nonexistent_id").await;
         assert!(
             result.is_ok(),
@@ -1029,8 +985,8 @@ mod tests {
         );
     }
 
-    /// Create a ticket in a pipeline-occupied phase (InDevelopment).
-    /// Used by wiring tests below to verify tools call `guard_not_pipeline_occupied`.
+    /// A ticket in a pipeline-occupied phase (InDevelopment), for the wiring tests
+    /// that verify tools call `guard_not_pipeline_occupied`.
     async fn create_occupied_ticket() -> String {
         crate::util::test::init_test_stores().await;
         let store = board_store();
@@ -1096,8 +1052,7 @@ mod tests {
         }
     }
 
-    /// One supersede call: the explicit priority (if any) and the priority the
-    /// replacement must end up with.
+    /// The explicit priority (if any) and the one the replacement must end up with.
     struct SupersedePriorityCase {
         name: &'static str,
         explicit: Option<i64>,
@@ -1123,7 +1078,7 @@ mod tests {
                 expected: 5,
             },
         ] {
-            // A ticket with a non-default priority (0 = highest urgency).
+            // 0 = highest urgency.
             let old_id = TicketBuilder::new(store, &ws)
                 .title("Old ticket")
                 .priority(0)
@@ -1135,8 +1090,7 @@ mod tests {
                 "title": "Replacement",
                 "description": "superseding the old ticket",
                 "supersede": &old_id,
-                // The replacement states its own label; it inherits neither
-                // priority nor label from the old ticket.
+                // The replacement inherits neither priority nor label.
                 "label": "fix",
             });
             if let Some(priority) = case.explicit {
@@ -1152,7 +1106,6 @@ mod tests {
                 case.name
             );
 
-            // The new ticket hangs off the old ticket's superseded_by link.
             let old_ticket = expect_ticket(store, &old_id).await;
             let new_id = old_ticket
                 .superseded_by
@@ -1176,19 +1129,15 @@ mod tests {
 
     #[test]
     fn test_resolve_ticket_id() {
-        // Bare numbers resolve against the bound workspace.
         assert_eq!(resolve_ticket_id("ws", "123").unwrap(), "ws-123");
         assert_eq!(resolve_ticket_id("ws", "  7 ").unwrap(), "ws-7");
-        // Fully prefixed form for the bound workspace is accepted.
         assert_eq!(resolve_ticket_id("ws", "ws-123").unwrap(), "ws-123");
         assert_eq!(resolve_ticket_id("my_ws", "my_ws-42").unwrap(), "my_ws-42");
-        // Foreign workspace prefixes are rejected.
         let err = format!("{}", resolve_ticket_id("ws", "other-123").unwrap_err());
         assert!(
             err.contains("different workspace"),
             "foreign prefix should be rejected: {err}"
         );
-        // Malformed IDs are rejected.
         for bad in [
             "", "abc", "-5", "ws-abc", "123-456", "ws-", "ws-12-34", "___-123",
         ] {
@@ -1198,9 +1147,8 @@ mod tests {
             );
         }
 
-        // `resolve_any_ticket_id` binds a bare number to the bound workspace
-        // but takes any well-formed prefix verbatim; malformed IDs are the
-        // shared parser's business, already pinned above.
+        // Binds a bare number to the bound workspace but takes any well-formed
+        // prefix verbatim; malformed IDs are the shared parser's business.
         assert_eq!(resolve_any_ticket_id("ws", "123").unwrap(), "ws-123");
         assert_eq!(resolve_any_ticket_id("ws", "  7 ").unwrap(), "ws-7");
         assert_eq!(
@@ -1226,7 +1174,6 @@ mod tests {
         let ticket = crate::util::test::expect_ticket(store, &id).await;
         let expected = ticket.detailed_display();
 
-        // Bare numeric ID resolves against the bound workspace.
         let seq = id.strip_prefix("ws-").expect("prefixed id");
         let result = GetTicketTool::new("manager", &ws)
             .execute(&ws, json!({"ticket_id": seq, "full": true}))
@@ -1234,8 +1181,8 @@ mod tests {
             .expect("bare number should resolve");
         assert_eq!(result, expected);
 
-        // A fully prefixed ID is accepted even from another workspace — the
-        // archive search spans the installation, so its hits must open here.
+        // Accepted even from another workspace — the archive search spans the
+        // installation, so its hits must open here.
         let foreign = test_ws("/other");
         let result = GetTicketTool::new("manager", &foreign)
             .execute(&foreign, json!({"ticket_id": id, "full": true}))

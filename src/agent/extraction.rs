@@ -1,7 +1,7 @@
 //! Structured extraction from conversation history.
 //!
-//! Provides LLM-powered extraction of structured data (JSON) from agent
-//! conversation history, with retry logic.
+//! Provides LLM-powered extraction of structured data (JSON) from agent conversation history, with
+//! retry logic.
 
 use serde::de::DeserializeOwned;
 use std::time::Instant;
@@ -13,18 +13,14 @@ use crate::retry::{
 use crate::util::json::parse_fenced_json;
 use crate::{ChatMessage, ChatRequest, ExtractionValidator};
 
-// ── Scoped retry extraction ────────────────────────────────
-
-/// Scoped structured extraction with the hardened outer retry loop
-/// ([`crate::retry`] — default 13 attempts). Used by
-/// verdict extraction, diagnostics discovery, comment summaries, and
-/// research orchestration. `policy_override` supplies a shorter schedule
-/// for fail-open comment-only callers ([`crate::retry::RetryPolicy::comment`]
-/// — 3 attempts); `None` uses the default policy.
+/// Scoped structured extraction with the hardened outer retry loop ([`crate::retry`] — default 13
+/// attempts). Used by verdict extraction, diagnostics discovery, comment summaries, and research
+/// orchestration. `policy_override` supplies a shorter schedule for fail-open comment-only callers
+/// ([`crate::retry::RetryPolicy::comment`] — 3 attempts); `None` uses the default policy.
 ///
-/// The outer loop is the SINGLE retry authority — provider-internal retries
-/// are suppressed via [`crate::providers::chat_scoped`], so total provider
-/// HTTP calls per operation are bounded by `max_attempts`.
+/// The outer loop is the SINGLE retry authority — provider-internal retries are suppressed via
+/// [`crate::providers::chat_scoped`], so total provider HTTP calls per operation are bounded by
+/// `max_attempts`.
 ///
 /// Retry semantics per attempt:
 /// - Provider/transport/truncation failure → retry byte-identical.
@@ -35,15 +31,13 @@ use crate::{ChatMessage, ChatRequest, ExtractionValidator};
 ///   (a non-empty assistant turn is required to re-prompt).
 /// - Valid JSON matching `T` and passing `validate` → return immediately.
 ///
-/// `validate` (typically a score ∈ [0,10] check for [`crate::Verdict`]) runs
-/// fail-closed: a rejected value is a parse failure, and if all attempts yield
-/// rejected values the operation fails with an out-of-range-score
-/// classification — a garbage score never passes any gate. It must be
+/// `validate` (typically a score ∈ [0,10] check for [`crate::Verdict`]) runs fail-closed: a
+/// rejected value is a parse failure, and if all attempts yield rejected values the operation fails
+/// with an out-of-range-score classification — a garbage score never passes any gate. It must be
 /// `Send + Sync` because extraction runs inside `join_all` futures.
 ///
-/// Terminal failure is [`RetryExhausted`] — it carries the
-/// last-attempt raw text (`last_raw`, for verdict-extraction ticket comments) plus
-/// the per-attempt diagnostics trail.
+/// Terminal failure is [`RetryExhausted`] — it carries the last-attempt raw text (`last_raw`, for
+/// verdict-extraction ticket comments) plus the per-attempt diagnostics trail.
 pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
     history: &[ChatMessage],
     extraction_prompt: &str,
@@ -59,11 +53,10 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
         extraction_history.push(ChatMessage::user(extraction_prompt));
     }
 
-    // Telemetry record request: the recorded request derives from params so
-    // recorded metadata can never diverge from the bytes actually sent. Only
-    // the telemetry fields are read from it — messages are emptied here so the
-    // per-attempt spread doesn't clone the caller's history; the one-time
-    // params.clone() below is that cost.
+    // Telemetry record request: the recorded request derives from params so recorded metadata can
+    // never diverge from the bytes actually sent. Only the telemetry fields are read from it —
+    // messages are emptied here so the per-attempt spread doesn't clone the caller's history; the
+    // one-time params.clone() below is that cost.
     let record_request = ChatRequest {
         messages: vec![],
         ..params.clone()
@@ -87,8 +80,6 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
             Ok(response) => {
                 last_raw = Some(response.text_or_empty().to_string());
 
-                // Determine the failure mode: tool call / parse failure /
-                // validation rejection all funnel into the re-prompt retry.
                 let (class, detail): (FailureClass, String) = if response.tool_calls.is_empty() {
                     let raw = last_raw.as_deref().unwrap_or_default();
                     match parse_fenced_json::<T>(raw) {
@@ -131,12 +122,11 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
                 );
                 loop_state.record(rec);
 
-                // Re-prompt: push raw assistant text + retry prompt. Only
-                // needed when another attempt will actually run — the final
-                // attempt's re-prompt is never sent.
+                // Re-prompt: push raw assistant text + retry prompt. Only needed when another
+                // attempt will actually run — the final attempt's re-prompt is never sent.
                 if attempt < policy.max_attempts {
-                    // An empty assistant turn gives the model nothing to
-                    // correct — replay a non-empty marker instead.
+                    // An empty assistant turn gives the model nothing to correct — replay a
+                    // non-empty marker instead.
                     let prev = last_raw.clone().filter(|text| !text.trim().is_empty());
                     extraction_history.push(ChatMessage::assistant(
                         prev.unwrap_or_else(|| load_prompt("extraction/retry_no_output.md")),
@@ -145,9 +135,8 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
                 }
             }
             Err(scoped_err) => {
-                // The final attempt died before producing text (transport /
-                // truncation / budget) — clear any earlier text so the
-                // ticket comment never labels it 'last attempt'.
+                // The final attempt died before producing text (transport / truncation / budget) —
+                // clear any earlier text so the ticket comment never labels it 'last attempt'.
                 last_raw = None;
                 let non_retryable = !scoped_err.class.is_retryable();
                 loop_state.record(scoped_err.record);
@@ -169,8 +158,8 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
         }
     }
 
-    // Exhausted — report the last failure's class so operators see e.g.
-    // out-of-range-score (never a garbage pass) rather than a generic class.
+    // Exhausted — report the last failure's class so operators see e.g. out-of-range-score (never a
+    // garbage pass) rather than a generic class.
     let final_class = loop_state.final_class();
     let exhausted =
         RetryExhausted::with_last_raw(loop_state.into_failures(), final_class, last_raw);
@@ -231,10 +220,6 @@ mod tests {
         .await
     }
 
-    /// A retryable failure is retried and the retry succeeds: the transport
-    /// class is retried byte-identically and the truncated-envelope class (the
-    /// EOF-while-parsing defect) likewise, and either recovers the parsed
-    /// verdict.
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     async fn recovers_after_retryable_failures() {
@@ -317,10 +302,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     async fn transport_final_failure_clears_earlier_text_from_last_raw() {
-        // Mixed sequence: an early attempt produces text (parse failure), then
-        // later attempts die on transport. The ticket comment must NOT label the
-        // earlier text as 'last attempt' — last_raw must be None because the
-        // final attempt died before producing text.
+        // Mixed sequence: an early attempt produces text (parse failure), then later attempts die
+        // on transport. The ticket comment must NOT label the earlier text as 'last attempt' —
+        // last_raw must be None because the final attempt died before producing text.
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy()); // 3 attempts
         let fake = Arc::new(
             FakeProvider::new()
@@ -336,7 +320,6 @@ mod tests {
             "earlier attempt text must not be presented as the last attempt"
         );
         assert_eq!(failure.failures.len(), 3);
-        // The first failure is a parse (re-prompted), the last two transport.
         assert_eq!(failure.failures[0].class, crate::retry::FailureClass::Parse);
         assert_eq!(
             failure.failures[1].class,
@@ -351,8 +334,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     async fn tool_call_final_attempt_keeps_empty_last_raw() {
-        // A tool-call final attempt (empty text) survives as Some("") so the
-        // comment can state "final attempt was a tool call".
+        // A tool-call final attempt (empty text) survives as Some("") so the comment can state
+        // "final attempt was a tool call".
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy()); // 3 attempts
         let fake = Arc::new(
             FakeProvider::new().ok("not json").ok("not json").ok(""), // tool-call-style final attempt: no text
@@ -381,23 +364,20 @@ mod tests {
 
         let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
         assert_eq!(fingerprints.len(), 3);
-        // Attempt 1 → 2: transport retry — byte-identical (no re-prompt).
         assert_eq!(
             fingerprints[0], fingerprints[1],
             "transport retry must be byte-identical"
         );
-        // Attempt 2 → 3: parse failure — re-prompt appended (messages grew).
         assert_ne!(
             fingerprints[1], fingerprints[2],
             "parse-failure re-prompt must extend the request"
         );
     }
 
-    /// The parse-failure re-prompt turns the failed reply into the appended
-    /// assistant turn: a JSON-shaped reply is carried verbatim (the production
-    /// trigger), and a reply with NO text — a tool-call-style response — is
-    /// replaced by the non-empty no-output marker rather than replayed as an
-    /// empty frame.
+    /// The parse-failure re-prompt turns the failed reply into the appended assistant turn: a
+    /// JSON-shaped reply is carried verbatim (the production trigger), and a reply with NO text — a
+    /// tool-call-style response — is replaced by the non-empty no-output marker rather than
+    /// replayed as an empty frame.
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     async fn parse_failure_reprompts_with_a_non_empty_assistant_turn() {
@@ -426,8 +406,8 @@ mod tests {
             let result = extract_with(fake.clone()).await;
             assert_eq!(result.expect("recovers").score, score, "case: {reason}");
 
-            // This seam verifies ChatMessages; the wire form is pinned by the
-            // decode-gate and serializer tests.
+            // This seam verifies ChatMessages; the wire form is pinned by the decode-gate and
+            // serializer tests.
             let messages = fake.request_messages.lock().unwrap().clone();
             assert_eq!(messages.len(), 2, "case: {reason}");
             assert!(messages[1].contains("Assistant"), "{}", messages[1]);
@@ -477,7 +457,6 @@ mod tests {
             crate::retry::FailureClass::OutOfRangeScore,
             "all-attempts-out-of-range must classify explicitly"
         );
-        // Every failed attempt was an out-of-range-score rejection.
         assert!(
             failure
                 .failures
@@ -487,18 +466,15 @@ mod tests {
         assert_eq!(failure.failures.len(), 3);
     }
 
-    /// End-to-end regression guard for the retry telemetry: recorded
-    /// `llm_requests` rows carry the caller's base params, and the failure
-    /// row keeps cost/provider NULL (no envelope on the failure path).
-    /// Catches the extraction path drifting from the recorded request.
+    /// End-to-end regression guard for the retry telemetry: recorded `llm_requests` rows carry the
+    /// caller's base params, and the failure row keeps cost/provider NULL (no envelope on the
+    /// failure path). Catches the extraction path drifting from the recorded request.
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     async fn extraction_rows_record_base_params_and_retry_context() {
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
         let (store, _tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
         let _store_guard = crate::util::test::install_test_log_store(store.clone());
-        // Base params + meta set so the extraction path records rows
-        // (meta-less requests are skipped by design).
         let params = ChatRequest {
             meta: Some(crate::ChatRequestMeta {
                 purpose: "extraction",
@@ -509,7 +485,6 @@ mod tests {
             }),
             ..test_params()
         };
-        // Success path: recorded row carries the caller's base params.
         let fake = Arc::new(FakeProvider::new().ok(r#"{"score": 8}"#));
         let provider: Arc<dyn crate::Provider> = fake.clone();
         let _fake_guard = install_fake_provider(provider);
@@ -522,7 +497,6 @@ mod tests {
         )
         .await;
         assert_eq!(result.expect("extraction succeeds").score, 8);
-        // Parse-failure path (re-prompted, recovers).
         let fake = Arc::new(FakeProvider::new().ok("garbage").ok(r#"{"score": 7}"#));
         let provider: Arc<dyn crate::Provider> = fake.clone();
         let _fake_guard = install_fake_provider(provider);
@@ -535,8 +509,6 @@ mod tests {
         )
         .await;
         assert_eq!(result.expect("recovers after re-prompt").score, 7);
-        // Failure path (all attempts die): rows keep the base params,
-        // cost/provider stay NULL — no envelope to read them from.
         let fake = Arc::new(
             FakeProvider::new()
                 .err(crate::retry::FailureClass::Transport, "always down")
@@ -557,8 +529,6 @@ mod tests {
             result.is_err(),
             "all-attempt failure must not produce a verdict"
         );
-        // The rows were queued rather than written inline: the drain is what
-        // writes queued records in a test (no test runs the boot's drain task).
         crate::telemetry::drain_for_test().await;
         let rows = store
             .conn

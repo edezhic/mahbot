@@ -19,10 +19,8 @@ use crate::{ChatRequest, ChatResponse, Provider};
 use crate::ChatMessage;
 
 /// Helper for tests that constructs a `ChatRequest` with sensible defaults.
-/// Callers override specific fields via struct update syntax:
-/// ```ignore
-/// let req = ChatRequest { model: "test-model".into(), ..test_request(messages, None) };
-/// ```
+/// Callers override specific fields via struct update syntax: ```ignore
+/// let req = ChatRequest { model: "test-model".into(), ..test_request(messages, None) }; ```
 #[cfg(test)]
 pub(crate) fn test_request(
     messages: Vec<ChatMessage>,
@@ -47,7 +45,7 @@ pub(crate) use crate::providers::transcribe::transcribe_video_file;
 use crate::retry::{FailureClass, RetryFailureRecord};
 use compatible::OpenAiCompatibleProvider;
 
-// ── Scoped call error ────────────────────────────────────
+// Scoped call error
 
 /// Error from a scoped (single-attempt) provider call.
 ///
@@ -142,7 +140,7 @@ pub(crate) fn provider_routing_json(order: &str) -> Option<serde_json::Value> {
     }))
 }
 
-// ── Global singletons (recreatable via RwLock) ─────────────────
+// Global singletons (recreatable via RwLock)
 
 /// Global provider instance. Recreatable when config changes at runtime.
 /// Wrapped in `Arc` so we can clone-and-drop the lock before awaiting.
@@ -176,8 +174,7 @@ fn build_provider_and_transcriber(
     // The effective endpoint + credential come from config: a custom
     // chat-completions endpoint when one is persisted, else the
     // default OpenRouter endpoint + OpenRouter key. The custom endpoint's own
-    // key (if any) is used only for the custom endpoint — never the OpenRouter
-    // key.
+    // key (if any) is used only for the custom endpoint — never the OpenRouter key.
     let endpoint = crate::config::effective_chat_endpoint(config);
     let credential = crate::config::chat_credential(config);
     let provider: Arc<dyn Provider> =
@@ -249,8 +246,7 @@ pub(crate) async fn warmup_provider_from_config(
 /// warmup, which then runs as a non-fatal background task (mirroring
 /// [`init_global`]) unless `background_warmup` is false. A failed warmup
 /// never leaves the old provider live — only structural validation and DB
-/// writes can fail a save now, so this function cannot fail and returns
-/// `()`.
+/// writes can fail a save now, so this function cannot fail and returns `()`.
 ///
 /// `background_warmup`: the provider-endpoint persist arm performs its own
 /// foreground warmup to surface the custom-endpoint warning (or deliberately skips
@@ -412,7 +408,7 @@ fn build_media_transcriber(config: &crate::config::ConfigData) -> Option<MediaTr
     ))
 }
 
-// ── Tests ─────────────────────────────────────────────────────
+// Tests
 
 #[cfg(test)]
 mod tests {

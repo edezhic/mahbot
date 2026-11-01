@@ -1,111 +1,46 @@
-//! Configuration system with two independent resolution chains.
+//! Configuration: hardcoded defaults in this module, overlayed from `core.db`
+//! by [`crate::config_db`]. [`load_or_init`] seeds
+//! `ConfigData::STRUCT_FIELDS_DEFAULT` into [`CONFIG`], then [`reload_from_db`]
+//! overlays persisted values.
 //!
-//! # Architecture overview
+//! Two **independent** resolution chains — a `config_kv` entry cannot override
+//! a per-model routing, and vice versa:
 //!
-//! The config system has a layered structure: hardcoded defaults in this module
-//! provide the base values, and the [`ConfigReload`] singleton is then overlayed
-//! with persisted values from the consolidated domain `core.db` (via
-//! [`crate::config_db`]).
+//! * KV chain: `config_kv` table → hardcoded `const`. Covers the
+//!   `string_config_fields!` fields and the two model slots. Accessor
+//!   annotations: `non_empty` → `Option<String>` (empty/whitespace → `None`);
+//!   `or(DEFAULT)` → `String`; `list_or(default = …)` → `Vec<String>` from a
+//!   newline-separated list, and a `, raw` suffix also generates
+//!   `<field>_raw`, the list exactly as configured with no default injected.
+//!   [`reload_from_db`] applies rows through [`ConfigData::set_string_field`];
+//!   an absent key stays `None` so the accessor resolves its fallback. Fields
+//!   outside this chain (e.g. `model_routings`) have their own table.
+//! * Routing chain: `config_model_routing` row → [`default_model_routing`] →
+//!   OpenRouter auto-routing. Stored in [`ConfigData::model_routings`]; every
+//!   chat request is built through [`ConfigReload::model_routing`].
 //!
-//! At startup, [`load_or_init`] seeds `ConfigData::STRUCT_FIELDS_DEFAULT` into the
-//! global [`CONFIG`]. Then [`reload_from_db`] overlays persisted values from the
-//! two config tables on top of those defaults.
+//! `provider_endpoint` (self-hosted OpenAI-compatible: Ollama, LM Studio,
+//! llama.cpp, vLLM, LiteLLM) is honored at runtime and falls back to
+//! OpenRouter when unset. `provider_endpoint_key` is that endpoint's own
+//! optional key — many servers are keyless — and is **only** ever sent to it,
+//! never to OpenRouter. Media features (image/video generation, catalogs,
+//! transcription) always use `DEFAULT_PROVIDER_ENDPOINT` + `provider_key`
+//! regardless of the custom chat endpoint.
 //!
-//! # Resolution chains
+//! [`ConfigReload::role_model`] maps `Role::Manager`, `Assistant`, `Discovery`,
+//! `Engineer` and `Maintainer` to the manager slot; every other role to the
+//! worker slot. Unset slots fall back to their `DEFAULT_*_MODEL` constant.
 //!
-//! The configuration system has two independent resolution chains. They are
-//! **independent** — an entry in the `config_kv` chain cannot override a
-//! per-model routing entry in the `config_model_routing` chain, and vice versa.
-//! Each chain applies to different fields.
-//!
-//! ## Chain 1: KV-backed string fields and model slots
-//!
-//! `config_kv` table → hardcoded default (`const` in this module)
-//!
-//! Both the fields listed in the `string_config_fields!` invocation and the two
-//! model slots (`manager_model`, `worker_model`) live in the `config_kv` table.
-//! Their accessor methods (generated on
-//! [`ConfigReload`]) each follow a per-field annotation:
-//!
-//! * `non_empty` — returns `Option<String>`, collapses empty/whitespace to `None`.
-//! * `or(DEFAULT)` — returns `String`, falls back to a compile-time constant
-//!   (e.g. `DEFAULT_PROVIDER_ENDPOINT`).
-//! * `list_or(default = …)` — returns `Vec<String>`, parses a
-//!   newline-separated list, falling back to a hardcoded default when unset.
-//!   A `, raw` suffix additionally generates `<field>_raw`, which returns the
-//!   list exactly as configured with no default injected.
-//!
-//! At reload time [`reload_from_db`] loads key–value pairs from the `config_kv`
-//! table (via [`crate::config_db::ConfigStore::get_all_kv`]) and applies them
-//! through [`ConfigData::set_string_field`]. Any key absent from the table
-//! remains `None`, and the accessor resolves the hardcoded fallback.
-//!
-//! Fields **not** in this chain (e.g. `model_routings`) have their own
-//! dedicated table and reload path.
-//!
-//! ### Custom chat-completions endpoint
-//!
-//! `provider_endpoint` is an `or(DEFAULT_PROVIDER_ENDPOINT)` field: a
-//! persisted value (a self-hosted OpenAI-compatible endpoint — Ollama,
-//! LM Studio, llama.cpp, vLLM, LiteLLM) is honored at runtime, falling back
-//! to OpenRouter when unset. `provider_endpoint_key` is the custom
-//! endpoint's own optional API key (many self-hosted servers are keyless) —
-//! it is only ever sent to the custom endpoint, never to OpenRouter. Media
-//! features (image/video generation, catalogs, media transcription) always
-//! use `DEFAULT_PROVIDER_ENDPOINT` + `provider_key` regardless of the
-//! custom chat endpoint.
-//!
-//! ### Model slots
-//!
-//! The two model slots share the `config_kv` storage of the ordinary fields
-//! above, but [`ConfigReload::role_model`] maps every role onto exactly one of
-//! them:
-//!
-//! > Manager group (`Role::Manager`, `Role::Assistant`, `Role::Discovery`,
-//! > `Role::Engineer`, `Role::Maintainer`) → manager slot;
-//! > every other role (Analyst, Worker, QA, Reviewer, Sanitation) →
-//! > worker slot.
-//!
-//! Unset slots fall back to their `DEFAULT_*_MODEL` constant.
-//!
-//! ## Chain 2: Per-model provider routing
-//!
-//! `config_model_routing` row (stored override) → [`default_model_routing`]
-//! (model default) → OpenRouter auto-routing
-//!
-//! Stored in [`ConfigData::model_routings`] as a [`Vec<ModelRouting>`][ModelRouting] and
-//! loaded at reload time from the `config_model_routing` table; every chat
-//! request is built through [`ConfigReload::model_routing`].
-//!
-//! # Persistence layer
-//!
-//! The tables live in the consolidated domain `core.db` and are managed by [`crate::config_db`]:
-//!
-//! | Table | Read | Write |
-//! |---|---|---|
-//! | `config_kv` | [`crate::config_db::ConfigStore::get_all_kv`] | [`crate::config_db::ConfigStore::set_kv`] |
-//! | `config_model_routing` | [`crate::config_db::ConfigStore::get_all_model_routings`] | [`crate::config_db::ConfigStore::save_model_routing`] |
-//!
-//! # Orphaned database keys
-//!
-//! Rows in `config_kv` without a corresponding [`ConfigData`] field are
-//! lazily purged on reload: [`reload_from_db`] logs each unknown key at
-//! `debug`, then best-effort deletes garbage rows (debug on success, warn
-//! on transient failure without failing boot) while the intentional shared
-//! namespaces written by other subsystems (the nightly-discovery marker, the
-//! temp-cleanup cadence state, the update notice's records and the low-disk
-//! notice's ladder) are left untouched.
-//! Downgrade resurrection is therefore lost — under the previous ghost policy
-//! orphans were retained and would re-appear on downgrade, now they are deleted
-//! on first reboot. New orphans cannot be created via the settings path because
-//! [`write_kv_and_update_config`] rejects unknown keys before any DB write.
-//!
-//! # See also
-//!
-//! * [`crate::config_db`] — database persistence for both chains.
-//! * [`crate::agent::role`] — [`crate::agent::role::RoleInfo`] definitions with per-role defaults.
-//! * [`crate::providers::compatible`] — writes the resolved provider order into
-//!   the OpenRouter request body (`None` sends no provider preference at all).
+//! Rows in `config_kv` without a [`ConfigData`] field are lazily purged on
+//! reload: each unknown key is logged at `debug`, then garbage rows are
+//! deleted best-effort (debug on success, warn without failing boot). The
+//! intentional shared namespaces — nightly-discovery marker, temp-cleanup
+//! cadence, update notice, low-disk notice ladder — are left untouched.
+//! Downgrade resurrection is therefore lost: orphans are deleted on first
+//! reboot instead of re-appearing. The settings path cannot create new ones
+//! because [`write_kv_and_update_config`] rejects unknown keys before any DB
+//! write. [`crate::providers::compatible`] writes the resolved provider order
+//! into the OpenRouter body (`None` sends no preference at all).
 
 use crate::Role;
 use crate::util::{UnwrapPoison, is_http_url};
@@ -116,22 +51,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock, RwLockReadGuard};
 use tokio::fs;
 
-// ── Hardcoded defaults ───────────────────────────────────────────
-
 pub(crate) const DEFAULT_PROVIDER_ENDPOINT: &str = "https://openrouter.ai/api/v1";
 
-/// The default chat model for both slots. Pinned by
-/// `default_model_identifier_is_pinned` so a typo fails the suite instead of
-/// reaching a provider request.
+/// Pinned by `default_model_identifier_is_pinned` so a typo fails the suite instead of reaching
+/// a provider request.
 const DEFAULT_CHAT_MODEL: &str = "deepseek/deepseek-v4.1-flash-1017";
 pub(crate) const DEFAULT_MANAGER_MODEL: &str = DEFAULT_CHAT_MODEL;
 pub(crate) const DEFAULT_WORKER_MODEL: &str = DEFAULT_CHAT_MODEL;
 
-// Every value a release ever compiled as a slot default, newest first. A
-// stored value equal to one of these was never chosen by the user (a
-// deliberate pick of the same id is indistinguishable and moves too), so
-// `migrate_old_default_models` rewrites it on boot. Per-slot lists keep a
-// genuine pick of the other slot's old default intact.
+// Every value a release ever compiled as a slot default, newest first. A stored value equal to one
+// was never chosen by the user (a deliberate pick of the same id is indistinguishable and moves
+// too), so `migrate_old_default_models` rewrites it on boot. Per-slot lists keep a genuine pick of
+// the other slot's old default intact.
 const OLD_DEFAULT_MANAGER_MODELS: &[&str] = &[
     "deepseek/deepseek-v4.1-flash",
     "z-ai/glm-5.3-flash",
@@ -143,27 +74,24 @@ const OLD_DEFAULT_WORKER_MODELS: &[&str] = &[
     "deepseek/deepseek-v4-flash-vision-exp",
     "deepseek/deepseek-v4-flash-0731",
 ];
-// Video-transcription model is fixed (not user-configurable) and always
-// targets OpenRouter.
+// Fixed (not user-configurable) and always targets OpenRouter.
 pub(crate) const VIDEO_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.8-flash";
 
-/// Image-generation model used by every account that has no explicit pick.
-/// The retired predecessor (`google/gemini-3.1-flash-image`) is rewritten out
-/// of the stored picker list and of every account's pick by catalog entry `50`.
+/// Used by every account with no explicit pick. The retired predecessor
+/// (`google/gemini-3.1-flash-image`) is rewritten out of the stored picker list and every
+/// account's pick by catalog entry `50`.
 pub(crate) const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-nano-banana-2.1";
 pub(crate) const DEFAULT_VIDEO_MODEL: &str = "minimax/hailuo-3";
 
-/// Fresh-install seeded image-generation model list (newline-separated, in
-/// picker order). Mirrors the curated set the live install ships.
+/// Fresh-install seeded image-generation model list: newline-separated, in picker order; mirrors
+/// the curated set the live install ships.
 const FRESH_INSTALL_IMAGE_GEN_MODELS: &str = "google/gemini-nano-banana-2.1\nmicrosoft/mai-image-2.6\nopenai/gpt-image-2.5-sunburst\nqwen/qwen-image-3-pro";
 
-/// Fresh-install seeded video-generation model list (newline-separated, in
-/// picker order). Mirrors the curated set the live install ships.
+/// Fresh-install seeded video-generation model list: newline-separated, in picker order; mirrors
+/// the curated set the live install ships.
 const FRESH_INSTALL_VIDEO_MODELS: &str = "bytedance/seedance-2.0-mini\nminimax/hailuo-3";
 
 pub(crate) const DEFAULT_TTS_LANGUAGE: &str = "na";
-
-// ── Named config structs ───────────────────────────────────────────
 
 /// A per-model provider routing rule.
 #[derive(Debug, Clone, PartialEq)]
@@ -173,11 +101,8 @@ pub struct ModelRouting {
 }
 
 impl ModelRouting {
-    /// Find-or-push: update a subset of fields on an existing entry matching
-    /// `model`, or push a new entry (all fields defaulted to `None`).
-    ///
-    /// Only the field(s) mutated inside `set_field` are touched — if the
-    /// entry already exists its other fields are preserved unchanged.
+    /// Find-or-push: update the fields `set_field` mutates on the entry matching `model`, or push a
+    /// new one defaulted to `None`. An existing entry's other fields are preserved.
     pub(crate) fn upsert(
         routings: &mut Vec<ModelRouting>,
         model: impl Into<String>,
@@ -197,83 +122,47 @@ impl ModelRouting {
     }
 }
 
-// ── ConfigData — the reloadable inner config ─────────────────────
-
 /// All runtime-configurable fields, protected by an [`RwLock`] in [`ConfigReload`].
+/// Accessors return owned strings because the lock guard cannot escape their scope.
 ///
-/// Every accessor returns an owned [`String`] (or [`Option<String>`]) because the
-/// lock guard cannot escape the accessor's scope. Clone is cheap — these are
-/// short strings read infrequently.
+/// Adding a persisted field needs two steps, in order: declare it here, then
+/// add it to the `string_config_fields!` invocation in this file — that macro
+/// emits `STRUCT_FIELDS_DEFAULT` (`const Self { … }`, so a missing entry is a
+/// compile error), [`ConfigData::string_fields()`], [`ConfigData::set_string_field()`],
+/// the `CONFIG_KEY_<FIELD>` consts and the typed accessors. Use those consts,
+/// never raw key literals, so a rename stays compiler-tied.
 ///
-/// ## Adding a new persisted `Option<String>` field
-///
-/// Follow all three steps in order:
-///
-/// 1. **Field declaration** — add the field here on [`ConfigData`].
-/// 2. **Macro** — add the field name to the `string_config_fields!` invocation in this file.
-///    The macro generates `ConfigData::STRUCT_FIELDS_DEFAULT` (used by [`ConfigReload::const_new`]),
-///    [`ConfigData::string_fields()`], [`ConfigData::set_string_field()`], and — for every field —
-///    a `pub const CONFIG_KEY_<FIELD>: &str` key constant from this list.  The compiler
-///    enforces that every field on [`ConfigData`] is present in `STRUCT_FIELDS_DEFAULT`,
-///    so forgetting this step is a compile error.  Use the emitted `CONFIG_KEY_<FIELD>` consts
-///    at write sites / match arms instead of raw string literals — a rename then stays
-///    compiler-tied at every use site.
-/// 3. **Typed accessor** — automatically generated. The `string_config_fields!` macro
-///    produces typed accessor methods on [`ConfigReload`] based on each field's
-///    annotation (`non_empty`, `or(DEFAULT)`, or `list_or(...)`) — no manual
-///    accessor code is needed.
-///
-/// ## All `Option<String>` fields must be in the macro
-///
-/// EVERY `Option<String>` field on [`ConfigData`] **must** appear in the
-/// `string_config_fields!` invocation — the compiler enforces this through
-/// `STRUCT_FIELDS_DEFAULT` (a `const Self { … }` that initialises every
-/// field).  There is no such thing as a "transient" `Option<String>` field
-/// that lives outside the macro.
-///
-/// Fields that should NOT be persisted as config KV pairs (runtime-only
-/// caches, reconstructed state) will still appear in `string_fields()`
-/// and thus be written/read by the per-field persist paths / `reload_from_db`.
-/// If you truly need an unpersisted value, use a different type or a
-/// separate data structure — not an `Option<String>` on [`ConfigData`].
-///
-/// ## UX asymmetry warning
-///
-/// The GUI Settings page reads [`ConfigData`] directly via [`ConfigReload::snapshot`]
-/// (all fields).  But the per-field persist functions persist fields **only** through
-/// [`ConfigData::string_fields`], which is macro-generated.  A field missing from
-/// the macro would appear editable in the GUI but silently discard its value on
-/// every save.  The compiler guard on `ConfigData::STRUCT_FIELDS_DEFAULT` prevents this.
+/// **Every** `Option<String>` here must be in the macro: there is no
+/// "transient" `Option<String>` outside it. A field not meant to persist
+/// should use another type or live elsewhere — otherwise it still lands in
+/// `string_fields()` and gets written by `reload_from_db`. The same guard
+/// covers the UX asymmetry: the GUI Settings page reads the whole
+/// [`ConfigReload::snapshot`], while persisting goes only through the
+/// macro-generated [`ConfigData::string_fields`], so a missing entry would look
+/// editable and silently discard its value on save.
 #[derive(Debug, Clone)]
 pub struct ConfigData {
-    /// API key for the LLM provider.
     pub provider_key: Option<String>,
-    /// Base URL for the OpenAI-compatible LLM provider.
     pub provider_endpoint: Option<String>,
-    /// API key for the custom chat-completions endpoint (optional — many
-    /// self-hosted servers are keyless). Only ever sent to the custom endpoint,
-    /// never to OpenRouter.
+    /// The custom endpoint's own key (many are keyless); never sent to OpenRouter.
     pub provider_endpoint_key: Option<String>,
-    /// Model slot for the Manager group (Manager, Assistant, Discovery,
-    /// Engineer, Maintainer).
+    /// Model slot for the Manager group (Manager, Assistant, Discovery, Engineer, Maintainer).
     pub manager_model: Option<String>,
-    /// Model slot for all worker roles (Analyst, Worker, QA,
-    /// Reviewer, Sanitation).
+    /// Model slot for all worker roles (Analyst, Worker, QA, Reviewer, Sanitation).
     pub worker_model: Option<String>,
-    /// Newline-separated list of available image generation models (for selection UI).
+    /// Newline-separated picker list.
     pub image_gen_models: Option<String>,
-    /// Newline-separated list of available video models (for selection UI).
+    /// Newline-separated picker list.
     pub video_models: Option<String>,
     /// DeepSeek platform API key (`api.deepseek.com`) for the web-search tool —
     /// not the OpenRouter key the product's DeepSeek models travel through.
     pub deepseek_key: Option<String>,
-    /// Exa API key for web search.
     pub exa_key: Option<String>,
     /// Web search provider selection: `"deepseek"` or `"exa"` (case-insensitive).
     /// When `None`, no explicit choice was made — text searches then go to
     /// DeepSeek and picture searches to Exa when that key is configured.
     pub web_search_provider: Option<String>,
-    /// Telegram Bot API token (hot-reloaded on save).
+    /// Hot-reloaded on save.
     pub telegram_bot_token: Option<String>,
     /// Which Bot API the Telegram transport talks to: `"local"` serves the bot
     /// from the product's own self-hosted server, anything else (or no row) is
@@ -284,7 +173,6 @@ pub struct ConfigData {
     /// `api_id` of the owner's Telegram application (`my.telegram.org`), read
     /// only by that server.
     pub telegram_api_id: Option<String>,
-    /// `api_hash` of the same application.
     pub telegram_api_hash: Option<String>,
     /// Journal of a switch to or from the local server that has not finished
     /// yet (JSON, see `channels::telegram_local`). Present only while a switch
@@ -304,27 +192,19 @@ pub struct ConfigData {
     /// are replaced with just the icon combo and the temp file is deleted, so
     /// voice messages are not recoverable.
     pub audio_transcription_use_local: Option<String>,
-    /// Enable voice assistant (wake word detection and voice commands) on
-    /// macOS, where the audio subsystem lives. Set to `"true"` to enable voice
-    /// mode.
+    /// Voice assistant (wake word detection and commands) on macOS; `"true"` enables
+    /// voice mode.
     pub voice_enabled: Option<String>,
     /// Enable speech output for the admin's Assistant (default: `"false"`;
     /// macOS only). Set to `"true"` to let it speak short updates aloud through
     /// the `say` tool on this machine. Nothing is ever read aloud on its own.
     pub tts_enabled: Option<String>,
-    /// Language tag for TTS synthesis (default: `"na"` — language-agnostic;
-    /// macOS only).
-    /// Supported codes: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr,
-    /// hi, hr, hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk,
-    /// vi, na.
-    ///
-    /// The default `"na"` works well for any language. Set to `"en"` for
-    /// optimal English pronunciation, or to your language's code for better
-    /// results in that language.
+    /// macOS only. Supported codes: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr,
+    /// hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na. The default `"na"`
+    /// works for any language; `"en"` gives optimal English pronunciation.
     pub tts_language: Option<String>,
-    /// JSON-serialized wake word enrollment (v2 schema: prototype + calibration)
-    /// for the voice assistant (macOS only).  Owned exclusively by the voice
-    /// pipeline.
+    /// JSON wake word enrollment (v2: prototype + calibration), macOS only. Owned exclusively by
+    /// the voice pipeline.
     pub wake_word_templates: Option<String>,
     /// Onboarding state machine: "init" | "finished".
     /// Absent = Init (fresh install). Set by the onboarding flow; existing
@@ -337,97 +217,28 @@ pub struct ConfigData {
     pub autolaunch: Option<String>,
     /// Update by itself: `"false"` when the owner turned the Settings switch off,
     /// anything else (or no row) when it is on. It only gates the unattended
-    /// trigger — the release check, the changelog and the manual update are
-    /// unaffected.
+    /// trigger — the release check, the changelog and the manual update are unaffected.
     pub autoupdate: Option<String>,
-    /// Per-model provider routing.
     pub model_routings: Vec<ModelRouting>,
 }
 
-// ── String config field mapping ──────────────────────────────────
-//
-// The four runtime sync items (`STRUCT_FIELDS_DEFAULT`, `string_fields()`,
-// `set_string_field()`, `normalize_string_fields()`) plus the typed accessors
-// on [`ConfigReload`]
-// are all generated from a single annotated field-name declaration by the
-// `string_config_fields!` macro — adding or removing a field in the
-// macro invocation updates all items automatically, eliminating the
-// entire class of sync bugs.
-//
-// The macro additionally emits a `pub const CONFIG_KEY_<FIELD>` constant per
-// field, alongside the sync items, so hand-written persist paths reference
-// keys by name instead of raw literals.
-//
-// ══ Structural protection ═════════════════════════════════════════
-//
-// `STRUCT_FIELDS_DEFAULT` is a `const Self { … }` that initialises every
-// [`ConfigData`] field.  The compiler requires every field to be present,
-// so adding a field to [`ConfigData`] without adding it to the macro is
-// a **compile error**.  This eliminates the silent-drift class entirely
-// — no manual count constants or runtime tests needed.
-//
-// ══ UX asymmetry ═══════════════════════════════════════════════════
-//
-// The GUI Settings page reads [`ConfigData`] via [`ConfigReload::snapshot`],
-// which clones every struct field directly.  But the per-field persist
-// functions persist **only** through [`ConfigData::string_fields`]
-// (macro-generated).  A field missing from the macro would appear editable
-// in the UI but silently discard on persist.  The compiler guard above
-// prevents this.
-//
-// ══ Per-field accessor patterns ═════════════════════════════════════
-//
-// Each field is annotated with one of these patterns:
-//
-// * `non_empty` — returns `Option<String>`, collapses empty/whitespace to `None`.
-// * `or(DEFAULT)` — returns `String`, falls back to the given default constant.
-// * `list_or(default = <const>)` — returns `Vec<String>`, parses a
-//   newline-separated list and falls back to a single-element list of the
-//   default constant when unset/empty.  A `, raw` suffix also emits
-//   `<field>_raw`, which returns the configured list with no default injected.
-//
-// Generated accessors live on `impl ConfigReload`, created by `string_config_fields!`.
-
-/// Generate the runtime sync methods `string_fields()` and `set_string_field()`,
-/// the const `STRUCT_FIELDS_DEFAULT`, **and** the typed accessors on [`ConfigReload`]
-/// — all from a single annotated list of `Option<String>` field names.
+/// Generate `string_fields()`, `set_string_field()`, the const `STRUCT_FIELDS_DEFAULT`, the
+/// `CONFIG_KEY_<FIELD>` constants **and** the typed accessors on [`ConfigReload`] from one
+/// annotated field list, so adding or removing a field updates every sync item at once.
 ///
-/// Each field is declared as `$field [$annotation]` where `$annotation` is one of
-/// `non_empty`, `or($default)`, `list_or(default = $default)`, or
-/// `list_or(default = $default, raw)` — the last also emitting a raw
-/// `<field>_raw` accessor that returns the configured list with no default
-/// injected.
+/// Each field is declared as `$field [$annotation]` with `non_empty`, `or($default)`,
+/// `list_or(default = $default)` or `list_or(default = $default, raw)` — the last also emitting
+/// a raw `<field>_raw` accessor with no default injected.
 ///
-/// All generated items are guaranteed to stay synchronised because they expand
-/// from the same source.
-///
-/// The macro also emits one `pub const CONFIG_KEY_<FIELD>: &str` per field
-/// (name pasted from the field token, value `stringify!` of the same token),
-/// so write sites and match arms can reference the key without raw literals —
-/// a rename in the invocation changes the constant and its value together.
-///
-/// ## Structural drift protection
-///
-/// The generated [`ConfigData::STRUCT_FIELDS_DEFAULT`] is a `const` value that
-/// initialises **every** field on [`ConfigData`] — both the listed `Option<String>`
-/// fields and the `Vec` fields.  Because `Self { ... }` in a const requires all
-/// fields, the **compiler** catches a struct–macro mismatch: adding a field to
-/// [`ConfigData`] without adding it to the macro invocation produces a compile
-/// error.  This eliminates the entire class of silent-drift bugs without manual
-/// count constants or runtime tests.
+/// The `CONFIG_KEY_<FIELD>` constant pastes the name from the field token and
+/// `stringify!`s the same token, so a rename changes both and stale use sites
+/// fail to compile instead of silently dropping their side effect.
 macro_rules! string_config_fields {
-    // ── Entry point: parse annotated field list ─────────────────
     (
         $(
             $field:ident [ $($annotation:tt)* ]
         ),* $(,)?
     ) => {
-        // ── Config-key constants — single source of truth ──────
-        //
-        // Each field emits a `CONFIG_KEY_<FIELD>` const: the name is pasted
-        // from the field token (`:upper`), the value `stringify!`s the same
-        // token, so a rename changes both together and stale use sites fail
-        // to compile instead of silently dropping their side effect.
         ::paste::paste! {
             $(
                 pub const [<CONFIG_KEY_ $field:upper>]: &str = stringify!($field);
@@ -435,42 +246,24 @@ macro_rules! string_config_fields {
         }
 
         impl ConfigData {
-            /// Default-initialised [`ConfigData`] with all `Option<String>` fields
-            /// set to `None` and `Vec` fields empty.
-            ///
-            /// Used by [`ConfigReload::const_new`] so that adding a new field to
-            /// the struct **and** the macro invocation is the *only* step needed
-            /// — the const automatically stays in sync.
-            ///
-            /// ## Compiler enforcement
-            ///
-            /// Because this is a `const Self { … }`, the compiler requires every
-            /// field on [`ConfigData`] to be present.  Adding a field to the
-            /// struct without adding it here (via the macro) is a **compile
-            /// error** — the entire silent-drift class is caught before a test
-            /// ever runs.
+            /// Default-initialised [`ConfigData`], used by [`ConfigReload::const_new`].
+            /// A `const Self { … }` requires every field, so a struct–macro
+            /// mismatch is a compile error before any test runs.
             pub(crate) const STRUCT_FIELDS_DEFAULT: Self = Self {
                 $($field: None,)*
                 model_routings: Vec::new(),
             };
 
-            /// Return all string-valued config fields as (db_key, current_value) pairs.
-            ///
-            /// `model_routings` is **not** included here — it lives in a
-            /// separate database table (`config_model_routing`).
+            /// All string-valued fields as (db_key, current_value) pairs;
+            /// `model_routings` is excluded — separate table.
             #[must_use]
             pub fn string_fields(&self) -> Vec<(&'static str, Option<&str>)> {
                 vec![$((stringify!($field), self.$field.as_deref())),*]
             }
 
-            /// Set a string field by its database key. Returns `true` if the key was
-            /// recognised and the field was updated, `false` for unknown keys.
-            ///
-            /// The value is stored as-is without normalization — call [`Self::normalize`]
-            /// before using the config to collapse empty/whitespace-only values to `None`.
-            ///
-            /// `model_routings` is **not** handled here — it lives in a separate
-            /// database table (`config_model_routing`).
+            /// Set a string field by its database key, `true` when recognised.
+            /// The value is stored as-is: call [`Self::normalize`] to collapse
+            /// empty/whitespace-only values to `None`.
             #[must_use]
             pub fn set_string_field(&mut self, key: &str, value: &str) -> bool {
                 match key {
@@ -480,17 +273,9 @@ macro_rules! string_config_fields {
                 true
             }
 
-            /// Read a string field's raw value by its database key, returning
-            /// `None` for unknown keys.
-            ///
-            /// This is the allocation-free read counterpart to [`set_string_field`]:
-            /// it mirrors the setter's match arms so the two always agree on the
-            /// exact generated key set. The value is returned as stored (not
-            /// normalized) — call [`Self::normalize`] before using the config to
-            /// collapse empty/whitespace-only values to `None`.
-            ///
-            /// `model_routings` is **not** handled here — it lives in a separate
-            /// database table (`config_model_routing`).
+            /// Allocation-free counterpart to [`set_string_field`], mirroring its
+            /// arms so both agree on the generated key set; `None` for unknown
+            /// keys. The value is as stored — [`Self::normalize`] first.
             #[must_use]
             pub(crate) fn get_string_field(&self, key: &str) -> Option<&str> {
                 match key {
@@ -499,13 +284,9 @@ macro_rules! string_config_fields {
                 }
             }
 
-            /// Whether `key` names a known string-field database key.
-            ///
-            /// Presence is checked against the generated field set, not against
-            /// the field's current value — this is why it is a separate method
-            /// rather than [`get_string_field(...).is_some()`]: on
-            /// [`STRUCT_FIELDS_DEFAULT`] every value is `None`, so a value-based
-            /// probe would always return `false`.
+            /// Whether `key` names a known field — checked against the generated
+            /// field set, not the value (on [`STRUCT_FIELDS_DEFAULT`] every value
+            /// is `None`, so [`get_string_field`] would always answer no).
             #[must_use]
             fn has_string_field(&self, key: &str) -> bool {
                 match key {
@@ -514,23 +295,17 @@ macro_rules! string_config_fields {
                 }
             }
 
-            /// Normalise all string fields in place: trim whitespace and collapse
-            /// empty or whitespace-only values to `None`.
-            ///
-            /// Unlike [`set_string_field`], which stores values as-is, this is the
-            /// canonical normalization point — callers that set individual fields
-            /// should ensure [`Self::normalize`] is called before using the config.
+            /// Trim every string field in place and collapse empty/whitespace to
+            /// `None`. [`set_string_field`] stores as-is, so this is the canonical
+            /// normalisation point — call it before the config is used.
             fn normalize_string_fields(&mut self) {
                 $(self.$field = non_empty(self.$field.take());)*
             }
         }
 
-        // ── Generate typed accessors on ConfigReload ────────────
-        //
-        // Both passes needed: `normalize()` writes canonical values so
-        // the per-field persist paths' `!=` comparisons against current
-        // CONFIG accessors see no spurious diffs; accessors below
-        // re-normalise raw values. See `config_accessors_resolve_defaults_and_override_them`.
+        // Both passes are needed: normalize() writes canonical values so the
+        // persist paths' `!=` comparisons see no spurious diffs, and the
+        // accessors below re-normalise raw values.
         impl ConfigReload {
             $(
                 string_config_fields!(@accessor $field $($annotation)*);
@@ -538,9 +313,7 @@ macro_rules! string_config_fields {
         }
     };
 
-    // ── Accessor pattern: non_empty ─────────────────────────────
-    //
-    // Returns Option<String>, collapses empty/whitespace to None.
+    // non_empty: Option<String>, empty/whitespace collapsed to None.
     (@accessor $field:ident non_empty) => {
         #[doc = concat!(
             "Returns the configured `", stringify!($field),
@@ -552,9 +325,7 @@ macro_rules! string_config_fields {
         }
     };
 
-    // ── Accessor pattern: or(DEFAULT) ───────────────────────────
-    //
-    // Returns String, falls back to the given default constant.
+    // or(DEFAULT): String, falling back to the given default constant.
     (@accessor $field:ident or($default:expr)) => {
         #[doc = concat!(
             "Returns the configured `", stringify!($field),
@@ -566,18 +337,10 @@ macro_rules! string_config_fields {
         }
     };
 
-    // ── Accessor pattern: list_or(default = <const>) ──
-    //
-    // Returns Vec<String>. Tries parsing `$field` as a newline-separated list.
-    // If non-empty, returns the parsed entries. Otherwise falls back to the
-    // hardcoded `$default` constant. Used for the model picker lists, whose
-    // active selection is now per-user (not a global config field) — the only
-    // fallback is the default model.
-    //
-    // `, raw` additionally emits `<field>_raw` — the stored list with no default
-    // injected, for a caller that must tell "nothing was chosen" apart from "the
-    // default was chosen". Only a field whose caller needs that difference asks
-    // for it.
+    // list_or(default = <const>): Vec<String> from a newline-separated list,
+    // falling back to `$default`. `, raw` also emits `<field>_raw` — the stored
+    // list with no default injected, for a caller that must tell "nothing was
+    // chosen" apart from "the default was chosen".
     (@accessor $field:ident list_or(default = $default:expr)) => {
         string_config_fields!(@list_accessor $field, $default);
     };
@@ -640,30 +403,18 @@ string_config_fields! {
 }
 
 impl ConfigData {
-    /// Normalise inner `Option<String>` fields of `Vec` entries in place:
-    /// trim whitespace and collapse empty/whitespace-only values to `None`.
-    ///
-    /// This is the Vec-entry counterpart of [`normalize_string_fields()`] —
-    /// the macro-generated method only touches top-level `Option<String>` fields,
-    /// not the inner fields of [`ModelRouting`] entries.
+    /// Trim inner fields of `Vec` entries and collapse empty to `None` — the
+    /// counterpart of [`normalize_string_fields()`], which stops at the top level.
     fn normalize_entries(&mut self) {
         for mr in &mut self.model_routings {
             mr.provider_order = non_empty(mr.provider_order.take());
         }
     }
 
-    /// Apply canonical normalisation + sorting to the in-memory
-    /// representation so it is consistent across all persistence paths.
-    ///
-    /// The sequence is:
-    /// 1. Trim top-level `Option<String>` fields and collapse empty → `None`.
-    /// 2. Trim inner fields on `Vec` entries (`[ModelRouting]`)
-    ///    and collapse empty → `None`.
-    /// 3. Sort `model_routings` by model name.
-    ///
-    /// Every caller that produces a newly-built [`ConfigData`] must call
-    /// this before swapping into the global [`CONFIG`] so that the in-memory
-    /// representation is the same regardless of which code path produced it.
+    /// Canonical form: trim top-level fields and `Vec`-entry inner fields,
+    /// collapsing empty to `None`, then sort `model_routings` by model name. Every
+    /// caller building a [`ConfigData`] MUST call this before swapping into
+    /// [`CONFIG`] so the in-memory value is path-independent.
     pub(crate) fn normalize(&mut self) {
         self.normalize_string_fields();
         self.normalize_entries();
@@ -671,10 +422,7 @@ impl ConfigData {
     }
 }
 
-// ── Config value helpers ────────────────────────────────────────────
-
-/// Trim a string and return `None` if empty or whitespace-only.
-/// This is the canonical primitive for string trimming helpers.
+/// Trim, and `None` when empty or whitespace-only. The canonical primitive.
 #[must_use]
 pub(crate) fn trimmed_or_none(s: &str) -> Option<String> {
     let trimmed = s.trim();
@@ -685,7 +433,7 @@ pub(crate) fn trimmed_or_none(s: &str) -> Option<String> {
     }
 }
 
-/// Parse a newline-separated string into a vector of non-empty, trimmed entries.
+/// Newline-separated string into non-empty, trimmed entries.
 #[must_use]
 pub(crate) fn parse_newline_list(s: &str) -> Vec<String> {
     s.split('\n')
@@ -694,9 +442,7 @@ pub(crate) fn parse_newline_list(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// Treat an empty or whitespace-only string as `None`.
-/// The value is trimmed before being returned.
-/// Delegates to [`trimmed_or_none`].
+/// Empty or whitespace-only becomes `None`; the value is trimmed.
 #[must_use]
 fn non_empty(val: Option<String>) -> Option<String> {
     val.and_then(|s| trimmed_or_none(&s))
@@ -710,17 +456,14 @@ pub(crate) fn flag_on(val: Option<&str>) -> bool {
     !val.is_some_and(|val| val.trim().eq_ignore_ascii_case("false"))
 }
 
-/// Resolve a value with a fallback: use `val` if non-empty (after trimming), else `fallback`.
+/// `val` when non-empty after trimming, else `fallback`.
 #[must_use]
 pub(crate) fn resolve_or(val: Option<String>, fallback: &str) -> String {
     non_empty(val).unwrap_or(fallback.to_string())
 }
 
-/// Parse a newline-separated list field, falling back to a hardcoded default.
-///
-/// If `list_field` is `Some` and contains at least one non-empty line (after trimming), the parsed
-/// lines are returned as a `Vec<String>`. Otherwise a single-element vec containing
-/// `default_value` is returned.
+/// Parsed non-empty lines of `list_field`, else the single-element
+/// `[default_value]`.
 #[must_use]
 fn resolve_list_or(list_field: Option<&str>, default_value: &str) -> Vec<String> {
     if let Some(raw) = list_field {
@@ -732,24 +475,19 @@ fn resolve_list_or(list_field: Option<&str>, default_value: &str) -> Vec<String>
     vec![default_value.to_string()]
 }
 
-/// Normalize an endpoint URL for comparison: trim surrounding whitespace,
-/// lowercase the scheme and host (not the path), strip trailing slashes, and
-/// strip a trailing `/chat/completions` suffix. The default OpenRouter URL and
-/// trivial variants (trailing slash, whitespace, scheme/host case,
-/// chat-completions suffix) must never count as a custom endpoint.
+/// Normalize an endpoint URL for comparison: trim, lowercase scheme and host
+/// but not the path, strip trailing slashes and one trailing
+/// `/chat/completions`. The default OpenRouter URL and these trivial variants
+/// must never count as a custom endpoint. Suffix matching is case-sensitive
+/// (`/Chat/Completions` stays). Scheme-less input is only trimmed/stripped, and
+/// empty input normalizes to `""`.
 ///
-/// Suffix matching is case-sensitive (`/Chat/Completions` is not stripped).
-/// Scheme-less input is returned largely unchanged (no `://` → no lowercasing,
-/// just trimmed/stripped); empty/whitespace-only input normalizes to `""`.
-///
-/// SSoT coupling: future changes here intentionally affect fetch URL
-/// construction at all call sites (catalog, transcribe, compatible provider).
+/// SSoT: a change here intentionally moves fetch-URL construction at every call
+/// site (catalog, transcribe, compatible provider).
 #[must_use]
 pub(crate) fn normalize_endpoint_url(url: &str) -> String {
     let t = url.trim().trim_end_matches('/');
-    // Strip one trailing `/chat/completions` suffix (after slash-stripping the
-    // suffix has no trailing slash). Handles a URL ending exactly in
-    // `/chat/completions`.
+    // The suffix has no trailing slash after it is stripped.
     let t = t
         .strip_suffix("/chat/completions")
         .unwrap_or(t)
@@ -773,8 +511,8 @@ pub(crate) fn normalize_endpoint_url(url: &str) -> String {
     }
 }
 
-/// Whether `endpoint` is the default OpenRouter chat-completions endpoint
-/// (modulo trivial variants — see [`normalize_endpoint_url`]).
+/// Whether `endpoint` is the default one, modulo the variants
+/// [`normalize_endpoint_url`] folds away.
 #[must_use]
 pub(crate) fn is_default_endpoint(endpoint: &str) -> bool {
     normalize_endpoint_url(endpoint) == normalize_endpoint_url(DEFAULT_PROVIDER_ENDPOINT)
@@ -787,34 +525,30 @@ pub(crate) fn is_custom_endpoint(endpoint: &str) -> bool {
 }
 
 /// Whether the LLM provider is configured: a non-empty OpenRouter key OR a
-/// genuinely custom endpoint active in the global CONFIG — keyless custom
-/// endpoints count too, while the default URL and trivial variants never do.
-/// Used by the pipeline pickup gate and the GUI boot-to-Settings redirect.
+/// genuinely custom endpoint (keyless ones count; the default URL never does).
+/// Gates pipeline pickup and the GUI boot-to-Settings redirect.
 #[must_use]
 pub(crate) fn provider_configured() -> bool {
     is_custom_endpoint(&CONFIG.provider_endpoint()) || CONFIG.provider_key().is_some()
 }
 
-/// Whether the installation can run an assistant turn at all: a model provider
-/// is configured and setup has been finished. A product-authored message that
-/// lands before either is a guaranteed failing turn, so its producer stays
+/// A model provider is configured and onboarding finished. A product message
+/// landing before either is a guaranteed failing turn, so its producer stays
 /// silent instead.
 #[must_use]
 pub(crate) fn assistant_can_run() -> bool {
     provider_configured() && CONFIG.onboarding_stage() == OnboardingState::Finished
 }
 
-/// Effective chat-completions endpoint for a config snapshot: the persisted
-/// endpoint when set (custom), else the default.
+/// The snapshot's persisted endpoint when set, else the default.
 #[must_use]
 pub(crate) fn effective_chat_endpoint(config: &ConfigData) -> String {
     resolve_or(config.provider_endpoint.clone(), DEFAULT_PROVIDER_ENDPOINT)
 }
 
-/// Credential for chat-completions requests under `config`: the custom
-/// endpoint's own key when a custom endpoint is active (None = keyless, no
-/// Authorization header), otherwise the OpenRouter key. The OpenRouter key is
-/// NEVER sent to a custom endpoint.
+/// Chat credential under `config`: the custom endpoint's own key when one is
+/// active (`None` = keyless, no Authorization header), else the OpenRouter key.
+/// The OpenRouter key is NEVER sent to a custom endpoint.
 #[must_use]
 pub(crate) fn chat_credential(config: &ConfigData) -> Option<String> {
     let ep = effective_chat_endpoint(config);
@@ -825,44 +559,29 @@ pub(crate) fn chat_credential(config: &ConfigData) -> Option<String> {
     }
 }
 
-// ── ConfigReload — global singleton ──────────────────────────────
-
 /// Global reloadable config singleton.
 ///
 /// The `storage_root` is immutable after startup; all other fields live in an
 /// `RwLock<ConfigData>` that can be atomically swapped at runtime.
 pub static CONFIG: ConfigReload = ConfigReload::const_new();
 
-/// Serializes all per-field config persistence (settings-page autosave).
-///
-/// Every settled-field persist runs inside this lock so that:
-/// - read-modify-write sequences (routing rows, endpoint/key probes built
-///   from the live config) never interleave with each other;
-/// - side-effect settles (provider warmup + recreate, Telegram listener
-///   restart) cannot race, which would let two full config rewrites with
-///   stale snapshots clobber each other's freshly-written rows.
-///
-/// The lock is held across the entire persist — including the provider
-/// warmup network call — so each settle validates and writes against the
-/// latest committed state.
+/// Serializes every settled-field persist (settings-page autosave), held across
+/// the whole persist — including the provider warmup call — so read-modify-write
+/// sequences and side-effect settles (warmup, Telegram restart) cannot race and
+/// clobber each other's rows with stale snapshots.
 static CONFIG_PERSIST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 fn persist_lock() -> &'static tokio::sync::Mutex<()> {
     CONFIG_PERSIST_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-/// Fresh-install discriminator: set during [`load_or_init`] to
-/// whether the consolidated `core.db` did not exist on disk before the
-/// config store was opened this boot. [`reload_from_db`] seeds the
-/// fresh-install defaults into brand-new config databases only — existing
-/// databases receive zero writes (hard constraint).
+/// Whether `core.db` was absent on disk before the config store was opened this
+/// boot, as recorded by [`load_or_init`]. [`reload_from_db`] seeds defaults into
+/// brand-new databases only — existing ones receive zero writes (hard constraint).
 static CONFIG_DB_FRESH_AT_BOOT: AtomicBool = AtomicBool::new(false);
 
-/// Reloadable configuration with atomic swap capability.
-///
-/// The inner [`ConfigData`] is protected by an [`RwLock`] so readers don't
-/// block each other. Writes happen only during startup and GUI-driven config
-/// saves.
+/// Reloadable configuration with atomic swap. Readers never block each other;
+/// writes happen only at startup and on GUI-driven saves.
 pub struct ConfigReload {
     storage_root: OnceLock<PathBuf>,
     inner: RwLock<ConfigData>,
@@ -877,8 +596,6 @@ impl ConfigReload {
         }
     }
 
-    // ── Storage root (set once at startup, immutable thereafter) ─
-
     /// # Panics
     /// Panics if storage root has not been set.
     pub fn global_storage_root(&self) -> PathBuf {
@@ -888,9 +605,8 @@ impl ConfigReload {
             .clone()
     }
 
-    /// Like [`Self::global_storage_root`], but returns `None` instead of panicking if
-    /// storage root has not been set yet. Useful for code paths that can tolerate
-    /// an uninitialized config (e.g., graceful degradation in tests).
+    /// `None` instead of panicking when no root is set — for paths that tolerate
+    /// an uninitialized config (tests).
     #[must_use]
     pub fn try_storage_root(&self) -> Option<PathBuf> {
         self.storage_root.get().cloned()
@@ -902,15 +618,12 @@ impl ConfigReload {
             .expect("CONFIG storage_root already set");
     }
 
-    /// Like [`set_storage_root`], but returns `Err` instead of panicking if
-    /// already set. Useful in test environments where the root may have been
-    /// set by a previously-running test.
+    /// `Err` instead of panicking when already set — the root may have been set
+    /// by a previously-running test.
     #[cfg(test)]
     pub(crate) fn try_set_storage_root(&self, root: PathBuf) -> std::result::Result<(), PathBuf> {
         self.storage_root.set(root)
     }
-
-    // ── Snapshot access ─────────────────────────────────────────
 
     /// Get a read-locked snapshot of the current config.
     /// Prefer the typed accessors below for individual fields.
@@ -935,25 +648,18 @@ impl ConfigReload {
         OnboardingState::from_raw(self.onboarding_state().as_deref())
     }
 
-    /// Update a single string config field in-memory.
-    ///
-    /// This is intentionally lightweight — it only mutates the in-memory
-    /// [`ConfigData`] without touching the database or triggering provider
-    /// warmup. Callers are responsible for persisting the change to the
-    /// config DB separately (e.g. via [`crate::config_db::ConfigStore::set_kv`]).
-    ///
-    /// Returns `true` if the key was recognised, `false` otherwise (unknown
-    /// keys are silently ignored for forward compatibility).
+    /// In-memory only: no DB write and no provider warmup, so callers must
+    /// persist separately (e.g. [`crate::config_db::ConfigStore::set_kv`]).
+    /// `true` when the key was recognised; unknown keys are ignored for
+    /// forward compatibility.
     #[must_use]
     pub fn set_string_field(&self, key: &str, value: &str) -> bool {
         let mut guard = self.inner.write().unwrap_poison();
         guard.set_string_field(key, value)
     }
 
-    /// Apply a single model-routing row to the in-memory config (find-or-push).
-    ///
-    /// `None` on `provider_order` removes the row (mirroring the
-    /// DELETE-if-empty persistence path).
+    /// Find-or-push in memory; `None` `provider_order` removes the row, mirroring
+    /// the DELETE-if-empty persistence path.
     fn set_model_routing_row(&self, model: &str, provider_order: Option<String>) {
         let mut guard = self.inner.write().unwrap_poison();
         if provider_order.is_none() {
@@ -965,15 +671,9 @@ impl ConfigReload {
         }
     }
 
-    // ── Provider routing (per-model) ──────────────────────────
-
-    /// Find the per-model routing row by model key, if one exists.
-    ///
-    /// Unlike [`Self::model_routing`] (which returns the *effective* routing —
-    /// a stored row, else the model's default provider), this returns the raw
-    /// stored row, and `None` when there is none: the settings page uses it to
-    /// tell "no override" apart from "override cleared" when mirroring settled
-    /// rows.
+    /// The raw stored row, unlike [`Self::model_routing`] which resolves the
+    /// effective one. `None` lets the settings page tell "no override" apart
+    /// from "override cleared" when mirroring settled rows.
     pub(crate) fn model_routing_by_key(&self, model: &str) -> Option<ModelRouting> {
         let guard = self.read();
         guard
@@ -983,11 +683,9 @@ impl ConfigReload {
             .cloned()
     }
 
-    /// Look up the effective provider routing for a model.
-    ///
-    /// The user's stored order (Settings → Provider Routing) wins when one is
-    /// set; otherwise the model's [`default_model_routing`] applies, so an
-    /// unset/cleared field behaves exactly as if that provider had been set.
+    /// The effective routing: the stored order (Settings → Provider Routing)
+    /// wins, else [`default_model_routing`], so a cleared field behaves exactly
+    /// as if that provider had been set.
     #[must_use]
     pub(crate) fn model_routing(&self, model: &str) -> ModelRouting {
         // No stored order → the model's default provider; see `default_model_routing`.
@@ -1001,14 +699,9 @@ impl ConfigReload {
         }
     }
 
-    // ── Role model resolution (two slots) ─────────────────────
-
-    /// Resolve the configured model for a role from the two model slots.
-    ///
-    /// The manager group (Manager, Assistant, Discovery, Engineer,
-    /// Maintainer) uses the manager slot; every other role (Analyst, Worker,
-    /// QA, Reviewer, Sanitation) uses the worker slot. Unset slots
-    /// fall back to their code default.
+    /// The manager group (Manager, Assistant, Discovery, Engineer, Maintainer)
+    /// uses the manager slot; every other role the worker slot. Unset slots fall
+    /// back to their code default.
     #[must_use]
     pub fn role_model(&self, role: Role) -> String {
         match role {
@@ -1021,8 +714,6 @@ impl ConfigReload {
         }
     }
 }
-
-// ── Startup / reload / save ──────────────────────────────────────
 
 pub fn default_config_dir() -> Result<PathBuf> {
     if let Ok(home) = std::env::var("HOME")
@@ -1037,17 +728,10 @@ pub fn default_config_dir() -> Result<PathBuf> {
     Ok(home.join(".mahbot"))
 }
 
-/// Load (or initialise) the config system.
-///
-/// 1. Resolves `~/.mahbot` as the storage root.
-/// 2. Creates the directory if needed.
-/// 3. Seeds runtime config with hardcoded defaults.
-/// 4. Stores the result in the global [`CONFIG`] singleton.
-///
-/// The caller must subsequently call [`reload_from_db`] to load any
-/// persisted configuration from the consolidated database. Providers must be
-/// initialised **after** `reload_from_db` so API keys and model
-/// settings take effect.
+/// Resolve `~/.mahbot` as the storage root, create it, seed hardcoded defaults
+/// and store the result in [`CONFIG`]. The caller must then call
+/// [`reload_from_db`], and providers must be initialised **after** it, or API
+/// keys and model settings do not take effect.
 pub async fn load_or_init() -> Result<()> {
     let mahbot_dir = default_config_dir()?;
     fs::create_dir_all(&mahbot_dir)
@@ -1056,11 +740,7 @@ pub async fn load_or_init() -> Result<()> {
 
     CONFIG.set_storage_root(mahbot_dir.clone());
 
-    // Fresh-install discriminator: capture whether the config store file exists
-    // BEFORE any store open creates it, so reload_from_db() can seed
-    // fresh-install defaults into brand-new databases only. In the consolidated
-    // layout the config store lives in the single `core.db`; an existing
-    // install is detected by that file. Probing any other location would
+    // Probed BEFORE any store open creates it. Probing any other location would
     // classify every existing install as fresh and re-seed it on each boot,
     // violating the zero-write hard constraint.
     CONFIG_DB_FRESH_AT_BOOT.store(config_db_is_fresh(&mahbot_dir), Ordering::Release);
@@ -1076,24 +756,17 @@ pub async fn load_or_init() -> Result<()> {
     Ok(())
 }
 
-/// Fresh-install discriminator: `true` when the config store
-/// file does not yet exist at its real location.
-///
-/// In the consolidated layout the config store lives in the single domain
-/// database ([`crate::db::CONSOLIDATED_DB_NAME`]); the discriminator is simply
-/// whether that consolidated file exists.
-///
-/// Must be probed BEFORE any store open creates the file, and must check the
-/// exact path the open uses (`init_all_stores` → `open_store` →
-/// `store_db_path`).
+/// `true` when the consolidated domain database
+/// ([`crate::db::CONSOLIDATED_DB_NAME`]) does not exist yet. Must be probed
+/// BEFORE any store open creates it, and must check the exact path the open
+/// uses (`init_all_stores` → `open_store` → `store_db_path`).
 fn config_db_is_fresh(mahbot_dir: &std::path::Path) -> bool {
     !crate::db::store_db_path(mahbot_dir, "config").exists()
 }
 
-/// The provider that serves a model unless the user chose one for it: a
-/// DeepSeek-family model (case-insensitive substring match on the model slug)
-/// goes to OpenRouter's canonical lowercase `deepseek` slug; every other model
-/// stays auto-routed.
+/// The provider that serves a model unless the user chose one: a DeepSeek-family
+/// slug (case-insensitive substring) → OpenRouter's lowercase `deepseek`; every
+/// other model stays auto-routed.
 ///
 /// **DO NOT DELETE, WEAKEN OR "SIMPLIFY" THIS RULE WITHOUT AN EXPLICIT USER
 /// REQUEST.** Which host serves a model decides prompt-cache locality, so
@@ -1105,19 +778,13 @@ pub(crate) fn default_model_routing(model: &str) -> Option<&'static str> {
         .then_some("deepseek")
 }
 
-/// Seed the fresh-install defaults into a brand-new config database
-///
-/// The transcription-off flag is not seeded here: catalog `69` writes it for
-/// every install that never wrote it, fresh or existing, when the config store
-/// opens — so the migration is the single owner of that initial value. This
-/// function seeds the rows a fresh install must show: the image/video
-/// generation model lists (the Settings GUI reads the raw snapshot fields
-/// `config.image_gen_models` / `config.video_models`, not the default-resolving
-/// `list_or` accessors) and the default model slots' routing. The active
-/// selection is per-user (see `crate::users`), not a config field, so no
-/// singular key is seeded. `fresh` is the pre-open file-existence discriminator
-/// captured in [`load_or_init`] — the seed itself writes nothing to existing
-/// databases.
+/// Seed the rows a fresh install must show: the image/video generation model
+/// lists (the Settings GUI reads the raw snapshot fields, not the
+/// default-resolving `list_or` accessors) and the default slots' routing. The
+/// active selection is per-user (`crate::users`), so no singular key is seeded.
+/// The transcription-off flag belongs to catalog `69`, the single owner of that
+/// initial value. `fresh` is the pre-open discriminator from [`load_or_init`] —
+/// the seed writes nothing to existing databases.
 async fn seed_fresh_install_defaults(
     fresh: bool,
     store: &crate::config_db::ConfigStore,
@@ -1131,13 +798,9 @@ async fn seed_fresh_install_defaults(
     store
         .set_kv(CONFIG_KEY_VIDEO_MODELS, FRESH_INSTALL_VIDEO_MODELS)
         .await?;
-    // Default model slots with a known provider route through it on fresh
-    // installs. The rows duplicate what an empty field resolves to, but are
-    // kept so the Settings routing field renders the value; they are derived
-    // from the default-model constants via `default_model_routing`, and only
-    // the manager/worker slots are seeded.
-    // Existing installs receive zero writes — the `fresh` guard above already
-    // returned for them.
+    // These rows duplicate what an empty field resolves to, but are kept so the
+    // Settings routing field renders the value. Only the manager/worker slots
+    // are seeded: the selection is per-user.
     for default_model in [DEFAULT_MANAGER_MODEL, DEFAULT_WORKER_MODEL] {
         if let Some(provider) = default_model_routing(default_model) {
             store
@@ -1151,13 +814,9 @@ async fn seed_fresh_install_defaults(
     Ok(())
 }
 
-/// Consume the boot fresh-install discriminator and seed the fresh-install
-/// defaults when it fired.
-///
-/// Mirrors the `load_or_init` → `reload_from_db` handoff exactly: the flag is
-/// set from [`config_db_is_fresh`] during boot and consumed (reset) here, so
-/// the seed lands once per fresh boot only. Kept as a separate function so the
-/// flag-consumption path is testable without the global store.
+/// Consume the boot discriminator and seed when it fired, mirroring the
+/// `load_or_init` → `reload_from_db` handoff, so the seed lands once per fresh
+/// boot only. Separate so the consumption path is testable without the global store.
 async fn seed_fresh_install_defaults_from_flag(
     store: &crate::config_db::ConfigStore,
 ) -> Result<()> {
@@ -1165,16 +824,13 @@ async fn seed_fresh_install_defaults_from_flag(
     seed_fresh_install_defaults(fresh, store).await
 }
 
-/// Idempotent migration: rewrite persisted manager/worker rows that still
-/// hold any historical compiled default to the current default. Every value a
-/// release ever shipped is listed, so an installation that skipped releases
-/// migrates too. Matching is exact on the full provider-prefixed string, so
-/// only rows the user never overrode are touched — with the accepted
-/// exception that a deliberate pick of an id which was also a historical
-/// default is indistinguishable and moves. A slot rewrite also seeds the
-/// routing row for the new default — the same order `default_model_routing`
-/// resolves for an empty field, written so the Settings routing field renders
-/// it. Safe to run on every boot — a no-op once no row matches.
+/// Idempotent: rewrite persisted manager/worker rows holding any historical
+/// compiled default. Every value a release ever shipped is listed, so an
+/// installation that skipped releases migrates too. Exact match on the full
+/// provider-prefixed string — accepted residual: a deliberate pick of an id that
+/// was also a historical default is indistinguishable and moves. A rewrite also
+/// seeds the new default's routing row so the Settings field renders it. A no-op
+/// once no row matches, so safe on every boot.
 async fn migrate_old_default_models(store: &crate::config_db::ConfigStore) -> Result<()> {
     let mut changed_manager = 0;
     for old in OLD_DEFAULT_MANAGER_MODELS {
@@ -1208,20 +864,14 @@ async fn migrate_old_default_models(store: &crate::config_db::ConfigStore) -> Re
     Ok(())
 }
 
-/// Reload config from the consolidated domain database, atomically swapping the
-/// runtime config. Called at startup (after config_db init) to overlay
-/// persisted settings on top of hardcoded defaults.
+/// Overlay persisted settings on top of the hardcoded defaults, atomically. Called
+/// at startup, after `config_db` init.
 pub async fn reload_from_db() -> Result<()> {
     let store = crate::config_db::store();
     let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
 
-    // Fresh-install seed: a brand-new config database gets the image/video
-    // generation model lists (so the Settings GUI pickers are populated; the
-    // active selection is per-user, not a config field). The transcription-off
-    // setting is not part of this seed — catalog `69` writes it for every install
-    // that never wrote it, and the config store open above already ran it. What
-    // this seed itself writes lands in a brand-new config database only (its
-    // `fresh` flag is decided by the config store not existing before that open).
+    // The config store open above already ran catalog 69, which owns the
+    // transcription-off flag.
     seed_fresh_install_defaults_from_flag(store).await?;
 
     // Rewrite persisted old-default manager/worker rows to the new default
@@ -1239,8 +889,8 @@ pub async fn reload_from_db() -> Result<()> {
     let routings = store.get_all_model_routings().await?;
     config.model_routings = routings;
 
-    // Normalise and sort so the in-memory representation matches the
-    // per-field persistence paths (see the "Per-field persistence" section).
+    // Normalised and sorted so the in-memory value matches what the
+    // per-field persistence paths write.
     config.normalize();
 
     CONFIG.swap(config);
@@ -1248,13 +898,10 @@ pub async fn reload_from_db() -> Result<()> {
     Ok(())
 }
 
-/// Delete `config_kv` rows whose keys are no longer recognized config fields
-/// (e.g. a setting removed in an upgrade), so stale values cannot resurface if
-/// the key is ever reintroduced. The shared namespaces written by other
-/// subsystems (the nightly-discovery marker, the temp-cleanup cadence state, the
-/// update notice's records and the low-disk notice's ladder) are left untouched.
-/// Delete failures are logged and tolerated (transient, retried on the next
-/// reload).
+/// Delete `config_kv` rows whose key is no longer a recognized field, so a stale
+/// value cannot resurface if the key is reintroduced. The shared namespaces above
+/// are left untouched. Delete failures are tolerated (transient, retried on the
+/// next reload).
 async fn purge_unknown_kv_orphans(store: &crate::config_db::ConfigStore, kvs: &[(String, String)]) {
     let orphans: Vec<String> = kvs
         .iter()
@@ -1282,51 +929,31 @@ async fn purge_unknown_kv_orphans(store: &crate::config_db::ConfigStore, kvs: &[
     }
 }
 
-// ── Per-field persistence (settings-page autosave) ─────────────────
-//
-// Each settled config field is persisted individually — a single KV row or a
-// single routing row — instead of a whole-config rewrite. Every function
-// in this section:
-//
-// 1. Runs under [`persist_lock`] so read-modify-write sequences and
-//    side-effect settles never interleave (see the lock's doc comment).
-// 2. Validates the settled value BEFORE anything is written; on failure the
-//    DB and the in-memory CONFIG are untouched and the error propagates to
-//    the caller for inline display.
-// 3. Applies targeted side effects only for the fields that need them
-//    (provider/transcriber re-init, Telegram listener reload) — never per
-//    keystroke, only when a value settles.
-// 4. Returns the canonical persisted value (trimmed, `None` collapsed to
-//    `""`) so the caller can re-sync its display snapshot — the settings
-//    page writes exactly this value back into the editable snapshot for
-//    every field type.
-//
-// `wake_word_templates` is excluded from every path: it is owned exclusively
-// by the voice pipeline (`persist_enrollment` in `voice.rs`), which writes
-// the key directly, and any GUI write would create a dual-writer race.
+// Per-field persistence (settings-page autosave): one KV row or one routing row per settled
+// field, never a whole-config rewrite. Every function here runs under [`persist_lock`],
+// validates BEFORE writing (a failure leaves the DB and CONFIG untouched and propagates for
+// inline display), applies side effects only when a value settles (never per keystroke) and
+// returns the canonical persisted value (trimmed, `None` as `""`) for the caller to re-sync its
+// snapshot. `wake_word_templates` is excluded everywhere: the voice pipeline
+// (`persist_enrollment`) owns the key, so a GUI write would be a dual-writer race.
 
-/// Outcome of persisting a settled config field: the canonical persisted value
-/// plus an optional non-fatal warning (e.g. an unreachable custom endpoint that
-/// was saved anyway).
-///
-/// `pub` (not `pub(crate)`) because it flows through the public
-/// [`crate::gui::settings::SettingsMessage`] enum's persist-result variant.
+/// The canonical persisted value plus an optional non-fatal warning (e.g. an unreachable custom
+/// endpoint that was saved anyway). `pub` because it flows through the public
+/// [`crate::gui::settings::SettingsMessage`] persist-result variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistOutcome {
     pub value: String,
     pub warning: Option<String>,
 }
 
-/// Persist a single settled string config field.
-///
-/// `key` must be a `config_kv` key (see [`ConfigData::string_fields`]).
-/// Returns the canonical persisted value plus an optional non-fatal warning.
+/// Persist one settled field; `key` must be a `config_kv` key
+/// ([`ConfigData::string_fields`]).
 pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<PersistOutcome> {
     let _guard = persist_lock().lock().await;
     let trimmed = value.trim().to_string();
 
-    // Defense in depth: the settings page renders no control for this key, but
-    // refuse it structurally so no future caller can ever write it here.
+    // Defense in depth: no control renders for this key, but refuse it
+    // structurally so no future caller can write it here.
     if key == CONFIG_KEY_WAKE_WORD_TEMPLATES {
         return Ok(PersistOutcome {
             value: CONFIG.wake_word_templates().unwrap_or_default(),
@@ -1337,30 +964,21 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
     let canonical = trimmed_or_none(&trimmed).unwrap_or_default();
 
     match key {
-        // Provider endpoint changes re-init the provider and transcriber. The
-        // probe→validate→write step is shared with the key arm via
-        // `probe_validate_write`; the endpoint-specific cascade, warmup, and
-        // recreate follow.
-        //
-        // Note: the active image model is per-user (see `crate::users`) and is
-        // not re-validated here. The image-model catalog is endpoint-keyed;
-        // validating committed models against the new endpoint could deadlock
-        // a provider switch to a disjoint catalog (endpoint rejects until the
-        // model changes, model rejects until the endpoint changes). Telegram
-        // picker taps validate image models against the default endpoint
-        // instead — so a switch is two steps (endpoint first, then model),
-        // each independently valid.
+        // The active image model is per-user (`crate::users`) and is NOT
+        // re-validated here: the image catalog is endpoint-keyed, so validating
+        // committed models against the new endpoint could deadlock a switch to a
+        // disjoint catalog (endpoint rejects until the model changes, model
+        // rejects until the endpoint changes). Telegram picker taps validate
+        // against the default endpoint instead, so a switch is two independently
+        // valid steps — endpoint first, then model.
         CONFIG_KEY_PROVIDER_ENDPOINT => {
             let probe = probe_validate_write(key, &trimmed).await?;
 
-            // Cascade: settling a default or empty endpoint removes the custom
-            // endpoint's key row — the key is only meaningful while a custom
-            // endpoint is active. Covers both the toggle-off "" and typing the
-            // default URL back. The endpoint row is written FIRST so a failure
-            // on the write leaves the key row intact (consistent state); a
-            // failure on the cascade leaves a stale key row, which is never
-            // read (harmless per the orphaned-key policy) — so the cleanup is
-            // best-effort and never fails the save.
+            // Settling a default or empty endpoint drops the custom key row —
+            // it is only meaningful while a custom endpoint is active. The
+            // endpoint row is written FIRST, so a failed write leaves the key row
+            // intact; a failed cascade leaves a stale row that is never read, so
+            // the cleanup is best-effort and never fails the save.
             if trimmed.is_empty() || crate::config::is_default_endpoint(&trimmed) {
                 let store = crate::config_db::store();
                 match store.delete_kv(CONFIG_KEY_PROVIDER_ENDPOINT_KEY).await {
@@ -1376,13 +994,10 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
                 }
             }
 
-            // Warmup is best-effort AND custom-only: an unreachable custom
-            // endpoint is saved anyway (with a warning) so a self-hosted
-            // server can be configured before it is reachable. Reverting to
-            // the default (empty or default URL — toggle-off / typing the
-            // default back) is NOT probed: a transient OpenRouter outage
-            // must not surface an 'unreachable' warning on a deliberate
-            // revert.
+            // Best-effort and custom-only: an unreachable custom endpoint is
+            // saved anyway (with a warning) so a self-hosted server can be
+            // configured before it is reachable. A revert to the default is NOT
+            // probed, so a transient OpenRouter outage cannot warn on it.
             let effective = effective_chat_endpoint(&probe);
             let warning = if crate::config::is_custom_endpoint(&effective) {
                 match crate::providers::warmup_provider_from_config(&probe).await {
@@ -1397,24 +1012,17 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
                 None
             };
 
-            // The foreground warmup above (or its deliberate skip on revert)
-            // is the only warmup this save performs — recreate_all must not
-            // fire a second background warmup of the same endpoint.
+            // The only warmup this save performs — recreate_all must not fire a
+            // second background one for the same endpoint.
             crate::providers::recreate_all(&CONFIG.snapshot(), false);
             return Ok(PersistOutcome {
                 value: canonical,
                 warning,
             });
         }
-        // Provider key changes re-init the provider with the new credential.
-        // No warn-and-save here: warmup is a connection-pool pre-warm that
-        // never validates keys (a GET that ignores auth status), so key saves
-        // are structurally validated + written, and `recreate_all` rebuilds the
-        // provider with the new credential (warmup runs as a non-fatal
-        // background task inside it). This keeps the custom-endpoint
-        // warning channel off the key fields — a warmup failure while a custom
-        // endpoint is active must not surface an 'unreachable' warning under
-        // the OpenRouter key field.
+        // No warn-and-save on key fields: warmup never validates keys (a GET ignoring auth
+        // status), so these saves only validate + write and let `recreate_all` rebuild the
+        // provider. That keeps the custom-endpoint warning channel off the key fields.
         CONFIG_KEY_PROVIDER_KEY | CONFIG_KEY_PROVIDER_ENDPOINT_KEY => {
             let _ = probe_validate_write(key, &trimmed).await?;
             crate::providers::recreate_all(&CONFIG.snapshot(), true);
@@ -1423,7 +1031,7 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
                 warning: None,
             });
         }
-        // Telegram token change hot-reloads the listener after the write.
+        // Hot-reloads the listener after the write.
         CONFIG_KEY_TELEGRAM_BOT_TOKEN => {
             let old_token = CONFIG.telegram_bot_token();
             let new_token = trimmed_or_none(&trimmed);
@@ -1438,10 +1046,9 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
                 && let Err(e) =
                     crate::channels::telegram::restart_telegram_listener(persisted.as_deref())
             {
-                // The token is written and in effect from the next start; only the
-                // hot-reload failed, so the save stands and the failure is logged.
-                // No warning is reported: the one slot that carries one belongs to
-                // the endpoint arm, which the Settings page renders.
+                // The token is written and takes effect at the next start; only
+                // the hot-reload failed, so the save stands. No warning: that slot
+                // belongs to the endpoint arm.
                 tracing::warn!(
                     key,
                     "Telegram listener restart failed (non-fatal, value saved): {e:#}"
@@ -1461,17 +1068,14 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
 }
 
 /// Probe→validate→write for the provider arms: snapshot the live CONFIG, apply
-/// `key = trimmed`, normalize, structurally validate, then write the KV row and
-/// mirror it into CONFIG. Returns the normalized probe — the live config with
-/// only this field applied, so concurrent changes to other fields are never
-/// clobbered.
+/// `key = trimmed`, normalize, validate, then write the KV row and mirror it into
+/// CONFIG. Returns the probe — the live config with only this field applied, so
+/// concurrent changes to other fields are never clobbered.
 ///
 /// # Precondition
-/// The caller holds [`persist_lock`] — this helper does not acquire it,
-/// matching [`write_kv_and_update_config`] and [`save_routing_row`].
+/// The caller holds [`persist_lock`]; this helper does not acquire it.
 ///
-/// This is the provider-arms-only probe contract, not the universal persist
-/// path (telegram/image_model/others use different validation). The returned
+/// Provider arms only — telegram/image_model/others validate differently. The
 /// probe is consumed only by the endpoint arm (for warmup); the key arm
 /// discards it via `let _ = …`.
 async fn probe_validate_write(key: &str, trimmed: &str) -> Result<ConfigData> {
@@ -1483,10 +1087,8 @@ async fn probe_validate_write(key: &str, trimmed: &str) -> Result<ConfigData> {
     Ok(probe)
 }
 
-/// Persist a settled per-model routing `provider_order` (`""` clears it).
-///
-/// Returns the canonical order value. Routing applies only to the manager and
-/// worker model slots.
+/// Persist a settled routing `provider_order` (`""` clears it), returning the
+/// canonical value. Routing applies only to the manager and worker slots.
 pub async fn persist_settled_routing_order(model: &str, order: &str) -> Result<String> {
     let _guard = persist_lock().lock().await;
     let order = trimmed_or_none(order);
@@ -1506,12 +1108,9 @@ async fn save_routing_row(model: &str, order: Option<String>) -> Result<String> 
 /// trimming) and mirror it into the in-memory CONFIG. Caller holds
 /// [`persist_lock`].
 async fn write_kv_and_update_config(key: &str, trimmed: &str) -> Result<()> {
-    // Reject unknown keys BEFORE touching the DB: `set_string_field` is
-    // deliberately lenient (returns `false` for unrecognised keys, leaving
-    // CONFIG untouched), and writing a row the in-memory config never
-    // mirrors would create an orphaned DB entry. Defensive — the settings
-    // page only renders known keys — but keeps a typo'd or future key from
-    // silently diverging the DB and CONFIG.
+    // Reject unknown keys BEFORE touching the DB: `set_string_field` is lenient
+    // (returns `false`, CONFIG untouched), so writing the row anyway would orphan
+    // a DB entry and silently diverge DB from CONFIG.
     if !ConfigData::STRUCT_FIELDS_DEFAULT.has_string_field(key) {
         anyhow::bail!("unknown config field: {key}");
     }
@@ -1525,14 +1124,13 @@ async fn write_kv_and_update_config(key: &str, trimmed: &str) -> Result<()> {
     Ok(())
 }
 
-/// The onboarding state machine's durable value (stored as a lowercase string
-/// in `config_kv` under `onboarding_state`).
+/// The onboarding state machine's durable value (lowercase in `config_kv`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnboardingState {
-    /// Fresh install, no provider configured yet / first-time onboarding.
+    /// Fresh install, no provider configured yet.
     Init,
-    /// Onboarding complete: "hi mah bot" has been auto-sent and the admin
-    /// Assistant is active (the Assistant now drives onboarding).
+    /// Onboarding complete: the greeting was auto-sent and the Assistant drives
+    /// onboarding from here.
     Finished,
 }
 
@@ -1540,12 +1138,10 @@ impl OnboardingState {
     #[must_use]
     pub fn from_raw(s: Option<&str>) -> Self {
         match s {
-            // Legacy `"welcomed"` (written before the Support role was removed,
-            // when Support ran the onboarding) is surfaced as `Finished`.
-            // Nothing writes it anymore, and a mid-onboarding user stuck at
-            // 'welcomed' is deliberately NOT migrated back to `Init` — they're
-            // treated as finished (the Assistant stays active). Any other
-            // unknown/corrupt value still fails toward `Init`, as before.
+            // Legacy `"welcomed"` (Support ran onboarding) reads as `Finished`:
+            // nothing writes it anymore, and a user stuck there is deliberately
+            // NOT migrated back to `Init`. Other unknown/corrupt values fail
+            // toward `Init`.
             Some("welcomed" | "finished") => Self::Finished,
             _ => Self::Init,
         }
@@ -1559,14 +1155,12 @@ impl OnboardingState {
     }
 }
 
-/// Validate a [`ConfigData`] before persisting — rejecting common misconfigurations.
+/// Reject common misconfigurations before persisting.
 ///
 /// # Precondition
-/// [`ConfigData::normalize`] MUST have been called before this function.
-/// All `Option<String>` fields are assumed to be already trimmed, with
-/// empty/whitespace-only values collapsed to `None` by
-/// [`normalize_string_fields`][ConfigData::normalize_string_fields] (which `normalize` calls unconditionally for **every** field regardless
-/// of its per-field annotation — `non_empty`, `or(…)`, or `list_or(…)`).
+/// [`ConfigData::normalize`] MUST have run: every `Option<String>` is assumed
+/// trimmed, empty collapsed to `None`, for **every** field regardless of its
+/// accessor annotation.
 fn validate_config(config: &ConfigData) -> Result<()> {
     if let Some(ref ep) = config.provider_endpoint {
         if !is_http_url(ep) {
@@ -1574,21 +1168,12 @@ fn validate_config(config: &ConfigData) -> Result<()> {
                 "Provider endpoint must be a valid URL starting with https:// or http://"
             );
         }
-        // Empty-host rejection — only in config validation, not in
-        // `is_http_url` (which intentionally stays prefix-only). For values
-        // where `is_http_url(ep)` is true (scheme is case-sensitive
-        // `http://`/`https://`), extract authority = substring after `://` up
-        // to first `/`, `?`, `#` or end, trim, and reject if empty or
-        // starts-with `:`.
-        //
-        // Intentionally NOT rejected here beyond the empty-host check:
-        // `https://exa mple.com` (embedded space) passes this check and is
-        // deferred to warmup — do not over-tighten to reject it here.
-        // IPv6 literals (`[::1]`) and userinfo (`user:pass@host`) are out of
-        // scope for this check.
-        // The authority double-trim (overall `normalize` trim + this
-        // `authority.trim()`) is required to catch `https://   /v1` where the
-        // authority is whitespace-only.
+        // Empty-host rejection lives here, not in `is_http_url` (prefix-only by
+        // design). Beyond it, nothing is rejected: `https://exa mple.com` passes
+        // and is deferred to warmup — do not over-tighten. IPv6 literals and
+        // userinfo are out of scope. The authority is trimmed twice (overall
+        // `normalize` + here) to catch whitespace-only hosts like
+        // `https://   /v1`.
         let rest = ep
             .strip_prefix("https://")
             .or_else(|| ep.strip_prefix("http://"))
@@ -1611,8 +1196,6 @@ fn validate_config(config: &ConfigData) -> Result<()> {
     Ok(())
 }
 
-// ── Test helpers ──────────────────────────────────────────────
-
 /// Construct a [`ModelRouting`] for tests.
 #[cfg(test)]
 pub(crate) fn model_routing(model: &str, provider_order: Option<&str>) -> ModelRouting {
@@ -1626,8 +1209,7 @@ pub(crate) fn model_routing(model: &str, provider_order: Option<&str>) -> ModelR
 mod tests {
     use super::*;
 
-    /// The default model id is pinned as a compile-time constant: a typo fails
-    /// here, before any provider request is built.
+    /// A typo in the pinned default fails here, before any request is built.
     #[test]
     fn default_model_identifier_is_pinned() {
         let reload = ConfigReload::const_new();
@@ -1650,9 +1232,6 @@ mod tests {
 
     #[test]
     fn onboarding_from_raw_maps_legacy_welcomed_to_finished() {
-        // Legacy `"welcomed"` (pre-Support-removal) surfaces as `Finished`, not
-        // migrated back to `Init`. `"finished"` maps to `Finished`; anything
-        // else (absent or corrupt) fails toward `Init`.
         assert_eq!(
             OnboardingState::from_raw(Some("welcomed")),
             OnboardingState::Finished
@@ -1668,31 +1247,21 @@ mod tests {
         assert_eq!(OnboardingState::from_raw(None), OnboardingState::Init);
     }
 
-    /// Every accessor pattern the macro generates — `non_empty`, `or`, `list_or`
-    /// — resolved through the ONE reload singleton, and the role slots it maps
-    /// onto: an unset `non_empty` field is `None`, an empty one collapses to
-    /// `None`, an unset `or` field falls back to its default while a persisted
-    /// custom value wins, and an unset list falls back to the default while its
-    /// raw accessor injects nothing (a caller must not mistake the setter's
-    /// fallback for a chosen model). The setter itself only stores: an empty or
-    /// whitespace-only value reaches `normalize` untouched and is collapsed
-    /// there, and a key that is no field is refused rather than silently
-    /// dropped. The manager slot serves every role that plans and the worker
-    /// slot every role that does the work, so a role wired to the wrong slot is
-    /// caught here rather than by a run.
+    /// Every accessor pattern through the ONE reload singleton, plus the role slots: the manager
+    /// slot serves every role that plans and the worker slot every role that does the work, so a
+    /// mis-wired role is caught here rather than by a run. The setter only stores — `normalize`
+    /// collapses — and an unknown key is refused, not silently dropped.
     #[test]
     #[expect(clippy::too_many_lines)] // one section per accessor pattern the macro generates
     fn config_accessors_resolve_defaults_and_override_them() {
         let reload = ConfigReload::const_new();
 
-        // ── non_empty: returns None when unset, Some(value) when set ──
         assert_eq!(reload.provider_key(), None, "unset provider_key is None");
         let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(config.set_string_field("provider_key", "sk-test"));
         reload.swap(config);
         assert_eq!(reload.provider_key(), Some("sk-test".to_string()));
 
-        // ── or: falls back to default when unset ──
         reload.swap(ConfigData::STRUCT_FIELDS_DEFAULT);
         assert_eq!(
             reload.manager_model(),
@@ -1705,7 +1274,6 @@ mod tests {
             "unset worker_model falls back to default"
         );
 
-        // ── or: persisted provider_endpoint is honored (custom endpoint) ──
         let mut custom_cfg = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(custom_cfg.set_string_field("provider_endpoint", "https://custom.example/v1"));
         reload.swap(custom_cfg);
@@ -1714,11 +1282,9 @@ mod tests {
             "https://custom.example/v1",
             "or field honors a persisted custom value"
         );
-        // and falls back to the default when unset
         reload.swap(ConfigData::STRUCT_FIELDS_DEFAULT);
         assert_eq!(reload.provider_endpoint(), DEFAULT_PROVIDER_ENDPOINT);
 
-        // ── non_empty: empty/whitespace → None ──
         let mut empty = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(empty.set_string_field("provider_key", ""));
         reload.swap(empty);
@@ -1728,21 +1294,19 @@ mod tests {
             "empty string is collapsed to None"
         );
 
-        // ── list_or: falls back to default when list is unset ──
         reload.swap(ConfigData::STRUCT_FIELDS_DEFAULT);
         assert_eq!(
             reload.image_gen_models(),
             vec![DEFAULT_IMAGE_GEN_MODEL.to_string()],
             "unset image_gen_models falls back to default"
         );
-        // The raw accessor injects no default — an unset picker is empty, so a
-        // caller cannot mistake the setter's fallback for a chosen model.
+        // The raw accessor injects no default, so a caller cannot mistake the
+        // setter's fallback for a chosen model.
         assert!(
             reload.image_gen_models_raw().is_empty(),
             "unset image_gen_models_raw must be empty"
         );
 
-        // When list is set, returns parsed entries
         let mut list_config = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(list_config.set_string_field("image_gen_models", "model-a\nmodel-b\nmodel-c"));
         reload.swap(list_config);
@@ -1756,7 +1320,6 @@ mod tests {
             "raw accessor returns exactly the configured entries, in order"
         );
 
-        // ── the setter stores; normalize() is what collapses ──
         let mut raw = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(raw.set_string_field("provider_key", ""));
         assert_eq!(
@@ -1780,7 +1343,6 @@ mod tests {
             "a key that is no field is refused"
         );
 
-        // ── the role slots ──
         let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(config.set_string_field("manager_model", "manager-slot-model"));
         assert!(config.set_string_field("worker_model", "worker-slot-model"));
@@ -1806,74 +1368,55 @@ mod tests {
         }
     }
 
-    /// Endpoint normalization: trivial variants of the default
-    /// OpenRouter URL — trailing slash, surrounding whitespace, uppercase
-    /// scheme/host, a trailing `/chat/completions` suffix — must never count
-    /// as a custom endpoint, while a genuinely different URL must.
+    /// Trivial variants of the default OpenRouter URL (trailing slash, padding,
+    /// scheme/host case, `/chat/completions` suffix) must never count as custom.
     #[test]
     fn endpoint_normalization_default_vs_custom() {
-        // Exact default.
         assert!(is_default_endpoint(DEFAULT_PROVIDER_ENDPOINT));
-        // Trailing slash.
         assert!(is_default_endpoint("https://openrouter.ai/api/v1/"));
-        // Surrounding whitespace.
         assert!(is_default_endpoint("  https://openrouter.ai/api/v1  "));
-        // Uppercase scheme/host.
         assert!(is_default_endpoint("HTTPS://OPENROUTER.AI/api/v1"));
-        // Chat-completions suffix (both bare and trailing-slash variants).
         assert!(is_default_endpoint(
             "https://openrouter.ai/api/v1/chat/completions"
         ));
         assert!(is_default_endpoint(
             "https://openrouter.ai/api/v1/chat/completions/"
         ));
-        // A genuinely custom endpoint.
         assert!(is_custom_endpoint("http://localhost:8080/v1"));
         assert!(is_custom_endpoint("https://custom.example/v1"));
         assert!(!is_custom_endpoint(DEFAULT_PROVIDER_ENDPOINT));
     }
 
-    /// Chat-credential key isolation: the OpenRouter key is
-    /// only ever used for the default endpoint. A custom endpoint uses its
-    /// own key; when that key is empty NO Authorization header is sent
-    /// (keyless servers) — the OpenRouter key must never reach a custom
-    /// endpoint.
+    /// The OpenRouter key is only ever used for the default endpoint; a keyless
+    /// custom endpoint sends NO Authorization header.
     #[test]
     fn chat_credential_isolates_keys_per_endpoint() {
-        // Default endpoint → OpenRouter key.
         let mut cfg = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(cfg.set_string_field("provider_key", "sk-or"));
         assert_eq!(chat_credential(&cfg).as_deref(), Some("sk-or"));
 
-        // Custom endpoint with its own key → the custom key (OR key ignored).
         let mut cfg = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(cfg.set_string_field("provider_key", "sk-or"));
         assert!(cfg.set_string_field("provider_endpoint", "http://localhost:8080/v1"));
         assert!(cfg.set_string_field("provider_endpoint_key", "sk-custom"));
         assert_eq!(chat_credential(&cfg).as_deref(), Some("sk-custom"));
 
-        // Custom endpoint, keyless (empty custom key), OR key set → None:
-        // the OR key must never be sent to a custom endpoint.
+        // Keyless custom endpoint: the OR key must never be sent.
         let mut cfg = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(cfg.set_string_field("provider_key", "sk-or"));
         assert!(cfg.set_string_field("provider_endpoint", "http://localhost:8080/v1"));
         assert!(cfg.set_string_field("provider_endpoint_key", ""));
         assert_eq!(chat_credential(&cfg), None);
 
-        // Custom endpoint, keyless, no OR key → None (keyless operation).
         let mut cfg = ConfigData::STRUCT_FIELDS_DEFAULT;
         assert!(cfg.set_string_field("provider_endpoint", "http://localhost:8080/v1"));
         assert_eq!(chat_credential(&cfg), None);
 
-        // Default endpoint, no key → None.
         assert_eq!(chat_credential(&ConfigData::STRUCT_FIELDS_DEFAULT), None);
     }
 
-    /// `ModelRouting::upsert` targets exactly one entry by model name: it
-    /// updates that entry, pushes one when the name is not there yet, clears the
-    /// field when the closure sets `None`, and leaves every other entry's own
-    /// value alone — one upsert never rewrites a sibling, and never adds a
-    /// duplicate row.
+    /// Exactly one entry by model name: one upsert never rewrites a sibling and
+    /// never adds a duplicate row.
     #[test]
     fn upsert_targets_one_entry_by_its_model() {
         let mut routings = vec![
@@ -1881,7 +1424,6 @@ mod tests {
             model_routing("test-router-b", Some("Anthropic")),
         ];
 
-        // An existing entry is updated in place, its sibling untouched.
         ModelRouting::upsert(&mut routings, "test-router-a", |mr| {
             mr.provider_order = Some("Google".into());
         });
@@ -1895,7 +1437,6 @@ mod tests {
         assert_eq!(routings[0].provider_order, Some("Google".into()));
         assert_eq!(routings[1].provider_order, Some("OpenAi".into()));
 
-        // Clearing the field on an existing entry removes the value, not the row.
         ModelRouting::upsert(&mut routings, "test-router-a", |mr| {
             mr.provider_order = None;
         });
@@ -1905,7 +1446,6 @@ mod tests {
             "a field cleared to None is cleared"
         );
 
-        // A name that is not there gets its own entry, with the field set.
         ModelRouting::upsert(&mut routings, "test-router-c", |mr| {
             mr.provider_order = Some("OpenAi".into());
         });
@@ -1914,15 +1454,9 @@ mod tests {
         assert_eq!(routings[2].provider_order, Some("OpenAi".into()));
     }
 
-    // ── validate_config tests ──────────────────────────────────────
-
-    /// A valid URL passes validation, padded or not: validation runs after
-    /// `normalize`, so it only ever sees the canonical value. This is a
-    /// regression test for the latent ordering bug where `validate_config`
-    /// (which used untrimmed `starts_with`) ran *before* `normalize` (which
-    /// trims). What validation REFUSES — an endpoint with no scheme, a provider
-    /// key still holding the placeholder — is pinned where it is reached in
-    /// production, through the settle-and-persist path
+    /// Regression for an ordering bug: `validate_config` (untrimmed
+    /// `starts_with`) once ran *before* `normalize`. What validation REFUSES is
+    /// pinned through the settle-and-persist path
     /// (`config_db::tests::test_persist_settled_rejects_invalid_values_before_writing`),
     /// which also holds that nothing is written when it refuses.
     #[test]
@@ -1939,17 +1473,12 @@ mod tests {
             ..ConfigData::STRUCT_FIELDS_DEFAULT
         };
         config.normalize();
-        // After normalize the value is trimmed — validation sees the canonical form.
         validate_config(&config).unwrap();
     }
 
-    /// The persist side-effect arms and the `wake_word_templates` guard are
-    /// wired through `CONFIG_KEY_*` constants (compile-tied: a rename in
-    /// `string_config_fields!` changes both the constant name and its value,
-    /// so every arm referencing the old name fails to compile). This test
-    /// pins the vocabulary contract: every key that carries a persist side
-    /// effect (or the structural guard) must still be a real config field,
-    /// and documents the exact set a rename must keep in sync.
+    /// Every key carrying a persist side effect (or the structural guard) must
+    /// still be a real config field — the set a rename in
+    /// `string_config_fields!` must keep in sync.
     #[test]
     fn side_effect_config_keys_are_real_fields() {
         let known: Vec<&'static str> = ConfigData::STRUCT_FIELDS_DEFAULT
@@ -1971,30 +1500,16 @@ mod tests {
         }
     }
 
-    /// Fresh-install seed: the fresh-install
-    /// defaults land in brand-new config databases only — the seed itself
-    /// writes nothing to existing databases.
+    /// Drives the real boot chain rather than hand-picked `fresh` values: the
+    /// probe, the boot flag, the store open that creates `core.db`, then the
+    /// flag consumption + seed.
     ///
-    /// The seeded set is the image/video generation model lists (so the
-    /// Settings GUI model pickers, which read the raw snapshot fields, are
-    /// populated on fresh installs). The active selection is per-user (see
-    /// `crate::users`), not a config field. The transcription-off row is not the
-    /// seed's: catalog `69` writes it on every store open that never wrote it,
-    /// so it is present on both lanes.
-    ///
-    /// This test drives the real boot chain end-to-end instead of hand-picking
-    /// `fresh` values: the discriminator probe (`config_db_is_fresh` — the
-    /// exact function `load_or_init` uses), the boot flag it feeds, the store
-    /// open that creates the consolidated `core.db`, and the flag-consumption + seed
-    /// (`seed_fresh_install_defaults_from_flag`, the `reload_from_db` path).
-    ///
-    /// Regression guard for the wrong-path probe: opening the config store
-    /// must flip the discriminator to "not fresh" — a probe of any other
-    /// location (e.g. a top-level `<root>/config.db`) would still report
-    /// "fresh" here and re-seed every existing install on every boot.
+    /// Regression guard for the wrong-path probe: opening the config store must
+    /// flip the discriminator to "not fresh" — probing a top-level
+    /// `<root>/config.db` would still report "fresh" and re-seed every existing
+    /// install on every boot.
     #[tokio::test]
     async fn fresh_config_db_seeds_defaults_only_when_new() {
-        // ── Fresh install: the store file does not exist yet ──
         let fresh_root = tempfile::TempDir::new().unwrap();
         let fresh = config_db_is_fresh(fresh_root.path());
         assert!(
@@ -2003,10 +1518,7 @@ mod tests {
         );
         CONFIG_DB_FRESH_AT_BOOT.store(fresh, Ordering::Release);
 
-        // Opening the config store creates the consolidated core.db — the
-        // exact file the probe must check. This is the regression pin for the
-        // original bug: probing a top-level <root>/config.db would still report
-        // "fresh" here and re-seed existing installs on every boot.
+        // Opening the store creates the exact file the probe must check.
         let fresh_store = crate::config_db::ConfigStore::open(fresh_root.path())
             .await
             .unwrap();
@@ -2015,7 +1527,6 @@ mod tests {
             "an existing config store file must not be classified fresh"
         );
 
-        // reload_from_db's path: consume the boot flag and seed.
         seed_fresh_install_defaults_from_flag(&fresh_store)
             .await
             .unwrap();
@@ -2042,8 +1553,7 @@ mod tests {
             ],
             "a fresh config database must hold catalog 69's transcription row plus the fresh-install defaults"
         );
-        // Manager and worker share the same default model, so the two seed
-        // passes collapse into a single routing row.
+        // Manager and worker share one default, so the passes collapse into one row.
         assert_eq!(
             fresh_store.get_all_model_routings().await.unwrap(),
             vec![model_routing(DEFAULT_MANAGER_MODEL, Some("deepseek"))],
@@ -2051,7 +1561,6 @@ mod tests {
              with a known provider (others get none)"
         );
 
-        // ── Existing install: the store file already exists ──
         let (existing_store, existing_dir) =
             crate::open_test_store!(crate::config_db::ConfigStore, "config");
         let fresh_existing = config_db_is_fresh(existing_dir.path());
@@ -2081,15 +1590,13 @@ mod tests {
         );
     }
 
-    /// One-time migration: persisted `config_kv` rows holding any historical
-    /// manager/worker default are rewritten to the current default, and only
-    /// those rows (exact full-string match) are touched; each rewritten slot
-    /// also seeds the new default's routing row. Re-running is a no-op.
+    /// Only exact full-string matches are rewritten, each seeding the new
+    /// default's routing row; re-running is a no-op.
     #[tokio::test]
     async fn migrate_old_default_models_rewrites_every_previous_default() {
         let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
 
-        // A stale video-transcription row and an unrelated key remain untouched.
+        // A stale video-transcription row and an unrelated key must survive.
         store
             .set_kv("video_transcription_model", "qwen/qwen3.7-flash")
             .await
@@ -2099,8 +1606,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Every manager default of every earlier release, including ones older
-        // than the immediately previous release.
+        // Every manager default of every earlier release, not just the last one.
         for old in [
             "deepseek/deepseek-v4.1-flash",
             "z-ai/glm-5.3-flash",
@@ -2155,14 +1661,13 @@ mod tests {
             Some("sk-example"),
             "unrelated config keys must never be touched"
         );
-        // Both slots migrated to the same default model: one shared routing row.
+        // Both slots share one default, so one shared routing row.
         assert_eq!(
             store.get_all_model_routings().await.unwrap(),
             vec![model_routing(DEFAULT_MANAGER_MODEL, Some("deepseek"))],
             "migrating a slot to the new default must upsert its routing row"
         );
 
-        // Idempotent: a second run changes nothing.
         migrate_old_default_models(&store).await.unwrap();
         assert_eq!(
             store
@@ -2189,10 +1694,9 @@ mod tests {
         );
     }
 
-    /// Regression for the retired `video_transcription_model` slot: a row
-    /// persisted by a pre-hardcode install must be deleted by the reload-time
-    /// orphan purge, so a stale stored value can never resurface if the key is
-    /// ever reintroduced. Known keys and preserved shared namespaces survive.
+    /// Regression for the retired `video_transcription_model` slot: the orphan
+    /// purge must delete a pre-hardcode row so a stale value cannot resurface if
+    /// the key returns. Known keys and shared namespaces survive.
     #[tokio::test]
     async fn purge_unknown_kv_orphans_deletes_stale_video_transcription_row() {
         let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
@@ -2291,17 +1795,14 @@ mod tests {
         }
     }
 
-    /// The migration must be a no-op when a slot already holds the target
-    /// default, a genuine user override, or a custom-endpoint installation's own
-    /// endpoint, key and models — it must never overwrite a user-configured
-    /// model, and a historical default of the *other* slot is not this slot's
-    /// default.
+    /// A no-op when a slot holds the target default, a genuine override, or a
+    /// custom-endpoint installation's own settings: a historical default of the
+    /// *other* slot is not this slot's default.
     #[tokio::test]
     async fn migrate_old_default_models_never_touches_a_genuine_choice() {
         let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
 
-        // A custom-endpoint installation: its endpoint, its own key and the two
-        // models the owner picked for it all survive, and nothing is routed.
+        // A custom-endpoint installation keeps its endpoint, key and models.
         let installation = [
             (CONFIG_KEY_PROVIDER_ENDPOINT, "https://llm.example/v1"),
             (CONFIG_KEY_PROVIDER_ENDPOINT_KEY, "sk-local"),
@@ -2331,7 +1832,6 @@ mod tests {
             .set_kv(CONFIG_KEY_MANAGER_MODEL, DEFAULT_MANAGER_MODEL)
             .await
             .unwrap();
-        // A genuine user override (not the old default) must be preserved.
         store
             .set_kv(CONFIG_KEY_WORKER_MODEL, "user/private-model")
             .await
@@ -2362,8 +1862,7 @@ mod tests {
             "no routing writes may happen when nothing was migrated"
         );
 
-        // A historical default of the *other* slot is not this slot's default:
-        // a genuine pick of it must survive.
+        // A historical default of the *other* slot must survive as a pick.
         store
             .set_kv(CONFIG_KEY_MANAGER_MODEL, "deepseek/deepseek-v4-flash-0731")
             .await
@@ -2399,11 +1898,9 @@ mod tests {
         );
     }
 
-    /// Effective routing on a private [`ConfigReload`]: a stored override wins,
-    /// an unset/cleared field falls back to the model's default provider, a
-    /// non-DeepSeek model stays auto-routed. Every entry passes through the
-    /// normalisation first, so the order a caller stored is trimmed, and one
-    /// holding only whitespace is as unset as an empty one.
+    /// A stored override wins, else the model's default provider; a non-DeepSeek
+    /// model stays auto-routed. Normalisation runs first, so a stored order is
+    /// trimmed and a whitespace-only one is as unset as an empty one.
     #[test]
     fn model_routing_applies_the_default_provider_when_unset() {
         let config = ConfigReload::const_new();

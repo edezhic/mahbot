@@ -1,13 +1,9 @@
-//! Carrying one command-line operation out in the running product.
-//!
-//! This is the instance side of the command line: the endpoint hands over a
-//! [`CallRequest`] and gets back a [`CallReply`]. The operation runs on the
-//! very tool an agent's assistant calls, in the owner's own workspace and with
-//! the owner's own toolset — so the frontend has no rules of its own to keep in
-//! step with the product's. The document family's `read` is the one operation
-//! with no tool behind it: it runs the product's own reader
-//! ([`crate::tools::read_document`]) and is served here before the toolset is
-//! consulted.
+//! Carrying one command-line operation out in the running product: the instance side of the command
+//! line. The endpoint hands over a [`CallRequest`] and gets back a [`CallReply`]. The operation
+//! runs on the very tool an agent's assistant calls, in the owner's own workspace and with the
+//! owner's own toolset, so the frontend has no rules of its own to keep in step with the product's.
+//! The document family's `read` is the one operation with no tool behind it: it runs the product's
+//! own reader ([`crate::tools::read_document`]) and is served here before the toolset is consulted.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -19,14 +15,11 @@ use tracing::Instrument as _;
 use crate::db::ipc::{CallReply, CallRequest};
 use crate::tools::ToolAnswer;
 
-/// Carry one command-line operation out in the running product.
-///
-/// An operation is a side effect that may route into the message pipeline, so
-/// it is never served before the instance has finished starting
-/// ([`crate::cli::mark_ready`]) and never on a socket another user could reach
-/// (handled by the endpoint). The endpoint also holds the registry guard that
-/// keeps a graceful drain from ending while this is in flight, across the
-/// writing of the answer too — see [`hold_flight`].
+/// Carry one command-line operation out in the running product. An operation is a side effect that
+/// may route into the message pipeline, so it is never served before the instance has finished
+/// starting ([`crate::cli::mark_ready`]) and never on a socket another user could reach (the
+/// endpoint's rule). The endpoint also holds the registry guard that keeps a graceful drain from
+/// ending while this is in flight, across the writing of the answer too — see [`hold_flight`].
 pub(crate) async fn execute(call: CallRequest) -> CallReply {
     match crate::cli::wait_for_service().await {
         crate::cli::ServiceGate::Ready => {}
@@ -50,21 +43,18 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
         }
     }
 
-    // Only a tool a frontend publishes is served by name: the owner's whole
-    // toolset must not be reachable through the channel, or the surface a
-    // same-user socket can drive would be neither reviewable nor tied to the
-    // command line. The caller's own secrets are removed even from this refusal:
-    // the tool name is caller input like any other.
+    // Only a tool a frontend publishes is served by name: the owner's whole toolset must not be
+    // reachable through the channel, or a same-user socket would drive a surface neither reviewable
+    // nor tied to the command line. The caller's own secrets are removed even from this refusal.
     if !crate::cli::fronts_tool(&call.tool) {
         return unknown_tool_refusal(&call);
     }
 
-    // The document family's `read` runs the product's own READER, which is no
-    // tool (see `cli::DOCUMENT_READ`), so it is served here, before the toolset
-    // is built. A product built before the operation answers it as an unknown
-    // action of the document tool — the failed class, since the family itself is
-    // served; one operation's absence cannot raise the family's protocol value
-    // without withholding the family's existing operations.
+    // The document family's `read` runs the product's own READER, which is no tool, so it is served
+    // here before the toolset is built. A product built before the operation answers it as an
+    // unknown action of the document tool — the failed class, since the family itself is served:
+    // one operation's absence cannot raise the family's protocol value without withholding the
+    // family's existing operations.
     if call.tool == "document"
         && call.args.get("action").and_then(serde_json::Value::as_str)
             == Some(crate::cli::DOCUMENT_READ)
@@ -72,8 +62,8 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
         return execute_document_read(&call).await;
     }
 
-    // The owner's workspace and the admin Assistant's own toolset: the command
-    // line exposes exactly what the owner's own tools hold and nothing else.
+    // The owner's workspace and the admin Assistant's own toolset: the command line exposes exactly
+    // what the owner's own tools hold.
     let ws = crate::users::personal_workspace_struct(crate::users::ADMIN_USER_NAME);
     let tools = crate::Role::Assistant.tools(
         &ws,
@@ -81,21 +71,18 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
         Arc::new(crate::tools::chrome::ChromeRunSessions::default()),
     );
     let Some(tool) = crate::tools::find_tool(&tools, &call.tool) else {
-        // Unreachable while the registry test holds — every fronted tool is in
-        // this toolset — but a refusal, never a panic, if the two ever drift.
+        // Unreachable while the registry test holds — but a refusal, never a panic, if the two
+        // drift.
         return unknown_tool_refusal(&call);
     };
     let tool_name = tool.name();
 
-    // Everything the tool's task-locals need is read SYNCHRONOUSLY, before the
-    // await — the task-local contract: a read inside the awaited tool would see
-    // nothing. The command acts as the machine's owner. No agent id is set:
-    // there is no agent session behind the command. The channel IS set to the
-    // command line's own: it attributes the operation to the shell rather than
-    // to a dashboard the owner typed into, and it travels with a message the
-    // command line hands over. The MARKER is what makes the call recognisable
-    // as the command line's — it is the flag tool code reads to behave as the
-    // shell caller's (see `SendTool::command_line`), while the channel is set
+    // Everything the tool's task-locals need is read SYNCHRONOUSLY, before the await — the
+    // task-local contract: a read inside the awaited tool would see nothing. The command acts as
+    // the machine's owner and sets no agent id (there is no agent session behind it). The channel
+    // IS set to the command line's own, which attributes the operation to the shell rather than a
+    // dashboard the owner typed into. The MARKER is what makes the call recognisable as the command
+    // line's — the flag tool code reads to behave as the shell caller's — while the channel is set
     // for provenance and cannot stand in for it.
     let user_name = crate::users::ADMIN_USER_NAME.to_string();
     let channel = crate::cli::CHANNEL.to_string();
@@ -109,10 +96,10 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
 
     let args = call.args.clone();
     let started = Instant::now();
-    // The destination a command line chose for the files this call produces, as
-    // the producing tools read it through [`crate::agent::tool_output_dir`]. It
-    // is read here because nothing in the tools' arguments carries it — a tool
-    // argument would be model input, while this is the caller's own operand.
+    // The destination a command line chose for the files this call produces, as the producing tools
+    // read it through [`crate::agent::tool_output_dir`]. Read here because nothing in the tools'
+    // arguments carries it: a tool argument would be model input, while this is the caller's own
+    // operand.
     let output_dir = call.output_dir.as_deref().map(std::path::PathBuf::from);
     let outcome = carry_out(&ws, async {
         crate::agent::CURRENT_TOOL_COMMAND_LINE
@@ -143,13 +130,12 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
     reply(outcome, &call.secrets)
 }
 
-/// Serve the document family's `read`: the same reading the read tool does,
-/// with the caller's destination and the family's answer shape.
+/// Serve the document family's `read`: the same reading the read tool does, with the caller's
+/// destination and the family's answer shape.
 async fn execute_document_read(call: &CallRequest) -> CallReply {
     let ws = crate::users::personal_workspace_struct(crate::users::ADMIN_USER_NAME);
-    // The frontend resolves a producing family's destination before it sends
-    // anything ([`crate::cli::resolve_output_dir`]), so a call without one is a
-    // malformed call, not a retryable one: there is nowhere to write.
+    // The frontend resolves a producing family's destination before it sends anything, so a call
+    // without one is malformed, not retryable: there is nowhere to write.
     let Some(destination) = call.output_dir.as_deref() else {
         return CallReply::refused(
             "the document family's read was sent with no destination directory, so nothing ran",
@@ -175,14 +161,12 @@ async fn execute_document_read(call: &CallRequest) -> CallReply {
     reply(outcome, &call.secrets)
 }
 
-/// Run one command-line operation the way the instance carries every one of them
-/// out: under the span the agent loop opens (so the logs bridge attributes its
-/// rows to `cli` exactly as it attributes an agent's), with a panic turned into
-/// its own message rather than a severed exchange — the crate builds with
-/// `panic = "unwind"` on purpose — and an error returned as the product's own
-/// wording: unwrapped, because the caller reads it as the answer and the `Error
-/// executing <tool>: …` envelope is worded for a model's failure block, and with
-/// any context chain kept, since `Display` alone would hide the cause.
+/// Run one command-line operation the way the instance carries every one out: under the span the
+/// agent loop opens (so the logs bridge attributes its rows to `cli` as it does an agent's), with a
+/// panic turned into its own message rather than a severed exchange (the crate builds with `panic =
+/// "unwind"` on purpose), and an error returned as the product's own wording — unwrapped, because
+/// the caller reads it as the answer and the `Error executing <tool>: …` envelope is worded for a
+/// model, with any context chain kept since `Display` alone would hide the cause.
 async fn carry_out<T>(
     ws: &crate::Workspace,
     operation: impl std::future::Future<Output = anyhow::Result<T>>,
@@ -204,14 +188,11 @@ async fn carry_out<T>(
     }
 }
 
-/// Hold the registry guard that keeps a graceful drain (or an update hand-off)
-/// from ending while one command-line operation is in flight.
-///
-/// The endpoint takes this BEFORE the operation is served and holds it until the
-/// answer has been written, so an operation the product accepted is always
-/// finished and always reported — there is no window in which it can be carried
-/// out yet lose its answer. The drain-watch fires the shutdown token only when
-/// `AGENT_REGISTRY` and `NON_AGENT_CALLS` are BOTH empty.
+/// Hold the registry guard that keeps a graceful drain (or an update hand-off) from ending while
+/// one command-line operation is in flight. Taken BEFORE the operation is served and held until the
+/// answer is written, so an accepted operation is always finished and always reported. The
+/// drain-watch fires the shutdown token only when `AGENT_REGISTRY` and `NON_AGENT_CALLS` are BOTH
+/// empty.
 pub(crate) fn hold_flight() -> crate::agent::registry::NonAgentCallGuard {
     let ws = crate::users::personal_workspace_struct(crate::users::ADMIN_USER_NAME);
     crate::agent::registry::NON_AGENT_CALLS.register("cli_command", &ws.name, None, false, None)
@@ -268,8 +249,8 @@ fn record_operation(
     workspace_path: &str,
 ) {
     let record = operation_record(call, tool_name, duration_ms, outcome);
-    // The row goes on the telemetry queue like the agent path's: the operation's
-    // own answer is what the caller is owed.
+    // The row goes on the telemetry queue like the agent path's: the operation's own answer is what
+    // the caller is owed.
     crate::telemetry::enqueue(crate::telemetry::TelemetryRecord::ToolCalls(
         crate::telemetry::ToolCallBatch {
             source: crate::stats::CallSource::CommandLine,
@@ -282,16 +263,12 @@ fn record_operation(
     ));
 }
 
-/// The row a finished operation becomes.
-///
-/// The caller's own secrets are removed from the recorded error text as well as
-/// from the arguments: a failed tool can quote what it was given. The reason is
-/// recorded with the same `Error executing <tool>: …` wrap the agent path uses
-/// ([`crate::tools::tool_failure_reason`]), even though the caller was answered
-/// with the tool's own words — the record is read as a tool failure, not as a
-/// human's answer. A partly carried-out operation is recorded as
-/// [`PARTIAL_RECORD_REASON`] with `success` unset: the caller is answered with a
-/// failed operation, and the row is what a reader filters on, so the two agree.
+/// The row a finished operation becomes. The caller's secrets are removed from the recorded error
+/// text as well as from the arguments — a failed tool can quote what it was given. The reason is
+/// recorded with the same `Error executing <tool>: …` wrap the agent path uses, even though the
+/// caller was answered with the tool's own words: the record is read as a tool failure, not a
+/// human's answer. A partly carried-out operation is recorded as [`PARTIAL_RECORD_REASON`] with
+/// `success` unset, so the caller's failed answer and the row agree.
 fn operation_record(
     call: &CallRequest,
     tool_name: &str,
@@ -300,11 +277,10 @@ fn operation_record(
 ) -> crate::ToolCallRecord {
     crate::ToolCallRecord {
         tool_name: tool_name.to_string(),
-        // The caller's own secrets are removed before the serialized arguments
-        // are scrubbed and capped. The DESTINATION is deliberately not among
-        // them: it is this command line's own operand rather than an argument the
-        // tool was handed, and the answer already names every produced file by
-        // its absolute path.
+        // The caller's secrets are removed before the serialized arguments are scrubbed and capped.
+        // The DESTINATION is deliberately not among them: it is this command line's own operand
+        // rather than an argument the tool was handed, and the answer already names every produced
+        // file by absolute path.
         arguments: crate::stats::recorded_arguments(&call.args, &call.secrets),
         duration_ms,
         success: matches!(outcome, Ok(answer) if !answer.partial),
@@ -320,13 +296,10 @@ fn operation_record(
     }
 }
 
-/// The reply one finished execution becomes.
-///
-/// Any text that goes back to the caller — success or failure — passes through
-/// [`crate::util::redact_secrets`], so no value the caller handed over as a
-/// secret can reach its own answer. The product's answer is otherwise neither
-/// shortened nor rewritten: the caller is owed what the tool said, and a
-/// partly carried-out operation is marked as such rather than dressed up.
+/// The reply one finished execution becomes. Any text going back to the caller — success or failure
+/// — passes through [`crate::util::redact_secrets`], so no value handed over as a secret can reach
+/// its own answer. The product's answer is otherwise neither shortened nor rewritten, and a partly
+/// carried-out operation is marked as such rather than dressed up.
 fn reply(outcome: Result<ToolAnswer, String>, secrets: &[String]) -> CallReply {
     match outcome {
         Ok(answer) => {
@@ -346,11 +319,10 @@ mod tests {
     use super::*;
     use crate::db::ipc::CallOutcome;
 
-    /// The reply carries what the tool said — with the caller's own secrets
-    /// removed — and a partly carried-out operation is marked `Partial` while a
-    /// whole one is `Done`. A refusal is the tool's own wording, as the caller
-    /// sees it: the `Error executing <tool>: …` wrap the record carries is added
-    /// by [`record_operation`], never by the reply.
+    /// The reply carries what the tool said, with the caller's own secrets removed: a partly
+    /// carried-out operation is `Partial`, a whole one `Done`, and a refusal is the tool's own
+    /// wording. The `Error executing <tool>: …` wrap the record carries is added by
+    /// [`record_operation`], never by the reply.
     #[test]
     fn replies_carry_the_answer_with_the_callers_secrets_removed() {
         let secrets = vec!["s3cret".to_string()];
@@ -375,10 +347,9 @@ mod tests {
         assert_eq!(refused.answer, "no workspace named [REDACTED]");
     }
 
-    /// The row a recorded operation leaves behind says what the caller saw: a
-    /// whole operation is a success with nothing to report, a partly carried-out
-    /// one is a failure naming the shortfall, and a refusal keeps the tool's own
-    /// reason — with the caller's secrets scrubbed out of it.
+    /// The recorded row says what the caller saw: a whole operation is a success with nothing to
+    /// report, a partly carried-out one a failure naming the shortfall, and a refusal keeps the
+    /// tool's own reason, with the caller's secrets scrubbed out.
     #[test]
     fn a_recorded_row_reports_a_partial_answer_as_a_failure() {
         let call = |args: serde_json::Value, secrets: Vec<String>| CallRequest {
@@ -425,11 +396,10 @@ mod tests {
         );
     }
 
-    /// End to end through the instance side: the two `workspace` operations that
-    /// need a ticket to exist are served on the running product's own tool and
-    /// come back as the answers the caller reads — `ticket` and `comment`
-    /// (whose note is attributed to `assistant`, as every note left through that
-    /// operation is).
+    /// End to end through the instance side: the two `workspace` operations that need a ticket to
+    /// exist are served on the running product's own tool and come back as the answers the caller
+    /// reads — `ticket` and `comment` (whose note is attributed to `assistant`, as every note
+    /// through that operation is).
     #[tokio::test]
     async fn execute_serves_the_workspace_ticket_and_comment_operations() {
         crate::util::test::init_test_stores().await;
@@ -447,8 +417,7 @@ mod tests {
             })
             .await
             .expect("create the ticket the operations act on");
-        // The endpoint's own gate: an operation is only served by a product that
-        // finished starting (the same signal `bootstrap_mahbot` sends).
+        // The endpoint's own gate: an operation is served only by a product that finished starting.
         crate::cli::mark_ready();
 
         let show = execute(CallRequest {
@@ -484,19 +453,17 @@ mod tests {
         );
     }
 
-    /// End to end through the instance side for a PRODUCING family: the
-    /// operation runs the owner's own document tool, and what it produces lands
-    /// in the destination the command line carried beside the tool's arguments —
-    /// not in the workspace directory an agent's call would use — with the
-    /// answer naming it by its absolute path. The destination is the command
-    /// line's own operand and never reaches the tool's args, which is why the
-    /// tool's own answer stays word-for-word what an agent reads. An operation
-    /// that produces SEVERAL files puts every one there too.
+    /// End to end through the instance side for a PRODUCING family: the operation runs the owner's
+    /// own document tool, and what it produces lands in the destination the command line carried
+    /// beside the tool's arguments — not in the directory an agent's call would use — with the
+    /// answer naming it by absolute path. The destination never reaches the tool's args, which is
+    /// why the tool's own answer stays word-for-word what an agent reads. An operation that
+    /// produces SEVERAL files puts every one there too.
     #[tokio::test]
     #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
     async fn execute_produces_a_document_into_the_destination_the_caller_chose() {
-        /// Run one document operation into the destination and return every file
-        /// the product's own answer names, each absolute and the destination's child.
+        /// Run one document operation into the destination and return every file the product's own
+        /// answer names, each absolute and the destination's child.
         async fn drive(
             destination: &std::path::Path,
             args: serde_json::Value,
@@ -544,8 +511,8 @@ mod tests {
         .await;
         assert_eq!(created, [destination.join("from-a-script.docx")]);
 
-        // The multi-file case: two single-page PDFs merged into one, and that
-        // merge split back into one file per page.
+        // The multi-file case: two single-page PDFs merged into one, and that merge split back per
+        // page.
         let mut pages = Vec::new();
         for name in ["one", "two"] {
             let pdf = drive(
@@ -568,9 +535,9 @@ mod tests {
         .await;
         assert_eq!(parts.len(), 2, "one file per page entry: {parts:?}");
 
-        // The page geometry the command line names: one page cropped to its left
-        // half, and that cropped page resized to both sides at once — each
-        // answered with a file in the same destination.
+        // The page geometry the command line names: one page cropped to its left half, and that
+        // cropped page resized to both sides at once — each answered with a file in the same
+        // destination.
         let cropped = drive(
             &destination,
             serde_json::json!({
@@ -595,8 +562,8 @@ mod tests {
         .await;
         assert_eq!(resized, [destination.join("resized.pdf")]);
 
-        // The agents' own generated directory is untouched: the destination
-        // replaced it for these calls alone.
+        // The agents' own generated directory is untouched: the destination replaced it for these
+        // calls alone.
         let agents = crate::users::personal_workspace_path(crate::users::ADMIN_USER_NAME)
             .join("generated")
             .join("from-a-script.docx");
@@ -606,9 +573,8 @@ mod tests {
         );
     }
 
-    /// A partly carried-out document operation reaches the caller as `Partial`:
-    /// the tool's own flag, never a reading of its wording — and the answer is
-    /// delivered whole.
+    /// A partly carried-out document operation reaches the caller as `Partial`: the tool's own
+    /// flag, never a reading of its wording — and the answer is delivered whole.
     #[tokio::test]
     #[ignore = "requires the managed bun runtime, installed on the product's first start; runs only when explicitly invoked"]
     async fn execute_reports_a_shortfall_the_document_tool_found() {
@@ -624,9 +590,9 @@ mod tests {
             .await
             .expect("a destination of the caller's own");
 
-        // A template with two placeholders of which the call fills one: the
-        // fill runs, the copy is produced, and the other placeholder is left as
-        // it was — a shortfall the tool's own answer names.
+        // A template with two placeholders of which the call fills one: the fill runs, the copy is
+        // produced, and the other placeholder is left as it was — a shortfall the tool's own answer
+        // names.
         let sample = destination.join("sample.docx");
         let created = execute(CallRequest {
             tool: "document".to_string(),
@@ -673,10 +639,9 @@ mod tests {
         );
     }
 
-    /// The rasterizer's own command line, end to end through the instance: the
-    /// family's tool is the one served by name, the file the caller named is the
-    /// one rendered, and the picture lands in the DESTINATION the caller chose —
-    /// never in the agent's own generated tree.
+    /// The rasterizer's own command line, end to end through the instance: the family's tool is the
+    /// one served by name, the file the caller named is the one rendered, and the picture lands in
+    /// the DESTINATION the caller chose — never in the agent's own generated tree.
     #[tokio::test]
     async fn execute_renders_a_file_into_the_destination_the_caller_chose() {
         crate::util::test::init_test_stores().await;
@@ -708,7 +673,6 @@ mod tests {
         let picture = marked_picture(&reply.answer);
         assert!(picture.is_absolute(), "{}", picture.display());
         assert_eq!(picture.parent(), Some(destination.as_path()));
-        // A picture, not merely a file: the magic PNG carries.
         assert_eq!(
             tokio::fs::read(&picture)
                 .await
@@ -726,9 +690,8 @@ mod tests {
             "a command-line call must not write into the agent's own generated directory"
         );
 
-        // One page of a PDF is the same action with the page named: the document
-        // tool writes the input (its own runtime does), and the picture comes back
-        // through the same marker as any other.
+        // One page of a PDF is the same action with the page named: the document tool writes the
+        // input, and the picture comes back through the same marker as any other.
         if crate::tools::bun::bun_binary_path().is_none() {
             return;
         }
@@ -771,8 +734,8 @@ mod tests {
         );
     }
 
-    /// The document family's `read` runs the product's own reader (no tool): the
-    /// converted text lands in a folder under the destination the caller chose.
+    /// The document family's `read` runs the product's own reader (no tool): the converted text
+    /// lands in a folder under the destination the caller chose.
     #[tokio::test]
     async fn execute_reads_a_document_into_the_destination_the_caller_chose() {
         crate::util::test::init_test_stores().await;

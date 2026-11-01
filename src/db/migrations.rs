@@ -126,40 +126,27 @@ use std::collections::HashSet;
 
 use crate::db::{Connection, TxGuard, params};
 
-/// Which physical database a migration targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TargetDb {
     Core,
     Logs,
 }
 
-/// A Rust-function migration body. The function is called without a
-/// surrounding transaction (it owns its own transactional/FK semantics).
+/// Runs without a surrounding transaction: the body owns its transactional/FK semantics.
 type RustFn = for<'a> fn(&'a Connection) -> BoxFuture<'a, anyhow::Result<()>>;
 
-/// The body of a migration: ready SQL text, or a Rust function.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MigrationBody {
     Sql(&'static str),
     Rust(RustFn),
 }
 
-/// One ordered schema migration: an id, a target database, and a body.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Migration {
     pub(crate) id: &'static str,
     pub(crate) target: TargetDb,
     pub(crate) body: MigrationBody,
 }
-
-// ── Current-shape baseline DDL ─────────────────────────────────────────
-//
-// The baseline encodes the exact current shape of the consolidated domain
-// database (core.db) and the logs database (logs.db) directly, without a
-// 0.4.2 delta chain. Every statement is `IF NOT EXISTS`, so on an already
-// current database the whole batch is a no-op. On a fresh install it
-// reproduces the shape that the retired chain (ids `1`–`23`) used to assemble
-// incrementally via ALTERs.
 
 /// The full current-shape core schema: every domain table in its final shape
 /// (the 0.4.2 baseline minus the retired `assigned_to` / `pipeline_reservation`
@@ -560,8 +547,7 @@ const ADD_LLM_FAILURES: &str = "CREATE TABLE IF NOT EXISTS llm_failures (
     error_chain         TEXT NOT NULL DEFAULT ''
 );";
 
-/// Catalog `64`: drop the logs store's indexes that no product query's plan
-/// reaches.
+/// Catalog `64`: drop the logs store's indexes that no product query's plan reaches.
 ///
 /// # The audit
 ///
@@ -625,8 +611,7 @@ DROP INDEX IF EXISTS idx_grep_telemetry_served;
 DROP INDEX IF EXISTS idx_grep_telemetry_reason;
 DROP INDEX IF EXISTS idx_grep_telemetry_command;";
 
-/// Catalog `65`: drop the core store's indexes that no product query's plan
-/// reaches.
+/// Catalog `65`: drop the core store's indexes that no product query's plan reaches.
 ///
 /// # The audit
 ///
@@ -757,8 +742,7 @@ const REWRITE_LEGACY_DEEPSEEK_ROUTING_SLUG: &str = "UPDATE config_model_routing 
 /// a stage's transition commit and its job deletion, and stale rows are
 /// purge-immune while their workspace is paused — so renaming both to
 /// `verification` would collide and abort this entry's transaction, and a
-/// failed SQL migration is a HARD BOOT REFUSAL, which this change must never
-/// cause.
+/// failed SQL migration is a HARD BOOT REFUSAL, which this change must never cause.
 ///
 /// Deleting the retired rows also discards their roster (`agents.job_id`
 /// references `jobs(id)` `ON DELETE CASCADE`), which is exactly what the merge
@@ -792,8 +776,7 @@ UPDATE ticket_chronicle SET target_phase = 'verification' WHERE target_phase IN 
 
 /// Catalog `46`: rebuild the ticket-title FTS index in the engine's 0.8.0
 /// on-disk layout. A no-op on stores that never had it (a fresh install's
-/// baseline already created it) and a one-shot rebuild on every store that
-/// did.
+/// baseline already created it) and a one-shot rebuild on every store that did.
 ///
 /// Turso 0.8.0's FTS rewrite added two document-identity fast fields to every
 /// segment without bumping the storage format number, so an index written by
@@ -842,8 +825,7 @@ CREATE INDEX IF NOT EXISTS idx_tickets_title_fts ON tickets USING fts (title) WI
 /// are one stage now, so the hop between them never happened. The remaining
 /// rewrites cannot collide on the unique `idx_ticket_chronicle_dedup`
 /// (`ticket_id, workspace_name, source_phase, target_phase, at`): `at` is the
-/// transition's own microsecond timestamp, so no two hops of one ticket share
-/// it.
+/// transition's own microsecond timestamp, so no two hops of one ticket share it.
 ///
 /// `last_transition_actor` is deliberately left alone, unlike every service-side
 /// phase write (see `board::PIPELINE_ACTOR`'s invariant): that column records
@@ -1314,31 +1296,18 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     },
 ];
 
-/// Apply the migration catalog to `conn` for one physical database.
-///
-/// Iterates [`MIGRATIONS`] in order, skipping entries that target a different
-/// database or whose id is already recorded in `schema_migrations`. Each
-/// SQL entry runs inside its own transaction (schema change + tracking row
-/// commit atomically); each Rust entry runs without a surrounding transaction.
-/// A failure propagates — it is a hard boot failure, never a reason to replace
-/// the store.
+/// Apply the catalog to `conn` for one physical database. Each SQL entry's
+/// schema change and tracking row commit in one transaction; a Rust entry runs
+/// outside one.
 pub(crate) async fn run_migrations(conn: &Connection, db: TargetDb) -> anyhow::Result<()> {
     run_catalog(conn, db, MIGRATIONS).await
 }
 
-/// The ledger table every product install carries: the catalog records applied
-/// ids in it, and the boot usability gate ([`crate::db::has_product_schema`])
-/// uses it as the marker of "built by this product".
+/// The applied-id ledger, and the boot usability gate's "built by this product" marker.
 pub(crate) const MIGRATIONS_TABLE: &str = "schema_migrations";
 
-/// True when the catalog still has entries to apply to `db`. The boot bring-up
-/// asks this before it decides whether to run the open's integrity scan: a start
-/// that is about to write schema DDL into the store must refuse an already
-/// unreadable store first and repair structure before building on it (see
-/// [`crate::db::open_store`]).
-///
-/// Reads [`MIGRATIONS_TABLE`], which the boot usability gate
-/// ([`crate::db::has_product_schema`]) has already required to exist.
+/// True when entries remain for `db`. Boot asks before writing schema DDL, so
+/// an unreadable store is refused and repaired first (see `db::open_store`).
 pub(crate) async fn has_pending(conn: &Connection, db: TargetDb) -> anyhow::Result<bool> {
     let applied = applied_ids(conn).await?;
     Ok(MIGRATIONS
@@ -1357,10 +1326,8 @@ async fn applied_ids(conn: &Connection) -> anyhow::Result<HashSet<String>> {
         .collect())
 }
 
-/// The migration loop, parameterized by a catalog so tests can replay the
-/// retired `1`–`23` chain (see the test fixtures). Creates [`MIGRATIONS_TABLE`],
-/// reads the applied ids, and runs each entry once, in catalog order, targeting
-/// only `db`.
+/// The migration loop, catalog-parameterized so tests can replay the retired
+/// `1`–`23` chain.
 async fn run_catalog(conn: &Connection, db: TargetDb, catalog: &[Migration]) -> anyhow::Result<()> {
     conn.execute(
         &format!(
@@ -1404,12 +1371,8 @@ async fn run_catalog(conn: &Connection, db: TargetDb, catalog: &[Migration]) -> 
                     .with_context(|| format!("Migration '{}': failed to commit", migration.id))?;
             }
             MigrationBody::Rust(run) => {
-                // Unlike an SQL entry, a Rust body and its tracking row are not
-                // recorded atomically (the body runs without a transaction). This
-                // is safe because every Rust body probes (or is written to be
-                // indifferent to) the state it applies, so it is idempotent and
-                // re-runnable: a crash between body success and id recording
-                // re-runs the body without corruption on the next boot.
+                // Not atomic with its tracking row: every Rust body is
+                // idempotent, so a crash between the two re-runs it safely.
                 run(conn)
                     .await
                     .with_context(|| format!("Migration '{}' failed", migration.id))?;
@@ -1427,8 +1390,6 @@ async fn run_catalog(conn: &Connection, db: TargetDb, catalog: &[Migration]) -> 
     Ok(())
 }
 
-// ── Rust-function migrations (called without a surrounding transaction) ──
-
 fn add_chat_history_reply_columns(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
     Box::pin(run_add_chat_history_reply_columns(conn))
 }
@@ -1438,8 +1399,7 @@ fn add_chat_history_reply_columns(conn: &Connection) -> BoxFuture<'_, anyhow::Re
 /// consolidation: a 0.5.0 database has neither column, a current-main database
 /// already has both, and a fresh install got them from entry `24`'s
 /// `CREATE TABLE`. Guarded by [`add_column_if_missing`], so this body is
-/// idempotent (non-transactional like every Rust body, re-runnable until
-/// recorded).
+/// idempotent (non-transactional like every Rust body, re-runnable until recorded).
 async fn run_add_chat_history_reply_columns(conn: &Connection) -> anyhow::Result<()> {
     for column in ["reply_author", "reply_snippet"] {
         add_column_if_missing(conn, "chat_history", column, "TEXT").await?;
@@ -1455,8 +1415,7 @@ fn add_chat_history_broadcast_id(conn: &Connection) -> BoxFuture<'_, anyhow::Res
 /// delta `33`: an id tagging the delivery dispatch that wrote an agent row.
 /// Fresh installs get the column from entry `24`'s `CREATE TABLE`, so the probe
 /// makes this a no-op there. Guarded by [`add_column_if_missing`], so this body
-/// is idempotent (non-transactional like every Rust body, re-runnable until
-/// recorded).
+/// is idempotent (non-transactional like every Rust body, re-runnable until recorded).
 async fn run_add_chat_history_broadcast_id(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "chat_history", "broadcast_id", "TEXT").await
 }
@@ -1550,8 +1509,7 @@ async fn add_column_if_missing(
 /// Drop `table.column` when it still exists. Turso has no
 /// `DROP COLUMN IF [NOT] EXISTS`, and a baseline `CREATE TABLE` already omits
 /// a dropped column on fresh installs, so the probe is what makes a drop body
-/// idempotent (non-transactional like every Rust body, re-runnable until
-/// recorded).
+/// idempotent (non-transactional like every Rust body, re-runnable until recorded).
 ///
 /// The table is rewritten by the drop, so a drop body holds exactly one
 /// statement. Dropping is one-way: an older binary whose queries still name the
@@ -1693,8 +1651,7 @@ fn add_session_metadata_custom_role(conn: &Connection) -> BoxFuture<'_, anyhow::
 /// anything) columns for databases created before delta `52`. Fresh installs
 /// get the columns from entry `24`'s `CREATE TABLE`, so the probe makes this a
 /// no-op there. Guarded by [`add_column_if_missing`], so this body is
-/// idempotent (non-transactional like every Rust body, re-runnable until
-/// recorded).
+/// idempotent (non-transactional like every Rust body, re-runnable until recorded).
 async fn run_add_session_metadata_custom_role(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "session_metadata", "custom_role", "TEXT").await?;
     add_column_if_missing(conn, "session_metadata", "custom_identifier", "TEXT").await?;
@@ -1728,8 +1685,7 @@ fn add_alarms_retry_state(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>
 /// that did not finish in time may run again (read only on active alarms), and
 /// `unfinished_attempts`, how many attempts in a row did not finish in time.
 /// Guarded by [`table_exists`] and [`add_column_if_missing`], so this body is
-/// idempotent (non-transactional like every Rust body, re-runnable until
-/// recorded).
+/// idempotent (non-transactional like every Rust body, re-runnable until recorded).
 async fn run_add_alarms_retry_state(conn: &Connection) -> anyhow::Result<()> {
     if !table_exists(conn, LEGACY_AUTOMATIONS_TABLE).await? {
         return Ok(());
@@ -1751,8 +1707,7 @@ async fn run_add_alarms_retry_state(conn: &Connection) -> anyhow::Result<()> {
 /// below is derived from it.
 const ROLE_RENAME: [(&str, &str); 2] = [("coder", "worker"), ("Coder", "Worker")];
 
-/// Catalog `68`: the canonical lowercase pair — the spelling outside a JSON `role`
-/// value.
+/// Catalog `68`: the canonical lowercase pair — the spelling outside a JSON `role` value.
 const ROLE_NAMES: (&str, &str) = ROLE_RENAME[0];
 
 /// Catalog `68`: the stored JSON columns carrying a role — a queued
@@ -2198,8 +2153,7 @@ fn add_session_metadata_personal_changes(conn: &Connection) -> BoxFuture<'_, any
 /// column — its home is now the `session_personal_changes` table — so on a fresh
 /// install this adds `personal_changes`, delta `62` carries it across and delta
 /// `63` drops it again. Guarded by [`add_column_if_missing`], so this body is
-/// idempotent (non-transactional like every Rust body, re-runnable until
-/// recorded).
+/// idempotent (non-transactional like every Rust body, re-runnable until recorded).
 async fn run_add_session_metadata_personal_changes(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "session_metadata", "personal_changes", "TEXT").await
 }
@@ -2264,8 +2218,7 @@ fn add_telegram_intake_claimed_by(conn: &Connection) -> BoxFuture<'_, anyhow::Re
 /// — on a database whose table was created without it (see entry `59`). A table
 /// that already carries the column (every fresh install, from the baseline's
 /// `CREATE TABLE`) is left alone. Guarded by [`add_column_if_missing`], so this
-/// body is idempotent (non-transactional like every Rust body, re-runnable until
-/// recorded).
+/// body is idempotent (non-transactional like every Rust body, re-runnable until recorded).
 async fn run_add_telegram_intake_claimed_by(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "telegram_intake", "claimed_by", "TEXT").await
 }
@@ -2307,8 +2260,7 @@ fn add_users_memory_inventory_day(conn: &Connection) -> BoxFuture<'_, anyhow::Re
 /// asked that account's assistant, so a restart cannot ask twice in one day.
 /// Fresh installs get the column from entry `24`'s `CREATE TABLE`, so the probe
 /// makes this a no-op there. Guarded by [`add_column_if_missing`], so this body
-/// is idempotent (non-transactional like every Rust body, re-runnable until
-/// recorded).
+/// is idempotent (non-transactional like every Rust body, re-runnable until recorded).
 async fn run_add_users_memory_inventory_day(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "users", "memory_inventory_day", "TEXT").await
 }
@@ -2365,8 +2317,7 @@ fn add_tickets_label(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
 /// path writes a different value, so nothing can re-label a ticket later.
 /// Fresh installs get the column from entry `24`'s `CREATE TABLE`, so the probe
 /// makes this a no-op there. Guarded by [`add_column_if_missing`], so this body
-/// is idempotent (non-transactional like every Rust body, re-runnable until
-/// recorded).
+/// is idempotent (non-transactional like every Rust body, re-runnable until recorded).
 async fn run_add_tickets_label(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "tickets", "label", "TEXT NOT NULL DEFAULT 'feat'").await
 }
@@ -2379,8 +2330,7 @@ fn add_alarms_command(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
 /// delta `32`. The baseline no longer declares the column — the command-armed
 /// feature it armed is retired and the baseline carries its replacement
 /// `trigger`. Guarded by [`table_exists`] and [`add_column_if_missing`], so this
-/// body is idempotent (non-transactional like every Rust body, re-runnable until
-/// recorded).
+/// body is idempotent (non-transactional like every Rust body, re-runnable until recorded).
 async fn run_add_alarms_command(conn: &Connection) -> anyhow::Result<()> {
     if !table_exists(conn, LEGACY_AUTOMATIONS_TABLE).await? {
         return Ok(());
@@ -2657,8 +2607,7 @@ const RETIRED_COMMANDS_CLAIM_MARKERS: &[&str] = &[
 ///
 /// Deliberately phrase-level, never a bare `ran`: the content is case-folded
 /// and the markers cover the spellings the retired arrangement was actually
-/// written in, so prose that merely mentions a command running in this round
-/// survives.
+/// written in, so prose that merely mentions a command running in this round survives.
 fn claims_commands_ran_before_the_round(content: &str) -> bool {
     let folded = content.to_ascii_lowercase();
     RETIRED_COMMANDS_CLAIM_MARKERS
@@ -2673,8 +2622,7 @@ fn drop_retired_commands_claim_descriptions(
 }
 
 /// Data migration (`49`): no stored workspace context may hand an agent the
-/// retired claim that the workspace's project commands already ran before the
-/// round.
+/// retired claim that the workspace's project commands already ran before the round.
 ///
 /// Since the merge the project commands run INSIDE the verification round, in
 /// parallel with the participants, and their result is the same round comment —
@@ -2685,8 +2633,7 @@ fn drop_retired_commands_claim_descriptions(
 /// The probe behind it is a heuristic in both directions: prose that describes
 /// the same thing without naming a marker phrase survives and waits for the next
 /// re-analysis, and the markers are deliberately phrase-level (never a bare
-/// `ran`), so a context that merely mentions a command running in this round is
-/// kept.
+/// `ran`), so a context that merely mentions a command running in this round is kept.
 async fn run_drop_retired_commands_claim_descriptions(conn: &Connection) -> anyhow::Result<()> {
     drop_workspace_contexts_where(conn, claims_commands_ran_before_the_round).await
 }
@@ -2903,8 +2850,6 @@ mod tests {
     use super::*;
     use crate::db::Connection;
 
-    // ── Shared schema-inspection helpers ──────────────────────────────
-
     async fn column_names(conn: &Connection, table: &str) -> Vec<String> {
         conn.query(&format!("PRAGMA table_info({table})"), ())
             .await
@@ -3037,7 +2982,7 @@ mod tests {
         .collect()
     }
 
-    // ── Expected-shape fixtures (hand-maintained, independent of the baseline)
+    // Expected-shape fixtures (hand-maintained, independent of the baseline)
     //
     // These are deliberately typed out literally, NOT derived from the baseline
     // DDL constants above, so a wrong baseline cannot validate itself.
@@ -3435,12 +3380,8 @@ mod tests {
             .collect()
     }
 
-    /// Tables a reopen introduces which the pre-reopen fixture cannot carry
-    /// (delta `51`'s `custom_roles`, delta `59`'s `telegram_intake`, delta
-    /// `61`'s `telegram_bursts` and delta `62`'s `session_personal_changes`).
-    /// They have no "before" row count to compare, so
-    /// the reopen snapshot skips them; their arrival is asserted by the schema
-    /// comparison instead.
+    /// Tables a reopen introduces, which the pre-reopen fixture cannot carry:
+    /// the snapshot skips them and the schema comparison asserts their arrival.
     const REOPEN_NEW_CORE_TABLES: &[&str] = &[
         "custom_roles",
         "telegram_intake",
@@ -3465,13 +3406,8 @@ mod tests {
             .collect()
     }
 
-    // ── Schema assertion helper ────────────────────────────────────────
-
-    /// Assert that `conn`'s schema matches `expected_tables` (table name-set
-    /// equality + per-table column-name SET equality, order-insensitive) and
-    /// `expected_indexes` (explicit index name-set equality, see
-    /// [`assert_index_set`]). Errors list the missing/extra items with
-    /// `context` for a helpful message.
+    /// Assert `conn`'s table and per-table column name sets, plus its explicit
+    /// index name set, against the expected ones; errors list the difference.
     async fn assert_schema_matches(
         conn: &Connection,
         expected_tables: &[(&str, &[&str])],
@@ -3557,16 +3493,10 @@ mod tests {
         m
     }
 
-    // ── Old-catalog fixture (simulated pre-consolidation databases) ─────
-    //
-    // The production catalog was rewritten to the current-shape baseline
-    // (ids `24`–`26`), so the retired `1`–`23` chain can no longer be observed
-    // by running `run_migrations`. These fixtures replay that chain (verbatim
-    // old DDL + old Rust bodies) so the baseline can be proven to be a strict
-    // no-op against a database built by the REAL pre-consolidation DDL text,
-    // not a hand-shaped imitation. They cover the three supported states:
-    // a 0.5.0 DB (one delta behind), a current-main DB (all columns), and a
-    // fresh install.
+    // The retired `1`–`23` chain can no longer be observed through the
+    // production catalog, so these fixtures replay it verbatim (old DDL, old
+    // Rust bodies) to prove the baseline a strict no-op against REAL
+    // pre-consolidation text.
 
     const OLD_BASELINE_BOARD_TABLES: &str = "\
 CREATE TABLE IF NOT EXISTS tickets (
@@ -4013,8 +3943,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     }
 
     /// One-time data migration: rewrite legacy score-based analysis verdict
-    /// rows to the score-less graded shape. Idempotent and re-runnable until
-    /// applied.
+    /// rows to the score-less graded shape. Idempotent and re-runnable until applied.
     async fn run_rewrite_analysis_verdicts(conn: &Connection) -> anyhow::Result<()> {
         let rows = conn
             .query(
@@ -4283,16 +4212,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             .collect()
     }
 
-    // ── Tests ──────────────────────────────────────────────────────────
-
-    /// A fresh install runs the baseline (`24`) plus the `25`/`27`–`34`/`38`/`42`
-    /// upfills and the `36`–`57`/`59`–`63`/`65`–`77` tail, and converges to the exact current
-    /// core shape: the table set (which also proves the required absences of
-    /// `user_roles` / `config_role` / `ticket_jobs` / `ticket_stage_jobs`) and
-    /// the per-table column sets (which prove the absences of `assigned_to` /
-    /// `pipeline_reservation` / `paused_frozen`, of the account-kind
-    /// `users.permissions` / `users.selected_role`, and of the retired
-    /// `command` column on `automations`).
+    /// A fresh install converges to the exact current core shape: the table set
+    /// (which proves the retired tables absent) and the per-table column sets
+    /// (which prove the retired columns absent).
     #[tokio::test]
     async fn fresh_install_converges_to_expected_shape() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4323,16 +4245,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         );
     }
 
-    /// Delta `65` must have nothing to remove on a fresh install: the only
-    /// creators of the four indexes it drops were the old baseline and delta
-    /// `28`'s body, and this replays the catalog up to the drop to show that
-    /// neither creates them any more. A `CREATE` left behind in either would
-    /// make a fresh store build an index only for `65` to drop it again — the
-    /// only place that regression is observable, since a dropped index leaves no
-    /// trace in the store. Only the absence is asserted: what else a pre-`65`
-    /// store carries is [`fresh_install_converges_to_expected_shape`]'s to say,
-    /// and holding this one to the current shape would fail it on the next index
-    /// delta instead of on a regression.
+    /// Delta `65` must find nothing to drop on a fresh install: neither the old
+    /// baseline nor delta `28`'s body may still create the four indexes — a
+    /// regression observable only here, since a dropped index leaves no trace.
     #[tokio::test]
     async fn a_fresh_core_store_before_delta_65_creates_none_of_the_dropped_indexes() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4352,8 +4267,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             .expect("catalog through delta 64");
 
         let indexes = index_defs(&conn).await;
-        // The prefix really built the store — a `position` that missed would
-        // leave the check below vacuously true.
+        // A `position` that missed would leave the check below vacuous.
         assert!(
             indexes.contains_key("idx_tickets_board_active"),
             "the catalog through delta 64 must have built the core store"
@@ -4513,16 +4427,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         );
     }
 
-    /// Delta `62` must copy each recorded `session_metadata.personal_changes`
-    /// value into `session_personal_changes` byte-for-byte before delta `63`
-    /// drops the source column: the baseline is the Assistant's change record,
-    /// so a value that failed to land would silently reset every session's
-    /// change detection. A row whose baseline is NULL gets no child row. The
-    /// copy runs once — a second reopen must not disturb the table.
-    ///
-    /// One seeded baseline is megabytes of JSON, the size the split exists for:
-    /// a value of that size is an overflow chain of its own, so the copy and the
-    /// drop rewrite it out of the session's row rather than editing it in place.
+    /// Delta `62` must copy each `session_metadata.personal_changes` value
+    /// byte-for-byte into its new table — the Assistant's change record, so a
+    /// lost value silently resets every session's change detection — before `63`
+    /// drops the source; a NULL gets no child row and a reopen leaves it alone.
     #[tokio::test]
     async fn a_recorded_baseline_moves_to_its_own_table() {
         use std::fmt::Write as _;
@@ -4623,11 +4531,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         .collect()
     }
 
-    /// A fresh logs store runs the baseline (`26`) plus the delta `35` and
-    /// delta `58` upfills, the delta `64` index drops and the delta `71`
-    /// `ticket` upfill, and converges to the exact current logs shape
-    /// (logs/tool_calls/llm_requests/llm_failures + grep_telemetry, carrying
-    /// only the indexes a product query's plan reaches).
+    /// A fresh logs store converges to the exact current shape: the five tables
+    /// and only the indexes a product query's plan reaches.
     #[tokio::test]
     async fn fresh_logs_install_converges_to_expected_shape() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4910,19 +4815,11 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             .collect()
     }
 
-    /// Assert that reopening the core catalog leaves the database unchanged,
-    /// except for `except_tables`, whose table DDL and column set may differ on
-    /// reopen (every column upfill the tail runs, plus the delta-72 rename of
-    /// `alarms` to `automations`, which the caller names on both sides). Row
-    /// counts (the renamed table aside, its rows are asserted one by one by the
-    /// caller), `chat_history` content and `tickets` content are strictly
-    /// unchanged. The index set must lose exactly [`REMOVED_CORE_INDEXES`] and
-    /// keep every other index byte-identical, except delta `72`'s due index
-    /// (`idx_alarms_due` → `idx_automations_due`), which the rename recreates
-    /// under its table's new name and whose DDL the caller pins; that the result
-    /// is [`EXPECTED_CORE_INDEXES`] is asserted separately by the caller — reopen
-    /// must converge to it, not merely keep what the pre-reopen shape carried
-    /// (delta `65`).
+    /// Assert that reopening changes DDL and columns only on `except_tables`
+    /// (the caller names the renamed table on both sides). Row counts — the
+    /// renamed table aside — `chat_history` and `tickets` content must be
+    /// untouched, and every index must survive byte-identical except
+    /// [`REMOVED_CORE_INDEXES`] and delta `72`'s recreated due index.
     async fn assert_core_catalog_unchanged(
         conn: &Connection,
         before: &CoreSnapshot,
@@ -4983,46 +4880,11 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         );
     }
 
-    /// The core fleet-wide boot-safety pin: a database shaped by the REAL
-    /// retired `1`–`23` chain (logged ids 1–23 recorded) must reopen through
-    /// the new baseline (`24`/`25`/`27`–`34`/`36`–`57`/`59`–`63`/`65`–`77`) as a
-    /// STRICT no-op except the delta-27 `workspaces.maintainer_recommendations`
-    /// column upfill, the delta-28 `jobs.caller_agent_id` /
-    /// `session_metadata.created_at` column upfills, the delta-29 per-user model
-    /// columns, the
-    /// delta-30 `jobs.mode` column upfill + backfill, the delta-31
-    /// `sleep_ended` column upfill, the pre-rename delta-32 `alarms.command`
-    /// column upfill, the delta-33 `chat_history.broadcast_id` column upfill, the
-    /// delta-34 `tickets.last_transition_actor` / `ticket_chronicle.actor`
-    /// column upfill, the delta-38 `users.granted_tools` column upfill, the
-    /// delta-39/40 `users` column drops, the pre-rename delta-41/42/43 `alarms`
-    /// command retirement (delete the command-armed rows, add `trigger`, drop
-    /// `command`), and the delta-72 rename of that table to `automations`
-    /// (the rows survive it untouched) —
-    /// plus the delta-36 data rewrite, which detaches the seeded guest from
-    /// `users.selected_workspace` (row counts unchanged; the snapshot compares
-    /// only counts, chat content and tickets), and the delta-65 index drops,
-    /// which converge the index set onto the fresh store's. All asserted
-    /// explicitly. The
-    /// entry-46 FTS rebuild is invisible to the snapshot by construction (the
-    /// index keeps its name and DDL text and the internal backing objects are
-    /// excluded), so this also proves Turso honors `IF NOT EXISTS` on the FTS
-    /// index when the baseline re-runs it and that dropping and recreating the
-    /// index leaves the rest of the store alone.
-    ///
-    /// The stage-merge and phase-retirement tail (`44`/`45`/`48`/`49`), the
-    /// image-model retirement (`50`), the custom-role / custom-launch /
-    /// personal-changes / context-block-length columns (`51`–`57`, with deltas
-    /// `62`/`63` moving the personal-changes baseline into a table of its own)
-    /// and the retired-concept context sweep (`73`) and the
-    /// `session_metadata.user_activity` upfill (`74`) and the
-    /// `users.memory_inventory_day` upfill (`75`)
-    /// are a no-op here too: the seeded rows
-    /// name none of the retired stages and claim no earlier command run, so no job
-    /// is deleted, no phase is rewritten and the empty `workspace_contexts` stays
-    /// empty, and the seeded `config_kv` rows are an unrelated key plus catalog
-    /// `69`'s already-present transcription flag while the seeded account's pick
-    /// is NULL.
+    /// The core boot-safety pin: a store shaped by the REAL retired `1`–`23`
+    /// chain reopens as a strict no-op except the column upfills and drops, the
+    /// `36` data rewrite, the `65` index drops and the `72` rename (whose rows
+    /// are compared one by one). The `46` FTS rebuild is invisible to the
+    /// snapshot, which proves the baseline's `IF NOT EXISTS` still honours it.
     #[tokio::test]
     #[expect(clippy::too_many_lines)]
     async fn old_catalog_current_db_reopens_as_noop() {
@@ -5078,29 +4940,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–77"
         );
 
-        // Everything else is a strict no-op; only workspaces (delta 27),
-        // jobs/session_metadata (delta 28), users (deltas 29/38/39/40),
-        // jobs.mode (delta 30), session_metadata.sleep_ended (delta 31),
-        // the pre-rename alarms.command (delta 32, retired by deltas 41/42/43),
-        // chat_history.broadcast_id (delta 33),
-        // tickets/ticket_chronicle (delta 34), jobs.exec_dir (delta 47),
-        // jobs.custom_launch (delta 54), session_metadata.personal_changes
-        // (delta 55, moved to `session_personal_changes` by deltas 62/63),
-        // session_metadata.reply_to (delta 56),
-        // session_metadata.context_block_len (delta 57),
-        // session_metadata.user_activity (delta 74),
-        // users.memory_inventory_day (delta 75),
-        // telegram_intake (delta 59) and the custom-role tail (delta 51's
-        // `custom_roles` table plus the session_metadata/alarms columns of
-        // deltas 52/53) change in shape, delta `72` renames `alarms` to
-        // `automations` (so the table is named on both sides of the snapshot),
-        // and delta `65` drops the unreached
-        // indexes. Delta `36` rewrites `users.selected_workspace` data
-        // (detaching the seeded guest), which leaves row counts unchanged — the
-        // snapshot compares only counts, chat content and tickets, so the no-op
-        // assertions still hold. The seeded automation row carries no command, so
-        // the delta-41 delete matches no rows and the count is unchanged there
-        // too.
+        // Only the tables named here change shape (`72` makes one appear under
+        // both names); `36` rewrites only data and `65` only drops indexes, so
+        // row counts, chat content and tickets stay put.
         assert_core_catalog_unchanged(
             &conn,
             &before,
@@ -5129,11 +4971,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         )
         .await;
 
-        // Delta `65` must drop the unreached core indexes: the old shape carries
-        // the old baseline's three of them, and the reopen converges the index
-        // set onto the fresh store's — the fresh/existing equality the entry
-        // guarantees. (`idx_jobs_caller_agent`, the fourth, is delta `28`'s and
-        // is covered by `delta_65_drops_the_index_the_retired_delta_28_created`.)
+        // `65` must drop the old baseline's three too, converging the set onto
+        // the fresh store's (`28`'s fourth index has its own test).
         for idx in [
             "idx_jobs_updated_at",
             "idx_chat_history_user",
@@ -5281,21 +5120,14 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         );
     }
 
-    /// The logs fleet-wide boot-safety pin: an old-catalog logs store (ids
-    /// `8`/`9`/`14`) reopens through the logs baseline (`26`), the delta `35`
-    /// upfill, the delta `58` column upfill, the delta `64` index drops and the
-    /// delta `71` `logs.ticket` upfill — the table DDL is unchanged except the
-    /// new `llm_failures` table and the appended `tool_calls.source` and
-    /// `logs.ticket` columns, and the index set converges to the kept indexes
-    /// (every write-only one the old shape carried is gone).
+    /// The logs boot-safety pin: an old-catalog logs store reopens with only the
+    /// new `llm_failures` table, the appended `tool_calls.source` and
+    /// `logs.ticket` columns, and the write-only indexes gone.
     #[tokio::test]
     async fn old_catalog_logs_db_reopens_as_noop() {
         const NEW_TABLE: &str = "llm_failures";
-        // `llm_failures` does not exist in the old-catalog shape, and delta `58`
-        // appends a column to `tool_calls` — exclude both from the
-        // unchanged-reopen comparison; their arrival on reopen is asserted
-        // below. Row counts are compared over the tables that exist on both
-        // sides.
+        // The new table and the appended `tool_calls` column are excluded from
+        // the unchanged-reopen comparison; their arrival is asserted separately.
         let counts_tables: Vec<&str> = expected_logs_domain_tables()
             .into_iter()
             .filter(|n| *n != NEW_TABLE)
@@ -5396,40 +5228,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     }
 
     /// The 0.5.0 (one-delta-behind) upgrade: a database built by the retired
-    /// chain WITHOUT entry `23` has no `chat_history` reply columns; the
-    /// baseline entry `25` upfills exactly those two columns, entry `27` adds
-    /// `workspaces.maintainer_recommendations`, entry `28` adds
-    /// `jobs.caller_agent_id` / `session_metadata.created_at`, entry `29` adds
-    /// the per-user `image_gen_model` / `video_model` columns, entry `30` adds
-    /// `jobs.mode`, entry `31` adds `session_metadata.sleep_ended`, the
-    /// pre-rename entry `32` adds `alarms.command`, and entry `33` adds
-    /// `chat_history.broadcast_id`,
-    /// and entry `34` adds
-    /// `tickets.last_transition_actor` / `ticket_chronicle.actor`. The tail is
-    /// entries `36`–`57`/`59`–`63`/`65`–`77`: the data migrations (detaching guests from
-    /// shared workspaces, rewriting the legacy `DeepSeek` routing slug,
-    /// deleting the command-armed alarm rows, rewriting the retired
-    /// `in_review`/`in_qa` stages to `verification`, invalidating the
-    /// stored workspace lifecycle descriptions that still name them, and
-    /// replacing the retired image-generation model in the picker list and in
-    /// the account picks), the `users.granted_tools`
-    /// column, the drops of the account-kind `users.permissions` /
-    /// `users.selected_role` columns, the pre-rename `alarms.trigger` upfill plus
-    /// the `alarms.command` drop that retire the command-armed alarm feature, the
-    /// custom-role tail (`custom_roles` plus the `session_metadata` and
-    /// pre-rename `alarms` columns), and the `jobs.exec_dir` /
-    /// `jobs.custom_launch` /
-    /// `session_metadata.reply_to` /
-    /// `session_metadata.context_block_len` columns, and the `telegram_intake`
-    /// table of delta `59` (its `claimed_by` column guaranteed by `60`), and the
-    /// `telegram_bursts` table of delta `61`, and deltas `62`/`63`, which move
-    /// the personal-changes baseline into `session_personal_changes`, and `65`,
-    /// which drops the indexes no production query's plan reaches, and `67`,
-    /// which adds the trigger-retry state on `alarms`, and `72`, which renames
-    /// that table to `automations` and its due index with it, and `73`, which
-    /// drops the stored workspace contexts naming the retired concept, and `74`,
-    /// which adds the `session_metadata.user_activity` column, and `75`, which
-    /// adds the `users.memory_inventory_day` column.
+    /// chain WITHOUT entry `23` lacks the `chat_history` reply columns, which
+    /// entry `25` upfills before the rest of the catalog converges the store
+    /// onto the current shape.
     #[expect(clippy::too_many_lines)] // large table-driven migration fixture
     #[tokio::test]
     async fn one_delta_behind_db_upgrades_reply_columns() {
@@ -5796,12 +5597,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         assert_eq!(column_names(&conn, "users").await, expected_columns);
     }
 
-    /// Behavioral pin for the pre-rename alarm-tail deltas on a store that still
-    /// carries the pre-rename table: entry `42` upfills its `trigger` column,
-    /// entry `41` deletes every row that carried a shell command — active and long
-    /// settled alike — while command-free rows survive, entry `43` drops the
-    /// column, leaving the new end state, and entry `72` renames the table,
-    /// carrying the surviving row across.
+    /// Behavioral pin for the pre-rename alarm tail: `42` upfills `trigger`, `41`
+    /// deletes every command-armed row, `43` drops the column and `72` renames
+    /// the table, carrying the surviving row across.
     #[tokio::test]
     async fn command_armed_automations_are_deleted_and_the_command_column_is_dropped() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -5811,11 +5609,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         )
         .await
         .expect("open core");
-        // The baseline builds the current shape, which has no pre-rename table,
-        // so the fixture is a store from before the rename: the catalog runs
-        // through delta `32` and the `alarms` table is then put in place by hand
-        // with the old DDL plus the `command` column the retired feature wrote and
-        // without `trigger`, so the tail's delta `42` upfills it here.
+        // The baseline has no pre-rename table, so the catalog runs through `32`
+        // and `alarms` is then installed by hand, without `trigger` for `42`.
         let through_command = MIGRATIONS
             .iter()
             .position(|m| m.id == "32")
@@ -5875,8 +5670,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         );
         // The end state carries `trigger` and no `command` (delta `43`), and the
         // table is the current one (delta `72`). The fixture above is hand-built
-        // without `trigger`, so this is the only place delta `42`'s upfill is
-        // exercised.
+        // without `trigger`, so this is the only place delta `42`'s upfill is exercised.
         let cols = column_names(&conn, "automations").await;
         assert!(!cols.contains(&"command".to_string()), "got: {cols:?}");
         assert!(
@@ -6048,8 +5842,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         }
     }
 
-    /// Role (empty for the NULL role) → content for every stored workspace
-    /// context.
+    /// Role (empty for the NULL role) → content for every stored workspace context.
     async fn workspace_context_rows(
         conn: &Connection,
     ) -> std::collections::BTreeMap<String, String> {
@@ -6069,15 +5862,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     }
 
     /// Behavioral pin for the stage-merge tail: entry `44` rewrites the retired
-    /// `in_review`/`in_qa` stages to `verification` on the ticket and on both
-    /// chronicle sides, DELETES the retired job rows — a ticket can hold
-    /// both an `in_review` and an `in_qa` row, so a rename would collide on the
-    /// unique `jobs(kind, ticket_id)` index and abort the migration — taking
-    /// their cascaded `agents` roster with them, and DELETES the retired→retired
-    /// chronicle hop, which never happened. Entry `45` deletes every stored
-    /// workspace lifecycle description that names a retired stage and leaves a
-    /// description naming none verbatim. Idempotent: re-running both bodies
-    /// matches no rows.
+    /// stages, DELETES the retired job rows (a rename would collide on the
+    /// unique `jobs(kind, ticket_id)` index) and the retired→retired hop; entry
+    /// `45` deletes the lifecycle descriptions naming a retired stage.
     #[tokio::test]
     #[expect(clippy::too_many_lines)] // large table-driven migration fixture
     async fn retired_stages_are_merged_into_verification() {
@@ -6293,14 +6080,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     }
 
     /// Behavioral pin for the phase-retirement tail: entry `48` rewrites the
-    /// retired `in_diagnostics` stage to `verification` on the ticket and on both
-    /// chronicle sides, DELETES the retired job row — renaming it could collide
-    /// on the unique `jobs(kind, ticket_id)` index and abort the migration —
-    /// taking its cascaded `agents` roster with it, and DELETES the
-    /// `in_diagnostics → verification` hop, which the merge turned into one
-    /// stage. Entry `49` deletes every stored workspace context that claims the
-    /// project commands already ran before the round and leaves a same-round
-    /// description verbatim. Idempotent: re-running both bodies matches no rows.
+    /// `in_diagnostics` stage and deletes its job row and hop; entry `49`
+    /// deletes the contexts claiming the project commands already ran.
     #[tokio::test]
     #[expect(clippy::too_many_lines)] // large table-driven migration fixture
     async fn retired_diagnostics_phase_is_merged_into_verification() {
@@ -6588,15 +6369,9 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
     }
 
     /// Behavioral pin for catalog entry `50`: the retired image-generation
-    /// default is replaced by its successor on both user-visible surfaces — the
-    /// owner-edited `image_gen_models` picker list and every account's
-    /// `users.image_gen_model` pick — while a near-miss id, the owner's other
-    /// picks and a NULL pick survive verbatim, and blank lines/repeats/order are
-    /// preserved. Matching is on the trimmed line, so the whitespace-padded pick
-    /// becomes the bare successor. A successor that was already in the list
-    /// stays beside the replacement — duplicates are the owner's business. The
-    /// `schema_migrations` ledger makes it one-shot: a later deliberate re-add
-    /// of the retired id is kept.
+    /// default is replaced in the picker list and in every account's pick, while
+    /// near-miss ids, the owner's other picks and duplicates survive, and the
+    /// ledger keeps a later deliberate re-add.
     #[tokio::test]
     async fn retire_old_image_gen_model_rewrites_both_picker_surfaces_once() {
         let tmp = tempfile::TempDir::new().unwrap();

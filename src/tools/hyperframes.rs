@@ -1,35 +1,18 @@
 //! The `hyperframes` tool: an HTML composition in, an ordinary video file out.
 //!
-//! HyperFrames seeks a paused HTML timeline in a headless Chrome frame by frame
-//! and encodes the frames with FFmpeg. The renderer, its browser and its FFmpeg
-//! are the product's own ([`crate::hyperframes`]): local, no cloud, no per-render
-//! cost.
+//! HyperFrames seeks a paused HTML timeline in a headless Chrome frame by frame and encodes
+//! the frames with FFmpeg — the product's own renderer, browser and FFmpeg: local, no cloud,
+//! no per-render cost.
 //!
-//! The model-facing cost is part of the design: one short description and a flat
-//! schema are paid every turn, while the long field guide (`instructions`) and
-//! its deep references (`reference`) are fetched only when the agent asks.
+//! The model-facing cost is part of the design: one short description and a flat schema are
+//! paid every turn, while the long field guide and its references are fetched on demand.
 //!
-//! The rules the implementation exists to hold:
-//!
-//! * **The caller's boundary.** The composition is resolved through the same gate
-//!   an ordinary read goes through, at the caller's own [`PathAccess`]; the
-//!   output through the write gate.
-//! * **The project is the vendor's.** `-c` must stay inside the project folder,
-//!   and the vendor finds that folder by walking up to the nearest `index.html`;
-//!   [`project_of`] mirrors exactly that, so the two never disagree about what
-//!   is rendered.
-//! * **Nothing is overwritten.** The output name is claimed by creating it, so two
-//!   renders naming the same file cannot both be handed it: the loser takes the
-//!   next free `_2`, `_3`, and the answer names the file actually written.
-//! * **The declaration is not the guarantee.** A value outside an enum is refused
-//!   by name rather than passed to the vendor.
-//! * **The artifact decides.** A file the product can play is the result, whatever the
-//!   run's exit status, output size or printed envelope; a stop, a failed step after the
-//!   write or a probe that could not answer is noted beside the file.
-//! * **A file is kept when the machine cannot judge it.** A probe that cannot run leaves
-//!   the render in place with a note, where a file the probe reads as unplayable is the
-//!   failure.
-
+//! The rules the implementation holds: the composition is resolved through the same read gate
+//! at the caller's [`PathAccess`], the output through the write gate; `-c` must stay inside the
+//! project folder the vendor finds by walking up to `index.html` ([`project_of`] mirrors that);
+//! the output name is claimed by creating it, so nothing is overwritten; an enum value outside
+//! its set is refused by name; and the artifact decides — a file the product can play is the
+//! result whatever the exit status, while a probe that cannot answer keeps the render with a note.
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -62,16 +45,14 @@ const FPS_RULE: &str = "an integer 1-240 or an FFmpeg rational such as 30000/100
 /// How many findings one `inspect` answer lists before it summarizes the rest.
 const MAX_FINDINGS: usize = 12;
 
-/// The `hyperframes` tool. `access` is the caller's [`PathAccess`], fixed when
-/// the role's toolset is built: the composition is read under it and the output
-/// written under it.
+/// The `hyperframes` tool. `access` is the caller's [`PathAccess`], fixed when the role's
+/// toolset is built: the composition is read under it and the output written under it.
 pub(crate) struct HyperframesTool {
     access: PathAccess,
 }
 
 impl HyperframesTool {
-    /// The tool's own name: what [`Tool::name`] reports and the prompt asset
-    /// that describes it.
+    /// The tool's own name: what [`Tool::name`] reports and the prompt asset that describes it.
     const NAME: &'static str = "hyperframes";
 
     #[must_use]
@@ -86,10 +67,8 @@ impl Tool for HyperframesTool {
         Self::NAME
     }
 
-    /// Hidden while the managed runtime is missing, exactly as the document tool is:
-    /// both cannot work without it (see [`Tool::is_advertised`] for why the verdict
-    /// is kept for an agent's lifetime), and `execute` still refuses honestly if the
-    /// runtime vanishes mid-run.
+    /// Hidden while the managed runtime is missing, exactly as the document tool is (see
+    /// [`Tool::is_advertised`]); `execute` still refuses honestly if it vanishes mid-run.
     fn is_advertised(&self) -> bool {
         crate::tools::bun::bun_binary_path().is_some()
     }
@@ -156,9 +135,8 @@ impl Tool for HyperframesTool {
     }
 
     fn preserve_full_output(&self) -> bool {
-        // The instruction documents must arrive whole, and this tool's own
-        // answers are short by construction — a marker plus a few facts, a
-        // bounded finding list — so nothing else grows unbounded.
+        // The instruction documents must arrive whole, and this tool's own answers are short by
+        // construction, so nothing else grows unbounded.
         true
     }
 
@@ -190,9 +168,8 @@ impl HyperframesTool {
         )))
     }
 
-    /// `inspect` — the vendor's static check, rendered as findings the agent can
-    /// act on. A file is checked as the render would see it: the vendor resolves a
-    /// file's project the way [`project_of`] does and checks only that composition.
+    /// `inspect` — the vendor's static check as findings the agent can act on. A file is checked
+    /// as the render would see it: the vendor resolves its project the way [`project_of`] does.
     async fn inspect(&self, ws: &Workspace, args: &serde_json::Value) -> anyhow::Result<String> {
         let requested = super::get_str(args, "composition")?;
         let target = self.resolve_composition(ws, requested).await?;
@@ -226,9 +203,9 @@ impl HyperframesTool {
         let (project, composition) = if target.is_dir() {
             (target, None)
         } else {
-            // The project the renderer is given follows the caller's access, not the
-            // workspace: a caller allowed to read anywhere renders a composition
-            // wherever it lives, scoped to that file's own project.
+            // The project the renderer is given follows the caller's access, not the workspace: a
+            // caller allowed to read anywhere renders a composition wherever it lives, scoped to
+            // its project.
             let root = match self.access {
                 PathAccess::Unrestricted => None,
                 _ => Some(ws.as_path()),
@@ -246,9 +223,8 @@ impl HyperframesTool {
             resolution,
         })
         .await;
-        // The renderer keeps its state beside the composition; the ignore file goes in
-        // once it has made the folder, and keeps a managed repository's `git add -A` off
-        // that state.
+        // The renderer keeps its state beside the composition; the ignore file goes in once it has
+        // made the folder. that state.
         keep_state_out_of_git(&project);
         // A failure takes the reservation with it: the empty file a failure that struck
         // before the renderer started left, and any file it wrote that no player could open.
@@ -318,10 +294,9 @@ impl HyperframesTool {
         ))
     }
 
-    /// The tool's answer for a file that was written: the marker, then one
-    /// sentence of facts from the probe that already let the render count, then whatever
-    /// notes the render earned. A file the probe could not read keeps the marker and the
-    /// notes; the facts are best-effort, the marker is not.
+    /// The tool's answer for a file that was written: the marker, one sentence of facts from the
+    /// probe, then whatever notes the render earned. A file the probe could not read keeps the
+    /// marker and the notes; the facts are best-effort, the marker is not.
     async fn rendered_result(
         &self,
         output: &Path,
@@ -357,10 +332,9 @@ impl HyperframesTool {
     }
 }
 
-/// The renderer's own state folder, `project/.hyperframes`, kept out of git: a managed
-/// repository's own `git add -A` would otherwise commit it. Only a folder the renderer made is
-/// touched — nothing of ours is invented in a project it never ran in — and nothing else inside
-/// it is: the ignore file is created, never replaced (`create_new`), so one already there stands.
+/// The renderer's own state folder, `project/.hyperframes`, kept out of git (a managed
+/// repository's `git add -A` would otherwise commit it). Only a folder the renderer made is
+/// touched, and the ignore file is created, never replaced.
 fn keep_state_out_of_git(project: &Path) {
     let state = project.join(".hyperframes");
     if !state.is_dir() {
@@ -382,16 +356,14 @@ fn keep_state_out_of_git(project: &Path) {
     }
 }
 
-/// Which file inside which folder the vendor is given. The project is the
-/// nearest ancestor of `file` — its own directory first, never above `root` —
-/// that `has_index` accepts, else the file's own directory; the composition is
-/// the file relative to that project, and `None` when the file IS the project's
-/// `index.html`.
+/// Which file inside which folder the vendor is given: the project is the nearest ancestor of
+/// `file` — its own directory first, never above `root` — that `has_index` accepts, else the
+/// file's own directory; the composition is the file relative to it, `None` when the file IS
+/// the project's `index.html`.
 ///
-/// `root` bounds the walk because the vendor writes its `.hyperframes` state into
-/// the project folder: a caller's access does not reach above its own workspace,
-/// so neither may the project. `None` is the unrestricted caller, whose walk is
-/// bounded by the filesystem alone.
+/// `root` bounds the walk because the vendor writes its `.hyperframes` state into the project
+/// folder, and a caller's access does not reach above its own workspace. `None` is the
+/// unrestricted caller.
 fn project_of(
     file: &Path,
     root: Option<&Path>,
@@ -423,9 +395,8 @@ fn project_of(
     (project.to_path_buf(), composition)
 }
 
-/// The extension `format` writes. A name carrying another extension is refused; a
-/// name with none gains the extension. A directory cannot reach here: the write gate
-/// already refuses a non-regular target.
+/// The extension `format` writes. A name carrying another extension is refused; a name with
+/// none gains it. A directory cannot reach here: the write gate refuses a non-regular target.
 fn with_format_extension(path: PathBuf, format: Format) -> anyhow::Result<PathBuf> {
     let extension = format.spelling();
     match path.extension().and_then(std::ffi::OsStr::to_str) {
@@ -445,11 +416,10 @@ fn with_format_extension(path: PathBuf, format: Format) -> anyhow::Result<PathBu
 
 /// Claim `path` for one render: create it now, or take the next free name beside it.
 ///
-/// The file is created with `create_new` ([`crate::util::create_unique_file`]), so
-/// the reservation is the collision check itself: two renders naming the same
-/// output cannot both be handed it, and the second gets `_2`, `_3` from the shared
-/// suffix scheme. The renderer overwrites the file it is given, so the empty
-/// reservation is what it writes into, and holding it is what clears it ([`Reservation`]).
+/// The file is created with `create_new` ([`crate::util::create_unique_file`]), so the
+/// reservation is the collision check itself: two renders naming one output cannot both be
+/// handed it. The renderer overwrites the file it is given, so the reservation is what it
+/// writes into.
 async fn claim(path: &Path) -> anyhow::Result<PathBuf> {
     let (Some(name), Some(dir)) = (
         path.file_name().and_then(std::ffi::OsStr::to_str),
@@ -468,10 +438,9 @@ async fn claim(path: &Path) -> anyhow::Result<PathBuf> {
 }
 
 /// The output name one render holds. Claiming it creates the empty file the renderer writes
-/// into, so the claim is also what clears it: a render that fails, and a call whose future is
-/// dropped before the file is the result, both take the file with them, and a retry gets the name
-/// the caller asked for rather than `_2`. The removal is best effort — a renderer the product has
-/// just ended may still hold the file (Windows), and the drop then leaves it.
+/// into, so the claim is also what clears it: a failed render and a dropped future both take
+/// the file with them, and a retry gets the name asked for rather than `_2`. The removal is
+/// best effort — a renderer just ended may still hold the file (Windows).
 struct Reservation {
     path: PathBuf,
 }
@@ -607,8 +576,7 @@ fn finding_line(finding: &Finding) -> String {
     line
 }
 
-/// `file:line`, with the file reduced to its own name — the project is known
-/// from the call, and a whole path only crowds the answer.
+/// `file:line`, with the file reduced to its own name — the project is known from the call.
 fn location(finding: &Finding) -> Option<String> {
     let file = clean(finding.file.as_deref()?);
     if file.is_empty() {
@@ -624,8 +592,7 @@ fn location(finding: &Finding) -> Option<String> {
     })
 }
 
-/// Errors, then warnings, then infos; anything else after them, in its own
-/// order.
+/// Errors, then warnings, then infos; anything else after them, in its own order.
 fn severity_rank(severity: &str) -> u8 {
     match clean(severity) {
         "error" => 0,
@@ -644,8 +611,8 @@ fn clean(text: &str) -> &str {
 mod tests {
     use super::*;
 
-    /// The state folder is the vendor's: the product touches it only once the renderer has made
-    /// it, and the one file it puts there is created whole, never replaced.
+    /// The state folder is the vendor's: the product touches it only once the renderer made it,
+    /// and the one file it puts there is created whole, never replaced.
     #[test]
     fn the_state_folder_is_kept_out_of_git_without_replacing_a_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -715,8 +682,8 @@ mod tests {
             ),
             (PathBuf::from("loose"), Some("clip.html".to_string()))
         );
-        // The walk stops at the caller's own root: an index.html above it is not
-        // the project, because the project folder is where the vendor writes.
+        // The walk stops at the caller's own root: an index.html above it is not the project,
+        // because the project folder is where the vendor writes.
         assert_eq!(
             project_of(
                 Path::new("ws/deep/clip.html"),
@@ -725,8 +692,8 @@ mod tests {
             ),
             (PathBuf::from("ws/deep"), Some("clip.html".to_string()))
         );
-        // An unrestricted caller's walk reaches the file's own project wherever it
-        // lives, outside the workspace included.
+        // An unrestricted caller's walk reaches the file's own project wherever it lives, outside
+        // the workspace included.
         assert_eq!(
             project_of(
                 Path::new("elsewhere/compositions/intro.html"),
@@ -762,8 +729,7 @@ mod tests {
     }
 
     /// A folder that does not exist yet is created for the render rather than refused, and the
-    /// never-overwrite rule stands. The tool's own output resolution is what is exercised: the
-    /// write gate is asked to make the folder, and the name is claimed through it.
+    /// never-overwrite rule stands.
     #[tokio::test]
     async fn a_named_output_in_a_new_folder_is_created_not_refused() {
         let dir = tempfile::tempdir().unwrap();

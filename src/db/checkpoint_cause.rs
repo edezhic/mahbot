@@ -1,32 +1,24 @@
-//! The engine's own reason for a failed WAL checkpoint, kept for the product's
-//! failure record.
+//! The engine's own reason for a failed WAL checkpoint, kept for the product's failure record.
 //!
-//! The engine reports a failed checkpoint as a *successful* statement whose row
-//! is always the same three values (`busy=1`, `NULL`, `NULL`), so
-//! [`crate::db::wal_checkpoint`] fails with the same constant text
-//! for a corrupt store and a healthy one. The engine's real reason is emitted
-//! only by a debug-level event inside `turso_core`'s VDBE execution
-//! ([`ENGINE_TARGET`]), which the product's logging filter drops. This module
-//! keeps that one event — and nothing else — via a narrow capture layer, armed
-//! per engine call by a [`CauseSink`] so a cause is never stale and never belongs
-//! to another store's call, and attaches it to the checkpoint error instead of
-//! emitting it as a log record of its own. The daemon's log-layer stack installs it
+//! The engine reports a failed checkpoint as a *successful* statement whose row is always the
+//! same three values (`busy=1`, `NULL`, `NULL`), so [`crate::db::wal_checkpoint`] fails with the
+//! same constant text for a corrupt store and a healthy one. The real reason is emitted only by
+//! a debug-level event inside `turso_core`'s VDBE execution ([`ENGINE_TARGET`]), which the
+//! product's logging filter drops. This module keeps that one event — and nothing else — via a
+//! narrow capture layer, armed per engine call by a [`CauseSink`] so a cause is never stale and
+//! never belongs to another store's call, and attaches it to the checkpoint error instead of
+//! emitting a log record of its own. The daemon's log-layer stack installs it
 //! ([`crate::logs::log_layers`]).
 //!
-//! That reason carries two duties: the failure record shows it to the operator
-//! ([`crate::db::failure_record`]), and [`is_blocked_checkpoint`] uses it to tell a
-//! blocked attempt, which never counts towards a stop, from a genuine pager error,
-//! which a persistent failure window turns into the stop
-//! ([`crate::db::checkpoint`]).
+//! That reason carries two duties: the failure record shows it to the operator, and
+//! [`is_blocked_checkpoint`] uses it to tell a blocked attempt, which never counts towards a
+//! stop, from a genuine pager error ([`crate::db::checkpoint`]).
 //!
-//! Accepted cost: enabling DEBUG on that engine module enables its other debug
-//! callsites too (notably its once-per-transaction-end event), whose arguments
-//! are evaluated and reach this layer's cheap "no sink armed" check whether or
-//! not a checkpoint is running; and enabling a target at DEBUG raises the
-//! subscriber's `max_level_hint`, so `LevelFilter::current()` is DEBUG
-//! process-wide and every `debug!` callsite gets past the static level check to
-//! its own callsite interest rather than short-circuiting at INFO (this layer
-//! interests no other target, so the added work is that lookup).
+//! Accepted cost: enabling DEBUG on that engine module enables its other debug callsites too,
+//! whose arguments are evaluated and reach this layer's cheap "no sink armed" check; and
+//! enabling a target at DEBUG raises the subscriber's `max_level_hint`, so every `debug!`
+//! callsite gets past the static level check to its own interest (this layer interests no other
+//! target, so the added work is that lookup).
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -37,27 +29,23 @@ use crate::util::UnwrapPoison;
 const ENGINE_TARGET: &str = "turso_core::vdbe::execute";
 /// The message prefix of the engine's checkpoint-failure event.
 const CAUSE_PREFIX: &str = "PRAGMA wal_checkpoint failed";
-/// The engine's reason for a checkpoint it could not run because another
-/// operation held the store back: `LimboError::Busy`, as the captured sentence
-/// renders it (the engine formats its error with `{:?}`, and `Busy` is a unit
-/// variant). A blocked checkpoint shares the engine's failure row and sentence
-/// with every genuine pager error, so this reason is the only thing that tells
-/// them apart.
+/// The engine's reason for a checkpoint it could not run because another operation held the
+/// store back: `LimboError::Busy`, as the captured sentence renders it (the engine formats its
+/// error with `{:?}`). A blocked checkpoint shares the failure row and sentence with every
+/// genuine pager error, so this reason is the only thing that tells them apart.
 pub(crate) const BLOCKED_REASON: &str = "PRAGMA wal_checkpoint failed: Busy";
 
 tokio::task_local! {
-    /// The sink armed for the polls of the engine call currently running, if
-    /// any. Set only by [`CauseSink::scoped`].
+    /// The sink armed for the polls of the engine call currently running. Set only by
+    /// [`CauseSink::scoped`].
     static ARMED: Arc<Mutex<Option<String>>>;
 }
 
-/// True when the engine's own reason in `e` says the checkpoint was blocked by
-/// another operation rather than genuinely failing. Matched up to a word
-/// boundary, never as a bare `Busy` substring, so the engine's `BusySnapshot`
-/// is not read as a blocked checkpoint. This capture is the only thing that tells a
-/// blocked attempt from a genuine failure, so a reason that never arrived keeps its
-/// round failing: it opens or extends the failure window and counts towards the stop.
-/// A blocked attempt never does: it opens no window and is no failure of its own.
+/// True when the engine's own reason in `e` says the checkpoint was blocked by another
+/// operation rather than genuinely failing. Matched up to a word boundary, never as a bare
+/// `Busy` substring, so the engine's `BusySnapshot` is not read as a blocked checkpoint. A
+/// reason that never arrived keeps its round failing; a blocked attempt opens no window and is
+/// no failure of its own.
 pub(crate) fn is_blocked_checkpoint(e: &anyhow::Error) -> bool {
     format!("{e:#}")
         .split_once(BLOCKED_REASON)
@@ -70,22 +58,20 @@ pub(crate) fn filter() -> tracing_subscriber::filter::Targets {
         .with_target(ENGINE_TARGET, tracing::level_filters::LevelFilter::DEBUG)
 }
 
-/// A per-call sink for the engine's own reason for a failed checkpoint: only
-/// events emitted inside [`Self::scoped`]'s future reach this sink.
+/// A per-call sink for the engine's own reason for a failed checkpoint: only events emitted
+/// inside [`Self::scoped`]'s future reach this sink.
 #[derive(Clone)]
 pub(crate) struct CauseSink(Arc<Mutex<Option<String>>>);
 
 impl CauseSink {
-    /// An empty sink; nothing is captured until it arms a future through
-    /// [`Self::scoped`].
+    /// An empty sink; nothing is captured until it arms a future through [`Self::scoped`].
     pub(crate) fn new() -> Self {
         Self(Arc::new(Mutex::new(None)))
     }
 
-    /// Arm this sink for `fut`'s polls: an engine event fired inside them lands
-    /// in this sink and nowhere else. The future owns its clone of the sink, so
-    /// it carries no borrow of `self` (precise capturing keeps `'_` out of the
-    /// opaque type; callers spawn the result).
+    /// Arm this sink for `fut`'s polls: an engine event fired inside them lands in this sink and
+    /// nowhere else. The future owns its clone, so it carries no borrow of `self` (precise
+    /// capturing keeps `'_` out of the opaque type; callers spawn the result).
     pub(crate) fn scoped<T, F>(&self, fut: F) -> impl Future<Output = T> + use<T, F>
     where
         F: Future<Output = T>,
@@ -93,9 +79,8 @@ impl CauseSink {
         ARMED.scope(Arc::clone(&self.0), fut)
     }
 
-    /// Attach the captured engine reason to `e`, when the engine reported one:
-    /// its own chain link rendered as `engine cause: <engine text>` so the
-    /// record line stays greppable.
+    /// Attach the captured engine reason to `e` when the engine reported one: its own chain link
+    /// rendered as `engine cause: <engine text>` so the record line stays greppable.
     pub(crate) fn attach(&self, e: anyhow::Error) -> anyhow::Error {
         match self.0.lock().unwrap_poison().take() {
             Some(cause) => e.context(format!("engine cause: {cause}")),
@@ -104,8 +89,8 @@ impl CauseSink {
     }
 }
 
-/// Keeps the engine's own reason for a failed checkpoint — the one event this
-/// process enables on the engine's behalf.
+/// Keeps the engine's own reason for a failed checkpoint — the one event this process enables
+/// on the engine's behalf.
 pub(crate) struct CauseCaptureLayer;
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CauseCaptureLayer {
@@ -114,10 +99,9 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CauseCaptureLayer 
         event: &tracing::Event<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        // No sink armed for this task (or one already holds a reason) → the
-        // event can be dropped before any work: the engine's unrelated debug
-        // events on this target cost one lock check, no `String` allocation
-        // and no `Debug` formatting.
+        // No sink armed for this task (or one already holds a reason) → drop the event before
+        // any work: the engine's unrelated debug events cost one lock check, no `String`
+        // allocation and no `Debug` formatting.
         let capturing = ARMED
             .try_with(|sink| sink.lock().unwrap_poison().is_none())
             .unwrap_or(false);
@@ -130,8 +114,8 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CauseCaptureLayer 
             return;
         };
         if message.starts_with(CAUSE_PREFIX) {
-            // Still armed and still empty: `on_event` runs synchronously on the
-            // task that armed the sink, so nothing can change in between.
+            // Still armed and still empty: `on_event` runs synchronously on the task that armed
+            // the sink.
             let _ = ARMED.try_with(|sink| *sink.lock().unwrap_poison() = Some(message));
         }
     }
@@ -149,8 +133,8 @@ impl tracing::field::Visit for MessageVisitor {
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
-            // A `format_args!` message renders its interpolated arguments
-            // through `Debug`, so this keeps the engine's full sentence.
+            // A `format_args!` message renders its arguments through `Debug`, so this keeps the
+            // engine's full sentence.
             self.0 = Some(format!("{value:?}"));
         }
     }
@@ -173,14 +157,12 @@ mod tests {
         Registry::default().with(CauseCaptureLayer.with_filter(filter()))
     }
 
-    /// The engine's blocked checkpoint and its genuine pager errors arrive as the
-    /// same failure row, so the captured reason is the only thing that tells them
-    /// apart: the engine's own busy sentence — captured for real here — is the
-    /// blocked attempt, and every other reason, including the engine's similarly
-    /// spelled `BusySnapshot`, is a genuine failure. The sentence is written out
-    /// instead of read from [`BLOCKED_REASON`], so the classifier's constant meets
-    /// an independently spelled copy; the engine's own rendering is only checkable
-    /// against the pinned source (see the module header).
+    /// The engine's blocked checkpoint and its genuine pager errors arrive as the same failure
+    /// row, so the captured reason is the only thing that tells them apart: the engine's own busy
+    /// sentence — captured for real here — is the blocked attempt, and every other reason,
+    /// including the similarly spelled `BusySnapshot`, is a genuine failure. The sentence is
+    /// written out instead of read from [`BLOCKED_REASON`], so the classifier's constant meets an
+    /// independently spelled copy.
     #[tokio::test]
     async fn only_the_engines_busy_sentence_reads_as_blocked() {
         let _guard = tracing::subscriber::set_default(filtered_subscriber());
@@ -217,8 +199,8 @@ mod tests {
         }
     }
 
-    /// A sink is armed only for its own calls: each concurrent scope keeps its
-    /// own reason, and an engine event outside any scope reaches no sink.
+    /// A sink is armed only for its own calls: each concurrent scope keeps its own reason, and
+    /// an engine event outside any scope reaches no sink.
     #[tokio::test]
     async fn a_sink_keeps_only_its_own_calls_reason() {
         let _guard = tracing::subscriber::set_default(capturing_subscriber());
@@ -255,17 +237,14 @@ mod tests {
         );
     }
 
-    /// The production layer stack — the real one, built by
-    /// [`crate::logs::log_layers`], not a copy of it: the `EnvFilter` must stay a
-    /// LAYER filter on the JSON log layer, because installed globally it would
-    /// drop the engine's DEBUG event and the record would silently fall back to
-    /// the product's constant text with every other test still green.
+    /// The production layer stack — the real one, built by [`crate::logs::log_layers`], not a
+    /// copy: the `EnvFilter` must stay a LAYER filter on the JSON log layer, because installed
+    /// globally it would drop the engine's DEBUG event and the record would silently fall back
+    /// to the constant text with every other test still green.
     ///
-    /// It is also the layer's whole filter: the checkpoint-failure sentence on
-    /// the engine's own target is kept whole — prefix and interpolated
-    /// diagnostics — while a different message on that target is dropped, the
-    /// same sentence on another target never reaches the layer, and the
-    /// product's own text stays a separate chain link.
+    /// It is also the layer's whole filter: the checkpoint-failure sentence on the engine's own
+    /// target is kept whole — prefix and interpolated diagnostics — while a different message on
+    /// that target is dropped and the same sentence on another target never reaches the layer.
     #[tokio::test]
     async fn the_production_filter_stack_keeps_only_the_engine_sentence() {
         use tracing_subscriber::EnvFilter;
@@ -312,8 +291,8 @@ mod tests {
             "the product's own text must survive: {rendered:?}"
         );
 
-        // The engine's real event interpolates its diagnostics, so a formatted
-        // message must be kept whole as well as a literal one.
+        // The engine's real event interpolates its diagnostics, so a formatted message must be
+        // kept whole as well as a literal one.
         let interpolated = CauseSink::new();
         interpolated
             .scoped(async {

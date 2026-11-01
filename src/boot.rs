@@ -1,20 +1,17 @@
-//! Process start-up: the store bring-up sequence ([`open_stores`]), the
-//! retirement of the removed text-embedding model files
-//! ([`remove_retired_embedding_model_files`]) and the diagnostics emitted before
-//! the tracing layer exists. Diagnostics are written to stderr immediately (carrying a
-//! local-time timestamp, so a line kept in `daemon.log` or `update.log` is
-//! time-attributable) and buffered for replay into the logs store once tracing is live,
-//! so they appear in the GUI boot log.
+//! Process start-up: the store bring-up sequence ([`open_stores`]), the retirement
+//! of the removed text-embedding model files, and the diagnostics emitted before
+//! the tracing layer exists. A diagnostic goes to stderr at once, timestamped
+//! locally so a line kept in `daemon.log` or `update.log` is time-attributable, and
+//! is buffered for replay into the logs store (the GUI boot log) once tracing is live.
 //!
-//! That stderr leg is best-effort, not a delivery guarantee: a launch detached from its
-//! terminal has its stderr in [`crate::detach`]'s `daemon.log` under the storage root, a
-//! launch the platform gave no standard streams prints into nothing, and the update
-//! hand-off's stderr is `update.log`. A store that is not usable refuses the start before
-//! either store is opened, and what makes such a failure recoverable is the storage
-//! root's durable failure record (`<root>/error.log`): every store bring-up failure — the
-//! refusal, the locked-store case, and any other error — is appended there, once per
-//! condition however often the launch repeats (see [`failure_record::record`]), which is
-//! why [`record_startup_failure`] exists for the start-up steps outside this module.
+//! That stderr leg is best-effort: a detached launch's stderr is [`crate::detach`]'s
+//! `daemon.log`, a launch given no standard streams prints into nothing, and the
+//! update hand-off's is `update.log`. An unusable store refuses the start before
+//! either store is opened, and every bring-up failure — the refusal, the
+//! locked-store case, any other error — is appended to the storage root's durable
+//! record (`<root>/error.log`), once per condition however often the launch repeats
+//! (see [`failure_record::record`]); [`record_startup_failure`] covers the start-up
+//! steps outside this module.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -28,15 +25,10 @@ static PRE_TRACING_DIAGNOSTICS: std::sync::Mutex<Vec<String>> = std::sync::Mutex
 static TRACING_INITIALIZED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Write a diagnostic line to stderr with a local-time timestamp prefix, so
-/// lines captured in `daemon.log` (a detached launch's own output) or `update.log`
-/// (the replacement daemon's stderr) are time-attributable during incident review.
-///
 /// The daemon's single stderr funnel: boot diagnostics, the failure record's
-/// stderr fallback, the log-store warnings and the panic hook all reach stderr
-/// through here. It prints through [`crate::util::print_stderr`], so a write that
-/// fails is discarded and a panic in a caller — the panic hook, whose own
-/// diagnostics come through here — cannot abort the process on its way out.
+/// stderr fallback, log-store warnings and the panic hook all pass through here.
+/// It prints through [`crate::util::print_stderr`], so a failed write is discarded
+/// and a panic in a caller (the panic hook) cannot abort the process on its way out.
 pub(crate) fn timestamped_stderr(message: &str) {
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     crate::util::print_stderr(&format!("[mahbot] [{ts}] {message}"));
@@ -52,24 +44,20 @@ pub(crate) fn boot_diagnostic(message: String) {
     }
 }
 
-/// Mark tracing as initialized; subsequent diagnostics go straight to logs.
 pub(crate) fn mark_tracing_initialized() {
     TRACING_INITIALIZED.store(true, std::sync::atomic::Ordering::Release);
 }
 
-/// Drop the pre-tracing buffer without replaying it. Called when
-/// `init_tracing` fails. The messages went to a best-effort channel — stderr, which is
-/// `daemon.log` for a detached launch and nothing at all for one the platform gave no
-/// standard streams (see the module header) — so dropping the buffer loses nothing that
-/// was not already lost; only the (failed) logs-store replay is skipped. The failure
-/// itself is not left to that channel: the step that failed it records the durable
-/// `error.log` block like any other bring-up failure.
+/// Drop the pre-tracing buffer without replaying it, for when `init_tracing` fails:
+/// the messages already went to the best-effort stderr channel, so only the (failed)
+/// logs-store replay is skipped. The failure itself is filed in `error.log` by the
+/// step that hit it.
 pub(crate) fn clear_boot_diagnostics() {
     PRE_TRACING_DIAGNOSTICS.lock().unwrap_poison().clear();
 }
 
-/// Replay buffered pre-tracing diagnostics through tracing (into the logs
-/// store) and clear the buffer. Called right after `init_tracing` succeeds.
+/// Replay buffered pre-tracing diagnostics into the logs store, right after
+/// `init_tracing` succeeds.
 pub(crate) fn replay_boot_diagnostics() {
     let messages = {
         let mut buf = PRE_TRACING_DIAGNOSTICS.lock().unwrap_poison();
@@ -80,28 +68,24 @@ pub(crate) fn replay_boot_diagnostics() {
     }
 }
 
-/// Open every store in the one supported boot order, returning the logs store
-/// (the daemon keeps it for the boot log and the background tasks).
-///
-/// The order is load-bearing: the file-level shape check of BOTH stores runs
-/// before anything opens a store (a stat plus one 18-byte header read — no
-/// engine open, so a refusal here leaves both stores untouched), the logs store
-/// opens inside `init_tracing` (which publishes the GUI log broadcast), then the
-/// process-global inits and the consolidated domain store.
-/// The store-lock check drives this same function, so a boot-order change cannot
+/// The one supported boot order, returning the logs store (kept for the boot log
+/// and the background tasks): the file-level shape check of BOTH stores (a stat and
+/// one 18-byte header read, no engine open, so a refusal leaves both untouched),
+/// then the logs store inside `init_tracing` (which publishes the GUI log
+/// broadcast), then the process-global inits and the consolidated domain store. The
+/// store-lock check drives this same function, so a boot-order change cannot
 /// silently weaken it.
 ///
 /// `config::load_or_init()` must have run first: the storage root comes from
-/// [`crate::config::CONFIG`], and an uninitialized root is a boot error here
-/// rather than a panic.
+/// [`crate::config::CONFIG`], and an uninitialized root is a boot error here rather
+/// than a panic.
 pub async fn open_stores() -> anyhow::Result<Arc<crate::logs::LogStore>> {
     let root = crate::config::CONFIG
         .try_storage_root()
         .context("config::load_or_init() must run before the stores are opened")
         .map_err(|e| record_startup_failure("boot::open_stores", e))?;
-    // Stage 1: check BOTH stores' data files before either is opened. On an
-    // unusable file, refuse here so the refusal leaves both stores untouched —
-    // every unusable store is named, in the diagnostic lines and the record.
+    // Both stores' data files are checked before either is opened, so the refusal
+    // leaves both untouched; every unusable store is named.
     let refusals: Vec<crate::db::StoreRefusal> = crate::db::wal_guard::scan_store_shapes(&root)
         .iter()
         .map(|store| {
@@ -127,8 +111,8 @@ pub async fn open_stores() -> anyhow::Result<Arc<crate::logs::LogStore>> {
     let _ = crate::gui::LOG_BROADCAST.set(log_broadcast);
     crate::workspace_index::init_global(); // sync — no I/O
     crate::pipeline::chronicle::init_global(); // sync — no I/O
-    // These globals are not stores, so a failure here has no store to name —
-    // but it is still a start-up failure and must be recorded, not lost.
+    // Not stores, so a failure names no store — but it is still a start-up failure
+    // and must be recorded, not lost.
     crate::agent::message_router::init_global()
         .map_err(|e| record_startup_failure("agent::message_router::init_global", e))?;
     #[cfg(target_os = "macos")]
@@ -144,21 +128,17 @@ pub async fn open_stores() -> anyhow::Result<Arc<crate::logs::LogStore>> {
     Ok(log_store)
 }
 
-/// Point the operator at the durable record when the block was filed, on the
-/// boot-diagnostic channel (stderr now, logs store after tracing init). The
-/// stderr fallback already carries the full block, so a failed write adds
-/// nothing here.
+/// Point the operator at the durable record when the block was filed. The stderr
+/// fallback already carries the full block, so a failed write adds nothing here.
 fn note_recorded(what: &str, filed: Option<failure_record::Filed>) {
     if let Some(pointer) = failure_record::recorded_pointer(what, filed) {
         boot_diagnostic(pointer);
     }
 }
 
-/// Record a start-up refusal: the loud one-liner on the boot-diagnostic channel
-/// (stderr now, logs store after tracing init) and the structured block in the
-/// storage root's ONE durable failure record (`<root>/error.log`, the shared
-/// writer) — plus a diagnostic line pointing the operator at the file it landed
-/// in when the write succeeded. Filed once per condition ([`failure_record::record`]).
+/// The loud one-liner on the boot-diagnostic channel plus the structured block in
+/// the storage root's ONE durable record (`<root>/error.log`). Filed once per
+/// condition ([`failure_record::record`]).
 fn record_refusal(root: &Path, refusal: &crate::db::StoreRefusal) {
     boot_diagnostic(refusal.to_string());
     note_recorded(
@@ -173,14 +153,11 @@ fn record_refusal(root: &Path, refusal: &crate::db::StoreRefusal) {
     );
 }
 
-/// Record a store bring-up failure and pass the error through unchanged. The
-/// rule for all three branches: a refusal (possibly under `.context()`
+/// Passes the error through unchanged. A refusal (possibly under `.context()`
 /// wrappers, so the whole chain is searched) goes through [`record_refusal`]; a
-/// store locked by another process is recorded as an environment-caused
-/// refusal; every other bring-up error is a start-up failure naming the store
-/// and its path, with the environment note when the cause is an external
-/// condition rather than store damage. Filed once per condition
-/// ([`failure_record::record`]).
+/// store locked by another process is an environment-caused refusal; any other error
+/// is a start-up failure naming the store and its path, with the environment note
+/// when the cause is external rather than store damage. Filed once per condition.
 fn record_bring_up_failure(root: &Path, store: &'static str, e: anyhow::Error) -> anyhow::Error {
     if let Some(refusal) = e
         .chain()
@@ -215,20 +192,15 @@ fn record_bring_up_failure(root: &Path, store: &'static str, e: anyhow::Error) -
     e
 }
 
-/// Record a start-up failure that is not a store bring-up error (a config load,
-/// a provider or another global init) and return `e` unchanged — the returned
-/// error is what the start-failure screen shows, while the record names `context`
-/// as the failing step, so the two texts are not identical by construction.
-/// Callers that need the screen to carry a prefix must put it in the error they
-/// pass (see the panic arm in the binary).
+/// For start-up failures that are not store bring-up errors (a config load, a
+/// provider, another global init). Returns `e` unchanged — the start-failure screen
+/// shows it, while the record names `context` as the failing step. Callers needing
+/// a prefix on the screen must put it in the error they pass.
 ///
-/// The storage root is resolved best-effort; when it is not resolved yet (a
-/// failure before config init) or cannot be written, [`failure_record::record`]
-/// puts the full block on stderr instead — the best-effort channel the module
-/// header names.
+/// The storage root is resolved best-effort; unresolved (a failure before config
+/// init) or unwritable, [`failure_record::record`] puts the full block on stderr.
 ///
-/// Public (and hidden from the library's docs) for the binary's pre-store boot
-/// steps, the sibling of [`open_stores`].
+/// Public and hidden for the binary's pre-store boot steps.
 #[must_use]
 #[doc(hidden)]
 pub fn record_startup_failure(context: &str, e: anyhow::Error) -> anyhow::Error {
@@ -240,23 +212,13 @@ pub fn record_startup_failure(context: &str, e: anyhow::Error) -> anyhow::Error 
     e
 }
 
-/// Record a start-up failure under an explicitly given storage root and return the
-/// error unchanged.
-///
-/// The binary's own pre-boot steps hold that root themselves: they run before
-/// `config::load_or_init()` sets the process-global one
-/// ([`record_startup_failure`] resolves), and the failure is filed in the durable
-/// record under the root they already resolved (`error.log`) rather than on the
-/// channel the module header calls best-effort. The error text is returned
+/// Like [`record_startup_failure`], under an explicitly given storage root: the
+/// binary's pre-boot steps run before `config::load_or_init()` sets the global one,
+/// and file under the root they already resolved. The error text is returned
 /// unchanged so the caller's own report is unaffected.
 ///
-/// The write is filed once per condition ([`failure_record::record`]): a launch
-/// failure whose condition — the step and the cause class — the record already holds
-/// is not appended again, so a double-launch refused again and again does not grow
-/// the file.
-///
-/// Public (and hidden from the library's docs) for the binary, like
-/// [`record_startup_failure`].
+/// Filed once per condition (step plus cause class), so a double-launch refused
+/// again and again does not grow the file.
 #[must_use]
 #[doc(hidden)]
 pub fn record_launch_failure(root: &Path, context: &str, e: anyhow::Error) -> anyhow::Error {
@@ -268,11 +230,9 @@ pub fn record_launch_failure(root: &Path, context: &str, e: anyhow::Error) -> an
     e
 }
 
-/// The durable block one start-up failure renders to, ready for
-/// [`failure_record::record`]: the failing step as its own line and the reason as
-/// the error chain alone — so the step is identity (see [`failure_record`]'s
-/// condition rule) rather than a prefix of a reason that two occurrences may word
-/// differently.
+/// The failing step as its own line and the reason as the error chain alone — so
+/// the step is identity (see [`failure_record`]'s condition rule) rather than a
+/// prefix of a reason two occurrences may word differently.
 fn start_up_block(context: &str, e: &anyhow::Error) -> String {
     failure_record::start_up_report(
         FailureKind::StartUpFailure,
@@ -284,22 +244,18 @@ fn start_up_block(context: &str, e: &anyhow::Error) -> String {
     .render()
 }
 
-/// The error a panic of the boot sequence is recorded and shown as: the panic
-/// summary qualified as a start-up panic. The start-failure screen renders the
-/// error [`record_startup_failure`] returns verbatim, so the qualifier lives in
-/// the error rather than in the recorder's step context.
+/// The start-failure screen renders the error [`record_startup_failure`] returns
+/// verbatim, so the qualifier lives in the error, not in the recorder's step context.
 #[must_use]
 #[doc(hidden)]
 pub fn startup_panic_error(message: &str) -> anyhow::Error {
     anyhow::anyhow!("Startup panicked: {message}")
 }
 
-/// Remove the retired text-embedding model files from the shared model cache.
-///
-/// A previous release downloaded these two files for the deleted embedder;
-/// they serve nothing now. The cache is shared with the audio models, so only
-/// these exact filenames are removed and nothing else in the directory is
-/// touched. A failure is logged, never fatal, and the next start retries.
+/// A previous release downloaded these two files for the deleted embedder. The
+/// cache is shared with the audio models, so only these exact filenames are removed
+/// and nothing else in the directory is touched. A failure is logged, never fatal,
+/// and the next start retries.
 pub fn remove_retired_embedding_model_files() {
     let Some(dir) = crate::util::models_dir() else {
         return;
@@ -307,8 +263,7 @@ pub fn remove_retired_embedding_model_files() {
     remove_retired_embedding_model_files_in(&dir);
 }
 
-/// The two files the deleted embedder downloaded — the weights and its
-/// tokenizer — and the only names this product ever removes from the cache.
+/// The weights and its tokenizer, and the only names this product removes from the cache.
 const RETIRED_EMBEDDING_MODEL_FILES: [&str; 2] =
     ["v5-nano-retrieval-Q4_K_M.gguf", "embed_tokenizer.json"];
 
@@ -338,11 +293,9 @@ fn remove_retired_embedding_model_files_in(dir: &Path) {
 mod tests {
     use super::*;
 
-    /// A refusal is appended to the storage root's one durable failure record
-    /// (`error.log`) with its store, path and reason; a refusal wrapped in
-    /// `.context()` is still found; an environment-caused refusal carries the
-    /// cause line; and a non-refusal bring-up error is recorded as a start-up
-    /// failure (never silent), passing through untouched.
+    /// A refusal lands in `error.log` with its store, path and reason, and is still
+    /// found under `.context()` wrappers; an environment-caused refusal carries the
+    /// cause line.
     #[test]
     fn startup_refusal_is_recorded_durably() {
         let tmp = tempfile::TempDir::new().expect("temp dir for test");
@@ -369,7 +322,6 @@ mod tests {
             );
         }
 
-        // A refusal under `.context()` wrappers is still found and recorded.
         let wrapped = anyhow::Error::new(crate::db::StoreRefusal::new(
             "logs",
             &crate::db::store_db_path(root, "logs"),
@@ -387,8 +339,7 @@ mod tests {
             "a wrapped refusal must still be recorded: {body}"
         );
 
-        // An environment-caused refusal (an unreadable file is not evidence of
-        // damage) is recorded as such.
+        // An unreadable file is not evidence of damage, so the refusal says so.
         let defect = crate::db::wal_guard::ShapeDefect::Unreadable;
         assert!(
             defect.is_environment_caused(),
@@ -404,13 +355,10 @@ mod tests {
         );
     }
 
-    /// A bring-up error that is not a store refusal is still recorded — never
-    /// silent — as a start-up failure naming the store and its path, and passes
-    /// the error through unchanged. The same writer serves the start-up steps
-    /// outside the stores, where there is no store and no path to name: the step
-    /// takes that place, and the record says so rather than inventing one. A
-    /// resource/permission cause is marked environment-caused; a cause that says
-    /// nothing about the environment is not.
+    /// Never silent: a non-refusal is recorded as a start-up failure naming the store
+    /// and its path and passes through unchanged. Outside the stores there is neither,
+    /// so the step takes that place. A resource/permission cause is marked
+    /// environment-caused; a cause saying nothing about the environment is not.
     #[test]
     fn a_failure_that_is_no_refusal_is_recorded_as_a_start_up_failure() {
         let tmp = tempfile::TempDir::new().expect("temp dir for test");
@@ -451,8 +399,7 @@ mod tests {
             "only the environment-caused failure may carry the cause line: {body}"
         );
 
-        // The steps outside the stores: no store, no path, and the step named in
-        // their place — through the root-explicit launch seam the binary uses.
+        // Outside the stores: no store, no path, the step named in their place.
         let passed = record_launch_failure(
             root,
             "providers::init_global",
@@ -474,12 +421,10 @@ mod tests {
         }
     }
 
-    /// The retirement removes exactly the two files the deleted embedder
-    /// downloaded and leaves every other file in the shared cache — the
-    /// unrelated gguf and an audio model alike — in place. A second start on an
-    /// already-clean cache is a silent no-op. Driven on a private directory, so
-    /// the test can never reach the owner's real model cache (the ignored TTS
-    /// end-to-end test symlinks the test root's `models/` to it).
+    /// Removes exactly the two files and leaves everything else in the shared cache
+    /// in place; a second start is a silent no-op. A private directory, so the test
+    /// can never reach the owner's real model cache (the ignored TTS end-to-end test
+    /// symlinks the test root's `models/` to it).
     #[test]
     fn only_the_retired_embedding_model_files_are_removed() {
         let tmp = tempfile::TempDir::new().expect("temp dir for test");

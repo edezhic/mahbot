@@ -1,46 +1,24 @@
-//! The vocabulary and shapes every document reader's output is built from: the
-//! block headers and unit marks, the story names and the cell addresses shared by
-//! the OOXML readers ([`crate::ooxml`]) and the legacy `.doc`/`.xls`/`.ppt` one
+//! The vocabulary and shapes every document reader's output is built from: the block
+//! headers and unit marks, the story names and the cell addresses shared by the OOXML
+//! readers ([`crate::ooxml`]) and the legacy `.doc`/`.xls`/`.ppt` one
 //! ([`crate::legacy`]).
 //!
-//! A reader's output is assembled from a handful of shapes — a header over
-//! indented lines, a label over a run of text, a sheet or slide header carrying
-//! its state, a cell address — and a mark or a name. What more than one reader
-//! prints is stated once here, so two of them cannot name one thing two ways: the
-//! Excel reader and the legacy one both print a sheet block, the Word reader and
-//! the legacy one both print the stories a Word file carries, and every reader
-//! that writes a spreadsheet cell address writes it through [`column_letters`].
-//! What a reading found in a file and did not show is stated here as well
-//! ([`Unshown`]): each kind's own words, one line per kind, so every reader's arm
-//! and both delivery layers report a loss the same way, and
-//! [`unshown_report_examples`] quotes a report line in the model-facing
-//! description of a reading.
-//! The names only the Word reader prints — the story names a `.docx` and a `.doc`
-//! reading share, and the block a text box prints as — sit beside them rather than
-//! inside one of the two files that print them: the marks the kit's refusals match
-//! are stated in `assets/docgen/rules.json`, and the Word reader's own tests pin
-//! the list to what a reading shows. The vocabulary a chart's content prints as —
-//! its block header, its field labels, the annotations a value carries and the
-//! marks standing in for values — is stated here as well, because all three OOXML
-//! readers print it through one module and the model-facing description of a
-//! reading names it.
+//! A reader's output is assembled from a handful of shapes — a header over indented
+//! lines, a label over a run of text, a sheet or slide header carrying its state, a cell
+//! address — and a mark or a name. What more than one reader prints is stated once here,
+//! so two of them cannot name one thing two ways. What a reading found and did not show
+//! is stated here too ([`Unshown`]), one line per kind, so every reader's arm and both
+//! delivery layers report a loss the same way.
 //!
-//! The words of the PowerPoint marks — `(title)`, `(hidden slide)`,
-//! `(diagram text)`, `(diagram text could not be read)`, `(no text)` — are
-//! stated in `assets/docgen/rules.json` rather than here, because the document
-//! kit's refusals name them too (see [`crate::docgen::ppt_marks`]), and
-//! `(no text)` in particular must be read from there by whoever prints it.
-//! [`slide_header`] composes the slide's number with that same hidden-slide mark,
-//! and [`ppt_description_substitutions`] binds those marks and the three slide
-//! labels to the `{{ppt_…}}` keys the model-facing texts naming a reading's marks
-//! spell.
+//! The PowerPoint marks (`(title)`, `(hidden slide)`, …) and the marks the kit's refusals
+//! match live in `assets/docgen/rules.json`; [`ppt_description_substitutions`] binds them
+//! and the three slide labels to the `{{ppt_…}}` keys the model-facing texts spell. The
+//! vocabulary a chart's content prints as is stated here, because all three OOXML readers
+//! print it through one module and the model-facing description names it.
 
 use strum::{EnumCount, EnumIter, IntoEnumIterator};
 
-// ── Shared text shapes ──────────────────────────────────────────
-
-/// `header` then one indented line per entry. Every reader builds its blocks
-/// from this, so the text shapes stay one implementation.
+/// `header` then one indented line per entry — every reader builds its blocks from this.
 pub(crate) fn text_lines(header: &str, lines: &[String]) -> String {
     let indented = lines
         .iter()
@@ -50,8 +28,8 @@ pub(crate) fn text_lines(header: &str, lines: &[String]) -> String {
     format!("{header}\n{indented}")
 }
 
-/// [`text_lines`], or `header (marker)` when there is nothing to list — each
-/// reader supplies the marker its own empty unit prints.
+/// [`text_lines`], or `header (marker)` when there is nothing to list — each reader
+/// supplies the marker its own empty unit prints.
 pub(crate) fn text_block(header: &str, empty_marker: &str, lines: &[String]) -> String {
     if lines.is_empty() {
         return format!("{header} {empty_marker}");
@@ -59,9 +37,8 @@ pub(crate) fn text_block(header: &str, empty_marker: &str, lines: &[String]) -> 
     text_lines(header, lines)
 }
 
-/// `Label:` then each line of `text` indented by two spaces — the shape
-/// [`text_lines`] gives the other two families, for a caller holding a block of
-/// text as one string rather than as lines.
+/// `Label:` then each line of `text` indented by two spaces, for a caller holding a block
+/// of text as one string rather than as lines.
 pub(crate) fn labeled_block(label: &str, text: &str) -> String {
     text_lines(&format!("{label}:"), &lines_of(text))
 }
@@ -70,8 +47,6 @@ pub(crate) fn labeled_block(label: &str, text: &str) -> String {
 pub(crate) fn lines_of(text: &str) -> Vec<String> {
     text.lines().map(str::to_owned).collect()
 }
-
-// ── Column addresses ────────────────────────────────────────────
 
 /// The spreadsheet column letters for a zero-based column index (`0` is `A`).
 /// Every reader that writes a cell address writes it through this.
@@ -89,10 +64,8 @@ pub(crate) fn column_letters(mut index: u32) -> String {
     letters.into_iter().collect()
 }
 
-/// The zero-based column index of a cell reference (`"B12"` -> `1`), or `None`
-/// when it does not start with a column letter — the inverse of
-/// [`column_letters`], so a reference one side writes is read back by one
-/// implementation.
+/// The zero-based column index of a cell reference (`"B12"` -> `1`), or `None` when it does
+/// not start with a column letter — the inverse of [`column_letters`].
 pub(crate) fn column_index(reference: &str) -> Option<u32> {
     let mut index = 0u32;
     let mut seen = false;
@@ -111,14 +84,11 @@ pub(crate) fn column_index(reference: &str) -> Option<u32> {
     seen.then(|| index - 1)
 }
 
-// ── Sheet marks ─────────────────────────────────────────────────
-
 /// The mark a sheet with no valued cell prints in place of its lines.
 pub(crate) const NO_VALUES: &str = "(no values)";
 
-/// The mark a value carries when it is the number the file stores rather than a
-/// display of it: the cell's or the chart cache's number format was not read, is
-/// not one this reader reproduces for this value, or shows nothing at all for it.
+/// The mark a value carries when it is the number the file stores rather than a display of
+/// it: the number format was not read, is not one this reader reproduces, or shows nothing.
 /// A spreadsheet cell and a chart's cached value carry the same one, so one
 /// number is not spelled two ways in one answer.
 pub(crate) const MARK_STORED: &str = " (stored number, format not shown)";
@@ -132,9 +102,8 @@ pub(crate) const CHART_SHEET: &str = "(chart sheet)";
 /// workbook writes is one of two words, and a producer's own casing is no reason
 /// to pass a hidden sheet off as an ordinary one. The legacy `.xls` reader
 /// deliberately passes `None`: the old format takes none of the newer arms' marks
-/// — not a hidden sheet, though the crate's own `Sheet::hidden` is right there and
-/// that arm reads the sheet struct anyway — so a legacy sheet is never marked (see
-/// [`crate::legacy`]).
+/// … not a hidden sheet, though `Sheet::hidden` is right there — so a legacy sheet is never
+/// marked (see [`crate::legacy`]).
 pub(crate) fn sheet_header(name: &str, state: Option<&str>) -> String {
     match state.map(str::to_ascii_lowercase).as_deref() {
         Some("veryhidden") => format!("Sheet \"{name}\" (very hidden):"),
@@ -143,13 +112,9 @@ pub(crate) fn sheet_header(name: &str, state: Option<&str>) -> String {
     }
 }
 
-// ── Slide marks ─────────────────────────────────────────────────
-
-/// One slide's block header: `Slide <n>:`, plus ` (hidden slide)` when the
-/// presentation hides it. The mark is the kit's own ([`crate::docgen::ppt_marks`])
-/// and the label the kit's refusals name is the shared template
-/// ([`crate::docgen::ppt_slide_labels`]), so the reader and the kit cannot name
-/// either two ways.
+/// One slide's block header: `Slide <n>:`, plus ` (hidden slide)` when the presentation
+/// hides it. The mark is the kit's own and the label the kit's refusals name is the shared
+/// template, so the reader and the kit cannot name either two ways.
 pub(crate) fn slide_header(number: usize, hidden: bool) -> String {
     let mut header = slide_label(
         &crate::docgen::ppt_slide_labels().slide,
@@ -162,8 +127,7 @@ pub(crate) fn slide_header(number: usize, hidden: bool) -> String {
     header
 }
 
-/// The header of the block a slide's speaker notes print under: `Slide <n>
-/// notes:`.
+/// The header of the block a slide's speaker notes print under: `Slide <n> notes:`.
 pub(crate) fn slide_notes_header(number: usize) -> String {
     slide_label(
         &crate::docgen::ppt_slide_labels().notes,
@@ -171,8 +135,7 @@ pub(crate) fn slide_notes_header(number: usize) -> String {
     )
 }
 
-/// The header of the block a slide's comments and their replies print under:
-/// `Slide <n> comments:`.
+/// The header of the block a slide's comments and replies print under.
 pub(crate) fn slide_comments_header(number: usize) -> String {
     slide_label(
         &crate::docgen::ppt_slide_labels().comments,
@@ -180,21 +143,16 @@ pub(crate) fn slide_comments_header(number: usize) -> String {
     )
 }
 
-/// `template` with its `{n}` replaced by `number` — the one place a slide's own
-/// label is built from the shared template, for a reading and for the
-/// model-facing descriptions alike. A description passes `<n>`, the way the rest
-/// of that text spells a place a real value fills, so the prompt names the label
-/// the reader prints without spelling it a second time.
+/// `template` with its `{n}` replaced by `number` — the one place a slide's own label is
+/// built from the shared template, for a reading and for a model-facing description alike
+/// (`<n>` there, a real number through [`slide_header`]).
 pub(crate) fn slide_label(template: &str, number: &str) -> String {
     template.replace("{n}", number)
 }
 
-/// The `{{ppt_…}}` pairs a model-facing text spells for a reading's marks: the
-/// kit's five marks and the three slide labels, with `<n>` where a description
-/// leaves the slide's number to the reader — a reading prints a real number
-/// through [`slide_header`], [`slide_notes_header`] and [`slide_comments_header`]
-/// instead. The chart keys stay bound in the `read` description alone, which is
-/// their only consumer.
+/// The `{{ppt_…}}` pairs a model-facing text spells for a reading's marks: the kit's five
+/// marks and the three slide labels, with `<n>` where a description leaves the number to
+/// the reader. The chart keys stay bound in the `read` description alone.
 pub(crate) fn ppt_description_substitutions() -> Vec<(&'static str, String)> {
     let marks = crate::docgen::ppt_marks();
     let labels = crate::docgen::ppt_slide_labels();
@@ -216,27 +174,18 @@ pub(crate) fn ppt_description_substitutions() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// The mark a text box is printed as, by both Word readers: a `[text box]`
-/// block in the enclosing flow.
+/// The mark a text box is printed as, by both Word readers: a `[text box]` block.
 pub(crate) const TEXT_BOX: &str = "[text box]";
 
 /// The mark that follows a Word link's own content: `(link: ADDRESS)`, or
-/// `(link: internal)` for an anchor inside the same document. The address and
-/// its closing `)` are the reader's; this is the opening the description names.
+/// `(link: internal)` for an anchor in the same document.
 pub(crate) const DOC_LINK: &str = "(link: ";
 
-// ── Chart marks ─────────────────────────────────────────────────
-//
-// The vocabulary a chart's content prints as, wherever a reading prints it: the
-// three OOXML readers all print it through [`crate::ooxml::chart`], and the
-// model-facing description of a reading names it from here (`src/tools/read.rs`),
-// so the two cannot spell one mark two ways. A chart's own field labels are
-// deliberately not patterns in the document kit's refusals (`docx_marks`):
-// `Title:`, `Text:` and `Label:` are ordinary words a document's own text can
-// hold. So is the bare `Chart:` of a part that names no kind, which would refuse
-// any document's own sentence opening with it. The header a named kind prints,
-// the series label (named or numbered), the annotation beside a value and the
-// marks standing in for values are patterns.
+// The vocabulary a chart's content prints as, wherever a reading prints it: the three OOXML readers
+// print it through [`crate::ooxml::chart`], and the model-facing description names it from here, so
+// the two cannot spell one mark two ways. A chart's field labels (`Title:`, `Text:`, `Label:`, a
+// bare `Chart:`) are deliberately not patterns in the kit's refusals — ordinary words a document's
+// own text can hold.
 
 /// The label a chart's own title prints under.
 pub(crate) const CHART_TITLE: &str = "Title:";
@@ -250,28 +199,24 @@ pub(crate) const CHART_LABEL: &str = "Label:";
 /// The mark a series with no values in the chart part carries in place of them.
 pub(crate) const CHART_NO_VALUES: &str = "(no values in the chart part)";
 
-/// The mark a series whose values are only in the table the chart attaches
-/// carries in place of them: that table is not opened by a reading.
+/// The mark a series whose values are only in the table the chart attaches carries in place
+/// of them: that table is not opened by a reading.
 pub(crate) const CHART_VALUES_ATTACHED: &str = "(values only in the attached table)";
 
 /// The mark a chart part that cannot be read prints.
 pub(crate) const CHART_UNREADABLE: &str = "(the chart part could not be read)";
 
-/// The mark an extended (`chartEx`) chart part prints: its own schema is not
-/// read here.
+/// The mark an extended (`chartEx`) chart part prints: its own schema is not read here.
 pub(crate) const CHART_EXTENDED: &str = "(an extended chart kind, not read)";
 
-/// The header a chart's content prints under: `Chart (<kind>):`, or `Chart:` for
-/// a part that names no kind. A model-facing description passes `<kind>`, the way
-/// it passes `<n>` for a slide's number, so the header is stated once.
+/// The header a chart's content prints under: `Chart (<kind>):`, or `Chart:` for a part
+/// that names no kind. A description passes `<kind>`, so the header is stated once.
 pub(crate) fn chart_header(kind: Option<&str>) -> String {
     kind.map_or_else(|| "Chart:".to_owned(), |kind| format!("Chart ({kind}):"))
 }
 
-/// The label a series' values print under: `Series "<name>":`, or the series'
-/// number when the part gives it no name. A model-facing description passes
-/// `<name>`, the way it passes `<n>` for a slide's number, so the label is
-/// stated once.
+/// The label a series' values print under: `Series "<name>":`, or the series' number when
+/// the part gives it no name. A description passes `<name>`.
 pub(crate) fn chart_series(name: Option<&str>, index: usize) -> String {
     name.map_or_else(
         || format!("Series {}:", index + 1),
@@ -289,7 +234,6 @@ pub(crate) fn chart_excess(count: usize, noun: &str) -> String {
     format!("{count} more {noun}")
 }
 
-// ── Word story names ────────────────────────────────────────────
 //
 // The names of the Word stories a reader prints. The `.docx` reader numbers one
 // block per definition — `Footnote 1:` — and pairs a header or footer with the
@@ -307,12 +251,10 @@ pub(crate) const WORD_ENDNOTE: &str = "Endnote";
 /// A `w:comment` definition's block name.
 pub(crate) const WORD_COMMENT: &str = "Comment";
 
-// The names the legacy `.doc` reader prints. Its own reader hands it a whole
-// story at once — every footnote in one, every header and every footer in one —
-// so there is nothing to number and the same word is used in the plural; the
-// header story holds every header and every footer, so it names both. These are
-// the same names the `WORD_*` block above gives one definition at a time, and
-// the colon a printed block header carries is added where the block is built.
+// The names the legacy `.doc` reader prints. Its reader hands it a whole story at once —
+// every footnote in one — so there is nothing to number and the same word is plural; the
+// header story holds every header and footer, so it names both. The colon a printed header
+// carries is added where the block is built.
 /// The legacy `.doc` header/footer story's name.
 pub(crate) const DOC_HEADERS_FOOTERS: &str = "Headers and footers";
 /// The legacy `.doc` footnote story's name.
@@ -322,52 +264,35 @@ pub(crate) const DOC_ENDNOTES: &str = "Endnotes";
 /// The legacy `.doc` comment story's name.
 pub(crate) const DOC_COMMENTS: &str = "Comments";
 
-// ── The report of what a reading did not show ───────────────────
-
-/// One kind of content a reading found in a file and did not show. The variants'
-/// own order is the report's order: the document's structure first, the media a
-/// package embeds after it, and the pages a reading could not deliver last, so two
-/// documents holding the same kinds read the same way.
+/// One kind of content a reading found in a file and did not show. The variants' order is
+/// the report's order — structure first, embedded media after it, undelivered pages last.
 #[derive(Clone, Copy, EnumCount, EnumIter)]
 pub(crate) enum UnshownKind {
-    /// A chart part the package holds (`charts/chart<N>.xml`, the modern
-    /// `chartEx<N>.xml` parts with it), whose content a reading did not describe.
-    /// An ordinary chart's content is described where the chart sits; a chart
-    /// whose part carries no cached values, cannot be read, or is an extended
-    /// `chartEx` kind is what the report names.
+    /// A chart part the package holds whose content a reading did not describe: one whose part
+    /// carries no cached values, cannot be read, or is an extended `chartEx` kind.
     Chart,
-    /// A sheet that is one chart over a whole tab rather than a grid of cells,
-    /// whose chart the reading did not describe where it sits.
+    /// A sheet that is one chart over a whole tab, whose chart the reading did not describe.
     ChartSheet,
-    /// A SmartArt diagram, whose data parts no reading here reaches: the Word and
-    /// Excel readers name them by count, and the PowerPoint one reads a slide's
-    /// diagram text instead.
+    /// A SmartArt diagram, whose data parts no reading here reaches: Word and Excel name them
+    /// by count, PowerPoint reads a slide's diagram text instead.
     Diagram,
-    /// A part a package embeds as an object (an OLE object, an embedded
-    /// workbook): what it holds is not read. Counted by the part the reading met,
-    /// so an object a package stores as more than one part (an OLE object and the
-    /// workbook beside it) is named by each.
+    /// A part a package embeds as an object (an OLE object, an embedded workbook), counted by
+    /// the part the reading met.
     Object,
-    /// An embedded vector drawing (EMF, WMF, SVG, PICT) among a package's media or
-    /// among an old format's pictures.
+    /// An embedded vector drawing (EMF, WMF, SVG, PICT) among a package's media or pictures.
     Drawing,
-    /// Embedded video among a package's media, or among an old presentation's
-    /// objects.
+    /// Embedded video among a package's media, or an old presentation's objects.
     Video,
-    /// Embedded audio among a package's media, or among an old presentation's
-    /// objects.
+    /// Embedded audio among a package's media, or among an old presentation's objects.
     Audio,
     /// Embedded media of a kind the reading cannot name.
     Media,
     /// A file attached to a PDF.
     Attachment,
-    /// A PDF annotation holding media rather than a note in the text (a sound, a
-    /// movie, a screen recording).
+    /// A PDF annotation holding media rather than a note in the text.
     MediaAnnotation,
-    /// A page a reading could not deliver as an image — one its own page list
-    /// does not hold, or one whose raster could not be built or written — whether
-    /// or not the page's text was read; the text, where there was any, is
-    /// delivered without the page.
+    /// A page a reading could not deliver as an image — one its page list does not hold, or one
+    /// whose raster could not be built; the text, where there was any, is delivered without it.
     Page,
 }
 
@@ -390,21 +315,15 @@ impl UnshownKind {
     }
 }
 
-/// What a reading found in the file and did not show, counted per kind: the
-/// report a conversion returns beside its text and its notes, so a loss is named
-/// rather than left to be read as content that is not there.
+/// What a reading found in the file and did not show, counted per kind: the report a
+/// conversion returns beside its text and its notes, so a loss is named rather than left to
+/// be read as content that is not there.
 ///
-/// A reader counts only what its own pass met and only what it really left out: a
-/// kind at zero prints nothing, so the report never names content the file does
-/// not hold. What no reader looks at — a PDF text page's vector drawings, or the
-/// parts of a package that hold nothing a model reads (its themes, its document
-/// properties) — is deliberately absent, and belongs in the model-facing
-/// description of the reading instead: a kind here is a promise the reading
-/// keeps. A PDF's own description is the exception: it *is* read (see
-/// [`crate::pdf_marks`]), while a Word, Excel or PowerPoint package's document
-/// properties are not. A package's styles part is read as far as a paragraph's
-/// heading follows from it (see [`crate::ooxml::docx`]), and the rest of what it
-/// states is formatting, not content a report could name.
+/// A reader counts only what its own pass met and really left out: a kind at zero prints
+/// nothing. What no reader looks at — a PDF text page's vector drawings, a package's themes
+/// and document properties — is deliberately absent and belongs in the model-facing
+/// description instead: a kind here is a promise the reading keeps. A PDF's own description
+/// is the exception (it *is* read, see [`crate::pdf_marks`]).
 #[derive(Default)]
 pub(crate) struct Unshown {
     counts: [usize; UnshownKind::COUNT],

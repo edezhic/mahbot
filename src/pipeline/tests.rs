@@ -1,14 +1,12 @@
-//! Core pipeline flow tests — the job-per-phase single-puller orchestration,
-//! claims, bounce/reset failure semantics, and the phase machine.
+//! Core pipeline flow tests — the job-per-phase single-puller orchestration, claims, bounce/reset
+//! failure semantics, and the phase machine.
 //!
-//! The deterministic store + orchestrator tests exercise claim/bounce/reset and
-//! phase classification without agent rounds. The end-to-end behavioral-oracle
-//! tests drive the real phase bodies (analysis / development /
-//! verification / sanitation) and the puller through a scripted
-//! [`FakeProvider`](crate::util::test::FakeProvider), so they are isolated from
-//! the live model. Global-DB tests are serialized behind
-//! [`STORE_LOCK`](crate::util::test::STORE_LOCK) because every global store
-//! shares one test root; isolated-store tests run freely.
+//! The deterministic store + orchestrator tests exercise claim/bounce/reset and phase
+//! classification without agent rounds. The end-to-end behavioral-oracle tests drive the real phase
+//! bodies (analysis / development / verification / sanitation) and the puller through a scripted
+//! [`FakeProvider`](crate::util::test::FakeProvider), so they are isolated from the live model.
+//! Global-DB tests are serialized behind [`STORE_LOCK`](crate::util::test::STORE_LOCK) because
+//! every global store shares one test root; isolated-store tests run freely.
 
 use crate::pipeline::board::{BoardStore, Ticket, TicketPhase};
 use crate::util::test::{
@@ -21,15 +19,14 @@ fn ws_named(name: &str) -> Workspace {
     crate::workspace::test_ws_named("/tmp/ws", name)
 }
 
-/// Claim Backlog → Analysis must wait out the claim grace; a ticket aged past
-/// it is claimed atomically.
+/// Claim Backlog → Analysis must wait out the claim grace; a ticket aged past it is claimed
+/// atomically.
 #[tokio::test]
 async fn claim_backlog_obeys_grace() {
     let (store, _dir) = crate::open_test_store!(BoardStore, "board");
     let ws = ws_named("ws-a");
     let id = make_ticket(&store, &ws, "Grace ticket", TicketPhase::Backlog).await;
 
-    // Fresh ticket sits inside the grace window → no claim.
     let (now, cutoff) = claim_clock();
     assert!(
         store
@@ -40,7 +37,6 @@ async fn claim_backlog_obeys_grace() {
         "fresh ticket must not be claimed inside the grace window",
     );
 
-    // Age the ticket past the grace window → the claim succeeds.
     let past = (chrono::Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
     store
         .conn
@@ -60,14 +56,11 @@ async fn claim_backlog_obeys_grace() {
     assert_eq!(claimed.phase, TicketPhase::Analysis);
 }
 
-/// Queued → InDevelopment is gated on single pipeline occupancy:
-/// a candidate is blocked exactly while a sibling sits in a pipeline phase.
 #[tokio::test]
 async fn claim_queued_blocks_on_pipeline_occupancy() {
     let (store, _dir) = crate::open_test_store!(BoardStore, "board");
     let ws = ws_named("ws-a");
 
-    // No occupied sibling yet → the Queued claim succeeds.
     let first = make_ticket(&store, &ws, "Queued one", TicketPhase::Queued).await;
     let claimed = store
         .claim_queued_for_development(&ws.name, crate::db::now())
@@ -76,8 +69,6 @@ async fn claim_queued_blocks_on_pipeline_occupancy() {
         .expect("Queued ticket must claim without a pipeline-occupied sibling");
     assert_eq!(claimed.id, first);
 
-    // `first` is now InDevelopment (a pipeline-occupied phase) → a second Queued
-    // ticket is blocked.
     make_ticket(&store, &ws, "Queued two", TicketPhase::Queued).await;
     assert!(
         store
@@ -89,10 +80,9 @@ async fn claim_queued_blocks_on_pipeline_occupancy() {
     );
 }
 
-/// Queued → InDevelopment is parked while a sibling ticket is failed and
-/// awaiting Manager triage. The park is part of the claim predicate itself, so
-/// the read-only probe agrees, and it lifts by itself once the failed ticket is
-/// cancelled (leaves `Failed`).
+/// Queued → InDevelopment is parked while a sibling ticket is failed and awaiting Manager triage.
+/// The park is part of the claim predicate itself, so the read-only probe agrees, and it lifts by
+/// itself once the failed ticket is cancelled (leaves `Failed`).
 #[tokio::test]
 async fn claim_queued_blocked_by_failed_sibling_until_cancelled() {
     let (store, _dir) = crate::open_test_store!(BoardStore, "board");
@@ -110,7 +100,6 @@ async fn claim_queued_blocked_by_failed_sibling_until_cancelled() {
         "the blocked ticket must stay Queued",
     );
 
-    // Manager triage: cancel the failed ticket → the park lifts.
     store
         .transition_to(
             &failed,
@@ -133,9 +122,6 @@ async fn claim_queued_blocked_by_failed_sibling_until_cancelled() {
     );
 }
 
-/// Superseding the failed ticket lifts the park too — the supersede cancels and
-/// archives the old ticket, so the workspace starts new work again with no
-/// manual state to clear.
 #[tokio::test]
 async fn claim_queued_unblocked_by_superseding_failed_sibling() {
     let (store, _dir) = crate::open_test_store!(BoardStore, "board");
@@ -177,10 +163,10 @@ async fn claim_queued_unblocked_by_superseding_failed_sibling() {
     );
 }
 
-/// A finished ticket's phase is immutable on every writer: the manual/GUI
-/// transition, the pipeline's transactional finalization and supersede all
-/// refuse it with the finished-ticket reason, `done → done` is not a transition,
-/// and archiving (of a non-archived or already-archived ticket) still works.
+/// A finished ticket's phase is immutable on every writer: the manual/GUI transition, the
+/// pipeline's transactional finalization and supersede all refuse it with the finished-ticket
+/// reason, `done → done` is not a transition, and archiving (of a non-archived or already-archived
+/// ticket) still works.
 #[tokio::test]
 async fn done_ticket_phase_is_immutable() {
     let (store, _dir) = crate::open_test_store!(BoardStore, "board");
@@ -218,8 +204,8 @@ async fn done_ticket_phase_is_immutable() {
         .to_string();
     assert!(err.contains("finished (phase 'done')"), "{err}");
 
-    // The pipeline's transactional finalizer refuses identically (it would
-    // otherwise report a benign external move).
+    // The pipeline's transactional finalizer refuses identically (it would otherwise report a
+    // benign external move).
     let err = crate::db::with_tx_outcome(&store.conn, &id, "transition", async |tx| {
         BoardStore::transition_to_tx(
             tx,
@@ -243,7 +229,6 @@ async fn done_ticket_phase_is_immutable() {
         .await
         .unwrap();
 
-    // Supersede is a phase write too (it cancels the superseded ticket).
     let err = store
         .supersede_and_create(
             &id,
@@ -265,7 +250,6 @@ async fn done_ticket_phase_is_immutable() {
     assert!(err.contains("finished (phase 'done')"), "{err}");
     assert_eq!(expect_ticket_phase(&store, &id).await, TicketPhase::Done);
 
-    // Archiving still works, and an archived finished ticket is equally frozen.
     store.set_archived(&id).await.unwrap();
     let err = store
         .transition_to(&id, None, TicketPhase::Backlog, "user")
@@ -276,16 +260,13 @@ async fn done_ticket_phase_is_immutable() {
     assert_eq!(expect_ticket_phase(&store, &id).await, TicketPhase::Done);
 }
 
-/// Backlog → Analysis claim honors prerequisites: a dependent ticket with an
-/// unmet prereq stays in Backlog; once the prereq reaches an unblocking phase
-/// the dependent is eligible.
 #[tokio::test]
 async fn claim_backlog_honors_prerequisites() {
     let (store, _dir) = crate::open_test_store!(BoardStore, "board");
     let ws = ws_named("ws-a");
 
-    // The prereq lives OUTSIDE Backlog so the only Backlog candidate is the
-    // dependent ticket (a Backlog prereq would be claimed itself).
+    // The prereq lives OUTSIDE Backlog so the only Backlog candidate is the dependent ticket (a
+    // Backlog prereq would be claimed itself).
     let prereq_analysis =
         make_ticket(&store, &ws, "Prereq (analysis)", TicketPhase::Analysis).await;
     let dependent = crate::util::test::TicketBuilder::new(&store, &ws)
@@ -296,9 +277,9 @@ async fn claim_backlog_honors_prerequisites() {
         .await
         .unwrap();
 
-    // Unmet prereq (its prereq is not in UNBLOCKING_PHASES) → blocked. Age the
-    // dependent past the grace window FIRST so this assertion isolates the
-    // prereq rule rather than passing vacuously on the grace cutoff.
+    // Unmet prereq (its prereq is not in UNBLOCKING_PHASES) → blocked. Age the dependent past the
+    // grace window FIRST so this assertion isolates the prereq rule rather than passing vacuously
+    // on the grace cutoff.
     age_ticket_past_grace(&store, &dependent).await;
     let (now, cutoff) = claim_clock();
     assert!(
@@ -310,7 +291,6 @@ async fn claim_backlog_honors_prerequisites() {
         "dependent with a non-unblocking prereq must not be claimed",
     );
 
-    // Move the prereq to Done (an unblocking phase) → the dependent claims.
     store
         .transition_to(
             &prereq_analysis,
@@ -329,16 +309,13 @@ async fn claim_backlog_honors_prerequisites() {
     assert_eq!(claimed.id, dependent);
 }
 
-/// Queued → InDevelopment honors prerequisites too (the same filter the
-/// Backlog claim applies): a Queued ticket with an unmet prereq stays queued
-/// even with a free pipeline, and claims once the prereq unblocks.
 #[tokio::test]
 async fn claim_queued_honors_prerequisites() {
     let (store, _dir) = crate::open_test_store!(BoardStore, "board");
     let ws = ws_named("ws-a");
 
-    // The prereq lives OUTSIDE Queued so the only Queued candidate is the
-    // dependent ticket (a Queued prereq would be claimed itself).
+    // The prereq lives OUTSIDE Queued so the only Queued candidate is the dependent ticket (a
+    // Queued prereq would be claimed itself).
     let prereq_analysis =
         make_ticket(&store, &ws, "Prereq (analysis)", TicketPhase::Analysis).await;
     let dependent = crate::util::test::TicketBuilder::new(&store, &ws)
@@ -349,7 +326,6 @@ async fn claim_queued_honors_prerequisites() {
         .await
         .unwrap();
 
-    // Unmet prereq → blocked despite a free pipeline.
     assert!(
         store
             .claim_queued_for_development(&ws.name, crate::db::now())
@@ -359,7 +335,6 @@ async fn claim_queued_honors_prerequisites() {
         "Queued ticket with a non-unblocking prereq must not be claimed",
     );
 
-    // Move the prereq to Done (an unblocking phase) → the dependent claims.
     store
         .transition_to(
             &prereq_analysis,
@@ -378,14 +353,12 @@ async fn claim_queued_honors_prerequisites() {
     assert_eq!(claimed.phase, TicketPhase::InDevelopment);
 }
 
-/// The claim probes are a fail-open cost gate, so a false negative (probe
-/// says "no candidate" while the claim would succeed) is the only forbidden
-/// outcome. Differential oracle: with a shared clock the probe decision must
-/// equal the claim outcome in every eligibility scenario — grace boundary,
+/// The claim probes are a fail-open cost gate, so a false negative (probe says "no candidate" while
+/// the claim would succeed) is the only forbidden outcome. Differential oracle: with a shared clock
+/// the probe decision must equal the claim outcome in every eligibility scenario — grace boundary,
 /// prerequisites, and pipeline occupancy.
 #[tokio::test]
 async fn claim_probes_agree_with_claim_outcomes() {
-    // ── Backlog grace boundary: fresh inside grace vs aged past it ───────
     {
         let (store, _dir) = crate::open_test_store!(BoardStore, "board");
         let ws = ws_named("probe-blog-grace");
@@ -406,7 +379,6 @@ async fn claim_probes_agree_with_claim_outcomes() {
         assert!(claimed.is_some(), "aged Backlog past grace must claim");
     }
 
-    // ── Backlog prerequisites: unmet blocks, unblocking frees ───────────
     {
         let (store, _dir) = crate::open_test_store!(BoardStore, "board");
         let ws = ws_named("probe-blog-prereq");
@@ -450,8 +422,8 @@ async fn claim_probes_agree_with_claim_outcomes() {
         );
     }
 
-    // ── Queued: unmet prereq (free pipeline) blocks; unblocking claims; a
-    //    sibling then occupies the pipeline and blocks a second candidate.
+    // Queued: unmet prereq (free pipeline) blocks; unblocking claims; a sibling then occupies
+    // the pipeline and blocks a second candidate.
     {
         let (store, _dir) = crate::open_test_store!(BoardStore, "board");
         let ws = ws_named("probe-queued");
@@ -465,7 +437,6 @@ async fn claim_probes_agree_with_claim_outcomes() {
             .await
             .unwrap();
 
-        // Unmet prereq with a free pipeline → blocked.
         let (probe, claimed) = probe_then_claim_queued(&store, &ws).await;
         assert!(
             !probe,
@@ -476,7 +447,6 @@ async fn claim_probes_agree_with_claim_outcomes() {
             "Queued with an unmet prereq must not claim",
         );
 
-        // Prereq unblocks → free pipeline → claims (now InDevelopment → occupied).
         store
             .transition_to(
                 &prereq_analysis,
@@ -492,8 +462,6 @@ async fn claim_probes_agree_with_claim_outcomes() {
         assert_eq!(claimed.phase, TicketPhase::InDevelopment);
         assert_eq!(claimed.id, dependent);
 
-        // The claimed ticket now occupies the pipeline → blocks the next Queued
-        // candidate.
         make_ticket(&store, &ws, "Queued two", TicketPhase::Queued).await;
         let (probe, claimed) = probe_then_claim_queued(&store, &ws).await;
         assert!(!probe, "Queued with an occupied sibling must probe false");
@@ -504,9 +472,9 @@ async fn claim_probes_agree_with_claim_outcomes() {
     }
 }
 
-/// A phase job is unique per (kind, ticket_id); creating a duplicate is a
-/// no-op error, and completing the job removes it. Runs on the consolidated
-/// test DB because `jobs.ticket_id` references the `tickets` table.
+/// A phase job is unique per (kind, ticket_id); creating a duplicate is a no-op error, and
+/// completing the job removes it. Runs on the consolidated test DB because `jobs.ticket_id`
+/// references the `tickets` table.
 #[tokio::test]
 async fn phase_job_is_unique_and_terminalizes() {
     let _guard = STORE_LOCK.lock().await;
@@ -575,8 +543,6 @@ async fn phase_job_is_unique_and_terminalizes() {
     );
 }
 
-/// The phase machine: pipeline-occupied, terminal, and unblocking sets are
-/// mutually consistent.
 #[tokio::test]
 async fn phase_machine_classifications_are_consistent() {
     use strum::IntoEnumIterator;
@@ -593,8 +559,6 @@ async fn phase_machine_classifications_are_consistent() {
     }
 }
 
-/// The puller claim driver claims Backlog → Analysis and Queued → InDevelopment
-/// for a live (Ready) workspace.
 #[tokio::test]
 async fn run_claim_pipeline_claims_new_work() {
     let _guard = STORE_LOCK.lock().await;
@@ -611,23 +575,21 @@ async fn run_claim_pipeline_claims_new_work() {
 
     super::run_claim_pipeline(&ws).await;
 
-    // Backlog ticket is too fresh (grace) → stays Backlog.
     assert_eq!(
         crate::util::test::expect_ticket_phase(store, &backlog_id).await,
         TicketPhase::Backlog,
     );
-    // Queued has no grace → claims immediately.
     assert_eq!(
         crate::util::test::expect_ticket_phase(store, &queued_id).await,
         TicketPhase::InDevelopment,
     );
 }
 
-/// The Manager's board notifications: the ticket header — transition line,
-/// separator and the ticket's id, title and new phase — on planning, done and
-/// failed only; a bounce warning block with its count on every second return to
-/// development (the 2nd, 4th, 6th, 8th and 10th of the shared budget) and on no
-/// other bounce; a done that notifies while another ticket is still queued.
+/// The Manager's board notifications: the ticket header — transition line, separator and the
+/// ticket's id, title and new phase — on planning, done and failed only; a bounce warning block
+/// with its count on every second return to development (the 2nd, 4th, 6th, 8th and 10th of the
+/// shared budget) and on no other bounce; a done that notifies while another ticket is still
+/// queued.
 #[tokio::test]
 async fn every_second_bounce_notifies_manager() {
     let _guard = STORE_LOCK.lock().await;
@@ -638,8 +600,8 @@ async fn every_second_bounce_notifies_manager() {
         .set_status(&ws.name, &WorkspaceStatus::Ready)
         .await
         .unwrap();
-    // Registered up front so the notifications land in a local inbox instead of
-    // spawning real Manager turns.
+    // Registered up front so the notifications land in a local inbox instead of spawning real
+    // Manager turns.
     let mut manager_inbox =
         crate::agent::message_router::register_agent(&crate::session::manager_agent_id(&ws.name));
 
@@ -674,7 +636,6 @@ async fn every_second_bounce_notifies_manager() {
         }
     }
 
-    // The header identifies the ticket on planning.
     let planning_id = make_ticket(store, &ws, "Planned", TicketPhase::Planning).await;
     let planning = expect_ticket(store, &planning_id).await;
     super::notify_ticket(&super::TransitionCtx::notifying(
@@ -690,8 +651,8 @@ async fn every_second_bounce_notifies_manager() {
         .expect("planning notifies the Manager");
     assert_has_header(&job.content, &planning.id, "Planned", "planning");
 
-    // A done notifies — and names the ticket — even while another ticket is
-    // still ticking in the queue.
+    // A done notifies — and names the ticket — even while another ticket is still ticking in the
+    // queue.
     let _queued_sibling = make_ticket(store, &ws, "Queued sibling", TicketPhase::Queued).await;
     let done_id = make_ticket(store, &ws, "Finished", TicketPhase::InSanitation).await;
     let done = expect_ticket(store, &done_id).await;
@@ -717,8 +678,6 @@ async fn every_second_bounce_notifies_manager() {
         .expect("done notifies the Manager with a queued sibling");
     assert_has_header(&job.content, &done.id, "Finished", "done");
 
-    // Exhausting the budget stops the ticket, and the failure says the budget was
-    // what stopped it.
     let failed = bounce_once(&ws, budget).await;
     assert_eq!(failed.phase, TicketPhase::Failed);
     let job = manager_inbox
@@ -733,9 +692,9 @@ async fn every_second_bounce_notifies_manager() {
     crate::agent::message_router::unregister_agent(&crate::session::manager_agent_id(&ws.name));
 }
 
-/// Assert the notification opens with the ticket header for `ticket_id`, `title`
-/// and `phase` — the transition line and separator, then the three fields, all
-/// before the blank line that opens the envelope's body.
+/// Assert the notification opens with the ticket header for `ticket_id`, `title` and `phase` — the
+/// transition line and separator, then the three fields, all before the blank line that opens the
+/// envelope's body.
 fn assert_has_header(content: &str, ticket_id: &str, title: &str, phase: &str) {
     let header = content
         .strip_prefix("<board-notification>\n")
@@ -757,8 +716,6 @@ fn assert_has_header(content: &str, ticket_id: &str, title: &str, phase: &str) {
     }
 }
 
-/// Bounce a fresh Verification ticket whose bounce counter starts at
-/// `bounce_count`, returning the ticket as the bounce left it.
 async fn bounce_once(ws: &Workspace, bounce_count: i64) -> Ticket {
     let store = crate::pipeline::board::store();
     let id = make_ticket(store, ws, "Bounce", TicketPhase::Verification).await;
@@ -803,8 +760,6 @@ async fn bounce_once(ws: &Workspace, bounce_count: i64) -> Ticket {
     expect_ticket(store, &id).await
 }
 
-/// A non-exhausting bounce moves the ticket back to InDevelopment and
-/// increments the bounce counter (no breaker trip, no workspace pause).
 #[tokio::test]
 async fn bounce_to_development_returns_ticket_without_tripping() {
     let _guard = STORE_LOCK.lock().await;
@@ -864,8 +819,6 @@ async fn bounce_to_development_returns_ticket_without_tripping() {
     );
 }
 
-/// Exhausting the bounce budget trips the breaker: the ticket → Failed, the
-/// phase job is deleted, and no bounce count is consumed further.
 #[tokio::test]
 async fn bounce_breaker_trips_to_failed() {
     let _guard = STORE_LOCK.lock().await;
@@ -897,7 +850,6 @@ async fn bounce_breaker_trips_to_failed() {
     )
     .await
     .unwrap();
-    // Seed the bounce budget at the exhaustion threshold.
     let budget: i64 = 10;
     store
         .conn
@@ -937,14 +889,13 @@ async fn bounce_breaker_trips_to_failed() {
     );
 }
 
-/// `reset_phase_attempt` destroys the current attempt: it cancels orphaned
-/// agents, pauses the workspace for an implementation phase, and deletes the
-/// phase job so the puller creates a fresh one — with no ticket comment.
+/// `reset_phase_attempt` destroys the current attempt: it cancels orphaned agents, pauses the
+/// workspace for an implementation phase, and deletes the phase job so the puller creates a fresh
+/// one — with no ticket comment.
 ///
-/// Serialized on `drain`: the auto-pause goes through
-/// `pause_workspace_on_failure`, which short-circuits while the process-global
-/// drain flag is set — a test that drives a drain (see `session::dead_session`)
-/// must not overlap with this assertion.
+/// Serialized on `drain`: the auto-pause goes through `pause_workspace_on_failure`, which
+/// short-circuits while the process-global drain flag is set — a test that drives a drain (see
+/// `session::dead_session`) must not overlap with this assertion.
 #[serial_test::serial(drain)]
 #[tokio::test]
 async fn reset_phase_attempt_destroys_attempt_and_pauses() {
@@ -997,7 +948,6 @@ async fn reset_phase_attempt_destroys_attempt_and_pauses() {
         .is_none(),
         "reset must delete the phase job",
     );
-    // Implementation-phase hard failure pauses the workspace.
     let ws_row = crate::workspace::store()
         .get_by_name(&ws.name)
         .await
@@ -1014,8 +964,8 @@ async fn reset_phase_attempt_destroys_attempt_and_pauses() {
     );
 }
 
-/// Analysis is not an implementation phase: a hard-failure reset there must NOT
-/// pause the workspace, while still deleting the phase job.
+/// Analysis is not an implementation phase: a hard-failure reset there must NOT pause the
+/// workspace, while still deleting the phase job.
 #[tokio::test]
 async fn reset_phase_attempt_analysis_does_not_pause() {
     let _guard = STORE_LOCK.lock().await;
@@ -1073,10 +1023,9 @@ async fn reset_phase_attempt_analysis_does_not_pause() {
     );
 }
 
-/// A parallel round member that died on its very first request never became a
-/// resumable session: its empty per-attempt session is discarded. A slot whose
-/// session already holds an assistant row keeps it — the discard is only for a
-/// session that never got past its first request.
+/// A parallel round member that died on its very first request never became a resumable session:
+/// its empty per-attempt session is discarded. A slot whose session already holds an assistant row
+/// keeps it — the discard is only for a session that never got past its first request.
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn first_request_failure_discards_only_empty_round_sessions() {
@@ -1122,11 +1071,9 @@ async fn first_request_failure_discards_only_empty_round_sessions() {
         .await
         .unwrap();
 
-    // The resumed slot's session already holds an assistant row (resumable work).
     let conn = &crate::session::store().conn;
     crate::util::test::seed_session_row(conn, &resumed_id, "assistant", "earlier work").await;
 
-    // Three identical errors per member cover the whole retry budget.
     let mut fake = crate::util::test::FakeProvider::new();
     for _ in 0..6 {
         fake = fake.err(
@@ -1185,9 +1132,8 @@ async fn first_request_failure_discards_only_empty_round_sessions() {
     );
 }
 
-/// An engineer provider failure pauses the workspace and leaves no ticket
-/// comment, while its reusable session pin keeps the accumulated session for
-/// the next attempt.
+/// An engineer provider failure pauses the workspace and leaves no ticket comment, while its
+/// reusable session pin keeps the accumulated session for the next attempt.
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn engineer_provider_failure_leaves_no_comment_and_keeps_the_session() {
@@ -1203,8 +1149,8 @@ async fn engineer_provider_failure_leaves_no_comment_and_keeps_the_session() {
         .set_paused(&ws.name, false)
         .await
         .unwrap();
-    // Registered up front so the pause notice lands in a local inbox instead of
-    // spawning a real Manager turn.
+    // Registered up front so the pause notice lands in a local inbox instead of spawning a real
+    // Manager turn.
     let mut manager_inbox =
         crate::agent::message_router::register_agent(&crate::session::manager_agent_id(&ws.name));
 
@@ -1268,10 +1214,8 @@ async fn engineer_provider_failure_leaves_no_comment_and_keeps_the_session() {
     );
 }
 
-// ── End-to-end behavioral-oracle helpers ────────────────────────────────
-
-/// Create a phase job row without spawning a body — the test drives the phase
-/// body directly so the provider script is consumed deterministically.
+/// Create a phase job row without spawning a body — the test drives the phase body directly so the
+/// provider script is consumed deterministically.
 async fn spawn_phase_job(
     job_id: &str,
     ws: &Workspace,
@@ -1301,7 +1245,6 @@ async fn spawn_phase_job(
     .unwrap();
 }
 
-/// Find the launched phase job for a ticket, if present.
 async fn expect_phase_job(
     store: &BoardStore,
     id: &str,
@@ -1312,10 +1255,10 @@ async fn expect_phase_job(
         .unwrap()
 }
 
-/// A provider script for a round with `count` participants: every response is
-/// the same clean verdict, so it does not matter which of the round's concurrent
-/// participants pops which one — a turn reads it as the assistant's message and
-/// the extraction that follows reads it as the verdict.
+/// A provider script for a round with `count` participants: every response is the same clean
+/// verdict, so it does not matter which of the round's concurrent participants pops which one — a
+/// turn reads it as the assistant's message and the extraction that follows reads it as the
+/// verdict.
 fn fake_clean_participants(count: usize) -> crate::util::test::FakeProvider {
     let mut fake = crate::util::test::FakeProvider::new();
     for _ in 0..count {
@@ -1326,9 +1269,6 @@ fn fake_clean_participants(count: usize) -> crate::util::test::FakeProvider {
     fake
 }
 
-/// [`fake_clean_participants`] with a sub-threshold verdict carrying one issue:
-/// the round bounces regardless of which concurrent participant pops which
-/// response.
 fn fake_failing_participants(count: usize) -> crate::util::test::FakeProvider {
     let mut fake = crate::util::test::FakeProvider::new();
     for _ in 0..count {
@@ -1339,10 +1279,10 @@ fn fake_failing_participants(count: usize) -> crate::util::test::FakeProvider {
     fake
 }
 
-/// [`fake_clean_participants`] that also leaves a file in the repository on every
-/// call — a participant touching the workspace mid-round, made deterministic.
-/// Every call happens after the round read the reviewers' content identity, so
-/// the file is exactly the content the code review was never handed.
+/// [`fake_clean_participants`] that also leaves a file in the repository on every call — a
+/// participant touching the workspace mid-round, made deterministic. Every call happens after the
+/// round read the reviewers' content identity, so the file is exactly the content the code review
+/// was never handed.
 struct ArtefactLeavingProvider {
     repo: std::path::PathBuf,
     fake: crate::util::test::FakeProvider,
@@ -1363,8 +1303,8 @@ impl crate::Provider for ArtefactLeavingProvider {
     }
 }
 
-/// Poll (tightly) until an agent for `ticket_id` is registered in the global
-/// registry, or panic after `timeout`.
+/// Poll (tightly) until an agent for `ticket_id` is registered in the global registry, or panic
+/// after `timeout`.
 async fn wait_for_agent_registered(ticket_id: &str, timeout: std::time::Duration) {
     tokio::time::timeout(timeout, async {
         loop {
@@ -1382,7 +1322,6 @@ async fn wait_for_agent_registered(ticket_id: &str, timeout: std::time::Duration
     .expect("agent must register within the timeout");
 }
 
-/// Assert the workspace row's `paused` column equals `expected`.
 async fn assert_workspace_paused(ws: &Workspace, expected: bool) {
     let ws_row = crate::workspace::store()
         .get_by_name(&ws.name)
@@ -1396,8 +1335,6 @@ async fn assert_workspace_paused(ws: &Workspace, expected: bool) {
     );
 }
 
-/// Age a ticket's `created_at` past the Backlog claim grace so the puller will
-/// claim it.
 async fn age_ticket_past_grace(store: &BoardStore, id: &str) {
     let past = (chrono::Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
     store
@@ -1410,16 +1347,14 @@ async fn age_ticket_past_grace(store: &BoardStore, id: &str) {
         .unwrap();
 }
 
-/// Claim-time clock shared by claim calls in tests: now + the grace cutoff
-/// derived from it (same instant, as in production).
 fn claim_clock() -> (String, String) {
     let now = crate::db::now();
     let cutoff = (chrono::Utc::now() - BoardStore::BACKLOG_CLAIM_GRACE).to_rfc3339();
     (now, cutoff)
 }
 
-/// Probe then claim Backlog→Analysis under a shared clock, asserting the
-/// probe decision equals the claim outcome (the differential invariant).
+/// Probe then claim Backlog→Analysis under a shared clock, asserting the probe decision equals the
+/// claim outcome (the differential invariant).
 async fn probe_then_claim_backlog(
     store: &BoardStore,
     ws: &Workspace,
@@ -1442,8 +1377,8 @@ async fn probe_then_claim_backlog(
     (probe, claimed)
 }
 
-/// Probe then claim Queued→InDevelopment, asserting the probe decision equals
-/// the claim outcome (the differential invariant).
+/// Probe then claim Queued→InDevelopment, asserting the probe decision equals the claim outcome
+/// (the differential invariant).
 async fn probe_then_claim_queued(store: &BoardStore, ws: &Workspace) -> (bool, Option<Ticket>) {
     let probe = store.queued_claim_candidate_exists(&ws.name).await.unwrap();
     let claimed = store
@@ -1457,12 +1392,6 @@ async fn probe_then_claim_queued(store: &BoardStore, ws: &Workspace) -> (bool, O
     );
     (probe, claimed)
 }
-
-// ── 1. Full pipeline lifecycle ──────────────────────────────────────────
-
-/// Drive a Backlog→Done lifecycle through the real phase bodies and the
-/// per-phase puller claims: analysis → planning → queued → development →
-/// verification (code review skipped, tester runs) → sanitation (dirty commit).
 
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
@@ -1478,12 +1407,11 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
         .unwrap();
     let id = make_ticket(store, &ws, "Lifecycle", TicketPhase::Backlog).await;
     age_ticket_past_grace(store, &id).await;
-    // Registered up front so the notifications, including the Done one, land in
-    // a local inbox instead of spawning real Manager turns.
+    // Registered up front so the notifications, including the Done one, land in a local inbox
+    // instead of spawning real Manager turns.
     let mut manager_inbox =
         crate::agent::message_router::register_agent(&crate::session::manager_agent_id(&ws.name));
 
-    // Puller claim Backlog → Analysis.
     super::run_claim_pipeline(&ws).await;
     assert_eq!(
         expect_ticket_phase(store, &id).await,
@@ -1491,7 +1419,6 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
         "aged backlog ticket must be claimed into Analysis",
     );
 
-    // Analysis: 2 clean analysts → Planning, job deleted.
     let job_id = crate::generate_id();
     spawn_phase_job(
         &job_id,
@@ -1524,7 +1451,6 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
         "a completed analysis round deletes the phase job",
     );
 
-    // Manual Planning → Queued, then puller claim Queued → InDevelopment.
     store
         .transition_to(
             &id,
@@ -1540,7 +1466,6 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
         TicketPhase::InDevelopment,
     );
 
-    // Engineer: 2 responses → InDevelopment → Verification.
     let job_id = crate::generate_id();
     spawn_phase_job(
         &job_id,
@@ -1568,8 +1493,8 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
         TicketPhase::Verification,
     );
 
-    // Record the reviewed base so the reviewer cohort is skipped
-    // (content-identical) while the functional tester still runs.
+    // Record the reviewed base so the reviewer cohort is skipped (content-identical) while the
+    // functional tester still runs.
     let head = crate::git::commands::run_git_head(repo_path.as_path())
         .await
         .ok();
@@ -1581,10 +1506,10 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
         .await
         .unwrap();
 
-    // Verification: ONE round. The content is identical to the reviewed base, so
-    // only the functional tester is dispatched — the reviewers are skipped, the
-    // round still advances the ticket, and the consolidated comment records the
-    // skipped code review and the workspace having no project commands.
+    // Verification: ONE round. The content is identical to the reviewed base, so only the
+    // functional tester is dispatched — the reviewers are skipped, the round still advances the
+    // ticket, and the consolidated comment records the skipped code review and the workspace having
+    // no project commands.
     let job_id = crate::generate_id();
     spawn_phase_job(
         &job_id,
@@ -1640,7 +1565,6 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
         round_comment.content,
     );
 
-    // Dirty the working tree, sanitation inspects and commits → Done.
     let base_head = crate::git::commands::run_git_head(repo_path.as_path())
         .await
         .unwrap();
@@ -1677,8 +1601,8 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
         "a dirty-tree sanitation round must create a new commit",
     );
 
-    // The Done transition announces itself: the header names the ticket and the
-    // phase, whether or not the workspace still holds other tickets.
+    // The Done transition announces itself: the header names the ticket and the phase, whether or
+    // not the workspace still holds other tickets.
     let mut done_notified = false;
     while let Ok(job) = manager_inbox.try_recv() {
         if job.content.contains("New phase: done\n") {
@@ -1692,10 +1616,9 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
     drop(repo_dir);
 }
 
-/// A verification roster that is not a verification round — no functional
-/// tester row — is never resumed as one: the job is dropped so the poller
-/// re-creates it and the round re-runs whole, and a clean reviewer verdict in
-/// it can never pass the ticket on in place of the functional check.
+/// A verification roster that is not a verification round — no functional tester row — is never
+/// resumed as one: the job is dropped so the poller re-creates it and the round re-runs whole, and
+/// a clean reviewer verdict in it can never pass the ticket on in place of the functional check.
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn a_roster_without_a_tester_row_is_not_resumed_as_a_round() {
@@ -1719,8 +1642,8 @@ async fn a_roster_without_a_tester_row_is_not_resumed_as_a_round() {
         "verification",
     )
     .await;
-    // One Done reviewer slot carrying a CLEAN verdict: a round that read this
-    // roster back would pass the ticket without running the functional check.
+    // One Done reviewer slot carrying a CLEAN verdict: a round that read this roster back would
+    // pass the ticket without running the functional check.
     let reviewer_outcome =
         super::serialize_verdict_outcome(&super::ParallelVerdict::Verdict(crate::Verdict {
             score: 10,
@@ -1759,11 +1682,10 @@ async fn a_roster_without_a_tester_row_is_not_resumed_as_a_round() {
     drop(repo_dir);
 }
 
-/// A verification round whose code review actually ran records the ticket's
-/// reviewed base — the recording the identical-content skip then fires on — from
-/// the content the reviewers were handed, not from the tree the round ended
-/// with. The round's size is pinned too: the churn-calibrated reviewers plus the
-/// single functional tester.
+/// A verification round whose code review actually ran records the ticket's reviewed base — the
+/// recording the identical-content skip then fires on — from the content the reviewers were handed,
+/// not from the tree the round ended with. The round's size is pinned too: the churn-calibrated
+/// reviewers plus the single functional tester.
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn passed_verification_round_records_the_reviewed_content() {
@@ -1776,20 +1698,20 @@ async fn passed_verification_round_records_the_reviewed_content() {
         .set_status(&ws.name, &WorkspaceStatus::Ready)
         .await
         .unwrap();
-    // No reviewed base is recorded for the ticket and the tree carries
-    // uncommitted work, so the code review runs (never skipped).
+    // No reviewed base is recorded for the ticket and the tree carries uncommitted work, so the
+    // code review runs (never skipped).
     let id = make_ticket(store, &ws, "ReviewedBase", TicketPhase::Verification).await;
     std::fs::write(repo_path.join("a.rs"), b"fn foo() {\n    bar();\n}\n").unwrap();
-    // The identity the round must record: the tree as the reviewers are handed
-    // it, before any participant runs.
+    // The identity the round must record: the tree as the reviewers are handed it, before any
+    // participant runs.
     let (root_head, root_tree) = crate::git::commands::run_git_worktree_identity(&repo_path)
         .await
         .unwrap();
 
-    // Round 1: churn inside the first band in a fresh temp repo → 1 reviewer +
-    // the single tester. The provider leaves a file in the repository on every
-    // call, i.e. after the round captured the reviewers' content: exactly the
-    // "the tester touched the workspace" case the recorded base must not absorb.
+    // Round 1: churn inside the first band in a fresh temp repo → 1 reviewer + the single tester.
+    // The provider leaves a file in the repository on every call, i.e. after the round captured the
+    // reviewers' content: exactly the "the tester touched the workspace" case the recorded base
+    // must not absorb.
     let artefact_fake = std::sync::Arc::new(ArtefactLeavingProvider {
         repo: repo_path.clone(),
         fake: fake_clean_participants(2),
@@ -1829,8 +1751,8 @@ async fn passed_verification_round_records_the_reviewed_content() {
         "the round must really have changed the tree, or the assertion above \
          could pass vacuously",
     );
-    // Both cohorts' verdicts become ONE comment: the stage's consolidated
-    // result, not one comment per participant group.
+    // Both cohorts' verdicts become ONE comment: the stage's consolidated result, not one comment
+    // per participant group.
     let round_comments = ticket
         .comments
         .iter()
@@ -1841,12 +1763,11 @@ async fn passed_verification_round_records_the_reviewed_content() {
         "the merged round must leave exactly one consolidated comment",
     );
 
-    // Round 2 on the same ticket and that artefact-carrying tree: the content is
-    // NOT what the reviewers were handed last time, so the code review runs
-    // again instead of being skipped for content it never saw. The unstaged file
-    // written here is what makes the round's own post-round staging load-bearing:
-    // the base recorded below only matches the index at round 3 because
-    // `git add -A` put this file into it.
+    // Round 2 on the same ticket and that artefact-carrying tree: the content is NOT what the
+    // reviewers were handed last time, so the code review runs again instead of being skipped for
+    // content it never saw. The unstaged file written here is what makes the round's own post-round
+    // staging load-bearing: the base recorded below only matches the index at round 3 because `git
+    // add -A` put this file into it.
     retry_verification(store, &id).await;
     std::fs::write(repo_path.join("docs.rs"), b"// unstaged\n").unwrap();
     let second_fake = std::sync::Arc::new(fake_clean_participants(2));
@@ -1867,10 +1788,9 @@ async fn passed_verification_round_records_the_reviewed_content() {
         "a tree that moved under the reviewers must not be reported as skipped",
     );
 
-    // Round 3: nothing changed since round 2 recorded its base, so the reviewers
-    // are skipped and only the functional tester runs — the whole point of
-    // recording it, and the part that silently stops working if the recording or
-    // the post-round staging goes away.
+    // Round 3: nothing changed since round 2 recorded its base, so the reviewers are skipped and
+    // only the functional tester runs — the whole point of recording it, and the part that silently
+    // stops working if the recording or the post-round staging goes away.
     retry_verification(store, &id).await;
     let third_fake = std::sync::Arc::new(fake_clean_participants(1));
     run_verification_round(store, &ws, &id, third_fake.clone()).await;
@@ -1894,10 +1814,9 @@ async fn passed_verification_round_records_the_reviewed_content() {
     drop(repo_dir);
 }
 
-/// The round's project commands are the round's own work, merged into its ONE
-/// result: they run in parallel with the participants, both parts land in the
-/// same comment, and either failing sends the ticket back exactly once — a
-/// failed command is ONE bounce, never two.
+/// The round's project commands are the round's own work, merged into its ONE result: they run in
+/// parallel with the participants, both parts land in the same comment, and either failing sends
+/// the ticket back exactly once — a failed command is ONE bounce, never two.
 
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
@@ -1911,8 +1830,8 @@ async fn verification_round_merges_the_project_commands_into_one_result() {
         .set_status(&ws.name, &WorkspaceStatus::Ready)
         .await
         .unwrap();
-    // Two commands in execution order: the first passes, the second fails —
-    // the run must stop at it.
+    // Two commands in execution order: the first passes, the second fails — the run must stop at
+    // it.
     crate::workspace::store()
         .set_diagnostics(
             &ws.name,
@@ -1926,8 +1845,7 @@ async fn verification_round_merges_the_project_commands_into_one_result() {
         .unwrap();
     let id = make_ticket(store, &ws, "MergedCommands", TicketPhase::Verification).await;
 
-    // One reviewer + the single tester, all clean: the round fails on the
-    // project commands alone.
+    // One reviewer + the single tester, all clean: the round fails on the project commands alone.
     let fake = std::sync::Arc::new(fake_clean_participants(2));
     run_verification_round(store, &ws, &id, fake.clone()).await;
 
@@ -1970,7 +1888,6 @@ async fn verification_round_merges_the_project_commands_into_one_result() {
         "the participants' verdict is the same comment's other half:\n{}",
         comment.content,
     );
-    // The participants were handed the round's concrete command list.
     assert!(
         fake.request_messages
             .lock()
@@ -1980,9 +1897,8 @@ async fn verification_round_merges_the_project_commands_into_one_result() {
         "the round's command list must be part of the participants' brief",
     );
 
-    // A passing command set does not save a failing verdict: flip the commands
-    // to all-passing, move the ticket back, and run a second round with
-    // sub-threshold participants.
+    // A passing command set does not save a failing verdict: flip the commands to all-passing, move
+    // the ticket back, and run a second round with sub-threshold participants.
     crate::workspace::store()
         .set_diagnostics(
             &ws.name,
@@ -2031,8 +1947,6 @@ async fn verification_round_merges_the_project_commands_into_one_result() {
     drop(repo_dir);
 }
 
-/// Move the ticket back into the verification phase so the stage can run another
-/// round on it.
 async fn retry_verification(store: &crate::pipeline::board::BoardStore, ticket_id: &str) {
     store
         .transition_to(
@@ -2045,8 +1959,6 @@ async fn retry_verification(store: &crate::pipeline::board::BoardStore, ticket_i
         .unwrap();
 }
 
-/// Spawn the ticket's verification phase job and run one round of the stage with
-/// `provider` as the global fake.
 async fn run_verification_round(
     store: &crate::pipeline::board::BoardStore,
     ws: &Workspace,
@@ -2072,13 +1984,6 @@ async fn run_verification_round(
     .await;
 }
 
-// ── 2. Analysis escalation + blocker verification ───────────────────────
-
-/// A base analysis round whose analysts flag a shared blocker escalates to the
-/// blocker-verification cohort; the verifiers grade the blocker with substance
-/// (kind/severity/impact/reasoning), the ticket still advances to Planning, and
-/// the joint comment records the enrichment.
-
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn analysis_escalation_and_blocker_verification() {
@@ -2103,11 +2008,10 @@ async fn analysis_escalation_and_blocker_verification() {
     .await;
 
     {
-        // 2 base analysts: BOTH flag the SAME blocker (grade=blocker). The base
-        // consolidation groups both blocker findings; the escalation then runs
-        // the blocker-verification cohort, which grades the blocker
-        // (enrichment-only: one sees it as a risk/edge-case, the other as a
-        // main-path blocker).
+        // 2 base analysts: BOTH flag the SAME blocker (grade=blocker). The base consolidation
+        // groups both blocker findings; the escalation then runs the blocker-verification cohort,
+        // which grades the blocker (enrichment-only: one sees it as a risk/edge-case, the other as
+        // a main-path blocker).
         let fake = crate::util::test::FakeProvider::new()
             .ok("analyst one")
             .ok(r#"{"issues":[{"text":"missing error handling","grade":"blocker"}]}"#)
@@ -2148,13 +2052,10 @@ async fn analysis_escalation_and_blocker_verification() {
     );
 }
 
-// ── 2b. Slot-resume: interrupted parallel-phase round reuses Done slots ──
-
-/// Slot-resume: an interrupted analysis round whose roster already carries a
-/// Done slot must reconstruct that slot from its stored outcome and re-run ONLY
-/// the not-Done slot with its stored task. A fresh rebuild (the pre-fix
-/// behavior) would re-run every slot with a new suffix and grow the roster with
-/// duplicate-idx rows; here the Done slot is provably NOT re-run (its stored
+/// Slot-resume: an interrupted analysis round whose roster already carries a Done slot must
+/// reconstruct that slot from its stored outcome and re-run ONLY the not-Done slot with its stored
+/// task. A fresh rebuild (the pre-fix behavior) would re-run every slot with a new suffix and grow
+/// the roster with duplicate-idx rows; here the Done slot is provably NOT re-run (its stored
 /// verdict is reconstructed without an LLM call).
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
@@ -2179,9 +2080,9 @@ async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
     )
     .await;
 
-    // Seed a partially-completed round: idx 0 Done (a stored clean verdict),
-    // idx 1 Failed (interrupted before it produced a verdict). The stored
-    // per-slot task is what the resume re-runs it with.
+    // Seed a partially-completed round: idx 0 Done (a stored clean verdict), idx 1 Failed
+    // (interrupted before it produced a verdict). The stored per-slot task is what the resume
+    // re-runs it with.
     let conn = &crate::session::store().conn;
     let done_outcome = super::serialize_verdict_outcome(&super::ParallelVerdict::Analysis(
         crate::AnalysisVerdict {
@@ -2222,8 +2123,8 @@ async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
     }
 
     {
-        // Only the not-Done slot is re-run: it consumes a turn response and a
-        // verdict extraction. The Done slot is reconstructed (0 calls).
+        // Only the not-Done slot is re-run: it consumes a turn response and a verdict extraction.
+        // The Done slot is reconstructed (0 calls).
         let fake: std::sync::Arc<crate::util::test::FakeProvider> = std::sync::Arc::new(
             crate::util::test::FakeProvider::new()
                 .ok("analyst one")
@@ -2236,10 +2137,10 @@ async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
             job_id.clone(),
         )
         .await;
-        // The not-Done slot is re-run from its STORED task (the only prompt that
-        // may appear), while the Done slot's stored task is never dispatched. An
-        // exact call count would be racy here: a slot's verdict extraction can
-        // fail and retry — retries still carry only the stored task.
+        // The not-Done slot is re-run from its STORED task (the only prompt that may appear), while
+        // the Done slot's stored task is never dispatched. An exact call count would be racy here:
+        // a slot's verdict extraction can fail and retry — retries still carry only the stored
+        // task.
         let fps = fake.request_fingerprints.lock().unwrap();
         assert!(
             fps.iter().any(|f| f.contains("resume task 1")),
@@ -2265,10 +2166,9 @@ async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
     );
 }
 
-/// Slot-resume across the escalation boundary: a base round that already
-/// appended its blocker-verification slots is resumed by reconstructing the
-/// done escalation slot and re-running only the not-Done one, without
-/// re-appending (so no duplicate-idx escalation rows accumulate).
+/// Slot-resume across the escalation boundary: a base round that already appended its
+/// blocker-verification slots is resumed by reconstructing the done escalation slot and re-running
+/// only the not-Done one, without re-appending (so no duplicate-idx escalation rows accumulate).
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
@@ -2293,13 +2193,11 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
     .await;
 
     let conn = &crate::session::store().conn;
-    // Base cohort (idx 0-1, kind Analyst): one analyst flags a blocker
-    // (grade=blocker), the other passes clean — Done, so both are reconstructed.
-    // Escalation cohort (idx 2-3, kind BlockerVerifier): idx 2 already graded the
-    // blocker (Done); idx 3 was interrupted (Failed) and must be re-run. The
-    // escalation task bakes the blocker list (marker + numbered line) so the
-    // resume can re-derive the entries from the stored task; the base rows carry
-    // a plain base task.
+    // Base cohort (idx 0-1, kind Analyst): one analyst flags a blocker (grade=blocker), the other
+    // passes clean — Done, so both are reconstructed. Escalation cohort (idx 2-3, kind
+    // BlockerVerifier): idx 2 already graded the blocker (Done); idx 3 was interrupted (Failed) and
+    // must be re-run. The escalation task bakes the blocker list (marker + numbered line) so the
+    // resume can re-derive the entries from the stored task; the base rows carry a plain base task.
     let blocker_verdict = super::serialize_verdict_outcome(&super::ParallelVerdict::Analysis(
         crate::AnalysisVerdict {
             issues_detected: vec![crate::AnalysisIssue {
@@ -2373,9 +2271,9 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
     }
 
     {
-        // Only the not-Done escalation slot (idx 3) is re-run: turn + verdict
-        // extraction. The joint-comment synthesis falls back on the `{}`
-        // scripted responses (base verdicts carry issues, so it is not clean).
+        // Only the not-Done escalation slot (idx 3) is re-run: turn + verdict extraction. The
+        // joint-comment synthesis falls back on the `{}` scripted responses (base verdicts carry
+        // issues, so it is not clean).
         let fake = crate::util::test::FakeProvider::new()
             .ok("verifier one")
             .ok(r#"{"verdicts":[{"index":0,"kind":"risk_edge_case","severity":"low","impact":"handled","reasoning":"handled"}]}"#)
@@ -2413,10 +2311,10 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
     );
 }
 
-/// A roster written by a wider (three-analyst) build is never resumed as an
-/// analysis round: the phase job is dropped so the poller re-creates it and the
-/// round re-runs whole — no slot is dispatched off a roster whose cohorts cannot
-/// be read back by label, and no verdict is lost at a guessed cohort boundary.
+/// A roster written by a wider (three-analyst) build is never resumed as an analysis round: the
+/// phase job is dropped so the poller re-creates it and the round re-runs whole — no slot is
+/// dispatched off a roster whose cohorts cannot be read back by label, and no verdict is lost at a
+/// guessed cohort boundary.
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn legacy_wider_analysis_roster_is_never_resumed() {
@@ -2538,12 +2436,9 @@ fn blocker_verification_merge_reduces_two_verifiers_to_one_outcome() {
     assert_eq!(r.reasoning, "present but not blocking — core requirement");
 }
 
-// ── 3. Verification-stage dynamic count calibration ─────────────────────
-
-/// The reviewer-count churn bands and P0 floor are product behavior; the merged
-/// stage's functional tester count is a single tester. These are asserted
-/// deterministically without an agent round (real churn is measured for at
-/// least one band).
+/// The reviewer-count churn bands and P0 floor are product behavior; the merged stage's functional
+/// tester count is a single tester. These are asserted deterministically without an agent round
+/// (real churn is measured for at least one band).
 
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
@@ -2567,8 +2462,8 @@ async fn verification_dynamic_count_calibration() {
         DEFAULT_REVIEW_COUNT_LOW_CHURN,
         DEFAULT_REVIEW_COUNT_HIGH_CHURN,
     );
-    // The calibration spec: up to and including 500 changed lines → 1 reviewer,
-    // 501–2999 → 2, 3000+ → the ceiling of 3.
+    // The calibration spec: up to and including 500 changed lines → 1 reviewer, 501–2999 → 2, 3000+
+    // → the ceiling of 3.
     assert_eq!(low, 500);
     assert_eq!(high, 3000);
     assert_eq!(review_base_from_signals(0, low, high), 1);
@@ -2576,26 +2471,25 @@ async fn verification_dynamic_count_calibration() {
     assert_eq!(review_base_from_signals(501, low, high), 2);
     assert_eq!(review_base_from_signals(2999, low, high), 2);
     assert_eq!(review_base_from_signals(3000, low, high), MAX_REVIEWERS);
-    // Priority floor: priority-0 tickets never drop below 2 reviewers, and the
-    // floor can never push a count past the ceiling.
+    // Priority floor: priority-0 tickets never drop below 2 reviewers, and the floor can never push
+    // a count past the ceiling.
     assert_eq!(review_agent_count(1, 0), 2);
     assert_eq!(review_agent_count(2, 0), 2);
     assert_eq!(review_agent_count(MAX_REVIEWERS, 0), 3);
     assert_eq!(review_agent_count(1, 5), 1);
 
-    // `compute_reviewer_count` reads real working-tree churn: a 3000+-line
-    // untracked file yields the top band (the ceiling).
+    // `compute_reviewer_count` reads real working-tree churn: a 3000+-line untracked file yields
+    // the top band (the ceiling).
     std::fs::write(repo_path.join("big.txt"), "x\n".repeat(3000)).unwrap();
     let ticket = expect_ticket(store, &id).await;
     let count =
         crate::pipeline::verification::compute_reviewer_count(&ticket, repo_path.as_path()).await;
     assert_eq!(count, 3, "churn >= 3000 must calibrate to 3 reviewers");
 
-    // A clean verification round advances the ticket → InSanitation. The
-    // workspace below is not a git repo, so the churn cannot be measured and
-    // the reviewer base falls back to the ceiling (3): the round is 3 reviewers
-    // + the single tester (8 responses). The skip never fires here (no recorded
-    // base), so this also pins that the tester is always dispatched.
+    // A clean verification round advances the ticket → InSanitation. The workspace below is not a
+    // git repo, so the churn cannot be measured and the reviewer base falls back to the ceiling
+    // (3): the round is 3 reviewers + the single tester (8 responses). The skip never fires here
+    // (no recorded base), so this also pins that the tester is always dispatched.
     drop(repo_dir);
     let ws2 = create_test_workspace("/tmp/qa_calib_ws", "qa_calib_ws").await;
     crate::workspace::store()
@@ -2629,11 +2523,10 @@ async fn verification_dynamic_count_calibration() {
     );
 }
 
-/// Every direction of a cohort must reach a slot at every possible cohort size:
-/// the directions are shared out, never truncated, so a round can never leave a
-/// direction unhanded. The reviewer directions are the product's three, and a
-/// reviewer cohort that covers them takes exactly one each. The analysis base
-/// cohort is dispatched at its fixed width, and a narrower panel must never
+/// Every direction of a cohort must reach a slot at every possible cohort size: the directions are
+/// shared out, never truncated, so a round can never leave a direction unhanded. The reviewer
+/// directions are the product's three, and a reviewer cohort that covers them takes exactly one
+/// each. The analysis base cohort is dispatched at its fixed width, and a narrower panel must never
 /// silently drop an angle.
 #[test]
 fn cohort_directions_are_all_handed_out_at_every_cohort_size() {
@@ -2641,7 +2534,6 @@ fn cohort_directions_are_all_handed_out_at_every_cohort_size() {
 
     let reviews = crate::prompt::load_prompt_sections("review_angles.md");
     assert_eq!(reviews.len(), 3);
-    // The cohort sizes a reviewer round can actually be dispatched with.
     for count in 1..=MAX_REVIEWERS {
         let tasks: Vec<String> = (0..count)
             .map(|k| super::agent_slot_task("PROMPT", &reviews, count, k))
@@ -2663,17 +2555,13 @@ fn cohort_directions_are_all_handed_out_at_every_cohort_size() {
             .collect::<Vec<_>>(),
         "three reviewers get exactly one direction each",
     );
-    // The functional tester is a cohort of one with its own directions.
     let qa = crate::prompt::load_prompt_sections("qa_angles.md");
     assert_eq!(
         super::agent_slot_task("PROMPT", &qa, 1, 0),
         format!("PROMPT\n\n{}", qa.join("\n\n")),
         "the lone functional tester keeps every one of its directions",
     );
-    // An analysis escalation slot carries no direction at all.
     assert_eq!(super::agent_slot_task("PROMPT", &[], 2, 1), "PROMPT");
-    // The analysis base cohort shares its angle sections across fewer analysts
-    // than there are sections.
     let angles = crate::prompt::load_prompt_sections("analyze/ticket_angles.md");
     let base = super::analysis::base_slots("ticket-1", "PROMPT");
     assert_eq!(base.len(), 2, "the base cohort is dispatched at its width");
@@ -2685,12 +2573,9 @@ fn cohort_directions_are_all_handed_out_at_every_cohort_size() {
     }
 }
 
-// ── 4. Bounce breaker trips terminal and drains Queued siblings ────────────
-
-/// When a ticket's bounce budget is exhausted the verification round trips it
-/// to Failed (terminal), the phase job is deleted, Queued siblings are drained
-/// to Planning, and the workspace is NOT paused (a bounce is not a technical
-/// failure).
+/// When a ticket's bounce budget is exhausted the verification round trips it to Failed (terminal),
+/// the phase job is deleted, Queued siblings are drained to Planning, and the workspace is NOT
+/// paused (a bounce is not a technical failure).
 
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
@@ -2707,7 +2592,6 @@ async fn bounce_breaker_fails_terminal_and_drains_queued_without_pausing() {
     let id = make_ticket(store, &ws, "Trip", TicketPhase::Verification).await;
     let sibling = make_ticket(store, &ws, "Sibling", TicketPhase::Queued).await;
 
-    // Seed the bounce budget at the exhaustion threshold (MAX_BOUNCES = 10).
     store
         .conn
         .execute(
@@ -2729,13 +2613,12 @@ async fn bounce_breaker_fails_terminal_and_drains_queued_without_pausing() {
     .await;
 
     {
-        // Zero-change repo → reviewer count 1 → the full merged round (one
-        // reviewer + the single functional tester) returns sub-threshold verdicts
-        // and trips the breaker (each participant consumes an agent-turn + an
-        // extraction). Every scripted response is that same sub-threshold verdict,
-        // so whichever of the two concurrently dispatched participants pops which
-        // one, the round bounces: a turn reads it as the assistant's message and
-        // the extraction that follows reads it as the verdict.
+        // Zero-change repo → reviewer count 1 → the full merged round (one reviewer + the single
+        // functional tester) returns sub-threshold verdicts and trips the breaker (each participant
+        // consumes an agent-turn + an extraction). Every scripted response is that same
+        // sub-threshold verdict, so whichever of the two concurrently dispatched participants pops
+        // which one, the round bounces: a turn reads it as the assistant's message and the
+        // extraction that follows reads it as the verdict.
         let fake = crate::util::test::FakeProvider::new()
             .ok(r#"{"score":5,"issues":["bug: x"]}"#)
             .ok(r#"{"score":5,"issues":["bug: x"]}"#)
@@ -2771,12 +2654,10 @@ async fn bounce_breaker_fails_terminal_and_drains_queued_without_pausing() {
     drop(repo_dir);
 }
 
-// ── 5. Hard-failure cleanup + puller re-drive + engineer session stability ──
-
-/// A hard technical failure (no usable output) resets the attempt: the phase
-/// job is destroyed, the workspace pause policy is honoured by phase, and the
-/// puller re-creates a fresh job. The engineer session pin survives the round
-/// job's deletion so the accumulated session is preserved across resets.
+/// A hard technical failure (no usable output) resets the attempt: the phase job is destroyed, the
+/// workspace pause policy is honoured by phase, and the puller re-creates a fresh job. The engineer
+/// session pin survives the round job's deletion so the accumulated session is preserved across
+/// resets.
 
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
@@ -2790,7 +2671,6 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
         .await
         .unwrap();
 
-    // ── Analysis hard technical failure ──
     let aid = make_ticket(store, &ws, "HardAnalysis", TicketPhase::Analysis).await;
     let ajob = crate::generate_id();
     spawn_phase_job(
@@ -2803,8 +2683,8 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
     )
     .await;
     {
-        // Every analyst turn + every extraction attempt fails to produce a
-        // verdict → `extracted_count == 0` → reset for a fresh attempt.
+        // Every analyst turn + every extraction attempt fails to produce a verdict →
+        // `extracted_count == 0` → reset for a fresh attempt.
         let fake = crate::util::test::FakeProvider::new()
             .ok("not json")
             .ok("not json")
@@ -2842,8 +2722,6 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
         );
     }
 
-    // The puller re-creates a fresh Analysis job and re-drives it to completion
-    // (so no lingering phase-body task consumes the next provider script).
     {
         let fake = fake_clean_participants(3);
         let _seam = crate::util::test::install_retry_seam(fake);
@@ -2870,7 +2748,6 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
         .expect("the re-created analysis round must re-drive to Planning");
     }
 
-    // ── Implementation-phase hard failure pauses + preserves the engine pin ──
     let eid = make_ticket(store, &ws, "HardDev", TicketPhase::InDevelopment).await;
     let ejob = crate::generate_id();
     spawn_phase_job(
@@ -2883,8 +2760,8 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
     )
     .await;
     let pin_id = crate::jobs::session_pin_id(&eid, crate::Role::Engineer);
-    // Seed the engineer's stable session anchor; a hard-failure reset must
-    // preserve it across the round job's deletion.
+    // Seed the engineer's stable session anchor; a hard-failure reset must preserve it across the
+    // round job's deletion.
     crate::jobs::upsert_session_pin(
         &crate::session::store().conn,
         &eid,
@@ -2926,8 +2803,8 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
         "the engineer session pin must survive the round job's deletion",
     );
 
-    // Resume, as production does: the poll gate serves only an unpaused, ready
-    // workspace (the step below is driven directly here).
+    // Resume, as production does: the poll gate serves only an unpaused, ready workspace (the step
+    // below is driven directly here).
     crate::workspace::store()
         .set_paused(&ws.name, false)
         .await
@@ -2944,7 +2821,6 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
                 .is_some(),
             "the puller must re-create a fresh InDevelopment job after a reset",
         );
-        // Let the re-created body consume the script and advance the phase.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if expect_ticket_phase(store, &eid).await == TicketPhase::Verification
@@ -2962,11 +2838,9 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
     }
 }
 
-// ── 5b. Verification technical participant failure ───────────────────────
-
-/// A verification round whose participant requests fail technically resets the
-/// attempt: the phase job is destroyed, the workspace is frozen, and the ticket
-/// carries no comment — the failure is logged, not commented.
+/// A verification round whose participant requests fail technically resets the attempt: the phase
+/// job is destroyed, the workspace is frozen, and the ticket carries no comment — the failure is
+/// logged, not commented.
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn verification_provider_failure_leaves_no_comment_and_resets() {
@@ -2981,8 +2855,8 @@ async fn verification_provider_failure_leaves_no_comment_and_resets() {
         .unwrap();
     let id = make_ticket(store, &ws, "VerificationFailure", TicketPhase::Verification).await;
 
-    // Every participant request fails with an exhausted-balance error; the
-    // script covers the reviewer cohort, the tester and any retry.
+    // Every participant request fails with an exhausted-balance error; the script covers the
+    // reviewer cohort, the tester and any retry.
     let mut fake = crate::util::test::FakeProvider::new();
     for _ in 0..20 {
         fake = fake.err(
@@ -3013,12 +2887,6 @@ async fn verification_provider_failure_leaves_no_comment_and_resets() {
     drop(repo_dir);
 }
 
-// ── 6. Analysis hard-failure cleanup stays in phase, no pause ────────────
-
-/// A hard analysis failure (no usable verdict from any analyst) resets the
-/// attempt without pausing the workspace or consuming the bounce budget; the
-/// ticket stays in Analysis for a fresh round.
-
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn analysis_hard_failure_cleanup_stays_in_phase_no_pause() {
@@ -3044,8 +2912,8 @@ async fn analysis_hard_failure_cleanup_stays_in_phase_no_pause() {
 
     let before = expect_ticket(store, &id).await;
     {
-        // Every analyst turn + every extraction attempt fails to produce a
-        // verdict → no usable output → reset for a fresh attempt.
+        // Every analyst turn + every extraction attempt fails to produce a verdict → no usable
+        // output → reset for a fresh attempt.
         let fake = crate::util::test::FakeProvider::new()
             .ok("not json")
             .ok("not json")
@@ -3087,13 +2955,6 @@ async fn analysis_hard_failure_cleanup_stays_in_phase_no_pause() {
     );
 }
 
-// ── 7. GUI cancel brings an in-flight engineer to a terminal Cancelled phase ─
-
-/// The GUI is the single cancel authority: it stops in-flight ticket agents,
-/// sets the terminal Cancelled phase (completing the phase job), and pauses the
-/// workspace. This holds even while an engineer round is in flight — the
-/// agent-side failure tail no longer drives a user cancel.
-
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn cancel_requested_engineer_goes_to_cancelled() {
@@ -3118,8 +2979,8 @@ async fn cancel_requested_engineer_goes_to_cancelled() {
     .await;
 
     {
-        // The engineer's first provider outcome is a tool call (empty-args read
-        // errors), keeping the agent in-flight until the test cancels it.
+        // The engineer's first provider outcome is a tool call (empty-args read errors), keeping
+        // the agent in-flight until the test cancels it.
         let mut fake = crate::util::test::FakeProvider::new().ok_tool_call("read");
         for _ in 0..9 {
             fake = fake.ok_tool_call("read");
@@ -3134,10 +2995,9 @@ async fn cancel_requested_engineer_goes_to_cancelled() {
         ));
         wait_for_agent_registered(&id, std::time::Duration::from_secs(2)).await;
 
-        // Reproduce the GUI cancel path: pause the workspace, stop in-flight
-        // ticket agents, then transition the ticket to the terminal Cancelled
-        // phase (which completes its phase job). The GUI path, not the agent's
-        // failure tail, is the source of the terminal state.
+        // Reproduce the GUI cancel path: pause the workspace, stop in-flight ticket agents, then
+        // transition the ticket to the terminal Cancelled phase (which completes its phase job).
+        // The GUI path, not the agent's failure tail, is the source of the terminal state.
         crate::pipeline::pause_workspace_on_failure(
             &expect_ticket(store, &id).await,
             "user cancelled a ticket in the development pipeline",
@@ -3165,12 +3025,6 @@ async fn cancel_requested_engineer_goes_to_cancelled() {
     assert_workspace_paused(&ws, true).await;
 }
 
-// ── 8. Cooperative pause keeps the job and unpause does not re-pause ─────
-
-/// A cooperative workspace pause freezes an in-flight verification round at its
-/// LLM boundary: the phase job is retained, the workspace is paused, and the
-/// unpause re-drives the round to completion without re-pausing.
-
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
@@ -3182,8 +3036,8 @@ async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
         .set_status(&ws.name, &WorkspaceStatus::Ready)
         .await
         .unwrap();
-    // Not a git repo: the churn cannot be measured, so the round is the 3
-    // reviewer-base fallback plus the single functional tester.
+    // Not a git repo: the churn cannot be measured, so the round is the 3 reviewer-base fallback
+    // plus the single functional tester.
     let id = make_ticket(store, &ws, "PauseVerification", TicketPhase::Verification).await;
     let job_id = crate::generate_id();
     spawn_phase_job(
@@ -3197,8 +3051,8 @@ async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
     .await;
 
     {
-        // The round's first outcome is a tool call (errors), holding every
-        // participant in-flight until the workspace pause lands.
+        // The round's first outcome is a tool call (errors), holding every participant in-flight
+        // until the workspace pause lands.
         let mut fake = crate::util::test::FakeProvider::new().ok_tool_call("read");
         for _ in 0..39 {
             fake = fake.ok_tool_call("read");
@@ -3226,10 +3080,9 @@ async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
         );
         assert_workspace_paused(&ws, true).await;
 
-        // The interrupted round's whole roster is preserved in place (the
-        // reviewers plus the tester), carrying the stored tasks the resume
-        // re-runs them with — a fresh dispatch would have re-derived a new
-        // suffix instead.
+        // The interrupted round's whole roster is preserved in place (the reviewers plus the
+        // tester), carrying the stored tasks the resume re-runs them with — a fresh dispatch would
+        // have re-derived a new suffix instead.
         let roster = crate::jobs::list_agents_for_job(&crate::session::store().conn, &job_id)
             .await
             .unwrap();
@@ -3246,8 +3099,8 @@ async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
         );
     }
 
-    // Resume and re-drive the same round with a clean script: it completes to
-    // InSanitation and does NOT re-pause the workspace.
+    // Resume and re-drive the same round with a clean script: it completes to InSanitation and does
+    // NOT re-pause the workspace.
     crate::workspace::store()
         .set_paused(&ws.name, false)
         .await
@@ -3270,10 +3123,9 @@ async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
     assert_workspace_paused(&ws, false).await;
 }
 
-/// A failure freeze that lands while the workspace is ALREADY paused — the
-/// discovery's own analysis pause owns the flag, and it is written by direct
-/// SQL, so nothing signalled the registry — still freezes in-flight ticket
-/// agents. Only the write in `set_paused` would otherwise reach them, so
+/// A failure freeze that lands while the workspace is ALREADY paused — the discovery's own analysis
+/// pause owns the flag, and it is written by direct SQL, so nothing signalled the registry — still
+/// freezes in-flight ticket agents. Only the write in `set_paused` would otherwise reach them, so
 /// `pause_workspace_on_failure` signals the freeze itself.
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
@@ -3286,8 +3138,8 @@ async fn failure_freeze_while_paused_stops_in_flight_ticket_agent() {
         .set_status(&ws.name, &WorkspaceStatus::Ready)
         .await
         .unwrap();
-    // Paused before the round is dispatched, so no agent of this round has been
-    // signalled yet — the registry only sees the pause through the failure call.
+    // Paused before the round is dispatched, so no agent of this round has been signalled yet — the
+    // registry only sees the pause through the failure call.
     crate::workspace::store()
         .set_paused(&ws.name, true)
         .await
@@ -3305,8 +3157,8 @@ async fn failure_freeze_while_paused_stops_in_flight_ticket_agent() {
     .await;
 
     {
-        // Holding script: tool calls keep the round's participants in flight
-        // until the freeze lands.
+        // Holding script: tool calls keep the round's participants in flight until the freeze
+        // lands.
         let mut fake = crate::util::test::FakeProvider::new().ok_tool_call("read");
         for _ in 0..39 {
             fake = fake.ok_tool_call("read");
@@ -3336,11 +3188,10 @@ async fn failure_freeze_while_paused_stops_in_flight_ticket_agent() {
     }
 }
 
-/// (i) A stage re-drive whose session carries a dangling analyze call runs the
-/// universal resume-completion step BEFORE the engineer's model round: the
-/// owned analyze job (Done roster) is terminalized, its consolidated result
-/// settles contiguously after the frame, and only then does the engineer LLM
-/// round proceed (the Done-slot replay adds zero LLM calls).
+/// (i) A stage re-drive whose session carries a dangling analyze call runs the universal
+/// resume-completion step BEFORE the engineer's model round: the owned analyze job (Done roster) is
+/// terminalized, its consolidated result settles contiguously after the frame, and only then does
+/// the engineer LLM round proceed (the Done-slot replay adds zero LLM calls).
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn stage_re_drive_completes_dangling_calls_before_model_round() {
@@ -3371,8 +3222,8 @@ async fn stage_re_drive_completes_dangling_calls_before_model_round() {
     let pin = crate::jobs::session_pin_id(&id, crate::Role::Engineer);
     let conn = &crate::session::store().conn;
 
-    // Seed the stage pin session [user(task), assistant frame with an analyze
-    // tool call] + an owned analyze job (Done roster "STAGE_RESULT").
+    // Seed the stage pin session [user(task), assistant frame with an analyze tool call] + an owned
+    // analyze job (Done roster "STAGE_RESULT").
     crate::util::test::seed_session_row(conn, &pin, "user", "implement the ticket").await;
     let frame = crate::providers::reasoning::assistant_replay_payload(
         Some(""),
@@ -3418,8 +3269,6 @@ async fn stage_re_drive_completes_dangling_calls_before_model_round() {
     .await
     .unwrap();
 
-    // Engineer round: 2 responses (answer + summary extraction). The completion
-    // (Done-slot replay) adds zero LLM calls, so exactly 2 are consumed.
     let fake = std::sync::Arc::new(
         crate::util::test::FakeProvider::new()
             .ok("implemented the ticket")
@@ -3434,8 +3283,8 @@ async fn stage_re_drive_completes_dangling_calls_before_model_round() {
     )
     .await;
 
-    // The dangling analyze job was terminalized by the completion (before the
-    // engineer's model round).
+    // The dangling analyze job was terminalized by the completion (before the engineer's model
+    // round).
     let jobs = conn
         .query(
             "SELECT id FROM jobs WHERE id = ?1",
@@ -3448,8 +3297,8 @@ async fn stage_re_drive_completes_dangling_calls_before_model_round() {
         "the dangling analyze job must be terminalized"
     );
 
-    // The stage session carries the settled tool result contiguous after the
-    // frame, then the appended turn message.
+    // The stage session carries the settled tool result contiguous after the frame, then the
+    // appended turn message.
     let rows = conn
         .query(
             "SELECT id, role, content FROM sessions WHERE agent_id = ?1 ORDER BY id",
@@ -3468,9 +3317,9 @@ async fn stage_re_drive_completes_dangling_calls_before_model_round() {
     assert_eq!(payload.tool_call_id, "call_stage_analyze");
     assert_eq!(payload.content, "STAGE_RESULT");
 
-    // The engineer's model round proceeded AFTER the settle — its first request
-    // already carries the settled tool result, and the Done-slot replay added
-    // zero LLM calls (exactly the engineer answer + summary extraction ran).
+    // The engineer's model round proceeded AFTER the settle — its first request already carries the
+    // settled tool result, and the Done-slot replay added zero LLM calls (exactly the engineer
+    // answer + summary extraction ran).
     let messages = fake.request_messages.lock().unwrap();
     assert_eq!(
         messages.len(),
@@ -3483,14 +3332,11 @@ async fn stage_re_drive_completes_dangling_calls_before_model_round() {
     );
 }
 
-// ── 9. Sanitation round stop — a round that cannot finish is not retried ──
-
-/// A persistent commit failure (a rejecting hook, a broken index, a missing git
-/// identity, an unreadable repository) must STOP the sanitation round instead of
-/// leaving its job behind for the puller to re-drive every poll tick: the full
-/// cause reaches the Manager notice and the log, the workspace is frozen, the
-/// phase job is deleted, and the ticket stays in sanitation with its changes
-/// uncommitted — with no failure comment on the ticket.
+/// A persistent commit failure (a rejecting hook, a broken index, a missing git identity, an
+/// unreadable repository) must STOP the sanitation round instead of leaving its job behind for the
+/// puller to re-drive every poll tick: the full cause reaches the Manager notice and the log, the
+/// workspace is frozen, the phase job is deleted, and the ticket stays in sanitation with its
+/// changes uncommitted — with no failure comment on the ticket.
 #[cfg(unix)]
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
@@ -3506,8 +3352,8 @@ async fn sanitation_commit_failure_stops_round_and_freezes_workspace() {
         .set_status(&ws.name, &WorkspaceStatus::Ready)
         .await
         .unwrap();
-    // Registered up front so the stop's Manager notice lands in a local inbox
-    // instead of spawning a real Manager turn.
+    // Registered up front so the stop's Manager notice lands in a local inbox instead of spawning a
+    // real Manager turn.
     let mut manager_inbox =
         crate::agent::message_router::register_agent(&crate::session::manager_agent_id(&ws.name));
     let id = make_ticket(store, &ws, "SanitationStop", TicketPhase::InSanitation).await;
@@ -3610,14 +3456,12 @@ async fn sanitation_commit_failure_stops_round_and_freezes_workspace() {
     drop(repo_dir);
 }
 
-/// The ticket pipeline runs only for a workspace that is BOTH unpaused and
-/// ready: a freeze holds at every status, and a workspace that is not ready —
-/// awaiting its first analysis, re-analysing (with or without a freeze), or
-/// failed — takes no ticket work either. No claims, no phase jobs.
+/// The ticket pipeline runs only for a workspace that is BOTH unpaused and ready: a freeze holds at
+/// every status, and a workspace that is not ready — awaiting its first analysis, re-analysing
+/// (with or without a freeze), or failed — takes no ticket work either. No claims, no phase jobs.
 ///
-/// The pending pickup stays exempt (it starts the discovery itself), and no
-/// provider is configured in tests, so a `Pending` row is never claimed into a
-/// discovery here and keeps its status.
+/// The pending pickup stays exempt (it starts the discovery itself), and no provider is configured
+/// in tests, so a `Pending` row is never claimed into a discovery here and keeps its status.
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn unsettled_or_frozen_workspace_skips_claims_and_dispatch() {
@@ -3668,9 +3512,9 @@ async fn unsettled_or_frozen_workspace_skips_claims_and_dispatch() {
         );
     }
 
-    // Positive control: the same poll step does claim for a ready, unpaused
-    // workspace. The pre-created job carries a launched roster row, so the
-    // dispatch arm skips it instead of spawning a real phase body.
+    // Positive control: the same poll step does claim for a ready, unpaused workspace. The
+    // pre-created job carries a launched roster row, so the dispatch arm skips it instead of
+    // spawning a real phase body.
     let ws = create_test_workspace("/tmp/settled_ws", "settled_ws").await;
     crate::workspace::store()
         .set_status(&ws.name, &WorkspaceStatus::Ready)

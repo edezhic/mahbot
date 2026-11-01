@@ -1,90 +1,62 @@
-//! Excel number formats: a stored numeric value rendered the way Excel would
-//! display it, or `None` when the format cannot be reproduced — a sheet cell's
-//! value and a chart cache's value alike, so one number is shown one way.
+//! Excel number formats: a stored numeric value rendered the way Excel would display
+//! it, or `None` when the format cannot be reproduced — a sheet cell's value and a
+//! chart cache's value alike, so one number is shown one way.
 //!
 //! # Invariants
 //!
-//! - **Never panics.** Nothing a workbook can carry trips it: the format code
-//!   ([`MAX_FORMAT_LENGTH`]), the placeholders a section names
-//!   ([`MAX_PLACEHOLDERS`]), the fractional-second digits it names
-//!   ([`MAX_SUB_SECOND_DIGITS`]), the scaled integer its display may need
-//!   ([`MAX_SCALED`]) and the serial domain of a value
-//!   ([`VALUE_LIMIT`]/[`SERIAL_LIMIT`]) are all bounded before they are used.
-//! - **Never silently wrong.** A format this reader does not implement, a value
-//!   outside the format's own domain, a scaled value with no exact display, a
-//!   format no section of which serves the value, a section that shows nothing, a
-//!   section holding only the format's own text that would have to carry the
-//!   value's own sign, and a scientific section naming a dot outside its
-//!   placeholders or anywhere in its exponent region, an exponent placeholder
-//!   outside that region's own run, or a zero mantissa its own width would widen
-//!   all come back as `None` — one outcome, which the caller turns into the value
-//!   the cell stores, marked as stored — never an empty or invented rendering.
-//! - **The shown value is the one Excel displays.** Excel works with the 15
-//!   significant decimal digits of a number, so `1.005` under `0.00` shows as
-//!   `1.01` even though the binary double holding it is a hair below the tie;
-//!   [`scaled_magnitude`] performs that canonicalisation and the
-//!   half-away-from-zero rounding after it.
-//! - **A section serves a value by Excel's own rule.** A format whose sections
-//!   carry a comparison is a conditional format, not one ordered by sign: the
-//!   conditions of its first two sections are tested in order and the one that holds
-//!   serves the value, through a section that shows the magnitude when the condition
-//!   is Excel's own way of naming the negative side (`[<0]0.0;0.00` shows -1 as
-//!   `1.0`) and lets the value keep its own minus otherwise (`[>=1]0;0` shows -2 as
-//!   `-2`). A value no condition serves falls to the section Excel keeps for what
-//!   none of them takes — the second of a two-section format, the third of a longer
-//!   one — where the minus is dropped for a format that has a section of its own for
-//!   the negative side, and only for that: one of three or more sections, or one
-//!   whose own condition covers every non-negative number (`[>=-1]0;0` shows -2 as
-//!   `2`, and `[>=1]0;0;0.00` shows it as `2` too). Otherwise the
-//!   sections stand for positive;negative;zero;text, the negative one carrying its own
-//!   sign, and a section standing alone shows the minus for a value that did not round
-//!   away to nothing. A value no section serves — which only a conditional format
-//!   can have — is declined, so what the cell stores stands for it, marked as stored.
-//! - **A code is read as Excel reads it, up to what a line of text can carry.**
-//!   The digits go in the places the section puts them, with the literals the
-//!   section stands *between* them (`000-00-0000`), the symbol of a currency
-//!   directive and every `%` are printed where they stand, and what shows nothing
-//!   of its own — a colour, a condition, a bare locale, a `*` fill out to the
-//!   cell's width — leaves nothing behind. What is left over — a fraction, a text
-//!   placeholder, a localized format word this reader does not know, a decimal point
-//!   standing anywhere but between the placeholders, a digit the layout has no place
-//!   for or a place the digits do not fill — is declined rather than guessed at.
-//!   A section naming a fractional part keeps the decimal point even when the
-//!   value shows no digit behind it (`#.#####` shows 1 as `1.`), the point
-//!   standing where the section puts it.
+//! - **Never panics.** The format code, the placeholders and fractional-second digits a
+//!   section names, the scaled integer its display may need and the serial domain are
+//!   all bounded before they are used.
+//! - **Never silently wrong.** An unimplemented format, a value outside the format's
+//!   domain, a scaled value with no exact display, a format no section of which serves
+//!   the value, and a section that shows nothing or would have to carry the value's own
+//!   sign all come back as `None` — which the caller turns into the stored value, marked
+//!   as stored, never an empty or invented rendering.
+//! - **The shown value is the one Excel displays.** Excel works with 15 significant
+//!   decimal digits, so `1.005` under `0.00` shows `1.01` although the double holding it
+//!   is a hair below the tie; [`scaled_magnitude`] canonicalises before rounding
+//!   half-away-from-zero.
+//! - **A section serves a value by Excel's own rule.** Sections carrying a comparison
+//!   make a conditional format: the first two sections' conditions are tested in order
+//!   and the holder serves the value — as a magnitude when the condition names the
+//!   negative side (`[<0]0.0;0.00` shows -1 as `1.0`), else keeping its own minus
+//!   (`[>=1]0;0` shows -2 as `-2`). A value no condition serves falls to the section
+//!   Excel keeps for it (the second of two, the third of more), where the minus is
+//!   dropped only for a format that has a section of its own for the negative side.
+//!   Otherwise sections stand for positive;negative;zero;text, the negative one carrying
+//!   its own sign, and a lone section shows the minus for a value that did not round
+//!   away to nothing. A value no section serves is declined.
+//! - **A code is read as Excel reads it.** Digits go where the section puts them, with
+//!   the literals it stands between (`000-00-0000`), and a currency symbol or `%` prints
+//!   where it stands; what shows nothing of its own (a colour, a condition, a bare
+//!   locale, a `*` fill) leaves nothing behind. A fraction, a text placeholder, an
+//!   unknown localized format word, a misplaced decimal point, a digit the layout has no
+//!   place for or a place the digits do not fill are declined rather than guessed at. A
+//!   section naming a fractional part keeps the point even with no digit behind it
+//!   (`#.#####` shows 1 as `1.`).
 
 use std::cmp::Ordering;
 
-/// Excel's own limit on a format code's length; a longer one is not a format the
-/// application could store, so it is declined rather than parsed.
+/// Excel's own limit: a longer code is not a format the application could store.
 const MAX_FORMAT_LENGTH: usize = 255;
-/// The placeholders a section may name before it stops being one this reader
-/// reproduces: a code can hold hundreds of them, and every one costs at most one
-/// digit of a rendered number.
+/// Past this a section stops being one this reader reproduces.
 const MAX_PLACEHOLDERS: usize = 30;
-/// The fractional-second digits a time section may name (Excel writes at most
-/// three, a millisecond).
+/// Excel writes at most three (a millisecond).
 const MAX_SUB_SECOND_DIGITS: usize = 9;
-/// The largest serial a value may be for a time of day or a duration — far past
-/// anything Excel's own display reaches, but still a value whose days, seconds
-/// and hours have an exact integer form.
+/// Far past anything Excel displays, but still a value whose days, seconds and hours
+/// have an exact integer form.
 const VALUE_LIMIT: f64 = 1e9;
-/// The sections a format may carry: one per sign and one for text, Excel's own
-/// limit.
+/// One per sign and one for text, Excel's own limit.
 const MAX_SECTIONS: usize = 4;
-/// The serial of 9999-12-31 in the 1900 system: the last day Excel's calendar
-/// holds, and the last one this reader renders a date for there.
+/// The serial of 9999-12-31 in the 1900 system: the last day Excel's calendar holds.
 const SERIAL_LIMIT: i64 = 2_958_465;
-/// The same last day in the 1904 system, whose day 0 is four years later: a
-/// serial is that much shorter for the same calendar date.
+/// The same last day in the 1904 system, whose day 0 is four years later.
 const SERIAL_LIMIT_1904: i64 = SERIAL_LIMIT - 1_462;
-/// The largest scaled integer a number's display may need, so that a value
-/// without any plausible display is declined rather than rendered into a
+/// So a value without a plausible display is declined rather than rendered into a
 /// three-hundred-digit line.
 const MAX_SCALED: i128 = 10_i128.pow(30);
 
-/// The built-in number-format code for `id`, or `None` when the id has no
-/// ECMA-376/POI builtin meaning.
+/// `None` when the id has no ECMA-376/POI builtin meaning.
 const fn builtin(id: u32) -> Option<&'static str> {
     Some(match id {
         0 => "General",
@@ -127,24 +99,20 @@ const fn builtin(id: u32) -> Option<&'static str> {
     })
 }
 
-/// Whether a cell shows its stored text: the format its `id` and declared `code`
-/// resolve to is `General`, whose display is the value's own stored text.
+/// Whether a cell shows its stored text: the format its `id` and `code` resolve to is `General`.
 #[must_use]
 pub(crate) fn is_general(id: u32, code: Option<&str>) -> bool {
     match code {
-        // A declared code that is empty names no format this reader can show, so
-        // the caller falls through to the stored value *marked* as stored rather
-        // than passed off as the display.
+        // An empty declared code names no format this reader can show, so the caller
+        // falls through to the stored value marked as stored.
         Some("") => false,
         Some(code) => is_general_code(code),
         None => builtin(id).is_some_and(is_general_code),
     }
 }
 
-/// Whether a format code is `General` under the directives a workbook wraps it in
-/// (`[DBNum1][$-804]General`), the padding it may carry (` General `) and the
-/// repetition across sections (`General;General`): every one of those shows the
-/// stored text and nothing else.
+/// `General` under the directives a workbook wraps it in (`[DBNum1][$-804]General`),
+/// the padding it carries and its repetition across sections (`General;General`).
 fn is_general_code(code: &str) -> bool {
     split_sections(code).map_or_else(
         || general_section(code),
@@ -152,8 +120,7 @@ fn is_general_code(code: &str) -> bool {
     )
 }
 
-/// Whether a section's body is `General`. The body does not depend on the value
-/// its condition is read against.
+/// The body does not depend on the value its condition is read against.
 fn general_section(section: &str) -> bool {
     split_section(section, 0.0)
         .0
@@ -161,21 +128,17 @@ fn general_section(section: &str) -> bool {
         .eq_ignore_ascii_case("General")
 }
 
-/// `value` as the number format `id` displays it, or `None` when this reader has
-/// no display to show for it — a format it cannot parse or does not reproduce, a
-/// value outside the format's own domain, a format no section of which serves it,
-/// a section that shows nothing and a section that would have to carry the value's
-/// own sign. The caller shows the value the cell stores, marked as stored, in that
-/// case. `General` is never asked here — it names no placeholder and no text of its
-/// own, its display being the value's own stored text, whose width depends on the
-/// cell, so the caller shows that text itself ([`is_general`]).
+/// `None` when this reader has no display for it: an unparseable or unsupported
+/// format, a value outside the format's domain, no serving section, a section showing
+/// nothing or one that would have to carry the value's sign. `General` is never asked
+/// here — its display is the value's own stored text, so the caller shows that text
+/// itself ([`is_general`]).
 #[must_use]
 pub(crate) fn display(value: f64, id: u32, code: Option<&str>, date1904: bool) -> Option<String> {
     if !value.is_finite() {
         return None;
     }
-    // A declared non-empty code always wins over the built-in meaning of `id`;
-    // an empty declared code is a format this reader does not reproduce.
+    // A declared non-empty code always wins over the built-in meaning of `id`.
     let format = match code {
         Some("") => return None,
         Some(code) => code,
@@ -194,17 +157,14 @@ pub(crate) fn display(value: f64, id: u32, code: Option<&str>, date1904: bool) -
         render_date(value, date1904, &tokens)?
     } else {
         let Rendered { text, shows_number } = render_number(value.abs(), &tokens)?;
-        // A section naming no digit placeholder at all shows text of the format's
-        // own and nothing of the value. For a negative value whose sign is this
-        // reader's to write, that sign has no place in the display — Excel writes
-        // its own minus into some such sections and not others — so the format is
-        // declined rather than shown with the sign dropped.
+        // A section with no digit placeholder shows the format's own text. For a negative
+        // value whose sign is this reader's to write, that sign has no place, so the
+        // format is declined rather than shown with the sign dropped.
         if signed && value < 0.0 && !tokens.iter().any(|tok| matches!(tok, Tok::Digit(_))) {
             return None;
         }
-        // The minus is the reader's to write only where the section writes none of
-        // its own (`-$0.00`), and only for a value that did not round away to
-        // nothing: Excel shows `0` for -0.4 under `0`, never `-0`.
+        // The minus is the reader's only where the section writes none of its own, and
+        // only for a value that did not round away: Excel shows `0` for -0.4 under `0`.
         if signed && value < 0.0 && shows_number && !text.starts_with('-') {
             format!("-{text}")
         } else {
@@ -218,11 +178,8 @@ pub(crate) fn display(value: f64, id: u32, code: Option<&str>, date1904: bool) -
     Some(rendered.to_owned())
 }
 
-// ── Sections ────────────────────────────────────────────────────
-
-/// The format's sections, split on top-level `;`. `None` when the format has
-/// more than four — the most Excel defines, one per sign and one for text — and
-/// a `;` inside `"..."`, escaped by `\`, or inside `[...]` never splits.
+/// Split on top-level `;`; `None` beyond four sections. A `;` inside `"..."`, escaped
+/// by `\`, or inside `[...]` never splits.
 fn split_sections(format: &str) -> Option<Vec<&str>> {
     let bytes = format.as_bytes();
     let mut sections = Vec::new();
@@ -260,34 +217,28 @@ fn split_sections(format: &str) -> Option<Vec<&str>> {
     Some(sections)
 }
 
-/// The section `value` renders with, and whether the minus it shows is the
-/// reader's to write. The rule that picks it, and that decides this, is the one
-/// the module's own sections states.
+/// The section `value` renders with, and whether the minus it shows is the reader's
+/// to write (the rule is in the module's invariants).
 struct Selection<'a> {
     body: &'a str,
-    /// Whether a negative value keeps its own minus: a section standing alone for
-    /// every value shows it, and a conditional format shows it unless its own
-    /// condition serves the value through a section written to display a negative
-    /// side. A format ordered by sign has a negative section written to carry its own
-    /// sign.
+    /// A lone section for every value shows it; a conditional format shows it unless
+    /// its condition serves the value through a section written to display a negative
+    /// side. A sign-ordered format's negative section carries its own sign.
     signed: bool,
 }
 
-/// The section `value` renders with: for a conditional format the one Excel's own
-/// condition rule serves ([`conditional_section`]), otherwise the one its sign
-/// names. `None` when no section serves the value at all, which the caller shows
-/// as the stored value marked as stored.
+/// For a conditional format the one Excel's rule serves ([`conditional_section`]),
+/// otherwise the one its sign names. `None` when no section serves the value.
 fn select_section<'a>(sections: &[&'a str], value: f64) -> Option<Selection<'a>> {
-    // One walk reads each section once, for both questions: whether the format
-    // compares at all, and which section serves this value.
+    // One walk reads each section once for both questions: does the format compare,
+    // and which section serves this value.
     let mut split = [("", None); MAX_SECTIONS];
     for (slot, section) in split.iter_mut().zip(sections) {
         *slot = split_section(section, value);
     }
     let split = &split[..sections.len()];
-    // Only the format's first two sections can carry a condition; one standing
-    // later is no part of Excel's rule, so such a format is read by sign as an
-    // unconditional one is.
+    // Only the first two sections can carry a condition; one standing later is no part
+    // of Excel's rule, so the format is read by sign.
     if split
         .iter()
         .take(2)
@@ -298,23 +249,21 @@ fn select_section<'a>(sections: &[&'a str], value: f64) -> Option<Selection<'a>>
     let position = sign_position(split.len(), value)?;
     Some(Selection {
         body: split[position].0,
-        // One section stands for every value, so a negative one has no section of
-        // its own to carry the minus.
+        // A lone section stands for every value, so a negative one has no section of its
+        // own to carry the minus.
         signed: split.len() == 1,
     })
 }
 
-/// The section a *conditional* format serves `value` with, and whether its minus
-/// is the reader's to write. The rule is the one this module's invariants state;
-/// what is worked out here is its order — a first section stating no condition,
-/// then the conditions of the first two sections, then the section Excel keeps for
-/// what none of them takes. `None` where no section serves the value at all.
+/// The rule is the module's invariants; worked out here is its order — a first section
+/// stating no condition, then the first two sections' conditions, then the section Excel
+/// keeps for what none of them takes. `None` where no section serves the value.
 fn conditional_section<'a>(
     split: &[(&'a str, Option<Condition>)],
     value: f64,
 ) -> Option<Selection<'a>> {
-    // The sections Excel's rule works on: a format of one section draws every value
-    // through it, and a two-section one repeats its first for a zero value.
+    // A one-section format draws every value through it; a two-section one repeats its
+    // first for a zero value.
     let at = |index: usize| split.get(index).copied().unwrap_or(split[0]);
     let (first, second) = (at(0).1, at(1).1);
     if first.is_none() && value > 0.0 {
@@ -336,35 +285,28 @@ fn conditional_section<'a>(
         });
     }
     let (index, signed) = if second.is_none() && value < 0.0 {
-        // The second section states no condition, so it is the format's own negative
-        // side. A format of three or more sections carries a section for that side
-        // written to show its own minus, and a zero boundary named from above
-        // ([`Condition::covers_the_positive`]) leaves a two-section one no positive
-        // side for the minus to belong to: either way the value goes through the
-        // second as its magnitude (`[>=1]0;0;0.00` shows -2 as `2`, and `[>=-1]0;0`
-        // as `2` too). A two-section format with a condition that does not cover the
-        // positive side has no such section — its second stands for the negative side
-        // the value did not fall into — so the value keeps its own minus
-        // (`[>=1]0;0` shows -2 as `-2`).
+        // The second section states no condition, so it is the format's own negative side.
+        // Three or more sections carry such a side showing its own minus, and a zero
+        // boundary named from above ([`Condition::covers_the_positive`]) leaves a
+        // two-section one no positive side: either way the value goes through the second as
+        // its magnitude (`[>=1]0;0;0.00` and `[>=-1]0;0` both show -2 as `2`). Otherwise it
+        // keeps its own minus (`[>=1]0;0` shows -2 as `-2`).
         (
             1,
             !(split.len() >= 3 || first.is_some_and(Condition::covers_the_positive)),
         )
     } else if split.len() >= 3 {
-        // A longer format keeps its third section for the value none of its
-        // conditions takes, and that section shows the value's own minus.
+        // A longer format's third section serves the value no condition takes, and shows
+        // the value's own minus.
         (2, true)
     } else if value < 0.0 || split.len() == 1 {
-        // A value no section serves — and a format whose only section is gated by a
-        // condition — is declined rather than shown through a section whose condition
-        // does not hold.
+        // Declined rather than shown against a condition that does not hold — which is also
+        // what a format whose only section is gated comes to.
         return None;
     } else {
-        // A positive value every condition of a two-section format let past: it goes
-        // through the second section when the two do not compare — that one is the
-        // format's negative side, the only section left for a value the first did not
-        // take — and through the first when both compare, which is the place a
-        // two-section format repeats its first for a zero value.
+        // A positive value both conditions let past goes through the second section when
+        // they do not compare (the negative side, the only one left), else through the
+        // first — where a two-section format repeats its first for a zero value.
         (usize::from(!(first.is_some() && second.is_some())), false)
     };
     Some(Selection {
@@ -373,9 +315,8 @@ fn conditional_section<'a>(
     })
 }
 
-/// The section of `count` a value's sign names: one section serves every value,
-/// two pick the second for a negative value, and three or four pick positive,
-/// negative and zero in order.
+/// One section serves every value, two pick the second for a negative value, three or four
+/// pick positive, negative and zero in order.
 fn sign_position(count: usize, value: f64) -> Option<usize> {
     match count {
         1 => Some(0),
@@ -392,14 +333,10 @@ fn sign_position(count: usize, value: f64) -> Option<usize> {
 }
 
 /// A section split into the text it renders and the condition it is gated on
-/// (`[>1000]0.0;[<=1000]0.00`), already evaluated for `value`. Every bracket of
-/// the run a section leads with is read, wherever it stands in that run: a
-/// comparison is evaluated (`[Red][<100]0.0` keeps its colour and its condition,
-/// and one standing after a currency directive — `[$$-409][>100]0.00` — gates the
-/// section too), a directive that prints nothing of its own leaves the body, and a
-/// bracket that *is* a format element (`[h]`, `[$€-407]`) begins the body — the
-/// tokenizer then drops from it whatever the walk has already read (`[>100]`), so
-/// the display keeps the symbol and the condition that chose it both.
+/// (`[>1000]0.0;[<=1000]0.00`), already evaluated for `value`. Every bracket in the run the
+/// section leads with is read wherever it stands: a comparison is evaluated, a directive
+/// printing nothing leaves the body, and a bracket that *is* a format element (`[h]`,
+/// `[$€-407]`) begins it.
 fn split_section(section: &str, value: f64) -> (&str, Option<Condition>) {
     let mut rest = section;
     let mut condition = None;
@@ -423,12 +360,10 @@ fn split_section(section: &str, value: f64) -> (&str, Option<Condition>) {
     (body.unwrap_or(rest), condition)
 }
 
-/// The operators a numbered condition may carry, longest first so a two-character
-/// operator is never read as one of its halves.
+/// Longest first, so a two-character operator is never read as one of its halves.
 const CONDITIONS: [&str; 6] = ["<=", ">=", "<>", "<", ">", "="];
 
-/// One of a section's own conditions: how Excel tests a value against it, and
-/// whether the test passed.
+/// How Excel tests a value against it, and whether the test passed.
 #[derive(Clone, Copy)]
 struct Condition {
     operator: &'static str,
@@ -438,22 +373,20 @@ struct Condition {
 
 impl Condition {
     /// Whether the condition is Excel's way of naming the negative side — `[<0]`,
-    /// `[<=-1]`, `[=-3]`. Such a section is written to display a negative value, so
-    /// Excel shows the value's magnitude through it and writes no minus of its own.
+    /// `[<=-1]`, `[=-3]`: such a section displays a negative value, so Excel shows the
+    /// magnitude through it and writes no minus.
     fn names_the_negative(self) -> bool {
         match self.operator {
-            // The negative side named from below includes its own zero boundary;
-            // named from above, a zero boundary still names a positive range.
+            // Named from below, the negative side includes its own zero boundary; from
+            // above, a zero boundary still names a positive range.
             "=" | "<=" => self.threshold < 0.0,
             "<" => self.threshold <= 0.0,
             _ => false,
         }
     }
 
-    /// Whether the condition holds for every non-negative number — `[>-1]`,
-    /// `[>=0]`. A format conditioned that way has no positive section of its own, so
-    /// a value the condition does not serve keeps no minus Excel would have written
-    /// through one.
+    /// Whether it holds for every non-negative number — `[>-1]`, `[>=0]`. Such a format
+    /// has no positive section of its own, so no minus can be written through one.
     fn covers_the_positive(self) -> bool {
         match self.operator {
             ">" => self.threshold < 0.0,
@@ -463,19 +396,16 @@ impl Condition {
     }
 }
 
-/// The condition a bracketed run is, evaluated for `value` — `None` when the run
-/// is not a comparison at all (a colour, a locale), which is what tells a section
-/// the condition gates apart from one the value's sign selects.
+/// `None` when the run is not a comparison at all (a colour, a locale), which is what
+/// tells a gated section from one the value's sign selects.
 ///
-/// A condition whose operand is not a number is one no value satisfies: the value
-/// falls to another section or is declined and marked as stored, never shown
-/// through a condition that does not hold.
+/// An operand that is not a number is a condition no value satisfies: the value falls to
+/// another section or is declined and marked as stored.
 fn condition_of(bracket: &str, value: f64) -> Option<Condition> {
     let (operator, operand) = CONDITIONS
         .iter()
         .find_map(|operator| bracket.strip_prefix(operator).map(|rest| (*operator, rest)))?;
-    // An operand that is not a number is a condition no value satisfies, and one no
-    // reading of it as a negative or a positive side either.
+    // Not a number, and no reading of it as a negative or a positive side either.
     let Some(threshold) = operand.trim().parse::<f64>().ok() else {
         return Some(Condition {
             operator,
@@ -483,8 +413,7 @@ fn condition_of(bracket: &str, value: f64) -> Option<Condition> {
             held: false,
         });
     };
-    // The comparison is Excel's own: the serial the format names is compared with
-    // the same exactness the stored value carries.
+    // Excel compares the named serial with the exactness the stored value carries.
     let ordering = value.partial_cmp(&threshold);
     let held = match operator {
         "<" => ordering == Some(Ordering::Less),
@@ -501,10 +430,8 @@ fn condition_of(bracket: &str, value: f64) -> Option<Condition> {
     })
 }
 
-// ── Tokens ──────────────────────────────────────────────────────
-
-/// A date/time unit. `m` is emitted as `Month` and reclassified as a minute by
-/// its neighbours; `Minute` itself is only ever produced by an elapsed `[m]`.
+/// `m` is emitted as `Month` and reclassified as a minute by its neighbours; `Minute` is
+/// only ever produced by an elapsed `[m]`.
 #[derive(Clone, Copy)]
 enum Unit {
     Year,
@@ -516,16 +443,13 @@ enum Unit {
     AmPm,
 }
 
-/// One meaningful token of a section, with the literal text a number format
-/// prints around its placeholders.
+/// With the literal text a number format prints around its placeholders.
 #[derive(Clone, Copy)]
 enum Tok {
-    /// A literal character the format quotes or escapes, so its author asked for
-    /// it to be printed.
+    /// Asked for by the format's author, printed as written.
     Lit(char),
-    /// A character no rule claimed: Excel prints it too, but in a section with no
-    /// placeholder at all it is as likely to be a format word this reader does not
-    /// know (a localized date pattern) as text the author meant to show.
+    /// In a section with no placeholder it is as likely a format word this reader does
+    /// not know as text the author meant to show.
     Raw(char),
     /// `0`, `#` or `?`.
     Digit(char),
@@ -533,29 +457,24 @@ enum Tok {
     Comma,
     Percent,
     Slash,
-    /// The unquoted `@` text placeholder. A cell holding a number has no text
-    /// for it to stand for, so its section is one this reader declines.
+    /// The unquoted `@`: a number cell has no text for it, so its section is declined.
     Text,
-    /// A bracketed directive that is not part of a date and prints a symbol into
-    /// the run of placeholders around it — `[$€-407]`. Anything else bracketed
-    /// (`[Red]`, `[>100]`, a bare locale) contributes nothing to a number.
+    /// A bracketed directive printing a symbol into the placeholders around it
+    /// (`[$€-407]`); any other bracket contributes nothing to a number.
     Directive(char),
-    /// A `*` jump: Excel pads the cell out to its width with the character that
-    /// follows, which a reader cannot reproduce inside a line of text.
+    /// A `*` jump: Excel pads the cell to its width with the next character — not
+    /// reproducible in a line of text.
     Star,
-    /// `E+`/`E-`/`e+`/`e-`: the sign that follows the exponent marker.
+    /// `E+`/`E-`/`e+`/`e-`.
     ExpSign(char),
-    /// A date/time unit.
     Date(Unit),
     /// An elapsed `[h]`/`[m]`/`[s]`.
     Elapsed(Unit),
 }
 
-/// Walk a section into tokens, dropping everything that carries no meaning:
-/// quoted and escaped text is literal, `_x`/`*x` emit nothing, and a bracketed
-/// run emits nothing unless it is an elapsed unit or a currency directive
-/// (`[$€-407]`, and the symbol it names is printed). Conditions and colours
-/// carry no text, and a condition is read where the sections are selected.
+/// Quoted and escaped text is literal, `_x`/`*x` emit nothing, and a bracketed run emits
+/// nothing unless it is an elapsed unit or a currency directive (`[$€-407]`, whose symbol
+/// is printed). Conditions and colours carry no text.
 fn tokenize(section: &str) -> Vec<Tok> {
     let chars: Vec<char> = section.chars().collect();
     let mut tokens = Vec::new();
@@ -647,8 +566,6 @@ fn tokenize(section: &str) -> Vec<Tok> {
     tokens
 }
 
-/// A run of one date letter (`y`, `d`, `h`, `s` or `m`, any case, repeated) as
-/// one token.
 fn push_date_run(chars: &[char], index: &mut usize, unit: Unit, tokens: &mut Vec<Tok>) {
     let letter = chars[*index].to_ascii_lowercase();
     tokens.push(Tok::Date(unit));
@@ -658,7 +575,6 @@ fn push_date_run(chars: &[char], index: &mut usize, unit: Unit, tokens: &mut Vec
     }
 }
 
-/// Whether `chars` at `at` spell `needle`, ignoring ASCII case.
 fn starts_with_ignore_ascii_case(chars: &[char], at: usize, needle: &str) -> bool {
     let needle: Vec<char> = needle.chars().collect();
     chars.len() >= at + needle.len()
@@ -668,8 +584,7 @@ fn starts_with_ignore_ascii_case(chars: &[char], at: usize, needle: &str) -> boo
             .all(|(current, expected)| current.to_ascii_lowercase() == *expected)
 }
 
-/// The elapsed unit a bracketed run names, or `None` for any other bracket
-/// (`[Red]`, `[$-409]`, `[>=100]`, …).
+/// `None` for any other bracket (`[Red]`, `[$-409]`, `[>=100]`, …).
 fn elapsed_unit(inner: &str) -> Option<Unit> {
     match inner.to_ascii_lowercase().as_str() {
         "h" | "hh" => Some(Unit::Hour),
@@ -679,13 +594,10 @@ fn elapsed_unit(inner: &str) -> Option<Unit> {
     }
 }
 
-/// The currency symbol a `[$symbol-locale]` directive names — `€` from
-/// `[$€-407]`, `$` from `[$$-409]`, `USD` from `[$USD-409]` — or `""` when the
-/// bracket names no symbol at all: a colour, a condition, or a directive
-/// carrying the locale alone, which is both the hex LCID Excel writes
-/// (`[$-409]`) and the BCP-47 tags a workbook also holds (`[$-en-US]`,
-/// `[$-x-sysdate]`). The locale is dropped either way: the code's own separators
-/// are what is printed, so the format stays locale-independent.
+/// `€` from `[$€-407]`, `$` from `[$$-409]`, `USD` from `[$USD-409]` — or `""` when the
+/// bracket names no symbol: a colour, a condition, or a locale alone (the hex LCID
+/// `[$-409]` or a BCP-47 tag like `[$-en-US]`). The locale is always dropped: the code's
+/// own separators print, so the format stays locale-independent.
 fn currency_symbol(inner: &str) -> &str {
     let Some(rest) = inner.strip_prefix('$') else {
         return "";
@@ -697,17 +609,14 @@ fn currency_symbol(inner: &str) -> &str {
     }
 }
 
-// ── Rendering ───────────────────────────────────────────────────
-
-/// Whether any token makes the section a date/time format.
 fn is_date(tokens: &[Tok]) -> bool {
     tokens
         .iter()
         .any(|tok| matches!(tok, Tok::Date(_) | Tok::Elapsed(_)))
 }
 
-/// Which date/time units a section names, and whether a minute-role `m`, a day,
-/// a month or a year is present — the shape the date renderer works from.
+/// And whether a minute-role `m`, a day, a month or a year is present — the shape the
+/// date renderer works from.
 #[derive(Default)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -724,7 +633,6 @@ struct DateShape {
     elapsed_second: bool,
 }
 
-/// Resolve the section's date tokens into [`DateShape`].
 fn date_shape(tokens: &[Tok]) -> DateShape {
     let mut shape = DateShape::default();
     for (index, tok) in tokens.iter().enumerate() {
@@ -764,8 +672,7 @@ fn date_shape(tokens: &[Tok]) -> DateShape {
     shape
 }
 
-/// Whether the `m` at `index` is a minute: it follows an hour, or precedes a
-/// second, else it is a month.
+/// It follows an hour, or precedes a second, else it is a month.
 fn minute_role(tokens: &[Tok], index: usize) -> bool {
     let is_date_token = |tok: &&Tok| matches!(tok, Tok::Date(_) | Tok::Elapsed(_));
     let preceding = tokens[..index].iter().rev().find(is_date_token);
@@ -782,10 +689,9 @@ fn minute_role(tokens: &[Tok], index: usize) -> bool {
     )
 }
 
-/// Render a date/time section, or `None` for a value outside the domain a serial
-/// has: a negative value or one past [`VALUE_LIMIT`] (Excel shows `#####`, this
-/// reader declines to guess), and a day the calendar Excel's epochs define does
-/// not hold.
+/// `None` outside the domain a serial has: a negative value or one past
+/// [`VALUE_LIMIT`] (Excel shows `#####`, this reader declines to guess), and a day the
+/// calendar Excel's epochs define does not hold.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "a value bounded by VALUE_LIMIT has a day count that fits i64"
@@ -844,10 +750,8 @@ fn render_date(value: f64, date1904: bool, tokens: &[Tok]) -> Option<String> {
     Some(parts.join(":"))
 }
 
-/// The whole seconds of a time of day, and the fractional-second digits a
-/// section naming `places` of them rounds to. The section's own precision
-/// decides both: a section naming no fractional digit rounds the second itself,
-/// and one naming them carries a rounded-up fraction into the second.
+/// The section's own precision decides both: no fractional digit rounds the second itself,
+/// and naming them carries a rounded-up fraction into it.
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -868,8 +772,7 @@ fn split_seconds(raw: f64, places: usize) -> (i64, i64) {
     (seconds, ticks)
 }
 
-/// The fractional-second digits a section names (`ss.0` names one, `ss.000`
-/// three), or zero when the smallest unit it names is not a second.
+/// (`ss.0` names one, `ss.000` three); zero when the smallest unit named is not a second.
 fn fractional_second_places(tokens: &[Tok]) -> usize {
     let Some(dot) = tokens.iter().rposition(|tok| matches!(tok, Tok::Dot)) else {
         return 0;
@@ -891,9 +794,8 @@ fn fractional_second_places(tokens: &[Tok]) -> usize {
     }
 }
 
-/// An elapsed format's total-count rendering: the elapsed unit counts the whole
-/// span, the smaller named units the remainder, and the fraction belongs to the
-/// seconds.
+/// The elapsed unit counts the whole span, the smaller named units the remainder, the
+/// fraction belongs to the seconds.
 fn duration(shape: &DateShape, total_seconds: i64, fraction: &str) -> String {
     let mut parts = Vec::new();
     if shape.hour {
@@ -918,21 +820,17 @@ fn duration(shape: &DateShape, total_seconds: i64, fraction: &str) -> String {
     parts.join(":")
 }
 
-// ── Number rendering ────────────────────────────────────────────
-
-/// A section's rendered body: the text it shows, and whether that text holds a
-/// non-zero digit of the value's own.
+/// Whether that text holds a non-zero digit of the value's own.
 struct Rendered {
     text: String,
-    /// A body of nothing but zeros is what a value rounded away to nothing shows,
-    /// and the minus on it is a zero Excel never writes (`-0.4` under `0` is `0`),
-    /// while a digit the format's own literals carry (`"v1 "0`) is no number of the
-    /// cell's: neither earns the minus a section standing alone adds.
+    /// A body of nothing but zeros is what a value rounded away to nothing shows, and the
+    /// minus on it is a zero Excel never writes (`-0.4` under `0` is `0`); a digit from the
+    /// format's own literals (`"v1 "0`) is no number of the cell's. Neither earns the minus
+    /// a lone section adds.
     shows_number: bool,
 }
 
-/// Whether the digits a section laid out hold a non-zero one — the digits alone,
-/// the format's own literal text excluded.
+/// The digits alone, the format's literals excluded.
 fn has_digits(digits: &str) -> bool {
     digits
         .bytes()
@@ -949,8 +847,7 @@ enum Point {
 }
 
 impl Point {
-    /// Whether the placeholder at `index` is one of the section's own integer ones:
-    /// every one of them when the section names no point.
+    /// Every placeholder when the section names no point.
     fn is_integer(self, index: usize) -> bool {
         match self {
             Self::Absent => true,
@@ -967,16 +864,14 @@ impl Point {
     }
 }
 
-/// The one decimal point a section body may name. `None` is a section this reader
-/// has no place for — one naming a second point (`0.0.0`), or one whose point stands
-/// outside the placeholders `first..=last`: before the first (`.00`, whose digits
-/// would be counted as the whole part) or after the last (`0.5`, whose `5` is literal
-/// in Excel) — either of which would be dropped along with the part of the layout
-/// around it.
+/// `None` is a section this reader has no place for: one naming a second point
+/// (`0.0.0`), or one whose point stands outside the placeholders `first..=last` — before
+/// the first (`.00`, whose digits would be counted as the whole part) or after the last
+/// (`0.5`, whose `5` is literal in Excel).
 fn decimal_point(tokens: &[Tok], first: usize, last: usize) -> Option<Point> {
     let mut point = Point::Absent;
     for (index, tok) in tokens.iter().enumerate() {
-        // A second point is no layout this reader has a place for either.
+        // A second point is no layout this reader has a place for.
         if matches!(tok, Tok::Dot) {
             if matches!(point, Point::At(_)) {
                 return None;
@@ -992,10 +887,8 @@ fn decimal_point(tokens: &[Tok], first: usize, last: usize) -> Option<Point> {
     Some(point)
 }
 
-/// Render a non-date section, or `None` when it is a form this reader does not
-/// implement: a fraction, the text placeholder, or a section that names no
-/// placeholder at all — which is a format string (`[$-419]ДД.ММ.ГГГГ`) or a
-/// directive, never a number a cell holds.
+/// `None` for a form this reader does not implement: a fraction, the text placeholder, or a section
+/// naming no placeholder at all — a format string or a directive, never a number a cell holds.
 fn render_number(value: f64, tokens: &[Tok]) -> Option<Rendered> {
     if tokens
         .iter()
@@ -1010,12 +903,10 @@ fn render_number(value: f64, tokens: &[Tok]) -> Option<Rendered> {
         tokens.iter().position(|tok| matches!(tok, Tok::Digit(_))),
         tokens.iter().rposition(|tok| matches!(tok, Tok::Digit(_))),
     ) else {
-        // No placeholder at all: only a section whose text the format asked for is
-        // shown. A quoted or escaped run (`"neg"`, `_(* "-"_)`) is text the author
-        // put there; anything else — a localized format word this reader does not
-        // know (`[$-419]ДД.ММ.ГГГГ`), a lone marker or directive (`%`, `,`,
-        // `[$USD-409]`) or `General` — is a format string, never a number a cell
-        // holds, so it is declined rather than passed off as the cell's value.
+        // With no placeholder, only text the format asked for is shown: a quoted or escaped
+        // run (`"neg"`, `_(* "-"_)`). Anything else — an unknown localized format word, a
+        // lone marker or directive (`%`, `,`, `[$USD-409]`) or `General` — is a format
+        // string, never a number a cell holds.
         return tokens
             .iter()
             .any(|tok| matches!(tok, Tok::Lit(_)))
@@ -1024,22 +915,20 @@ fn render_number(value: f64, tokens: &[Tok]) -> Option<Rendered> {
                 shows_number: false,
             });
     };
-    // The point the section names must stand between its placeholders; one anywhere
-    // else would be dropped along with the part of the layout around it, so the
-    // section is declined ([`decimal_point`]).
+    // The point must stand between the placeholders; anywhere else it would be dropped with
+    // the layout around it, so the section is declined ([`decimal_point`]).
     let point = decimal_point(tokens, first, last)?;
-    // A literal standing *between* the placeholders (`000-00-0000`) is laid
-    // between the digits; one only around them is a plain prefix or suffix.
+    // A literal standing *between* the placeholders (`000-00-0000`) is laid between the
+    // digits; one only around them is a plain prefix or suffix.
     if tokens[first..=last].iter().copied().any(is_text) {
         return render_layered(value, tokens, first, last, point);
     }
     render_plain(value, tokens, first, last, point)
 }
 
-/// Whether a token prints text of its own, in the place the section puts it: a
-/// literal, a directive's symbol or the sign a `%` stands for. A body holding one
-/// cannot be a plain layout of digits — the text would drop out of it — so such a
-/// section is laid out in place instead ([`render_layered`]).
+/// A literal, a directive's symbol or the sign a `%` stands for. A body holding one cannot
+/// be a plain layout of digits — the text would drop out of it — so such a section is laid
+/// out in place instead ([`render_layered`]).
 fn is_text(tok: Tok) -> bool {
     matches!(
         tok,
@@ -1047,9 +936,7 @@ fn is_text(tok: Tok) -> bool {
     )
 }
 
-/// The literal text tokens carry, placeholders and markers contributing nothing:
-/// the `%` a section prints, a currency directive's symbol and escaped or quoted
-/// characters.
+/// The `%` a section prints, a currency directive's symbol, and escaped or quoted characters.
 fn literal_text(tokens: &[Tok]) -> String {
     let mut out = String::new();
     for tok in tokens {
@@ -1058,7 +945,6 @@ fn literal_text(tokens: &[Tok]) -> String {
     out
 }
 
-/// Append a token's literal text; placeholders and markers contribute nothing.
 fn push_literal(tok: Tok, out: &mut String) {
     match tok {
         Tok::Lit(c) | Tok::Raw(c) | Tok::Directive(c) => out.push(c),
@@ -1068,10 +954,9 @@ fn push_literal(tok: Tok, out: &mut String) {
     }
 }
 
-/// The digits a section's placeholders ask for: how many are in the integer part
-/// (the `0`s force that part's width), how many are fractional and how many of
-/// those are forced to a digit, and whether a `,` anywhere groups the integer
-/// part.
+/// How many placeholders are in the integer part (the `0`s force its width), how many
+/// are fractional and how many of those force a digit, and whether a `,` groups the
+/// integer part.
 #[derive(Default)]
 struct PlainShape {
     int_zeros: usize,
@@ -1080,9 +965,8 @@ struct PlainShape {
     grouping: bool,
 }
 
-/// Count the shape of the placeholders in `tokens[first..=last]`, whose section
-/// names its decimal point `point` (at its own index in `tokens`): a `,` inside the
-/// body groups rather than scales.
+/// Count the shape of the placeholders in `tokens[first..=last]`, whose section names its
+/// decimal point `point`: a `,` inside the body groups rather than scales.
 fn plain_shape(tokens: &[Tok], first: usize, last: usize, point: Point) -> PlainShape {
     let mut shape = PlainShape::default();
     for (offset, tok) in tokens[first..=last].iter().enumerate() {
@@ -1101,8 +985,7 @@ fn plain_shape(tokens: &[Tok], first: usize, last: usize, point: Point) -> Plain
     shape
 }
 
-/// How many `,` standing right at the start of `tokens` scale the value by a
-/// thousand each; a `,` between placeholders groups instead.
+/// Each scales the value by a thousand; a `,` between placeholders groups instead.
 fn leading_commas(tokens: &[Tok]) -> usize {
     tokens
         .iter()
@@ -1110,14 +993,13 @@ fn leading_commas(tokens: &[Tok]) -> usize {
         .count()
 }
 
-/// How many `,` right after the last placeholder scale the value by a thousand
-/// each (`,`, `,,`).
+/// Each scales the value by a thousand (`,`, `,,`).
 fn scaling_commas(tokens: &[Tok], last: usize) -> usize {
     leading_commas(&tokens[last + 1..])
 }
 
-/// The scaled integer a section's placeholders show: `value` after the `%` and
-/// trailing-comma scaling the section asks for, rounded at its own precision.
+/// `value` after the `%` and trailing-comma scaling the section asks for, rounded at its
+/// own precision.
 fn scaled_plain(value: f64, tokens: &[Tok], last: usize, places: i32) -> Option<i128> {
     let mut value = value;
     for tok in tokens {
@@ -1131,10 +1013,9 @@ fn scaled_plain(value: f64, tokens: &[Tok], last: usize, places: i32) -> Option<
     scaled_magnitude(value, places)
 }
 
-/// A scaled integer as the digit body a section shows: the integer part padded to
-/// the `0`s that force its width and grouped when the section asks, the fraction
-/// trimmed to the digits that force one, behind the point a section naming any
-/// fractional part always carries.
+/// The integer part padded to the `0`s that force its width and grouped when the section
+/// asks, the fraction trimmed to the digits that force one, behind the point a section
+/// naming any fractional part always carries.
 fn digit_text(scaled: i128, shape: &PlainShape) -> Option<String> {
     let rendered = magnitude_text(scaled, u32::try_from(shape.frac_placeholders).ok()?)?;
     let (int_raw, mut frac_digits) = rendered.find('.').map_or_else(
@@ -1156,9 +1037,8 @@ fn digit_text(scaled: i128, shape: &PlainShape) -> Option<String> {
     if shape.grouping {
         int_digits = group_thousands(&int_digits);
     }
-    // The point is a literal of the section, wherever it names a fractional part:
-    // it stands even when the value shows no digit after it (`#.#####` shows 1 as
-    // `1.` and 0 as `.`), and a section naming no fraction never writes one.
+    // The point stands even when the value shows no digit after it (`#.#####` shows 1 as
+    // `1.` and 0 as `.`); a section naming no fraction never writes one.
     if shape.frac_placeholders > 0 {
         int_digits.push('.');
         int_digits.push_str(&frac_digits);
@@ -1173,13 +1053,11 @@ struct Pieces {
     suffix: String,
 }
 
-/// The digit body a plain fixed-point section shows — the integer part padded to
-/// the `0`s that force its width and grouped when the section asks, the fraction
-/// trimmed to the digits that force one — with the literal text standing before
-/// and after it (the scaling commas excluded: they are not printed). `grouping`
-/// says whether the form being rendered can carry the section's grouping at all:
-/// a body whose literals stand *between* its placeholders cannot, since the
-/// commas the digits then carry would land in a placeholder.
+/// The integer part padded to the `0`s that force its width and grouped when the section
+/// asks, the fraction trimmed to the digits that force one, with the literals before and
+/// after it (scaling commas excluded). `grouping` says whether this form can carry the
+/// section's grouping at all: a body whose literals stand *between* its placeholders
+/// cannot, since the commas would land in a placeholder.
 fn plain_pieces(
     value: f64,
     tokens: &[Tok],
@@ -1204,8 +1082,8 @@ fn plain_pieces(
     })
 }
 
-/// A plain fixed-point section: literals around a digit body of integer and
-/// fractional placeholders, with `%`, scaling commas and grouping.
+/// Literals around a digit body of integer and fractional placeholders, with `%`, scaling
+/// commas and grouping.
 fn render_plain(
     value: f64,
     tokens: &[Tok],
@@ -1224,12 +1102,10 @@ fn render_plain(
     })
 }
 
-/// A section whose literals stand *between* its placeholders (`000-00-0000`,
-/// `(###) ###-####`): the digits are laid into the placeholder positions and the
-/// literals keep their own. A body naming a fractional part or a grouping comma is
-/// not one this layout can carry, and neither is a value whose digits do not fill
-/// it exactly — a value with more digits than there are places would be shown
-/// shorter than it is, and one with fewer leaves a literal nothing stands beside.
+/// The digits are laid into the placeholder positions and the literals keep their own. A
+/// body naming a fractional part or a grouping comma is not one this layout can carry, nor
+/// is a value whose digits do not fill it exactly — more digits would be shown shorter
+/// than they are, fewer leave a literal nothing stands beside.
 fn render_layered(
     value: f64,
     tokens: &[Tok],
@@ -1238,8 +1114,8 @@ fn render_layered(
     point: Point,
 ) -> Option<Rendered> {
     let body = &tokens[first..=last];
-    // The section's own point is the one its body names ([`decimal_point`]): a body
-    // between whose placeholders it stands cannot carry a fractional part.
+    // The section's own point is the one its body names ([`decimal_point`]); a body with
+    // literals between its placeholders cannot carry a fractional part.
     if matches!(point, Point::At(_)) {
         return None;
     }
@@ -1255,8 +1131,7 @@ fn render_layered(
     if digits.len() != places {
         return None;
     }
-    // Walk the body, giving each placeholder the next digit. Every one of them has
-    // a digit: the lengths above are equal.
+    // Each placeholder takes the next digit; the lengths above are equal, so every one has one.
     let mut chars = digits.chars();
     let mut out = prefix;
     for tok in body {
@@ -1272,12 +1147,11 @@ fn render_layered(
     })
 }
 
-/// Scientific notation: a mantissa the section's placeholders lay out, then `E`,
-/// the sign and the exponent. Excel normalises the mantissa into
-/// `[1, 10^width)` — `width` the integer placeholders the section names — so the
-/// exponent is the largest multiple of that width at or below the value's decade:
-/// `##0.0E+0` shows 1234 as `1.2E+3`, not as `123.4E+1`, and `00.0E+0` shows
-/// 12345 as `01.2E+4`.
+/// A mantissa the section's placeholders lay out, then `E`, the sign and the exponent.
+/// Excel normalises the mantissa into `[1, 10^width)`, `width` being the integer
+/// placeholders the section names, so the exponent is the largest multiple of that width at
+/// or below the value's decade: `##0.0E+0` shows 1234 as `1.2E+3`, `00.0E+0` shows 12345
+/// as `01.2E+4`.
 fn render_scientific(value: f64, tokens: &[Tok]) -> Option<Rendered> {
     let marker = tokens
         .iter()
@@ -1293,11 +1167,9 @@ fn render_scientific(value: f64, tokens: &[Tok]) -> Option<Rendered> {
         .iter()
         .rposition(|tok| matches!(tok, Tok::Digit(_)))?;
     let exponent_tokens = &tokens[marker + 1..];
-    // The exponent prints its own placeholders — one run of them — with the literal
-    // text around them and the scaling commas after them. A decimal point anywhere in
-    // the region, or a placeholder the run does not reach (`E+0.0`, `E+0,0`), is a
-    // character this reader would drop from the display, so the section is declined
-    // rather than shown without it.
+    // The exponent prints its one run of placeholders, with the literals around them and the
+    // scaling commas after them. A decimal point in the region, or a placeholder the run does
+    // not reach (`E+0.0`, `E+0,0`), would be dropped from the display, so the section is declined.
     let digits_at = exponent_tokens
         .iter()
         .position(|tok| matches!(tok, Tok::Digit(_)))?;
@@ -1313,10 +1185,8 @@ fn render_scientific(value: f64, tokens: &[Tok]) -> Option<Rendered> {
     }
     let exponent_width = last_digit - digits_at + 1;
 
-    // The point the section names must stand between the mantissa's placeholders;
-    // one anywhere else would be dropped along with the part of the mantissa around
-    // it, so the section is declined ([`decimal_point`]), exactly as the plain path
-    // declines the same shapes.
+    // The point must stand between the mantissa's placeholders; anywhere else it would be
+    // dropped with the part around it, so the section is declined ([`decimal_point`]).
     let point = decimal_point(mantissa_tokens, first, last)?;
     // The mantissa's integer placeholders that force a digit.
     let int_zeros = plain_shape(mantissa_tokens, first, last, point).int_zeros;
@@ -1337,9 +1207,9 @@ fn render_scientific(value: f64, tokens: &[Tok]) -> Option<Rendered> {
     let width = i32::try_from(width).ok()?;
     let places = i32::try_from(places).ok()?;
 
-    // A `%` scales the value by a hundred each and is printed where it stands, and
-    // a `,` run after the mantissa's or the exponent's placeholders scales it by a
-    // thousand each and is not printed at all — exactly as in a plain section.
+    // A `%` scales by a hundred each and prints where it stands; a `,` run after the
+    // mantissa's or the exponent's placeholders scales by a thousand each and does not
+    // print — as in a plain section.
     let mut value = value;
     for tok in tokens {
         if matches!(tok, Tok::Percent) {
@@ -1358,8 +1228,8 @@ fn render_scientific(value: f64, tokens: &[Tok]) -> Option<Rendered> {
     if value != 0.0 {
         exponent = decade(value.abs())?.div_euclid(width) * width;
         scaled = scaled_magnitude(value, places - exponent)?;
-        // The mantissa's own display rounding can carry it into the next decade
-        // (`0.00E+00` shows 999.5 as `1.00E+03`), which raises the exponent.
+        // The mantissa's own rounding can carry it into the next decade (`0.00E+00` shows
+        // 999.5 as `1.00E+03`), which raises the exponent.
         let ceiling = pow10_int(usize::try_from(places).ok()?)?
             .checked_mul(pow10_int(usize::try_from(width).ok()?)?)?;
         if scaled >= ceiling {
@@ -1368,11 +1238,9 @@ fn render_scientific(value: f64, tokens: &[Tok]) -> Option<Rendered> {
         }
     }
 
-    // Excel lays a zero mantissa out to the section's own integer width, so
-    // `##0.0E+0` shows 0 as `000.0E+0`; this reader does not, so a section whose
-    // integer placeholders force a wider zero than they show is declined rather
-    // than shown with a mantissa Excel would fill — one whose integer run is all
-    // `0` (`0.00E+00`) keeps its zero.
+    // Excel lays a zero mantissa out to the section's integer width, so `##0.0E+0` shows 0 as
+    // `000.0E+0`; this reader does not, and declines a section whose integer placeholders
+    // force a wider zero (an all-`0` run like `0.00E+00` keeps its zero).
     if scaled == 0 && usize::try_from(width).ok()? > int_zeros {
         return None;
     }
@@ -1401,10 +1269,9 @@ fn render_scientific(value: f64, tokens: &[Tok]) -> Option<Rendered> {
     })
 }
 
-/// The mantissa a scientific section shows: the digits `scaled` stands for, laid
-/// out by the section's own placeholders with the literal text around them. A
-/// mantissa whose literals stand between its placeholders, or whose placeholders
-/// a display cannot hold, is declined rather than laid out wrong.
+/// The digits `scaled` stands for, laid out by the section's placeholders with the literals
+/// around them. A mantissa with literals between its placeholders, or with placeholders a
+/// display cannot hold, is declined rather than laid out wrong.
 fn mantissa_text(
     tokens: &[Tok],
     first: usize,
@@ -1427,10 +1294,8 @@ fn mantissa_text(
     ))
 }
 
-/// A scaled magnitude as the digit text a section shows: its digits and the
-/// decimal point `places` digits from the right. The sign is the section's own
-/// business — [`display`] writes the minus a lone section adds, and every caller
-/// here works from a magnitude.
+/// Its digits and the decimal point `places` digits from the right. The sign is the
+/// section's own business — every caller here works from a magnitude.
 fn magnitude_text(scaled: i128, places: u32) -> Option<String> {
     let digits = scaled.to_string();
     let places = usize::try_from(places).ok()?;
@@ -1444,16 +1309,13 @@ fn magnitude_text(scaled: i128, places: u32) -> Option<String> {
     })
 }
 
-/// `|value| * 10^shift` as the integer Excel's display rounding produces: the
-/// magnitude canonicalised to the 15 significant decimal digits Excel works with,
-/// then rounded half away from zero at the place `shift` names. `None` when the
-/// value has no exact display at that place.
+/// The magnitude canonicalised to the 15 significant decimal digits Excel works with, then
+/// rounded half away from zero at the place `shift` names; `None` when it has no exact
+/// display there.
 ///
-/// The 15-digit step is what displays `1.005` under `0.00` as `1.01` — the binary
-/// double holding it is a hair below the tie — and the mantissa of a scientific
-/// section as the digits the section's own width normalises to. A `shift` no
-/// integer can reach means the value rounds to nothing there, which is the zero a
-/// display of that precision shows.
+/// The 15-digit step is what displays `1.005` under `0.00` as `1.01` — the double holding it
+/// is a hair below the tie — and what normalises a scientific mantissa. A `shift` no integer
+/// can reach means the value rounds to nothing there.
 fn scaled_magnitude(value: f64, shift: i32) -> Option<i128> {
     if !value.is_finite() {
         return None;
@@ -1489,10 +1351,8 @@ fn scaled_magnitude(value: f64, shift: i32) -> Option<i128> {
     };
     (rounded <= MAX_SCALED).then_some(rounded)
 }
-
-/// The decade of a finite non-zero magnitude: the exponent of its leading
-/// significant digit, read from the same canonical decimal the display rounding
-/// works from rather than from a logarithm a binary value can land just under.
+/// The exponent of its leading significant digit, read from the same canonical decimal the
+/// display rounding works from rather than from a logarithm a binary value can land just under.
 fn decade(magnitude: f64) -> Option<i32> {
     let text = format!("{magnitude:.14e}");
     text.split_once('e')?.1.parse().ok()
@@ -1519,8 +1379,6 @@ fn group_thousands(digits: &str) -> String {
     out
 }
 
-// ── Civil dates ─────────────────────────────────────────────────
-
 /// Days from the Unix epoch to 1899-12-31, the 1900 system's day 0.
 const EPOCH_1900: i64 = days_from_civil(1899, 12, 31);
 /// Days from the Unix epoch to 1904-01-01, the 1904 system's day 0.
@@ -1529,8 +1387,7 @@ const EPOCH_1904: i64 = days_from_civil(1904, 1, 1);
 /// The serial's civil date, applying Excel's phantom 1900-02-29 (serial 60) in
 /// the 1900 system and the 1904 base otherwise. `None` for a serial day outside
 /// the calendar that system defines — day 0 of the 1900 system, the fake
-/// `1900-01-00` Excel writes for a zero date, and anything past 9999-12-31 in
-/// either.
+/// `1900-01-00` Excel writes for a zero date, and anything past 9999-12-31 in either.
 fn civil_date(serial_days: i64, date1904: bool) -> Option<(i64, u32, u32)> {
     if date1904 {
         return (0..=SERIAL_LIMIT_1904)
@@ -1622,8 +1479,7 @@ mod tests {
     }
 
     /// The plain, grouped and percentage sections of the builtin table: the places
-    /// a section names decide what is shown, and a `%` scales the value by a
-    /// hundred.
+    /// a section names decide what is shown, and a `%` scales the value by a hundred.
     #[test]
     fn plain_formats_round_pad_and_group() {
         for (label, value, id, shown) in [
@@ -1744,8 +1600,7 @@ mod tests {
     /// Excel displays a number rounded from the 15 significant decimal digits it
     /// works with, so a value that is really the decimal `1.005` shows `1.01`
     /// under `0.00` even though the binary double holding it is a hair below the
-    /// tie. A value that rounds away to nothing is never shown as a negative
-    /// zero.
+    /// tie. A value that rounds away to nothing is never shown as a negative zero.
     #[test]
     fn a_tie_rounds_the_way_excel_displays_it() {
         for (label, value, id, shown) in [
@@ -2324,8 +2179,7 @@ mod tests {
 
     /// An over-wide value, an under-wide one, a fractional part and a grouping
     /// comma are all layouts this reader cannot put the digits into, so they are
-    /// declined rather than shown as a shorter, longer, ungrouped or misplaced
-    /// number.
+    /// declined rather than shown as a shorter, longer, ungrouped or misplaced number.
     #[test]
     fn a_layered_body_declines_what_it_cannot_hold() {
         for (label, value, code) in [

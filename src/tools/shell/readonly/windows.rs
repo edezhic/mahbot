@@ -1,214 +1,118 @@
 //! Windows (`cmd.exe`) platform layer of the read-only shell guard.
 //!
-//! Active only for [`super::ShellPlatform::Windows`]: there the command string is
-//! executed by `cmd.exe /C` while the guard's rules are unix-shaped — a word
-//! containing `\` is classified unprovable and a leading `/` token is a path
-//! operand rather than a switch. The layer closes both directions: the
-//! destructive cmd.exe verbs are refused and the legitimate Windows spellings
-//! (`%TEMP%\scratch`, `> NUL`, `del/q`) are admitted; the null device and the
-//! temp roots are dispatched by platform in the shared file (`is_null_target`,
-//! `writes_outside_temp`). The unix verdicts and their tests are untouched: the
-//! shared dispatch calls this layer once per command string ([`check_line`],
-//! which scans the whole tree and checks the platform itself) and, behind its
-//! own platform branch, for every command segment ([`check_segment`]).
+//! Active only for [`super::ShellPlatform::Windows`]: there the command string runs under
+//! `cmd.exe /C` while the guard's rules are unix-shaped — a word containing `\` is unprovable and a
+//! leading `/` token is a path operand, not a switch. The layer closes both directions: destructive
+//! cmd.exe verbs are refused, the legitimate Windows spellings (`%TEMP%\scratch`, `> NUL`, `del/q`)
+//! are admitted; the null device and the temp roots are dispatched by platform in the shared file
+//! (`is_null_target`, `writes_outside_temp`). Unix verdicts and their tests are untouched: the
+//! shared dispatch calls this layer once per command string ([`check_line`], which scans the whole
+//! tree) and, behind its own platform branch, per command segment ([`check_segment`]).
 //!
-//! `grep_engine/windows.rs` is the sibling cmd.exe reader — the grep
-//! interception's own, with its own fail-closed policy — so a cmd.exe rule
-//! change belongs in both: its verb reading (the tables below on this side,
-//! `grep_verb` on the other's) and the `%` expansion, which the two sides read
-//! on purpose by different rules ([`expand_percent_vars`] here against the
-//! engine's coarse `grep_engine::windows::has_percent_expansion`).
+//! `grep_engine/windows.rs` is the sibling cmd.exe reader with its own fail-closed policy, so a
+//! cmd.exe rule change belongs in both: verb reading (the tables below against `grep_verb`) and
+//! `%` expansion, which the two sides read on purpose by different rules ([`expand_percent_vars`]
+//! against `grep_engine::windows::has_percent_expansion`).
 //!
 //! # Refused
 //!
 //! [`DENIED_VERBS`], [`TEMP_GATED_VERBS`], [`CWD_DESTINATION_VERBS`],
-//! [`TEMP_GATED_DESTINATION_VERBS`] (with [`COPY_DENIED_SWITCHES`]),
-//! [`LIST_ONLY_VERBS`], [`QUERY_VERBS`], [`CLOCK_VERBS`] with an operand, a drive
-//! switch with an operand, a switch glued to its operand by cmd's parameter
-//! delimiter ([`glued_delimiter_switch`]), and the `set` forms [`check_set`]
-//! names. Each table is authoritative on its own category and states its own
-//! rule; so does every predicate below. A command string the bash grammar cannot
-//! parse at all is refused by the shared parse before this layer sees a segment —
-//! cmd-only shapes (`if exist x ( … )`, cmd's `for %i in (…) do …` loops) are
-//! refused that way, since no cmd.exe parser is added.
+//! [`TEMP_GATED_DESTINATION_VERBS`] (with [`COPY_DENIED_SWITCHES`]), [`LIST_ONLY_VERBS`],
+//! [`QUERY_VERBS`], [`CLOCK_VERBS`] with an operand, a drive switch with an operand, a switch glued
+//! to its operand by cmd's parameter delimiter ([`glued_delimiter_switch`]), and the `set` forms
+//! [`check_set`] names — each table authoritative on its own category. A command string the bash
+//! grammar cannot parse at all is refused by the shared parse before this layer sees a segment;
+//! cmd-only shapes (`if exist x ( … )`, `for %i in (…) do …`) are refused that way, since no
+//! cmd.exe parser is added.
 //!
 //! # Matching
 //!
-//! Verb matching is case-insensitive, extension-insensitive, aware of
-//! path-qualified spellings and of cmd's glued switch ([`verb_key`],
-//! [`split_glued_switch`]): `C:\Windows\System32\FORMAT.COM`, `"C:\Program
-//! Files\x\del.exe"`, `format` and `del/q` name the same verb as their plain
-//! spellings — a word carrying a path separator names a program only through a
-//! known executable extension.
+//! Verb matching is case-insensitive, extension-insensitive, aware of path-qualified spellings and
+//! of cmd's glued switch ([`verb_key`], [`split_glued_switch`]): a word carrying a path separator
+//! names a program only through a known executable extension.
 //!
-//! A path word is read only where cmd.exe and the bash parse the guard reads
-//! agree on the operand; a disagreement the layer models is refused
-//! fail-closed:
+//! A path word is read only where cmd.exe and the bash parse agree on the operand; every
+//! disagreement modelled here is refused fail-closed:
 //!
-//! - whitespace — literal or arriving from a `%VAR%`, since cmd expands before
-//!   it tokenises — is one operand only when double-quoted. cmd quotes with `"`
-//!   alone, so a single-quoted OPERAND is ordinary text and is refused; a VERB
-//!   word is judged under the literal name the shared balanced-quote strip reads
-//!   on both platforms ([`verb_key`]) — `'del' C:\ws\x.txt` is refused while
-//!   `'del' "%TEMP%\x.txt"` stays a temp write, so the quotes hide nothing;
-//! - an unquoted `,`/`=`/`;` is an argument delimiter to cmd.exe (several of its
-//!   internal commands split their ARGUMENTS at it), while `&`/`|`/`<`/`>` are its
-//!   separators and redirects — a spelling the bash parse reads as one word only
-//!   through a `\` escape, where cmd.exe still splits or redirects the operand.
-//!   Behind a switch the same delimiter is refused outright
-//!   ([`glued_delimiter_switch`]): cmd.exe splits the token there and hands the
-//!   text behind it to the verb as another argument, so the token is either a
-//!   switch the gate drops or one fused word it cannot parse — never the operand
-//!   cmd would hand over;
-//! - `*`/`?`/`~` (a glob the program reading the path expands), `^` (cmd's
-//!   escape, which hides a character the layer must see) and `!` (the interpreter
-//!   this shell starts has delayed expansion off, but `setlocal
-//!   enabledelayedexpansion` inside a command, or a nested interpreter the command
-//!   starts, is not covered) anywhere in the expanded text;
-//! - every relative spelling: no relative path OPERAND is provable (see
-//!   below), so the temp gate accepts absolute paths only.
+//! - whitespace — literal or from a `%VAR%`, since cmd expands before it tokenises — is one
+//!   operand only when double-quoted. cmd quotes with `"` alone, so a single-quoted OPERAND is
+//!   ordinary text and is refused; a VERB word is judged under the literal name the shared
+//!   balanced-quote strip reads on both platforms.
+//! - an unquoted `,`/`=`/`;` is an argument delimiter to cmd.exe while `&`/`|`/`<`/`>` are its
+//!   separators and redirects — a spelling the bash parse reads as one word only through a `\`
+//!   escape, where cmd.exe still splits or redirects. Behind a switch the delimiter is refused
+//!   outright ([`glued_delimiter_switch`]).
+//! - `*`/`?`/`~`, `^` (cmd's escape, hiding a character the layer must see) and `!` (delayed
+//!   expansion is off here, but `setlocal enabledelayedexpansion` or a nested interpreter is not
+//!   covered) anywhere in the expanded text.
+//! - every relative spelling: no relative path OPERAND is provable, so the temp gate takes absolute
+//!   paths only.
 //!
-//! A `;`-split line is refused whole, which is not a path-word rule: cmd.exe
-//! keeps one line, and several of its internal commands split their ARGUMENTS at
-//! the `;`, so the fragment the bash parse reads as a second command would become
-//! an extra operand of the first (`del %TEMP%\a;C:\ws\x.exe`). cmd.exe has no
-//! comment syntax either, so a `#` is an ordinary character to it: `echo hi # &
-//! del C:\ws\x.txt` is a comment for the bash parse and two commands for cmd.
-//! A heredoc is refused outright: this platform has no text block at all, so a
-//! `<<` is two input redirections to it, and the body's later lines would be
-//! commands of their own here — lines this guard never read as commands.
-//! All three are checked once, over the whole tree ([`check_line`]) — each is a
-//! property of the LINE rather than of a nesting position, so all three also hold
-//! inside a substituted command, a parenthesised group, a function body, a case
-//! branch and a pipeline member. They are also the one rule BOTH modes decide: the
-//! read-only guard reaches them inside its own walk, and the unrestricted mode —
-//! which has no walk to reach them through — through
-//! [`super::check_line_divergences`], so both modes refuse the same lines in the
-//! same words. That is why their message opens with the shared [`REFUSAL_FRAME`]
-//! rather than the guard's own mode-naming one.
+//! A `;`-split line is refused whole: cmd.exe keeps one line and several internal commands split
+//! their ARGUMENTS at the `;`, so the fragment the bash parse reads as a second command would
+//! become an extra operand of the first. `#` is ordinary text to cmd, so `echo hi # & del
+//! C:\ws\x.txt` is a comment for the bash parse and two commands for cmd. A heredoc is refused
+//! outright — this platform has no text block, so `<<` is two input redirections and the body's
+//! later lines would be commands of their own. All three are properties of the LINE, checked once
+//! over the whole tree ([`check_line`]), and both modes decide them (the unrestricted mode through
+//! [`super::check_line_divergences`]), which is why their message opens with [`REFUSAL_FRAME`].
 //!
-//! The line breaks of a command text are read by the shell itself
-//! ([`crate::tools::shell::windows_line`]) before this guard is consulted: in
-//! read-only mode — the mode this guard is the reader of — a break this platform's
-//! reader and the execution would read differently (an odd run of `\` before one, a
-//! break inside a quoted word, a caret over a character this guard reads as an
-//! operator) is refused whole there, because this guard reads the ORIGINAL text
-//! through the bash grammar while the execution reads what actually runs, and a shape
-//! the two read differently must never run. A break with nothing after it is the one
-//! such shape this reading does not refuse: nothing but the platform's own separators
-//! follows it, so the text is run as the line before the break — the reading a command
-//! with no break at all has always had here. Two breaks are left differing on purpose:
-//! this one, which neither reader can find a command in, and a caret-continued one,
-//! whose reading is this platform's own.
+//! Line breaks are read by the shell itself ([`crate::tools::shell::windows_line`]) first: in
+//! read-only mode a break the platform reader and the execution would read differently (an odd run
+//! of `\`, a break inside a quoted word, a caret over an operator) is refused whole. A break with
+//! nothing after it is the one such shape not refused — the text runs as the line before it.
 //!
 //! # Accepted limits (settled, not chased)
 //!
-//! Each is recorded as a limit rather than chased:
+//! - wrappers and other interpreters are NOT chased, and on Windows they are idiomatic: `cmd /c …`,
+//!   `powershell`/`pwsh`, `start`, `call`, `mshta`, `rundll32`, `forfiles` (the sanitation
+//!   temp-cleanup task uses it), `wmic`, `cscript`/`wscript`.
+//! - a VERB spelled through cmd's escape (`d^el`) or variable syntax (`%DEL%`), and a decorated or
+//!   trailing-dot name (`del.`, `format.com.`), match no table and pass; an OPERAND carrying the
+//!   same characters is refused instead.
+//! - a word escaping a separator or redirect (`dir \& del C:\ws\x.exe`) is admitted unless it is a
+//!   path OPERAND of a verb the layer reads.
+//! - a command on no table passes — the same "not a complete account" contract the unix tables
+//!   have. The writers among them are the sharp edge: `certutil`, `sort`, and one that picks its
+//!   own destination from a lone source (`makecab C:\ws\x.txt`).
+//! - a path-qualified known verb with forward slashes and no extension reaches no Windows table:
+//!   [`verb_key`] reads a separator-carrying word as a program only through a known extension, so
+//!   the shared dispatch judges the basename cmd.exe would resolve ([`dispatch_word`]) —
+//!   deliberately, since that fallback keeps `/usr/bin/rm` a verb on unix.
+//! - an OPERAND carrying a `%…%` outside `[A-Za-z0-9_]` is read as literal text: cmd resolves one
+//!   of that shape, so a defined name would put the write outside temp at runtime.
 //!
-//! - wrappers and other interpreters are NOT chased, and on Windows they are
-//!   idiomatic: `cmd /c …` (the shell itself — the Windows counterpart of the
-//!   unix limit for a command handed to `sh -c`), `powershell`/`pwsh`, `start`,
-//!   `call`, `mshta`, `rundll32`, `forfiles`, `wmic`, and the scripting and
-//!   execution hosts `cscript`/`wscript`. (`forfiles` is what the sanitation
-//!   temp-cleanup task uses to report the newest file in a tree, so refusing it
-//!   would break a documented read-only workflow.)
-//! - a VERB word spelled through cmd's escape (`d^el`, `^del`) or its variable
-//!   syntax (`%DEL%`, `!DEL!`), and a decorated or trailing-dot name (`del.`,
-//!   `format.com.`), match no table and pass. An OPERAND carrying the same
-//!   characters is refused instead, the unexpanded `%…%` form below excepted.
-//! - a word that escapes a separator or a redirect (`dir \& del C:\ws\x.exe`,
-//!   `whoami \> C:\ws\out.txt`) is admitted unless it is a path OPERAND of a
-//!   verb the layer reads: cmd.exe reads the backslash as an ordinary character
-//!   and then splits or redirects at the character behind it, while the bash
-//!   parse keeps one word.
-//! - a command on no table at all passes — the same "not a complete account"
-//!   contract the unix tables have. The writers among them are the sharp edge:
-//!   `certutil` and `sort` are named by no rule here, and neither is a command
-//!   that picks its own destination when only a source is given (`makecab
-//!   C:\ws\x.txt` defaults its output into cmd's own directory, the unmodelled
-//!   one the paragraph after this list describes). The layer models the mutator
-//!   families it knows and discloses the rest.
-//! - a path-qualified spelling of a known verb written with forward slashes and
-//!   no executable extension reaches no Windows table: [`verb_key`] reads a
-//!   separator-carrying word as a program only through a known executable
-//!   extension, and the bash parse keeps the whole word literal, so the shared
-//!   dispatch judges the basename cmd.exe would resolve instead
-//!   ([`dispatch_word`]) — deliberately, since the same fallback is what keeps a
-//!   `/usr/bin/rm`-shaped word a verb on unix. A name the shared tables carry is
-//!   therefore still refused (`C:/Windows/System32/rm C:\ws\x.txt`), while a
-//!   Windows-only one passes (`C:/Windows/System32/del C:\ws\x.txt`, and likewise
-//!   `erase`, `rd`, `md`, `move`, `copy`, `xcopy`, `ren`, `replace`, `mklink` and
-//!   even the denied `format`). The same spelling with backslashes is the shared
-//!   classifier's unprovable word and is refused.
-//! - an OPERAND carrying a `%…%` whose name is not `[A-Za-z0-9_]` (`del
-//!   "%TEMP%\%中%\x.txt"`) is read as literal text: the model follows no such
-//!   variable, yet cmd resolves one of that shape, so a defined name would put
-//!   the write outside temp at runtime.
+//! cmd resolves a relative operand against its own directory, which is not modelled — and not
+//! reliably outside the temp roots, since the temp cleaner runs its shell in a workspace built at
+//! the private temp root. Writes under temp therefore name it absolutely: a literal path or
+//! `%TMP%`/`%TEMP%` (same single source as the accepted roots), quoted when it carries whitespace.
+//! A daemon temp path carrying `~`, `!` or `^` makes even the literal spelling unprovable — the
+//! accepted over-rejection direction. The cd family writes nothing and is allowed; a fused target
+//! (`cd..\..`) is unprovable and refused.
+//! Only the temp variables are modelled, resolving against the bindings the shells are handed;
+//! `set` rebinding one is refused, since the runtime `%TEMP%` would then name a location the model
+//! still reads as the daemon temp root. Any other `NAME=value` is not tracked, so a later `%NAME%`
+//! operand is refused — cmd.exe cannot run `NAME=value` at all.
 //!
-//! cmd resolves a relative operand against its own directory, which is not
-//! modelled — and that directory is not reliably outside the temp roots, because
-//! the temp cleaner runs its shell in a workspace built at the private temp
-//! root. Writes under temp therefore name it absolutely: a literal path, or
-//! `%TMP%`/`%TEMP%`, the variables the shells are handed (from the same single
-//! source as the accepted roots). A temp path that carries whitespace must be
-//! quoted, exactly as cmd requires. A daemon temp path that itself carries one
-//! of the refused characters (`~`, `!`, `^` — an 8.3 short-name component, say)
-//! makes even the literal spelling unprovable, which is the accepted
-//! over-rejection direction, but it is the one rule here that can deny a
-//! legitimate temp write. The cd family itself is allowed and not
-//! modelled further: it writes nothing, a target fused with a separator
-//! (`cd..\..`, `cd\Users`) is an unprovable word and is refused, and the spaced
-//! spelling (`cd ..`) works.
+//! `robocopy`/`xcopy` are gated on the destination only: a tree copy INTO temp from anywhere is
+//! allowed, and `/MIR`/`/PURGE` deletions inside that destination are part of the grant;
+//! [`COPY_DENIED_SWITCHES`] is the known set reaching beyond it. A copy with a single path argument
+//! is refused — cmd's destination is optional and defaults to its own directory
+//! ([`destination_under_temp`]); `move` and `replace` share that ([`CWD_DESTINATION_VERBS`]). A
+//! switch-SHAPED argument carrying a path signal (`/ws/b.txt`) is read as an operand, since cmd
+//! accepts `/` as a separator; one carrying none stays a switch. `ren`'s second operand is a bare
+//! name cmd anchors on the FIRST operand's directory, so the temp grant there is unreachable.
 //!
-//! Only the temp variables are modelled, and they resolve against the very
-//! bindings the shells are handed. `set` rebinding one of them is refused: the
-//! runtime `%TEMP%` would then name a location the model still reads as the
-//! daemon temp root. Any other `NAME=value` (through `set` or the shell's own
-//! syntax, which cmd.exe cannot run) is not tracked, so a later `%NAME%` operand
-//! is unresolvable and refused. The bindings the shared unix assignment path
-//! records are not consulted: cmd.exe cannot execute `NAME=value` at all, so
-//! resolving through one would approve a path the runtime never builds.
+//! The shared tables are matched case-insensitively on Windows (`TAR`, `shutdown.exe` all dispatch)
+//! while the unix verdicts stay case-sensitive — a settled limit of the shared tables rather than a
+//! gap this layer's fold closes.
 //!
-//! `robocopy`/`xcopy` are gated on the destination only, so a tree copy INTO
-//! temp from anywhere is allowed and `/MIR`'s and `/PURGE`'s deletions inside
-//! that destination are accepted as part of the same grant;
-//! [`COPY_DENIED_SWITCHES`] is the known set of copy switches that reach beyond
-//! that grant, and a switch outside it keeps the destination-only grant. A copy
-//! with a single path argument is refused: cmd's destination is optional and
-//! then defaults to cmd's own directory, which read-only mode never proved is
-//! the accepted location (see [`destination_under_temp`]). `move` and `replace`
-//! have the same optional destination and are refused the same way when they name
-//! fewer than two paths ([`CWD_DESTINATION_VERBS`]). A switch-SHAPED
-//! argument carrying a path signal (`/ws/b.txt`) is read as an operand — cmd.exe
-//! accepts `/` as a path separator — and must satisfy the gate like any other
-//! path; one carrying no path signal (`/s`, `/ws`) stays a switch and is
-//! dropped from the gate. A switch-shaped token carrying cmd's parameter
-//! delimiter is refused before any of that ([`glued_delimiter_switch`]).
-//! `ren`'s second operand is a bare name that cmd anchors on the FIRST operand's
-//! directory, so the temp grant here is effectively unreachable: the
-//! fully-qualified spelling the gate accepts (`ren %TEMP%\a.txt %TEMP%\b.txt`) is
-//! one cmd refuses to run, while the spelling cmd runs (`ren %TEMP%\a.txt b.txt`)
-//! is refused as a workspace write.
-//! The shared tables are matched case-insensitively on Windows (`TAR`,
-//! `shutdown.exe` and `Git push` all dispatch), while the unix verdicts stay
-//! case-sensitive: a destructive verb written in another case is not recognised
-//! there, which is a settled limit of the shared tables rather than a gap this
-//! layer's fold closes.
-//!
-//! # The cmd.exe reading this layer applies
-//!
-//! The layer reads cmd.exe's own behaviour: how it splits and quotes arguments (a
-//! `\` before a space is ordinary text for cmd but an escape for the bash parse the
-//! guard reads), its parameter delimiters and separators, its glued switches, its
-//! device names, its delayed `!VAR!`/caret escapes and its case-insensitive verb
-//! dispatch. Every verdict the layer reaches rests on that reading — the refusals
-//! under `# Matching` and the limits under `# Accepted limits` alike. What it reads
-//! is: Win32 strips a trailing dot or space off a name component; cmd.exe resolves a
-//! bare `;`-bearing word the way it resolves the fragments the guard splits it into;
-//! a `%…%` outside the name grammar stays literal; this platform has no text block
-//! at all, so a `<<` has none to reach; an omitted `move`/`replace` destination
-//! defaults to cmd's own directory ([`CWD_DESTINATION_VERBS`]); and `ren`/`mklink`
-//! refuse an omitted second operand rather than defaulting it.
+//! Every verdict rests on cmd.exe's own reading: argument splitting and quoting (a `\` before a
+//! space is ordinary text for cmd but an escape for the bash parse), parameter delimiters and
+//! separators, glued switches, device names, delayed `!VAR!`/caret escapes, case-insensitive verb
+//! dispatch. Win32 strips a trailing dot or space off a name component; a `%…%` outside the name
+//! grammar stays literal; an omitted `move`/`replace` destination defaults to cmd's own directory;
+//! `ren`/`mklink` refuse an omitted second operand.
 
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -219,7 +123,7 @@ use super::super::{REFUSAL_FRAME, framed_refusal};
 use super::scan;
 use super::{CheckContext, ShellPlatform, rejection_message};
 
-// ── Verdict ──────────────────────────────────────────────────────────────
+// Verdict
 
 /// Verdict of the Windows layer for one command segment.
 pub(super) enum WinVerdict {
@@ -232,7 +136,7 @@ pub(super) enum WinVerdict {
     Pass,
 }
 
-// ── Verb tables ──────────────────────────────────────────────────────────
+// Verb tables
 
 /// Executable extensions stripped from a verb word before matching.
 const VERB_EXTENSIONS: &[&str] = &["exe", "com", "bat", "cmd"];
@@ -269,38 +173,29 @@ const TEMP_GATED_VERBS: &[&str] = &[
     "del", "erase", "rd", "rmdir", "md", "mkdir", "move", "ren", "rename", "mklink", "replace",
 ];
 
-/// Temp-gated verbs whose destination cmd.exe may omit, defaulting it to its own
-/// process directory — the unmodelled cwd the module doc describes. They need the
-/// rule the copy-shaped verbs get from [`destination_under_temp`]: a write whose
-/// destination is not proven stays refused. `ren`/`mklink` error out without
-/// their second operand, so only `move` and `replace` qualify.
+/// Temp-gated verbs whose destination cmd.exe may omit, defaulting it to its own process
+/// directory — the unmodelled cwd. They need the rule the copy verbs get from
+/// [`destination_under_temp`]: a write whose destination is not proven stays refused.
+/// `ren`/`mklink` error out without their second operand, so only these two qualify.
 const CWD_DESTINATION_VERBS: &[&str] = &["move", "replace"];
 
 /// Copy-shaped mutators: only the destination (the last path argument) must be
 /// under temp — sources are read-only, mirroring the unix `cp` grant.
 const TEMP_GATED_DESTINATION_VERBS: &[&str] = &["copy", "xcopy", "robocopy"];
 
-/// The known switches of the copy-shaped verbs that touch something other than
-/// the destination: the source tree (`/MOVE`, `/MOV` delete what was copied),
-/// the registry (`/REG`), an arbitrary log file (`/LOG:`, `/UNILOG:`), file
-/// times (`/TIMFIX`), the never-terminating monitor modes (`/MOT:`, `/MON:`,
-/// which re-run the copy until interrupted) and the source files' archive
-/// attribute (`xcopy /M`). Refused outright — the monitor modes included
-/// although they delete nothing by themselves, because they are not a read-only
-/// shape. Not a family-closed list: a switch outside it keeps the
-/// destination-only grant.
+/// Copy switches that touch something other than the destination: the source tree (`/MOVE`),
+/// the registry (`/REG`), an arbitrary log file (`/LOG:`, `/UNILOG:`), file times (`/TIMFIX`),
+/// the never-terminating monitor modes (`/MOT:`, `/MON:`) and the archive attribute (`/M`).
+/// Refused outright — the monitor modes included, since they are not a read-only shape. Not
+/// family-closed: a switch outside it keeps the destination-only grant.
 const COPY_DENIED_SWITCHES: &[&str] = &[
     "move", "mov", "reg", "log", "unilog", "m", "mot", "mon", "timfix",
 ];
 
-/// Attribute/ACL/encryption tools: the list form and its path operands are
-/// read-only, while a switch (`/grant`, `/c`, `/w`) or an attribute operator
-/// (`+r`, `-h`) is a mutation.
-///
-/// The read-only spelling cannot be separated from the mutating one
-/// unambiguously — `attrib /s` and `icacls /T` only list, but the same shape
-/// carries `attrib +r` and `icacls /grant` — so any switch or operator refuses
-/// the tool rather than risk a mutating spelling.
+/// Attribute/ACL/encryption tools: the list form is read-only, while a switch (`/grant`, `/c`,
+/// `/w`) or an attribute operator (`+r`, `-h`) is a mutation. The two cannot be separated
+/// unambiguously — `attrib /s` only lists, but the same shape carries `attrib +r` — so any
+/// switch or operator refuses the tool.
 const LIST_ONLY_VERBS: &[&str] = &["attrib", "icacls", "cacls", "cipher", "compact"];
 
 /// Verbs whose read-only spelling is a named subcommand/switch: the FIRST
@@ -311,42 +206,26 @@ const QUERY_VERBS: &[(&str, &[&str])] = &[
     ("schtasks", &["/query"]),
 ];
 
-/// cmd's clock builtins: bare (or `/t`) they only print, an operand sets the
-/// machine clock. Matched on the segment's FIRST word rather than on
-/// `verb_idx`, because the shared resolver reads a leading `time` as the bash
-/// reserved word and lands the index on its operand (`time 12:00`), while
+/// cmd's clock builtins: bare (or `/t`) they only print, an operand sets the machine clock.
+/// Matched on the segment's FIRST word rather than `verb_idx`: the shared resolver reads a
+/// leading `time` as the bash reserved word and lands on its operand (`time 12:00`), while
 /// cmd.exe runs its builtin on the whole line.
 const CLOCK_VERBS: &[&str] = &["time", "date"];
 
-/// cmd.exe's internal commands that no other table covers: `cd`/`chdir` and
-/// `pushd`/`popd` (allowed outright by [`check_segment`], whatever is glued to
-/// them) and `set`. The rest of the `cmd /?` list either already sits in a
-/// [`VERB_TABLES`] entry or has no verdict the glue split could change — `del`,
-/// `date` and `assoc` are the table verbs' own spellings.
+/// cmd.exe's internal commands no other table covers: `cd`/`chdir`, `pushd`/`popd` (allowed
+/// outright by [`check_segment`], whatever is glued to them) and `set`.
 ///
-/// The four cwd spellings are one family HERE because the guard only needs to
-/// admit them; the engine's own reading of the same family differs by what it
-/// does with each — `grep_engine::is_cd_segment` recognises all four so none is
-/// left with a stale tracked cwd, while `grep_engine::resolve_cd` tracks
-/// `cd`/`chdir`/`pushd` as navigation and refuses `popd` fail-closed, since the
-/// directory it returns to lives only in the pushed stack that model does not
-/// keep. A change to either side — the family, or what a member of it does to
-/// the cwd — is checked against the other.
+/// The four cwd spellings are one family HERE because the guard only admits them; the engine
+/// reads the same family by what each does — `grep_engine::resolve_cd` tracks `cd`/`chdir`/`pushd`
+/// and refuses `popd` fail-closed, since the directory it returns to lives only in a stack that
+/// model does not keep. A change to either side is checked against the other.
 const INTERNAL_VERBS: &[&str] = &["cd", "chdir", "popd", "pushd", "set"];
 
-// ── Verb key ─────────────────────────────────────────────────────────────
-
-/// Split cmd.exe's glued switch off a raw command word: an internal command
-/// takes its switches with no separating space (`del/q C:\ws\x.txt` runs
-/// `del /q …`, `rd/s/q X` runs `rd /s /q X`). The split is what makes such a
-/// verb readable at all: left whole, the word is a separator-carrying spelling
-/// with no known executable extension — not a plain command name — so the
-/// mutator behind it would never reach its table. The word is split only when
-/// the text before the first `/` names a verb the layer acts on
-/// ([`is_glue_splittable`]), so a path-qualified spelling keeps its basename
-/// (`subdir/rm.exe` stays the program `rm.exe`, `C:/Windows/format.com` the
-/// program `format.com`). An `@` prefix stays on the head — [`verb_key`] strips
-/// it.
+/// Split cmd.exe's glued switch off a raw command word: an internal command takes its switches
+/// with no separating space (`del/q C:\ws\x.txt` runs `del /q …`). Left whole, the word is a
+/// separator-carrying spelling with no known executable extension, so the mutator behind it would
+/// never reach its table. Split only when the text before the first `/` names a verb the layer
+/// acts on ([`is_glue_splittable`]), so `subdir/rm.exe` keeps its basename. An `@` prefix stays.
 fn split_glued_switch(word: &str) -> (&str, Vec<&str>) {
     let bare = word.strip_prefix('@').unwrap_or(word);
     let Some((head, _)) = bare.split_once('/') else {
@@ -359,11 +238,10 @@ fn split_glued_switch(word: &str) -> (&str, Vec<&str>) {
     (&word[..at], switch_cluster(&word[at..]))
 }
 
-/// The switch tokens of a glued cluster: cmd starts a new switch at every `/`
-/// (`rd/s/q X` is `rd /s /q X`). The split is load-bearing, not cosmetic: a
-/// cluster left whole carries a `/`, which [`switch_is_operand`] reads as the
-/// path signal of a `/ws/b.txt`-shaped operand — the switches would then have to
-/// satisfy the temp gate and every glued invocation would be refused.
+/// The switch tokens of a glued cluster: cmd starts a new switch at every `/` (`rd/s/q X` is
+/// `rd /s /q X`). Load-bearing, not cosmetic: a cluster left whole carries a `/`, which
+/// [`switch_is_operand`] reads as the path signal of a `/ws/b.txt`-shaped operand, so every
+/// glued invocation would be refused.
 fn switch_cluster(glue: &str) -> Vec<&str> {
     let mut switches = Vec::new();
     let mut start = 0;
@@ -375,12 +253,10 @@ fn switch_cluster(glue: &str) -> Vec<&str> {
     switches
 }
 
-/// The flat verb tables the glue split consults. A table whose verbs may take a
-/// glued switch belongs here, or its glued spellings silently miss the split
-/// ([`is_glue_splittable`]); [`CWD_DESTINATION_VERBS`] is not listed because its
-/// verbs all sit on [`TEMP_GATED_VERBS`] as well, so they are covered through
-/// that entry. [`QUERY_VERBS`] pairs a verb with its permitted spellings, so
-/// [`is_glue_splittable`] consults it separately.
+/// The flat verb tables the glue split consults. A table whose verbs may take a glued switch
+/// belongs here, or its glued spellings silently miss the split ([`is_glue_splittable`]);
+/// [`CWD_DESTINATION_VERBS`] is covered through [`TEMP_GATED_VERBS`], and [`QUERY_VERBS`] pairs a
+/// verb with its spellings, so [`is_glue_splittable`] consults it separately.
 const VERB_TABLES: &[&[&str]] = &[
     DENIED_VERBS,
     TEMP_GATED_VERBS,
@@ -390,13 +266,10 @@ const VERB_TABLES: &[&[&str]] = &[
     INTERNAL_VERBS,
 ];
 
-/// True when a command word's leading text names a verb this layer acts on, and
-/// so may carry a glued switch. Splitting the token is cmd.exe's own behaviour
-/// for its internal commands (see the module doc's `# The cmd.exe reading this
-/// layer applies`); the table verbs that are external programs (`format`,
-/// `taskkill`, `xcopy`, …) are split the same way, and over-rejection is the
-/// accepted failure direction. Balanced quotes are stripped first, so a quoted
-/// head (`"del"/q`) is read as the name cmd.exe resolves.
+/// True when a command word's leading text names a verb this layer acts on, and so may carry a
+/// glued switch. Splitting is cmd.exe's own behaviour for its internal commands; the external
+/// table verbs (`format`, `taskkill`, `xcopy`, …) are split the same way, over-rejection being
+/// the accepted failure direction. Balanced quotes are stripped first (`"del"/q`).
 fn is_glue_splittable(head: &str) -> bool {
     let head = scan::strip_quoted_word(head);
     VERB_TABLES
@@ -407,34 +280,23 @@ fn is_glue_splittable(head: &str) -> bool {
             .any(|(name, _)| name.eq_ignore_ascii_case(head))
 }
 
-/// The guard's verb key for a raw command word: the glued switch is split off
-/// ([`split_glued_switch`]), balanced outer quotes stripped, cmd's `@` no-echo
-/// prefix dropped, the directory prefix dropped on `\` or `/`, a known
-/// executable extension removed, ASCII-lowercased
-/// (`C:\Windows\System32\FORMAT.COM` → `format`, `"C:\Program Files\x\del.exe"`
-/// → `del`, `@del` → `del`, `del/q` → `del`). A word carrying a separator names
-/// a program only through a known executable extension; without one it is not a
-/// plain command name. `None` when the word is not a plain command name — a
-/// `$`/`%`/`!` word (indirection), a glob, a separator-carrying word with no
-/// executable extension, or an empty/still-quoted/exotic spelling — so the
-/// caller falls through to the shared dispatch, which either refuses the word as
-/// unprovable or matches its own tables against the folded basename. It is never
-/// this layer's deny list that decides such a word (an accepted limit).
-/// Deliberate drift seam: the shared `command_word_basename`/
-/// `canonical_command` pair keeps selecting the shell's output profile from the
-/// unplatformed spelling, so a later platform-aware change there would make this
-/// deny list and the profile dispatch disagree.
+/// The guard's verb key for a raw command word: glued switch split off ([`split_glued_switch`]),
+/// balanced outer quotes stripped, cmd's `@` no-echo prefix dropped, directory prefix dropped on
+/// `\` or `/`, known executable extension removed, ASCII-lowercased (`FORMAT.COM` → `format`,
+/// `"C:\Program Files\x\del.exe"` → `del`, `del/q` → `del`). `None` when the word is not a plain
+/// command name — a `$`/`%`/`!` word, a glob, a separator-carrying word with no executable
+/// extension, or an empty/still-quoted/exotic spelling — so the caller falls through to the shared
+/// dispatch, which refuses it as unprovable or matches its own tables against the folded basename.
+/// Deliberate drift seam: the shared `command_word_basename`/`canonical_command` pair keeps
+/// selecting the shell's output profile from the unplatformed spelling.
 pub(super) fn verb_key(word: &str) -> Option<String> {
     verb_key_of(split_glued_switch(word).0)
 }
 
-/// The command word the shared dispatch matches its tables against on
-/// `platform`.
-///
-/// On Windows cmd.exe dispatches case-insensitively and ignores the executable
-/// extension, so `raw` is read through [`verb_key`] — and, for a word the layer
-/// cannot read as a plain command name (a variable, a quoted spelling), through
-/// the lowercased `fallback`. On unix `fallback` is returned unchanged: the
+/// The command word the shared dispatch matches its tables against on `platform`: on Windows
+/// cmd.exe dispatches case-insensitively and ignores the extension, so `raw` is read through
+/// [`verb_key`] — and, for a word that is not a plain command name (a variable, a quoted
+/// spelling), through the lowercased `fallback`. On unix `fallback` is returned unchanged: the
 /// shared tables stay case-sensitive there.
 pub(super) fn dispatch_word(platform: ShellPlatform, raw: &str, fallback: String) -> String {
     if platform == ShellPlatform::Windows {
@@ -481,7 +343,7 @@ fn verb_key_of(word: &str) -> Option<String> {
     Some(stem.to_ascii_lowercase())
 }
 
-// ── Lexical Windows path model ───────────────────────────────────────────
+// Lexical Windows path model
 
 /// Split a folded Windows path into its prefix (`c:` / `\\server\share` / `""`)
 /// and the remaining segment text. A `\\`-leading path with an empty server or
@@ -554,21 +416,18 @@ fn normalize(path: &str) -> Option<String> {
     Some(out)
 }
 
-/// The inner text of a balanced pair of surrounding DOUBLE quotes. cmd.exe
-/// quotes only with `"`, so a single-quoted word keeps its quotes (and the
-/// lexical model then fails closed on it).
+/// The inner text of a balanced pair of surrounding DOUBLE quotes. cmd.exe quotes only with
+/// `"`, so a single-quoted word keeps its quotes and the lexical model fails closed on it.
 fn strip_double_quotes(word: &str) -> Option<&str> {
     word.strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'))
         .filter(|inner| !inner.contains('"'))
 }
 
-/// The text cmd.exe delivers for one word: balanced double quotes stripped, the
-/// word as written otherwise. `None` when the word carries a quote character cmd
-/// does not interpret — a single-quoted word is ordinary text whose characters
-/// are not the ones the layer must judge, and an unbalanced `"` is not a quoted
-/// argument — so every classifier that would read it as a switch or a name fails
-/// closed instead.
+/// The text cmd.exe delivers for one word: balanced double quotes stripped, the word as written
+/// otherwise. `None` when the word carries a quote character cmd does not interpret — a
+/// single-quoted word is ordinary text whose characters are not the ones to judge, and an
+/// unbalanced `"` is not a quoted argument — so every classifier reading it fails closed.
 fn cmd_token(word: &str) -> Option<&str> {
     match strip_double_quotes(word) {
         Some(inner) => Some(inner),
@@ -577,30 +436,26 @@ fn cmd_token(word: &str) -> Option<&str> {
     }
 }
 
-/// The absolute, unfolded spelling of a path operand: balanced double quotes
-/// stripped, `%VAR%` expanded, `/` folded to `\`. `None` for every spelling
-/// whose operand the layer cannot prove — the classes and their reasons are in
-/// the module doc's `# Matching`.
+/// The absolute, unfolded spelling of a path operand: balanced double quotes stripped, `%VAR%`
+/// expanded, `/` folded to `\`. `None` for every spelling whose operand the layer cannot prove —
+/// the classes and their reasons are in the module doc's `# Matching`.
 fn resolve_raw(word: &str, ctx: &CheckContext) -> Option<String> {
     let raw = cmd_token(word)?;
-    // `cmd_token` strips only a balanced double-quoted pair, so a delivered text
-    // differing from the word is exactly "cmd read this as one quoted token".
+    // `cmd_token` strips only a balanced double-quoted pair, so a delivered text differing from
+    // the word is exactly "cmd read this as one quoted token".
     let quoted = raw != word;
     if raw.is_empty() {
         return None;
     }
     let expanded = expand_percent_vars(raw, ctx)?.replace('/', "\\");
-    // A glob, cmd's `^` escape and `!`, its delayed expansion: the interpreter this
-    // shell starts has delayed expansion off, but `setlocal enabledelayedexpansion`
-    // inside a command, or a nested interpreter the command starts, is not covered —
-    // and `^` hides the character behind it in any case. None of them is a path the
-    // layer can prove.
+    // A glob, cmd's `^` escape and `!` delayed expansion: this shell starts with delayed expansion
+    // off, but `setlocal enabledelayedexpansion` or a nested interpreter is not covered — and `^`
+    // hides the character behind it anyway. None is a path the layer can prove.
     if expanded.contains(['*', '?', '~', '^', '!']) {
         return None;
     }
-    // cmd expands before it tokenises, so a delimiter or separator arriving from
-    // a `%VAR%` value splits the operand exactly as a literal one does; only the
-    // double-quoted spelling is one operand for both readers.
+    // cmd expands before it tokenises, so a delimiter or separator arriving from a `%VAR%` splits
+    // the operand as a literal one does; only the double-quoted spelling is one operand for both.
     if !quoted
         && (expanded.chars().any(char::is_whitespace)
             || expanded.contains([',', '=', ';', '&', '|', '<', '>']))
@@ -630,19 +485,17 @@ fn under_roots(path: &str, ctx: &CheckContext) -> bool {
     })
 }
 
-/// Compare a `canonicalize` result against the accepted temp roots: the verbatim
-/// prefix is dropped and the string goes through [`normalize`] — `canonicalize`
-/// returns the on-disk case, so a raw comparison never matches the lowercased
-/// roots.
+/// Compare a `canonicalize` result against the accepted temp roots: the verbatim prefix is
+/// dropped and the string goes through [`normalize`] — `canonicalize` returns the on-disk case, so
+/// a raw comparison never matches the lowercased roots.
 fn canonical_under_roots(canonical: &str, ctx: &CheckContext) -> bool {
     normalize(&strip_verbatim(canonical)).is_some_and(|path| under_roots(&path, ctx))
 }
 
-/// Reparse-point (junction/symlink) escape check: the canonical location of
-/// `path` — of its nearest existing ancestor when the leaf is still new — must
-/// still be under an accepted temp root, the analogue of the unix
-/// `is_path_under_temp` parent walk. Nothing this host can resolve (a
-/// Windows-shaped path off Windows) leaves the lexical verdict standing.
+/// Reparse-point (junction/symlink) escape check: the canonical location of `path` — of its
+/// nearest existing ancestor when the leaf is still new — must still be under an accepted temp
+/// root, the analogue of the unix `is_path_under_temp` parent walk. Nothing this host can resolve
+/// (a Windows-shaped path off Windows) leaves the lexical verdict standing.
 fn resolves_inside_temp(path: &str, ctx: &CheckContext) -> bool {
     let mut probe = PathBuf::from(path);
     loop {
@@ -651,9 +504,9 @@ fn resolves_inside_temp(path: &str, ctx: &CheckContext) -> bool {
         }
         match probe.parent() {
             // The empty-parent guard is load-bearing: off Windows
-            // `Path::new(r"C:\Temp\x").parent()` is `""`, and an empty path
-            // canonicalizes to the host cwd — which would reject every
-            // Windows temp path in the unit lane.
+            // `Path::new(r"C:\Temp\x").parent()`
+            // is `""`, and an empty path canonicalizes to the host cwd — rejecting every Windows
+            // temp path in the unit lane.
             Some(parent) if !parent.as_os_str().is_empty() && parent != probe => {
                 probe = parent.to_path_buf();
             }
@@ -683,24 +536,16 @@ fn strip_verbatim(canonical: &str) -> String {
         .to_string()
 }
 
-/// Expand cmd.exe's `%NAME%` references against the temp variables the shells
-/// are handed — the same single source as the accepted temp roots, so the name
-/// the layer resolves and the environment cmd gives the child cannot drift. The
-/// name matches case-insensitively; a name the layer does not bind fails closed
-/// — an unbound one expands to nothing and the empty expansion is not a provable
-/// path, while cmd's own `%USERPROFILE%`/`%CD%` resolve to values this model
-/// cannot see. A `%` with no partner, or with a non-name between, stays literal
-/// — an accepted limit; see the module doc.
+/// Expand cmd.exe's `%NAME%` references against the temp variables the shells are handed — the
+/// same single source as the accepted temp roots, so the name resolved and the environment cmd
+/// gives the child cannot drift. The name matches case-insensitively; a name the layer does not
+/// bind fails closed, since an unbound one expands to nothing while cmd's own `%USERPROFILE%`
+/// resolves to a value this model cannot see. A `%` with no partner, or with a non-name between,
+/// stays literal — an accepted limit.
 ///
-/// The pairing above is this reader's, and the interception reads the same
-/// character with a coarser rule of its own: `grep_engine::windows::has_percent_expansion`
-/// refuses any word carrying two `%` at all, whatever sits between them. That is
-/// a deliberate superset, not an older draft of this function — a served
-/// member's text rides its spec file and never reaches cmd.exe's command line,
-/// so the engine only needs to know whether an expansion could change what the
-/// program receives, while this reader must decide what the expansion IS (an
-/// operand path, or an unprovable one). The two readings answer different
-/// questions and are not to be reconciled into one.
+/// The interception reads the same character coarser (`has_percent_expansion` refuses any word
+/// carrying two `%`): a deliberate superset, since a served member's text never reaches cmd.exe's
+/// command line.
 fn expand_percent_vars(word: &str, ctx: &CheckContext) -> Option<String> {
     let mut out = String::with_capacity(word.len());
     let mut rest = word;
@@ -728,37 +573,31 @@ fn expand_percent_vars(word: &str, ctx: &CheckContext) -> Option<String> {
     Some(out)
 }
 
-/// True when `name` is a `%NAME%` reference cmd.exe would resolve: non-empty
-/// ASCII letters, digits and underscores.
+/// True when `name` is a `%NAME%` reference cmd.exe would resolve: non-empty ASCII letters,
+/// digits and underscores.
 fn is_var_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// The refusal for one of the whole-line divergences [`check_line`] decides: the
-/// shared frame names the refusal ([`REFUSAL_FRAME`]) rather than a mode, because
-/// these three are the one guard rule BOTH modes decide — read-only mode reaches
-/// them through the guard's own walk, the unrestricted mode through
-/// [`super::check_line_divergences`], where a frame claiming "Read-only mode"
-/// would be false. The text after the frame is the shared one
-/// ([`framed_refusal`]), so these refusals cannot read differently from the
-/// guard's own.
+/// The refusal for one of the whole-line divergences [`check_line`] decides: the shared frame
+/// names the refusal ([`REFUSAL_FRAME`]) rather than a mode, because these three are the one guard
+/// rule BOTH modes decide — a frame claiming "Read-only mode" would be false in the unrestricted
+/// mode. The text after the frame is the shared one ([`framed_refusal`]).
 fn refusal(cmd: &str, why: &str, suggestion: &str) -> String {
     framed_refusal(REFUSAL_FRAME, cmd, why, suggestion)
 }
 
-/// The whole-line Windows divergences — a comment, an unquoted `;` and a
-/// heredoc — checked once over the whole syntax tree, before the walk. Each is a
-/// property of the LINE for cmd.exe rather than of a nesting position (see the
-/// module doc), so this scan is the layer's only decision point for any of them:
-/// a rule hooked into the walker instead would police the positions that walker
-/// happens to visit and skip the rest.
+/// The whole-line Windows divergences — a comment, an unquoted `;` and a heredoc — checked once
+/// over the whole syntax tree, before the walk. Each is a property of the LINE for cmd.exe rather
+/// than of a nesting position, so this scan is the only decision point for any of them: a rule
+/// hooked into the walker instead would police the positions that walker happens to visit.
 pub(super) fn check_line(root: Node, src: &str, platform: ShellPlatform) -> Result<(), String> {
     if platform != ShellPlatform::Windows {
         return Ok(());
     }
-    // An explicit stack, not recursion: this walks the raw tree, whose depth is
-    // the command string's, and a guard that aborts on a deeply nested command
-    // is worse than one that over-rejects it.
+    // An explicit stack, not recursion: this walks the raw tree, whose depth is the command
+    // string's, and a guard that aborts on a deeply nested command is worse than one that
+    // over-rejects it.
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         match node.kind() {
@@ -797,11 +636,10 @@ pub(super) fn check_line(root: Node, src: &str, platform: ShellPlatform) -> Resu
     Ok(())
 }
 
-/// One command segment's Windows verdict. `words` are the bash-parsed words;
-/// `verb_idx` is the index the shared resolver found for the effective verb
-/// (cmd.exe has no pre-verb prefixes, but the shared `time`-prefix handling
-/// lands the index on the operand, which is what must be judged). `cmd` is the
-/// raw command text used in rejection messages.
+/// One command segment's Windows verdict. `words` are the bash-parsed words; `verb_idx` is the
+/// index the shared resolver found for the effective verb (cmd.exe has no pre-verb prefixes, but
+/// the shared `time`-prefix handling lands the index on the operand, which is what must be
+/// judged). `cmd` is the raw command text used in rejection messages.
 #[expect(clippy::too_many_lines)] // one branch per verb table, in refusal order
 pub(super) fn check_segment(
     words: &[&str],
@@ -809,12 +647,10 @@ pub(super) fn check_segment(
     cmd: &str,
     ctx: &CheckContext,
 ) -> WinVerdict {
-    // cmd also accepts switches glued to the command name (`del/q`, `time/t`,
-    // `set/a`), so the verb word's glue is split off and re-joined to the
-    // arguments, where every switch-consuming branch below sees it. The split
-    // and the key of the segment's first word are computed once: the clock check
-    // below and the main path both read that same word whenever the resolver
-    // landed the verb index on it.
+    // cmd also accepts switches glued to the command name (`del/q`, `time/t`, `set/a`), so the
+    // verb word's glue is split off and re-joined to the arguments, where every switch-consuming
+    // branch below sees it. The split and the first word's key are computed once: the clock check
+    // and the main path both read that same word whenever the resolver landed on it.
     let first = words.first().copied().unwrap_or_default();
     let (first_word, first_glue) = split_glued_switch(first);
     let first_key = verb_key(first_word);
@@ -847,20 +683,18 @@ pub(super) fn check_segment(
     let Some(verb) = verb else {
         return WinVerdict::Pass;
     };
-    // The cd family writes nothing, so it is allowed outright — and the layer
-    // must own the verdict: no relative operand is provable here
-    // ([`resolve_raw`]), so a tracked directory would buy nothing, while the
-    // shared dispatch would read `cd C:\ws` as an unknown command word.
+    // The cd family writes nothing, so it is allowed outright — and the layer must own the
+    // verdict: no relative operand is provable here ([`resolve_raw`]), so a tracked directory
+    // would buy nothing, while the shared dispatch would read `cd C:\ws` as an unknown word.
     if matches!(verb.as_str(), "cd" | "chdir" | "popd" | "pushd") {
         return WinVerdict::Allow;
     }
     let args = glued_args(&glue, words.get(verb_idx + 1..).unwrap_or_default());
     let args = args.as_ref();
 
-    // A bare drive switch (`D:`) moves the process to that drive: it writes no
-    // file and needs no verdict of its own. An operand after it is a different
-    // thing — cmd.exe takes none, and reading the rest as words of one command
-    // would hide a mutator (`D: del C:\ws\x.txt`) — so it is refused.
+    // A bare drive switch (`D:`) moves the process to that drive: no file write, no verdict. An
+    // operand after it is refused — cmd.exe takes none, and reading the rest as words of one
+    // command would hide a mutator (`D: del C:\ws\x.txt`).
     if is_drive_switch(verb_word) {
         return if args.is_empty() {
             WinVerdict::Allow
@@ -873,9 +707,9 @@ pub(super) fn check_segment(
         };
     }
 
-    // `set` is cmd's variable builtin: the layer's view of the temp variables
-    // must not drift from the one the children run with, so the shared unix
-    // assignment machinery must not see it either.
+    // `set` is cmd's variable builtin: the layer's view of the temp variables must not drift from
+    // the one the children run with, so the shared unix assignment machinery must not see it
+    // either.
     if verb == "set" {
         return check_set(args, cmd, ctx);
     }
@@ -891,16 +725,12 @@ pub(super) fn check_segment(
         ));
     }
 
-    // cmd's parameter delimiter glued behind a switch (`del /f,C:\ws\x.txt`,
-    // `xcopy /move=C:\ws\x.txt`), for the verbs this layer acts on
-    // ([`is_glue_splittable`]): cmd.exe splits the token there and hands the text
-    // behind the delimiter to the verb as another argument. That text is never
-    // read — the token stays switch-shaped, and a drive-qualified operand behind
-    // the delimiter leaves [`switch_is_operand`] false too — and on the
-    // copy-shaped verbs the glued deny-list spelling is invisible twice over,
-    // since a copy switch's name stops at `:`/`+` ([`denied_copy_switch`]) and so
-    // `/move,` and `/log=` never reached [`COPY_DENIED_SWITCHES`] either, leaving
-    // the line inside the destination-only grant. Refused outright.
+    // cmd's parameter delimiter glued behind a switch (`del /f,C:\ws\x.txt`, `xcopy
+    // /move=C:\ws\x.txt`), for the verbs this layer acts on ([`is_glue_splittable`]): cmd.exe
+    // splits the token there and hands the text behind it to the verb as another argument. That
+    // text is never read — the token stays switch-shaped — and on the copy verbs the glued
+    // deny-list spelling is invisible twice over, since a copy switch's name stops at `:`/`+`
+    // ([`denied_copy_switch`]), leaving the line inside the destination-only grant.
     if is_glue_splittable(&verb) && args.iter().copied().any(glued_delimiter_switch) {
         return WinVerdict::Refuse(rejection_message(
             cmd,
@@ -914,16 +744,15 @@ pub(super) fn check_segment(
         ));
     }
 
-    // A verb on either mutator table holds the same single temp grant, so the
-    // gate is asked with both in hand — a verb added to the narrower
-    // [`CWD_DESTINATION_VERBS`] alone must not reach the shared dispatch ungated.
-    // The omitted-destination rule stays the narrower table's own.
+    // A verb on either mutator table holds the same single temp grant, so the gate is asked with
+    // both in hand — a verb added to the narrower [`CWD_DESTINATION_VERBS`] alone must not reach
+    // the shared dispatch ungated. The omitted-destination rule stays the narrower table's own.
     let needs_destination = CWD_DESTINATION_VERBS.contains(&verb.as_str());
     let temp_gated = TEMP_GATED_VERBS.contains(&verb.as_str()) || needs_destination;
     if temp_gated {
         let paths = path_args(args);
-        // Its own rule and its own why: a segment with no path has nothing for
-        // the grant to cover — not the same statement as a path outside temp.
+        // Its own rule and its own why: a segment with no path has nothing for the grant to
+        // cover — not the same statement as a path outside temp.
         if paths.is_empty() {
             return WinVerdict::Refuse(rejection_message(
                 cmd,
@@ -973,13 +802,10 @@ pub(super) fn check_segment(
         return if destination_under_temp(&paths, ctx) {
             WinVerdict::Allow
         } else {
-            // This branch spells its own temp route instead of taking the shared
-            // `super::temp_path_or_alternatives_hint` the temp-gate branches
-            // above use, and the duplication is deliberate: "sources may be read
-            // from anywhere" is this family's own half of the grant, which that
-            // helper cannot carry, and it is a `&'static str` selector, so
-            // composing the two would mean building a string per refusal. An
-            // edit to this advice belongs here, not in the helper.
+            // This branch spells its own temp route instead of the shared
+            // `super::temp_path_or_alternatives_hint`: "sources may be read from anywhere" is this
+            // family's own half of the grant, which that `&'static str` selector cannot carry —
+            // composing the two would build a string per refusal. An edit belongs here, not there.
             WinVerdict::Refuse(rejection_message(
                 cmd,
                 &format!(
@@ -1012,8 +838,8 @@ pub(super) fn check_segment(
     }
 
     if let Some((_, spellings)) = QUERY_VERBS.iter().find(|(name, _)| *name == verb) {
-        // The slash is not part of the spelling: `schtasks /query` and the
-        // glued `schtasks/query` are the same command.
+        // The slash is not part of the spelling: `schtasks /query` and the glued
+        // `schtasks/query` are the same command.
         if args
             .first()
             .copied()
@@ -1043,18 +869,15 @@ pub(super) fn check_segment(
     WinVerdict::Pass
 }
 
-/// `set` is cmd's variable builtin. The value is everything after the first
-/// space, so the words are re-joined before splitting, and cmd strips the outer
-/// double quotes of the quoted spelling (`set "NAME=value"`) — both spellings
-/// bind the same variable. `set` alone lists the environment and `set NAME`
-/// queries one variable: both only read, and only the name's shape has to hold.
+/// `set` is cmd's variable builtin. The value is everything after the first space, so the words
+/// are re-joined before splitting, and cmd strips the outer double quotes of the quoted spelling
+/// (`set "NAME=value"`) — both spellings bind the same variable. `set` alone lists the
+/// environment and `set NAME` queries one variable: both only read.
 ///
-/// A binding is refused when the name is not a plain environment name — a
-/// `/a`/`/p` switch form evaluates an expression or reads input, an empty name
-/// binds nothing addressable, and cmd rewrites the line before it binds, so
-/// `set TEMP^=C:\ws` would bind `TEMP` under the layer's feet — and when it
-/// binds something the guard resolves: a temp variable or a `GIT_*` name. The
-/// temp-variable policy behind that is in the module doc.
+/// A binding is refused when the name is not a plain environment name — a `/a`/`/p` switch form
+/// evaluates an expression or reads input, an empty name binds nothing addressable, and cmd
+/// rewrites the line before it binds (`set TEMP^=C:\ws` would bind `TEMP` under the layer's feet)
+/// — and when it binds something the guard resolves: a temp variable or a `GIT_*` name.
 fn check_set(args: &[&str], cmd: &str, ctx: &CheckContext) -> WinVerdict {
     let joined = args.join(" ");
     let Some(joined) = cmd_token(&joined) else {
@@ -1098,9 +921,8 @@ fn check_set(args: &[&str], cmd: &str, ctx: &CheckContext) -> WinVerdict {
              daemon temp root, or `%TMP%`/`%TEMP%`).",
         ));
     }
-    // cmd's environment is case-insensitive, so the shared `GIT_*` binding rule
-    // applies to the folded name — otherwise `set git_dir=…` slips a transitive
-    // git invocation past the exec-vector scan.
+    // cmd's environment is case-insensitive, so the shared `GIT_*` rule applies to the folded
+    // name — otherwise `set git_dir=…` slips a transitive git invocation past the exec-vector scan.
     if super::git_env_name_denied(&name.to_ascii_uppercase()) {
         return WinVerdict::Refuse(rejection_message(
             cmd,
@@ -1111,12 +933,11 @@ fn check_set(args: &[&str], cmd: &str, ctx: &CheckContext) -> WinVerdict {
     WinVerdict::Allow
 }
 
-// ── Argument helpers ─────────────────────────────────────────────────────
+// Argument helpers
 
-/// A verb word's glued switches ([`split_glued_switch`]) followed by the segment's
-/// own arguments, so a switch-consuming branch reads the glued spelling exactly
-/// as the spaced one. Borrowed when there is no glue — the common case, and the
-/// reason this does not copy the arguments for every modelled segment.
+/// A verb word's glued switches ([`split_glued_switch`]) followed by the segment's own arguments,
+/// so a switch-consuming branch reads the glued spelling as the spaced one. Borrowed when there is
+/// no glue — the common case, and why this does not copy for every modelled segment.
 fn glued_args<'x, 'a>(glue: &'x [&'a str], rest: &'x [&'a str]) -> Cow<'x, [&'a str]> {
     if glue.is_empty() {
         return Cow::Borrowed(rest);
@@ -1124,15 +945,14 @@ fn glued_args<'x, 'a>(glue: &'x [&'a str], rest: &'x [&'a str]) -> Cow<'x, [&'a 
     Cow::Owned(glue.iter().copied().chain(rest.iter().copied()).collect())
 }
 
-/// True when a token is a cmd.exe switch or a unix-style flag — never a path
-/// argument. A token cmd would not deliver as written (a single-quoted word) is
-/// an operand, so it must satisfy the temp gate like any other.
+/// True when a token is a cmd.exe switch or a unix-style flag — never a path argument. A token
+/// cmd would not deliver as written (a single-quoted word) is an operand and must satisfy the gate.
 fn is_switch(tok: &str) -> bool {
     cmd_token(tok).is_some_and(|tok| tok.starts_with('/') || tok.starts_with('-'))
 }
 
-/// A bare cmd.exe drive switch (`D:`), which moves the process cwd to that
-/// drive's own current directory — a location the layer does not model.
+/// A bare cmd.exe drive switch (`D:`), which moves the process cwd to that drive's own current
+/// directory — a location the layer does not model.
 fn is_drive_switch(word: &str) -> bool {
     cmd_token(word).is_some_and(|word| {
         word.len() == 2
@@ -1141,12 +961,10 @@ fn is_drive_switch(word: &str) -> bool {
     })
 }
 
-/// True when a copy-shaped verb's switch is one of the refused
-/// [`COPY_DENIED_SWITCHES`]: delivered as cmd delivers it, the token must start
-/// with `/` or `-` and its name is the text up to the first `:` or `+` — so
-/// `/LOG:C:\ws\run.log`, `/LOG+:x` and `-move` are all caught. A token cmd would
-/// not deliver as written (a single-quoted word) is not a switch and is read as
-/// an operand instead; these verbs gate their destination only, so such a token
+/// True when a copy verb's switch is one of the refused [`COPY_DENIED_SWITCHES`]: as cmd
+/// delivers it, the token starts with `/` or `-` and its name is the text up to the first `:` or
+/// `+`, so `/LOG:C:\ws\run.log`, `/LOG+:x` and `-move` are all caught. A single-quoted token is
+/// not a switch and is read as an operand; these verbs gate the destination only, so such a token
 /// goes unjudged unless it is the last path argument.
 fn denied_copy_switch(token: &str) -> bool {
     let Some(tok) = cmd_token(token) else {
@@ -1161,10 +979,9 @@ fn denied_copy_switch(token: &str) -> bool {
         .any(|switch| name.eq_ignore_ascii_case(switch))
 }
 
-/// True when a switch-shaped token is really an operand: cmd.exe accepts `/` as a
-/// path separator, so `/ws/b.txt` (or `/b.txt`) names a file, not a switch. A
-/// token carrying a `:` is a switch with its argument (`/R:1`, `/XF:*.log`), and
-/// one carrying no path signal at all is an ordinary switch (`/s`, `/-Y`).
+/// True when a switch-shaped token is really an operand: cmd.exe accepts `/` as a path separator,
+/// so `/ws/b.txt` names a file. A token carrying a `:` is a switch with its argument (`/R:1`), and
+/// one carrying no path signal is an ordinary switch (`/s`, `/-Y`).
 fn switch_is_operand(tok: &str) -> bool {
     let Some(tok) = cmd_token(tok) else {
         return false;
@@ -1175,20 +992,18 @@ fn switch_is_operand(tok: &str) -> bool {
     !rest.contains(':') && rest.contains(['.', '\\', '/'])
 }
 
-/// True when a switch-shaped token carries cmd's parameter delimiter after the
-/// switch text (`/f,C:\ws\x.txt`, `/move=C:\ws`): cmd.exe splits the token there
-/// and hands the text behind the delimiter to the verb as another argument — so
-/// the token is neither a switch the layer may drop nor a word it can read as a
-/// path. The segment is refused (see `# Matching`).
+/// True when a switch-shaped token carries cmd's parameter delimiter after the switch text
+/// (`/f,C:\ws\x.txt`, `/move=C:\ws`): cmd.exe splits there and hands the text behind it to the
+/// verb as another argument — neither a switch to drop nor a word to read as a path.
 fn glued_delimiter_switch(tok: &str) -> bool {
     cmd_token(tok)
         .and_then(|tok| tok.strip_prefix(['/', '-']))
         .is_some_and(|rest| rest.contains([',', '=']))
 }
 
-/// The path arguments of a Windows command segment: every word that is not a
-/// switch — plus a switch-shaped spelling that carries a path signal, which cmd
-/// reads as an operand, so it must satisfy the temp gate like any other path.
+/// The path arguments of a Windows command segment: every word that is not a switch, plus a
+/// switch-shaped spelling carrying a path signal, which cmd reads as an operand and which must
+/// therefore satisfy the temp gate.
 fn path_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
     args.iter()
         .copied()
@@ -1196,17 +1011,14 @@ fn path_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
         .collect()
 }
 
-/// True when every path argument of a segment resolves under an accepted temp
-/// root. Vacuously true with no path argument — that case has its own refusal at
-/// the call site.
+/// True when every path argument resolves under an accepted temp root. Vacuously true with no
+/// path argument — that case has its own refusal at the call site.
 fn all_paths_under_temp(paths: &[&str], ctx: &CheckContext) -> bool {
     paths.iter().copied().all(|path| under_temp(path, ctx))
 }
 
-/// True when the LAST path argument (the destination of a copy-shaped verb)
-/// resolves under an accepted temp root. A copy naming fewer than two paths is
-/// refused — the why is in the module doc. Takes a segment's path arguments, as
-/// [`all_paths_under_temp`] does.
+/// True when the LAST path argument (a copy verb's destination) resolves under an accepted temp
+/// root. A copy naming fewer than two paths is refused — the why is in the module doc.
 fn destination_under_temp(paths: &[&str], ctx: &CheckContext) -> bool {
     paths.len() >= 2
         && paths
@@ -1214,8 +1026,6 @@ fn destination_under_temp(paths: &[&str], ctx: &CheckContext) -> bool {
             .copied()
             .is_some_and(|dest| under_temp(dest, ctx))
 }
-
-// ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1226,14 +1036,11 @@ mod tests {
     };
     use std::path::Path;
 
-    /// The fixture's temp root, in Windows spelling: the host's own temp
-    /// directory on a Windows host — the reparse-point walk canonicalizes the
-    /// nearest existing ancestor, so the root must exist there — and the
-    /// fabricated `C:\Temp` elsewhere, where nothing resolves and the lexical
-    /// verdict carries (the walk's fallback). It is what the context binds
-    /// `%TMP%`/`%TEMP%` to, and it is expressed in its canonical comparison form:
-    /// `canonicalize` answers in the on-disk case behind a `\\?\` verbatim
-    /// prefix, which `canonical_under_roots` strips off its own probes.
+    /// The fixture's temp root in Windows spelling: the host's own temp directory on a Windows
+    /// host (the reparse-point walk canonicalizes the nearest existing ancestor, so it must exist
+    /// there) and a fabricated `C:\Temp` elsewhere, where nothing resolves and the lexical verdict
+    /// carries. It binds `%TMP%`/`%TEMP%` and is in canonical comparison form: `canonicalize`
+    /// answers in the on-disk case behind a `\\?\` verbatim prefix.
     fn temp_root() -> String {
         if cfg!(windows) {
             let temp = std::env::temp_dir();
@@ -1244,18 +1051,14 @@ mod tests {
         }
     }
 
-    /// A Windows-platform context over the layer's own lexical model: the
-    /// platform is pinned (the host must never decide what these assert), while
-    /// the temp root and its `%TMP%`/`%TEMP%` bindings come from the host — the
-    /// layer expands the variables, so the production `%TEMP%` spelling is
-    /// exercised on any host.
+    /// A Windows-platform context over the layer's lexical model: the platform is pinned (the host
+    /// must never decide what these assert) while the temp root and its `%TMP%`/`%TEMP%` bindings
+    /// come from the host.
     ///
-    /// Every temp OPERAND below is written double-quoted. The lane has to hold on
-    /// a host whose temp path carries whitespace (`C:\Users\John Doe\…`, a common
-    /// install), where cmd.exe hands an unquoted operand to the program in
-    /// pieces — the layer refuses that spelling, which is its cmd-parity rule and
-    /// not a fixture failure. The unquoted spelling's verdicts are pinned by
-    /// `whitespace_after_expansion_fails_closed`.
+    /// Every temp OPERAND below is written double-quoted: the lane must hold on a host whose temp
+    /// path carries whitespace (`C:\Users\John Doe\…`), where cmd.exe hands an unquoted operand to
+    /// the program in pieces — the layer refuses that spelling, which is its cmd-parity rule. The
+    /// unquoted verdicts are pinned by `whitespace_after_expansion_fails_closed`.
     fn win_ctx() -> CheckContext {
         let mut ctx = CheckContext::for_platform(Path::new(r"C:\ws"), ShellPlatform::Windows);
         ctx.temp_roots = vec![PathBuf::from(temp_root())];
@@ -1289,16 +1092,12 @@ mod tests {
             (r"C:\Windows\System32\FORMAT.COM", Some("format")),
             (r#""C:\Program Files\x\del.exe""#, Some("del")),
             ("DEL.BAT", Some("del")),
-            // A separator-carrying word names a program only through a known
-            // executable extension.
             ("/usr/bin/rm", None),
             ("/usr/bin/rm.exe", Some("rm")),
             ("dir", Some("dir")),
-            // cmd's `@` no-echo prefix is not part of the command name.
             ("@del", Some("del")),
             ("@FORMAT.COM", Some("format")),
-            // A switch glued to a modelled verb is not part of its name; a
-            // word whose head is not a verb keeps its basename.
+            // A switch glued to a modelled verb is not part of its name.
             ("del/q", Some("del")),
             ("RD/S/Q", Some("rd")),
             ("@del/q", Some("del")),
@@ -1307,9 +1106,7 @@ mod tests {
             ("\"del\"/q", Some("del")),
             ("C:/Windows/format.com", Some("format")),
             ("bin/rm", None),
-            // Only known executable extensions are stripped.
             ("nul.txt", Some("nul.txt")),
-            // Indirection, globs and non-names are never plain command names.
             ("%BIN%", None),
             ("!BIN!", None),
             ("$del", None),
@@ -1323,29 +1120,27 @@ mod tests {
         }
     }
 
-    /// cmd's internal commands accept their switch glued to the name
-    /// (`del/q X` runs `del /q X`), so the glued spelling must get the verdict
-    /// of the spaced one — refused where it writes outside temp, admitted
-    /// inside it, and never read as a command whose arguments were never gated.
+    /// cmd's internal commands accept their switch glued to the name (`del/q X` runs
+    /// `del /q X`), so the glued spelling must get the spaced verdict — refused where it writes
+    /// outside temp, admitted inside it, never read as a command whose arguments were never gated.
     #[test]
     fn glued_switches_keep_the_spaced_verdict() {
         assert_rejected(r"del/q C:\ws\x.txt");
         assert_rejected(r"rd/s/q C:\ws\tree");
         assert_rejected(r#"move/y C:\ws\a.txt "%TEMP%\b.txt""#);
         assert_rejected(r#"copy/y "%TEMP%\a.txt" C:\ws\b.txt"#);
-        // A table verb that is an external program is split the same way, and the
-        // over-rejection is the accepted direction.
+        // A table verb that is an external program is split the same way; over-rejection is the
+        // accepted direction.
         assert_rejected(r"taskkill/f /im notepad.exe");
         assert_rejected(r"format/q C:");
         ok(r#"del/q "%TEMP%\x.txt""#);
         ok(r#"rd/s/q "%TEMP%\junk""#);
         ok(r#"md/q "%TEMP%\new""#);
         ok(r#"copy/y C:\ws\a.txt "%TEMP%\b.txt""#);
-        // `set /a` evaluates an expression instead of binding a literal.
         assert_rejected("set/a x=1");
         assert_rejected("set/p x=");
-        // `cd/d` is a builtin's glued switch: the cd is allowed and the layer
-        // never reads it as a program whose arguments would go ungated.
+        // `cd/d` is a builtin's glued switch: the cd is allowed and never read as a program whose
+        // arguments would go ungated.
         ok(r#"md "%TEMP%\new" && cd/d "%TEMP%\new""#);
     }
 
@@ -1359,7 +1154,6 @@ mod tests {
         );
         assert_eq!(split_prefix(r"c:\x"), Some(("c:".to_string(), r"\x")));
         assert_eq!(split_prefix("relative"), Some((String::new(), "relative")));
-        // Degenerate UNC and empty paths cannot be proven (fail-closed).
         assert_eq!(split_prefix(r"\\"), None);
         assert_eq!(normalize(""), Some(String::new()));
     }
@@ -1376,20 +1170,17 @@ mod tests {
             expand_percent_vars(r"%TMP%\x", &ctx).as_deref(),
             Some(expected.as_str())
         );
-        // A `%` with no partner or a non-name between it stays literal.
         assert_eq!(expand_percent_vars("100%", &ctx).as_deref(), Some("100%"));
         assert_eq!(expand_percent_vars("%%", &ctx).as_deref(), Some("%%"));
         assert_eq!(expand_percent_vars("%a b%", &ctx).as_deref(), Some("%a b%"));
-        // An unbound name has no provable expansion — including a name the
-        // shared unix assignment path would have recorded: cmd.exe cannot run
-        // `NAME=value`, so that binding never exists, and the layer reads the
-        // context rather than the shared state.
+        // An unbound name has no provable expansion — including a name the shared unix assignment
+        // path would have recorded: cmd.exe cannot run `NAME=value`, so that binding never exists.
         assert_eq!(expand_percent_vars("%UNSET%", &ctx), None);
         assert_eq!(expand_percent_vars("%FOO%", &ctx), None);
     }
 
-    /// Every denied verb is refused by its bare name and by a path-qualified,
-    /// capitalized, extension-qualified spelling.
+    /// Every denied verb is refused by its bare name and by a path-qualified, capitalized,
+    /// extension-qualified spelling.
     #[test]
     fn denied_verbs_are_refused_in_every_spelling() {
         for verb in DENIED_VERBS {
@@ -1400,32 +1191,29 @@ mod tests {
                 verb.to_ascii_uppercase()
             ));
         }
-        // The `@` no-echo prefix does not hide the verb.
         assert_rejected(r"@del C:\ws\x.txt");
         assert_rejected(r"@format C:");
-        // A path word the bash parse split at its whitespace must not hide the
-        // real verb in a later fragment.
+        // A path word the bash parse split at its whitespace must not hide the real verb in a
+        // later fragment.
         assert_rejected(r"C:\Program Files\format.com C:");
-        // A verb with a variable embedded in its name matches no table — but it
-        // is not admitted either: the exact-pinned bash grammar errors on the
-        // spelling, so the shared parse failure refuses the line before this
-        // layer's tables are consulted.
+        // A verb with a variable embedded in its name matches no table — but it is not admitted
+        // either: the exact-pinned bash grammar errors on the spelling, so the shared parse
+        // failure refuses the line before this layer's tables are consulted.
         assert_rejected(r"del%X% C:\ws\x.txt");
     }
 
     #[test]
     fn file_mutators_need_every_path_under_temp() {
         let temp = temp_root();
-        // The literal absolute spelling, and the `%TEMP%` spelling production
-        // hands the layer (the layer expands it to the same text).
+        // The literal absolute spelling, and the `%TEMP%` spelling production hands the layer.
         ok(&format!(r#"del "{temp}\scratch.txt""#));
         ok(r#"del "%TEMP%\scratch.txt""#);
         ok(r#"DEL "%TEMP%\scratch.txt""#);
         ok(r#"move "%TEMP%\a.txt" "%TEMP%\b.txt""#);
         ok(r#"md "%TEMP%\new""#);
         ok(r#"replace "%TEMP%\new.txt" "%TEMP%""#);
-        // `/` is a path separator for cmd.exe, so a switch-shaped token carrying
-        // a path signal is an operand and must satisfy the gate like any other.
+        // `/` is a path separator for cmd.exe, so a switch-shaped token carrying a path signal is
+        // an operand and must satisfy the gate like any other.
         assert_rejected(r#"move "%TEMP%\a.txt" /ws/b.txt"#);
         assert_rejected(r#"del "%TEMP%\a.txt" /b.txt"#);
         ok(r#"move /-Y "%TEMP%\a.txt" "%TEMP%\b.txt""#);
@@ -1433,22 +1221,20 @@ mod tests {
         assert_rejected(r"del %TEMP%\..\..\ws\main.rs");
         assert_rejected("del src\\main.rs"); // relative: cmd resolves it against a directory no model has
         assert_rejected(r#"del C:\ws\src\main.rs "%TEMP%\a.txt""#); // one outside is enough
-        // Nothing to prove — refused for naming no path, not for the temp
-        // location the other spellings are refused for.
+        // Nothing to prove — refused for naming no path, not for the temp location.
         let err = check_command("del", &win_ctx()).unwrap_err();
         assert!(err.contains("names no path"), "{err}");
         assert_rejected(r#"erase "%TEMP%\a.txt" "%TEMP%d\b.txt""#);
-        // `move`/`replace` with their destination omitted: cmd writes into its own
-        // directory, a location the layer does not model.
+        // `move`/`replace` with their destination omitted: cmd writes into its own directory.
         assert_rejected(r#"move "%TEMP%\junk.rs""#);
         assert_rejected(r#"move /y "%TEMP%\junk.rs""#);
         assert_rejected(r#"replace "%TEMP%\junk.txt""#);
         assert_rejected(r#"replace /A "%TEMP%\junk.txt""#);
-        // `ren`'s usable spelling — a bare new name — is refused with the relative
-        // operand it carries.
+        // `ren`'s usable spelling — a bare new name — is refused with the relative operand it
+        // carries.
         assert_rejected(r#"ren "%TEMP%\a.txt" b.txt"#);
-        // A single operand outside temp is refused for that write, not for the
-        // missing destination — the fix the agent is pointed at is the path.
+        // A single operand outside temp is refused for that write, not for the missing
+        // destination — the fix the agent is pointed at is the path.
         let err = check_command(r"move C:\ws\x.txt", &win_ctx()).unwrap_err();
         assert!(
             err.contains("not allowed outside the temp directory"),
@@ -1456,33 +1242,28 @@ mod tests {
         );
     }
 
-    /// Spellings Windows rewrites before touching the filesystem: the lexical
-    /// comparison must not read them as the path they look like.
+    /// Spellings Windows rewrites before touching the filesystem: the lexical comparison must not
+    /// read them as the path they look like.
     #[test]
     fn platform_rewritten_paths_fail_closed() {
-        // Drive-relative: `<cwd on C>\Temp\scratch.txt` at runtime, not
-        // `C:\Temp\scratch.txt`.
+        // Drive-relative: `<cwd on C>\Temp\scratch.txt` at runtime, not `C:\Temp\scratch.txt`.
         assert_rejected(r"del c:Temp\scratch.txt");
-        // Win32 strips a component's trailing space and dot, so this is
-        // `C:\Temp\..\x.txt` — outside temp.
+        // Win32 strips a component's trailing space and dot, so this is `C:\Temp\..\x.txt`.
         assert_rejected(r"del %TEMP%\.. \x.txt");
         assert_rejected(r"del %TEMP%\..\x.txt.");
     }
 
-    /// cmd.exe splits an unquoted word carrying whitespace where the bash parse
-    /// reads one word, so the spelling must fail closed.
+    /// cmd.exe splits an unquoted word carrying whitespace where the bash parse reads one word,
+    /// so the spelling must fail closed.
     #[test]
     fn whitespace_in_an_operand_fails_closed() {
-        // One bash word, two cmd operands — cmd would delete `b.txt` relative
-        // to the real cwd.
+        // One bash word, two cmd operands — cmd would delete `b.txt` relative to the real cwd.
         assert_rejected(r"del %TEMP%\a\ b.txt");
-        // The spelling cmd reads as one operand.
         ok(r#"del "%TEMP%\a b.txt""#);
     }
 
-    /// A single-quoted token is ordinary text for cmd, not a quoted argument: a
-    /// classifier that read it as a switch would drop a real operand from the
-    /// temp gate (`del "…\a.txt" '/C:\ws\x'` leaves `'/C:\ws\x'` unchecked).
+    /// A single-quoted token is ordinary text for cmd, not a quoted argument: a classifier that
+    /// read it as a switch would drop a real operand from the temp gate.
     #[test]
     fn single_quoted_tokens_are_ordinary_text() {
         assert_rejected(r#"del "%TEMP%\a.txt" '/C:\ws\x'"#);
@@ -1490,18 +1271,15 @@ mod tests {
         assert_rejected(r#"move "%TEMP%\a.txt" 'C:\ws\x'"#);
         assert_rejected(r"dir > '%TEMP%\listing.txt'");
         assert_rejected(r#"copy '%TEMP%\a.txt' "C:\ws\b.txt""#);
-        // A single-quoted VERB word is judged under its literal name, so a
-        // destructive verb cannot hide in quotes — and a word whose rule passes
-        // stays a pass, quotes or not.
+        // A single-quoted VERB word is judged under its literal name, so a destructive verb
+        // cannot hide in quotes — and a word whose rule passes stays a pass, quotes or not.
         assert_rejected(r"'del' C:\ws\x.txt");
         ok(r#"'del' "%TEMP%\x.txt""#);
     }
 
-    /// Whitespace that only appears once a `%VAR%` is expanded: cmd expands
-    /// before it tokenises, so a temp path with a space in it (a `%TEMP%` under
-    /// `C:\Users\John Doe\...`) splits the operand where the layer reads one
-    /// word — the first half is not under temp at all. The quoted spelling is the
-    /// one cmd keeps whole, and it is what the rest of this lane writes.
+    /// Whitespace that only appears once a `%VAR%` is expanded: cmd expands before it tokenises,
+    /// so a temp path with a space splits the operand where the layer reads one word — the first
+    /// half is not under temp at all. The quoted spelling is the one cmd keeps whole.
     #[test]
     fn whitespace_after_expansion_fails_closed() {
         let mut ctx = win_ctx();
@@ -1512,10 +1290,9 @@ mod tests {
             check_command(r"del %TEMP%\x.txt", &ctx).is_err(),
             "expanded whitespace must split the operand, not be read as one word"
         );
-        // The other half of the lane's contract: a root that carries a space
-        // must not cost the quoted spelling its temp grant. Only the lexical
-        // gate is asserted — the fabricated root does not exist, so a verdict
-        // through the reparse-point walk would assert the host instead.
+        // The other half of the lane's contract: a root that carries a space must not cost the
+        // quoted spelling its temp grant. Only the lexical gate is asserted — the fabricated root
+        // does not exist, so a verdict through the reparse-point walk would assert the host.
         let quoted = resolve(r#""%TEMP%\x.txt""#, &ctx).expect("the quoted spelling resolves");
         assert!(
             under_roots(&quoted, &ctx),
@@ -1523,12 +1300,11 @@ mod tests {
         );
     }
 
-    /// cmd's caret escape and its delayed (`!NAME!`) expansion are not modelled,
-    /// and both hide the characters the layer must judge: cmd sees a workspace
-    /// file where the lexical model sees a temp path, or a path that only exists
-    /// once `setlocal enabledelayedexpansion` — which the interpreter this shell
-    /// starts with delayed expansion off does not rule out — expands a name the
-    /// model does not track.
+    /// cmd's caret escape and its delayed (`!NAME!`) expansion are not modelled, and both hide
+    /// characters the layer must judge: cmd sees a workspace file where the lexical model sees a
+    /// temp path, or a path that only exists once `setlocal enabledelayedexpansion` — which the
+    /// interpreter (started with delayed expansion off) does not rule out — expands an untracked
+    /// name.
     #[test]
     fn caret_escapes_and_delayed_expansion_fail_closed() {
         assert_rejected(r"del C:\ws\^..\..\ws\main.rs");
@@ -1541,12 +1317,10 @@ mod tests {
         );
     }
 
-    /// cmd's parameter delimiters: unlike the bash parse, cmd splits an
-    /// unquoted `,`/`=` into a parameter boundary, so `del a.txt,C:\ws\b.txt`
-    /// deletes a workspace file the layer reads as one temp-scoped operand. Glued
-    /// behind a switch (`del /f,C:\ws\x.txt`) the delimiter is refused outright,
-    /// which is also what stops the copy-shaped verbs' glued deny-list spellings
-    /// from slipping past their destination-only grant.
+    /// cmd's parameter delimiters: unlike the bash parse, cmd splits an unquoted `,`/`=` into a
+    /// parameter boundary, so `del a.txt,C:\ws\b.txt` deletes a workspace file the layer reads as
+    /// one temp-scoped operand. Glued behind a switch the delimiter is refused outright, which is
+    /// also what stops the copy verbs' glued deny-list spellings slipping past their grant.
     #[test]
     fn parameter_delimiters_and_separators_fail_closed() {
         assert_rejected(r"copy %TEMP%\a.txt,C:\ws\b.txt");
@@ -1555,37 +1329,32 @@ mod tests {
         assert_rejected(r#"del /f,C:\ws\x.txt "%TEMP%\junk.txt""#);
         assert_rejected(r#"del /f=C:\ws\x.txt "%TEMP%\junk.txt""#);
         assert_rejected(r#"rd /s,C:\ws\dir "%TEMP%\junk""#);
-        // The copy family's twin of the shape, and the reason the rule matters
-        // there: a switch name is read up to the first `:` or `+`
-        // ([`denied_copy_switch`]), so `/move,` and `/log=` never reached
-        // [`COPY_DENIED_SWITCHES`] while the glued token was dropped as a switch —
-        // the destination-only grant then admitted the line.
+        // The copy family's twin, and why the rule matters there: a switch name is read up to the
+        // first `:` or `+` ([`denied_copy_switch`]), so `/move,` and `/log=` never reached
+        // [`COPY_DENIED_SWITCHES`] while the glued token was dropped as a switch.
         assert_rejected(r#"xcopy /move,C:\ws\y C:\ws\x.txt "%TEMP%\junk.txt""#);
         assert_rejected(r#"robocopy /log=C:\ws\l C:\ws\x.txt "%TEMP%\junk.txt""#);
-        // cmd's separators and redirects: the bash parse keeps them inside one
-        // word through a `\` escape, where the line-level `;` rule cannot see
-        // them, while cmd.exe still splits or redirects the operand.
+        // cmd's separators and redirects: the bash parse keeps them inside one word through a `\`
+        // escape, where the line-level `;` rule cannot see them, while cmd.exe still splits.
         assert_rejected(r"del %TEMP%\x\;C:\ws\y.txt");
         assert_rejected(r"del %TEMP%\a\&b.txt");
         assert_rejected(r"del %TEMP%\x\>C:\ws\out.txt");
         assert_rejected(r"del %TEMP%\x\|C:\ws\y.txt");
         assert_rejected(r"del %TEMP%\x\<C:\ws\y.txt");
-        // The quoted spelling is one parameter for cmd too.
         ok(r#"del "%TEMP%\a,b.txt""#);
         ok(r#"copy C:\ws\a.txt "%TEMP%\b,c.txt""#);
         ok(r#"del "%TEMP%\a&b.txt""#);
         ok(r#"del "%TEMP%\a;b.txt""#);
     }
 
-    /// A `;` is bash's command separator but cmd.exe's ARGUMENT delimiter for its
-    /// internal commands, so the fragment the parse reads as a second command is
-    /// an extra operand of the first — `del %TEMP%\a;C:\ws\x.exe` deletes a
-    /// workspace file. The line is refused on the Windows platform, while `&&`
-    /// (which both readers split on) keeps working.
+    /// A `;` is bash's command separator but cmd.exe's ARGUMENT delimiter for its internal
+    /// commands, so the fragment the parse reads as a second command is an extra operand of the
+    /// first — `del %TEMP%\a;C:\ws\x.exe` deletes a workspace file. The line is refused on
+    /// Windows, while `&&` (which both readers split on) keeps working.
     ///
-    /// The divergence is a property of the LINE for cmd.exe, not of a nesting
-    /// position: the guard reads the raw tree once, so a `;` inside a construct
-    /// is refused here too (see `line_divergences_are_refused_inside_every_construct`).
+    /// The divergence is a property of the LINE, not of a nesting position: the guard reads the raw
+    /// tree once, so a `;` inside a construct is refused too
+    /// (`line_divergences_are_refused_inside_every_construct`).
     #[test]
     fn semicolon_split_lines_are_refused() {
         assert_rejected(r"del %TEMP%\a;C:\ws\x.exe");
@@ -1605,38 +1374,30 @@ mod tests {
         assert!(err.contains("quote a `;` you mean literally"), "{err}");
     }
 
-    /// cmd.exe has no comment syntax: to it the `#` is an ordinary character, so
-    /// the text the bash parse drops as a comment still reaches it — in
-    /// `echo hi # & del C:\ws\x.txt` it deletes the workspace file. Refused on
-    /// the Windows platform, where a comment node is the divergence; unix keeps
-    /// its verdict (a comment executes nothing for either reader there).
+    /// cmd.exe has no comment syntax: `#` is an ordinary character to it, so the text the bash
+    /// parse drops as a comment still reaches it — `echo hi # & del C:\ws\x.txt` deletes the
+    /// workspace file. Refused on Windows; unix keeps its verdict (a comment executes nothing).
     ///
-    /// Like the `;` and the heredoc, the divergence is a property of the LINE
-    /// rather than of a nesting position
-    /// (see `line_divergences_are_refused_inside_every_construct`).
+    /// Like the `;` and the heredoc, the divergence is a property of the LINE rather than of a
+    /// nesting position (`line_divergences_are_refused_inside_every_construct`).
     #[test]
     fn comment_lines_are_refused() {
         assert_rejected(r"echo hi # & del C:\ws\x.txt");
         assert_rejected(r"# & format C:");
         assert_rejected(r"dir C:\ws # list");
-        // Quoted or word-internal, the `#` is ordinary text for both readers.
         ok(r#"echo "a # b""#);
         ok(r"echo a#b");
-        // The shared frame and the advice that a literal `#` is kept by quoting.
         let err = check_command(r"# & format C:", &win_ctx()).unwrap_err();
         assert!(err.starts_with("Command not run: "), "{err}");
         assert!(err.contains("quote a `#` you mean literally"), "{err}");
     }
 
-    /// Every whole-line divergence is decided once, over the raw syntax tree,
-    /// before the walk — so each holds in every position a command can sit in,
-    /// including the constructs whose children the walker filters (a subshell, a
-    /// command substitution, a brace group, a function body, a case branch and a
-    /// pipeline member). A rule hooked into the walker instead would police only
-    /// the positions that walker happens to visit. The comment and `;` cases name
-    /// a harmless command (`dir`), so the rule's own message is what must come
-    /// back — not a parse error or a mutator verdict from the construct around
-    /// it.
+    /// Every whole-line divergence is decided once, over the raw syntax tree, before the walk — so
+    /// each holds in every position a command can sit in, including the constructs whose children
+    /// the walker filters (a subshell, a command substitution, a brace group, a function body, a
+    /// case branch, a pipeline member). A rule hooked into the walker would police only the
+    /// positions it happens to visit. The comment and `;` cases name a harmless command (`dir`), so
+    /// the rule's own message is what must come back — not a parse error or a mutator verdict.
     #[test]
     fn line_divergences_are_refused_inside_every_construct() {
         for cmd in [
@@ -1650,8 +1411,8 @@ mod tests {
             let err = check_command(cmd, &win_ctx()).unwrap_err();
             assert!(err.contains("no comment syntax"), "{cmd}: {err}");
         }
-        // The same constructs carrying a `;`-split line instead: the fragment
-        // after the `;` is an extra operand of `del` for cmd.exe.
+        // The same constructs carrying a `;`-split line: the fragment after the `;` is an extra
+        // operand of `del` for cmd.exe.
         for cmd in [
             "(del %TEMP%\\a;C:\\ws\\x.exe)",
             "echo $(del %TEMP%\\a;C:\\ws\\x.exe)",
@@ -1678,13 +1439,11 @@ mod tests {
         }
     }
 
-    /// The whole-line divergences as the shared entry the unrestricted mode calls:
-    /// it has no walk of its own to find them through, so it must get exactly the
-    /// text the read-only guard's walk produces for the same line — same frame,
-    /// same wording, on the same trimmed text. A cmd-only shape whose bash parse
-    /// has errors is not this rule's business — that is a shape the unrestricted
-    /// mode is there to run — so the entry refuses nothing for it, where the
-    /// read-only guard's fail-closed parse refusal (asserted here) does.
+    /// The whole-line divergences as the shared entry the unrestricted mode calls: it has no walk
+    /// of its own, so it must get exactly the text the read-only guard's walk produces for the same
+    /// line — same frame, same wording, on the same trimmed text. A cmd-only shape whose bash parse
+    /// has errors is not this rule's business (the unrestricted mode is there to run it), so the
+    /// entry refuses nothing for it, where the guard's fail-closed parse refusal does.
     #[test]
     fn line_divergences_are_refused_in_both_modes() {
         for cmd in [r"del %TEMP%\a;C:\ws\x.exe", r"echo hi # & del C:\ws\x.txt"] {
@@ -1694,16 +1453,15 @@ mod tests {
                 guard,
                 "cmd `{cmd}`"
             );
-            // Trimmed exactly as the guard trims: the padded spelling is the same
-            // text, refused with the same words.
+            // Trimmed exactly as the guard trims: the padded spelling is the same text.
             let padded = format!("  {cmd}  ");
             assert_eq!(
                 check_line_divergences(&padded, ShellPlatform::Windows).unwrap_err(),
                 guard,
                 "padded `{padded}`"
             );
-            // Neither divergence is one for unix — the `;` splits and a comment
-            // executes nothing there — so the entry adds no refusal of its own.
+            // Neither divergence is one for unix — the `;` splits and a comment executes
+            // nothing there — so the entry adds no refusal of its own.
             assert!(
                 check_line_divergences(cmd, ShellPlatform::Unix).is_ok(),
                 "{cmd}"
@@ -1714,37 +1472,34 @@ mod tests {
         assert!(check_line_divergences("if exist x (echo a;b)", ShellPlatform::Windows).is_ok());
     }
 
-    /// A tripwire for the module doc's `# Accepted limits` section: one admitted
-    /// spelling per limit, so a later change that starts refusing one comes past
-    /// this test first. Not the whole list — the wrapper limit is pinned by
-    /// `unmodelled_verbs_fall_through_to_the_shared_dispatch`, and the unix
-    /// case-variant one by `unix_platform_verdicts_never_use_the_windows_rules`.
+    /// A tripwire for the module doc's `# Accepted limits` section: one admitted spelling per
+    /// limit, so a change that starts refusing one comes past this test first. Not the whole list
+    /// — the wrapper limit is pinned by `unmodelled_verbs_fall_through_to_the_shared_dispatch`, the
+    /// unix case-variant one by `unix_platform_verdicts_never_use_the_windows_rules`.
     #[test]
     fn documented_limits_are_not_closed() {
-        // A word escaping a separator or a redirect: cmd.exe reads the `\` as an
-        // ordinary character and splits or redirects at the character behind it,
-        // so the second command runs although the bash parse reads one word.
+        // A word escaping a separator or a redirect: cmd.exe reads the `\` as an ordinary
+        // character and splits or redirects behind it, so the second command runs although the bash
+        // parse reads one word.
         ok(r"dir \& del C:\ws\x.exe");
         ok(r"whoami \> C:\ws\out.txt");
-        // A VERB word spelled through cmd's escape or its variable syntax, and a
-        // decorated or trailing-dot name: none matches a table.
+        // A VERB spelled through cmd's escape or variable syntax, or decorated/trailing-dot: none
+        // matches a table.
         ok(r"%DEL% C:\ws\x.txt");
         ok(r"!DEL! C:\ws\x.txt");
         ok(r"d^el C:\ws\x.txt");
         ok(r"DEL. C:\ws\x.txt");
         ok(r"format.com. C:");
-        // A command on no table at all — the writers among them, and one that
-        // picks its own destination when it is given only a source.
+        // A command on no table at all — the writers among them, and one that picks its own
+        // destination from a lone source.
         ok(r"certutil -decode C:\ws\x.b64 C:\ws\out.bin");
         ok(r"sort /o C:\ws\out.txt C:\ws\a.txt");
         ok(r"makecab C:\ws\x.txt");
-        // A path-qualified verb with forward slashes and no executable
-        // extension: a literal word for the bash parse, and no table for
-        // `verb_key` — which reads a separator-carrying word as a program only
-        // through a known extension. The shared dispatch then judges the
-        // basename cmd.exe would resolve, so a name the shared tables carry is
-        // still refused in this spelling while a Windows-only one passes. The
-        // backslash spelling is the shared classifier's unprovable word instead.
+        // A path-qualified verb with forward slashes and no extension: a literal word for the bash
+        // parse and no table for `verb_key`, so the shared dispatch judges the basename cmd.exe
+        // would resolve — a name the shared tables carry is still refused in this spelling while a
+        // Windows-only one passes. The backslash spelling is the shared classifier's unprovable
+        // word.
         ok(r"C:/Windows/System32/del C:\ws\x.txt");
         ok(r"C:/Windows/System32/copy C:\ws\a.txt C:\ws\b.txt");
         // The sharpest one: `format` IS on a Windows deny table, and this
@@ -1855,32 +1610,28 @@ mod tests {
         assert_rejected(r"set temp=C:\ws");
         assert_rejected(r#"set "TEMP=%TEMP%\x""#);
         assert_rejected(r"set TMP=C:\ws && del %TMP%\x.txt");
-        // The binding is not tracked, so using it cannot be resolved.
         assert_rejected(r"set FOO=%TEMP%\x && del %FOO%\x.txt");
         assert_rejected("set /a x=1");
         assert_rejected("set /p x=");
         assert_rejected("set =value");
-        // A quote character cmd.exe does not interpret leaves the binding
-        // unreadable; the double-quoted spelling is the one cmd assigns, and a
-        // temp name is refused through it too.
+        // A quote character cmd.exe does not interpret leaves the binding unreadable; the
+        // double-quoted spelling is the one cmd assigns, and a temp name is refused through it too.
         assert_rejected(r"set TEMP='C:\ws'");
         assert_rejected(r#"set "TEMP='C:\ws'""#);
-        // cmd's transform pass rewrites the line before the builtin binds, so a
-        // name carrying an escape would set a variable spelled differently from
-        // the text the layer reads.
+        // cmd's transform pass rewrites the line before the builtin binds, so a name carrying an
+        // escape would set a variable spelled differently from the text the layer reads.
         assert_rejected(r"set TEMP^=C:\ws");
         assert_rejected(r"set TEMP =C:\ws");
         assert_rejected(r"set TEM%P%=C:\ws");
-        // cmd's environment is case-insensitive, so the unix `GIT_*` binding
-        // rule applies to any casing; `GIT_PAGER` is the documented carve-out.
+        // cmd's environment is case-insensitive, so the unix `GIT_*` rule applies to any casing;
+        // `GIT_PAGER` is the documented carve-out.
         assert_rejected(r"set GIT_SSH_COMMAND=C:\ws\evil.exe && git ls-remote x");
         assert_rejected(r"set git_dir=C:\ws");
         ok("set GIT_PAGER=cat");
     }
 
-    /// cmd.exe dispatches `Git`/`GIT`/`GIT.EXE` to the same program, so a
-    /// mixed-case or extension-qualified verb must get exactly the `git`
-    /// verdict.
+    /// cmd.exe dispatches `Git`/`GIT`/`GIT.EXE` to the same program, so a mixed-case or
+    /// extension-qualified verb must get exactly the `git` verdict.
     #[test]
     fn mixed_case_git_verbs_keep_their_verdict() {
         for verb in ["Git", "GIT", "git.exe", "GIT.EXE", "Git.EXE"] {
@@ -1907,25 +1658,22 @@ mod tests {
         ok("git.exe log --oneline");
     }
 
-    /// No relative path operand is provable: cmd resolves one against a
-    /// directory the guard does not model, and that directory is not reliably
-    /// outside the temp roots — the temp cleaner runs its shell in a workspace
-    /// built at the private temp root, where a workspace-anchored relative path
-    /// would satisfy the gate while cmd writes wherever a `cd` left it. The temp
-    /// gate therefore accepts absolute spellings only.
+    /// No relative path operand is provable: cmd resolves one against a directory the guard does
+    /// not model, and that directory is not reliably outside the temp roots — the temp cleaner runs
+    /// its shell in a workspace built at the private temp root, where a workspace-anchored relative
+    /// path would satisfy the gate while cmd writes wherever a `cd` left it.
     #[test]
     fn relative_operands_are_refused() {
         let ctx = win_ctx();
-        // No relative word has a proving form.
         assert_eq!(resolve_raw("x.txt", &ctx), None);
         assert!(!under_temp("x.txt", &ctx));
-        // cmd's other relative spellings: root-relative (the drive's own current
-        // directory) and drive-relative.
+        // cmd's other relative spellings: root-relative (the drive's own current directory) and
+        // drive-relative.
         assert_eq!(resolve_raw(r"\x.txt", &ctx), None);
         assert_eq!(resolve_raw("c:x.txt", &ctx), None);
         assert!(!under_temp(r"\x.txt", &ctx));
-        // The temp cleaner's session: the workspace IS the private temp root, so
-        // an anchored relative operand would have satisfied the gate.
+        // The temp cleaner's session: the workspace IS the private temp root, so an anchored
+        // relative operand would have satisfied the gate.
         let mut cleaner =
             CheckContext::for_platform(Path::new(&temp_root()), ShellPlatform::Windows);
         cleaner.temp_roots = vec![PathBuf::from(temp_root())];
@@ -1960,11 +1708,10 @@ mod tests {
         ok(r#"cd %TEMP% && del "%TEMP%\x.txt""#);
     }
 
-    /// The layer owns the cd family outright: it writes nothing, and the shared
-    /// dispatch would read a cmd path as an unknown command word. The target is
-    /// not modelled — a spelling fused with a separator (`cd..\..`, `cd\Users`)
-    /// is unprovable and refused — and no cd can make a relative operand
-    /// writable (see `relative_operands_are_refused`).
+    /// The layer owns the cd family outright: it writes nothing, and the shared dispatch would read
+    /// a cmd path as an unknown command word. The target is not modelled — a spelling fused with a
+    /// separator (`cd..\..`, `cd\Users`) is unprovable and refused — and no cd can make a relative
+    /// operand writable (`relative_operands_are_refused`).
     #[test]
     fn cd_family_is_owned_by_the_layer() {
         ok("cd");
@@ -1972,8 +1719,7 @@ mod tests {
         ok("cd..");
         ok(r"cd /d %TEMP%");
         ok("cdrecord /dev/x"); // a longer name is not the builtin
-        // cmd's own spellings of the family: case-folded, glued switch, and the
-        // `chdir` alias are the same builtin.
+        // cmd's own spellings: case-folded, glued switch, and the `chdir` alias.
         ok(r"CD C:\ws");
         ok("cd/d C:\\ws");
         ok(r"chdir C:\ws");
@@ -1981,18 +1727,16 @@ mod tests {
         ok("popd");
         assert_rejected(r"cd..\..");
         assert_rejected(r"cd\Users");
-        // A bare drive switch writes nothing and is allowed; one carrying an
-        // operand is not a shape cmd.exe has, and reading the rest as words of
-        // one command would hide a mutator.
+        // A bare drive switch writes nothing and is allowed; one carrying an operand is not a
+        // shape cmd.exe has, and reading the rest as words of one command would hide a mutator.
         ok("C:");
         ok(r"C: && dir C:\ws");
         assert_rejected(r"D: del C:\ws\x.txt");
         assert_rejected(r#"D: del "%TEMP%\x.txt""#);
     }
 
-    /// A non-ASCII command word must be judged, never panic: a panic here aborts
-    /// a phase dispatch. The word is either an unmodelled program (allowed) or
-    /// unprovable (refused) — what matters is that it has a verdict.
+    /// A non-ASCII command word must be judged, never panic: a panic here aborts a phase dispatch.
+    /// The word is either an unmodelled program (allowed) or unprovable (refused).
     #[test]
     fn non_ascii_command_words_are_judged_not_panicked() {
         for cmd in [
@@ -2016,11 +1760,10 @@ mod tests {
         ok(r#"dir C:\ws\céd && del "%TEMP%\céd.txt""#);
     }
 
-    /// The exact command block the sanitation temp-cleanup task is given on
-    /// Windows must keep running: the removal verbs are inside its scan roots
-    /// (which are the guard's accepted temp roots, passed as literal absolute
-    /// paths), and the inspection rows — `forfiles` included — are not chased as
-    /// wrappers.
+    /// The exact command block the sanitation temp-cleanup task is given on Windows must keep
+    /// running: the removal verbs are inside its scan roots (the guard's accepted temp roots,
+    /// passed as literal absolute paths), and the inspection rows — `forfiles` included — are not
+    /// chased.
     #[test]
     fn sanitation_windows_tool_block_still_works() {
         let temp = temp_root();
@@ -2047,13 +1790,10 @@ mod tests {
         ok("dir 2>&1");
         assert_rejected(r"dir > C:\ws\listing.txt");
         assert_rejected("dir > NULX");
-        // cmd does not interpret single quotes: the target is an ordinary file
-        // in the cwd, not the device.
+        // cmd does not interpret single quotes: the target is an ordinary file in the cwd.
         assert_rejected("dir > 'NUL'");
-        // A separator makes the spelling an ordinary path, not the device.
         assert_rejected(r"dir > NUL\..\..\ws\x.txt");
         assert_rejected("dir > NUL.x\\foo");
-        // `/dev/null` is a unix spelling: under cmd.exe it is a real path.
         assert_rejected("dir > /dev/null");
     }
 
@@ -2074,22 +1814,19 @@ mod tests {
 
     #[test]
     fn unmodelled_verbs_fall_through_to_the_shared_dispatch() {
-        // `forfiles` is what the sanitation temp-cleanup task reports a tree's
-        // newest mtime with, so refusing it would break a documented read-only
-        // workflow.
+        // `forfiles` is what the sanitation temp-cleanup task reports a tree's newest mtime with,
+        // so refusing it would break a documented read-only workflow.
         ok(r"forfiles /p %TEMP% /m * /d -7");
         ok(r"dir /b C:\ws");
         ok(r"where cargo.exe");
         ok(r"type C:\ws\Cargo.toml");
         ok(r"findstr /s /i TODO C:\ws\src\*.rs");
-        // Interpreters stay unchased, as on unix — the shell itself included,
-        // with its own `/c`.
+        // Interpreters stay unchased, as on unix — the shell itself included, with its own `/c`.
         ok(r"powershell -Command Get-ChildItem");
         ok(r"cmd /c del C:\ws\x.txt");
-        // cmd.exe dispatches case-insensitively and ignores the executable
-        // extension, so the shared tables are matched on the layer's verb key:
-        // `tar`/`curl`/`sed`/`dd` are flag-gated and `shutdown` is an
-        // unconditional mutator, in any casing and with or without `.exe`.
+        // cmd.exe dispatches case-insensitively and ignores the extension, so the shared tables are
+        // matched on the layer's verb key: `tar`/`curl`/`sed`/`dd` are flag-gated and `shutdown` is
+        // an unconditional mutator, in any casing and with or without `.exe`.
         assert_rejected(r"TAR -xf C:\ws\a.tar");
         assert_rejected(r"CURL -o C:\ws\f https://example.com");
         assert_rejected(r"SHUTDOWN /s");
@@ -2103,18 +1840,15 @@ mod tests {
         assert_rejected(r"rm.exe C:\ws\x.txt");
         assert_rejected(r"C:\tools\rm.exe C:\ws\x.txt");
         ok(r#"rm.exe "%TEMP%\x.txt""#);
-        // A quoted absolute executable path is a command word cmd.exe runs, so it
-        // is admitted too — here it is the product's own binary, whose `--version`
-        // is one of the read-only second words the shared dispatch leaves it (the
-        // row proves the folded basename reaches that rule; it is no longer a
-        // row about an unmodelled verb falling through).
+        // A quoted absolute executable path is a command word cmd.exe runs, so it is admitted too —
+        // here the product's own binary, whose `--version` is one of the read-only second words the
+        // shared dispatch leaves it.
         ok(r#""C:\Program Files\mahbot\mahbot.exe" --version"#);
     }
 
-    /// The platform is a runtime value, so this host can pin both lanes: the
-    /// Windows-only rules (the null device, the case fold) must not reach a
-    /// unix verdict. The uppercase unix verdicts asserted here are the
-    /// documented case-sensitivity limit of the shared tables, not a Windows
+    /// The platform is a runtime value, so this host can pin both lanes: the Windows-only rules
+    /// (the null device, the case fold) must not reach a unix verdict. The uppercase unix verdicts
+    /// asserted here are the documented case-sensitivity limit of the shared tables, not a Windows
     /// behaviour — the fold is what makes the difference.
     #[test]
     fn unix_platform_verdicts_never_use_the_windows_rules() {
@@ -2122,15 +1856,14 @@ mod tests {
         let state = ValidationState::new(&unix);
         assert!(!is_null_target("NUL", &state));
         assert!(!is_null_target("nul:", &state));
-        // `NUL` is not the unix null device, so the unix redirect verdict stands.
         assert!(check_command("echo hi > NUL", &unix).is_err());
         assert!(check_command("tar -xf a.tar", &unix).is_err());
         assert!(check_command("TAR -xf a.tar", &unix).is_ok());
         assert!(check_command("shutdown /s", &unix).is_err());
         assert!(check_command("SHUTDOWN /s", &unix).is_ok());
         assert!(check_command("shutdown.exe /s", &unix).is_ok());
-        // A `;` separates commands for both readers on unix, so the Windows
-        // `;`-refusal must not reach a unix verdict.
+        // A `;` separates commands for both readers on unix, so the Windows `;`-refusal must not
+        // reach a unix verdict.
         assert!(check_command("echo a; echo b", &unix).is_ok());
         // A comment executes nothing on unix, so only Windows refuses it.
         assert!(check_command("echo a # b", &unix).is_ok());

@@ -23,8 +23,7 @@
 //! failed) hold every claim and job creation, while the discovery itself and the
 //! manager/maintainer/auxiliary agents are not gated by it. A workspace holding a
 //! failed ticket awaiting Manager triage skips the `Queued -> InDevelopment` claim
-//! (enforced inside the claim predicate, not here); every other puller step still
-//! runs.
+//! (enforced inside the claim predicate, not here); every other puller step still runs.
 
 pub mod analysis;
 pub mod board;
@@ -83,8 +82,7 @@ fn phase_bodies_running() -> &'static std::sync::Mutex<HashSet<String>> {
 }
 
 /// Claim the spawn slot for a phase body. Returns `false` when another poll
-/// tick already owns it (a body is live on this job) — the caller must not
-/// re-spawn.
+/// tick already owns it (a body is live on this job) — the caller must not re-spawn.
 fn claim_phase_body(job_id: &str) -> bool {
     phase_bodies_running()
         .lock()
@@ -575,7 +573,7 @@ async fn run_claim_pipeline(ws: &Workspace) {
     }
 }
 
-// ── Shared phase-module constants ───────────────────────────────────────
+// Shared phase-module constants
 
 /// Neutral reason for a phase-gate bail (transients are not misattributed).
 const PHASE_GATE_BAIL_REASON: &str = "ticket not in expected phase";
@@ -595,7 +593,7 @@ pub const BOUNCE_BADGE_WARNING_THRESHOLD: usize = 5;
 /// [`MAX_BOUNCES`]. See [`bounce_notice_mark`].
 const BOUNCE_NOTICE_INTERVAL: usize = 2;
 
-// ── Transition + notification helpers (shared by the phase modules) ─────
+// Transition + notification helpers (shared by the phase modules)
 
 /// Returns `true` if the ticket is in the expected phase (safe to proceed).
 /// Returns `false` otherwise — the ticket may have been moved externally,
@@ -863,8 +861,7 @@ async fn resolve_ticket_workspace(ticket: &Ticket, log_label: &str) -> Option<Wo
 /// those rows carry the interrupted round's stored per-slot tasks, so they are
 /// preserved for a slot-resume rather than discarded. The `paused` signal is
 /// typed and captured immutably at the agent's bail, so this handles even the
-/// narrow window where the workspace is resumed between the bail and this
-/// finalizer.
+/// narrow window where the workspace is resumed between the bail and this finalizer.
 async fn pause_freezing(ticket: &Ticket, job_id: &str) {
     info!(
         ticket = %ticket.id,
@@ -1035,8 +1032,7 @@ async fn discard_failed_first_request_session(ticket_id: &str, agent: &Agent) {
     }
 }
 
-/// Fetch the last ticket comment (any role) as failure details for a Manager
-/// notification.
+/// Fetch the last ticket comment (any role) as failure details for a Manager notification.
 async fn last_comment_as_failure_details(ticket_id: &str) -> String {
     match board().get_comments(ticket_id).await {
         Ok(comments) => comments.last().map_or_else(
@@ -1207,7 +1203,7 @@ async fn register_running_agent(
     incoming_rx
 }
 
-// ── Parallel-agent machinery (analysis / verification) ──────────────────
+// Parallel-agent machinery (analysis / verification)
 
 /// Canonical agent-id format for ticket phase roster slots
 /// (`ticket_{ticket_id}_{idx}_{suffix}_{role}`).
@@ -1567,8 +1563,7 @@ async fn run_parallel_agents(
     }
 }
 
-/// Build the raw-response dump section for a verdict-extraction failure
-/// diagnostic.
+/// Build the raw-response dump section for a verdict-extraction failure diagnostic.
 fn raw_response_dump_section(failure: &crate::retry::RetryExhausted) -> String {
     match failure.last_raw.as_deref() {
         Some(text) if !text.trim().is_empty() => format!(
@@ -1589,7 +1584,7 @@ fn raw_response_dump_section(failure: &crate::retry::RetryExhausted) -> String {
     }
 }
 
-// ── Single-agent stage rounds (engineer / sanitation) ───────────────────
+// Single-agent stage rounds (engineer / sanitation)
 
 /// The single-agent stage rounds sharing one run tail (each driven by a
 /// permanently-NULL-seat session pin): engineer and sanitation.
@@ -1748,7 +1743,7 @@ async fn run_stage_agent(
     }
 }
 
-// ── Stage-handoff roster helpers ────────────────────────────────────────
+// Stage-handoff roster helpers
 
 /// Persist the phase job's dispatch task at dispatch time. Phase dispatch
 /// re-derives its prompt from live state, so this stored value is not read for
@@ -1777,7 +1772,7 @@ async fn clear_implementation_roster(conn: &crate::db::Connection, job_id: &str,
     }
 }
 
-// ── Bounce breaker (unified post-development non-success) ───────────────
+// Bounce breaker (unified post-development non-success)
 
 /// Comment posted when the bounce breaker trips: a fixed failure notice that
 /// names the "circuit breaker" and the configured `MAX_BOUNCES` budget.
@@ -1807,8 +1802,7 @@ fn bounce_notice_mark(bounce_count: i64) -> Option<i64> {
     (n % BOUNCE_NOTICE_INTERVAL == 0).then_some(next)
 }
 
-/// Move all other Queued tickets in the workspace to Planning after a breaker
-/// trip.
+/// Move all other Queued tickets in the workspace to Planning after a breaker trip.
 ///
 /// This is the visible half of the post-failure triage step, not the
 /// enforcement: the hard guarantee that the workspace starts no new ticket

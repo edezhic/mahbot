@@ -1,68 +1,19 @@
 //! Voice Assistant — wake word detection and voice command pipeline.
 //!
-//! # Architecture
+//! Microphone (cpal) → Earshot VAD → a 1024-dim [`encode_window`] embedding of the trailing
+//! ≤1 s of VAD-gated speech, scored by cosine against the enrolled prototype → rolling-sum
+//! detection → command recording → shared Qwen3-ASR transcription → the composer message.
+//! Wake word reuses the transcriber model and needs transcription enabled
+//! (`audio_transcription_use_local != "false"`); the pipeline runs unconditionally as a boot
+//! background task, with no agent loop.
 //!
-//! The voice assistant provides hands-free interaction via a custom wake word.
-//! The pipeline stages are:
-//!
-//! 1. **Microphone capture** — capture mono 16 kHz audio via cpal
-//! 2. **Voice activity detection** — Earshot neural VAD to gate processing
-//! 3. **Encoder window embedding** — the trailing ≤1 s window is run through
-//!    the shared Qwen3-ASR encoder's mel frontend + transformer
-//!    ([`crate::audio::wake_word::encode_window`]), producing a 1024-dim
-//!    L2-normalized window embedding
-//! 4. **Wake word matching** — cosine similarity of the window embedding
-//!    against the enrolled prototype, mapped through negative-sample
-//!    calibration into a soft score, with the rolling-sum detection machinery
-//!    (speaker-blind, immediate-fire).
-//! 5. **Command recording** — record speech until silence or the 10 min cap.
-//!    Recording starts by discarding everything captured before the fire plus
-//!    [`POST_FIRE_DISCARD_SAMPLES`], so the trigger phrase is not carried into
-//!    the recognition input (at worst a trailing fragment of it survives, when
-//!    the phrase is still being spoken at the fire); an activation whose
-//!    retained audio holds no speech delivers nothing at all.  Two short cue
-//!    sounds (see [`crate::audio::cue`]) mark the start and the end of the
-//!    recording.  The composer's mic button starts a recording of its own
-//!    ([`RecordingOrigin::Button`]): same mechanism, same message — it just has
-//!    no silence end and no cues.
-//! 6. **Transcription** — via the shared Qwen3-ASR local transcriber
-//! 7. **Delivery** — the transcribed text is marked with the audio-icon combo
-//!    and published on [`RECORDING`]. The Home composer owns the message it
-//!    becomes, whichever way the recording started: it sends the transcript as
-//!    one message together with whatever the field holds, through the ordinary
-//!    desktop send path.
-//!
-//! The pipeline runs unconditionally as a boot background task. It does NOT
-//! use an LLM agent loop.
-//!
-//! # Model sharing
-//!
-//! Wake word detection reuses the exact same loaded Qwen3-ASR model instance
-//! as speech-to-text transcription — no separate artifact, no download
-//! machinery, no model handling.  Wake word detection functions only when ASR
-//! is enabled (`audio_transcription_use_local != "false"`); if transcription
-//! is disabled, wake word is disabled too.
-//!
-//! # Scoring geometry
-//!
-//! Every scoring step encodes the trailing [`WINDOW_SAMPLES`] (12 160
-//! samples ≈ 0.76 s) of the VAD-gated speech window through the shared
-//! encoder.  The stride between scoring steps is [`SCORE_STRIDE_SAMPLES`]
-//! (2560 samples ≈ 160 ms), derived from [`SCORE_STRIDE_MEL_FRAMES`] (16 mel
-//! frames × 160-sample mel stride).  The raw audio ring is capped at
-//! [`AUDIO_BUFFER_MAX`] (~2.0 s) so the VAD loop always sees a bounded trailing
-//! window; the ring itself is dropped when detection fires.  A fire is
-//! accepted only near the start of the speech segment it belongs to — see
-//! [`WAKE_WORD_MAX_SEGMENT_STEPS`] for the position and its justification.
-//!
-//! # Enrollment
-//!
-//! ~10 utterances are each embedded via [`crate::audio::wake_word::encode_window`];
-//! the prototype is the L2-normalized mean of the accepted utterances
-//! (no trainable head).  Negative-sample calibration (owner negatives + ambient
-//! negatives) sets the cosine floor for scoring.  Persistence uses the v2
-//! enrollment schema under the `wake_word_templates` config key; old v1 records
-//! are rejected (re-enrollment required).
+//! Each scoring step encodes the trailing [`WINDOW_SAMPLES`] (12 160 samples ≈ 0.76 s) of the
+//! VAD-gated speech window, once per [`SCORE_STRIDE_SAMPLES`] (2560 ≈ 160 ms, 16 mel frames ×
+//! 160-sample stride); the raw ring is capped at [`AUDIO_BUFFER_MAX`] (~2.0 s) and dropped on a
+//! fire, and a fire counts only near the start of its speech segment
+//! ([`WAKE_WORD_MAX_SEGMENT_STEPS`]).  Enrollment embeds ~10 utterances into their L2-normalized
+//! mean (no trainable head) and calibrates the cosine floor on owner and ambient negatives; it
+//! persists under `wake_word_templates` in the v2 schema, v1 records being rejected.
 
 use crate::audio::cue::{self, Cue};
 use crate::audio::util::cosine_similarity;
@@ -84,8 +35,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
-// Constants
-
 /// Target sample rate: 16 kHz mono.
 const SAMPLE_RATE: u32 = 16_000;
 
@@ -99,10 +48,9 @@ fn samples_to_ms(len: usize, rate: u32) -> u64 {
 /// Frame size for VAD / quality frames (512 samples = 32ms at 16kHz).
 const FRAME_LENGTH: usize = 512;
 
-/// Hop length between frames (256 samples at 16 kHz).  This constant controls
-/// VAD frame iteration stride and silence tracking in the application code.
-/// The Qwen3-ASR mel frontend uses its own internal stride (160 samples =
-/// 10ms) — HOP_LENGTH does NOT affect mel frame spacing.
+/// Hop between VAD frames (256 samples at 16 kHz): the VAD iteration stride and silence tracking.
+/// The Qwen3-ASR mel frontend strides its own 160 samples (10 ms) — [`HOP_LENGTH`] does not
+/// affect mel frame spacing.
 const HOP_LENGTH: usize = 256;
 
 /// Maximum command recording duration (10 minutes).
@@ -111,92 +59,62 @@ const MAX_RECORD_SECS: usize = 600;
 /// Minimum silence duration before stopping command recording.
 const COMMAND_SILENCE_DURATION: Duration = Duration::from_millis(1500);
 
-/// Silence threshold in audio samples at 16 kHz.
-/// Derived from COMMAND_SILENCE_DURATION × SAMPLE_RATE to prevent silent drift
-/// if either constant changes.
+/// Silence threshold in samples, derived from [`COMMAND_SILENCE_DURATION`] × sample rate so it
+/// cannot silently drift if either changes.
 const SILENCE_THRESHOLD_SAMPLES: usize =
     (COMMAND_SILENCE_DURATION.as_millis() as usize * SAMPLE_RATE as usize) / 1000;
 
-/// Enrollment/segmentation silence threshold (~304ms = 19 hops × 256 samples).
-/// Aligned to streaming detection's [`SEGMENT_TIMEOUT_HOPS`] so that utterance
-/// boundaries are detected consistently between training and inference.
-///
-/// The longer [`SILENCE_THRESHOLD_SAMPLES`] is preserved for command recording
-/// (`handle_recording_audio`) where 1.5s is appropriate for natural command
-/// phrasing pauses.
+/// Enrollment/segmentation silence threshold (~304ms = 19 hops × 256 samples), aligned to
+/// [`SEGMENT_TIMEOUT_HOPS`] so training and inference find the same utterance boundaries.
+/// [`SILENCE_THRESHOLD_SAMPLES`] stays the command-recording one, where 1.5s suits phrasing.
 const ENROLLMENT_SILENCE_THRESHOLD_SAMPLES: usize = SEGMENT_TIMEOUT_HOPS * HOP_LENGTH;
 
-/// Silence threshold (200ms) before showing "Keep silent to confirm…" UI hint.
-/// Intentionally wider than a single frame (16ms) so the UI reliably transitions
-/// even under scheduling jitter.
+/// Silence threshold (200ms) before the "Keep silent to confirm…" hint — wider than one frame
+/// (16ms) so the UI transitions even under scheduling jitter.
 const SILENCE_UI_GATE_SAMPLES: usize = 200 * SAMPLE_RATE as usize / 1000;
 
-/// Capacity of the microphone audio channel feeding the voice pipeline.
+/// Capacity of the microphone channel feeding the pipeline: 32 chunks × 512 samples ≈ 1 s.  A
+/// full channel drops chunks at
+/// [`try_send`](tokio::sync::mpsc::Sender::try_send) while the pipeline is blocked (encoder
+/// inference in [`handle_wake_word_detection`]), so memory stays bounded.
 ///
-/// 32 chunks × 512 samples / 16000 Hz ≈ 1 second of audio.  When the pipeline
-/// is blocked (e.g. encoder inference in [`handle_wake_word_detection`]),
-/// [`try_send`](tokio::sync::mpsc::Sender::try_send) silently drops chunks
-/// at this threshold, preventing unbounded memory growth.
-///
-/// # Drop policy
-///
-/// This is **drop-newest**: the most recent audio chunk is discarded when the
-/// channel is full.  During a pipeline stall the buffered audio is slightly
-/// delayed (~1 s) but temporally contiguous, so downstream processing (VAD,
-/// window encoding, wake-word scoring) operates on consistent stream
-/// segments.  The wake word may be missed if it arrives entirely within the
-/// dropped window, but the user will simply repeat it.
+/// The policy is drop-newest: buffered audio lags ~1 s but stays temporally contiguous, so VAD,
+/// windowing and scoring still see consistent segments.  A wake word arriving entirely inside the
+/// dropped span is missed, and the user simply repeats it.
 const MIC_CHANNEL_CAPACITY: usize = 32;
 
-/// Duration of non-VAD audio before showing "speak louder" warning during
-/// enrollment (~5s).  Derived from SAMPLE_RATE and HOP_LENGTH so the threshold
-/// stays correct if frame/hop sizes are adjusted.
+/// Non-VAD audio before the enrollment "speak louder" warning (~5s); see the frame threshold
+/// derived from it below.
 const ENROLLMENT_NO_SPEECH_DURATION: Duration = Duration::from_secs(5);
 
-/// Consecutive non-VAD frame threshold for enrollment no-speech warning.
-/// Each frame iteration processes HOP_LENGTH new samples, so the threshold
-/// is (duration × sample_rate) / hop_length to be robust against frame/hop
-/// size changes.
+/// The same window in frames, each iteration consuming [`HOP_LENGTH`] new samples, so the
+/// threshold survives frame or hop changes.
 const ENROLLMENT_NO_SPEECH_TIMEOUT_FRAMES: usize =
     (ENROLLMENT_NO_SPEECH_DURATION.as_millis() as usize * SAMPLE_RATE as usize)
         / (HOP_LENGTH * 1000);
 
-/// Consecutive VAD-negative hops before a detection segment boundary fires
-/// (~300 ms at 16 ms/hop).  The rolling score window and adaptive threshold
-/// are reset at the boundary so scores cannot accumulate across separate
-/// utterances.
+/// Consecutive VAD-negative hops before a detection segment boundary fires (~300 ms at 16 ms/hop).
+/// The boundary resets the rolling score window and adaptive threshold, so scores cannot
+/// accumulate across separate utterances.
 const SEGMENT_TIMEOUT_HOPS: usize = 19;
 
-/// Target number of user utterances for enrollment (Phase 2).
 const NUM_ENROLLMENT_SAMPLES: usize = 10;
 
-/// Minimum length of a saved ambient negative audio chunk (0.5 s).
 const MIN_NEGATIVE_AUDIO_LEN: usize = SAMPLE_RATE as usize / 2;
 
 /// Maximum number of ambient negative audio chunks retained in memory.
 const MAX_NEGATIVE_AUDIO_CHUNKS: usize = 100;
 
-/// Maximum automatic retry cycles after a terminal ASR load failure.
-///
-/// Each cycle is a full load-or-download chain (up to 12 download attempts ×
-/// 1.88 GB in the transcriber's [`crate::audio::local_transcriber`] retry
-/// loop).  The periodic pipeline self-healing path is bounded to this budget
-/// so a persistently failing download cannot loop forever (retry → 12
-/// download attempts → Failed → 30 s later retry → …).  Beyond the budget the
-/// pipeline stops auto-retrying: the user must either press the GUI retry
-/// button ([`VoiceCommand::RetryModelLoading`], which bypasses the budget) or
-/// restart the app.
+/// Maximum automatic retry cycles after a terminal ASR load failure.  One cycle is a full
+/// load-or-download chain (up to 12 download attempts × 1.88 GB in the transcriber retry loop),
+/// and the self-healing path stays inside this budget so a persistently failing download cannot
+/// loop forever (retry → 12 attempts → Failed → 30 s → retry → …).  Past it the pipeline stops
+/// auto-retrying: the user presses the GUI retry button
+/// ([`VoiceCommand::RetryModelLoading`], which bypasses the budget) or restarts.
 const MAX_AUTO_MODEL_RETRY_CYCLES: u32 = 3;
 
-// ── Phase 3 (owner-negative) enrollment constants ────────────
-
-/// Target VAD-positive speech seconds for Phase 3 owner-negative collection.
-///
-/// 15 s of real VAD-positive speech is sufficient to collect calibration data
-/// and anti-prototypes while keeping the per-user negative phase short.  The
-/// phase still collects owner-negative chunks for calibration and
-/// anti-prototypes as designed.  The wall-clock timeout ([`PHASE3_TIMEOUT_SECS`])
-/// is unchanged.
+/// Target VAD-positive speech seconds for Phase 3 owner-negative collection: enough real audio
+/// for calibration data and anti-prototypes while keeping the per-user phase short.
 const NEGATIVES_TARGET_SECONDS: usize = 15;
 
 /// Memory cap for owner-negative chunks (~22.5 s of 16 kHz f32 audio).
@@ -215,12 +133,9 @@ pub(crate) const ENROLLMENT_QUALITY_DURATION_MIN_MS: u64 = 400;
 /// Maximum acceptable enrollment utterance duration in milliseconds.
 pub(crate) const ENROLLMENT_QUALITY_DURATION_MAX_MS: u64 = 2000;
 
-/// Minimum fraction of enrollment utterances that must pass the enrollment
-/// self-test for the model to be accepted.
+/// Fraction of utterances that must pass the enrollment self-test for the model to be accepted.
 const ENROLLMENT_QUALITY_SELF_TEST_MIN_FRACTION: f32 = 0.8;
 
-/// Per-utterance enrollment prompts (guidance shown to the user as they
-/// record the required samples).
 const ENROLLMENT_PROMPTS: &[(&str, usize)] = &[
     ("Say it normally", 3),
     ("Say it a bit further from the mic", 3),
@@ -228,83 +143,55 @@ const ENROLLMENT_PROMPTS: &[(&str, usize)] = &[
     ("Say it with your normal morning voice", 2),
 ];
 
-// ── Wake-word scoring geometry (re-calibrated for the encoder pipeline) ──
-//
-// The scoring constants below were re-calibrated for the 1024-dim cosine
-// soft-score space produced by [`crate::audio::wake_word::encode_window`] +
-// [`Calibration::soft_score`] (raw cosine mapped through a calibration-derived
-// parametric floor into [0,1]).  The old pipeline scored a sigmoid Conv1D head
-// whose per-frame outputs were well above the cosine soft scores a calibrated
-// enrollment produces; the thresholds were re-derived for this space.  The
-// floor is now derived parametrically from the negative mean/std (see
-// [`Calibration::soft_floor`]) and anchored at [`POS_MATCH_COSINE_ANCHOR`]
-// (see [`Calibration::fire_soft`]) so a hotter negative pool never crushes
-// recall.
+// Scoring geometry, re-calibrated for the 1024-dim cosine soft scores of
+// [`crate::audio::wake_word::encode_window`] + [`Calibration::soft_score`]: the old thresholds
+// scored a sigmoid Conv1D head, whose outputs sat far above these.  The floor is derived
+// parametrically from the negative mean/std ([`Calibration::soft_floor`]) and anchored at
+// [`POS_MATCH_COSINE_ANCHOR`] ([`Calibration::fire_soft`]), so a hotter negative pool never
+// crushes recall.
 
-/// Bounded detection window: the trailing 0.76 s (12 160 samples) of the
-/// VAD-gated speech window — the same [`WINDOW_SAMPLES`] geometry enrollment
-/// uses ([`crate::audio::wake_word::encode_window`]).
+/// Detection window: the trailing 0.76 s (12 160 samples) of the VAD-gated speech window — the
+/// [`WINDOW_SAMPLES`] geometry enrollment encodes.
 const WAKE_WORD_WINDOW_SAMPLES: usize = WINDOW_SAMPLES;
 
-/// Scoring stride in samples: 16 mel frames × 160-sample mel stride = 2560
-/// samples ≈ 160 ms.  The encoder forward is heavy, so the stride is widened
-/// to keep the real-time budget sane while the rolling window (N=3) still
-/// spans ~0.5 s of speech.
+/// Scoring stride: 16 mel frames × 160-sample mel stride = 2560 samples ≈ 160 ms.  The encoder
+/// forward is heavy, so the stride is widened to keep the real-time budget sane; the rolling
+/// window (N=3) still spans ~0.5 s of speech.
 const SCORE_STRIDE_SAMPLES: usize =
     crate::audio::wake_word::SCORE_STRIDE_MEL_FRAMES * qwen_asr::config::HOP_LENGTH;
 
-/// Cap for the raw audio ring (~2.0 s): one full [`WINDOW_SAMPLES`] window
-/// (12 160 samples) plus up to eight scoring strides of context
-/// (8 × 2560 = 20 480) so the VAD loop always has the most recent audio to
-/// consume while older samples drain.  The ring is the raw VAD input only —
-/// the detection→recording handoff drops it wholesale (see
-/// [`handle_wake_word_detection`]), so nothing downstream depends on its depth.
+/// Cap for the raw audio ring (~2.0 s): one [`WINDOW_SAMPLES`] window plus up to eight scoring
+/// strides (8 × 2560), so the VAD loop always has recent audio to consume while older samples
+/// drain.  Only the VAD reads it — the detection→recording handoff drops it wholesale.
 const AUDIO_BUFFER_MAX: usize = WINDOW_SAMPLES + 8 * SCORE_STRIDE_SAMPLES;
 
-/// Audio discarded at the start of a wake-word recording (0.2 s).
-///
-/// Everything captured before the fire is dropped outright, and this window
-/// covers what the detection lag left behind plus the recording-start cue
-/// ([`Cue::Start`], which the still-open microphone captures): the cue is ~70 ms
-/// of it, the rest absorbs the detection handoff and output latency.  The price
-/// is the opening of the command — up to ~0.5 s in the worst case, when the
-/// command starts right after the trigger phrase and detection lands late —
-/// which is the accepted trade for keeping the trigger phrase out of the
-/// recognition input; a trailing fragment of the phrase can still survive when
-/// the phrase is still being spoken at the fire.  Fixed product behaviour —
-/// there is no switch.
+/// Audio discarded at the start of a wake-word recording (0.2 s).  Everything captured before the
+/// fire is dropped outright, and this covers the detection lag plus the start cue ([`Cue::Start`],
+/// ~70 ms, which the still-open microphone captures).  The price is the opening of the command —
+/// up to ~0.5 s when detection lands late — traded for keeping the trigger phrase out of the
+/// recognition input; a trailing fragment survives if the phrase is still being spoken at the fire.
+/// Fixed product behaviour — there is no switch.
 const POST_FIRE_DISCARD_SAMPLES: usize = 200 * SAMPLE_RATE as usize / 1000;
 
-/// Cooldown after a wake word detection — prevents rapid consecutive false
-/// triggers.
+/// Cooldown after a detection, so a rapid consecutive false trigger cannot follow.
 const WAKE_WORD_COOLDOWN: Duration = Duration::from_secs(3);
 
-/// A single embedding decision recorded in the activation trace.
-/// Each frame represents ~160 ms of audio (one [`SCORE_STRIDE_SAMPLES`]
-/// stride), so N=3 covers ~480 ms — matching the original temporal window
-/// but using accumulated weight instead of a strict consecutive binary
-/// counter.
+/// One stride-gated scoring step, recorded in the activation trace: ~160 ms each
+/// ([`SCORE_STRIDE_SAMPLES`]), so N=3 covers ~480 ms.
 const ROLLING_WINDOW_N: usize = 3;
 
-/// Maximum position at which a fire is accepted, counted in stride-gated
-/// scoring steps since the first scoring step of the current speech segment
-/// (a segment starts at the first speech after [`SEGMENT_TIMEOUT_HOPS`] of
-/// silence ends the previous one, and ends when silence returns).  One step is
-/// one [`SCORE_STRIDE_SAMPLES`] stride ≈ 160 ms, so six steps cover roughly
-/// the first 1.0 s of the segment.
+/// Maximum position at which a fire is accepted, in stride-gated scoring steps since the first
+/// step of the current speech segment.  A segment starts at the first speech after
+/// [`SEGMENT_TIMEOUT_HOPS`] of silence ends the previous one, ends when silence returns; one step
+/// ≈ 160 ms, so six steps cover roughly the first 1.0 s of the segment.
 ///
-/// Six is the chosen trade: the tighter window removes substantially more
-/// false fires than a wider one, which is the trade the owner chose.
-/// Measured price of this value, against the earlier eight-step (~1.3 s)
-/// window: recognition 43/50 against 46/50 — the three commands that stopped
-/// firing are two previously-firing wake-only clips and one
-/// command-plus-other-speech clip — synthetic false accepts 19 of 121 against
-/// 36 of 121, and 15 merged fires (19 raw events) on the hour of real audio
-/// against the 18 merged (22 raw) belonging to the earlier eight-step run.
-/// Fixed product behaviour — there is no switch.
+/// Six is the owner's trade: the tighter window removes substantially more false fires.  Measured
+/// price against the earlier eight-step (~1.3 s) window: recognition 43/50 against 46/50 (two of
+/// the three lost commands were previously-firing wake-only clips, the third
+/// command-plus-other-speech), synthetic false accepts 19 of 121 against 36 of 121, and 15 merged
+/// fires (19 raw events) on the hour of real audio against 18 merged (22 raw).  Fixed product
+/// behaviour — there is no switch.
 const WAKE_WORD_MAX_SEGMENT_STEPS: usize = 6;
-
-// ── Adaptive threshold ──────────────────────────────────────
 
 /// Number of recent per-frame scores to track for adaptive threshold
 /// statistics. At ~160 ms per frame, N=15 covers ~2.4 seconds of context.
@@ -313,21 +200,18 @@ const ADAPTIVE_WINDOW_N: usize = 15;
 /// Default k multiplier for the adaptive threshold (mean + k × std).
 const ADAPTIVE_K_DEFAULT: f32 = 2.5;
 
-/// Absolute ceiling — the adaptive threshold must never exceed this value.
-/// Sits above the anchored positive range: genuine 3-frame rolling sums stay
-/// ~1.5-2.5 across the whole derived floor range [0.55, 0.80], so 2.60 leaves
-/// headroom for a genuine wake while capping threshold drift from noise.
+/// Ceiling the adaptive threshold must never exceed.  It sits above the anchored positive range:
+/// genuine 3-frame rolling sums stay ~1.5-2.5 across the whole derived floor range [0.55, 0.80],
+/// so 2.60 leaves headroom for a genuine wake while capping threshold drift from noise.
 const ADAPTIVE_CEILING: f32 = 2.60;
 
-/// Number of bootstrap frames to use the static threshold while the adaptive
-/// window fills.
+/// Bootstrap frames fed the static threshold while the adaptive window fills.
 const ADAPTIVE_BOOTSTRAP_FRAMES: usize = 5;
 
-/// Static (non-adaptive) rolling-window detection geometry, derived from the
-/// enrollment calibration: the rolling-sum firing threshold
-/// (`ROLLING_WINDOW_N × Calibration::fire_soft()`) and the per-frame reset
-/// threshold (`Calibration::reset_soft()`).  Enrollments without calibration
-/// fall back to the legacy operating point (threshold 1.65, reset ≈0.35).
+/// Static (non-adaptive) geometry, co-derived from the enrollment calibration: the rolling-sum
+/// firing threshold (`ROLLING_WINDOW_N × Calibration::fire_soft()`) and the per-frame reset line
+/// (`Calibration::reset_soft()`).  Without calibration the legacy operating point applies
+/// (threshold 1.65, reset ≈0.35).
 #[derive(Debug, Clone, Copy)]
 struct DetectionGeometry {
     static_threshold: f32,
@@ -346,19 +230,11 @@ impl DetectionGeometry {
     }
 }
 
-/// Process a per-frame soft score through the rolling window and determine
-/// whether wake word detection should fire.
-///
-/// Returns `true` when the rolling sum of recent scores meets or exceeds the
-/// geometry's static threshold (co-derived from the enrollment calibration).
-/// When the incoming score is below [`DetectionGeometry::reset`], the window
-/// is cleared entirely to prevent slow accumulation from noise.
-/// On detection the score window is NOT cleared here — the caller is
-/// responsible for full pipeline cleanup.
-///
-/// This function is pure with respect to global state: it only reads its
-/// parameters and modifies `score_window` in place.  This makes it directly
-/// testable without models or voice pipeline initialization.
+/// Run one per-frame soft score through the rolling window and decide whether detection fires:
+/// true when the rolling sum reaches the geometry static threshold (co-derived from the enrollment
+/// calibration).  A score below [`DetectionGeometry::reset`] clears the window entirely, so noise
+/// cannot accumulate slowly.  The window is NOT cleared on fire — the caller owns full pipeline
+/// cleanup.  Pure: only `score_window` is modified, so it is testable without models or a pipeline.
 fn process_wake_word_score(
     total_score: f32,
     score_window: &mut Vec<f32>,
@@ -367,8 +243,7 @@ fn process_wake_word_score(
 ) -> (bool, f32) {
     let reset = geometry.reset;
     if total_score < reset {
-        // Far from matching — reset the entire rolling window to prevent
-        // slow accumulation from noise.
+        // Far from matching — clear the whole window, so noise cannot accumulate slowly.
         if !score_window.is_empty() {
             debug!(
                 "Wake word match lost: total_score={total_score:.4} < reset ({reset:.4}) \
@@ -379,9 +254,7 @@ fn process_wake_word_score(
         score_window.clear();
         (false, 0.0)
     } else {
-        // Good-enough frame: append score to rolling window.
         score_window.push(total_score);
-        // Keep window at most ROLLING_WINDOW_N frames.
         while score_window.len() > ROLLING_WINDOW_N {
             score_window.remove(0);
         }
@@ -408,44 +281,19 @@ fn process_wake_word_score(
     }
 }
 
-/// Process a single window embedding through the wake word detection pipeline.
+/// Score one window embedding: the cosine soft score against the enrolled prototype
+/// ([`WakeWordEnrollment::soft_score`]), fed or peeked into the adaptive threshold, then through
+/// the rolling window of [`process_wake_word_score`].  Shared by the live pipeline
+/// ([`handle_wake_word_detection`]) and the enrollment self-test ([`run_enrollment_self_test`]).
+/// Scoring is speaker-blind and this function adds no gate of its own — the live pipeline
+/// additionally requires the fire to sit within [`WAKE_WORD_MAX_SEGMENT_STEPS`] steps of the
+/// segment start.
 ///
-/// This is the **core detection step** shared between the live pipeline
-/// ([`handle_wake_word_detection`]) and the enrollment self-test
-/// ([`run_enrollment_self_test`]).
-///
-/// It scores the embedding as the cosine soft score against the enrolled
-/// prototype ([`WakeWordEnrollment::soft_score`]), feeds/peeks the adaptive
-/// threshold, and applies rolling window scoring via
-/// [`process_wake_word_score`].  Detection fires as soon as the rolling sum
-/// crosses the effective threshold: the scoring is speaker-blind (cosine to
-/// the enrolled prototype, no separate speaker check) and this function adds
-/// no gate of its own — [`handle_wake_word_detection`] is where the live
-/// pipeline additionally requires the fire to sit within
-/// [`WAKE_WORD_MAX_SEGMENT_STEPS`] steps of the segment start.
-///
-/// # Returns
-/// - `(true, rolling_sum, total_score, effective_threshold)` — the embedding
-///   triggered wake word detection.
-/// - `(false, _, total_score, effective_threshold)` — continue feeding more
-///   embeddings (the score window is updated for the next call).
-///
-/// - `rolling_sum` — the rolling window sum at the time of evaluation
-///   (0.0 if the window was reset due to low score).
-/// - `total_score` — the cosine soft score (0.0 when no enrollment is set).
-/// - `effective_threshold` — the threshold value used for the rolling window
-///   comparison this frame (adaptive threshold post-bootstrap, or the static
-///   threshold during bootstrap / when no adaptive state is configured).
-///
-/// # Parameters
-/// - `embedding` — one 1024-dim L2-normalized window embedding.
-/// - `enrollment` — the enrolled prototype+calibration (`None` disables
-///   detection — total_score stays 0.0).
-/// - `score_window` — persistent rolling window of recent soft scores.
-/// - `adaptive_state` — optional adaptive threshold state (`None` disables
-///   adaptive threshold adjustment).
-/// - `adaptive_k` — multiplier for the adaptive threshold's standard-deviation
-///   term (passed to [`AdaptiveThresholdState::feed`]/[`peek`]).
+/// Returns `(fired, rolling_sum, total_score, effective_threshold)`: `rolling_sum` is 0.0 when the
+/// window was just reset, `total_score` is 0.0 with no enrollment (detection then impossible), and
+/// `effective_threshold` is the adaptive value post-bootstrap, else the static one.  `score_window`
+/// persists across calls; `enrollment == None` disables detection and `adaptive_state == None` the
+/// adaptive adjustment.
 fn score_single_embedding(
     embedding: &[f32],
     enrollment: Option<&WakeWordEnrollment>,
@@ -453,35 +301,22 @@ fn score_single_embedding(
     mut adaptive_state: Option<&mut AdaptiveThresholdState>,
     adaptive_k: f32,
 ) -> (bool, f32, f32, f32) {
-    // ── Cosine soft score against the enrolled prototype ───────────────
-    // No enrollment → total_score = 0.0 (no detection possible).
+    // Cosine soft score against the enrolled prototype; with no enrollment the score is 0.0 and no
+    // detection is possible.
     let total_score = enrollment.map_or(0.0, |enr| enr.soft_score(embedding));
 
-    // Detection geometry is co-derived from the enrollment calibration: the
-    // static rolling-sum firing threshold and the per-frame reset line.  With
-    // no enrollment the default calibration (legacy operating point) is used.
+    // Detection geometry is co-derived from the enrollment calibration (static firing threshold and
+    // per-frame reset line); with no enrollment the default legacy calibration applies.
     let geometry = DetectionGeometry::for_enrollment(enrollment);
 
-    // Feed only background (non-wake-word) scores to the adaptive threshold
-    // so it learns the noise-floor distribution without being contaminated
-    // by the high scores it's trying to detect.  Scores below
-    // `geometry.reset` are clearly "not wake word" and represent
-    // the background acoustic environment.  For wake-word-like frames we
-    // call peek() which returns the current threshold without updating
-    // statistics, preventing the self-defeating loop where high scores
-    // inflate the threshold and block detection.
-    //
-    // The same feed/peek rule applies during bootstrap — the old
-    // unconditional bootstrap feed inflated the adaptive threshold with
-    // wake-word-like burst scores, blocking detection after the deferred
-    // burst.  With the score-only rule, a high-scoring utterance
-    // legitimately keeps the bootstrap alive for its whole duration: high
-    // scores peek (peek() returns None during bootstrap → the static
-    // threshold stays in effect), and only below-reset background
-    // frames feed and advance the bootstrap counter.  Residual
-    // contamination cannot persist across the soft reset
-    // (detection→recording handoff) because no wake-word-like score ever
-    // enters the statistics.
+    // Feed only background scores to the adaptive threshold, so it learns the noise floor instead
+    // of being contaminated by the scores it is meant to detect. Frames below `geometry.reset` are
+    // clearly not the wake word; wake-word-like frames peek() instead, which returns the threshold
+    // without updating statistics — otherwise high scores inflate the threshold and block the
+    // detection they should allow. The same rule governs bootstrap: peek() answers `None` there, so
+    // the static threshold stays in effect and a high-scoring utterance legitimately keeps
+    // bootstrap alive. No wake-word-like score ever enters the statistics, so residual
+    // contamination cannot survive the soft reset.
     let adaptive_override = adaptive_state.as_mut().and_then(|state| {
         if total_score < geometry.reset {
             state.feed(total_score, adaptive_k, geometry.static_threshold)
@@ -490,18 +325,13 @@ fn score_single_embedding(
         }
     });
 
-    // ── Effective threshold (adaptive post-bootstrap, static otherwise) ──
     let effective_threshold = adaptive_override.unwrap_or(geometry.static_threshold);
 
-    // ── Rolling window gate ─────────────────────────────
     let (detected, rolling_sum) =
         process_wake_word_score(total_score, score_window, geometry, adaptive_override);
 
-    // ── Voice debug logging ─────────────────────────────
-    // When the `voice-debug` feature is enabled, log every per-frame
-    // total_score along with whether it passed the reset threshold and
-    // the resulting rolling sum.  The feature gate ensures zero overhead
-    // when not compiled in.
+    // With the `voice-debug` feature, log every per-frame total_score, whether it passed the reset
+    // threshold, and the resulting rolling sum; the gate keeps it zero-overhead otherwise.
     #[cfg(feature = "voice-debug")]
     {
         let passed_threshold = total_score >= geometry.reset;
@@ -513,46 +343,33 @@ fn score_single_embedding(
         info!("VOICE_DEBUG: total_score={total_score:.4}{below_note} rolling_sum={rolling_sum:.4}",);
     }
 
-    // Immediate-fire: this function applies no gate beyond the threshold
-    // crossing (the segment-position cut is the caller's — see above).
+    // Immediate fire: no gate beyond the threshold crossing — the segment-position cut is the
+    // caller.
     (detected, rolling_sum, total_score, effective_threshold)
 }
 
-/// VAD threshold: scores >= this are considered speech.
-/// Unified to 0.5 for both enrollment and streaming detection.
+/// VAD speech threshold, unified for both enrollment and streaming detection.
 const VAD_THRESHOLD: f32 = 0.5;
 
-/// Minimum consecutive VAD-positive frames before setting utterance_had_speech
-/// during enrollment (~0ms at 16ms/frame).  Set to 1 to match streaming
-/// detection behavior, which starts accumulating at the first VAD-positive
-/// frame.
+/// Consecutive VAD-positive frames before `utterance_had_speech` during enrollment: 1, matching
+/// streaming detection, which starts accumulating at its first positive frame.
 const ENROLLMENT_VAD_CONSECUTIVE_REQUIRED: usize = 1;
 
-// Neural VAD (Earshot) — replaces RMS-based `is_speech`
-
-/// Global Earshot VAD detector instance. Thread-safe behind a mutex because
-/// `predict_f32` completes in ~5-6 µs, so lock contention is negligible.
-/// The detector has internal state (768-sample ring buffer, pre-emphasis filter,
-/// 3-frame feature context) that must be kept in sync with the audio stream.
-/// Created once in [`init_global`].
+/// Global Earshot detector.  Behind a mutex because `predict_f32` takes ~5-6 µs, so contention is
+/// negligible; its internal state (768-sample ring buffer, pre-emphasis filter, 3-frame feature
+/// context) must stay in sync with the stream.  Created once in [`init_global`].
 static VAD_DETECTOR: OnceLock<std::sync::Mutex<earshot::Detector>> = OnceLock::new();
 
-/// Check whether wake word detection is ready for inference.
-///
-/// Wake word detection shares the Qwen3-ASR transcriber model, so "models
-/// ready" means the local transcriber is loaded.
+/// Whether wake word inference can run: it shares the Qwen3-ASR transcriber, so this is whether
+/// that model is loaded.
 #[must_use]
 fn models_ready() -> bool {
     crate::audio::local_transcriber::is_loaded()
 }
 
-/// Whether local audio transcription is disabled by config
-/// (`audio_transcription_use_local == "false"`).
-///
-/// The voice pipeline shares the local ASR transcriber, and with transcription
-/// disabled nothing loads it (the boot path no longer preloads it either), so
-/// the whole voice stack is unavailable — callers must surface the configuration
-/// rather than a loading state that can never complete.
+/// Whether local transcription is disabled by config (`audio_transcription_use_local == "false"`).
+/// Nothing loads the shared transcriber while it is disabled, so the whole voice stack is
+/// unavailable — callers must surface the configuration, not a loading state that cannot complete.
 #[must_use]
 pub fn is_transcription_disabled() -> bool {
     crate::config::CONFIG
@@ -561,17 +378,11 @@ pub fn is_transcription_disabled() -> bool {
         == Some("false")
 }
 
-/// Resolve the voice status from the shared ASR transcriber's state.  Pure
-/// helper shared by the pipeline's startup block and its periodic wake-up so the
-/// two can never drift apart:
-///
-/// - failed → [`VoiceStatus::ModelError`] (terminal);
-/// - ready → [`VoiceStatus::Listening`] when voice is enabled,
-///   [`VoiceStatus::Disabled`] (indicator hidden) otherwise;
-/// - loading → [`VoiceStatus::LoadingModels`] (transient — the periodic wake-up
-///   keeps polling until a terminal state is reached);
-/// - uninitialised → [`VoiceStatus::Disabled`]: the recogniser is a first-use
-///   load, so there is no load to report until something asks for one.
+/// Resolve the voice status from the transcriber state — pure, shared by the pipeline startup block
+/// and its periodic wake-up so the two can never drift: failed → [`VoiceStatus::ModelError`]
+/// (terminal); ready → [`VoiceStatus::Listening`] when voice is enabled, [`VoiceStatus::Disabled`]
+/// when not; loading → [`VoiceStatus::LoadingModels`] (the wake-up keeps polling until terminal);
+/// uninitialised → [`VoiceStatus::Disabled`], since the recogniser is a first-use load.
 fn resolved_model_status(state: ModelState, voice_enabled: bool) -> VoiceStatus {
     match state {
         ModelState::Failed => VoiceStatus::ModelError,
@@ -587,17 +398,14 @@ fn resolved_model_status(state: ModelState, voice_enabled: bool) -> VoiceStatus 
     }
 }
 
-/// Current resolved status from the live local-transcriber state machine.
+/// Status resolved from the live transcriber state machine.
 fn current_model_status() -> VoiceStatus {
     resolved_model_status(crate::audio::local_transcriber::state(), is_enabled())
 }
 
-/// Demand the shared ASR model for work that needs it to listen — a wake-word
-/// start or a button recording — and report the load it starts. Nothing
-/// preloads the model at boot, so a voice-path demand is the first use; the
-/// resolved status is [`VoiceStatus::Disabled`] while nothing is in flight, so
-/// without this report the footer would show nothing at all during that first
-/// load. A no-op once the model is ready.
+/// Demand the shared ASR model for work that needs to listen (a wake-word start or a button
+/// recording) and report the load it starts: nothing preloads it, so a demand is the first use, and
+/// without this the footer would show nothing while it loads.  A no-op once ready.
 fn demand_transcriber() {
     crate::audio::local_transcriber::spawn_background_init();
     if crate::audio::local_transcriber::is_loading() {
@@ -605,54 +413,41 @@ fn demand_transcriber() {
     }
 }
 
-// Voice pipeline status (shared between pipeline task and GUI)
-
-/// Voice pipeline status.
 #[derive(Debug, Clone, PartialEq)]
 pub enum VoiceStatus {
     Disabled,
     LoadingModels,
     ModelError,
     Listening,
-    /// A recording the wake word started: it ends itself on silence, and the
-    /// composer's controls end it too.
+    /// A recording the wake word started: it ends itself on silence, and the composer ends it too.
     RecordingWakeWord,
-    /// A recording started from the Home composer's mic button: the same
-    /// mechanism, without a silence end. Wake-word listening is paused while it
-    /// is active.
+    /// A recording started from the composer mic button: same mechanism, no silence end, and
+    /// wake-word listening paused while it runs.
     RecordingButton,
     Transcribing,
     MicPermissionDenied,
-    /// The microphone became unavailable while voice was in use.  Voice stops
-    /// (no recording is left hanging and no enrollment survives) and no device
-    /// is acquired automatically: the user recovers by pressing the record
-    /// button or switching voice off and on.
+    /// The microphone went away while voice was in use.  Voice stops (no recording left hanging, no
+    /// enrollment surviving) and no device is acquired again automatically: the user recovers by
+    /// pressing record or toggling voice.
     MicDisconnected,
-    /// Actively enrolled, waiting for the next sample.
-    /// `sample` = completed samples, `total` = required, `duration_ms` = most recent
-    /// utterance duration in milliseconds (0 if not yet available).
-    /// `quality` = per-utterance quality score (None before the first sample).
+    /// Enrolled, waiting for the next sample (`sample` of `total`, `duration_ms` of the last
+    /// utterance, per-utterance `quality`).
     Enrolling {
         sample: usize,
         total: usize,
         duration_ms: u64,
         quality: Option<UtteranceQuality>,
     },
-    /// Actively capturing speech during enrollment.
     ListeningDuringEnrollment {
         sample: usize,
         total: usize,
     },
-    /// Speech detected, waiting for silence to confirm utterance end.
     WaitingForSilenceDuringEnrollment {
         sample: usize,
         total: usize,
     },
-    /// Collecting owner-general speech as negative examples
-    /// (Phase 3 enrollment).  `accumulated_secs` is the
-    /// VAD-positive speech time collected so far, `target_secs` is the
-    /// target (15 s of VAD-positive speech), `wall_clock_elapsed` is
-    /// the wall-clock seconds since Phase 3 started.
+    /// Collecting owner-general speech as negatives (Phase 3): `accumulated_secs` of VAD-positive
+    /// speech towards `target_secs`, `wall_clock_elapsed` since the phase started.
     EnrollingNegatives {
         accumulated_secs: usize,
         target_secs: usize,
@@ -662,9 +457,6 @@ pub enum VoiceStatus {
     Error(String),
 }
 
-// Enrollment quality scoring
-
-/// Quality level for a single enrollment utterance.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum QualityLevel {
     Good,       // score > 0.7
@@ -683,7 +475,6 @@ impl QualityLevel {
         }
     }
 
-    /// Returns a user-facing label for this quality level.
     #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
@@ -694,30 +485,17 @@ impl QualityLevel {
     }
 }
 
-/// Per-utterance quality assessment result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UtteranceQuality {
-    /// Composite quality score 0.0–1.0 (weighted combination of all factors).
     pub score: f32,
-    /// Quality level derived from `score`.
     pub level: QualityLevel,
-    /// Whether clipping was detected (samples at or near i16::MAX).
     pub clipping_detected: bool,
-    /// Utterance duration in milliseconds.
     pub duration_ms: u64,
-    /// Estimated signal-to-noise ratio in dB.
-    ///
-    /// When a pre-speech noise RMS is available (enrollment path via
-    /// [`compute_utterance_quality`]), this is the actual SNR computed as
-    /// 20*log10(speech_rms / noise_rms) — unbounded, typically 10–50 dB
-    /// in quiet rooms.  When the energy-based fallback ([`estimate_snr_energy`])
-    /// is used (tests or edge cases where no noise measurement exists), the
-    /// value is 0–40 dB or NaN if the utterance is too short for meaningful
-    /// estimation.
+    /// Estimated SNR in dB: 20*log10(speech_rms / noise_rms) when a pre-speech noise RMS exists
+    /// (unbounded, typically 10–50 dB in quiet rooms), else 0–40 dB from the energy-based fallback,
+    /// or NaN for an utterance too short to estimate.
     pub snr_db: f32,
 }
-
-// Global state
 
 static VOICE_PIPELINE: OnceLock<RwLock<VoicePipelineState>> = OnceLock::new();
 
@@ -730,35 +508,23 @@ struct VoicePipelineState {
     /// Per-utterance 1024-dim L2-normalized window embeddings collected
     /// during enrollment (one entry per accepted utterance).
     enrollment_embeddings: Vec<Vec<f32>>,
-    /// Raw audio chunks collected during non-wake-word periods of enrollment
-    /// (pre-enrollment ambient noise and inter-utterance silence).  These are
-    /// encoded at finalization time to produce real (non-synthetic) negative
-    /// examples.
+    /// Ambient non-wake-word chunks (pre-enrollment noise and inter-utterance silence), encoded at
+    /// finalization into real negative examples.
     negative_audio_chunks: Vec<Vec<f32>>,
-    /// Owner-negative audio chunks collected during Phase 3 enrollment.
-    /// ~15 seconds of VAD-positive general speech from the user,
-    /// stored as audio chunks for embedding extraction at finalization.
-    /// Preserved across Full/Soft pipeline resets (same as `negative_audio_chunks`)
-    /// but cleared on Cancel (via `reset_enrollment`).
+    /// Owner-negative chunks from Phase 3 (~15 s of VAD-positive general speech), embedded at
+    /// finalization; preserved across Full/Soft resets, cleared on Cancel.
     owner_negative_chunks: Vec<Vec<f32>>,
-    /// Whether the user has completed all 10 enrollment utterances (Phase 2
-    /// done).  Set by `handle_enrollment_sample` when
-    /// `enrolled_utterance_count >= NUM_ENROLLMENT_SAMPLES`.  The main loop
-    /// reads this flag to initiate the Phase 2→3 transition
-    /// (`transition_to_phase3`).  Cleared on Cancel (via `reset_enrollment`).
+    /// Whether Phase 2 finished (all [`NUM_ENROLLMENT_SAMPLES`] utterances in): the main loop reads
+    /// it to start the Phase 2→3 transition. Cleared on Cancel.
     utterances_collected: bool,
-    /// Number of user utterances enrolled so far.  Incremented once per
-    /// accepted `handle_enrollment_sample` call.  The UI counter and
-    /// finalization trigger use this field.
+    /// Accepted utterances so far, read by the UI counter and the finalization trigger.
     enrolled_utterance_count: usize,
     cmd_tx: Option<mpsc::UnboundedSender<VoiceCommand>>,
 }
 
 impl VoicePipelineState {
-    /// Clear all enrollment accumulators (embeddings + utterance counter).
-    ///
-    /// Called by [`PipelineCtx::reset_pipeline_state`] on [`ResetLevel::Cancel`]
-    /// and by tests to verify data model invariants.
+    /// Clear the enrollment accumulators (embeddings + counter); called on [`ResetLevel::Cancel`]
+    /// and by tests.
     fn reset_enrollment(&mut self) {
         self.enrollment_embeddings.clear();
         self.negative_audio_chunks.clear();
@@ -772,25 +538,21 @@ impl VoicePipelineState {
 pub enum VoiceCommand {
     StartListening,
     StopListening,
-    /// Start wake word enrollment.
     StartEnrollment,
     CancelEnrollment,
     /// Retry loading the shared Qwen3-ASR transcriber model after a terminal
     /// failure (the wake-word pipeline has no model machinery of its own).
     RetryModelLoading,
-    /// Start a voice recording from the Home composer's mic button. Pauses
-    /// wake-word listening for the duration of the recording.
+    /// Start a recording from the composer mic button, pausing wake-word listening meanwhile.
     StartRecording,
-    /// Stop the recording in progress — whichever way it started — and
-    /// transcribe it; the transcript is published on [`RECORDING`] for the
-    /// composer to send as one message with its own content.
+    /// Stop the recording in progress — whichever way it started — and transcribe it; the
+    /// transcript is published on [`RECORDING`] for the composer to send with its own content.
     StopRecordingSend,
     /// Stop the recording in progress and discard the captured audio.
     StopRecordingDiscard,
-    /// Voice-relevant config changed externally (e.g. the Settings
-    /// transcription toggle). Used to wake the pipeline loop when the periodic
-    /// timer is parked because transcription is disabled — the loop re-reads
-    /// config and re-resolves status / auto-start here.
+    /// Voice-relevant config changed (e.g. the Settings transcription toggle): wakes the loop when
+    /// the periodic timer is parked because transcription is disabled, so it re-reads config and
+    /// re-resolves status / auto-start.
     ConfigChanged,
 }
 
@@ -824,67 +586,57 @@ pub fn get_status() -> VoiceStatus {
     voice_state().read().unwrap_poison().status.clone()
 }
 
-/// How the recording in progress started. Both kinds share one mechanism — the
-/// same message-row controls, the same single message — and differ only in how
-/// they can end.
+/// How the recording in progress started: one mechanism and one message either way, differing only
+/// in how it can end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordingOrigin {
-    /// Started from the composer's mic button; only the composer's controls end
-    /// it.
+    /// Started from the composer mic button; only the composer controls end it.
     Button,
-    /// Started by the wake word; it also ends itself on silence, and the
-    /// composer's controls end it like any other.
+    /// Started by the wake word; it also ends itself on silence.
     WakeWord,
 }
 
-/// Progress of a voice recording, delivered to the Home composer: whichever way
-/// a recording started, the composer owns the message it becomes, from the
-/// start until this resolves it.
+/// Progress of a recording, delivered to the composer: whichever way it started, the composer
+/// owns the message it becomes, from the start until this resolves it.
 #[derive(Debug, Clone)]
 pub enum RecordingEvent {
-    /// A wake-word recording began: the field belongs to the message it will
-    /// become. A button recording needs no event — the press that starts it
-    /// opens the window itself. The composer drops a recording that starts while
-    /// an earlier message is still committed: the two never share one window.
+    /// A wake-word recording began: the field belongs to the message it will become. A button
+    /// recording needs no event — the press opens the window itself. The composer drops a recording
+    /// that starts while an earlier message is committed: the two never share one window.
     Started,
-    /// Recording stopped and transcription is starting: the composer takes the
-    /// field's content now, and the message is in flight until the transcript
-    /// joins it.
+    /// Recording stopped, transcription starting: the composer takes the field content now, and the
+    /// message is in flight until the transcript joins it.
     Stopped,
     /// The transcript, already carrying the spoken marker.
     Transcript(String),
     /// The recording held no speech.
     NoSpeech,
-    /// The recording produced no message. The notice says why, and a composer
-    /// holding a committed message gives the field back.
+    /// The recording produced no message; the notice says why and a composer holding a committed
+    /// message gives the field back.
     Failed(&'static str),
-    /// Nothing was recorded — the microphone could not be opened, transcription
-    /// is unavailable: the composer's window closes, and a message a press
-    /// already committed goes out with the field's own content, the caller
+    /// Nothing was recorded (no microphone, transcription unavailable): the composer window closes
+    /// and a message a press already committed goes out with the field's own content, the caller
     /// having reported the reason.
     NotStarted,
 }
 
-/// Broadcast of voice-recording progress. Warmed from `main` before the iced
-/// application runs (same convention as the other GUI broadcast senders): an
-/// uninitialized sender would end the composer's subscription on its first poll.
+/// Broadcast of recording progress, warmed from `main` before the iced app runs (like the other GUI
+/// senders): an uninitialized sender would end the composer subscription on its first poll.
 pub(crate) static RECORDING: OnceLock<broadcast::Sender<RecordingEvent>> = OnceLock::new();
 
-/// Initialise the voice-recording broadcast (see [`RECORDING`]).
+/// Initialise the recording broadcast (see [`RECORDING`]).
 pub(crate) fn init_recording_tx() {
     RECORDING.get_or_init(|| broadcast::channel(16).0);
 }
 
-/// Publish recording progress to the composer. Best-effort: a no-op when the
-/// channel is not initialised (tests, headless runs).
+/// Publish recording progress; a no-op when the channel is not initialised (tests, headless).
 fn publish_recording(event: RecordingEvent) {
     if let Some(tx) = RECORDING.get() {
         let _ = tx.send(event);
     }
 }
 
-/// Broadcast a composer-facing voice notice in the admin's conversation — the
-/// persisted agent-direction notice the pipeline's own failures use.
+/// Broadcast a composer-facing notice in the admin conversation, as the pipeline failures do.
 pub(crate) async fn broadcast_notice(message: &str) {
     let user_name = crate::users::ADMIN_USER_NAME;
     let ws = crate::users::resolve_workspace_for_user_name(user_name).await;
@@ -901,41 +653,34 @@ pub(crate) async fn broadcast_notice(message: &str) {
     .await;
 }
 
-/// Notice for the [`VoiceStatus::MicPermissionDenied`] state: the microphone
-/// cannot be used, and the fix is on the user's side.
+/// Notice for [`VoiceStatus::MicPermissionDenied`]: the fix is on the user side.
 const MIC_PERMISSION_NOTICE: &str = "Microphone permission denied — enable mic access to record";
 
-/// Notice the composer reports when a recording held no speech and the field
-/// had nothing to send either.
+/// Notice when a recording held no speech and the field had nothing to send either.
 pub(crate) const NO_SPEECH_NOTICE: &str = "*Voice: no speech detected — recording discarded*";
 
-/// Notice the composer reports when a recording's transcript cannot be sent
-/// because the message it belonged to never went out: the words exist only in
-/// that one message, so they cannot be recovered.
+/// Notice when a transcript cannot be sent because its message never went out: the words exist
+/// only in that message.
 pub(crate) const VOICE_UNSENT_NOTICE: &str =
     "*Voice: the voice part was not sent and cannot be restored*";
 
-/// Notice the composer reports when a recording's transcription fails.
+/// Notice when a recording transcription fails.
 pub(crate) const TRANSCRIPTION_FAILED_NOTICE: &str =
     "*Voice: transcription failed — the voice part was not sent and cannot be restored*";
 
-/// Window in which at most one voice notice of a class reaches the conversation.
-/// Each side keeps its own memory of the last one — the pipeline one, the
-/// composer one per class — and this is the interval they all use, so a rapid
-/// repeat cannot become a stream.
+/// Window in which at most one voice notice of a class reaches the conversation. Each side keeps
+/// its own memory of the last one and they share this interval, so a rapid repeat cannot become a
+/// stream.
 pub(crate) const NOTICE_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Best-effort reason a voice recording cannot start right now
-/// (None = allowed). Mirrors the field-based guards in
-/// [`PipelineCtx::handle_start_button_recording`] for the GUI's pre-flight
-/// toast; the pipeline remains the authoritative check and this mapping can
-/// drift on transient transitions.  The transcription-disabled configuration
-/// is permanent rather than transient, so it is checked here directly.
+/// Best-effort reason a recording cannot start (None = allowed), mirroring the field guards in
+/// [`PipelineCtx::handle_start_button_recording`] for the GUI pre-flight toast; the pipeline stays
+/// authoritative and this can drift on transient transitions.  The transcription-disabled
+/// configuration is permanent, so it is checked here directly.
 #[must_use]
 pub fn recording_blocked_reason() -> Option<&'static str> {
-    // Local transcription disabled ⇒ the shared ASR model never loads, so a
-    // recording can never start.  Surface the configuration rather than a
-    // loading state that can never complete.
+    // Local transcription disabled ⇒ the shared ASR model never loads ⇒ no recording can start:
+    // surface the configuration, not a loading state that can never complete.
     if is_transcription_disabled() {
         return Some("Voice recording unavailable — local transcription is disabled");
     }
@@ -948,8 +693,7 @@ pub fn recording_blocked_reason() -> Option<&'static str> {
         | VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
         | VoiceStatus::EnrollingNegatives { .. } => Some("Voice enrollment is in progress"),
         VoiceStatus::MicPermissionDenied => Some(MIC_PERMISSION_NOTICE),
-        // MicDisconnected is not blocked — retrying is how the user recovers
-        // (see [`VoiceStatus::MicDisconnected`]).
+        // MicDisconnected is not blocked — retrying is how the user recovers.
         _ => None,
     }
 }
@@ -971,11 +715,8 @@ fn set_status(status: VoiceStatus) {
     set_status_and_notify(&mut voice_state().write().unwrap_poison(), status);
 }
 
-/// Write a new pipeline status, broadcasting [`RuntimeEvent::VoiceStatus`] only
-/// when the value actually changed. The GUI coalesces the broadcast stream, but
-/// enrollment variants update per sample and would emit continuously — a
-/// no-op write is still worth skipping so the re-render only fires on a real
-/// status transition.
+/// Write a new status, broadcasting [`RuntimeEvent::VoiceStatus`] only on a real change: enrollment
+/// variants update per sample and would otherwise emit continuously.
 fn set_status_and_notify(state: &mut VoicePipelineState, status: VoiceStatus) {
     if state.status != status {
         state.status = status;
@@ -989,15 +730,13 @@ pub(crate) fn get_enrollment() -> Option<WakeWordEnrollment> {
     voice_state().read().unwrap_poison().enrollment.clone()
 }
 
-/// Install a wake word enrollment into the global pipeline state.
 fn set_enrollment(enrollment: WakeWordEnrollment) {
     let mut state = voice_state().write().unwrap_poison();
     state.enrollment = Some(enrollment);
 }
 
-/// Queue a command for the voice pipeline, returning whether one is running to
-/// take it. A no-op before the pipeline is initialised — the GUI's controls exist
-/// before it starts, and a press there must not panic.
+/// Queue a command, returning whether a pipeline is running to take it.  A no-op before the
+/// pipeline initialises — the GUI controls exist earlier and a press must not panic.
 pub fn send_command(cmd: VoiceCommand) -> bool {
     let Some(state) = VOICE_PIPELINE.get() else {
         warn!("Voice pipeline not initialized — dropping command {cmd:?}");
@@ -1010,9 +749,8 @@ pub fn send_command(cmd: VoiceCommand) -> bool {
     tx.send(cmd).is_ok()
 }
 
-/// Test seam: stand in for a running pipeline's command receiver, so
-/// [`send_command`] reports its commands taken. The receiver keeps them accepted
-/// for as long as the caller holds it.
+/// Test seam: stand in for a running pipeline command receiver, so [`send_command`] reports its
+/// commands taken.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn install_test_command_receiver() -> mpsc::UnboundedReceiver<VoiceCommand> {
     let _ = init_global();
@@ -1021,16 +759,11 @@ pub(crate) fn install_test_command_receiver() -> mpsc::UnboundedReceiver<VoiceCo
     rx
 }
 
-// ── Voice VAD (Earshot) ─────────────────────────────────────────────────
-
-/// Inner VAD check using an explicit detector reference and configurable
-/// threshold: [`is_speech_with_threshold`] supplies the shared detector with
-/// [`VAD_THRESHOLD`], and [`enrollment_is_speech`] a context-local one so a
-/// mode transition cannot contaminate the enrollment decision.
-///
-/// Processes ALL 256-sample chunks through the detector to keep its internal
-/// state (ring buffer + pre-emphasis filter) synchronized with the audio
-/// stream, even when speech is detected early in the frame.
+/// Inner VAD check on an explicit detector with a configurable threshold —
+/// [`is_speech_with_threshold`] passes the shared detector with [`VAD_THRESHOLD`],
+/// [`enrollment_is_speech`] a context-local one so a mode transition cannot contaminate the
+/// enrollment decision. Every 256-sample chunk goes through the detector, even once speech is
+/// found, to keep its ring buffer and pre-emphasis state in sync with the stream.
 fn is_speech_with_detector(
     samples: &[f32],
     detector: &mut earshot::Detector,
@@ -1042,10 +775,8 @@ fn is_speech_with_detector(
 
     let mut any_speech = false;
 
-    // Clamp audio samples to [-1, 1] before feeding to the VAD detector.
-    // TTS-generated audio and microphone capture can produce samples slightly
-    // outside this range due to floating-point overflow, which triggers
-    // earshot's debug_assert! in debug/test builds.
+    // Clamp samples to [-1, 1] before the detector: TTS audio and capture can overflow slightly,
+    // which trips earshot debug_assert! in debug builds.
     let clamp_frame = |frame: &[f32]| -> [f32; 256] {
         let mut clamped = [0.0f32; 256];
         for (i, &s) in frame.iter().enumerate() {
@@ -1054,25 +785,21 @@ fn is_speech_with_detector(
         clamped
     };
 
-    // Process each complete 256-sample frame (Earshot requires exactly 256
-    // samples per call at 16 kHz).  Callers pass one HOP_LENGTH (256-sample)
-    // hop; longer slices are chunked at 256 so the detector's sliding window
-    // stays in sync with the actual audio stream.
+    // Process each complete 256-sample frame (Earshot requires exactly 256 at 16 kHz). Callers pass
+    // one [`HOP_LENGTH`] hop; longer slices are chunked so the detector sliding window stays in
+    // sync.
     for chunk in samples.as_chunks::<256>().0 {
         if detector.predict_f32(&clamp_frame(chunk)) >= threshold {
             any_speech = true;
         }
     }
 
-    // Trailing partial frame (<256 samples) — pad with silence to avoid
-    // discarding the tail of a short burst.  Zero-padding is safe because
-    // Earshot's neural model correctly rejects silence-padded frames
-    // (the spectral pattern is not speech-like).
+    // Trailing partial frame (<256 samples): pad with silence rather than discard the tail of a
+    // short burst. Earshot rejects silence-padded frames as non-speech, so padding is safe.
     let remainder = samples.len() % 256;
     if remainder > 0 {
         let mut padded = [0.0f32; 256];
         padded[..remainder].copy_from_slice(&samples[samples.len() - remainder..]);
-        // Clamp the partial frame too (the copy_from_slice copies raw samples).
         for s in &mut padded[..remainder] {
             *s = s.clamp(-1.0, 1.0);
         }
@@ -1084,17 +811,15 @@ fn is_speech_with_detector(
     any_speech
 }
 
-/// VAD check with a configurable threshold.  Locks the global [`VAD_DETECTOR`]
-/// and delegates to [`is_speech_with_detector`].
+/// VAD check at a configurable threshold: locks the global [`VAD_DETECTOR`].
 fn is_speech_with_threshold(samples: &[f32], threshold: f32) -> bool {
     let detector = VAD_DETECTOR.get_or_init(|| std::sync::Mutex::new(earshot::Detector::default()));
     let mut detector = detector.lock().unwrap_poison();
     is_speech_with_detector(samples, &mut detector, threshold)
 }
 
-/// Enrollment/negatives VAD decision: prefer the context-local detector to
-/// avoid mode-transition state contamination; fall back to the global
-/// detector path when the enrollment VAD is not initialized (defensive).
+/// Enrollment/negatives VAD decision: prefer the context-local detector so a mode transition
+/// cannot contaminate it; fall back to the global one when enrollment VAD is not initialised.
 fn enrollment_is_speech(
     enrollment_vad: &mut Option<earshot::Detector>,
     threshold: f32,
@@ -1106,9 +831,8 @@ fn enrollment_is_speech(
     }
 }
 
-/// Reset the Earshot VAD detector's internal state (ring buffer, feature
-/// context).  Called when the audio source changes to prevent stale context
-/// from contaminating a new stream.
+/// Reset the detector internal state (ring buffer, feature context) when the audio source changes,
+/// so stale context cannot contaminate a new stream.
 fn reset_vad() {
     if let Some(detector) = VAD_DETECTOR.get()
         && let Ok(mut d) = detector.lock()
@@ -1117,13 +841,10 @@ fn reset_vad() {
     }
 }
 
-/// Detect whether a microphone-error report is caused by OS-level
-/// permission denial (rather than a transient device issue).
-///
-/// On macOS, CoreAudio returns `kAudioUnitErr_NoConnection` (-10875)
-/// when the application has not been granted microphone access.  We
-/// also check common error-text patterns so the user sees a clear
-/// `MicPermissionDenied` status instead of a generic `MicDisconnected`.
+/// Whether a microphone error is OS-level permission denial rather than a transient device issue.
+/// macOS CoreAudio returns `kAudioUnitErr_NoConnection` (-10875) without microphone access;
+/// common error-text patterns are checked too, so the user sees `MicPermissionDenied` rather than
+/// a generic `MicDisconnected`.
 fn is_mic_permission_error(err: &anyhow::Error) -> bool {
     let msg = format!("{err:#}");
     msg.contains("NoConnection")
@@ -1133,8 +854,7 @@ fn is_mic_permission_error(err: &anyhow::Error) -> bool {
         || msg.to_lowercase().contains("access denied")
 }
 
-/// Status for a microphone that could not be opened: a permission problem is
-/// reported as one, anything else as the device being unavailable.
+/// Status for a microphone that could not open: permission problem, or device unavailable.
 fn mic_start_failure(err: &anyhow::Error) -> VoiceStatus {
     if is_mic_permission_error(err) {
         VoiceStatus::MicPermissionDenied
@@ -1143,17 +863,9 @@ fn mic_start_failure(err: &anyhow::Error) -> VoiceStatus {
     }
 }
 
-// Microphone capture
-
-/// Convert raw audio samples to mono f32 and send to the pipeline.
-///
-/// Combines the format conversion and channel-averaging into a single pass,
-/// avoiding the intermediate `Vec<f32>` allocation that separate convert-then-
-/// to_mono steps would incur.  This reduces allocator pressure in the audio
-/// input callback, which runs at audio hardware interrupt frequency.
-///
-/// When `T = f32` and `convert` is the identity closure `|&s| s`, this
-/// function handles the F32 path identically to the integer format paths.
+/// Convert raw samples to mono f32 and send them to the pipeline in one pass, avoiding the
+/// intermediate `Vec<f32>` that convert-then-mono would allocate — this runs at audio interrupt
+/// frequency.  `T = f32` with the identity closure is the F32 path, handled identically.
 fn convert_and_send_audio_to_pipeline<T, F>(
     tx: &mpsc::Sender<Vec<f32>>,
     data: &[T],
@@ -1164,10 +876,8 @@ fn convert_and_send_audio_to_pipeline<T, F>(
     F: Fn(&T) -> f32,
 {
     let mono: Vec<f32> = if channels == 1 {
-        // Fast path: single channel — no averaging needed, just convert.
         data.iter().map(&convert).collect()
     } else {
-        // Multi-channel: average each frame across channels.
         data.chunks_exact(usize::from(channels))
             .map(|frame| frame.iter().map(&convert).sum::<f32>() / f32::from(channels))
             .collect()
@@ -1177,21 +887,16 @@ fn convert_and_send_audio_to_pipeline<T, F>(
     } else {
         super::util::resample_audio(&mono, sample_rate, SAMPLE_RATE)
     };
-    // try_send: drop-newest policy when the bounded channel is full
-    // (see MIC_CHANNEL_CAPACITY docs).
+    // Drop-newest when the bounded channel is full (see [`MIC_CHANNEL_CAPACITY`]).
     let _ = tx.try_send(resampled);
 }
 
-/// Error callback for microphone streams: report the error and, when no audio
-/// can be delivered any more (the device was removed, its host died, or the
-/// stream was invalidated and never rebuilt), report that on the stream's own
-/// loss channel.
-///
-/// Everything else the callback reports keeps voice running: a buffer
-/// overrun/underrun (the backend recovers), a device that is merely busy or
-/// automatically rerouted, and a permission problem, which keeps its own
-/// [`VoiceStatus::MicPermissionDenied`] wording.  The stream owns the channel
-/// (see [`Microphone`]), so a late report from a replaced stream dies with it.
+/// Error callback: report the error, and when no audio can be delivered any more (device removed,
+/// host gone, stream invalidated and never rebuilt) report that on the stream's loss channel.
+/// Everything else keeps voice running: buffer overruns and underruns recover, a busy or rerouted
+/// device recovers, and a permission problem keeps its [`VoiceStatus::MicPermissionDenied`]
+/// wording.  The stream owns the channel (see [`Microphone`]), so a late report from a replaced
+/// stream dies with it.
 fn mic_error(err: &cpal::Error, lost_tx: &mpsc::UnboundedSender<()>) {
     error!("Microphone stream error: {err}");
     if matches!(
@@ -1204,7 +909,6 @@ fn mic_error(err: &cpal::Error, lost_tx: &mpsc::UnboundedSender<()>) {
     }
 }
 
-/// Build a cpal input stream for a supported sample format.
 fn build_int_stream<T, F>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -1230,10 +934,9 @@ where
     )
 }
 
-/// An open microphone: the sample stream, the `cpal::Stream` driving it, and
-/// that stream's loss reports.  All three belong to one device stream, so they
-/// are created, held and dropped together and a loss report can only ever
-/// describe the microphone the pipeline currently owns.
+/// An open microphone: the sample stream, the `cpal::Stream` driving it, and that stream loss
+/// reports — created, held and dropped together, so a loss report can only describe the microphone
+/// the pipeline currently owns.
 struct Microphone {
     rx: mpsc::Receiver<Vec<f32>>,
     lost_rx: mpsc::UnboundedReceiver<()>,
@@ -1245,20 +948,18 @@ struct Microphone {
 }
 
 impl Microphone {
-    /// Await the next chunk of mono 16 kHz samples; `None` means the stream can
-    /// no longer deliver audio — its error callback reported the device as gone,
-    /// or it ended without saying why.
+    /// Await the next chunk of mono 16 kHz samples; `None` means the stream can no longer deliver
+    /// audio — its error callback reported the device gone, or it ended without saying why.
     async fn next(&mut self) -> Option<Vec<f32>> {
         tokio::select! {
             chunk = self.rx.recv() => chunk,
-            // `None` (the callback is gone) means the stream cannot report at
-            // all — the same dead microphone the callback would describe.
+            // `None` (the callback is gone) means the stream cannot report at all — same dead mic.
             _ = self.lost_rx.recv() => None,
         }
     }
 }
 
-/// Start the microphone and return it with its sample and loss channels.
+/// Start the microphone; returns it with its sample and loss channels.
 fn start_microphone() -> Result<Microphone> {
     let (tx, rx) = mpsc::channel::<Vec<f32>>(MIC_CHANNEL_CAPACITY);
     let (lost_tx, lost_rx) = mpsc::unbounded_channel::<()>();
@@ -1332,37 +1033,30 @@ fn start_microphone() -> Result<Microphone> {
     })
 }
 
-// Transcription via existing Qwen3-ASR
-
 async fn transcribe_audio(samples: &[f32]) -> Result<String> {
     let wav_bytes = crate::audio::tts::render_wav(samples, SAMPLE_RATE)?;
     let tmp_dir = std::env::temp_dir().join("mahbot_voice");
 
-    // Pre-clean any stale files left from a prior crash so they don't
-    // accumulate.  This is best-effort — if the
-    // directory doesn't exist yet, remove_dir_all returns Ok(()).
+    // Pre-clean stale files from a prior crash; best-effort (a missing directory is `Ok`).
     let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
 
     tokio::fs::create_dir_all(&tmp_dir).await?;
     let tmp_path = tmp_dir.join(format!("cmd_{}.wav", crate::generate_id()));
     tokio::fs::write(&tmp_path, &wav_bytes).await?;
 
-    // 10-minute inference timeout, shared with the enrichment path — long
-    // recordings (up to the 10-minute recording cap) must not time out.
+    // 10-minute inference timeout, shared with the enrichment path — recordings up to the 10-minute
+    // cap must not time out.
     let result = crate::audio::local_transcriber::transcribe_file_async(
         &tmp_path,
         crate::audio::local_transcriber::INFERENCE_TIMEOUT,
     )
     .await;
 
-    // Remove the specific temp file.
     if let Err(e) = tokio::fs::remove_file(&tmp_path).await {
         warn!("Failed to remove temp transcription file: {e}");
     }
-    // Remove the entire temp directory (including any leftover files from
-    // prior crashes that weren't cleaned).  Uses remove_dir_all instead of
-    // remove_dir so that ENOTEMPTY errors from orphaned files don't cause
-    // unbounded accumulation.
+    // Remove the whole temp directory, leftovers included: `remove_dir_all` rather than
+    // `remove_dir` so ENOTEMPTY from orphaned files cannot accumulate.
     if let Err(e) = tokio::fs::remove_dir_all(&tmp_dir).await {
         warn!("Failed to remove temp transcription directory: {e}");
     }
@@ -1370,37 +1064,20 @@ async fn transcribe_audio(samples: &[f32]) -> Result<String> {
     result
 }
 
-// Enrollment quality scoring
-
-/// Compute a per-utterance quality score from the raw audio.
-///
-/// The composite score (0.0–1.0) is a weighted combination of:
-/// - **Duration** (50%): whether the utterance is in [400ms, 2000ms].
-/// - **Clipping** (25%): penalty if any sample hit i16::MAX.
-/// - **SNR** (25%): estimated signal-to-noise ratio.  If `noise_rms` is
-///   `Some`, uses the real pre-speech noise floor captured from the raw audio
-///   ring during enrollment; otherwise falls back to an energy-based heuristic.
-///
-/// # Parameters
-/// - `samples`: raw audio samples of the utterance.
-/// - `noise_rms`: pre-speech ambient noise RMS captured at the moment of
-///   first sustained speech detection.  `None` falls back to
-///   energy-based SNR estimation.
+/// Per-utterance quality score (0.0–1.0) from the raw audio, weighting duration (50%, in
+/// [400ms, 2000ms]), clipping (25%, penalised on any sample at i16::MAX) and SNR (25%).  SNR uses
+/// `noise_rms` — the real pre-speech floor captured from the raw ring — when present, else the
+/// energy-based heuristic.
 #[expect(clippy::cast_precision_loss)]
 fn compute_utterance_quality(samples: &[f32], noise_rms: Option<f32>) -> UtteranceQuality {
     let duration_ms = samples_to_ms(samples.len(), SAMPLE_RATE);
 
-    // ── Clipping detection ───────────────────────────────────────────
     let clipping_detected = samples
         .iter()
         .any(|&s| s.abs() >= ENROLLMENT_QUALITY_CLIPPING_THRESHOLD);
 
-    // ── SNR estimation ───────────────────────────────────────────────
-    // If we have a real pre-speech noise RMS captured from the raw audio
-    // ring at the moment of first sustained speech, compute actual SNR as
-    // 20*log10(speech_rms / noise_rms).  Otherwise fall back to energy-based
-    // heuristic (estimate_snr_energy) which measures speech dynamic range
-    // rather than true SNR.
+    // With a real pre-speech noise RMS, the SNR is 20*log10(speech_rms / noise_rms); otherwise the
+    // energy-based heuristic measures speech dynamic range rather than true SNR.
     let snr_db = if let Some(noise_rms) = noise_rms {
         let speech_rms = super::util::compute_rms(samples);
         if noise_rms > 1e-10 && speech_rms > noise_rms {
@@ -1412,31 +1089,25 @@ fn compute_utterance_quality(samples: &[f32], noise_rms: Option<f32>) -> Utteran
         estimate_snr_energy(samples)
     };
 
-    // ── Composite score (basic metrics only) ──────────────────────────
-    // During enrollment collection, quality is based on duration, clipping,
-    // and SNR.
-    //
-    // Duration score: 0.0 if too short, 0.3 if too long, ramping 0.6→1.0 in range.
+    // During collection, quality is duration + clipping + SNR.  Duration: 0.0 too short, 0.3 too
+    // long, ramping 0.6→1.0 in range.
     let duration_score = if duration_ms < ENROLLMENT_QUALITY_DURATION_MIN_MS {
         0.0
     } else if duration_ms > ENROLLMENT_QUALITY_DURATION_MAX_MS {
         0.3 // Long utterances still have some value (contain the wake word)
     } else {
-        // Normalize to [0.6, 1.0] within the valid range
         0.6 + (0.4 * (duration_ms - ENROLLMENT_QUALITY_DURATION_MIN_MS) as f32
             / (ENROLLMENT_QUALITY_DURATION_MAX_MS - ENROLLMENT_QUALITY_DURATION_MIN_MS) as f32)
     };
 
-    // Clipping penalty: 1.0 if no clipping, 0.0 if clipping detected.
     let clipping_score = if clipping_detected { 0.0 } else { 1.0 };
 
     // SNR score: 0.0 at 0 dB, 1.0 at 20+ dB (with smooth ramp).
     let snr_score = if snr_db.is_finite() {
         (snr_db / 20.0).clamp(0.0, 1.0)
     } else {
-        // If SNR estimation fails (e.g. all samples silence), give a
-        // moderate score — don't penalise the caller for our estimation
-        // limitations.
+        // A failed SNR estimate (e.g. all silence) gets a moderate score — do not penalise the
+        // caller for an estimation limit.
         0.5
     };
 
@@ -1451,13 +1122,9 @@ fn compute_utterance_quality(samples: &[f32], noise_rms: Option<f32>) -> Utteran
     }
 }
 
-/// Estimate SNR using energy-based VAD (no neural model dependency).
-///
-/// Frames audio into 512-sample windows, computes RMS per frame,
-/// classifies the top 40% RMS frames as "speech" and bottom 40% as
-/// "noise" (middle 20% is ambiguous transition region).  Returns the
-/// ratio in dB, clamped to [0, 40] dB to avoid extreme values from
-/// synthetic/test signals.
+/// Energy-based SNR, no neural model: frames the audio into 512-sample windows, takes the top 40%
+/// RMS frames as speech and the bottom 40% as noise (the middle 20% is transition), and returns
+/// the ratio in dB clamped to [0, 40] to avoid extremes from synthetic signals.
 #[expect(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -1483,11 +1150,9 @@ fn estimate_snr_energy(samples: &[f32]) -> f32 {
     frame_rms.sort_unstable_by(|a, b| a.partial_cmp(b).expect("RMS values must be finite"));
     let n = frame_rms.len();
 
-    // Bottom 40% = noise floor
     let noise_len = (n as f32 * 0.4).ceil() as usize;
     let noise_rms: f32 = frame_rms[..noise_len.min(n)].iter().sum::<f32>() / noise_len as f32;
 
-    // Top 40% = speech
     let speech_start = (n as f32 * 0.6).ceil() as usize;
     let speech_len = n.saturating_sub(speech_start);
     let speech_rms = if speech_len > 0 {
@@ -1504,17 +1169,10 @@ fn estimate_snr_energy(samples: &[f32]) -> f32 {
     snr.clamp(0.0, 40.0)
 }
 
-/// Run a self-test of the enrolled prototype against the enrollment buffer.
-///
-/// Simulates the live detection pipeline for each enrollment utterance: runs
-/// each utterance's window embedding through [`score_single_embedding`] with
-/// a fresh score window and no adaptive state.
-///
-/// An utterance "triggers" if the rolling window sum exceeds the detection
-/// threshold at any point.
-///
-/// Returns `Ok(())` if the self-test passes, or `Err` with a descriptive
-/// message if too many utterances fail to trigger detection.
+/// Self-test the enrolled prototype against the enrollment buffer: run each utterance embedding
+/// through [`score_single_embedding`] with a fresh score window and no adaptive state.  An
+/// utterance triggers if its rolling sum crosses the detection threshold at any point.  `Ok(())`
+/// when enough trigger, else `Err` with a user-facing message.
 #[expect(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -1531,14 +1189,10 @@ fn run_enrollment_self_test(
     let mut passed = 0usize;
 
     for embedding in utterance_embeddings {
-        // Fresh simulation for each utterance: no cross-utterance state.
-        //
-        // Feed the utterance embedding ROLLING_WINDOW_N (3) times through the
-        // rolling-sum machinery — the streaming pipeline sees the same phrase
-        // across ~3 consecutive stride-gated window encodings (a ~0.5 s phrase
-        // spans 3 windows at the 160 ms scoring stride).  A single embedding
-        // would only ever produce a rolling sum of one soft score (max 1.0),
-        // which can never reach the static rolling threshold.
+        // Fresh simulation per utterance, no cross-utterance state. The embedding is fed
+        // ROLLING_WINDOW_N times: the streaming pipeline sees the phrase across ~3 stride-gated
+        // encodings (a ~0.5 s phrase spans 3 windows at 160 ms), and one embedding could only ever
+        // sum to a single soft score (max 1.0), which never reaches the static threshold.
         let mut score_window = Vec::new();
         let mut detected_this = false;
         for _ in 0..ROLLING_WINDOW_N {
@@ -1575,9 +1229,7 @@ fn run_enrollment_self_test(
     }
 }
 
-/// Resolve the enrollment prompt for a given sample index (0-based).
-/// Returns a static string with guidance for the user's next utterance
-/// (e.g. "Say it normally", "Say it further from the mic", etc.).
+/// Guidance for the utterance at this 0-based index.
 #[must_use]
 pub fn enrollment_prompt_for_sample(sample: usize) -> &'static str {
     let mut cumulative = 0;
@@ -1587,38 +1239,22 @@ pub fn enrollment_prompt_for_sample(sample: usize) -> &'static str {
             return prompt;
         }
     }
-    // Fallback (shouldn't happen with well-formed prompts)
     "Say the wake word clearly"
 }
 
-/// Segmentation parameters for [`segment_utterances_by_vad`].
-///
-/// Bundles the four module-level constants that are identical across all call
-/// sites into a single struct.  This reduces the function signature from 8 to
-/// 3 parameters and makes the call sites more resilient to parameter-order
-/// changes.
+/// Segmentation parameters for [`segment_utterances_by_vad`]: the four module constants that are
+/// identical at every call site, bundled so the signature has 3 parameters instead of 8.
 struct VadSegmentationConfig {
-    /// Frame size in samples (typically [`FRAME_LENGTH`] = 512).
     frame_length: usize,
-    /// Frame stride in samples (typically [`HOP_LENGTH`] = 256).
     hop_length: usize,
-    /// Min consecutive VAD-positive frames to confirm sustained speech
-    /// (typically [`ENROLLMENT_VAD_CONSECUTIVE_REQUIRED`] = 1 after the threshold unification).
     consecutive_required: usize,
-    /// Silence duration in samples before utterance ends
-    /// (typically [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] = 4 864 ≈ 304 ms
-    /// aligned to streaming's segment timeout).
+    /// Silence before an utterance ends ([`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] ≈ 304 ms, aligned
+    /// to the streaming segment timeout).
     silence_threshold_samples: usize,
 }
 
-/// Module-level default config for [`segment_utterances_by_vad`] using the
-/// standard voice-pipeline constants.
-///
-/// Utterances intentionally include no context padding, matching the
-/// streaming detection path.
-///
-/// Silence threshold uses [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] (~304ms)
-/// aligned to streaming detection's [`SEGMENT_TIMEOUT_HOPS`].
+/// Default config for [`segment_utterances_by_vad`]: no context padding (matching streaming) and
+/// the [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] threshold aligned to [`SEGMENT_TIMEOUT_HOPS`].
 const DEFAULT_VAD_SEGMENTATION_CONFIG: VadSegmentationConfig = VadSegmentationConfig {
     frame_length: FRAME_LENGTH,
     hop_length: HOP_LENGTH,
@@ -1626,42 +1262,13 @@ const DEFAULT_VAD_SEGMENTATION_CONFIG: VadSegmentationConfig = VadSegmentationCo
     silence_threshold_samples: ENROLLMENT_SILENCE_THRESHOLD_SAMPLES,
 };
 
-/// Core VAD-gated utterance segmentation.
-///
-/// Processes raw audio with per-frame VAD decisions and segments it into
-/// utterances using the same boundary-detection algorithm as the enrollment
-/// pipeline's streaming handler ([`handle_enrollment_audio`]).  The caller
-/// provides VAD decisions so this function is pure with respect to VAD state
-/// management — it does not touch the global [`VAD_DETECTOR`].
-///
-/// # Algorithm (matches [`handle_enrollment_audio`])
-///
-/// 1. For each frame (stride = `config.hop_length`), check the VAD decision.
-/// 2. VAD-positive frames accumulate into the current utterance.
-/// 3. `config.consecutive_required` consecutive VAD-positive frames confirm
-///    **sustained speech**.
-/// 4. After speech, `config.silence_threshold_samples` of consecutive
-///    VAD-negative audio ends the utterance.
-/// 5. The complete utterance is emitted and internal state resets for the
-///    next utterance.
-///
-/// No context padding is added, so segmentation matches the streaming
-/// detection path.
-///
-/// # Parameters
-///
-/// - `raw_audio`: Complete raw mono audio buffer (16 kHz f32 samples).
-/// - `vad_decisions`: One boolean per frame (stride = `config.hop_length`).
-///   Each decision is whether the frame at that position contains speech.
-///   The caller is responsible for computing these (e.g. via
-///   [`is_speech_with_detector`] on each frame).
-/// - `config`: Segmentation parameters (see [`VadSegmentationConfig`]).
-///   Use [`DEFAULT_VAD_SEGMENTATION_CONFIG`] for the standard pipeline.
-///
-/// # Returns
-///
-/// A list of utterance segments (raw audio samples, **not** VAD-subsampled),
-/// in detection order.
+/// Segment raw audio into utterances from per-frame VAD decisions, with the boundary algorithm of
+/// the enrollment streaming handler ([`handle_enrollment_audio`]). Pure with respect to VAD state —
+/// it never touches [`VAD_DETECTOR`]; the caller supplies one decision per `config.hop_length`
+/// frame. `config.consecutive_required` consecutive VAD-positive frames confirm sustained speech,
+/// then `config.silence_threshold_samples` of VAD-negative audio ends the utterance, which is
+/// emitted with internal state reset. No context padding, so segmentation matches streaming; the
+/// result is raw audio segments (**not** VAD-subsampled) in detection order.
 fn segment_utterances_by_vad(
     raw_audio: &[f32],
     vad_decisions: &[bool],
@@ -1692,13 +1299,10 @@ fn segment_utterances_by_vad(
     let mut utterance_speech_end_len: usize = 0;
     let mut vad_positives_in_a_row: usize = 0;
 
-    // Iterate frames at hop_length stride.
-    // Each frame corresponds to one VAD decision.
     for (frame_idx, &is_speech) in vad_decisions.iter().enumerate() {
         let frame_start = frame_idx * hop_length;
 
         if is_speech {
-            // VAD-positive: accumulate hop_length samples into utterance.
             let hop_end = (frame_start + hop_length).min(raw_audio.len());
             if hop_end > frame_start {
                 utterance_buf.extend_from_slice(&raw_audio[frame_start..hop_end]);
@@ -1707,25 +1311,20 @@ fn segment_utterances_by_vad(
             vad_positives_in_a_row += 1;
 
             if vad_positives_in_a_row >= consecutive_required {
-                // Sustained speech confirmed.
                 utterance_had_speech = true;
                 utterance_speech_end_len = utterance_buf.len();
                 utterance_silence_samples = 0;
             } else if utterance_had_speech {
-                // Single VAD-positive frame after sustained speech:
-                // extend utterance end and reset silence.
                 utterance_speech_end_len = utterance_buf.len();
                 utterance_silence_samples = 0;
             }
         } else {
-            // VAD-negative: reset consecutive counter.
             vad_positives_in_a_row = 0;
 
             if utterance_had_speech {
                 utterance_silence_samples += hop_length;
 
                 if utterance_silence_samples >= silence_threshold_samples {
-                    // Utterance is complete.
                     utterance_buf.truncate(utterance_speech_end_len);
                     if !utterance_buf.is_empty() {
                         utterances.push(std::mem::take(&mut utterance_buf));
@@ -1742,46 +1341,24 @@ fn segment_utterances_by_vad(
     utterances
 }
 
-// Voice pipeline background task
-
 // Adaptive threshold state
 
-/// Tracks running mean and standard deviation of recent per-frame soft scores
-/// for adaptive threshold computation.
-///
-/// Maintains O(1) sum/sum_sq statistics over a rolling window of the last
-/// [`ADAPTIVE_WINDOW_N`] scores.  On each call to [`feed`](AdaptiveThresholdState::feed),
-/// the adaptive threshold is computed as:
-///
-/// ```text
-/// threshold = (mean_of_window + k × std_of_window) × ROLLING_WINDOW_N
-/// ```
-///
-/// The per-frame result is scaled by [`ROLLING_WINDOW_N`] to convert from
-/// per-frame score space [0,1] into rolling-sum space [0, ROLLING_WINDOW_N],
-/// matching the detection comparison in [`process_wake_word_score`].  Without
-/// this scaling the adaptive threshold (max ~1.0 + k × std) could never reach
-/// the rolling sum range, making the feature structurally a no-op.
-///
-/// The result is then clamped to the caller's safe harbor (the per-enrollment
-/// static detection threshold, co-derived from the calibration) and never
-/// above [`ADAPTIVE_CEILING`].  During the
-/// first [`ADAPTIVE_BOOTSTRAP_FRAMES`] frames the function returns `None`,
-/// telling the caller to use the static threshold while the window fills.
+/// Running mean/std of the recent per-frame soft scores, kept as O(1) sum/sum_sq over the last
+/// [`ADAPTIVE_WINDOW_N`].  The threshold is `(mean + k × std) × ROLLING_WINDOW_N`: the scaling into
+/// rolling-sum space is what matches [`process_wake_word_score`], and without it the adaptive value
+/// (max ~1.0 + k × std) could never reach the rolling sum and the feature would be a no-op.  The
+/// result is clamped between the caller's safe harbor (the per-enrollment static threshold) and
+/// [`ADAPTIVE_CEILING`]; the first [`ADAPTIVE_BOOTSTRAP_FRAMES`] frames return `None`, telling the
+/// caller to use the static threshold while the window fills.
 #[derive(Debug, Clone)]
 struct AdaptiveThresholdState {
-    /// Rolling window of per-frame scores.
     scores: Vec<f32>,
-    /// Running sum of scores in the window.
     sum: f32,
-    /// Running sum of squared scores in the window.
     sum_sq: f32,
-    /// Bootstrap frame counter.
     bootstrap_count: usize,
 }
 
 impl AdaptiveThresholdState {
-    /// Create a new adaptive threshold tracker with empty statistics.
     fn new() -> Self {
         Self {
             scores: Vec::with_capacity(ADAPTIVE_WINDOW_N),
@@ -1791,20 +1368,13 @@ impl AdaptiveThresholdState {
         }
     }
 
-    /// Feed a new per-frame soft score and return the adaptive threshold.
-    ///
-    /// The threshold is computed from per-frame scores (range [0,1]), then
-    /// scaled by [`ROLLING_WINDOW_N`] to match the rolling-sum space [0,3]
-    /// where the detection comparison lives.  Returns `None` during the
-    /// bootstrap period (first [`ADAPTIVE_BOOTSTRAP_FRAMES`] frames) to tell
-    /// the caller to use the static threshold.  After bootstrap returns
-    /// `Some(threshold)` where `threshold` is already clamped to the safeguard
-    /// range (`[harbor, ADAPTIVE_CEILING]`) in rolling-sum space — `harbor`
-    /// being the caller's static detection threshold (per-enrollment,
-    /// co-derived from the calibration), which keeps the anti-feedback-loop
+    /// Feed a per-frame soft score (range [0,1]), scaled by [`ROLLING_WINDOW_N`] into the
+    /// rolling-sum space [0,3] where detection compares. `None` during the first
+    /// [`ADAPTIVE_BOOTSTRAP_FRAMES`] frames (use the static threshold); after that
+    /// `Some(threshold)`, already clamped to `[harbor, ADAPTIVE_CEILING]` in rolling-sum space,
+    /// where `harbor` is the caller's per-enrollment static threshold — the anti-feedback-loop
     /// property.
     fn feed(&mut self, score: f32, k: f32, harbor: f32) -> Option<f32> {
-        // ── Update rolling window statistics ──
         if self.scores.len() >= ADAPTIVE_WINDOW_N {
             let oldest = self.scores.remove(0);
             self.sum -= oldest;
@@ -1814,26 +1384,18 @@ impl AdaptiveThresholdState {
         self.sum += score;
         self.sum_sq += score * score;
 
-        // ── Bootstrap phase ──
         if self.bootstrap_count < ADAPTIVE_BOOTSTRAP_FRAMES {
             self.bootstrap_count += 1;
             return None;
         }
 
-        // ── Compute adaptive threshold ──
         let threshold = self.compute_threshold(k, harbor);
 
         Some(threshold)
     }
 
-    /// Compute the clamped adaptive threshold from current window statistics.
-    ///
-    /// Assumes the window is non-empty (caller must check).  Returns the
-    /// clamped threshold in rolling-sum space (range `[harbor,
-    /// ADAPTIVE_CEILING]`), where `harbor` is the caller-provided safe harbor.
-    ///
-    /// Shared by [`feed`](Self::feed) and [`peek`](Self::peek) to avoid
-    /// duplicating the computation and clamping chain.
+    /// Clamped adaptive threshold from the current statistics; the window must be non-empty
+    /// (checked by the caller). Shared by [`feed`](Self::feed) and [`peek`](Self::peek).
     #[expect(clippy::cast_precision_loss)]
     fn compute_threshold(&self, k: f32, harbor: f32) -> f32 {
         let n = self.scores.len() as f32;
@@ -1842,30 +1404,20 @@ impl AdaptiveThresholdState {
         let variance = (self.sum_sq / n) - (mean * mean);
         let std = variance.max(0.0).sqrt();
 
-        // Scale from per-frame [0,1] space to rolling-sum [0,ROLLING_WINDOW_N]
-        // space so the threshold is comparable to the rolling sum used in
-        // process_wake_word_score.
+        // Scale per-frame [0,1] to rolling-sum [0,ROLLING_WINDOW_N] space, so the threshold is
+        // comparable to the sum used by process_wake_word_score.
         #[expect(clippy::cast_precision_loss)]
         let adaptive = (mean + k * std) * ROLLING_WINDOW_N as f32;
 
-        // ── Safeguards ──
-        // Lower bound is the caller's safe harbor (the per-enrollment static
-        // detection threshold), upper bound is the ceiling.  Note: clamp()
-        // propagates NaN while the old max() chain returned the harbor for
-        // NaN input — unreachable with finite scores, but the semantics differ.
+        // Lower bound is the caller's safe harbor (the per-enrollment static threshold), upper the
+        // ceiling. `clamp()` propagates NaN where the old `max()` chain returned the harbor:
+        // unreachable with finite scores, but the semantics differ.
         adaptive.clamp(harbor, ADAPTIVE_CEILING)
     }
 
-    /// Return the current adaptive threshold without updating statistics.
-    ///
-    /// Returns `None` during the bootstrap period (first
-    /// [`ADAPTIVE_BOOTSTRAP_FRAMES`] frames) or when the window is empty.
-    /// After bootstrap, returns `Some(threshold)` using the current window
-    /// statistics and the given `k` multiplier, clamped to the same safeguard
-    /// range as [`feed`](Self::feed).
-    ///
-    /// This is used to avoid contaminating the background statistics with
-    /// wake-word-like frames.
+    /// The threshold for the current statistics without updating them: `None` during bootstrap or
+    /// with an empty window, else the same clamped value [`feed`](Self::feed) gives. This is how
+    /// wake-word-like frames avoid contaminating the background statistics.
     fn peek(&self, k: f32, harbor: f32) -> Option<f32> {
         if self.bootstrap_count < ADAPTIVE_BOOTSTRAP_FRAMES {
             return None;
@@ -1876,22 +1428,14 @@ impl AdaptiveThresholdState {
         Some(self.compute_threshold(k, harbor))
     }
 
-    /// Returns `true` while the tracker is still in the bootstrap phase
-    /// (first [`ADAPTIVE_BOOTSTRAP_FRAMES`] below-reset frames since the
-    /// score-only feed rule).  During bootstrap the caller
-    /// feeds below-reset background scores (which populate the window and
-    /// advance the bootstrap counter) and peeks wake-word-like scores —
-    /// [`peek`](Self::peek) returns `None` during bootstrap, so the static
-    /// detection threshold stays in effect.
-    ///
-    /// Production callers no longer consult this method (the feed/peek rule
-    /// is now score-only); it exists for unit tests.
+    /// Whether the tracker is still bootstrapping (the first [`ADAPTIVE_BOOTSTRAP_FRAMES`]
+    /// below-reset frames since the score-only feed rule). Production callers no longer consult it
+    /// — [`peek`](Self::peek) returns `None` during bootstrap — it exists for unit tests.
     #[cfg(test)]
     fn is_bootstrapping(&self) -> bool {
         self.bootstrap_count < ADAPTIVE_BOOTSTRAP_FRAMES
     }
 
-    /// Reset all statistics (called on pipeline reset / re-enrollment).
     fn reset(&mut self) {
         self.scores.clear();
         self.sum = 0.0;
@@ -1899,13 +1443,9 @@ impl AdaptiveThresholdState {
         self.bootstrap_count = 0;
     }
 
-    /// Create a pre-warmed state that has exited the bootstrap phase,
-    /// initialized with near-silence scores.  Used by the adaptive-threshold
-    /// unit test so the threshold is active from the start.  `harbor` is the
-    /// caller's static detection threshold (co-derived from the enrollment
-    /// calibration) — the seed value (~0.03) ensures the threshold immediately
-    /// clamps to it, matching production behavior where real audio starts from
-    /// silence.
+    /// A pre-warmed state past bootstrap, seeded with near-silence scores so the threshold is
+    /// active from the start; the ~0.03 seed clamps immediately to `harbor`, as real audio from
+    /// silence does.
     #[cfg(test)]
     fn warmed(harbor: f32) -> Self {
         let mut state = Self::new();
@@ -1915,211 +1455,136 @@ impl AdaptiveThresholdState {
         state
     }
 
-    /// The number of scores currently in the window.
     #[cfg(test)]
     fn len(&self) -> usize {
         self.scores.len()
     }
 }
 
-// Pipeline context
-
-/// What an attempt to start a recording did.
 enum StartAttempt {
-    /// The recording is running.
     Started,
-    /// A recording was already running and owns the composer's field: nothing is
-    /// reported, so its message is not closed by this press.
+    /// A recording was already running and owns the composer field: nothing is reported, so its
+    /// message is not closed by this press.
     AlreadyRecording,
     /// Nothing is recording. The notice, when there is one, says why.
     Refused(Option<&'static str>),
 }
 
-/// Runtime state for the voice pipeline main loop.
 #[expect(clippy::struct_excessive_bools)]
 struct PipelineCtx {
-    /// The open microphone, if any.  One handle owns the sample stream, the
-    /// device stream and that stream's loss reports, so they can never drift
-    /// apart (see [`Microphone`]).
+    /// The open microphone, if any (see [`Microphone`]).
     mic: Option<Microphone>,
     is_listening: bool,
-    /// The recording in progress, if any: the mic button and the wake word share
-    /// one mechanism and differ only in how a recording can end (a wake-word
-    /// recording also ends itself on silence).
+    /// The recording in progress: the mic button and the wake word share one mechanism, differing
+    /// only in how it can end.
     recording: Option<RecordingOrigin>,
-    /// Whether wake-word listening resumes when the current recording ends: set
-    /// when the wake-word mic was already running (or asked to start while the
-    /// recording was in progress), and when the user's switch is on for a
-    /// recording-only microphone — so a recording never leaves voice stopped
-    /// while the switch shows it on.
+    /// Whether wake-word listening resumes when the current recording ends — set when the wake-word
+    /// mic was running, or the switch is on, so a recording never leaves voice stopped while the
+    /// switch shows it on.
     resume_listening_after_recording: bool,
     command_buffer: Vec<f32>,
-    /// Track silence duration by audio sample count rather than wall-clock
-    /// time, so that system load / processing delays don't affect recording
-    /// cutoff consistency.
+    /// Silence by audio sample count, not wall-clock, so load and processing delays cannot skew the
+    /// cutoff.
     silence_sample_count: usize,
-    /// Wake-word recording: samples still to be dropped from the front of the
-    /// recording before any of it reaches recognition
-    /// ([`POST_FIRE_DISCARD_SAMPLES`]).  Armed by the detection handoff.
+    /// Wake-word recording: samples still to drop from the front before any reaches recognition
+    /// ([`POST_FIRE_DISCARD_SAMPLES`]); armed by the detection handoff.
     post_fire_discard_samples: usize,
-    /// Whether the retained part of the current wake-word recording contained
-    /// any speech, judged by the same per-chunk VAD measurement detection uses.
-    /// A recording with none is dropped without delivering anything.
+    /// Whether the retained part of the current wake-word recording held speech, by the same
+    /// per-chunk VAD detection uses. A recording with none delivers nothing.
     recording_had_speech: bool,
     enrollment_mode: bool,
-    /// Accumulated VAD decisions across all frames processed this enrollment
-    /// session.  Paired with [`frame_raw_audio`] for the extracted
-    /// [`segment_utterances_by_vad`] function.
     frame_vad: Vec<bool>,
-    /// Accumulated raw audio samples (full-resolution, NOT sub-sampled) for
-    /// all frames processed this enrollment session.  Used by the extracted
-    /// [`segment_utterances_by_vad`] function alongside [`frame_vad`].
     frame_raw_audio: Vec<f32>,
-    /// Number of utterances already emitted by the extracted
-    /// [`segment_utterances_by_vad`] function.  Reset across enrollment
-    /// sessions (Cancel/Full) but preserved within a single session so the
-    /// function is called on the full accumulated buffer each time.
+    /// Utterances already emitted by [`segment_utterances_by_vad`]: reset across sessions, kept
+    /// within one so the function can run over the whole buffer each call.
     emitted_utterances: usize,
     utterance_had_speech: bool,
-    /// Silence duration in samples for enrollment utterance detection
-    /// (sample-based to avoid wall-clock drift under load).
+    /// Enrollment silence duration in samples (sample-based, so load cannot drift it).
     utterance_silence_samples: usize,
-    /// Counter of consecutive non-VAD frames during enrollment.
-    /// Used to detect when the user has not spoken for too long
-    /// and show a "speak louder" warning.
+    /// Consecutive non-VAD frames during enrollment, for the "speak louder" warning.
     enrollment_no_speech_frame_count: usize,
-    /// Consecutive VAD-positive frame counter for enrollment sustained-speech
-    /// confirmation.  Now, accumulation starts on
-    /// the first VAD-positive frame ([`ENROLLMENT_VAD_CONSECUTIVE_REQUIRED`] = 1),
-    /// matching streaming detection's first-positive behavior.
+    /// Consecutive VAD-positive frames for sustained-speech confirmation — accumulation starts at
+    /// the first one ([`ENROLLMENT_VAD_CONSECUTIVE_REQUIRED`] = 1), like streaming detection.
     vad_positives_in_a_row: usize,
-    /// VAD threshold for the current mode.  Unified to [`VAD_THRESHOLD`] for
-    /// both detection and enrollment.
+    /// VAD threshold for the current mode, unified to [`VAD_THRESHOLD`].
     vad_threshold: f32,
-    /// Separate Earshot VAD detector instance for enrollment mode.
-    ///
-    /// The streaming detection path uses the global [`VAD_DETECTOR`] singleton
-    /// to maintain continuous noise-floor and ring-buffer state across the
-    /// live microphone stream.  Enrollment mode uses its own detector instance
-    /// to prevent mode-transition state contamination.
-    ///
-    /// Initialised to `None` outside enrollment.  Set to
-    /// `Some(earshot::Detector::default())` when enrollment starts and cleared
-    /// to `None` when enrollment ends or is cancelled.
+    /// Earshot detector for enrollment mode. The global [`VAD_DETECTOR`] keeps continuous
+    /// noise-floor and ring-buffer state across the live stream, so enrollment uses its own
+    /// instance to prevent mode-transition contamination: `None` outside enrollment, set to
+    /// `Some(earshot::Detector::default())` from start to end or cancel.
     enrollment_vad: Option<earshot::Detector>,
-    /// Raw audio ring for wake-word detection.  Accumulates raw mic samples
-    /// (no AGC/NS) capped at [`AUDIO_BUFFER_MAX`]; the VAD frame loop walks it
-    /// via [`vad_cursor`], and scoring encodes the VAD-gated
-    /// [`speech_window`] — never this buffer.
+    /// Raw audio ring for wake-word detection, capped at [`AUDIO_BUFFER_MAX`] and walked by the VAD
+    /// loop via [`vad_cursor`]; scoring encodes the VAD-gated [`speech_window`], never this buffer.
     audio_buffer: Vec<f32>,
-    /// VAD-gated speech-only window for encoder scoring.
-    ///
-    /// Holds only the [`HOP_LENGTH`] hops that the VAD classified as speech,
-    /// capped at [`WAKE_WORD_WINDOW_SAMPLES`] (draining the front).  This
-    /// matches the enrollment windowing exactly — enrollment encodes
-    /// VAD-segmented speech-only utterances, so scoring the same speech-only
-    /// window keeps the cosine distributions aligned (raw trailing audio
-    /// dilutes the embedding with context/silence and shifts detection
-    /// cosines ~0.05-0.08 below enrollment, letting confusables through).
+    /// VAD-gated speech-only window for encoder scoring: only the [`HOP_LENGTH`] hops the VAD
+    /// called speech, capped at [`WAKE_WORD_WINDOW_SAMPLES`] (draining the front). Enrollment
+    /// encodes VAD-segmented speech-only utterances, so scoring the same kind of window keeps the
+    /// cosine distributions aligned — raw trailing audio dilutes the embedding with context/silence
+    /// and shifts detection cosines ~0.05-0.08 below enrollment, letting confusables through.
     speech_window: Vec<f32>,
-    /// Number of samples at the FRONT of [`audio_buffer`] already consumed by
-    /// the VAD frame loop.  The VAD loop advances this cursor instead of
-    /// draining the ring, so the ring keeps the whole trailing window of raw
-    /// audio even after every frame has been VAD-checked.
+    /// Samples at the FRONT of [`audio_buffer`] already consumed: the loop advances this cursor
+    /// instead of draining, so the ring keeps the whole trailing window even after every frame was
+    /// checked.
     vad_cursor: usize,
-    /// Samples processed since the last window encoding (scoring step).
-    /// Reset to 0 after each encode; when it reaches [`SCORE_STRIDE_SAMPLES`]
-    /// and speech was seen, the pipeline encodes and scores.
+    /// Samples since the last scoring step, reset after each encode; at [`SCORE_STRIDE_SAMPLES`]
+    /// with speech seen, the pipeline encodes and scores.
     last_score_sample_count: usize,
-    /// Queue of completed enrollment utterances awaiting processing by the main
-    /// pipeline loop.  Each element is a Vec<f32> of raw audio samples for one
-    /// utterance.  The extracted [`segment_utterances_by_vad`] function detects
-    /// utterance boundaries and queues completed utterances here.  The main loop
-    /// pops them one at a time via [`pop_front`](VecDeque::pop_front) and
-    /// processes them through [`handle_enrollment_sample`].  Using a queue
-    /// (rather than a single `Option`) ensures that if multiple utterances
-    /// complete within a single mic frame, all are preserved — no utterance is
-    /// silently dropped.
+    /// Completed enrollment utterances awaiting the main loop, which pops one per tick and runs
+    /// [`handle_enrollment_sample`].  A queue rather than a single `Option`, so several utterances
+    /// completing within one mic frame are all preserved.
     enrollment_pending: VecDeque<Vec<f32>>,
     auto_start_pending: bool,
-    /// Timestamp of the last automatic transcriber retry attempt.  Used to
-    /// debounce so we don't spam the retry path every 1-second tick when the
-    /// transcriber is in [`ModelState::Failed`] (the periodic wake-up checks
-    /// the state).
+    /// Last automatic retry time, debouncing the retry path against the 1-second tick while the
+    /// transcriber sits in [`ModelState::Failed`].
     last_model_retry: Option<Instant>,
-    /// Timestamp of the last wake word detection.
-    /// Used to enforce a cooldown period after detection to prevent rapid
-    /// consecutive false triggers.
+    /// Last detection time, for the cooldown that prevents rapid consecutive false triggers.
     last_wake_word_detection: Option<Instant>,
-    /// Pre-speech noise RMS captured at the moment of first sustained speech
-    /// detection during enrollment.  Computed from the raw audio ring so the
-    /// SNR estimate reflects the true room noise floor.
-    /// Used for real SNR estimation in [`compute_utterance_quality`].
-    /// Reset to `None` after the utterance is consumed by
+    /// Pre-speech noise RMS captured at the first sustained speech, from the raw audio ring so the
+    /// SNR reflects the true room floor; consumed and reset to `None` by
     /// [`handle_enrollment_sample`].
     noise_rms_estimate: Option<f32>,
-    // ── Phase 3 (owner-negative) enrollment state ────────────
-    /// Whether the pipeline is actively collecting owner-negative general speech
-    /// during Phase 3 enrollment.  Set by `transition_to_phase3()` when the
-    /// user has completed all 10 wake word utterances.
+    /// Actively collecting owner-negative general speech (Phase 3); set by
+    /// `transition_to_phase3()` once the ten wake-word utterances are done.
     collecting_negatives: bool,
-    /// Independent audio buffer for Phase 3 VAD frame processing.  NOT shared
-    /// with `audio_buffer` (used by enrollment Phase 2) to avoid interference.
+    /// Phase 3 audio buffer, kept apart from the Phase 2 `audio_buffer` so they cannot interfere.
     phase3_audio_buf: Vec<f32>,
-    /// Silence tracking for Phase 3 chunk boundary detection.  Uses
-    /// [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] (same constant as enrollment
-    /// utterance end, aligned to streaming's segment timeout)
-    /// to detect chunk boundaries.
+    /// Phase 3 silence tracking, on [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] like enrollment
+    /// utterance end, to detect chunk boundaries.
     phase3_silence_samples: usize,
-    /// Accumulated VAD-positive speech samples collected during Phase 3.
-    /// Monotone 1:1 record of real audio: each VAD-positive hop contributes
-    /// exactly [`HOP_LENGTH`] samples, exactly once (see [`phase3_processed`]).
-    /// When `negatives_speech_samples >= SAMPLE_RATE * NEGATIVES_TARGET_SECONDS`,
-    /// Phase 3 is complete and the pipeline transitions to finalization.
+    /// VAD-positive speech samples in Phase 3: every VAD-positive hop contributes exactly
+    /// [`HOP_LENGTH`], once (see [`phase3_processed`]).  At
+    /// `SAMPLE_RATE * NEGATIVES_TARGET_SECONDS` the phase completes and finalization starts.
     negatives_speech_samples: usize,
-    /// Watermark into [`phase3_audio_buf`]: number of samples at the head of
-    /// the buffer already fed to the VAD.  The frame loop resumes at this
-    /// index on the next mic chunk so each hop reaches the stateful VAD
-    /// exactly once.  Without it, an un-drained buffer re-processes (and
-    /// re-counts) every prior frame on each chunk — the quadratic Phase-3
+    /// Watermark into [`phase3_audio_buf`]: samples already fed to the VAD, which resumes here on
+    /// the next chunk so each hop reaches the stateful detector exactly once. Without it an
+    /// un-drained buffer re-processes and re-counts every prior frame per chunk — the quadratic
     /// counter defect.
     phase3_processed: usize,
-    /// Wall-clock start time of Phase 3 owner-negative collection.  Used for
-    /// timeout — if [`PHASE3_TIMEOUT_SECS`] elapses, finalize with whatever
-    /// was collected.
+    /// Wall-clock start of Phase 3, for the [`PHASE3_TIMEOUT_SECS`] finalize-anyway timeout.
     phase3_start_time: Option<Instant>,
-    /// Rolling window of per-frame soft scores from the cosine-prototype
-    /// scorer.  Each element is the soft score (0.0–1.0) from the last
-    /// scoring step.
+    /// Per-frame soft scores from the cosine-prototype scorer, one per scoring step.
     score_window: Vec<f32>,
-    /// Consecutive VAD-negative hops since the last VAD-positive frame,
-    /// persisted across calls.  When it reaches [`SEGMENT_TIMEOUT_HOPS`]
+    /// Consecutive VAD-negative hops since the last positive frame; at [`SEGMENT_TIMEOUT_HOPS`]
     /// (~300 ms) the per-segment detection state resets.
     segment_silence_hops: usize,
-    /// Stride-gated scoring steps taken since the first scoring step of the
-    /// current speech segment.  Every scoring step counts, including steps
-    /// that re-score unchanged audio while the speaker pauses.  Cleared where
-    /// the segment ends and wherever a detection is handled, so each command
-    /// is judged on its own; a fire is accepted only while this is
-    /// ≤ [`WAKE_WORD_MAX_SEGMENT_STEPS`].
+    /// Stride-gated scoring steps since the first step of the current speech segment — every step
+    /// counts, even ones re-scoring unchanged audio during a pause. Cleared where the segment ends
+    /// and wherever a detection is handled, so a fire is accepted only while this is ≤
+    /// [`WAKE_WORD_MAX_SEGMENT_STEPS`].
     segment_score_steps: usize,
     /// Adaptive threshold tracker for the rolling score window.
     adaptive_threshold: AdaptiveThresholdState,
     /// Adaptive threshold k multiplier (fixed at [`ADAPTIVE_K_DEFAULT`]).
     adaptive_k: f32,
-    /// Accumulated non-VAD audio during enrollment (pre-speech ambient noise
-    /// and inter-utterance silence), saved as negative examples at speech
-    /// onset.
+    /// Non-VAD audio during enrollment (pre-speech ambient noise, inter-utterance silence), saved
+    /// as a negative example at speech onset.
     negative_audio_buf: Vec<f32>,
-    /// Timestamp until which the pipeline suppresses Error→Listening
-    /// transitions (set after transcription failures).
+    /// Timestamp until which Error→Listening is suppressed, set after transcription failures.
     refractory_until: Option<Instant>,
     /// Timestamp of the last rate-limited voice notice.
     last_voice_notice_time: Option<Instant>,
-    /// Remaining automatic model-retry cycles (see
-    /// [`MAX_AUTO_MODEL_RETRY_CYCLES`]).  Decremented only when the periodic
-    /// self-healing path actually initiates a retry; the explicit GUI retry
-    /// bypasses this budget.
+    /// Remaining automatic retry cycles ([`MAX_AUTO_MODEL_RETRY_CYCLES`]), consumed only when the
+    /// self-healing path retries; the explicit GUI retry bypasses the budget.
     auto_model_retries_left: u32,
 }
 
@@ -2180,25 +1645,20 @@ impl PipelineCtx {
         }
     }
 
-    /// Run a Full reset while preserving [`auto_start_pending`] (the reset
-    /// clears it; a pending wake-word auto-start must survive the
-    /// recording-only-mic lifecycle).
+    /// Full reset while preserving [`auto_start_pending`], which the reset clears but a pending
+    /// wake-word auto-start must survive the recording-only-mic lifecycle.
     fn full_reset_preserving_auto_start(&mut self) {
         let auto_start = self.auto_start_pending;
         self.reset_pipeline_state(ResetLevel::Full);
         self.auto_start_pending = auto_start;
     }
 
-    /// Take what a wake-word recording captured and end it: the audio, and
-    /// whether anything was said.
-    ///
-    /// Every path that stops a wake-word recording goes through here, so the
-    /// order cannot be lost: the silence flag is read before the end clears it,
-    /// and the buffer is taken before the reset drops it. Soft level drops the
-    /// recording/detection buffers while preserving VAD continuity,
-    /// `vad_threshold` and the wake-word cooldown timestamp, so the trigger
-    /// cannot immediately re-fire.  The caller owns the voice status (Listening
-    /// after a normal end, Enrolling after an aborted recording).
+    /// Take what a wake-word recording captured and end it: the audio and whether anything was
+    /// said. Every stop path goes through here so the order cannot be lost — the silence flag is
+    /// read before the end clears it, the buffer is taken before the reset drops it. Soft drops the
+    /// recording and detection buffers while preserving VAD continuity, `vad_threshold` and the
+    /// cooldown timestamp, so the trigger cannot immediately re-fire. The caller owns the status
+    /// (Listening after a normal end, Enrolling after an aborted recording).
     fn take_wake_recording(&mut self) -> (Vec<f32>, bool) {
         let had_speech = self.recording_had_speech;
         let cmd_buf = std::mem::take(&mut self.command_buffer);
@@ -2207,49 +1667,31 @@ impl PipelineCtx {
         (cmd_buf, had_speech)
     }
 
-    /// Drop a wake-word recording's buffers while keeping VAD continuity, and
-    /// play the end cue its stop owes.
+    /// Drop a wake-word recording's buffers while keeping VAD continuity, and play the end cue its
+    /// stop owes.
     fn end_wake_state(&mut self) {
         self.reset_pipeline_state(ResetLevel::Soft);
         cue::play(Cue::End);
     }
 
-    /// End an enrollment attempt — completed successfully, cancelled by the
-    /// user, failed during finalization, or cut short by a lost microphone.
-    ///
-    /// Cancel is the only level that clears the global enrollment accumulators,
-    /// and it also clears the ctx-level `collecting_negatives`: those two are
-    /// what the Phase 2→3 and Phase 3→4 gates read.  It leaves the VAD alone so
-    /// the noise-floor estimate carries into detection.  The caller owns the
-    /// voice status.
+    /// End an enrollment attempt — completed, cancelled, failed in finalization, or cut short by a
+    /// lost microphone. Cancel is the only level that clears the global accumulators, and it also
+    /// clears `collecting_negatives`: those are what the Phase 2→3 and 3→4 gates read. The VAD is
+    /// left alone, so its noise-floor estimate carries into detection; the caller owns the status.
     fn end_enrollment_attempt(&mut self) {
         self.reset_pipeline_state(ResetLevel::Cancel);
         self.enrollment_mode = false;
     }
 
-    /// Parameterised pipeline state reset.
-    ///
-    /// A reset only clears state: it never publishes an outcome, so a caller
-    /// ending a recording reports it itself ([`Self::abandon_recording`]) with
-    /// wording that matches what actually happened.
-    ///
-    /// | Field | Full | Soft | Cancel |
-    /// |---|---|---|---|
-    /// | `audio_buffer`, `command_buffer`, `score_window`, `negative_audio_buf`, `frame_vad`, `frame_raw_audio` | cleared | cleared | cleared |
-    /// | `silence_sample_count`, `segment_silence_hops`, `segment_score_steps`, `last_score_sample_count`, `post_fire_discard_samples` | = 0 | = 0 | = 0 |
-    /// | `recording_had_speech`, `utterance_had_speech`, `utterance_silence_samples`, `enrollment_no_speech_frame_count`, `vad_positives_in_a_row`, `emitted_utterances`, `enrollment_pending`, `noise_rms_estimate` | cleared | cleared | cleared |
-    /// | Phase 3 (`collecting_negatives`, `phase3_audio_buf`, `phase3_silence_samples`, `negatives_speech_samples`, `phase3_processed`, `phase3_start_time`) | cleared | cleared | cleared |
-    /// | `vad_threshold` | `VAD_THRESHOLD` | preserved | `VAD_THRESHOLD` |
-    /// | `enrollment_vad` | `None` | `None` | `None` |
-    /// | `last_wake_word_detection` | `None` | preserved | `None` |
-    /// | `auto_start_pending` | `false` | preserved | preserved |
-    /// | `recording` | cleared | preserved | preserved |
-    /// | `resume_listening_after_recording` | preserved | preserved | preserved |
-    /// | VAD (`reset_vad()`) | called | NOT called | NOT called |
-    /// | Global `enrollment_embeddings`, `negative_audio_chunks` | preserved | preserved | cleared |
-    /// | `refractory_until`, `last_voice_notice_time`, `last_model_retry`, `mic`, `is_listening`, `enrollment_mode` | NOT touched | NOT touched | NOT touched |
+    /// Parameterised reset. It only clears state and never publishes an outcome — a caller ending a
+    /// recording reports that itself ([`Self::abandon_recording`]) in wording matching what
+    /// happened. Audio buffers, the counters, enrollment/segment state and the Phase 3 fields clear
+    /// at every level. `vad_threshold`, `enrollment_vad` and `last_wake_word_detection` are reset
+    /// by Full and Cancel but preserved by Soft, as are `auto_start_pending`, `recording` and
+    /// `resume_listening_after_recording`; `reset_vad()` runs on Full only, and the global
+    /// enrollments are cleared by Cancel alone. `refractory_until`, the notice/retry stamps, `mic`,
+    /// `is_listening` and `enrollment_mode` are never touched.
     fn reset_pipeline_state(&mut self, level: ResetLevel) {
-        // ── Audio accumulators (cleared by all levels) ──
         self.audio_buffer.clear();
         self.speech_window.clear();
         self.vad_cursor = 0;
@@ -2263,7 +1705,6 @@ impl PipelineCtx {
         self.segment_score_steps = 0;
         self.last_score_sample_count = 0;
 
-        // ── Enrollment detection/accumulator state (cleared by all levels) ──
         self.utterance_had_speech = false;
         self.utterance_silence_samples = 0;
         self.enrollment_no_speech_frame_count = 0;
@@ -2274,7 +1715,6 @@ impl PipelineCtx {
         self.frame_raw_audio.clear();
         self.emitted_utterances = 0;
 
-        // ── Phase 3 owner-negative state (cleared by all levels) ──
         self.collecting_negatives = false;
         self.phase3_audio_buf.clear();
         self.phase3_silence_samples = 0;
@@ -2282,9 +1722,7 @@ impl PipelineCtx {
         self.phase3_processed = 0;
         self.phase3_start_time = None;
 
-        // ── Enrollment VAD detector (cleared by all levels) ──
-        // Separate VAD instance prevents state contamination between
-        // enrollment and streaming modes.
+        // Enrollment VAD detector, cleared at every level so modes cannot contaminate each other.
         self.enrollment_vad = None;
 
         match level {
@@ -2292,97 +1730,57 @@ impl PipelineCtx {
                 self.vad_threshold = VAD_THRESHOLD;
                 self.last_wake_word_detection = None;
                 self.auto_start_pending = false;
-                // A reset clears state; it does not decide what the user is
-                // told. A caller ending a recording owns its event and wording
-                // (see [`Self::abandon_recording`]).
                 self.recording = None;
                 reset_vad();
                 self.adaptive_threshold.reset();
-
-                // Full does NOT clear global enrollment accumulators — those
-                // survive mic stop/start cycles so mid-enrollment progress is
-                // preserved across toggle-off/on.
             }
             ResetLevel::Soft => {
-                // Preserve VAD state, vad_threshold, last_wake_word_detection
-                // cooldown, auto_start_pending, the running recording, and
-                // global enrollment accumulators.
-                // Clear rolling-window detection state so stale scores cannot
-                // carry cross-utterance contamination across Soft pipeline
-                // resets (which occur during the detection→recording handoff).
+                // Soft preserves VAD state, `vad_threshold`, the cooldown, `auto_start_pending`,
+                // the running recording and the global enrollments, and clears the rolling-window
+                // state so stale scores cannot cross utterances (Soft runs on the
+                // detection→recording handoff).
             }
             ResetLevel::Cancel => {
                 self.vad_threshold = VAD_THRESHOLD;
                 self.last_wake_word_detection = None;
                 self.adaptive_threshold.reset();
 
-                // Cancel also clears global enrollment accumulators.
                 voice_state().write().unwrap_poison().reset_enrollment();
             }
         }
     }
 
-    /// Reset all per-segment detection state at a VAD-driven utterance boundary.
-    /// Called when [`SEGMENT_TIMEOUT_HOPS`] (~300 ms) of
-    /// consecutive VAD-negative hops have been observed since the last
-    /// VAD-positive frame.
-    ///
-    /// This prevents soft scores and rolling sums from
-    /// accumulating across separate utterances separated by more than ~300 ms
-    /// of silence, which was a structural source of false triggers.
-    ///
-    /// | Field | Reset? | Rationale |
-    /// |---|---|---|
-    /// | `score_window` | Yes | **Critical**: rolling scores must not accumulate across utterances — this is the primary false-trigger mechanism this function fixes |
-    /// | `adaptive_threshold` | Yes | Noise floor estimate is per-segment; the 5-call bootstrap is brief and acceptable |
-    /// | `segment_silence_hops` | Yes | Reset the silence counter so the next segment starts fresh |
-    /// | `segment_score_steps` | Yes | The next segment must start again at position 1 |
-    ///
-    /// **Preserved**: `audio_buffer` (normal drain handles leftover overlap),
-    /// VAD state (acoustic environment unchanged), `vad_threshold`,
-    /// `last_wake_word_detection` (cooldown still active if within 3 s),
-    /// `recording`.
+    /// Reset all per-segment detection state at a VAD-driven utterance boundary
+    /// ([`SEGMENT_TIMEOUT_HOPS`] ≈ 300 ms of VAD-negative hops): the score window and adaptive
+    /// threshold (both per-segment, so a brief re-bootstrap is acceptable), the silence counter and
+    /// the score-step clock, which must start the next segment at position 1. This stops soft
+    /// scores and rolling sums accumulating across utterances — a structural source of false
+    /// triggers. The raw ring and VAD cursor are cleared with them so the trailing window cannot
+    /// span the boundary; `audio_buffer` (the drain handles its overlap), VAD state,
+    /// `vad_threshold`, the cooldown and `recording` are preserved.
     fn reset_detection_segment(&mut self) {
-        // ── Clear per-segment rolling scores (PRIMARY false-trigger fix) ──
         self.score_window.clear();
 
-        // ── Reset threshold/scores ──
         self.adaptive_threshold.reset();
 
-        // ── Reset silence counter ──
         self.segment_silence_hops = 0;
         self.segment_score_steps = 0;
 
-        // ── Reset the raw ring + VAD cursor so the next utterance starts a
-        // fresh segment (the trailing ≤1 s window must not span the boundary).
         self.audio_buffer.clear();
         self.speech_window.clear();
         self.vad_cursor = 0;
         self.last_score_sample_count = 0;
     }
 
-    /// Handle the segment boundary check at the end of a detection call.
-    ///
-    /// Called from [`handle_wake_word_detection`] after the VAD frame loop,
-    /// with the accumulated `hop_count` from the VAD-negative frame counter.
-    ///
-    /// If `hop_count` reaches [`SEGMENT_TIMEOUT_HOPS`], resets per-segment
-    /// detection state so that soft scores and rolling sums do not accumulate
-    /// across separate utterances.
-    ///
-    /// If `hop_count` is below the threshold, persists the counter in
-    /// [`segment_silence_hops`](PipelineCtx::segment_silence_hops) so the
-    /// next call to [`handle_wake_word_detection`] can continue counting.
-    ///
-    /// # Parameters
-    ///
-    /// - `hop_count`: Accumulated consecutive VAD-negative frames from the
-    ///   detection call's VAD loop.
+    /// Segment boundary check, called from [`handle_wake_word_detection`] after the VAD loop with
+    /// the accumulated `hop_count` of consecutive VAD-negative frames. At [`SEGMENT_TIMEOUT_HOPS`]
+    /// it resets the per-segment detection state, so soft scores and rolling sums cannot accumulate
+    /// across utterances; below it the counter is persisted in
+    /// [`segment_silence_hops`](PipelineCtx::segment_silence_hops) for the next call.
     fn handle_segment_boundary(&mut self, hop_count: usize) {
         if hop_count >= SEGMENT_TIMEOUT_HOPS {
-            // Re-check the not-recording condition: a just-fired detection
-            // must NOT be reset (the detection→recording handoff in
-            // handle_wake_word_detection completes the transition).
+            // Re-check not-recording: a just-fired detection must NOT be reset — the handoff in
+            // handle_wake_word_detection completes the transition.
             if self.recording.is_none() {
                 self.reset_detection_segment();
             }
@@ -2391,17 +1789,11 @@ impl PipelineCtx {
         }
     }
 
-    /// Check whether the refractory period has elapsed and transition back
-    /// to [`VoiceStatus::Listening`] if so.
-    ///
-    /// Called once per main-loop iteration.  When the pipeline is in
-    /// [`VoiceStatus::Error`] after a transcription failure, the refractory
-    /// period (3 seconds) prevents immediate re-triggering.  Once the timer
-    /// expires this method transitions back to Listening unless the pipeline is
-    /// currently recording (which would mean a concurrent error path already
-    /// initiated a new recording) or not listening any more (nothing to return
-    /// to — e.g. the microphone was lost and an Error status came from
-    /// somewhere else).
+    /// Check the refractory period and return to [`VoiceStatus::Listening`] once it has elapsed;
+    /// called once per main-loop iteration. After a transcription failure the 3-second period
+    /// prevents immediate re-triggering. No transition while a recording runs (a concurrent error
+    /// path already started one) or when the pipeline stopped listening (the microphone is gone,
+    /// and the Error came from elsewhere).
     fn check_refractory_period(&mut self) {
         if let Some(refractory_until) = self.refractory_until
             && Instant::now() >= refractory_until
@@ -2416,8 +1808,7 @@ impl PipelineCtx {
         }
     }
 
-    /// Whether [`NOTICE_INTERVAL`] has elapsed since `last` (true when no prior
-    /// message was sent).
+    /// Whether [`NOTICE_INTERVAL`] has elapsed since `last` (true when nothing was sent yet).
     fn should_send_rate_limited(last: Option<Instant>) -> bool {
         last.is_none_or(|t| t.elapsed() >= NOTICE_INTERVAL)
     }
@@ -2427,8 +1818,8 @@ impl PipelineCtx {
         Self::should_send_rate_limited(self.last_voice_notice_time)
     }
 
-    /// Broadcast a rate-limited voice notice chat message: the pipeline's own
-    /// report for a recording that could not start.
+    /// Broadcast a rate-limited notice: the pipeline's own report for a recording that could not
+    /// start.
     async fn broadcast_voice_notice(&mut self, msg: &str) {
         if !self.should_send_voice_notice() {
             return;
@@ -2438,16 +1829,14 @@ impl PipelineCtx {
     }
 
     fn handle_start_listening(&mut self) {
-        // While the composer's own recording is in progress, defer wake-word
-        // listening until the recording ends (mutual exclusion). The resume
-        // flag is set so `end_button_recording` starts listening afterwards.
+        // While the composer's own recording runs, defer wake-word listening until it ends (mutual
+        // exclusion); the resume flag makes `end_button_recording` start listening afterwards.
         if self.recording == Some(RecordingOrigin::Button) {
             self.resume_listening_after_recording = true;
             info!("Voice pipeline: start_listening deferred until the recording ends");
             return;
         }
-        // Wake word shares the ASR transcriber: with transcription disabled
-        // the shared model never loads, so wake word is disabled too.
+        // Wake word shares the ASR transcriber: with transcription disabled it never loads.
         if is_transcription_disabled() {
             self.auto_start_pending = false;
             warn!(
@@ -2455,21 +1844,17 @@ impl PipelineCtx {
             );
             return;
         }
-        // Defense-in-depth: reject if voice has been disabled between the
-        // time the command was sent and the time it's processed. This
-        // mirrors the guard in handle_start_enrollment.
+        // Defense in depth: voice may have been disabled between sending and processing the
+        // command, as the guard in handle_start_enrollment.
         if !is_enabled() {
             self.auto_start_pending = false;
             warn!("Ignoring start_listening — voice assistant is disabled");
             return;
         }
         if !models_ready() {
-            // The shared ASR model is still loading — mark pending so
-            // check_auto_start retries when it becomes ready. This is NOT set
-            // on mic failure, preventing a continuous retry loop.
-            //
-            // If the transcriber has previously failed (ModelError trap state),
-            // trigger a retry immediately so the user doesn't need to
+            // The shared ASR model is still loading — mark pending so check_auto_start retries when
+            // it is ready; this is NOT set on mic failure, which would retry forever. A previously
+            // failed transcriber (ModelError trap) is retried immediately, so the user need not
             // restart the app.
             if crate::audio::local_transcriber::is_failed() {
                 warn!("ASR model previously failed — triggering retry...");
@@ -2480,9 +1865,8 @@ impl PipelineCtx {
             return;
         }
         if !self.is_listening {
-            // A recording holding nothing but its own microphone cannot outlive
-            // this start: it is reported here, where the reason is known, rather
-            // than by the reset below.
+            // A recording holding nothing but its own microphone cannot outlive this start: report
+            // it here, where the reason is known.
             self.abandon_recording("*Voice: recording discarded — wake-word listening started*");
             self.reset_pipeline_state(ResetLevel::Full);
             self.mic = None;
@@ -2492,40 +1876,33 @@ impl PipelineCtx {
                     self.is_listening = true;
                     set_status(VoiceStatus::Listening);
                     info!("Voice pipeline: started listening");
-                    // Open the cue output device now, while nothing is being
-                    // recorded: a cold device open on the detection path would
-                    // delay the start cue past the opening the recording
+                    // Open the cue device now, while nothing is recorded: a cold open on the
+                    // detection path would delay the start cue past the opening the recording
                     // discards, leaking it into recognized audio.
                     cue::warm_up();
                 }
                 Err(e) => {
                     warn!("Failed to start microphone: {e}");
                     set_status(mic_start_failure(&e));
-                    // auto_start_pending stays cleared: re-opening the device is
-                    // the user's own action ([`VoiceStatus::MicDisconnected`]),
-                    // never an automatic retry.
+                    // auto_start_pending stays cleared: re-opening the device is the user's own
+                    // action ([`VoiceStatus::MicDisconnected`]), never an automatic retry.
                 }
             }
         }
     }
 
-    /// Tear down the open microphone and the per-stream pipeline state.
-    ///
-    /// The caller owns the resulting voice status: [`VoiceStatus::Disabled`] on
-    /// an explicit stop or a loss with the wake-word switch off,
-    /// [`VoiceStatus::MicDisconnected`] when the device disappeared while voice
-    /// was on.  An in-progress recording is reported to the composer as lost,
-    /// with `notice` saying why.
+    /// Tear down the open microphone and the per-stream pipeline state. The caller owns the
+    /// resulting status: [`VoiceStatus::Disabled`] on an explicit stop or a loss with the switch
+    /// off, [`VoiceStatus::MicDisconnected`] when the device disappeared while voice was on. An
+    /// in-progress recording is reported to the composer as lost, with `notice` saying why.
     fn teardown_microphone(&mut self, notice: &'static str) {
-        // The recording is abandoned here, wake-word one included: its end cue
-        // and state clear belong to the helper, which is a no-op when nothing is
-        // recording.
+        // The recording is abandoned here, wake-word one included: its end cue and state clear
+        // belong to the helper, which is a no-op when nothing records.
         self.abandon_recording(notice);
-        // Full reset: the mic stream is being torn down, so the old VAD state
-        // is no longer representative of the next acoustic environment (Full
-        // uses `reset_vad()`).  Global enrollment accumulators are deliberately
-        // preserved here — the toggle-off/on path keeps mid-enrollment progress
-        // — so a caller that must end an attempt cancels it explicitly.
+        // Full reset: the mic stream is torn down, so the old VAD state no longer represents the
+        // next acoustic environment ([`reset_vad`](Self::reset_vad)). Global enrollment
+        // accumulators are deliberately preserved here — toggle-off/on keeps mid-enrollment
+        // progress — so a caller that must end an attempt cancels it explicitly.
         self.reset_pipeline_state(ResetLevel::Full);
         self.is_listening = false;
         self.enrollment_mode = false;
@@ -2540,21 +1917,16 @@ impl PipelineCtx {
         info!("Voice pipeline: stopped listening");
     }
 
-    /// Handle the microphone becoming unavailable (device unplugged, its host
-    /// gone, the stream invalidated), reported by the stream itself.
-    ///
-    /// No audio can arrive any more, so everything the microphone was doing
-    /// ends here: an in-progress recording — wake-word one included, end cue and
-    /// all — is discarded, and an enrollment attempt is abandoned with
-    /// everything it collected dropped, so its gates cannot complete it later
-    /// with no microphone.  Nothing is re-armed: re-opening the device is the
-    /// user's own action ([`VoiceStatus::MicDisconnected`]).
+    /// Handle the microphone becoming unavailable (unplugged, host gone, stream invalidated),
+    /// reported by the stream itself. Everything it was doing ends: an in-progress recording —
+    /// wake-word one, end cue included — is discarded, and an enrollment attempt is abandoned with
+    /// everything it collected dropped, so its gates cannot complete it later. Nothing is re-armed:
+    /// re-opening is the user's own action ([`VoiceStatus::MicDisconnected`]).
     fn handle_microphone_lost(&mut self) {
         self.end_enrollment_attempt();
         self.teardown_microphone("*Voice: recording discarded — microphone disconnected*");
-        // Read the switch and write the status under one lock: a user turning
-        // voice off while this runs keeps the Disabled state their action
-        // wrote, never a stale one from here.
+        // Read the switch and write the status under one lock: a user turning voice off here keeps
+        // the Disabled state their action wrote, never a stale one.
         {
             let mut state = voice_state().write().unwrap_poison();
             let status = if state.enabled {
@@ -2567,8 +1939,7 @@ impl PipelineCtx {
         info!("Voice pipeline: microphone unavailable — voice input stopped");
     }
 
-    /// Start an enrollment, aborting the recording it cannot coexist with (the
-    /// composer is told the recording was discarded).
+    /// Start an enrollment, aborting the recording it cannot coexist with.
     fn handle_start_enrollment(&mut self) {
         if !self.is_listening {
             warn!("Cannot start enrollment: microphone not running");
@@ -2578,21 +1949,17 @@ impl PipelineCtx {
             return;
         }
 
-        // No recording can coexist with enrollment: the audio router gives
-        // enrollment priority, so a recording's buffer would starve (its
-        // auto-send cap never fires) and later resume as garbage. Abandoning it
-        // also ends a wake-word recording's cue.
+        // No recording can coexist with enrollment: the router gives enrollment priority, so a
+        // recording buffer would starve (its auto-send cap never fires) and later resume as
+        // garbage. Abandoning it also ends a wake-word recording cue.
         if self.abandon_recording("*Voice: recording discarded — enrollment started*") {
             warn!("Aborting the recording — enrollment started");
             self.resume_listening_after_recording = false;
         }
 
-        // Resume existing enrollment progress if available (e.g., the user
-        // clicked Enroll while already enrolled or mid-enrollment — the
-        // global enrollment_embeddings from the interrupted session is
-        // intact).  When starting fresh (existing_utterances == 0), use
-        // Cancel-level reset to clear stale buffers while preserving VAD
-        // continuity (same mic stream, same acoustic environment).
+        // Resume existing progress if there is any (an interrupted session keeps its global
+        // embeddings). Starting fresh clears stale buffers at Cancel level, preserving VAD
+        // continuity — same mic stream, same acoustic environment.
         let existing_utterances = voice_state()
             .read()
             .unwrap_poison()
@@ -2608,12 +1975,10 @@ impl PipelineCtx {
         }
 
         self.enrollment_mode = true;
-        // Initialize a separate VAD detector for this enrollment session
-        // to prevent state contamination between enrollment and streaming
-        // modes.
+        // A separate VAD detector for this session, so modes cannot contaminate each other.
         self.enrollment_vad = Some(earshot::Detector::default());
-        // vad_threshold is intentionally NOT changed here — it stays at
-        // VAD_THRESHOLD (0.5) for both enrollment and streaming detection.
+        // `vad_threshold` is intentionally not changed: it stays [`VAD_THRESHOLD`] (0.5) in both
+        // modes.
         set_status(VoiceStatus::Enrolling {
             sample: existing_utterances,
             total: NUM_ENROLLMENT_SAMPLES,
@@ -2636,16 +2001,10 @@ impl PipelineCtx {
         info!("Voice pipeline: enrollment cancelled");
     }
 
-    /// Transition the pipeline from Phase 2 (wake word utterance collection)
-    /// to Phase 3 (owner-negative general speech collection).
-    ///
-    /// Called by the main loop when `utterances_collected` is true and
-    /// `collecting_negatives` is false.  VAD threshold is already unified to
-    /// [`VAD_THRESHOLD`], so no threshold switch occurs.
-    /// Drains any stale enrollment pending queue, clears the negative audio
-    /// buffer and silence counters, and sets the Phase 3 state flags.
+    /// Phase 2 → Phase 3, when `utterances_collected` and not yet `collecting_negatives`.  The VAD
+    /// threshold is already unified, so nothing switches; stale pending utterances are drained, the
+    /// negative buffer and silence counters cleared, and the Phase 3 flags set.
     fn transition_to_phase3(&mut self) {
-        // Drain any stale enrollment_pending queue (should be empty, but be safe).
         if !self.enrollment_pending.is_empty() {
             warn!(
                 "transition_to_phase3: draining {} stale enrollment pending utterances",
@@ -2654,13 +2013,11 @@ impl PipelineCtx {
             self.enrollment_pending.clear();
         }
 
-        // Clear inter-utterance state that may carry over from Phase 2.
         self.negative_audio_buf.clear();
         self.utterance_silence_samples = 0;
         self.utterance_had_speech = false;
         self.vad_positives_in_a_row = 0;
 
-        // Set Phase 3 state.
         self.collecting_negatives = true;
         self.phase3_start_time = Some(Instant::now());
 
@@ -2681,32 +2038,19 @@ impl PipelineCtx {
         self.mic = None;
     }
 
-    /// Start a voice recording from the composer's mic button.
-    ///
-    /// The composer opened its message window on the press; a start that does
-    /// not take closes it again, so the field is never held by a recording that
-    /// does not exist.
-    ///
-    /// Pauses wake-word detection for the duration of the recording
-    /// (mutual exclusion — audio routes to [`handle_button_recording_audio`]
-    /// instead of [`handle_wake_word_detection`]).  Wake-word listening resumes
-    /// when the recording ends, as `resume_listening_after_recording` decides.
-    ///
-    /// Works independently of the wake-word assistant: the microphone is
-    /// started on demand when voice is not already listening, and the recogniser
-    /// is not a prerequisite (nothing preloads it; transcription waits for it on
-    /// use), so a press is recorded even as its very first load begins.
-    /// Returns a notice message when the on-demand microphone could not be
-    /// started (the caller broadcasts it so the failure is user-visible);
-    /// `None` otherwise (started, or silently rejected by a guard the GUI's
-    /// pre-flight already surfaced).
+    /// Start a recording from the composer mic button. The composer opened its message window on
+    /// the press, so a start that does not take closes it again — the field is never held by a
+    /// recording that does not exist. Wake-word detection pauses for the recording (audio routes to
+    /// [`handle_button_recording_audio`]) and resumes as `resume_listening_after_recording`
+    /// decides. None of it needs the wake-word assistant: the microphone starts on demand and the
+    /// recogniser is not a prerequisite (it loads on use), so a press is recorded even as its first
+    /// load begins. Returns the notice when the on-demand mic could not start, `None` otherwise.
     fn handle_start_button_recording(&mut self) -> Option<&'static str> {
         match self.try_start_button_recording() {
             StartAttempt::Started | StartAttempt::AlreadyRecording => None,
             StartAttempt::Refused(notice) => {
-                // The composer opened its message window on the press; a start
-                // that did not take closes it, or the field waits for a message
-                // that will never come.
+                // The composer opened its message window on the press; a start that did not take
+                // closes it, or the field waits for a message that never comes.
                 publish_recording(RecordingEvent::NotStarted);
                 notice
             }
@@ -2716,8 +2060,7 @@ impl PipelineCtx {
     /// [`Self::handle_start_button_recording`] without the composer hand-off.
     fn try_start_button_recording(&mut self) -> StartAttempt {
         if self.recording.is_some() {
-            // Whichever way it started, a running recording owns the composer's
-            // field: this press leaves that window alone.
+            // A running recording owns the composer field: this press leaves that window alone.
             warn!("Cannot start a recording — one is already running");
             return StartAttempt::AlreadyRecording;
         }
@@ -2725,19 +2068,17 @@ impl PipelineCtx {
             warn!("Cannot start a voice recording during enrollment");
             return StartAttempt::Refused(None);
         }
-        // With local transcription disabled the shared ASR model never loads
-        // (or is unavailable after a restart) — surface the configuration,
-        // not a loading state that can never complete.  Unconditional guard
-        // mirroring [`recording_blocked_reason`], so a still-loaded
-        // in-memory model cannot contradict the disabled configuration.
+        // With local transcription disabled the shared ASR model never loads (or is gone after a
+        // restart): surface the configuration, not a loading state that can never complete. The
+        // guard is unconditional, mirroring [`recording_blocked_reason`], so a still-loaded
+        // in-memory model cannot contradict it.
         if is_transcription_disabled() {
             warn!("Cannot start a voice recording — local transcription disabled");
             return StartAttempt::Refused(Some(
                 "Voice recording unavailable — local transcription is disabled",
             ));
         }
-        // A model that failed to load is the one case a recording cannot end well:
-        // say that, not the loading message it would otherwise be given.
+        // A model that failed to load is the one case a recording cannot end well: say that.
         if crate::audio::local_transcriber::is_failed() {
             warn!("Cannot start a voice recording — the local speech model failed to load");
             set_status(VoiceStatus::ModelError);
@@ -2745,22 +2086,19 @@ impl PipelineCtx {
                 "Voice unavailable — the local speech model failed to load; retry it in Settings",
             ));
         }
-        // Recording does not need the recogniser — transcription loads it on use
-        // and waits for it (see `local_transcriber::transcribe_file_async`), so
-        // the first press after a start is recorded instead of answered with a
-        // wait. Asking for it here is what lets the load overlap the recording.
+        // Recording needs no recogniser — transcription loads it on use and waits (see
+        // `local_transcriber::transcribe_file_async`) — so asking for it here is what lets the load
+        // overlap the recording instead of answering the first press with a wait.
         demand_transcriber();
 
         if self.mic.is_none() {
-            // Voice assistant not listening — start the mic just for this
-            // recording.
+            // Neither listening nor loading a model: start the mic just for this recording.
             match start_microphone() {
                 Ok(mic) => self.mic = Some(mic),
                 Err(e) => {
                     warn!("Failed to start recording mic: {e}");
-                    // Say why the microphone is unavailable; with the mic still
-                    // gone the attempt leaves that state standing rather than
-                    // silently doing nothing.
+                    // Say why the microphone is unavailable; with the mic still gone the attempt
+                    // leaves that state standing rather than doing nothing.
                     let status = mic_start_failure(&e);
                     let notice = if matches!(status, VoiceStatus::MicPermissionDenied) {
                         MIC_PERMISSION_NOTICE
@@ -2773,11 +2111,9 @@ impl PipelineCtx {
             }
         }
 
-        // Resume wake-word listening after the recording whenever the user's
-        // switch is on — not only when the wake-word mic was already running.
-        // The mic may have been opened just for this recording (after a
-        // microphone loss), and a recording must not leave voice sitting
-        // stopped while the switch shows it on.
+        // Resume wake-word listening after the recording whenever the switch is on — not only when
+        // the wake-word mic was already running, since the mic may have been opened just for this
+        // recording
         self.resume_listening_after_recording = self.is_listening || is_enabled();
         self.recording = Some(RecordingOrigin::Button);
         self.command_buffer.clear();
@@ -2800,8 +2136,7 @@ impl PipelineCtx {
                 if send {
                     self.finish_button_recording(cmd_buf).await;
                 } else {
-                    // The user's own discard: the composer closed its message
-                    // window on the same press, so nothing waits for an outcome.
+                    // The user's own discard: the composer closed its window on the same press.
                     self.end_button_recording();
                 }
             }
@@ -2810,17 +2145,15 @@ impl PipelineCtx {
                 if send {
                     self.finish_wake_recording(cmd_buf, had_speech).await;
                 } else {
-                    // The user's own discard, exactly like the silence end that
-                    // found nothing to send: the composer closed its window on
-                    // the same press.
+                    // The user's own discard, exactly like the silence end that found nothing to
+                    // send.
                     set_status(VoiceStatus::Listening);
                 }
             }
         }
     }
 
-    /// Accumulate audio during a button recording; auto-send at the
-    /// 10-minute cap.
+    /// Accumulate audio during a button recording; auto-send at the 10-minute cap.
     #[expect(clippy::cast_precision_loss)]
     async fn handle_button_recording_audio(&mut self, samples: &[f32]) {
         self.command_buffer.extend_from_slice(samples);
@@ -2833,13 +2166,11 @@ impl PipelineCtx {
         }
     }
 
-    /// Transcribe a completed button recording and hand its outcome to the
-    /// composer, which owns the message the transcript joins; then restore
-    /// wake-word listening state.
+    /// Transcribe a completed button recording, hand its outcome to the composer (which owns the
+    /// message), then restore wake-word listening.
     async fn finish_button_recording(&mut self, cmd_buf: Vec<f32>) {
-        // The composer takes the field's content over now, so the message is in
-        // flight from the moment the recording stops — whether the user pressed
-        // send or the cap stopped it.
+        // The composer takes the field content now, so the message is in flight from the moment
+        // recording stops — whether the user pressed send or the cap stopped it.
         publish_recording(RecordingEvent::Stopped);
         set_status(VoiceStatus::Transcribing);
         if cmd_buf.is_empty() {
@@ -2851,9 +2182,8 @@ impl PipelineCtx {
         self.end_button_recording();
     }
 
-    /// Transcribe a finished recording and publish its outcome for the
-    /// composer. `false` when transcription failed: the failure is already
-    /// published, and the caller decides what the pipeline's own status does.
+    /// Transcribe a finished recording and publish its outcome; `false` when transcription failed
+    /// (the failure is already published), the caller deciding what the status does.
     async fn publish_transcript(&mut self, cmd_buf: Vec<f32>) -> bool {
         match transcribe_audio(&cmd_buf).await {
             Ok(transcribed) if !transcribed.trim().is_empty() => {
@@ -2875,13 +2205,11 @@ impl PipelineCtx {
         }
     }
 
-    /// Finish a wake-word recording that ended itself (silence, the cap) or was
-    /// ended from the composer: its transcript joins the field's content, which
-    /// the composer then sends as one message.
+    /// Finish a wake-word recording that ended itself (silence, the cap) or was ended from the
+    /// composer: its transcript joins the field, which the composer sends as one message.
     async fn finish_wake_recording(&mut self, cmd_buf: Vec<f32>, had_speech: bool) {
-        // Nothing was said, so there is nothing to join the field: publishing
-        // that leaves the composer's window — and its text and attachments —
-        // exactly as they were.
+        // Nothing was said, so nothing joins the field: publishing that leaves the composer window,
+        // its text and attachments exactly as they were.
         if !had_speech || cmd_buf.is_empty() {
             debug!(
                 "No speech in wake-word recording — dropping {} samples",
@@ -2891,34 +2219,30 @@ impl PipelineCtx {
             set_status(VoiceStatus::Listening);
             return;
         }
-        // The words join the field: the composer takes its content over now, so
-        // the message is in flight until the transcript arrives.
+        // The words join the field, which the composer takes over now; the message is in flight.
         publish_recording(RecordingEvent::Stopped);
         set_status(VoiceStatus::Transcribing);
         if self.publish_transcript(cmd_buf).await {
             set_status(VoiceStatus::Listening);
         } else {
             set_status(VoiceStatus::Error("Transcription failed".to_string()));
-            // Enforce a 3-second refractory period before returning to
-            // Listening (replaces the old 2-second blocking sleep with a
-            // non-blocking alternative), handled by the main loop.
+            // Enforce a 3-second refractory period before returning to Listening — non-blocking,
+            // checked by the main loop instead of the old 2-second sleep.
             self.refractory_until = Some(Instant::now() + Duration::from_secs(3));
         }
     }
 
-    /// End the recording in progress without producing a message — a teardown, an
-    /// enrolment starting, wake-word listening starting on a recording-only
-    /// microphone, shutdown — and tell the composer, so a field it had committed
-    /// comes back instead of waiting for a message that will never arrive.
-    /// `notice` says why the recording was dropped, in the words the user sees.
-    /// Returns whether a recording was running.
+    /// End the recording in progress without producing a message — a teardown, an enrollment
+    /// starting, wake-word listening starting on a recording-only mic, shutdown — and tell the
+    /// composer, so a field it committed comes back instead of waiting for a message that never
+    /// arrives. `notice` says why, in the words the user sees; returns whether a recording was
+    /// running.
     fn abandon_recording(&mut self, notice: &'static str) -> bool {
         let Some(origin) = self.recording.take() else {
             return false;
         };
-        // A wake-word recording ends like any other: its buffers go and its end
-        // cue plays. A button recording owes no cue — the press that ends it
-        // never got one either.
+        // A wake-word recording ends like any other: its buffers go and its end cue plays. A button
+        // recording owes no cue — the press that started it never got one.
         if origin == RecordingOrigin::WakeWord {
             self.end_wake_state();
         } else {
@@ -2930,29 +2254,26 @@ impl PipelineCtx {
     }
 
     /// Finalize a button recording: resume wake-word listening when
-    /// `resume_listening_after_recording` says so, otherwise tear down the
-    /// recording-only mic.
+    /// `resume_listening_after_recording` says so, else tear down the recording-only mic.
     fn end_button_recording(&mut self) {
         self.recording = None;
         if self.resume_listening_after_recording {
             self.resume_listening_after_recording = false;
             if self.is_listening {
-                // Wake-word mic still running — clear recording buffers while
-                // preserving VAD continuity, then flip back to listening.
+                // Wake-word mic still running: clear recording buffers, keep VAD continuity, back
+                // to listening.
                 self.reset_pipeline_state(ResetLevel::Soft);
                 set_status(VoiceStatus::Listening);
             } else {
-                // Voice was toggled ON during the recording. If the wake-word
-                // mic cannot start right now (models still loading),
-                // auto_start_pending is re-armed by handle_start_listening so
-                // check_auto_start retries once models are ready. Tear down
-                // the recording-only mic instead of leaving a zombie stream.
+                // Voice was toggled ON during the recording. If the wake-word mic cannot start now
+                // (models still loading), handle_start_listening re-arms auto_start_pending and
+                // check_auto_start retries; tear the recording-only mic down rather than leaving a
+                // zombie stream.
                 self.handle_start_listening();
                 if !self.is_listening {
                     self.mic = None;
-                    // Preserve a mic-failure status set by
-                    // handle_start_listening so the user sees WHY the
-                    // wake-word assistant did not resume.
+                    // Keep a mic-failure status set by handle_start_listening, so the user sees WHY
+                    // voice did not resume.
                     if !matches!(
                         get_status(),
                         VoiceStatus::MicPermissionDenied | VoiceStatus::MicDisconnected
@@ -2962,9 +2283,8 @@ impl PipelineCtx {
                 }
             }
         } else {
-            // Recording-only mic — tear it down. Preserve auto_start_pending
-            // (cleared by the Full reset) so a wake-word assistant enabled in
-            // config but still loading models auto-starts after the recording.
+            // Recording-only mic: tear it down, preserving auto_start_pending (cleared by the Full
+            // reset) so a wake-word assistant still loading models auto-starts afterwards.
             self.full_reset_preserving_auto_start();
             self.is_listening = false;
             self.mic = None;
@@ -2973,11 +2293,8 @@ impl PipelineCtx {
         debug!("Voice pipeline: recording ended");
     }
 
-    /// Attempt to retry loading the shared ASR transcriber, debounced to at
-    /// most once every 30 seconds.  This prevents rapid retry storms from the
-    /// periodic 1-second wake-up in the main pipeline loop.
-    ///
-    /// Returns `true` when a retry was actually initiated.
+    /// Retry loading the shared transcriber, at most once every 30 seconds, so the periodic
+    /// 1-second wake-up cannot start a retry storm. `true` when a retry was initiated.
     fn try_retry_models(&mut self) -> bool {
         let cooldown = Duration::from_secs(30);
         if self
@@ -2995,14 +2312,11 @@ impl PipelineCtx {
         }
     }
 
-    /// Periodic (self-healing) retry path — bounded so a persistently failing
-    /// download cannot loop forever.
-    ///
-    /// Unlike the user-initiated paths ([`handle_start_listening`] and the
-    /// explicit [`VoiceCommand::RetryModelLoading`]), this runs without any
-    /// user involvement on every pipeline iteration.  It consumes the
-    /// [`MAX_AUTO_MODEL_RETRY_CYCLES`] budget and stops once exhausted —
-    /// further recovery requires the GUI retry button or a restart.
+    /// Self-healing retry, bounded so a persistently failing download cannot loop forever. Unlike
+    /// the user-initiated paths ([`handle_start_listening`], [`VoiceCommand::RetryModelLoading`])
+    /// this runs on every pipeline iteration without user involvement; it consumes the
+    /// [`MAX_AUTO_MODEL_RETRY_CYCLES`] budget and stops once exhausted, further recovery needing
+    /// the GUI retry button or a restart.
     fn try_retry_models_auto(&mut self) {
         if self.auto_model_retries_left == 0 {
             return;
@@ -3020,22 +2334,13 @@ impl PipelineCtx {
     }
 
     fn check_auto_start(&mut self) {
-        // One-shot retry: only fires when auto_start_pending is true (set at
-        // pipeline creation or by handle_start_listening when models weren't
-        // ready yet). Cleared after the first attempt — no continuous retry
-        // loop on mic failure.
-        //
-        // Model error recovery (Failed state) is handled by two paths:
-        // - Fast path: handle_start_listening() triggers try_retry_models
-        //   immediately when a user explicitly starts listening (voice toggle).
-        // - Periodic path: the post-select block in run_voice_pipeline runs
-        //   every iteration and triggers try_retry_models unconditionally
-        //   (debounced to 30s) for self-healing without user interaction.
-        //
-        // Once the transcriber transitions back to Ready, this function picks
-        // it up via the auto_start_pending flag (set by handle_start_listening).
-        // Nothing is loaded while transcription is disabled, and once the state
-        // has left `Uninit` the demand is a cheap no-op.
+        // One-shot auto-start, only while `auto_start_pending` (set at pipeline creation, or by
+        // handle_start_listening when models were not ready); cleared after the first attempt, so a
+        // mic failure cannot retry forever. Failed-state recovery has two paths:
+        // handle_start_listening() retries immediately on an explicit start, and the post-select
+        // block in run_voice_pipeline retries every iteration, debounced to 30 s. Once the
+        // transcriber is Ready this picks it up through the pending flag; nothing loads while
+        // transcription is disabled, and past `Uninit` the demand is a cheap no-op.
         if self.auto_start_pending && !models_ready() && !is_transcription_disabled() {
             demand_transcriber();
         }
@@ -3046,13 +2351,8 @@ impl PipelineCtx {
     }
 }
 
-/// Schedule a transition back to [`VoiceStatus::Listening`] after enrollment
-/// finalization completes successfully.
-///
-/// Ends the attempt via [`PipelineCtx::end_enrollment_attempt`] and spawns a
-/// 1.5-second delayed task that transitions to [`VoiceStatus::Listening`]
-/// (respecting the global shutdown token so it does not write stale state after
-/// pipeline exit).
+/// Schedule the transition back to [`VoiceStatus::Listening`] 1.5 s after a successful
+/// finalization, respecting the global shutdown token so it cannot write stale state after exit.
 fn schedule_listening_transition(ctx: &mut PipelineCtx) {
     ctx.end_enrollment_attempt();
     // Schedule transition to Listening after showing "Enrolled" for 1.5s.
@@ -3071,12 +2371,9 @@ fn schedule_listening_transition(ctx: &mut PipelineCtx) {
     });
 }
 
-/// Encode raw PCM chunks through the shared Qwen3-ASR encoder into 1024-dim
-/// L2-normalized window embeddings.
-///
-/// Each chunk is encoded once via [`encode_window`] (the trailing ≤1 s of
-/// the chunk).  Runs in `spawn_blocking` — the encoder forward is CPU-bound.
-/// Returns one embedding per chunk; chunks that fail to encode are skipped.
+/// Encode raw PCM chunks through the shared encoder into 1024-dim L2-normalized window embeddings,
+/// each over its trailing ≤1 s. CPU-bound, so it runs in `spawn_blocking`; failed chunks are
+/// skipped.
 async fn extract_negative_embeddings(chunks: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
     if chunks.is_empty() {
         return Vec::new();
@@ -3107,16 +2404,11 @@ async fn extract_negative_embeddings(chunks: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
     })
 }
 
-/// Centroid-consistency gate for the enrollment utterance set.
-///
-/// The prototype is the L2-normalized mean of the accepted utterance
-/// embeddings.  Requires ≥ [`MIN_ENROLLMENT_UTTERANCES`] (5) utterances and
-/// that ≥ ceil(N × [`ENROLLMENT_CONSISTENCY_MIN_FRACTION`]) have cosine ≥
-/// [`ENROLLMENT_CONSISTENCY_MIN_SIMILARITY`] (0.70) against the centroid.
-///
-/// Pure function so the gate is unit-testable without the ASR model.
-/// Returns `Ok(prototype)` — the L2-normalized centroid used for negative
-/// calibration — on pass, or `Err` with a user-facing message.
+/// Centroid-consistency gate for the enrollment set: the prototype is the L2-normalized mean of the
+/// accepted embeddings, and it needs ≥ [`MIN_ENROLLMENT_UTTERANCES`] (5) utterances with at least
+/// ceil(N × [`ENROLLMENT_CONSISTENCY_MIN_FRACTION`]) of them at cosine ≥
+/// [`ENROLLMENT_CONSISTENCY_MIN_SIMILARITY`] (0.70) to the centroid.  Pure, so the gate is testable
+/// without the ASR model; `Ok(prototype)` on pass, else `Err` with a user-facing message.
 #[expect(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -3151,20 +2443,16 @@ fn enrollment_consistency_check(utterance_embeddings: &[Vec<f32>]) -> Result<Vec
     Ok(centroid)
 }
 
-/// Finalize enrollment: build the prototype, calibrate against negatives, run
-/// the self-test, and persist the v2 enrollment record.
-///
-/// Called after Phase 3 owner-negative collection completes (or times out).
-/// Returns `true` on success.  On failure the cause is logged, `false` is
-/// returned, and the caller ends the attempt via
-/// [`PipelineCtx::end_enrollment_attempt`] so the user can start a new one.
+/// Finalize enrollment — build the prototype, calibrate against negatives, self-test, persist the
+/// v2 record — after Phase 3 completes or times out. `true` on success; on failure the cause is
+/// logged, `false` returned, and the caller ends the attempt via
+/// [`PipelineCtx::end_enrollment_attempt`].
 async fn finalize_enrollment_pipeline() -> bool {
     if !models_ready() {
         warn!("finalize_enrollment_pipeline: models not ready");
         return false;
     }
 
-    // ── Snapshot enrollment buffers (positives + ambient/owner negatives) ──
     let (utterance_embeddings, negative_audio_chunks, owner_negative_chunks) = {
         let state = voice_state().read().unwrap_poison();
         (
@@ -3174,8 +2462,7 @@ async fn finalize_enrollment_pipeline() -> bool {
         )
     };
 
-    // ── Consistency gate ──
-    // Returns the L2-normalized prototype (centroid) used for calibration.
+    // Consistency gate → the L2-normalized prototype (centroid) used for calibration.
     let prototype = match enrollment_consistency_check(&utterance_embeddings) {
         Ok(proto) => proto,
         Err(msg) => {
@@ -3185,16 +2472,12 @@ async fn finalize_enrollment_pipeline() -> bool {
         }
     };
 
-    // ── Build negatives (owner + ambient raw chunks) ──
-    // Negative calibration sources: owner-negative Phase 3 chunks and ambient
-    // non-wake-word chunks collected during enrollment.  TTS confusable/
-    // unrelated phrases were part of the old Conv1D training set; the
-    // prototype-cosine pipeline calibrates against real recorded negatives
-    // only — simpler and sufficient for the cosine floor.
-    //
-    // The two encode batches are independent spawn_blocking tasks sharing the
-    // read-only model Arc (per-call scratch buffers make concurrent forwards
-    // safe), so they run in parallel.
+    // Negative sources are the Phase 3 owner-negative chunks and the ambient non-wake-word chunks.
+    // The old Conv1D training set used TTS confusable/unrelated phrases; the prototype-cosine
+    // pipeline calibrates on real recordings only, which is simpler and enough for the cosine
+    // floor. The two encode batches are independent `spawn_blocking` tasks sharing the read-only
+    // model `Arc` (per-call scratch buffers make concurrent forwards safe), so they run in
+    // parallel.
     let owner_fut = async {
         if owner_negative_chunks.is_empty() {
             Vec::new()
@@ -3218,17 +2501,14 @@ async fn finalize_enrollment_pipeline() -> bool {
     let mut negative_embeddings: Vec<Vec<f32>> = owner_embs;
     negative_embeddings.extend(ambient_embs);
 
-    // ── Clear chunk buffers from global state ──
     {
         let mut state = voice_state().write().unwrap_poison();
         state.negative_audio_chunks.clear();
         state.owner_negative_chunks.clear();
     }
 
-    // ── Calibrate + build the enrollment record ──
     let calibration = calibrate_negatives(&prototype, &negative_embeddings);
-    // Preserve the original creation timestamp from an existing stored record
-    // (re-enrollment keeps the first creation time); trained_at is now.
+    // Keep the original creation timestamp (re-enrollment does not reset it); `trained_at` is now.
     let created_at = get_enrollment()
         .filter(|e| !e.created_at.is_empty())
         .map_or_else(db::now, |e| e.created_at.clone());
@@ -3248,7 +2528,7 @@ async fn finalize_enrollment_pipeline() -> bool {
         return false;
     };
 
-    // ── Cancel guard: check before persisting ──
+    // Cancel guard: check before persisting.
     if crate::shutdown::shutdown_token().is_cancelled() {
         warn!(
             "finalize_enrollment_pipeline: cancelled during finalization, \
@@ -3257,9 +2537,8 @@ async fn finalize_enrollment_pipeline() -> bool {
         return false;
     }
 
-    // ── Self-test ──
-    // Require ≥80% of the accepted utterances to trigger detection with a
-    // fresh score window and no adaptive state.
+    // Self-test: ≥80% of accepted utterances must trigger with a fresh window and no adaptive
+    // state.
     if let Err(e) = run_enrollment_self_test(&utterance_embeddings, &enrollment) {
         warn!("Enrollment self-test failed — model rejected: {e}.  Re-enrollment required.");
         set_status(VoiceStatus::Error(format!(
@@ -3269,20 +2548,18 @@ async fn finalize_enrollment_pipeline() -> bool {
     }
     info!("Enrollment self-test: passed — deploying model");
 
-    // ── Store + persist ──
     set_enrollment(enrollment.clone());
 
     if !persist_enrollment(&enrollment).await {
         warn!("Enrollment persisted to memory but failed to save to config DB");
-        // The enrollment is live in memory until the process exits — name the
-        // saving failure, not a wake-word failure.
+        // The enrollment is live in memory until exit — name the saving failure, not a wake-word
+        // one.
         set_status(VoiceStatus::Error(
             "Wake word enrolled but not saved — it will be lost when the app restarts".to_string(),
         ));
         return false;
     }
 
-    // ── Clear enrollment accumulators ──
     {
         let mut state = voice_state().write().unwrap_poison();
         state.enrollment_embeddings.clear();
@@ -3306,7 +2583,7 @@ pub async fn run_voice_pipeline() {
         state.cmd_tx = Some(cmd_tx);
     }
 
-    // ── Load persisted wake word enrollment (v2 schema) ──
+    // Load the persisted enrollment (v2 schema).
     if let Some(json) = CONFIG.wake_word_templates() {
         match serde_json::from_str::<WakeWordEnrollment>(&json) {
             Ok(enr)
@@ -3318,8 +2595,7 @@ pub async fn run_voice_pipeline() {
                 info!("Loaded wake word enrollment (v2)");
             }
             Ok(_) | Err(_) => {
-                // Legacy (v1 classifier) records and unparseable JSON are
-                // rejected outright — no migration path.  The user must
+                // v1 classifier records and unparseable JSON are rejected outright — no migration,
                 // re-enroll.
                 warn!(
                     "Stored wake word enrollment is incompatible or legacy (v1). \
@@ -3329,17 +2605,11 @@ pub async fn run_voice_pipeline() {
         }
     }
 
-    // ── Model gating: wake word shares the ASR transcriber ──
-    // No download machinery — the voice stack's own demand owns the load
-    // (`check_auto_start` asks for it on first need). The status is resolved
-    // from the transcriber's state via [`resolved_model_status`]; the periodic
-    // wake-up below re-resolves it once loading finishes so the UI can never
-    // hang on LoadingModels.
-    //
-    // Transcription disabled ⇒ wake word disabled: the shared ASR model is
-    // never loaded when `audio_transcription_use_local == "false"`, so wake
-    // word cannot function.  Surface Disabled (not LoadingModels — that would
-    // hang forever) and skip auto-start.
+    // Wake word shares the ASR transcriber: no download machinery of its own (check_auto_start
+    // demands the load on first need) and the status resolves from the transcriber state via
+    // [`resolved_model_status`], re-resolved by the periodic wake-up so the UI cannot hang on
+    // LoadingModels. Transcription disabled ⇒ wake word disabled, since the model never loads:
+    // surface Disabled (not LoadingModels, which would hang) and skip auto-start.
     let transcription_disabled = is_transcription_disabled();
     if transcription_disabled {
         set_status(VoiceStatus::Disabled);
@@ -3353,8 +2623,7 @@ pub async fn run_voice_pipeline() {
         info!("Voice assistant enabled in config — will auto-start when models are ready");
     }
 
-    // Try auto-start immediately if models are already loaded (avoids waiting
-    // for the select! timeout on the first iteration).
+    // Auto-start now if models are loaded, instead of waiting for the first select! timeout.
     ctx.check_auto_start();
 
     loop {
@@ -3368,8 +2637,8 @@ pub async fn run_voice_pipeline() {
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(VoiceCommand::StartListening) => ctx.handle_start_listening(),
-                    // The recording a stop or an enrollment aborts is reported
-                    // to the composer, which carries the reason to the user.
+                    // The recording a stop or enrollment aborts is reported to the composer, which
+                    // shows the reason.
                     Some(VoiceCommand::StopListening) => ctx.handle_stop_listening(),
                     Some(VoiceCommand::StartEnrollment) => ctx.handle_start_enrollment(),
                     Some(VoiceCommand::CancelEnrollment) => ctx.handle_cancel_enrollment(),
@@ -3395,31 +2664,25 @@ pub async fn run_voice_pipeline() {
                         ctx.handle_stop_recording(false).await;
                     }
                     Some(VoiceCommand::ConfigChanged) => {
-                        // A runtime transcription re-enable must re-resolve the
-                        // status and re-arm auto-start here: the periodic timer
-                        // is parked while transcription is disabled, so this
-                        // wake replaces the 1s tick that normally drives the
-                        // LoadingModels→Listening and auto-start recovery.
+                        // A runtime re-enable must re-resolve the status and re-arm auto-start
+                        // here: the periodic timer is parked while transcription is disabled, so
+                        // this wake replaces the 1s tick.
                         if !is_transcription_disabled()
                             && matches!(get_status(), VoiceStatus::Disabled)
                         {
-                            // Auto-start was deferred at boot when transcription
-                            // was disabled; re-arm voice so it reaches Listening
+                            // Auto-start was deferred at boot; re-arm so voice reaches Listening
                             // once the ASR model loads.
                             if ctx.auto_start_pending {
                                 set_enabled(true);
                             }
-                            // Covers the "voice toggled on while transcription
-                            // was disabled" case: voice is enabled but the
-                            // pending auto-start was cleared by the rejected
-                            // StartListening, so re-arm it.
+                            // Voice enabled while transcription was disabled: the rejected
+                            // StartListening cleared the pending start, so re-arm it.
                             if is_enabled() && !ctx.is_listening {
                                 ctx.auto_start_pending = true;
                             }
                             set_status(current_model_status());
-                            // Fire StartListening immediately if models are ready;
-                            // otherwise the pending flag keeps it armed so the
-                            // (re-armed) periodic tick starts it once loaded.
+                            // Fire StartListening now if models are ready; the pending flag keeps
+                            // it armed otherwise.
                             ctx.check_auto_start();
                         }
                     }
@@ -3435,29 +2698,22 @@ pub async fn run_voice_pipeline() {
                 }
             } => {
                 let Some(samples) = event else {
-                    // The device is gone: the handler ends everything the
-                    // microphone was doing (a recording is discarded, not sent),
-                    // drops what an enrollment collected, and stops claiming to
-                    // listen.
+                    // The device is gone: the handler ends everything the microphone was doing
+                    // (recording discarded, enrollment dropped) and stops claiming to listen.
                     ctx.handle_microphone_lost();
                     continue;
                 };
 
-                // ── TTS playback gate ──
-                // If TTS audio is actively playing through the speakers, skip
-                // ALL audio processing for this chunk.  This prevents TTS echo
-                // from contaminating the VAD ring buffer, window embeddings,
-                // wake word scoring, enrollment, and recording.
-                //
-                // The gate stays active for a reverb tail period after playback
-                // ends (see crate::audio::tts::PLAYBACK_REVERB_TAIL_MS).
+                // TTS playback gate: while TTS audio plays, skip ALL processing for the chunk, so
+                // TTS echo cannot contaminate the VAD ring buffer, the window embeddings, scoring,
+                // enrollment or the recording. The gate stays active for the reverb tail (see
+                // `crate::audio::tts::PLAYBACK_REVERB_TAIL_MS`).
                 if crate::audio::tts::is_playback_active() {
                     continue;
                 }
 
-                // Samples flow RAW to the mode dispatch — the old AGC/NS
-                // preprocessor was removed; the encoder pipeline needs no
-                // preprocessing and the enrollment SNR uses the raw floor.
+                // Samples flow RAW to the mode dispatch: the old AGC/NS preprocessor is gone, the
+                // encoder pipeline needs no preprocessing and enrollment SNR uses the raw floor.
                 if ctx.collecting_negatives {
                     handle_negative_collection_audio(&samples, &mut ctx);
                 } else if ctx.enrollment_mode {
@@ -3467,10 +2723,9 @@ pub async fn run_voice_pipeline() {
                     };
                     handle_enrollment_audio(&samples, &mut ctx, sample, total);
                 } else if ctx.recording.is_some() {
-                    // A recording takes priority over detection — the two are
-                    // mutually exclusive. The origin decides how its audio is
-                    // handled: a button recording keeps everything it captures,
-                    // a wake-word one ends itself on silence.
+                    // A recording outranks detection — the two are mutually exclusive. Its origin
+                    // decides the audio: a button recording keeps everything, a wake-word one ends
+                    // itself on silence.
                     if ctx.recording == Some(RecordingOrigin::Button) {
                         ctx.handle_button_recording_audio(&samples).await;
                     } else {
@@ -3485,15 +2740,10 @@ pub async fn run_voice_pipeline() {
                 }
             }
 
-            // Periodic wake-up so auto-recovery can fire when the shared ASR
-            // transcriber finishes loading or transitions to Ready/Failed
-            // after the initial select! entry.  check_auto_start runs in the
-            // post-select section below so we don't duplicate it here.
-            //
-            // While transcription is disabled nothing can change, so the timer
-            // pends instead of ticking every second; it is re-armed by any
-            // loop wake (e.g. VoiceCommand::ConfigChanged from the Settings
-            // toggle), since select! rebuilds this future every iteration.
+            // Periodic wake-up, so auto-recovery fires when the transcriber finishes loading or
+            // turns Ready/Failed after the initial `select!` entry (check_auto_start runs
+            // post-select, not here). While transcription is disabled the timer pends instead of
+            // ticking; select! rebuilds it on any loop wake (e.g. `VoiceCommand::ConfigChanged`).
             () = async {
                 if is_transcription_disabled() {
                     std::future::pending::<()>().await;
@@ -3501,18 +2751,12 @@ pub async fn run_voice_pipeline() {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             } => {
-                // ── Transcriber state transition ──
-                // Light polling.  A transcriber failure surfaces ModelError
-                // from ANY status (pre-existing behavior — e.g. a load started
-                // by the Settings toggle failing while voice is off must not
-                // silently hide).
-                // Otherwise, resolve a LoadingModels status to its terminal
-                // state once loading finishes, using the same
-                // [`resolved_model_status`] as the startup block so the
-                // footer can never hang on "Loading…": Listening when voice
-                // is enabled, Disabled (indicator hidden) when it is
-                // disabled — regardless of which path initiated the loading
-                // (pipeline start, automatic retry, or the GUI Retry button).
+                // Light polling. A transcriber failure surfaces ModelError from ANY status (a load
+                // started by the Settings toggle must not be hidden while voice is off). Otherwise
+                // LoadingModels resolves to its terminal state through the same
+                // [`resolved_model_status`] the startup block uses, so the footer can never hang on
+                // "Loading…" — Listening when voice is on, Disabled when not, whatever started the
+                // load.
                 if crate::audio::local_transcriber::is_failed() {
                     if !matches!(get_status(), VoiceStatus::ModelError) {
                         set_status(VoiceStatus::ModelError);
@@ -3527,27 +2771,22 @@ pub async fn run_voice_pipeline() {
 
         }
 
-        // Periodic auto-recovery: if the transcriber is in Failed state,
-        // attempt to retry loading (debounced to at most once every 30s and
-        // bounded to MAX_AUTO_MODEL_RETRY_CYCLES cycles so a persistently
-        // failing download cannot loop forever).  This runs regardless of
-        // auto_start_pending so that the model error state is self-healing
-        // even when voice is toggled off/on manually.
+        // Periodic auto-recovery: in Failed state, retry loading (at most every 30s, bounded to
+        // [`MAX_AUTO_MODEL_RETRY_CYCLES`] so a failing download cannot loop forever). It runs
+        // regardless of auto_start_pending, so the error state heals even when voice is toggled
+        // manually.
         if crate::audio::local_transcriber::is_failed() {
             ctx.try_retry_models_auto();
         }
 
-        // ── Phase 2→3 transition ──
-        // After all 10 enrollment utterances are collected, automatically
-        // transition to owner-negative speech collection (Phase 3).
+        // After all 10 utterances, transition automatically to owner-negative collection.
         let utterances_collected = voice_state().read().unwrap_poison().utterances_collected;
         if utterances_collected && !ctx.collecting_negatives {
             ctx.transition_to_phase3();
         }
 
-        // ── Phase 3→4 transition ──
-        // When the target VAD-positive speech time is reached (or wall-clock
-        // timeout), finalize residual audio, build the prototype, and clean up.
+        // On target speech time (or the wall-clock timeout): finalize residual audio, build, clean
+        // up.
         if ctx.collecting_negatives {
             let target_samples = SAMPLE_RATE as usize * NEGATIVES_TARGET_SECONDS;
             let target_met = ctx.negatives_speech_samples >= target_samples;
@@ -3590,8 +2829,8 @@ pub async fn run_voice_pipeline() {
                     set_status(VoiceStatus::Enrolled);
                     schedule_listening_transition(&mut ctx);
                 } else {
-                    // A failed finalization ends the attempt like a successful one
-                    // — leaving it open re-enters finalization on every mic chunk.
+                    // A failed finalization ends the attempt like a successful one — leaving it
+                    // open re-enters finalization on every mic chunk.
                     ctx.end_enrollment_attempt();
                 }
             } else {
@@ -3606,21 +2845,17 @@ pub async fn run_voice_pipeline() {
             }
         }
 
-        // Process any pending enrollment utterances (accumulated inline to avoid
-        // race conditions with the command channel).  Using a VecDeque so all
-        // completed utterances are preserved even if multiple complete within a
-        // single mic frame — each is popped one per tick.
-        // The encoder forward inside handle_enrollment_sample uses spawn_blocking
-        // so it doesn't block.  Only processes during Phase 2 (before
-        // utterances_collected), since Phase 3 handles audio independently.
+        // Process pending enrollment utterances, accumulated inline to avoid a race with the
+        // command channel; a `VecDeque` keeps every utterance when several complete within one mic
+        // frame (one popped per tick). The encoder forward uses `spawn_blocking`. Phase 2 only —
+        // Phase 3 handles its audio independently.
         if !utterances_collected && let Some(samples) = ctx.enrollment_pending.pop_front() {
             let noise_rms = ctx.noise_rms_estimate.take();
             handle_enrollment_sample(samples, noise_rms).await;
         }
 
-        // Transition from Error to Listening after the refractory period
-        // has elapsed.  This replaces the old 2-second blocking
-        // sleep with a non-blocking check in the main loop.
+        // Error → Listening once the refractory period elapses, checked non-blocking in the main
+        // loop.
         ctx.check_refractory_period();
 
         // Auto-start when models become ready (async load case).
@@ -3630,17 +2865,10 @@ pub async fn run_voice_pipeline() {
     info!("Voice pipeline exited");
 }
 
-/// Persist a wake word enrollment to the config DB and update the in-memory
-/// CONFIG.
-///
-/// The CONFIG update ensures GUI snapshot readers / pipeline restart see the
-/// latest enrollment.  The per-field persist paths never write
-/// `wake_word_templates` (it's structurally excluded), so this update is
-/// about cross-session visibility.
-///
-/// Warnings are logged on failure.  Returns `true` if both the DB write and the
-/// CONFIG update succeeded; the only caller ends the enrollment attempt on
-/// `false`, leaving the enrollment in memory for the rest of the session.
+/// Persist an enrollment to the config DB and update the in-memory CONFIG, so GUI snapshot readers
+/// and a pipeline restart see it — the per-field persist paths never write `wake_word_templates`.
+/// Failures are logged; `true` only when both the DB write and the CONFIG update succeeded, since
+/// the only caller ends the attempt on `false` and leaves the enrollment in memory for the session.
 async fn persist_enrollment(enrollment: &WakeWordEnrollment) -> bool {
     let Ok(json) = serde_json::to_string(enrollment) else {
         warn!("Failed to serialize wake word enrollment for persistence");
@@ -3661,29 +2889,20 @@ async fn persist_enrollment(enrollment: &WakeWordEnrollment) -> bool {
     true
 }
 
-/// Handle audio during wake-word command recording (post-detection).
-///
-/// The opening [`POST_FIRE_DISCARD_SAMPLES`] of the recording are dropped, so the
-/// audio handed to recognition begins after the trigger (the pre-fire audio is
-/// already gone by then; only the phrase tail left by a fire that landed
-/// mid-phrase can survive).  The remainder accumulates into `command_buffer`,
-/// silence is tracked by sample count, and the recording stops after
-/// [`SILENCE_THRESHOLD_SAMPLES`] of silence or the [`MAX_RECORD_SECS`] cap, then
-/// transcribes what it holds and publishes the outcome for the composer.
-///
-/// A recording whose retained audio contains no speech is dropped without
-/// delivering anything — no message, no notice.  A button recording never
-/// reaches this gate: it has no silence end and keeps everything it captures.
-///
-/// Silence duration is measured in audio samples (not wall-clock time) so that
-/// system load / processing delays don't affect recording cutoff consistency.
+/// Audio during wake-word command recording (post-detection). The opening
+/// [`POST_FIRE_DISCARD_SAMPLES`] are dropped, so recognition starts after the trigger — the
+/// pre-fire audio is already gone, and only a phrase tail survives a fire that landed mid-phrase.
+/// The rest accumulates into `command_buffer`, silence tracked by sample count (not wall-clock, so
+/// load cannot skew the cutoff), and the recording stops after [`SILENCE_THRESHOLD_SAMPLES`] of
+/// silence or the [`MAX_RECORD_SECS`] cap, then transcribes and publishes. A recording whose
+/// retained audio holds no speech delivers nothing at all; a button recording never reaches this
+/// gate.
 #[expect(clippy::cast_precision_loss)]
 async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
-    // Discard the armed opening before anything is kept.  The dropped samples
-    // are still fed to the VAD: the detector is stateful and tracks the live
-    // stream, so skipping them would leave the trigger phrase in its context
-    // and make the first retained frames read as speech — which would wrongly
-    // satisfy the no-speech gate below.
+    // Discard the armed opening before keeping anything — but still feed it to the VAD: the
+    // detector is stateful and tracks the live stream, so skipping it would leave the trigger
+    // phrase in its context and make the first retained frames read as speech, wrongly satisfying
+    // the no-speech gate.
     let discarded = ctx.post_fire_discard_samples.min(samples.len());
     ctx.post_fire_discard_samples -= discarded;
     if discarded > 0 {
@@ -3701,8 +2920,7 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
         ctx.silence_sample_count = 0;
         ctx.recording_had_speech = true;
     } else {
-        // Accumulate silence by raw chunk size: each call receives a
-        // variable-size chunk of audio samples directly from the mic.
+        // Accumulate silence by raw chunk size: each call gets a variable-size chunk from the mic.
         ctx.silence_sample_count += samples.len();
     }
 
@@ -3720,21 +2938,16 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
             }
         );
 
-        // The recording has ended — acknowledge that regardless of what
-        // follows (silence, the cap, a failed transcription) — and clear its
-        // state, so the outcome below owns no reset of its own.
+        // The recording has ended — acknowledge that whatever follows (silence, the cap, a failed
+        // transcription) — and clear its state, so the outcome below owns no reset.
         let (cmd_buf, had_speech) = ctx.take_wake_recording();
         ctx.finish_wake_recording(cmd_buf, had_speech).await;
     }
 }
 
-/// Check that an enrollment utterance is long enough for meaningful matching.
-/// Returns an error message if the sample is shorter than 400ms — this rejects
-/// noise blips and coughs while accepting any real wake word utterance.
-///
-/// Uses wall-clock duration: the encoder produces exactly one window
-/// embedding per utterance, so the 400ms floor (well below the ~1s window
-/// that a typical wake word needs) is the meaningful quality gate.
+/// Reject an enrollment utterance shorter than 400ms: that drops noise blips and coughs while
+/// accepting any real wake word. The floor is wall-clock duration, since the encoder produces
+/// exactly one window embedding per utterance and 400 ms is well below the ~1s a wake word needs.
 fn check_enrollment_utterance_length(duration_ms: u64) -> Result<(), String> {
     if duration_ms < ENROLLMENT_QUALITY_DURATION_MIN_MS {
         Err(format!(
@@ -3745,13 +2958,9 @@ fn check_enrollment_utterance_length(duration_ms: u64) -> Result<(), String> {
     }
 }
 
-/// Encode a completed enrollment utterance through the shared Qwen3-ASR
-/// encoder and store the 1024-dim window embedding in the global enrollment
-/// state.
-///
-/// The utterance is encoded ONCE (no PCM augmentation — the prototype-cosine
-/// pipeline needs no variant expansion).  Rejects utterances shorter than
-/// 400 ms and updates the enrollment UI status with per-utterance quality.
+/// Encode a completed enrollment utterance and store its 1024-dim embedding. Encoded ONCE — the
+/// prototype-cosine pipeline needs no PCM augmentation; utterances under 400 ms are rejected and
+/// the enrollment status is updated with per-utterance quality.
 #[expect(clippy::cast_precision_loss)]
 async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     if !models_ready() {
@@ -3761,18 +2970,15 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
 
     let duration_ms = samples_to_ms(samples.len(), SAMPLE_RATE);
 
-    // ── Minimum utterance length check ──
     if let Err(msg) = check_enrollment_utterance_length(duration_ms) {
         warn!("{msg}");
         set_status(VoiceStatus::Error(msg));
         return;
     }
 
-    // ── Quality assessment (computed before `samples` moves into the
-    // encoder task below) ──
+    // Quality is assessed before `samples` moves into the encoder task.
     let quality = compute_utterance_quality(&samples, noise_rms);
 
-    // ── Encode the utterance ONCE via the shared encoder ──
     let Some(model) = crate::audio::local_transcriber::shared_model_arc() else {
         warn!("ASR model not loaded — skipping enrollment sample");
         return;
@@ -3788,7 +2994,6 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
         }
     };
 
-    // ── Push into global enrollment state ──
     let utterance_count = {
         let mut state = voice_state().write().unwrap_poison();
         state.enrollment_embeddings.push(embedding);
@@ -3805,10 +3010,9 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     );
 
     if utterance_count >= NUM_ENROLLMENT_SAMPLES {
-        // All 10 utterances collected: signal Phase 2 completion so the main
-        // loop's Phase 2→3 transition starts owner-negative collection.
+        // All 10 collected: signal Phase 2 completion so the main loop starts owner-negative
+        // collection.
         voice_state().write().unwrap_poison().utterances_collected = true;
-        // Keep the current Enrolling status until transition_to_phase3 fires.
     } else {
         set_status(VoiceStatus::Enrolling {
             sample: utterance_count,
@@ -3819,9 +3023,8 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     }
 }
 
-/// Append `samples` to `buf`, draining the front if that pushes the buffer
-/// past `cap`.  Returns the number of samples drained from the front (0 when
-/// under cap) so callers can shift cursors into the buffer accordingly.
+/// Append `samples` to `buf`, draining the front past `cap`; returns how many were drained so
+/// callers can shift their cursors.
 fn push_capped(buf: &mut Vec<f32>, samples: &[f32], cap: usize) -> usize {
     buf.extend_from_slice(samples);
     let excess = buf.len().saturating_sub(cap);
@@ -3829,39 +3032,22 @@ fn push_capped(buf: &mut Vec<f32>, samples: &[f32], cap: usize) -> usize {
     excess
 }
 
-/// Handle a chunk of raw mic audio during wake-word detection.
-///
-/// # Pipeline (encoder-window pipeline)
-///
-/// 1. **Cooldown gate** — within [`WAKE_WORD_COOLDOWN`] of a detection, audio
-///    is only accumulated into the raw ring (capped at [`AUDIO_BUFFER_MAX`]).
-/// 2. **Raw ring accumulation** — raw mic samples are appended to
-///    [`PipelineCtx::audio_buffer`], capped at [`AUDIO_BUFFER_MAX`].
-/// 3. **VAD-gated frame loop** — each [`HOP_LENGTH`] hop is fed to the global
-///    earshot VAD detector; per-segment silence is counted and
-///    [`PipelineCtx::handle_segment_boundary`] resets the segment at
-///    [`SEGMENT_TIMEOUT_HOPS`] (only when not recording).  No mel frames are
-///    built — the raw ring is only the VAD input.
-/// 4. **Window encoding + scoring** — when [`SCORE_STRIDE_SAMPLES`] samples
-///    have been processed since the last scoring step AND speech was seen in
-///    this call (or the rolling window is mid-utterance), the trailing ≤1 s
-///    of the VAD-gated [`PipelineCtx::speech_window`] is encoded through the
-///    shared Qwen3-ASR encoder ([`crate::audio::wake_word::encode_window`])
-///    and scored via [`score_single_embedding`].  A fire is accepted only
-///    within the first [`WAKE_WORD_MAX_SEGMENT_STEPS`] scoring steps of the
-///    current segment (counted in [`PipelineCtx::segment_score_steps`]); a
-///    later match is refused.
-/// 5. **Detection→recording handoff** — on detection the raw ring is dropped
-///    (everything it holds was captured before the fire, the trigger phrase
-///    included) and the recording is armed to discard its own opening
-///    ([`POST_FIRE_DISCARD_SAMPLES`]) before anything reaches recognition.
+/// Handle a chunk of raw mic audio during wake-word detection. Within [`WAKE_WORD_COOLDOWN`] of a
+/// detection, audio only accumulates into the raw ring ([`AUDIO_BUFFER_MAX`]). Each [`HOP_LENGTH`]
+/// hop then goes to the global Earshot VAD, which counts per-segment silence and lets
+/// [`PipelineCtx::handle_segment_boundary`] reset the segment at [`SEGMENT_TIMEOUT_HOPS`] (never
+/// while recording); no mel frames are built — the raw ring is the VAD input only. When
+/// [`SCORE_STRIDE_SAMPLES`] have been processed since the last step and either speech was seen in
+/// this call or the rolling window is mid-utterance, the trailing ≤1 s of the VAD-gated
+/// [`PipelineCtx::speech_window`] is encoded ([`crate::audio::wake_word::encode_window`]) and
+/// scored ([`score_single_embedding`]); a fire counts only within the first
+/// [`WAKE_WORD_MAX_SEGMENT_STEPS`] steps of the segment ([`PipelineCtx::segment_score_steps`]) and
+/// a later match is refused. On detection the raw ring is dropped — all of it is pre-fire audio —
+/// and the recording discards its own opening ([`POST_FIRE_DISCARD_SAMPLES`]).
 fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
-    // ── Cooldown check ──
-    // If we recently detected the wake word, skip ALL processing for this
-    // chunk to prevent rapid consecutive false triggers.  During cooldown
-    // audio accumulates into audio_buffer (capped at AUDIO_BUFFER_MAX) so
-    // that when the cooldown expires the pipeline has data to process
-    // immediately.
+    // Cooldown: skip ALL processing for the chunk, so a rapid consecutive false trigger cannot
+    // follow. Audio still accumulates into `audio_buffer` (capped), so the pipeline has data the
+    // moment the cooldown expires.
     if let Some(last) = ctx.last_wake_word_detection
         && last.elapsed() < WAKE_WORD_COOLDOWN
     {
@@ -3873,40 +3059,30 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
         return;
     }
 
-    // ── Accumulate into the raw audio ring (capped) ──
     let excess = push_capped(&mut ctx.audio_buffer, samples, AUDIO_BUFFER_MAX);
     ctx.vad_cursor = ctx.vad_cursor.saturating_sub(excess);
 
-    // ── VAD-gated frame loop ──
-    // Iterate HOP_LENGTH frames over the UNCONSUMED audio (from `vad_cursor`),
-    // feeding each frame's NEW HOP_LENGTH samples to the global VAD detector
-    // (the 512-sample frame overlaps the previous by 256 samples; feeding the
-    // full frame would double-feed overlapping audio and corrupt earshot's
-    // internal ring buffer).  No mel frames are built — the VAD loop only
-    // tracks speech presence and per-segment silence; scoring encodes the
-    // VAD-gated `speech_window`, not this ring.  The ring is NOT drained:
-    // `vad_cursor` marks the consumed prefix and the unconsumed overlap tail
-    // (up to FRAME_LENGTH - HOP_LENGTH samples) has to survive into the next
-    // call.
+    // Iterate [`HOP_LENGTH`] frames over the UNCONSUMED audio (from `vad_cursor`), feeding each
+    // frame's NEW hop to the global VAD: the 512-sample frame overlaps the previous by 256, and
+    // feeding the full frame would double-feed and corrupt Earshot's ring buffer. No mel frames are
+    // built — this loop only tracks speech and per-segment silence, and scoring encodes the
+    // VAD-gated `speech_window`, not this ring. The ring is NOT drained: `vad_cursor` marks the
+    // consumed prefix and the overlap tail (up to [`FRAME_LENGTH`] - [`HOP_LENGTH`]) must survive
+    // into the next call.
     let mut speech_seen_this_call = false;
-    // Side-channel for consecutive VAD-negative hop tracking, seeded with the
-    // accumulated count from previous calls so the counter is continuous.
+    // Seeded with the count from previous calls, so the VAD-negative hop counter stays continuous.
     let mut hop_count = ctx.segment_silence_hops;
 
     while ctx.vad_cursor + FRAME_LENGTH <= ctx.audio_buffer.len() {
         let frame = &ctx.audio_buffer[ctx.vad_cursor..ctx.vad_cursor + FRAME_LENGTH];
-        // ── VAD check ──
-        // The global VAD_DETECTOR singleton keeps continuous noise-floor/ring
-        // state across the live mic stream.
+        // The global [`VAD_DETECTOR`] keeps continuous noise-floor and ring state across the live
+        // stream.
         let is_speech = is_speech_with_threshold(&frame[..HOP_LENGTH], VAD_THRESHOLD);
         if is_speech {
             speech_seen_this_call = true;
             hop_count = 0;
-            // ── VAD-gated speech window ──
-            // Append only the VAD-positive hop to the scoring window so the
-            // encoder sees speech-only audio — the same distribution as
-            // enrollment's VAD-segmented utterances.  Capped at
-            // WAKE_WORD_WINDOW_SAMPLES (drain the front).
+            // Append only the VAD-positive hop, so the encoder sees speech-only audio like
+            // enrollment utterances; capped at [`WAKE_WORD_WINDOW_SAMPLES`], draining the front.
             push_capped(
                 &mut ctx.speech_window,
                 &frame[..HOP_LENGTH],
@@ -3919,47 +3095,40 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
         ctx.last_score_sample_count += HOP_LENGTH;
     }
 
-    // ── Segment boundary check ──
-    // Resets the rolling score window / adaptive threshold when the
-    // consecutive-silence counter reaches SEGMENT_TIMEOUT_HOPS so scores do
-    // not accumulate across separate utterances.  Runs BEFORE scoring so a
-    // just-fired boundary starts a fresh segment.
+    // Reset the rolling window and adaptive threshold once consecutive silence reaches
+    // [`SEGMENT_TIMEOUT_HOPS`], so scores cannot accumulate across utterances. Runs BEFORE scoring,
+    // so a just-fired boundary starts a fresh segment.
     ctx.handle_segment_boundary(hop_count);
 
-    // ── Window encoding + scoring (stride-gated) ──
-    // Score when SCORE_STRIDE_SAMPLES have been processed since the last
-    // encode AND speech was seen in this call (or the rolling window is
-    // non-empty — i.e., mid-utterance continuation after a VAD gap).
+    // Score when [`SCORE_STRIDE_SAMPLES`] were processed since the last encode AND speech was seen
+    // in this call, or the rolling window is non-empty (mid-utterance continuation across a VAD
+    // gap).
     if ctx.recording.is_none()
         && ctx.last_score_sample_count >= SCORE_STRIDE_SAMPLES
         && (speech_seen_this_call || !ctx.score_window.is_empty())
     {
         ctx.last_score_sample_count = 0;
 
-        // No enrollment installed → skip the scoring step entirely.  The
-        // heavy 18-layer encoder forward is gated behind BOTH the enrollment
-        // and the model, so a listening session without a deployed wake word
-        // does no per-stride encoding work.
+        // No enrollment installed → skip the step: the heavy 18-layer forward is gated behind both
+        // the enrollment and the model, so listening without a deployed wake word does no
+        // per-stride encoding.
         let Some(enrollment) = voice_state().read().unwrap_poison().enrollment.clone() else {
             return;
         };
 
         let Some(model) = crate::audio::local_transcriber::shared_model_arc() else {
-            // ASR not loaded — no scoring this step.  The status is handled
-            // elsewhere (LoadingModels / ModelError).
+            // ASR not loaded — no scoring this step; the status is handled elsewhere.
             return;
         };
 
-        // The segment clock the fire-position cut reads advances only on steps
-        // that really score: a stride that bailed out above (no enrollment, no
-        // model yet) must not shorten the segment's accept window.
+        // The segment clock the fire-position cut reads advances only on steps that really score: a
+        // stride that bailed out above must not shorten the accept window.
         ctx.segment_score_steps += 1;
 
-        // Take the trailing ≤WAKE_WORD_WINDOW_SAMPLES of the VAD-gated speech
-        // window.  Scoring speech-only audio (not the raw ring) keeps the
-        // cosine distribution aligned with enrollment — raw trailing audio
-        // includes context/silence that dilutes the embedding and shifts
-        // positives below the calibration floor.
+        // Take the trailing ≤[`WAKE_WORD_WINDOW_SAMPLES`] of the VAD-gated speech window, not the
+        // raw ring: speech-only audio keeps the cosine distribution aligned with enrollment, while
+        // raw trailing audio dilutes the embedding and shifts positives below the calibration
+        // floor.
         let start = ctx
             .speech_window
             .len()
@@ -3983,14 +3152,11 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
                     crate::user_activity::report_activity();
                 }
 
-                // A fire is accepted only near the start of the segment it
-                // belongs to; past that position the match is inert (the
-                // position only grows within a segment, so a refused match
-                // stays refused until a boundary or a handled detection
-                // clears the count).
+                // A fire counts only near the start of its segment; past that position the match is
+                // inert (the position only grows within a segment, so a refused match stays refused
+                // until a boundary or a handled detection clears the count).
                 if detected && ctx.segment_score_steps <= WAKE_WORD_MAX_SEGMENT_STEPS {
-                    // Detection fires immediately — the handoff below
-                    // completes the transition to recording mode.
+                    // Fire now — the handoff below completes the transition to recording.
                     ctx.recording = Some(RecordingOrigin::WakeWord);
                     publish_recording(RecordingEvent::Started);
                     ctx.last_wake_word_detection = Some(Instant::now());
@@ -4003,76 +3169,44 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
         }
     }
 
-    // ── Detection→recording handoff ──
-    // The ring is dropped, not seeded into the recording: everything it holds
-    // was captured before the fire — the trigger phrase included — and the
-    // recorded command must start after the phrase that triggered it (a
-    // trailing fragment can still survive when the phrase is still being spoken
-    // at the fire).  A Soft reset clears the detection state (ring, speech
-    // window, score window) while preserving VAD continuity, the adaptive
-    // threshold and the cooldown timestamp; the recording then starts by
-    // discarding its own opening.
+    // Detection→recording handoff: the ring is dropped, not seeded into the recording — everything
+    // it holds predates the fire, trigger phrase included, and the command must start after the
+    // phrase (a trailing fragment can survive when the phrase is still being spoken at the fire). A
+    // Soft reset clears the detection state (ring, speech window, score window) while preserving
+    // VAD continuity, the adaptive threshold and the cooldown; the recording then discards its own
+    // opening.
     if ctx.recording.is_some() {
         ctx.reset_pipeline_state(ResetLevel::Soft);
         ctx.post_fire_discard_samples = POST_FIRE_DISCARD_SAMPLES;
     }
 }
 
-/// Handle audio during enrollment mode.
-///
-/// Accumulates VAD decisions and raw audio into `ctx.frame_vad` /
-/// `ctx.frame_raw_audio`, then after the frame loop calls the extracted
-/// [`segment_utterances_by_vad`] function which performs utterance-boundary
-/// detection.  Newly completed utterances are queued in `enrollment_pending`
-/// (a `VecDeque`) for the main loop to process one per tick (avoids race
-/// conditions with the command channel).  Using a queue ensures no utterance
-/// is dropped if multiple complete within a single mic frame.  The frame loop maintains lightweight inline state only for
-/// side-effect gating (noise RMS capture, negative audio collection, UI
-/// status) — utterance construction itself is delegated to the extracted
-/// function.
-///
-/// **Negative collection**: Non-VAD frames captured
-/// before the first detected speech (pre-enrollment ambient noise) and during
-/// inter-utterance silence (audio between wake word utterances) are accumulated
-/// into `ctx.negative_audio_buf`. On the first transition to sustained speech,
-/// this buffer is saved as a chunk in `voice_state().negative_audio_chunks`.
-/// These real (non-synthetic) negative examples are later encoded for
-/// calibration at enrollment finalization.
-///
-/// **VAD symmetry**: Only VAD-positive frames are accumulated
-/// by the extracted function into utterances, mirroring the detection pipeline
-/// ([`handle_wake_word_detection`]). This eliminates the asymmetry where
-/// enrollment built templates on audio that the detector never processes.
-/// Utterance end is detected after [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`]
-/// consecutive non-VAD-positive frames (~304ms), matching the detection-side
-/// segment timeout.
-///
-/// If no speech has been detected for a prolonged period (~5s), a warning
-/// status is set to prompt the user to speak louder or move closer to the mic.
-///
-/// Updates voice status dynamically to reflect the enrollment phase:
-/// - No speech yet: caller's `Enrolling` text persists (or no-speech warning)
-/// - Speech detected: `ListeningDuringEnrollment`
-/// - Speech ended, awaiting silence: `WaitingForSilenceDuringEnrollment`
+/// Handle audio during enrollment: accumulate VAD decisions and raw audio into `frame_vad` /
+/// `frame_raw_audio`, then run [`segment_utterances_by_vad`] over the accumulated buffer and queue
+/// newly completed utterances in `enrollment_pending` for the main loop (one per tick, so no
+/// command-channel race and nothing dropped when several complete within one mic frame). The frame
+/// loop keeps inline state only for side effects: noise RMS capture, negative audio collection and
+/// UI status. Non-VAD frames before the first speech and between utterances accumulate into
+/// `negative_audio_buf` and are saved as a chunk at the first sustained speech, giving real
+/// (non-synthetic) negatives to calibrate on. Only VAD-positive frames become utterances, mirroring
+/// the detection pipeline, and utterance end follows [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`]
+/// (~304ms), matching the detection-side segment timeout. No speech for ~5 s raises the "speak
+/// louder" warning; the status otherwise tracks the phase.
 fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize, total: usize) {
     ctx.audio_buffer.extend_from_slice(samples);
 
-    // ── Accumulate full-res audio for extracted VAD gating function ──
-    // Store the ORIGINAL mic samples (not sub-sampled, not framed) so
-    // [`segment_utterances_by_vad`] can access frames at hop_length stride,
-    // aligned with `ctx.frame_vad`, at full 16 kHz resolution.
+    // Store the ORIGINAL mic samples (not sub-sampled, not framed), so
+    // [`segment_utterances_by_vad`] can read frames at hop stride aligned with `ctx.frame_vad` at
+    // full 16 kHz.
     ctx.frame_raw_audio.extend_from_slice(samples);
 
-    // Process frames with offset tracking instead of per-iteration O(n) drain.
     let len = ctx.audio_buffer.len();
     let mut consumed = 0;
     while consumed + FRAME_LENGTH <= len {
         let frame = &ctx.audio_buffer[consumed..consumed + FRAME_LENGTH];
 
-        // Feed only the NEW HOP_LENGTH samples (not the full 512-sample
-        // frame) to avoid double-feeding overlapping audio into earshot's
-        // internal state; prefer the context-local detector with a
-        // global-detector fallback (see [`enrollment_is_speech`]).
+        // Feed only the NEW hop, not the full 512-sample frame, so Earshot's internal state is not
+        // double-fed; prefer the context-local detector, falling back to the global one.
         let is_speech = enrollment_is_speech(
             &mut ctx.enrollment_vad,
             ctx.vad_threshold,
@@ -4086,26 +3220,17 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
             ctx.enrollment_no_speech_frame_count = 0;
 
             if ctx.vad_positives_in_a_row >= ENROLLMENT_VAD_CONSECUTIVE_REQUIRED {
-                // Sustained speech confirmed: perform inline side-effect gating.
-                // The extracted [`segment_utterances_by_vad`] function handles
-                // utterance-boundary detection and construction;
-                // the inline code below only gates real-time side effects that
-                // must happen during the frame loop: noise RMS capture,
-                // negative audio collection, and UI status updates.
+                // Sustained speech confirmed: gate the real-time side effects that must run inside
+                // the frame loop — noise RMS capture, negative audio collection, UI status.
+                // Boundary detection belongs to [`segment_utterances_by_vad`].
 
                 let was_waiting_for_silence = ctx.utterance_silence_samples > 0;
 
-                // ── Capture noise RMS from raw audio ring ──
-                // On the FIRST transition from silence to sustained speech,
-                // capture the ambient noise RMS from the raw audio ring (the
-                // encoder pipeline applies no AGC, so the raw floor is the
-                // true room noise floor).
+                // First transition from silence to sustained speech: capture the ambient noise RMS
+                // from the raw ring (no AGC in this pipeline, so that is the true room floor).
                 let already_had_speech = ctx.utterance_had_speech;
-                // ── Save collected ambient audio for negatives ──
-                // On the FIRST transition from silence to sustained speech,
-                // save the accumulated non-wake-word audio (pre-enrollment
-                // ambient noise or inter-utterance silence) as a potential
-                // negative calibration example.
+                // Same transition: save the accumulated non-wake-word audio (pre-enrollment
+                // ambience or inter-utterance silence) as a potential negative calibration example.
                 if !already_had_speech {
                     if ctx.negative_audio_buf.len() >= MIN_NEGATIVE_AUDIO_LEN {
                         let mut state = voice_state().write().unwrap_poison();
@@ -4135,16 +3260,14 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                 }
 
                 if !already_had_speech || was_waiting_for_silence {
-                    // Transition from silence to speech, or speech resumed after
-                    // a pause before the 1.5s timeout — show "Listening…"
+                    // Silence → speech, or speech resumed inside 1.5 s: show "Listening…".
                     set_status(VoiceStatus::ListeningDuringEnrollment { sample, total });
                 }
                 ctx.utterance_had_speech = true;
                 ctx.utterance_silence_samples = 0;
             } else if ctx.utterance_had_speech {
-                // A single VAD-positive frame (below the consecutive threshold)
-                // after sustained speech: just reset silence.  Handles brief
-                // VAD gaps during continuous speech (e.g. unvoiced stops).
+                // One VAD-positive frame after sustained speech: just reset silence, which rides
+                // over brief VAD gaps in continuous speech (unvoiced stops).
                 ctx.utterance_silence_samples = 0;
             }
         } else {
@@ -4152,19 +3275,15 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
             ctx.vad_positives_in_a_row = 0;
 
             if ctx.utterance_had_speech {
-                // After speech: track silence duration to detect utterance end.
-                // Track by sample count (not wall-clock time) so that system load
-                // / processing delays don't affect cutoff consistency.
+                // After speech: track silence by sample count (not wall-clock, so load cannot skew
+                // the cutoff).
                 ctx.utterance_silence_samples += HOP_LENGTH;
 
-                // Inline silence threshold reset: partially duplicates the
-                // extracted function's boundary logic but is needed so that
-                // post-utterance silence within the same chunk accumulates
-                // into negative_audio_buf rather than being discarded.
-                // Snapshot before reset so the UI status gate uses the
-                // pre-reset value — after utterance completion the silence
-                // samples are 0, which would spuriously trigger the "waiting
-                // for silence" status for one frame.
+                // Inline silence reset, partly duplicating the extracted function boundary logic,
+                // so post-utterance silence in the same chunk still accumulates into
+                // `negative_audio_buf`. It snapshots before resetting, so the status gate reads the
+                // pre-reset value — at zero it would spuriously show "waiting for silence" for one
+                // frame.
                 let silence_ui_check = ctx.utterance_silence_samples;
 
                 if ctx.utterance_silence_samples >= ENROLLMENT_SILENCE_THRESHOLD_SAMPLES {
@@ -4174,25 +3293,20 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                     ctx.vad_positives_in_a_row = 0;
                 }
 
-                // Set status during the first 200ms of silence to show
-                // "Keep silent to confirm…".  Uses the snapshot captured
-                // before the threshold reset so that utterance completion
-                // does not spuriously re-trigger this status.
+                // First 200ms of silence shows "Keep silent to confirm…", using the pre-reset
+                // snapshot.
                 if silence_ui_check < SILENCE_UI_GATE_SAMPLES {
                     set_status(VoiceStatus::WaitingForSilenceDuringEnrollment { sample, total });
                 }
             } else {
-                // Accumulate non-VAD audio for negatives:
-                // pre-enrollment ambient noise, inter-utterance silence, or
-                // any non-wake-word audio between utterances.  Each frame
-                // contributes HOP_LENGTH new samples.
+                // Accumulate non-VAD audio for negatives (pre-enrollment noise, inter-utterance
+                // silence), each frame contributing [`HOP_LENGTH`] new samples.
                 ctx.negative_audio_buf
                     .extend_from_slice(&frame[..HOP_LENGTH]);
 
-                // Pre-speech silence: increment no-speech counter.  When the
-                // count reaches ENROLLMENT_NO_SPEECH_TIMEOUT_FRAMES (~5 seconds
-                // of non-VAD audio), show a warning so the user knows to speak
-                // louder or move closer (VAD symmetry mitigation).
+                // Pre-speech silence: count consecutive non-VAD frames and, at
+                // [`ENROLLMENT_NO_SPEECH_TIMEOUT_FRAMES`] (~5 s), warn so the user speaks louder or
+                // moves closer.
                 ctx.enrollment_no_speech_frame_count += 1;
                 // Warn after the derived frame threshold.
                 if ctx.enrollment_no_speech_frame_count >= ENROLLMENT_NO_SPEECH_TIMEOUT_FRAMES {
@@ -4200,8 +3314,8 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
                         "No speech detected — try speaking louder or move closer to microphone"
                             .to_string(),
                     ));
-                    // Don't reset the counter; the status persists until VAD fires
-                    // or the user re-initiates enrollment.
+                    // Do not reset the counter: the status persists until VAD fires or enrollment
+                    // restarts.
                 }
             }
         }
@@ -4213,12 +3327,9 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
         ctx.audio_buffer.drain(..consumed);
     }
 
-    // ── Extracted VAD gating: detect completed utterances ─────────────
-    // Uses the full accumulated audio and VAD decisions to detect utterance
-    // boundaries with the same algorithm as the inline logic above.
-    // `emitted_utterances` tracks how many utterances have already been
-    // processed across calls — newly completed utterances are those with
-    // index >= emitted_utterances.
+    // Hand the full accumulated audio and VAD decisions to the same boundary algorithm as the
+    // inline logic; `emitted_utterances` counts what was already processed, so newly completed ones
+    // are those with index >= it.
     if !ctx.frame_vad.is_empty() {
         let utterances = segment_utterances_by_vad(
             &ctx.frame_raw_audio,
@@ -4226,33 +3337,27 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
             &DEFAULT_VAD_SEGMENTATION_CONFIG,
         );
 
-        // Handle any newly completed utterances
         while utterances.len() > ctx.emitted_utterances {
             let new_idx = ctx.emitted_utterances;
             ctx.emitted_utterances += 1;
 
-            // Queue the utterance in enrollment_pending (VecDeque) for the
-            // main loop to process.  Using a queue ensures all utterances are
-            // preserved even if multiple complete within a single mic frame.
+            // Queue it in `enrollment_pending` for the main loop, keeping every utterance when
+            // several complete within one mic frame.
             let utterance = utterances[new_idx].clone();
             ctx.enrollment_pending.push_back(utterance);
 
-            // Reset inline tracking state for the next utterance.
             ctx.utterance_had_speech = false;
             ctx.utterance_silence_samples = 0;
             ctx.vad_positives_in_a_row = 0;
             ctx.enrollment_no_speech_frame_count = 0;
-            // Note: noise_rms_estimate is intentionally NOT reset here.
-            // It is consumed by the main loop alongside enrollment_pending.
+            // `noise_rms_estimate` is intentionally not reset here: the main loop consumes it
+            // later.
         }
     }
 }
 
-// Phase 3 owner-negative audio processing
-
-/// Append an owner-negative chunk under the [`MAX_OWNER_NEGATIVE_SAMPLES`]
-/// memory cap (dropping with a warning otherwise).  `label` distinguishes the
-/// final residual buffer from silence-bounded speech segments in the warning.
+/// Append an owner-negative chunk under the [`MAX_OWNER_NEGATIVE_SAMPLES`] cap (dropping with a
+/// warning); `label` distinguishes the final residual buffer from speech segments in that warning.
 fn push_owner_negative_chunk(chunk: Vec<f32>, label: &str) {
     let mut state = voice_state().write().unwrap_poison();
     let total_samples: usize = state
@@ -4272,59 +3377,35 @@ fn push_owner_negative_chunk(chunk: Vec<f32>, label: &str) {
     }
 }
 
-/// Outcome of one [`process_phase3_frames`] pass.
-///
-/// Carries the Phase-3 accumulation state forward (so it survives across mic
-/// chunks) plus any completed speech segments finalized during the pass.
+/// Outcome of one [`process_phase3_frames`] pass: the accumulation state carried across mic chunks
+/// plus the segments finalized in the pass.
 struct Phase3Progress {
-    /// Post-drain watermark: number of samples at the head of the buffer
-    /// already fed to the VAD (index of the next unprocessed frame start).
+    /// Samples at the head of the buffer already fed to the VAD (next unprocessed frame start).
     processed: usize,
-    /// Silence-run accumulator (VAD-negative samples since the last
-    /// VAD-positive frame or chunk boundary).
+    /// VAD-negative samples since the last positive frame or chunk boundary.
     silence_samples: usize,
-    /// Monotone 1:1 VAD-positive speech counter.
     negatives_speech_samples: usize,
-    /// Completed speech segments finalized this pass (full segments — never
-    /// hop slivers).  The caller decides where they land (production pushes
-    /// them via [`push_owner_negative_chunk`]).
+    /// Segments finalized this pass (whole segments, never hop slivers); the caller decides where
+    /// they land.
     completed_chunks: Vec<Vec<f32>>,
 }
 
-/// Process new Phase-3 audio frames against caller-supplied VAD decisions.
+/// Pure Phase-3 frame processing over caller-supplied VAD decisions, mirroring the
+/// [`segment_utterances_by_vad`] pattern: all state is threaded explicitly and the decision per hop
+/// is injected, so tests drive segmentation deterministically instead of relying on the stateful
+/// Earshot detector over synthetic audio.
 ///
-/// Pure Phase-3 frame-processing state machine (mirrors the
-/// [`segment_utterances_by_vad`] testability pattern): all accumulation state
-/// is threaded through explicitly and the VAD decision per hop is injected,
-/// so tests can drive the segmentation deterministically instead of relying
-/// on the stateful earshot neural detector on synthetic audio.
+/// Frames start at the `processed` watermark, not the buffer head, so each hop reaches the VAD —
+/// and the speech counter — exactly once across mic chunks. The old code restarted at the head
+/// every call and drained only at a chunk boundary, so during continuous speech every chunk
+/// re-counted the whole buffer (quadratic counter → Phase 3 completed after ~2–4 real seconds). The
+/// counter must stay a monotone 1:1 record of real audio: after the drain/watermark adjustment it
+/// neither re-counts nor under-counts (which would silently fall back to the 120 s timeout path).
 ///
-/// # 1:1 counting guarantee (regression)
-///
-/// Frames are processed starting at the `processed` watermark (not at the
-/// buffer head), so each hop reaches the VAD — and the speech counter —
-/// exactly once across mic chunks.  The old code restarted at the buffer head
-/// every call and only drained when a chunk boundary fired, so during
-/// continuous speech every new chunk re-counted all previously buffered
-/// frames (quadratic counter → Phase 3 completed after ~2–4 real seconds).
-///
-/// The counter must stay a monotone 1:1 record of real audio: after the
-/// drain/watermark adjustment it neither re-counts (the original bug) nor
-/// under-counts (which would silently degrade to the 120 s timeout path).
-///
-/// # Segment preservation
-///
-/// The drain is gated on the segment being closed: while no chunk boundary
-/// has fired (`segment_start == 0`, an unfinalized segment open at the buffer
-/// head), no drain runs, so the segment — and the unprocessed VAD-window
-/// overlap — survives across mic chunks intact.  When a boundary fires, the
-/// closed segment is pushed as a chunk and the drain removes everything up to
-/// the boundary, so the next segment starts at the drained buffer head.  The
-/// silence-run accumulator is reset at each chunk boundary so subsequent
-/// chunk pushes stay aligned.
-///
-/// `buf` is the full accumulated audio buffer (the caller extends it with new
-/// mic chunks before each call).  Returns the updated state; `buf` is drained
+/// The drain is gated on a closed segment: while no boundary has fired (`segment_start == 0`)
+/// nothing is drained, so the open segment and its unprocessed VAD-window overlap survive across
+/// chunks; when one fires, the segment is pushed and the drain removes everything up to it, and the
+/// silence-run reset keeps later pushes aligned. `buf` is the caller-extended audio buffer, drained
 /// in place.
 fn process_phase3_frames(
     buf: &mut Vec<f32>,
@@ -4334,12 +3415,11 @@ fn process_phase3_frames(
     mut vad: impl FnMut(&[f32]) -> bool,
 ) -> Phase3Progress {
     let len = buf.len();
-    // Resume at the watermark: everything before it was fed to the VAD in a
-    // previous call and must not be re-counted.
+    // Resume at the watermark: everything before it was fed in a previous call and must not be
+    // re-counted.
     let mut consumed = processed;
-    // Segment start is always 0 on entry: a call that closed a segment (a
-    // boundary fired) drained everything up to the boundary, so the next
-    // segment always starts at the drained buffer head.
+    // Segment start is always 0 on entry: a call that closed a segment drained everything up to the
+    // boundary.
     let mut segment_start = 0;
     let mut silence_samples = silence_samples;
     let mut negatives_speech_samples = negatives_speech_samples;
@@ -4349,28 +3429,23 @@ fn process_phase3_frames(
         let is_speech = vad(&buf[consumed..consumed + HOP_LENGTH]);
 
         if is_speech {
-            // 1:1 real-audio accounting: this hop contributes exactly
-            // HOP_LENGTH samples of VAD-positive speech, exactly once.
+            // 1:1 accounting: this hop contributes exactly [`HOP_LENGTH`] samples, exactly once.
             negatives_speech_samples += HOP_LENGTH;
-            // Reset silence counter on any VAD-positive frame.
             silence_samples = 0;
         } else {
             silence_samples += HOP_LENGTH;
-            // Check for chunk boundary: when silence exceeds ENROLLMENT_SILENCE_THRESHOLD_SAMPLES
-            // (aligned to streaming's ~304ms) after sustained speech,
-            // finalize the current segment as a chunk.
+            // Chunk boundary: silence past [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] (~304ms,
+            // aligned to streaming) after sustained speech finalizes the current segment as a
+            // chunk.
             if silence_samples >= ENROLLMENT_SILENCE_THRESHOLD_SAMPLES {
                 let chunk_end = consumed.saturating_sub(silence_samples);
                 if chunk_end > segment_start {
                     completed_chunks.push(buf[segment_start..chunk_end].to_vec());
                 }
-                // Advance segment_start past the silence boundary so the next
-                // segment starts after this silence region.
+                // Advance past the silence boundary so the next segment starts after this silence.
                 segment_start = consumed;
-                // Reset the silence run at each boundary so subsequent chunk
-                // pushes stay aligned — without the reset the run keeps
-                // growing, `chunk_end` drifts below `segment_start`, and the
-                // next push is delayed/misaligned.
+                // Reset the silence run at each boundary, or it keeps growing, `chunk_end` drifts
+                // below `segment_start` and the next push is delayed and misaligned.
                 silence_samples = 0;
             }
         }
@@ -4378,12 +3453,10 @@ fn process_phase3_frames(
         consumed += HOP_LENGTH;
     }
 
-    // Drain fully processed frames (everything before segment_start) from the
-    // audio buffer, preserving the unfinalized speech segment (and the
-    // unprocessed VAD-window overlap).  Everything drained is either already
-    // pushed as a completed chunk or pure lead-in.  This also closes the
-    // drain window: the next call enters with segment_start = 0 and a new
-    // segment open at the drained buffer head.
+    // Drain everything before `segment_start`, keeping the unfinalized segment and the unprocessed
+    // VAD-window overlap. What is drained was already pushed as a chunk or is pure lead-in; this
+    // also closes the drain window, so the next call enters with `segment_start = 0` at the new
+    // buffer head.
     if segment_start > 0 {
         buf.drain(..segment_start);
         consumed -= segment_start;
@@ -4397,31 +3470,16 @@ fn process_phase3_frames(
     }
 }
 
-/// Process incoming audio for Phase 3 owner-negative collection.
-///
-/// Extends [`PipelineCtx::phase3_audio_buf`] with the new mic chunk and runs
-/// the pure [`process_phase3_frames`] state machine, feeding each hop to the
-/// Phase-3 VAD (the stateful earshot detector when available, else the global
-/// fallback) exactly once.
-///
-/// Uses independent buffers (`phase3_audio_buf`, `phase3_silence_samples`)
-/// that are NOT shared with `negative_audio_buf` or `utterance_silence_samples`.
-/// Does NOT accumulate `frame_raw_audio` or `frame_vad` (Phase 3 never
-/// consumes them — they are only consumed by `segment_utterances_by_vad`
-/// during enrollment).  Does NOT reset `enrollment_no_speech_frame_count`
-/// (no-speech warnings suppressed during Phase 3).
-///
-/// Uses [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] for chunk boundary detection —
-/// aligned to streaming's segment timeout, same constant
-/// as enrollment utterance end.
-///
-/// Audio chunks are finalized into `voice_state().owner_negative_chunks` (not
-/// `PipelineCtx` — matches ambient negative pattern and survives mic resets),
-/// via [`push_owner_negative_chunk`] which enforces the memory cap.
-///
-/// Updates `negatives_speech_samples` counter with the VAD-positive frames
-/// detected this call (1:1 real-audio accounting — see
-/// [`process_phase3_frames`]).
+/// Process incoming audio for Phase 3: extend [`PipelineCtx::phase3_audio_buf`] with the mic chunk,
+/// then run [`process_phase3_frames`], feeding each hop to the Phase-3 VAD exactly once (stateful
+/// Earshot when available, else the global fallback). Its buffers are independent of
+/// `negative_audio_buf` and `utterance_silence_samples`; it does not accumulate `frame_raw_audio` /
+/// `frame_vad` (only `segment_utterances_by_vad` consumes those) and does not reset
+/// `enrollment_no_speech_frame_count` (no no-speech warnings in Phase 3). Boundaries use
+/// [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`], and finished chunks land in
+/// `voice_state().owner_negative_chunks` via [`push_owner_negative_chunk`] (which enforces the
+/// memory cap) so they survive mic resets. `negatives_speech_samples` advances by this call
+/// VAD-positive frames.
 fn handle_negative_collection_audio(samples: &[f32], ctx: &mut PipelineCtx) {
     ctx.phase3_audio_buf.extend_from_slice(samples);
     let progress = process_phase3_frames(
@@ -4439,16 +3497,13 @@ fn handle_negative_collection_audio(samples: &[f32], ctx: &mut PipelineCtx) {
     }
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    // ── VAD-gated utterance segmentation tests ────────────────────────────
-    // These test the pure [`segment_utterances_by_vad`] function with synthetic
-    // audio and manually-computed VAD decisions.  No global voice state needed.
+    // Tests for the pure [`segment_utterances_by_vad`]: synthetic audio, hand-computed VAD
+    // decisions.
 
     /// Test config with a shorter silence threshold (10 frames ≈ 2560 samples
     /// instead of the default ~304 ms ≈ 4864 samples, see
@@ -4478,7 +3533,6 @@ mod tests {
             /// `(n_frames, is_speech)` runs describing the per-frame VAD
             /// decision sequence.  The total is the number of frames.
             vad_runs: &'static [(usize, bool)],
-            /// Expected number of emitted utterances.
             expected_utterances: usize,
             /// When true, additionally assert each emitted utterance has
             /// non-empty audio samples.
@@ -4543,8 +3597,6 @@ mod tests {
             }
         }
     }
-
-    // ── Refractory period tests ──────────────────────────────────────────
 
     #[test]
     #[serial_test::serial(voice)]
@@ -4645,7 +3697,6 @@ mod tests {
         }
     }
 
-    // ── Recording state-machine tests ────────────────────────────────────
     // The StartRecording/StopRecording interactions that need no real
     // microphone: reject guards, the resume/teardown transitions in
     // [`PipelineCtx::end_button_recording`], and the outcomes the composer sees.
@@ -4762,7 +3813,6 @@ mod tests {
         }
     }
 
-    // ── Microphone-loss tests ────────────────────────────────────────────
     // The device-loss scenarios themselves need real hardware; these cover the
     // state transitions the loss handler performs.
 
@@ -4808,8 +3858,7 @@ mod tests {
         assert!(!state.utterances_collected);
         drop(state);
 
-        // Voice stopped with the honest status, and the user's switch is
-        // untouched.
+        // Voice stopped with the honest status, and the user's switch is untouched.
         assert!(!ctx.is_listening);
         assert!(!ctx.auto_start_pending, "no automatic re-acquisition");
         assert!(matches!(get_status(), VoiceStatus::MicDisconnected));
@@ -4945,7 +3994,6 @@ mod tests {
         assert!(matches!(get_status(), VoiceStatus::Disabled));
     }
 
-    // ── Model-status resolution tests ────────────────────────────────────
     // The pure [`resolved_model_status`] helper is the single source of truth
     // for the startup block AND the periodic wake-up — the wake-up bug that
     // stranded the footer on "Loading…" was an asymmetry between the two.
@@ -4991,7 +4039,6 @@ mod tests {
         ));
     }
 
-    // ── Rate-limiting debounce tests ─────────────────────────────────────
     // These test the 10-second voice-notice rate limit via the canonical
     // [`PipelineCtx::should_send_voice_notice`] method.  No serial marker
     // needed — these only read from [`PipelineCtx`] fields without touching
@@ -5023,7 +4070,6 @@ mod tests {
         }
     }
 
-    // ── AdaptiveThresholdState tests ──────────────────────────────────────
     // Pure unit tests for the z-score adaptive threshold tracker.  Uses
     // synthetic per-frame scores — no models or voice pipeline state.
 
@@ -5211,7 +4257,6 @@ mod tests {
         );
     }
 
-    // ── process_wake_word_score tests ───────────────────────────────────
     // Pure rolling-window scoring — no models, no pipeline state.
 
     /// Detection geometry for an enrollment with no calibration — the legacy
@@ -5222,13 +4267,11 @@ mod tests {
     }
 
     /// The rolling window's three rules: a below-reset score clears it, frames
-    /// accumulate to the static threshold, and an adaptive override raises the
-    /// bar.
+    /// accumulate to the static threshold, and an adaptive override raises the bar.
     #[test]
     fn process_wake_word_score_clears_fires_and_honours_the_override() {
         let geometry = legacy_geometry();
 
-        // A below-reset score clears the window.
         let mut window = vec![0.9, 0.8, 0.7];
         let (detected, rolling) =
             process_wake_word_score(geometry.reset - 0.01, &mut window, geometry, None);
@@ -5264,7 +4307,6 @@ mod tests {
         }
     }
 
-    // ── score_single_embedding (cosine-prototype) tests ─────────────────
     // The new encoder pipeline scores each window embedding as the cosine
     // soft score against the enrolled prototype.  These tests use synthetic
     // L2-normalized embeddings and a synthetic enrollment.
@@ -5293,8 +4335,7 @@ mod tests {
 
     /// The cosine-prototype scorer's decisions: without an enrollment nothing
     /// scores, a prototype match fires after the rolling window fills, and a
-    /// below-reset frame clears the window and feeds only the background
-    /// statistics.
+    /// below-reset frame clears the window and feeds only the background statistics.
     #[test]
     fn score_single_embedding_fires_on_a_match_and_resets_without_one() {
         // Without an enrollment no detection is possible: total_score = 0.0
@@ -5402,8 +4443,7 @@ mod tests {
         );
 
         // A negative at the pooled mean (cosine 0.80) maps to soft ≈0 through
-        // the enrollment's soft_score path (no anti-prototypes → pure floor
-        // mapping).
+        // the enrollment's soft_score path (no anti-prototypes → pure floor mapping).
         let mut neg_at_mean = basis_embedding(0);
         neg_at_mean[1] = 0.75; // cosine ≈ 1/√(1+0.5625) = 0.80
         let neg_at_mean = crate::audio::wake_word::l2_normalize(&neg_at_mean);
@@ -5434,7 +4474,6 @@ mod tests {
             !single,
             "a single strong frame must not fire (rolling sum < static threshold)",
         );
-        // Reset the window and feed 3 consecutive strong frames.
         window.clear();
         let mut detected = false;
         for _ in 0..ROLLING_WINDOW_N {
@@ -5473,7 +4512,6 @@ mod tests {
         );
     }
 
-    // ── Enrollment consistency gate tests ────────────────────────────────
     // The centroid gate is a pure function so it is testable without the ASR
     // model.  Uses basis embeddings: utterances on basis 0 form a consistent
     // cluster; utterances on other bases are outliers.
@@ -5484,11 +4522,8 @@ mod tests {
         // basis-1 embeddings are outliers.  `bad_dim_at` corrupts one slot.
         struct Case {
             name: &'static str,
-            /// Count of consistent basis-0 utterances.
             basis0: usize,
-            /// Count of outlier basis-1 utterances.
             basis1: usize,
-            /// 0-based embedding slot to replace with a wrong-dimension vector.
             bad_dim_at: Option<usize>,
             /// Expected substring of the user-facing error; `None` means the
             /// gate must succeed.
@@ -5557,8 +4592,6 @@ mod tests {
         }
     }
 
-    // ── Utterance quality ──────────────────────────────────────────────────
-
     #[test]
     fn compute_utterance_quality_short_utterance_scores_zero_duration() {
         // A 100ms blip is below the 400ms floor → duration score 0.  The
@@ -5571,7 +4604,6 @@ mod tests {
         assert_eq!(q.level, QualityLevel::Poor);
     }
 
-    // ── reset_pipeline_state level tests ──────────────────────────────────
     // These test the three ResetLevel variants against a PipelineCtx with
     // non-default field values.  The group is serialized on the voice key
     // because the tests seed/assert the process-global enrollment accumulators
@@ -5616,7 +4648,6 @@ mod tests {
     /// Assert that all audio accumulators and enrollment-state fields are
     /// cleared — the common post-reset invariant shared by all level variants.
     fn assert_buffers_cleared(ctx: &PipelineCtx) {
-        // Audio accumulators.
         assert!(ctx.audio_buffer.is_empty());
         assert!(ctx.command_buffer.is_empty());
         assert_eq!(ctx.silence_sample_count, 0);
@@ -5626,12 +4657,10 @@ mod tests {
         assert_eq!(ctx.last_score_sample_count, 0);
         assert!(ctx.negative_audio_buf.is_empty());
 
-        // Enrollment VAD accumulation state.
         assert!(ctx.frame_vad.is_empty());
         assert!(ctx.frame_raw_audio.is_empty());
         assert_eq!(ctx.emitted_utterances, 0);
 
-        // Enrollment detection/accumulator state.
         assert!(!ctx.utterance_had_speech);
         assert_eq!(ctx.utterance_silence_samples, 0);
         assert_eq!(ctx.enrollment_no_speech_frame_count, 0);
@@ -5639,7 +4668,6 @@ mod tests {
         assert!(ctx.enrollment_pending.is_empty());
         assert!(ctx.noise_rms_estimate.is_none());
 
-        // Segment boundary tracking.
         assert_eq!(
             ctx.segment_silence_hops, 0,
             "segment_silence_hops must be cleared by all reset levels"
@@ -5649,7 +4677,6 @@ mod tests {
             "segment_score_steps must be cleared by all reset levels"
         );
 
-        // Phase 3 owner-negative state.
         assert!(
             !ctx.collecting_negatives,
             "collecting_negatives must be false after reset"
@@ -5715,8 +4742,7 @@ mod tests {
         assert!(ctx.enrollment_mode);
 
         // Global enrollment accumulators PRESERVED by Full — they survive
-        // mic stop/start cycles so mid-enrollment progress is not lost on
-        // toggle-off/on.
+        // mic stop/start cycles so mid-enrollment progress is not lost on toggle-off/on.
         let state = voice_state().read().unwrap_poison();
         assert_eq!(state.enrollment_embeddings.len(), 1);
         assert_eq!(state.negative_audio_chunks.len(), 1);
@@ -5806,7 +4832,6 @@ mod tests {
         }
     }
 
-    // ── Phase 3 owner-negative state machine tests ───────────────────────
     // Regression tests for the Phase-3 speech counter grew
     // quadratically (un-drained buffers re-counted every prior frame on each
     // mic chunk), tripping the (then-60 s, now 15 s) target after ~2–4 real
@@ -5938,7 +4963,6 @@ mod tests {
         }
     }
 
-    // ── handle_segment_boundary tests ───────────────────────────────────
     // Tests the extracted segment boundary check logic with the encoder
     // pipeline signature `(&mut self, hop_count: usize)`.
 

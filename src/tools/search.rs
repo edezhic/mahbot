@@ -1,8 +1,6 @@
-//! Backed by `fff-search` — an indexed search engine with fuzzy file
-//! name matching, content grep, constraint filtering, and pagination.
-//!
-//! All agents searching the same workspace share a single engine instance
-//! managed by [`crate::workspace_index`]. Background scanning starts eagerly.
+//! Backed by `fff-search` — an indexed search engine with fuzzy file name matching,
+//! content grep, constraint filtering and pagination. All agents searching one workspace
+//! share a single engine instance managed by [`crate::workspace_index`].
 
 use crate::Tool;
 use crate::workspace_index;
@@ -18,41 +16,21 @@ use std::sync::LazyLock;
 const DEFAULT_MAX_RESULTS: usize = 50;
 const MAX_RESULTS_LIMIT: usize = 500;
 
-/// Canonical list of argument aliases for the `"query"` key.
+/// Canonical list of argument aliases for the `"query"` key: `"pattern"`, `"search"`,
+/// `"search_term"` and `"grep_search"`. The single source of truth for [`normalize_search_args`]
+/// and [`resolve_query`].
 ///
-/// Tools accept `"pattern"`, `"search"`, `"search_term"`, and `"grep_search"`
-/// as aliases for the primary `"query"` argument. This constant is the single
-/// source of truth for those aliases, used by [`normalize_search_args`] and
-/// [`resolve_query`].
-///
-/// # Priority ordering
-///
-/// The iteration order defines alias priority in [`normalize_search_args`]:
-/// the first alias present in the argument map wins. Currently:
-/// 1. `"pattern"`
-/// 2. `"search"`
-/// 3. `"search_term"`
-/// 4. `"grep_search"`
-///
-/// [`resolve_query`] intentionally excludes `"grep_search"` — see its
-/// documentation for rationale. Do not change this ordering without
-/// updating both callers' priority semantics.
+/// The iteration order is alias priority — the first alias present wins.
+/// [`resolve_query`] intentionally excludes `"grep_search"` (see its doc): do not change the
+/// ordering without updating both callers' priority semantics.
 pub(crate) const QUERY_ALIAS_KEYS: &[&str] = &["pattern", "search", "search_term", "grep_search"];
 
-/// Valid parameter keys (schema + normalization aliases).
+/// Valid parameter keys (schema + normalization aliases), used for unknown-parameter
+/// detection in the execute path: the schema keys (`mode`, `query`, `grep_mode`,
+/// `case_sensitive`, `max_results`, `offset`, `context_lines`), the query aliases
+/// ([`QUERY_ALIAS_KEYS`]), the constraint params (`path`, `ext`) and `file_pattern`.
 ///
-/// Used for unknown-parameter detection in the execute path.
-///
-/// This is the union of:
-/// - Schema keys: `mode`, `query`, `grep_mode`, `case_sensitive`,
-///   `max_results`, `offset`, `context_lines`
-/// - Query aliases: see [`QUERY_ALIAS_KEYS`]
-/// - Constraint params: `path`, `ext`
-/// - Mode switch: `file_pattern`
-///
-/// Built at runtime via [`LazyLock`] so that adding a new alias to
-/// [`QUERY_ALIAS_KEYS`] automatically propagates here — no manual
-/// duplication needed.
+/// Built via [`LazyLock`] so a new alias propagates here automatically.
 static KNOWN_KEYS: LazyLock<Vec<&str>> = LazyLock::new(|| {
     let mut keys = vec![
         // schema keys
@@ -136,20 +114,14 @@ fn normalize_search_args(args: &mut serde_json::Value) {
     }
 }
 
-/// Normalize search arguments by resolving the effective query string.
-///
-/// Handles common agent input mistakes:
-/// - `"pattern"` as an alias for `"query"`
-/// - Standalone `"path"` key → trailing-slash path segment constraint
-/// - Standalone `"ext"` key → glob extension constraint
-///
-/// Returns `None` when no query components are present.
+/// Normalize search arguments by resolving the effective query string: `"pattern"` as an
+/// alias for `"query"`, a standalone `"path"` as a trailing-slash segment constraint, and a
+/// standalone `"ext"` as a glob extension constraint. `None` when no query components
+/// are present.
 fn resolve_query(args: &serde_json::Value) -> Option<String> {
     let raw_query = super::get_opt_str(args, "query").or_else(|| {
-        // grep_search is intentionally excluded — it is only a
-        // normalization alias (consumed by normalize_search_args),
-        // not a query alias that resolve_query should recognize.
-        // See QUERY_ALIAS_KEYS doc comment for the full list.
+        // grep_search is intentionally excluded — it is only a normalization alias, consumed by
+        // normalize_search_args, not a query alias resolve_query recognizes.
         QUERY_ALIAS_KEYS
             .iter()
             .filter(|k| **k != "grep_search")
@@ -191,9 +163,8 @@ fn resolve_query(args: &serde_json::Value) -> Option<String> {
     if query.is_empty() { None } else { Some(query) }
 }
 
-/// Resolve a workspace's search engine, ensuring the background scan has
-/// finished (or timed out). A completed-but-empty index is not an error —
-/// the live watcher populates it incrementally as files are added.
+/// Resolve a workspace's search engine, ensuring the background scan has finished (or
+/// timed out). A completed-but-empty index is not an error — the watcher fills it.
 async fn resolve_workspace_engine(
     ws: &crate::Workspace,
 ) -> anyhow::Result<std::sync::Arc<workspace_index::SearchEngineEntry>> {
@@ -202,10 +173,8 @@ async fn resolve_workspace_engine(
         .map_err(|e| anyhow::anyhow!(e))
 }
 
-/// Unified workspace search tool.
-///
-/// - `mode = "files"` — fuzzy file/path name search (replaces `glob`)
-/// - `mode = "grep"`  — file content search (replaces `rg`)
+/// Unified workspace search tool: `mode = "files"` is fuzzy file/path name search
+/// (replaces `glob`) and `mode = "grep"` file content search (replaces `rg`).
 #[derive(Default)]
 pub struct SearchTool;
 
@@ -236,9 +205,8 @@ impl SearchTool {
         output
     }
 
-    /// Run a single fuzzy file search, returning owned relative paths and
-    /// match/file counts. Path mapping happens inside because `SearchResult`
-    /// borrows from the picker behind the lock guard.
+    /// Run a single fuzzy file search, returning owned relative paths and match/file counts.
+    /// Path mapping happens inside because `SearchResult` borrows from the picker.
     fn fuzzy_file_search(
         entry: &workspace_index::SearchEngineEntry,
         query: &str,
@@ -344,16 +312,16 @@ impl SearchTool {
         let grep_opts = GrepSearchOptions {
             mode: grep_mode,
             smart_case: !case_sensitive,
-            // The explicit case mode overrides `smart_case` when set, so this stays
-            // `None`: the tool's `case_sensitive` argument keeps deciding.
+            // The explicit case mode overrides `smart_case` when set, so this stays `None`: the
+            // tool's `case_sensitive` argument keeps deciding.
             casing: None,
             max_file_size: super::MAX_FILE_SIZE_BYTES,
             max_matches_per_file: 100,
             file_offset: offset,
             page_limit: max_results,
             time_budget_ms: 10_000, // 10 seconds
-            // The budget stays dormant until the search has matched something, as
-            // it has always been here: a zero-match query scans the whole index.
+            // The budget stays dormant until the search has matched something: a zero-match query
+            // scans the whole index.
             enforce_time_budget: false,
             before_context: context_lines,
             after_context: context_lines,
@@ -497,11 +465,9 @@ impl Tool for SearchTool {
     }
 
     fn side_effects(&self) -> bool {
-        // The lazily git-init of a personal workspace is a one-time idempotent
-        // setup that never mutates content and cannot conflict with parallel
-        // read-only tools, so search stays safely groupable. A folder that
-        // cannot be created is reported to its owner over Telegram — equally
-        // unfit to interfere with a sibling tool, and claimed once per process.
+        // The lazily git-init of a personal workspace is a one-time idempotent setup that never
+        // mutates content and cannot conflict with parallel read-only tools, so search stays
+        // groupable; a folder that cannot be created is reported to its owner.
         false
     }
 
@@ -510,11 +476,8 @@ impl Tool for SearchTool {
         ws: &crate::Workspace,
         mut args: serde_json::Value,
     ) -> anyhow::Result<String> {
-        // Personal workspaces have no `workspaces` row and may lack a git repo
-        // (the indexer scans normal content fine without
-        // one, but a repo ensures hidden/dot-prefixed content is indexed).
-        // Ensure the directory exists and is git-initialized before the search
-        // engine scans it.
+        // Personal workspaces have no `workspaces` row and may lack a git repo (the indexer scans
+        // normal content fine without one, but a repo ensures dot-prefixed content is indexed).
         if crate::users::is_personal_workspace(&ws.name)
             && let Some(user) = crate::users::personal_user_name(&ws.name)
             && let Err(e) = crate::users::ensure_personal_workspace(user).await
@@ -530,7 +493,6 @@ impl Tool for SearchTool {
             .unwrap_or("grep")
             .to_string();
 
-        // --- Normalize: handle common agent input mistakes ---
         let query = resolve_query(&args).ok_or_else(|| {
             anyhow::anyhow!(
                 "Missing required field: 'query'. \
@@ -540,14 +502,10 @@ impl Tool for SearchTool {
             )
         })?;
 
-        // ── Lookaround detection for regex mode ──────────────────────────
-        // The Rust `regex` crate does not support lookahead/lookbehind.
-        // Detecting these before dispatch prevents silent plain-text fallback
-        // that would return wrong results without the agent knowing.
-        //
-        // Note: substring scanning may false-positive on patterns like [(?=)]
-        // where lookaround syntax appears inside a character class, but such
-        // patterns are vanishingly rare in agent-generated regex.
+        // The Rust `regex` crate does not support lookahead/lookbehind; detecting them before
+        // dispatch prevents a silent plain-text fallback that would return wrong results.
+        // Substring scanning may false-positive on patterns like [(?=)], but such patterns are
+        // vanishingly rare in agent-generated regex.
         if mode == "grep" {
             let grep_mode = super::get_opt_str(&args, "grep_mode").unwrap_or("fuzzy");
             if grep_mode == "regex"
@@ -562,9 +520,8 @@ impl Tool for SearchTool {
             }
         }
 
-        // ── Unknown parameter detection ────────────────────────────
-        // Schema keys + normalization aliases that are valid in args.
-        // Any other top-level key is an agent mistake worth warning about.
+        // Schema keys + normalization aliases that are valid in args; any other top-level key is
+        // an agent mistake worth warning about.
         let unknown_keys: Vec<&str> = args
             .as_object()
             .map(|obj| {
@@ -591,7 +548,6 @@ impl Tool for SearchTool {
             ))
         };
 
-        // ── Parse query constraints for diagnostics ─────────────────
         let fff_query = parse_grep_query(&query);
         let query_constraints: Vec<Constraint<'_>> = fff_query.constraints.clone();
 
@@ -632,14 +588,9 @@ impl Tool for SearchTool {
     }
 }
 
-// ── Constraint formatting helpers ─────────────────────────────────────
-
-/// Format a single constraint to human-readable text.
-///
-/// The `Constraint` enum only implements `Debug` (producing `Extension("rs")`,
-/// `FilePath("src/")`, etc.), which is machine-oriented. This function
-/// produces agent-friendly labels using the inline query syntax: `*.rs`,
-/// `src/`, `!*.md`, etc.
+/// Format a single constraint to human-readable text: the `Constraint` enum's `Debug` is
+/// machine-oriented, while this produces agent-friendly inline-query labels (`*.rs`,
+/// `src/`, `!*.md`).
 fn format_constraint(constraint: &Constraint<'_>) -> String {
     match constraint {
         Constraint::Extension(s) => format!("*.{s}"),
@@ -671,11 +622,8 @@ fn format_constraints(constraints: &[Constraint<'_>]) -> String {
         .join(", ")
 }
 
-/// Build diagnostic output for a zero-result grep search.
-///
-/// Extracted from `search_greps` to keep the main function under the
-/// clippy `too_many_lines` threshold while providing rich diagnostics
-/// for agents to self-correct.
+/// Build diagnostic output for a zero-result grep search (kept out of `search_greps` to stay
+/// under the clippy `too_many_lines` threshold).
 fn build_grep_zero_diag(
     query: &str,
     result: &fff_search::grep::GrepResult<'_>,
@@ -726,8 +674,8 @@ fn build_grep_zero_diag(
             total = result.filtered_file_count
         );
     } else if result.next_file_offset > 0 {
-        // There are more files to search but the current offset yielded no matches.
-        // This can happen when the offset lands in a gap between matching files.
+        // More files to search but this offset yielded no matches: the offset landed in a gap
+        // between matching files.
         let _ = writeln!(
             diag,
             "  ℹ offset={} covered the searched range but found no matches — \
@@ -772,8 +720,6 @@ mod tests {
         input: serde_json::Value,
         expected: Option<&'static str>,
     }
-
-    // ── normalize_search_args ──────────────────────────────────────────
 
     /// Assert that normalizing `input` produces `expected`.
     fn assert_normalize(input: &serde_json::Value, expected: &serde_json::Value, name: &str) {
@@ -860,7 +806,6 @@ mod tests {
                 input: json!({"pattern": "my_query", "file_pattern": "*.rs"}),
                 expected: json!({"query": "my_query", "file_pattern": "*.rs"}),
             },
-            // ── plain_text ──────────────────────────────────────────────
             NormalizeCase {
                 name: "plain_text sets mode=grep and grep_mode=plain_text",
                 input: json!({"mode": "plain_text"}),
@@ -871,19 +816,16 @@ mod tests {
                 input: json!({"mode": "plain_text", "grep_mode": "fuzzy"}),
                 expected: json!({"mode": "grep", "grep_mode": "fuzzy"}),
             },
-            // ── regex ───────────────────────────────────────────────────
             NormalizeCase {
                 name: "regex sets mode=grep and grep_mode=regex",
                 input: json!({"mode": "regex"}),
                 expected: json!({"mode": "grep", "grep_mode": "regex"}),
             },
-            // ── content ─────────────────────────────────────────────────
             NormalizeCase {
                 name: "content sets mode=grep without grep_mode",
                 input: json!({"mode": "content"}),
                 expected: json!({"mode": "grep"}),
             },
-            // ── code ────────────────────────────────────────────────────
             NormalizeCase {
                 name: "code sets mode=grep and grep_mode=fuzzy",
                 input: json!({"mode": "code"}),
@@ -894,37 +836,31 @@ mod tests {
                 input: json!({"mode": "code", "grep_mode": "regex"}),
                 expected: json!({"mode": "grep", "grep_mode": "regex"}),
             },
-            // ── files (pass-through) ────────────────────────────────────
             NormalizeCase {
                 name: "files mode unchanged",
                 input: json!({"mode": "files", "query": "lib.rs"}),
                 expected: json!({"mode": "files", "query": "lib.rs"}),
             },
-            // ── unknown (pass-through) ──────────────────────────────────
             NormalizeCase {
                 name: "unknown mode passes through unchanged",
                 input: json!({"mode": "unknown_value"}),
                 expected: json!({"mode": "unknown_value"}),
             },
-            // ════════════════════════════════════════════════════════════
             // Double-mapping: mode remapping runs BEFORE grep_mode
             // remapping.  "plain_text" mode first sets grep_mode to
             // "plain_text" (since grep_mode is absent), then the
             // grep_mode remapping sees the already-valid "plain_text"
             // and leaves it — it does NOT re-process the original "exact".
-            // ════════════════════════════════════════════════════════════
             NormalizeCase {
                 name: "plain_text mode + exact grep_mode — mode remaps first, grep_mode sees already-valid plain_text",
                 input: json!({"mode": "plain_text", "grep_mode": "exact"}),
                 expected: json!({"mode": "grep", "grep_mode": "plain_text"}),
             },
-            // ── exact → plain_text ──────────────────────────────────────
             NormalizeCase {
                 name: "exact grep_mode remapped to plain_text",
                 input: json!({"grep_mode": "exact"}),
                 expected: json!({"grep_mode": "plain_text"}),
             },
-            // ── files → mode=files with grep_mode removed ──────────────
             NormalizeCase {
                 name: "files grep_mode promotes mode to files and removes grep_mode",
                 input: json!({"grep_mode": "files"}),
@@ -971,12 +907,10 @@ mod tests {
         }
     }
 
-    // ── QUERY_ALIAS_KEYS / KNOWN_KEYS consistency ──────────────────────
-
     #[test]
     fn known_keys_contains_all_expected_keys() {
-        // Sanity check: KNOWN_KEYS should contain everything we expect.
-        // If this test fails after adding new schema keys, update KNOWN_KEYS.
+        // Sanity check: KNOWN_KEYS should contain every key we expect — update it when adding
+        // schema keys.
         let expected: std::collections::HashSet<&str> = std::collections::HashSet::from([
             // schema keys
             "mode",
@@ -1017,8 +951,6 @@ mod tests {
         }
     }
 
-    // ── resolve_query ──────────────────────────────────────────────────
-
     /// Assert that resolving `input` produces `expected`.
     fn assert_resolve(input: &serde_json::Value, expected: Option<&str>, name: &str) {
         let result = resolve_query(input);
@@ -1030,7 +962,6 @@ mod tests {
     #[test]
     fn resolve_query_cases() {
         let cases = [
-            // ── Individual aliases ──────────────────────────────────────
             ResolveCase {
                 name: "pattern alias resolves to query",
                 input: json!({"pattern": "struct Foo"}),
@@ -1051,7 +982,6 @@ mod tests {
                 input: json!({"grep_search": "qux"}),
                 expected: None,
             },
-            // ── Priority ────────────────────────────────────────────────
             ResolveCase {
                 name: "canonical query overrides all aliases",
                 input: json!({
@@ -1124,7 +1054,6 @@ mod tests {
                 input: json!({"ext": ""}),
                 expected: None,
             },
-            // ── Constraint combinations ─────────────────────────────────
             ResolveCase {
                 name: "query with path constraint",
                 input: json!({"query": "foo", "path": "src"}),
@@ -1145,7 +1074,6 @@ mod tests {
                 input: json!({"path": "src", "ext": "rs"}),
                 expected: Some("src/ *.rs"),
             },
-            // ── Empty query behavior ────────────────────────────────────
             ResolveCase {
                 name: "no query components returns None",
                 input: json!({}),
@@ -1186,8 +1114,6 @@ mod tests {
             assert_resolve(&c.input, c.expected, c.name);
         }
     }
-
-    // ── format_files_zero_result ───────────────────────────────────────
 
     /// Lock the zero-result diagnostics format (byte-identical output).
     #[test]

@@ -130,8 +130,7 @@ macro_rules! define_store {
             ///
             /// This is intentionally **test-only**: production never calls it for
             /// the domain stores (they are constructed directly in
-            /// [`crate::db::init_all_stores`]), so the `dead_code` lint is
-            /// silenced.
+            /// [`crate::db::init_all_stores`]), so the `dead_code` lint is silenced.
             #[allow(dead_code)]
             $vis async fn open(
                 root: &std::path::Path,

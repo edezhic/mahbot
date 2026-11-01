@@ -1,31 +1,22 @@
 //! The single chrome-use CLI spawn path.
 //!
 //! A wedged daemon hangs inside the CLI's own ~152 s retry loop, so every
-//! health/watchdog/sweep call is deadline-bounded; the interactive tool
-//! bounds its dispatch itself per call through [`crate::chrome::clocks`] (the
-//! derivation of the pair for a step that declares its own chrome-side clock),
-//! and on a timeout runs a bounded health
-//! evaluation — failing fast with daemon guidance when the daemon is down or
-//! wedged (a second consecutive hang on a session-daemon probe), since the
-//! mahbot-side bound cuts off the CLI's own wedge signature. One helper,
-//! [`spawn_cli`], plus the per-call timeout and cancellation policies.
+//! health/watchdog/sweep call is deadline-bounded; the interactive tool bounds its dispatch
+//! per call through [`crate::chrome::clocks`] and on a timeout runs a bounded health
+//! evaluation — failing fast with daemon guidance when the daemon is down or wedged. One
+//! helper, [`spawn_cli`], plus the per-call timeout and cancellation policies.
 //!
-//! Two clocks and the relay-recovery policy ride every call — [`crate::chrome`]
-//! is the one statement of both. The environment is pinned so nothing the
-//! service happens to be started with can divert the call onto a browser
-//! chrome-use launches itself.
+//! Two clocks and the relay-recovery policy ride every call — [`crate::chrome`] is the one
+//! statement of both. The environment is pinned so nothing the service happens to be started
+//! with can divert the call onto a browser chrome-use launches itself.
 //!
-//! The child's EXIT decides the call, never pipe EOF: on Windows a program the
-//! command leaves behind keeps the output channel open, so pipe EOF cannot stand
-//! in for the child's exit. The exit status plus whatever bytes the pipes
-//! delivered are therefore the result — the exited child's own answer keeps being
-//! drained while it arrives (one [`PIPE_DRAIN_MAX`] window over BOTH pipes
-//! together) — and a pipe a leftover holder keeps open past [`PIPE_DRAIN_GRACE`]
-//! is reported instead ([`CliOutput::leftover_pipes`]). The per-call deadline
-//! bounds the CHILD's lifetime — spawning and waiting for its exit — only: the
-//! collection that follows is that one bounded window, so a child that answers at
-//! the very end of its deadline is still reported by its answer, never as a
-//! timeout.
+//! The child's EXIT decides the call, never pipe EOF: on Windows a program the command leaves
+//! behind keeps the output channel open. The exit status plus whatever bytes the pipes
+//! delivered are the result — the exited child's own answer keeps being drained while it
+//! arrives (one [`PIPE_DRAIN_MAX`] window over BOTH pipes together) — and a pipe a leftover
+//! holder keeps open past [`PIPE_DRAIN_GRACE`] is reported instead
+//! ([`CliOutput::leftover_pipes`]). The deadline bounds the CHILD's lifetime only, so a child
+//! that answers at the very end of its deadline is still reported by its answer.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,109 +28,88 @@ use tracing::debug;
 use crate::chrome::{CliRecovery, RELAY_RECOVERY_BUDGET};
 use crate::util::UnwrapPoison;
 
-/// Everything one chrome-use CLI invocation needs. The binary path is
-/// resolved by the caller so call-site-specific missing-CLI handling (and,
-/// for the tool, session tracking after the path resolves) stays at the call
-/// site. Argument ORDER is the caller's business: the helper folds
-/// `--json` / `--session <s>` in last, or before a caller `--` marker (see
-/// [`build_argv`]).
+/// Everything one chrome-use CLI invocation needs. The binary path is resolved by the caller,
+/// so call-site-specific missing-CLI handling stays there. Argument ORDER is the caller's
+/// business: the helper folds `--json` / `--session <s>` in last, or before a caller `--`
+/// marker (see [`build_argv`]).
 pub(crate) struct CliSpawn<'a> {
     pub(crate) path: &'a Path,
     pub(crate) args: &'a [&'a str],
     pub(crate) session: Option<&'a str>,
-    /// Add `--json` and pipe stdout (JSON envelopes are read from stdout).
-    /// Without it stdout is nulled — non-JSON callers judge by exit status.
+    /// Add `--json` and pipe stdout; without it stdout is nulled — non-JSON callers judge by
+    /// exit status.
     pub(crate) json: bool,
-    /// Pipe stderr (needed when the caller reads failure details from it);
-    /// otherwise null it.
+    /// Pipe stderr (needed when the caller reads failure details from it); otherwise null it.
     pub(crate) capture_stderr: bool,
-    /// Kill the child when the awaiting future is dropped (task cancellation,
-    /// or the caller's deadline dropping the future) instead of letting it run to
-    /// completion: letting a timed-out call's chrome-use child keep retrying in the
-    /// background has no upside. Every caller passes `true` except the session-recovery stop, which
-    /// passes `false` so a stop nothing is waiting on any more still runs on and
-    /// reclaims the session's tabs (`chrome_daemon::session_stop_via`).
+    /// Kill the child when the awaiting future is dropped, instead of letting it run on:
+    /// letting a timed-out call's child keep retrying in the background has no upside. Every
+    /// caller passes `true` except the session-recovery stop, which passes `false` so a stop
+    /// nothing waits on still reclaims the session's tabs (`chrome_daemon::session_stop_via`).
     pub(crate) cancel_kills: bool,
-    /// Optional stdin payload (e.g. `fill --stdin`). When set, stdin is piped
-    /// and the payload is written concurrently with output collection.
+    /// Optional stdin payload (e.g. `fill --stdin`): stdin is piped and the payload written
+    /// concurrently with output collection.
     pub(crate) input: Option<Vec<u8>>,
-    /// The product's own kill for this call — computed with
-    /// [`crate::chrome::kill_bound`] so it rides above the declared `chrome_side`
-    /// plus whatever recovery the call allows, or with
-    /// [`crate::chrome::probe_clocks`], where the one bound IS both the kill and the
-    /// declaration. It bounds the CHILD's lifetime — spawning and waiting for its
-    /// exit — only: collecting the bytes it wrote is a separate step bounded by one
-    /// [`PIPE_DRAIN_MAX`] window over BOTH pipes together, renewed while bytes keep
-    /// arriving, so an answer the child already produced is never cut off by it.
+    /// The product's own kill for this call — [`crate::chrome::kill_bound`] so it rides above the
+    /// declared `chrome_side` plus whatever recovery the call allows, or
+    /// [`crate::chrome::probe_clocks`] where the one bound IS both the kill and the declaration. It
+    /// bounds the CHILD's lifetime only: collecting the bytes is a separate step bounded by one
+    /// [`PIPE_DRAIN_MAX`] window over BOTH pipes, renewed while bytes keep arriving.
     pub(crate) timeout: Duration,
-    /// The chrome-side deadline this call DECLARES to chrome-use (always
-    /// applied as `AGENT_BROWSER_DEFAULT_TIMEOUT`, in ms) — the clock
-    /// chrome-use itself works to.
+    /// The chrome-side deadline this call DECLARES to chrome-use (always applied as
+    /// `AGENT_BROWSER_DEFAULT_TIMEOUT`, in ms) — the clock chrome-use works to.
     pub(crate) chrome_side: Duration,
     /// Whether this call may run chrome-use's own relay self-heal.
     pub(crate) recovery: CliRecovery,
 }
 
-/// The result of one chrome-use CLI invocation. `status` is the child's own
-/// exit status and decides the call (never pipe EOF; see the module doc);
-/// `stdout`/`stderr` are the bytes its pipes delivered within that one
-/// [`PIPE_DRAIN_MAX`] window (`stderr` is empty unless `capture_stderr` was set);
-/// `leftover_pipes` is true when the child exited but a process it left behind
-/// still held an output channel open past that window — the verdict is still the
-/// child's, and the leftover is reported separately by the caller.
+/// The result of one chrome-use CLI invocation. `status` is the child's own exit status and
+/// decides the call; `stdout`/`stderr` are the bytes its pipes delivered within that one
+/// [`PIPE_DRAIN_MAX`] window; `leftover_pipes` is true when a process the child left behind
+/// still held an output channel open past that window.
 pub(crate) struct CliOutput {
     pub(crate) status: std::process::ExitStatus,
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
     pub(crate) leftover_pipes: bool,
-    /// The product cut off what chrome-use wrote, so what the caller parses may
-    /// be a truncated envelope rather than the whole answer. Either cause counts:
-    /// a stream reached [`PIPE_READ_CAP`], or the collection window ended while
-    /// bytes were still arriving ([`PipeDrain::held_after_exit`]).
+    /// The product cut off what chrome-use wrote, so what the caller parses may be a truncated
+    /// envelope: a stream reached [`PIPE_READ_CAP`], or the collection window ended while
+    /// bytes were still arriving.
     pub(crate) truncated: bool,
 }
 
 pub(crate) enum CliRun {
     Output(CliOutput),
-    /// Nothing came back from a child of ours: it could not be spawned (the `path`
-    /// the caller resolved is gone, or the OS refused the spawn) or its exit could
-    /// not be waited on — the two legs [`run_child`] folds here.
+    /// Nothing came back from a child of ours: it could not be spawned (the resolved `path` is
+    /// gone, or the OS refused) or its exit could not be waited on.
     SpawnFailure,
     /// Bounded call exceeded its deadline (child killed).
     TimedOut,
 }
 
-/// Set HOME, `CHROMIUM_FLAGS`, and the fixed chrome-use knobs on the command
-/// so that the Chromium spawned by chrome-use works in service/docker
-/// environments, and pin the call to the owner's real browser
-/// ([`pin_real_browser_env`]). The whole inherited browser-control namespace —
-/// chrome-use's own `AGENT_BROWSER_*` switches and its `CHROME_USE_*` ones — is
-/// cleared FIRST, before any of the product's own values are set, so no switch
-/// the service happened to be started with can survive into chrome-use. The two
-/// per-call policies — the declared chrome-side deadline and the relay-recovery
-/// allowance — are applied separately ([`apply_chrome_side`],
-/// [`apply_recovery_env`]).
+/// Set HOME, `CHROMIUM_FLAGS` and the fixed chrome-use knobs on the command so the Chromium
+/// chrome-use spawns works in service/docker environments, and pin the call to the owner's
+/// real browser ([`pin_real_browser_env`]). The whole inherited browser-control namespace —
+/// `AGENT_BROWSER_*` and `CHROME_USE_*` — is cleared FIRST, so no switch the service was
+/// started with can survive. The per-call policies are applied separately
+/// ([`apply_chrome_side`], [`apply_recovery_env`]).
 pub(crate) fn ensure_chrome_env(cmd: &mut Command) {
     clear_browser_env(cmd);
     if std::env::var_os("HOME").is_none() {
         cmd.env("HOME", "/tmp");
     }
-    // Suppress Chromium's "--enable-crashes-dialog" and GPU-related flags
-    // that cause issues in headless/service environments.
+    // Suppress Chromium's "--enable-crashes-dialog" and GPU flags, which misbehave in
+    // headless/service environments.
     if std::env::var_os("CHROMIUM_FLAGS").is_none() {
         cmd.env(
             "CHROMIUM_FLAGS",
             "--no-first-run --no-default-browser-check --disable-gpu",
         );
     }
-    // 5-minute idle timeout — the chrome-use daemon still stops after 5 idle
-    // minutes, but chrome-use ≥1.5.101 PRESERVES external Chrome tabs on idle
-    // (only an explicit close/session stop cleans them up), so mahbot closes
-    // the sessions a run opened when it ends, via `crate::tools::chrome_release`.
+    // 5-minute idle timeout. chrome-use ≥1.5.101 PRESERVES external Chrome tabs on idle, so
+    // mahbot closes the sessions a run opened when it ends (`crate::tools::chrome_release`).
     cmd.env("AGENT_BROWSER_IDLE_TIMEOUT_MS", "300000");
-    // Enable human-like interaction speed for bot-detection avoidance.
-    // chrome-use supports the same env vars as agent-browser for backward
-    // compatibility.
+    // Human-like interaction speed for bot-detection avoidance (the same env vars
+    // agent-browser uses).
     cmd.env("AGENT_BROWSER_HUMANIZE", "human");
     // Keep the upgrade-available banner out of every command's stderr.
     cmd.env("CHROME_USE_NO_UPDATE_CHECK", "1");
@@ -150,11 +120,9 @@ pub(crate) fn ensure_chrome_env(cmd: &mut Command) {
     }
 }
 
-/// The helper's own group-cleanup backstop the command-line surface hands it
-/// (`AGENT_BROWSER_GROUP_CLEANUP_MS`), in milliseconds. [`NOT_SET`] leaves chrome-use's
-/// own default in place, which is what the agent tool — running in the service — and
-/// every other spawn keep; only the `mahbot chrome` CLI's process sets a value, and `0`
-/// (the keep mark) means no idle cleanup at all.
+/// The helper's own group-cleanup backstop (`AGENT_BROWSER_GROUP_CLEANUP_MS`), in ms.
+/// [`NOT_SET`] leaves chrome-use's default in place; only the `mahbot chrome` CLI sets a
+/// value, and `0` means no idle cleanup at all.
 static GROUP_CLEANUP_MS: AtomicU64 = AtomicU64::new(NOT_SET);
 
 const NOT_SET: u64 = u64::MAX;
@@ -163,8 +131,8 @@ pub(crate) fn set_group_cleanup_backstop(ms: u64) {
     GROUP_CLEANUP_MS.store(ms, Ordering::Relaxed);
 }
 
-/// Re-entry reset for [`crate::chrome::cli::run_cli`]: an in-process second invocation
-/// must not inherit the first call's backstop.
+/// Re-entry reset for [`crate::chrome::cli::run_cli`]: a second in-process invocation must not
+/// inherit the first call's backstop.
 pub(crate) fn clear_group_cleanup_backstop() {
     GROUP_CLEANUP_MS.store(NOT_SET, Ordering::Relaxed);
 }
@@ -176,19 +144,15 @@ fn group_cleanup_backstop() -> Option<u64> {
     }
 }
 
-/// Clear the WHOLE inherited browser-control namespace from the child's
-/// environment — both chrome-use's own `AGENT_BROWSER_*` switches and its
-/// `CHROME_USE_*` ones — so only the values the product sets afterwards reach
-/// chrome-use. An enumerated remove-list only covers the switches known today: a
-/// switch nobody enumerated (`AGENT_BROWSER_CONFIG`, `AGENT_BROWSER_BROWSER`,
-/// `CHROME_USE_PROFILE`, …) would still divert the call. The match is
-/// case-insensitive because Windows' environment is. Names only — the values are
-/// never read or logged.
+/// Clear the WHOLE inherited browser-control namespace from the child's environment — both
+/// `AGENT_BROWSER_*` and `CHROME_USE_*` — so only the values the product sets afterwards
+/// reach chrome-use. An enumerated remove-list only covers the switches known today, and one
+/// nobody enumerated (`AGENT_BROWSER_CONFIG`, `CHROME_USE_PROFILE`, …) would still divert the
+/// call. The match is case-insensitive because Windows' environment is. Names only — values
+/// are never read or logged.
 ///
-/// The relay-dir name of each namespace is the only one spared:
-/// `AGENT_BROWSER_RELAY_DIR`/`CHROME_USE_RELAY_DIR` has to agree with the
-/// registered native host (see [`pin_real_browser_env`]), so it rides the
-/// service's environment through untouched.
+/// The relay-dir name of each namespace is the only one spared: it has to agree with the
+/// registered native host (see [`pin_real_browser_env`]).
 fn clear_browser_env(cmd: &mut Command) {
     for (name, _) in std::env::vars_os() {
         if let Some(name) = name.to_str() {
@@ -205,35 +169,27 @@ fn clear_browser_env(cmd: &mut Command) {
     }
 }
 
-/// Pin the browser this call drives to the OWNER'S REAL one, whatever the
-/// environment the service happens to be started with says: nothing present in
-/// that environment may move a call onto a throwaway browser chrome-use starts
-/// itself. That is why the whole browser-control namespace — chrome-use's own
-/// `AGENT_BROWSER_*` switches and its `CHROME_USE_*` ones — is CLEARED
-/// ([`clear_browser_env`]) rather than the switches found so far removed: only
-/// the product's own values then reach chrome-use. `CI` presents the
-/// throwaway-profile case, and `AGENT_BROWSER_AUTO_CONNECT` is pinned on so the
-/// call attaches to the browser that is already running.
+/// Pin the browser this call drives to the OWNER'S REAL one, whatever the service's
+/// environment says: nothing there may move a call onto a throwaway browser chrome-use starts
+/// itself. That is why the whole browser-control namespace is CLEARED
+/// ([`clear_browser_env`]) rather than the switches found so far removed. `CI` presents the
+/// throwaway-profile case, and `AGENT_BROWSER_AUTO_CONNECT` is pinned on so the call attaches
+/// to the browser already running.
 ///
-/// `CHROME_USE_RELAY_DIR`/`AGENT_BROWSER_RELAY_DIR` is deliberately NOT
-/// touched — not cleared with the rest of the namespace, never set: it has to
-/// agree with the registered native host. A per-call guarantee that the real
-/// browser was actually used is established higher up (the pre-action readiness
-/// check and chrome-use's own browser-replacement warning), not here. The
-/// per-call knobs ([`apply_chrome_side`], [`apply_recovery_env`]) are applied
-/// afterwards.
+/// `CHROME_USE_RELAY_DIR`/`AGENT_BROWSER_RELAY_DIR` is deliberately NOT touched — not
+/// cleared, never set: it has to agree with the registered native host. Proof that the real
+/// browser was used is established higher up (the readiness check and chrome-use's own
+/// browser-replacement warning), not here.
 fn pin_real_browser_env(cmd: &mut Command) {
     cmd.env_remove("CI");
     cmd.env("AGENT_BROWSER_AUTO_CONNECT", "1");
 }
 
-/// Apply the relay-recovery policy ([`CliRecovery`]): `Allowed` leaves
-/// chrome-use's own self-heal on and pins its revive budget to the number the
-/// product's kill rides above — [`clear_browser_env`] has already removed any
-/// inherited auto-reconnect switch, so nothing has to be un-set here;
-/// `Suppressed` disables the self-heal outright (`0` seconds, no
-/// auto-reconnect), so a probe returns "the tool did not answer" instead of
-/// spending the recovery window.
+/// Apply the relay-recovery policy ([`CliRecovery`]): `Allowed` leaves chrome-use's own
+/// self-heal on and pins its revive budget to the number the product's kill rides above
+/// ([`clear_browser_env`] already removed any inherited auto-reconnect switch);
+/// `Suppressed` disables the self-heal outright (`0` seconds, no auto-reconnect), so a probe
+/// returns "the tool did not answer" instead of spending the recovery window.
 fn apply_recovery_env(cmd: &mut Command, recovery: CliRecovery) {
     match recovery {
         CliRecovery::Allowed => {
@@ -249,10 +205,9 @@ fn apply_recovery_env(cmd: &mut Command, recovery: CliRecovery) {
     }
 }
 
-/// Declare `chrome_side` as this call's chrome-use-side deadline by setting
-/// `AGENT_BROWSER_DEFAULT_TIMEOUT` (ms). Applied to EVERY call — the declaration
-/// is what lets chrome-use's own verdict, rather than the product's kill,
-/// normally reach the caller.
+/// Declare `chrome_side` as this call's chrome-use-side deadline (`AGENT_BROWSER_DEFAULT_TIMEOUT`,
+/// ms). Applied to EVERY call — the declaration is what lets chrome-use's own verdict, rather
+/// than the product's kill, normally reach the caller.
 pub(crate) fn apply_chrome_side(cmd: &mut Command, chrome_side: Duration) {
     cmd.env(
         "AGENT_BROWSER_DEFAULT_TIMEOUT",
@@ -260,11 +215,9 @@ pub(crate) fn apply_chrome_side(cmd: &mut Command, chrome_side: Duration) {
     );
 }
 
-/// Caller args with the global `--json` / `--session <s>` flags folded in.
-/// The flags go before a `--` end-of-options marker when the caller args
-/// contain one (a fill/type leading-dash text shield): chrome-use's arg
-/// preprocessor drops everything after `--`, so appended flags would be
-/// swallowed into the text value (verified against chrome-use 1.5.111).
+/// Caller args with the global `--json` / `--session <s>` flags folded in, before a `--`
+/// end-of-options marker when there is one (a fill/type leading-dash text shield): chrome-use
+/// drops everything after `--`, so appended flags would be swallowed into the text value.
 /// Without a `--` the flags go last.
 fn build_argv(args: &[&str], json: bool, session: Option<&str>) -> Vec<String> {
     let mut global: Vec<String> = Vec::new();
@@ -284,12 +237,10 @@ fn build_argv(args: &[&str], json: bool, session: Option<&str>) -> Vec<String> {
     folded
 }
 
-/// Spawn a chrome-use CLI invocation per [`CliSpawn`]: apply
-/// [`ensure_chrome_env`], the declared chrome-side deadline and the recovery
-/// policy, the caller's args with the global `--json` / `--session <s>` flags
-/// folded in, pipe stdout and stderr per the `json` / `capture_stderr` flags,
-/// and kill-on-drop. A bounded call that hits its deadline reports
-/// [`CliRun::TimedOut`]; any spawn IO error is folded into
+/// Spawn a chrome-use CLI invocation per [`CliSpawn`]: apply [`ensure_chrome_env`], the
+/// declared chrome-side deadline and the recovery policy, the caller's args with the global
+/// flags folded in, pipe stdout and stderr per the flags, and kill-on-drop. A bounded call that
+/// hits its deadline reports [`CliRun::TimedOut`]; a spawn IO error becomes
 /// [`CliRun::SpawnFailure`].
 pub(crate) async fn spawn_cli(spec: CliSpawn<'_>) -> CliRun {
     let mut cmd = Command::new(spec.path);
@@ -309,8 +260,8 @@ pub(crate) async fn spawn_cli(spec: CliSpawn<'_>) -> CliRun {
     } else {
         cmd.stderr(std::process::Stdio::null());
     }
-    // Null stdin unless a payload is coming: a spawned child must never read
-    // the service's own stdin.
+    // Null stdin unless a payload is coming: a spawned child must never read the service's own
+    // stdin.
     if spec.input.is_some() {
         cmd.stdin(std::process::Stdio::piped());
     } else {
@@ -321,30 +272,24 @@ pub(crate) async fn spawn_cli(spec: CliSpawn<'_>) -> CliRun {
     run_child(&mut cmd, spec.input, spec.timeout).await
 }
 
-/// Spawn `cmd`, wait for its exit under `timeout`, and collect its output. The
-/// child's EXIT decides the call, not pipe EOF (see the module doc): two reader
-/// tasks drain the pipes, the child is waited concurrently, and once it has
-/// exited — with both readers already running, so the grace measures a genuinely
-/// pending pipe — each reader is given [`PIPE_DRAIN_GRACE`] to deliver its bytes,
-/// renewed while they keep arriving and capped by [`PIPE_DRAIN_MAX`]. The two
-/// streams are collected in ONE such window, awaited together, so a leftover
-/// holding both pipes costs one bounded window, not one per stream. The deadline
-/// bounds the CHILD's lifetime only; the collection that follows is that one
-/// window, never that clock. Each reader is handed to the bounded retained-channel
-/// set ([`crate::util::leftover_channels`]) when the call ends ([`PipeDrain`]), so
-/// a retained reader always belongs to a call that has already returned: a reader
-/// that reached EOF delivers all its bytes, and a pipe a leftover still holds past
-/// the grace keeps its read end open — the leftover is never blocked by a full
-/// pipe nor faulted by a closed read end, so the call is reported with a leftover
-/// holder rather than allowed to turn a finished command into a timeout.
+/// Spawn `cmd`, wait for its exit under `timeout`, and collect its output. The child's EXIT
+/// decides the call, not pipe EOF (see the module doc): two reader tasks drain the pipes, the
+/// child is waited concurrently, and once it has exited — with both readers already running,
+/// so the grace measures a genuinely pending pipe — each reader is given
+/// [`PIPE_DRAIN_GRACE`], renewed while bytes keep arriving and capped by [`PIPE_DRAIN_MAX`].
+/// Both streams share ONE window, so a leftover holding both pipes costs one bounded window.
+///
+/// Each reader is handed to the bounded retained-channel set
+/// ([`crate::util::leftover_channels`]) when the call ends ([`PipeDrain`]), so a retained
+/// reader always belongs to a call that has already returned: the leftover is never blocked
+/// by a full pipe nor faulted by a closed read end, so the call is reported with a leftover
+/// holder rather than turned into a timeout.
 async fn run_child(cmd: &mut Command, input: Option<Vec<u8>>, deadline: Duration) -> CliRun {
     let Ok(mut child) = cmd.spawn() else {
         return CliRun::SpawnFailure;
     };
-    // A stdin payload is written concurrently: a full stdin write must not
-    // deadlock against a full stdout pipe. The task is detached — the payload
-    // is handed to the pipe, and a child that exited leaves it to fail on
-    // EPIPE.
+    // A stdin payload is written concurrently: a full stdin write must not deadlock against a
+    // full stdout pipe. The task is detached; a child that exited leaves it to fail on EPIPE.
     if let (Some(data), Some(mut stdin)) = (input, child.stdin.take()) {
         tokio::task::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -354,10 +299,8 @@ async fn run_child(cmd: &mut Command, input: Option<Vec<u8>>, deadline: Duration
     }
     let stdout = child.stdout.take().map(PipeDrain::start);
     let stderr = child.stderr.take().map(PipeDrain::start);
-    // The post-exit grace below must measure a genuinely pending pipe, never a
-    // reader the runtime has not polled yet: a child that is already gone while
-    // its readers have not been scheduled would otherwise be reported as a
-    // leftover with a truncated envelope.
+    // The post-exit grace must measure a genuinely pending pipe, never a reader the runtime
+    // has not polled yet — that would report a leftover with a truncated envelope.
     if let Some(drain) = stdout.as_ref() {
         drain.started().await;
     }
@@ -365,24 +308,19 @@ async fn run_child(cmd: &mut Command, input: Option<Vec<u8>>, deadline: Duration
         drain.started().await;
     }
 
-    // The deadline bounds the CHILD's lifetime only. Collecting the bytes it wrote
-    // is a separate step that must not be charged to it: every byte a child wrote
-    // before exiting is already in its pipes, so a child that answers at the very
-    // end of its deadline would otherwise be reported as a timeout with its answer
-    // thrown away. The collection bounds itself ([`PipeDrain::held_after_exit`]).
+    // The deadline bounds the CHILD's lifetime only. Collecting the bytes is a separate step:
+    // every byte a child wrote before exiting is already in its pipes, so charging collection
+    // to the deadline would throw away the answer of a child that finished just in time.
     let status = match tokio::time::timeout(deadline, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(_)) => return CliRun::SpawnFailure,
-        // The child is dropped as this returns (`kill_on_drop`), and the drains
-        // with it — a pipe a leftover holds stays readable for it (see
-        // [`crate::util::leftover_channels`]).
+        // The child is dropped as this returns (`kill_on_drop`), and the drains with it — a
+        // pipe a leftover holds stays readable for it.
         Err(_) => return CliRun::TimedOut,
     };
-    // The command's own answer is already written by the time it exits, so the
-    // wait below only covers the last bytes of a pipe still being closed, and a
-    // pipe a leftover holder keeps open is reported rather than waited for. Both
-    // streams share ONE window ([`tokio::join!`]), so a leftover holding both
-    // costs one [`PIPE_DRAIN_MAX`], not one per stream.
+    // The command's answer is already written by the time it exits, so this wait only covers
+    // the last bytes of a closing pipe, and a pipe a leftover keeps open is reported rather
+    // than waited for. Both streams share ONE window ([`tokio::join!`]).
     let (stdout_held, stderr_held) = tokio::join!(
         held_after_exit(stdout.as_ref()),
         held_after_exit(stderr.as_ref())
@@ -408,11 +346,9 @@ async fn run_child(cmd: &mut Command, input: Option<Vec<u8>>, deadline: Duration
     CliRun::Output(output)
 }
 
-/// Whether the pipe of `drain` is still held after the child exited; `false` for
-/// a stream that was nulled (no drain). A free function so both streams can be
-/// awaited together in one [`tokio::join!`] — which is what bounds the whole
-/// post-exit collection by one [`PIPE_DRAIN_MAX`] window
-/// ([`PipeDrain::held_after_exit`]).
+/// Whether the pipe of `drain` is still held after the child exited; `false` for a stream that
+/// was nulled. A free function so both streams can be awaited together in one
+/// [`tokio::join!`], which bounds the whole post-exit collection by one [`PIPE_DRAIN_MAX`].
 async fn held_after_exit(drain: Option<&PipeDrain>) -> bool {
     match drain {
         Some(drain) => drain.held_after_exit().await,
@@ -420,60 +356,50 @@ async fn held_after_exit(drain: Option<&PipeDrain>) -> bool {
     }
 }
 
-/// How long a finished call's output pipes are given to deliver their last
-/// bytes before a leftover holder is reported — and the bound on waiting for a
-/// freshly spawned reader to be polled at all.
+/// How long a finished call's output pipes are given to deliver their last bytes before a
+/// leftover holder is reported — and the bound on waiting for a freshly spawned reader to be
+/// polled at all.
 const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// Ceiling on the post-exit collection: ONE window covering BOTH pipes together,
-/// renewed while bytes keep arriving. A reader that keeps receiving output is
-/// draining the exited child's own answer (a large envelope takes longer than one
-/// grace), while the pipe a leftover holder keeps open is left open and reported.
-/// Five graces — long enough for a multi-megabyte answer, short enough that a
-/// leftover writing forever cannot hold the call.
+/// Ceiling on the post-exit collection: ONE window covering BOTH pipes, renewed while bytes
+/// keep arriving. A reader that keeps receiving output is draining the exited child's own
+/// answer, while the pipe a leftover holder keeps open is left open and reported. Five graces
+/// — long enough for a multi-megabyte answer, short enough that a leftover writing forever
+/// cannot hold the call.
 const PIPE_DRAIN_MAX: Duration = Duration::from_secs(10);
 
 /// Byte chunk a pipe drain reads at a time.
 const PIPE_DRAIN_CHUNK_BYTES: usize = 8 * 1024;
 
-/// Bytes one output stream may keep — a memory bound, not a policy: far above
-/// any envelope a chrome-use command returns (a page's own text) and small enough
-/// that a leftover writing at full speed cannot grow memory. The reader keeps
-/// draining past it, so the writer is never blocked by a full pipe; a reader that
-/// drops bytes because of this cap marks the drain ([`PipeDrain::truncated`]), so
-/// the frontends can name the truncation instead of reading the cut-off envelope
-/// as malformed output.
+/// Bytes one output stream may keep — a memory bound, not a policy: far above any envelope a
+/// chrome-use command returns, small enough that a leftover writing at full speed cannot grow
+/// memory. The reader keeps draining past it, so the writer is never blocked; a reader that
+/// drops bytes marks the drain ([`PipeDrain::truncated`]), so the frontends name the
+/// truncation instead of reading the cut-off envelope as malformed output.
 pub(crate) const PIPE_READ_CAP: usize = 64 * 1024 * 1024;
 
-/// A drain of one of the child's output pipes: the buffer the reader fills plus
-/// the signals that mark the reader polled and done.
+/// A drain of one of the child's output pipes: the buffer the reader fills plus the signals
+/// that mark the reader polled and done.
 ///
-/// The reader task is handed to the bounded retained-channel set when this drain
-/// is dropped ([`crate::util::leftover_channels`], which prunes a finished reader
-/// on its next pass) — i.e. when the CALL ends, never while it is still in
-/// flight. That is what lets the set's cap release the oldest channel without
-/// ever truncating a call still awaiting its reader: a reader that reached EOF
-/// contributes all its bytes, and one still pending when the call ends is a
-/// genuine leftover holder whose read end must stay open.
+/// The reader task is handed to the bounded retained-channel set when this drain is dropped
+/// ([`crate::util::leftover_channels`]) — i.e. when the CALL ends, never while it is still in
+/// flight. That is what lets the set's cap release the oldest channel without truncating a
+/// call still awaiting its reader.
 struct PipeDrain {
     /// Bytes drained so far (see [`PipeBuf`]).
     buf: Arc<PipeBuf>,
-    /// Signalled by the reader task immediately before its read loop, so
-    /// [`Self::started`] can tell a genuinely pending pipe from a reader the
-    /// runtime has not polled yet.
+    /// Signalled by the reader task immediately before its read loop, so [`Self::started`] can
+    /// tell a genuinely pending pipe from a reader the runtime has not polled yet.
     started: Arc<tokio::sync::Notify>,
     /// Signalled when the read loop ends (EOF or a read error).
     finished: Arc<tokio::sync::Notify>,
-    /// Bytes read so far, for [`Self::held_after_exit`]: whether the reader is
-    /// still receiving output is what separates a slow drain from a pipe a
-    /// thing that outlived the command keeps open.
+    /// Bytes read so far, for [`Self::held_after_exit`]: whether the reader is still receiving
+    /// output separates a slow drain from a pipe a thing that outlived the command keeps open.
     progress: Arc<std::sync::atomic::AtomicU64>,
-    /// Set by the reader when it had to drop bytes at [`PIPE_READ_CAP`] (see
-    /// [`Self::truncated`]).
+    /// Set by the reader when it had to drop bytes at [`PIPE_READ_CAP`].
     truncated: Arc<std::sync::atomic::AtomicBool>,
-    /// The reader task, handed to the bounded retained-channel set when this
-    /// drain is dropped — after the post-exit grace on the normal path, and from
-    /// the dropped future on the timeout path.
+    /// The reader task, handed to the bounded retained-channel set when this drain is dropped —
+    /// after the post-exit grace, or from the dropped future on the timeout path.
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -501,9 +427,8 @@ impl PipeDrain {
                     if read == 0 {
                         break;
                     }
-                    // Every byte read is counted — the post-exit renewal below
-                    // keys on bytes still arriving — while only what fits under
-                    // [`PIPE_READ_CAP`] is kept.
+                    // Every byte read is counted — the renewal keys on bytes still arriving —
+                    // while only what fits under [`PIPE_READ_CAP`] is kept.
                     progress.fetch_add(read as u64, std::sync::atomic::Ordering::Relaxed);
                     if let Some(bytes) = buf.0.lock().unwrap_poison().as_mut() {
                         let room = PIPE_READ_CAP.saturating_sub(bytes.len()).min(read);
@@ -526,29 +451,23 @@ impl PipeDrain {
         }
     }
 
-    /// Wait until the reader task has actually been polled. A grace measured
-    /// before that would count a reader the runtime simply had not reached yet
-    /// as a pending pipe. The wait is bounded by [`PIPE_DRAIN_GRACE`]: when it
-    /// expires the pipe is treated as pending, so the call is reported with a
-    /// leftover holder rather than hanging or spinning on a reader the runtime
-    /// never reached.
+    /// Wait until the reader task has actually been polled: a grace measured before that would
+    /// count a reader the runtime had not reached as a pending pipe. Bounded by
+    /// [`PIPE_DRAIN_GRACE`]; when it expires the pipe is treated as pending, so the call is
+    /// reported with a leftover holder rather than hanging on a reader never reached.
     async fn started(&self) {
         let _ = tokio::time::timeout(PIPE_DRAIN_GRACE, self.started.notified()).await;
     }
 
-    /// Wait out the post-exit grace and report whether a thing that OUTLIVED the
-    /// command still holds this pipe.
+    /// Wait out the post-exit grace and report whether a thing that OUTLIVED the command still
+    /// holds this pipe.
     ///
-    /// Progress — not the mere absence of EOF — is what tells the two apart: a
-    /// reader still receiving bytes is draining the exited child's own answer (a
-    /// large envelope outlives one grace), while a reader that saw neither bytes
-    /// nor EOF across a whole grace is waiting on a holder the call left behind.
-    /// The wait is renewed while bytes keep arriving, capped by
-    /// [`PIPE_DRAIN_MAX`], so a leftover writing forever is reported instead of
-    /// holding the call — but when that cap ends the collection while bytes were
-    /// still arriving, the buffer may be cut mid-envelope, so the cap case is also
-    /// reported as the product's own cut-off ([`PipeDrain::truncated`]) rather than
-    /// only as a leftover holder.
+    /// Progress — not the absence of EOF — tells the two apart: a reader still receiving bytes
+    /// is draining the exited child's own answer, while one that saw neither bytes nor EOF
+    /// across a whole grace is waiting on a holder the call left behind. The wait is renewed
+    /// while bytes keep arriving, capped by [`PIPE_DRAIN_MAX`]; when that cap ends the
+    /// collection while bytes were still arriving the buffer may be cut mid-envelope, so the
+    /// cap case is also reported as the product's own cut-off ([`PipeDrain::truncated`]).
     async fn held_after_exit(&self) -> bool {
         let mut last = self.bytes();
         let mut waited = Duration::ZERO;
@@ -565,8 +484,8 @@ impl PipeDrain {
                 return true;
             }
             if waited >= PIPE_DRAIN_MAX {
-                // Bytes were still arriving when the cap ended the collection, so
-                // what the caller reads may be cut mid-envelope: mark it here.
+                // Bytes were still arriving when the cap ended the collection: what the caller
+                // reads may be cut mid-envelope.
                 self.truncated
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 return true;
@@ -580,25 +499,22 @@ impl PipeDrain {
         self.progress.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Whether the reader had to drop bytes at [`PIPE_READ_CAP`], so the
-    /// envelope the caller reads is the product's own cut-off answer rather than
-    /// what chrome-use wrote.
+    /// Whether the reader had to drop bytes at [`PIPE_READ_CAP`], so the envelope the caller
+    /// reads is the product's own cut-off rather than what chrome-use wrote.
     fn truncated(&self) -> bool {
         self.truncated.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
 impl Drop for PipeDrain {
-    /// Discard the buffer and hand the reader to the bounded retained-channel set
-    /// as the call ends. On the normal path the post-exit grace has run, so an
-    /// unfinished reader here is a genuine leftover holder; on the timeout path
-    /// the call's dropped future lands here too — which is why retention exists
-    /// at all. Retaining at the END rather than at spawn is what keeps the cap
-    /// from ever truncating a call still in flight.
+    /// Discard the buffer and hand the reader to the bounded retained-channel set as the call
+    /// ends. On the normal path the post-exit grace has run, so an unfinished reader here is a
+    /// genuine leftover holder; on the timeout path the dropped future lands here too.
+    /// Retaining at the END rather than at spawn is what keeps the cap from truncating a call
+    /// still in flight.
     fn drop(&mut self) {
-        // The bytes go first: on the timeout path nothing takes the envelope, so
-        // the buffer would stay armed, and a reader retained to keep a leftover's
-        // pipe open must not keep growing a buffer nobody will read.
+        // The bytes go first: on the timeout path nothing takes the envelope, and a retained
+        // reader must not keep growing a buffer nobody will read.
         self.buf.take();
         if let Some(task) = self.task.take() {
             crate::util::leftover_channels::retain_channel(task);
@@ -608,13 +524,10 @@ impl Drop for PipeDrain {
 
 /// Bytes drained from one of the child's output pipes.
 ///
-/// The reader appends as it goes, under the lock, up to [`PIPE_READ_CAP`] bytes:
-/// whatever arrived before the drain grace expired survives even when the pipe
-/// never reaches EOF, and a leftover process writing into the pipe can neither
-/// block (the reader keeps draining past the cap) nor grow this buffer past that
-/// bound. Once the collector has taken the bytes (`None`) the reader appends
-/// nothing more at all. Whatever the cap cut off is marked on the drain, not
-/// here ([`PipeDrain::truncated`]).
+/// The reader appends as it goes, under the lock, up to [`PIPE_READ_CAP`] bytes: whatever
+/// arrived before the grace expired survives even when the pipe never reaches EOF, and a
+/// leftover writing into the pipe can neither block nor grow this buffer past that bound. Once
+/// the collector has taken the bytes (`None`) the reader appends nothing more.
 struct PipeBuf(Mutex<Option<Vec<u8>>>);
 
 impl PipeBuf {
@@ -638,16 +551,15 @@ mod tests {
             .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
     }
 
-    /// Whether the command explicitly REMOVES `key` from the child's
-    /// environment (`env_remove` lands as a `(key, None)` entry).
+    /// Whether the command explicitly REMOVES `key` from the child's environment
+    /// (`env_remove` lands as a `(key, None)` entry).
     fn cmd_removes(cmd: &Command, key: &str) -> bool {
         cmd.as_std()
             .get_envs()
             .any(|(k, v)| v.is_none() && k == std::ffi::OsStr::new(key))
     }
 
-    /// Whether the command says nothing about `key`, leaving whatever the
-    /// parent has (if anything) inherited.
+    /// Whether the command says nothing about `key`, leaving whatever the parent has inherited.
     fn cmd_inherits(cmd: &Command, key: &str) -> bool {
         cmd.as_std()
             .get_envs()
@@ -723,10 +635,8 @@ mod tests {
 
     #[test]
     fn browser_targeting_env_cannot_divert_a_call_off_the_owners_browser() {
-        // A switch nobody enumerated is cleared from the child, because BOTH
-        // whole namespaces — chrome-use's own `AGENT_BROWSER_*` switches and its
-        // `CHROME_USE_*` ones — are cleared rather than the switches found so
-        // far.
+        // A switch nobody enumerated is cleared from the child, because BOTH whole namespaces
+        // are cleared rather than the switches found so far.
         for key in [
             "CI",
             "AGENT_BROWSER_CONFIG",
@@ -751,8 +661,8 @@ mod tests {
             );
         }
 
-        // The product's own values are set AFTER the clear, so a hostile value
-        // under the same name never survives into chrome-use.
+        // The product's own values are set AFTER the clear, so a hostile value under the same
+        // name never survives.
         for (key, expected) in [
             ("AGENT_BROWSER_IDLE_TIMEOUT_MS", "300000"),
             ("AGENT_BROWSER_HUMANIZE", "human"),
@@ -770,9 +680,8 @@ mod tests {
             );
         }
 
-        // The relay dir is the one name spared the clear in each namespace: it
-        // has to ride the service's environment through to agree with the
-        // registered native host.
+        // The relay dir is the one name spared the clear in each namespace: it has to ride the
+        // service's environment through.
         for key in ["AGENT_BROWSER_RELAY_DIR", "CHROME_USE_RELAY_DIR"] {
             let mut cmd = Command::new("true");
             {
@@ -788,9 +697,8 @@ mod tests {
 
     #[test]
     fn recovery_policy_gates_the_relay_self_heal() {
-        // Allowed: an inherited auto-reconnect-OFF switch never reaches the
-        // child — the namespace clear removes it — and the revive budget is
-        // pinned to the number the product's kill rides above.
+        // Allowed: an inherited auto-reconnect-OFF switch never reaches the child — the clear
+        // removes it — and the revive budget is pinned to the kill's number.
         let _guard = set_env_var("AGENT_BROWSER_NO_AUTO_RECONNECT", Some("1"));
         let mut allowed = Command::new("true");
         ensure_chrome_env(&mut allowed);
@@ -824,8 +732,7 @@ mod tests {
             Some("18000")
         );
 
-        // Always applied — even for the smallest step, because the declaration
-        // is what makes chrome-use's own verdict reach the caller.
+        // Always applied — the declaration is what makes chrome-use's own verdict reach the caller.
         let mut cmd = Command::new("true");
         ensure_chrome_env(&mut cmd);
         apply_chrome_side(&mut cmd, Duration::from_millis(250));
@@ -835,14 +742,13 @@ mod tests {
         );
     }
 
-    /// The child's exit decides the call: a process it leaves behind holding
-    /// the output channel must not turn a finished command into a timeout, and
-    /// the leftover is reported instead of waited for.
+    /// The child's exit decides the call: a process it leaves behind holding the output channel
+    /// must not turn a finished command into a timeout.
     #[cfg(unix)]
     #[tokio::test]
     async fn child_exit_decides_the_call_when_a_leftover_holds_the_pipe() {
-        // `sh` exits as soon as the script ends; the background `sleep` inherits
-        // stdout and keeps the pipe open well past the drain grace.
+        // `sh` exits as soon as the script ends; the background `sleep` inherits stdout and
+        // keeps the pipe open past the drain grace.
         let run = spawn_cli(CliSpawn {
             path: Path::new("/bin/sh"),
             args: &["-c", "sleep 5 & echo answered"],

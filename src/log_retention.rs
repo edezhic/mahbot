@@ -51,8 +51,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_mins(10);
 struct RetentionRule {
     table: &'static str,
     /// The `WHERE` body selecting this class's expired records, with `?1` the
-    /// cutoff — a class carries its own predicate whenever one table holds two
-    /// policies.
+    /// cutoff — a class carries its own predicate whenever one table holds two policies.
     expired: &'static str,
     window_hours: i64,
 }
@@ -161,8 +160,7 @@ async fn sweep_expired(store: &LogStore) -> u64 {
 }
 
 /// Background loop: one paced sweep every [`SWEEP_INTERVAL`], the first one a
-/// whole interval after start — never at the same instant the stores are coming
-/// up.
+/// whole interval after start — never at the same instant the stores are coming up.
 pub async fn run_retention_loop(store: Arc<LogStore>) {
     loop {
         if !crate::shutdown::sleep_or_shutdown_or_drain(SWEEP_INTERVAL).await {

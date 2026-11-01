@@ -11,10 +11,7 @@ use super::editor_widget::{CursorState, EditorAction, EditorBuffer};
 /// Maximum characters allowed in a chat message / comment input.
 pub(crate) const MAX_INPUT_CHARS: usize = 100_000;
 
-/// Pagination state shared by dashboard pages that display paginated data.
-///
-/// Groups `page`, `page_size`, and `total` into a single struct with helper
-/// methods for common operations (used by the Logs page's two views).
+/// Shared by dashboard pages that display paginated data.
 #[derive(Debug, Clone)]
 pub(crate) struct PaginationState {
     pub(crate) page: usize,
@@ -31,7 +28,6 @@ impl PaginationState {
         }
     }
 
-    /// Total number of pages given the current `total` and `page_size`.
     pub(crate) const fn total_pages(&self) -> usize {
         if self.total == 0 {
             0
@@ -40,7 +36,7 @@ impl PaginationState {
         }
     }
 
-    /// Move to the previous page.  Returns `true` if the page changed.
+    /// `true` if the page changed.
     pub(crate) fn prev_page(&mut self) -> bool {
         if self.page > 0 {
             self.page -= 1;
@@ -50,7 +46,7 @@ impl PaginationState {
         }
     }
 
-    /// Move to the next page.  Returns `true` if the page changed.
+    /// `true` if the page changed.
     pub(crate) fn next_page(&mut self) -> bool {
         if self.page + 1 < self.total_pages() {
             self.page += 1;
@@ -60,27 +56,18 @@ impl PaginationState {
         }
     }
 
-    /// Reset to page 0 (e.g. when a filter changes).
     pub(crate) fn reset(&mut self) {
         self.page = 0;
     }
 
-    /// Clamp `page` to a valid range for a freshly returned `total`.
-    ///
     /// Totals can shrink between refreshes (e.g. log retention purges rows),
-    /// leaving a previously valid page past the end. Returns `true` when the
-    /// page moved to a valid in-range page and the caller should re-query —
-    /// the entries it currently holds are from a now-out-of-range offset.
-    /// Returns `false` when no re-query is needed (the page was already
-    /// valid, or the total is zero so the fresh empty result is correct).
+    /// leaving a valid page past the end; `true` means the page moved and the caller
+    /// should re-query — its entries are from a now-out-of-range offset.
     ///
-    /// Note: the bound is computed from `total` (the value just returned by
-    /// the query), not the stored `self.total` — the stored value is stale
-    /// until the caller assigns it, so clamping against it could never fire
-    /// on the refresh that observes the shrink. When a clamp fires, callers
-    /// should assign `self.total = total` before re-querying so the page
-    /// indicator stays consistent with the clamped page during the re-query
-    /// window.
+    /// The bound comes from `total`, not the stale stored `self.total` (clamping
+    /// against that could never fire on the refresh that observes the shrink).
+    /// A caller whose clamp fires should assign `self.total = total` before
+    /// re-querying, so the page indicator matches the clamped page meanwhile.
     pub(crate) fn clamp_page(&mut self, total: usize) -> bool {
         let total_pages = total.div_ceil(self.page_size);
         if total_pages == 0 {
@@ -94,19 +81,12 @@ impl PaginationState {
         }
     }
 
-    /// Compute the offset for SQL ``LIMIT … OFFSET …`` queries.
     pub(crate) fn offset(&self) -> usize {
         self.page * self.page_size
     }
 }
 
-/// Shared async loading state, used by GUI pages that fetch data asynchronously.
-///
-/// Combines the three common fields (`loading`, `has_loaded`, `error`) into a single
-/// struct with helper methods for the standard lifecycle:
-/// 1. [`start_loading`](AsyncLoadState::start_loading) — called before a fetch
-/// 2. [`finish_loading`](AsyncLoadState::finish_loading) — on success
-/// 3. [`fail`](AsyncLoadState::fail) — on error
+/// Loading state of one async fetch: before it, in flight, succeeded or failed.
 #[derive(Debug, Clone)]
 pub(crate) struct AsyncLoadState {
     loading: bool,
@@ -123,74 +103,57 @@ impl AsyncLoadState {
         }
     }
 
-    /// Returns `true` while an async fetch is in progress.
     pub(crate) fn loading(&self) -> bool {
         self.loading
     }
 
-    /// Returns `true` after at least one successful fetch has completed.
     pub(crate) fn has_loaded(&self) -> bool {
         self.has_loaded
     }
 
-    /// The last error message, if any.
     pub(crate) fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
 
-    /// Mark the start of an async load — clears any previous error.
+    /// Clears any previous error.
     pub(crate) fn start_loading(&mut self) {
         self.loading = true;
         self.error = None;
     }
 
-    /// Mark successful completion of an async load.
     pub(crate) fn finish_loading(&mut self) {
         self.loading = false;
         self.has_loaded = true;
     }
 
-    /// Mark failure of an async load.
-    ///
-    /// Leaves `has_loaded` untouched, so a failed read never counts as a
-    /// completed one — each view decides what an unloaded failure renders.
+    /// Leaves `has_loaded` untouched, so a failed read never counts as a completed
+    /// one — each view decides what an unloaded failure renders.
     pub(crate) fn fail(&mut self, error: String) {
         self.error = Some(error);
         self.loading = false;
     }
 
-    /// Clear the error state without starting a new load.
-    ///
-    /// Used after a successful operation (e.g. delete) that should dismiss any
-    /// prior error banner without re-triggering the loading spinner.
+    /// Dismiss a prior error banner without re-triggering the loading spinner.
     pub(crate) fn clear_error(&mut self) {
         self.error = None;
     }
 }
 
-/// Interval a polled list re-reads its source at, while it is shown.
-///
-/// The tick is deliberately not gated on a read being in flight — the render
-/// that follows it is what moves the automations countdown, so suppressing it would
-/// freeze the digits. Starting no second read while one is in flight is
+/// Interval a shown polled list re-reads its source at. Deliberately not gated on a
+/// read being in flight — the render that follows moves the automations countdown,
+/// so suppressing it would freeze the digits; not starting a second read is
 /// [`PolledList`]'s job.
 pub(crate) const POLLED_LIST_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// A list a surface re-reads on a timer.
+/// A list a surface re-reads on a timer. The shared rules, so no consumer restates
+/// them: [`begin`](Self::begin) starts a read only when none is in flight; the last
+/// successful entries stay on screen during the next read and after a failed one, so
+/// a failure never blanks the list; [`loaded`](Self::loaded) flips on the first
+/// outcome either way, so "Loading…" belongs to the first read only; a failure is
+/// recorded as data, once per read, and nothing is logged here.
 ///
-/// The shared rules of a re-read list, so no consumer restates them:
-/// - [`begin`](Self::begin) starts a read only when none is in flight, so
-///   repeated asks never pile reads up;
-/// - the entries of the last successful read stay on screen while the next read
-///   is in flight and after a failed one, so a failure never blanks the list;
-/// - [`loaded`](Self::loaded) flips on the first outcome either way, so the
-///   "Loading…" placeholder belongs to the first read only;
-/// - a failure is recorded as data, once per read — nothing is logged here, so
-///   a caller whose read keeps failing writes no log records.
-///
-/// The asks may come from a timer (the Automations page and the custom-tools area) or
-/// from events (the Sessions page re-reads on every runtime tick, because a
-/// session is only ever created or grown by a running agent).
+/// Asks come from a timer (Automations, custom tools) or from events (Sessions
+/// re-reads on every runtime tick: a session only grows by a running agent).
 pub(crate) struct PolledList<T> {
     entries: Vec<T>,
     in_flight: bool,
@@ -208,7 +171,7 @@ impl<T> PolledList<T> {
         }
     }
 
-    /// Mark a read in flight; `false` when one already is (start no second read).
+    /// `false` when a read already is in flight (start no second read).
     pub(crate) fn begin(&mut self) -> bool {
         if self.in_flight {
             return false;
@@ -217,7 +180,7 @@ impl<T> PolledList<T> {
         true
     }
 
-    /// Apply a finished read: keep the previous entries when it failed.
+    /// Keeps the previous entries when the read failed.
     pub(crate) fn settle(&mut self, result: Result<Vec<T>, String>) {
         self.in_flight = false;
         self.loaded = true;
@@ -234,8 +197,7 @@ impl<T> PolledList<T> {
         &self.entries
     }
 
-    /// The entries for in-place bookkeeping after a mutation this page itself
-    /// performed (a deleted row, a truncated session's count).
+    /// For in-place bookkeeping after a mutation this page performed.
     pub(crate) fn entries_mut(&mut self) -> &mut Vec<T> {
         &mut self.entries
     }
@@ -249,14 +211,9 @@ impl<T> PolledList<T> {
     }
 }
 
-/// Shared state for one paginated view of a dashboard page.
-///
-/// Groups the per-view fields (`entries`, `load_state`, `pagination`, `search`,
-/// `refresh_generation`) and the common refresh bookkeeping. Each view still
-/// owns its own `refresh()` (query type, store path and message enum differ),
-/// so callers use [`begin_refresh`](Self::begin_refresh) to prepare a refresh
-/// and [`handle_refreshed`](Self::handle_refreshed)/
-/// [`handle_refresh_error`](Self::handle_refresh_error) to process responses.
+/// Shared state for one paginated view of a dashboard page. Each view owns its own
+/// `refresh()` (query type, store path and message enum differ) and brackets it with
+/// [`begin_refresh`](Self::begin_refresh) and the two response handlers.
 pub(crate) struct PaginatedViewState<T> {
     pub(crate) entries: Vec<T>,
     pub(crate) load_state: AsyncLoadState,
@@ -276,21 +233,17 @@ impl<T> PaginatedViewState<T> {
         }
     }
 
-    /// Prepare the next refresh: mark loading and bump the generation counter.
-    /// Returns the new generation for tagging the async response.
+    /// Marks loading, bumps the generation, and returns it for tagging the response.
     pub(crate) fn begin_refresh(&mut self) -> u64 {
         self.load_state.start_loading();
         self.refresh_generation = self.refresh_generation.wrapping_add(1);
         self.refresh_generation
     }
 
-    /// Process a successful refresh response.
-    ///
-    /// Returns `true` when the fresh `total` shrank past the current page and
-    /// the caller should re-query (the total is already adopted, so the page
-    /// indicator stays consistent during the re-query window). Returns `false`
-    /// when the response was stale and dropped, or fresh and applied — in both
-    /// cases the caller does nothing further.
+    /// `true` when the fresh `total` shrank past the current page and the caller
+    /// should re-query — the total is already adopted, so the page indicator stays
+    /// consistent meanwhile. `false` covers both a stale, dropped response and a
+    /// fresh, applied one: the caller does nothing further.
     pub(crate) fn handle_refreshed(
         &mut self,
         generation: u64,
@@ -310,7 +263,6 @@ impl<T> PaginatedViewState<T> {
         false
     }
 
-    /// Process a failed refresh response.
     pub(crate) fn handle_refresh_error(&mut self, generation: u64, e: String) {
         if generation != self.refresh_generation {
             return;
@@ -318,32 +270,22 @@ impl<T> PaginatedViewState<T> {
         self.load_state.fail(e);
     }
 
-    /// Drop the loaded entries and return to the first page — the post-delete
-    /// state of a view whose rows no longer exist.
+    /// The post-delete state of a view whose rows no longer exist.
     pub(crate) fn clear_entries(&mut self) {
         self.entries.clear();
         self.pagination.reset();
     }
 }
 
-// ── Debounce state ──────────────────────────────────────────────────
-
-/// Debounce state shared by text inputs that persist or refresh only after
-/// the user stops typing.
-///
-/// Groups the generation counter and pending flag from the manual debounce
-/// pattern into a single struct.  The caller keeps a `DebounceState` field,
-/// calls [`trigger`](Self::trigger) on input changes, and calls
-/// [`should_process`](Self::should_process) in the response handler.
-///
+/// Debounce state for text inputs that persist or refresh only after the user stops
+/// typing: [`trigger`](Self::trigger) on input, [`should_process`](Self::should_process)
+/// in the response handler.
 #[derive(Debug, Clone)]
 pub(crate) struct DebounceState {
-    /// Monotonically increasing (modulo overflow) counter.  Each
-    /// [`trigger`](Self::trigger) call bumps this; the response handler
-    /// compares the incoming generation against it to reject stale tasks.
+    /// Bumped by every trigger; the response handler compares against it to reject
+    /// stale tasks.
     generation: u64,
-    /// `true` while a debounced refresh is pending (avoids processing
-    /// stale responses after a newer trigger has been spawned).
+    /// Avoids processing stale responses after a newer trigger was spawned.
     pending: bool,
 }
 
@@ -355,14 +297,9 @@ impl DebounceState {
         }
     }
 
-    /// Register a new debounced trigger.
-    ///
-    /// Increments the generation counter (wrapping on overflow), sets
-    /// `pending` to `true`, and returns a [`Task`] that resolves to the
-    /// new generation after `ms` milliseconds.
-    ///
-    /// The caller should map the returned task to their debounced-refresh
-    /// message variant (e.g. `.map(MyMessage::DebouncedRefresh)`).
+    /// Bumps the generation (wrapping on overflow), sets `pending`, and returns a
+    /// [`Task`] resolving to the new generation after `ms`. Map it to the caller's own
+    /// debounced-refresh message variant.
     pub(crate) fn trigger(&mut self, ms: u64) -> Task<u64> {
         self.generation = self.generation.wrapping_add(1);
         self.pending = true;
@@ -373,13 +310,8 @@ impl DebounceState {
         )
     }
 
-    /// Check whether a debounced response should be processed.
-    ///
-    /// Returns `true` **and** clears the pending flag when `generation`
-    /// matches the current generation while a response is pending.
-    /// Returns `false` for stale (out-of-date) responses.
-    ///
-    /// After a `true` return the caller should run their refresh logic.
+    /// `true` **and** clears the pending flag when `generation` matches while a
+    /// response is pending; `false` for stale responses.
     #[must_use]
     pub(crate) fn should_process(&mut self, generation: u64) -> bool {
         if generation == self.generation && self.pending {
@@ -391,41 +323,31 @@ impl DebounceState {
     }
 }
 
-// ── Undo/Redo stack ─────────────────────────────────────────────────
-
-/// Content accessor for the shared undo stack.
-///
-/// Implemented for `editor_widget::EditorBuffer` — the single text-buffer
-/// engine shared by the code editor and all GUI prose fields.
-///
-/// `cursor` returns the unified [`CursorState`] so undo/redo snapshots can
-/// restore both text and cursor position regardless of the underlying buffer.
+/// Content accessor for the shared undo stack, implemented for
+/// `editor_widget::EditorBuffer`. `cursor` returns the unified [`CursorState`] so a
+/// snapshot can restore text and cursor position whatever the buffer.
 pub(crate) trait UndoableText {
     fn text(&self) -> String;
     fn cursor(&self) -> CursorState;
 
-    /// Replace all content with `text` and reset the cursor to (0, 0).
+    /// Resets the cursor to (0, 0).
     fn set_text(&mut self, text: &str);
 
-    /// Move the cursor to `(line, column)`, clearing any selection.
+    /// Clears any selection.
     fn move_to(&mut self, line: usize, col: usize);
 }
 
-/// Snapshot-based undo/redo stack for a text input editor.
-///
-/// Stores `(String, CursorState)` pairs because `editor_widget::EditorBuffer`
-/// does not implement `Clone` in a way that preserves cursor position.
-/// Restoration reconstructs via [`UndoableText::set_text`] +
-/// [`UndoableText::move_to`].
+/// Snapshot-based undo/redo stack for a text input editor. Stores `(String,
+/// CursorState)` pairs because `EditorBuffer` has no `Clone` that preserves the
+/// cursor; restoration replays [`UndoableText::set_text`] + `move_to`.
 #[derive(Debug, Clone)]
 pub(crate) struct UndoStack {
-    /// Previous states, newest last.
+    /// Newest last.
     undo: Vec<UndoSnapshot>,
-    /// Undone states, cleared on new edit.
+    /// Cleared on new edit.
     redo: Vec<UndoSnapshot>,
 }
 
-/// A single undo snapshot for a text input editor.
 #[derive(Debug, Clone)]
 pub(crate) struct UndoSnapshot {
     pub(crate) text: String,
@@ -443,8 +365,8 @@ impl UndoStack {
         }
     }
 
-    /// Take a snapshot before an edit is performed. Content larger than
-    /// [`Self::LARGE_FILE_UNDO_THRESHOLD`] halves the depth cap to bound memory.
+    /// Content larger than [`Self::LARGE_FILE_UNDO_THRESHOLD`] halves the depth cap
+    /// to bound memory.
     pub(crate) fn snap_before_edit(&mut self, content: &impl UndoableText) {
         let text = content.text();
         let max_depth = if text.len() > Self::LARGE_FILE_UNDO_THRESHOLD {
@@ -474,30 +396,27 @@ impl UndoStack {
         src.pop()
     }
 
-    /// Pop the most recent snapshot, saving current state to the redo stack.
+    /// Saves the current state to the redo stack.
     pub(crate) fn undo(&mut self, content: &impl UndoableText) -> Option<UndoSnapshot> {
         Self::push_and_pop(&mut self.redo, &mut self.undo, content)
     }
 
-    /// Pop the most recent undone snapshot, saving current state to the undo stack.
+    /// Saves the current state to the undo stack.
     pub(crate) fn redo(&mut self, content: &impl UndoableText) -> Option<UndoSnapshot> {
         Self::push_and_pop(&mut self.undo, &mut self.redo, content)
     }
 
-    /// Reset the stack (e.g. after sending a message).
+    /// E.g. after sending a message.
     pub(crate) fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();
     }
 }
 
-/// Shared broadcast-stream producer skeleton used by the chat and logs pages.
-///
-/// Subscribes to `source` (skipped when it already has >100 receivers) and
-/// forwards events through `emit` — called with `Some(item)` for received
-/// items and `None` for lagged slots — via a direct `broadcast::Receiver`
-/// recv loop. `emit` decides how to publish (awaited send vs. try_send), so
-/// each page keeps its own backpressure semantics.
+/// Broadcast-stream producer skeleton used by the chat and logs pages. Subscribes to
+/// `source` — skipped when it already has >100 receivers — and forwards events through
+/// `emit`, `None` for lagged slots. `emit` decides how to publish (awaited send vs.
+/// try_send), so each page keeps its own backpressure semantics.
 pub(crate) fn broadcast_stream_producer<Msg, T, E>(
     capacity: usize,
     source: &'static std::sync::OnceLock<tokio::sync::broadcast::Sender<T>>,
@@ -526,10 +445,7 @@ where
                 return;
             };
 
-            // Direct broadcast receiver loop matching the removed
-            // tokio-stream BroadcastStream's semantics: Ok(event) →
-            // emit(Some(event)), Lagged → emit(None) (gap in the stream),
-            // Closed → end.
+            // A lagged slot is a gap in the stream, emitted as `None`; Closed ends.
             loop {
                 match rx.recv().await {
                     Ok(event) => emit(&mut output, Some(event)).await,
@@ -543,14 +459,12 @@ where
     )
 }
 
-/// Coalescing broadcast-stream producer: collapses bursts of broadcast events
-/// into a single trailing message per `window`. The first event anchors a
-/// deadline; every event arriving before it (including a `Lagged` slot, which
-/// means events were lost and counts as "changed") is absorbed; at the
-/// deadline exactly one message is emitted via `make_msg`. A `Lagged` error is
-/// treated as an event, never as end-of-stream. Ends only when the channel
-/// closes. Used for high-frequency GUI refresh signals (agent registry /
-/// transcript content / voice status) where only "something changed" matters.
+/// Collapses a burst of broadcast events into one trailing message per `window`: the
+/// first event anchors a deadline, everything arriving before it (a `Lagged` slot,
+/// i.e. lost events, counts as "changed") is absorbed, and at the deadline exactly one
+/// `make_msg` is emitted. A `Lagged` error is never end-of-stream; only channel
+/// closure ends the stream. For high-frequency refresh signals where only "something
+/// changed" matters.
 pub(crate) fn coalesced_broadcast_producer<Msg, T>(
     capacity: usize,
     source: &'static std::sync::OnceLock<tokio::sync::broadcast::Sender<T>>,
@@ -578,8 +492,7 @@ where
     )
 }
 
-/// The coalescing body of [`coalesced_broadcast_producer`], extracted so it can
-/// be driven directly in tests without an iced stream channel.
+/// The body of [`coalesced_broadcast_producer`], extracted for tests.
 async fn coalesce_loop<Msg, T, F>(
     mut rx: broadcast::Receiver<T>,
     mut output: iced::futures::channel::mpsc::Sender<Msg>,
@@ -591,8 +504,7 @@ async fn coalesce_loop<Msg, T, F>(
     F: Fn() -> Msg + Send,
 {
     loop {
-        // First event anchors a batch. A Lagged slot means events were lost and
-        // still counts as a change, so it anchors a batch too.
+        // A Lagged slot means events were lost and still counts as a change.
         match rx.recv().await {
             Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
                 let deadline = tokio::time::Instant::now() + window;
@@ -604,10 +516,7 @@ async fn coalesce_loop<Msg, T, F>(
                         }
                         recv = rx.recv() => {
                             match recv {
-                                // Absorb into the current batch; keep batching
-                                // until the deadline fires.
                                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                                // Source gone — no more changes will arrive.
                                 Err(broadcast::error::RecvError::Closed) => return,
                             }
                         }
@@ -619,11 +528,9 @@ async fn coalesce_loop<Msg, T, F>(
     }
 }
 
-/// Apply a text-editor action to a buffer: edit actions snapshot the
-/// pre-edit state for undo, then the action is performed. The editor widget
-/// publishes every action (cursor movement, click positioning, edit), so
-/// `perform_action` is called unconditionally; only edit actions are
-/// snapshotted. Undo/Redo restore from the undo/redo stack instead.
+/// Edit actions snapshot the pre-edit state for undo and then run; every other
+/// action (cursor movement, click positioning) is applied without a snapshot.
+/// Undo/Redo restore from the stack instead.
 pub(crate) fn apply_editor_action(
     content: &mut EditorBuffer,
     undo_stack: &mut UndoStack,
@@ -649,8 +556,7 @@ pub(crate) fn apply_editor_action(
     }
 }
 
-/// Restore an undo/redo snapshot into a buffer (`None`, i.e. an empty stack,
-/// is a no-op).
+/// `None` (an empty stack) is a no-op.
 fn restore_undo_snapshot(content: &mut EditorBuffer, snapshot: Option<UndoSnapshot>) {
     if let Some(snapshot) = snapshot {
         content.set_text(&snapshot.text);
@@ -658,12 +564,8 @@ fn restore_undo_snapshot(content: &mut EditorBuffer, snapshot: Option<UndoSnapsh
     }
 }
 
-/// Map a single-line Tab / Shift+Tab action to Iced focus traversal.
-///
-/// Returns `Some(task)` for [`EditorAction::FocusNext`] / [`FocusPrevious`]
-/// and `None` for every other action, so a page can intercept focus navigation
-/// at the top of any single-line field's handler without disturbing the
-/// buffer/undo logic below.
+/// `Some` for [`EditorAction::FocusNext`] / `FocusPrevious`, so a page can intercept
+/// focus navigation at the top of a single-line field's handler.
 #[must_use]
 pub(crate) fn focus_navigation_task<Message>(action: &EditorAction) -> Option<iced::Task<Message>> {
     match action {
@@ -673,9 +575,8 @@ pub(crate) fn focus_navigation_task<Message>(action: &EditorAction) -> Option<ic
     }
 }
 
-/// Per-field state for a single-line shared-editor field: an [`EditorBuffer`]
-/// plus its own undo stack. Each input owns its own undo/redo, matching the
-/// per-field undo requirement.
+/// Per-field state for a single-line shared-editor field: an [`EditorBuffer`] plus
+/// its own undo stack, so undo/redo is per field.
 pub(crate) struct SingleLineEditorState {
     pub(crate) buffer: EditorBuffer,
     undo: UndoStack,
@@ -692,29 +593,25 @@ impl SingleLineEditorState {
         }
     }
 
-    /// Re-populate the field from an external source (e.g. config reload),
-    /// resetting the undo stack so stale snapshots cannot be restored.
+    /// E.g. a config reload; resets the undo stack so stale snapshots cannot be restored.
     pub(crate) fn set_text(&mut self, text: &str) {
         self.buffer.set_text(text);
         self.undo.clear();
     }
 
-    /// Current field text.
     pub(crate) fn text(&self) -> String {
         self.buffer.text()
     }
 
-    /// Reset the field to empty (clears undo too).
+    /// Clears undo too.
     pub(crate) fn clear(&mut self) {
         self.buffer.clear();
         self.undo.clear();
     }
 
-    /// Apply an [`EditorAction`] emitted by the shared widget.
     pub(crate) fn apply_action(&mut self, action: EditorAction) {
-        // `apply_editor_action` uniformly handles undo/redo (restoring from the
-        // stack) and edit actions (snapshotting then performing), so there is
-        // no separate undo/redo dispatch here.
+        // Undo/redo (stack restore) and edit actions (snapshot then perform) share
+        // one dispatch, so there is nothing undo-specific here.
         apply_editor_action(&mut self.buffer, &mut self.undo, action);
     }
 }
@@ -722,18 +619,15 @@ impl SingleLineEditorState {
 /// Which page's send rules apply, beyond the shared length limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SendRules {
-    /// The chat composer: the field is content even with no text (an attachment,
-    /// or a recording that the send stops), and an in-flight send is refused
-    /// before the length limit is reported.
+    /// The field is content even with no text (an attachment, a recording the send
+    /// stops), and an in-flight send is refused before the length limit is reported.
     Chat { has_content: bool },
-    /// The board comment box: text is required, and the length limit is
-    /// reported before an in-flight send.
+    /// Text is required, and the length limit is reported before an in-flight send.
     Board,
 }
 
-/// Guard a chat send: a silent noop for empty text (unless the chat composer
-/// holds content of its own), then the page's own pair of checks. Returns the
-/// trimmed text when the send may proceed.
+/// A silent noop for empty text (unless the chat composer holds content of its own),
+/// then the page's own pair of checks. Returns the trimmed text when a send may go.
 pub(crate) fn send_guard<M: 'static>(
     text: &str,
     sending: bool,
@@ -778,7 +672,7 @@ mod tests {
     use Step::{Insert, Move, Redo, RedoSnapshot, Restore, Set, Snap, Text, Undo};
     use std::cell::Cell;
 
-    /// A step through an [`UndoStack`]-backed buffer: edits, undo/redo, and setup.
+    /// A step through an [`UndoStack`]-backed buffer.
     #[derive(Clone, Copy)]
     enum Step {
         Set(&'static str),
@@ -787,12 +681,11 @@ mod tests {
         Insert(char),
         Undo,
         Redo,
-        /// Restore a snapshot holding this text, cursor at `(line, column)`.
+        /// The snapshot's text and cursor `(line, column)`.
         Restore(&'static str, usize, usize),
-        /// Call [`UndoStack::redo`] itself: the snapshot it hands back, or
-        /// `None` when the redo stack is empty.
+        /// Call [`UndoStack::redo`]: the snapshot it hands back, `None` when empty.
         RedoSnapshot(Option<&'static str>),
-        /// The buffer must hold exactly this text at this point in the sequence.
+        /// The buffer must hold exactly this text here.
         Text(&'static str),
     }
 
@@ -809,7 +702,7 @@ mod tests {
     }
 
     type UndoCase<'a> = (&'a str, &'a [Step], (&'a str, usize, usize));
-    /// The undo stack preserves the cursor, restores text, and drops invalidated redo.
+    /// The stack preserves the cursor, restores text, and drops invalidated redo.
     #[test]
     fn undo_stack_cases() {
         const EDITED: &[Step] = &[Set(OLD), Snap, Set(NEW), Undo, Redo];
@@ -936,8 +829,8 @@ mod tests {
             .expect("burst should flush within the timeout");
         assert_eq!(first, Some(1));
 
-        // A single event after a flush is still delivered (a deregister
-        // coalesced with transcript traffic must not be lost).
+        // A lone event after a flush is still delivered: a deregister coalesced with
+        // transcript traffic must not be lost.
         let _ = tx.send(());
         let second = tokio::time::timeout(Duration::from_secs(1), out_rx.next())
             .await

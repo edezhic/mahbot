@@ -1,66 +1,46 @@
-//! The document kit: the embedded JavaScript document kit and its `rules.json`
-//! vocabulary, compiled in once and materialized on demand. The kit runner's
-//! `run` and `probe` entry points serve `crate::tools::document` alone, while
-//! the rules and mark tables are shared by the document readers and by
-//! rasterization.
+//! The document kit: the embedded JavaScript document kit and its `rules.json` vocabulary,
+//! compiled in once and materialized on demand. The kit runner's `run` and `probe` entry points
+//! serve `crate::tools::document` alone, while the rules and mark tables are shared by the
+//! document readers and by rasterization.
 //!
-//! The kit (`assets/docgen/document-kit.js`, built from `assets/docgen/kit.js`
-//! and the shared `assets/docgen/rules.json`) is a self-contained bundle that
-//! runs on the managed bun runtime. It is not a prompt asset: it is megabytes
-//! of raw bytes, and the prompt folder pins LF endings and is not for binaries
-//! — so the bundle and the PDF text font it embeds
-//! (`assets/docgen/NotoSans-Regular.ttf`) are compiled in with `include_bytes!`
-//! and written out at run time.
+//! The kit (`assets/docgen/document-kit.js`, built from `assets/docgen/kit.js` and the shared
+//! `assets/docgen/rules.json`) is a self-contained bundle that runs on the managed bun runtime.
+//! It is not a prompt asset: it is megabytes of raw bytes, and the prompt folder pins LF
+//! endings and is not for binaries — so the bundle and the PDF text font it embeds
+//! (`assets/docgen/NotoSans-Regular.ttf`) are compiled in with `include_bytes!` and written out
+//! at run time.
 //!
 //! # Protocol
 //!
-//! A request is a JSON object naming the operation (`op`), the paths that
-//! operation reads and writes, and any data the operation's own refusals need
-//! (`pptx_edit` carries the diagram text a reading showed per slide, so the kit
-//! names text the reader really showed rather than restating how a diagram is
-//! read — see [`crate::ooxml::pptx_diagram_text`]). The runner always writes
-//! that object to a `request-<nonce>.json` file, always points the kit at a
-//! `result-<nonce>.json` file, and always reads the RESULT FILE — never stdout,
-//! which is only the run's diagnostics. Both files live in the kit's `scratch/`
-//! directory, which is emptied when the kit is prepared. A result is
-//! `{"ok": bool, "outputs": [...], "missing": [...], "placeholders": N,
-//! "unsupported": [...], "notes": [...], "losses": [...], "class": "...",
-//! "error": "..."}`, where `placeholders` is a `fill_template` result only,
-//! `unsupported` lists the distinct characters the embedded PDF font could not
-//! draw for a PDF-writing operation, `notes` are the caveats an operation
-//! discovered at run time — already-bracketed, user-facing sentences the reply
-//! appends verbatim — `losses` are the subset of those that say part of what the
-//! call asked for is NOT in the produced file: what an Office edit could not carry
-//! over, a reference it left naming the old cell, something it removed beyond what
-//! was named, or a created Word document whose table of contents could not have a
-//! page number worked out, or whose `{pages}` could not be filled in. A note about
-//! the input's own properties — a signature that no longer matches, a chart or
-//! pivot cache nothing recomputes — is not a loss. `class` is present only on a
-//! failure the kit blamed on the request ("usage": the caller can fix it, see
-//! [`read_result`]). A failure of the run itself (a timeout, a kill, a spawn
-//! failure) never reaches the result file and is reported by the runner, with its
-//! own class token.
+//! A request is a JSON object naming the operation (`op`), the paths it reads and writes, and any
+//! data its refusals need. The runner always writes that object to a `request-<nonce>.json` file,
+//! always points the kit at a `result-<nonce>.json` file, and always reads the RESULT FILE —
+//! never stdout, which is only the run's diagnostics. Both live in the kit's `scratch/`, emptied
+//! when the kit is prepared. A result is `{"ok", "outputs", "missing", "placeholders",
+//! "unsupported", "notes", "losses", "class", "error"}`: `placeholders` is a `fill_template`
+//! result only; `unsupported` lists the distinct characters the embedded PDF font could not
+//! draw; `notes` are already-bracketed, user-facing caveats the reply appends verbatim; `losses`
+//! are the subset of those saying part of what the call asked for is NOT in the produced file. A
+//! note about the input's own properties — a signature that no longer matches, a chart or pivot
+//! cache nothing recomputes — is not a loss. `class` is present only on a failure the kit blamed
+//! on the request ("usage": the caller can fix it, see [`read_result`]). A failure of the run
+//! itself (a timeout, a kill, a spawn failure) never reaches the result file and is reported by
+//! the runner with its own class token.
 //!
 //! # Containment
 //!
-//! The materialized kit directory is a subdirectory of the product's storage
-//! root. In the product's own layout (`$HOME` outside the temp roots) that is a
-//! place no workspace, no tool-accessible root and no OS temp root an agent may
-//! write covers — unlike the temp-root path it used to occupy. It is out of
-//! reach of every pipeline role and of a guest, but not of the admin's Assistant,
-//! which reaches the machine by design (see [`crate::tools::path::PathAccess`]):
-//! that role could leave a file beside the kit, and its own full shell could
-//! reach the same file anyway, which is the accepted limit of a location rule.
-//! A sandbox launch that points `HOME` at a temp root puts the storage root
-//! there too, where a read-only agent may write, and the guarantee is only as
-//! good as the layout.
+//! The materialized kit directory is a subdirectory of the product's storage root. In the
+//! product's own layout that is a place no workspace, no tool-accessible root and no OS temp root
+//! an agent may write covers. It is out of reach of every pipeline role and of a guest, but not
+//! of the admin's Assistant, which reaches the machine by design (see
+//! [`crate::tools::path::PathAccess`]) — the accepted limit of a location rule. A sandbox launch
+//! that points `HOME` at a temp root puts the storage root there too, where a read-only agent may
+//! write, and the guarantee is only as good as the layout.
 //!
-//! The kit runs with that directory as its cwd, never the caller's workspace:
-//! bun auto-loads `$cwd/bunfig.toml` and runs its `preload` scripts (verified —
-//! `--config` does not suppress it), so a workspace holding a `bunfig.toml`
-//! would run attacker-authored code as the OS owner. The invocation also passes
-//! `--no-install` and `--no-env-file`, so neither an install nor a stray env
-//! file can run either.
+//! The kit runs with that directory as its cwd, never the caller's workspace: bun auto-loads
+//! `$cwd/bunfig.toml` and runs its `preload` scripts (verified — `--config` does not suppress
+//! it), so a workspace holding a `bunfig.toml` would run attacker-authored code as the OS owner.
+//! The invocation also passes `--no-install` and `--no-env-file`.
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -68,26 +48,21 @@ use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// The committed, self-contained kit bundle. Deliberately raw bytes rather than
-/// a prompt asset (see the module docs).
+/// The committed, self-contained kit bundle — raw bytes rather than a prompt asset.
 const KIT_SCRIPT: &[u8] = include_bytes!("../assets/docgen/document-kit.js");
 
 /// The Cyrillic-covering general-text font the product ships (see
-/// `assets/docgen/NotoSans-LICENSE.txt`): the kit embeds it into the PDFs it
-/// writes or annotates, and the rasterizer answers text that names no
-/// family — or one the machine cannot supply — with it
+/// `assets/docgen/NotoSans-LICENSE.txt`): the kit embeds it into the PDFs it writes or annotates,
+/// and the rasterizer answers text naming no family — or one the machine cannot supply — with it
 /// (see [`crate::tools::rasterize`]).
 pub(crate) const TEXT_FONT_DATA: &[u8] = include_bytes!("../assets/docgen/NotoSans-Regular.ttf");
 
-/// The shared statement of the input rules, the bounds and the marks the document
-/// readers print: one file rather than a copy per side, read by the document kit,
-/// the `document` tool and the document readers alike (see the file for what each
-/// entry governs). The kit imports it, and bun inlines it into the committed
-/// bundle.
+/// The shared statement of the input rules, the bounds and the marks the document readers print:
+/// one file rather than a copy per side, read by the kit, the `document` tool and the readers
+/// alike. The kit imports it, and bun inlines it into the committed bundle.
 const RULES_JSON: &str = include_str!("../assets/docgen/rules.json");
 
-/// [`RULES_JSON`] parsed once: the file is read as JSON in this one place, and
-/// each consumer deserializes the shape it needs out of the result.
+/// [`RULES_JSON`] parsed once; each consumer deserializes the shape it needs out of the result.
 pub(crate) fn rules() -> &'static Value {
     static RULES: OnceLock<Value> = OnceLock::new();
     RULES.get_or_init(|| {
@@ -95,25 +70,19 @@ pub(crate) fn rules() -> &'static Value {
     })
 }
 
-/// The marks a slide carries in what a presentation reader prints. The editing
-/// side names the same words in its refusals, so one statement of them lives in
-/// [`RULES_JSON`] rather than being spelled twice and drifting.
+/// The marks a slide carries in what a presentation reader prints. The editing side names the
+/// same words in its refusals, so one statement of them lives in [`RULES_JSON`].
 #[derive(serde::Deserialize)]
 pub(crate) struct PptMarks {
-    /// Prefix of a line carrying the slide's own title.
     pub(crate) title: String,
-    /// Beside a slide's number, for one the presentation does not show.
     pub(crate) hidden_slide: String,
-    /// Heading of the visible text a diagram holds.
     pub(crate) diagram_text: String,
-    /// Stands where a diagram's own text could not be read.
     pub(crate) diagram_text_lost: String,
-    /// Stands for a slide with nothing to read.
     pub(crate) no_text: String,
 }
 
-/// [`PptMarks`] out of [`rules`]. An entry the file lost is a build fault,
-/// caught by the tests that read a slide rather than by a call.
+/// [`PptMarks`] out of [`rules`]. An entry the file lost is a build fault, caught by the tests
+/// that read a slide rather than by a call.
 pub(crate) fn ppt_marks() -> &'static PptMarks {
     static MARKS: OnceLock<PptMarks> = OnceLock::new();
     MARKS.get_or_init(|| {
@@ -122,22 +91,16 @@ pub(crate) fn ppt_marks() -> &'static PptMarks {
     })
 }
 
-/// The headers a presentation reader prints a slide's own block, its
-/// speaker-notes block and its comments under, each with `{n}` for the slide's
-/// number. The editing side names the same headers in its refusals, so one
-/// statement of them lives in [`RULES_JSON`] rather than being spelled twice and
-/// drifting.
+/// The headers a presentation reader prints a slide's block, its speaker-notes block and its
+/// comments under, each with `{n}` for the slide's number. The editing side names the same
+/// headers in its refusals, so one statement of them lives in [`RULES_JSON`].
 #[derive(serde::Deserialize)]
 pub(crate) struct PptSlideLabels {
-    /// The header one slide's block is printed under.
     pub(crate) slide: String,
-    /// The header a slide's speaker notes are printed under.
     pub(crate) notes: String,
-    /// The header the comments and replies on a slide print under.
     pub(crate) comments: String,
 }
 
-/// [`PptSlideLabels`] out of [`rules`], as [`ppt_marks`] reads its own.
 pub(crate) fn ppt_slide_labels() -> &'static PptSlideLabels {
     static LABELS: OnceLock<PptSlideLabels> = OnceLock::new();
     LABELS.get_or_init(|| {
@@ -146,10 +109,8 @@ pub(crate) fn ppt_slide_labels() -> &'static PptSlideLabels {
     })
 }
 
-/// The words a PDF form's field list names a field's kind by. The reading prints
-/// them and the document kit's own refusal lists the same fields, so one
-/// statement of them lives in [`RULES_JSON`] rather than being spelled twice and
-/// drifting.
+/// The words a PDF form's field list names a field's kind by. The reading prints them and the
+/// kit's own refusal lists the same fields, so one statement of them lives in [`RULES_JSON`].
 #[derive(serde::Deserialize)]
 pub(crate) struct PdfFieldKinds {
     pub(crate) text: String,
@@ -159,8 +120,6 @@ pub(crate) struct PdfFieldKinds {
 }
 
 impl PdfFieldKinds {
-    /// The kinds spelled for a model-facing sentence: `` `text`, `checkbox`,
-    /// `radio` and `choice` ``.
     pub(crate) fn spelled(&self) -> String {
         format!(
             "`{}`, `{}`, `{}` and `{}`",
@@ -169,7 +128,6 @@ impl PdfFieldKinds {
     }
 }
 
-/// [`PdfFieldKinds`] out of [`rules`], as [`ppt_marks`] reads its own.
 pub(crate) fn pdf_field_kinds() -> &'static PdfFieldKinds {
     static KINDS: OnceLock<PdfFieldKinds> = OnceLock::new();
     KINDS.get_or_init(|| {
@@ -178,24 +136,18 @@ pub(crate) fn pdf_field_kinds() -> &'static PdfFieldKinds {
     })
 }
 
-/// The words a PDF form reading prints: the section's own heading, the marker for
-/// an empty value, the one for a field a fill cannot reach, and the name of a
-/// field the file gives none. The reading and the prompt that describes it both
-/// take them from [`RULES_JSON`], so the vocabulary the model is told to expect
-/// cannot drift from the one the reader emits.
+/// The words a PDF form reading prints: the section heading, the empty-value marker, the one
+/// for a field a fill cannot reach, and the name of a field the file gives none. The reading and
+/// the prompt describing it both take them from [`RULES_JSON`], so the vocabulary the model is
+/// told to expect cannot drift from the one the reader emits.
 #[derive(serde::Deserialize)]
 pub(crate) struct PdfFormWords {
-    /// Heading of the form section, without its colon.
     pub(crate) fields: String,
-    /// Stands where a field carries no value.
     pub(crate) no_value: String,
-    /// Marks a field a fill cannot reach.
     pub(crate) not_fillable: String,
-    /// The name shown for a field with no `/T`.
     pub(crate) unnamed: String,
 }
 
-/// [`PdfFormWords`] out of [`rules`].
 pub(crate) fn pdf_form_words() -> &'static PdfFormWords {
     static WORDS: OnceLock<PdfFormWords> = OnceLock::new();
     WORDS.get_or_init(|| {
@@ -204,30 +156,21 @@ pub(crate) fn pdf_form_words() -> &'static PdfFormWords {
     })
 }
 
-/// The spellings a PDF metadata date accepts, as one model-facing sentence. The
-/// schema, the boundary's refusal, the command line's help and the writing
-/// prompt all state it from here; the kit is handed the value already in the
-/// PDF's own spelling and does not restate the grammar.
+/// The spellings a PDF metadata date accepts, as one model-facing sentence. The schema, the
+/// boundary's refusal, the command line's help and the writing prompt all state it from here.
 pub(crate) fn pdf_date_format() -> &'static str {
     rules()["pdf_date_format"]
         .as_str()
         .expect("assets/docgen/rules.json must carry the pdf_date_format a metadata date accepts")
 }
 
-/// One of the description fields a PDF's Info dictionary carries: the request
-/// key `metadata` names and a reading prints, the sentence the schema describes
-/// it with, and whether the value is a PDF date. The schema, both refusals, the
-/// reading and the kit's own writer read this one ordered list (the kit also
-/// takes the Info-dictionary entry name each field carries), so the field set
-/// lives in [`RULES_JSON`] rather than being spelled again in each of them and
-/// drifting.
+/// One description field a PDF's Info dictionary carries: the `metadata` request key, the
+/// sentence the schema describes it with, and whether the value is a PDF date. The schema, both
+/// refusals, the reading and the kit's writer read this one ordered list.
 #[derive(serde::Deserialize)]
 pub(crate) struct PdfMetadataField {
-    /// The `metadata` request key and the label a reading prints.
     pub(crate) key: String,
-    /// The sentence the schema describes the field with.
     pub(crate) description: String,
-    /// Whether the value is a PDF date rather than text.
     pub(crate) date: bool,
 }
 
@@ -241,8 +184,8 @@ pub(crate) fn pdf_metadata_fields() -> &'static [PdfMetadataField] {
     })
 }
 
-/// The description fields spelled for a model-facing sentence, in the rules'
-/// order, each in backticks and joined as a list.
+/// The description fields spelled for a model-facing sentence, in the rules' order, each in
+/// backticks and joined as a list.
 pub(crate) fn pdf_metadata_fields_spelled() -> String {
     let keys: Vec<String> = pdf_metadata_fields()
         .iter()
@@ -251,24 +194,18 @@ pub(crate) fn pdf_metadata_fields_spelled() -> String {
     crate::util::listed(&keys, "and")
 }
 
-/// The marks a Word reading prints that are labels rather than text: the pattern
-/// each is matched by and the spelling the reader prints it as. The editing side
-/// names the same marks in its refusals, so one statement of them lives in
-/// [`RULES_JSON`] rather than being spelled twice and drifting.
+/// The marks a Word reading prints that are labels rather than text: the pattern each is matched
+/// by and the spelling it prints as. The editing side names the same marks in its refusals.
 #[derive(serde::Deserialize)]
 pub(crate) struct DocxMark {
-    /// The pattern the mark is matched by — by the kit in JavaScript and by this
-    /// crate's own [`docx_marks`], which compiles each one.
+    /// The pattern the mark is matched by — by the kit in JavaScript and by this crate's own
+    /// [`docx_marks`], which compiles each one.
     pub(crate) pattern: String,
-    /// The spelling the reader prints the mark as.
     pub(crate) example: String,
 }
 
-/// [`DocxMark`]s out of [`rules`], as [`ppt_marks`] reads its own. Each pattern is
-/// compiled here: the kit matches fragments against them in JavaScript and this
-/// crate matches a reader's own spelling against them, so a pattern only one of
-/// the two accepts is a build fault, named at the first read rather than by a
-/// call.
+/// [`DocxMark`]s out of [`rules`], as [`ppt_marks`] reads its own. Each pattern is compiled here:
+/// a pattern only one side accepts is a build fault, named at the first read.
 pub(crate) fn docx_marks() -> &'static [DocxMark] {
     static MARKS: OnceLock<Vec<DocxMark>> = OnceLock::new();
     MARKS.get_or_init(|| {
@@ -282,25 +219,21 @@ pub(crate) fn docx_marks() -> &'static [DocxMark] {
     })
 }
 
-/// One of the parts a docx edit does not change — a header, a footer, a note or
-/// a comment: the relationship type `word/document.xml` names it by, and the
-/// conventional part a package that names none of that kind is read from. The
-/// document kit reads the same entry for the same part, with the phrase its
-/// refusals call the part by, so the two sides cannot name one part two ways.
+/// One of the parts a docx edit does not change — a header, a footer, a note or a comment: the
+/// relationship type naming it and the conventional part a package naming none of that kind is
+/// read from. The kit reads the same entry, so the two sides cannot name one part two ways.
 #[derive(serde::Deserialize)]
 pub(crate) struct DocxPeripheralPart {
-    /// The kind's own name, the key a reader resolves one by.
     pub(crate) kind: String,
-    /// The relationship-type tail the part is named by.
     pub(crate) rel: String,
-    /// The conventional part name, absent for a kind a package reaches through
-    /// a relationship alone (a header, a footer).
+    /// The conventional part name, absent for a kind a package reaches through a relationship
+    /// alone (a header, a footer).
     #[serde(default)]
     pub(crate) part: Option<String>,
 }
 
-/// The shared entry for one peripheral kind, by the name it carries. A kind the
-/// file lost is a build fault, caught where the entry is resolved.
+/// The shared entry for one peripheral kind, by name. A kind the file lost is a build fault,
+/// caught where the entry is resolved.
 pub(crate) fn docx_peripheral_part(kind: &str) -> &'static DocxPeripheralPart {
     static PARTS: OnceLock<Vec<DocxPeripheralPart>> = OnceLock::new();
     PARTS
@@ -314,67 +247,42 @@ pub(crate) fn docx_peripheral_part(kind: &str) -> &'static DocxPeripheralPart {
         .expect("assets/docgen/rules.json must name every peripheral part a docx edit leaves alone")
 }
 
-/// The materialized-kit directory name under the product's storage root. The
-/// per-content subdirectory keeps a new binary from ever reusing an older
-/// kit's files.
+/// The materialized-kit directory name under the storage root. The per-content subdirectory keeps
+/// a new binary from reusing an older kit's files.
 const KIT_DIR_NAME: &str = "mahbot-document-kit";
 const KIT_SCRIPT_NAME: &str = "document-kit.js";
 const KIT_FONT_NAME: &str = "NotoSans-Regular.ttf";
 
-/// The kit's own scratch directory, inside the version directory: a run's
-/// request and result files and the probe's tree. It is emptied when the kit is
-/// prepared, so the leftovers of a killed run do not accumulate in a storage
-/// root nothing else sweeps.
+/// The kit's scratch directory, inside the version directory: a run's request and result files
+/// and the probe's tree. Emptied when the kit is prepared.
 const KIT_SCRATCH_NAME: &str = "scratch";
 
-/// Bytes of the content hash that name the per-version directory.
 const KIT_HASH_BYTES: usize = 8;
 
-/// Characters of a failed run's output carried into the error when the kit
-/// itself said nothing.
 const OUTPUT_TAIL_CHARS: usize = 2000;
 
-/// What one kit operation produced.
 pub(crate) struct KitOutcome {
-    /// Absolute paths of the files the kit wrote, in the order it wrote them.
     pub outputs: Vec<PathBuf>,
-    /// Placeholder names the request supplied no value for (a `fill_template`
-    /// sample's `{name}` fields), left as they were in the produced file.
+    /// Placeholder names the request supplied no value for, left as they were in the produced file.
     pub missing: Vec<String>,
-    /// The distinct `{name}` template tags the filler compiled or substituted,
-    /// counted once per name — a `fill_template` result only, and only over the
-    /// parts the filler rewrites (docx/pptx: the rendered parts plus the notes
-    /// slides; xlsx: the worksheets plus the shared-string table). It is not a
-    /// count of substitution sites, and a tag in a part outside that set — a
-    /// chart label, a comment — is not in it at all. `Some(0)` means the parts
-    /// it rewrites held none, which is the one fact a filled copy cannot state
-    /// about itself. `None` for every other operation, none of which reports a
-    /// count.
+    /// The distinct `{name}` template tags the filler compiled or substituted, once per name — a
+    /// `fill_template` result only. `Some(0)` means the rewritten parts held none; `None` for every
+    /// other operation.
     pub placeholders: Option<usize>,
-    /// The distinct characters the embedded PDF font could not draw, in the
-    /// order the kit first drew them — the PDF-writing operations only, and
-    /// empty for every operation that draws no text. Each entry is one
-    /// character, missing from the produced file rather than present in it.
+    /// The distinct characters the embedded PDF font could not draw, in the order the kit drew
+    /// them — the PDF-writing operations only.
     pub unsupported: Vec<String>,
-    /// The caveats an operation discovered at run time — already bracketed,
-    /// user-facing sentences the reply appends verbatim: references or anchors a
-    /// row or column shift left naming the old cells, text that lost several runs'
-    /// formatting, a chart or pivot that keeps the values it cached, a signature
-    /// that no longer matches the edited package, a stamp or picture a PDF page
-    /// shows only in part. Empty for every operation that reports none.
+    /// The caveats an operation discovered at run time — already bracketed, user-facing sentences
+    /// the reply appends verbatim: references naming old cells after a shift, text that lost runs'
+    /// formatting, a chart or pivot keeping cached values, a signature that no longer matches.
     pub notes: Vec<String>,
-    /// Whether the kit itself raised at least one caveat that means part of what
-    /// the call asked for is NOT in the produced file — as opposed to a note that
-    /// records the scope of the edit or a property of the input it edited (see
-    /// [`Self::notes`]). The kit marks these where it raises them, so a shortfall
-    /// is never inferred from anyone reading the wording.
+    /// Whether the kit raised at least one caveat meaning part of what the call asked for is NOT
+    /// in the produced file — as opposed to a note recording the scope of the edit.
     pub lossy: bool,
 }
 
-/// Run one kit operation and report what it produced.
-///
-/// `request` must be a JSON object naming `op`. The runner adds the result path
-/// and the materialized font path itself, so a caller never names either.
+/// Run one kit operation and report what it produced. `request` must be a JSON object naming
+/// `op`; the runner adds the result path and the materialized font path itself.
 pub(crate) async fn run(request: Value) -> Result<KitOutcome> {
     let value = invoke(request).await?;
     Ok(KitOutcome {
@@ -389,48 +297,44 @@ pub(crate) async fn run(request: Value) -> Result<KitOutcome> {
             .and_then(|count| usize::try_from(count).ok()),
         unsupported: string_array(&value, "unsupported"),
         notes: string_array(&value, "notes"),
-        // The kit reports `losses` for the operations that can fall short — the
-        // three edits, and a create whose table of contents could not have every
-        // page number worked out or whose `{pages}` could not be filled in; any
-        // other operation leaves it out, which reads as no loss.
+        // The kit reports `losses` for the operations that can fall short — the three edits, and
+        // a create whose table of contents could not be worked out; any other operation leaves
+        // it out, which reads as no loss.
         lossy: !string_array(&value, "losses").is_empty(),
     })
 }
 
-/// Run the kit's own `probe` operation once per process, into a scratch
-/// directory removed afterwards, and cache SUCCESS only.
-///
-/// A failure is retried on the next call because a kit that is broken now may
-/// become usable: the product keeps the managed runtime at its newest release on
-/// every start, so a permanent refusal would outlive its cause.
+/// Run the kit's own `probe` operation once per process, into a scratch directory removed
+/// afterwards, and cache SUCCESS only. A failure is retried on the next call because a kit broken
+/// now may become usable: the product keeps the managed runtime at its newest release on every
+/// start.
 pub(crate) async fn probe() -> Result<()> {
     static PROBED: OnceLock<()> = OnceLock::new();
     if PROBED.get().is_some() {
         return Ok(());
     }
-    // Refused before the kit is materialized: writing megabytes out only to
-    // report an unavailable runtime is work for nothing.
+    // Refused before the kit is materialized: writing megabytes out only to report an
+    // unavailable runtime is work for nothing.
     managed_runtime()?;
     let dir = kit_directory().await?;
     let scratch = dir
         .join(KIT_SCRATCH_NAME)
         .join(format!("probe-{:016x}", rand::random::<u64>()));
     let result = invoke(json!({ "op": "probe", "scratch": scratch })).await;
-    // The scratch tree is the kit's own artifact, never something the tool
-    // reserved, so it is removed here whatever the probe reported.
+    // The scratch tree is the kit's own artifact, never something the tool reserved, so it is
+    // removed here whatever the probe reported.
     let _ = tokio::fs::remove_dir_all(&scratch).await;
     result?;
     let _ = PROBED.set(());
     Ok(())
 }
 
-/// One kit operation end to end: fill in the result path, write the request,
-/// run the kit, read and parse the result, then remove both files (best effort,
-/// the error path included). Shared by [`run`] and [`probe`], which interpret
-/// the parsed result differently.
+/// One kit operation end to end: fill in the result path, write the request, run the kit, read
+/// and parse the result, then remove both files (best effort, the error path included). Shared by
+/// [`run`] and [`probe`], which interpret the parsed result differently.
 async fn invoke(mut request: Value) -> Result<Value> {
-    // Resolved before anything is materialized: the kit is megabytes, and
-    // writing it out only to refuse the call is work for nothing.
+    // Resolved before anything is materialized: the kit is megabytes, and writing it out only to
+    // refuse the call is work for nothing.
     let runtime = managed_runtime()?;
     let op = request
         .get("op")
@@ -446,8 +350,8 @@ async fn invoke(mut request: Value) -> Result<Value> {
         .join(KIT_SCRATCH_NAME)
         .join(format!("result-{nonce}.json"));
 
-    // The runner owns both paths, so a caller can never point the kit at a file
-    // of its own choosing; the font is materialized beside the kit.
+    // The runner owns both paths, so a caller can never point the kit at a file of its own
+    // choosing; the font is materialized beside the kit.
     request["result"] = Value::String(result_path.to_string_lossy().into_owned());
     request["font"] = Value::String(dir.join(KIT_FONT_NAME).to_string_lossy().into_owned());
 
@@ -469,12 +373,9 @@ async fn invoke(mut request: Value) -> Result<Value> {
     outcome
 }
 
-/// The managed script runtime, or the mahbot-side fault that says why the
-/// document kit cannot run: nothing here is the request's fault, so it carries
-/// the `internal` token the model needs to tell it from a call it can fix. The
-/// path is absent both when the runtime is not installed and while the product
-/// replaces it at startup, so the message says it is unavailable rather than
-/// claiming an install state this side cannot know.
+/// The managed script runtime, or the mahbot-side fault saying why the kit cannot run: nothing
+/// here is the request's fault, so it carries the `internal` token. The path is absent both when
+/// the runtime is not installed and while the product replaces it at startup.
 fn managed_runtime() -> Result<PathBuf> {
     crate::tools::bun::bun_binary_path().ok_or_else(|| {
         crate::tools::internal_fault(
@@ -483,13 +384,12 @@ fn managed_runtime() -> Result<PathBuf> {
     })
 }
 
-/// Run the kit on the managed runtime with the kit directory as cwd: the
-/// materialized script, then the request file as its argument.
+/// Run the kit on the managed runtime with the kit directory as cwd: the materialized script,
+/// then the request file as its argument.
 ///
-/// A failure of the RUN itself — one that timed out, was killed or would not
-/// start — is the product's own, and the runner reports it with its own class
-/// token ("timeout:", "io:", "terminated:"), as it does for the custom tool:
-/// the model reads one class and a subject, not two classes for one failure.
+/// A failure of the RUN itself — a timeout, a kill, one that would not start — is the product's
+/// own, reported with its own class token ("timeout:", "io:", "terminated:"), so the model reads
+/// one class and a subject.
 async fn run_kit(dir: &Path, runtime: &Path, request_path: &Path) -> Result<String> {
     let args: Vec<String> = crate::tools::bun::SCRIPT_GUARDS
         .iter()
@@ -499,20 +399,18 @@ async fn run_kit(dir: &Path, runtime: &Path, request_path: &Path) -> Result<Stri
             request_path.to_string_lossy().into_owned(),
         ])
         .collect();
-    // The kit is the product's own code and needs none of the owner's
-    // environment, which is what this entry point is for.
+    // The kit is the product's own code and needs none of the owner's environment, which is what
+    // this entry point is for.
     crate::tools::shell::run_internal_program_with_timeout(dir, runtime, &args, "the document kit")
         .await
 }
 
 /// Read and parse the kit's result file.
 ///
-/// A missing or unreadable result file, or an `ok: false` the kit did NOT blame
-/// on the request, is a mahbot-side fault ([`crate::tools::internal_fault`]): the
-/// kit's own code failed on data it is supposed to handle. A failure the kit DID
-/// blame on the request (`"class": "usage"` — a page the document does not have,
-/// a field it does not declare) carries the `usage` token instead, because the
-/// model can fix that by changing the call.
+/// A missing or unreadable result file, or an `ok: false` the kit did NOT blame on the request, is
+/// a mahbot-side fault ([`crate::tools::internal_fault`]): the kit's own code failed on data it
+/// handles. A failure the kit DID blame on the request (`"class": "usage"`) carries the `usage`
+/// token instead, because the model can fix that by changing the call.
 async fn read_result(path: &Path, output: &str, op: &str) -> Result<Value> {
     let bytes = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
@@ -554,24 +452,20 @@ async fn read_result(path: &Path, output: &str, op: &str) -> Result<Value> {
     )))
 }
 
-/// The materialized-kit directory for THIS build's kit bytes, prepared on every
-/// call so a kit file that is missing or truncated is restored before the call
-/// runs. The path itself is cached; the length-checked writes are not, because
-/// the files may have gone with the directory (and the first write moves
-/// megabytes onto the disk, so it is done through async I/O rather than on a
-/// worker thread that could be running other work).
+/// The materialized-kit directory for THIS build's kit bytes, prepared on every call so a missing
+/// or truncated kit file is restored before the call runs. The path is cached; the length-checked
+/// writes are not, because the files may have gone with the directory (and the first write moves
+/// megabytes onto the disk, so it uses async I/O rather than a worker thread).
 async fn kit_directory() -> Result<&'static Path> {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
-    // Once per process, and before this call's own request is written: the sweep
-    // is what a killed run cannot do for itself, and `OnceCell` is what makes
-    // the ordering hold — every caller waits for it, so none of them can have a
-    // file inside the directory it clears.
+    // Once per process, and before this call's own request is written: the sweep is what a
+    // killed run cannot do for itself, and `OnceCell` makes the ordering hold — every caller
+    // waits for it, so none can have a file inside the directory it clears.
     static SWEPT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-    // The kit is materialized under the storage root rather than a temp root so
-    // that no tool-accessible root an agent may write reaches it — except the
-    // admin Assistant's own reach, which the module docs name as the accepted
-    // limit of a location rule. Boot resolves the storage root before any agent
-    // runs, so its absence here is a boot-order bug, not the caller's fault.
+    // The kit is materialized under the storage root rather than a temp root so that no
+    // tool-accessible root an agent may write reaches it — except the admin Assistant's own reach,
+    // the accepted limit the module docs name. Boot resolves the storage root before any agent
+    // runs, so its absence here is a boot-order bug.
     let root = crate::config::CONFIG.try_storage_root().ok_or_else(|| {
         crate::tools::internal_fault(
             "the document kit cannot be prepared: the storage root is not resolved",
@@ -600,7 +494,6 @@ fn content_version() -> String {
     hex[..KIT_HASH_BYTES * 2].to_string()
 }
 
-/// Create the kit directory and put both files in place.
 async fn materialize(dir: &Path) -> std::io::Result<()> {
     tokio::fs::create_dir_all(dir).await?;
     write_if_missing(&dir.join(KIT_SCRIPT_NAME), KIT_SCRIPT).await?;
@@ -749,9 +642,8 @@ mod tests {
         assert!(error.to_string().starts_with("internal: "), "{error}");
     }
 
-    /// The kit file is written once per content version and then left alone: only
-    /// a file of the wrong LENGTH is a leftover to replace, and no temporary
-    /// sibling survives either outcome.
+    /// The kit file is written once per content version and then left alone: only a file of the
+    /// wrong LENGTH is a leftover to replace, and no temporary sibling survives either outcome.
     #[tokio::test]
     async fn write_if_missing_keeps_a_complete_copy_and_replaces_a_partial_one() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -781,10 +673,9 @@ mod tests {
         assert_eq!(names, ["kit.js"], "no temporary sibling is left behind");
     }
 
-    /// Only the version in use survives, and its scratch starts empty: an older
-    /// version's directory is megabytes nothing else sweeps away, and a killed
-    /// run's request and result files would otherwise stay in the storage root
-    /// for good.
+    /// Only the version in use survives, and its scratch starts empty: an older version's
+    /// directory is megabytes nothing else sweeps away, and a killed run's request and result
+    /// files would otherwise stay in the storage root for good.
     #[tokio::test]
     async fn the_kit_directory_is_swept_once() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -818,8 +709,8 @@ mod tests {
         );
     }
 
-    /// An edited `kit.js` without a rebuild changes nothing and would otherwise
-    /// fail nothing, leaving the embedded bytes and their source out of step.
+    /// An edited `kit.js` without a rebuild changes nothing and would otherwise fail nothing,
+    /// leaving the embedded bytes and their source out of step.
     #[test]
     fn the_committed_bundle_is_the_build_of_the_committed_sources() {
         let mut hasher = Sha256::new();

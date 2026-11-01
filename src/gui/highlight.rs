@@ -1,16 +1,14 @@
 //! Tree-sitter syntax highlighting for diff code lines and the code editor.
 //!
-//! Provides per-language highlight queries that classify token spans into
-//! categories (keyword, string, comment, type, function, number, operator).
+//! Per-language highlight queries classify token spans into categories (keyword, string, comment,
+//! type, function, number, operator).
 //!
-//! Diff view: files are parsed in their entirety — the caller reads the old
-//! version (via `git show HEAD:<path>`) and new version (from disk), then
-//! passes the complete source to [`parse_file_highlights`] which distributes
-//! tree-sitter captures across lines. This preserves multi-line context
-//! for block comments, docstrings, and multi-line strings.
+//! Diff view: files are parsed in their entirety — the caller reads the old version (via
+//! `git show HEAD:<path>`) and the new one (from disk), then passes the complete source to
+//! [`parse_file_highlights`], which distributes tree-sitter captures across lines. That preserves
+//! the multi-line context of block comments, docstrings and multi-line strings.
 //!
-//! Editor: [`parse_highlights`] classifies a single in-memory buffer the
-//! same way for the live editor widget.
+//! Editor: [`parse_highlights`] classifies a single in-memory buffer the same way.
 
 use iced::Color;
 use std::collections::HashMap;
@@ -35,22 +33,17 @@ use tree_sitter_toml_ng::HIGHLIGHTS_QUERY as TOML_HIGHLIGHTS_QUERY;
 use super::text_rendering::MAX_HIGHLIGHT_SIZE;
 use super::theme;
 
-// ── Compiled query cache — avoids re-parsing query patterns per line ───
-
-// Note: MARKDOWN_INLINE_QUERY is not part of this array because the inline
-// grammar is a separate tree-sitter language (MD_INLINE_LANG) not tied to
-// the HighlightLanguage::Markdown variant (which uses the block grammar).
+// MARKDOWN_INLINE_QUERY is not part of this array: the inline grammar is a separate
+// tree-sitter language (MD_INLINE_LANG), not the block grammar of `HighlightLanguage::Markdown`.
 static MARKDOWN_INLINE_QUERY: OnceLock<Option<Query>> = OnceLock::new();
 
-/// Per-language highlight query cache, indexed by `#[repr(usize)]`
-/// discriminant of [`HighlightLanguage`]. Initialised lazily on first
-/// access via [`cached_query`]. Array size is automatically determined
-/// from the enum variant count via `strum::EnumCount`.
+/// Per-language highlight query cache, indexed by the `#[repr(usize)]` discriminant of
+/// [`HighlightLanguage`], initialised lazily via [`cached_query`].
 static QUERIES: [OnceLock<Option<Query>>; HighlightLanguage::COUNT] =
     [const { OnceLock::new() }; HighlightLanguage::COUNT];
 
-/// Get (or compile) the highlight query for a language.
-/// Returns None if the query is invalid (should not happen with baked-in queries).
+/// Get (or compile) the highlight query for a language. `None` if the query is invalid (it
+/// should not be, with baked-in queries).
 fn cached_query(lang: HighlightLanguage) -> Option<&'static Query> {
     let cell = &QUERIES[lang as usize];
     cell.get_or_init(|| {
@@ -63,11 +56,8 @@ fn cached_query(lang: HighlightLanguage) -> Option<&'static Query> {
 /// A color-coded span within a single line of code.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HighlightSpan {
-    /// Byte offset within the line (not the file).
     pub start: usize,
-    /// Byte offset within the line (exclusive).
     pub end: usize,
-    /// The CSS-like class name for styling.
     pub highlight_class: HighlightClass,
 }
 
@@ -81,7 +71,6 @@ pub struct FileHighlights {
 }
 
 impl FileHighlights {
-    /// Empty highlights — every line gets an empty vec (caller renders as plain text).
     #[must_use]
     pub fn empty(line_count: usize) -> Self {
         Self {
@@ -94,54 +83,33 @@ impl FileHighlights {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HighlightClass {
     Keyword,
-    /// String literals
     String,
-    /// Type names (struct, enum, class, trait names both in definition and use)
     Type,
-    /// Function/method names
     Function,
-    /// Comments (single-line and block)
     Comment,
-    /// Numeric literals
     Number,
-    /// Operators and punctuation
     Operator,
-    /// Default — no special highlighting
     Text,
 }
 
 impl HighlightClass {
     /// Map to a theme color.
-    ///
-    /// Uses a neutral/muted palette inspired by the ayu dark theme (Zed editor).
-    /// All values are opaque — no alpha blending is applied here.
     #[must_use]
     pub const fn color(self) -> Color {
         match self {
-            // Ayu dark keyword: #D580FF (purple)
             HighlightClass::Keyword => Color::from_rgb(0.835, 0.502, 1.0),
-            // Ayu dark string: #C2D94C (olive green)
             HighlightClass::String => Color::from_rgb(0.761, 0.851, 0.298),
-            // Ayu dark type: #59C2FF (sky blue)
             HighlightClass::Type => Color::from_rgb(0.349, 0.761, 1.0),
-            // Ayu dark function: #FFB454 (warm orange)
             HighlightClass::Function => Color::from_rgb(1.0, 0.706, 0.329),
-            // Ayu dark comment: #5A6673 (muted blue-gray)
             HighlightClass::Comment => Color::from_rgb(0.353, 0.400, 0.451),
-            // Ayu dark number: #5CCFFF (light cyan)
             HighlightClass::Number => Color::from_rgb(0.361, 0.812, 1.0),
-            // Ayu dark operator: #F29668 (peach)
             HighlightClass::Operator => Color::from_rgb(0.949, 0.588, 0.408),
-            // Default text — matches the dashboard's primary text color
             HighlightClass::Text => theme::TEXT_PRIMARY,
         }
     }
 }
 
-/// Parse file highlights with a fresh tree-sitter parser, unless the
-/// content exceeds [`super::text_rendering::MAX_HIGHLIGHT_SIZE`]
-/// (returns `None` so callers fall back to plain text rendering).
-/// Shared entry point for the editor and diff widgets.
+/// Parse file highlights with a fresh tree-sitter parser, unless the language has none.
 #[must_use]
 pub(crate) fn parse_highlights(content: &str, lang: HighlightLanguage) -> Option<FileHighlights> {
     if content.len() > MAX_HIGHLIGHT_SIZE {
@@ -152,16 +120,6 @@ pub(crate) fn parse_highlights(content: &str, lang: HighlightLanguage) -> Option
 }
 
 /// Parse an entire source file and return per-line highlight spans.
-///
-/// Parses the complete file with tree-sitter and distributes capture spans
-/// across lines. The returned `FileHighlights` maps line index (0-based)
-/// to spans with byte offsets relative to each line's start.
-///
-/// Lines with no captures get an empty `Vec` — the caller should render
-/// those lines as plain text.
-///
-/// For Markdown, delegates to `parse_markdown_highlights` which uses
-/// the dual-grammar (block + inline) parsing approach.
 #[must_use]
 pub(crate) fn parse_file_highlights(
     parser: &mut Parser,
@@ -187,15 +145,8 @@ pub(crate) fn parse_file_highlights(
     build_highlights_from_tree(&tree, source, query_obj)
 }
 
-/// Parse a Markdown source file using the dual-grammar approach.
-///
-/// 1. Parse with block grammar → collect block captures.
-/// 2. Walk block tree for inline content nodes → re-parse each range
-///    with inline grammar → collect inline captures.
-/// 3. Both capture sets are sorted together and distributed to lines.
-///    When block and inline spans overlap, the distribution loop
-///    pushes both; the inline span typically comes later in sorted
-///    order and wins visually when colors differ.
+/// Parse a Markdown source file using the dual-grammar approach: the block grammar for the
+/// document, the inline grammar for its inline content.
 #[must_use]
 fn parse_markdown_highlights(source: &str) -> FileHighlights {
     let mut markdown_parser = MarkdownParser::default();
@@ -206,18 +157,11 @@ fn parse_markdown_highlights(source: &str) -> FileHighlights {
 }
 
 /// Build per-line highlight spans from an already-parsed [`MarkdownTree`].
-///
-/// Runs the block highlight query, then the inline highlight query on each
-/// inline content tree. Both capture sets are collected into a single
-/// sorted byte-span list and distributed to lines via
-/// [`distribute_byte_spans`]. Used by the editor highlighter which reuses
-/// a persistent [`MarkdownParser`] across edits.
 #[must_use]
 fn build_markdown_highlights_from_tree(
     markdown_tree: &MarkdownTree,
     source: &str,
 ) -> FileHighlights {
-    // ── 1. Collect block-level highlights ──────────────────────────
     let mut byte_spans: Vec<(usize, usize, HighlightClass)> = Vec::new();
     if let Some(query) = cached_query(HighlightLanguage::Markdown) {
         let block_tree = markdown_tree.block_tree();
@@ -241,7 +185,6 @@ fn build_markdown_highlights_from_tree(
         }
     }
 
-    // ── 2. Collect inline-level highlights ─────────────────────────
     let inline_query = MARKDOWN_INLINE_QUERY.get_or_init(|| {
         let inline_lang: Language = MD_INLINE_LANG.into();
         Query::new(&inline_lang, MD_HIGHLIGHT_QUERY_INLINE).ok()
@@ -269,20 +212,10 @@ fn build_markdown_highlights_from_tree(
 
     byte_spans.sort_by_key(|(s, e, _)| (*s, *e));
 
-    // ── 3. Distribute byte spans to lines ──────────────────────────
     distribute_byte_spans(source, &byte_spans)
 }
 
-/// Distribute byte-offset spans across lines, with gap-filling and
-/// converting to line-relative offsets.
-///
-/// # Overlap handling
-///
-/// When multiple spans overlap at the same byte range (e.g. a delimiter
-/// span and its parent formatting span), the span with higher paint
-/// priority wins for that byte range. Delimiter spans (`Operator`) beat
-/// parent emphasis/strong spans (`Function` / `Keyword`), so both opening
-/// and closing `*` / `**` delimiters keep delimiter color.
+/// Distribute byte-offset spans across lines, with gap-filling and class precedence.
 #[must_use]
 fn distribute_byte_spans(
     source: &str,
@@ -358,7 +291,6 @@ fn distribute_byte_spans(
             });
         }
 
-        // Merge adjacent spans with the same class.
         let mut merged: Vec<HighlightSpan> = Vec::with_capacity(line_spans.len());
         for span in line_spans {
             if let Some(last) = merged.last_mut() {
@@ -376,7 +308,7 @@ fn distribute_byte_spans(
     FileHighlights { spans: lines }
 }
 
-/// Lower values win when spans overlap at the same byte offset.
+// Lower values win when spans overlap at the same byte offset.
 const fn span_paint_priority(class: HighlightClass) -> u8 {
     match class {
         HighlightClass::Operator => 0,
@@ -391,9 +323,6 @@ const fn span_paint_priority(class: HighlightClass) -> u8 {
 }
 
 /// Build per-line highlight spans from an already-parsed tree-sitter tree.
-///
-/// Collects capture spans from the tree and delegates to
-/// [`distribute_byte_spans`] for line distribution.
 #[must_use]
 fn build_highlights_from_tree(
     tree: &tree_sitter::Tree,
@@ -473,7 +402,7 @@ fn capture_class(capture_name: &str) -> HighlightClass {
         "variable" | "variable.builtin" | "variable.parameter" | "parameter" | "spell" => {
             HighlightClass::Text
         }
-        // ── Markdown block captures ──────────────────────────────────────
+        // Markdown block captures
         // Headings — use Type for distinctive color
         "text.title" => HighlightClass::Type,
         // Code blocks / literal text — use String style
@@ -482,7 +411,7 @@ fn capture_class(capture_name: &str) -> HighlightClass {
         "text.uri" => HighlightClass::Function,
         // Link labels / references — plain text
         "text.reference" => HighlightClass::Text,
-        // ── Markdown inline captures ─────────────────────────────────────
+        // Markdown inline captures
         //
         // text.emphasis and text.strong only come from the inline query —
         // not the block query. The inline query is applied per-inline-tree
@@ -497,7 +426,7 @@ fn capture_class(capture_name: &str) -> HighlightClass {
     }
 }
 
-// ── Language definitions ──────────────────────────────────────────────
+// Language definitions
 
 /// Supported languages for syntax highlighting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumCount, strum::VariantArray)]
@@ -533,8 +462,7 @@ impl HighlightLanguage {
     /// Delegates to the canonical mapping in
     /// [`crate::util::tree_sitter::tree_sitter_language_for_extension`],
     /// then looks up the returned tree-sitter [`Language`] in the
-    /// reverse-lookup map to obtain the corresponding [`HighlightLanguage`]
-    /// variant.
+    /// reverse-lookup map to obtain the corresponding [`HighlightLanguage`] variant.
     #[must_use]
     pub fn from_extension(ext: &str) -> Option<Self> {
         let lang = crate::util::tree_sitter::tree_sitter_language_for_extension(ext)?;
@@ -610,7 +538,7 @@ impl HighlightLanguage {
     }
 }
 
-// ── Highlight queries ─────────────────────────────────────────────────
+// Highlight queries
 // These queries use tree-sitter's pattern syntax to capture tokens.
 // Each capture name maps to a HighlightClass via capture_class().
 

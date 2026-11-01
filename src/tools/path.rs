@@ -1,71 +1,55 @@
-//! Path validation and resolution functions for tool operations.
+//! Path validation and resolution for tool file operations.
 //!
-//! This module implements the path boundary for all tool file operations. The
-//! boundary itself is the tool's [`PathAccess`], fixed when a role's toolset is
+//! The boundary itself is the tool's [`PathAccess`], fixed when a role's toolset is
 //! built: the guest Assistant's workspace-only frame, the pipeline roles' read
-//! allowlist (temp files, dependency caches) and the admin Assistant's
-//! unrestricted access.
+//! allowlist (temp files, dependency caches) and the admin Assistant's unrestricted access.
 //!
 //! Two product rules hold whatever the level. The service's own live stores are
-//! refused by location ([`StoreFile`]) for every read and every write. A write
-//! is refused inside a managed workspace too — but that second rule binds only
-//! the unrestricted writer ([`unrestricted_write_refusal`]): a confined write
-//! is inside its own workspace, where the case never arises.
+//! refused by location ([`StoreFile`]) for every read and every write. A write is
+//! refused inside a managed workspace too, but that second rule binds only the
+//! unrestricted writer ([`unrestricted_write_refusal`]).
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-/// What a file tool may reach. The level is fixed when a role's toolset is
-/// built ([`crate::Role::tools`]), so it is a property of the tool instance and
-/// never of a call.
+/// What a file tool may reach. The level is fixed when a role's toolset is built
+/// ([`crate::Role::tools`]), never per call.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PathAccess {
-    /// The guest Assistant: the workspace alone.
     Workspace,
-    /// The pipeline roles, and every general read: the workspace plus the read
-    /// allowlist (dependency caches, SDK headers, temp roots, spill files).
-    /// Writes have no extra allowed paths, so this reads as [`Self::Workspace`]
-    /// for them.
+    /// The pipeline roles, and every general read: the workspace plus the read allowlist
+    /// (dependency caches, SDK headers, temp roots, spill files). Writes have no extra
+    /// allowed paths, so this reads as [`Self::Workspace`] for them.
     Allowlisted,
-    /// The admin Assistant: any path the shell could name, minus the two places
-    /// the product keeps to itself (see [`StoreFile`] and
-    /// [`unrestricted_write_refusal`]).
+    /// The admin Assistant: any path the shell could name, minus the two places the
+    /// product keeps to itself (see [`StoreFile`] and [`unrestricted_write_refusal`]).
     Unrestricted,
 }
 
 /// True when `s` contains glob metacharacters (`*`, `?`, `[`, and optionally `]`).
-///
-/// `include_close_bracket` preserves per-site semantics: the read tool treats a
-/// lone `]` as a glob signal, the shell readonly sandbox does not.
+/// `include_close_bracket` preserves per-site semantics: the read tool treats a lone
+/// `]` as a glob signal, the shell readonly sandbox does not.
 #[must_use]
 pub(crate) fn contains_glob(s: &str, include_close_bracket: bool) -> bool {
     s.contains(['*', '?', '[']) || (include_close_bracket && s.contains(']'))
 }
 
-/// Shell-quote a string for safe interpolation into a POSIX shell command.
-///
-/// Wraps the value in single quotes; embedded `'` is escaped as `'\''`
-/// (terminate, insert escaped quote, resume). Single quotes suppress all
-/// expansion, so spaces, `$`, backticks, backslashes, and glob characters
-/// pass through literally.
+/// Shell-quote a string for safe interpolation into a POSIX shell command: single quotes,
+/// with an embedded `'` escaped as `'\''`. Single quotes suppress all expansion, so spaces,
+/// `$`, backticks, backslashes and glob characters pass through literally.
 pub(crate) fn shell_quote(s: &str) -> String {
     let escaped = s.replace('\'', "'\\''");
     format!("'{escaped}'")
 }
 
-/// Canonicalize the parent directory of `path` and join the original file name.
+/// Canonicalize the parent directory of `path` and join the original file name — the
+/// strategy shared by [`resolve_directory_read_fallback`] and [`resolve_write_target`]: the
+/// parent is canonicalized (settling symlinks in the directory chain) while the final
+/// component is preserved, since the file may not exist yet.
 ///
-/// This is the common canonicalization strategy used by both
-/// [`resolve_directory_read_fallback`] and [`resolve_write_target`]: the parent
-/// directory is canonicalized (to resolve symlinks in the directory chain) while
-/// the final file component is preserved as-is (the file itself may not exist
-/// yet for write operations).
-///
-/// Returns an error if `path` has no parent or file_name component, or if
-/// [`tokio::fs::canonicalize`] fails on the parent directory. The verbatim prefix
-/// is dropped (see [`crate::util::strip_verbatim_prefix`]), so the tool hands on
-/// the plain spelling.
+/// Errors when `path` has no parent or file name component, or canonicalization fails. The
+/// verbatim prefix is dropped ([`crate::util::strip_verbatim_prefix`]).
 async fn canonicalize_parent_and_join(path: &Path) -> std::io::Result<PathBuf> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent directory")
@@ -77,12 +61,9 @@ async fn canonicalize_parent_and_join(path: &Path) -> std::io::Result<PathBuf> {
     Ok(crate::util::strip_verbatim_prefix(&canon_parent).join(name))
 }
 
-/// Fallback directory resolution when full-path [`canonicalize`] fails with
-/// `NotFound` but the lexical path still exists as a directory.
-///
-/// Uses parent canonicalization + final component (same strategy as write-mode
-/// path resolution) so existing directories are listable even when agents omit
-/// a trailing `/` or when full-path canonicalization fails on edge-case paths.
+/// Fallback directory resolution when full-path [`canonicalize`] fails with `NotFound` but
+/// the lexical path still exists as a directory: parent canonicalization plus the final
+/// component, so existing directories are listable even without a trailing `/`.
 async fn resolve_directory_read_fallback(full_path: &Path) -> Option<PathBuf> {
     let meta = tokio::fs::symlink_metadata(full_path).await.ok()?;
     if !meta.is_dir() {
@@ -102,24 +83,17 @@ async fn resolve_directory_read_fallback(full_path: &Path) -> Option<PathBuf> {
 
 /// Resolve and validate a file target for write/edit operations.
 ///
-/// For every access but [`PathAccess::Unrestricted`], path validation is
-/// [`is_path_safe_for_workspace`] (pre- and post-canonicalization): the write
-/// stays inside the workspace, where the extra *read* paths (spill files,
-/// dependency caches) are not writable either.
+/// For every access but [`PathAccess::Unrestricted`], validation is
+/// [`is_path_safe_for_workspace`] (pre- and post-canonicalization): the write stays inside
+/// the workspace, where the extra *read* paths are not writable either.
 ///
-/// Additional security:
 /// 1. Canonicalize the **parent** directory only — the file itself may not exist yet.
-/// 2. Symlink check: if the target exists and is a symlink, refuse (unlike reading,
-///    where `canonicalize` resolves through symlinks safely).
+/// 2. Symlink check: if the target exists and is a symlink, refuse (reading resolves
+///    through symlinks safely).
 /// 3. If `ensure_parent` is `true`, creates parent directories before canonicalizing.
 ///
-/// [`PathAccess::Unrestricted`] (the admin Assistant) instead reaches anything
-/// the shell could, minus two places, and resolves the file the write would
-/// really land in — see [`resolve_unrestricted_write`].
-///
-/// See [`resolve_read_target`] for the read-side counterpart.
-///
-/// Returns `Ok(path)` on success, or an error message to propagate to the agent.
+/// [`PathAccess::Unrestricted`] instead reaches anything the shell could, minus two places,
+/// and resolves the file the write would really land in ([`resolve_unrestricted_write`]).
 pub(crate) async fn resolve_write_target(
     workspace_root: &Path,
     path: &str,
@@ -132,9 +106,8 @@ pub(crate) async fn resolve_write_target(
         return resolve_unrestricted_write(workspace_root, &full_path, path, ensure_parent).await;
     }
 
-    // The live stores are an invariant of the product, not a rule of a role:
-    // refused by location for every holder, before anything is created. It can
-    // only bite here if a workspace covers the store directory.
+    // The live stores are an invariant of the product, not a rule of a role: refused by
+    // location for every holder, before anything is created.
     if let Some(StoreFile::Live) = product_store_file(&full_path) {
         return Err(live_store_refusal("write to", path));
     }
@@ -163,9 +136,8 @@ pub(crate) async fn resolve_write_target(
         .await
         .context("Failed to resolve file path")?;
 
-    // The post-canonicalization half of the store rule, as on the read side: a
-    // parent that is a symlink into the store directory is not visible in the
-    // spelling, and the resolved file is what would be opened.
+    // The post-canonicalization half of the store rule: a parent that is a symlink into the
+    // store directory is not visible in the spelling, and the resolved file is what is opened.
     if let Some(StoreFile::Live) = product_store_file(&resolved_target) {
         return Err(live_store_refusal("write to", path));
     }
@@ -200,10 +172,8 @@ pub(crate) async fn resolve_write_target(
     Ok(resolved_target)
 }
 
-/// Refuse a write whose target already exists as anything but a regular file:
-/// a device, a socket or a FIFO has no bounded read — and the edit tool reads
-/// the file it edits — and a directory is not what any caller means to write
-/// over.
+/// Refuse a write whose target already exists as anything but a regular file: a device, a
+/// socket or a FIFO has no bounded read, and a directory is not what any caller writes over.
 async fn refuse_non_regular_target(resolved_target: &Path, requested: &str) -> anyhow::Result<()> {
     if let Ok(meta) = tokio::fs::symlink_metadata(resolved_target).await
         && !meta.is_file()
@@ -218,15 +188,13 @@ async fn refuse_non_regular_target(resolved_target: &Path, requested: &str) -> a
     Ok(())
 }
 
-/// Resolve a write for the admin's Assistant: any path the shell could name,
-/// minus two places — the product's own store files, and the managed
-/// workspaces, whose work belongs to their own Manager.
+/// Resolve a write for the admin's Assistant: any path the shell could name, minus two
+/// places — the product's own store files, and the managed workspaces, whose work belongs to
+/// their own Manager.
 ///
-/// The decision is made on the file the write would really land in: the deepest
-/// existing ancestor is canonicalized, so every symlink and `..` on the way —
-/// the final component included — is settled before the checks read the path.
-/// Nothing is created on disk until every check has passed, so a refused write
-/// leaves no directory behind.
+/// The decision is made on the file the write would really land in: the deepest existing
+/// ancestor is canonicalized, so every symlink and `..` on the way is settled before the
+/// checks read the path. Nothing is created until every check has passed.
 async fn resolve_unrestricted_write(
     own_workspace: &Path,
     full_path: &Path,
@@ -236,17 +204,13 @@ async fn resolve_unrestricted_write(
     let resolved = resolve_through_existing_ancestor(full_path)
         .await
         .with_context(|| format!("Failed to resolve file path: {}", full_path.display()))?;
-    // A dangling final component is a link the walk above cannot settle (its
-    // target does not exist yet): it is followed to the file it names, which is
-    // the file the write really lands in — the shell would create that same
-    // file through the link.
+    // A dangling final component is a link the walk above cannot settle: it is followed to
+    // the file it names, which is the file the write really lands in.
     let resolved = follow_final_links(resolved).await?;
 
-    // The list is read before anything is judged, so an unreadable list is
-    // a refusal rather than a silently empty one.
+    // The list is read before anything is judged, so an unreadable one is a refusal.
     let managed = managed_workspace_paths(requested).await?;
-    // Only the resolved file is judged: the file the write really lands in is
-    // what decides, never the spelling it came in as.
+    // Only the resolved file is judged, never the spelling it came in as.
     if let Some(err) = unrestricted_write_refusal(own_workspace, &resolved, requested, &managed) {
         return Err(err);
     }
@@ -262,13 +226,9 @@ async fn resolve_unrestricted_write(
     Ok(resolved)
 }
 
-/// The refusal a write of the admin's Assistant meets, or `None` when the write
-/// is allowed. Both refusals are by location and neither by content: the
-/// product's own store files (never opened to find out what they are), and the
-/// managed workspaces, whose work belongs to their own manager.
-/// `own_workspace` — the admin's own working folder — outranks the second rule,
-/// so a personal folder that happens to sit inside a managed workspace
-/// stays writable.
+/// The refusal a write of the admin's Assistant meets, or `None` when it is allowed. Both
+/// refusals are by location, neither by content. `own_workspace` — the admin's own working
+/// folder — outranks the managed-workspace rule, so a personal folder inside one stays writable.
 fn unrestricted_write_refusal(
     own_workspace: &Path,
     candidate: &Path,
@@ -301,18 +261,16 @@ fn unrestricted_write_refusal(
         })
 }
 
-/// The managed workspaces, by name and path.
-///
-/// An unreadable list is an error, never an empty one: a write that cannot see
-/// which areas belong to managed workspaces is refused rather than guessed at.
-/// The consequence is accepted — while the product's stores are unavailable,
-/// the admin cannot write into its own memory either.
+/// The managed workspaces, by name and path. An unreadable list is an error, never an empty
+/// one: a write that cannot see which areas belong to managed workspaces is refused rather
+/// than guessed at. Accepted consequence: while the stores are unavailable, the admin cannot
+/// write into its own memory either.
 async fn managed_workspace_paths(requested: &str) -> anyhow::Result<Vec<(String, PathBuf)>> {
     managed_workspace_paths_from(crate::users::managed_workspaces().await, requested)
 }
 
-/// [`managed_workspace_paths`] over an already-read list, so the refusal an
-/// unreadable one meets is decided without the store.
+/// [`managed_workspace_paths`] over an already-read list, so the unreadable-list refusal is
+/// decided without the store.
 fn managed_workspace_paths_from(
     read: anyhow::Result<Vec<crate::Workspace>>,
     requested: &str,
@@ -332,19 +290,14 @@ fn managed_workspace_paths_from(
     })
 }
 
-/// Canonicalize the deepest existing ancestor of `path` and re-append the
-/// components below it — the resolution a target that does not exist yet needs,
-/// so every symlink and `..` on the way is settled before any check reads the
-/// path. Nothing is created on disk.
+/// Canonicalize the deepest existing ancestor of `path` and re-append the components below
+/// it — the resolution a target that does not exist yet needs. Nothing is created on disk.
 ///
-/// The walk keeps the caller's own spelling: a `..` behind a symlinked component
-/// is settled by the filesystem, as the shell settles it. Only the components
-/// below the deepest existing ancestor are resolved lexically (they do not
-/// exist, so no symlink can hide in them) — where a component on the way is a
-/// *dangling* symlink, no ancestor including it canonicalizes and the tail stays
-/// lexical, so the path lands beside the link where the shell's own open would
-/// fail. Both the checks and the write use the same resolved path, so no
-/// boundary is crossed.
+/// The walk keeps the caller's own spelling: a `..` behind a symlinked component is settled
+/// by the filesystem, as the shell settles it. Only the components below the deepest existing
+/// ancestor are resolved lexically. Where a component on the way is a *dangling* symlink, no
+/// ancestor including it canonicalizes and the tail stays lexical. Both the checks and the
+/// write use the same resolved path, so no boundary is crossed.
 async fn resolve_through_existing_ancestor(path: &Path) -> std::io::Result<PathBuf> {
     let components: Vec<std::path::Component<'_>> = path.components().collect();
     let mut last_error = None;
@@ -373,15 +326,14 @@ async fn resolve_through_existing_ancestor(path: &Path) -> std::io::Result<PathB
     }))
 }
 
-/// How many links a resolved path may end in before the chain is refused, as
-/// the shell refuses a link loop.
+/// How many links a resolved path may end in before the chain is refused, as the shell
+/// refuses a link loop.
 const MAX_FINAL_LINKS: usize = 32;
 
 /// Settle a chain of symlinks at the END of `resolved` — the part
-/// [`resolve_through_existing_ancestor`] cannot canonicalize, because the file
-/// it names does not exist yet. Each link is replaced by the file it points at
-/// and resolved in turn, so the returned path is a name that is not a link (or
-/// does not exist at all). Nothing is created.
+/// [`resolve_through_existing_ancestor`] cannot canonicalize because the file does not exist
+/// yet. Each link is replaced by the file it points at and resolved in turn, so the returned
+/// path is not a link (or does not exist at all). Nothing is created.
 async fn follow_final_links(resolved: PathBuf) -> std::io::Result<PathBuf> {
     let mut resolved = resolved;
     for _ in 0..MAX_FINAL_LINKS {
@@ -409,18 +361,13 @@ async fn follow_final_links(resolved: PathBuf) -> std::io::Result<PathBuf> {
 
 /// Resolve and validate a file path for read operations.
 ///
-/// `access` decides the boundary (see [`check_path_read_allowed`]), checked
-/// pre- and post-canonicalization. Whatever the access, a path that is neither
-/// a regular file nor a directory is refused: the read tool holds no bounded
-/// read for a device, a socket or a channel.
+/// `access` decides the boundary (see [`check_path_read_allowed`]), checked pre- and
+/// post-canonicalization. Whatever the access, a path that is neither a regular file nor a
+/// directory is refused: the read tool holds no bounded read for a device, a socket or a channel.
 ///
-/// Key differences from [`resolve_write_target`]:
-/// - Canonicalizes the **full path**, not just the parent (file must exist).
-/// - No `ensure_parent` parameter — parent creation is a write-only concept.
-/// - No explicit symlink refusal — `tokio::fs::canonicalize` resolves symlinks,
-///   so the post-canonicalization check catches escapes via the resolved path.
-///
-/// Returns `Ok(path)` on success, or an error message to propagate to the agent.
+/// Unlike [`resolve_write_target`] it canonicalizes the **full path** (the file must exist),
+/// has no parent creation, and refuses no symlink explicitly — `canonicalize` resolves them,
+/// so the post-canonicalization check catches escapes.
 pub(crate) async fn resolve_read_target(
     workspace_root: &Path,
     path: &str,
@@ -428,12 +375,11 @@ pub(crate) async fn resolve_read_target(
 ) -> anyhow::Result<PathBuf> {
     let full_path = resolve_tool_path_with_base(path, workspace_root, access)?;
 
-    // Pre-canonicalization check — allows EXTRA_READ_ALLOWED paths
-    // (temp files, dependency source directories) outside the workspace
+    // Pre-canonicalization check — allows EXTRA_READ_ALLOWED paths (temp files,
+    // dependency source directories) outside the workspace
     check_path_read_allowed(path, workspace_root, access)?;
 
-    // Canonicalize full path (file must exist). Resolves symlinks,
-    // so the post-canonicalization check catches escapes.
+    // Canonicalize full path (file must exist), which resolves symlinks.
     let resolved_path = match tokio::fs::canonicalize(&full_path).await {
         Ok(resolved) => crate::util::strip_verbatim_prefix(&resolved),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -453,10 +399,9 @@ pub(crate) async fn resolve_read_target(
 
     check_path_read_allowed(&resolved_path.to_string_lossy(), workspace_root, access)?;
 
-    // The read tool opens regular files and lists directories. Anything else —
-    // a device, a socket, a channel — has no bounded read and is refused for
-    // every role: the refusal is about what the tool can hold open, not about
-    // policy (which is what `access` decides above).
+    // The read tool opens regular files and lists directories. Anything else has no bounded
+    // read and is refused for every role: the refusal is about what the tool can hold open,
+    // not about policy.
     let meta = tokio::fs::metadata(&resolved_path)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", resolved_path.display()))?;
@@ -471,18 +416,13 @@ pub(crate) async fn resolve_read_target(
     Ok(resolved_path)
 }
 
-/// Resolve a file a tool's own output refers to — a resource a drawing points
-/// at, a nested drawing — to a path that may be loaded, or `None` when it must
-/// not be loaded at all.
+/// Resolve a file a tool's own output refers to — a resource a drawing points at, a nested
+/// drawing — to a path that may be loaded, or `None` when it must not be loaded at all.
 ///
-/// The same gate [`resolve_read_target`] puts in front of a read — on the
-/// spelling and on the canonical target — plus the two facts a read needs and a
-/// reference is held to just the same: a regular file (nothing else has a bounded
-/// read) and the caller's own size limit ([`super::MAX_FILE_SIZE_BYTES`]).
-///
-/// Synchronous, for a caller that resolves references while it renders rather
-/// than from an async task, and silent by design: a resource that fails any of
-/// this is refused by not being read, not by an error the caller has to handle.
+/// The same gate [`resolve_read_target`] puts in front of a read, on both spellings, plus the
+/// two facts a read needs: a regular file and the caller's own size limit
+/// ([`super::MAX_FILE_SIZE_BYTES`]). Silent by design: a resource that fails any of this is
+/// refused by not being read.
 pub(crate) fn resolve_reference_target(
     candidate: &Path,
     workspace_root: &Path,
@@ -495,30 +435,19 @@ pub(crate) fn resolve_reference_target(
     (meta.is_file() && meta.len() <= super::MAX_FILE_SIZE_BYTES).then_some(resolved)
 }
 
-/// Lexically normalize a path by resolving `.` and `..` components
-/// without filesystem access (no I/O).
+/// Lexically normalize a path by resolving `.` and `..` components without filesystem
+/// access (no I/O): no symlink resolution, no existence check, no canonicalization.
 ///
-/// This is a pure lexical transformation — it does not resolve symlinks,
-/// verify existence, or canonicalize. It is safe to call on paths that
-/// do not yet exist (e.g. target paths for write operations).
-///
-/// Algorithm:
-/// - `RootDir` components establish the root anchor.
-/// - `CurDir` (`.`) components are dropped.
-/// - `ParentDir` (`..`) components pop the last `Normal` component if
-///   one exists; if no `Normal` component remains and the path is
-///   absolute (has a root), the `..` is silently dropped (can't go above
-///   root); if relative, excess `..` are preserved.
-/// - `Normal` components are pushed sequentially.
+/// - `RootDir` components establish the root anchor; `CurDir` (`.`) components are dropped.
+/// - `ParentDir` (`..`) pops the last `Normal` component; with no `Normal` left an absolute
+///   path drops the `..` (it cannot go above root) while a relative path preserves it.
 ///
 /// # Limitations
 ///
-/// - Does not resolve symlinks. If a symlink within an allowed root
-///   points outside the root, lexical normalization cannot detect the
-///   escape — only filesystem-level canonicalization can.
-/// - A Windows `Prefix` component (`C:`, `\\?\C:`) is carried through as an
-///   absolute anchor — `..` cannot escape past it — and is otherwise left
-///   untouched, verbatim spelling included.
+/// - Does not resolve symlinks: a link inside an allowed root that points outside it is not
+///   detectable here — only filesystem-level canonicalization can see the escape.
+/// - A Windows `Prefix` component (`C:`, `\\?\C:`) is carried through as an absolute anchor —
+///   `..` cannot escape past it — and is otherwise left untouched, verbatim spelling included.
 #[must_use]
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     use std::path::Component;
@@ -548,9 +477,8 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
                     if matches!(last, Component::Normal(_)) {
                         normalized.pop();
                     } else {
-                        // Last component is RootDir, Prefix, or another ParentDir.
-                        // For absolute paths: can't go above root → drop `..`.
-                        // For relative paths: keep excess `..` as meaningful prefix.
+                        // Last component is RootDir, Prefix, or another ParentDir:
+                        // absolute paths drop the `..`, relative ones keep it as a prefix.
                         if !is_absolute {
                             normalized.push(component);
                         }
@@ -572,16 +500,12 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     result
 }
 
-/// Check whether a path is under any of the given roots, after tilde expansion
-/// and lexical normalization.
+/// Check whether a path is under any of the given roots, after tilde expansion and lexical
+/// normalization. A leading `~` is expanded to the user's home before comparing against the
+/// (already-expanded) roots.
 ///
-/// The path may contain a leading `~` (user-provided input before
-/// canonicalization). In that case the `~` is expanded to the user's
-/// home directory before comparing against the (already-expanded) roots.
-///
-/// The path is normalized (`.`, `..` resolved) *after* tilde expansion so that
-/// `../` segments introduced by tilde expansion or present in the original path
-/// cannot escape the allowed roots via lexical traversal. The comparison itself is
+/// Normalization happens *after* tilde expansion, so `../` segments introduced either way
+/// cannot escape the allowed roots by lexical traversal. The comparison is
 /// [`crate::util::is_within`], which settles the spelling on both sides.
 pub(crate) fn is_path_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
     let expanded = crate::util::expand_tilde(&path.to_string_lossy());
@@ -591,8 +515,8 @@ pub(crate) fn is_path_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
         .any(|root| crate::util::is_within(&normalized, root))
 }
 
-/// The canonical allowed temp/scratch roots (shared by the read-path
-/// allowlists and the read-only shell guard).
+/// The canonical allowed temp/scratch roots (shared by the read-path allowlists and the
+/// read-only shell guard).
 #[must_use]
 pub(crate) fn allowed_temp_roots() -> Vec<PathBuf> {
     ALLOWED_TEMP_ROOTS.clone()
@@ -603,11 +527,8 @@ fn is_path_in_extra_allowed(path: &Path) -> bool {
     is_path_under_roots(path, &EXTRA_READ_ALLOWED)
 }
 
-/// Whether two paths refer to the same file or directory.
-///
-/// First compares by direct structural equality; if that fails, falls back
-/// to canonicalizing both paths and comparing the canonical forms.
-/// Returns `false` if either path cannot be canonicalized.
+/// Whether two paths refer to the same file or directory: direct structural equality, else
+/// both canonicalized and compared. `false` if either cannot be canonicalized.
 fn paths_same_or_canonical(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
@@ -620,9 +541,9 @@ fn paths_same_or_canonical(a: &Path, b: &Path) -> bool {
 
 /// Whether `path` is an OS temp directory root (not merely nested under temp).
 ///
-/// Deliberately permissive: it accepts every spelling any platform uses for the
-/// temp location, while the daemon's own temp environment (`crate::temp`) holds
-/// only the names this platform actually pins and models.
+/// Deliberately permissive: it accepts every spelling any platform uses for the temp
+/// location, while the daemon's own temp environment (`crate::temp`) holds only the names
+/// this platform pins.
 fn is_os_temp_root(path: &Path) -> bool {
     let check_path = crate::util::expand_tilde(&path.to_string_lossy());
 
@@ -662,8 +583,7 @@ pub(crate) fn format_spill_filename() -> String {
     format!("spill_{:04x}.txt", rand::random::<u16>())
 }
 
-/// Whether `name` is a mahbot shell spill/full log name: `spill_XXXX.txt`
-/// (4-digit hex) or a `.full.log` suffix.
+/// Whether `name` is a mahbot shell spill/full log name: `spill_XXXX.txt` or `.full.log`.
 fn is_mahbot_spill_filename(name: &str) -> bool {
     if name.ends_with(".full.log") {
         return true;
@@ -690,59 +610,48 @@ fn is_mahbot_spill_shaped(path: &Path) -> bool {
         == Some(".agent")
 }
 
-/// Whether the grandparent directory of `path` is an OS temp/scratch root.
-///
-/// This is the "on OS temp" half of the spill-file check: for a spill path
-/// like `/tmp/.agent/spill_ab12.txt`, the grandparent is `/tmp/`, which is
-/// an OS temp root.  The shape check (`.agent` parent + spill filename) is
-/// separate — see [`is_mahbot_spill_shaped`].
+/// Whether the grandparent directory of `path` is an OS temp/scratch root — the "on OS temp"
+/// half of the spill-file check, e.g. `/tmp` for `/tmp/.agent/spill_ab12.txt`. The shape
+/// check is separate (see [`is_mahbot_spill_shaped`]).
 fn is_grandparent_temp_root(path: &Path) -> bool {
     path.parent()
         .and_then(|p| p.parent())
         .is_some_and(is_os_temp_root)
 }
 
-/// The product's own storage root — where its stores, and the copies it keeps
-/// of them, live. Read from the running configuration (set at startup; a test
-/// run resolves its own root), so no path is hard-coded here.
+/// The product's own storage root — where its stores, and the copies it keeps, live. Read
+/// from the running configuration, so no path is hard-coded here.
 fn storage_root() -> Option<PathBuf> {
     crate::config::CONFIG
         .try_storage_root()
         .or_else(|| crate::config::default_config_dir().ok())
 }
 
-/// Sidecar suffixes of a store file — the write-ahead log and its journal
-/// siblings. They belong to the store and are refused with it.
+/// Sidecar suffixes of a store file — the write-ahead log and its journal siblings. They
+/// belong to the store and are refused with it.
 const STORE_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal"];
 
 /// A store file of the product, identified by its location alone.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StoreFile {
-    /// One of the two live stores. The service holds whole-file locks on them,
-    /// so opening one from inside the service — briefly, to read a header, to
-    /// find out whether it is a database — silently releases those locks for
-    /// the rest of the process's life. Never opened, by any tool, for any
-    /// reason.
+    /// One of the two live stores. The service holds whole-file locks on them, so opening one
+    /// from inside the service — briefly, to read a header, to find out whether it is a
+    /// database — silently releases those locks for the rest of the process's life. Never
+    /// opened, by any tool, for any reason.
     Live,
-    /// A copy the service keeps for itself: the quarantine and pre-reindex
-    /// families, and the rebuild's own temp file. Static, so it is readable as
-    /// an ordinary file; only the unrestricted writer's refusal covers it.
+    /// A copy the service keeps for itself: the quarantine and pre-reindex families, and the
+    /// rebuild's own temp file. Static, so it is readable as an ordinary file; only the
+    /// unrestricted writer's refusal covers it.
     Copy,
 }
 
-/// Whether `path` is inside `base`, comparing every component without ASCII
-/// case.
+/// Whether `path` is inside `base`, comparing every component without ASCII case.
 ///
-/// The store and project rules are location rules, and the volumes they run on
-/// (macOS, Windows) compare file names without case, while a canonicalized path
-/// keeps the spelling the caller typed — so a differently-cased spelling of a
-/// protected place is that place, and the rule must answer it the same way. On a
-/// case-sensitive volume the two spellings are two directories; the comparison
-/// still answers as if they were one, which over-refuses where it backs a
-/// refusal (accepted — a rule that limits rather than fences the shell) and
-/// over-permits where it backs the admin's own-folder exemption (a case-varied
-/// sibling of that folder inside a managed workspace stays writable). The
-/// supported volumes cannot tell the two apart.
+/// The store and project rules are location rules, and the volumes they run on compare file
+/// names without case, while a canonicalized path keeps the spelling the caller typed — so a
+/// differently-cased spelling of a protected place is that place. On a case-sensitive volume
+/// the comparison over-refuses where it backs a refusal (accepted — a rule that limits rather
+/// than fences the shell) and over-permits where it backs the admin's own-folder exemption.
 #[must_use]
 fn is_within_ignoring_case(candidate: &Path, base: &Path) -> bool {
     let candidate = crate::util::strip_verbatim_prefix(candidate);
@@ -762,16 +671,12 @@ fn is_within_ignoring_case(candidate: &Path, base: &Path) -> bool {
     }
 }
 
-/// Classify `path` as one of the product's own store files under the store
-/// directory — **by location and name only**, and without case. Deciding what a
-/// file is by opening it is exactly what the live-store rule forbids, so the
-/// store file itself is never opened here (only its directory's spelling is
-/// settled).
+/// Classify `path` as one of the product's own store files under the store directory — **by
+/// location and name only**, and without case. Deciding what a file is by opening it is
+/// exactly what the live-store rule forbids, so the store file itself is never opened.
 fn store_file_at(root: &Path, path: &Path) -> Option<StoreFile> {
-    // The store directory is matched in both spellings: a caller's resolved
-    // path carries the canonical one (`/private/tmp` where the storage root is
-    // spelled `/tmp`), and the rule must not depend on which of the two a path
-    // happened to come in as.
+    // The store directory is matched in both spellings: a caller's resolved path carries the
+    // canonical one (`/private/tmp` where the root is spelled `/tmp`).
     let db_dir = crate::db::store_dir(root);
     let candidate = normalize_path(&crate::util::expand_tilde(&path.to_string_lossy()));
     let under = is_within_ignoring_case(&candidate, &db_dir)
@@ -786,18 +691,15 @@ fn store_file_at(root: &Path, path: &Path) -> Option<StoreFile> {
         .find_map(|suffix| crate::util::strip_suffix_ignoring_case(name, suffix))
         .unwrap_or(name);
     let lowered = base.to_ascii_lowercase();
-    // `{store}.db` is a live store — only the two the service runs on, so a
-    // file left over from a retired store name is an ordinary file.
+    // `{store}.db` is a live store — only the two the service runs on.
     if let Some(stem) = lowered.strip_suffix(".db")
         && (stem == crate::db::CONSOLIDATED_DB_NAME || stem == crate::db::LOG_DB_NAME)
     {
         return Some(StoreFile::Live);
     }
-    // `{store}.db.{copy}` is a copy the service keeps of one — of ANY store,
-    // since it quarantines a retired name exactly as it quarantines a live one.
-    // The naming contract is `db::debug`'s (and the rebuild's own, `db`'s), so
-    // a copy is recognised through them rather than through a second spelling
-    // of either; both are matched without case, like the rest of this rule.
+    // `{store}.db.{copy}` is a copy of ANY store, since the service quarantines a retired
+    // name exactly as it quarantines a live one. The naming contract is `db::debug`'s, so a
+    // copy is recognised through it rather than through a second spelling.
     if let Some((_, rest)) = lowered.split_once(".db")
         && rest.starts_with(crate::db::REBUILD_TEMP_MARKER)
     {
@@ -806,10 +708,8 @@ fn store_file_at(root: &Path, path: &Path) -> Option<StoreFile> {
     crate::db::debug::parse_family_name(base).map(|_| StoreFile::Copy)
 }
 
-/// [`store_file_at`] against the running storage root. `None` when the root
-/// cannot be resolved at all (no `HOME` and no user directories) — a case a
-/// running service cannot be in, since it resolves the root before any tool
-/// runs.
+/// [`store_file_at`] against the running storage root. `None` when the root cannot be
+/// resolved at all — a case a running service cannot be in.
 fn product_store_file(path: &Path) -> Option<StoreFile> {
     store_file_at(&storage_root()?, path)
 }
@@ -825,17 +725,15 @@ fn live_store_refusal(action: &str, path: &str) -> anyhow::Error {
     )
 }
 
-/// The same refusal for a caller outside this module that hands a local file to
-/// something else — the browser's attach — and must not open a live store on the
-/// way. Answered by location alone, like every store rule.
+/// The same refusal for a caller outside this module that hands a local file to something
+/// else — the browser's attach — and must not open a live store on the way.
 pub(crate) fn live_store_denial(path: &Path, action: &str) -> Option<anyhow::Error> {
     matches!(product_store_file(path), Some(StoreFile::Live))
         .then(|| live_store_refusal(action, &path.to_string_lossy()))
 }
 
-/// Whether `path` names an existing file or directory once resolved the way a
-/// read resolves it — the test that tells a literal path whose own name carries
-/// glob metacharacters from a pattern.
+/// Whether `path` names an existing file or directory once resolved the way a read resolves
+/// it — the test that tells a literal name carrying glob metacharacters from a pattern.
 pub(crate) async fn literal_path_exists(
     workspace_root: &Path,
     path: &str,
@@ -847,12 +745,11 @@ pub(crate) async fn literal_path_exists(
     tokio::fs::try_exists(full_path).await.unwrap_or(false)
 }
 
-/// Whether a read of `path` is a wildcard listing rather than a read of the file
-/// it names: the path carries glob metacharacters (`* ? [ ]`) AND names nothing.
+/// Whether a read of `path` is a wildcard listing rather than a read of the file it names:
+/// the path carries glob metacharacters (`* ? [ ]`) AND names nothing.
 ///
-/// A file whose own name holds one (`report[1].txt`) is an ordinary path the
-/// shell could name — the edit tool takes it — so the read does too, and only a
-/// pattern that names no file falls through to the workspace listing.
+/// A file whose own name holds one (`report[1].txt`) is an ordinary path the shell could
+/// name, so the read takes it and only a pattern that names no file falls through.
 pub(crate) async fn is_wildcard_read(
     workspace_root: &Path,
     path: &str,
@@ -863,19 +760,17 @@ pub(crate) async fn is_wildcard_read(
 
 /// Check that a path is allowed by the read policy of `access`.
 ///
-/// Every level is refused the product's own live stores. Beyond that,
-/// [`PathAccess::Workspace`] allows the workspace alone,
-/// [`PathAccess::Unrestricted`] allows anything, and
-/// [`PathAccess::Allowlisted`] allows the workspace plus [`EXTRA_READ_ALLOWED`]
-/// (temp files, dependency caches, SDK headers) and spill files on a temp root.
+/// Every level is refused the product's own live stores. Beyond that, [`PathAccess::Workspace`]
+/// allows the workspace alone, [`PathAccess::Unrestricted`] anything, and
+/// [`PathAccess::Allowlisted`] the workspace plus [`EXTRA_READ_ALLOWED`] and spill files on a
+/// temp root.
 fn check_path_read_allowed(
     path: &str,
     workspace_root: &Path,
     access: PathAccess,
 ) -> anyhow::Result<()> {
-    // The live stores are an invariant of the product, not a rule of a role:
-    // refused by location, before anything is opened, for every holder and
-    // every access level. Copies are ordinary files and pass.
+    // The live stores are an invariant of the product, not a rule of a role: refused by
+    // location, before anything is opened. Copies are ordinary files and pass.
     if let Some(StoreFile::Live) = product_store_file(Path::new(path)) {
         return Err(live_store_refusal("read", path));
     }
@@ -897,8 +792,8 @@ fn check_path_read_allowed(
 
     let path_buf = Path::new(path);
 
-    // Early-return for spill files on an OS temp root (allowed unconditionally).
-    // If a path looks like a spill file but is NOT on a temp root, reject it.
+    // Spill files on an OS temp root are allowed unconditionally; a spill-shaped path that is
+    // NOT on a temp root is rejected.
     if is_mahbot_spill_shaped(path_buf) {
         if !is_grandparent_temp_root(path_buf) {
             anyhow::bail!(
@@ -921,12 +816,9 @@ fn check_path_read_allowed(
     Ok(())
 }
 
-/// Helper for [`EXTRA_READ_ALLOWED`] initialization: canonicalizes `raw` and
-/// pushes both the canonical and raw paths (if they differ) into `dirs`,
-/// ensuring no duplicates. On macOS `/tmp` → `/private/tmp` symlink, this
-/// ensures both `/tmp` and `/private/tmp` are in the allowed set so that
-/// both the raw and resolved forms match during [`resolve_read_target`]'s
-/// pre- and post-canonicalization checks.
+/// Helper for [`EXTRA_READ_ALLOWED`] initialization: canonicalizes `raw` and pushes both the
+/// canonical and raw paths (if they differ) into `dirs`. On macOS the `/tmp` → `/private/tmp`
+/// link means both spellings must match during [`resolve_read_target`]'s checks.
 fn add_path_with_canonical(dirs: &mut Vec<PathBuf>, raw: PathBuf) {
     if dirs.contains(&raw) {
         return;
@@ -946,9 +838,8 @@ fn add_path_with_canonical(dirs: &mut Vec<PathBuf>, raw: PathBuf) {
     }
 }
 
-/// Map of XDG subdirectory (under `~`) to the corresponding environment variable.
-/// Used to generate alternative paths when e.g. `$XDG_CACHE_HOME` is set to a
-/// non-default location.
+/// Map of XDG subdirectory (under `~`) to the corresponding environment variable, used to
+/// generate alternative paths when e.g. `$XDG_CACHE_HOME` is set elsewhere.
 const XDG_SUBDIR_TO_ENV: &[(&str, &str)] = &[
     (".cache/", "XDG_CACHE_HOME"),
     (".config/", "XDG_CONFIG_HOME"),
@@ -956,20 +847,16 @@ const XDG_SUBDIR_TO_ENV: &[(&str, &str)] = &[
     (".local/state/", "XDG_STATE_HOME"),
 ];
 
-/// For a `~`-prefixed path that starts with an XDG subdirectory
-/// (e.g. `~/.cache/pypoetry/`), generate the alternative path using the
-/// corresponding XDG environment variable if it's set and different from
-/// the default.
-///
-/// Returns `None` if the path doesn't start with a known XDG subdirectory,
-/// or if the corresponding env var is unset.
+/// For a `~`-prefixed path that starts with an XDG subdirectory (e.g. `~/.cache/pypoetry/`),
+/// generate the alternative path using the corresponding XDG variable if it is set and
+/// different from the default. `None` when the path starts with no known subdirectory or the
+/// variable is unset.
 fn xdg_variant_path(tilde_path: &str) -> Option<String> {
     xdg_variant_path_with(|var| std::env::var(var).ok(), tilde_path)
 }
 
-/// Pure, getter-driven variant of [`xdg_variant_path`]: reads environment
-/// values through `get` so tests can drive it without mutating the process
-/// environment. Production passes `|var| std::env::var(var).ok()`.
+/// Pure, getter-driven variant of [`xdg_variant_path`]: reads environment values through
+/// `get` so tests need not mutate the process environment.
 #[must_use]
 fn xdg_variant_path_with(get: impl Fn(&str) -> Option<String>, tilde_path: &str) -> Option<String> {
     for (xdg_subdir, env_var) in XDG_SUBDIR_TO_ENV {
@@ -985,15 +872,11 @@ fn xdg_variant_path_with(get: impl Fn(&str) -> Option<String>, tilde_path: &str)
     None
 }
 
-/// Roots whose location is spelled by an environment variable, mapped to the
-/// subpaths allowed beneath them. Two kinds share the shape: toolchain homes,
-/// whose default is a location under HOME that can be relocated entirely
-/// (`CARGO_HOME`, `RUSTUP_HOME`, …), and the Windows system roots, whose
-/// defaults hard-code the system drive — those variables exist only on Windows,
-/// so elsewhere they are unset and contribute nothing, while the rows
-/// themselves stay compiled and covered on every platform. A subpath is a
-/// `/`-separated component list joined with the host's own separator; an empty
-/// subpath means the whole variable prefix is allowed.
+/// Roots whose location is spelled by an environment variable, mapped to the subpaths
+/// allowed beneath them: toolchain homes whose default sits under HOME and can be relocated,
+/// and the Windows system roots whose defaults hard-code the system drive. A subpath is a
+/// `/`-separated component list joined with the host's own separator; an empty subpath means
+/// the whole variable prefix is allowed.
 const ENV_DERIVED_ROOTS: &[(&str, &[&str])] = &[
     ("CARGO_HOME", &["registry/src/", "git/checkouts/"]),
     ("RUSTUP_HOME", &["toolchains/"]),
@@ -1016,16 +899,12 @@ const ENV_DERIVED_ROOTS: &[(&str, &[&str])] = &[
     ("ProgramFiles", &["Microsoft Visual Studio"]),
 ];
 
-/// Pure, I/O-free construction of env-derived read-allowed paths.
-/// For each `(var, subpaths)` in [`ENV_DERIVED_ROOTS`], when `get(var)`
-/// yields a non-empty value, emits `<value><sep><subpath>` for each subpath (an
-/// empty subpath yields the bare, trailing-separator-trimmed value). The
-/// separator is spelled explicitly because several of these values are a bare
-/// drive prefix (`C:`), and `C:` is drive-RELATIVE — a plain join onto it is
-/// not a join at all. An unset or empty variable contributes nothing: fail
-/// closed rather than allowlist a fabricated root. The env getter is injected
-/// so tests can drive it without mutating the process environment; production
-/// passes `|var| std::env::var(var).ok()`.
+/// Pure, I/O-free construction of env-derived read-allowed paths: for each `(var, subpaths)`
+/// in [`ENV_DERIVED_ROOTS`], when `get(var)` yields a non-empty value, emit
+/// `<value><sep><subpath>` per subpath (an empty subpath yields the bare, trimmed value). The
+/// separator is explicit because several values are a bare drive prefix (`C:`), which is
+/// drive-RELATIVE and would not join. An unset or empty variable contributes nothing: fail
+/// closed rather than allowlist a fabricated root.
 #[must_use]
 fn env_derived_allowed_paths(get: impl Fn(&str) -> Option<String>) -> Vec<String> {
     let sep = std::path::MAIN_SEPARATOR;
@@ -1050,9 +929,8 @@ fn env_derived_allowed_paths(get: impl Fn(&str) -> Option<String>) -> Vec<String
     paths
 }
 
-/// Enumerate `<root>/<child>/<suffix>` JVM header roots at init. The system
-/// JVM locations are scoped to `include/` headers only (never the whole JDK
-/// tree), so the individual JDK directories must be enumerated one level.
+/// Enumerate `<root>/<child>/<suffix>` JVM header roots at init: the system JVM locations
+/// are scoped to `include/` headers only, so the JDK directories must be walked one level.
 /// Nothing is added when the root doesn't exist (fail closed).
 fn jvm_include_roots(root: &str, suffix: &str) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -1064,17 +942,13 @@ fn jvm_include_roots(root: &str, suffix: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Extra read-allowed roots: dependency caches, toolchain and SDK sources,
-/// package-manager stores.
-/// Paths starting with `~` are expanded at init time. Paths that don't
-/// exist on the current platform are harmless (they fail canonicalization
-/// and just get added as-is, never matching any read request).
+/// Extra read-allowed roots: dependency caches, toolchain and SDK sources, package-manager
+/// stores. `~`-prefixed entries are expanded at init; paths that don't exist on this platform
+/// are harmless (they never match a read).
 const EXTRA_ALLOWED_RAW_PATHS: &[&str] = &[
-    // ── Rust (Cargo) ────────────────────────────────────────
     "~/.cargo/registry/src/",
     "~/.cargo/git/checkouts/",
     "~/.rustup/toolchains/",
-    // ── Python ──────────────────────────────────────────────
     "~/.local/lib/",
     "~/Library/Python/",
     "~/AppData/Roaming/Python/",
@@ -1099,7 +973,6 @@ const EXTRA_ALLOWED_RAW_PATHS: &[&str] = &[
     "~/.local/share/uv/",
     "~/AppData/Local/uv/",
     "~/.rye/",
-    // ── JavaScript / TypeScript ─────────────────────────────
     "~/.bun/install/cache/",
     "~/.local/share/pnpm/",
     "~/Library/pnpm/",
@@ -1112,30 +985,22 @@ const EXTRA_ALLOWED_RAW_PATHS: &[&str] = &[
     "~/Library/Caches/Yarn/",
     "~/AppData/Local/Yarn/",
     "~/.pnpm-store/",
-    // ── Go ──────────────────────────────────────────────────
     "~/go/pkg/mod/",
     "/usr/local/go/",
     "/opt/homebrew/opt/go/",
     "/usr/local/opt/go/",
-    // ── JVM ─────────────────────────────────────────────────
-    // Note: JDK `src.zip` is intentionally NOT readable — archives are not
-    // extracted by the read tool, so don't advertise it in docs.
+    // JDK `src.zip` is intentionally NOT readable: archives are not extracted by the read tool.
     "~/.m2/repository/",
     "~/.gradle/caches/",
-    // System JVM locations (`/Library/Java/JavaVirtualMachines/`,
-    // `/usr/lib/jvm/`) are NOT whole-tree allowlisted — they are scoped to
-    // `include/` headers only via init-time enumeration in EXTRA_READ_ALLOWED
-    // (see `jvm_include_roots`).
-    // ── Ruby ────────────────────────────────────────────────
+    // System JVM locations are NOT whole-tree allowlisted — they are scoped to `include/`
+    // headers via init-time enumeration (`jvm_include_roots`).
     "~/.gem/",
     "~/.local/share/gem/",
     "~/.bundle/",
-    // ── PHP (Composer) ──────────────────────────────────────
     "~/.composer/",
     "~/.cache/composer/",
     "~/Library/Caches/composer/",
     "~/AppData/Local/composer/",
-    // ── C/C++ ───────────────────────────────────────────────
     "~/.conan/",
     "~/.conan2/",
     "/usr/local/Cellar/",
@@ -1148,55 +1013,41 @@ const EXTRA_ALLOWED_RAW_PATHS: &[&str] = &[
     "/opt/homebrew/Frameworks/",
     "/usr/local/opt/",
     "/usr/local/Frameworks/",
-    // The Windows installs of these (chocolatey, msys2, the Windows SDK, MSVC)
-    // normally live under the system drive, so they are derived from
-    // [`ENV_DERIVED_ROOTS`] rather than hard-coded here.
-    // ── SDK roots ────────────────────────────────────────────
+    // The Windows installs of these normally live under the system drive, so they are derived
+    // from [`ENV_DERIVED_ROOTS`] rather than hard-coded here.
     "/Applications/Xcode.app/Contents/Developer/",
     "/Library/Developer/CommandLineTools/",
-    // ── Swift ───────────────────────────────────────────────
     "~/.swiftpm/",
     "~/Library/Developer/Xcode/DerivedData/",
-    // ── Dart / Flutter ──────────────────────────────────────
     "~/.pub-cache/",
-    // ── Elixir / Erlang ─────────────────────────────────────
     "~/.hex/",
     "~/.mix/",
-    // ── Haskell ─────────────────────────────────────────────
     "~/.cabal/",
     "~/.local/state/cabal/",
     "~/.stack/",
     "~/AppData/Local/stack/",
     "~/AppData/Roaming/stack/",
-    // ── Lua (LuaRocks) ──────────────────────────────────────
     "~/.luarocks/",
     "~/.cache/luarocks/",
     "~/Library/Caches/luarocks/",
     "~/AppData/Local/luarocks/",
-    // ── R ───────────────────────────────────────────────────
     "~/Library/R/",
     "~/R/",
     "~/Documents/R/",
-    // ── OCaml (opam) ────────────────────────────────────────
     "~/.opam/",
-    // ── Julia ───────────────────────────────────────────────
     "~/.julia/",
-    // ── Nix ─────────────────────────────────────────────────
     "/nix/store/",
-    // ── System package managers ─────────────────────────────
     "/opt/local/",
     "~/.local/pipx/",
 ];
 
-/// Allowed filesystem roots for scratch/temp files (single source of truth).
-///
-/// Used by read-path allowlists and read-only shell redirect / scratch-write policy.
+/// Allowed filesystem roots for scratch/temp files (single source of truth), used by the
+/// read-path allowlists and the read-only shell redirect / scratch-write policy.
 static ALLOWED_TEMP_ROOTS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
     let mut dirs = Vec::new();
     add_path_with_canonical(&mut dirs, std::env::temp_dir());
-    // The unix shared temp directories. Elsewhere they are not temp roots at
-    // all, and (never canonicalizing) they would sit in the allowlist as raw
-    // paths, so they are gated rather than merely documented.
+    // The unix shared temp directories: elsewhere they are not temp roots at all, and (never
+    // canonicalizing) they would sit in the allowlist as raw paths.
     #[cfg(unix)]
     {
         add_path_with_canonical(&mut dirs, PathBuf::from("/tmp"));
@@ -1205,14 +1056,11 @@ static ALLOWED_TEMP_ROOTS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
     }
     // Explicit spill directory (usually under `temp_dir()`; documents intent).
     add_path_with_canonical(&mut dirs, std::env::temp_dir().join(".agent"));
-    // The legacy (pre-pin) OS temp dir — the one captured before the daemon
-    // pinned the temp environment to the private root: on macOS the darwin user
-    // temp dir (`/var/folders/.../T`), where bare `mktemp -d` STILL lands
-    // because it ignores the temp variables, and on Windows the user's own temp
-    // directory. The read allowlist and the cleaner's scan roots
-    // (`crate::temp`) are built from this same value, so the guard's coverage
-    // stays exactly as broad as before the pin (no write restrictions are added
-    // by the consolidation).
+    // The legacy (pre-pin) OS temp dir — captured before the daemon pinned the temp
+    // environment to the private root: on macOS the darwin user temp dir, where bare
+    // `mktemp -d` STILL lands, and on Windows the user's own temp directory. The read
+    // allowlist and the cleaner's scan roots (`crate::temp`) use this same value, so the
+    // guard's coverage stays as broad as before the pin.
     if let Some(legacy) = crate::temp::legacy_temp_dir() {
         add_path_with_canonical(&mut dirs, legacy.to_path_buf());
         add_path_with_canonical(&mut dirs, legacy.join(".agent"));
@@ -1220,24 +1068,14 @@ static ALLOWED_TEMP_ROOTS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
     dirs
 });
 
-/// Paths under any of these directories are allowed for reading (temp dir,
-/// dependency caches, SDK headers, etc.). Paths are canonicalized at init
-/// to handle symlinks (e.g. macOS `/tmp` → `/private/tmp`) so that
-/// `is_path_in_extra_allowed()` matches paths resolved by `resolve_read_target`.
+/// Paths under any of these directories are allowed for reading (temp dir, dependency
+/// caches, SDK headers, etc.). Paths are canonicalized at init to handle symlinks (macOS
+/// `/tmp` → `/private/tmp`), and both the canonical and raw forms are included because
+/// [`resolve_read_target`] validates the path twice, before and after canonicalization.
 ///
-/// Both the canonicalized and raw paths are included because `resolve_read_target`
-/// validates the path twice — once before canonicalization (raw user-provided path)
-/// and once after — and both validations may bypass via `EXTRA_READ_ALLOWED`.
-///
-/// `~`-prefixed entries are expanded at init time using
-/// [`crate::util::expand_tilde`]. If `$HOME` (and `$USERPROFILE` on Windows)
-/// is unset, `~`-prefixed entries are skipped. Entries that follow XDG Base
-/// Directory conventions (`~/.cache/`, `~/.local/share/`, `~/.local/state/`,
-/// `~/.config/`) also generate variants using the corresponding `$XDG_*`
-/// environment variable when set. Roots whose location is carried by an
-/// environment variable — relocated toolchain homes and the Windows system
-/// roots a Windows install would otherwise place on the system drive — are
-/// likewise emitted from the variable value when set (see
+/// `~`-prefixed entries are expanded at init; with `$HOME` unset they are skipped. Entries
+/// following XDG conventions also generate variants from the corresponding `$XDG_*`
+/// variable, and roots carried by an environment variable are emitted from its value (see
 /// [`ENV_DERIVED_ROOTS`]).
 static EXTRA_READ_ALLOWED: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
     let mut dirs = ALLOWED_TEMP_ROOTS.clone();
@@ -1261,15 +1099,13 @@ static EXTRA_READ_ALLOWED: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
         }
     }
 
-    // Env-derived roots (whole-prefix replacement, e.g. $CARGO_HOME/registry/src
-    // or $ProgramData/chocolatey/lib when those variables are set).
+    // Env-derived roots (whole-prefix replacement, e.g. $CARGO_HOME/registry/src).
     for raw_path in env_derived_allowed_paths(|var| std::env::var(var).ok()) {
         add_path_with_canonical(&mut dirs, PathBuf::from(raw_path));
     }
 
-    // System JVM `include/` header roots: enumerated one level at init so the
-    // JDK trees are scoped to headers only, not whole-directory allowlisted.
-    // Nothing is added when the root is absent (fail closed).
+    // System JVM `include/` header roots: enumerated one level at init, so the JDK trees are
+    // scoped to headers only. Nothing is added when the root is absent (fail closed).
     for header_root in
         jvm_include_roots("/Library/Java/JavaVirtualMachines", "Contents/Home/include")
             .into_iter()
@@ -1281,18 +1117,14 @@ static EXTRA_READ_ALLOWED: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
     dirs
 });
 
-// ── Path validation ──────────────────────────
-
 /// Check whether `path` is safe to access within the given `workspace_root`.
 ///
-/// This is the central security gate for all file-path operations: it performs
-/// a purely lexical check — no filesystem I/O — so it cannot detect symlink-based
-/// escapes. The caller is responsible for that post-canonicalization validation
-/// (see [`resolve_read_target`] and [`resolve_write_target`]).
-///
-/// The workspace comparison runs through [`crate::util::is_within`], so a stored
-/// root and a canonicalized candidate that differ only by the Windows verbatim
-/// prefix still match.
+/// The central security gate for all file-path operations: a purely lexical check — no
+/// filesystem I/O — so it cannot detect symlink escapes. The caller is responsible for the
+/// post-canonicalization validation (see [`resolve_read_target`] and
+/// [`resolve_write_target`]). The comparison runs through [`crate::util::is_within`], so a
+/// stored root and a canonicalized candidate differing only by the Windows verbatim prefix
+/// still match.
 #[must_use]
 fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
     let path = path.trim();
@@ -1317,15 +1149,10 @@ fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
     }
     let expanded_path = crate::util::expand_tilde(path);
     if expanded_path.is_absolute() {
-        // Lexical prefix check — no sync I/O.
-        //
-        // Note: workspace_root is pre-canonicalized when the workspace is added
-        // (see canonicalize_workspace_path in workspace.rs). The lexical check
-        // may reject absolute paths whose prefix is a symlink into the workspace
-        // (e.g. /tmp/… when the real workspace is /private/tmp/… on macOS), but
-        // this is harmless: agents use relative paths, and the post-canonicalization
-        // checks in resolve_read_target / resolve_write_target catch any symlink
-        // escapes that would bypass this pre-check.
+        // Lexical prefix check — no sync I/O. `workspace_root` is pre-canonicalized when the
+        // workspace is added, so an absolute path whose prefix is a symlink into the workspace
+        // (e.g. /tmp/… for a real /private/tmp/… on macOS) may be rejected here; that is
+        // harmless, since the post-canonicalization checks catch any escape.
         crate::util::is_within(&expanded_path, workspace_root)
     } else {
         // Relative path without parent-dir components — always safe
@@ -1335,11 +1162,9 @@ fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
 
 /// Resolve a user path segment against `workspace_root`.
 ///
-/// A bare `~` means the workspace root — except for the admin's Assistant,
-/// whose `~` is the shell's: the user's home directory, bare or with a path
-/// under it (`~/notes.md`). `~user` is refused there rather than answered with
-/// `$HOME/user`, which is not the file the shell would name; the other access
-/// levels keep their existing wording, where the frame refuses it.
+/// A bare `~` means the workspace root — except for the admin's Assistant, whose `~` is the
+/// shell's: the user's home directory, bare or with a path under it. `~user` is refused there
+/// rather than answered with `$HOME/user`, which is not the file the shell would name.
 fn resolve_tool_path_with_base(
     path: &str,
     workspace_root: &Path,
@@ -1379,22 +1204,17 @@ fn resolve_tool_path_with_base(
     Ok(workspace_root.join(expanded))
 }
 
-/// A `~`-prefixed spelling that names another user (`~user…`) rather than the
-/// caller's own home — [`crate::util::expand_tilde`] would answer it with
-/// `$HOME/user…`, a file the caller did not name.
+/// A `~`-prefixed spelling that names another user (`~user…`) rather than the caller's own
+/// home — [`crate::util::expand_tilde`] would answer it with `$HOME/user…`.
 fn is_foreign_tilde(path: &str) -> bool {
     path.starts_with('~') && path != "~" && !path.starts_with("~/")
 }
-
-// ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::util::test::canonical_without_verbatim_prefix;
     use tempfile::TempDir;
-
-    // ── Path validation: is_path_safe_for_workspace ─────────────────────
 
     #[expect(clippy::too_many_lines)]
     #[test]
@@ -1405,8 +1225,7 @@ mod tests {
             safe: bool,
         }
 
-        // Most security invariants are workspace-independent and can be
-        // verified against a minimal "." base.
+        // Most security invariants are workspace-independent, so a minimal "." base suffices.
         let dot_cases = [
             Case {
                 name: "traversal_etc_passwd",
@@ -1534,9 +1353,7 @@ mod tests {
             );
         }
 
-        // Workspace-relative checks (ws_cases below) require a real
-        // TempDir because they exercise workspace-scope behavior that
-        // can't be tested against a static "." base.
+        // Workspace-relative cases need a real TempDir: they exercise workspace scope.
         let tmp = TempDir::new().expect("tempdir");
         let ws = tmp.path().to_path_buf();
 
@@ -1612,9 +1429,8 @@ mod tests {
             );
         }
 
-        // Paths outside the workspace (even temp dirs and dependency paths)
-        // must be blocked — the extra-read bypass is read-only and must not
-        // affect write-path checks.
+        // Paths outside the workspace (even temp and dependency paths) must be blocked — the
+        // extra-read bypass is read-only.
         {
             let temp_file = std::env::temp_dir().join("test-spill.txt");
             assert!(
@@ -1631,12 +1447,10 @@ mod tests {
         }
     }
 
-    /// Containment is judged in one spelling, so a candidate that differs from
-    /// the root only by the Windows verbatim prefix is still accepted — in both
-    /// directions — while a path outside the root is still refused. The
-    /// separator is a forward slash so the assertion means the same thing on
-    /// both platforms (Windows accepts either separator), which is what makes
-    /// it host-runnable evidence for the comparison logic.
+    /// Containment is judged in one spelling, so a candidate differing from the root only by
+    /// the Windows verbatim prefix is still accepted — in both directions — while a path
+    /// outside the root is refused. The separator is a forward slash so the assertion means
+    /// the same thing on both platforms.
     #[test]
     fn containment_accepts_either_spelling_but_is_case_sensitive() {
         assert!(crate::util::is_within(
@@ -1652,20 +1466,17 @@ mod tests {
             Path::new("C:/ws")
         ));
         // Ordinary name components are compared exactly — no case folding — so a
-        // differently-cased directory is a sibling of the base, not inside it. The
-        // drive letter cannot witness this: Windows folds it while parsing a path,
-        // while unix compares it as an ordinary name component, so a drive-case
-        // assertion holds on one host and fails on the other.
+        // differently-cased directory is a sibling. The drive letter cannot witness this:
+        // Windows folds it while parsing a path, unix compares it as an ordinary component.
         assert!(!crate::util::is_within(
             Path::new("C:/ws/Docs/a"),
             Path::new("C:/ws/docs")
         ));
     }
 
-    /// The location rules' own comparison: same shape as [`crate::util::is_within`]
-    /// but case-blind, so a differently-cased spelling of a protected place is
-    /// that place — the bypass a byte-exact comparison left open on the
-    /// case-insensitive volumes the product ships on.
+    /// The location rules' own comparison: same shape as [`crate::util::is_within`] but
+    /// case-blind, so a differently-cased spelling of a protected place is that place — the
+    /// bypass a byte-exact comparison left open.
     #[test]
     fn location_containment_is_case_blind() {
         assert!(is_within_ignoring_case(
@@ -1676,8 +1487,7 @@ mod tests {
             Path::new(r"\\?\C:/ws/a/b"),
             Path::new("C:/WS")
         ));
-        // A sibling that merely shares the name prefix is still outside, in
-        // either spelling.
+        // A sibling that merely shares the name prefix is still outside, in either spelling.
         assert!(!is_within_ignoring_case(
             Path::new("/storage/db-other/core.db"),
             Path::new("/storage/db")
@@ -1688,11 +1498,8 @@ mod tests {
         ));
     }
 
-    // ── is_path_under_roots / allowed_temp_roots tests ───────────────────
-
-    /// The roots gate settles the verbatim spelling the way containment does: a
-    /// root stored in either form is honoured, while a sibling directory that
-    /// merely shares the name prefix is not.
+    /// The roots gate settles the verbatim spelling the way containment does: a root stored in
+    /// either form is honoured, while a sibling sharing the name prefix is not.
     #[test]
     fn verbatim_root_spelling_is_settled_by_the_roots_gate() {
         let roots = [PathBuf::from("C:/ws")];
@@ -1728,8 +1535,6 @@ mod tests {
             "Traversal back into temp should be allowed"
         );
     }
-
-    // ── check_path_read_allowed: spill / extra-read ────────────────────
 
     #[test]
     fn check_path_read_allowed_all_cases() {
@@ -1785,12 +1590,10 @@ mod tests {
             );
         }
 
-        // macOS per-user temp path (e.g. /var/folders/xx/yy/T/…) should be
-        // detected as a temp-root spill even when it doesn't match the active
-        // temp_dir() at-test-time (which may be /private/var/…).
-        // Inline rather than table-driven because this path relies on
-        // is_os_temp_root's Unix-specific /var/folders/… detection and
-        // #[cfg(unix)] wrapping a table push() would be more awkward.
+        // macOS per-user temp path (/var/folders/xx/yy/T/…) must be detected as a temp-root
+        // spill even when it doesn't match the at-test-time temp_dir() (/private/var/…).
+        // Inline rather than table-driven because it relies on the Unix-specific
+        // /var/folders/… detection and a #[cfg(unix)] table push() would be awkward.
         #[cfg(unix)]
         {
             let mac_spill = PathBuf::from("/var/folders/xx/yy/T/.agent/spill_cd34.txt");
@@ -1805,10 +1608,8 @@ mod tests {
             );
         }
 
-        // Non-temp spill-shaped path outside the workspace must be rejected.
-        // Inline rather than table-driven for the same reason as the
-        // macOS-spill block above — the path relies on is_os_temp_root's
-        // Unix-specific logic and the #[cfg(unix)] guard is cleaner here.
+        // Non-temp spill-shaped path outside the workspace must be rejected. Inline for the
+        // same reason as the macOS-spill block above.
         #[cfg(unix)]
         {
             let outside = PathBuf::from("/usr/local/.agent/spill_ab12.txt");
@@ -1824,8 +1625,6 @@ mod tests {
         }
     }
 
-    // ── EXTRA_READ_ALLOWED tests ──────────────────────────────────────
-
     #[test]
     fn extra_allowed_all_cases() {
         struct Case {
@@ -1834,15 +1633,13 @@ mod tests {
             allowed: bool,
         }
 
-        // Force LazyLock init and verify it's populated (preserved from the
-        // removed extra_allowed_init_does_not_panic for diagnostic clarity).
+        // Force LazyLock init and verify it is populated.
         assert!(
             !EXTRA_READ_ALLOWED.is_empty(),
             "EXTRA_READ_ALLOWED should not be empty"
         );
 
-        // Paths inside known dependency directories should match via
-        // is_path_in_extra_allowed.
+        // Paths inside known dependency directories match via is_path_in_extra_allowed.
         let cases = [
             Case {
                 name: "cargo_registry_tilde",
@@ -1896,9 +1693,8 @@ mod tests {
         }
     }
 
-    /// `check_path_read_allowed` permits paths under dependency source
-    /// directories (e.g. cargo registry, pip site-packages) even when
-    /// they're outside the workspace.
+    /// `check_path_read_allowed` permits paths under dependency source directories (cargo
+    /// registry, pip site-packages) even outside the workspace.
     #[test]
     fn check_path_read_allowed_extra_dependency_paths() {
         let tmp = TempDir::new().expect("tempdir");
@@ -1929,14 +1725,10 @@ mod tests {
         }
     }
 
-    // ── Env-derived allowed-path tests ─────────────────────────────────
-
     #[test]
     fn env_derived_allowed_paths_pure() {
-        // Unset/unknown vars are skipped.
         assert!(env_derived_allowed_paths(|_| None).is_empty());
 
-        // CARGO_HOME with subpaths.
         let paths = env_derived_allowed_paths(|var| match var {
             "CARGO_HOME" => Some("/opt/cargo".to_string()),
             _ => None,
@@ -1949,7 +1741,6 @@ mod tests {
             ]
         );
 
-        // Trailing slash on the value is trimmed before joining subpaths.
         let paths = env_derived_allowed_paths(|var| match var {
             "CARGO_HOME" => Some("/opt/cargo/".to_string()),
             _ => None,
@@ -1962,21 +1753,18 @@ mod tests {
             ]
         );
 
-        // Empty subpath → the bare, trailing-slash-trimmed value.
         let paths = env_derived_allowed_paths(|var| match var {
             "GOMODCACHE" => Some("/modcache".to_string()),
             _ => None,
         });
         assert_eq!(paths, vec!["/modcache".to_string()]);
 
-        // Non-empty subpath appends the subpath to the value.
         let paths = env_derived_allowed_paths(|var| match var {
             "GOROOT" => Some("/go".to_string()),
             _ => None,
         });
         assert_eq!(paths, vec!["/go/src/".to_string()]);
 
-        // Empty value is skipped.
         assert!(
             env_derived_allowed_paths(|var| match var {
                 "GOMODCACHE" => Some(String::new()),
@@ -1985,8 +1773,7 @@ mod tests {
             .is_empty()
         );
 
-        // A system root contributes each of its subpaths, spelled with the
-        // host's own separator.
+        // A system root contributes each of its subpaths, spelled with the host's separator.
         let sep = std::path::MAIN_SEPARATOR;
         let paths = env_derived_allowed_paths(|var| match var {
             "ProgramData" => Some("/data".to_string()),
@@ -2001,7 +1788,6 @@ mod tests {
             ]
         );
 
-        // A trailing separator on the value does not double up.
         assert_eq!(
             env_derived_allowed_paths(|var| match var {
                 "ProgramData" => Some("/data/".to_string()),
@@ -2010,9 +1796,9 @@ mod tests {
             vec![format!("/data{sep}chocolatey{sep}lib")]
         );
 
-        // A BARE drive value (`SystemDrive=C:`) is joined with an explicit
-        // separator: `C:` is drive-RELATIVE, so a plain join would produce
-        // `C:msys64…` — a different path, and the reason this formatting exists.
+        // A BARE drive value (`SystemDrive=C:`) is joined with an explicit separator: `C:` is
+        // drive-RELATIVE, so a plain join would produce `C:msys64…` — a different path, and the
+        // reason this formatting exists.
         assert_eq!(
             env_derived_allowed_paths(|var| match var {
                 "SystemDrive" => Some("C:".to_string()),
@@ -2034,16 +1820,13 @@ mod tests {
             _ => None,
         };
 
-        // XDG subpath maps to the env-derived path.
         assert_eq!(
             xdg_variant_path_with(get, "~/.cache/pypoetry/"),
             Some("/xdg/pypoetry/".to_string())
         );
 
-        // Non-XDG path returns None.
         assert_eq!(xdg_variant_path_with(get, "~/.cargo/registry/src/"), None);
 
-        // Unset var returns None.
         assert_eq!(xdg_variant_path_with(|_| None, "~/.cache/foo/"), None);
     }
 
@@ -2064,9 +1847,8 @@ mod tests {
             );
         }
 
-        // A pipeline role reaches the workspace and its dependency caches —
-        // including a name that used to be a credential denial, inside the
-        // workspace where its own envelope already reached.
+        // A pipeline role reaches the workspace and its dependency caches — including a name
+        // that used to be a credential denial, inside the workspace.
         for path in ["src/main.rs", dependency, "src/id_rsa"] {
             assert!(
                 check_path_read_allowed(path, &workspace, PathAccess::Allowlisted).is_ok(),
@@ -2082,8 +1864,8 @@ mod tests {
             "a credential place outside the envelope stays out of a pipeline role's reach"
         );
 
-        // The admin Assistant reaches the machine — `..`, symlinks and
-        // "forbidden" names included, all of which the other levels refuse.
+        // The admin Assistant reaches the machine — `..`, symlinks and "forbidden" names
+        // included, all of which the other levels refuse.
         for path in [
             outside,
             dependency,
@@ -2099,15 +1881,10 @@ mod tests {
         }
     }
 
-    // ── Store-file tests ───────────────────────────────────────────────
-
-    /// A store file is recognised from its name and its place, never from its
-    /// contents: the two live stores and their tails are refused, the recovery
-    /// copies are recognised as copies, and everything else in the directory —
-    /// including a stale `config.db` or a file left by a retired store name — is
-    /// an ordinary file. Name and place are matched without case, because the
-    /// volumes the service runs on compare them without case: a differently-cased
-    /// spelling is the same file.
+    /// A store file is recognised from its name and its place, never from its contents: the
+    /// two live stores and their tails are refused, the recovery copies are recognised as
+    /// copies, and everything else in the directory — a stale `config.db`, a retired store
+    /// name — is an ordinary file. Name and place are matched without case.
     #[test]
     fn store_files_are_classified_by_name_and_place() {
         let root = Path::new("/storage");
@@ -2143,8 +1920,7 @@ mod tests {
             // The same copies as the volume sees them.
             "Core.db.Quarantine-20260101t101010z-42",
             "LOGS.DB.Pre-Reindex-20260101T101010z-42",
-            // A copy of ANY store: the service quarantines a retired store name
-            // exactly as it quarantines a live one.
+            // A copy of ANY store: a retired store name is quarantined like a live one.
             "board.db.quarantine-20260101T101010Z-42",
             "sessions.db.pre-reindex-20260101T101010Z-42",
             "stats.db.rebuild-20260101T101010Z",
@@ -2162,9 +1938,8 @@ mod tests {
             "core.db.quarantine-nonsense",
             "some_other.db",
             "core.txt",
-            // A retired store name is not a live store: the service runs on the
-            // consolidated file and the logs file, and everything else in the
-            // directory is an ordinary file.
+            // A retired store name is not a live store: everything else in the directory is
+            // an ordinary file.
             "board.db",
             "board.db-wal",
             "sessions.db",
@@ -2192,8 +1967,8 @@ mod tests {
         );
     }
 
-    /// The read refusal is wired to the running storage root for every access
-    /// level — the product invariant, not a rule of a role.
+    /// The read refusal is wired to the running storage root for every access level — the
+    /// product invariant, not a rule of a role.
     #[test]
     fn live_stores_are_refused_at_every_access_level() {
         let Some(root) = storage_root() else {
@@ -2265,12 +2040,10 @@ mod tests {
             );
         }
 
-        // System JVM locations are allowlisted via init-time I/O enumeration
-        // (scoped to `include/` headers only, never the whole JDK tree), so a
-        // lexically-nonexistent JDK name can no longer be asserted as allowed.
-        // If the system JVM root exists, verify the enumerated header for every
-        // child passes; otherwise skip (the test must not depend on a specific
-        // JDK being installed).
+        // System JVM locations are allowlisted via init-time I/O enumeration (scoped to
+        // `include/` headers only), so a lexically-nonexistent JDK name cannot be asserted as
+        // allowed. If the system root exists, verify the enumerated header for every child;
+        // otherwise skip (the test must not depend on a JDK being installed).
         if let Ok(entries) = std::fs::read_dir("/Library/Java/JavaVirtualMachines") {
             for entry in entries.filter_map(std::io::Result::ok) {
                 let header = entry
@@ -2285,8 +2058,8 @@ mod tests {
             }
         }
 
-        // Gradle root (outside caches/) is NOT covered: the allowlist is
-        // deliberately as narrow as the caches themselves.
+        // Gradle root (outside caches/) is NOT covered: the allowlist is as narrow as the
+        // caches themselves.
         let err = check_path_read_allowed(
             "~/.gradle/gradle.properties",
             &workspace,
@@ -2300,9 +2073,8 @@ mod tests {
         );
     }
 
-    /// The admin's write refusals, which are the only two: the product's own
-    /// store files, and the managed workspaces — with the admin's
-    /// own folder outranking the second rule.
+    /// The admin's write refusals, which are the only two: the product's own store files, and
+    /// the managed workspaces — with the admin's own folder outranking the second rule.
     #[test]
     fn unrestricted_write_refusals() {
         let own = Path::new("/storage/userspaces/admin");
@@ -2318,9 +2090,8 @@ mod tests {
             "the refusal must name the route: {err}"
         );
 
-        // The volume compares names without case, so a differently-cased
-        // spelling of the project is the same place and must be refused too —
-        // the bypass a byte-exact comparison left open.
+        // The volume compares names without case, so a differently-cased spelling of the
+        // project is the same place and must be refused too.
         let err = unrestricted_write_refusal(
             own,
             &PathBuf::from("/WORK/Proj/src/main.rs"),
@@ -2330,9 +2101,8 @@ mod tests {
         .expect("a differently-cased project spelling must be refused");
         assert!(err.to_string().contains("'proj'"), "{err}");
 
-        // Everything else is an ordinary file: another tree, another user's
-        // folder, and a database of any kind — the product's own stores
-        // excepted, and only by location.
+        // Everything else is an ordinary file: another tree, another user's folder, and a
+        // database of any kind — the product's own stores excepted, and only by location.
         for allowed in [
             "/work/other/src/main.rs",
             "/storage/userspaces/bob/notes.md",
@@ -2345,8 +2115,7 @@ mod tests {
             );
         }
 
-        // The admin's own folder outranks the project rule, even when it sits
-        // inside a managed workspace.
+        // The admin's own folder outranks the project rule, even inside a managed workspace.
         let nested = project.join("personal");
         assert!(
             unrestricted_write_refusal(&nested, &nested.join("MEMORY.md"), "MEMORY.md", &managed)
@@ -2365,9 +2134,8 @@ mod tests {
         );
     }
 
-    /// The admin's own folder outranks the project rule even when the two are
-    /// spelled differently: the candidate arrives resolved, so the folder is
-    /// compared in its canonical spelling rather than as it was stored.
+    /// The admin's own folder outranks the project rule even when the two are spelled
+    /// differently: the candidate arrives resolved, so the folder is compared canonically.
     #[cfg(unix)]
     #[test]
     fn the_admin_own_folder_outranks_a_project_it_is_spelled_differently_in() {
@@ -2393,8 +2161,7 @@ mod tests {
         );
     }
 
-    /// The project rule end to end, through the store the managed workspaces
-    /// are read from: the wiring a pure-helper test cannot reach.
+    /// The project rule end to end, through the store the managed workspaces are read from.
     #[tokio::test]
     async fn unrestricted_write_consults_the_managed_workspaces() {
         crate::util::test::init_test_stores().await;
@@ -2406,8 +2173,8 @@ mod tests {
         crate::util::test::create_test_workspace(&project.to_string_lossy(), "path-policy-project")
             .await;
 
-        // A write inside the project is refused, naming the project and the
-        // route, and creates nothing on the way.
+        // A write inside the project is refused, naming the project and the route, and
+        // creates nothing on the way.
         let inside = project.join("src/main.rs");
         let err = resolve_write_target(
             &own,
@@ -2424,8 +2191,8 @@ mod tests {
             "a refused write creates nothing"
         );
 
-        // What decides is the file the write lands in: a spelling that only
-        // passes through the project on its way out is an ordinary write.
+        // What decides is the file the write lands in: a spelling that only passes through
+        // the project on its way out is an ordinary write.
         let through = project.join("../elsewhere/new.txt");
         let resolved = resolve_write_target(
             &own,
@@ -2440,9 +2207,8 @@ mod tests {
         drop((dir, project_dir));
     }
 
-    /// An unreadable managed workspace list refuses the write with a plain
-    /// message rather than an accident — the accepted price is that the admin's
-    /// own memory is closed with it.
+    /// An unreadable managed workspace list refuses the write with a plain message — the
+    /// accepted price is that the admin's own memory is closed with it.
     #[test]
     fn an_unreadable_managed_workspace_list_refuses_the_write() {
         let read = Err(anyhow::anyhow!("the workspace store is not open"));
@@ -2457,9 +2223,8 @@ mod tests {
         assert!(message.contains("retry once"), "{message}");
     }
 
-    /// The store half of the same rule: the live stores and their tails are
-    /// refused, the copies the service keeps are refused too, and nothing is
-    /// opened to decide any of it.
+    /// The store half of the same rule: the live stores and their tails are refused, the
+    /// copies too, and nothing is opened to decide any of it.
     #[test]
     fn unrestricted_write_refuses_store_files() {
         let Some(root) = storage_root() else {
@@ -2500,10 +2265,9 @@ mod tests {
         }
     }
 
-    /// A `~` reading, for the admin's Assistant alone: the home directory, bare
-    /// or with a path under it. Every other access keeps the workspace-root
-    /// reading, and `~user` is refused with the way out rather than answered
-    /// with `$HOME/user`.
+    /// A `~` reading, for the admin's Assistant alone: the home directory, bare or with a path
+    /// under it. Every other access keeps the workspace-root reading, and `~user` is refused
+    /// with the way out.
     #[tokio::test]
     async fn tilde_is_the_home_directory_for_the_admin_only() {
         let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
@@ -2534,8 +2298,7 @@ mod tests {
             home.parent().expect("the home directory has a parent"),
         );
 
-        // Another user's `~` never becomes `$HOME/user`: it is refused, and the
-        // refusal says how to spell the path instead.
+        // Another user's `~` never becomes `$HOME/user`: it is refused, with the way out.
         for access in [PathAccess::Unrestricted, PathAccess::Allowlisted] {
             let read = resolve_read_target(&ws, "~other/notes.md", access).await;
             let err = read.expect_err("`~user` must be refused");
@@ -2553,9 +2316,8 @@ mod tests {
         drop(dir);
     }
 
-    /// The admin's write reaches what the frame refuses everyone else (a `..`
-    /// spelling, a database of another product, the admin's own memory),
-    /// creates parents on the way, and leaves nothing behind when it is refused.
+    /// The admin's write reaches what the frame refuses everyone else, creates parents on the
+    /// way, and leaves nothing behind when it is refused.
     #[tokio::test]
     async fn unrestricted_write_reaches_outside_without_leaving_traces() {
         crate::util::test::init_test_stores().await;
@@ -2579,8 +2341,8 @@ mod tests {
         assert!(resolved.is_absolute(), "the `..` was settled: {resolved:?}");
         tokio::fs::write(&resolved, "hello").await.unwrap();
 
-        // The admin's own workspace and a database of someone else's — the
-        // same format as the product's, and an ordinary file for all that.
+        // The admin's own workspace and a database of someone else's — the same format as the
+        // product's, and an ordinary file for all that.
         for path in [own.join("MEMORY.md"), outside.join("user.db")] {
             let resolved = resolve_write_target(
                 &own,
@@ -2597,10 +2359,9 @@ mod tests {
         drop((dir, outside));
     }
 
-    /// Every symlink the admin's write meets is settled by the file the write
-    /// would land in: a link into a private-key folder is writable, a `..`
-    /// behind a link follows the target, a dangling link is followed to the file
-    /// it names, and a link that leads to a live store is refused.
+    /// Every symlink the admin's write meets is settled by the file the write would land in: a
+    /// link into a private-key folder is writable, a `..` behind a link follows the target, a
+    /// dangling link is followed to the file it names, and a link to a live store is refused.
     #[cfg(unix)]
     #[tokio::test]
     async fn unrestricted_write_settles_every_symlink_by_its_target() {
@@ -2629,9 +2390,8 @@ mod tests {
             .await
             .unwrap();
 
-        // `..` behind a symlinked component is the filesystem's to settle, as it
-        // is the shell's: the write lands beside the link's target, not beside
-        // the link.
+        // `..` behind a symlinked component is the filesystem's to settle: the write lands
+        // beside the link's target, not beside the link.
         let through_link = own.join("link-to-keys/../through-link.txt");
         let resolved = resolve_write_target(
             &own,
@@ -2647,9 +2407,8 @@ mod tests {
             "the `..` is the link target's parent, not the link's"
         );
 
-        // A link whose target does not exist yet is followed to that target: the
-        // shell would create it through the link, so the write lands there and
-        // the link itself is left alone.
+        // A link whose target does not exist yet is followed to that target: the shell would
+        // create it through the link, so the link itself is left alone.
         let dangling = own.join("not-yet.txt");
         symlink(outside.join("made-by-link.txt"), &dangling).unwrap();
         let resolved = resolve_write_target(
@@ -2677,8 +2436,7 @@ mod tests {
             "reading the link reaches the file the write landed in"
         );
 
-        // The same link aimed at a live store is refused, and the refusal
-        // creates nothing anywhere on the way.
+        // The same link aimed at a live store is refused, and nothing is created on the way.
         let Some(root) = storage_root() else {
             return;
         };
@@ -2699,8 +2457,8 @@ mod tests {
             "a refused write must not create directories"
         );
 
-        // A link as the final component is the same question: what counts is
-        // the file the write would land in.
+        // A link as the final component is the same question: what counts is the file the
+        // write would land in.
         let file_link = own.join("store-link.db");
         symlink(store_dir.join("core.db"), &file_link).unwrap();
         let err = resolve_write_target(
@@ -2716,10 +2474,8 @@ mod tests {
         drop((dir, outside));
     }
 
-    // ── Path resolution tests ──────────────────────────────────────────
-
-    /// Create a temporary workspace and return `(TempDir, canonical_ws_path)`.
-    /// The `TempDir` guard must be held alive for the test duration.
+    /// Create a temporary workspace and return `(TempDir, canonical_ws_path)`; the guard must
+    /// be held alive for the test duration.
     async fn test_workspace() -> (TempDir, PathBuf) {
         let tmp = TempDir::new().expect("tempdir");
         let ws_raw = tmp.path().join("ws");
@@ -2728,10 +2484,8 @@ mod tests {
         (tmp, ws)
     }
 
-    /// The reference gate a drawing's resources go through: the read boundary on
-    /// both spellings, and the two facts a read needs — a regular file, within the
-    /// caller's own size limit. Silent by design: a reference that fails any of it
-    /// is not read rather than refused.
+    /// The reference gate a drawing's resources go through: the read boundary on both
+    /// spellings, plus a regular file within the caller's own size limit. Silent by design.
     #[tokio::test]
     async fn resolve_reference_target_holds_the_read_rules() {
         let (tmp, ws) = test_workspace().await;
@@ -2760,8 +2514,8 @@ mod tests {
             resolved(&outside).is_none(),
             "a resource outside the boundary is not read"
         );
-        // The platform's own links: a link out of the boundary is caught on the
-        // canonical target it was given up for.
+        // The platform's own links: a link out of the boundary is caught on the canonical
+        // target it was given up for.
         #[cfg(unix)]
         {
             let escaped = ws.join("link.png");
@@ -2929,8 +2683,7 @@ mod tests {
             result.err()
         );
 
-        // The workspace-only read rejects it — the only allowed paths are
-        // in-workspace.
+        // The workspace-only read rejects it — the only allowed paths are in-workspace.
         let result = resolve_read_target(&ws, &spill_str, PathAccess::Workspace).await;
         assert!(
             result.is_err(),
@@ -2947,10 +2700,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_read_target_non_canonicalized_workspace_root() {
-        // When workspace_root is not canonicalized (e.g. /tmp vs /private/tmp on macOS),
-        // reading via relative path should still succeed because resolve_tool_path_with_base
-        // joins the (non-canonical) root with the relative path, and canonicalize resolves
-        // the full path before the post-check.
+        // With a non-canonicalized workspace_root (/tmp vs /private/tmp on macOS), reading via
+        // a relative path still succeeds: the join uses the non-canonical root and the full
+        // path is canonicalized before the post-check.
         let tmp = TempDir::new().expect("tempdir");
         let ws_dir = tmp.path().join("ws");
         tokio::fs::create_dir(&ws_dir).await.unwrap();
@@ -3078,12 +2830,9 @@ mod tests {
         );
     }
 
-    // ── normalize_path tests ──────────────────────────────────────────────
-
-    /// Path normalization (`/`, `.`, `..` resolution) is exercised via a
-    /// data-driven table so the identity, dot-component removal, simple `..`,
-    /// root-limit no-op, excess-`..` preservation for relative paths, and
-    /// complex traversal rules are all covered in one place.
+    /// Path normalization (`/`, `.`, `..` resolution) is exercised via a data-driven table:
+    /// identity, dot removal, simple `..`, the root limit, excess-`..` preservation for
+    /// relative paths and complex traversal all in one place.
     #[expect(clippy::too_many_lines)]
     #[test]
     fn normalize_path_all_cases() {
@@ -3094,7 +2843,6 @@ mod tests {
         }
 
         let cases = [
-            // Paths without `.` or `..` should be unchanged.
             Case {
                 name: "identity_root",
                 input: "/",
@@ -3120,7 +2868,6 @@ mod tests {
                 input: "single",
                 expected: "single",
             },
-            // Dot components are dropped.
             Case {
                 name: "dot_tmp_file",
                 input: "/tmp/./file.txt",
@@ -3146,7 +2893,6 @@ mod tests {
                 input: ".",
                 expected: "",
             },
-            // Simple `..` resolution.
             Case {
                 name: "dotdot_tmp_etc",
                 input: "/tmp/../etc/passwd",
@@ -3162,7 +2908,6 @@ mod tests {
                 input: "/tmp/..",
                 expected: "/",
             },
-            // Can't go above root — excess `..` after root are dropped.
             Case {
                 name: "dotdot_above_root_tmp",
                 input: "/../tmp",
@@ -3178,7 +2923,6 @@ mod tests {
                 input: "/../../..",
                 expected: "/",
             },
-            // For relative paths, excess `..` are preserved as meaningful prefix.
             Case {
                 name: "rel_excess_dotdot_foo",
                 input: "../../foo",
@@ -3199,28 +2943,24 @@ mod tests {
                 input: "a/b/c/../../d",
                 expected: "a/d",
             },
-            // Complex traversals, preserving the inline `->` transformation
-            // illustrations for the expected result.
+            // Complex traversals; the inline `->` illustrations show the expected result:
             // /a/b/c/../d/./e/../../f → /a/b/f
             Case {
                 name: "complex_abs",
                 input: "/a/b/c/../d/./e/../../f",
                 expected: "/a/b/f",
             },
-            // a/./b/./c/../d/../../e → a/e
             Case {
                 name: "complex_rel",
                 input: "a/./b/./c/../d/../../e",
                 expected: "a/e",
             },
             // Relative path with excess `..`: a/b/../../../../c → ../../c
-            //   (pop past 'a' into excess `..` preserved for relative paths)
             Case {
                 name: "complex_rel_excess",
                 input: "a/b/../../../../c",
                 expected: "../../c",
             },
-            // Empty and dot-only paths.
             Case {
                 name: "empty_string",
                 input: "",
@@ -3248,12 +2988,9 @@ mod tests {
         }
     }
 
-    // ── is_path_under_roots / allowed_temp_roots (traversal cluster) ──────
-
-    /// Allow/reject semantics for [`is_path_under_roots`] against
-    /// [`allowed_temp_roots`], covering path traversal, tilde expansion, clean
-    /// temp paths, absolute non-temp paths, harmless dot components, and the
-    /// root limit. The common-roots coverage test is kept separate.
+    /// Allow/reject semantics for [`is_path_under_roots`] against [`allowed_temp_roots`]:
+    /// traversal, tilde expansion, clean temp paths, absolute non-temp paths, harmless dot
+    /// components and the root limit.
     #[expect(clippy::too_many_lines)]
     #[test]
     fn is_path_under_allowed_temp_all_cases() {
@@ -3286,55 +3023,47 @@ mod tests {
                 path: "/tmp/./../etc/shadow",
                 allowed: false,
             },
-            // Traversal that stays within temp should still be allowed.
-            // /tmp/../tmp/file.txt → /tmp/file.txt
+            // Traversal that stays within temp is allowed: /tmp/../tmp/file.txt → /tmp/file.txt
             Case {
                 name: "traversal_back_into_tmp",
                 path: "/tmp/../tmp/file.txt",
                 allowed: true,
             },
-            // /tmp/foo/../../tmp/file.txt → /tmp/file.txt
             Case {
                 name: "traversal_foo_back_tmp",
                 path: "/tmp/foo/../../tmp/file.txt",
                 allowed: true,
             },
-            // /tmp/../../tmp/../tmp/bar → /tmp/bar
             Case {
                 name: "traversal_deep_back_tmp",
                 path: "/tmp/../../tmp/../tmp/bar",
                 allowed: true,
             },
-            // Tilde expansion + traversal: ~ expands to $HOME (e.g. /Users/username).
-            // ~/../tmp/file.txt → /Users/username/../tmp/file.txt → /Users/tmp/file.txt
-            //   NOT under /tmp → rejected
+            // Tilde expansion + traversal: ~/../tmp/file.txt → /Users/tmp/file.txt — NOT under
+            // /tmp → rejected
             Case {
                 name: "tilde_traversal_tmp",
                 path: "~/../tmp/file.txt",
                 allowed: false,
             },
-            // ~/../../tmp/file.txt → /Users/username/../../tmp/file.txt → /tmp/file.txt
-            //   IS under /tmp → allowed
+            // ~/../../tmp/file.txt → /tmp/file.txt — under /tmp → allowed
             Case {
                 name: "tilde_traversal_tmp_allowed",
                 path: "~/../../tmp/file.txt",
                 allowed: true,
             },
-            // ~/../etc/passwd → /Users/username/../etc/passwd → /Users/etc/passwd
-            //   NOT under /tmp → rejected
+            // ~/../etc/passwd → /Users/etc/passwd — NOT under /tmp → rejected
             Case {
                 name: "tilde_traversal_etc",
                 path: "~/../etc/passwd",
                 allowed: false,
             },
-            // ~/../../etc/passwd → /Users/username/../../etc/passwd → /etc/passwd
-            //   NOT under /tmp → rejected
+            // ~/../../etc/passwd → /etc/passwd — NOT under /tmp → rejected
             Case {
                 name: "tilde_traversal_etc_deep",
                 path: "~/../../etc/passwd",
                 allowed: false,
             },
-            // Ensure normal temp paths still work (no regression).
             Case {
                 name: "clean_tmp_out",
                 path: "/tmp/out.txt",
@@ -3350,7 +3079,6 @@ mod tests {
                 path: "/var/tmp/out.txt",
                 allowed: true,
             },
-            // Relative paths still rejected (can't start_with absolute roots).
             Case {
                 name: "clean_relative_rejected",
                 path: "relative.txt",
@@ -3361,7 +3089,6 @@ mod tests {
                 path: "../tmp/out.txt",
                 allowed: false,
             },
-            // Absolute paths outside temp are still rejected.
             Case {
                 name: "non_temp_etc_passwd",
                 path: "/etc/passwd",
@@ -3377,7 +3104,6 @@ mod tests {
                 path: "/var/log/system.log",
                 allowed: false,
             },
-            // Dot components in isolation should not affect the result.
             Case {
                 name: "dot_harmless_tmp_file",
                 path: "/tmp/./file.txt",
@@ -3398,7 +3124,6 @@ mod tests {
                 path: "/tmp/./../etc/passwd",
                 allowed: false,
             },
-            // Paths that would normalize to just "/" or above root should be rejected.
             Case {
                 name: "root_limit_tmp",
                 path: "/tmp/../../../",
@@ -3421,25 +3146,15 @@ mod tests {
         }
     }
 
-    // ── shell_quote / contains_glob ─────────────────────────────────────
-
     #[test]
     fn shell_quoting_edge_cases() {
-        // Simple path
         assert_eq!(shell_quote("/tmp/dir"), "'/tmp/dir'");
-        // Path with spaces
         assert_eq!(shell_quote("/my dir/file"), "'/my dir/file'");
-        // Path with single quote
         assert_eq!(shell_quote("/it's dir"), "'/it'\\''s dir'");
-        // Path with dollar sign
         assert_eq!(shell_quote("/$dir"), "'/$dir'");
-        // Path with backtick
         assert_eq!(shell_quote("/`dir`"), "'/`dir`'");
-        // Path with backslash
         assert_eq!(shell_quote("/dir\\name"), "'/dir\\name'");
-        // Empty string
         assert_eq!(shell_quote(""), "''");
-        // Already quoted — just wraps
         assert_eq!(shell_quote("normal"), "'normal'");
     }
 

@@ -1,8 +1,6 @@
 //! Dialog UI builders for the editor — overlay, confirmation, quick-open,
-//! close-save-discard, delete-confirm, and new-item-input dialogs.
-//!
-//! These are free functions extracted from `EditorState` in `editor.rs`.
-//! They take all state explicitly via parameters; none access `&self`.
+//! close-save-discard, delete-confirm and new-item-input dialogs. Free functions extracted
+//! from `EditorState`: they take all state via parameters and none access `&self`.
 
 use iced::widget::{Space, button, column, container, row, text};
 use iced::{Alignment, Color, Element, Length, widget::Id};
@@ -19,8 +17,6 @@ use super::{
     QuickOpenState,
 };
 
-// ── Overlay helpers ────────────────────────────────────────────────
-
 /// Standard overlay shell: dialog chrome inside a backdrop that closes on Escape.
 fn overlay_shell<'a>(
     content: impl Into<Element<'a, EditorMessage>>,
@@ -33,8 +29,7 @@ fn overlay_shell<'a>(
     )
 }
 
-/// Style for a search/quick-open result row: transparent by default,
-/// highlighted when selected.
+/// Style for a search/quick-open result row: transparent by default, highlighted when selected.
 fn result_entry_style(bg: Color) -> impl Fn(&iced::Theme) -> container::Style {
     move |_t: &iced::Theme| container::Style {
         background: Some(iced::Background::Color(bg)),
@@ -42,8 +37,8 @@ fn result_entry_style(bg: Color) -> impl Fn(&iced::Theme) -> container::Style {
     }
 }
 
-/// A clickable search-result row: padded content inside a full-width
-/// transparent button whose container is highlighted when selected.
+/// A clickable search-result row: padded content inside a full-width transparent button whose
+/// container is highlighted when selected.
 fn result_entry(
     content: impl Into<Element<'static, EditorMessage>>,
     bg: Color,
@@ -62,8 +57,7 @@ fn result_entry(
     .into()
 }
 
-/// Build the quick-open overlay: a centered dialog with search input
-/// and filtered results list.
+/// Build the quick-open overlay: a centered dialog with search input and filtered results list.
 pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'_, EditorMessage> {
     let search_input = widgets::single_line_editor(
         &qo.filter.buffer,
@@ -145,8 +139,6 @@ pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'_, Edito
 
     overlay_shell(content, 400.0)
 }
-
-// ── Close dialog ──────────────────────────────────────────────────
 
 /// Create a styled dialog button with consistent size (13) and center-aligned text.
 fn dialog_button(
@@ -296,10 +288,8 @@ pub(super) fn build_new_item_input(target: &NewItemTarget) -> Element<'_, Editor
     )
 }
 
-// ── Global Search overlay ──────────────────────────────────────────
-
-/// Build the global search (find-in-files) overlay: a search input with
-/// status line and results list, wrapped in a centered overlay dialog.
+/// Build the global search (find-in-files) overlay: a search input with status line and
+/// results list, in a centered overlay dialog.
 #[expect(clippy::too_many_lines)]
 pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_, EditorMessage> {
     let search_input = widgets::single_line_editor(

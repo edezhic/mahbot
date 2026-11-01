@@ -1,25 +1,17 @@
 //! Burst collector for the Telegram inbound path.
 //!
-//! Telegram gives bots no "still typing" signal, so a short quiet window per
-//! account and chat is the only available mechanism to fuse one burst into one
-//! request; the collector hands the parts to the pipeline in send order.
+//! Telegram gives bots no "still typing" signal, so a short quiet window per account and chat is
+//! the only mechanism to fuse one burst into one request; the collector hands the parts to the
+//! pipeline in send order.
 //!
-//! One quiet window is not enough on its own, because a forwarded attachment is
-//! handed to the collector only once its fetch has finished while the comment
-//! that came with it opens a group whose much shorter window keeps running. The
-//! collector therefore holds a group while a message of the same sender in the
-//! same chat is still being prepared ([`Preparations`]) — whatever that message
-//! is, an attachment as much as a forwarded one — and takes the hold from that
-//! preparation: the mark is cleared before the part is handed over, and the
-//! group's window starts at that clear rather than at its last part — the moment
-//! in between is what the window covers — so the part it produced lands inside it.
-//! The ceiling yields to a held group for the same reason: a ceiling falling at
-//! the end of a hold would cut the group before that part had been taken in. The
-//! wait is the preparation's own — bounded by the transfer, which abandons a
-//! fetch that overruns it — and the caps still bound the group's size: they release
-//! a group whatever is being prepared for it, a burst that large being beyond what
-//! one turn is for. Only that pair is affected; a group with nothing of its
-//! sender's in flight keeps the window it has today.
+//! One quiet window is not enough on its own: a forwarded attachment reaches the collector only
+//! once its fetch has finished, while the comment that came with it opens a group whose much
+//! shorter window keeps running. The collector therefore holds a group while a message of the same
+//! sender in the same chat is still being prepared ([`Preparations`]), and takes the hold from
+//! that preparation — the mark is cleared before the part is handed over and the group's window
+//! starts at that clear, so the part lands inside it. The ceiling yields to a held group for the
+//! same reason. The wait is the preparation's own, bounded by the transfer, and the caps still
+//! bound the group's size whatever is being prepared for it.
 //!
 //! Every release — a lone message's included — is recorded durably (see
 //! [`crate::channels::telegram_intake::BurstRecord`]).
@@ -32,49 +24,38 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-/// Quiet window after a lone plain part — imperceptible against an assistant
-/// turn, so a single message still feels immediate.
+/// Quiet window after a lone plain part — imperceptible against an assistant turn.
 pub(super) const QUIET_WINDOW: Duration = Duration::from_secs(1);
-/// Quiet window once the group already holds a second part or forwarded content:
-/// the user is evidently still sending, so the longer wait is worth it.
+/// Quiet window once the group already holds a second part or forwarded content.
 const EXTENDED_WINDOW: Duration = Duration::from_secs(3);
 /// Hard ceiling from the group's first part, so a long stream still moves.
 const CEILING: Duration = Duration::from_secs(5);
 /// Release the group as soon as it holds this many parts...
 const MAX_PARTS: usize = 6;
-/// ...or more than this many characters of raw part text, which keeps a burst
-/// that is still being typed from growing without bound. Enrichment (captions,
-/// transcriptions, native image parts) is added after this check, so this bounds
-/// the user's own text; a part's attachment payload is bounded by the inbound
-/// limits of one message, exactly as it is without grouping.
+/// ...or more than this many characters of raw part text. Enrichment is added after this check,
+/// so this bounds the user's own text; an attachment payload is bounded by the inbound limits of
+/// one message, exactly as it is without grouping.
 const MAX_CHARS: usize = 4000;
 
-/// Boundary between the parts of a burst in the one request the assistant
-/// receives. The parts are already in send order; the boundary is explicit
-/// because a blank line alone is indistinguishable from the user's own
-/// paragraph break.
+/// Boundary between the parts of a burst in the one request the assistant receives — explicit,
+/// because a blank line alone is indistinguishable from the user's own paragraph break.
 const PART_SEPARATOR: &str = "\n\n--- next message ---\n\n";
 
-/// How far the listener may run ahead of the pipeline: a stalled pipeline still
-/// backpressures the poll loop through the collector, while one poll's worth of
-/// slack absorbs a batch.
+/// How far the listener may run ahead of the pipeline: a stalled pipeline backpressures the poll
+/// loop through the collector, while one poll's worth of slack absorbs a batch.
 pub(crate) const QUEUE_CAPACITY: usize = 100;
 
 /// The one attachment this listener is preparing right now, by sender and chat.
 ///
-/// The mark is taken by `try_parse_attachment_message` — once the message is known
-/// to be an attachment and its sender and chat are resolved — and dropped when that
-/// call returns, so it covers the fetch and every refusal path in between, while a
-/// message that is not an attachment also takes none. That pair's group is not
-/// released while the mark is on it; nothing else reads it (see the module doc).
+/// The mark is taken once the message is known to be an attachment and its sender and chat are
+/// resolved, and dropped when that call returns, so it covers the fetch and every refusal path in
+/// between. That pair's group is not released while the mark is on it.
 #[derive(Debug)]
 pub(crate) struct Preparations {
-    /// The pair being prepared, if any. The listener walks a batch in order and
-    /// prepares one message at a time, so there is never more than one.
+    /// The pair being prepared, if any. The listener prepares one message at a time.
     preparing: std::sync::Mutex<Option<(String, String)>>,
-    /// Signalled on every mark and clear. A `watch` rather than a `Notify` because
-    /// what a waiter acts on is the state, not the notification: one that missed
-    /// a change still reads the newest state on its next pass.
+    /// Signalled on every mark and clear. A `watch` rather than a `Notify` because what a waiter
+    /// acts on is the state: one that missed a change still reads it on its next pass.
     changed: tokio::sync::watch::Sender<()>,
 }
 
@@ -131,8 +112,7 @@ pub(crate) struct Preparation<'a> {
 impl Drop for Preparation<'_> {
     fn drop(&mut self) {
         let mut preparing = self.preparations.preparing.lock().unwrap_poison();
-        // The mark is this guard's to clear — unless a later one has taken the
-        // pair over, which the mark being a single pair cannot normally happen.
+        // The mark is this guard's to clear, unless a later one has taken the pair over.
         if preparing.as_ref() == Some(&self.key) {
             *preparing = None;
         }
@@ -141,9 +121,8 @@ impl Drop for Preparation<'_> {
     }
 }
 
-/// One collected part: the message, and the moment the collector took it in —
-/// the wall clock the release's record keeps, read here rather than at the
-/// release so the record names the part's own moment.
+/// One collected part: the message, and the moment the collector took it in — read here rather
+/// than at the release so the record names the part's own moment.
 struct Part {
     message: ChannelMessage,
     taken_at: SystemTime,
@@ -158,20 +137,18 @@ impl Part {
     }
 }
 
-/// One burst: the parts of one account in one chat/thread, in send order.
-/// Messages the same account sends in two chats (or two forum topics) never land
-/// in one group.
+/// One burst: the parts of one account in one chat/thread, in send order. Messages the same
+/// account sends in two chats (or two forum topics) never land in one group.
 struct OpenGroup {
     parts: Vec<Part>,
     chars: usize,
     first_at: Instant,
     last_at: Instant,
-    /// A preparation of this group's sender in this chat was in flight while the
-    /// group was open, so the group is not due however long its own window runs.
+    /// A preparation of this group's sender was in flight while the group was open, so the group
+    /// is not due however long its own window runs.
     held: bool,
-    /// When the last preparation for this group's pair ended: the quiet window
-    /// runs from there, not from the last part, so a part that took seconds to
-    /// fetch does not shorten the wait for the companion message that follows.
+    /// When the last preparation for this group's pair ended: the quiet window runs from there, so
+    /// a part that took seconds to fetch does not shorten the wait for the next message.
     held_until: Option<Instant>,
 }
 
@@ -220,10 +197,9 @@ impl OpenGroup {
         self.parts.len() > 1 || self.parts.iter().any(|part| part.message.forwarded)
     }
 
-    /// When the group is due and which rule decides it: the window from the last
-    /// part, or from the end of the last preparation for this pair once there was
-    /// one, and — for a group that was never held — the ceiling from the first part
-    /// (see the module doc for why a held group waits out its window instead).
+    /// When the group is due and which rule decides it: the window from the last part, or from the
+    /// end of the last preparation for this pair, and — for a group never held — the ceiling from
+    /// the first part (see the module doc).
     fn due(&self) -> (Instant, Release) {
         let baseline = self
             .held_until
@@ -251,8 +227,7 @@ impl OpenGroup {
     }
 }
 
-/// What released a group: the `telegram_bursts.released_by` value, and the
-/// answer to "which window applied" for the split a complaint is about.
+/// What released a group: the `telegram_bursts.released_by` value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Release {
     /// The short window a lone part that is not forwarded gets.
@@ -295,12 +270,9 @@ struct Released {
 }
 
 impl Released {
-    /// The one message the burst becomes: the parts in send order (each keeping
-    /// its own content, markers, attachments and reply reference until the
-    /// pipeline expands them) plus the addressing the pipeline routes with,
-    /// taken from the newest part — every part carries the same one, so any of
-    /// them speaks for the group. `content` belongs to the parts. A group of one
-    /// is that message unchanged, moved rather than copied.
+    /// The one message the burst becomes: the parts in send order, each keeping its own content,
+    /// markers, attachments and reply reference, plus the addressing the pipeline routes with,
+    /// taken from the newest part. A group of one is that message unchanged, moved not copied.
     fn into_message(self) -> ChannelMessage {
         let parts: Vec<ChannelMessage> = self.parts.into_iter().map(|part| part.message).collect();
         match <[ChannelMessage; 1]>::try_from(parts) {
@@ -342,16 +314,15 @@ impl Released {
     }
 }
 
-/// Collects one burst per account+chat. Every method takes the current instant
-/// so the timing policy is testable without sleeping.
+/// Collects one burst per account+chat. Every method takes the current instant, so the timing
+/// policy is testable without sleeping.
 #[derive(Default)]
 struct Collector {
     open: Vec<OpenGroup>,
 }
 
 impl Collector {
-    /// Add one part of an account's burst. Returns the group when it must be
-    /// released now (it reached the part or character cap).
+    /// Add one part of an account's burst. Returns the group when it must be released now.
     fn push(&mut self, part: ChannelMessage, now: Instant) -> Option<Released> {
         let Some(at) = self.open.iter().position(|group| group.matches(&part)) else {
             // A fresh group holds this one part, so neither cap is reached yet.
@@ -362,9 +333,8 @@ impl Collector {
         Some(self.take_at(at, release))
     }
 
-    /// Note the preparations in flight onto the open groups: a group whose pair
-    /// is being prepared is held, and one whose preparation has just ended takes
-    /// its window from that moment.
+    /// Note the preparations in flight onto the open groups: a group whose pair is being prepared
+    /// is held, and one whose preparation has just ended takes its window from that moment.
     fn observe(&mut self, preparations: &Preparations, now: Instant) {
         for group in &mut self.open {
             let (user, target) = group.key();
@@ -397,11 +367,9 @@ impl Collector {
         })
     }
 
-    /// Every open group of one account in one chat/thread, released by
-    /// `release` — the group a control message arriving in that chat is handed
-    /// over ahead of, and the one an urgent message leaves with. Order is
-    /// preserved only as enqueue order: the group is put on the pipeline before
-    /// the message that released it is.
+    /// Every open group of one account in one chat/thread, released by `release` — the group a
+    /// control message is handed over ahead of, and the one an urgent message leaves with. The
+    /// group is put on the pipeline before the message that released it.
     fn release_chat(
         &mut self,
         user_name: &str,
@@ -439,14 +407,10 @@ impl Collector {
     }
 }
 
-/// The single message a burst becomes: the parts in send order (each keeping its
-/// own text, markers, attachments and reply reference until the pipeline expands
-/// them) plus the addressing the pipeline routes with, taken from the newest
-/// part — every part carries the same one, so any of them speaks for the group.
-/// `content` belongs to the parts. The record entries the parts stand for are
-/// moved onto the envelope, which is what the hand-over settles: a part does not
-/// keep entries the envelope already carries. The envelope is urgent when any of
-/// its parts is.
+/// The single message a burst becomes: the parts in send order, plus the addressing the pipeline
+/// routes with, taken from the newest part — every part carries the same one. The record entries
+/// the parts stand for are moved onto the envelope, which is what the hand-over settles. The
+/// envelope is urgent when any of its parts is.
 fn group_message(mut parts: Vec<ChannelMessage>) -> ChannelMessage {
     // A released group always holds at least one part (see `OpenGroup`).
     let newest = parts
@@ -471,9 +435,8 @@ fn group_message(mut parts: Vec<ChannelMessage>) -> ChannelMessage {
     }
 }
 
-/// The one request the assistant receives for a collected burst: the parts in
-/// send order with an explicit boundary between them. A lone message is its own
-/// content, moved out rather than copied.
+/// The one request the assistant receives for a collected burst: the parts in send order with an
+/// explicit boundary between them.
 #[must_use]
 pub fn compose_group_content(parts: Vec<ChannelMessage>) -> String {
     match <[ChannelMessage; 1]>::try_from(parts) {
@@ -486,14 +449,12 @@ pub fn compose_group_content(parts: Vec<ChannelMessage>) -> String {
     }
 }
 
-/// Spawn the collector that turns the listener's stream of inbound messages into
-/// one message per burst. Its input sender lives in the listener, so dropping it
-/// — the listener exiting, which is what a bot-token hot reload does — releases
-/// an open group immediately instead of waiting out its window.
+/// Spawn the collector that turns the listener's stream of inbound messages into one message per
+/// burst. Its input sender lives in the listener, so dropping it — the listener exiting, which is
+/// what a bot-token hot reload does — releases an open group immediately.
 ///
-/// The collector owns the listener's frame for its whole body: a listener whose
-/// future is dropped or that panics still leaves the frame open until its
-/// collector has handed on (and settled) the burst it held.
+/// The collector owns the listener's frame for its whole body, so a listener whose future is
+/// dropped still leaves the frame open until its collector has handed on the burst it held.
 pub(crate) fn spawn_collector(
     input: mpsc::Receiver<ChannelMessage>,
     output: mpsc::Sender<ChannelMessage>,
@@ -514,9 +475,8 @@ async fn run_collector(
     let mut collector = Collector::default();
     let mut holds_changed = preparations.watch();
     loop {
-        // Everything the listener has already handed over belongs to the group it
-        // was sent to: a part that arrives in the same instant a window closes
-        // must not be split off from it.
+        // Everything the listener has already handed over belongs to the group it was sent to: a
+        // part arriving as a window closes must not be split off.
         loop {
             match input.try_recv() {
                 Ok(msg) => {
@@ -538,8 +498,7 @@ async fn run_collector(
         }
         tokio::select! {
             () = wait_until(collector.deadline()) => {}
-            // The end of a preparation is what starts a held group's window;
-            // without this the collector would sleep past it.
+            // The end of a preparation starts a held group's window.
             Ok(()) = holds_changed.changed() => {}
             msg = input.recv() => {
                 let Some(msg) = msg else {
@@ -554,11 +513,9 @@ async fn run_collector(
     }
 }
 
-/// Take one part from the listener: control input is never collected — the group
-/// open in that chat goes on the pipeline ahead of it — and joins no burst, so
-/// it is handed over without a record; an urgent message is never collected
-/// either, leaving at once with whatever group was open ahead of it; everything
-/// else joins the burst of its sender in that chat.
+/// Take one part from the listener: control input is never collected — the group open in that
+/// chat goes on the pipeline ahead of it — and joins no burst; an urgent message leaves at once
+/// with whatever group was open ahead of it; everything else joins its sender's burst.
 async fn absorb(
     collector: &mut Collector,
     output: &mpsc::Sender<ChannelMessage>,
@@ -578,8 +535,7 @@ async fn absorb(
         // Control input is never collected: there is no group to record.
         return send_to_pipeline(output, intake, msg).await;
     }
-    // An urgent message never waits for a burst: the parts collected before it
-    // go out with it, in their order, and it is the last of them.
+    // An urgent message never waits for a burst: the parts collected before it go out with it.
     if msg.urgent {
         let mut released =
             collector.release_chat(&msg.user_name, &msg.reply_target, Release::Urgent);
@@ -623,11 +579,9 @@ async fn hand_over_all(
     true
 }
 
-/// Hand one released group to the pipeline: its parts as one message (a group of
-/// one is that message unchanged, moved rather than copied), and — once the
-/// message is on the queue — the settlement of the record entries it stands for
-/// and the durable record of the release. Returns `false` when the pipeline is
-/// gone.
+/// Hand one released group to the pipeline: its parts as one message, then the settlement of the
+/// record entries it stands for and the durable record of the release. Returns `false` when the
+/// pipeline is gone.
 async fn hand_over(
     output: &mpsc::Sender<ChannelMessage>,
     intake: &Intake,
@@ -649,11 +603,9 @@ async fn hand_over(
     true
 }
 
-/// Put one message on the pipeline and settle the record entries it carries.
-/// Returns `false` when the pipeline is gone — logged, because a released group
-/// that cannot be handed over is the one message the collector itself gives up;
-/// a group that was not handed over is not recorded either (its events stay held
-/// in the intake's record and come back).
+/// Put one message on the pipeline and settle the record entries it carries. Returns `false` when
+/// the pipeline is gone — logged, because that is the one message the collector itself gives up;
+/// a group not handed over is not recorded either (its events stay held in the intake).
 async fn send_to_pipeline(
     output: &mpsc::Sender<ChannelMessage>,
     intake: &Intake,
@@ -685,8 +637,7 @@ mod tests {
         }
     }
 
-    /// A frame of its own for the collector to own: the check has no listener, so
-    /// nothing waits for it to end.
+    /// A frame of its own for the collector to own: the check has no listener to wait on.
     fn test_frame() -> ListenerFrame {
         ListenerFrame::enter(
             &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -694,14 +645,12 @@ mod tests {
         )
     }
 
-    /// No message is being prepared in these checks, so the collector holds no
-    /// group on a preparation's account.
+    /// No message is being prepared in these checks.
     fn no_preparations() -> std::sync::Arc<Preparations> {
         std::sync::Arc::new(Preparations::new())
     }
 
-    /// The quiet window starts at the first part and is extended by each later
-    /// one; a lone part is released on it, unchanged.
+    /// The quiet window starts at the first part and is extended by each later one.
     #[test]
     fn the_window_starts_at_the_first_part_and_extends_with_later_ones() {
         let mut collector = Collector::default();
@@ -739,9 +688,8 @@ mod tests {
         assert_eq!(forwarded.deadline(), Some(t0 + EXTENDED_WINDOW));
     }
 
-    /// The ceiling bounds an ordinary group, and does not cut one that was held:
-    /// a preparation that ends past the ceiling releases the group after its own
-    /// window from that end.
+    /// The ceiling bounds an ordinary group, and does not cut one that was held: a preparation
+    /// ending past the ceiling releases the group after its own window from that end.
     #[test]
     fn the_ceiling_bounds_the_window_but_waits_with_a_held_group() {
         let mut collector = Collector::default();

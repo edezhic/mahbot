@@ -82,22 +82,17 @@ use tokio::sync::broadcast;
 
 use futures_util::StreamExt;
 
-/// Coalescing window for runtime-change re-renders. Bounds re-render frequency
-/// for per-message / per-tool-call broadcasts while keeping the Running Agents
-/// cards and footer responsive.
+/// Coalescing window for runtime-change re-renders: bounds per-message and
+/// per-tool-call bursts while keeping the Running Agents cards responsive.
 const RUNTIME_REFRESH_COALESCE: Duration = Duration::from_millis(250);
 
-/// The left nav rail's fixed width, in px: the content area starts to its right.
 const SIDEBAR_RAIL_WIDTH: f32 = 56.0;
 
-/// The rail's icon size, in px — the nav icons, the voice status and the update
-/// entry — so an entry that came from the footer sits like its neighbours. The
-/// running-agent indicators are smaller.
+/// The rail's icon size, in px; the running-agent indicators are smaller.
 const RAIL_ICON_SIZE: f32 = 28.0;
 
-/// The window control's vertical padding where it is drawn in its own chrome — the start-up splash,
-/// a failed boot: the room the system's rounded corner needs, 12px on macOS, whose radius is the
-/// deeper one, and 8px on Windows.
+/// The window control's vertical padding in its own chrome (start-up splash, a
+/// failed boot): room for the system's rounded corner — 12px on macOS, 8px on Windows.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const WINDOW_CONTROL_PADDING: f32 = if cfg!(target_os = "macos") {
     theme::PAD_12
@@ -105,95 +100,72 @@ const WINDOW_CONTROL_PADDING: f32 = if cfg!(target_os = "macos") {
     theme::PAD_8
 };
 
-/// The gap under the rail's control, before the first nav entry — 12px on macOS, 8px on Windows:
-/// the same padding the control keeps below itself rather than above.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const RAIL_WINDOW_CONTROL_GAP: f32 = WINDOW_CONTROL_PADDING;
 
-/// The bottom footer bar's fixed height, in px. The toast stack clears it (see
-/// [`Dashboard::view`]), and there is no bar to clear while
-/// [`Dashboard::footer_hidden`].
+/// The bottom footer bar's fixed height, in px: the toast stack clears it (see
+/// [`Dashboard::view`]) unless [`Dashboard::footer_hidden`].
 const FOOTER_HEIGHT: f32 = 42.0;
 
-/// The portions the Home page's chat and its ticket column split the content
-/// area by. The column's share also sizes a fresh window's opening width (see
-/// [`ticket_column_share`]).
+/// The portions the Home page's chat and ticket column split the content area
+/// by; the column's share also sizes a fresh window's opening width.
 const CHAT_COLUMN_PORTION: u16 = 7;
 const TICKET_COLUMN_PORTION: u16 = 3;
 
-/// How long an exit requested before boot finished waits for the boot task to
-/// deliver its result before the exit path runs anyway. The boot is the only
-/// writer to the stores until then, and a store left before its first catalog
-/// run is refused on the next start (`db::has_product_schema`) — so waiting is
-/// the normal case (a boot takes well under a second), and this limit covers
-/// only a start that never finishes, which must stay closable.
+/// How long an exit requested before boot finished waits for the boot's result.
+/// The boot is the only store writer until then, and a store left before its
+/// first catalog run is refused on the next start (`db::has_product_schema`),
+/// so waiting is the normal case; this bound covers only a start that never
+/// finishes, which must stay closable.
 const BOOT_EXIT_WAIT: Duration = Duration::from_secs(15);
-
-// ── Global log broadcast for live streaming ──────────────────────
 
 /// Global broadcast sender for live log streaming. Set during `startup()`.
 pub static LOG_BROADCAST: OnceLock<broadcast::Sender<String>> = OnceLock::new();
 
-/// Initialise the git file-change broadcast before the iced application runs
-/// (matching the [`LOG_BROADCAST`] convention) so the file-change subscription
-/// always has a source. Called from `main`.
+/// Warm the git file-change broadcast (see [`init_board_change_tx`]). Called from `main`.
 pub fn init_git_file_change_tx() {
     git::init_file_change_tx();
 }
 
-/// Initialise the git-commit broadcast before the iced application runs
-/// (matching the [`LOG_BROADCAST`] convention) so the pipeline-commit
-/// subscription always has a source. Called from `main`.
+/// Warm the git-commit broadcast (see [`init_board_change_tx`]). Called from `main`.
 pub fn init_git_commit_tx() {
     crate::git::commands::init_git_commit_tx();
 }
 
-/// Initialise the CDC ticket change broadcast before the iced application runs
-/// (same convention as [`init_git_file_change_tx`] / [`LOG_BROADCAST`]) so the
-/// board change subscription always has a source. An uninitialized `OnceLock`
-/// would end the subscription stream on its first poll and freeze the board at
-/// the initial snapshot — Iced does not re-spawn an ended subscription. Called
-/// from `main` before `iced::application(...).run()`.
+/// Warm the CDC ticket-change broadcast before iced runs. Every `init_*_tx` here
+/// must be warmed from `main`: an uninitialized `OnceLock` ends its subscription
+/// stream on the first poll, and iced never re-spawns it, so the board freezes at
+/// the initial snapshot.
 pub fn init_board_change_tx() {
     let _ = crate::db::cdc::ticket_sender();
 }
 
-/// Warm the CDC workspaces-table sender before the iced application runs (same
-/// convention as [`init_board_change_tx`]) so the workspaces CDC subscription
-/// always has a source. Called from `main`.
+/// Warm the CDC workspaces-table sender (see [`init_board_change_tx`]). Called from `main`.
 pub fn init_workspace_tx() {
     crate::db::cdc::init_workspace_tx();
 }
 
-/// Warm the CDC users-table sender before the iced application runs (same
-/// convention as [`init_board_change_tx`]). Called from `main`.
+/// Warm the CDC users-table sender (see [`init_board_change_tx`]). Called from `main`.
 pub fn init_users_tx() {
     crate::db::cdc::init_users_tx();
 }
 
-/// Warm the CDC user_channels-table sender before the iced application runs
-/// (same convention as [`init_board_change_tx`]). Called from `main`.
+/// Warm the CDC user_channels-table sender (see [`init_board_change_tx`]). Called from `main`.
 pub fn init_user_channels_tx() {
     crate::db::cdc::init_user_channels_tx();
 }
 
-/// Initialise the runtime-change broadcast before the iced application runs
-/// (same convention as [`init_board_change_tx`]) so the dashboard's
-/// runtime-change subscription always has a source. Called from `main`.
+/// Warm the runtime-change broadcast (see [`init_board_change_tx`]). Called from `main`.
 pub fn init_runtime_event_tx() {
     crate::runtime_events::init_runtime_event_tx();
 }
 
-/// Warm the voice-recording broadcast before the iced application runs (same
-/// convention as [`init_board_change_tx`]) so the Home composer's recording
-/// subscription always has a source. Called from `main`; nothing to warm on a
-/// platform with no voice stack.
+/// Warm the voice-recording broadcast (see [`init_board_change_tx`]); nothing to
+/// warm on a platform with no voice stack. Called from `main`.
 pub fn init_recording_tx() {
     #[cfg(target_os = "macos")]
     crate::audio::voice::init_recording_tx();
 }
-
-// ── Navigation pages ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
@@ -201,29 +173,24 @@ pub enum Page {
     /// The session list's viewer. It has no rail entry:
     /// [`DashboardShortcut::Sessions`] is its only way in.
     Sessions,
-    /// The log store's viewer. It has no rail entry: [`DashboardShortcut::Logs`]
-    /// is its only way in.
+    /// The log store's viewer: [`DashboardShortcut::Logs`] is its only way in.
     Logs,
     Shell,
     Editor,
     Settings,
     Automations,
-    /// Live view of running agents and in-flight non-agent LLM work. Its way in
-    /// is the activity indicators — the footer bar's, or the rail column's while
-    /// [`Dashboard::footer_hidden`] — so, like them, it has no entry while
-    /// nothing runs.
+    /// Live view of running agents and in-flight non-agent LLM work, reached only from the
+    /// activity indicators (the footer's, or the rail's while [`Dashboard::footer_hidden`]).
     RunningAgents,
 }
 
 impl Page {
-    /// Pages in the sidebar top nav. The top nav renders this list minus the
-    /// pages [`Dashboard::page_available`] excludes.
+    /// The sidebar top nav, minus the pages [`Dashboard::page_available`] excludes.
     const fn sidebar_pages() -> &'static [Page] {
         &[Page::Home, Page::Editor, Page::Shell, Page::Automations]
     }
 
-    /// Pages in the sidebar bottom nav — Sessions and Logs are absent by design
-    /// (see [`Page::Sessions`] and [`Page::Logs`]).
+    /// The sidebar bottom nav — Sessions and Logs are absent by design.
     const fn sidebar_bottom_pages() -> &'static [Page] {
         &[Page::Settings]
     }
@@ -242,9 +209,6 @@ impl Page {
     }
 }
 
-// ── Main message type ────────────────────────────────────────────
-
-/// Toast notification kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToastKind {
     Success,
@@ -256,10 +220,8 @@ pub(crate) enum ToastKind {
 /// toast's expiry timer cannot dismiss a later toast that reused its slot.
 static NEXT_TOAST_ID: AtomicU64 = AtomicU64::new(0);
 
-/// A floating toast notification.
 #[derive(Debug, Clone)]
 pub(crate) struct Toast {
-    /// Stable id used to dismiss the toast when its expiry timer fires.
     pub id: u64,
     pub message: String,
     pub kind: ToastKind,
@@ -272,7 +234,6 @@ pub enum ToastMessage {
     Deleted,
     Error(String),
     Warning(String),
-    /// Generic success with custom message.
     SuccessMsg(String),
 }
 
@@ -303,12 +264,10 @@ impl Toast {
     }
 }
 
-/// Distinguishes between pause-toggle and maintenance-toggle toggles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToggleKind {
-    /// Pause/unpause the pipeline.
     Pause,
-    /// Enable/disable the maintainer.
+    /// The maintainer, not the pipeline.
     Maintenance,
 }
 
@@ -334,7 +293,6 @@ impl ToggleKind {
         }
     }
 
-    /// Persist the new toggle state to the workspace store.
     async fn persist_to_store(self, name: String, state: bool) -> Result<(), String> {
         let store = crate::workspace::store();
         match self {
@@ -353,82 +311,56 @@ impl ToggleKind {
 #[derive(Debug, Clone)]
 #[expect(private_interfaces)]
 pub enum Message {
-    /// MahBot finished async startup (or failed), carrying the log store it
-    /// opened — the logs page is built from it.
+    /// Async startup finished (or failed), carrying the log store the logs page is built from.
     Boot(Result<LogStore, String>),
     Navigation(Page),
-    /// A toast's expiry timer fired — dismiss the toast by its stable id.
-    /// Dismissing an already-expired/unknown id is a safe no-op.
+    /// A toast's expiry timer fired: dismiss by stable id; an unknown id is a no-op.
     ToastExpired(u64),
-    /// Coalesced notification that the agent/non-agent registries, live
-    /// transcript content, or voice status changed — triggers a re-render.
+    /// Coalesced: the agent registries, live transcript content or voice status changed.
     RuntimeChanged,
-    /// A workspaces-table row changed (or the CDC stream lagged/baseline
-    /// fired) — triggers one full map reload via `load_workspace_map`.
+    /// A workspaces row changed (or the CDC stream lagged): one full map reload.
     WorkspacesCdcChanged,
-    /// A users-table or user_channels-table row changed (or the CDC stream
-    /// lagged) — triggers a full users re-list on the Settings page and a
-    /// read-back of the admin's active workspace (the `workspace` tool's `add`
-    /// writes that same column).
+    /// A users or user_channels row changed: re-list the Settings users and read the admin's
+    /// active workspace back (the `workspace` tool's `add` writes that column).
     UsersCdcChanged,
-    /// The admin's DB-stored active workspace read back after a users-table
-    /// change — the desktop and the DB are one and the same choice, so a
-    /// switch made by another surface applies here without a restart. A personal
-    /// answer applies only while no project exists to show (see the handler: an
-    /// empty selection is not a steady state). `generation` is the
-    /// `active_workspace_gen` guard value captured at dispatch, so a read a
-    /// newer pick or read superseded cannot apply.
+    /// The admin's stored active workspace read back after a users change, so another
+    /// surface's switch applies without a restart. A superseded read (`generation`) cannot.
     ActiveWorkspaceSynced {
         generation: u64,
         name: Option<String>,
     },
-    /// Shutdown signaled — leave the iced runtime for the product's exit path
-    /// (`save_and_exit`), which `main` continues after `run()` returns.
-    /// Triggered by the shutdown token: a self-update restart, SIGTERM/SIGINT, and the
-    /// end of a drain a quit began.
+    /// Leave the iced runtime for `save_and_exit`, which `main` continues after `run()`: the
+    /// shutdown token fires it (self-update restart, SIGTERM/SIGINT, the end of a drain).
     Shutdown,
-    /// The graceful-drain window began (first signal / a close that could not hide / a quit /
-    /// self-update). Draining disables input; iced::exit is deferred until
-    /// the drain completes (the token fires).
+    /// Input is disabled and `iced::exit` waits for the token.
     DrainStarted,
-    /// The dashboard window's close request — the system's own close, Alt+F4, a shortcut:
-    /// [`Dashboard::close_window`], which HIDES the window on macOS and Windows and runs the
-    /// exit path on Linux and wherever a hide is not the right answer.
+    /// [`Dashboard::close_window`] hides on macOS/Windows, exits elsewhere.
     CloseRequested(window::Id),
-    /// One of the platform's own ordinary quit asks — macOS's ⌘Q, the application menu's Quit
-    /// item or the Dock's Quit — delivered by `quit_requests_subscription`, subscribed from the
-    /// first frame. Runs the exit path (`request_exit`), the second-quit escape included; the
-    /// system's asks during a log-out, restart or shut-down are not delivered here
-    /// (see `shutdown`).
+    /// A platform quit ask (⌘Q, the menu's Quit, the Dock's) runs `request_exit`, the
+    /// second-quit escape included. Log-out/restart asks are not delivered here (`shutdown`).
     QuitRequested,
-    /// A window event delivered to the dashboard: geometry (move/resize), which
-    /// is tracked for persist-on-exit, and file drops, which attach to the
-    /// chat composer while the Home page is showing.
+    /// Geometry, tracked for persist-on-exit, and file drops, which attach to the composer
+    /// while Home is showing.
     WindowEvent(window::Id, window::Event),
-    /// The dashboard window was created, carrying the id of the new window. macOS and Windows
-    /// only: the window is the app's own there — macOS hides the system's title strip before
-    /// showing the window (see [`crate::gui::app_window`]), and Windows attaches to its handle
-    /// the icons the taskbar and Alt-Tab show (see [`crate::app_icon`]).
+    /// The dashboard window was created: macOS hides the title strip first
+    /// ([`crate::gui::app_window`]), Windows takes the taskbar/Alt-Tab icons.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     WindowOpened(window::Id),
-    /// The window's own platform handle, the answer to [`Message::WindowOpened`].
-    /// Windows only — the value is the window's `HWND`.
+    /// The window's own platform handle — the `HWND` — answering [`Message::WindowOpened`].
     #[cfg(target_os = "windows")]
     WindowHandle(u64),
     /// A window action the rail asks for ([`WindowAction`]).
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     WindowAction(WindowAction),
-    /// A gesture from outside the window — the tray icon's click, a second launch of the
-    /// product, a click on the macOS Dock icon ([`crate::window_requests`]): the window comes
-    /// up, or the product quits. A show during a drain does nothing.
+    /// A gesture from outside the window ([`crate::window_requests`]): the window
+    /// comes up, or the product quits. A show during a drain does nothing.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     WindowRequested(crate::window_requests::WindowRequest),
     /// Keyboard shortcut: Cmd+F — focus the primary search input on the current page.
     FocusSearch,
     /// Keyboard shortcut: Cmd+L — open the Logs page, which has no rail item.
     OpenLogs,
-    /// Keyboard shortcut: Cmd+K — open the Sessions page, which has no rail
-    /// item.
+    /// Keyboard shortcut: Cmd+K — open the Sessions page, which has no rail item.
     OpenSessions,
     /// Keyboard shortcut: Escape — dismiss modal/panel/confirmation on the current page.
     EscapePressed,
@@ -436,52 +368,41 @@ pub enum Message {
     UpdateBot,
     /// Self-update confirmed — start the background update.
     ConfirmUpdate,
-    /// Self-update confirmation dismissed — nothing happens.
     CancelUpdate,
-    /// Self-update result.
     UpdateResult(Result<String, String>),
     /// Toggle the selected workspace's pipeline pause or maintainer state.
     Toggle(ToggleKind),
-    /// Footer workspace picker: switch the admin's workspace (managed
-    /// workspaces only).
+    /// Footer workspace picker: switch the admin's workspace (managed workspaces only).
     WorkspacePick(String),
-    /// Result of a per-workspace toggle DB write. Carries (kind, result, workspace_name, intended_state).
-    /// On success, the workspace map is reloaded from the store; on error an error toast is shown.
+    /// A per-workspace toggle DB write's result: (kind, result, name, intended
+    /// state). Success reloads the workspace map; an error shows a toast.
     ToggleResult(ToggleKind, Result<(), String>, String, bool),
-    /// No-op — the completion message for a fire-and-forget write whose
-    /// failure is already logged at the write site.
+    /// The completion message for a fire-and-forget write whose failure is logged at the
+    /// write site.
     Nop,
-    /// Workspace info and restored selection loaded during boot. The read
-    /// result is carried as-is so a failed boot read surfaces in the picker
-    /// and Settings list instead of silently rendering as "no workspaces".
-    /// The selection is the resolved name. `remember` says whether that name has
-    /// to be written back as the admin's stored selection — it differs from a
-    /// successful stored read (see [`Dashboard::apply_boot_workspaces`]). The
-    /// generation is the reload generation the read was issued under, so a reload
-    /// that answered while it was in flight wins.
+    /// Workspace info and restored selection loaded during boot. The read result is carried as-is
+    /// so a failed read shows in the picker and Settings list rather than as "no workspaces";
+    /// `remember` says whether the name must be written back as the admin's selection
+    /// ([`Dashboard::apply_boot_workspaces`]); `generation` is the read's reload generation, so a
+    /// reload that answered meanwhile wins.
     BootWorkspaces {
         workspaces: Result<HashMap<String, Workspace>, String>,
         restored_name: String,
         remember: bool,
         generation: u64,
     },
-    /// The wait for a still-running boot expired ([`BOOT_EXIT_WAIT`], a start
-    /// that hangs): run the exit path for the exit request that was waiting.
+    /// The wait for a hanging boot expired ([`BOOT_EXIT_WAIT`]): run the waiting exit.
     BootExitWaitExpired,
-    /// Full workspace map reloaded from the store (CDC workspaces event,
-    /// stream lag/baseline, toggle completion, or a settings add/delete). The
-    /// handler replaces the map and re-pushes the workspace-scoped surfaces; it
-    /// never re-resolves the live selection against it, because the map can lag
-    /// the stored choice — that is the DB read-back's call (see
-    /// `Message::ActiveWorkspaceSynced`). The generation is the reload it
-    /// answers, so a slow read cannot overwrite a newer one.
+    /// Full workspace map reloaded from the store: the handler replaces the map and re-pushes the
+    /// workspace-scoped surfaces, but never re-resolves the live selection, because the map can
+    /// lag the stored choice — that is the DB read-back's call. A slow read cannot overwrite a
+    /// newer one.
     WorkspacesReloaded {
         workspaces: HashMap<String, Workspace>,
         generation: u64,
     },
-    /// The post-ready workspace map reload failed (all retries exhausted). The
-    /// current map is preserved and the failure is rendered where the picker /
-    /// Settings list would be — unless a newer reload has already answered.
+    /// The post-ready map reload failed: the current map is preserved and the failure renders
+    /// where the picker / Settings list would be — unless a newer reload has answered.
     WorkspacesReloadFailed {
         error: String,
         generation: u64,
@@ -490,52 +411,36 @@ pub enum Message {
     Logs(logs::LogMessage),
     Board(board::BoardMessage),
     Sessions(sessions::SessionsMessage),
-    /// Automations page messages (refresh and card-menu deletion).
     Automations(automations::AutomationsMessage),
-    /// Running Agents page messages (manual stop of a research run or a
-    /// custom-role launch).
     RunningAgents(running::RunningMessage),
-    /// Diff modal overlay (not a page) — wraps [`diff::DiffMessage`].
-    /// Named `DiffModal` rather than `Diff` to avoid ambiguity with the
-    /// removed `Page::Diff` variant and the existing page-message convention.
+    /// Diff modal overlay, not a page — named so around the removed `Page::Diff` variant.
     DiffModal(diff::DiffMessage),
-    /// The read-only foreign commit view's own [`diff::DiffMessage`]s — a
-    /// sidebar ticket of a project that is not the picked one. Routing is by
-    /// origin, not by what is on screen, so a task still in flight from the
-    /// picked view can never land in another project's view.
+    /// The read-only foreign commit view's own messages. Routing is by origin, not by what is
+    /// on screen, so a task in flight from the picked view never lands in another project.
     ForeignDiff(diff::DiffMessage),
-    /// Git sub-state message.
     Git(git::GitMessage),
     Shell(shell::ShellMessage),
     Editor(editor::EditorMessage),
     Settings(settings::SettingsMessage),
 
-    // ── Diff modal ──────────────────────────────────────────────
     /// Open the diff modal. Optional commit hash — `None` = working tree diff.
     OpenDiffModal(Option<String>),
-    /// A sidebar ticket's project, looked up in the store because the
-    /// dashboard's workspace map had no entry for it yet. `path` is `None`
-    /// when the project is gone.
+    /// A sidebar ticket's project, looked up in the store because the dashboard's map had no
+    /// entry for it yet; `path` is `None` when the project is gone.
     TicketCommitProjectResolved {
         workspace: String,
         commit_hash: String,
         path: Option<String>,
     },
-    /// Close the diff modal.
     CloseDiffModal,
-    /// TTS model download progress event.
     #[cfg(target_os = "macos")]
     TtsDownloadEvent(crate::audio::tts::TtsDownloadEvent),
 }
 
-// ── Message introspection helpers ────────────────────────────────
-//
-// These methods let [`Dashboard::update`] intercept Toast and
-// LinkClicked messages before dispatching to page handlers,
-// consolidating what would otherwise be per-page boilerplate.
-
+/// Let [`Dashboard::update`] intercept Toast and LinkClicked messages before
+/// dispatching to page handlers, instead of repeating that in every page.
 impl Message {
-    /// Returns a reference to the inner [`ToastMessage`] if this message wraps one.
+    /// The inner [`ToastMessage`], if this message wraps one.
     pub(crate) fn as_toast(&self) -> Option<&ToastMessage> {
         match self {
             Message::Home(home::HomeMessage::Toast(tm))
@@ -554,14 +459,8 @@ impl Message {
         }
     }
 
-    /// Returns the URL string if this message wraps a `LinkClicked`.
-    ///
-    /// # Design note
-    ///
-    /// [`HomeMessage::LinkClicked`] is deliberately **not** included here
-    /// because `home.rs` handles its own inline context links internally
-    /// (see `HomeState::update`).  Do not add it without understanding
-    /// the Home page's self-handling logic.
+    /// The URL if this message wraps a `LinkClicked`. [`HomeMessage::LinkClicked`] is
+    /// deliberately absent: `home.rs` handles its own inline context links.
     fn as_link_url(&self) -> Option<&str> {
         match self {
             Message::Board(board::BoardMessage::LinkClicked(url))
@@ -574,38 +473,23 @@ impl Message {
     }
 }
 
-// ── Keyboard modifier helper ─────────────────────────────────────
-
-/// Platform-aware keyboard modifier state computed from a
-/// [`keyboard::Modifiers`] value.  Centralises the duplicated
-/// `#[cfg]`-gated setup that was repeated across four GUI keyboard
-/// subscription handlers.
+/// Platform-aware keyboard modifier state from a [`keyboard::Modifiers`] value.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct KeyboardMods {
-    /// True if the Command key (macOS) is held (⌘).
+    /// ⌘ is held.
     pub is_cmd: bool,
-    /// True if the platform modifier is held — Command (⌘) on macOS,
-    /// Control (Ctrl) on other platforms.
+    /// The platform modifier: ⌘ on macOS, Ctrl elsewhere.
     pub is_platform_mod: bool,
-    /// True if the Control key is held (any platform).
     pub ctrl_held: bool,
-    /// On macOS: true if Ctrl is held without Cmd (triggers terminal
-    /// control characters / emacs bindings).  Always false on other
-    /// platforms.
+    /// macOS: Ctrl without Cmd — terminal control characters / emacs bindings.
     pub is_emacs_ctrl: bool,
-    /// On non-macOS: true if Ctrl+Alt is held (AltGr character input).
-    /// Always false on macOS.
+    /// Non-macOS: Ctrl+Alt, i.e. AltGr character input.
     pub altgr_active: bool,
 }
 
 impl KeyboardMods {
-    /// Platform modifier for shortcut-like navigation
-    /// (arrow-key movement, line start/end, etc.).
-    ///
-    /// On macOS: Cmd only — Ctrl is reserved for Emacs-style bindings
-    /// (Ctrl+F/B/A/E/P/N etc.) and terminal control characters.
-    ///
-    /// On other platforms: Cmd or Ctrl.
+    /// Navigation modifier (arrow-key movement, line start/end). macOS: Cmd only,
+    /// because Ctrl is reserved for emacs bindings and control characters.
     #[must_use]
     pub(crate) fn is_nav_platform_mod(self) -> bool {
         if cfg!(target_os = "macos") {
@@ -615,13 +499,8 @@ impl KeyboardMods {
         }
     }
 
-    /// Platform modifier for text-affecting shortcuts
-    /// (clipboard C/X/V, IME guard).
-    ///
-    /// Stricter than [`is_nav_platform_mod`]: on macOS, Cmd+Ctrl combos
-    /// are excluded (Ctrl+C/X/V are terminal control characters); on
-    /// other platforms, AltGr (Ctrl+Alt) is excluded because it produces
-    /// text characters for international keyboard layouts.
+    /// Text modifier (clipboard C/X/V, IME guard), stricter than
+    /// [`Self::is_nav_platform_mod`]: no macOS Cmd+Ctrl, no AltGr.
     #[must_use]
     pub(crate) fn is_text_platform_mod(self) -> bool {
         if cfg!(target_os = "macos") {
@@ -631,24 +510,14 @@ impl KeyboardMods {
         }
     }
 
-    /// Platform modifier for general keyboard shortcuts
-    /// (everything except navigation and text operations).
-    ///
-    /// On macOS: Cmd is pressed (with or without Ctrl), but not Ctrl alone
-    /// (which triggers terminal control characters / Emacs bindings).
-    ///
-    /// On other platforms: Cmd or Ctrl is pressed, but not AltGr
-    /// (Ctrl+Alt, which produces international text characters).
+    /// General-shortcut modifier: the platform modifier, but never emacs Ctrl or AltGr.
     #[must_use]
     pub(crate) fn is_shortcut_platform_mod(self) -> bool {
         self.is_platform_mod && !self.is_emacs_ctrl && !self.altgr_active
     }
 }
 
-/// Compute [`KeyboardMods`] from an Iced [`keyboard::Modifiers`] value.
-///
-/// Encapsulates the `cfg!()`-based platform branching that every keyboard
-/// subscription handler previously inlined.
+/// [`KeyboardMods`] from an Iced [`keyboard::Modifiers`] value.
 pub(crate) fn detect_keyboard_mods(modifiers: keyboard::Modifiers) -> KeyboardMods {
     let is_cmd = modifiers.command();
     let is_platform_mod = modifiers.command() || modifiers.control();
@@ -683,28 +552,23 @@ pub(crate) fn parse_key_press(
     Some((key, modifiers, physical_key))
 }
 
-/// One of the dashboard's own shortcuts — the keys that still reach the
-/// dashboard while a page holds the keyboard.
+/// One of the dashboard's own shortcuts — the keys that still reach the dashboard
+/// while a page holds the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DashboardShortcut {
     /// Close the open overlay, or clear the page's own transient state.
     Escape,
-    /// Focus the page's search.
     Search,
-    /// Open the Logs page — the shortcut that replaces its rail item.
+    /// The shortcut that replaces the Logs page's rail item.
     Logs,
-    /// Open the Sessions page — the shortcut that replaces its rail item.
+    /// The shortcut that replaces the Sessions page's rail item.
     Sessions,
 }
 
-/// The dashboard shortcut a key press stands for, or `None` — Escape, Cmd+F,
-/// Cmd+L or Cmd+K (Ctrl+F / Ctrl+L / Ctrl+K elsewhere, resolved through the
-/// physical key so a non-Latin layout still produces them).
-///
-/// A focused input leaves exactly these uncaptured, because
-/// [`keyboard::listen`] only delivers events no widget captured — and the chat
-/// composer holds the keyboard from the moment Home is drawn, so capturing
-/// them would take the dashboard's own shortcuts away from the whole page.
+/// The dashboard shortcut a key press stands for — Escape, Cmd+F, Cmd+L or Cmd+K (Ctrl
+/// elsewhere), resolved through the physical key so a non-Latin layout still produces them. A
+/// focused input leaves exactly these uncaptured: [`keyboard::listen`] only delivers events no
+/// widget captured, and the composer holds the keyboard from Home's first frame.
 pub(crate) fn dashboard_shortcut(
     key: &keyboard::Key,
     modifiers: keyboard::Modifiers,
@@ -735,34 +599,27 @@ pub(crate) fn is_dashboard_shortcut(
     dashboard_shortcut(key, modifiers, physical_key).is_some()
 }
 
-// ── Dashboard state ──────────────────────────────────────────────
-
-/// Where the window's one start-up width decision stands. A fresh window opens
-/// without the ticket column's width ([`WindowState::opening_size`]), because a
-/// fresh board normally has nothing to show; the board's first read takes the
-/// default width back when the column is drawn after all. Nothing resizes the
-/// window after that decision — a column appearing or disappearing later
-/// changes the layout, never the window.
+/// Where the window's one start-up width decision stands. A fresh window opens without the
+/// ticket column's width ([`WindowState::opening_size`]), because a fresh board normally has
+/// nothing to show; the board's first read takes the default width back when the column is drawn
+/// after all. Nothing resizes the window later: a column appearing changes the layout only.
 #[derive(Clone, Copy)]
 enum StartupWidth {
-    /// Nothing to decide: a saved geometry opened at the size it was saved
-    /// with, or the decision is already made.
+    /// Nothing to decide: saved geometry, or the decision is already made.
     Settled,
-    /// Owed, waiting for the window's own report of the size it opened at. The
-    /// requested size is not that size — the platform rounds it to its pixel
-    /// grid and keeps it on screen.
+    /// Owed, waiting for the window's own report of its size — the platform rounds the
+    /// requested size to its pixel grid.
     AwaitingReport,
-    /// Owed, with the opening size in [`Dashboard::last_size`]: a width the
-    /// window was not at is the user's own drag, which wins over the decision.
+    /// Owed, with the opening size in [`Dashboard::last_size`]: a different width is the
+    /// user's own drag, which wins over the decision.
     Owed,
 }
 
 pub struct Dashboard {
     ready: bool,
     boot_error: Option<String>,
-    /// An exit requested while the boot task was still running: the exit waits
-    /// for the boot's result (bounded by [`BOOT_EXIT_WAIT`]) instead of
-    /// interrupting the store bring-up. See `request_exit`.
+    /// An exit requested while the boot task ran: the exit waits for the boot's
+    /// result (bounded by [`BOOT_EXIT_WAIT`]) rather than interrupt store bring-up.
     exit_after_boot: bool,
     page: Page,
     log_store: Option<LogStore>,
@@ -772,62 +629,42 @@ pub struct Dashboard {
     last_position: iced::Point,
     /// Where the one start-up width decision stands (see [`StartupWidth`]).
     startup_width: StartupWidth,
-    /// Toast notification stack.
     toasts: Vec<Toast>,
 
-    /// Full per-workspace records (path, paused, maintenance, metadata),
-    /// keyed by name. Populated during boot and updated via CDC-driven
-    /// [`Message::WorkspacesReloaded`], which rebuilds the whole map from the
-    /// store (no incremental boolean patching).
+    /// Per-workspace records keyed by name, rebuilt whole from the store on
+    /// [`Message::WorkspacesReloaded`] (no incremental boolean patching).
     workspaces: HashMap<String, Workspace>,
-    /// Last workspace-map read failure (boot or a post-ready reload), rendered
-    /// where the footer picker and the Settings workspace list would be.
-    /// `None` once a successful read replaces it.
+    /// Last workspace-map read failure, rendered where the footer picker and the
+    /// Settings list would be; `None` once a read succeeds.
     workspaces_error: Option<String>,
-    /// Generation of the latest workspace-map reload, so a slow read cannot
-    /// apply its (now stale) outcome over a newer one.
+    /// Generation of the latest map reload, so a slow read cannot apply its stale
+    /// outcome over a newer one.
     workspaces_reload_gen: u64,
-    /// The read-back guard: bumped wherever this app makes the selection newer
-    /// than anything a read in flight can return — a pick, a deletion's relocation
-    /// (its transaction has committed) and a boot pick that is written back — and
-    /// on every read-back it dispatches. Each read carries the generation it was
-    /// dispatched with and applies only while it still matches, so a read
-    /// dispatched before a local pick — or before a newer read — can never apply. A
-    /// read dispatched *after* a pick can still observe that pick's pre-commit row
-    /// (the commit lands after the write is issued) and revert the display until
-    /// the pick's own CDC event re-reads it.
+    /// The read-back guard: bumped wherever this app makes the selection newer than anything a
+    /// read in flight can return (a pick, a deletion's relocation, a boot pick written back) and
+    /// on every read-back it dispatches; each read applies only while its generation matches. A
+    /// read dispatched *after* a pick can still see that pick's pre-commit row and revert the
+    /// display until its CDC event re-reads it.
     active_workspace_gen: u64,
-    /// The `(name, path)` pair last pushed to the workspace-scoped surfaces;
-    /// `None` while none has been pushed. A workspace-map reload compares
-    /// against it, so a change of *resolvability* alone — the selected name
-    /// staying the same — still re-pushes (see [`Self::sync_workspace_surfaces`]).
+    /// The `(name, path)` last pushed to the workspace-scoped surfaces, so a change of
+    /// *resolvability* alone still re-pushes.
     pushed_workspace: Option<(String, String)>,
-    /// Currently selected workspace name. `Some("personal:admin")` = the
-    /// admin's "Personal" workspace; `Some("ws")` = a managed workspace;
-    /// `None` = nothing selected.
+    /// Selected workspace name: `personal:{user}`, a managed workspace, or nothing.
     selected_workspace_name: Option<String>,
-    /// True when a genuine exit request — a close that could not hide, or a platform quit —
-    /// arrived while the update was in its finalizing window (daemon shut down; checkpoint + spawn +
-    /// exit pending). Only a real request sets this: the update's own shutdown step also fires
-    /// `Message::Shutdown` via the subscription, which must not be mistaken for one. If the
-    /// update fails, this flag makes the GUI run its own checkpoint + exit.
+    /// A genuine exit request arrived while the update was finalizing (daemon shut down;
+    /// checkpoint + spawn + exit pending). Only a real request sets it — the update's shutdown
+    /// step also fires `Message::Shutdown`; if the update fails, the GUI exits on its own.
     exit_requested_during_update: bool,
-    /// Graceful-drain window active: the window stays open with input
-    /// disabled until the drain completes.
+    /// Graceful-drain window active: the window stays open, input disabled.
     draining: bool,
-    /// Whether the self-update confirmation modal is open. Set by
-    /// [`Message::UpdateBot`]; the update itself only starts on
-    /// [`Message::ConfirmUpdate`], so dismissing leaves the system untouched.
+    /// The update starts only on [`Message::ConfirmUpdate`], so dismissing leaves the system
+    /// untouched.
     show_update_confirm: bool,
-    /// Running work item awaiting manual-stop confirmation: a research run or a
-    /// custom-role launch. `Some` while the confirm dialog is shown on the
-    /// Running Agents page; the stop runs only on
-    /// [`running::RunningMessage::StopConfirmed`]. The carried key is never
-    /// displayed as text — the button message carries it.
+    /// The work item awaiting manual-stop confirmation, while the Running Agents dialog shows;
+    /// the stop runs on [`running::RunningMessage::StopConfirmed`], whose message carries the key.
     pending_stop: Option<running::StopTarget>,
-    /// Running Agents page expanded-card state, keyed by (agent_id, generation)
-    /// so a recycled agent_id never inherits a stale expansion. Pruned against
-    /// the live agent list on each [`Message::RuntimeChanged`] registry event.
+    /// Expanded cards, keyed by (agent_id, generation) so a recycled agent_id never inherits a
+    /// stale expansion; pruned on each [`Message::RuntimeChanged`].
     running_expanded: HashSet<(String, u64)>,
     logs_state: logs::LogsState,
     board_state: board::BoardState,
@@ -839,38 +676,25 @@ pub struct Dashboard {
     editor_state: editor::EditorState,
     settings_state: settings::SettingsState,
 
-    // ── Diff modal ──────────────────────────────────────────────
     /// Whether the picked workspace's diff view is open.
     show_diff_modal: bool,
-    /// The read-only view of another project's commit, opened from a sidebar
-    /// ticket card whose workspace is not the picked one: the project named in
-    /// the view's header while it is open, `None` while it is closed. Mutually
-    /// exclusive with [`Self::show_diff_modal`], and independent of the picked
-    /// workspace's own diff state — viewing a foreign commit never re-points
-    /// the working-tree view.
+    /// The read-only view of another project's commit, from a sidebar ticket of another
+    /// workspace: the project named in its header while open.
     foreign_workspace: Option<String>,
-    /// That view's own state, held for the dashboard's lifetime so its load
-    /// generation keeps increasing across opens: a load left in flight when the
-    /// view is closed can then never be accepted by the next one. A state
-    /// rebuilt per open would restart at generation 1 and could paint one
-    /// project's commit under another project's header.
+    /// That view's own state, held for the dashboard's lifetime so its load generation keeps
+    /// increasing across opens and a load left in flight can never be accepted by the next one.
     foreign_diff_state: diff::DiffState,
 
-    // ── Git state ───────────────────────────────────────────────
-    /// All git-related state (branch info, sync, branch modal).
     git_state: git::GitState,
 
-    // ── TTS download progress ───────────────────────────────────
     /// Current TTS download progress: (file_name, progress 0.0–1.0).
-    /// `None` when no download is active.
     #[cfg(target_os = "macos")]
     tts_download_progress: Option<(String, f32)>,
 }
 
 impl Dashboard {
-    /// The dashboard before its boot task finishes. `window` is the geometry the
-    /// window opens with (`WindowState::opening_size`); a fresh one leaves the
-    /// start-up width owed (see `StartupWidth`).
+    /// The dashboard before its boot task finishes. `window` is the geometry it opens with
+    /// (`WindowState::opening_size`); a fresh one leaves the start-up width owed.
     #[must_use]
     pub fn loading(window: &WindowState) -> Self {
         Self {
@@ -929,21 +753,14 @@ impl Dashboard {
                     std::convert::identity,
                 );
 
-                // The app's own conversation opens with the screen — once,
-                // because the app started, together with the persisted composer
-                // draft. It is never loaded by a workspace selection.
+                // The app's conversation opens with the screen, once, with the
+                // persisted composer draft; never by a workspace selection.
                 let open_chat = self.home_state.open().map(Message::Home);
 
-                // The Home chat now runs the Phase-1 scripted onboarding
-                // scenario while no LLM provider is configured (and fires the
-                // Phase-2 Assistant kickoff once a provider is set), so no boot
-                // redirect to Settings is needed here. The decision is made
-                // after the config is fully loaded (bootstrap_mahbot
-                // finished), not in the initial loading state where CONFIG
-                // still holds defaults. A trimmed non-empty key counts as set
-                // — `provider_key()` collapses empty/whitespace to None, so
-                // those re-arm the script; an active custom endpoint counts as
-                // configured too.
+                // The Home chat runs the Phase-1 scripted onboarding while no LLM provider is
+                // configured (and the Phase-2 Assistant kickoff once one is), so no boot redirect
+                // to Settings. A trimmed non-empty key counts as set — `provider_key()` collapses
+                // empty/whitespace to None — and so does an active custom endpoint.
                 Task::batch([
                     refresh_logs.map(Message::Logs),
                     refresh_board.map(Message::Board),
@@ -956,10 +773,9 @@ impl Dashboard {
                 Task::none()
             }
         };
-        // A boot that failed has nothing left to keep running hidden, and a launch the updater
-        // restarted hidden has no way back without a tray icon: either way the window comes up
-        // rather than staying unreachable. A login start never does (see
-        // `app_window::login_start`).
+        // A failed boot has nothing to keep running hidden, and a launch the updater restarted
+        // hidden has no way back without a tray icon: either way the window comes up. A login
+        // start never does.
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         if self::app_window::hidden() && (!self.ready || !crate::tray::available()) {
             if self::app_window::login_start() {
@@ -973,16 +789,14 @@ impl Dashboard {
         tasks
     }
 
-    /// Returns the [`Workspace`] for the currently selected workspace, if any.
     fn selected_workspace_info(&self) -> Option<&Workspace> {
         self.selected_workspace_name
             .as_ref()
             .and_then(|name| self.workspaces.get(name))
     }
 
-    /// The workspace resolved for the current selection: a managed workspace
-    /// present in the loaded map with a non-empty path. A personal name, a name
-    /// missing from the map and an empty path resolve to nothing.
+    /// The resolved selection: a managed workspace in the map with a non-empty path.
+    /// A personal name, a missing name and an empty path resolve to nothing.
     fn resolved_workspace(&self) -> Option<(&str, &str)> {
         let name = self.selected_workspace_name.as_deref()?;
         if crate::users::is_personal_workspace(name) {
@@ -992,19 +806,13 @@ impl Dashboard {
         (!path.is_empty()).then_some((name, path))
     }
 
-    /// Whether the bottom footer bar is hidden: the workspace map holds no
-    /// managed workspace, and the personal folder is the active selection. Both
-    /// halves are load-bearing, because each one covers a transient the other
-    /// cannot: the selection stays unset until a read settles one, which carries
-    /// the bar through the boot window, and after the last project is deleted it
-    /// keeps naming that project while the map is already empty. The empty map
-    /// must in turn not be a failed read's placeholder, so a failed read leaves
-    /// the bar — and how it reports the failure — exactly where it is.
-    ///
-    /// With the bar hidden, what it carried moves into the rail: the voice
-    /// status under the nav icons, the running-agent indicators above the bottom
-    /// nav ([`Self::render_sidebar_mid`]) and the update entry directly above
-    /// Settings ([`Self::render_sidebar_update`]).
+    /// Whether the bottom footer bar is hidden: no managed workspace in the map and the personal
+    /// folder selected. Both halves are load-bearing — the selection stays unset until a read
+    /// settles one, and after the last project is deleted it keeps naming that project while the
+    /// map is empty. A failed read must not look like an empty map, so it leaves the bar and its
+    /// failure report where they are. Hidden, the bar's content moves into the rail: voice status
+    /// under the nav icons, the running-agent indicators above the bottom nav
+    /// ([`Self::render_sidebar_mid`]), the update entry above Settings.
     fn footer_hidden(&self) -> bool {
         self.workspaces_error.is_none()
             && self
@@ -1017,19 +825,18 @@ impl Dashboard {
                 .is_some_and(crate::users::is_personal_workspace)
     }
 
-    /// Whether `page` is offered in the navigation. Only the editor and the
-    /// shell are conditional, on [`Self::resolved_workspace`].
+    /// Whether `page` is offered in the navigation: the editor and the shell need a
+    /// resolved workspace ([`Self::resolved_workspace`]).
     fn page_available(&self, page: Page) -> bool {
         !matches!(page, Page::Editor | Page::Shell) || self.resolved_workspace().is_some()
     }
 
-    /// Whether the selected workspace's pipeline is paused (a strict freeze:
-    /// all in-flight work stops and no pipeline stage advances until resume).
+    /// Whether the selected workspace's pipeline is paused (a strict freeze: no
+    /// in-flight work and no stage advance until resume).
     fn paused(&self) -> bool {
         self.selected_workspace_info().is_some_and(|w| w.paused)
     }
 
-    /// Whether the selected workspace's maintainer is enabled.
     fn maintenance_enabled(&self) -> bool {
         self.selected_workspace_info()
             .is_some_and(|w| w.maintenance_enabled)
@@ -1039,15 +846,13 @@ impl Dashboard {
         iced::Theme::Dark
     }
 
-    /// Persist the current window position and size.
     fn persist_window_state(&self) {
         save_window_state(self.last_position, self.last_size);
     }
 
-    /// Take the one start-up width decision, on the board's first read (see
-    /// [`StartupWidth`]): the width to resize to, once. A board with nothing to
-    /// show takes none — the narrow opening already fits it — while one that
-    /// draws the column takes the default width back.
+    /// The one start-up width decision, taken on the board's first read ([`StartupWidth`]): a board
+    /// with nothing to show keeps the narrow opening, one that draws the column takes the default
+    /// width back.
     fn take_startup_width(&mut self) -> Option<iced::Size> {
         let owed = !matches!(self.startup_width, StartupWidth::Settled);
         self.startup_width = StartupWidth::Settled;
@@ -1064,15 +869,12 @@ impl Dashboard {
         iced::window::latest().and_then(move |id| iced::window::resize(id, size))
     }
 
-    /// The window's close — the platform's own close request (Alt+F4 on Windows, the system
-    /// menu, whatever a shortcut asks for) and the one control the rail, the splash and a failed
-    /// boot carry: a hide where a hidden window is still reachable, the exit path otherwise.
-    ///
-    /// A hide would be wrong while there is nothing to keep working (before the boot finished,
-    /// a boot that failed), while the product is already on its way out
-    /// ([`crate::shutdown::aborting`], or the drain and hand-off a self-update owns), and with
-    /// no tray icon — a hidden window would then leave no in-app way to quit the product. A
-    /// platform with no hidden window ([`self::app_window`]) never takes it.
+    /// The window's close — the platform's own request (Alt+F4, the system menu, a shortcut) and
+    /// the rail's/splash's/failed boot's control: a hide where a hidden window stays reachable,
+    /// the exit path otherwise. A hide is wrong while nothing keeps working (before boot, a failed
+    /// boot), while the product is already leaving ([`crate::shutdown::aborting`], a
+    /// self-update's drain) and with no tray icon; a platform with no hidden window
+    /// ([`self::app_window`]) never hides.
     fn close_window(&mut self) -> Task<Message> {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         if self.ready
@@ -1086,27 +888,16 @@ impl Dashboard {
         self.request_exit(None)
     }
 
-    /// Act on a request for the product to exit: name the route that asked, then start the wait
-    /// the request calls for.
-    ///
-    /// The requests that reach it — a close that cannot hide ([`Self::close_window`]), an
-    /// ordinary platform quit and the tray menu's Quit — are handled identically, because
-    /// full parity is the point of the interception; so are the states with no drain to
-    /// complete (a self-update finalizing, a boot that has not finished, a boot that
-    /// failed). `route` is the platform's wording for the ask, one of the route constants
-    /// beside the routes that produce them, or `None` for a close, whose wording the exit line
-    /// already falls back to.
-    /// It is recorded where this request is what drives the exit (or, in the self-update window,
-    /// may yet drive it once the update is seen to fail); a request that finds the exit already
-    /// pending leaves the record to the one that caused it.
+    /// Act on a request for the product to exit: name the route that asked, then start the wait it
+    /// calls for. A close that cannot hide ([`Self::close_window`]), a platform quit and the tray
+    /// menu's Quit are handled identically — parity is the point — as are the states with no
+    /// drain (a self-update finalizing, a boot unfinished or failed). `route` is the ask's wording,
+    /// or `None` for a close; a request that finds the exit pending leaves the record to its cause.
     fn request_exit(&mut self, route: Option<&'static str>) -> Task<Message> {
         if crate::self_update::update_in_progress() && crate::self_update::update_is_finalizing() {
-            // The update owns the exit (its own drain + checkpoint + swap + spawn): record the
-            // request and wait — a force-cancel here would abort the update's full drain. The
-            // route is recorded because a failed update re-enters the exit path for this request
-            // (see `exit_requested_during_update`); a request that finds the update window
-            // already claimed changes nothing, and must not take the record over from the
-            // request that claimed it.
+            // The update owns the exit (its drain + checkpoint + swap + spawn): record the
+            // request and wait, since a force-cancel would abort its drain. A failed update
+            // re-enters for this request (`exit_requested_during_update`).
             if !self.exit_requested_during_update {
                 record_exit_route(route);
             }
@@ -1114,21 +905,17 @@ impl Dashboard {
             self.exit_requested_during_update = true;
             Task::none()
         } else if !self.ready {
-            // An exit request before boot finished has no drain to complete: the drain-watch,
-            // and the shutdown subscription that turns the token into an exit, both exist only
-            // after a successful boot — so the exit path runs directly. Not while the boot is
-            // still writing the stores, though: a store left before its first catalog run is
-            // refused on the next start (`db::has_product_schema`), so a request that arrives
-            // mid-boot waits for the boot's result instead, and [`BOOT_EXIT_WAIT`] bounds that
-            // wait so a start which never finishes stays closable.
+            // Before boot finished there is no drain to complete — the drain-watch and the
+            // shutdown subscription exist only after a successful boot. Mid-boot the exit waits
+            // for the boot's result, since a store left before its first catalog run is refused
+            // on the next start (`db::has_product_schema`); [`BOOT_EXIT_WAIT`] bounds a
+            // hanging start.
             if self.boot_error.is_some() {
-                // The start failed, so the boot stopped with it: nothing is writing the stores
-                // any more.
+                // The start failed, so nothing is writing the stores any more.
                 record_exit_route(route);
                 self.save_and_exit()
             } else if self.exit_after_boot {
-                // Nothing changes: this exit is already pending, so the request is not what ends
-                // the process and must not take the exit record over from the one that is.
+                // Already pending: this request is not what ends the process.
                 Task::none()
             } else {
                 record_exit_route(route);
@@ -1138,73 +925,58 @@ impl Dashboard {
                 })
             }
         } else if crate::shutdown::is_draining() {
-            // An exit request during a drain = second request: force-cancel (fires the token →
-            // Message::Shutdown → exit path). The rule is the drain flag's, not the gesture's:
-            // a first ⌘Q after a close's drain forces that drain too. A drain whose token
-            // has already fired is an exit under way, though — this request changes nothing about
-            // it and must not take the record over.
+            // A request during a drain is the second request: force-cancel (fires the token →
+            // Message::Shutdown → exit path). The rule is the drain flag's, not the gesture's: a
+            // first ⌘Q after a close's drain forces it too. Once the token has fired, the exit is
+            // under way and this request must not take the record over.
             if !crate::shutdown::shutdown_token().is_cancelled() {
                 record_exit_route(route);
             }
             crate::shutdown::force_cancel();
             Task::none()
         } else {
-            // Begin the GRACEFUL drain: the window stays open with input disabled; the
-            // drain-watch fires the token when no in-flight work remains (or force-cancels at
-            // the cap). save_and_exit is deferred until Message::Shutdown.
+            // Begin the GRACEFUL drain: the window stays open, input disabled, and the drain-watch
+            // fires the token when no in-flight work remains (or force-cancels at the cap);
+            // save_and_exit waits for Message::Shutdown.
             record_exit_route(route);
             crate::shutdown::drain_begin();
             Task::none()
         }
     }
 
-    /// Leave the iced runtime for the product's exit path: flush the draft, record the window
-    /// geometry, fire the shutdown token, then exit the runtime.
-    ///
-    /// The ordinary exit for everything the interface handles — a quit, a close that could not
-    /// hide, SIGINT/SIGTERM, the clean end of a drain — and the entry to the teardown in
-    /// `main` that the token's cancellation is checked against. It is not the only way this
-    /// process ends: [`crate::shutdown`]'s module docs name the exits that never reach it.
+    /// Leave the iced runtime for the exit path: flush the draft, record the window geometry,
+    /// fire the shutdown token, then exit the runtime. The ordinary exit for everything the
+    /// interface handles — a quit, a close that could not hide, SIGINT/SIGTERM, the clean end of
+    /// a drain — and the entry to the teardown in `main`; [`crate::shutdown`] names the rest.
     fn save_and_exit(&self) -> Task<Message> {
         crate::channels::chat_draft::flush_global();
         self.persist_window_state();
         if crate::self_update::update_in_progress() && crate::self_update::update_is_finalizing() {
-            // The update path has shut down the daemon and owns the exit: checkpoint,
-            // temp-root cleanup, lock release, spawn, exit(0). Exiting here would drop the
-            // iced runtime and abort that sequence mid-checkpoint, leaving the daemon down
-            // without a replacement — so wait instead. A request that arrives meanwhile is
-            // recorded by `request_exit`; if the update fails, UpdateResult re-enters this path
-            // (in-progress cleared, flag cleared) and honors it.
+            // The update owns the exit (checkpoint, temp-root cleanup, lock release, spawn,
+            // exit(0)): exiting here would abandon it mid-checkpoint and leave the daemon down
+            // without a replacement, so wait. A failed update re-enters through UpdateResult.
             return Task::none();
         }
-        // Fire the token before the runtime drops — `shutdown_after_dashboard` relies on it
-        // being cancelled by then (see its note in main.rs), and a request that arrives before
-        // boot finished reaches here with no drain to have fired it. Idempotent: every other
-        // arrival has it cancelled already.
+        // Fire the token before the runtime drops: `shutdown_after_dashboard` relies on it being
+        // cancelled by then (see its note in main.rs), and a pre-boot request reaches here with
+        // no drain to have fired it. Idempotent.
         crate::shutdown::force_cancel();
-        // The checkpoint is deliberately NOT run here: it relocated to
-        // shutdown_after_dashboard, which runs after the iced runtime drops — genuinely
-        // single-writer (today's in-iced checkpoint ran while background writers were still
-        // live).
+        // No checkpoint here: it lives in shutdown_after_dashboard, after the iced
+        // runtime drops, so it is genuinely single-writer.
         iced::exit()
     }
 
-    /// Window title with page name.
     pub fn title(&self) -> String {
         let page_name = self.page.label();
         format!("MahBot — {page_name}")
     }
 
-    /// Apply workspace configuration loaded during boot. The boot path must
-    /// complete either way: a failed read leaves an empty map beside the failure
-    /// that stands in for it.
+    /// Apply the boot's workspace configuration; the boot completes either way, a failed read
+    /// leaving an empty map beside the failure.
     ///
-    /// `read_generation` is the reload generation the read was issued under. A
-    /// reload that landed while it was in flight read the same table later, so
-    /// its map (or its failure) wins and this read's outcome is dropped — the
-    /// rest of the boot path still completes. The restored selection is applied
-    /// and propagated either way; the workspace-scoped surfaces stay empty until
-    /// it resolves (see [`Self::sync_workspace_surfaces`]).
+    /// `read_generation` is the read's reload generation: a reload that landed meanwhile read the
+    /// table later, so its map (or failure) wins and this outcome is dropped. The restored
+    /// selection is applied either way; the page surfaces stay empty until it resolves.
     fn apply_boot_workspaces(
         &mut self,
         workspaces: Result<HashMap<String, Workspace>, String>,
@@ -1216,63 +988,53 @@ impl Dashboard {
             self.apply_boot_workspace_map(workspaces);
         }
 
-        // The boot read always yields a name — a project or the admin's
-        // `personal:{user}` fallback, which is the answer only when no project
-        // exists. A pick produced by a failed read is written by nobody — a failed
-        // read is no evidence that nothing is selected — so an in-flight read-back
-        // may still correct it.
+        // The boot read always yields a name — a project or `personal:{user}`. A pick from a
+        // failed read is written by nobody (it is no evidence that nothing is selected), so an
+        // in-flight read-back may still correct it.
         if !remember {
             return self.apply_workspace_selection(restored_name);
         }
-        // Written back unconditionally, unlike a pick: the name came from the same
-        // DB read as the stored selection, so the loaded map — which may not even
-        // have arrived — has no say in it. Reusing `switch_workspace` here would let
-        // a stale map skip the write, and the next read-back would drop the desktop
-        // back into the personal folder.
+        // Written back unconditionally, unlike a pick: the name came from the same DB read as
+        // the stored selection, so the loaded map has no say. `switch_workspace` would let a
+        // stale map skip the write, and the next read-back would drop the desktop into the
+        // personal folder.
         Task::batch([
             self.apply_workspace_selection_superseding_read_back(restored_name),
             Self::persist_active_workspace(restored_name.to_owned(), |_| Message::Nop),
         ])
     }
 
-    /// Navigate to a page, refreshing page-specific state as needed. A page that
-    /// does not resolve ([`Self::page_available`]) is refused rather than opened
-    /// over no workspace.
+    /// Navigate to a page, refreshing page state; a page that does not resolve
+    /// ([`Self::page_available`]) is refused rather than opened over no workspace.
     fn navigate_to(&mut self, page: Page) -> Task<Message> {
         if !self.page_available(page) {
             return Task::none();
         }
         self.page = page;
-        // Every navigation notifies the editor of its visibility AFTER
-        // `self.page` is set, so the handler sees the new state. This is the
-        // single source of truth for the editor's page-visible gating: on the
-        // Editor page it triggers refresh-on-entry, on any other page it closes
-        // the editor's modals (modals do not survive a page switch).
+        // Sent AFTER `self.page` is set, so the handler sees the new state: the single source of
+        // truth for the editor's gating — refresh on entry to Editor, close its modals elsewhere.
         let visibility = Task::done(Message::Editor(
             editor::EditorMessage::PageVisibilityChanged(self.page == Page::Editor),
         ));
         let refresh = match page {
-            // Logs and Shell maintain their own internal state; Editor
-            // receives workspace state via WorkspaceSelected from the
-            // Dashboard — none need a refresh on navigation. Running Agents
-            // reads the live registries at render time.
+            // These four need no refresh: Logs and Shell keep their own state, Editor receives
+            // WorkspaceSelected, Running Agents reads the live registries at render time.
             Page::Logs | Page::Shell | Page::Editor | Page::RunningAgents => Task::none(),
             Page::Home => {
                 let snap = iced::widget::operation::snap_to_end::<Message>(home::CHAT_SCROLL_ID);
-                // The composer takes the keyboard once this page is on screen,
-                // so a paste lands in the input without a click first.
+                // The composer takes the keyboard once this page is on screen, so a
+                // paste lands in the input without a click first.
                 self.home_state.arm_composer_focus();
                 let board_refresh = self.board_state.refresh().map(Message::Board);
                 Task::batch([snap, board_refresh])
             }
             Page::Sessions => self.sessions_state.refresh().map(Message::Sessions),
-            // The Automations page renders nothing but its polled list, so entering
-            // it starts a read rather than a render of stale entries.
+            // The page renders nothing but its polled list, so entering it starts a
+            // read rather than rendering stale entries.
             Page::Automations => self.automations_state.refresh().map(Message::Automations),
             Page::Settings => {
-                // Workspace list comes from the managed-workspace map; only the users
-                // list, the custom-tools area and the custom-roles list need a
-                // DB / folder read on navigation.
+                // The workspace list comes from the managed-workspace map; only the
+                // users, custom-tools and custom-roles lists need a read here.
                 self.sync_settings_workspaces_from_map();
                 Task::batch([
                     self.settings_state.refresh().map(Message::Settings),
@@ -1286,8 +1048,7 @@ impl Dashboard {
     }
 
     /// Enter `page` from the shortcut that replaces its rail item. A dashboard
-    /// overlay covers the rail, so nothing navigates out from under one — Escape
-    /// is what closes overlays.
+    /// overlay covers the rail, so nothing navigates out from under one.
     fn open_from_shortcut(&mut self, page: Page) -> Task<Message> {
         if self.overlay_modal_open() {
             return Task::none();
@@ -1295,9 +1056,6 @@ impl Dashboard {
         self.navigate_to(page)
     }
 
-    /// Refresh the Settings users list. The workspace list is not read here —
-    /// it is synced from the dashboard's managed-workspace map. Does not absorb
-    /// the config snapshot (`settings_state.refresh()`).
     fn refresh_settings_users(&self) -> Task<Message> {
         self.settings_state
             .users_state
@@ -1305,8 +1063,6 @@ impl Dashboard {
             .map(|msg| Message::Settings(settings::SettingsMessage::UserMsg(msg)))
     }
 
-    /// Refresh the Settings custom-tools area (its tool-folder read). Does not
-    /// absorb the config snapshot (`settings_state.refresh()`).
     fn refresh_settings_custom_tools(&mut self) -> Task<Message> {
         self.settings_state
             .custom_tools_state
@@ -1314,8 +1070,6 @@ impl Dashboard {
             .map(|msg| Message::Settings(settings::SettingsMessage::CustomToolsMsg(msg)))
     }
 
-    /// Refresh the Settings custom-roles list (its DB read). Does not absorb the
-    /// config snapshot (`settings_state.refresh()`).
     fn refresh_settings_custom_roles(&self) -> Task<Message> {
         self.settings_state
             .custom_roles_state
@@ -1323,18 +1077,16 @@ impl Dashboard {
             .map(|msg| Message::Settings(settings::SettingsMessage::CustomRolesMsg(msg)))
     }
 
-    /// Sync the Settings workspaces section list from the managed-workspace map
-    /// (sorted by name, matching the store's `ORDER BY name`). No DB read — the
-    /// map is the single source of truth.
+    /// Sync the Settings workspace list from the managed-workspace map, sorted by
+    /// name to match the store's `ORDER BY name`. No DB read: the map is the source.
     fn sync_settings_workspaces_from_map(&mut self) {
         let mut list: Vec<Workspace> = self.workspaces.values().cloned().collect();
         list.sort_by(|a, b| a.name.cmp(&b.name));
         self.settings_state.workspaces_state.workspaces = list;
     }
 
-    /// Toggle the active project's pause or maintainer state. Only a resolved
-    /// project offers these (see [`Self::resolved_workspace`]), so the name written
-    /// is the resolved one — never a stored value that names no existing project.
+    /// Toggle the resolved project's pause or maintainer state; the name written is the
+    /// resolved one, never a stored name that no longer exists.
     fn toggle_workspace_state(&mut self, kind: ToggleKind) -> Task<Message> {
         let Some(ws_name) = self.resolved_workspace().map(|(name, _)| name.to_string()) else {
             return Task::none();
@@ -1351,7 +1103,6 @@ impl Dashboard {
         )
     }
 
-    /// Handle the result of a workspace toggle write.
     fn finish_toggle(
         &mut self,
         kind: ToggleKind,
@@ -1367,8 +1118,7 @@ impl Dashboard {
                     kind.label_off()
                 };
                 let toast = self.push_toast(format!("{label} for {ws_name}"), ToastKind::Success);
-                // Immediate post-toggle refresh; the CDC stream provides the
-                // durable confirmation later.
+                // Immediate post-toggle refresh; CDC confirms durably later.
                 let refresh = self.reload_workspace_map();
                 Task::batch([toast, refresh])
             }
@@ -1376,14 +1126,11 @@ impl Dashboard {
         }
     }
 
-    /// Push a toast with a kind-specific expiry timer. The timer is a
-    /// fire-and-forget task that emits [`Message::ToastExpired`] with the
-    /// toast's stable id when it fires.
+    /// Push a toast whose expiry timer emits [`Message::ToastExpired`] with its id.
     fn push_toast(&mut self, message: String, kind: ToastKind) -> Task<Message> {
         self.spawn_toast(Toast::new(message, kind))
     }
 
-    /// Push a toast from a [`ToastMessage`] (see [`Self::push_toast`]).
     fn push_toast_msg(&mut self, msg: &ToastMessage) -> Task<Message> {
         self.spawn_toast(Toast::from_toast_msg(msg))
     }
@@ -1398,13 +1145,9 @@ impl Dashboard {
         )
     }
 
-    /// Handle Escape key: dismiss modals in priority order (self-update
-    /// confirmation → foreign commit view → diff modal → git branch modal →
-    /// page-level escape dispatch).
+    /// Escape: dismiss modals in priority order (self-update confirmation → foreign
+    /// commit view → diff modal → git branch modal → page-level escape).
     fn process_escape(&mut self) -> Task<Message> {
-        // Modal close priority: self-update confirmation first, then the
-        // foreign commit view, then the picked diff modal, then the branch
-        // modal, then page-level escapes.
         if self.show_update_confirm {
             self.show_update_confirm = false;
             Task::none()
@@ -1424,9 +1167,8 @@ impl Dashboard {
                     .board_state
                     .update(board::BoardMessage::Escape)
                     .map(Message::Board),
-                // Shell and Automations have no escape handling.
-                // Running Agents: Escape dismisses the pending stop
-                // confirmation (Keep) — never confirms it.
+                // Shell and Automations have no escape handling; on Running Agents,
+                // Escape dismisses the pending stop confirmation (Keep), never confirms.
                 Page::RunningAgents => {
                     self.pending_stop = None;
                     Task::none()
@@ -1455,30 +1197,28 @@ impl Dashboard {
         }
     }
 
-    /// Process a Settings message, optionally reloading the workspace map when
-    /// workspaces are added or deleted.
+    /// Process a Settings message, reloading the workspace map when workspaces are
+    /// added or deleted.
     fn process_settings_message(&mut self, msg: settings::SettingsMessage) -> Task<Message> {
         // A Settings-side workspace mutation activates at most one project: an add
-        // activates the new workspace (the `workspace` tool's own `add` does the
-        // same), a delete moves the admin's selection in the store and the desktop
-        // follows it. Whatever moved the desktop is reported — changed tabs, git
-        // state and toggles are otherwise the only sign of it.
+        // activates the new workspace (as the `workspace` tool's own `add` does), a
+        // delete moves the admin's selection in the store and the desktop follows —
+        // reported, since changed tabs, git state and toggles are otherwise the only
+        // sign of it.
         let mut activation = None;
         match &msg {
             settings::SettingsMessage::AddWorkspaceResult(Ok(ws)) => {
-                // Seeded into the map so the picker renders it at once and the
-                // activation's own map-guard sees the workspace it just created;
-                // the reload this message triggers below is what confirms it.
+                // Seeded so the picker renders it at once and the activation's map
+                // guard sees it; the reload below confirms it.
                 self.workspaces.insert(ws.name.clone(), ws.clone());
                 activation = Some(self.activate_workspace(&ws.name));
             }
             settings::SettingsMessage::WorkspaceMsg(
                 workspaces::WorkspacesMessage::DeleteResult(Ok((removed, active_now))),
             ) => {
-                // The store has already resolved the admin's selection; aligning the
-                // desktop with that answer at once keeps it from passing through the
-                // no-project state while the map reload and the users read-back race
-                // each other.
+                // The store already resolved the admin's selection; aligning the desktop at
+                // once keeps it out of the no-project state while the map reload and the users
+                // read-back race each other.
                 let active_now = active_now.clone().unwrap_or_else(|| {
                     crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME)
                 });
@@ -1496,13 +1236,10 @@ impl Dashboard {
             }
             _ => {}
         }
-        // Any successful Settings-side workspace mutation (add, delete,
-        // reanalyze, diagnostics/rules edits) refreshes the managed
-        // workspace map from one full DB read — the map is the single source
-        // of truth, and syncing the Settings workspace list from it (see
-        // [`Self::sync_settings_workspaces_from_map`]) gives the page its immediate
-        // post-op feedback. The workspaces sub-state itself never reads the
-        // store.
+        // Any successful Settings-side workspace mutation (add, delete, reanalyze,
+        // diagnostics/rules edits) refreshes the managed-workspace map from one full DB read —
+        // the map is the source of truth, and syncing the Settings list from it gives the page
+        // immediate feedback. The workspaces sub-state never reads the store.
         let needs_global_reload = matches!(
             msg,
             settings::SettingsMessage::WorkspaceMsg(
@@ -1523,14 +1260,11 @@ impl Dashboard {
         Task::batch(std::iter::once(tail).chain(activation))
     }
 
-    /// Process a Running Agents page message — the manual-stop flow for
-    /// research runs and custom-role launches: button → pending-confirmation →
-    /// async stop → toast.
+    /// The Running Agents manual-stop flow: button → confirmation → async stop → toast.
     fn process_running_message(&mut self, msg: running::RunningMessage) -> Task<Message> {
         match msg {
             running::RunningMessage::StopRequest(target) => {
-                // Pending-confirmation only: the dialog renders over the
-                // Running Agents page; the target's key is never displayed.
+                // Confirmation only; the target's key is never displayed.
                 self.pending_stop = Some(target);
                 Task::none()
             }
@@ -1539,11 +1273,9 @@ impl Dashboard {
                     return Task::none();
                 };
                 match target {
-                    // The cancel is async: fire the run's signal and stop the
-                    // run's agents. Silent to the Manager/caller — only the GUI
-                    // gets a toast. The cancelled-run handoff (or a
-                    // no-orchestrator sweep) owns the cleanup dispatch and
-                    // folder release. Infallible.
+                    // Fire the run's signal and stop its agents, silently: only the GUI gets a
+                    // toast. The cancelled-run handoff (or a no-orchestrator sweep) owns cleanup
+                    // and folder release. Infallible.
                     running::StopTarget::Research(run_key) => Task::perform(
                         async move { crate::research_cancel::cancel_research_run(&run_key).await },
                         |()| {
@@ -1554,9 +1286,8 @@ impl Dashboard {
                             )))
                         },
                     ),
-                    // Stopping a launch: cancel its agent, mark the branch as
-                    // deliberately stopped and drop its pending messages. A
-                    // failure is reported as an error toast, not swallowed.
+                    // Stopping a launch: cancel its agent, mark the branch deliberately stopped,
+                    // drop its pending messages. A failure is a toast, never swallowed.
                     running::StopTarget::Launch(agent_id) => Task::perform(
                         async move {
                             match crate::launch::stop(&agent_id).await {
@@ -1601,11 +1332,8 @@ impl Dashboard {
 
     #[expect(clippy::too_many_lines)]
     pub fn update(&mut self, message: Message) -> Task<Message> {
-        // ── Centralized Toast and LinkClicked interception ──────────
-        // Intercepted at the Dashboard level (before page dispatch)
-        // so page handlers only need a Task::none() arm for match exhaustiveness.
-        // HomeMessage::LinkClicked is handled by Home itself — see
-        // as_link_url() for details.
+        // Toast and LinkClicked are intercepted before page dispatch, so page handlers only need
+        // a Task::none() arm for exhaustiveness. A Home LinkClicked is handled by Home itself.
         if self.ready {
             if let Some(tm) = message.as_toast() {
                 return self.push_toast_msg(tm);
@@ -1618,19 +1346,16 @@ impl Dashboard {
         }
 
         match message {
-            // ── Pre-ready handlers (execute regardless of ready state) ──
             Message::Boot(result) => {
-                // An exit request that arrived while the boot was still writing the
-                // stores takes effect now — the boot has stopped, so it cannot
-                // be left mid-bring-up (see `request_exit`).
+                // An exit requested while the boot was writing the stores takes effect now: the
+                // boot has stopped, so it cannot be left mid-bring-up (`request_exit`).
                 if std::mem::take(&mut self.exit_after_boot) {
                     return self.save_and_exit();
                 }
                 self.finish_boot(result)
             }
             Message::BootExitWaitExpired => {
-                // The boot did not deliver a result within [`BOOT_EXIT_WAIT`] (a
-                // start that hangs): the exit request that was waiting ends the
+                // The boot hung past [`BOOT_EXIT_WAIT`]: the waiting exit ends the
                 // process anyway.
                 self.save_and_exit()
             }
@@ -1641,16 +1366,14 @@ impl Dashboard {
                 generation,
             } => self.apply_boot_workspaces(workspaces, &restored_name, remember, generation),
             Message::CloseRequested(_) => self.close_window(),
-            // An exit a gesture outside the window asks for — the tray menu's one item — ends
-            // the process in every state, the way a platform quit does.
+            // A quit from outside the window — the tray menu's item — ends the process in
+            // every state, as a platform quit does.
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             Message::WindowRequested(crate::window_requests::WindowRequest::Quit) => {
                 self.request_exit(Some(crate::shutdown::TRAY_QUIT_TRIGGER))
             }
-            // The same for the way back: a window a restart left hidden comes up before boot
-            // finishes too — the start-up view is all there is to show then. A product on its
-            // way out has no window to bring up, and the frame a second launch sends asks the
-            // same question before it gets here (see `db::ipc`).
+            // A window a restart left hidden comes up before boot finishes too. A product on its
+            // way out has none to bring up — and a second launch asks this first (`db::ipc`).
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             Message::WindowRequested(crate::window_requests::WindowRequest::Show) => {
                 if crate::shutdown::aborting() {
@@ -1663,18 +1386,16 @@ impl Dashboard {
             Message::WindowAction(action) => match action {
                 // The window follows the pointer for the rest of the gesture.
                 WindowAction::Drag => iced::window::latest().and_then(iced::window::drag),
-                // The control hides the window on these platforms; where it cannot hide — the
-                // splash and a failed boot, before the app runs — it quits (`close_window`).
+                // Where it cannot hide — the splash, a failed boot — the control quits
+                // instead (`close_window`).
                 WindowAction::Close => self.close_window(),
             },
             Message::QuitRequested => self.request_exit(Some(crate::shutdown::MACOS_QUIT_TRIGGER)),
             Message::Shutdown => self.save_and_exit(),
             Message::DrainStarted => {
-                // Restart toast: only when the update has finished and finalize
-                // is shutting the service down — a plain quit, close or
-                // signal during an update still in flight (not yet finalizing)
-                // must not show a false "restarting" toast. `!self.draining` is
-                // defensive single-emission protection.
+                // A restart toast only once the update is finalizing and shutting the
+                // service down: a plain quit, close or signal during an update still in
+                // flight must not claim a restart. `!self.draining` guards single emission.
                 if !self.draining
                     && crate::self_update::update_in_progress()
                     && crate::self_update::update_is_finalizing()
@@ -1692,16 +1413,14 @@ impl Dashboard {
             Message::WindowEvent(_, event) => match event {
                 window::Event::Resized(new_size) => {
                     match self.startup_width {
-                        // The window's first report of its size is the one the
-                        // platform gave it, not a resize.
+                        // The first report is the size the platform gave the window, not
+                        // a resize.
                         StartupWidth::AwaitingReport => {
                             self.startup_width = StartupWidth::Owed;
                         }
-                        // A width the window was not at is the user's own drag —
-                        // before the board's first read included — while a
-                        // report of the width it already has is the platform's
-                        // again. Only the width decides: the decision is about
-                        // the width.
+                        // A different width is the user's own drag, even before the board's
+                        // first read; a report of the width the window already has is the
+                        // platform's again. Only the width decides.
                         #[expect(
                             clippy::float_cmp,
                             reason = "the platform reports a width exactly; a different width is not an approximate one"
@@ -1718,11 +1437,9 @@ impl Dashboard {
                     self.last_position = new_pos;
                     Task::none()
                 }
-                // A dropped file attaches to the next chat message: the whole
-                // Home page is the target, while every other page (and a
-                // dashboard overlay drawn above Home) ignores drops. Several
-                // files arrive as several events, and a folder is not an
-                // attachment.
+                // A dropped file attaches to the next chat message: the whole Home page
+                // is the target, every other page (and an overlay above Home) ignores
+                // drops. Several files arrive as several events; a folder is not an attachment.
                 window::Event::FileDropped(path) => {
                     if self.page != Page::Home || self.overlay_modal_open() {
                         return Task::none();
@@ -1750,8 +1467,7 @@ impl Dashboard {
                 Task::none()
             }
             Message::CloseDiffModal => {
-                // The backdrop closes whichever view is showing, dropping that
-                // view's commit ref with it so a later open cannot inherit a
+                // Drops whichever view's commit ref, so a later open cannot inherit a
                 // stale one. `ClearCommitState` never returns work.
                 let was_foreign = self.foreign_workspace.take().is_some();
                 self.show_diff_modal = false;
@@ -1767,13 +1483,12 @@ impl Dashboard {
             Message::Navigation(_) if !self.ready => Task::none(),
             Message::Navigation(page) => self.navigate_to(page),
 
-            // ── Everything else before boot → silent no-op ──
+            // Everything else before boot → silent no-op
             _ if !self.ready => Task::none(),
 
-            // ── Post-ready handlers (no per-arm guards needed) ──
             Message::WorkspacePick(name) => self.select_workspace(&name),
             Message::ToastExpired(id) => {
-                // Dismissing an already-expired/unknown id is a safe no-op.
+                // An already-expired or unknown id is a safe no-op.
                 self.toasts.retain(|t| t.id != id);
                 Task::none()
             }
@@ -1782,10 +1497,8 @@ impl Dashboard {
                     &mut self.running_expanded,
                     &crate::agent::registry::AGENT_REGISTRY.list(),
                 );
-                // The tick's Sessions work (list-cache refresh + live
-                // transcript merge) is only observable while the page is
-                // visible; navigating onto it refreshes, so gating here
-                // cannot go stale.
+                // The tick's Sessions work is only observable while the page is
+                // visible, and navigating onto it refreshes, so this cannot go stale.
                 if self.page == Page::Sessions {
                     self.sessions_state
                         .update(sessions::SessionsMessage::RuntimeChanged, &self.workspaces)
@@ -1801,8 +1514,8 @@ impl Dashboard {
                 .update(msg, self.log_store.as_ref().expect("ready"))
                 .map(Message::Logs),
             Message::Board(msg) => {
-                // Intercept a ticket's commit diff for cross-page navigation
-                // before it reaches board_state.update.
+                // A ticket's commit diff is intercepted for cross-page navigation before
+                // it reaches board_state.update.
                 if let board::BoardMessage::ViewCommitDiff {
                     ref commit_hash,
                     ref workspace_name,
@@ -1810,10 +1523,9 @@ impl Dashboard {
                 {
                     return self.open_ticket_commit_diff(workspace_name, commit_hash.clone());
                 }
-                // An applied read outcome is when the one start-up width decision
-                // is taken (see [`StartupWidth`]); a delta carries no board state
-                // to decide it, and an outcome the board dropped as stale carries
-                // none either — a newer read is still on its way.
+                // An applied read outcome is when the one start-up width decision is
+                // taken (see [`StartupWidth`]); a delta, or an outcome dropped as stale,
+                // carries no board state to decide it.
                 let read = match &msg {
                     board::BoardMessage::Refreshed { generation, .. }
                     | board::BoardMessage::RefreshError { generation, .. } => Some(*generation),
@@ -1834,19 +1546,16 @@ impl Dashboard {
                 self.automations_state.update(msg).map(Message::Automations)
             }
             Message::RunningAgents(msg) => self.process_running_message(msg),
-            // Intercept CloseModal from successful manual commit — auto-close
-            // the diff modal while keeping the diff state in working-tree view.
-            // ClearCommitState is intentionally not emitted; the commit handler
-            // already cleared commit state and kicked off a diff refresh. A
-            // foreign view is untouched: it has a channel of its own and closes
-            // through its own controls.
+            // Auto-close the diff modal on a successful manual commit, keeping the diff
+            // state in working-tree view: the commit handler already cleared commit state
+            // and refreshed the diff, so no ClearCommitState. A foreign view has its own
+            // channel and closes through its own controls.
             Message::DiffModal(diff::DiffMessage::CloseModal) => {
                 self.show_diff_modal = false;
                 Task::none()
             }
-            // "Back to working tree" in the foreign view leaves that project
-            // for the picked workspace's working tree — the other project's
-            // working tree is not a place to land.
+            // "Back to working tree" from the foreign view lands on the picked
+            // workspace's working tree — the other project's is not a place to land.
             Message::ForeignDiff(diff::DiffMessage::BackToWorkingTree) => {
                 self.open_diff_modal(None)
             }
@@ -1859,16 +1568,13 @@ impl Dashboard {
                     .map(Message::ForeignDiff)
             }
             Message::DiffModal(msg) => {
-                // A manual commit is a ref-only change (HEAD + `.git/index`)
-                // that the file watcher never reports, so refresh the git footer
-                // promptly — otherwise diff stats and remote state stay stale
-                // until the periodic timer.
+                // A manual commit is a ref-only change (HEAD + `.git/index`) the file
+                // watcher never reports, so refresh the git footer promptly — otherwise
+                // diff stats and remote state stay stale until the periodic timer.
                 let commit_succeeded = matches!(&msg, diff::DiffMessage::CommitResult(Ok(_)));
-                // Every `Message::DiffModal` belongs to the picked workspace's
-                // view — its subscription, its rendered controls, the
-                // dashboard's pushes to it. The foreign view speaks
-                // `Message::ForeignDiff`, so neither state can receive the
-                // other's messages.
+                // Every `Message::DiffModal` belongs to the picked workspace's view and
+                // the foreign view speaks `Message::ForeignDiff`, so neither state can
+                // receive the other's messages.
                 let diff_task = self.diff_state.update(msg).map(Message::DiffModal);
                 if commit_succeeded {
                     Task::batch([
@@ -1882,12 +1588,10 @@ impl Dashboard {
                 }
             }
             Message::Editor(msg) => {
-                // The editor's commit/staging mtime detector requests a
-                // git-status refresh. Route it through GitState's standard
-                // throttle/coalescing file-change path instead of the editor's
-                // own handler, so it reuses the 300ms refresh coalescing (and
-                // the resulting WorktreeSnapshot flows back to the editor via
-                // the usual GitStatusUpdated forward).
+                // The editor's mtime detector routes through GitState's throttled
+                // file-change path (300ms coalescing) rather than its own handler, so the
+                // resulting WorktreeSnapshot reaches the editor as a normal
+                // GitStatusUpdated.
                 if matches!(msg, editor::EditorMessage::RequestGitStatusRefresh) {
                     self.git_state
                         .update(git::GitMessage::FileChanged)
@@ -1897,7 +1601,6 @@ impl Dashboard {
                 }
             }
             Message::Settings(msg) => self.process_settings_message(msg),
-            // ── Diff modal ────────────────────────────────────────
             Message::OpenDiffModal(commit_hash) => self.open_diff_modal(commit_hash),
             Message::TicketCommitProjectResolved {
                 workspace,
@@ -1910,20 +1613,18 @@ impl Dashboard {
                     ToastKind::Error,
                 ),
             },
-            // ── Git state (routed to self.git_state) ─────────────────
             Message::Git(msg) => {
-                // Cross-modal close: if opening the branch modal, close both
-                // diff views from the Dashboard side — one overlay at a time.
+                // One overlay at a time: opening the branch modal closes both diff views
+                // from the Dashboard side.
                 if matches!(msg, git::GitMessage::OpenModal) {
                     self.show_diff_modal = false;
                     self.foreign_workspace = None;
                 }
                 let snapshot = matches!(msg, git::GitMessage::WorktreeSnapshot(..));
                 let task = self.git_state.update(msg).map(Message::Git);
-                // A current-generation worktree snapshot (Ok or Err) hands the
-                // editor the latest (possibly last-known-good) per-file statuses
-                // so its file-tree colors track GitState — the editor no longer
-                // runs its own `git status` subprocess.
+                // A current-generation worktree snapshot (Ok or Err) forwards the latest
+                // (possibly last-known-good) per-file statuses to the editor, so its tree
+                // colours track GitState and it runs no `git status` itself.
                 if snapshot {
                     if let Some((workspace, statuses)) = self.git_state.take_status_forward() {
                         return Task::batch([
@@ -1949,9 +1650,8 @@ impl Dashboard {
             },
             Message::OpenLogs => self.open_from_shortcut(Page::Logs),
             Message::OpenSessions => {
-                // A repeat press on the page it opens changes nothing:
-                // re-entering it would re-run the read `navigate_to` starts on
-                // entry.
+                // Re-entering the page it opens would re-run the read `navigate_to`
+                // starts on entry.
                 if self.page == Page::Sessions {
                     return Task::none();
                 }
@@ -1959,10 +1659,8 @@ impl Dashboard {
             }
             Message::EscapePressed => self.process_escape(),
             Message::UpdateBot => {
-                // Only opens the confirmation modal — the update
-                // starts on `ConfirmUpdate`. Availability is read from the
-                // shared cache, so a Telegram-initiated update disables the
-                // button here too.
+                // Opens the confirmation modal only; availability comes from the shared
+                // cache, so a Telegram-initiated update disables the button here too.
                 let availability = crate::self_update::update_availability();
                 if availability.available && !availability.in_progress {
                     self.show_update_confirm = true;
@@ -1975,18 +1673,15 @@ impl Dashboard {
                 if !availability.available || availability.in_progress {
                     return Task::none();
                 }
-                // Claim the update before spawning it, exactly as the `/update`
-                // command does: an update that fires by itself can start between
-                // the check above and the task below, and a second attempt must
-                // stand down here instead of colliding inside `execute_update`
-                // and reporting the collision as a failure.
+                // Claim the update before spawning it, exactly as the `/update` command
+                // does: an update that fires by itself can start between the check above
+                // and the task below, and a second attempt must stand down here rather
+                // than collide inside `execute_update` and report it as a failure.
                 if !crate::self_update::claim_update_start() {
                     return Task::none();
                 }
-                // Save window state before update (synchronous).
                 self.persist_window_state();
-                // Transient confirmation that the update has kicked off; the
-                // update itself tells the admin the same thing in its own words.
+                // The update reports itself to the admin in its own words too.
                 let toast = self.push_toast("Update started…".to_string(), ToastKind::Success);
                 Task::batch([
                     toast,
@@ -1995,9 +1690,8 @@ impl Dashboard {
                             match crate::self_update::execute_update(None).await {
                                 Ok(()) => Ok("ok".to_string()),
                                 Err(e) => {
-                                    // Reported to the admin exactly as the
-                                    // unattended trigger reports it, while the
-                                    // window shows its own toast.
+                                    // Reported exactly as the unattended trigger reports
+                                    // it, while the window shows its own toast.
                                     crate::self_update::report_update_failure(&e).await;
                                     Err(format!("❌ Update failed:\n{e:#}"))
                                 }
@@ -2012,18 +1706,14 @@ impl Dashboard {
                 Task::none()
             }
             Message::UpdateResult(result) => {
-                // execute_update() calls exit(0) on success, so we never
-                // actually reach this branch for the Ok case. The update
-                // toasts (start + restart) are the success signals; the
-                // window closing is the final confirmation. On failure
-                // `execute_update` already cleared the shared in-progress
-                // flag, so the exit guards below no longer wait.
+                // `execute_update` calls exit(0) on success, so the Ok case never gets
+                // here: the toasts and the window closing are its confirmation. On failure
+                // it has already cleared the shared in-progress flag.
                 if let Err(err) = result {
                     let toast = self.push_toast_msg(&ToastMessage::Error(err));
                     if self.exit_requested_during_update {
-                        // A close or a platform quit arrived while the
-                        // update owned the exit; it failed, so run the normal
-                        // exit checkpoint.
+                        // A close or quit arrived while the update owned the exit; it
+                        // failed, so run the normal exit checkpoint.
                         self.exit_requested_during_update = false;
                         return Task::batch([toast, self.save_and_exit()]);
                     }
@@ -2035,34 +1725,26 @@ impl Dashboard {
             Message::ToggleResult(kind, result, ws_name, intended_state) => {
                 self.finish_toggle(kind, result, &ws_name, intended_state)
             }
-            // A workspaces-table row changed (or the stream lagged/baseline
-            // fired) — one full map reload; the handler below re-pushes the
-            // workspace-scoped surfaces from the fresh map.
+            // One full map reload; the handler re-pushes the workspace-scoped surfaces
+            // from the fresh map.
             Message::WorkspacesCdcChanged => self.reload_workspace_map(),
             Message::WorkspacesReloaded {
                 workspaces,
                 generation,
             } => {
-                // Stale-result guard: a slow reload must not overwrite a newer
-                // one that has already answered.
+                // Stale-result guard: a slow reload must not overwrite a newer one.
                 if generation != self.workspaces_reload_gen {
                     return Task::none();
                 }
                 self.apply_workspace_reload(Ok(workspaces));
 
-                // Nothing is picked from this map: it can lag the stored choice (a
-                // workspace added and selected in one go is missing from a read that
-                // started before its insert), and resolving against it would leave
-                // the desktop on the personal space while the DB keeps the project
-                // active. The DB owns the choice and its read-back applies it (see
-                // `active_workspace_gen`), so the applied map only re-pushes the
-                // workspace-scoped surfaces — whose resolvability this map may have
-                // changed (the boot race leaves the restored selection resolved
-                // against the map that was dropped as stale).
-                //
-                // The one case left to settle is a desktop that has applied no
-                // selection at all yet — the reload landed before the boot read —
-                // which takes the personal default the boot selection then replaces.
+                // Nothing is picked from this map: it can lag the stored choice (a workspace added
+                // and selected in one go is missing from a read that started before its insert),
+                // and resolving against it would leave the desktop on the personal space while the
+                // DB keeps the project active. The DB owns the choice and its read-back applies it
+                // (`active_workspace_gen`); this map only re-pushes the workspace-scoped surfaces,
+                // whose resolvability it may have changed. Only a desktop that applied no selection
+                // yet takes the personal default, which the boot selection then replaces.
                 if self.selected_workspace_name.is_some() {
                     return self.sync_workspace_surfaces();
                 }
@@ -2070,10 +1752,8 @@ impl Dashboard {
                     crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
                 self.apply_workspace_selection(&personal_name)
             }
-            // A users-table / user_channels-table row changed (or the stream
-            // lagged) — the event does not say which column changed, so the
-            // read-back is the authority on the managed selection. Full re-list
-            // is its own recovery.
+            // The event does not say which column changed, so the read-back is the authority
+            // on the managed selection; the full re-list is its own recovery.
             Message::UsersCdcChanged => {
                 self.active_workspace_gen += 1;
                 let generation = self.active_workspace_gen;
@@ -2088,19 +1768,16 @@ impl Dashboard {
                 generation,
                 name: Some(name),
             } => {
-                // Stale reads are dropped (see `active_workspace_gen`); an
-                // unchanged value is a no-op rather than a re-run of the
-                // propagate's pushes.
+                // Stale reads are dropped (see `active_workspace_gen`); an unchanged
+                // value is a no-op rather than a re-run of the propagate's pushes.
                 if generation != self.active_workspace_gen
                     || self.selected_workspace_name.as_deref() == Some(name.as_str())
                 {
                     return Task::none();
                 }
-                // "No project selected" is not a steady state: start-up and a
-                // deletion both write the fallback back, so a personal answer while
-                // the loaded map carries a project is the residue of a failed
-                // start-up read (which wrote nothing, on purpose). Applying it would
-                // drop the desktop outside every project — the live pick stands.
+                // "No project selected" is not a steady state: start-up and a deletion both
+                // write the fallback back, so a personal answer while the map carries a
+                // project is the residue of a failed start-up read — the live pick stands.
                 if crate::users::is_personal_workspace(&name)
                     && self
                         .workspaces
@@ -2109,23 +1786,22 @@ impl Dashboard {
                 {
                     return Task::none();
                 }
-                // Applied as stored, not resolved against the loaded map the way a
-                // reload is: the map can be a reload behind while the DB is
-                // authoritative about the choice. In memory only — writing the value
-                // back would answer our own CDC event.
+                // Applied as stored, not resolved against the loaded map as a reload is:
+                // the map can be a reload behind while the DB is authoritative about the
+                // choice. In memory only — writing it back would answer our own CDC event.
                 self.apply_workspace_selection(&name)
             }
             // A failed read-back changes nothing: the live selection stands.
             Message::ActiveWorkspaceSynced { name: None, .. } => Task::none(),
             Message::WorkspacesReloadFailed { error, generation } => {
-                // Stale-result guard, mirroring the success arm: without it a
-                // reload that fails after a newer one succeeded would re-set the
-                // failure over the map that read produced.
+                // Stale-result guard, mirroring the success arm: without it, a reload that
+                // fails after a newer one succeeded would set the failure over the map
+                // that read produced.
                 if generation != self.workspaces_reload_gen {
                     return Task::none();
                 }
-                // Keep the current map (the selection may still resolve) and
-                // render the failure where the picker / Settings list would be.
+                // Keep the current map (the selection may still resolve) and render the
+                // failure where the picker / Settings list would be.
                 self.apply_workspace_reload(Err(error));
                 Task::none()
             }
@@ -2135,7 +1811,6 @@ impl Dashboard {
         }
     }
 
-    /// Handle a TTS download progress event.
     #[cfg(target_os = "macos")]
     #[expect(clippy::cast_precision_loss)]
     fn handle_tts_download_event(
@@ -2173,28 +1848,23 @@ impl Dashboard {
         }
     }
 
-    /// Open the picked workspace's diff modal, closing any board or branch
-    /// modal first, and leaving any foreign commit view behind.
+    /// Open the picked workspace's diff modal, closing any board or branch modal first and
+    /// leaving any foreign commit view behind. `Some(commit_hash)` navigates to that commit,
+    /// `None` to the working tree (clearing stale commit state).
     ///
-    /// When `commit_hash` is `Some`, navigates to that commit; when `None`,
-    /// navigates to the working tree (clearing any stale commit state).
-    ///
-    /// The change/diff view is workspace-scoped, so it never opens while
-    /// nothing is resolved; losing the resolution has already closed it (see
-    /// [`Self::sync_workspace_surfaces`]).
+    /// The view is workspace-scoped, so it never opens while nothing is resolved; losing the
+    /// resolution has already closed it ([`Self::sync_workspace_surfaces`]).
     fn open_diff_modal(&mut self, commit_hash: Option<String>) -> Task<Message> {
         self.foreign_workspace = None;
         if self.resolved_workspace().is_none() {
             return Task::none();
         }
-        // Close any board modal
         let close_board = self
             .board_state
             .update(board::BoardMessage::CloseModal)
             .map(Message::Board);
         self.show_diff_modal = true;
-        // Close branch modal synchronously if open.
-        // CloseModal always returns Task::none() so discarding is safe.
+        // CloseModal always returns Task::none(), so discarding the branch modal's is safe.
         let _ = self.git_state.update(git::GitMessage::CloseModal);
         let diff_task = match commit_hash {
             Some(hash) => Task::done(Message::DiffModal(diff::DiffMessage::NavigateToCommit(
@@ -2205,13 +1875,9 @@ impl Dashboard {
         Task::batch([close_board, diff_task])
     }
 
-    /// Open a sidebar ticket's commit diff against the ticket's own project.
-    ///
-    /// A ticket of the picked workspace opens the ordinary diff view. A ticket
-    /// of another project is shown read-only — that project's own commit
-    /// history, named in the view, with no file-changing control and without
-    /// re-pointing the picked workspace's view. A ticket whose project cannot
-    /// be resolved reports that instead of showing another project's history.
+    /// Open a sidebar ticket's commit diff against its own project: the picked workspace's
+    /// ordinary view, or a read-only view of another project's commit (named in the view, no
+    /// file-changing control, the picked view untouched). An unresolvable project is reported.
     fn open_ticket_commit_diff(&mut self, workspace: &str, commit_hash: String) -> Task<Message> {
         if self
             .resolved_workspace()
@@ -2219,10 +1885,8 @@ impl Dashboard {
         {
             return self.open_diff_modal(Some(commit_hash));
         }
-        // The workspace map is read at boot and kept live by CDC, but a click
-        // on the sidebar can beat that first read — the store is the authority,
-        // so a miss falls back to it rather than reporting a project that
-        // exists as unavailable.
+        // A click can beat the boot read of the map, so a miss falls back to the store
+        // rather than calling an existing project unavailable.
         let Some(path) = self
             .workspaces
             .get(workspace)
@@ -2274,32 +1938,30 @@ impl Dashboard {
         Task::batch([close_board, view.map(Message::ForeignDiff)])
     }
 
-    /// Apply a workspace selection in memory and broadcast it to all pages,
-    /// without writing the DB. Used where nothing supersedes a read-back in flight:
-    /// the read-back itself (`Message::ActiveWorkspaceSynced`), the pre-boot
-    /// personal default, and a boot pick produced by a failed read. Every other
-    /// path goes through [`Self::apply_workspace_selection_superseding_read_back`].
+    /// Apply a workspace selection in memory and broadcast it to all pages, without
+    /// writing the DB. Only for paths nothing supersedes: the read-back itself
+    /// (`Message::ActiveWorkspaceSynced`), the pre-boot personal default and a boot pick
+    /// from a failed read. Everything else uses
+    /// [`Self::apply_workspace_selection_superseding_read_back`].
     fn apply_workspace_selection(&mut self, name: &str) -> Task<Message> {
-        // Git state is cleared and eagerly refreshed below via
-        // propagate_workspace_selection → set_workspace_path.
+        // Git state is cleared and eagerly refreshed by propagate → set_workspace_path.
         self.selected_workspace_name = Some(name.to_string());
         self.propagate_workspace_selection(name)
     }
 
-    /// Make `name` the active project, superseding any read-back already in flight:
-    /// what sets the selection here — a pick, a deletion whose transaction has
-    /// committed, a boot pick that is written back — is newer than anything a read
-    /// dispatched earlier can return (see `active_workspace_gen`).
+    /// Make `name` active, superseding any read-back in flight: a pick, a deletion whose
+    /// transaction has committed and a boot pick that is written back are all newer than
+    /// anything a read dispatched earlier can return (see `active_workspace_gen`).
     fn apply_workspace_selection_superseding_read_back(&mut self, name: &str) -> Task<Message> {
         let propagate = self.apply_workspace_selection(name);
         self.active_workspace_gen += 1;
         propagate
     }
 
-    /// The one workspace-switch path, shared by the footer picker and the
-    /// Settings add form: [`Self::apply_workspace_selection_superseding_read_back`]
-    /// plus the write, which is skipped when the loaded map has dropped the name
-    /// since the render (see [`Self::selection_persistable`]).
+    /// The one workspace-switch path, shared by the footer picker and the Settings add
+    /// form: [`Self::apply_workspace_selection_superseding_read_back`] plus the write,
+    /// skipped when the loaded map dropped the name since the render
+    /// ([`Self::selection_persistable`]).
     fn switch_workspace(
         &mut self,
         name: &str,
@@ -2312,20 +1974,19 @@ impl Dashboard {
         Task::batch(std::iter::once(activate).chain(write))
     }
 
-    /// Whether a pick may be written to the DB: a managed name only when the
-    /// loaded map carries it — the map can drop one between render and click, and
-    /// the DB must not gain a dangling value (the in-memory selection still
-    /// applies; the read-back decides if it stands). A personal space is always
-    /// writable: the map holds managed workspaces only and so never carries
-    /// one, and the write stores NULL — the product's own "no managed workspace
-    /// selected", from which it computes the personal workspace on the fly.
+    /// Whether a pick may be written to the DB: a managed name only while the loaded map
+    /// carries it — the map can drop one between render and click, and the DB must not
+    /// gain a dangling value (the in-memory selection still applies; the read-back
+    /// decides). A personal space is always writable: the write stores NULL, the
+    /// product's "no managed workspace selected", from which it computes the personal
+    /// workspace on the fly.
     fn selection_persistable(&self, name: &str) -> bool {
         crate::users::is_personal_workspace(name) || self.workspaces.contains_key(name)
     }
 
-    /// Persist `name` as the admin's active workspace. A failure is always logged
-    /// here; `feedback` decides what the caller hears on top of that — the footer
-    /// picker drops it (`Message::Nop`), the Settings side turns it into a toast.
+    /// Persist `name` as the admin's active workspace. A failure is always logged here;
+    /// `feedback` decides what the caller hears on top of that — the footer picker drops
+    /// it (`Message::Nop`), the Settings side turns it into a toast.
     fn persist_active_workspace(
         name: String,
         feedback: fn(Result<String, String>) -> Message,
@@ -2346,31 +2007,24 @@ impl Dashboard {
         )
     }
 
-    /// The footer picker's switch: [`Self::switch_workspace`] with logging-only
-    /// feedback — a failed write here is logged, not toasted.
+    /// The footer picker's switch: [`Self::switch_workspace`], logging a failed write.
     fn select_workspace(&mut self, name: &str) -> Task<Message> {
         self.switch_workspace(name, |_| Message::Nop)
     }
 
-    /// Make a just-added workspace the active one from the Settings add form —
-    /// the same switch path as the picker, with the Settings section's own
-    /// feedback so a failed write is reported rather than only logged.
+    /// Make a just-added workspace active from the Settings add form, reporting a failed write.
     fn activate_workspace(&mut self, name: &str) -> Task<Message> {
         self.switch_workspace(name, Self::activation_feedback)
     }
 
-    /// The activation write's feedback, through the Settings section's own toast
-    /// message (intercepted by [`Message::as_toast`]) rather than a message of
-    /// its own — so a failure carries the same `Failed: …` wording as the
-    /// section's other error toasts.
+    /// The activation write's feedback, through the Settings section's toast message
+    /// ([`Message::as_toast`]) so a failure carries the same `Failed: …` wording as the rest.
     fn activation_feedback(outcome: Result<String, String>) -> Message {
         Message::Settings(settings::SettingsMessage::WorkspaceMsg(
             workspaces::WorkspacesMessage::Toast(Self::activation_toast(outcome)),
         ))
     }
 
-    /// What the Settings list reports for the add form's activation write: the
-    /// write's success, or its failure.
     fn activation_toast(outcome: Result<String, String>) -> ToastMessage {
         match outcome {
             Ok(name) => ToastMessage::SuccessMsg(format!("Active workspace: {name}")),
@@ -2378,19 +2032,16 @@ impl Dashboard {
         }
     }
 
-    /// Propagate the global workspace selection to the Home page, then push the
-    /// resolved workspace to the workspace-scoped surfaces (see
-    /// [`Self::sync_workspace_surfaces`]).
+    /// Propagate the selection to Home, then push the resolved workspace to the
+    /// workspace-scoped surfaces ([`Self::sync_workspace_surfaces`]).
     ///
-    /// The ticket sidebar is deliberately not one of the surfaces this touches:
-    /// it lists every workspace's tickets — never the selected project's — so a
-    /// switch, including one onto the personal folder, must leave it (its search
-    /// included) exactly as it is.
+    /// The ticket sidebar is deliberately untouched: it lists every workspace's
+    /// tickets, so a switch (onto the personal folder included) leaves it and its
+    /// search exactly as they are.
     fn propagate_workspace_selection(&mut self, name: &str) -> Task<Message> {
-        // Notify the Home page of the selection as stored, with no
-        // substitution, so the composer's send carries the same choice the
-        // picker and the DB carry. The conversation Home shows is the admin's
-        // own and is not touched by it.
+        // Home hears the selection as stored, with no substitution, so the composer's
+        // send carries the same choice as the picker and the DB. Its conversation is the
+        // admin's own and is not touched.
         let home_task: Task<Message> =
             Task::done(home::HomeMessage::WorkspaceChanged(name.to_string())).map(Message::Home);
 
@@ -2398,29 +2049,21 @@ impl Dashboard {
         Task::batch([home_task, surfaces])
     }
 
-    /// Push the resolved workspace to the four workspace-scoped surfaces — the
-    /// editor, the shell, the footer git status and the change/diff view — and
-    /// leave a page that stops resolving (see [`Self::leave_unavailable_page`]).
-    /// No substitution of any kind happens here: an unresolved selection is
+    /// Push the resolved workspace to the four workspace-scoped surfaces — editor, shell, footer
+    /// git status and the change/diff view — and leave a page that stops resolving
+    /// ([`Self::leave_unavailable_page`]). Nothing is substituted: an unresolved selection is
     /// never shown the personal workspace.
     ///
-    /// The editor and the shell own per-workspace tab state, so they are only
-    /// ever pushed a real resolution; while nothing is resolved the Dashboard
-    /// hides their pages and drops the editor's subscription instead of tearing
-    /// their tabs down. The footer git status and the change/diff view hold
-    /// derived state only, so they are cleared — that is what drops the
-    /// watcher, the refresh loop and the diff tick of a workspace that is no
-    /// longer selected.
-    ///
-    /// An unchanged resolution is a no-op: the workspace-map reload path calls
-    /// this on every CDC event and the push must not run then.
+    /// The editor and the shell own per-workspace tabs, so they are only pushed a real
+    /// resolution and never torn down; the git status and diff view hold derived state, so they
+    /// are cleared, dropping the watcher, the refresh loop and the diff tick. An unchanged
+    /// resolution is a no-op — the map-reload path calls this on every CDC event.
     fn sync_workspace_surfaces(&mut self) -> Task<Message> {
         let resolved = self
             .resolved_workspace()
             .map(|(name, path)| (name.to_string(), path.to_string()));
-        // The change/diff view is an overlay of the current page: while nothing
-        // is resolved it is closed rather than left open and empty (it would
-        // keep owning Escape and the diff keyboard shortcuts).
+        // The diff view is an overlay of the current page: unresolved, it is closed rather
+        // than left open and empty, owning Escape and the diff shortcuts.
         if resolved.is_none() {
             self.show_diff_modal = false;
         }
@@ -2457,10 +2100,9 @@ impl Dashboard {
         Task::batch([leave, surfaces])
     }
 
-    /// Return to Home when the current page is one the dashboard no longer
-    /// offers (a workspace-scoped page whose selection stopped resolving).
-    /// [`Self::navigate_to`] refuses such a page, so leaving it open would mean
-    /// showing a page nothing can navigate to.
+    /// Return to Home when the current page is one the dashboard no longer offers:
+    /// [`Self::navigate_to`] refuses such a page, so leaving it open would show a page
+    /// nothing can navigate to.
     fn leave_unavailable_page(&mut self) -> Task<Message> {
         if self.page_available(self.page) {
             return Task::none();
@@ -2468,25 +2110,22 @@ impl Dashboard {
         self.navigate_to(Page::Home)
     }
 
-    /// Reload the full workspace map from storage (e.g. after add/delete on
-    /// the Workspaces page or a post-toggle refresh). The applied map re-pushes
-    /// the workspace-scoped surfaces and fills in the pre-boot personal default;
-    /// it never picks the active project from itself (see
-    /// [`Message::WorkspacesReloaded`]).
+    /// Reload the full workspace map from storage: the applied map re-pushes the
+    /// workspace-scoped surfaces and fills in the pre-boot personal default, but never
+    /// picks the active project from itself ([`Message::WorkspacesReloaded`]).
     ///
-    /// The reload carries the generation it was issued under: this read retries
-    /// for a second on a transient failure, so without it a delayed failure
-    /// could re-set the error over a newer read that has already succeeded.
+    /// The read carries its generation because it retries for a second on a transient
+    /// failure: a delayed failure could otherwise re-set the error over a newer read
+    /// that already succeeded.
     fn reload_workspace_map(&mut self) -> Task<Message> {
         self.workspaces_reload_gen = self.workspaces_reload_gen.wrapping_add(1);
         let generation = self.workspaces_reload_gen;
         Task::perform(load_workspace_map(generation), std::convert::identity)
     }
 
-    /// Apply the boot workspace-map read. There is no previous map to keep, so a
-    /// failure leaves an empty map beside the failure that stands in for it and
-    /// the boot path completes either way. The Settings list is re-derived here,
-    /// so it can never diverge from the map.
+    /// Apply the boot map read. There is no previous map to keep, so a failure leaves an
+    /// empty map beside the failure, and the boot path completes either way. The Settings
+    /// list is re-derived here, so it can never diverge from the map.
     fn apply_boot_workspace_map(&mut self, result: Result<HashMap<String, Workspace>, String>) {
         match result {
             Ok(map) => {
@@ -2501,9 +2140,8 @@ impl Dashboard {
         self.sync_settings_workspaces_from_map();
     }
 
-    /// Apply a post-ready workspace-map reload: a failed read keeps the map the
-    /// live selection may still resolve against, while the failure is recorded
-    /// for the picker and the Settings list.
+    /// Apply a post-ready map reload: a failed read keeps the map the live selection may
+    /// still resolve against, recording the failure for the picker and the Settings list.
     fn apply_workspace_reload(&mut self, result: Result<HashMap<String, Workspace>, String>) {
         match result {
             Ok(map) => {
@@ -2515,15 +2153,11 @@ impl Dashboard {
         self.sync_settings_workspaces_from_map();
     }
 
-    /// Whether a dashboard-level overlay modal is open over the current page.
-    /// Gates the editor page's keyboard ownership and the rail-replacing
-    /// shortcuts — the overlay covers the rail, so the keys that replace rail
-    /// entries do nothing from under one. The board ticket modal is not
-    /// included: it renders only inside the Home page content (never the global
-    /// overlay stack), so it cannot sit above the editor.
-    ///
-    /// `pending_stop` is likewise excluded: it is rendered inside
-    /// the Running Agents page body, not as an overlay over other pages.
+    /// Whether a dashboard-level overlay modal is open over the current page. Gates the
+    /// editor's keyboard ownership and the rail-replacing shortcuts: the overlay covers
+    /// the rail, so those keys do nothing from under one. The board ticket modal is not
+    /// included (it renders inside the Home page content, never the global overlay
+    /// stack), and neither is `pending_stop` (rendered inside the Running Agents body).
     fn overlay_modal_open(&self) -> bool {
         self.foreign_workspace.is_some()
             || self.show_diff_modal
@@ -2531,16 +2165,14 @@ impl Dashboard {
             || self.git_state.is_modal_open()
     }
 
-    /// The Home page: the chat, and the ticket column beside it while the board
-    /// has a ticket to show. The chat is the row's first child either way — a
-    /// root that flipped shape with the column would be rebuilt on the flip,
-    /// taking the chat's scroll position and the composer's caret and draft with
-    /// it — and a lone fill portion still spans the row.
+    /// The Home page: the chat, and the ticket column beside it while the board has a
+    /// ticket to show. The chat is the row's first child either way — a root that flipped
+    /// shape with the column would be rebuilt, taking the chat's scroll position and the
+    /// composer's caret and draft with it — and a lone fill portion still spans the row.
     fn home_page(&self) -> Element<'_, Message> {
         let home_view = self.home_state.view(self.draining).map(Message::Home);
-        // Wrap chat area in a right-click context menu with "Reset session".
-        // Per-bubble ContextMenus (Copy message, see home.rs) capture bubble
-        // right-clicks; this outer menu is the fallback for empty-space ones.
+        // Reset session from a right-click on empty space; per-bubble ContextMenus
+        // (Copy message, see home.rs) capture the bubble ones.
         let home_view: Element<'_, Message> = ContextMenu::new(
             home_view,
             vec![menus::MenuItem::new(
@@ -2553,9 +2185,8 @@ impl Dashboard {
             row![container(home_view).width(Length::FillPortion(CHAT_COLUMN_PORTION))];
         if !self.board_state.has_nothing_to_show() {
             let sidebar = ticket_sidebar(&self.board_state);
-            // Sidebar right-click menu: the two bulk actions over the board —
-            // archiving done and cancelled tickets, pausing queued ones.
-            // Pausing is offered only when a queued ticket is listed.
+            // The board's two bulk actions. Pausing is offered only when a queued
+            // ticket is listed.
             let mut menu_items = vec![menus::MenuItem::new(
                 "Archive done & cancelled".into(),
                 Message::Board(board::BoardMessage::ArchiveAllCompleted),
@@ -2658,10 +2289,9 @@ impl Dashboard {
             body = body.push(self.footer_view());
         }
 
-        // Keep Stack widget type stable to prevent state loss on toast
-        // transitions. A type tag change (Column ↔ Stack) would cause Iced
-        // to destroy the entire widget tree, losing scroll positions, cursor
-        // states, and all other widget state.
+        // Keep the Stack widget type stable across toast transitions: a type tag change
+        // (Column ↔ Stack) makes Iced destroy the whole widget tree, losing scroll
+        // positions, cursor state and everything else.
         let overlay: Element<'_, Message> = if self.toasts.is_empty() {
             widgets::empty_stack_placeholder()
         } else {
@@ -2691,8 +2321,8 @@ impl Dashboard {
                 .width(Length::Fill)
                 .align_x(Alignment::Center)
                 .padding(iced::Padding {
-                    // Clears the footer bar; with the bar hidden the stack keeps
-                    // only the window's own inset instead of a vacated strip.
+                    // Clears the footer bar; with the bar hidden the stack keeps only
+                    // the window's own inset.
                     bottom: if footer_hidden {
                         theme::PAD_16
                     } else {
@@ -2704,12 +2334,10 @@ impl Dashboard {
                 .into()
         };
 
-        // ── Diff modal overlay ─────────────────────────────────────
-        // The picked workspace's view is the default; a sidebar ticket card
-        // from another project opens the read-only foreign view instead, and
-        // the two are mutually exclusive. `sync_workspace_surfaces` closes the
-        // picked one when its resolution is lost and never touches the foreign
-        // one.
+        // The picked workspace's view is the default; a sidebar ticket from another
+        // project opens the read-only foreign view instead, mutually exclusive with it.
+        // `sync_workspace_surfaces` closes the picked one when its resolution is lost and
+        // never touches the foreign one.
         let diff_overlay: Element<'_, Message> = if let Some(foreign) = &self.foreign_workspace {
             render_diff_modal(
                 &self.foreign_diff_state,
@@ -2722,7 +2350,7 @@ impl Dashboard {
             widgets::empty_stack_placeholder()
         };
 
-        // ── Branch management modal (small centered dialog) ──────────
+        // The branch management dialog (small, centered).
         let branch_overlay: Element<'_, Message> = if self.git_state.is_modal_open() {
             let dialog = dialog::dialog_shell(self.git_state.view().map(Message::Git), 400.0, 24.0);
             widgets::modal_backdrop(dialog, Message::Git(git::GitMessage::CloseModal), 0.5)
@@ -2730,21 +2358,16 @@ impl Dashboard {
             widgets::empty_stack_placeholder()
         };
 
-        // ── Self-update confirmation modal overlay ─────────────────
         let update_overlay: Element<'_, Message> = self.render_update_confirm();
 
         iced::widget::stack![body, diff_overlay, branch_overlay, update_overlay, overlay].into()
     }
 }
 
-/// Wrap dialog content in a modal overlay with a semi-transparent backdrop
-/// and centered 80%-width dialog container.
-///
-/// Creates a backdrop that dismisses the modal on click, wraps `inner` in the
-/// standard dialog container style with 16px padding, and centers it at 80%
-/// width using a `FillPortion(1/8/1)` row layout. The dialog rectangle is
-/// click-claimed (via [`widgets::dialog_click_guard`]) so interior clicks do
-/// not fall through to the backdrop, while the surrounding margin still does.
+/// Wrap dialog content in a modal overlay with a semi-transparent backdrop: 16px padding,
+/// the standard dialog container style, centered at 80% width by a `FillPortion(1/8/1)`
+/// row. The dialog rectangle claims its clicks ([`widgets::dialog_click_guard`]) so
+/// interior clicks do not dismiss it, while the surrounding margin does.
 fn modal_overlay<'a>(
     inner: impl Into<Element<'a, Message>>,
     on_close: Message,
@@ -2769,12 +2392,11 @@ fn modal_overlay<'a>(
     .into()
 }
 
-/// Render the diff modal (80% width, 100% height, centered).
+/// The diff modal (80% width, full height, centered).
 ///
-/// `foreign_workspace` is `Some(name)` while the modal shows another project's
-/// commit (opened from a sidebar ticket card). That view is read-only and its
-/// Back button leaves it for the picked workspace, so the commit header names
-/// the project: it must never be taken for the picked workspace's history.
+/// `foreign_workspace` is `Some(name)` while it shows another project's commit: that view
+/// is read-only and its Back button leaves it for the picked workspace, so the commit
+/// header names the project — it must never be taken for the picked workspace's history.
 fn render_diff_modal<'a>(
     diff_state: &'a diff::DiffState,
     foreign_workspace: Option<&'a str>,
@@ -2782,8 +2404,8 @@ fn render_diff_modal<'a>(
 ) -> Element<'a, Message> {
     let viewing_commit = diff_state.is_viewing_commit();
 
-    // Outer header: commit message (large, bold) + short hash (muted) for
-    // historical commits, or "Uncommitted changes" for working-tree diff.
+    // Header: the commit message with its short hash for a historical commit, or
+    // "Uncommitted changes" for the working tree.
     let header: Element<'_, Message> = if viewing_commit {
         let msg = diff_state
             .commit_message()
@@ -2827,19 +2449,12 @@ fn render_diff_modal<'a>(
     modal_overlay(inner, Message::CloseDiffModal)
 }
 
-// ── Ticket sidebar (Home page, right side) ────────────────────────
-
-/// Ticket sidebar shown on the right side of the Home page.
-/// Displays every workspace's non-archived tickets, grouped by phase — absent
-/// entirely while there is no such ticket to show
-/// ([`board::BoardState::has_nothing_to_show`]), so the chat takes the whole
-/// width. A right-click context menu on this panel offers the two bulk actions
-/// over that list — archiving its done and cancelled tickets, pausing its queued
-/// ones.
+/// Ticket sidebar on the right of the Home page: every workspace's non-archived
+/// tickets, grouped by phase — absent entirely while there is none to show
+/// ([`board::BoardState::has_nothing_to_show`]), so the chat takes the whole width.
 fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
     let search_active = !board_state.search_query.text().is_empty();
 
-    // ── Search input row ───────────────────────────────────────────
     let search_input = widgets::single_line_editor(
         &board_state.search_query.buffer,
         "Search tickets…",
@@ -2866,7 +2481,6 @@ fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
         .padding([0.0, theme::PAD_8])
         .align_y(Alignment::Center);
 
-    // ── Body: search results or normal ticket groups ────────────────
     let body: Element<'_, Message> = if search_active {
         render_search_results(board_state)
     } else {
@@ -2902,12 +2516,10 @@ fn section_hint(label: &str) -> Element<'_, Message> {
     .into()
 }
 
-/// Render the normal ticket list partitioned into groups (In Progress,
-/// Queued, Pending, Completed).
+/// The normal ticket list, partitioned into In Progress, Queued, Pending and Completed.
 fn render_normal_ticket_list(board_state: &board::BoardState) -> Element<'_, Message> {
-    // A failed list read must show the failure in the body itself — otherwise
-    // a first failure renders "Loading…" forever and a later failure leaves a
-    // stale list that looks current.
+    // A failed list read must show in the body itself — otherwise a first failure
+    // renders "Loading…" forever and a later one leaves a stale list looking current.
     if let Some(err) = board_state.load_state.error() {
         return widgets::error_banner(err);
     }
@@ -2979,15 +2591,12 @@ fn group_section<'a>(
 
 impl Dashboard {
     pub fn subscription(&self) -> iced::Subscription<Message> {
-        // Window events are subscribed from the start, before boot completes —
-        // a close request included: it must reach the dashboard in every state
-        // (see `close_window`). Resized also carries the start-up width decision
-        // (see `StartupWidth`), and both it and Moved keep last_size and
-        // last_position at the geometry the window really has, which the exit path
-        // persists (iced does not replay missed window events).
-        //
-        // The platform's quit requests are subscribed from the start for the
-        // same reason: the platform can ask before boot has finished.
+        // Window events are subscribed from the start, before boot completes — a close request
+        // included, which must reach the dashboard in every state (see `close_window`).
+        // Resized carries the start-up width decision ([`StartupWidth`]), and Resized and Moved
+        // keep last_size and last_position at the window's real geometry for the exit path to
+        // persist (iced does not replay missed events). The platform's quit requests are
+        // subscribed from the start for the same reason: it can ask before boot has finished.
         let always_on = iced::Subscription::batch([
             window::resize_events()
                 .map(|(id, size)| Message::WindowEvent(id, window::Event::Resized(size))),
@@ -2995,20 +2604,17 @@ impl Dashboard {
                 window::Event::Moved(_) | window::Event::FileDropped(_) => {
                     Some(Message::WindowEvent(id, event))
                 }
-                // The window is created after this subscription is registered, so
-                // its first `Opened` event arrives here: macOS uses it to hide the system's
-                // title strip before the window is ever shown, Windows to attach the
-                // taskbar/Alt-Tab icon to the window's handle (see `crate::app_icon`).
+                // The window is created after this subscription registers, so its first
+                // `Opened` arrives here: macOS hides the title strip, Windows sets the icons.
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 window::Event::Opened { .. } => Some(Message::WindowOpened(id)),
                 _ => None,
             }),
             window::close_requests().map(Message::CloseRequested),
             iced::Subscription::run(quit_requests_subscription),
-            // The ways into the window from outside it, subscribed from the start like the
-            // platform's quit asks: both are handled in every state — the tray menu's quit
-            // ends the process the way a platform quit does, and the way back brings up even
-            // a window that is still booting. A platform without them has no such gestures.
+            // The ways into the window from outside it, subscribed from the start like the quit
+            // asks: the tray menu's quit ends the process as a platform quit does, and the way
+            // back brings up even a booting window. A platform without them has no gestures.
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             iced::Subscription::run(window_requests_subscription),
         ]);
@@ -3028,10 +2634,9 @@ impl Dashboard {
             }),
             self.shell_state.subscription().map(Message::Shell),
             self.logs_state.subscription().map(Message::Logs),
-            // The editor holds a workspace-scoped page: while nothing is
-            // resolved it is given no subscription at all — no tick and no tree
-            // ping may act on the workspace it still holds in memory (its tabs
-            // are deliberately kept).
+            // The editor's page is workspace-scoped: while nothing is resolved it gets no
+            // subscription at all — no tick and no tree ping may act on the workspace it
+            // still holds in memory (its tabs are deliberately kept).
             if self.page_available(Page::Editor) {
                 self.editor_state
                     .subscription(self.overlay_modal_open())
@@ -3040,9 +2645,8 @@ impl Dashboard {
                 iced::Subscription::none()
             },
             self.home_state.subscription().map(Message::Home),
-            // The Automations page and the Settings page's custom-tools area re-read
-            // their source while they are shown; the tick is page-gated so a
-            // page nobody is looking at reads nothing.
+            // The Automations page and the Settings custom-tools area re-read their source
+            // while shown; the tick is page-gated so a page nobody is looking at reads nothing.
             match self.page {
                 Page::Automations => iced::time::every(common::POLLED_LIST_REFRESH_INTERVAL)
                     .map(|_| Message::Automations(automations::AutomationsMessage::Tick)),
@@ -3056,39 +2660,30 @@ impl Dashboard {
                 _ => iced::Subscription::none(),
             },
             iced::Subscription::run(shutdown_subscription),
-            // Git file-change subscription: drives the event-driven local git
-            // footer refresh when workspace files change.
+            // Local git footer refresh, event-driven, when workspace files change.
             iced::Subscription::run(git_file_changes_subscription),
-            // Git pipeline-commit subscription: refreshes the footer promptly
-            // after a pipeline auto-commit (ref-only change the watcher misses).
+            // Pipeline auto-commits are ref-only changes the watcher misses.
             iced::Subscription::run(git_commit_subscription),
-            // Standalone 60s remote-sync subscription (replaces the tick duty;
-            // also the recovery path for ref-only/commit-only changes).
+            // The standalone 60s remote-sync tick, which also recovers ref-only and
+            // commit-only changes.
             iced::time::every(git::REMOTE_REFRESH_INTERVAL)
                 .map(|_| Message::Git(git::GitMessage::PeriodicSyncTick)),
-            // Board change-stream subscription: drives the board ticket list from
-            // CDC deltas instead of a 1s full re-poll.
+            // Board tickets from CDC deltas instead of a 1s full re-poll.
             iced::Subscription::run(board_change_subscription),
-            // Workspaces change-stream subscription: a full map reload whenever
-            // a workspaces row changes (or the stream lags / the baseline fires).
+            // A full map reload whenever a workspaces row changes (or the stream lags /
+            // the baseline fires).
             iced::Subscription::run(workspaces_cdc_subscription),
-            // Users / user_channels change-stream subscriptions: re-list the
-            // Settings users page when a users/user_channels row changes (or
-            // the stream lags — full re-list is its own recovery).
+            // Re-list the Settings users on a users/user_channels row change (or a lag —
+            // a full re-list is its own recovery).
             iced::Subscription::run(users_cdc_subscription),
             iced::Subscription::run(user_channels_cdc_subscription),
-            // Runtime-change subscription: coalesces agent/non-agent registry,
-            // live transcript, and voice-status broadcasts into a single
-            // re-render, driving the Running Agents page and footer.
+            // Coalesces agent/non-agent registry, live transcript and voice-status
+            // broadcasts into one re-render, driving Running Agents and the footer.
             iced::Subscription::run(runtime_change_subscription),
-            // TTS download progress subscription (always active while ready).
             #[cfg(target_os = "macos")]
             iced::Subscription::run(tts_download_subscription).map(Message::TtsDownloadEvent),
-            // Diff modal subscription (keyboard shortcuts, auto-refresh).
-            // Only active when the modal is open to avoid intercepting
-            // global keyboard shortcuts unnecessarily. The foreign commit view
-            // owns it while it is the one shown, so the two never both
-            // subscribe.
+            // The diff state's own shortcuts and auto-refresh, only while its view is
+            // open: the foreign view owns it while shown, so the two never both subscribe.
             if self.foreign_workspace.is_some() {
                 self.foreign_diff_state
                     .subscription()
@@ -3102,19 +2697,16 @@ impl Dashboard {
     }
 }
 
-/// Subscription that emits [`Message::Shutdown`] when the global shutdown
-/// token fires (self-update restart, SIGTERM/SIGINT, the end of a drain), and
-/// [`Message::DrainStarted`] when the graceful-drain window begins (first
-/// signal / a close that could not hide / a quit / self-update) — the token does NOT fire on the
-/// first signal, so the GUI needs a separate drain signal to disable input
-/// while the drain runs.
+/// Emits [`Message::Shutdown`] when the shutdown token fires (self-update restart,
+/// SIGTERM/SIGINT, the end of a drain) and [`Message::DrainStarted`] when the drain window
+/// begins — the token does not fire on the first signal, so input needs a separate signal to
+/// be disabled while the drain runs.
 fn shutdown_subscription() -> impl futures_util::Stream<Item = Message> {
     use iced::futures::channel::mpsc;
     iced::stream::channel(1, |mut output: mpsc::Sender<Message>| async move {
         let token = crate::shutdown::shutdown_token();
-        // Wait for the drain flag OR the token (a drain always precedes the
-        // token in the two-signal protocol, but the token may fire without a
-        // drain on force-cancel paths).
+        // A drain always precedes the token in the two-signal protocol, but the token can
+        // fire without a drain on the force-cancel paths.
         tokio::select! {
             () = crate::shutdown::drain_wait() => {
                 let _ = output.try_send(Message::DrainStarted);
@@ -3126,21 +2718,18 @@ fn shutdown_subscription() -> impl futures_util::Stream<Item = Message> {
     })
 }
 
-/// Record `route` as the exit route, where the ask has wording of its own — a platform quit passes
-/// its label, a close passes `None`, and this is the one home of the rule that `None` leaves
-/// the record alone. Nothing is shown for it (the exit path's line is dropped with the iced
-/// runtime — see `shutdown::EXIT_TRIGGER`), so it is set for accuracy, not for reporting.
+/// Record `route` as the exit route where the ask has wording of its own — a platform quit
+/// passes its label, a close passes `None`, which leaves the record alone. Nothing is shown
+/// for it (see `shutdown::EXIT_TRIGGER`), so it is set for accuracy, not reporting.
 fn record_exit_route(route: Option<&'static str>) {
     if let Some(route) = route {
         crate::shutdown::record_exit_trigger(route);
     }
 }
 
-/// Subscription that turns an ordinary quit the platform's own application machinery delivered
-/// — one of the asks [`Message::QuitRequested`] names — into that message.
-///
-/// The source is the process-lifetime channel the quit source fills
-/// ([`crate::shutdown::install_stop_request_sources`], called before the iced application runs).
+/// Turns an ordinary platform quit — one of the asks [`Message::QuitRequested`] names — into
+/// that message, from the channel the quit source fills
+/// ([`crate::shutdown::install_stop_request_sources`], before iced runs).
 fn quit_requests_subscription() -> impl futures_util::Stream<Item = Message> {
     use futures_util::SinkExt;
     use iced::futures::channel::mpsc;
@@ -3158,13 +2747,10 @@ fn quit_requests_subscription() -> impl futures_util::Stream<Item = Message> {
     })
 }
 
-/// Subscription that turns the ways into the window from outside it into their messages: a
-/// click on the tray icon or the Dock brings the window up, the tray menu's single item is an
-/// ordinary exit request ([`crate::window_requests`]).
-///
-/// The source is the process-lifetime channel [`crate::window_requests::init`] fills before
-/// the iced application runs. Neither gesture ever waits on the platform: the handlers only
-/// enqueue, and the platform's own menu tracking is never held up by the interface.
+/// Turns the ways into the window from outside it into their messages: a tray or Dock click
+/// brings it up, the tray menu's item is an ordinary exit request. Source:
+/// [`crate::window_requests`], filled before iced runs. The platform's handlers only enqueue,
+/// so its menu tracking is never held up by the interface.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn window_requests_subscription() -> impl futures_util::Stream<Item = Message> {
     use futures_util::SinkExt;
@@ -3187,12 +2773,8 @@ fn window_requests_subscription() -> impl futures_util::Stream<Item = Message> {
     })
 }
 
-/// Subscription that emits [`crate::audio::tts::TtsDownloadEvent`]s from the global
-/// TTS download broadcast channel, forwarded as [`Message::TtsDownloadEvent`].
-///
-/// Unlike the hand-rolled channel loop this replaces, an uninitialized
-/// `DOWNLOAD_EVENTS` source yields an empty stream instead of panicking
-/// (unreachable in practice — `tts::init_global` precedes GUI startup).
+/// The TTS download broadcast as [`Message::TtsDownloadEvent`]. An uninitialized source yields
+/// an empty stream rather than panicking (`tts::init_global` precedes GUI startup).
 #[cfg(target_os = "macos")]
 fn tts_download_subscription()
 -> impl futures_util::Stream<Item = crate::audio::tts::TtsDownloadEvent> {
@@ -3203,8 +2785,8 @@ fn tts_download_subscription()
         |output: &mut mpsc::Sender<crate::audio::tts::TtsDownloadEvent>,
          event: Option<crate::audio::tts::TtsDownloadEvent>| {
             Box::pin(async move {
-                // Best-effort delivery: drop events if the GUI channel is full;
-                // lagged progress slots are dropped (next event is current state).
+                // Best-effort: drop events when the GUI channel is full, and lagged
+                // progress slots (the next event is the current state).
                 if let Some(event) = event {
                     let _ = output.try_send(event);
                 }
@@ -3213,17 +2795,11 @@ fn tts_download_subscription()
     )
 }
 
-/// Subscription that emits [`Message::RuntimeChanged`] (coalesced) when any
-/// runtime source the GUI renders directly changes: agent/non-agent registries,
-/// live transcript content, voice status, or the update availability that puts the
-/// footer's update entry — or the rail's, while the footer is hidden — on screen.
-/// The [`RuntimeEvent`] broadcast is initialized in `main` before the iced
-/// application runs (matching the [`LOG_BROADCAST`] convention); an uninitialized
-/// source would yield an immediately-ending stream, which iced's subscription
-/// tracker does not re-spawn. A burst of per-message / per-tool-call events
-/// collapses into a single trailing [`Message::RuntimeChanged`] per
-/// [`RUNTIME_REFRESH_COALESCE`] window — only "something changed" matters for a
-/// re-render.
+/// Emits [`Message::RuntimeChanged`] (coalesced) when a source the GUI renders directly
+/// changes: the agent registries, live transcript, voice status, or the update availability
+/// behind the update entry. Source warmed in `main` (see [`init_board_change_tx`]). A burst of
+/// per-message and per-tool-call events collapses into one trailing message per
+/// [`RUNTIME_REFRESH_COALESCE`] window — only "something changed" matters for a re-render.
 fn runtime_change_subscription() -> impl futures_util::Stream<Item = Message> {
     common::coalesced_broadcast_producer(
         128,
@@ -3233,14 +2809,8 @@ fn runtime_change_subscription() -> impl futures_util::Stream<Item = Message> {
     )
 }
 
-/// Subscription that emits [`Message::Git`] with [`GitMessage::FileChanged`]
-/// when workspace files change. Filesystem events are delivered by the
-/// fff-search watcher on a dedicated thread (which only does a non-blocking
-/// broadcast send) and consumed here to drive the event-driven git local
-/// refresh. The broadcast is initialized in `main` before the iced application
-/// runs (matching the [`LOG_BROADCAST`] convention); an uninitialized source
-/// would yield an immediately-ending stream, which iced's subscription tracker
-/// does not re-spawn.
+/// Emits [`Message::Git`] with [`GitMessage::FileChanged`] when workspace files change, from
+/// the watcher thread's non-blocking broadcast ([`init_board_change_tx`]).
 fn git_file_changes_subscription() -> impl futures_util::Stream<Item = Message> {
     use iced::futures::channel::mpsc;
     common::broadcast_stream_producer(
@@ -3256,10 +2826,8 @@ fn git_file_changes_subscription() -> impl futures_util::Stream<Item = Message> 
     )
 }
 
-/// Subscription that emits [`Message::Git`] with
-/// [`GitMessage::PipelineCommit`] when a pipeline auto-commit completes. A
-/// commit is a ref-only change the file watcher never reports, so the footer
-/// is refreshed promptly via [`GitState`]`s path-matched handler.
+/// Emits [`Message::Git`] with [`GitMessage::PipelineCommit`]: a ref-only change the watcher
+/// never reports, going through [`GitState`]'s path-matched handler.
 fn git_commit_subscription() -> impl futures_util::Stream<Item = Message> {
     use iced::futures::channel::mpsc;
     common::broadcast_stream_producer(
@@ -3275,13 +2843,9 @@ fn git_commit_subscription() -> impl futures_util::Stream<Item = Message> {
     )
 }
 
-/// Subscription that emits [`BoardMessage::TicketChanged`] deltas from the
-/// CDC change stream, and [`BoardMessage::BoardRefreshNeeded`] on a lagged
-/// channel (a delta was lost — force a full snapshot refresh). The change
-/// source is the shared [`crate::db::cdc`] tickets sender, initialised before
-/// the iced app runs via [`crate::gui::init_board_change_tx`]; an uninitialized
-/// source would yield an immediately-ending stream (Iced does not re-spawn it),
-/// so the warm-up in `main` is required for the board to receive any delta.
+/// Emits [`BoardMessage::TicketChanged`] CDC deltas, or [`BoardMessage::BoardRefreshNeeded`]
+/// after a lag that lost one. Source: [`crate::db::cdc`]'s tickets sender, warmed by
+/// [`crate::gui::init_board_change_tx`].
 fn board_change_subscription() -> impl futures_util::Stream<Item = Message> {
     use iced::futures::channel::mpsc;
     common::broadcast_stream_producer(
@@ -3289,8 +2853,8 @@ fn board_change_subscription() -> impl futures_util::Stream<Item = Message> {
         crate::db::cdc::ticket_sender_lock(),
         |output: &mut mpsc::Sender<Message>, event: Option<crate::db::cdc::ChangeEvent>| {
             Box::pin(async move {
-                // Awaited send (backpressure): a full/lagged channel triggers a
-                // refresh rather than silently dropping a delta.
+                // Awaited send (backpressure): a full or lagged channel triggers a refresh
+                // rather than silently dropping a delta.
                 let msg = Message::Board(match event {
                     Some(ev) => board::BoardMessage::TicketChanged(Box::new(ev)),
                     None => board::BoardMessage::BoardRefreshNeeded,
@@ -3301,19 +2865,13 @@ fn board_change_subscription() -> impl futures_util::Stream<Item = Message> {
     )
 }
 
-/// Subscription that emits [`Message::WorkspacesCdcChanged`] for a full
-/// workspace-map reload. The source is the shared [`crate::db::cdc`] workspaces
-/// sender, warmed in `main` before the iced app runs (same immediately-ending-
-/// stream rationale as the board sender — Iced does not re-spawn an ended
-/// subscription).
+/// Emits [`Message::WorkspacesCdcChanged`] for a full map reload, from
+/// [`crate::db::cdc`]'s workspaces sender ([`init_board_change_tx`]).
 ///
-/// The stream opens with one synthetic BASELINE event, so a full read happens
-/// at stream start regardless of upstream activity. Because this subscription
-/// only exists in the post-boot (`ready`) branch of [`Dashboard::subscription`],
-/// the baseline is delivered after the `Boot` arm has set `ready` — it can
-/// never be swallowed by the pre-boot no-op catch-all. Every received delta AND
-/// a lagged channel map to the same message (a full reload is its own Lagged
-/// recovery).
+/// It opens with one synthetic BASELINE event, so a full read happens at stream start. The
+/// subscription lives only in the post-boot `ready` branch, so the baseline lands after `Boot`
+/// set `ready` and is never swallowed by the pre-boot no-op. A delta and a lag both mean a
+/// full reload, which is its own lag recovery.
 fn workspaces_cdc_subscription() -> impl futures_util::Stream<Item = Message> {
     use iced::futures::channel::mpsc;
     futures_util::stream::once(async { Message::WorkspacesCdcChanged }).chain(
@@ -3322,8 +2880,8 @@ fn workspaces_cdc_subscription() -> impl futures_util::Stream<Item = Message> {
             crate::db::cdc::workspace_sender_lock(),
             |output: &mut mpsc::Sender<Message>, _event: Option<crate::db::cdc::ChangeEvent>| {
                 Box::pin(async move {
-                    // Awaited send (backpressure): a dropped reload trigger
-                    // would leave the sidebar stale until the next event.
+                    // Awaited send (backpressure): a dropped reload trigger would leave
+                    // the sidebar stale until the next event.
                     let _ =
                         futures_util::SinkExt::send(output, Message::WorkspacesCdcChanged).await;
                 })
@@ -3332,19 +2890,12 @@ fn workspaces_cdc_subscription() -> impl futures_util::Stream<Item = Message> {
     )
 }
 
-/// Subscription that emits [`Message::UsersCdcChanged`] when a users-table row
-/// changes or the stream lags. Both map to the same message: the full users
-/// re-list and the DB read-back of the active workspace (the same single choice
-/// the footer picker writes) that follow are each their own recovery.
+/// Emits [`Message::UsersCdcChanged`] when a users row changes or the stream lags: the re-list
+/// and the DB read-back that follow are each their own recovery.
 ///
-/// The stream opens with one synthetic BASELINE event, like
-/// [`workspaces_cdc_subscription`]: a switch written between the boot selection
-/// read and this subscription's first poll would otherwise be missed for the
-/// rest of the run, leaving the dashboard showing a project the account no
-/// longer has active. The subscription only exists in the post-boot (`ready`)
-/// branch of [`Dashboard::subscription`], so the baseline can never be
-/// swallowed by the pre-boot no-op catch-all. Source is the shared
-/// [`crate::db::cdc`] users sender, warmed in `main` before the iced app runs.
+/// It opens with one synthetic BASELINE event, like [`workspaces_cdc_subscription`]: a switch
+/// written between the boot selection read and this stream's first poll would otherwise be
+/// missed for the rest of the run. Source: [`crate::db::cdc`]'s users sender, warmed in `main`.
 fn users_cdc_subscription() -> impl futures_util::Stream<Item = Message> {
     use iced::futures::channel::mpsc;
     futures_util::stream::once(async { Message::UsersCdcChanged }).chain(
@@ -3362,11 +2913,8 @@ fn users_cdc_subscription() -> impl futures_util::Stream<Item = Message> {
     )
 }
 
-/// Subscription that emits [`Message::UsersCdcChanged`] when a user_channels
-/// row changes or the stream lags — the Settings users page re-lists on either
-/// (a channel bind/unbind updates the user_channels table). Source is the shared
-/// [`crate::db::cdc`] user_channels sender, warmed in `main` before the iced app
-/// runs.
+/// Emits [`Message::UsersCdcChanged`] when a user_channels row changes or the stream lags (a
+/// bind/unbind updates it). Source: [`crate::db::cdc`]'s user_channels sender, warmed in `main`.
 fn user_channels_cdc_subscription() -> impl futures_util::Stream<Item = Message> {
     use iced::futures::channel::mpsc;
     common::broadcast_stream_producer(
@@ -3374,24 +2922,23 @@ fn user_channels_cdc_subscription() -> impl futures_util::Stream<Item = Message>
         crate::db::cdc::user_channels_sender_lock(),
         |output: &mut mpsc::Sender<Message>, _event: Option<crate::db::cdc::ChangeEvent>| {
             Box::pin(async move {
-                // Awaited send: a dropped trigger would leave the list stale
-                // until the next event (same rationale as the board stream).
+                // Awaited send: a dropped trigger would leave the list stale until the
+                // next event (same rationale as the board stream).
                 let _ = futures_util::SinkExt::send(output, Message::UsersCdcChanged).await;
             })
         },
     )
 }
 
-/// A running indicator — a role's agent count, or the in-flight non-agent call
-/// counter — ready for either place it is drawn: its content, and the wording its
-/// tooltip carries.
+/// A running indicator — a role's agent count or the in-flight call counter — ready for either
+/// place it is drawn, with the wording its tooltip carries.
 struct RunningIndicator {
     content: Element<'static, Message>,
     label: String,
 }
 
 impl RunningIndicator {
-    /// The footer's presentation: in the right-hand indicator row, tooltip above.
+    /// In the footer's right-hand indicator row, tooltip above.
     fn footer(self) -> Element<'static, Message> {
         widgets::icon_tooltip_button(
             container(self.content).padding([0.0, theme::PAD_3]),
@@ -3403,8 +2950,7 @@ impl RunningIndicator {
         )
     }
 
-    /// The rail's presentation: a full-bleed rail entry, tooltip to the side like
-    /// every other item in the rail.
+    /// A full-bleed rail entry, tooltip to the side like every other rail item.
     fn rail(self) -> Element<'static, Message> {
         Dashboard::sidebar_rail_item(
             self.content,
@@ -3415,13 +2961,8 @@ impl RunningIndicator {
     }
 }
 
-// ── Navigation sidebar ──────────────────────────────────────────
-
-/// Map a [`Page`] variant to its corresponding Lucide icon element, unstyled so
-/// each call site sizes and colors it.
-///
-/// Exhaustive match — adding a new `Page` variant produces a compile error
-/// until its icon is assigned here.
+/// A [`Page`]'s Lucide icon, unstyled so each call site sizes and colours it. An exhaustive
+/// match, so a new `Page` variant fails to compile until it has an icon.
 fn page_icon(page: Page) -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
     match page {
         Page::Home => lucide::layout_dashboard::<iced::Theme, iced::Renderer>(),
@@ -3440,7 +2981,6 @@ fn page_icon(page: Page) -> iced::widget::Text<'static, iced::Theme, iced::Rende
 /// window control is the one entry that keeps [`theme::PAD_2`] beside its glyph.
 #[derive(Clone, Copy)]
 enum RailEntry {
-    /// A rail entry away from the rail's bottom end.
     Item,
     /// The rail entry at the rail's bottom end.
     AtBottom,
@@ -3450,9 +2990,8 @@ enum RailEntry {
 }
 
 impl RailEntry {
-    /// The entry's vertical content padding: [`theme::PAD_14`] on the rail's
-    /// outer side at its end instead of [`theme::PAD_10`], and [`theme::PAD_6`]
-    /// for a window control.
+    /// [`theme::PAD_14`] on the rail's outer side at its end instead of [`theme::PAD_10`];
+    /// [`theme::PAD_6`] for a window control.
     fn content_padding(self) -> iced::Padding {
         let (top, bottom) = match self {
             Self::AtBottom => (theme::PAD_10, theme::PAD_14),
@@ -3468,8 +3007,8 @@ impl RailEntry {
     }
 }
 
-/// Which end of the rail a nav column sits at. Only the bottom one reaches the
-/// layout's edge, so only there does the last entry take [`RailEntry::AtBottom`].
+/// Which end of the rail a nav column sits at: only the bottom one reaches the layout's edge,
+/// so only there does the last entry take [`RailEntry::AtBottom`].
 #[derive(Clone, Copy)]
 enum NavColumn {
     Top,
@@ -3477,21 +3016,19 @@ enum NavColumn {
 }
 
 /// A window action the app performs for itself, the platform's title bar being hidden on macOS
-/// and Windows: the one control the rail carries in its place and the drag its empty space
-/// starts ([`Dashboard::sidebar_view`]).
+/// and Windows ([`Dashboard::sidebar_view`]).
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum WindowAction {
-    /// The window follows the pointer: a press that is not claimed by a rail
-    /// button starts this.
+    /// The window follows the pointer: a press no rail button claimed starts this.
     Drag,
-    /// Close the window — the platform's own close, which on these platforms hides it
+    /// The platform's own close, which on these platforms hides the window
     /// ([`Dashboard::close_window`]).
     Close,
 }
 
-/// The update affordance both places draw: what it says, what pressing it does, and
-/// the color its glyph takes there.
+/// The update affordance both places draw: its wording, its action, and the colour its glyph
+/// takes there.
 struct UpdateControl {
     color: iced::Color,
     tooltip: String,
@@ -3499,7 +3036,7 @@ struct UpdateControl {
 }
 
 impl UpdateControl {
-    /// The update glyph at `size`: each place draws it at its own.
+    /// The glyph at `size`: each place draws it at its own.
     fn glyph(&self, size: f32) -> Element<'static, Message> {
         lucide::refresh_cw::<iced::Theme, iced::Renderer>()
             .size(size)
@@ -3509,13 +3046,11 @@ impl UpdateControl {
 }
 
 impl Dashboard {
-    /// The rail: the window's own chrome where the platform's title bar is hidden, the top
-    /// nav icons, the voice status while the footer is hidden, the stretch in between
-    /// ([`Self::render_sidebar_mid`]) and the bottom nav icons. Its empty space drags the window,
-    /// the title bar being hidden there.
+    /// The rail: the window's own chrome where the title bar is hidden, the top nav icons, the
+    /// voice status while the footer is hidden, the stretch in between
+    /// ([`Self::render_sidebar_mid`]) and the bottom nav icons. Its empty space drags the window.
     fn sidebar_view(&self, footer_hidden: bool) -> Element<'_, Message> {
         let mut col = Column::new().spacing(theme::SPACE_2);
-        // The window's own chrome, where the platform's title bar is hidden.
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             col = col.push(Self::rail_window_control());
@@ -3531,9 +3066,9 @@ impl Dashboard {
         .width(Length::Fixed(SIDEBAR_RAIL_WIDTH))
         .height(Length::Fill)
         .style(theme::surface_container_style);
-        // The rail drags the window: the mouse area passes a press to the entry under
-        // it first, so buttons keep their clicks, and holds no state, so a drag whose
-        // release the platform keeps leaves nothing stuck.
+        // The rail drags the window: the mouse area passes a press to the entry under it
+        // first, so buttons keep their clicks, and holds no state, so a drag whose release
+        // the platform keeps leaves nothing stuck.
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         return mouse_area(rail)
             .on_press(Message::WindowAction(WindowAction::Drag))
@@ -3542,12 +3077,10 @@ impl Dashboard {
         rail.into()
     }
 
-    /// The rail's stretch between the nav icons and the bottom nav. With the
-    /// footer hidden it carries the running-agent indicators, bottom-aligned so
-    /// the column sits directly above the bottom nav; it fills the free height
-    /// and scrolls inside its own area, so the nav entries keep their size
-    /// however many roles run. Otherwise it is the plain spacer that keeps the
-    /// two nav groups apart.
+    /// The rail's stretch between the nav icons and the bottom nav. With the footer hidden it
+    /// carries the running-agent indicators, bottom-aligned above the bottom nav, filling the
+    /// free height and scrolling in its own area so the nav entries keep their size however
+    /// many roles run. Otherwise it is the plain spacer keeping the two nav groups apart.
     fn render_sidebar_mid(footer_hidden: bool) -> Element<'static, Message> {
         if footer_hidden && let Some(agents) = Self::render_sidebar_agents() {
             return container(agents)
@@ -3558,10 +3091,9 @@ impl Dashboard {
         Space::new().height(Length::Fill).into()
     }
 
-    /// A rail entry: its content centered in the entry's full width, tooltip to the
-    /// side — iced snaps Top tooltips into the viewport, overlapping the topmost
-    /// rail entry. `on_press: None` makes a static entry (the voice status, which
-    /// only reports).
+    /// A rail entry: content centred in the entry's full width, tooltip to the side — iced
+    /// snaps Top tooltips into the viewport, overlapping the topmost rail entry. `on_press:
+    /// None` makes a static entry (the voice status, which only reports).
     fn sidebar_rail_item(
         content: Element<'static, Message>,
         label: impl Into<Cow<'static, str>>,
@@ -3570,8 +3102,8 @@ impl Dashboard {
     ) -> Element<'static, Message> {
         tooltip(
             button(
-                // The container's vertical padding gives the button a large hit
-                // area and keeps the icon's place.
+                // The container's padding gives the button a large hit area and keeps the
+                // icon's place.
                 container(content)
                     .width(Length::Fill)
                     .center_x(Length::Fill)
@@ -3588,13 +3120,11 @@ impl Dashboard {
         .into()
     }
 
-    /// Shared nav-icon column for the sidebar top and bottom navs. Each page is
-    /// a full-width icon button (28px icon) with the active page accent-colored;
-    /// a page that is not available ([`Self::page_available`]) is absent from the
-    /// column entirely.
+    /// The nav-icon column shared by the top and bottom navs: a full-width icon button per page,
+    /// accent-coloured when active, absent when [`Self::page_available`] refuses it.
     fn sidebar_nav_column(&self, pages: &[Page], column: NavColumn) -> Column<'_, Message> {
-        // Only the column at the rail's bottom end reaches the layout's edge, so
-        // only there is an entry marked.
+        // Only the column at the rail's bottom end reaches the layout's edge, so only there
+        // is an entry marked.
         let edge = match column {
             NavColumn::Bottom => pages.iter().rposition(|page| self.page_available(*page)),
             NavColumn::Top => None,
@@ -3624,9 +3154,8 @@ impl Dashboard {
         col
     }
 
-    /// A view that has no rail — the start-up splash, a failed boot — with the
-    /// window's own chrome above it: its control at the top, the whole surface
-    /// draggable.
+    /// A view with no rail — the start-up splash, a failed boot — with the window's own chrome
+    /// above it: its control at the top, the whole surface draggable.
     fn window_chrome(view: Element<'_, Message>) -> Element<'_, Message> {
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         return view;
@@ -3639,7 +3168,7 @@ impl Dashboard {
     /// The window's one control, built like the rail's entries. `glyph` is what the press does
     /// where the control is drawn: the eye-off that hides the window on the rail
     /// ([`Self::close_window`]), the cross that quits from the surfaces drawn before the app
-    /// runs. Minimizing is the platform's own — the taskbar's menu on Windows — and the tray
+    /// runs. Minimizing is the platform's own (the taskbar's menu on Windows), and the tray
     /// brings a minimized window back like a hidden one.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn window_control(
@@ -3656,11 +3185,10 @@ impl Dashboard {
         )
     }
 
-    /// The rail's placement of it, with the hide glyph: padding at its sides and below, and none
-    /// above, so the control meets the window's top edge and the system's own rounded corner cuts
-    /// its top border — the intended look. That edge is the platform's: the rows just below it
-    /// are the window's resize band, where a press resizes the window instead of reaching the
-    /// control.
+    /// The rail's placement, with the hide glyph: padding at its sides and below and none above,
+    /// so the control meets the window's top edge and the system's rounded corner cuts its top
+    /// border. That edge is the platform's: the rows below it are the resize band, where a press
+    /// resizes the window instead of reaching the control.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn rail_window_control() -> Element<'static, Message> {
         container(Self::window_control(lucide::eye_off()))
@@ -3674,9 +3202,8 @@ impl Dashboard {
             .into()
     }
 
-    /// The rail-less placement — the start-up splash, a failed boot — with the cross: there the
-    /// app does not run yet, so the press quits. It keeps the padding on every side, the room the
-    /// system's rounded corner needs above the glyph included.
+    /// The rail-less placement — the start-up splash, a failed boot — with the cross: the app
+    /// does not run there, so the press quits. Padding on every side, room for the rounded corner.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn chrome_window_control() -> Element<'static, Message> {
         container(Self::window_control(lucide::x()))
@@ -3685,18 +3212,17 @@ impl Dashboard {
             .into()
     }
 
-    /// Sidebar top nav icons (see [`Page::sidebar_pages`]). Running Agents is not
-    /// in the sidebar — it is reachable only via the running-agent indicators,
-    /// which live in the footer bar or, with the footer hidden, in the rail
-    /// ([`Self::render_sidebar_agents`]).
+    /// The top nav icons ([`Page::sidebar_pages`]). Running Agents is not here — only the
+    /// running-agent indicators reach it, in the footer bar or, with the footer hidden, in the
+    /// rail ([`Self::render_sidebar_agents`]).
     fn render_sidebar_nav(&self) -> Element<'_, Message> {
         self.sidebar_nav_column(Page::sidebar_pages(), NavColumn::Top)
             .into()
     }
 
-    /// Sidebar bottom nav icons (see [`Page::sidebar_bottom_pages`]), with the
-    /// self-update entry directly above them while the footer is hidden — the only
-    /// place the update is offered with no bar to carry it.
+    /// The bottom nav icons ([`Page::sidebar_bottom_pages`]), with the self-update entry
+    /// directly above them while the footer is hidden — the only place the update is offered
+    /// with no bar to carry it.
     fn render_sidebar_bottom_nav(&self, footer_hidden: bool) -> Element<'_, Message> {
         let mut col = Column::new().spacing(theme::SPACE_2);
         if footer_hidden {
@@ -3708,12 +3234,10 @@ impl Dashboard {
         col.into()
     }
 
-    /// The rail's voice status, standing in for the footer bar's label while the
-    /// footer is hidden: the status's glyph (see [`Self::voice_status_icon`]) with
-    /// the bar's own wording as its tooltip. The bar's resting label is the one
-    /// state the rail leaves out — an idle listener is the normal condition, not
-    /// something to report from the navigation — and an empty slot then keeps its
-    /// place, so no status change rebuilds the column below it.
+    /// The rail's voice status, standing in for the footer's label while the footer is hidden: the
+    /// status glyph ([`Self::voice_status_icon`]) with the bar's wording as its tooltip. The bar's
+    /// resting label is left out — an idle listener is the normal condition — and an empty slot
+    /// keeps its place, so no status change rebuilds the column below it.
     #[cfg(target_os = "macos")]
     fn render_sidebar_voice() -> Element<'static, Message> {
         let status = crate::audio::voice::get_status();
@@ -3740,10 +3264,9 @@ impl Dashboard {
         Space::new().height(0).into()
     }
 
-    /// The rail's running-agent indicators — one per role with agents running,
-    /// in the footer's order, then the in-flight non-agent call counter — as a
-    /// column that scrolls once the rail cannot show them all. `None` when
-    /// nothing is running: neither indicator renders, exactly as in the footer.
+    /// The rail's running-agent indicators — one per role in the footer's order, then the
+    /// in-flight non-agent call counter — as a column that scrolls once the rail cannot show
+    /// them all. `None` when nothing runs, exactly as in the footer.
     fn render_sidebar_agents() -> Option<Element<'static, Message>> {
         let mut items: Vec<Element<'static, Message>> = Self::running_roles()
             .into_iter()
@@ -3820,10 +3343,9 @@ impl Dashboard {
         )
     }
 
-    /// The failure the footer picker must show in place of its dropdown: a
-    /// failed workspace-map read that left nothing to pick. A read that failed
-    /// but preserved a usable map keeps the working picker — the Settings
-    /// workspace list shows that failure.
+    /// The failure the footer picker must show in place of its dropdown: a failed map read
+    /// that left nothing to pick. A read that failed but kept a usable map keeps the working
+    /// picker — the Settings list shows that failure.
     fn picker_failure<'a>(&'a self, options: &[widgets::PickOption]) -> Option<&'a str> {
         if options.is_empty() {
             self.workspaces_error.as_deref()
@@ -3832,17 +3354,13 @@ impl Dashboard {
         }
     }
 
-    /// Footer workspace picker: managed workspaces only, persists via
-    /// [`Self::select_workspace`]. A project also becomes active by being added
-    /// and when the active one is deleted, but this is the only place the admin
-    /// chooses one, so it is offered even when a single managed workspace
-    /// exists. When a failed workspace-map read leaves nothing to pick, a static,
-    /// non-selectable "Workspaces unavailable" pill replaces it in the same
-    /// footprint. Returns `None` for the zero-managed-workspaces state.
+    /// Footer workspace picker: managed workspaces only, persisted by
+    /// [`Self::select_workspace`]. It is offered even for a single workspace, since this is the
+    /// only place the admin chooses one. A failed read with nothing to pick leaves a static,
+    /// non-selectable "Workspaces unavailable" pill in the same footprint. `None` when no
+    /// managed workspace exists.
     fn render_workspace_picker(&self) -> Option<Element<'_, Message>> {
-        // Nothing left to pick: the failed read renders a static, non-selectable
-        // failure pill in the picker's footprint. The error text lives only in
-        // the tooltip — it must never become an option of the dropdown.
+        // The error text lives only in the tooltip — never as an option of the dropdown.
         let options = managed_workspace_options(&self.workspaces);
         if let Some(err) = self.picker_failure(&options) {
             return Some(widgets::tooltip_hint(
@@ -3858,13 +3376,11 @@ impl Dashboard {
             ));
         }
         if options.is_empty() {
-            // No managed workspaces exist — an inert placeholder dropdown would
-            // suggest a choice that isn't there; hide the picker instead.
+            // An inert placeholder would suggest a choice that isn't there.
             return None;
         }
-        // Guard the displayed selection: a dangling persisted value (the
-        // workspace vanished from the map) renders no highlight; a personal
-        // selection renders the placeholder.
+        // A dangling persisted value renders no highlight; a personal selection renders the
+        // placeholder.
         let selected = self
             .selected_workspace_name
             .as_deref()
@@ -3880,19 +3396,15 @@ impl Dashboard {
         ))
     }
 
-    /// Render the self-update confirmation modal (opened by
-    /// [`Message::UpdateBot`], confirmed by [`Message::ConfirmUpdate`]).
-    /// Returns a type-stable placeholder when closed.
+    /// The self-update confirmation modal (opened by [`Message::UpdateBot`], confirmed by
+    /// [`Message::ConfirmUpdate`]), or a type-stable placeholder when closed.
     ///
-    /// The text truthfully reflects the real sequence for this copy: the update
-    /// runs in the background while the system keeps working — nothing is paused
-    /// during it — then in-flight work drains, databases are checkpointed, and the
-    /// app restarts and resumes work automatically. The window closing is the
-    /// success signal.
+    /// Its text is the real sequence: the update runs in the background while the system keeps
+    /// working, then in-flight work drains, databases are checkpointed, and the app restarts
+    /// and resumes. The window closing is the success signal.
     fn render_update_confirm(&self) -> Element<'_, Message> {
         if !self.show_update_confirm {
-            // Keep the Stack widget type stable across open/close transitions
-            // (see `empty_stack_placeholder`): the open state is a Stack.
+            // The Stack type stays stable across open/close (see `empty_stack_placeholder`).
             return iced::widget::stack([widgets::empty_stack_placeholder()]).into();
         }
         let mode_desc = match crate::self_update::update_mode() {
@@ -3932,19 +3444,17 @@ impl Dashboard {
         )
     }
 
-    /// The update affordance: its tooltip and the press (none while an update is in
-    /// flight), shared by the footer button and the rail entry so the two can never
-    /// read as two different controls. `None` when no update is offered.
+    /// The update affordance — tooltip and press (none while an update is in flight) — shared
+    /// by the footer button and the rail entry so the two never read as different controls.
+    /// `None` when no update is offered.
     ///
-    /// Visibility is driven entirely by the shared availability cache — no
-    /// platform gate is needed: a downloaded copy finds and puts this system's
-    /// ready-made file at the standard location on every platform, and replacing a
-    /// file that is in use there is the platform's own rename-aside, so a running
-    /// copy is never in the way.
+    /// Visibility comes entirely from the shared availability cache, with no platform gate: a
+    /// downloaded copy puts this system's ready-made file at the standard location everywhere,
+    /// and replacing a file in use is the platform's own rename-aside.
     fn update_control() -> Option<UpdateControl> {
         let availability = crate::self_update::update_availability();
-        // Show the control while an update is in flight even if `available` was
-        // transiently clobbered, so "Updating…" is never hidden mid-update.
+        // Shown while an update is in flight even if `available` was transiently clobbered,
+        // so "Updating…" is never hidden mid-update.
         if !availability.available && !availability.in_progress {
             return None;
         }
@@ -3964,8 +3474,7 @@ impl Dashboard {
         })
     }
 
-    /// Render the self-update button in the footer bar.
-    /// Returns `None` when self-update is not available on this installation.
+    /// The self-update button in the footer bar, or `None` when it is not available.
     fn render_update_button() -> Option<Element<'static, Message>> {
         let control = Self::update_control()?;
         Some(widgets::icon_tooltip_button(
@@ -3978,9 +3487,9 @@ impl Dashboard {
         ))
     }
 
-    /// The same control in the rail, for a window whose footer is hidden — the only
-    /// place an update is offered then. It sits directly above the bottom nav, which
-    /// is where the Settings entry lives, and takes the rail's own glyph size.
+    /// The same control in the rail, for a window whose footer is hidden — the only place an
+    /// update is offered then. Directly above the bottom nav (where Settings lives), at the
+    /// rail's own glyph size.
     fn render_sidebar_update() -> Option<Element<'static, Message>> {
         let control = Self::update_control()?;
         Some(Self::sidebar_rail_item(
@@ -4003,8 +3512,7 @@ impl Dashboard {
             .into()
     }
 
-    /// Render the current git branch button (clickable -> branch modal).
-    /// Returns `None` when no branch is known.
+    /// The current git branch button (clickable -> branch modal), `None` when no branch is known.
     fn render_git_branch(&self) -> Option<Element<'_, Message>> {
         let b = self.git_state.current_branch()?;
         let truncated = crate::util::truncate(b, 20);
@@ -4045,19 +3553,15 @@ impl Dashboard {
         .into()
     }
 
-    /// Render the git sync control: the commits a push would carry (with the
-    /// destination the tooltip names) and the commits a pull would take from the
-    /// branch's own update source.
+    /// The git sync control: the commits a push would carry (destination in the tooltip) and the
+    /// commits a pull would take from the branch's update source.
     ///
-    /// Visible whenever there is anything to push or pull — a branch that can be
-    /// pushed is never hidden because its tracked upstream is fetch-only or
-    /// absent, and a destination that could not be asked is reported with the
-    /// commits the branch carries rather than as nothing to do — and whenever no
-    /// remote can take the branch at all, so it can say why. A branch with
-    /// somewhere to push and nothing to push or pull hides it, as before. The pull
-    /// metric is shown only when pressing would actually pull: a publish skips the
-    /// update step. Icons are lucide (not Unicode arrows) at 16px, the number
-    /// text's size, so all elements share the same vertical baseline.
+    /// Shown whenever there is anything to push or pull — a pushable branch is never hidden
+    /// because its upstream is fetch-only or absent, and a destination that could not be asked
+    /// reports the commits it carries — and whenever no remote can take the branch, so it can
+    /// say why; a branch with somewhere to push and nothing to move hides it. The pull metric
+    /// appears only when pressing would pull, since a publish skips the update step. Icons are
+    /// lucide at 16px, the number text's size, so all elements share a baseline.
     fn render_git_sync(&self) -> Option<Element<'_, Message>> {
         let state = self.git_state.remote_state()?;
         if !state.has_sync_work() {
@@ -4125,8 +3629,8 @@ impl Dashboard {
                 }
             }
         };
-        // A spacer separates a push count from the pull count; with nothing to
-        // push the row starts at the pull metric, so it must not lead.
+        // The spacer separates the push count from the pull count; with nothing to push the
+        // row starts at the pull metric, so it must not lead.
         if state.behind > 0 && !publish {
             if !parts.is_empty() {
                 parts.push(Space::new().width(theme::SPACE_8).into());
@@ -4152,9 +3656,8 @@ impl Dashboard {
         ))
     }
 
-    /// Render the git diff stats button (+X/−Y, clickable -> diff modal).
-    /// Returns `None` when there are no non-zero changes (including no
-    /// oversized/binary untracked files or cap omissions to report).
+    /// The git diff stats button (+X/−Y, clickable -> diff modal), `None` when there are no
+    /// changes to report (nor any oversized/binary untracked file or cap omission).
     fn render_git_diff_stats(&self) -> Option<Element<'_, Message>> {
         let stats = self.git_state.diff_stats()?;
         let tooltip_text: Cow<'static, str> = stats.omitted_note().map_or_else(
@@ -4177,10 +3680,8 @@ impl Dashboard {
         ))
     }
 
-    /// Render the git block: divider, branch, sync, and diff stats.
-    ///
-    /// `None` while nothing is resolved: the path that
-    /// [`Self::sync_workspace_surfaces`] owns *is* the resolution.
+    /// The git block: divider, branch, sync, diff stats. `None` while nothing is resolved —
+    /// the path [`Self::sync_workspace_surfaces`] owns *is* the resolution.
     fn render_git_block(&self) -> Option<Element<'_, Message>> {
         if !self.git_state.has_filesystem_path() {
             return None;
@@ -4204,8 +3705,8 @@ impl Dashboard {
         )
     }
 
-    /// Roles with agents running and how many of each, in role order — the one
-    /// grouping every running-agent indicator is built from.
+    /// Roles with agents running and how many of each, in role order — the one grouping every
+    /// running-agent indicator is built from.
     fn running_roles() -> Vec<(Role, usize)> {
         let handles = crate::agent::registry::AGENT_REGISTRY.list();
         let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
@@ -4218,9 +3719,8 @@ impl Dashboard {
             .collect()
     }
 
-    /// One role's indicator: the role icon in its badge color, plus a `×N` count
-    /// once more than one agent of the role runs. `count_size` sizes that count —
-    /// the rail has less width for it than the footer.
+    /// One role's indicator: its icon in its badge colour, plus `×N` once more than one agent
+    /// of the role runs. `count_size` sizes that count — the rail has less width than the footer.
     fn running_role_indicator(role: Role, count: usize, count_size: f32) -> RunningIndicator {
         let (color, _bg) = theme::role_badge_color_for(&role);
         let icon = theme::role_icon(&role).size(theme::TEXT_24).color(color);
@@ -4242,7 +3742,7 @@ impl Dashboard {
     }
 
     /// The in-flight non-agent LLM call counter, `count_size` as in
-    /// [`Self::running_role_indicator`]. `None` when none are in flight.
+    /// [`Self::running_role_indicator`]; `None` when none are in flight.
     fn non_agent_calls(count_size: f32) -> Option<RunningIndicator> {
         let handles = crate::agent::registry::NON_AGENT_CALLS.list();
         if handles.is_empty() {
@@ -4260,10 +3760,9 @@ impl Dashboard {
         .spacing(theme::SPACE_3)
         .align_y(Alignment::Center)
         .into();
-        // Tooltip lists the in-flight kinds as static human-readable labels —
-        // raw snake_case kind names never surface. Map to labels FIRST, then
-        // dedup: two unknown kinds share the generic fallback label, so
-        // deduping raw kinds first could repeat it.
+        // The tooltip lists the in-flight kinds as human labels — raw snake_case never
+        // surfaces. Map to labels FIRST, then dedup: two unknown kinds share the generic
+        // fallback, so deduping raw kinds first could repeat it.
         let mut labels: Vec<&str> = handles
             .iter()
             .map(|h| crate::agent::registry::call_kind_label(h.kind))
@@ -4276,8 +3775,7 @@ impl Dashboard {
         })
     }
 
-    /// The active agent icons in the right side of the footer. `None` when no
-    /// agents are running.
+    /// The footer's active agent icons; `None` when no agents run.
     fn render_active_agents() -> Option<Element<'static, Message>> {
         let icons: Vec<Element<'static, Message>> = Self::running_roles()
             .into_iter()
@@ -4294,14 +3792,14 @@ impl Dashboard {
         )
     }
 
-    /// The in-flight non-agent call counter next to the agent icons in the
-    /// footer. `None` when none are in flight.
+    /// The in-flight non-agent call counter next to the agent icons; `None` when none are in
+    /// flight.
     fn render_non_agent_calls() -> Option<Element<'static, Message>> {
         Some(Self::non_agent_calls(theme::TEXT_14)?.footer())
     }
 
-    /// Render the TTS download progress indicator in the centre of the footer bar.
-    /// Shows the current file name and percentage (e.g. "duration_predictor.onnx 83%").
+    /// The TTS download progress in the footer's centre: the current file and its percentage
+    /// (e.g. "duration_predictor.onnx 83%").
     #[cfg(target_os = "macos")]
     fn render_tts_download_progress(&self) -> Element<'_, Message> {
         let Some((file_name, progress)) = &self.tts_download_progress else {
@@ -4313,9 +3811,9 @@ impl Dashboard {
         footer_status_label(label, None)
     }
 
-    /// The wording for a [`VoiceStatus`], shared by the footer bar's label and
-    /// the rail's tooltip, without the glyph [`Self::voice_status_icon`] draws in
-    /// front of it. `None` for voice off, which both surfaces hide.
+    /// The wording for a [`VoiceStatus`], shared by the footer's label and the rail's tooltip,
+    /// without the glyph [`Self::voice_status_icon`] draws. `None` for voice off, which both
+    /// surfaces hide.
     #[cfg(target_os = "macos")]
     fn voice_status_label(status: &VoiceStatus) -> Option<String> {
         Some(match status {
@@ -4344,12 +3842,8 @@ impl Dashboard {
         })
     }
 
-    /// Render a compact voice status indicator in the footer bar: the status's
-    /// glyph in front of its wording (see [`Self::voice_status_icon`]).
-    ///
-    /// Shows a compact indicator for every [`VoiceStatus`] the shared label
-    /// covers (see [`Self::voice_status_label`]); [`VoiceStatus::Error`]
-    /// displays the actual error string rather than a hardcoded message.
+    /// The footer's compact voice status: the glyph in front of its wording. A
+    /// [`VoiceStatus::Error`] shows the actual error string.
     #[cfg(target_os = "macos")]
     fn render_voice_status() -> Element<'static, Message> {
         let status = crate::audio::voice::get_status();
@@ -4359,8 +3853,7 @@ impl Dashboard {
         footer_status_label(label, Some(Self::voice_status_icon(&status)))
     }
 
-    /// The glyph drawn in front of a [`VoiceStatus`]: `ear` for the microphone
-    /// side, `pen-line` while a recording is being transcribed.
+    /// The glyph in front of a [`VoiceStatus`]: `ear`, or `pen-line` while transcribing.
     #[cfg(target_os = "macos")]
     fn voice_status_icon(
         status: &VoiceStatus,
@@ -4372,8 +3865,8 @@ impl Dashboard {
         }
     }
 
-    /// 42px footer bar — update/picker/toggle chrome (left) and active
-    /// agents (right).
+    /// The 42px footer bar: update/picker/toggle chrome and git on the left, active agents on
+    /// the right.
     fn footer_view(&self) -> Element<'_, Message> {
         let mut left_elements: Vec<Element<'_, Message>> = Vec::with_capacity(5);
 
@@ -4395,7 +3888,6 @@ impl Dashboard {
             .spacing(theme::SPACE_6)
             .align_y(Alignment::Center);
 
-        // TTS download progress and voice status indicator (center of footer bar)
         #[cfg(target_os = "macos")]
         let center = row![
             self.render_tts_download_progress(),
@@ -4403,8 +3895,8 @@ impl Dashboard {
         ]
         .spacing(theme::SPACE_8)
         .align_y(Alignment::Center);
-        // Off macOS there is no audio subsystem, so the centre slot collapses to
-        // nothing — the footer row below is shared and stays untouched.
+        // Off macOS there is no audio subsystem, so the centre slot collapses to nothing —
+        // the footer row below is shared and stays untouched.
         #[cfg(not(target_os = "macos"))]
         let center = Space::new().width(0);
 
@@ -4430,8 +3922,7 @@ impl Dashboard {
     }
 }
 
-/// Muted 12px status label with side padding, shown in the centre of the footer
-/// bar, with an optional glyph in front of it.
+/// Muted 12px footer status label with side padding, optionally behind a glyph.
 #[cfg(target_os = "macos")]
 fn footer_status_label(
     label: String,
@@ -4462,25 +3953,24 @@ pub struct WindowState {
     pub height: f32,
     pub x: i32,
     pub y: i32,
-    /// Whether a geometry was actually read from the state file, rather than
-    /// falling back to [`WindowState::default`]: a saved geometry opens as it
-    /// was saved, a fresh one as [`WindowState::opening_size`] derives it.
+    /// Whether a geometry was actually read from the state file rather than falling back to
+    /// [`WindowState::default`]: a saved geometry opens as it was saved, a fresh one as
+    /// [`WindowState::opening_size`] derives it.
     #[serde(skip)]
     restored: bool,
 }
 
 impl WindowState {
-    /// Position to use when restoring the window.
     #[expect(clippy::cast_precision_loss)]
     #[must_use]
     pub const fn position(&self) -> iced::window::Position {
         iced::window::Position::Specific(iced::Point::new(self.x as f32, self.y as f32))
     }
 
-    /// The size the window opens at: a saved geometry as it was saved, a fresh
-    /// one without the ticket column's share, so the chat's line length is the
-    /// one it has beside the column in the default window (the board's first
-    /// read then settles the one width decision, `StartupWidth`).
+    /// The size the window opens at: a saved geometry as saved, a fresh one without the ticket
+    /// column's share, so the chat's line length is the one it has beside the column in the
+    /// default window (the board's first read then settles the one width decision,
+    /// [`StartupWidth`]).
     #[must_use]
     pub fn opening_size(&self) -> iced::Size {
         let full = iced::Size::new(self.width, self.height);
@@ -4494,19 +3984,17 @@ impl WindowState {
     }
 }
 
-/// The window's default size in px, sized for the Home page with its ticket
-/// column beside the chat.
+/// The window's default size in px, sized for Home with its ticket column beside the chat.
 const DEFAULT_WINDOW_WIDTH: f32 = 1500.0;
 const DEFAULT_WINDOW_HEIGHT: f32 = 800.0;
 
-/// The window's minimum size, shared with the platform settings so the one
-/// width the app derives ([`WindowState::opening_size`]) stays a usable window.
+/// The window's minimum size, shared with the platform settings so the width
+/// [`WindowState::opening_size`] derives stays a usable window.
 pub const MIN_WINDOW_WIDTH: f32 = 800.0;
 pub const MIN_WINDOW_HEIGHT: f32 = 500.0;
 
-/// The width the ticket column takes of a window `width` px wide: its portion
-/// of the content area beside the nav rail, which is exactly what the chat
-/// gains back when the column is absent.
+/// The width the ticket column takes of a window `width` px wide: its portion of the content
+/// area beside the nav rail, which is what the chat gains back when the column is absent.
 #[must_use]
 fn ticket_column_share(width: f32) -> f32 {
     (width - SIDEBAR_RAIL_WIDTH) * f32::from(TICKET_COLUMN_PORTION)
@@ -4525,7 +4013,6 @@ impl Default for WindowState {
     }
 }
 
-/// The window geometry file in the storage root.
 const WINDOW_STATE_FILE: &str = "window-state.json";
 
 /// Read persisted window state, falling back to defaults when it is missing or unreadable.
@@ -4544,7 +4031,6 @@ pub fn read_window_state() -> WindowState {
         .unwrap_or_default()
 }
 
-/// Save current window geometry.
 #[expect(clippy::cast_possible_truncation)]
 fn save_window_state(pos: iced::Point, size: iced::Size) {
     let state = serde_json::json!({
@@ -4559,16 +4045,13 @@ fn save_window_state(pos: iced::Point, size: iced::Size) {
     }
 }
 
-/// Reload the full workspace map from the store after boot (CDC workspaces
-/// event, stream lag, toggle completion, or a settings add/delete).
-///
-/// On a transient read failure — the one scoped retry in this reload path — it
-/// retries once after a short delay; if the retry also fails, it returns
-/// [`Message::WorkspacesReloadFailed`] so the current (non-empty) map is
-/// preserved and the failure is rendered instead of silently vanishing.
+/// Reload the full workspace map from the store (CDC workspaces event, stream lag, toggle
+/// completion, a settings add/delete). A transient read failure — the one scoped retry in this
+/// path — is retried once after a short delay; if that fails too,
+/// [`Message::WorkspacesReloadFailed`] keeps the current map and renders the failure.
 async fn load_workspace_map(generation: u64) -> Message {
-    // Transient read failure: retry once after a short delay, then report the
-    // failure while keeping the current map.
+    // A transient read failure: retry once after a short delay, then report it while
+    // keeping the current map.
     let mut attempt = 0;
     let workspaces = loop {
         match read_workspace_map().await {
@@ -4599,15 +4082,13 @@ async fn read_workspace_map() -> anyhow::Result<HashMap<String, Workspace>> {
     Ok(list.into_iter().map(|ws| (ws.name.clone(), ws)).collect())
 }
 
-/// Resolve the boot selection against a freshly loaded map: the stored name when
-/// it is an existing project, otherwise
-/// [`crate::users::fallback_workspace_name`]'s pick — the one a deletion makes
-/// too — otherwise the personal name, which is the answer only when the map
-/// carries no project at all.
+/// Resolve the boot selection against a freshly loaded map: the stored name when it is an
+/// existing project, otherwise [`crate::users::fallback_workspace_name`]'s pick (the one a
+/// deletion makes too), otherwise the personal name, the answer only when the map has no project.
 ///
-/// `prev_selection` is [`crate::users::resolve_selected_workspace_name`]'s
-/// answer, so `None` is a failed read: it resolves like any other unusable value
-/// (the boot path must complete) and only decides whether the pick is stored.
+/// `prev_selection` is [`crate::users::resolve_selected_workspace_name`]'s answer, so `None` is
+/// a failed read: it resolves like any unusable value (the boot must complete) and only decides
+/// whether the pick is stored.
 #[must_use]
 fn resolve_workspace_selection(
     map: &HashMap<String, Workspace>,
@@ -4624,23 +4105,15 @@ fn resolve_workspace_selection(
         .unwrap_or_else(|| personal_name.to_string())
 }
 
-/// Load the full workspace map during boot and resolve the active project from
-/// the DB (`users.selected_workspace` for the admin — the single source of truth)
-/// via the admin-aware [`crate::users::resolve_selected_workspace_name`]
-/// primitive, together with the projects that actually exist. An empty or
-/// dangling stored selection lands on a project whenever one exists; the personal
-/// name only when none does.
+/// Load the full map during boot and resolve the active project from the DB
+/// (`users.selected_workspace`, the single source of truth) via
+/// [`crate::users::resolve_selected_workspace_name`]: an empty or dangling selection lands on a
+/// project whenever one exists, the personal name only when none does.
 ///
-/// `remember` is set when a successful stored-selection read differs from the
-/// resolved pick (see [`Message::BootWorkspaces`]).
-///
-/// The read result travels to [`Dashboard::apply_boot_workspaces`] as-is: a
-/// failed boot read still completes with an empty map (nothing to land on), but
-/// the failure is rendered by the workspace picker / Settings list instead of
-/// being indistinguishable from an installation with no workspaces.
-///
-/// `generation` is captured when the read is dispatched and travels back with
-/// it, so a reload that answered meanwhile supersedes this read.
+/// `remember` is set when a successful stored-selection read differs from the resolved pick
+/// ([`Message::BootWorkspaces`]). The read travels to [`Dashboard::apply_boot_workspaces`]
+/// as-is: a failed boot read completes with an empty map, but the picker / Settings list render
+/// the failure. `generation` is captured at dispatch, so a reload that answered supersedes it.
 async fn load_workspace_options(generation: u64) -> Message {
     let user = crate::users::ADMIN_USER_NAME;
     // `None` — the read failed.
@@ -4666,17 +4139,14 @@ async fn load_workspace_options(generation: u64) -> Message {
     }
 }
 
-/// Read the admin's stored active workspace back from the DB (the admin-aware
-/// resolution: a NULL/personal value yields the canonical `personal:{user}`
-/// name). `None` — the read failed; the live selection is kept.
+/// Read the admin's stored active workspace back from the DB (NULL/personal yields the
+/// canonical `personal:{user}`). `None` — the read failed; the live selection is kept.
 async fn read_active_workspace() -> Option<String> {
     crate::users::resolve_selected_workspace_name(crate::users::ADMIN_USER_NAME).await
 }
 
-/// Build the footer workspace picker options from the managed-workspace map:
-/// values sorted by name, labeled by each workspace's display name. A personal
-/// workspace is never an option — a lingering `personal:{user}` row is filtered
-/// out.
+/// The footer picker's options from the managed-workspace map, sorted by name; a personal
+/// workspace is never an option.
 #[must_use]
 fn managed_workspace_options(map: &HashMap<String, Workspace>) -> Vec<widgets::PickOption> {
     let mut values: Vec<&Workspace> = map
@@ -4693,12 +4163,10 @@ fn managed_workspace_options(map: &HashMap<String, Workspace>) -> Vec<widgets::P
         .collect()
 }
 
-/// Reveal a path in the platform's file manager: Finder on macOS, Explorer on
-/// Windows, and the containing folder on Linux (where `xdg-open` has no select
-/// verb). A directory is accepted too — macOS and Windows select it in its
-/// parent, Linux just opens that parent. The launchers report success and
-/// failure unreliably, so their outcome is never trusted: a caller that
-/// requires a real file checks for it beforehand.
+/// Reveal a path in the platform's file manager: Finder on macOS, Explorer on Windows, the
+/// containing folder on Linux (where `xdg-open` has no select verb). A directory works too —
+/// macOS and Windows select it in its parent, Linux opens that parent. The launchers report
+/// success and failure unreliably, so their outcome is never trusted.
 fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -4731,10 +4199,8 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Open an address with the platform's own handler (fire-and-forget).
-///
-/// The address is handed over as data — never to something that reads it as a
-/// command line.
+/// Open an address with the platform's own handler (fire-and-forget). The address is handed
+/// over as data — never to something that reads it as a command line.
 fn open_url(url: &str) {
     #[cfg(target_os = "windows")]
     shell_open(url);
@@ -4752,29 +4218,21 @@ fn open_url(url: &str) {
 
 /// Hand an address to the Windows shell as a *data* argument.
 ///
-/// `ShellExecuteExW` resolves the address against the registered protocol and
-/// file associations, and takes it whole in `lpFile`, with `lpParameters` NULL
-/// and `lpVerb` NULL (the system's default verb for the item — forcing `open`
-/// would change what some addresses do). The address is therefore one opaque
-/// value: `&`, `^`, `%`, `"`, `?`, `|` or a space in it is data, never a command,
-/// a second command or an argument of one. `SEE_MASK_DOENVSUBST` is left out of
-/// `fMask` too, so the shell does not expand a `%NAME%`-shaped address either.
-///
-/// The launch runs on a throw-away thread because `ShellExecuteExW` is a
-/// synchronous shell call and `open_url` is called on the iced event-loop thread,
-/// which must not wait on the shell. The thread is detached, so a process that
-/// exits right after the click takes the launch with it.
-///
-/// An empty or whitespace-only address is not an address: it never reaches the
-/// shell, because there is nothing to open and nothing may be launched for one.
+/// `ShellExecuteExW` resolves it against the registered protocol and file associations and
+/// takes it whole in `lpFile`, with `lpParameters` and `lpVerb` NULL (forcing `open` would
+/// change what some addresses do), so `&`, `^`, `%`, `"`, `?`, `|` or a space in it is data,
+/// never a command or an argument — `SEE_MASK_DOENVSUBST` is left out so `%NAME%` is not
+/// expanded either. The launch runs on a detached throw-away thread, since the call is
+/// synchronous and `open_url` runs on the iced event-loop thread, which must not wait on the
+/// shell. An empty or whitespace-only address is not an address: nothing may be launched.
 #[cfg(target_os = "windows")]
 fn shell_open(address: &str) {
     if address.trim().is_empty() {
         return;
     }
     let address = address.to_owned();
-    // The NUL-terminated UTF-16 spelling the Win32 API takes; an interior NUL in
-    // the address would end the string the shell sees there.
+    // The NUL-terminated UTF-16 spelling the Win32 API takes; an interior NUL would end the
+    // string the shell sees.
     let mut wide: Vec<u16> = address.encode_utf16().collect();
     wide.push(0);
     let spawned = std::thread::Builder::new()
@@ -4789,16 +4247,14 @@ fn shell_open(address: &str) {
     }
 }
 
-/// One `ShellExecuteExW` call for the NUL-terminated UTF-16 `address`, on a
-/// thread whose COM apartment has just been initialised for it. Returns the
-/// `GetLastError` code when the shell did not open the address.
+/// One `ShellExecuteExW` call for the NUL-terminated UTF-16 `address`, on a thread whose COM
+/// apartment was just initialised: the single-threaded one the API documents for itself, which
+/// some shell extensions require. Returns the `GetLastError` code when the shell did not open
+/// the address.
 ///
-/// The apartment is the single-threaded one the API documents for itself (some
-/// of the shell extensions it may activate require it). `SEE_MASK_NOASYNC` is
-/// the one `fMask` flag the call needs: the API requires it of a caller without
-/// a message loop that does not outlive the call. No `SEE_MASK_*` suppression
-/// flag is set — whatever the shell shows for an address it cannot open is its
-/// own, and the `GetLastError` code is logged alongside it.
+/// `SEE_MASK_NOASYNC` is the one `fMask` flag needed: the API requires it of a caller without a
+/// message loop that does not outlive the call. No `SEE_MASK_*` suppression flag is set —
+/// whatever the shell shows for an address it cannot open is its own, and the code is logged.
 #[cfg(target_os = "windows")]
 fn shell_execute_address(address: &[u16]) -> Option<u32> {
     use windows_sys::Win32::Foundation::{FALSE, GetLastError};
@@ -4808,8 +4264,8 @@ fn shell_execute_address(address: &[u16]) -> Option<u32> {
     use windows_sys::Win32::UI::Shell::{SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW};
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-    // `CoInitializeEx` takes the flags as an unsigned word, while `windows-sys`
-    // types the constants as the signed `COINIT` alias.
+    // `CoInitializeEx` takes the flags as an unsigned word, while `windows-sys` types the
+    // constants as the signed `COINIT` alias.
     let coinit = u32::try_from(COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)
         .expect("COINIT flags are small positives");
     // SAFETY: `pv_reserved` is required to be null, and the apartment is the one
@@ -4834,8 +4290,7 @@ fn shell_execute_address(address: &[u16]) -> Option<u32> {
     // call can overwrite the error the failed launch set.
     let code = failed.then(|| unsafe { GetLastError() });
     if apartment >= 0 {
-        // SAFETY: pairs with the successful `CoInitializeEx` above, on the same
-        // thread.
+        // SAFETY: pairs with the successful `CoInitializeEx` above, on the same thread.
         unsafe { CoUninitialize() };
     }
     code
@@ -5103,7 +4558,8 @@ mod tests {
         Boot(Result<&'static str, &'static str>, &'static str, bool, u64),
     }
 
-    /// The reload state machine: a read replaces the map and the Settings list, never the live selection.
+    /// The reload state machine: a read replaces the map and the Settings list, never the live
+    /// selection.
     #[test]
     fn workspace_reload_cases() {
         use ReloadStep::*;
@@ -5303,7 +4759,8 @@ mod tests {
         ),
     ];
 
-    /// Only the selection's own entry points change it, and a superseded read-back never reverts a pick.
+    /// Only the selection's own entry points change it, and a superseded read-back never reverts
+    /// a pick.
     #[test]
     fn workspace_selection_cases() {
         use SelectionStep::*;
@@ -5337,7 +4794,7 @@ mod tests {
         }
     }
 
-    /// A selection resolves only to a managed workspace present in the loaded map with a usable path.
+    /// A selection resolves only to a managed workspace in the loaded map with a usable path.
     #[test]
     fn workspace_resolution_cases() {
         enum Probe {
@@ -5462,7 +4919,8 @@ mod tests {
         Moved(Option<&'static str>, Option<&'static str>),
     }
 
-    /// The workspace-scoped surfaces follow the resolution, and a deleted project says where the desktop moved.
+    /// The workspace-scoped surfaces follow the resolution, and a deleted project says where the
+    /// desktop moved.
     #[test]
     fn workspace_scoped_surface_cases() {
         use SurfaceSee as See;
@@ -5566,7 +5024,8 @@ mod tests {
         }
     }
 
-    /// A foreign project's commit opens read-only without re-pointing the picked workspace's own change view.
+    /// A foreign project's commit opens read-only without re-pointing the picked workspace's own
+    /// change view.
     #[test]
     fn foreign_ticket_commit_diff_keeps_the_picked_view() {
         let mut dash = ready_dashboard();
@@ -5641,11 +5100,9 @@ mod tests {
         assert_eq!(dash.board_state.search_results.len(), 1);
     }
 
-    /// The DB-sourced boot resolution: the seeded admin with a managed stored
-    /// workspace present in the map restores it and writes nothing; a stored
-    /// value naming no existing project lands on the project the desktop falls
-    /// back to — the first in the footer switcher's order — and that pick is
-    /// remembered.
+    /// The DB-sourced boot resolution: a stored project present in the map is restored and
+    /// nothing is written; a stored value naming no existing project lands on the fallback — the
+    /// first in the footer switcher's order — and that pick is remembered.
     #[tokio::test]
     #[serial_test::serial(gui_admin_workspace)] // writes the shared seeded admin row
     async fn boot_workspace_options_resolve_from_db() {

@@ -1,12 +1,10 @@
-//! The admin's own view into the managed workspaces: list them, add one
-//! (which activates it), freeze/unfreeze their pipelines, read a board and a
-//! single ticket, and leave a clarification note on a ticket.
+//! The admin's own view into the managed workspaces: list them, add one (which activates
+//! it), freeze/unfreeze their pipelines, read a board and a single ticket, and leave a
+//! clarification note on a ticket.
 //!
-//! It manages no board. Adding a managed workspace activates it; the desktop
-//! itself moves the active project onto another one when the active one is
-//! deleted, and onto a project at start-up whenever the stored one no longer
-//! exists. Choosing a project in the desktop's footer switcher is its own way of
-//! selecting one.
+//! It manages no board. Adding a managed workspace activates it; the desktop itself moves
+//! the active project when the active one is deleted, and onto a project at start-up
+//! whenever the stored one no longer exists.
 use anyhow::anyhow;
 use async_trait::async_trait;
 use serde_json::json;
@@ -18,21 +16,20 @@ use crate::tools::ticket::{GET_TICKET_COMMENT_MAX, GET_TICKET_DESC_MAX, GET_TICK
 use crate::workspace::WorkspaceStore;
 use crate::{Role, Tool, Workspace, WorkspaceStatus};
 
-/// The tool's own byte budget, needed because the framework's ~5 KB tool-output
-/// truncation is off for it (see [`WorkspaceTool::preserve_full_output`]): the
-/// `board` listing and the shortened `ticket` view bound themselves, and a byte
-/// cap is required alongside `BOARD_LINE_LIMIT` because a title, a description
-/// and a comment are all unbounded. `ticket` with `full: true` is deliberately
-/// exempt.
+/// The tool's own byte budget, needed because the framework's ~5 KB tool-output truncation is
+/// off for it (see [`WorkspaceTool::preserve_full_output`]): the `board` listing and the
+/// shortened `ticket` view bound themselves, and a byte cap is required alongside
+/// `BOARD_LINE_LIMIT` because a title, a description and a comment are all unbounded.
+/// `ticket` with `full: true` is deliberately exempt.
 const OUTPUT_BYTE_LIMIT: usize = 24_000;
 const BOARD_LINE_LIMIT: usize = 100;
 
-/// What an action that covers the whole managed set answers when there is
-/// none — one wording, so `list` and a fleet-wide pause say the same thing.
+/// What an action that covers the whole managed set answers when there is none — one
+/// wording, so `list` and a fleet-wide pause say the same thing.
 const NO_WORKSPACE: &str = "No managed workspaces exist.";
 
-/// The `workspace` tool: the admin's project view — list / add / board / ticket
-/// / comment / pause / resume.
+/// The `workspace` tool: the admin's project view — list / add / board / ticket / comment /
+/// pause / resume.
 pub(crate) struct WorkspaceTool;
 
 #[async_trait]
@@ -83,9 +80,8 @@ impl Tool for WorkspaceTool {
     }
 
     fn preserve_full_output(&self) -> bool {
-        // A `ticket` answer can carry hundreds of KB of comments, so a fixed
-        // ~5 KB tool-output truncation is wrong for the whole tool; the read
-        // paths bound themselves instead (`OUTPUT_BYTE_LIMIT`).
+        // A `ticket` answer can carry hundreds of KB of comments, so the fixed ~5 KB
+        // truncation is wrong for the whole tool; the read paths bound themselves.
         true
     }
 
@@ -103,11 +99,9 @@ impl Tool for WorkspaceTool {
 }
 
 impl WorkspaceTool {
-    /// The one action dispatch both faces of the tool go through: `execute`
-    /// renders it to its text (so an agent's view is unchanged) and
-    /// [`Tool::execute_answer`] hands it over with the partiality flag a
-    /// command-line caller reads. There is no second code path to drift from
-    /// this one.
+    /// The one action dispatch both faces of the tool go through: `execute` renders it to its
+    /// text, and [`Tool::execute_answer`] hands it over with the partiality flag a command-line
+    /// caller reads. There is no second code path to drift from this one.
     async fn answer(&self, args: serde_json::Value) -> anyhow::Result<ToolAnswer> {
         match super::get_str(&args, "action")? {
             "list" => Ok(ToolAnswer::done(
@@ -144,23 +138,18 @@ impl WorkspaceTool {
     }
 }
 
-// ── Shared resolution ────────────────────────────────────────────
-
-/// The workspace a `pause` / `resume` was pointed at: the `workspace` argument,
-/// or `None` for every managed workspace when none is named.
+/// The workspace a `pause` / `resume` was pointed at: the `workspace` argument, or `None`
+/// for every managed workspace when none is named.
 ///
-/// The one action pair that can act on a single workspace or on all of them must
-/// never widen because the address was spelled some other way — a folder path, a
-/// ticket id, `add`'s `name`, or a key no schema declares — so with no `workspace`
-/// argument such a call may name nothing else at all. An extra field is a usage
-/// error phrased around that rule, never around the key that carried it, so the
-/// message cannot name a key the caller did not write. The read actions (`list`,
-/// `board`) take the same address but ignore a stray field, as the other tools
-/// do; only a write that would cover the fleet has to say so.
+/// The one action pair that can act on a single workspace or on all of them must never widen
+/// because the address was spelled some other way — a folder path, a ticket id, `add`'s
+/// `name`, or a key no schema declares — so with no `workspace` argument such a call may name
+/// nothing else at all. An extra field is a usage error phrased around that rule, never around
+/// the key that carried it. The read actions take the same address but ignore a stray field;
+/// only a write that would cover the fleet has to say so.
 ///
-/// A JSON `null` counts as absent, here as everywhere in the product (providers
-/// fill omitted arguments with nulls), so a call whose address arrived nulled is
-/// the unnamed form — which the tool description says plainly.
+/// A JSON `null` counts as absent, as everywhere in the product (providers fill omitted
+/// arguments with nulls).
 fn write_address<'a>(args: &'a serde_json::Value, action: &str) -> anyhow::Result<Option<&'a str>> {
     if let Some(address) = super::get_opt_str_strict(args, "workspace")? {
         return Ok(Some(address));
@@ -178,10 +167,9 @@ fn write_address<'a>(args: &'a serde_json::Value, action: &str) -> anyhow::Resul
     Ok(None)
 }
 
-/// Resolve `name` to a managed workspace — never a personal space, including
-/// a legacy `personal:*` row. Matching is exact, and a miss names the live set
-/// because the admin names workspaces from a session-start context block that
-/// may predate an add or a delete.
+/// Resolve `name` to a managed workspace — never a personal space, including a legacy
+/// `personal:*` row. Matching is exact, and a miss names the live set because the admin names
+/// workspaces from a session-start context block that may predate an add or a delete.
 async fn managed_workspace(name: &str) -> anyhow::Result<Workspace> {
     let name = name.trim();
     let workspaces = crate::users::managed_workspaces().await?;
@@ -209,13 +197,11 @@ async fn managed_workspace(name: &str) -> anyhow::Result<Workspace> {
     })
 }
 
-/// Resolve a full `<workspace>-<number>` ticket id, refusing every other
-/// spelling with the expected form, and an id whose workspace prefix is not
-/// a managed workspace.
+/// Resolve a full `<workspace>-<number>` ticket id, refusing every other spelling with the
+/// expected form, and an id whose workspace prefix is not a managed workspace.
 async fn managed_ticket_id(raw: &str) -> anyhow::Result<String> {
-    // Only the full spelling addresses a ticket here: the project manager's
-    // own ticket tools resolve a bare number against the workspace they are
-    // bound to, and this tool is bound to none.
+    // Only the full spelling addresses a ticket here: the manager's own ticket tools resolve a
+    // bare number against the workspace they are bound to, and this tool is bound to none.
     let Ok((Some(prefix), full)) = crate::tools::ticket::parse_ticket_id(raw) else {
         return Err(anyhow!(
             "Ticket id '{}' is not a full '<workspace>-<number>' id — `ticket` and `comment` \
@@ -223,23 +209,18 @@ async fn managed_ticket_id(raw: &str) -> anyhow::Result<String> {
             raw.trim()
         ));
     };
-    // An id naming a workspace that is not managed is refused as an unknown
-    // workspace, with the managed set named.
+    // An id naming a workspace that is not managed is refused as an unknown workspace, with
+    // the managed set named.
     managed_workspace(prefix).await?;
     Ok(full.to_string())
 }
 
-// ── list ─────────────────────────────────────────────────────────
-
 /// The managed workspaces, one line each, with the admin's active one marked.
 ///
-/// The active workspace is the stored selection and counts only when it is one
-/// of the managed names: a personal value, or a name no longer a managed
-/// workspace, means nothing is active — while the resolver's `None` is a failed
-/// read, which is reported as such rather than as nothing being active. The
-/// desktop repairs such a selection to a project of its own accord at start-up
-/// and after a deletion, so the two surfaces agree in the steady state. A
-/// narrowed listing still uses the full managed set to decide all this.
+/// The active workspace is the stored selection and counts only when it is one of the managed
+/// names: a personal value, or a name no longer managed, means nothing is active — while the
+/// resolver's `None` is a failed read, reported as such. The desktop repairs such a selection
+/// at start-up and after a deletion, so the two surfaces agree in the steady state.
 async fn list_workspaces(only: Option<&str>) -> anyhow::Result<String> {
     let workspaces = crate::users::managed_workspaces().await?;
     if workspaces.is_empty() {
@@ -281,22 +262,16 @@ async fn list_workspaces(only: Option<&str>) -> anyhow::Result<String> {
     Ok(listing.trim_end().to_string())
 }
 
-// ── add ──────────────────────────────────────────────────────────
-
-/// Add a managed workspace and make it the admin's active one — adding and
-/// activating are one rule on every path (the desktop's own add form does the
-/// same), so a newly added project is the one the desktop works with.
+/// Add a managed workspace and make it the admin's active one — adding and activating are one
+/// rule on every path (the desktop's own add form does the same).
 ///
-/// PARTIAL exactly when the add succeeded but the activation write did not: the
-/// workspace is added either way, and the answer already says which half
-/// happened.
+/// PARTIAL exactly when the add succeeded but the activation write did not.
 async fn add_workspace(args: &serde_json::Value) -> anyhow::Result<ToolAnswer> {
     let name = super::get_str(args, "name")?;
     let path = super::get_str(args, "path")?;
     crate::workspace::store().add(name, path).await?;
-    // Adding activates: the row exists by now, so a failed selection write is
-    // reported as the partial outcome it is rather than as an add that did not
-    // happen.
+    // Adding activates: the row exists by now, so a failed selection write is reported as the
+    // partial outcome it is rather than as an add that did not happen.
     match crate::users::store()
         .set_selected_workspace(crate::users::ADMIN_USER_NAME, Some(name))
         .await
@@ -314,16 +289,12 @@ async fn add_workspace(args: &serde_json::Value) -> anyhow::Result<ToolAnswer> {
     }
 }
 
-// ── pause / resume ───────────────────────────────────────────────
-
-/// What a pause/resume request does to one workspace — the rule both forms
-/// below follow, so the named and the fleet-wide answer can never disagree about
-/// which rows are written.
+/// What a pause/resume request does to one workspace — the rule both forms follow, so the
+/// named and the fleet-wide answer can never disagree about which rows are written.
 enum PipelineChange {
-    /// Not `ready`: only a `ready` row is dispatchable (the poll gates every
-    /// claim and phase dispatch on the status), so a non-ready row's `paused`
-    /// flag is the discovery's own analysis pause rather than a freeze of running
-    /// work, and it is never written.
+    /// Not `ready`: only a `ready` row is dispatchable (the poll gates every claim and phase
+    /// dispatch on the status), so a non-ready row's `paused` flag is the discovery's own
+    /// analysis pause rather than a freeze of running work, and it is never written.
     NotReady,
     /// Already in the requested state: reported as such, never written again.
     Already,
@@ -341,8 +312,8 @@ fn pipeline_change(ws: &Workspace, paused: bool) -> PipelineChange {
     }
 }
 
-/// Pause or resume the named workspace's pipeline, or every managed
-/// workspace at once when no name was given.
+/// Pause or resume the named workspace's pipeline, or every managed workspace at once when no
+/// name was given.
 async fn pause_or_resume(name: Option<&str>, paused: bool) -> anyhow::Result<ToolAnswer> {
     match name {
         Some(name) => Ok(ToolAnswer::done(
@@ -379,31 +350,19 @@ async fn set_one_pipeline_paused(name: &str, paused: bool) -> anyhow::Result<Str
     }
 }
 
-/// Pause or resume every workspace of `workspaces` where the write is honest —
-/// see [`pipeline_change`] — one line per workspace, or [`NO_WORKSPACE`] for an
-/// empty set.
+/// Pause or resume every workspace of `workspaces` where the write is honest — see
+/// [`pipeline_change`] — one line per workspace, or [`NO_WORKSPACE`] for an empty set.
 ///
-/// Takes the store the writes go to and the set they cover, so the fleet-wide
-/// form is not hardwired to the process-global store: production passes that one
-/// with the managed workspaces, the test its own store with rows of its own,
-/// and a fleet-wide write can then never reach a row another test created.
-///
-/// Never [`WorkspaceStore::pause_all`](crate::workspace::WorkspaceStore::pause_all):
+/// Takes the store the writes go to and the set they cover, so the fleet-wide form is not
+/// hardwired to the process-global store: a fleet-wide write can then never reach a row a test
+/// created. Never [`WorkspaceStore::pause_all`](crate::workspace::WorkspaceStore::pause_all):
 /// that would also pause not-ready rows and the discovery's own analysis pause.
 ///
-/// PARTIAL exactly when the requested state was not reached for a workspace: a
-/// write that failed (the rows written before it are real, so the fleet-wide form
-/// did not do the whole of what was asked) or a workspace skipped as not ready
-/// (its pipeline was not paused/resumed, and the answer above says so). A
-/// workspace already in the requested state leaves the operation whole — the
-/// state the caller asked for holds.
-///
-/// The not-ready skip counts in BOTH directions on purpose, `resume` included,
-/// where a pending workspace is not paused anyway: the named form refuses a
-/// not-ready workspace the same way in both directions ("only a ready workspace
-/// has a pipeline to pause or resume" — its flag is the discovery's own analysis
-/// pause, not a freeze of running work), and one rule for both forms is what
-/// keeps them from disagreeing about the same workspace.
+/// PARTIAL exactly when the requested state was not reached for a workspace: a write that
+/// failed, or a workspace skipped as not ready. A workspace already in the requested state
+/// leaves the operation whole. The not-ready skip counts in BOTH directions on purpose,
+/// `resume` included: the named form refuses a not-ready workspace the same way, and one rule
+/// for both forms keeps them from disagreeing about the same workspace.
 async fn set_pipelines_paused(
     store: &WorkspaceStore,
     workspaces: &[Workspace],
@@ -421,8 +380,7 @@ async fn set_pipelines_paused(
     let mut incomplete = false;
     for ws in workspaces {
         let line = match pipeline_change(ws, paused) {
-            // The caller asked for every managed workspace; this one was left
-            // untouched, so the call is not the whole of what was asked.
+            // The caller asked for every managed workspace; this one was left untouched.
             PipelineChange::NotReady => {
                 incomplete = true;
                 format!("- {}: skipped — not ready ({})", ws.name, ws.status)
@@ -432,8 +390,8 @@ async fn set_pipelines_paused(
             PipelineChange::Write => match store.set_paused(&ws.name, paused).await {
                 Ok(()) if paused => format!("- {}: paused", ws.name),
                 Ok(()) => format!("- {}: resumed", ws.name),
-                // Reported like every other outcome: the rows written before a
-                // failure are real, so the report must cover each workspace.
+                // The rows written before a failure are real, so the report must cover each
+                // workspace.
                 Err(e) => {
                     incomplete = true;
                     format!("- {}: failed — {e}", ws.name)
@@ -450,17 +408,14 @@ async fn set_pipelines_paused(
     })
 }
 
-/// Every managed workspace at once: the global store and the set it must
-/// cover.
+/// Every managed workspace at once: the global store and the set it must cover.
 async fn set_all_pipelines_paused(paused: bool) -> anyhow::Result<ToolAnswer> {
     let workspaces = crate::users::managed_workspaces().await?;
     set_pipelines_paused(crate::workspace::store(), &workspaces, paused).await
 }
 
-// ── board ────────────────────────────────────────────────────────
-
-/// List the live tickets of the managed workspaces, optionally narrowed to
-/// one workspace and/or one phase.
+/// List the live tickets of the managed workspaces, optionally narrowed to one workspace
+/// and/or one phase.
 async fn list_board(only: Option<&str>, phase: Option<&str>) -> anyhow::Result<String> {
     let workspaces = crate::users::managed_workspaces().await?;
     let phase_filter = match phase {
@@ -496,9 +451,8 @@ async fn list_board(only: Option<&str>, phase: Option<&str>) -> anyhow::Result<S
         {
             break;
         }
-        // The first line is always shown — the notice must never read "the first
-        // 0 of N tickets" — so a line larger than the whole budget is cut rather
-        // than escaping the tool's own limit.
+        // The first line is always shown — the notice must never read "the first 0 of N
+        // tickets" — so a line larger than the whole budget is cut.
         line = crate::util::cut_bytes(&line, OUTPUT_BYTE_LIMIT);
         bytes += line.len() + 1;
         lines.push(line);
@@ -518,10 +472,8 @@ async fn list_board(only: Option<&str>, phase: Option<&str>) -> anyhow::Result<S
     Ok(out)
 }
 
-// ── ticket / comment ─────────────────────────────────────────────
-
-/// Read one ticket by its full id. The default is the shortened form for every
-/// ticket, whoever filed it.
+/// Read one ticket by its full id. The default is the shortened form for every ticket,
+/// whoever filed it.
 async fn show_ticket(ticket_id: &str, full: bool) -> anyhow::Result<String> {
     let id = managed_ticket_id(ticket_id).await?;
     let Some(ticket) = board_store().get_ticket(&id).await? else {
@@ -535,8 +487,8 @@ async fn show_ticket(ticket_id: &str, full: bool) -> anyhow::Result<String> {
         GET_TICKET_COMMENT_MAX,
         GET_TICKET_LAST_N_FULL,
     );
-    // The newest comments come back in full, so a ticket carrying a huge one is
-    // still bounded here — `full: true` is the unbounded read.
+    // The newest comments come back in full, so a ticket carrying a huge one is still bounded
+    // here — `full: true` is the unbounded read.
     if shortened.len() <= OUTPUT_BYTE_LIMIT {
         return Ok(shortened);
     }
@@ -546,8 +498,8 @@ async fn show_ticket(ticket_id: &str, full: bool) -> anyhow::Result<String> {
     ))
 }
 
-/// Leave a clarification note on a ticket. Refused when the ticket does not
-/// exist, so a note is never stored for a missing ticket.
+/// Leave a clarification note on a ticket. Refused when the ticket does not exist, so a note
+/// is never stored for a missing ticket.
 async fn add_note(ticket_id: &str, content: &str) -> anyhow::Result<String> {
     anyhow::ensure!(
         !content.trim().is_empty(),
@@ -599,8 +551,8 @@ mod tests {
             "got: {err}"
         );
 
-        // A freshly added workspace is `pending` — it has no pipeline yet,
-        // so nothing may be frozen or resumed.
+        // A freshly added workspace is `pending` — it has no pipeline yet, so nothing may be
+        // frozen or resumed.
         crate::util::test::create_test_workspace("/tmp/ws_pending", "ws_pending").await;
         let err = tool
             .execute(&ws, tool_args("pause", Some("ws_pending")))
@@ -687,11 +639,9 @@ mod tests {
         );
     }
 
-    /// Every managed workspace at once: the ready one is written, the
-    /// not-ready one is skipped and reported as skipped.
-    ///
-    /// Driven against the test's own store, so the fleet-wide write can only ever
-    /// reach rows this test created.
+    /// Every managed workspace at once: the ready one is written, the not-ready one is skipped
+    /// and reported as skipped. Driven against the test's own store, so the fleet-wide write
+    /// can only reach rows this test created.
     #[tokio::test]
     async fn pause_every_managed_workspace_skips_not_ready() {
         let (store, _dir) = crate::open_test_store!(WorkspaceStore, "workspace");
@@ -707,11 +657,11 @@ mod tests {
             .set_status("ws_fleet", &WorkspaceStatus::Ready)
             .await
             .expect("mark ready");
-        // A fresh row is created paused (the pickup step lifts it), so the fleet
-        // pause below starts from a running pipeline.
+        // A fresh row is created paused (the pickup step lifts it), so the fleet pause below
+        // starts from a running pipeline.
         store.set_paused("ws_fleet", false).await.expect("unpause");
-        // Another not-ready workspace must be skipped rather than written — left
-        // unpaused, so a write would show.
+        // Another not-ready workspace must be skipped rather than written — left unpaused, so
+        // a write would show.
         store
             .add("ws_fleet_pending", pending.to_str().expect("utf-8 path"))
             .await
@@ -760,8 +710,8 @@ mod tests {
             "a not-ready workspace must not be paused"
         );
 
-        // A second fleet call, resuming: the ready workspace is written again and
-        // the not-ready one is still skipped.
+        // A second fleet call, resuming: the ready workspace is written again and the
+        // not-ready one is still skipped.
         let workspaces = store.list().await.expect("list");
         let reply = set_pipelines_paused(&store, &workspaces, false)
             .await
@@ -784,13 +734,11 @@ mod tests {
         assert_eq!(reply.text, NO_WORKSPACE);
     }
 
-    /// The unnamed form of `pause` / `resume` is the fleet-wide write, so it may
-    /// only be reached by a call that names nothing else: any other field —
-    /// whether it names a place (`name` and `path` belong to `add`, a ticket id
-    /// to the ticket actions), nothing this tool knows, or the ticket id the
-    /// product's own argument repair makes of a mistaken `id` — is a usage error.
-    /// The read actions take the same address and ignore such a field, as every
-    /// other tool does.
+    /// The unnamed form of `pause` / `resume` is the fleet-wide write, so it may only be
+    /// reached by a call that names nothing else: any other field — whether it names a place
+    /// (`name` and `path` belong to `add`, a ticket id to the ticket actions), nothing this
+    /// tool knows, or the ticket id the product's argument repair makes of a mistaken `id` — is
+    /// a usage error. The read actions take the same address and ignore such a field.
     #[tokio::test]
     async fn a_misspelled_address_never_escalates_to_the_fleet() {
         let _guard = crate::util::test::STORE_LOCK.lock().await;
@@ -822,8 +770,7 @@ mod tests {
             assert!(err.contains("usage:"), "for {call}: {err}");
         }
 
-        // A wrong-typed address is a usage error too, and it names the field the
-        // caller did write.
+        // A wrong-typed address is a usage error too, and it names the field the caller wrote.
         for value in [
             json!(3),
             json!(["ws_address"]),
@@ -848,10 +795,9 @@ mod tests {
             "a refused address must not pause anything"
         );
 
-        // A stray field on a read action is ignored rather than refused: the
-        // answer is the listing the call gives without it, neither widened nor
-        // dropped. (Narrowed to this one workspace, so a test running beside this
-        // one cannot change what is listed.)
+        // A stray field on a read action is ignored rather than refused: the answer is the
+        // listing the call gives without it, neither widened nor dropped. (Narrowed to this one
+        // workspace, so a test running beside this one cannot change what is listed.)
         for args in [
             json!({ "action": "list", "workspace": "ws_address" }),
             json!({ "action": "list", "workspace": "ws_address", "folder": "/tmp/ws_address" }),
@@ -899,8 +845,7 @@ mod tests {
         assert!(err.contains("<workspace>-<number>"), "got: {err}");
     }
 
-    /// `ticket` refuses an id whose workspace is not managed and an id with
-    /// no such ticket.
+    /// `ticket` refuses an id whose workspace is not managed and an id with no such ticket.
     #[tokio::test]
     async fn ticket_refuses_a_not_managed_workspace_and_missing_ticket() {
         crate::util::test::init_test_stores().await;
@@ -969,8 +914,8 @@ mod tests {
         );
     }
 
-    /// `board` refuses the archived phase, lists finished tickets of managed
-    /// workspaces and never a ticket of one that is not managed.
+    /// `board` refuses the archived phase, lists finished tickets of managed workspaces and
+    /// never a ticket of one that is not managed.
     #[tokio::test]
     async fn board_refuses_archived_and_skips_workspaces_that_are_not_managed() {
         crate::util::test::init_test_stores().await;
@@ -1011,8 +956,8 @@ mod tests {
             !listing.contains(&ghost_id),
             "a ticket of a workspace that is not managed must never be listed: {listing}"
         );
-        // The default listing keeps finished tickets — deliberately unlike the
-        // manager's own listing, which hides them.
+        // The default listing keeps finished tickets — deliberately unlike the manager's own
+        // listing, which hides them.
         let listing = tool
             .execute(&ws, json!({ "action": "board" }))
             .await
@@ -1048,8 +993,7 @@ mod tests {
                     "got: {listing}"
                 );
 
-                // A personal selection is not a managed workspace, so
-                // nothing is active.
+                // A personal selection is not a managed workspace, so nothing is active.
                 crate::users::store()
                     .set_selected_workspace(crate::users::ADMIN_USER_NAME, Some("personal:admin"))
                     .await

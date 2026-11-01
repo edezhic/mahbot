@@ -1,25 +1,19 @@
-//! Key handling for widgets we do not own — the embedded terminal.
+//! Key handling for widgets we do not own — the embedded terminal. iced's keyboard contract is
+//! built around the widgets it ships; the terminal is a third-party one that captures what it
+//! handles, so the adaptations below keep it consistent with the rest of the dashboard.
 //!
-//! iced's keyboard contract is built around the widgets it ships; the terminal
-//! is a third-party one that captures what it handles, so the adaptations below
-//! keep it consistent with the rest of the dashboard:
-//!
-//! - A widget that matches `keyboard::Key::Character("c")` matches the
-//!   character the active layout produces, so Ctrl/Cmd+C does nothing under a
-//!   Cyrillic (or any other non-Latin) layout. iced's own widgets translate the
-//!   key through `Key::to_latin(physical_key)`; this wrapper applies the same
-//!   translation to the events the terminal receives while a command/control
-//!   shortcut is held, so the terminal behaves as it does under an English
-//!   layout. Keys without that modifier are passed through untouched.
-//! - The terminal types any unbound printable key press into the session, so
-//!   the dashboard's Logs shortcut would become a literal character instead of
-//!   reaching [`keyboard::listen`]. Its `text` is dropped here, which leaves the
-//!   press uncaptured. Only macOS needs this: off macOS the chord is Ctrl+L,
-//!   which the terminal binds itself and therefore already captures.
-//! - The Sessions shortcut is dropped whole (see [`is_sessions_shortcut`]): off
-//!   macOS the terminal binds Ctrl+K itself and would swallow the press, so
-//!   dropping only the `text` would not be enough — and unlike Logs, its page
-//!   has to open from the terminal on every platform.
+//! A widget matching `keyboard::Key::Character("c")` matches the character the active layout
+//! produces, so Ctrl/Cmd+C does nothing under a Cyrillic layout. iced's own widgets translate the
+//! key through `Key::to_latin(physical_key)`; this wrapper applies the same translation to the
+//! events the terminal receives while a command/control shortcut is held, so it behaves as under an
+//! English layout. Keys without that modifier pass through untouched.
+//! The terminal types any unbound printable press into the session, so the dashboard's Logs
+//! shortcut would become a literal character instead of reaching [`keyboard::listen`]: its `text`
+//! is dropped here, leaving the press uncaptured. Only macOS needs that — off macOS the chord is
+//! Ctrl+L, which the terminal binds and captures itself. The Sessions shortcut is dropped whole
+//! ([`is_sessions_shortcut`]): off macOS the terminal binds Ctrl+K itself, so dropping only the
+//! `text` would not be enough — and unlike Logs, its page has to open from the terminal on every
+//! platform.
 
 use std::borrow::Cow;
 
@@ -39,10 +33,9 @@ struct TerminalKeys<'a, M> {
     content: Element<'a, M>,
 }
 
-/// Whether the press opens the Sessions page. The terminal must not see it at
-/// all — typing the `k` on macOS would capture the press, and off macOS the
-/// terminal's own Ctrl+K binding would — so it is dropped, which leaves the
-/// press for [`keyboard::listen`].
+/// Whether the press opens the Sessions page. The terminal must not see it at all — typing the `k`
+/// on macOS would capture the press, and off macOS the terminal's own Ctrl+K binding would — so it
+/// is dropped, which leaves the press for [`keyboard::listen`].
 fn is_sessions_shortcut(
     key: &keyboard::Key,
     modifiers: keyboard::Modifiers,
@@ -52,8 +45,8 @@ fn is_sessions_shortcut(
         == Some(super::DashboardShortcut::Sessions)
 }
 
-/// The same event, with a shortcut key translated to its latin character and
-/// the Logs shortcut left untyped.
+/// The same event, with a shortcut key translated to its latin character and the Logs shortcut left
+/// untyped.
 fn normalize(event: &Event) -> Cow<'_, Event> {
     let Event::Keyboard(keyboard::Event::KeyPressed {
         key,
@@ -67,8 +60,8 @@ fn normalize(event: &Event) -> Cow<'_, Event> {
     if !modifiers.command() {
         return Cow::Borrowed(event);
     }
-    // macOS only: off macOS Ctrl+L is the terminal's own clear-screen binding,
-    // matched before the text fallback, so the terminal keeps it.
+    // macOS only: off macOS Ctrl+L is the terminal's own clear-screen binding, matched before the
+    // text fallback, so the terminal keeps it.
     let logs_shortcut = cfg!(target_os = "macos")
         && super::dashboard_shortcut(key, *modifiers, *physical_key)
             == Some(super::DashboardShortcut::Logs);

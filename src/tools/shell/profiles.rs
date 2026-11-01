@@ -13,9 +13,6 @@
 use regex::{Regex, RegexSet};
 use std::sync::LazyLock;
 
-// ── Profile data structures ───────────────────────────────────────────
-
-/// A compiled output filter profile. Built once at init via [`Profile::new`] + builder methods.
 pub(super) struct Profile {
     pub(super) match_command: Regex,
     pub(super) strip_lines: Option<RegexSet>,
@@ -25,16 +22,12 @@ pub(super) struct Profile {
     pub(super) tail_lines: Option<usize>,
     pub(super) max_lines: Option<usize>,
     pub(super) on_empty: Option<&'static str>,
-    /// Message used instead of `on_empty` on non-zero exit; see `on_fail`.
     pub(super) on_fail_msg: Option<&'static str>,
-    /// Pipeline output transform; see `output_transform`.
     pub(super) output_transform: Option<fn(&str, exit_code: i32) -> String>,
-    /// Restricts `output_transform` to standalone commands; see `standalone_only`.
     pub(super) standalone_only: bool,
 }
 
 impl Profile {
-    /// Create a new profile that matches `command_pattern` (a regex against the canonical command).
     pub(super) fn new(match_command: &str) -> Self {
         Self {
             match_command: Regex::new(match_command)
@@ -60,8 +53,6 @@ impl Profile {
         self
     }
 
-    /// Like [`Self::strip`], but takes a pre-compiled [`RegexSet`] directly (e.g. from a
-    /// `LazyLock`-cached set). Clones the set (cheap — internally reference-counted).
     fn strip_set(mut self, patterns: &RegexSet) -> Self {
         self.strip_lines = Some(patterns.clone());
         self
@@ -133,17 +124,12 @@ impl Profile {
     }
 }
 
-// ── Shared strip/keep patterns ──────────────────────────────────────────
-
-/// Canonical list of cargo compilation noise prefixes (plain text).
+/// Canonical list of cargo compilation noise prefixes (plain text): the single source of truth for
+/// both the regexes built below and `filter_cargo_test_output`'s `starts_with` skips.
 ///
-/// This is the single source of truth for cargo compilation noise patterns.
-/// - `profiles.rs` builds regex patterns (`^\s*<prefix>\s`) from these for the profile pipeline.
-/// - `filter_cargo_test_output` uses `starts_with` checks against these to skip compilation noise.
-///
-/// NOTE: `Running` is intentionally included — it is noise in cargo build output
-/// (`Running \`rustc ...\``). However, `filter_cargo_test_output` explicitly skips `Running`
-/// because `Running unittests src/lib.rs` is useful context in test output.
+/// `Running` is included on purpose — it is noise in cargo build output (`Running \`rustc ...\``) —
+/// while `filter_cargo_test_output` skips it, because `Running unittests src/lib.rs` is useful
+/// context in test output.
 pub(super) const CARGO_COMPILE_PREFIXES: &[&str] = &[
     "Compiling",
     "Checking",
@@ -156,8 +142,6 @@ pub(super) const CARGO_COMPILE_PREFIXES: &[&str] = &[
     "Running",
 ];
 
-/// Derived [`RegexSet`] from [`CARGO_COMPILE_PREFIXES`], compiled once at init.
-/// Used by `cargo_tool` and other cargo profiles via `Profile::strip_set`.
 static CARGO_COMPILE_STRIP: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new(
         CARGO_COMPILE_PREFIXES
@@ -169,15 +153,10 @@ static CARGO_COMPILE_STRIP: LazyLock<RegexSet> = LazyLock::new(|| {
     })
 });
 
-/// Stderr lines *kept* through cargo compile output filtering.
 const CARGO_COMPILE_KEEP_STDERR: &[&str] = &[r"warning:", r"^error"];
 
-/// Blank/empty line pattern. Used in `.strip()` calls to remove whitespace-only lines.
 const BLANK_LINE: &str = r"^\s*$";
 
-// ── Helper builders ─────────────────────────────────────────────────
-
-/// Build a "small utility" profile: strips blanks, truncates long lines, caps at `max_lines`.
 fn small_util(matcher: &str, max_lines: usize) -> Profile {
     Profile::new(matcher)
         .strip(&[BLANK_LINE])
@@ -216,8 +195,6 @@ fn lint_tool(matcher: &str, max_lines: usize, ok_msg: &'static str) -> Profile {
         .on_empty(ok_msg)
 }
 
-// ── Profile definitions ─────────────────────────────────────────────
-
 /// Generic fallback applied to all commands that don't match a specific profile.
 pub(super) static GEN_FALLBACK: LazyLock<Profile> = LazyLock::new(|| {
     Profile::new("")
@@ -240,13 +217,10 @@ fn product_surface_profile() -> Profile {
     Profile::new(&format!(r"^mahbot\s+(?:chrome|audio|{families})\b"))
 }
 
-/// Compiled profiles, built once on first access.
 pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
     vec![
-        // ── General shell ────────────────────────────────────────────────
         product_surface_profile(),
         Profile::new(r"^df\b").max_line_len(80).max(20),
-        // Simple utilities: strip blanks, truncate long lines, cap at 50
         small_util(r"^(?:du|shellcheck|stat|ps|rustc)\b", 50),
         Profile::new(r"^make\b")
             .strip(&[r"make\[\d+\]:", BLANK_LINE, r"Nothing to be done"])
@@ -270,7 +244,6 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
             .strip(&[BLANK_LINE])
             .head(5)
             .tail(10),
-        // ── Container & infra ─────────────────────────────────────────────
         Profile::new(r"^docker\b")
             .strip(&[
                 BLANK_LINE,
@@ -292,14 +265,12 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
             .tail(10)
             .max(30)
             .on_empty("[helm: ok]"),
-        // ── VCS ─────────────────────────────────────────────────────────
         Profile::new(r"^git\s+log\b")
             .strip(&[BLANK_LINE])
             .max_line_len(200)
             .head(20)
             .max(50),
         Profile::new(r"^git\s+diff\b").on_empty("[git diff: no changes]"),
-        // ── Rust toolchain ────────────────────────────────────────────────
         cargo_tool(
             r"^cargo\s+(build|check)\b",
             50,
@@ -321,7 +292,6 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
         Profile::new(r"^rustup\b")
             .strip(&[r"^info:", r"syncing", r"downloading", r"installing"])
             .max(20),
-        // ── JS/TS ecosystem ──────────────────────────────────────────────
         Profile::new(r"^npm\s+install\b")
             .strip(&[
                 r"^\s*added\s",
@@ -377,7 +347,7 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
         Profile::new(r"^yarn\b")
             .strip(&[r"^info\s", r"\[\d+/\d+\]"])
             .max(20),
-        // ── Python ecosystem ──────────────────────────────────────────────
+        // Python ecosystem
         // NOTE: Only `^pytest\b` is needed here — `python -m pytest` and
         // `poetry run pytest` intentionally fall through to GEN_FALLBACK
         // because canonical_command() strips intermediate flags (like `-m`)
@@ -403,7 +373,6 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
                 r"^Successfully installed\s",
             ])
             .max(30),
-        // ── Query & search ──────────────────────────────────────────────
         Profile::new(r"^fd\b")
             .strip(&[BLANK_LINE])
             .head(20)
@@ -414,23 +383,19 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
             .head(20)
             .tail(10)
             .max(60),
-        // ── Test frameworks ──────────────────────────────────────────────
         Profile::new(r"^mocha\b")
             .strip(&[BLANK_LINE, r"^\s*(✓|✗|√|×)\s"])
             .tail(15)
             .max(40),
-        // ── Terraform ────────────────────────────────────────────────────
         Profile::new(r"^terraform\b")
             .strip(&[BLANK_LINE, r"^Initializing", r"^Terraform has been"])
             .head(5)
             .tail(15)
             .max(40)
             .on_empty("[terraform: ok]"),
-        // ── Cargo test / nextest ────────────────────────────────────────
         Profile::new(r"^cargo\s+(test|nextest)\b")
             .output_transform(super::filter_cargo_test_output)
             .standalone_only(),
-        // ── ls ─────────────────────────────────────────────────────────────
         Profile::new(r"^ls\b")
             .output_transform(super::compact_ls)
             .standalone_only(),

@@ -1,51 +1,32 @@
-//! The shell tool: a command string run by the platform's shell, with its output
-//! captured, its process tree contained, and its bounds enforced.
+//! The shell tool: a command string run by the platform's shell, its output captured, its process
+//! tree contained, its bounds enforced.
 //!
-//! Two modes ([`ShellMode`]) share everything below: `Full` is an agent's own
-//! shell, while `ReadOnly` only lets through the commands the guard ([`readonly`])
-//! allows. A third, deliberately separate surface — the background session
-//! ([`bg`]) — is how a `Full` agent starts a command meant to keep running after
-//! the tool call returns.
+//! Two modes ([`ShellMode`]) share everything below: `Full` is an agent's own shell, `ReadOnly`
+//! lets through what the guard ([`readonly`]) allows; the background session ([`bg`]) is how a
+//! `Full` agent starts a command meant to outlive the call.
 //!
-//! # What decides a call
+//! What decides a call: the command's own EXIT STATUS, never the fate of the pipe readers. Two
+//! bounds frame its output — the per-stream capture ([`SHELL_PIPE_READ_CAP`] head,
+//! [`SHELL_PIPE_TAIL_CAP`] end) and the post-exit drain ([`DEFAULT_OUTPUT_DRAIN_TIMEOUT_SECS`]) —
+//! and neither turns a finished command into an error.
 //!
-//! The command's own EXIT STATUS decides the call, never the fate of the pipe
-//! readers: a command that exited 0 is a success and one that exited non-zero is
-//! its own failure, and its output is what its pipes delivered. Two bounds frame
-//! that output — the per-stream capture ([`SHELL_PIPE_READ_CAP`]): a head, and the
-//! [`SHELL_PIPE_TAIL_CAP`] end a flood would otherwise push it past, keeping the
-//! verdict a run ends with — and the post-exit drain
-//! ([`DEFAULT_OUTPUT_DRAIN_TIMEOUT_SECS`]) — and neither turns a finished command
-//! into an error.
+//! A leftover can keep a capture pipe open past the drain bound, so EOF never arrives. It is
+//! abandoned work: the run's whole tree is ended the moment it is detected ([`stop_leftover`]) and
+//! the call keeps the command's own result. Only a stop that does not take is reported — the
+//! residual case, where the channel is RETAINED on our side (past the retained-channel cap that
+//! guarantee ends, [`crate::util::leftover_channels`]) and named with how to stop it
+//! ([`format_leftover_note`]).
 //!
-//! A process the command left behind can keep a capture pipe open past the drain
-//! bound, so EOF never arrives. It is abandoned work: the run's whole tree is ended
-//! the moment it is detected ([`stop_leftover`]) and the call keeps the command's own
-//! result. Only a stop that does not take is reported — the residual case, where the
-//! channel is RETAINED on our side (past the retained-channel cap that guarantee ends,
-//! [`crate::util::leftover_channels`]) and the leftover is named in the result with how
-//! to stop it ([`format_leftover_note`]).
+//! `leftovers` decides what the call reports ([`LeftoverPolicy`]): an agent's command keeps its own
+//! exit status and output and names what it could not stop, while a program this product runs for
+//! itself (automation, custom tool, document kit, renderer, browser probes) has its leftover ended
+//! first and is judged by the status it had already produced
+//! ([`ShellRunResult::EndedWithLeftovers`]).
 //!
-//! `leftovers` decides what the call reports ([`LeftoverPolicy`]): an agent's
-//! command keeps its own exit status and output and names the leftover it could not
-//! stop, while a program this product runs for itself (a user's automation, a custom
-//! tool's script, the document kit, the renderer's installs, browser probes and
-//! renders) has its leftover ended first and is then judged by the exit status it had
-//! already produced ([`ShellRunResult::EndedWithLeftovers`]). A process a `Full` agent
-//! starts to keep running belongs to the background session ([`bg`]), not to a
-//! call, so it never reaches this path.
-//!
-//! # The runner's own steps
-//!
-//! On Windows a line that runs this product's own image is decomposed by the runner
-//! ([`plan`]): a call it can reproduce as a step of its own is run by the runner,
-//! which waits for it and reports its own status and output — the same
-//! [`ShellRunResult`] a shell run produces — while a shape it cannot reproduce stays
-//! with the shell or is refused (see [`plan`]'s refusals and residuals). The grep
-//! engine ([`grep_engine`]) rewrites searches the same way. The plan runner and the
-//! single-child runner share the capture ([`Readers`]), the containment
-//! ([`tree`]) and the bounds ([`Watchdog`]) below, so a change to any of them is a
-//! change to both.
+//! The runner's own steps: on Windows a line that runs this product's image is decomposed by the
+//! runner ([`plan`]), and the grep engine ([`grep_engine`]) rewrites searches the same way. Both
+//! share the capture ([`Readers`]), the containment ([`tree`]) and the bounds ([`Watchdog`]), so a
+//! change to any of them is a change to both.
 //!
 //! [`tree`]: self::tree
 //! [`bg`]: self::bg
@@ -93,70 +74,49 @@ pub use self::readonly::ShellMode;
 use self::readonly::check_command;
 use self::tree::{RunOwner, Tree};
 
-/// The shell that runs a validated command string (`sh -c` on unix, `cmd.exe`
-/// with its own settings pinned — [`WINDOWS_COMMAND_SWITCHES`] — and `/C` on
-/// Windows). Every platform rule in this module tree reads
-/// this one value — the spawn side ([`build_shell_command`]), the reading of a
-/// command's line breaks ([`windows_line`], which decides the text the spawn
-/// hands over), the read-only guard's tables and the grep engine's command
-/// model — as a runtime value
-/// rather than a `cfg` branch, so both platforms' behaviour is drivable from
-/// any host's unit-test lane. Only the value's own definition branches on the
-/// target ([`SHELL_PLATFORM`] is one `if cfg!(windows)` constant); every
-/// consumer takes it as data.
+/// The shell a validated command string runs through (`sh -c`, or `cmd.exe` with its own settings
+/// pinned, [`WINDOWS_COMMAND_SWITCHES`]). Every platform rule in this module tree reads this value
+/// rather than a `cfg` branch, so both platforms' behaviour is drivable from any host's unit-test
+/// lane; only its own definition branches on the target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ShellPlatform {
     Unix,
     Windows,
 }
 
-/// The running process's [`ShellPlatform`]; its spawn side is
-/// [`build_shell_command`] — the two must not drift.
+/// The running process's [`ShellPlatform`]; its spawn side is [`build_shell_command`] — the two
+/// must not drift.
 pub(super) const SHELL_PLATFORM: ShellPlatform = if cfg!(windows) {
     ShellPlatform::Windows
 } else {
     ShellPlatform::Unix
 };
 
-/// The Windows command interpreter, named once so the spawn side
-/// ([`build_shell_command`]) and the GUI Shell page's terminal
-/// (`gui::shell::terminal_program`) cannot start different programs.
+/// Named once so the spawn side ([`build_shell_command`]) and the GUI Shell page's terminal cannot
+/// start different programs.
 pub(crate) const WINDOWS_COMMAND_INTERPRETER: &str = "cmd.exe";
 
-/// The switches the Windows command interpreter is always started with, ahead of
-/// `/C`: `/D` disables the machine's AutoRun scripts, `/E:ON` fixes command
-/// extensions on and `/V:OFF` fixes delayed expansion off. Those three are
-/// otherwise read from the machine's registry, where any of them would make the
-/// same command text behave differently; pinned here, this interpreter's own
-/// behaviour is the product's rather than the machine's. Two consequences are
-/// deliberate: the machine's AutoRun scripts no longer run for the commands this
-/// shell starts, and an interpreter a command starts for itself (`cmd`,
-/// `powershell`) keeps the machine's own settings, because only this one is
+/// The switches the Windows interpreter always starts with, ahead of `/C`: `/D` disables AutoRun
+/// scripts, `/E:ON` fixes command extensions on and `/V:OFF` fixes delayed expansion off — all
+/// three otherwise read from the machine's registry, where any would make the same command text
+/// behave differently. AutoRun scripts therefore no longer run for this shell's commands, while a
+/// `cmd` or `powershell` a command starts for itself keeps the machine's settings: only this one is
 /// pinned.
 const WINDOWS_COMMAND_SWITCHES: &str = "/D /E:ON /V:OFF";
 
-/// The frame every refusal of a run opens with — the cause follows, then the
-/// consequence that belongs to the entry point that refused. Spelled once here so
-/// the four renderers of it ([`grep_engine::unserved_failure`], the plan runner's
-/// [`plan::refusal_message`], [`windows_line::refusal`], and the read-only guard's
-/// own [`readonly::windows::refusal`]) cannot word one cause two ways.
+/// The frame every refusal opens with — the cause follows, then the consequence the refusing entry
+/// point owns. Spelled once so its four renderers ([`grep_engine::unserved_failure`],
+/// [`plan::refusal_message`], [`windows_line::refusal`], [`readonly::windows::refusal`]) cannot
+/// drift.
 pub(super) const REFUSAL_FRAME: &str = "Command not run: ";
 
-/// The shared rendering of a refusal: the frame that names the refusing reader —
-/// the shared [`REFUSAL_FRAME`] above, or the read-only guard's own — the cause,
-/// the command itself and what to write instead. Both frames go through here so
-/// their tail cannot drift apart.
 pub(super) fn framed_refusal(frame: &str, cmd: &str, why: &str, suggestion: &str) -> String {
     format!("{frame}{why}\nCommand: `{cmd}`\nSuggestion: {suggestion}")
 }
 
-/// Shell builtins/prefixes to skip when extracting the primary command.
-/// NOTE: `su` is intentionally NOT in this list. It can be used to run
-/// commands as another user (e.g., `su -c "rm -rf /"`), which would bypass
-/// the read-only validation. This is an accepted gap — adding `su` would be
-/// a half-measure since there are countless other privilege-escalation
-/// vectors, and the read-only shell is a best-effort safety layer, not a
-/// sandbox.
+/// Shell builtins/prefixes to skip when extracting the primary command. `su` is deliberately
+/// absent: it runs commands as another user (`su -c "rm -rf /"`) and would bypass read-only
+/// validation — an accepted gap, a half-measure against the countless other escalation vectors.
 pub(super) const SHELL_PREFIXES: &[&str] = &[
     "cd",
     "pushd",
@@ -166,10 +126,8 @@ pub(super) const SHELL_PREFIXES: &[&str] = &[
     ".",
     "sudo",
     "time",
-    // `!` negation: needed so the raw first-command-word scan skips it
-    // (`time ! rm -rf ./x` must dispatch `rm` to the blocklist). Side effect
-    // on shared consumers: `canonical_command` routes `! ls` to the ls
-    // profile — safe direction, profile selection only.
+    // `!` negation: the raw first-command-word scan must skip it (`time ! rm -rf ./x` dispatches
+    // `rm`). Side effect: `canonical_command` routes `! ls` to the ls profile.
     "!",
     "command",
     "builtin",
@@ -183,86 +141,57 @@ pub(super) const SHELL_PREFIXES: &[&str] = &[
     "npx",
 ];
 
-/// Corresponding entries in [`SHELL_PREFIXES`] that do NOT forward their
-/// arguments as a command — they change shell state internally. These are
-/// excluded from delegation-based tests because they don't execute their
-/// arguments.
 #[cfg(test)]
 pub(super) const NON_DELEGATING_PREFIXES: &[&str] =
     &["cd", "pushd", "popd", "export", "source", "."];
 
-/// Git global flags that may appear between `git` and its subcommand.
-///
-/// **IMPORTANT**: Only include flags that take a space-separated value argument.
-/// Boolean flags like `--bare` MUST NOT be listed here — `find_first_non_flag_index`
-/// skips 2 words (flag + value) for each entry, causing boolean flags to consume
-/// the subcommand as their "value" and bypass read-only validation entirely.
+/// Git global flags that may appear between `git` and its subcommand, space-separated values only.
+/// Never a boolean flag like `--bare`: `find_first_non_flag_index` skips two words per entry, so it
+/// would swallow the subcommand and bypass read-only validation.
 const GIT_GLOBAL_FLAGS: &[&str] = &["-C", "--git-dir", "--work-tree", "-c"];
 
-/// Default maximum shell command execution time before kill, and the ceiling an
-/// ordinary product call is held to.
 pub(crate) const DEFAULT_SHELL_TIMEOUT: Duration = Duration::from_secs(600);
-/// Absolute maximum allowed shell command timeout (1 hour).
-/// Prevents agents from setting absurdly long timeouts.
+/// Absolute maximum shell command timeout (1 hour), so agents cannot set absurd ones.
 const MAX_SHELL_TIMEOUT_SECS: u64 = 3600;
-/// Default bound on the post-exit output drain (seconds). Output still not at EOF
-/// past it means a leftover process holds a capture pipe — [`leftover_result`]'s
-/// case to end and report.
+/// Default bound on the post-exit output drain (seconds). Output still not at EOF past it means a
+/// leftover process holds a capture pipe — [`leftover_result`]'s case to end and report.
 const DEFAULT_OUTPUT_DRAIN_TIMEOUT_SECS: u64 = 10;
-/// Grace window given to pipe readers to notice cancellation and return
-/// buffered partial output after a process-group kill. It is also the bound
-/// within which a stopped leftover's capture pipes must close ([`stop_leftover`]):
-/// past it, the stop is taken not to have happened.
+/// Grace for pipe readers to return buffered partial output after a process-group kill, and the
+/// bound within which a stopped leftover's pipes must close ([`stop_leftover`]): past it the stop
+/// is taken not to have happened.
 const DRAIN_CANCEL_GRACE: Duration = Duration::from_secs(2);
-/// How often a running command's whole process tree is sampled for resident
-/// memory ([`mem`]) — modest, since every sample walks the tree and reads
-/// each process in it. A run always takes at least one sample: the interval's
-/// first tick is immediate.
+/// How often a running command's tree is sampled for resident memory ([`mem`]); every sample walks
+/// the tree. The first tick is immediate, so a run always takes one.
 const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
-/// Cap bytes collected from a run's pipes during command execution (including
-/// timeouts): the head of what each stream of a run's capture gets
-/// ([`CaptureBudget`]).
+/// Cap bytes collected from a run's pipes during command execution (timeouts included): the head
+/// each stream's capture gets ([`CaptureBudget`]).
 ///
-/// # Truncation safety
-///
-/// One stream delivers this head, the [`SHELL_PIPE_TAIL_CAP`] end and the
-/// [`TRUNCATED_MIDDLE`] join — 288 KB — which a lossy decode can expand to at most
-/// three bytes per byte. Both stay below 1 MB, so the [`decode_and_strip_ansi`]
-/// output never reaches a size where truncation would be necessary. If either cap is
-/// raised past that, re-add truncation safeguards (e.g.,
-/// [`truncate_sandwich`](crate::util::truncate_sandwich) after ANSI stripping)
-/// to prevent unbounded output.
+/// One stream delivers this head, the [`SHELL_PIPE_TAIL_CAP`] end and the [`TRUNCATED_MIDDLE`] join
+/// — 288 KB, which a lossy decode can expand threefold. Both stay below 1 MB, so
+/// [`decode_and_strip_ansi`] output never reaches a size needing truncation; raise either cap past
+/// that and truncation safeguards must come back.
 const SHELL_PIPE_READ_CAP: usize = 256 * 1024;
-/// Bytes kept from the *end* of a stream the head above had no room for: a run's
-/// verdict, its last error line and its exit summary are written after everything
-/// else, so the end is the part a reader needs most — and the one an unbounded run
-/// (a render) would otherwise lose to its own progress noise.
+/// Bytes kept from the *end* of a stream the head had no room for: a run's verdict, its last error
+/// line and its exit summary are written last, so the end is what a reader needs most and what an
+/// unbounded run's own progress noise would otherwise push out.
 const SHELL_PIPE_TAIL_CAP: usize = 32 * 1024;
-/// Where a stream outgrew its head: a line of its own, so a reader that scans lines
-/// never mistakes the join for the program's own output.
+/// Where a stream outgrew its head: a line of its own, so a line scanner cannot mistake the join.
 const TRUNCATED_MIDDLE: &str = "\n…\n";
 /// Max chars of partial output included in timeout error messages.
 const TIMEOUT_OUTPUT_TAIL_CHARS: usize = 2_000;
-/// Max chars of the engine's own stderr line quoted as the cause of a refused
-/// Windows search (see [`engine_cause`]).
 const ENGINE_FAILURE_DETAIL_CHARS: usize = 200;
 
-/// The reduced environment the product uses for its own internal work and as the
-/// fallback for the agent's commands until a read of the owner's environment
-/// succeeds (see [`crate::shell_env`]).
-///
-/// Only functional variables are included — never API keys or secrets. The
-/// platform's temp variables are NOT listed here: they are bound to the daemon's
-/// private temp root by [`crate::temp::shell_temp_vars`].
+/// The reduced environment for the product's own work and the fallback for an agent's commands
+/// until the owner's environment is read ([`crate::shell_env`]). Functional variables only — never
+/// API keys or secrets. Temp variables are not listed: they are bound to the daemon's private temp
+/// root by [`crate::temp::shell_temp_vars`].
 #[cfg(not(target_os = "windows"))]
 const FALLBACK_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL",
 ];
 
-/// The reduced environment, as [`FALLBACK_ENV_VARS`] on every other platform,
-/// carrying in addition the Windows-specific variables program resolution and
-/// cmd.exe need. The temp variables are not listed here either: they are bound to
-/// the daemon's private temp root.
+/// [`FALLBACK_ENV_VARS`] plus the Windows names program resolution and cmd.exe need; the temp
+/// variables are bound to the private temp root here too.
 #[cfg(target_os = "windows")]
 const FALLBACK_ENV_VARS: &[&str] = &[
     "PATH",
@@ -280,24 +209,13 @@ const FALLBACK_ENV_VARS: &[&str] = &[
     "USERNAME",
 ];
 
-/// The environment the product's own work runs in — git (see
-/// [`crate::git::commands::git_command`]) and the document kit — and the one an
-/// agent's command falls back to until the owner's environment has been read
-/// ([`agent_env_pairs`]): every name in [`FALLBACK_ENV_VARS`] with its baseline
-/// value, then the platform's temp variables bound to the daemon's private temp
-/// root.
-///
-/// The temp names and value come from [`crate::temp::shell_temp_vars`] — the same
-/// pair the read-only guard's temp model reads — so the scratch location a child
-/// actually writes to and the location the guard accepts for a write cannot drift
-/// apart, and a new temp name reaches both at once.
-///
-/// A child's environment is cleared and re-populated from this list (see
-/// [`program_command`]): the product's own work must not be affected by the
-/// owner's personal environment, and must not leak credentials anywhere. Internal
-/// work that is not given an environment at all — self-update's cargo child, the
-/// chrome CLI and the browser, the GUI Shell page's terminal — inherits this
-/// process's environment, as documented where each is spawned.
+/// The environment the product's own work runs in — git ([`crate::git::commands::git_command`]) and
+/// the document kit — and the one an agent's command falls back to until the owner's is read
+/// ([`agent_env_pairs`]): every [`FALLBACK_ENV_VARS`] name with its baseline value, then the temp
+/// variables bound to the daemon's private temp root. Those come from
+/// [`crate::temp::shell_temp_vars`] — the pair the read-only guard's temp model reads — so the
+/// location a child writes to and the one the guard accepts cannot drift. A child is cleared and
+/// re-populated from this list ([`program_command`]): no owner environment, no credential leaks.
 #[must_use]
 pub(crate) fn internal_env_pairs() -> Vec<(OsString, OsString)> {
     let mut pairs = Vec::new();
@@ -312,31 +230,23 @@ pub(crate) fn internal_env_pairs() -> Vec<(OsString, OsString)> {
     pairs
 }
 
-/// The environment an agent's command runs in: the owner's own environment
-/// ([`crate::shell_env::snapshot`]) once a read has succeeded, with the
-/// data-location home and the pinned temp names applied last, otherwise the
-/// reduced [`internal_env_pairs`].
+/// The environment an agent's command runs in: the owner's own ([`crate::shell_env::snapshot`])
+/// once a read has succeeded, with the data-location home and the pinned temp names applied last;
+/// the reduced [`internal_env_pairs`] otherwise.
 ///
-/// Nothing read from the owner's environment is filtered — his secrets and
-/// tokens are handed over as they are, by design: these are his own commands
-/// doing his own work. The two overrides keep winning, which is what the
-/// documented "test instance from another folder" workflow relies on: `HOME`
-/// stays the data-location home and the temp names stay the private temp root,
-/// so a command cannot write into the owner's real home or temp area by
-/// accident. On Windows the home that wins is the profile the OS reports for the
-/// owner — not `$HOME`, so an install relocated through it is not reflected — and
-/// the OS-assembled `USERPROFILE` stays as the owner's profile; the temp names
-/// are pinned there like everywhere else.
+/// Nothing read from the owner is filtered — his secrets and tokens go over as they are, by design.
+/// The two overrides keep winning, which the documented "test instance from another folder"
+/// workflow relies on: `HOME` stays the data-location home and the temp names stay the private temp
+/// root, so a command cannot write into the owner's real home or temp area. On Windows the home
+/// that wins is the profile the OS reports for the owner, not `$HOME`.
 #[must_use]
 pub(crate) fn agent_env_pairs() -> Vec<(OsString, OsString)> {
     crate::shell_env::snapshot()
         .map_or_else(internal_env_pairs, |owner| agent_env_pairs_from(&owner))
 }
 
-/// [`agent_env_pairs`] for a read that is not the published one: the same
-/// application, so a caller can ask what commands *will* get before the read is in
-/// place (the environment reader drops the parity verdict for exactly that
-/// environment, in the step before it publishes).
+/// [`agent_env_pairs`] for a read that is not yet published: the same application, so a caller can
+/// ask what commands *will* get before the read is in place.
 #[must_use]
 pub(crate) fn agent_env_pairs_from(
     owner: &crate::shell_env::OwnerEnv,
@@ -349,10 +259,9 @@ pub(crate) fn agent_env_pairs_from(
     for (name, value) in crate::temp::shell_temp_vars() {
         overrides.push((OsString::from(name), OsString::from(value)));
     }
-    // The product's own values replace the owner's rather than shadowing them, so
-    // the list is exactly the environment a command gets: nothing in it that the
-    // child will not see, and the parity key — which is compared on this list —
-    // moves only when what commands get moves.
+    // The product's own values replace the owner's, so the list is exactly the environment a
+    // command gets — nothing in it the child will not see — and the parity key moves only when that
+    // changes.
     for (name, value) in overrides {
         match pairs.iter().position(|(existing, _)| *existing == name) {
             Some(index) => pairs[index].1 = value,
@@ -362,9 +271,9 @@ pub(crate) fn agent_env_pairs_from(
     pairs
 }
 
-/// Apply `pairs` to a child's environment, from nothing: the one definition of
-/// a clear-and-fill spawn environment, used by [`program_command`] and by the
-/// async builders [`apply_agent_env`] and [`program_command_with`].
+/// Apply `pairs` to a child's environment, from nothing: the one definition of a clear-and-fill
+/// spawn environment, used by [`program_command`] and by the async builders [`apply_agent_env`] and
+/// [`program_command_with`].
 fn apply_env_pairs(cmd: &mut std::process::Command, pairs: &[(OsString, OsString)]) {
     cmd.env_clear();
     cmd.envs(pairs.iter().map(|(name, value)| (name, value)));
@@ -375,44 +284,23 @@ pub(crate) fn apply_agent_env(cmd: &mut tokio::process::Command) {
     apply_env_pairs(cmd.as_std_mut(), &agent_env_pairs());
 }
 
-/// The command that starts `program` with `env` as the child's whole environment
-/// and `dir` as its working directory. On macOS `program` is named by the absolute
-/// path that environment's own search list resolves it to ([`resolve_program_path`]),
-/// so that [`std`](std::process::Command) takes its non-forking start: it forks for a
-/// bare program name whenever the command sets `PATH` (it must — the search belongs to
-/// the child), and a forked child of this process makes macOS print a line about memory
-/// tooling to the daemon's own stderr, once per command started — the terminal the launch
-/// came from, or `daemon.log` once it detached from one.
-/// `argv[0]` keeps the bare name, so the program sees exactly what
-/// `Command::new(program)` would have handed it; environment, directory, streams,
-/// process group and exit status stay the caller's. Only `Command::new` can name a
-/// program, so the name is chosen here rather than on a command already built.
+/// Start `program` with `env` as the child's whole environment and `dir` as its directory.
 ///
-/// `env` is applied here ([`apply_env_pairs`]): the list that names the program and
-/// the environment the child gets must be one, so a site that sets the child's
-/// directory afterwards passes an absolute list (the product's own internal one is) or
-/// nothing. A name carrying a separator is the caller's own program, passed through as
-/// it is, and the classes where a resolved path would change what runs keep the bare
-/// name ([`resolve_program_path`], [`is_mach_o`]) — those fork exactly as they do
-/// today.
-///
-/// Only macOS resolves anything: elsewhere `program` is named exactly as given, the
-/// Windows `cmd.exe` site included, where the platform's own start call does the
-/// search with its own extension rules. The command carries `CREATE_NO_WINDOW` on
-/// Windows, like every spawn in this tree ([`tree`]).
-///
-/// The starts that need a session of their own are deliberately not served here
-/// ([`crate::shell_env`], [`crate::gui::shell`], the Telegram Bot API helper, the update
-/// replacement): `std` has no session control, so no naming can spare them the fork — a
-/// hand-written start call could, and is not attempted.
+/// On macOS the program is named by the absolute path its search list resolves to
+/// ([`resolve_program_path`]) so [`std`](std::process::Command) takes its non-forking start — it
+/// forks for a bare name whenever the command sets `PATH`, and a forked child makes macOS print a
+/// memory-tooling line per command. `argv[0]` keeps the bare name; environment, directory, streams,
+/// process group and exit status stay the caller's, and `env` is applied here ([`apply_env_pairs`])
+/// because the list naming the program and the one the child gets must be one. Elsewhere the name
+/// goes through as given (Windows spawns carry `CREATE_NO_WINDOW`); starts needing a session of
+/// their own are deliberately not served here, `std` being unable to spare them the fork.
 #[must_use]
 pub(crate) fn program_command(
     program: &str,
     env: &[(OsString, OsString)],
     dir: Option<&Path>,
 ) -> std::process::Command {
-    // macOS only: otherwise every name is left as it was given. `None` is also the
-    // answer for the classes the doc lists as left alone.
+    // macOS only: otherwise every name is left as it was given, and `None` is the answer.
     #[cfg(target_os = "macos")]
     let resolved = if program.contains('/') {
         None
@@ -443,30 +331,19 @@ pub(crate) fn program_command(
     cmd
 }
 
-/// `/usr/bin:/bin` — Darwin's `_PATH_DEFPATH`, the list `execvp` falls back to when
-/// the child's environment carries no `PATH`.
+/// `/usr/bin:/bin` — Darwin's `_PATH_DEFPATH`, the list `execvp` falls back to when the child's
+/// environment carries no `PATH`.
 #[cfg(target_os = "macos")]
 const DEFAULT_SEARCH_PATH: &str = "/usr/bin:/bin";
 
-/// The path [`program_command`] names `program` by: the first entry of `env`'s
-/// search list ([`DEFAULT_SEARCH_PATH`] when the environment carries none) that
-/// holds an executable regular file by that name.
-///
-/// The rules are `execvp`'s, because the point is to name the program that same
-/// call would have started: entries in order, an empty or relative entry resolved
-/// against the child's own directory (`None`: the daemon's working directory, which
-/// is where a child with no directory of its own looks), an absolute one joined
-/// directly, and a directory, or a file the effective user may not execute, skipped
-/// with the search going on. The result is absolute, so a leftover relative path
-/// ([`std::path::absolute`]) carries no dependence on the daemon's own working
-/// directory.
-///
-/// Two residues, both of them on the way to the start rather than in it. The
-/// permission test happens once, here, where `execvp` repeats it in the child and
-/// goes on to the next entry when it fails there: a permission that changes between
-/// this look and the start makes the start fail where today the search would have
-/// continued. And the look is a few `stat`s and one `access` on the caller's own
-/// thread, where `execvp` did that work in the forked child.
+/// The path [`program_command`] names `program` by: the first entry of `env`'s search list holding
+/// an executable regular file by that name ([`DEFAULT_SEARCH_PATH`] when the environment carries
+/// none). The rules are `execvp`'s, because the point is to name the program that call would have
+/// started: entries in order, an empty or relative entry resolved against the child's own directory
+/// (`None`: the daemon's), an absolute one joined directly, a directory or a nonexecutable file
+/// skipped with the search going on, and the result made absolute. Residues: the permission test
+/// happens once here where `execvp` repeats it in the child, so a permission changing in between
+/// fails the start; and the look is a few `stat`s on the caller's own thread.
 #[cfg(target_os = "macos")]
 fn resolve_program_path(
     program: &str,
@@ -477,10 +354,9 @@ fn resolve_program_path(
         || OsString::from(DEFAULT_SEARCH_PATH),
         |(_, value)| value.clone(),
     );
-    // Resolved only if a relative or empty entry needs it: an absolute entry — every
-    // entry of the product's own list — never asks. A directory that cannot be read
-    // leaves the candidate relative, and the absolute step below then gives up and
-    // leaves the bare name, as before.
+    // Resolved only if a relative or empty entry needs it: an absolute entry — every entry of the
+    // product's own list — never asks. A directory that cannot be read leaves the candidate
+    // relative, and the absolute step below then gives up and leaves the bare name, as before.
     let mut search_dir: Option<PathBuf> = base_dir.map(Path::to_path_buf);
     std::env::split_paths(&search)
         .map(|entry| {
@@ -497,10 +373,9 @@ fn resolve_program_path(
         .and_then(|candidate| std::path::absolute(candidate).ok())
 }
 
-/// Whether `path` is a regular file the effective user may execute — `execvp`'s own
-/// test, `access(X_OK)` included: mode bits alone would name a file that is
-/// executable for someone else and then fail the start, where the search should
-/// have continued.
+/// Whether `path` is a regular file the effective user may execute — `execvp`'s own test,
+/// `access(X_OK)` included: mode bits alone would name a file executable for someone else and then
+/// fail the start, where the search should have continued.
 #[cfg(target_os = "macos")]
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
@@ -514,27 +389,14 @@ fn is_executable_file(path: &Path) -> bool {
     unsafe { libc::access(c_path.as_ptr(), libc::X_OK) == 0 }
 }
 
-/// Whether `path` begins with a Mach-O header: thin (`MH_MAGIC`/`MH_MAGIC_64`) or
-/// universal (`FAT_MAGIC`/`FAT_MAGIC_64`), each in both byte orders — the images the
-/// kernel starts directly, which is the whole of what the naming rule acts on.
-/// (`CAFEBABE` also heads a Java class file, which would then be handed to the
-/// platform's own validation rather than re-run under `/bin/sh`; accepted, like every
-/// other head here.)
-///
-/// Anything else with an execute bit keeps the bare name and forks, the conservative
-/// direction twice over. A text file with no interpreter line is what `execvp` re-runs
-/// under `/bin/sh`; and a script *with* one is reached by the kernel through its
-/// interpreter under rules this deliberately does not model — an interpreter that does
-/// not exist, a relative one, a line longer than the kernel reads — so naming the
-/// script here would turn a search that today moves on to the next entry into a start
-/// that fails. Any read error (a file shorter than the four bytes read here included)
-/// answers `false` for the same reason.
-///
-/// That is also where the line this exists to stop still comes back: a program that is
-/// a script — a version manager's shim standing in for `git`, say — is started the
-/// forking way and prints it. Behaviour is unchanged there; the programs the product
-/// names itself (`sh`, `git`, the search tools its battery asks about) are Mach-O
-/// images on this platform, so what the product starts is covered.
+/// Whether `path` begins with a Mach-O header — thin (`MH_MAGIC`/`MH_MAGIC_64`) or universal
+/// (`FAT_MAGIC`/`FAT_MAGIC_64`), both byte orders: the images the kernel starts directly.
+/// (`CAFEBABE` also heads a Java class file, accepted here.)
+/// Anything else with an execute bit keeps the bare name and forks, the conservative direction
+/// twice over: a text file with no interpreter line is what `execvp` re-runs under `/bin/sh`, and a
+/// script *with* one is reached through its interpreter under rules this does not model, so naming
+/// it here would turn a search that moves on into a start that fails. Any read error answers
+/// `false`.
 #[cfg(target_os = "macos")]
 fn is_mach_o(path: &Path) -> bool {
     use std::io::Read;
@@ -558,52 +420,27 @@ fn is_mach_o(path: &Path) -> bool {
     )
 }
 
-/// Build a [`tokio::process::Command`] for executing a shell command in the
-/// workspace root.
+/// Build a [`tokio::process::Command`] running `command` in the workspace root.
 ///
-/// The environment is [`agent_env_pairs`]: once the owner's environment has been
-/// read, the command runs in exactly that — secrets and all, by design, since
-/// these are the owner's own commands. Until the first read succeeds, and
-/// whenever one cannot be obtained, the reduced [`internal_env_pairs`] is used
-/// instead. The data-location home and the private temp root always win (see
-/// [`agent_env_pairs`]).
-///
-/// On Unix the child is made a process group leader (via
-/// [`process_group(0)`](tokio::process::Command::process_group)), so that the
-/// timeout handler in [`run_command_with_timeout`] can kill the entire
-/// subprocess tree (child + grandchildren) with a single PGID signal.
-/// Grandchildren (e.g., `cargo test` or long-running `sleep`) inherit the new
-/// PGID from `sh`, preventing orphaned CPU-consuming process trees when a
-/// shell command times out.
-///
-/// The interpreter is still the one the child's own search list resolves to —
-/// the product's own baseline until a read succeeds, the owner's own afterwards —
-/// but [`program_command`] names it by the path that search finds rather than by
-/// the bare `sh`, so macOS takes its non-forking start. That resolution is a real
-/// consequence of running the owner's environment, not a fault to repair: on a
-/// machine whose own search path holds no `sh`, or whose `sh` is a wrapper of its
-/// own, commands start that program or fail to start at all, exactly as they would
-/// for the owner. Nothing here compensates for the owner's search path, and
-/// nothing about which program is started changes. Windows keeps its bare
-/// `cmd.exe` name (see [`program_command`]), and hands it the settings every
-/// command of this shell runs under ([`WINDOWS_COMMAND_SWITCHES`]) rather than
-/// whichever ones that machine's registry happens to carry.
-///
-/// On Windows the child is what the runner puts under a job object right after
-/// the spawn — the platform's own whole-tree mechanism ([`tree`]).
+/// The environment is [`agent_env_pairs`] (the reduced [`internal_env_pairs`] until the owner's is
+/// read), the data-location home and private temp root always winning. On Unix the child leads its
+/// own process group, so the timeout handler ([`run_command_with_timeout`]) kills the whole tree
+/// with one PGID signal. The interpreter is whichever the child's search list resolves to, named by
+/// its path ([`program_command`]) so macOS takes its non-forking start; Windows keeps the bare
+/// `cmd.exe` name under [`WINDOWS_COMMAND_SWITCHES`], its child put under a job object right after
+/// the spawn.
 fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::Command {
-    // The interpreter is named under the very environment the child is handed, so
-    // the pairs are the ones [`program_command`] applies.
+    // The interpreter is named under the very environment the child is handed, so the pairs are the
+    // ones [`program_command`] applies.
     let env = agent_env_pairs();
 
-    // The spawn side of [`SHELL_PLATFORM`]; the two must not drift.
     #[cfg(not(target_os = "windows"))]
     let process = {
         let mut p: tokio::process::Command =
             program_command("sh", &env, Some(workspace_root)).into();
         p.arg("-c").arg(command);
-        // Make this child a process group leader so grandchildren inherit the
-        // PGID and can be killed together on timeout (see run_command_with_timeout).
+        // Make this child a process group leader so grandchildren inherit the PGID and can be
+        // killed together on timeout (see run_command_with_timeout).
         #[cfg(unix)]
         {
             p.process_group(0);
@@ -615,29 +452,14 @@ fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::
     let process = {
         let mut p: tokio::process::Command =
             program_command(WINDOWS_COMMAND_INTERPRETER, &env, Some(workspace_root)).into();
-        // `raw_arg`, not `arg`: std's argument escaping belongs to the
-        // `CommandLineToArgvW` convention `cmd.exe` does not follow (see
-        // `Command::raw_arg`'s own doc). It would re-escape the command's quotes
-        // to `\"`, which cmd.exe keeps literally — it has no backslash escape —
-        // so a command whose first word is a quoted path (every engine rewrite
-        // is, and an install under `C:\Program Files\…` needs it) would name a
-        // program cmd.exe cannot resolve.
-        //
-        // The command goes inside the extra quote pair cmd.exe documents for
-        // this hand-off (`cmd /?`, "the remainder of the command line after the
-        // switch"): its quote processing strips that pair, so the command
-        // arrives verbatim — whatever quotes it carries of its own. The
-        // settings the interpreter is started with lead the switch, so the text
-        // arrives under them and not under this machine's registry
-        // ([`WINDOWS_COMMAND_SWITCHES`]).
-        // What arrives is the platform's reading of the agent's command
-        // ([`windows_line`]): every plain break is already respelled as `&`, and a
-        // line this reader would swallow at such a break — a comment or a label, a
-        // statement whose own text runs to the line's end — is refused whole, so the
-        // lines after the first are never lost silently. Only the shapes cmd.exe
-        // itself continues across — a caret's break, a break inside a group it opened
-        // — still carry a line break here, and they are the platform's own reading,
-        // not a raw text.
+        // `raw_arg`, not `arg`: std's escaping belongs to `CommandLineToArgvW`, which `cmd.exe`
+        // does not follow, and would re-escape the command's quotes to `\"` — cmd.exe keeps those
+        // literally, so a first word that is a quoted path (every engine rewrite, an install under
+        // `C:\Program Files\…`) would not resolve. The extra quote pair cmd.exe documents for this
+        // hand-off keeps the command verbatim, under the pinned settings. What arrives is the
+        // platform's reading of the command ([`windows_line`]): plain breaks are already `&`, and a
+        // line the reader would swallow at such a break — a comment or a label, a statement running
+        // to the line's end — is refused.
         p.raw_arg(format!("{WINDOWS_COMMAND_SWITCHES} /C \"{command}\""));
         p
     };
@@ -645,18 +467,13 @@ fn build_shell_command(command: &str, workspace_root: &Path) -> tokio::process::
     process
 }
 
-/// The shared setup of a direct program run: argv, the working directory, the
-/// child leading its own process group (Unix) or running under the runner's job
-/// (Windows), and `apply_env` as the last word on the child's environment — the
-/// clear-and-fill spawn environment belongs to whoever the run is for. Nothing
-/// here resolves a name: `program` is already an absolute path by the time it
-/// arrives (the managed bun runtime, this service's own image).
+/// The shared setup of a direct program run: argv, the working directory, the child leading its own
+/// process group (Unix) or running under the runner's job (Windows), and `apply_env` as the last
+/// word on the child's environment. Nothing here resolves a name: `program` is already absolute.
 ///
-/// `cwd` is the caller's choice, not necessarily a workspace: the program paths
-/// take a workspace root, while the document kit runs inside its own materialized
-/// directory and the renderer inside the product's own package directory, so bun
-/// cannot load a config from a workspace (see [`crate::docgen`] and
-/// [`crate::hyperframes`]).
+/// `cwd` is the caller's choice, not necessarily a workspace: the document kit runs inside its own
+/// materialized directory and the renderer inside the product's package directory, so bun cannot
+/// load a config from a workspace ([`crate::docgen`], [`crate::hyperframes`]).
 fn program_command_with(
     program: &Path,
     args: &[String],
@@ -676,30 +493,21 @@ fn program_command_with(
     process
 }
 
-/// Build a [`tokio::process::Command`] that runs `program` with `args` as
-/// argv — no shell in between, so no argument can ever be reinterpreted as
-/// shell syntax (unlike [`build_shell_command`], whose string is parsed by
-/// `sh -c`). Containment is otherwise identical: `cwd` as the working
-/// directory, the OWNER's environment — his own once a read has succeeded (the
-/// reduced fallback until then, see [`agent_env_pairs`]) — and (Unix) the child
-/// leading its own process group; on Windows the runner's job is the platform's
-/// side of that containment ([`tree`]).
-///
-/// These are the owner's own commands doing his own work — an automation's program, a
-/// custom tool, a plan step — so his environment is handed over whole. The
-/// product's own work goes through [`internal_program_command`] instead.
+/// Run `program` with `args` as argv — no shell in between, so no argument can be reinterpreted as
+/// shell syntax (unlike [`build_shell_command`], whose string `sh -c` parses). Containment as a
+/// shell run's: `cwd`, the OWNER's environment — his own once a read has succeeded, the reduced
+/// fallback until then ([`agent_env_pairs`]) — and, on Unix, its own process group; on Windows the
+/// runner's job ([`tree`]). These are the owner's commands doing his work, so his environment goes
+/// over whole; the product's own work goes through [`internal_program_command`] instead.
 fn build_program_command(program: &Path, args: &[String], cwd: &Path) -> tokio::process::Command {
     program_command_with(program, args, cwd, apply_agent_env)
 }
 
-/// The one product-owned command: `extra` variables over the reduced
-/// [`internal_env_pairs`] environment, and end-of-file on stdin, so a program that
-/// decides to ask a question never reads the daemon's own standard input.
-///
-/// Contained as an agent's command is ([`program_command_with`]): the child leads
-/// its own process group on Unix, and on Windows a [`RunOwner::Agent`] run gets the
-/// job object — a product program starts descendants of its own (a render's browser
-/// workers), and none of them may outlive the product.
+/// The one product-owned command: `extra` variables over the reduced [`internal_env_pairs`], and
+/// end-of-file on stdin, so a program that asks a question never reads the daemon's own. Contained
+/// as an agent's command is ([`program_command_with`]); on Windows its [`RunOwner`] run gets the
+/// job object — a product program starts descendants of its own (a render's browser workers) and
+/// none may outlive the product.
 fn internal_program_command(
     cwd: &Path,
     program: &Path,
@@ -714,7 +522,6 @@ fn internal_program_command(
     })
 }
 
-/// Outcome of a timed shell subprocess run.
 #[derive(Debug)]
 enum ShellRunResult {
     Completed {
@@ -723,22 +530,14 @@ enum ShellRunResult {
         status: std::process::ExitStatus,
         elapsed: Duration,
     },
-    /// The main process exited, and its OWN exit status and the output collected
-    /// up to the drain bound are the run's result; a process it left behind still
-    /// holds a capture pipe open, so EOF never arrived — and still held it after the
-    /// run's tree was ended ([`stop_leftover`]), which makes this the residual case:
-    /// a leftover that escaped the tree, or a run whose containment could not be
-    /// established. Only [`LeftoverPolicy::Command`] produces it (an agent's command,
-    /// the rewritten-line plan run): the capture readers are detached so the channel
-    /// stays open, and `scope` names the containment the leftover is reached through,
-    /// which differs per platform. On
-    /// unix it is the child's process group id, and the group still
-    /// exists while any member lives, so the note can offer `kill -TERM -<pgid>`. On
-    /// Windows it is the pid of the run's root process, which `child.wait()` has
-    /// already reaped by the time this path is reached — so the note lists the tree
-    /// by parent (`tasklist /FI "PPID eq <pid>"`) and stops each listed process
-    /// instead of addressing the released pid. `None` when it could not be
-    /// identified.
+    /// The main process exited, and its OWN exit status and the output collected up to the drain
+    /// bound are the run's result; a leftover still holds a capture pipe open, so EOF never arrived
+    /// — and still held it after the run's tree was ended ([`stop_leftover`]), the residual case.
+    /// Only [`LeftoverPolicy::Command`] produces it; the capture readers are detached so the
+    /// channel stays open. `scope` names the containment: on unix the process group id, live while
+    /// any member lives, so the note offers `kill -TERM -<pgid>`; on Windows the run's root pid,
+    /// already reaped, so the note lists the tree by parent (`tasklist /FI "PPID eq <pid>"`).
+    /// `None` when unidentifiable.
     ExitedWithLeftovers {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
@@ -746,12 +545,10 @@ enum ShellRunResult {
         scope: Option<u32>,
         elapsed: Duration,
     },
-    /// The main process exited but a process it left behind held a capture pipe open
-    /// past the drain bound, so the run's tree was ended ([`LeftoverPolicy::Program`] —
-    /// the program paths, [`run_program_outcome`] and [`run_program_with_timeout`]).
-    /// The exit status it had already produced and the output the readers had collected
-    /// are carried, and that status is the verdict: a run whose own process had exited
-    /// finished, whatever kept writing after it.
+    /// The main process exited but a leftover held a capture pipe open past the drain bound, so the
+    /// run's tree was ended ([`LeftoverPolicy::Program`] — the program paths,
+    /// [`run_program_outcome`] and [`run_program_with_timeout`]). The status it had already
+    /// produced is the verdict: a run whose own process exited finished, whatever kept writing.
     EndedWithLeftovers {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
@@ -764,11 +561,9 @@ enum ShellRunResult {
         pid: Option<u32>,
         elapsed: Duration,
     },
-    /// The run's whole process tree grew past the memory ceiling and was
-    /// ended like a timeout — `used` is the sample that tripped the watchdog
-    /// and `limit` the ceiling it crossed. A variant of its own rather than a
-    /// `TimedOut` with a reason: a run ended for memory must be impossible to
-    /// mistake for one that ran out of time.
+    /// The run's whole tree grew past the memory ceiling and was ended like a timeout — `used` is
+    /// the sample that tripped the watchdog, `limit` the ceiling it crossed. A variant of its own
+    /// so a run ended for memory cannot be mistaken for one that ran out of time.
     MemoryExceeded {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
@@ -780,54 +575,42 @@ enum ShellRunResult {
     SpawnFailed(std::io::Error),
 }
 
-/// What a run does when its main process exited but a leftover process still holds
-/// a capture pipe past the drain bound — one policy per run, so the two behaviours
-/// cannot drift apart ([`leftover_result`] is where each is shaped).
+/// What a run does when its main process exited but a leftover still holds a capture pipe past the
+/// drain bound — one policy per run, so the two behaviours cannot drift ([`leftover_result`] shapes
+/// each). Its own exit status answers either way.
 ///
-/// The two differ in what they do with the leftover, not in how they read the run: the
-/// run's own exit status is the answer either way, because its own process had already
-/// exited.
-///
-/// `Command` is the agent-facing behaviour (the shell tool's commands in both modes,
-/// and the rewritten-line plan runner): the leftover is stopped and the command's own
-/// exit status and output are the result. `Program` is the program paths' behaviour
-/// (`run_program_outcome` — a user's automation — and the `run_program_with_timeout` /
-/// `run_internal_program_with_timeout` pair — a custom tool's script, the document
-/// kit — plus [`run_internal_program_outcome`]'s product runs, the renderer included):
-/// the run's whole tree is ended at once and the result is the status it had already
-/// produced ([`ShellRunResult::EndedWithLeftovers`]).
+/// `Command` is the agent-facing behaviour (the shell tool's commands in both modes, the
+/// rewritten-line plan runner): the leftover is stopped and the command's own status and output are
+/// the result. `Program` is the program paths' (automation, custom tool, document kit, renderer):
+/// the whole tree is ended at once and the result is the status already produced.
 #[derive(Clone, Copy)]
 pub(super) enum LeftoverPolicy {
     /// An agent's command: stop the leftover, then report the run's own status.
     Command,
-    /// A program this product runs for itself: end the run's tree, then report the
-    /// status the run had already produced.
+    /// A program this product runs for itself: end the run's tree, then report the status the run
+    /// had already produced.
     Program,
 }
 
-/// How the wait inside [`run_command_with_timeout`] ended — the three bounds
-/// it watches at once.
 enum WaitOutcome {
-    /// The child exited (or the wait itself failed): the result is handed on
-    /// exactly as `child.wait()` produced it.
+    /// The child exited (or the wait failed): the result is handed on as `child.wait()` produced
+    /// it.
     Exited(std::io::Result<std::process::ExitStatus>),
     /// The timeout expired — a stop.
     TimedOut,
-    /// A memory sample crossed the ceiling — a stop, carrying the sample and
-    /// the ceiling so the failure can report both.
+    /// A memory sample crossed the ceiling — a stop, carrying the sample and the ceiling so the
+    /// failure can report both.
     MemoryExceeded { used: u64, limit: u64 },
 }
 
-/// One memory sample that crossed the ceiling: what it measured and the ceiling.
 struct MemorySample {
     used: u64,
     limit: u64,
 }
 
-/// The bounds every runner watches over the command tree it spawned: one
-/// deadline, one memory cadence, and the warn-once flag for a watchdog that
-/// cannot measure. Shared by [`run_command_with_timeout`] and the plan runner
-/// ([`plan::run`]) so the two cannot drift on the bounds they enforce.
+/// The bounds every runner watches over the tree it spawned: one deadline, one memory cadence, and
+/// the warn-once flag for a watchdog that cannot measure. Shared by [`run_command_with_timeout`]
+/// and the plan runner ([`plan::run`]) so the two cannot drift.
 struct Watchdog {
     deadline: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     sample: tokio::time::Interval,
@@ -835,11 +618,9 @@ struct Watchdog {
 }
 
 impl Watchdog {
-    /// `timeout` is the run's whole-run deadline, `None` for a run whose
-    /// operation has no ceiling of its own — the deadline future is then
-    /// pending forever, so the other bounds still fire and the select arms
-    /// stay as they are; the memory cadence is [`MEMORY_SAMPLE_INTERVAL`] for
-    /// every run.
+    /// `timeout` is the whole-run deadline; `None` for a run with no ceiling of its own, where the
+    /// deadline future is pending forever so the other bounds still fire and the select arms stay
+    /// as they are. The memory cadence is [`MEMORY_SAMPLE_INTERVAL`] for every run.
     pub(in crate::tools::shell) fn new(timeout: Option<Duration>) -> Self {
         let mut sample = tokio::time::interval(MEMORY_SAMPLE_INTERVAL);
         sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -855,17 +636,12 @@ impl Watchdog {
         }
     }
 
-    /// Sample the trees of the run's live members (`pids`, empty for a reaped
-    /// one) and report the first total over `limit`.
-    ///
-    /// A run with no live pid has nothing to sample: that is not a failure to
-    /// measure, so it is silent. Fail open, loudly once: a watchdog that killed
-    /// a command it could not measure would be worse than the unbounded command
-    /// it exists to stop. A pid that does not answer is left out of the sum
-    /// rather than failing the whole sample — the run's next cadence reads it
-    /// again if it is still there — so the warning stands for a tree nothing
-    /// could be read from at all. It names the first pid, one process: the
-    /// field's shape for the single-child run as well.
+    /// Sample the trees of the run's live members (`pids`, empty for a reaped one) and report the
+    /// first total over `limit`. A run with no live pid has nothing to sample, which is not a
+    /// failure to measure. Fail open, loudly once: a watchdog that killed a command it could not
+    /// measure would be worse than the unbounded command it exists to stop. A pid that does not
+    /// answer is left out of the sum — the next cadence reads it again — so the warning stands for
+    /// a tree nothing could be read from at all.
     pub(in crate::tools::shell) fn measure(
         &mut self,
         pids: &[u32],
@@ -897,8 +673,8 @@ impl Watchdog {
     }
 }
 
-/// The three standard streams of a run: what a member's redirect spelling names,
-/// and what [`AppliedRedirects::streams`] reports back.
+/// The three standard streams of a run: what a member's redirect spelling names, and what
+/// [`AppliedRedirects::streams`] reports back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stream {
     Stdin,
@@ -906,24 +682,14 @@ enum Stream {
     Stderr,
 }
 
-/// How many bytes one stream of a run's capture may keep.
-///
-/// Every runner gives each stream a budget of its own — the cap each pipe was
-/// always read up to ([`SHELL_PIPE_READ_CAP`]): the single-child runner one per
-/// pipe it reads, a plan one per *stream*, shared by every member that writes it
-/// ([`plan`]), because a plan's stdout is one stream where the shell's was one pipe
-/// and a member's stderr one channel however many members filled it. A member that
-/// floods stdout therefore cannot truncate a later member's stderr, and per-member
-/// budgets would keep more than the shell ever did — the unsafe direction.
-///
-/// The budget is drawn on by the readers of its stream, which run concurrently, so
-/// the split between two of them is decided by which reads first; what is guaranteed
-/// is the total (the cap), which is the truncation-safety property
-/// [`SHELL_PIPE_READ_CAP`] documents.
-///
-/// What the cap refuses is kept as the stream's *end* instead, up to
-/// [`SHELL_PIPE_TAIL_CAP`]: a run's verdict is written after everything else it
-/// printed, so a run that outruns the head still says how it ended.
+/// How many bytes one stream of a run's capture may keep: the cap each pipe was always read up to
+/// ([`SHELL_PIPE_READ_CAP`]). The single-child runner has one per pipe; a plan one per *stream*,
+/// shared by every member that writes it ([`plan`]), so a member flooding stdout cannot truncate a
+/// later member's stderr, where per-member budgets would keep more than the shell ever did — the
+/// unsafe direction. The readers draw on it concurrently, so which of two gets the bytes is decided
+/// by who reads first; what is guaranteed is the total. What the cap refuses is kept as the
+/// stream's *end*, up to [`SHELL_PIPE_TAIL_CAP`]: a run's verdict is written after everything else
+/// it printed.
 #[derive(Clone)]
 struct CaptureBudget {
     head: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -938,10 +704,9 @@ impl CaptureBudget {
         }
     }
 
-    /// Charge `bytes` kept bytes against the budget, returning how many the
-    /// reader may keep: a reader that finds the budget spent keeps nothing, and
-    /// keeps reading (a full pipe must never stall the member it belongs to —
-    /// the cap is a capture bound, never back-pressure).
+    /// Charge `bytes` kept bytes against the budget, returning how many the reader may keep: a
+    /// spent budget keeps nothing and the reader keeps reading — a full pipe must never stall the
+    /// member it belongs to, so the cap is a capture bound, never back-pressure.
     fn claim(&self, bytes: usize) -> usize {
         use std::sync::atomic::Ordering;
 
@@ -963,8 +728,8 @@ impl CaptureBudget {
         }
     }
 
-    /// Keep what the head refused — the part of the stream it had no room for, which
-    /// is where a run says how it ended — bounded by [`SHELL_PIPE_TAIL_CAP`].
+    /// Keep what the head refused — the part of the stream it had no room for, which is where a run
+    /// says how it ended — bounded by [`SHELL_PIPE_TAIL_CAP`].
     fn keep_end(&self, refused: &[u8]) {
         let mut tail = self.tail.lock().unwrap_poison();
         tail.extend_from_slice(refused);
@@ -978,20 +743,12 @@ impl CaptureBudget {
     }
 }
 
-/// Read from an async stream up to what `budget` still allows, appending what is
-/// kept to `buf` — the stream's shared live buffer — and continuing to read and
-/// discard any remaining data to drain the pipe (preventing back-pressure on the
-/// child process from a full pipe buffer).
-///
-/// `buf` is what lets a run take a snapshot of a still-reading stream without
-/// cancelling its reader ([`Readers::take`]): the reader appends as
-/// it reads, under the lock, so whatever has arrived is visible at any moment. The
-/// budget is the same one that caps a finished reader's output, so the buffer can
-/// never grow past [`SHELL_PIPE_READ_CAP`] however long a leftover keeps writing.
-///
-/// Returns when `cancel` is signalled or the stream reaches EOF. The timeout path
-/// still collects partial output even when grandchild processes inherited the pipe
-/// write end and prevent EOF.
+/// Read an async stream up to what `budget` still allows, appending what is kept to `buf` and
+/// draining the rest so a full pipe never back-pressures the child. `buf` is the stream's live
+/// buffer, so a run can snapshot a still-reading stream without cancelling its reader
+/// ([`Readers::take`]); the budget is the same one that caps a finished reader, so it cannot grow
+/// past [`SHELL_PIPE_READ_CAP`]. Returns on `cancel` or EOF — the timeout path still collects
+/// partial output when grandchildren hold the pipe's write end open.
 async fn read_stream_limited(
     reader: &mut (impl tokio::io::AsyncRead + Unpin),
     budget: &CaptureBudget,
@@ -1008,11 +765,8 @@ async fn read_stream_limited(
                 match result {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        // Whatever the budget still allows is kept; the rest is
-                        // read and kept as the stream's end, so a spent budget
-                        // never stops the member from writing (the drain half of
-                        // the original per-pipe cap) and never loses how the run
-                        // ended.
+                        // What the budget allows is kept, the rest kept as the stream's end: a
+                        // spent budget never stalls the member and never loses the verdict.
                         let keep = budget.claim(n);
                         if keep > 0 {
                             buf.lock().unwrap_poison().extend_from_slice(&chunk[..keep]);
@@ -1026,10 +780,9 @@ async fn read_stream_limited(
     }
 }
 
-/// Spawn a background task that reads from a pipe into `buf`.
-/// The task stops early when `cancel` is signalled; otherwise it runs to EOF.
-/// A reader is never what decides a run: one still holding a pipe at the drain
-/// bound makes the run a leftover one and nothing more (see [`Readers`]).
+/// Spawn a task that reads a pipe into `buf`, stopping early on `cancel` and running to EOF
+/// otherwise. A reader is never what decides a run: one still holding a pipe at the drain bound
+/// makes the run a leftover one and nothing more (see [`Readers`]).
 fn spawn_pipe_reader(
     pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     budget: CaptureBudget,
@@ -1042,8 +795,8 @@ fn spawn_pipe_reader(
     })
 }
 
-/// A capture pipe that hands every byte it delivers to the run's [`CompleteOutput`]
-/// as well: the budget decides what stays inline, never what is kept at all.
+/// A capture pipe that hands every byte it delivers to the run's [`CompleteOutput`] as well: the
+/// budget decides what stays inline, never what is kept at all.
 struct TeeReader<R> {
     pipe: R,
     output: Option<CompleteOutput>,
@@ -1068,42 +821,24 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for TeeReader<R> {
 }
 
 /// Where a direct run's complete output goes once it outgrows the inline budget
-/// ([`TOOL_OUTPUT_BUDGET_BYTES`]): a file in the directory the caller named,
-/// holding every byte the program printed — both streams, as their readers take
-/// them — rather than the prefix the [`CaptureBudget`] keeps inline.
+/// ([`TOOL_OUTPUT_BUDGET_BYTES`]): a file in the caller's directory holding every byte both streams
+/// delivered, rather than the prefix [`CaptureBudget`] keeps inline. It sits where the caller's
+/// file tools can read it, is recorded in [`SPILL_OWNERS`] as it is created, and is deleted when
+/// the run ends.
 ///
-/// The product's one rule for such a file: it sits where the caller's own file
-/// tools can read it, is recorded in [`SPILL_OWNERS`] as it is created (a sweep
-/// asks [`is_live_spill_name`] again before deleting, for the instant between),
-/// and is deleted when the caller's run ends — a failed or dropped run included.
-/// Only a completed run's answer names the file; a run that could not complete
-/// reports its own error and the file goes with the run, unread.
-///
-/// Nothing is created until the budget is crossed: an output that fits is
-/// returned from the captured streams exactly as before. The budget counts the
-/// raw pipe bytes while the inline result is the decoded, ANSI-stripped string,
-/// so escape-heavy output can spill although its decoded form would have fit —
-/// the safe direction, since the file keeps what the inline result would drop.
-/// The file holds the raw streams (interleaved as their readers take them,
-/// neither ANSI-stripped nor credential-scrubbed) because keeping them
-/// byte-for-byte is the point; the summary built from it is scrubbed like any
-/// inline result, and a later `read` of the file is an ordinary read of a file on
-/// the user's disk, which needs no case of its own. What it cannot fix is the
-/// reader: past the read tool's own size cap the file is not openable through it,
-/// and a confined guest has no shell — an accepted limit.
-///
-/// The bytes are written from the reader's own task as they arrive, synchronously
-/// and under one lock the two streams share: a run that prints far faster than
-/// the disk takes it slows its readers (and so its own pipes), and each write
-/// holds the runtime thread for its duration — a few kilobytes at a time.
+/// Nothing is created until the budget is crossed: it counts raw pipe bytes while the inline result
+/// is decoded, so escape-heavy output can spill although its decoded form would have fitted, the
+/// safe direction. The file holds the raw streams (neither stripped nor scrubbed) because
+/// byte-for-byte is the point; the summary built from it is scrubbed. Bytes are written from the
+/// reader's own task under one lock both streams share, so a run printing faster than the disk
+/// takes it slows its own pipes.
 #[derive(Clone)]
 struct CompleteOutput(std::sync::Arc<CompleteOutputInner>);
 
 struct CompleteOutputInner {
     dir: PathBuf,
-    /// The [`SPILL_OWNERS`] key, resolved where the run is created: the file is
-    /// written from reader tasks of their own, where the tool's task-local
-    /// identity is not set.
+    /// The [`SPILL_OWNERS`] key, resolved where the run is created: the file is written from reader
+    /// tasks of their own, where the tool's task-local identity is not set.
     owner: String,
     state: std::sync::Mutex<SpillState>,
 }
@@ -1113,9 +848,8 @@ enum SpillState {
     Buffered(Vec<u8>),
     /// Past it: the file holds the run's output from its first byte.
     Spilling(Spilled),
-    /// No file: either one could not be kept — the run falls back to the
-    /// captured streams, which is the truncation this file exists to avoid — or
-    /// [`CompleteOutput::finish`] already built the answer from it.
+    /// No file: one could not be kept — the run falls back to the captured streams, which is the
+    /// truncation this file exists to avoid — or [`CompleteOutput::finish`] built the answer.
     Unavailable,
 }
 
@@ -1128,9 +862,8 @@ impl CompleteOutput {
         }))
     }
 
-    /// Take bytes a run's readers have just read, before the capture budget
-    /// charges them: they are the program's output whether or not they are kept
-    /// inline.
+    /// Take bytes a run's readers have just read, before the capture budget charges them: they are
+    /// the program's output whether or not they are kept inline.
     fn write(&self, bytes: &[u8]) {
         let mut state = self.0.state.lock().unwrap_poison();
         let mut next = None;
@@ -1169,8 +902,6 @@ impl CompleteOutput {
         }
     }
 
-    /// Start the run's file with the bytes buffered so far; `None` when it cannot
-    /// be kept (no create, or the first write failed).
     fn start_file(dir: &Path, buffered: &[u8]) -> Option<Spilled> {
         let mut spilled = Spilled::create(dir)?;
         if spilled.append(buffered) {
@@ -1180,10 +911,9 @@ impl CompleteOutput {
         None
     }
 
-    /// The caller's answer: once the run outgrew the budget, the product's spill
-    /// summary naming the file that now holds the output whole. Takes the state,
-    /// so bytes a straggling reader delivers after the summary is built are
-    /// dropped rather than appended to a file nobody will mention again.
+    /// The caller's answer: once the run outgrew the budget, the spill summary naming the file that
+    /// holds the output whole. Takes the state, so bytes a straggling reader delivers after the
+    /// summary is built are dropped rather than appended to a file nobody will mention again.
     fn finish(&self, output: String) -> String {
         let state = std::mem::replace(
             &mut *self.0.state.lock().unwrap_poison(),
@@ -1196,7 +926,6 @@ impl CompleteOutput {
     }
 }
 
-/// A direct run's complete output on disk.
 struct Spilled {
     path: PathBuf,
     file: std::fs::File,
@@ -1206,8 +935,8 @@ struct Spilled {
 }
 
 impl Spilled {
-    /// Reserve a fresh file in `dir`: create-new, so a name the caller already
-    /// has is never overwritten and two runs never share one.
+    /// Reserve a fresh file in `dir`: create-new, so a name the caller already has is never
+    /// overwritten and two runs never share one.
     fn create(dir: &Path) -> Option<Self> {
         std::fs::create_dir_all(dir).ok()?;
         for _ in 0..SPILL_NAME_ATTEMPTS {
@@ -1257,35 +986,28 @@ impl Spilled {
     }
 }
 
-/// How many attempts a fresh complete-output name is given: `create_new`
-/// guarantees the name that succeeds is new, so the retries exist only for the
-/// random 16-bit identifier colliding with a file already there.
+/// Attempts a fresh complete-output name gets: `create_new` guarantees the successful one is new,
+/// so the retries only cover a random 16-bit identifier colliding with a file already there.
 const SPILL_NAME_ATTEMPTS: usize = 16;
 
-/// One capture reader of a run: the live buffer it fills, and the reading task or
-/// its end once it finished. A completed [`tokio::task::JoinHandle`] must never be
-/// awaited again (tokio panics on a re-poll), so its state is recorded in its place.
-///
-/// The bytes live in [`Reader::buf`], not in the task's return value: the task
-/// appends as it reads, which is what lets the leftover path take what has arrived
-/// without cancelling the reader ([`Readers::take`]).
+/// One capture reader of a run: the live buffer it fills, and the reading task or its end once
+/// finished. A completed [`tokio::task::JoinHandle`] must never be awaited again (tokio panics on a
+/// re-poll), so its state is recorded in its place. The bytes live in [`Reader::buf`], not in the
+/// task's return value, which is what lets the leftover path take what has arrived without
+/// cancelling the reader ([`Readers::take`]).
 struct Reader {
     stream: Captured,
-    /// The live buffer this reader fills, bounded by the reader's
-    /// [`CaptureBudget`]: the reader appends under the lock as it reads, and the
-    /// collector takes (and so drains) it, so a leftover that keeps writing can
-    /// never grow it past the cap.
+    /// The live buffer this reader fills, bounded by its [`CaptureBudget`]: appended under the lock
+    /// as it reads and drained by the collector, so a leftover cannot grow it past the cap.
     buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-    /// The same budget, kept so the collector can take the stream's end — the bytes
-    /// the head had no room for ([`CaptureBudget::take_end`]).
+    /// The same budget, kept so the collector can take the stream's end
+    /// ([`CaptureBudget::take_end`]).
     budget: CaptureBudget,
     task: ReaderTask,
 }
 
-/// The two streams a run captures. A reader exists for each of a run's output
-/// streams and for nothing else: a member's stdin is never a capture pipe, so the
-/// plumbing cannot name it, and what each reader fills is decided by this — the
-/// label a stalled reader warns with included.
+/// The two streams a run captures: a reader exists for each of a run's output streams and for
+/// nothing else — a member's stdin is never a capture pipe, so the plumbing cannot name it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Captured {
     Stdout,
@@ -1306,24 +1028,19 @@ enum ReaderTask {
     Done,
 }
 
-/// The capture readers of one run, in the order their bytes belong in the run's
-/// output.
-///
-/// One home for the three things every run shape does with them: drain them under
-/// the output bound ([`Readers::drain`]), collect what they hold after a cancel
-/// ([`Readers::collect`]), and — when a leftover kept a pipe open past the bound —
-/// take what has arrived ([`Readers::take`]) and either let the pipes close once the
-/// leftover is stopped (drained again over [`DRAIN_CANCEL_GRACE`]) or keep the
-/// still-pending readers draining ([`Readers::retain_pending`]). The single-child
-/// runner has one reader per stream; the plan runner one per captured member
-/// stream ([`plan`]), all those of one stream charged to that stream's budget.
+/// The capture readers of one run, in the order their bytes belong in its output: one home for the
+/// three things every run shape does with them — drain them under the output bound
+/// ([`Readers::drain`]), collect what they hold after a cancel ([`Readers::collect`]), and, when a
+/// leftover kept a pipe open past the bound, take what has arrived ([`Readers::take`]) and either
+/// let the pipes close once it is stopped (over [`DRAIN_CANCEL_GRACE`]) or keep the pending readers
+/// draining ([`Readers::retain_pending`]). The single-child runner has one reader per stream; the
+/// plan runner one per captured member stream ([`plan`]), all those of one stream on its budget.
 #[derive(Default)]
 struct Readers {
     readers: Vec<Reader>,
 }
 
 impl Readers {
-    /// Start a reader for one captured output stream of one member.
     fn push(
         &mut self,
         stream: Captured,
@@ -1340,11 +1057,10 @@ impl Readers {
         });
     }
 
-    /// Drain every reader within `drain_limit`, taking the bytes of each that
-    /// finishes in time. `true` when they all did — the run's output is complete;
-    /// `false` when the bound expired with a reader still pending, which means a
-    /// leftover process still holds a capture pipe open: [`leftover_result`] is what
-    /// the caller does next.
+    /// Drain every reader within `drain_limit`, taking the bytes of each that finishes in time.
+    /// `true` when they all did; `false` when the bound expired with a reader still pending — a
+    /// leftover process still holds a capture pipe open, and [`leftover_result`] is what the caller
+    /// does next.
     async fn drain(&mut self, drain_limit: Duration) -> bool {
         let limit = tokio::time::sleep(drain_limit);
         tokio::pin!(limit);
@@ -1356,8 +1072,8 @@ impl Readers {
             {
                 return true;
             }
-            // One poll of the reading handles per round: `pending` borrows them,
-            // so the round's outcome is stored only after it is dropped.
+            // One poll of the reading handles per round: `pending` borrows them, so the round's
+            // outcome is stored only after it is dropped.
             let finished = {
                 let mut pending = FuturesUnordered::new();
                 for (index, reader) in self.readers.iter_mut().enumerate() {
@@ -1378,28 +1094,23 @@ impl Readers {
         }
     }
 
-    /// The run's output: every reader's bytes, in the order the readers were
-    /// created. A reader that has not finished is given the cancellation grace
-    /// ([`DRAIN_CANCEL_GRACE`]): the run's processes are gone by the time this is
-    /// called, so the bound is for whatever leftover holder still has a pipe.
+    /// The run's output: every reader's bytes, in reader order. A reader that has not finished gets
+    /// the cancellation grace ([`DRAIN_CANCEL_GRACE`]): the run's processes are gone by now, so the
+    /// bound is for whatever leftover holder still has a pipe.
     async fn collect(&mut self) -> (Vec<u8>, Vec<u8>) {
         futures_util::future::join_all(self.readers.iter_mut().map(Reader::finish)).await;
         self.take()
     }
 
-    /// Hand every still-pending reader to [`crate::util::leftover_channels`] rather
-    /// than dropping it: it keeps draining its pipe to EOF, so the leftover holding
-    /// it is neither blocked by a full pipe nor killed by a closed read end (on unix a
-    /// closed read end turns its next write into SIGPIPE/EPIPE). Past that set's
-    /// shared cap of 16 channels the OLDEST is released, and its leftover faults on
-    /// its next write.
-    ///
-    /// The residual case's alone: a leftover that survived the stop
-    /// ([`stop_leftover`]) keeps its channel, which is what makes the note's
-    /// "left running" true.
+    /// Hand every still-pending reader to [`crate::util::leftover_channels`] rather than dropping
+    /// it: it keeps draining to EOF, so the leftover holding it is neither blocked by a full pipe
+    /// nor killed by a closed read end (on unix the next write becomes SIGPIPE/EPIPE). Past that
+    /// set's shared cap of 16 channels the OLDEST is released and its leftover faults on its next
+    /// write. The residual case's alone: a leftover that survived the stop ([`stop_leftover`])
+    /// keeps its channel, which is what makes the note's "left running" true.
     fn retain_pending(&mut self) {
-        // A completed handle is already `Done`; a pending one is retained (not
-        // dropped) so its task keeps draining within the shared bound.
+        // A completed handle is already `Done`; a pending one is retained (not dropped) so its task
+        // keeps draining within the shared bound.
         for reader in &mut self.readers {
             if let ReaderTask::Reading(handle) =
                 std::mem::replace(&mut reader.task, ReaderTask::Done)
@@ -1409,15 +1120,13 @@ impl Readers {
         }
     }
 
-    /// Every reader's kept bytes, in the order the readers were created, separated by
-    /// stream, then the ends the streams' heads had no room for — gathered per stream and
-    /// placed after everything that stream kept, because a plan's members share one budget
-    /// per stream and a tail belongs to the stream, not to whichever reader met it first.
-    /// Each buffer and each tail is emptied by the take.
+    /// Every reader's kept bytes, in reader order, separated by stream, then the ends the streams'
+    /// heads had no room for — gathered per stream and placed after everything that stream kept,
+    /// because a plan's members share one budget per stream and a tail belongs to the stream, not
+    /// to whichever reader met it first. Each buffer and tail is emptied by the take.
     ///
-    /// This is the leftover path's snapshot: the output collected up to the moment a
-    /// leftover is detected, never what arrives after it ([`leftover_result`] takes it
-    /// before the stop for exactly that reason).
+    /// This is the leftover path's snapshot: what was collected when the leftover was detected,
+    /// never what arrives after ([`leftover_result`] takes it before the stop for that reason).
     fn take(&mut self) -> (Vec<u8>, Vec<u8>) {
         let mut streams = [Vec::new(), Vec::new()];
         let mut ends: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
@@ -1431,8 +1140,8 @@ impl Readers {
             // A shared budget answers the second reader with nothing: its tail was taken.
             ends[index].extend_from_slice(&reader.budget.take_end());
         }
-        // A stream longer than the head held says so, then ends where it really did: the
-        // verdict a run prints last is never the part that is lost.
+        // A stream longer than the head held says so, then ends where it really did: the verdict a
+        // run prints last is never the part that is lost.
         for (stream, end) in streams.iter_mut().zip(ends) {
             if !end.is_empty() {
                 stream.extend_from_slice(TRUNCATED_MIDDLE.as_bytes());
@@ -1445,8 +1154,8 @@ impl Readers {
 }
 
 impl Reader {
-    /// Fold a finished task's outcome in: the reader is done, and whatever it kept
-    /// is in its live buffer.
+    /// Fold a finished task's outcome in: the reader is done, and whatever it kept is in its live
+    /// buffer.
     fn store(&mut self, result: std::result::Result<(), tokio::task::JoinError>) {
         if let Err(e) = result {
             tracing::warn!(%e, "{} reader task panicked", self.stream.label());
@@ -1454,9 +1163,8 @@ impl Reader {
         self.task = ReaderTask::Done;
     }
 
-    /// Wait for whatever the reader still holds — immediately when it already
-    /// finished, else the cancellation grace for one whose pipe a leftover process
-    /// still keeps open.
+    /// Wait for whatever the reader still holds — immediately when it already finished, else the
+    /// cancellation grace for one whose pipe a leftover process still keeps open.
     async fn finish(&mut self) {
         match std::mem::replace(&mut self.task, ReaderTask::Done) {
             ReaderTask::Done => {}
@@ -1472,13 +1180,11 @@ impl Reader {
     }
 }
 
-/// Await a pipe reader task with a grace timeout, used after killing a child
-/// process — the reader is given `cancellation_timeout` to notice cancellation and
-/// stop. A reader that misses the grace is handed to
-/// [`crate::util::leftover_channels`] instead of being dropped: it keeps draining
-/// its pipe to EOF, so nothing it belongs to stalls on a full pipe — until the
-/// shared cap of 16 channels is reached, past which the OLDEST is released and its
-/// leftover faults on its next write.
+/// Await a pipe reader with a grace timeout after a child was killed — the reader is given
+/// `cancellation_timeout` to notice and stop. One that misses the grace is handed to
+/// [`crate::util::leftover_channels`] rather than dropped: it keeps draining to EOF, so nothing it
+/// belongs to stalls on a full pipe — until the shared cap of 16 channels is reached, past which
+/// the OLDEST is released and its leftover faults on its next write.
 async fn await_pipe_reader_with_cancellation_timeout(
     mut handle: tokio::task::JoinHandle<()>,
     label: &str,
@@ -1496,9 +1202,9 @@ async fn await_pipe_reader_with_cancellation_timeout(
     }
 }
 
-/// Output-drain bound for [`run_command_with_timeout`]: after the main command
-/// exits, remaining output must drain within this bound. Overridable via env
-/// for tuning; tests pass explicit durations.
+/// Output-drain bound for [`run_command_with_timeout`]: after the main command exits, remaining
+/// output must drain within this bound. Overridable via env for tuning; tests pass explicit
+/// durations.
 fn output_drain_timeout() -> Duration {
     crate::util::env_duration_secs(
         "MAHBOT_SHELL_DRAIN_TIMEOUT_SECS",
@@ -1506,37 +1212,28 @@ fn output_drain_timeout() -> Duration {
     )
 }
 
-/// Signal the process group of a spawned shell (PGID == the child PID after
-/// `process_group(0)` in [`build_shell_command`]). Used to terminate the whole
-/// subprocess tree when a stop ends a run — the command timeout, the memory
-/// ceiling, or either [`LeftoverPolicy`]'s drain bound, where a leftover
-/// backgrounded process keeps the output pipes open after the main process
-/// exited ([`stop_leftover`]) — so orphaned strays cannot accumulate.
+/// Signal the process group of a spawned shell (PGID == the child PID after `process_group(0)` in
+/// [`build_shell_command`]), to end the run's whole tree when a stop ends it — the timeout, the
+/// memory ceiling, or either [`LeftoverPolicy`]'s drain bound ([`stop_leftover`]) — so orphaned
+/// strays cannot accumulate. [`self::bg`] uses it for the two-stage session stop and the teardown
+/// kill, where the target is the watcher's PID (the group leader) and the group always exists; the
+/// unix arm of [`tree`]'s containment is this same call.
 ///
-/// Also used by [`self::bg`] for the two-stage background-session stop
-/// (SIGTERM then SIGKILL) and the teardown kill; there the target is the
-/// background watcher's PID (the group leader), which stays alive for the
-/// whole session, so the group always exists when the signal is sent. The unix
-/// arm of [`tree`]'s containment is this same call.
-///
-/// Note on ordering: the timeout path deliberately kills before reaping the
-/// child (see [`run_command_with_timeout`]) to avoid a PID-reuse race; the
-/// drain path kills after `child.wait()` already reaped it, so the PID could
-/// in theory be recycled as a new group leader within the drain window —
-/// accepted risk, the kill is best-effort.
+/// Ordering: the timeout path kills before reaping to avoid a PID-reuse race, the drain path after
+/// `child.wait()` — a recycled PID there is an accepted risk, the kill being best-effort.
 #[cfg(unix)]
 fn kill_process_group(pid: u32, signal: libc::c_int) {
     let pid_signed: libc::pid_t = pid.try_into().expect("PID fits in pid_t");
-    // SAFETY: kill(-pgid, sig) is the standard POSIX way to signal an entire
-    // process group. The target PGID is our own child's PID (also its
-    // PGID after process_group(0)), so we own every process in the group.
+    // SAFETY: kill(-pgid, sig) is the standard POSIX way to signal an entire process group. The
+    // target PGID is our own child's PID (also its PGID after process_group(0)), so we own every
+    // process in the group.
     let ret = unsafe { libc::kill(-pid_signed, signal) };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        // ESRCH: the group is already gone, so nothing in it can survive — the
-        // outcome this call is for, not a failure to report. It is the leftover
-        // path's ordinary case for a member that exited first or a holder that left
-        // the group, and a warning there would claim a stray that does not exist.
+        // ESRCH: the group is already gone, so nothing in it can survive — the outcome this call is
+        // for, not a failure to report. It is the leftover path's ordinary case for a member that
+        // exited first or a holder that left the group, and a warning there would claim a stray
+        // that does not exist.
         if err.raw_os_error() != Some(libc::ESRCH) {
             tracing::warn!(
                 pid = pid,
@@ -1548,14 +1245,12 @@ fn kill_process_group(pid: u32, signal: libc::c_int) {
     }
 }
 
-/// The lifecycle point of the grep engine's scratch spec files: Windows serves a
-/// member's spec through a file (cmd.exe cannot carry the payload on its command
-/// line), and every exit path from the serve decision — including the validation
-/// `bail!`s and a cancellation drop — must clean it up. The removal itself, and
-/// its best-effort policy, are the engine's ([`grep_engine::discard_spec_files`],
-/// which the engine also calls inline when a hand-off abandons a rewrite); this
-/// guard owns only the point. A killed daemon still leaves a file behind; the
-/// temp cleaner is the backstop.
+/// The lifecycle point of the grep engine's scratch spec files: Windows serves a member's spec
+/// through a file (cmd.exe cannot carry the payload on its command line), and every exit path from
+/// the serve decision — the validation `bail!`s and a cancellation drop included — must clean it
+/// up. The removal and its best-effort policy are the engine's
+/// ([`grep_engine::discard_spec_files`]); this guard owns only the point. A killed daemon still
+/// leaves a file behind; the temp cleaner is the backstop.
 struct SpecFiles(Vec<PathBuf>);
 
 impl Drop for SpecFiles {
@@ -1564,19 +1259,15 @@ impl Drop for SpecFiles {
     }
 }
 
-/// The refusal this shell call must fail with, if any: the serve decision's own
-/// refusal ([`grep_engine::GrepServe::refusal`] — a Windows-only value), or a
-/// produced-but-unapplied rewrite, i.e. one the read-only guard rejected.
-/// Returns the short cause; the agent-facing message is rendered from it by
-/// [`grep_engine::unserved_failure`] at the bail site, the way the engine's own
-/// cause is.
+/// The refusal this shell call must fail with, if any: the serve decision's own refusal
+/// ([`grep_engine::GrepServe::refusal`] — a Windows-only value), or a produced-but-unapplied
+/// rewrite, i.e. one the read-only guard rejected. Returns the short cause; the agent-facing
+/// message is rendered from it by [`grep_engine::unserved_failure`] at the bail site.
 ///
-/// `applied` is whether the rewrite reached the shell (`exec_str !=` the
-/// platform's own reading of the line, [`windows_line::executable`] — the text
-/// the shell would run had the engine not rewritten it). The platform is tested
-/// first: on unix neither case refuses — the original command runs and its `grep`
-/// is the real one — while on Windows an unserved search must not come back
-/// looking like an empty result (see [`grep_engine::unserved_failure`]).
+/// `applied` is whether the rewrite reached the shell (`exec_str` against the platform's own
+/// reading of the line, [`windows_line::executable`]). The platform is tested first: on unix
+/// neither case refuses — the original command runs and its `grep` is the real one — while on
+/// Windows an unserved search must not come back looking like an empty result.
 fn unserved_refusal(
     platform: ShellPlatform,
     grep_serve: &grep_engine::GrepServe,
@@ -1590,43 +1281,36 @@ fn unserved_refusal(
     })
 }
 
-/// The grep telemetry cause for a rewrite that was produced but never applied
-/// (the read-only guard rejected it), spelled once so the refusal's cause and
-/// the stored row's reason cannot drift apart.
+/// The grep telemetry cause for a rewrite that was produced but never applied (the read-only guard
+/// rejected it), spelled once so the refusal's cause and the stored row's reason cannot drift
+/// apart.
 const GUARD_REJECTED_REASON: &str = "read-only guard rejected rewrite";
 
 /// What a completed run's engine failure means to this platform.
 enum EngineFailure {
-    /// The engine could not serve and reported no account to render: the
-    /// original command is re-run, so the agent gets the authentic answer (the
-    /// platform with a real `grep` to re-run).
+    /// The engine could not serve and reported no account to render: the original command is
+    /// re-run, so the agent gets the authentic answer (the platform with a real `grep` to re-run).
     ReRun,
-    /// The engine's own short account of the failure (the platform that refuses
-    /// the call instead of re-running it).
+    /// The engine's own short account of the failure (the platform that refuses the call instead of
+    /// re-running it).
     Refused(String),
 }
 
-/// Classify a completed run: `Some` when it is the engine failing to serve —
-/// the sentinel exit code, the stale-binary lock message, or, on the platform
-/// that refuses rather than re-runs, the engine's refusal marker on a line of
-/// its own, which survives a pipeline tail masking the exit status. `None` when
-/// the run is not an engine failure.
-///
-/// The marker is recognised by line equality, never as a substring: a served
-/// run's stderr may echo the token inside a matched line, and a result is not a
-/// refusal. Only the refusing platform carries a cause; on the other one the
-/// marker is not even scanned and [`EngineFailure::ReRun`] says all that
-/// platform's caller needs.
+/// Classify a completed run: `Some` when it is the engine failing to serve — the sentinel exit
+/// code, the stale-binary lock message, or, on the platform that refuses rather than re-runs, the
+/// engine's refusal marker on a line of its own, which survives a pipeline tail masking the exit
+/// status. The marker is recognised by line equality, never as a substring: a served run's stderr
+/// may echo the token inside a matched line. Only the refusing platform carries a cause; on unix
+/// the marker is not even scanned and [`EngineFailure::ReRun`] says all that caller needs.
 fn engine_failure(
     status_code: Option<i32>,
     stderr: &[u8],
     platform: ShellPlatform,
 ) -> Option<EngineFailure> {
-    // The engine child is a program this product started, and on one path it
-    // re-execs the platform's real `grep` in place, whose own stderr reaches this
-    // same stream — so it is read the way a program's output is read here, not as
-    // UTF-8 ([`windows_text::decode`]). The markers matched below are this
-    // product's own ASCII lines, which every code page agrees on.
+    // The engine child is a program this product started, and on one path it re-execs the
+    // platform's real `grep` in place, whose own stderr reaches this same stream — so it is read
+    // the way a program's output is read here, not as UTF-8 ([`windows_text::decode`]). The markers
+    // matched below are this product's own ASCII lines, which every code page agrees on.
     let text = windows_text::decode(stderr);
     let marked = platform == ShellPlatform::Windows
         && text
@@ -1644,23 +1328,18 @@ fn engine_failure(
     Some(EngineFailure::Refused(engine_cause(&text, marked)))
 }
 
-/// The engine's own short account of a failure it reported: the detail it wrote
-/// after the refusal marker, which it emits first — so this is the engine's own
-/// line and never a served member's stderr earlier in the stream — else the line
-/// carrying the stale-binary lock message
-/// ([`grep_engine::STALE_BINARY_LOCK_MSG`]), else the run's first non-blank line,
-/// else a generic cause for a failure that carried none. Trimmed and length-capped;
-/// [`grep_engine::unserved_failure`] renders the agent-facing message from it.
+/// The engine's own short account of a failure it reported: the detail after the refusal marker,
+/// which it emits first — so this is the engine's own line, never a served member's stderr earlier
+/// in the stream — else the line carrying the stale-binary lock message
+/// ([`grep_engine::STALE_BINARY_LOCK_MSG`]), else the first non-blank line, else a generic cause.
+/// Trimmed and length-capped; [`grep_engine::unserved_failure`] renders the agent-facing message.
 ///
-/// The lock message is looked up by its text rather than taken as the first line,
-/// because it is not always the first: a launch that meets the instance lock files
-/// its durable record before it prints the lock error, so the failure-record
-/// pointer ([`crate::boot::record_launch_failure`]'s) comes first. An own-image
-/// member whose command word is outside the hidden subcommands (`mahbot version`)
-/// is a launch like any other and prints both to the same stderr this reads.
+/// The lock message is looked up by its text because it is not always the first line: a launch that
+/// meets the instance lock files its durable record before printing the lock error, so the
+/// failure-record pointer ([`crate::boot::record_launch_failure`]'s) comes first.
 fn engine_cause(text: &str, marked: bool) -> String {
-    // The marked branch is one forward scan; only the two-scan branch below needs
-    // the lines materialised.
+    // The marked branch is one forward scan; only the two-scan branch below needs the lines
+    // materialised.
     let detail = if marked {
         text.lines()
             .map(str::trim)
@@ -1680,21 +1359,12 @@ fn engine_cause(text: &str, marked: bool) -> String {
     )
 }
 
-/// Ends a run's whole process tree if the run is dropped before a stop path or
-/// the successful-completion path has taken responsibility for it — its tool call's
-/// future dropped (an abandoned call, runtime teardown), a panic in a sibling tool.
-/// The tree is the platform's ([`Tree`]): the child's process group on unix, the job
-/// on Windows.
-///
-/// It must be disarmed on every path where the child is reaped or the tree is
-/// handed on: after a unix child is reaped a group kill risks PID reuse, a Windows
-/// job retained for the process lifetime must not be ended by this guard, and the
-/// leftover path ([`stop_leftover`]) has ended the tree or retained it itself —
-/// either way this guard must not speak for it.
-///
-/// It holds only the tree, never the child, so it has no fallback when
-/// [`Tree::terminate`] reports `false` — a Windows run with no job (fail-open,
-/// see [`tree`]) kills nothing here, just as it did before this guard existed.
+/// Ends a run's whole process tree if the run is dropped before a stop path or the
+/// successful-completion path took responsibility — its tool call's future dropped, a panic in a
+/// sibling tool. The tree is the platform's ([`Tree`]). It must be disarmed wherever the child is
+/// reaped or the tree is handed on: a group kill after a unix reap risks PID reuse, a Windows job
+/// retained for the process lifetime must not be ended here, and the leftover path
+/// ([`stop_leftover`]) has ended or retained the tree itself.
 struct KillOnDrop {
     tree: Tree,
     armed: bool,
@@ -1718,30 +1388,13 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// Spawn `cmd`, read stdout/stderr concurrently, and enforce `timeout` when the
-/// run has one (`None` for an operation whose length is its own, see
-/// [`run_internal_program_outcome`]). After the main process exits, remaining
-/// output must drain within `drain_limit` — a leftover backgrounded process
-/// holding the pipes open otherwise blocks EOF forever. Such a leftover is
-/// abandoned work, so the run's whole tree is ended at the detection, and
-/// `leftovers` decides what happens to it: an agent's command is stopped
-/// through [`stop_leftover`] and keeps its own exit status, reporting the leftover
-/// only when the stop did not take ([`ShellRunResult::ExitedWithLeftovers`]),
-/// while a program run ends its whole tree at once and is judged by the exit status
-/// it had already produced ([`ShellRunResult::EndedWithLeftovers`]).
-///
-/// While the child runs, its whole process tree is also sampled for resident
-/// memory ([`mem`]); a sample over `memory_limit` ends the run the way the
-/// timeout does and reports [`ShellRunResult::MemoryExceeded`].
-///
-/// `owner` decides the run's whole-tree containment ([`tree`]): unix contains
-/// every run the same way — the process group the child leads — while Windows
-/// gives a job object only to an agent's run. A plan run's members get the same
-/// containment through [`plan::run`], which spawns them the same way.
-///
-/// `spill` keeps the run's complete output when a caller needs it whole: every
-/// byte read off both pipes goes there as well, so output past the capture cap
-/// is kept in a file instead of being read and discarded.
+/// Spawn `cmd`, read stdout/stderr concurrently, and enforce `timeout` when the run has one (`None`
+/// for an operation whose length is its own). After the main process exits, remaining output must
+/// drain within `drain_limit` — a leftover holding the pipes open would block EOF forever — so a
+/// leftover is abandoned work: the tree is ended at the detection and `leftovers` decides the rest
+/// (an agent's command stopped and judged by its own status, a program run ended at once and judged
+/// by the status it had). The tree is sampled for resident memory ([`mem`]), and `spill` keeps the
+/// complete output when a caller needs it.
 async fn run_command_with_timeout(
     cmd: &mut tokio::process::Command,
     timeout: Option<Duration>,
@@ -1756,9 +1409,8 @@ async fn run_command_with_timeout(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    // The run's containment, created before the spawn so the child can be put
-    // under it the moment it exists; the window between the two is the accepted
-    // limitation `tree` documents.
+    // The run's containment, created before the spawn so the child can be put under it the moment
+    // it exists; the window between the two is the accepted limitation `tree` documents.
     let mut tree = Tree::new(owner);
 
     let mut child = match cmd.spawn() {
@@ -1770,18 +1422,17 @@ async fn run_command_with_timeout(
     if let Some(pid) = pid {
         tree.attach(pid);
     }
-    // Kill-on-drop: an aborted task (drain-cap force-cancel, panic, runtime
-    // teardown) must not orphan the run's tree. Disarmed on every path where
-    // the child is reaped or the tree is handed on.
+    // Kill-on-drop: an aborted task (drain-cap force-cancel, panic, runtime teardown) must not
+    // orphan the run's tree. Disarmed on every path where the child is reaped or the tree is handed
+    // on.
     let mut kill_guard = KillOnDrop::new(tree.clone());
     // Stdio::piped() was set above, so the handles are always present.
     let stdout_pipe = child.stdout.take().expect("stdout piped");
     let stderr_pipe = child.stderr.take().expect("stderr piped");
 
     let cancel = tokio_util::sync::CancellationToken::new();
-    // One budget per stream here: each pipe is read up to `SHELL_PIPE_READ_CAP`,
-    // the cap it always had — the split a plan run gives its two streams too
-    // ([`CaptureBudget`]).
+    // One budget per stream here: each pipe is read up to `SHELL_PIPE_READ_CAP`, the cap it always
+    // had — the split a plan run gives its two streams too ([`CaptureBudget`]).
     let mut readers = Readers::default();
     readers.push(
         Captured::Stdout,
@@ -1804,16 +1455,15 @@ async fn run_command_with_timeout(
 
     match await_run_end(&mut child, timeout, memory_limit, pid).await {
         WaitOutcome::Exited(Ok(status)) => {
-            // Child reaped — the guard must not fire: on unix the group leader
-            // is gone and a post-reap kill would risk PID reuse, while a Windows
-            // job retained for the process lifetime must not be ended here.
+            // Child reaped — the guard must not fire: on unix the group leader is gone and a
+            // post-reap kill would risk PID reuse, while a Windows job retained for the process
+            // lifetime must not be ended here.
             kill_guard.disarm();
-            // Child exited naturally — drain remaining output with a bound.
-            // A leftover backgrounded process that inherited the pipes prevents
-            // EOF; without the bound the drain would hang the tool forever.
+            // Child exited naturally — drain the rest with a bound: a leftover that inherited the
+            // pipes prevents EOF, and without the bound the drain would hang the tool forever.
             if readers.drain(drain_limit).await {
-                // The run ended on its own — not a stop, so nothing is killed
-                // here and the job is kept rather than closed (`tree`).
+                // The run ended on its own — not a stop, so nothing is killed here and the job is
+                // kept rather than closed (`tree`).
                 tree.retain_after_completion();
                 let (stdout, stderr) = readers.collect().await;
                 ShellRunResult::Completed {
@@ -1852,11 +1502,9 @@ async fn run_command_with_timeout(
     }
 }
 
-/// Wait for the run to end on the first of its three bounds — the child
-/// exiting, `timeout` (when the run has one), or the resident memory its whole
-/// tree has grown to above `memory_limit` — and say which one fired. The memory
-/// sample rides the runtime path the wait already occupies: a sample is a handful
-/// syscalls, no thread of its own.
+/// Wait for the run to end on the first of its three bounds — the child exiting, `timeout` (when
+/// the run has one), or the resident memory its whole tree grew past `memory_limit` — and say which
+/// fired. The memory sample rides the runtime path the wait already occupies: no thread of its own.
 async fn await_run_end(
     child: &mut tokio::process::Child,
     timeout: Option<Duration>,
@@ -1885,18 +1533,13 @@ async fn await_run_end(
     }
 }
 
-/// End a run's tree the way the timeout does and collect the output the pipe
-/// readers still hold — the one stop path the timeout and the memory watchdog
-/// share, so the watchdog cannot grow a second kill mechanism.
-///
-/// The direct child is signalled first, then the containment: on unix
-/// `start_kill` (fire-and-forget SIGKILL) precedes the group kill, because
-/// `child.kill().await` — which includes `wait()` — would let the child's pid
-/// be reused before the group it leads could be signalled (`process_group(0)`
-/// in [`build_shell_command`]). On Windows the direct kill is the fallback for
-/// a run whose containment could not be established (see `tree`) and for a job
-/// termination that failed. The plan runner's stop path does the same for each
-/// of its members ([`plan::run`]'s `end_group`).
+/// End a run's tree the way the timeout does and collect what the pipe readers still hold — the one
+/// stop path the timeout and the memory watchdog share, so the watchdog cannot grow a second kill
+/// mechanism. The direct child is signalled first, then the containment: on unix `start_kill`
+/// (fire-and-forget SIGKILL) precedes the group kill, because `child.kill().await` — which includes
+/// `wait()` — would let the child's pid be reused before the group it leads could be signalled. On
+/// Windows the direct kill is the fallback for a run with no containment and for a failed job
+/// termination; the plan runner's stop path does the same per member ([`plan::run`]'s `end_group`).
 async fn stop_and_collect(
     child: &mut tokio::process::Child,
     tree: &Tree,
@@ -1911,30 +1554,20 @@ async fn stop_and_collect(
     kill_guard.disarm();
     cancel.cancel();
 
-    // Give readers a grace window to notice cancellation and return their
-    // buffers. If a reader takes longer than the grace (e.g. because a grandchild
-    // keeps the pipe open), we still get partial data from the buffer it
-    // returns after noticing cancellation.
+    // Give readers the grace window to notice cancellation and return their buffers; a reader that
+    // misses it (a grandchild keeping the pipe open) still reports what it had buffered.
     readers.collect().await
 }
 
-/// End the process a finished run left holding its output channel, and say whether
-/// that took.
+/// End the process a finished run left holding its output channel, and say whether that took.
 ///
-/// The run's whole tree is ended — the process group on unix, the job on Windows,
-/// which is everything the run started — and the still-pending readers are given
-/// [`DRAIN_CANCEL_GRACE`] to reach EOF. `true` means they all did. `false` is the
-/// residual case, which keeps both the channel and, on Windows, the job handle alive
-/// ([`Readers::retain_pending`], [`Tree::retain_after_completion`]).
-///
-/// Success is the channel closing, never [`Tree::terminate`]'s return value: on unix
-/// a group kill reports nothing about who was left in it, and a process that was
-/// already gone is a stop too (a leftover is abandoned work, so neither a polite
-/// phase nor a second mechanism is wanted).
-///
-/// The caller snapshots the output before the stop ([`Readers::take`]), so the run
-/// reports what the channel held at the detection, never bytes read during the grace;
-/// [`leftover_result`] is the caller that shapes the answer.
+/// The run's whole tree is ended — the process group on unix, the job on Windows — and the pending
+/// readers get [`DRAIN_CANCEL_GRACE`] to reach EOF. `true` means they all did; `false` is the
+/// residual case, keeping both the channel and, on Windows, the job handle alive
+/// ([`Readers::retain_pending`], [`Tree::retain_after_completion`]). Success is the channel
+/// closing, never [`Tree::terminate`]'s return value. The caller snapshots the output before the
+/// stop ([`Readers::take`]), so the run reports what the channel held then, never bytes read during
+/// the grace.
 async fn stop_leftover(tree: Tree, readers: &mut Readers) -> bool {
     tree.terminate();
     if readers.drain(DRAIN_CANCEL_GRACE).await {
@@ -1945,19 +1578,16 @@ async fn stop_leftover(tree: Tree, readers: &mut Readers) -> bool {
     false
 }
 
-/// What a finished run reports when a leftover held a capture pipe past the drain
-/// bound ([`LeftoverPolicy`]) — the single shaping both runners (the single-child one
-/// and [`plan`]) end on, so the two cannot drift apart.
+/// What a finished run reports when a leftover held a capture pipe past the drain bound
+/// ([`LeftoverPolicy`]) — the single shaping both runners (the single-child one and [`plan`]) end
+/// on, so the two cannot drift apart.
 ///
-/// An agent's command is stopped ([`stop_leftover`]) and its own exit status and the
-/// output collected up to the detection are the result: a stop that took leaves a
-/// plain completed command, with no note and no record, and only the residual case
-/// keeps today's shape — its note and its log-store record hang off
-/// [`ShellRunResult::ExitedWithLeftovers`]. A program run ends its whole tree, cancels
-/// its readers and carries the partial output for the prose (a reader that already
-/// finished keeps its output — a completed JoinHandle must not be re-awaited) together
-/// with the exit status the run had already produced: what the program paths say is the
-/// status of the process that exited, never a verdict the leftover invented.
+/// An agent's command is stopped ([`stop_leftover`]) and its own exit status and the output up to
+/// the detection are the result: a stop that took leaves a plain completed command, and only the
+/// residual case keeps its note and log-store record. A program run ends its tree, cancels its
+/// readers and carries the partial output (finished readers keep theirs — a completed JoinHandle
+/// must not be re-awaited) with the status the run had already produced — never a verdict the
+/// leftover invented.
 async fn leftover_result(
     leftovers: LeftoverPolicy,
     tree: Tree,
@@ -2005,14 +1635,11 @@ async fn leftover_result(
     }
 }
 
-/// Outcome of a direct program run (argv — never a shell command string), used
-/// by trigger-armed automations to decide whether a check reported anything.
-///
-/// `output` is the combined stdout+stderr AFTER ANSI stripping, but WITHOUT
-/// credential scrubbing and WITHOUT the shell pipeline's annotations (the
-/// exit-status note, timing, spill hints). `has_output` is the wake/no-wake
-/// signal and reads the streams themselves: output that is nothing but
-/// whitespace or escape sequences is still output.
+/// Outcome of a direct program run (argv, never a shell command string), used by trigger-armed
+/// automations to decide whether a check reported anything. `output` is stdout+stderr AFTER ANSI
+/// stripping, but WITHOUT credential scrubbing and WITHOUT the shell pipeline's annotations (the
+/// exit-status note, timing, spill hints). `has_output` is the wake/no-wake signal and reads the
+/// streams themselves: output that is nothing but whitespace or escape sequences is still output.
 pub(crate) struct ProgramOutcome {
     /// Whether the program exited with status 0.
     pub success: bool,
@@ -2022,20 +1649,19 @@ pub(crate) struct ProgramOutcome {
     pub output: String,
     /// Whether the program emitted anything at all.
     pub has_output: bool,
-    /// How the product intervened in this run: it never started it, its wall-clock
-    /// ceiling, or its memory watchdog. A stop is a verdict about the machine, never about
-    /// the program.
+    /// How the product intervened in this run: it never started it, its wall-clock ceiling, or its
+    /// memory watchdog. A stop is a verdict about the machine, never about the program.
     pub stop: Option<Stop>,
 }
 
-/// How the product intervened in a run before the program's own verdict could be read:
-/// it never started, its ceiling, or its memory watchdog. A run whose own process had
-/// exited carries no stop — a leftover that kept our capture pipe open did not change
-/// its verdict ([`ShellRunResult::EndedWithLeftovers`]).
+/// How the product intervened in a run before the program's own verdict could be read: it never
+/// started, its ceiling, or its watchdog. A run whose own process exited carries no stop — a
+/// leftover that kept our capture pipe open did not change its verdict
+/// ([`ShellRunResult::EndedWithLeftovers`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Stop {
-    /// The program could not be started at all: the machine's verdict, not the
-    /// program's, so the same call is worth another attempt.
+    /// The program could not be started at all: the machine's verdict, so the call is worth
+    /// retrying.
     Spawn,
     /// The wall-clock ceiling the run was given.
     Timeout,
@@ -2044,22 +1670,19 @@ pub(crate) enum Stop {
 }
 
 impl ProgramOutcome {
-    /// Whether the run was stopped by its wall-clock ceiling rather than finishing: a
-    /// verdict about the machine, not about the check.
+    /// Whether the run was stopped by its wall-clock ceiling rather than finishing.
     pub(crate) fn timed_out(&self) -> bool {
         self.stop == Some(Stop::Timeout)
     }
 
-    /// Whether the product intervened in the run at all — it never started it, its
-    /// ceiling, its memory watchdog — rather than the program finishing on its own. A stop
-    /// is a verdict about the machine, not about the program.
+    /// Whether the product intervened at all rather than the program finishing on its own.
     pub(crate) fn stopped(&self) -> bool {
         self.stop.is_some()
     }
 
-    /// What ended the run, without the memory watchdog's `terminated: ` prefix — the reason
-    /// a caller that already says the run was stopped needs, where
-    /// `terminated: exceeded memory limit (…)` would read twice.
+    /// What ended the run, without the memory watchdog's `terminated: ` prefix — the reason a
+    /// caller that already says the run was stopped needs, where `terminated: exceeded memory limit
+    /// (…)` would read twice.
     pub(crate) fn stop_reason(&self) -> &str {
         self.detail
             .strip_prefix(mem::TERMINATED)
@@ -2067,8 +1690,6 @@ impl ProgramOutcome {
     }
 }
 
-/// The sentence a run the product stopped carries: what ended it and how long it was
-/// given.
 pub(crate) fn timeout_sentence(label: &str, ceiling: Duration) -> String {
     format!(
         "timeout: {label} did not finish within {}s and was killed",
@@ -2076,8 +1697,8 @@ pub(crate) fn timeout_sentence(label: &str, ceiling: Duration) -> String {
     )
 }
 
-/// A finished run's own verdict: the one reading every consumer of the shared run machinery
-/// takes, so a leftover that held our capture pipe open past the drain bound cannot change it.
+/// A finished run's own verdict: the one reading every consumer takes, so a leftover cannot change
+/// it.
 #[derive(Clone, Copy)]
 enum ExitVerdict {
     /// The run exited with status 0.
@@ -2089,7 +1710,6 @@ enum ExitVerdict {
 }
 
 impl ExitVerdict {
-    /// Whether the run exited clean.
     fn clean(self) -> bool {
         matches!(self, Self::Clean)
     }
@@ -2121,27 +1741,23 @@ fn exit_verdict(status: std::process::ExitStatus) -> ExitVerdict {
     }
 }
 
-/// Build the outcome for a run that produced (possibly partial) raw streams.
-/// A run with no streams at all (spawn failure) yields empty, no-output.
+/// Build the outcome for a run that produced (possibly partial) raw streams. A run with no streams
+/// at all (spawn failure) yields empty, no-output.
 fn program_outcome(success: bool, detail: String, stdout: &[u8], stderr: &[u8]) -> ProgramOutcome {
     ProgramOutcome {
         success,
         detail,
         output: decode_raw_streams(stdout, stderr),
-        // The raw streams decide: only a run that emitted nothing at all
-        // reported nothing.
+        // The raw streams decide: only a run that emitted nothing at all reported nothing.
         has_output: !stdout.is_empty() || !stderr.is_empty(),
         stop: None,
     }
 }
 
-/// Run `program` with `args` (argv — never a shell command string) in `cwd` and
-/// return the raw run result, under the OWNER's environment: his own commands
-/// doing his own work. The bounds a direct run is held to live in [`run_bounded`].
-///
-/// A direct run is never an agent's own command, so a leftover it leaves behind is
-/// ended rather than kept ([`LeftoverPolicy::Program`]): an automation or a custom tool must
-/// not be able to leave a process holding its output open.
+/// Run `program` with `args` (argv, never a shell command string) in `cwd` under the OWNER's
+/// environment — his own commands doing his work — and return the raw run result; the bounds a
+/// direct run is held to live in [`run_bounded`]. A direct run is never an agent's own command, so
+/// a leftover it leaves behind is ended rather than kept ([`LeftoverPolicy::Program`]).
 async fn run_program(
     cwd: &Path,
     program: &Path,
@@ -2152,10 +1768,9 @@ async fn run_program(
     run_bounded(build_program_command(program, args, cwd), owner, spill).await
 }
 
-/// Perform one [`run_command_with_timeout`] call with the bounds every direct
-/// run is held to: `timeout` as the whole-run ceiling — `None` for a run whose
-/// operation has no ceiling of its own — the per-pipe output cap and the
-/// post-exit drain bound. `owner` decides the run's containment.
+/// One [`run_command_with_timeout`] call with the bounds every direct run is held to: `timeout` as
+/// the whole-run ceiling (`None` for a run with no ceiling of its own), the per-pipe output cap and
+/// the post-exit drain bound. `owner` decides the containment.
 async fn run_bounded_within(
     mut cmd: tokio::process::Command,
     owner: RunOwner,
@@ -2174,8 +1789,7 @@ async fn run_bounded_within(
     .await
 }
 
-/// [`run_bounded_within`] under the default ceiling every direct run is held to
-/// ([`DEFAULT_SHELL_TIMEOUT`]).
+/// [`run_bounded_within`] under the default ceiling ([`DEFAULT_SHELL_TIMEOUT`]).
 async fn run_bounded(
     cmd: tokio::process::Command,
     owner: RunOwner,
@@ -2184,13 +1798,10 @@ async fn run_bounded(
     run_bounded_within(cmd, owner, Some(DEFAULT_SHELL_TIMEOUT), spill).await
 }
 
-/// Run `program` with `args` in `cwd` and report the run as an outcome instead
-/// of folding a non-zero exit into an error: a run that did not complete is a
-/// failed outcome, never an `Err`, because the caller's rule is about what the
-/// run reported rather than about this layer's error type.
-///
-/// The run is a service launch rather than an agent's work, so Windows gives it
-/// no job ([`RunOwner::Service`] — see [`tree`]).
+/// Run `program` with `args` in `cwd` and report the run as an outcome instead of folding a
+/// non-zero exit into an error: a run that did not complete is a failed outcome, never an `Err`,
+/// because the caller's rule is about what the run reported. A service launch rather than an
+/// agent's work, so Windows gives it no job ([`RunOwner::Service`], [`tree`]).
 pub(crate) async fn run_program_outcome(
     cwd: &Path,
     program: &Path,
@@ -2199,10 +1810,9 @@ pub(crate) async fn run_program_outcome(
     run_program_outcome_within(cwd, program, args, DEFAULT_SHELL_TIMEOUT).await
 }
 
-/// [`run_program_outcome`] under an explicit wall-clock ceiling. A run stopped
-/// by it is marked [`ProgramOutcome::timed_out`], which is a stop rather than a
-/// verdict about the program — the automation layer retries such a check instead of
-/// treating it as broken.
+/// [`run_program_outcome`] under an explicit wall-clock ceiling. A run stopped by it is marked
+/// [`ProgramOutcome::timed_out`] — a stop rather than a verdict about the program, so the
+/// automation layer retries the check instead of treating it as broken.
 pub(crate) async fn run_program_outcome_within(
     cwd: &Path,
     program: &Path,
@@ -2219,17 +1829,13 @@ pub(crate) async fn run_program_outcome_within(
     program_outcome_from(result, Some(timeout))
 }
 
-/// [`run_program_outcome_within`] for a program that is the product's own rather
-/// than an agent's: `extra` is applied over the reduced [`internal_env_pairs`]
-/// environment ([`internal_program_command`]), so none of the owner's variables
-/// reach it. `timeout` is the whole-run ceiling, `None` for a run whose operation
-/// has no ceiling of its own.
+/// [`run_program_outcome_within`] for a program that is the product's own: `extra` over the reduced
+/// [`internal_env_pairs`] environment ([`internal_program_command`]), so none of the owner's
+/// variables reach it. `timeout` is the whole-run ceiling, `None` for a run with no ceiling.
 ///
-/// The run is contained as an agent's command is ([`RunOwner::Agent`]) rather than
-/// as a service's: a product program starts descendants of its own, and none of
-/// them may outlive the product. The per-pipe output cap, the post-exit drain
-/// bound, the memory watchdog and the leftover policy are the same as every other
-/// direct run's.
+/// Contained as an agent's command ([`RunOwner::Agent`]) rather than as a service's: a product
+/// program starts descendants of its own and none may outlive the product. The output cap, drain
+/// bound, memory watchdog and leftover policy are every other direct run's.
 pub(crate) async fn run_internal_program_outcome(
     cwd: &Path,
     program: &Path,
@@ -2247,15 +1853,14 @@ pub(crate) async fn run_internal_program_outcome(
     program_outcome_from(result, timeout)
 }
 
-/// The outcome a direct run reports. `ceiling` is the wall clock the run was held to —
-/// the number a stop names; a run without one has no deadline to fire.
+/// The outcome a direct run reports; `ceiling` is the wall clock it was held to, the number a stop
+/// names.
 ///
-/// A run whose own process exited is judged by the status it gave, wherever it sits in
-/// this match: `Completed` is the ordinary case, and the two leftover variants are the
-/// same answer — the process had exited before a leftover took the pipes, so only our
-/// capture of what it printed after that was lost, never its verdict. `EndedWithLeftovers`
-/// is the only one a direct run reaches ([`LeftoverPolicy::Program`]); the other is shaped
-/// alike rather than left uncovered.
+/// A run whose own process exited is judged by the status it gave, wherever it sits in this match:
+/// `Completed` is the ordinary case, and the two leftover variants are the same answer — the
+/// process had exited before a leftover took the pipes, so only our capture of what it printed
+/// after that was lost, never its verdict. `EndedWithLeftovers` is the only one a direct run
+/// reaches ([`LeftoverPolicy::Program`]); the other is shaped alike rather than left uncovered.
 fn program_outcome_from(result: ShellRunResult, ceiling: Option<Duration>) -> ProgramOutcome {
     match result {
         ShellRunResult::Completed {
@@ -2279,9 +1884,9 @@ fn program_outcome_from(result: ShellRunResult, ceiling: Option<Duration>) -> Pr
             let verdict = exit_verdict(status);
             program_outcome(verdict.clean(), verdict.detail(), &stdout, &stderr)
         }
-        // A stop always means the run had a deadline: its wall clock, the only one
-        // that ends a run from here. `unwrap_or` stands in for a ceiling that cannot
-        // exist — a run given none has no deadline to fire.
+        // A stop always means the run had a deadline: its wall clock, the only one that ends a run
+        // from here. `unwrap_or` stands in for a ceiling that cannot exist — a run given none has
+        // no deadline to fire.
         ShellRunResult::TimedOut {
             stdout,
             stderr,
@@ -2306,8 +1911,8 @@ fn program_outcome_from(result: ShellRunResult, ceiling: Option<Duration>) -> Pr
             stop: Some(Stop::Memory),
             ..program_outcome(false, mem::exceeded_failure(used, limit), &stdout, &stderr)
         },
-        // A program the machine would not start is the machine's verdict, not the
-        // program's: it never ran, so it is a stop rather than a failure of what it does.
+        // A program the machine would not start is the machine's verdict, not the program's: it
+        // never ran, so it is a stop rather than a failure of what it does.
         ShellRunResult::SpawnFailed(e) => ProgramOutcome {
             stop: Some(Stop::Spawn),
             ..program_outcome(false, format!("failed to start: {e}"), &[], &[])
@@ -2315,28 +1920,15 @@ fn program_outcome_from(result: ShellRunResult, ceiling: Option<Duration>) -> Pr
     }
 }
 
-/// Run `program` with `args` (argv — never a shell command string) in `cwd`,
-/// under the bounds a direct run is held to (see [`run_bounded`]), contained as
-/// an agent's command (see [`RunOwner::Agent`]), with the OWNER's environment:
-/// his own command doing his own work.
+/// Run `program` with `args` (argv, never a shell command string) in `cwd` under the bounds a
+/// direct run is held to ([`run_bounded`]), contained as an agent's command ([`RunOwner::Agent`]),
+/// with the OWNER's environment: his own command doing his work.
 ///
-/// `label` names what the caller asked to run and is what the failure prose
-/// talks about, so the model reads back the thing it called rather than the
-/// interpreter's path. Program and argv are taken explicitly rather than
-/// specialised to the script convention so that the argv contract — nothing in
-/// an argument is ever parsed as shell syntax — can be exercised without the
-/// managed runtime.
-///
-/// Returns the run's combined output, annotated the way the shell annotates a
-/// failure: the `[exit status: …]` note is appended as its own paragraph for
-/// anything but a clean exit. `Err` is a run that could not complete — spawn
-/// failure, timeout or the memory ceiling — never a non-zero exit, and never a
-/// leftover the product ended after the run's own process had exited: a script's own
-/// failure stays the script's output.
-///
-/// `spill_in` is the directory the run's complete-output file goes in
-/// ([`CompleteOutput`]); the captured streams stay the answer if no file could be
-/// written.
+/// `label` names what the caller asked to run, so the model reads back the thing it called rather
+/// than the interpreter's path. Returns the combined output with the `[exit status: …]` note as its
+/// own paragraph for anything but a clean exit; `Err` is a run that could not complete, never a
+/// non-zero exit. `spill_in` is where the complete-output file goes ([`CompleteOutput`]); the
+/// captured streams stay the answer if none could be written.
 pub(crate) async fn run_program_with_timeout(
     cwd: &Path,
     program: &Path,
@@ -2352,10 +1944,9 @@ pub(crate) async fn run_program_with_timeout(
     )
 }
 
-/// [`run_program_with_timeout`] for the product's OWN work rather than the
-/// owner's: the run gets the reduced [`internal_env_pairs`] environment, which
-/// holds none of his secrets. The entry point is separate so that no caller has
-/// to name an environment to say whose work a run is.
+/// [`run_program_with_timeout`] for the product's OWN work: the run gets the reduced
+/// [`internal_env_pairs`] environment, which holds none of the owner's secrets. The entry point is
+/// separate so no caller has to name an environment to say whose work a run is.
 pub(crate) async fn run_internal_program_with_timeout(
     cwd: &Path,
     program: &Path,
@@ -2374,14 +1965,13 @@ pub(crate) async fn run_internal_program_with_timeout(
     )
 }
 
-/// The one mapping behind both entry points above: a finished run turned into
-/// the caller's answer. `spill` keeps a run that outgrows the inline budget in
-/// its file — applied to the output alone, so the `[exit status: …]` note still
-/// follows a spilled result the way it follows an inline one.
+/// The one mapping behind both entry points above: a finished run turned into the caller's answer.
+/// `spill` keeps a run that outgrows the inline budget in its file — applied to the output alone,
+/// so the `[exit status: …]` note still follows a spilled result as it follows an inline one.
 ///
-/// A run whose own process exited is a finished run, so it is answered with its output
-/// and the note its own status earns — including one a leftover kept our capture pipe
-/// open past the drain bound: that is our bookkeeping, not the caller's failure.
+/// A run whose own process exited is a finished run, answered with its output and the note its own
+/// status earns — including one a leftover kept our capture pipe open past the drain bound: that is
+/// our bookkeeping, not the caller's failure.
 fn annotate_run(
     run: ShellRunResult,
     label: &str,
@@ -2417,12 +2007,9 @@ fn annotate_run(
                 None => output,
             })
         }
-        // The same error class as the shell tool's timeout (a run that could
-        // not complete), but a typed one-liner carrying the output tail rather
-        // than the shell's structured block: a direct run has no per-call knob
-        // to raise, so nothing here may advertise the `timeout_secs` escape
-        // hatch, and it does not name what the kill ended the way the tool's
-        // block does.
+        // The same error class as the tool's own timeout, but a typed one-liner carrying the output
+        // tail rather than the structured block: a direct run has no per-call knob to raise, so
+        // nothing here may advertise the `timeout_secs` escape hatch.
         ShellRunResult::TimedOut {
             stdout,
             stderr,
@@ -2451,8 +2038,7 @@ fn annotate_run(
     }
 }
 
-/// Elapsed time plus the scrubbed tails of both streams, for a program run
-/// that did not complete.
+/// Elapsed time plus the scrubbed tails of both streams, for a program run that did not complete.
 fn program_error_tail(elapsed: Duration, stdout: &[u8], stderr: &[u8]) -> String {
     let mut msg = format!("elapsed: {:.1}s", elapsed.as_secs_f64());
     append_output_tail(&mut msg, "stdout", stdout);
@@ -2460,10 +2046,9 @@ fn program_error_tail(elapsed: Duration, stdout: &[u8], stderr: &[u8]) -> String
     msg
 }
 
-/// Decode both raw streams ([`decode_and_strip_ansi`]'s reading + ANSI strip) and
-/// combine stderr onto its own line when non-blank (never a leading blank line
-/// when stdout is empty). Never credential-scrubbed here: the `custom` tool's
-/// output is scrubbed by the agent-level pass, while an automation's trigger
+/// Decode both raw streams ([`decode_and_strip_ansi`]) and put stderr on its own line when
+/// non-blank (never a leading blank line when stdout is empty). Never credential-scrubbed here: the
+/// `custom` tool's output is scrubbed by the agent-level pass, while an automation's trigger
 /// deliberately shows a check exactly as the check produced it.
 fn decode_raw_streams(stdout: &[u8], stderr: &[u8]) -> String {
     let stdout = decode_and_strip_ansi(stdout);
@@ -2485,11 +2070,9 @@ fn tail_chars(s: &str, max_chars: usize) -> String {
     s.chars().skip(char_count - max_chars).collect()
 }
 
-/// Appends the tail of an output buffer to `msg` with a label (e.g. "stdout" or "stderr").
-///
-/// The transformation chain: this platform's reading of a program's output
-/// ([`decode_and_strip_ansi`]) → strip ANSI escapes → scrub credentials →
-/// truncate to [`TIMEOUT_OUTPUT_TAIL_CHARS`] characters.
+/// Append the tail of an output buffer to `msg` with a label: this platform's reading of a
+/// program's output ([`decode_and_strip_ansi`]) → strip ANSI escapes → scrub credentials → truncate
+/// to [`TIMEOUT_OUTPUT_TAIL_CHARS`] characters.
 fn append_output_tail(msg: &mut String, label: &str, data: &[u8]) {
     if !data.is_empty() {
         let scrubbed = strip_and_scrub(data);
@@ -2531,14 +2114,11 @@ fn format_timeout_error(
     msg
 }
 
-/// The memory failure's structured block, in the shape of
-/// [`format_timeout_error`]: the same fields and output tails, a reason that
-/// names the memory ceiling rather than the timeout, and a hint pointing at
-/// the one thing an agent can do about it. It never says "timed out" — a run
-/// ended for memory must be impossible to mistake for one that ran out of
-/// time. The amount is weighed against the machine's RAM in the first line,
-/// and the ceiling that was crossed is named as its own field, as
-/// `timeout_limit` is for a timeout.
+/// The memory failure's structured block, in the shape of [`format_timeout_error`]: the same fields
+/// and output tails, a reason naming the memory ceiling rather than the timeout, and a hint at the
+/// one thing an agent can do. It never says "timed out" — a run ended for memory must be impossible
+/// to mistake for one that ran out of time. The amount is weighed against the machine's RAM in the
+/// first line, and the crossed ceiling is its own field, as `timeout_limit` is for a timeout.
 fn format_memory_error(
     command: &str,
     elapsed: Duration,
@@ -2571,35 +2151,23 @@ fn format_memory_error(
     msg
 }
 
-/// The block appended to a completed command's output in the residual case: the
-/// command exited, the run's whole tree was ended for the process it left behind
-/// ([`stop_leftover`]), and something still holds an output channel
-/// ([`ShellRunResult::ExitedWithLeftovers`], the [`LeftoverPolicy::Command`] path).
+/// The block appended to a completed command's output in the residual case: the command exited, the
+/// run's whole tree was ended for the process it left behind ([`stop_leftover`]), and something
+/// still holds an output channel ([`ShellRunResult::ExitedWithLeftovers`],
+/// [`LeftoverPolicy::Command`]).
 ///
-/// It is a NOTE on a completed command, never an error: the command's own exit
-/// status and the output above it are the result, so this block only reports what is
-/// still running and, in the mode that can act on it, how to stop it. Its lead is the
-/// second section of `tool/shell_leftover.md` — moved out of Rust so the asset is the
-/// one statement of it, including the survival bound the held channel gives the
-/// leftover ([`crate::util::leftover_channels`]). `platform` is taken as a value
-/// rather than read from [`SHELL_PLATFORM`] so both platforms' wording is drivable
-/// from any host's tests, and the stop recipe is the platform's own
-/// ([`leftover_stop_recipe`] — on Windows it lists the released root's children
-/// rather than addressing the released pid). The mode's own sentence is the SAME
-/// fragment [`render_leftover_notes`] renders into the tool description
-/// ([`leftover_mode_sentence`]), so no Rust literal can drift from it: Full mode
-/// emits the platform's stop recipe and then that fragment; ReadOnly emits the
-/// fragment alone, because its guard rejects the process-control commands
-/// (`kill`/`pkill`/`killall`, `taskkill`) the recipe names. `leftover_stop_recipe`
-/// stays available for the durable record written into the log store (shown on
-/// Logs → Issues), which is a record rather than guidance.
+/// It is a NOTE, never an error: the command's exit status and the output above it are the result.
+/// Its lead is the second section of `tool/shell_leftover.md`, the stop recipe is the platform's
+/// own ([`leftover_stop_recipe`]), and the mode's sentence is the SAME fragment
+/// [`render_leftover_notes`] renders into the description; Full emits recipe then sentence,
+/// ReadOnly the sentence alone.
 fn format_leftover_note(mode: ShellMode, platform: ShellPlatform, scope: Option<u32>) -> String {
     let mut msg = crate::prompt::load_prompt_sections("tool/shell_leftover.md")
         .into_iter()
         .nth(1)
         .expect("tool/shell_leftover.md carries the note's lead as its second section");
-    // Full mode can stop what it names, so only there does the note carry this
-    // platform's stop recipe; ReadOnly's guard rejects the commands it names.
+    // Full mode can stop what it names, so only there does the note carry this platform's stop
+    // recipe; ReadOnly's guard rejects the commands it names.
     if matches!(mode, ShellMode::Full) {
         let _ = write!(msg, "\n{}", leftover_stop_recipe(platform, scope));
     }
@@ -2607,9 +2175,9 @@ fn format_leftover_note(mode: ShellMode, platform: ShellPlatform, scope: Option<
     msg
 }
 
-/// The mode's own leftover fragment — [`render_leftover_notes`] renders it into
-/// the tool description and [`format_leftover_note`] appends it to the per-call
-/// note, so one asset serves both and neither can drift from the other.
+/// The mode's own leftover fragment — [`render_leftover_notes`] renders it into the tool
+/// description and [`format_leftover_note`] appends it to the per-call note, so one asset serves
+/// both.
 fn leftover_mode_sentence(mode: ShellMode) -> String {
     crate::prompt::load_prompt(match mode {
         ShellMode::Full => "tool/shell_leftover_full.md",
@@ -2619,19 +2187,15 @@ fn leftover_mode_sentence(mode: ShellMode) -> String {
     .to_owned()
 }
 
-/// A leftover's containment and the way to stop it, in the exact wording Full mode's
-/// note embeds and the durable record's `detail` carries — the identification
-/// line plus the platform's stop command, or the honest unnamed case. Extracted so the
-/// agent's note and the record cannot drift.
+/// A leftover's containment and the way to stop it, in the exact words Full mode's note embeds and
+/// the durable record's `detail` carries — identification line plus the platform's stop command,
+/// or the honest unnamed case. Extracted so the agent's note and the record cannot drift.
 ///
-/// The two platforms differ in what `scope` can name. On unix it is the leftover's
-/// process group id and the group still exists while any member lives, so
-/// `kill -TERM -<pgid>` is directly actionable. On Windows it is the pid of the run's
-/// root process, which the caller has already reaped with `child.wait()` by the time
-/// this path is reached — so `taskkill /PID <pid> /T /F` would address a released pid
-/// (failing, or worse, hitting a recycled unrelated tree). Windows records the parent
-/// pid on each child, so the tree left behind is still reachable by parent: the recipe
-/// lists it with `tasklist /FI "PPID eq <pid>"` and stops each listed process instead.
+/// `scope` names different things per platform: on unix the leftover's process group id, still live
+/// while any member lives, so `kill -TERM -<pgid>` is actionable; on Windows the pid of the
+/// run's root, already reaped by `child.wait()`, so addressing it would hit a released pid. Windows
+/// records the parent pid on each child, so the recipe lists the tree with
+/// `tasklist /FI "PPID eq <pid>"` and stops each listed process instead.
 fn leftover_stop_recipe(platform: ShellPlatform, scope: Option<u32>) -> String {
     match (scope, platform) {
         (Some(pid), ShellPlatform::Unix) => {
@@ -2648,34 +2212,26 @@ fn leftover_stop_recipe(platform: ShellPlatform, scope: Option<u32>) -> String {
     }
 }
 
-/// Shell command execution tool
 pub struct ShellTool {
     /// Whether the shell runs in full or read-only mode.
     pub mode: ShellMode,
 }
 
 impl ShellTool {
-    /// Create a new [`ShellTool`] with the given execution mode.
     #[must_use]
     pub const fn new(mode: ShellMode) -> Self {
         Self { mode }
     }
 
-    /// Launch a command in the background (Full mode only): the command keeps
-    /// running after this tool call returns, its raw output is written to a
-    /// file in the temp area's `.agent` directory, and the returned message
-    /// carries that file's path. The agent reads progress with the read tool
-    /// and stops the session via [`Self::stop_background`].
+    /// Launch a command in the background (Full mode only): it keeps running after this call
+    /// returns, its raw output going to a file in the temp area's `.agent` directory whose path the
+    /// message carries; the agent follows it with the read tool and stops the session via
+    /// [`Self::stop_background`].
     ///
-    /// Two texts, and neither substitutes for the other: `executed` is the
-    /// platform's reading of `written` ([`windows_line::executable`]), which is
-    /// what actually runs, while `written` is the line the agent wrote: the one the
-    /// started-session message shows it, and the one a launch failure or a refusal
-    /// names it by. They arrive as [`windows_line::Executed`] and
-    /// [`windows_line::Written`], so a call cannot pass them the other way round. A
-    /// background command must never be the one path that loses its lines after the
-    /// first: the whole reading is what the shell is handed here, and [`self::bg`] is
-    /// where it is measured and handed over.
+    /// `executed` is the platform's reading of `written` ([`windows_line::executable`]), which is
+    /// what actually runs, while `written` is the line the agent wrote — the one the message shows
+    /// and a launch failure names. The newtypes keep a call from swapping them, and the whole
+    /// reading is what the shell is handed ([`self::bg`]), so no line is lost after the first.
     async fn launch_background(
         &self,
         ws: &Workspace,
@@ -2705,9 +2261,8 @@ impl ShellTool {
         ))
     }
 
-    /// Stop a background session by its output-file path (Full mode only):
-    /// two-stage SIGTERM → grace → SIGKILL on unix, the session's whole process
-    /// tree ended at once on Windows (see [`self::bg`] for the mechanism);
+    /// Stop a background session by its output-file path (Full mode only): two-stage SIGTERM →
+    /// grace → SIGKILL on unix, the session's whole tree ended at once on Windows ([`self::bg`]);
     /// stopping an already-finished session is a no-op.
     async fn stop_background(&self, stop_path: &str) -> anyhow::Result<(String, Option<i32>)> {
         let sessions = Self::background_sessions_handle()?;
@@ -2731,10 +2286,9 @@ impl ShellTool {
         }
     }
 
-    /// The agent-scoped background-session registry, read from the tool-batch
-    /// context (set once per tool batch by the agent's `execute_tool_group`).
-    /// `None` outside an agent run (management diagnostics, tests) —
-    /// background mode is unavailable there.
+    /// The agent-scoped background-session registry, read from the tool-batch context (set once per
+    /// batch by the agent's `execute_tool_group`). `None` outside an agent run — diagnostics, tests
+    /// — where background mode is unavailable.
     fn background_sessions_handle()
     -> anyhow::Result<std::sync::Arc<crate::tools::shell::BackgroundSessions>> {
         crate::agent::CURRENT_TOOL_BACKGROUND_SESSIONS
@@ -2748,24 +2302,19 @@ impl ShellTool {
             })
     }
 
-    /// Execute a command and return `(formatted_output, exit_code)`.
-    ///
-    /// `exit_code` is `Some(0)` for success, `Some(n)` for non-zero exit, or
-    /// `None` when the process was terminated by a signal.
-    ///
-    /// The `formatted_output` includes the `[exit status: N]` annotation for
-    /// non-zero exits and signal termination (same format as [`execute()`]).
-    /// Credentials are already scrubbed from the returned output.
+    /// Execute a command and return `(formatted_output, exit_code)`: `Some(0)` for success,
+    /// `Some(n)` for a non-zero exit, `None` when a signal terminated the process. The output
+    /// carries the `[exit status: N]` annotation for non-zero exits and signal termination, and
+    /// credentials are already scrubbed.
     #[expect(clippy::too_many_lines)] // orchestration: validation, engine hook, containment
     pub(crate) async fn execute_with_status(
         &self,
         ws: &Workspace,
         args: serde_json::Value,
     ) -> anyhow::Result<(String, Option<i32>)> {
-        // ── Background mode (Full shell roles only) ──
-        // `stop`/`background` are checked before `command` is required, so a
-        // stop-only invocation (no command) works. ReadOnly mode never reads
-        // these arguments — its behavior is byte-identical to before.
+        // `stop`/`background` are checked before `command` is required, so a stop-only invocation
+        // (no command) works. ReadOnly mode never reads these arguments — its behavior is
+        // byte-identical to before.
         if self.mode == ShellMode::Full {
             let stop_path = super::get_opt_str(&args, "stop").filter(|s| !s.is_empty());
             let background = super::get_opt_bool(&args, "background")?.unwrap_or(false);
@@ -2780,14 +2329,13 @@ impl ShellTool {
             }
             if background {
                 let command_str = super::get_str(&args, "command")?;
-                // The foreground's own reading (see [`Self::launch_background`]), so a
-                // background command loses no line either.
+                // The foreground's own reading (see [`Self::launch_background`]), so a background
+                // command loses no line either.
                 let exec_str = windows_line::executable(command_str, SHELL_PLATFORM, self.mode)
                     .map_err(anyhow::Error::msg)?;
-                // The one whole-line rule both modes share: read-only mode reaches
-                // it through `check_command`'s walk, this mode through its own entry
-                // — keyed on the agent's own text, not on the platform's respelt
-                // reading the spawn is handed.
+                // The one whole-line rule both modes share: read-only mode reaches it through
+                // `check_command`'s walk, this mode through its own entry — keyed on the agent's
+                // own text, not on the platform's respelt reading the spawn is handed.
                 readonly::check_line_divergences(command_str, SHELL_PLATFORM)
                     .map_err(anyhow::Error::msg)?;
                 return self
@@ -2802,26 +2350,24 @@ impl ShellTool {
 
         let command_str = super::get_str(&args, "command")?;
 
-        // Read-only mode: validate command before execution.
-        // The grep engine interception runs in BOTH modes (read-only for the
-        // validation path, full for the inherent read-only engine) — see below.
+        // Read-only mode: validate command before execution. The grep engine interception runs in
+        // BOTH modes (read-only for the validation path, full for the inherent read-only engine) —
+        // see below.
         //
-        // `base` is the platform's reading of the command — the text that will
-        // be executed, and the text the serve decision below is taken on (a
-        // rewrite's members are that reading's, not the agent's spelling of it).
-        // `command_str` stays the original: it is what the read-only check
-        // validates, what the grep telemetry records, what profiles the output
-        // and what every error message quotes.
+        // `base` is the platform's reading of the command — the text that will be executed, and the
+        // text the serve decision below is taken on (a rewrite's members are that reading's, not
+        // the agent's spelling of it). `command_str` stays the original: it is what the read-only
+        // check validates, what the grep telemetry records, what profiles the output and what every
+        // error message quotes.
         let base = windows_line::executable(command_str, SHELL_PLATFORM, self.mode)
             .map_err(anyhow::Error::msg)?;
         let mut exec_str = base.as_ref().to_owned();
 
-        // Capture the grep-engine serve decision once, before the mode branch;
-        // reused by both branches for the rewrite and by the telemetry write
-        // after execution.
+        // Capture the grep-engine serve decision once, before the mode branch; reused by both
+        // branches for the rewrite and by the telemetry write after execution.
         let mut grep_serve = grep_engine::try_serve_command(&exec_str, ws.as_path());
-        // The rewrite may name scratch spec files (the Windows hand-off); the
-        // guard removes them on every exit path below, `bail!`s included.
+        // The rewrite may name scratch spec files (the Windows hand-off); the guard removes them on
+        // every exit path below, `bail!`s included.
         let _spec_files = SpecFiles(std::mem::take(&mut grep_serve.spec_files));
 
         if self.mode == ShellMode::ReadOnly {
@@ -2830,53 +2376,44 @@ impl ShellTool {
                 anyhow::bail!("{rejection}");
             }
             if let Some(rewritten) = grep_serve.rewritten.as_deref() {
-                // The engine verb is one of the product binary's read-only second
-                // words (see `readonly::PRODUCT_READ_ONLY_SUBCOMMANDS`), so the
-                // rewrite passes validation; on the off chance a rewrite does not
-                // (an argument spelling the rule refuses), `exec_str` keeps the
-                // reading of the line it was seeded with (on Windows the refusal
-                // below reports it instead).
+                // The engine verb is one of the product binary's read-only second words
+                // (`readonly::PRODUCT_READ_ONLY_SUBCOMMANDS`), so the rewrite passes validation; on
+                // the off chance one does not (an argument spelling the rule refuses), `exec_str`
+                // keeps the reading it was seeded with, and on Windows the refusal below reports
+                // it.
                 if check_command(rewritten, &ctx).is_ok() {
                     exec_str = rewritten.to_string();
                 }
             }
         } else {
-            // Full mode: no read-only validation, but the whole-line divergences
-            // (`;`, `#`, a heredoc) are the one guard rule both modes decide —
-            // `check_command` reaches them in read-only mode, this entry here, and
-            // before the engine's refusal below so a `;`-line carrying a grep word
-            // still gets the guard's message. Keyed on the agent's own text, not on
-            // the platform's respelt reading the spawn is handed. Like every other
-            // guard refusal, this one files no grep telemetry: a refused line is
-            // not a search outcome, and nothing ran.
+            // Full mode: no read-only validation, but the whole-line divergences (`;`, `#`, a
+            // heredoc) are the one guard rule both modes decide — and it runs before the engine's
+            // refusal below, so a `;`-line carrying a grep word still gets the guard's message.
+            // Keyed on the agent's own text, not the platform's respelt reading. Like every guard
+            // refusal it files no grep telemetry: a refused line is not a search outcome.
             readonly::check_line_divergences(command_str, SHELL_PLATFORM)
                 .map_err(anyhow::Error::msg)?;
-            // The engine is inherently read-only and preserves non-grep (incl.
-            // mutating) segments verbatim. Background-mode Full greps are
-            // deliberately NOT served (the early return above runs them on the
-            // platform's reading of the line, and a background command is never
-            // handed to the engine).
+            // The engine is inherently read-only and preserves non-grep (mutating) segments
+            // verbatim. Background-mode Full greps are deliberately NOT served: they returned
+            // above, and a background command is never handed to the engine.
             if let Some(rewritten) = grep_serve.rewritten.as_deref() {
                 exec_str = rewritten.to_string();
             }
         }
 
-        // ── Windows: an unserved search is a tool error ──
-        // The deliberate, documented exception to "a completed command is never
-        // a tool error" (the engine module header states why): an unserved grep
-        // member, or a produced rewrite the read-only guard rejected, would
-        // otherwise reach the agent as interpreter noise under a status it
-        // cannot tell from "no match". On unix `unserved_refusal` is `None` and
-        // the original command runs.
+        // The deliberate, documented exception to "a completed command is never a tool error" (the
+        // engine module header states why): an unserved grep member, or a rewrite the read-only
+        // guard rejected, would otherwise reach the agent as interpreter noise under a status it
+        // cannot tell from "no match". On unix `unserved_refusal` is `None` and the original
+        // command runs.
         if let Some(cause) =
             unserved_refusal(SHELL_PLATFORM, &grep_serve, exec_str != base.as_ref())
         {
             self.write_grep_telemetry(ws, command_str, &grep_serve, false, &cause, None);
-            // The remedy follows the text that would run, not the cause: a text that
-            // still carries a line break is the one shape only a file can run, whatever
-            // cause the engine's refusal carries ([`windows_line::remedy`]). Only this
-            // refusal can offer one — the text it refuses is a reading this module kept
-            // a break in, while the failure the engine reports after a run is about a
+            // The remedy follows the text that would run, not the cause: a text still carrying a
+            // line break is the one shape only a file can run, whatever cause the refusal carries
+            // ([`windows_line::remedy`]). Only this refusal can offer one — the text it refuses is
+            // a reading this module kept a break in, while the engine's post-run failure is about a
             // text it served, which carries none.
             let remedy = exec_str
                 .contains('\n')
@@ -2887,8 +2424,8 @@ impl ShellTool {
             );
         }
 
-        // Allow agent to override the default timeout via `timeout_secs`.
-        // Capped at MAX_SHELL_TIMEOUT_SECS to prevent absurdly long runs.
+        // `timeout_secs` overrides the default, capped at MAX_SHELL_TIMEOUT_SECS against absurd
+        // runs.
         let timeout_secs = super::get_opt_u64(&args, "timeout_secs")?
             .map_or(DEFAULT_SHELL_TIMEOUT.as_secs(), |s| {
                 s.min(MAX_SHELL_TIMEOUT_SECS)
@@ -2896,19 +2433,15 @@ impl ShellTool {
         let timeout = Duration::from_secs(timeout_secs);
         let drain_limit = output_drain_timeout();
 
-        // ── The runner's own steps ──
-        // A produced rewrite is executed by the plan its analysis was rendered
-        // with, because a call of this service's own image is the runner's to make
-        // ([`plan`]): the members it spawns itself are waited for by the runner, and
-        // the status the tool reports is theirs. A produced rewrite that was never
-        // applied bailed out above as an unserved search, so a plan here is always
-        // the one the line was rewritten into.
+        // A produced rewrite is executed by the plan its analysis was rendered with, because a call
+        // of this service's own image is the runner's to make ([`plan`]): the members it spawns are
+        // waited for by the runner, and the status the tool reports is theirs. A rewrite that was
+        // never applied bailed out above, so a plan here is always the applied line's.
         let mut plan_run = grep_serve.plan.take();
         if plan_run.is_none() {
-            // A line the serve decision did not plan can still be an own-image
-            // call of its own (`mahbot debug …`, `mahbot -V`): one the runner can
-            // run as a single step is run by the runner, one it cannot is refused
-            // rather than run.
+            // A line the serve decision did not plan can still be an own-image call of its own
+            // (`mahbot debug …`, `mahbot -V`): one the runner can run as a single step is run by
+            // the runner, one it cannot is refused rather than run.
             match plan::plan_for_command(
                 windows_line::Executed(&exec_str),
                 windows_line::Written(command_str),
@@ -2922,8 +2455,8 @@ impl ShellTool {
             }
         }
 
-        // Measured at each hand-off — a planned fold, or the text the shell is spawned
-        // with when no plan serves it — as [`windows_line::check_command_line`] states.
+        // Measured at each hand-off — a planned fold, or the text the shell is spawned with when no
+        // plan serves it — as [`windows_line::check_command_line`] states.
         match &plan_run {
             Some(plan_run) => plan_run
                 .steps
@@ -2939,11 +2472,10 @@ impl ShellTool {
                 .map_err(anyhow::Error::msg)?,
         }
 
-        // Execute with timeout to prevent hanging commands. `exec_str` may be
-        // the grep-engine rewrite — run through its plan when one was built, and
-        // through the shell otherwise. The ORIGINAL `command_str` is what
-        // `process_shell_output` sees below, so the grep output profile keeps
-        // matching (and `cd … &&` chains still navigate the shell).
+        // `exec_str` may be the grep-engine rewrite — run through its plan when one was built, and
+        // through the shell otherwise. The ORIGINAL `command_str` is what `process_shell_output`
+        // sees below, so the grep output profile keeps matching and `cd … &&` chains still
+        // navigate.
         let mut result = if let Some(plan_run) = &plan_run {
             plan::run(
                 plan_run,
@@ -2967,14 +2499,11 @@ impl ShellTool {
             .await
         };
 
-        // Stream-size marker: the engine reports stdin-fed stream bytes
-        // consumed via a stderr marker; strip it from the agent-visible stderr.
-        // The strip removes any line containing the marker token. The pre-flight
-        // `exec` check misses env-prefixed (`FOO=1 exec 2>&1`) and escaped-verb
-        // (`\exec 2>&1`) redirects, so the marker can leak into the agent-visible
-        // stdout or a file — beyond this strip's reach. Runs on timeout output
-        // too — the marker is flushed before the engine exits, so a later-member
-        // hang would otherwise surface it.
+        // Stream-size marker: the engine reports stdin-fed stream bytes consumed via a stderr
+        // marker; strip every line carrying it from the agent-visible stderr. The pre-flight `exec`
+        // check misses env-prefixed (`FOO=1 exec 2>&1`) and escaped-verb (`\exec 2>&1`) redirects,
+        // so the marker can leak into stdout or a file beyond this reach. Runs on timeout output
+        // too: the marker is flushed before the engine exits.
         match &mut result {
             ShellRunResult::Completed { stderr, .. }
             | ShellRunResult::ExitedWithLeftovers { stderr, .. }
@@ -2988,40 +2517,15 @@ impl ShellTool {
             ShellRunResult::SpawnFailed(_) => {}
         }
 
-        // Grep-engine failure containment: the sentinel exit code means the
-        // engine could neither serve nor exec the real grep, and a stale
-        // self-update binary (one lacking the hidden subcommand) runs full
-        // main() and dies at instance-lock with the lock message — its exit 1
-        // is a legitimate grep no-match code, so the message is treated the
-        // same. On unix the original command is re-run so the agent sees the
-        // authentic result: in Full mode that re-executes the whole original
-        // command, including any preserved mutation segments (mv/cp/mkdir/…)
-        // kept verbatim in the rewrite — documented behavior: a mid-command
-        // engine failure may repeat them. Residual: a mid-search panic after
-        // output was streamed exits sentinel-3, but a pipe/chain member's exit
-        // status masks it — aggregation tails (`grep | wc -l`, `grep | sort`)
-        // are the worst case, turning the partial stream into authoritative-
-        // looking wrong answers — so the agent sees the partial output.
-        //
-        // On Windows the same signatures are the engine failing to serve a
-        // search the platform cannot run itself: telemetry is recorded and the
-        // call is refused (the Windows-only exception above), with the engine's
-        // own stderr line — where it wrote why it could not serve — as the
-        // named cause. There the refusal marker covers the pipe/chain case the
-        // exit status would otherwise mask. Timed-out/spawn-failed
-        // results are not sentinel cases and keep their own handling below; a
-        // leftover-holding result carries the command's own exit status and is
-        // read the same way a completed one is.
-        //
-        // Accepted limit of reading exit 3 as the engine's on both platforms: on
-        // Windows that refuses the call, so a SERVED multi-member command whose
-        // last verbatim member legitimately exits 3 (`grep -rn x . &&
-        // something-that-exits-3`, or `grep … | tail -1` with a tail that exits
-        // 3) is refused even though the search ran — with the run's stderr read
-        // as the cause, the generic line when it holds none. On unix the same
-        // false trigger only re-runs the original command. The parent reads the
-        // run's one composed status, never a per-member one, so a member-3 is
-        // not told apart from an engine-3 here.
+        // // Grep-engine failure containment: the sentinel exit code means the engine could neither
+        // serve nor // exec the real grep, and a stale self-update binary runs full main() and dies
+        // at instance-lock — // its exit 1 is a legitimate grep no-match code, so the message is
+        // treated the same. On unix the // original command is re-run, mutation segments included,
+        // so a mid-command failure may repeat // them; a mid-search panic after streaming exits
+        // sentinel-3 but a pipe member's status masks it. // // On Windows the same signatures are
+        // a search the platform cannot serve: telemetry is recorded and // the call is refused, the
+        // engine's own stderr line being the cause. Accepted limit: a SERVED // command whose last
+        // verbatim member legitimately exits 3 is refused on Windows, re-run on unix.
         let engine_failure = match &result {
             ShellRunResult::Completed { status, stderr, .. }
             | ShellRunResult::ExitedWithLeftovers { status, stderr, .. }
@@ -3042,15 +2546,15 @@ impl ShellTool {
                     &cause,
                     Some(&result),
                 );
-                // No remedy: a served text carries no break, so the serve decision
-                // above offers none.
+                // No remedy: a served text carries no break, so the serve decision above offers
+                // none.
                 anyhow::bail!("{}", grep_engine::unserved_failure(&cause, None));
             }
             Some(EngineFailure::ReRun) => {
                 sentinel_rerun = true;
-                // The platform that re-runs here is the one whose interpreter reads the
-                // whole text itself, so the re-executed line has no single-line limit
-                // to check — the refusal arm above is the other platform's.
+                // The platform that re-runs here is the one whose interpreter reads the whole text
+                // itself, so the re-executed line has no single-line limit to check — the refusal
+                // arm above is the other platform's.
                 let mut original = build_shell_command(base.as_ref(), ws.as_path());
                 run_command_with_timeout(
                     &mut original,
@@ -3066,9 +2570,9 @@ impl ShellTool {
             None => result,
         };
 
-        // Record the served invocation's exit code at DEBUG (filtered from the
-        // general log stream). The dedicated `grep_telemetry` table is the
-        // source of truth for grep decisions; this line is observability only.
+        // Record the served invocation's exit code at DEBUG (filtered from the general log stream).
+        // The dedicated `grep_telemetry` table is the source of truth for grep decisions; this line
+        // is observability only.
         if exec_str != base.as_ref() {
             let exit_code = match &result {
                 ShellRunResult::Completed { status, .. }
@@ -3082,28 +2586,20 @@ impl ShellTool {
             );
         }
 
-        // Grep-engine telemetry: one row per greppable call lands in the
-        // dedicated `grep_telemetry` table, keeping the general `logs` stream
-        // clean of grep detail. Best-effort/fail-open — a telemetry failure
-        // never affects the shell result. `applied` is the ground truth of
-        // whether the shell was rewritten to the engine: the analysis outcomes
-        // can report served even when no engine ran (engine unavailable, spec
-        // too large, ReadOnly rejection) — and a sentinel re-run replaced the
-        // engine with a real-grep run — so the row's served flag must reflect
-        // the ACTUAL execution. The engine-internal `exec_grep` path (cwd
-        // mismatch, matcher-build failure, version mismatch) re-execs real grep
-        // in place, which the parent cannot see; that residual is accepted as it
-        // stands.
+        // Grep-engine telemetry: one row per greppable call lands in `grep_telemetry`, keeping the
+        // `logs` stream clean of grep detail, and is best-effort — a failure never affects the
+        // shell result. `applied` is the ground truth of whether the shell was rewritten: the
+        // analysis can report served when no engine ran (engine unavailable, spec too large,
+        // ReadOnly rejection) and a sentinel re-run replaced it, so the row's flag reflects the
+        // ACTUAL execution. The engine-internal `exec_grep` re-exec is invisible here; accepted.
         let applied = exec_str != base.as_ref();
         let served = applied && !sentinel_rerun;
         let reason = if sentinel_rerun {
             "engine sentinel re-run (real grep)"
         } else if !applied && grep_serve.rewritten.is_some() {
-            // The rewrite was produced but ReadOnly validation rejected it —
-            // the whole command ran real grep. Per-member skip reasons
-            // describe the analysis, not why real grep ran. (On Windows this
-            // case never reaches the row: it is refused above, under the same
-            // cause.)
+            // The rewrite was produced but ReadOnly validation rejected it, so the whole command
+            // ran real grep: per-member skip reasons describe the analysis, not why grep ran. (On
+            // Windows this never reaches the row — it is refused above, under the same cause.)
             GUARD_REJECTED_REASON
         } else if applied {
             grep_serve
@@ -3113,8 +2609,8 @@ impl ShellTool {
                 .map(|o| o.reason.as_str())
                 .unwrap_or_default()
         } else {
-            // No rewrite at all (engine unavailable / spec too large / only
-            // skipped members): the outcomes carry the concrete reason.
+            // No rewrite at all (engine unavailable, spec too large, only skipped members): the
+            // outcomes carry the concrete reason.
             grep_serve
                 .outcomes
                 .iter()
@@ -3123,12 +2619,11 @@ impl ShellTool {
         };
         self.write_grep_telemetry(ws, command_str, &grep_serve, served, reason, Some(&result));
 
-        // A completed run and one whose leftover survived its stop are the same
-        // result — the command's own exit status and the output above it. Only the
-        // latter additionally reports the leftover, so its scope is read off the
-        // result before the match consumes it: `Some(None)` is a leftover whose
-        // containment could not be identified (a rewritten plan's, whose members are
-        // separate process groups), which is still a leftover to report.
+        // A completed run and one whose leftover survived its stop are the same result — the
+        // command's own exit status and the output above it; only the latter reports the leftover,
+        // so its scope is read before the match consumes it. `Some(None)` is a leftover whose
+        // containment could not be identified (a rewritten plan's members are separate process
+        // groups).
         let leftover_scope = match &result {
             ShellRunResult::ExitedWithLeftovers { scope, .. } => Some(*scope),
             _ => None,
@@ -3160,9 +2655,8 @@ impl ShellTool {
                 let exit_code = status.code(); // Option<i32> — None means signal
                 let exit_note = format_exit_status_note(exit_code);
 
-                // All completed commands return output with exit info,
-                // regardless of exit code. Only actual execution failures
-                // (timeout, process launch failure) are tool errors — plus the
+                // All completed commands return output with exit info, whatever the code. Only
+                // actual execution failures (timeout, launch failure) are tool errors — plus the
                 // Windows unserved search refused above.
                 let processed = process_shell_output(
                     command_str,
@@ -3177,21 +2671,17 @@ impl ShellTool {
                     with_note(&processed, &exit_note)
                 };
 
-                // The residual case adds a leftover note on top of this completed
-                // result, and one durable record in the log store (shown on Logs →
-                // Issues): the tool already tried to stop the leftover
-                // ([`stop_leftover`]), so both are only ever produced for something
-                // that survived that. The note is built as
-                // its own step and applied once below, so the call has a single
-                // return and the "finished result plus a leftover note" shape is
-                // visible at a glance.
+                // The residual case adds a leftover note on top of this completed result, and one
+                // durable record in the log store (Logs → Issues): the tool already tried to stop
+                // the leftover ([`stop_leftover`]), so both are only produced for something that
+                // survived it. The note is built as its own step and applied once below, so the
+                // call has a single return.
                 let leftover_note = match leftover_scope {
                     Some(scope) => {
-                        // The durable record of what outlived the call — the one
-                        // record of the occurrence, shown on Logs → Issues: the
-                        // stop recipe (shown to the agent only in Full mode), the
-                        // containment it names, the run's elapsed time and the
-                        // calling agent's own attribution (see
+                        // The durable record of what outlived the call — the one record of the
+                        // occurrence, shown on Logs → Issues: the stop recipe (shown to the agent
+                        // only in Full mode), the containment it names, the run's elapsed time and
+                        // the calling agent's own attribution (see
                         // [`crate::logs::record_stray_event`]).
                         let scope_text = scope.map_or_else(String::new, |pid| pid.to_string());
                         crate::logs::record_stray_event(&crate::logs::StrayEvent {
@@ -3264,17 +2754,12 @@ impl ShellTool {
         }
     }
 
-    /// Queue one grep-engine telemetry row. One helper because the record is
-    /// required on every platform and on every outcome — the post-execution
-    /// decision as well as the two Windows failure paths, which bail with the
-    /// row's `reason` before ever running a command.
-    ///
-    /// `served` is the ground truth of the actual engine execution and `reason`
-    /// the decision's cause; `result` is the run the row describes (`None` for
-    /// a call that bailed before executing, so its elapsed time and exit code
-    /// are empty). A command the analysis never reached a grep member in writes
-    /// no row — except a refused Windows search, which is recorded precisely
-    /// because it must not be invisible (the shape fields stay empty).
+    /// Queue one grep-engine telemetry row: required on every platform and every outcome — the
+    /// post-execution decision and the two Windows failure paths, which bail with the row's
+    /// `reason` before a command runs. `served` is the ground truth of the actual execution,
+    /// `reason` its cause, and `result` the run described (`None` for a call that bailed, so
+    /// elapsed and exit code are empty). A command with no grep member writes no row — except a
+    /// refused Windows search, which is recorded precisely because it must not be invisible.
     fn write_grep_telemetry(
         &self,
         ws: &Workspace,
@@ -3287,8 +2772,7 @@ impl ShellTool {
         if grep_serve.outcomes.is_empty() && grep_serve.refusal.is_none() {
             return;
         }
-        // Nothing will take the row with no log store to reach, so a process that
-        // has none builds nothing.
+        // Nothing will take the row with no log store to reach, so none is built.
         if !crate::telemetry::recording() {
             return;
         }
@@ -3310,19 +2794,16 @@ impl ShellTool {
                     elapsed, status, ..
                 },
             ) => (Some(crate::util::millis_i64(*elapsed)), status.code()),
-            // A stopped run reports a clock and no exit status: the program never
-            // produced one.
+            // A stopped run reports a clock and no exit status: it never produced one.
             Some(
                 ShellRunResult::TimedOut { elapsed, .. }
                 | ShellRunResult::MemoryExceeded { elapsed, .. },
             ) => (Some(crate::util::millis_i64(*elapsed)), None),
-            // A spawn failure has an attempt behind it but no clock to read: the
-            // duration is the placeholder zero, and the absent exit status is
-            // what marks the row.
+            // A spawn failure has an attempt behind it but no clock to read: the duration is the
+            // placeholder zero, and the absent exit status is what marks the row.
             Some(ShellRunResult::SpawnFailed(_)) => (Some(0), None),
-            // A call that bailed before running has nothing to measure: the row
-            // carries no timing at all, rather than a zero that would read as a
-            // genuine zero-duration run.
+            // A call that bailed before running has nothing to measure: no timing at all, rather
+            // than a zero that would read as a genuine zero-duration run.
             None => (None, None),
         };
         crate::telemetry::enqueue(crate::telemetry::TelemetryRecord::GrepTelemetry(
@@ -3347,37 +2828,22 @@ impl ShellTool {
     }
 }
 
-/// Extra `PATH` entries prepended to the fallback `PATH` (see
-/// [`resolved_shell_path`]) so developer tools (`cargo`, Homebrew, npm global
-/// bins, the managed bun runtime, etc.) resolve even in the product's own
-/// internal work, which never reads a parent `PATH`.
-///
-/// Always includes the cargo bin directory (via `$CARGO_HOME/bin` if set,
-/// else `~/.cargo/bin`) plus commonly expected system tool directories.
-///
-/// The standard per-user programs directory
-/// ([`crate::util::managed_bin::mahbot_install_dir`]) is on the list as well: the
-/// product's own installed command lives there, so an agent that runs it by bare
-/// name reaches the installed copy.
-///
-/// # `$CARGO_HOME` belt-and-suspenders
-///
-/// When `$CARGO_HOME` is explicitly set, both `$CARGO_HOME/bin` (from
-/// [`crate::util::cargo_bin_dir`]) AND `~/.cargo/bin` are added, so users
-/// with a non-default `CARGO_HOME` still have their cargo-installed tools
-/// found. Deduplication in [`prepend_path_entries`] handles the case when
-/// both point to the same directory.
+/// Extra `PATH` entries prepended to the fallback `PATH` ([`resolved_shell_path`]) so developer
+/// tools (`cargo`, Homebrew, npm global bins, the managed bun runtime) resolve even in the
+/// product's own internal work, which never reads a parent `PATH`: the cargo bin directory, common
+/// system tool directories, and the per-user programs directory
+/// ([`crate::util::managed_bin::mahbot_install_dir`]) where the product's own command lives. When
+/// `$CARGO_HOME` is set, `~/.cargo/bin` is added too ([`prepend_path_entries`] dedups); managed bun
+/// is LAST, so a user-installed bun keeps precedence.
 fn extra_shell_path_prefixes() -> Vec<PathBuf> {
     let mut v = Vec::new();
 
-    // cargo_bin_dir() returns $CARGO_HOME/bin if CARGO_HOME is set,
-    // else ~/.cargo/bin.
+    // `$CARGO_HOME/bin` if set, else `~/.cargo/bin`.
     if let Some(dir) = crate::util::cargo_bin_dir() {
         v.push(dir);
     }
 
-    // Belt-and-suspenders: when CARGO_HOME is explicitly set, also add
-    // ~/.cargo/bin so both paths are covered. Dedup by prepend_path_entries.
+    // Both paths covered when CARGO_HOME is set; `prepend_path_entries` dedups.
     if let Ok(cargo_home) = std::env::var("CARGO_HOME")
         && !cargo_home.is_empty()
         && let Some(dirs) = UserDirs::new()
@@ -3400,8 +2866,7 @@ fn extra_shell_path_prefixes() -> Vec<PathBuf> {
         v.push(PathBuf::from("/usr/local/bin"));
     }
 
-    // Managed bun runtime (~/.bun/bin) — appended LAST so a user-installed bun
-    // (Homebrew, npm, official installer) keeps precedence over ours.
+    // Managed bun (~/.bun/bin) LAST, so a user-installed bun keeps precedence.
     if let Some(dir) = crate::util::managed_bin::bun_bin_dir() {
         v.push(dir);
     }
@@ -3413,13 +2878,11 @@ const fn default_search_path_without_parent_env() -> &'static str {
     "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 }
 
-/// The system root (normally `C:\Windows`) from the system's own values — the
-/// drive is never assumed, since Windows may be installed on another one.
-///
-/// Resolution order: [`GetWindowsDirectoryW`] (authoritative — it is what the
-/// OS itself uses), then `%SystemRoot%`, then `%WINDIR%`. Cached because it is
-/// read several times per spawned command. The empty string when all three
-/// fail, in which case callers refuse to hand out a fabricated root.
+/// The system root (normally `C:\Windows`) from the system's own values — the drive is never
+/// assumed, since Windows may be installed on another one. Resolution order:
+/// [`GetWindowsDirectoryW`] (authoritative — what the OS itself uses), then `%SystemRoot%`, then
+/// `%WINDIR%`. Cached, as it is read several times per spawned command. The empty string when all
+/// three fail, in which case callers refuse to hand out a fabricated root.
 ///
 /// [`GetWindowsDirectoryW`]: windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW
 #[cfg(windows)]
@@ -3440,30 +2903,29 @@ fn windows_system_root() -> &'static str {
     })
 }
 
-/// The system root as the OS reports it, through `GetWindowsDirectoryW`'s
-/// two-pass protocol: probe the required length with a null/short buffer, then
-/// read into a buffer of exactly that length. Trailing separators are trimmed
-/// so callers can append `\System32` to the result.
+/// The system root as the OS reports it, through `GetWindowsDirectoryW`'s two-pass protocol: probe
+/// the required length with a null buffer, then read into one of that length. Trailing separators
+/// are trimmed so callers can append `\System32`.
 #[cfg(windows)]
 #[must_use]
 fn system_root_from_api() -> Option<String> {
     use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
 
-    // SAFETY: a null buffer with a zero size is the documented length probe —
-    // with no room to write, the API only reports the required size.
+    // SAFETY: a null buffer with a zero size is the documented length probe — with no room to
+    // write, the API only reports the required size.
     let needed = unsafe { GetWindowsDirectoryW(std::ptr::null_mut(), 0) };
     if needed == 0 {
         return None;
     }
     let mut buf = vec![0u16; needed as usize];
-    // SAFETY: `buf` has room for exactly the `needed` UTF-16 units the probe
-    // asked for; the API writes at most that many and reports how many.
+    // SAFETY: `buf` has room for exactly the `needed` UTF-16 units the probe asked for; the API
+    // writes at most that many and reports how many.
     let written = unsafe { GetWindowsDirectoryW(buf.as_mut_ptr(), needed) };
     if written == 0 {
         return None;
     }
-    // `written` excludes the terminator, but a root that grew between the probe
-    // and the read returns the (larger) required size instead — clamp it.
+    // `written` excludes the terminator, but a root that grew between the probe and the read
+    // returns the (larger) required size instead — clamp it.
     let root = String::from_utf16_lossy(&buf[..(written as usize).min(buf.len())]);
     let root = root.trim_end_matches(['\\', '/', '\0']);
     if root.is_empty() {
@@ -3472,9 +2934,8 @@ fn system_root_from_api() -> Option<String> {
     Some(root.to_string())
 }
 
-/// A root taken from the named environment variable: unset, empty or
-/// separator-only values count as absent, and a trailing separator is trimmed
-/// so the value joins natively.
+/// A root from the named variable: unset, empty or separator-only values count as absent, and a
+/// trailing separator is trimmed so the value joins natively.
 #[cfg(windows)]
 #[must_use]
 fn env_system_root(name: &str) -> Option<String> {
@@ -3491,8 +2952,8 @@ fn env_system_root(name: &str) -> Option<String> {
 fn default_search_path_without_parent_env() -> String {
     let root = windows_system_root();
     if root.is_empty() {
-        // An empty baseline beats one fabricated around a drive we can't
-        // confirm; the extra prefixes are still prepended onto it.
+        // An empty baseline beats one fabricated around an unconfirmed drive; prefixes still go on
+        // it.
         return String::new();
     }
     format!(r"{root}\System32;{root};{root}\System32\Wbem;{root}\System32\WindowsPowerShell\v1.0")
@@ -3535,14 +2996,11 @@ fn prepend_path_entries(base: impl AsRef<str>, extras: &[PathBuf]) -> String {
     parts.join(sep)
 }
 
-/// The `PATH` of the reduced fallback environment
-/// ([`internal_env_pairs`]): a portable system baseline plus
-/// [`extra_shell_path_prefixes`], not the owner's `PATH`.
-///
-/// It is *not* what an agent's commands get once the owner's environment has
-/// been read — those run with the owner's own `PATH` (see [`agent_env_pairs`]).
-/// This list serves the product's internal work and stands in whenever no read
-/// has succeeded.
+/// The `PATH` of the reduced fallback environment ([`internal_env_pairs`]): a portable system
+/// baseline plus [`extra_shell_path_prefixes`], not the owner's `PATH`. It is *not* what an agent's
+/// commands get once the owner's environment has been read — those run with the owner's own `PATH`
+/// ([`agent_env_pairs`]); this list serves the product's internal work and stands in whenever no
+/// read has succeeded.
 fn resolved_shell_path() -> String {
     prepend_path_entries(
         default_search_path_without_parent_env(),
@@ -3550,17 +3008,16 @@ fn resolved_shell_path() -> String {
     )
 }
 
-/// Baseline value of a [`FALLBACK_ENV_VARS`] entry. The temp variables are not
-/// handled here: they come from [`crate::temp::shell_temp_vars`] (see
-/// [`internal_env_pairs`]).
+/// Baseline value of a [`FALLBACK_ENV_VARS`] entry. Temp variables come from
+/// [`crate::temp::shell_temp_vars`] instead ([`internal_env_pairs`]).
 fn baseline_env_value(name: &str) -> Option<String> {
     match name {
         "PATH" => Some(resolved_shell_path()),
         "HOME" | "USERPROFILE" => {
             UserDirs::new().map(|d| d.home_dir().to_string_lossy().into_owned())
         }
-        // Read from this process rather than derived: usernames are not
-        // secrets, and the fallback has no other source for one.
+        // Read from this process rather than derived: usernames are not secrets, and the fallback
+        // has no other source for one.
         "USER" | "USERNAME" => std::env::var("USER")
             .or_else(|_| std::env::var("USERNAME"))
             .ok()
@@ -3578,24 +3035,18 @@ fn baseline_env_value(name: &str) -> Option<String> {
     }
 }
 
-/// Returns baseline values for Windows-specific environment variables.
-///
-/// These variables are only meaningful on Windows. Where the parent process
-/// knows the value (`%SystemDrive%`, `%ComSpec%`), its own is preferred; the
-/// rest are derived from the OS-reported system root rather than from a
-/// hard-coded `C:`, so an install on another drive still gets a usable
-/// environment.
+/// Baseline values for Windows-specific environment variables. Where the parent process knows the
+/// value (`%SystemDrive%`, `%ComSpec%`), its own is preferred; the rest are derived from the
+/// OS-reported system root rather than a hard-coded `C:`, so an install on another drive still gets
+/// a usable environment.
 #[cfg(windows)]
 fn windows_baseline_env_value(name: &str) -> Option<String> {
     match name {
         "PATHEXT" => Some(".COM;.EXE;.BAT;.CMD;.VBS;.JS".into()),
         "HOMEDRIVE" | "HOMEPATH" => UserDirs::new().and_then(|d| {
             let s = d.home_dir().to_string_lossy().into_owned();
-            // Note: Windows home paths always start with a drive letter
-            // (e.g., "C:\Users\..."), so byte-index slicing at positions 0..2
-            // is safe. We validate the drive-letter pattern by checking that
-            // the second byte is b':' (colon). This relies on the ASCII
-            // representation of drive letters (A-Z).
+            // Windows home paths start with a drive letter, so slicing at 0..2 is safe once the
+            // second byte is `:`; both bytes are ASCII.
             if s.len() >= 2 && s.as_bytes().get(1) == Some(&b':') {
                 match name {
                     "HOMEDRIVE" => Some(s[..2].to_string()),
@@ -3606,18 +3057,15 @@ fn windows_baseline_env_value(name: &str) -> Option<String> {
                 None
             }
         }),
-        // None of these is ever fabricated around a `C:` assumption: an absent
-        // system root leaves the variable unset rather than pointing a child at
-        // a plausible-but-wrong drive.
+        // Never fabricated around a `C:` assumption: an absent system root leaves the variable
+        // unset rather than pointing a child at a plausible-but-wrong drive.
         "SYSTEMROOT" | "WINDIR" => {
             let root = windows_system_root();
             (!root.is_empty()).then(|| root.to_string())
         }
         "SYSTEMDRIVE" => inherited_env_value("SystemDrive").or_else(|| {
-            // Drive prefix of the system root — the drive letter plus its colon
-            // (`C:`), derived rather than assumed: the second byte being `:`
-            // proves the `X:` shape, and both bytes are ASCII, so slicing is
-            // safe.
+            // Drive prefix of the system root (`C:`), derived rather than assumed: a `:` as the
+            // second byte proves the `X:` shape, and both bytes are ASCII.
             let root = windows_system_root();
             (root.as_bytes().get(1) == Some(&b':')).then(|| root[..2].to_string())
         }),
@@ -3629,23 +3077,20 @@ fn windows_baseline_env_value(name: &str) -> Option<String> {
     }
 }
 
-/// The parent process's value for a Windows variable that is not a secret, when
-/// set to something non-empty — the authoritative source when it exists.
+/// The parent's value for a Windows variable that is not a secret, when non-empty.
 #[cfg(windows)]
 #[must_use]
 fn inherited_env_value(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-/// The read-only banner: the shared skeleton with the daemon's temp root and the
-/// session platform's check bullets substituted in. A literal path is the one
-/// spelling every shell resolves the same way, so the skeleton carries it; the
-/// platform's own tools and temp variables are named only in the selected
-/// fragment, since one shared file would push one platform's spellings at the
-/// other's sessions (the same reason `crate::temp`'s temp-cleanup renderer
-/// selects its tool block). The producing families are substituted too: the words
-/// come from the CLI registry ([`crate::cli::producing_families`]), so the banner
-/// cannot name a family the registry does not carry or miss one it does.
+/// The read-only banner: the shared skeleton with the daemon's temp root and the session platform's
+/// check bullets substituted in — a literal path is the one spelling every shell resolves the same
+/// way, so the skeleton carries it, while the platform's own tools and temp variables are named
+/// only in the selected fragment, so one platform's spellings are never pushed at the other's
+/// sessions. The producing families come from the CLI registry
+/// ([`crate::cli::producing_families`]), so the banner cannot name a family it does not carry or
+/// miss one it does.
 fn render_readonly_banner() -> String {
     let platform_checks = crate::prompt::load_prompt(match SHELL_PLATFORM {
         ShellPlatform::Windows => "tool/shell_readonly_banner_windows.md",
@@ -3663,13 +3108,10 @@ fn render_readonly_banner() -> String {
     )
 }
 
-/// The grep-engine disclosure: the shared skeleton with the session platform's
-/// fragment substituted in — the engine serves the same searches here as
-/// everywhere, but what a platform does with the ones it cannot serve, and what
-/// it has to fall back on, differs. Both renderers read [`SHELL_PLATFORM`], the
-/// same value the guard and the engine's command model read, so a Windows
-/// session is never told about a system `grep` and a unix one never about its
-/// absence.
+/// The grep-engine disclosure: the shared skeleton with the session platform's fragment substituted
+/// in — the engine serves the same searches everywhere, but what a platform does with the ones it
+/// cannot serve, and what it falls back on, differs. Both renderers read [`SHELL_PLATFORM`], so a
+/// Windows session is never told about a system `grep` and a unix one never about its absence.
 fn render_grep_notes() -> String {
     let platform_notes = crate::prompt::load_prompt(match SHELL_PLATFORM {
         ShellPlatform::Windows => "tool/shell_grep_notes_windows.md",
@@ -3683,25 +3125,21 @@ fn render_grep_notes() -> String {
     )
 }
 
-/// The command-line reading: this platform's own rules for a command text's line
-/// breaks, the reading the shell applies before the guard looks at anything. One
-/// skeleton for both modes — the reading is the same in both, one line or two — with
-/// the sentences the mode decides substituted in from its own fragment: which
-/// characters a caret's escape may reach, whether that same text is read by the
-/// guard's reader as well, and the answer to every shape the reading refuses (a file,
-/// which the read-only mode does not run). The read-only mode's aside is the one
-/// sentence the skeleton carries no place for: the mode that has none must not be left
-/// a paragraph for it, so it is added to the rendered text (see below). `platform` and
-/// `mode` are arguments rather than the process-global pair, so a host of either kind
-/// renders — and tests — both. `None` on the platform whose own interpreter already
-/// separates commands at a break: it has nothing to be told about line breaks.
+/// The command-line reading: this platform's rules for a command text's line breaks, the reading
+/// the shell applies before the guard looks at anything. One skeleton for both modes — the reading
+/// is the same in either — with the sentences the mode decides substituted in from its own
+/// fragment: which characters a caret's escape reaches, whether the guard's reader reads that text
+/// too, and the answer to every shape the reading refuses (a file, which the read-only mode does
+/// not run). The read-only aside is the one sentence the skeleton carries no place for, so it is
+/// added to the rendered text. `platform` and `mode` are arguments rather than the process globals,
+/// so a host of either kind renders — and tests — both. `None` on the platform whose interpreter
+/// already separates commands at a break.
 fn render_command_line_notes(platform: ShellPlatform, mode: ShellMode) -> Option<String> {
     if platform != ShellPlatform::Windows {
         return None;
     }
-    // Each of the mode's fragments — the caret's clause and the remedy — is written
-    // exactly once in the skeleton, and [`crate::prompt::substitute`] replaces every
-    // occurrence it finds: a fragment written twice is a sentence the agent reads twice.
+    // Each of the mode's fragments is written exactly once in the skeleton, and
+    // [`crate::prompt::substitute`] replaces every occurrence it finds.
     let escaped_target = crate::prompt::load_prompt(match mode {
         ShellMode::Full => "tool/shell_command_lines_escaped_full.md",
         ShellMode::ReadOnly => "tool/shell_command_lines_escaped_read_only.md",
@@ -3709,8 +3147,7 @@ fn render_command_line_notes(platform: ShellPlatform, mode: ShellMode) -> Option
     .trim()
     .to_owned();
     let remedy = windows_line::remedy(mode);
-    // The limit's sentence is built from the same constants the refusal names, so the
-    // three numbers cannot drift apart.
+    // Built from the same constants the refusal names, so the numbers cannot drift apart.
     let cap = windows_line::COMMAND_LINE_CAP.to_string();
     let limit = windows_line::TEXT_UNIT_LIMIT.to_string();
     let overhead = (windows_line::COMMAND_LINE_CAP - windows_line::TEXT_UNIT_LIMIT).to_string();
@@ -3724,8 +3161,8 @@ fn render_command_line_notes(platform: ShellPlatform, mode: ShellMode) -> Option
             ("{{overhead}}", &overhead),
         ],
     );
-    // The aside is added to the mode that has one, one blank line after the last
-    // paragraph: the skeleton's own trailing line break goes with the join.
+    // Added one blank line after the last paragraph; the skeleton's trailing break goes with the
+    // join.
     if mode == ShellMode::ReadOnly {
         notes = format!(
             "{}\n\n{}",
@@ -3736,12 +3173,10 @@ fn render_command_line_notes(platform: ShellPlatform, mode: ShellMode) -> Option
     Some(notes)
 }
 
-/// The full-mode notes: the shared skeleton with this platform's answers
-/// substituted in. What stopping a session does, and what a trailing separator
-/// is, are the two things the platforms do differently — a session must never be
-/// promised a mechanism its platform does not have, and a separator must not be
-/// described by another platform's meaning. [`tree`] is where the stop mechanisms
-/// themselves are.
+/// The full-mode notes: the shared skeleton with this platform's answers substituted in. What
+/// stopping a session does and what a trailing separator is are the two things the platforms do
+/// differently — a session must never be promised a mechanism its platform does not have. [`tree`]
+/// is where the stop mechanisms themselves are.
 fn render_full_mode_notes() -> String {
     let stop = stop_semantics();
     let trailing = crate::prompt::load_prompt(match SHELL_PLATFORM {
@@ -3759,17 +3194,12 @@ fn render_full_mode_notes() -> String {
     )
 }
 
-/// The leftover-process section, rendered in **both** modes: what the agent is
-/// handed when a command exits while a process it started still holds the
-/// command's output channel and could not be stopped ([`format_leftover_note`]). It
-/// renders ONLY the first section of `tool/shell_leftover.md` — the shared skeleton
-/// that states it (a FINISHED call whose result is the command's own output and exit
-/// status, the leftover killed with no further output from it collected) — so the
-/// description does not grow the per-call note's lead, which is the asset's second
-/// section. The mode's own sentence closes it: Full mode points at the
-/// `background: true` / `stop` mechanism, ReadOnly mode states that everything
-/// launched must stay inside the command's lifetime. One skeleton, so the two modes
-/// cannot describe the same note differently.
+/// The leftover-process section, rendered in **both** modes: what the agent is handed when a
+/// command exits while a process it started still holds the output channel and could not be stopped
+/// ([`format_leftover_note`]). It renders ONLY the first section of `tool/shell_leftover.md` — the
+/// shared skeleton (a FINISHED call whose result is the command's own output and exit status, the
+/// leftover killed with no further output collected) — so the description does not grow the
+/// per-call note's lead, which is the asset's second section. The mode's own sentence closes it.
 fn render_leftover_notes(mode: ShellMode) -> String {
     let mode_sentence = leftover_mode_sentence(mode);
     let skeleton = crate::prompt::load_prompt_sections("tool/shell_leftover.md")
@@ -3779,11 +3209,9 @@ fn render_leftover_notes(mode: ShellMode) -> String {
     crate::prompt::substitute(&skeleton, &[("{{mode_sentence}}", &mode_sentence)])
 }
 
-/// This platform's own section — what its tool set is, what the two readers read
-/// differently, how its interpreter is started and how its programs' output is
-/// read back — rendered in **both** modes: none of it is a mode's rule, and an
-/// agent's command is read the same way whichever mode it is running in. `None`
-/// on the platform these notes would not be true of, so nothing is said there.
+/// This platform's own section — its tool set, what its two readers read differently, how its
+/// interpreter is started and how its programs' output is read back — rendered in **both** modes,
+/// as none of it is a mode's rule. `None` on the platform these notes would not be true of.
 fn render_platform_notes(platform: ShellPlatform) -> Option<String> {
     match platform {
         ShellPlatform::Windows => Some(
@@ -3795,9 +3223,8 @@ fn render_platform_notes(platform: ShellPlatform) -> Option<String> {
     }
 }
 
-/// What stopping a run does on this platform — one text for both the tool
-/// description's stop bullet and the `stop` argument's schema entry, so the two
-/// cannot promise different mechanisms.
+/// What stopping a run does on this platform — one text for the description's stop bullet and the
+/// `stop` argument's schema entry, so the two cannot promise different mechanisms.
 fn stop_semantics() -> String {
     crate::prompt::load_prompt(match SHELL_PLATFORM {
         ShellPlatform::Windows => "tool/shell_full_stop_windows.md",
@@ -3814,20 +3241,17 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> String {
-        // The base description and the grep-engine disclosure are shared
-        // verbatim between the modes (a single copy each, so the two
-        // descriptions cannot drift); only the read-only banner, the full-mode
-        // sections (stop semantics included), the leftover-process section and
-        // the platform-selected texts — this platform's own rules, the grep
-        // notes and the command-line reading — are mode-/platform-specific.
+        // The base description and the grep-engine disclosure are shared verbatim between the modes
+        // (one copy each, so they cannot drift); the read-only banner, the full-mode sections, the
+        // leftover section and the platform-selected texts are mode- and platform-specific.
         let base = crate::prompt::load_prompt("tool/shell.md");
         let mut sections: Vec<String> = match self.mode {
             ShellMode::ReadOnly => vec![render_readonly_banner(), base],
             ShellMode::Full => vec![base, render_full_mode_notes()],
         };
         sections.push(render_leftover_notes(self.mode));
-        // A platform with nothing to add is handed the sections it had before this one
-        // existed, with no blank line where it would have been.
+        // A platform with nothing to add is handed the sections it had before this one existed,
+        // with no blank line where it would have been.
         if let Some(platform_notes) = render_platform_notes(SHELL_PLATFORM) {
             sections.push(platform_notes);
         }
@@ -3850,9 +3274,8 @@ impl Tool for ShellTool {
             "maximum": 3600
         });
         match self.mode {
-            // ReadOnly: byte-identical to the pre-background literal. The
-            // background capability is Full-only; the shared `timeout_secs`
-            // binding below keeps the two schemas from drifting.
+            // ReadOnly: byte-identical to the pre-background literal. Background is Full-only; the
+            // shared `timeout_secs` binding keeps the two schemas from drifting.
             ShellMode::ReadOnly => super::tool_params_schema(
                 &json!({
                     "command": {
@@ -3863,13 +3286,10 @@ impl Tool for ShellTool {
                 }),
                 &["command"],
             ),
-            // Full: adds the background/stop arguments on top of the same
-            // command/timeout_secs literal. `command` is intentionally NOT in
-            // `required` here: a stop-only invocation passes just `stop`, and
-            // requiring `command` would push a schema-following model into
-            // inventing a dummy command for stop calls (the daemon accepts
-            // both shapes, but the documented stop-only shape must not be
-            // rejected by provider-side validation).
+            // Full: the background/stop arguments on top of the same command/timeout_secs literal.
+            // `command` is intentionally NOT `required` here: a stop-only invocation passes just
+            // `stop`, and requiring it would push a schema-following model into inventing a dummy
+            // command for stop calls.
             ShellMode::Full => super::tool_params_schema(
                 &json!({
                     "command": {
@@ -3884,8 +3304,8 @@ impl Tool for ShellTool {
                     },
                     "stop": {
                         "type": "string",
-                        // The platform's own stop text (`stop_semantics`) — the
-                        // same text the description's stop bullet carries.
+                        // The platform's own stop text (`stop_semantics`) — the same text the
+                        // description's stop bullet carries.
                         "description": format!(
                             "Output-file path of a background session (as returned by a \
                              background launch) to stop. {} Pass only `stop` with the exact \
@@ -3902,8 +3322,8 @@ impl Tool for ShellTool {
     }
 
     fn side_effects(&self) -> bool {
-        // ReadOnly mode validates commands against a mutating-command blocklist
-        // — best-effort guard, not a sandbox, but sufficient for grouping.
+        // ReadOnly mode validates commands against a mutating-command blocklist — best-effort
+        // guard, not a sandbox, but sufficient for grouping.
         self.mode != ShellMode::ReadOnly
     }
 
@@ -3918,43 +3338,33 @@ impl Tool for ShellTool {
     }
 }
 
-/// Get the shared temp directory for spill/full output logs.
-///
-/// NO startup purge here: crash-leftover `.agent` files are reclaimed by the
-/// periodic temp cleaner (see [`crate::temp`]) or the OS temp sweep — the
-/// daemon builds no startup reclamation. Within a run, owner-deletes-at-end
-/// removes what the agent created.
+/// The shared temp directory for spill/full output logs. NO startup purge: crash-leftover `.agent`
+/// files are reclaimed by the periodic temp cleaner ([`crate::temp`]) or the OS temp sweep, and
+/// within a run owner-deletes-at-end removes what the agent created.
 pub(crate) fn agent_temp_dir() -> Option<std::path::PathBuf> {
     let dir = std::env::temp_dir().join(".agent");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
 
-/// Spill paths created during agent runs, keyed by the owning agent id: spill
-/// files, a direct run's complete-output file and the read tool's per-call
-/// document-conversion directories. Owner-deletes-at-end:
-/// [`cleanup_agent_spills`] removes them when the agent run ends. A file created
-/// after that point (a reader still draining a leftover) or left by a daemon
-/// crash falls to the OS temp sweep and the periodic temp cleaner — and, for one
-/// inside a user's `generated/` folder, to the media sweep once no stored session
-/// mentions it (a crashed run whose result was stored keeps mentioning it, so
-/// only an unmentioned leftover is ever collected). [`is_live_spill_name`] is how
-/// that sweep spares a live run's file.
+/// Spill paths created during agent runs, keyed by the owning agent id: spill files, a direct run's
+/// complete-output file and the read tool's per-call conversion directories. Owner-deletes-at-end
+/// ([`cleanup_agent_spills`]); a file created after that, or left by a crash, falls to the OS temp
+/// sweep and the periodic temp cleaner — and, inside a user's `generated/` folder, to the media
+/// sweep once no stored session mentions it. [`is_live_spill_name`] spares a live run's file.
 static SPILL_OWNERS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, Vec<std::path::PathBuf>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Record a spill path (file or the read tool's conversion directory) under the
-/// current tool's owner, [`spill_owner_key`].
+/// Record a spill path (file or conversion directory) under [`spill_owner_key`].
 pub(crate) fn record_spill_owner(path: std::path::PathBuf) {
     record_spill_owner_as(&spill_owner_key(), path);
 }
 
 /// The [`SPILL_OWNERS`] key of the current tool call — its owning agent id, or
-/// [`crate::agent::role::DIAGNOSTICS_ROLE`] outside an agent run. Resolved where
-/// the caller can still see the tool's task-local identity: a run's complete
-/// output reads this before it hands bytes to reader tasks, which are scopes of
-/// their own.
+/// [`crate::agent::role::DIAGNOSTICS_ROLE`] outside an agent run. Resolved where the caller still
+/// sees the tool's task-local identity: a complete-output run reads it before handing bytes to
+/// reader tasks, which are scopes of their own.
 fn spill_owner_key() -> String {
     let agent = crate::agent::CURRENT_TOOL_AGENT_ID
         .try_with(Clone::clone)
@@ -3969,20 +3379,18 @@ fn spill_owner_key() -> String {
     agent.unwrap_or_else(|| crate::agent::role::DIAGNOSTICS_ROLE.to_string())
 }
 
-/// [`record_spill_owner`] under an owner key resolved earlier, for a path that
-/// only exists inside a spawned reader (a direct run's complete-output file).
+/// [`record_spill_owner`] under an owner key resolved earlier, for a path that only exists inside a
+/// spawned reader.
 fn record_spill_owner_as(owner: &str, path: std::path::PathBuf) {
     let mut map = SPILL_OWNERS.lock().unwrap_poison();
     map.entry(owner.to_string()).or_default().push(path);
 }
 
-/// Whether a live run owns a file named `name`. The media sweep walks the same
-/// `generated/` folder a complete-output file sits in and keeps only what stored
-/// session content mentions — but a running turn's file reaches that content only
-/// after its tool result is recorded, so it is not mentioned yet. The check
-/// matches by file name (the sweep's path and the caller's differ in
-/// canonicalization), may spare another user's same-named file for a tick — the
-/// safe direction — and is asked only for files about to be deleted.
+/// Whether a live run owns a file named `name`. The media sweep keeps only what stored session
+/// content mentions, but a running turn's file reaches that content only after its result is
+/// recorded. The check matches by file name (paths differ in canonicalization), may spare another
+/// user's same-named file for a tick — the safe direction — and is asked only for files about to be
+/// deleted.
 pub(crate) fn is_live_spill_name(name: &OsStr) -> bool {
     SPILL_OWNERS
         .lock()
@@ -3992,32 +3400,26 @@ pub(crate) fn is_live_spill_name(name: &OsStr) -> bool {
         .any(|owned| owned.file_name() == Some(name))
 }
 
-/// Delete the spill paths recorded for `agent_id` (owner-deletes-at-end): a
-/// path that is a directory (the read tool's per-call document-conversion
-/// artifacts) is removed whole with [`std::fs::remove_dir_all`], a spill file
-/// with [`std::fs::remove_file`]. Also clears the registry entry so a later run
-/// of the same agent id starts fresh. Callers: the agent run-end cleanup guard
-/// (`RunEndCleanup`, which fires on every unwinding exit path of a run — see its
-/// doc for the ones it cannot cover) and the verification round's project-commands
-/// run (which passes [`crate::agent::role::DIAGNOSTICS_ROLE`]). That spill owner is
-/// [`crate::agent::role::DIAGNOSTICS_ROLE`] (`"diagnostics"`).
+/// Delete the spill paths recorded for `agent_id` (owner-deletes-at-end): a directory (the read
+/// tool's conversion artifacts) whole, a file with [`std::fs::remove_file`], and the registry entry
+/// cleared so a later run of the same id starts fresh. Callers: the run-end cleanup guard
+/// (`RunEndCleanup`, which fires on every unwinding exit path) and the verification round's
+/// project-commands run ([`crate::agent::role::DIAGNOSTICS_ROLE`], `"diagnostics"`).
 pub(crate) fn cleanup_agent_spills(agent_id: &str) {
     let mut map = SPILL_OWNERS.lock().unwrap_poison();
     let Some(paths) = map.remove(agent_id) else {
         return;
     };
     for p in paths {
-        // Only the recorded path goes: its parent may be a directory other runs
-        // share (`uploads/`, the agent temp area), and removing one this run did
-        // not create would race them.
+        // Only the recorded path goes: its parent may be a directory other runs share (`uploads/`,
+        // the agent temp area), and removing one this run did not create would race them.
         let removed = if p.is_dir() {
             std::fs::remove_dir_all(&p)
         } else {
             std::fs::remove_file(&p)
         };
-        // Already gone is the normal case (a call that cleaned up after its own
-        // failure); anything else is worth a line, because the alternative is a file
-        // nothing will report again.
+        // Already gone is the normal case (a call that cleaned up after its own failure); anything
+        // else is worth a line, because the alternative is a file nothing will report again.
         if let Err(e) = removed
             && e.kind() != std::io::ErrorKind::NotFound
         {
@@ -4026,14 +3428,9 @@ pub(crate) fn cleanup_agent_spills(agent_id: &str) {
     }
 }
 
-// ── Pipeline functions ────────────────────────────────────────────────
-
-/// Quote-tracking state machine. Returns `true` when `c` is outside quotes
-/// and should be examined for shell operators or redirect patterns.
-///
-/// This function tracks ONLY quote state — escape handling is the caller's
-/// responsibility. Most callers should use [`track_char_context`] instead,
-/// which combines both escape and quote tracking.
+/// Quote-tracking state machine: `true` when `c` is outside quotes and should be examined for shell
+/// operators or redirect patterns. Tracks ONLY quote state — escape handling is the caller's job;
+/// most callers want [`track_char_context`], which combines both.
 const fn check_outside_quotes(c: char, in_single: &mut bool, in_double: &mut bool) -> bool {
     match c {
         '\'' if !*in_double => {
@@ -4048,29 +3445,14 @@ const fn check_outside_quotes(c: char, in_single: &mut bool, in_double: &mut boo
     }
 }
 
-/// Combined escape and quote tracking for shell command scanning.
+/// Combined escape and quote tracking for shell command scanning, through [`check_outside_quotes`]:
+/// `true` when `c` is an ordinary unescaped character outside quotes that the caller should examine
+/// for operators or redirects; `false` when it was preceded by an escape backslash, is a backslash
+/// starting one, or is a quote or inside quotes. After a `false` the caller may still push the
+/// character to an output buffer ([`super::scan::strip_heredoc_bodies`] does).
 ///
-/// Handles backslash escaping (with the `escaped` flag) and quote state
-/// transitions (via [`check_outside_quotes`]). Returns `true` when `c` is
-/// a normal unescaped character outside quotes that the caller should
-/// examine for shell operators or redirect patterns. Returns `false` when:
-///
-/// * `c` was preceded by an escape backslash (the `escaped` flag was set)
-/// * `c` is itself a backslash starting an escape
-/// * `c` is a quote character or inside quotes
-///
-/// After a `false` return, the caller may still need to push the character
-/// to an output buffer (e.g., [`super::scan::strip_heredoc_bodies`]
-/// preserves the command string for redirect scanning, while the token
-/// classifier simply continues without pushing).
-///
-/// # Known limitation
-///
-/// Inside double quotes, `\` should only escape `\`, `$`, `` ` ``, `"`, and
-/// newline in a real shell. This function treats any backslash inside double
-/// quotes as an escape, which is acceptable for redirect detection: a quoted
-/// redirect operator is harmless, and an escaped actual redirect would be a
-/// false negative (allow), also harmless.
+/// Known limitation: a real shell lets `\` escape only `\`, `$`, `` ` ``, `"` and newline inside
+/// double quotes; treating any backslash there as an escape is harmless for redirect detection.
 const fn track_char_context(
     c: char,
     in_single: &mut bool,
@@ -4088,13 +3470,11 @@ const fn track_char_context(
     check_outside_quotes(c, in_single, in_double)
 }
 
-/// Consume a `$(...)` or backtick command substitution (delimiters included)
-/// into `current` when `c` starts one; returns whether one was consumed.
-/// Escape- and quote-aware via [`track_char_context`]: separators inside the
-/// body are substitution content, not command separators — mis-splitting
-/// flips `is_chained` in [`process_shell_output`] and disables
-/// standalone-only output transforms. Paren depth mirrors
-/// scan::find_paren_close.
+/// Consume a `$(...)` or backtick substitution (delimiters included) into `current` when `c` starts
+/// one; returns whether one was consumed. Escape- and quote-aware via [`track_char_context`]:
+/// separators inside the body are content, not command separators — mis-splitting flips
+/// `is_chained` in [`process_shell_output`] and disables standalone-only output transforms. Paren
+/// depth mirrors `scan::find_paren_close`.
 fn consume_substitution(
     c: char,
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
@@ -4142,14 +3522,12 @@ fn consume_substitution(
     false
 }
 
-/// Split a shell command string into logical segments at shell operators
-/// (quote- and substitution-aware, newlines separate, heredoc bodies
-/// stripped first). Mis-splitting flips `is_chained` in
-/// [`process_shell_output`] and disables standalone-only output transforms.
+/// Split a shell command string into logical segments at shell operators (quote- and
+/// substitution-aware, newlines separate, heredoc bodies stripped first). Mis-splitting flips
+/// `is_chained` in [`process_shell_output`] and disables standalone-only output transforms.
 fn extract_command_segments(command: &str) -> Vec<String> {
-    // Heredoc bodies are excluded from command scanning (see the read-only
-    // shell guard contract): body text must never be segmented
-    // as commands, and redirect operators inside bodies must not be scanned.
+    // Heredoc bodies are excluded (the read-only guard's contract): body text must never be
+    // segmented as commands, and redirect operators inside bodies must not be scanned.
     let scan = scan::strip_heredoc_bodies(command);
     segment_command(&scan, SegmentMode::Profile)
         .expect("profile segmentation never errors")
@@ -4158,33 +3536,30 @@ fn extract_command_segments(command: &str) -> Vec<String> {
         .collect()
 }
 
-/// Splitting policy of the shared segmenter core ([`segment_command`]): the
-/// profile-selection and grep-interception splitters had already drifted
-/// apart silently (backslash handling); both run this core, and the divergence
-/// is these policies plus, in grep mode, `sh`'s bare-`&` separator and its
-/// unquoted-`#` comment. Unifying them is a separate decision.
+/// Splitting policy of the shared segmenter core ([`segment_command`]): the profile-selection and
+/// grep-interception splitters had drifted apart silently (backslash handling), and both now run
+/// this core — the divergence being these policies plus, in grep mode, `sh`'s bare-`&` separator
+/// and its unquoted-`#` comment. Unifying them is a separate decision.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum SegmentMode {
     /// Empty segments silently skipped; backslash dropped before ordinary chars.
     Profile,
-    /// Empty segments before a connector are syntax errors, except blank
-    /// lines and `;;` case-arm terminators; backslash always preserved; an
-    /// unquoted `#` opening a word comments out the rest of its line (see the
-    /// arm).
+    /// Empty segments before a connector are syntax errors, except blank lines and `;;` case-arm
+    /// terminators; backslash always preserved; an unquoted `#` opening a word comments out the
+    /// rest of its line (see the arm).
     Grep,
 }
 
-/// Empty-segment handling at a flush: skip (profile) or hard error (grep).
-/// Grep's blank-line and case-`;;` allowances are structural, not policy
-/// variants: the `\n` flush skips; the `;` arm consumes the second `;`.
+/// Empty-segment handling at a flush: skip (profile) or hard error (grep). Grep's blank-line and
+/// case-`;;` allowances are structural, not policy variants.
 #[derive(Clone, Copy)]
 enum EmptySegPolicy {
     Skip,
     Error,
 }
 
-/// Escape-sensitive chars for the profile backslash policy: preserved so
-/// downstream scans see escaped operators, not real ones.
+/// Preserved under the profile backslash policy so downstream scans see escaped operators, not
+/// real.
 const fn is_escape_sensitive(c: char) -> bool {
     matches!(
         c,
@@ -4192,11 +3567,10 @@ const fn is_escape_sensitive(c: char) -> bool {
     )
 }
 
-/// True when the raw text accumulated for the current segment ends where a word
-/// could open — nothing yet, or an unescaped whitespace. `\ ` is an escaped
-/// space and stays inside its word, so the backslash run before the whitespace
-/// decides; quotes need no handling here (a closing quote is not whitespace, so
-/// `f" "#c` counts as mid-word, as `sh` reads it).
+/// True when the raw text of the current segment ends where a word could open — nothing yet, or an
+/// unescaped whitespace: `\ ` is an escaped space, so the backslash run before it decides. Quotes
+/// need no handling (a closing quote is not whitespace, so `f" "#c` counts as mid-word, as `sh`
+/// reads it).
 fn at_word_start(segment: &str) -> bool {
     match segment.chars().next_back() {
         None => true,
@@ -4211,9 +3585,8 @@ fn at_word_start(segment: &str) -> bool {
     }
 }
 
-/// True when `keyword` (e.g. `case` when opening, `esac` when closing a
-/// `case` statement) appears in command position: first word of the segment,
-/// or second after a block keyword that introduces commands.
+/// True when `keyword` (`case` opening, `esac` closing) appears in command position: first word of
+/// the segment, or second after a block keyword that introduces commands.
 fn segment_command_word(segment: &str, keyword: &str) -> bool {
     let mut words = segment.split_whitespace();
     match words.next() {
@@ -4223,13 +3596,11 @@ fn segment_command_word(segment: &str, keyword: &str) -> bool {
     }
 }
 
-/// Shared quote/substitution-aware segmenter core: split an already-heredoc-
-/// stripped command into (segment, connector) pairs. Grep mode also reads
-/// `sh`'s bare `&` as the separator it is (`&>` and a `>&` dup stay inside
-/// their token) and its unquoted `#` as the comment it is (dropped with
-/// everything inside it, to the end of its line); the profile splitter sees
-/// both as ordinary text. Returns `None` when a connector follows an empty
-/// segment in a mode that errors on it (grep; blank-line and case-arm `;;`
+/// Shared quote/substitution-aware segmenter core: split an already-heredoc-stripped command into
+/// (segment, connector) pairs. Grep mode also reads `sh`'s bare `&` as the separator it is (`&>`
+/// and a `>&` dup stay inside their token) and its unquoted `#` as the comment it is (dropped to
+/// the end of its line); the profile splitter sees both as ordinary text. `None` when a connector
+/// follows an empty segment in a mode that errors on it (grep; blank-line and case-arm `;;`
 /// exceptions apply).
 #[expect(clippy::too_many_lines)] // quote/substitution state machine
 pub(super) fn segment_command(command: &str, mode: SegmentMode) -> Option<Vec<(String, String)>> {
@@ -4266,8 +3637,8 @@ pub(super) fn segment_command(command: &str, mode: SegmentMode) -> Option<Vec<(S
         if c == '\\' && !in_single {
             match chars.next() {
                 Some('\n') => continue,
-                // Profile drops the backslash before ordinary chars; grep
-                // always preserves both (dropping `\*` makes a shell glob).
+                // Profile drops the backslash before ordinary chars; grep always preserves both
+                // (dropping `\*` makes a shell glob).
                 Some(next) if mode == SegmentMode::Profile && !is_escape_sensitive(next) => {
                     current.push(next);
                 }
@@ -4292,11 +3663,10 @@ pub(super) fn segment_command(command: &str, mode: SegmentMode) -> Option<Vec<(S
                     }
                     continue;
                 }
-                // An unquoted `<`/`>` keeps a glued `&` inside its token: `>&`
-                // and `<&` are one fd-dup operator each (`2>&1`, `<&2`,
-                // `2<&1`) and must not split at that `&`. Only that `&` is
-                // consumed: every other character — a second `<`/`>`, a pipe —
-                // still takes the path it took before.
+                // An unquoted `<`/`>` keeps a glued `&` inside its token: `>&` and `<&` are one
+                // fd-dup operator each (`2>&1`, `<&2`, `2<&1`) and must not split at that `&`. Only
+                // that `&` is consumed: every other character — a second `<`/`>`, a pipe — still
+                // takes the path it took before.
                 '<' | '>' if mode == SegmentMode::Grep => {
                     current.push(c);
                     if chars.peek() == Some(&'&') {
@@ -4304,11 +3674,9 @@ pub(super) fn segment_command(command: &str, mode: SegmentMode) -> Option<Vec<(S
                     }
                     continue;
                 }
-                // A bare `&` backgrounds the command before it — `sh`'s own
-                // separator, like `;` but asynchronous. Everything after it
-                // belongs to the next command and must survive the rewrite
-                // verbatim. `&>` is the bash redirect operator, not a
-                // backgrounding, and stays inside its token.
+                // A bare `&` backgrounds the command before it — `sh`'s own asynchronous separator:
+                // what follows belongs to the next command and must survive the rewrite verbatim.
+                // `&>` is a redirect, not a backgrounding, and stays in its token.
                 '&' if mode == SegmentMode::Grep && chars.peek() != Some(&'>') => {
                     if !flush(&mut current, &mut out, "&", base, &mut in_case) {
                         return None;
@@ -4337,8 +3705,8 @@ pub(super) fn segment_command(command: &str, mode: SegmentMode) -> Option<Vec<(S
                     }
                     continue;
                 }
-                // Newlines separate commands; blank lines stay valid sh
-                // (grep's blank-line exception: this flush always skips).
+                // Newlines separate commands; blank lines stay valid sh (grep's blank-line
+                // exception: this flush always skips).
                 '\n' => {
                     flush(
                         &mut current,
@@ -4353,19 +3721,16 @@ pub(super) fn segment_command(command: &str, mode: SegmentMode) -> Option<Vec<(S
                     if !flush(&mut current, &mut out, ";", base, &mut in_case) {
                         return None;
                     }
-                    // Case-arm `;;` (grep): consume the second `;` so no empty
-                    // flush happens for it. Outside a case, `;;` errors in grep
-                    // mode and is silently skipped in profile mode.
+                    // Case-arm `;;` (grep): consume the second `;` so no empty flush happens.
+                    // Outside a case, `;;` errors in grep mode and is skipped in profile mode.
                     if mode == SegmentMode::Grep && in_case && chars.peek() == Some(&';') {
                         chars.next();
                     }
                     continue;
                 }
-                // An unquoted `#` opening a word starts `sh`'s comment, which
-                // ends at the newline. The comment text is dropped with
-                // everything inside it (`&`, `;` and `|` are ordinary characters
-                // there, and a search spelled after it never runs), and the
-                // line's own connector is that newline, so the lines below are
+                // An unquoted `#` opening a word starts `sh`'s comment, which ends at the newline:
+                // its text is dropped with everything inside it (`&`, `;` and `|` are ordinary
+                // there), and the line's own connector is that newline, so the lines below are
                 // still segmented — and served.
                 '#' if mode == SegmentMode::Grep && at_word_start(&current) => {
                     let _ = chars.find(|c| *c == '\n');
@@ -4392,8 +3757,8 @@ pub(super) fn segment_command(command: &str, mode: SegmentMode) -> Option<Vec<(S
         EmptySegPolicy::Skip,
         &mut in_case,
     );
-    // Trailing pipe/`&&`/`||` would silently drop an empty member into a
-    // VALID executed pipeline — fail closed (grep policy only).
+    // Trailing pipe/`&&`/`||` would silently drop an empty member into a VALID executed pipeline —
+    // fail closed (grep policy only).
     if mode == SegmentMode::Grep
         && matches!(
             out.last().map(|(_, c)| c.as_str()),
@@ -4405,17 +3770,11 @@ pub(super) fn segment_command(command: &str, mode: SegmentMode) -> Option<Vec<(S
     Some(out)
 }
 
-/// Find the index of the first non-flag word in a slice, skipping:
-/// - Git global flags (and their values) when `is_git` is true
-/// - Cargo toolchain specifiers (`+nightly`-style) when not git
-/// - Stderr-capture suffixes (`2>&1`, `1>&2`) — never a subcommand
-/// - Any word starting with `-`
-///
-/// Shared helper used by [`canonical_command`] and `extract_git_subcommand`
-/// to avoid duplicating the flag-skipping loop. The toolchain/stderr-capture
-/// skipping fixes the subcommand-resolution bugs where `cargo +nightly build`
-/// or `git --version 2>&1` parsed the toolchain/suffix as the subcommand
-/// (guard contract, resolved).
+/// Index of the first non-flag word in a slice, skipping git global flags and their values
+/// (`is_git`), cargo toolchain specifiers (`+nightly`), stderr-capture suffixes (`2>&1`, `1>&2`) —
+/// never a subcommand — and any word starting with `-`. Shared by [`canonical_command`] and
+/// `extract_git_subcommand`; the toolchain/suffix skipping fixes the bugs where `cargo +nightly
+/// build` or `git --version 2>&1` parsed the specifier as the subcommand.
 pub(super) fn find_first_non_flag_index(words: &[&str], is_git: bool) -> Option<usize> {
     let mut i = 0;
     while i < words.len() {
@@ -4443,19 +3802,12 @@ pub(super) fn find_first_non_flag_index(words: &[&str], is_git: bool) -> Option<
     None
 }
 
-/// Find the index of the first word that is a command (not a shell prefix,
-/// flag, or environment variable assignment).
-///
-/// Shared helper used by [`first_command_word`] and [`canonical_command`]
-/// to avoid duplicating the scanning logic. A balanced-quoted word (`"env"`,
-/// `'sudo'`) names the same program — it is normalized before the prefix
-/// match so `"env" "t"ouch` resolves to `touch` instead of being masked as
-/// an unknown quoted `env` (fail-closed blocklist dispatch). Env assignments
-/// are matched the same way (`"TMPDIR=/tmp"` is an assignment), so `export
-/// "TMPDIR=/tmp"` has no command word and `"TMPDIR=/tmp" cmd` resolves to
-/// `cmd`. Note this also feeds profile selection (`"env" ls` classifies as
-/// the ls profile), which is directionally more correct for exotic
-/// quoted-prefix spellings.
+/// Index of the first word that is a command — not a shell prefix, flag or environment assignment —
+/// shared by [`first_command_word`] and [`canonical_command`]. A balanced-quoted word (`"env"`,
+/// `'sudo'`) names the same program and is normalized before the prefix match, so `"env" "t"ouch`
+/// resolves to `touch` instead of masking an unknown quoted `env` (fail-closed blocklist dispatch).
+/// Env assignments match the same way, so `export "TMPDIR=/tmp"` has no command word. This also
+/// feeds profile selection (`"env" ls` classifies as the ls profile).
 pub(super) fn find_first_command_word_index(words: &[&str]) -> Option<usize> {
     words.iter().position(|w| {
         let u = scan::strip_quoted_word(w);
@@ -4463,16 +3815,12 @@ pub(super) fn find_first_command_word_index(words: &[&str]) -> Option<usize> {
     })
 }
 
-/// Extract the first command word index, basename, and the split words
-/// from a shell segment.
-///
-/// Trims the segment, splits on whitespace keeping `$(...)`/backtick
-/// substitutions whole (bash treats them as ONE word — a plain split would
-/// shift the command word onto a substitution's inner word and skip the
-/// mutator/git/cargo dispatch), finds the first non-prefix/non-flag/non-env
-/// word index via [`find_first_command_word_index`], and extracts the
-/// basename from it (see [`command_word_basename`]). Returns `None` when no
-/// command word is found (e.g., only prefixes/flags/env assignments).
+/// The first command word of a shell segment: its index, basename and the split words. Splits on
+/// whitespace keeping `$(...)`/backtick substitutions whole (bash treats them as ONE word — a plain
+/// split would shift the command word onto a substitution's inner word and skip the
+/// mutator/git/cargo dispatch), then takes the first non-prefix/non-flag/non-env word
+/// ([`find_first_command_word_index`], [`command_word_basename`]). `None` when there is no command
+/// word — only prefixes, flags or assignments.
 fn command_word_from_segment(segment: &str) -> Option<(usize, &str, Vec<&str>)> {
     let trimmed = segment.trim();
     let words = scan::split_words_keeping_substitutions(trimmed);
@@ -4480,17 +3828,14 @@ fn command_word_from_segment(segment: &str) -> Option<(usize, &str, Vec<&str>)> 
     Some((idx, command_word_basename(words[idx]), words))
 }
 
-/// Basename of a command word, for the blocklist/git/profile dispatch.
-///
-/// Balanced quotes are not part of the name, so the split runs on the literal
-/// spelling rather than the raw one — otherwise the split leaves a stray quote
-/// in the basename (`'/opt/mahbot/bin/mahbot'` → `mahbot'`) and the verb
-/// classifiers read the result as unprovable. An unprovable word keeps its raw
-/// spelling: it is no literal name anyway, and the guard resolves a variable
-/// command word by exact spelling (`"$BIN"` must stay `"$BIN"`).
+/// Basename of a command word for the blocklist/git/profile dispatch. Balanced quotes are not part
+/// of the name, so the split runs on the literal spelling — otherwise it leaves a stray quote in
+/// the basename (`'/opt/mahbot/bin/mahbot'` → `mahbot'`) and the verb classifiers read it as
+/// unprovable. An unprovable word keeps its raw spelling: the guard resolves a variable command
+/// word by exact spelling (`"$BIN"` must stay `"$BIN"`).
 pub(super) fn command_word_basename(word: &str) -> &str {
-    // Unix-only, like the classifier arm this consumes (see
-    // `classify_verb_word`): elsewhere the raw spelling is split, as before.
+    // Unix-only, like the classifier arm this consumes (see `classify_verb_word`): elsewhere the
+    // raw spelling is split, as before.
     #[cfg(unix)]
     let word = match readonly::classify_verb_word(word) {
         readonly::VerbClass::Literal(content) => content,
@@ -4501,12 +3846,8 @@ pub(super) fn command_word_basename(word: &str) -> &str {
         .expect("rsplit always yields at least one element")
 }
 
-/// Extract just the first command word (basename) from a shell segment.
-///
-/// Strips shell prefixes, environment variable assignments (`KEY=value`), and
-/// absolute paths, but stops before any subcommand detection. This is the
-/// lightweight alternative to [`canonical_command`] for callers that only need
-/// the command name (e.g., the read-only guard's verb dispatch).
+/// Just the first command word (basename) of a shell segment, prefixes, assignments and absolute
+/// paths stripped: what the read-only guard's verb dispatch needs.
 pub(super) fn first_command_word(segment: &str) -> &str {
     let Some((_, cmd, _)) = command_word_from_segment(segment) else {
         return "";
@@ -4514,15 +3855,11 @@ pub(super) fn first_command_word(segment: &str) -> &str {
     cmd
 }
 
-/// Extract a canonical command key from a shell segment for profile matching.
-///
-/// Strips shell prefixes, environment variable assignments (`KEY=value`),
-/// absolute paths, and flags between the command and its subcommand. For git, also skips flag *values* for global flags like `-C` and
-/// `-c`. For all other commands, only the flag token itself is skipped — flags
-/// that take values (e.g., `cargo --profile release build`) will have their
-/// value misidentified as the subcommand. This is a known limitation: the
-/// returned key won't match any profile, falling through to generic filtering,
-/// which is the same end state as the pre-fix behavior.
+/// A canonical command key from a shell segment for profile matching: prefixes, assignments,
+/// absolute paths and the flags between command and subcommand stripped. For git, flag *values* of
+/// `-C` and `-c` are skipped too; for other commands only the flag token is, so a value-taking flag
+/// (`cargo --profile release build`) has its value misread as the subcommand — a known limitation
+/// that leaves the key matching no profile and falling through to generic filtering.
 fn canonical_command(segment: &str) -> String {
     let Some((cmd_idx, cmd, words)) = command_word_from_segment(segment) else {
         return String::new();
@@ -4533,9 +3870,8 @@ fn canonical_command(segment: &str) -> String {
         return cmd.to_string();
     }
 
-    // Skip flags between command and subcommand using shared helper
-    // cmd is the bare basename (quotes stripped, then rsplit('/').next()),
-    // so == comparison is safe.
+    // Skip flags between command and subcommand using shared helper cmd is the bare basename
+    // (quotes stripped, then rsplit('/').next()), so == comparison is safe.
     let is_git = cmd == "git";
     if let Some(sub_idx) = find_first_non_flag_index(remaining, is_git) {
         format!("{} {}", cmd, remaining[sub_idx])
@@ -4544,10 +3880,8 @@ fn canonical_command(segment: &str) -> String {
     }
 }
 
-/// Check if a word is a POSIX shell variable assignment (`VAR=value`).
-///
-/// The word must start with `[A-Za-z_]`, contain at least one `=`, and the
-/// name portion (before `=`) must consist only of `[A-Za-z0-9_]`.
+/// Check if a word is a POSIX shell variable assignment (`VAR=value`). The word must start with
+/// `[A-Za-z_]`, contain at least one `=`, and have a name portion of `[A-Za-z0-9_]` only.
 fn is_env_assignment(word: &str) -> bool {
     if let Some(eq_pos) = word.find('=')
         && eq_pos > 0
@@ -4564,15 +3898,10 @@ fn is_env_assignment(word: &str) -> bool {
     false
 }
 
-/// Select the first matching profile for a command string.
-/// Returns on the first match in the first matching command segment
-/// (breaks out of both segment and profile iteration early); chained
-/// commands are handled by iterating over pre-parsed segments.
-///
-/// Profiles with `standalone_only` are skipped when `is_chained` is true,
-/// so transforms that assume homogeneous output (e.g., `compact_ls`) are
-/// not applied to chained commands. The command falls through to
-/// `GEN_FALLBACK` with its sensible truncation defaults instead.
+/// The first matching profile for a command string: the first match in the first matching segment,
+/// or `GEN_FALLBACK`. Profiles with `standalone_only` are skipped when `is_chained` is true, so
+/// transforms that assume homogeneous output (e.g., `compact_ls`) are not applied to chained
+/// commands.
 fn select_profile(segments: &[String], is_chained: bool) -> &'static Profile {
     for segment in segments {
         let canonical = canonical_command(segment);
@@ -4591,17 +3920,10 @@ fn select_profile(segments: &[String], is_chained: bool) -> &'static Profile {
     &GEN_FALLBACK
 }
 
-/// Combine stdout with (filtered) stderr.
-///
-/// Returns stdout as-is when stderr is empty, regardless of exit code.
-/// On success (exit 0) with `keep_stderr` patterns: only stderr lines
-/// matching those patterns are appended. On success without patterns
-/// (or when no stderr lines match), stderr is silently dropped.
-/// On failure (non-zero exit) with `keep_stderr` patterns: the same
-/// filtering is applied to avoid dumping command progress noise
-/// (e.g. `Checking mahbot ...` from cargo). When no lines match,
-/// the stderr section is omitted entirely. On failure without
-/// patterns, all stderr is appended unconditionally.
+/// Combine stdout with (filtered) stderr. Empty stderr returns stdout as-is, whatever the exit
+/// code. With `keep_stderr` patterns only matching lines are appended — on success and on failure
+/// alike, avoiding progress noise like `Checking mahbot ...` from cargo — and the section is
+/// omitted when nothing matches; on failure without patterns all stderr is appended.
 fn combine_output(
     stdout: &str,
     stderr: &str,
@@ -4631,8 +3953,7 @@ fn combine_output(
     }
 }
 
-/// Filter stderr lines through `keep_stderr` patterns and join matching lines.
-/// Returns `None` when no lines match.
+/// Stderr lines matching `keep_stderr`, joined; `None` when none match.
 fn filter_keep_stderr<'a>(stderr: &'a str, patterns: &RegexSet) -> Option<String> {
     let relevant: Vec<&'a str> = stderr.lines().filter(|l| patterns.is_match(l)).collect();
     if relevant.is_empty() {
@@ -4641,38 +3962,28 @@ fn filter_keep_stderr<'a>(stderr: &'a str, patterns: &RegexSet) -> Option<String
     Some(relevant.join("\n"))
 }
 
-/// Shared tail: append elapsed timing (if ≥1s), then spill to file.
-///
-/// When `full_output_for_spill` is provided, it represents the full output
-/// *before* head/tail truncation was applied. If it exceeds the spill
-/// threshold, the full version is saved and a spill header is appended to
-/// `combined` — this preserves complete content for agent review when
-/// head/tail trimming reduces the inline view to a small snippet.
-///
-/// When no pre-head/tail output is available (or it's too small to spill),
-/// the final `combined` output is checked against the threshold and spilled
-/// if large enough, replacing the inline content with a preview.
+/// Shared tail: append elapsed timing (if ≥1s), then spill to file. `full_output_for_spill` is the
+/// output *before* head/tail truncation: past the spill threshold that version is saved and a spill
+/// header appended to `combined`, preserving the complete content for agent review where trimming
+/// left a small snippet. Without it (or when it is too small), `combined` itself is checked and
+/// replaced by a preview if large enough.
 fn finish_shell_output(
     mut combined: String,
     elapsed: Duration,
     full_output_for_spill: Option<&str>,
 ) -> String {
-    // Both stdout and stderr are credential-scrubbed once at
-    // `apply_profile_pipeline` entry, so no further scrubbing is needed
-    // here.  ShellTool overrides `should_scrub_output` to return `false`,
-    // disabling the agent-level scrub as redundant — the pipeline
-    // guarantees scrubbing before any data reaches this function.
+    // Both streams are credential-scrubbed once at `apply_profile_pipeline` entry, so nothing more
+    // is needed here; ShellTool overrides `should_scrub_output` to `false`, disabling the redundant
+    // agent-level scrub.
     if elapsed.as_secs_f64() >= 1.0 {
         let _ = write!(combined, "\n[took {:.1}s]", elapsed.as_secs_f64());
     }
 
-    // When pre-head/tail output is available and large enough, spill the
-    // fuller version so agents can `read` the complete output despite the
-    // head/tail truncation reducing inline content to a snippet.
-    // `full_output_for_spill` is already credential-scrubbed.
-    // The `pre` value is only provided when output exceeds
-    // `TOOL_OUTPUT_BUDGET_BYTES` (guaranteed by `apply_line_truncation`),
-    // so no length re-check is needed here.
+    // When pre-head/tail output is available and large enough, spill the fuller version so agents
+    // can `read` the complete output despite the head/tail truncation reducing inline content to a
+    // snippet. `full_output_for_spill` is already credential-scrubbed. The `pre` value is only
+    // provided when output exceeds `TOOL_OUTPUT_BUDGET_BYTES` (guaranteed by
+    // `apply_line_truncation`), so no length re-check is needed here.
     if let Some(pre) = full_output_for_spill {
         debug_assert!(
             pre.len() > TOOL_OUTPUT_BUDGET_BYTES,
@@ -4720,8 +4031,7 @@ fn collapse_blank_lines(input: &str) -> String {
     result
 }
 
-/// State machine for processing cargo test output.
-/// Drops passing test lines, captures only failure blocks + summary.
+/// Drop passing test lines from cargo test output, capturing only failure blocks and the summary.
 pub(super) fn filter_cargo_test_output(output: &str, exit_code: i32) -> String {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Section {
@@ -4778,10 +4088,9 @@ pub(super) fn filter_cargo_test_output(output: &str, exit_code: i32) -> String {
             continue;
         }
 
-        // Capture test result summary — must remain unconditional by section.
-        // The second "failures:" now stays in InFailures (no InFailureNames state),
-        // so "test result:" after a failure-name list is caught here, not by the
-        // InFailures block below. Adding a section guard here would break the output.
+        // Must remain unconditional by section: the second "failures:" stays in InFailures (no
+        // InFailureNames state), so "test result:" after a failure-name list is caught here, not by
+        // the InFailures block below. A section guard here would break the output.
         if trimmed.starts_with("test result:") {
             f.summary_lines.push(line.to_string());
             f.section = Section::Normal;
@@ -4835,23 +4144,18 @@ pub(super) fn filter_cargo_test_output(output: &str, exit_code: i32) -> String {
     // Fallback: return raw output (shouldn't normally reach here)
     let result = output.to_string();
     if exit_ok && result.trim().is_empty() {
-        // NOTE: This emptiness check runs before combine_output, so it only
-        // considers stdout. The cargo test profile has keep_stderr: None, so
-        // combine_output never appends stderr on success — the result is empty
-        // too. If keep_stderr were ever added to the cargo test profile, this
-        // check would produce [cargo test: ok] even when stderr contains
-        // warnings, while combine_output would then append them after it.
-        // That's arguably better behavior (tests passed, warnings are
-        // secondary), but the coupling should be intentional.
+        // NOTE: this runs before combine_output, so it only sees stdout. The cargo test profile has
+        // keep_stderr: None, so combine_output appends nothing on success. Were keep_stderr ever
+        // added to it, this would say [cargo test: ok] (and combine_output would append the
+        // warnings after) — arguably better, but the coupling should be intentional.
         "[cargo test: ok]".to_string()
     } else {
         result
     }
 }
 
-/// Parse a single `ls -l` line into its listing entry. Returns `None` for the
-/// `total` header, blank lines, the `.`/`..` entries, and anything that is not
-/// an `ls -l` row.
+/// An `ls -l` line as a listing entry; `None` for the `total` header, blank lines, the `.`/`..`
+/// entries and anything that is not an `ls -l` row.
 fn parse_ls_line(line: &str) -> Option<ListingEntry> {
     if line.starts_with("total ") || line.trim().is_empty() {
         return None;
@@ -4870,9 +4174,8 @@ fn parse_ls_line(line: &str) -> Option<ListingEntry> {
     parts.next(); // link count
     parts.next(); // owner
     parts.next(); // group
-    // `ls -l` prints bytes, which the listing renders human-readable. A `-h`
-    // listing's `1.0K` and the `?` of an entry `ls` itself could not stat are
-    // already display text and pass through unchanged.
+    // `ls -l` prints bytes, rendered human-readable. A `-h` listing's `1.0K` and the `?` of an
+    // entry `ls` could not stat are display text already and pass through unchanged.
     let size = parts.next()?;
     let size = size
         .parse::<u64>()
@@ -4902,13 +4205,11 @@ fn parse_ls_line(line: &str) -> Option<ListingEntry> {
     })
 }
 
-/// Compress `ls -l` output into the compact listing ([`format_listing`]).
-///
-/// Non-`-l` output (without a `total N` header) passes through unchanged.
+/// Compress `ls -l` output into the compact listing ([`format_listing`]); non-`-l` output passes
+/// through unchanged.
 pub(super) fn compact_ls(output: &str, _exit_code: i32) -> String {
-    // If the output lacks a "total N" header, it's not in `-l` format.
-    // `parse_ls_line` can only parse `-l` lines — passing non-`-l` output
-    // through would trigger the "(empty)" false positive.
+    // Without a "total N" header it is not `-l` format, and `parse_ls_line` could only produce the
+    // "(empty)" false positive from it.
     if !output.lines().any(|line| line.starts_with("total ")) {
         return output.to_string();
     }
@@ -4934,13 +4235,9 @@ pub(super) fn compact_ls(output: &str, _exit_code: i32) -> String {
     format_listing(&entries)
 }
 
-/// Main entry point for shell output processing.
-///
-/// Routes command output through the profile system: select profile → apply
-/// profile pipeline → combine → finish. Custom output transforms for commands
-/// like `cargo test` (state machine) and `ls` (compact parser) are handled
-/// through the profile's `output_transform` field rather than as hardcoded
-/// special cases.
+/// Main entry point for shell output processing: select profile → apply profile pipeline → combine
+/// → finish. Per-command transforms (`cargo test`'s state machine, `ls` compaction) hang off the
+/// profile's `output_transform` rather than being hardcoded cases here.
 fn process_shell_output(
     command: &str,
     stdout: &str,
@@ -4970,21 +4267,14 @@ fn apply_strip_lines(output: &str, profile: &Profile) -> String {
         .join("\n")
 }
 
-/// Build a head/tail sandwich with an omission marker in the middle.
+/// A head/tail sandwich with an omission marker in the middle. `marker_verb` is the verb in the
+/// marker line — "omitted" for head/tail sandwiches, "truncated" for the `max_lines`-only cap —
+/// kept a plain string rather than an enum for the fixed call sites.
 ///
-/// `marker_verb` is the verb shown in the marker line — "omitted" for head/tail
-/// sandwiches, "truncated" for the `max_lines`-only cap. It is a plain string
-/// rather than an enum; a typo would silently alter tool output, which is
-/// acceptable for the fixed call sites given the existing tests.
-///
-/// Edge cases:
-/// - `head=0` (tail-only, e.g., `ping`, `gh`, `helm` profiles, and the
-///   `max_lines`-only cap, which calls this as `(output, max, 0, "truncated")`):
-///   no leading newline before the omission marker. A future `max_lines = 0`
-///   profile would hit this path too (unreachable today — profiles.rs minimum
-///   is 20) and would format the marker without a leading newline.
-/// - `tail=0` (head-only, e.g., `git log` profile): no trailing newline after
-///   the omission marker.
+/// `head=0` (tail-only: `ping`, `gh`, `helm`, and the `max_lines`-only cap) emits no leading
+/// newline before the marker; a future `max_lines = 0` profile would take that path too
+/// (unreachable today — profiles.rs minimum is 20). `tail=0` (head-only, `git log`) emits no
+/// trailing newline after it.
 fn format_sandwich(output: &str, head: usize, tail: usize, marker_verb: &str) -> String {
     let lines: Vec<&str> = output.lines().collect();
     let total = lines.len();
@@ -5010,12 +4300,10 @@ fn omitted_lines_marker(omitted: usize, verb: &str) -> String {
     format!("... ({omitted} lines {verb})")
 }
 
-/// Apply line truncation: head/tail sandwich (byte-gated), `max_lines`-only absolute cap, or passthrough.
-///
-/// Returns `(truncated_output, pre_truncation_copy)` where the copy captures the
-/// full output before truncation for potential spilling by `finish_shell_output`.
-/// Head/tail is gated on `TOOL_OUTPUT_BUDGET_BYTES` — small outputs are shown in full
-/// regardless of configured head/tail line counts.
+/// Head/tail sandwich (byte-gated), `max_lines`-only absolute cap, or passthrough. Returns
+/// `(truncated_output, pre_truncation_copy)`, the copy holding the full output for
+/// `finish_shell_output`'s spill. Head/tail is gated on `TOOL_OUTPUT_BUDGET_BYTES`, so small
+/// outputs show in full whatever the configured line counts.
 fn apply_line_truncation(output: &str, profile: &Profile) -> (String, Option<String>) {
     let head = profile.head_lines.unwrap_or(0);
     let tail = profile.tail_lines.unwrap_or(0);
@@ -5028,8 +4316,8 @@ fn apply_line_truncation(output: &str, profile: &Profile) -> (String, Option<Str
 
     let line_count = output.lines().count();
 
-    // Capture pre-truncation output for spilling — only when head/tail
-    // actually truncates (byte threshold exceeded + would reduce lines).
+    // Capture pre-truncation output for spilling — only when head/tail actually truncates (byte
+    // threshold exceeded and line count would drop).
     let should_sandwich = (head > 0 || tail > 0)
         && line_count > head + tail
         && output.len() > TOOL_OUTPUT_BUDGET_BYTES;
@@ -5040,10 +4328,8 @@ fn apply_line_truncation(output: &str, profile: &Profile) -> (String, Option<Str
         None
     };
 
-    // Single-pass truncation:
-    // 1. Head/tail sandwich (byte-gated), OR
-    // 2. max_lines-only absolute cap (head-only sandwich with "truncated" verb), OR
-    // 3. passthrough.
+    // Single pass: head/tail sandwich (byte-gated), else the max_lines-only cap (a head-only
+    // sandwich with the "truncated" verb), else passthrough.
     let result = if should_sandwich {
         format_sandwich(output, head, tail, "omitted")
     } else if let Some(max) = max {
@@ -5063,26 +4349,14 @@ fn apply_line_truncation(output: &str, profile: &Profile) -> (String, Option<Str
     (result, pre_truncation)
 }
 
-/// Run the full profile-based processing pipeline on pre-processed output.
-///
-/// Upstream processing (`execute()`) handles ANSI stripping, and the pipe read
-/// cap (`SHELL_PIPE_READ_CAP`, 256 KB) bounds output collected during execution.
-/// Both stdout and stderr are scrubbed once at pipeline entry so all paths
-/// (early-return and main) consistently receive clean data.  No further
-/// scrubbing is needed anywhere downstream — all derived output (truncated,
-/// pre-head/tail for spill, on_empty messages) originates
-/// from this single scrubbed source.
-///
-/// Early-return stages (on_empty) call `combine_output` only.  The main path continues through `combine_output` →
-/// `finish_shell_output` (timing, spill-to-file).  `TOOL_OUTPUT_BUDGET_BYTES`
-/// (5 KB) gates the head/tail truncation and spill preview — it is a trigger,
-/// not a truncation cutoff.  `finish_shell_output` → `try_spill_to_file`'s
-/// use of `crate::util::truncate_tool_output` (a ~5 KB head+tail trigger plus
-/// its omission marker) provides a final safety net for output that still
-/// exceeds the threshold after all pipeline stages.
-///
-/// Stages: line filters, collapse, truncate, line_truncation,
-///         on_empty, output_transform.
+/// The full profile-based pipeline on pre-processed output. Upstream (`execute()`) has already
+/// stripped ANSI, and the pipe read cap ([`SHELL_PIPE_READ_CAP`]) bounded what was collected; both
+/// streams are scrubbed once at entry, so every path (early return and main) receives clean data.
+/// Early-return stages (`on_empty`) call `combine_output` only; the main path continues through
+/// `combine_output` → `finish_shell_output` (timing, spill-to-file). [`TOOL_OUTPUT_BUDGET_BYTES`]
+/// gates the head/tail truncation and the spill preview — a trigger, not a cutoff — and
+/// `try_spill_to_file`'s `crate::util::truncate_tool_output` is the final net. Stages: line
+/// filters, collapse, truncate, line_truncation, on_empty, output_transform.
 fn apply_profile_pipeline(
     profile: &Profile,
     output: &str,
@@ -5090,21 +4364,14 @@ fn apply_profile_pipeline(
     exit_code: i32,
     elapsed: Duration,
 ) -> String {
-    // Scrub both stdout and stderr once at pipeline entry so all
-    // downstream paths (on_empty, main) uniformly receive clean
-    // data.  Scrubbing before keep_stderr filtering means credential
-    // lines that matched keep_stderr patterns will be dropped entirely
-    // because the redacted version no longer matches — this is acceptable
-    // since credentials should never appear in output.  No further
-    // credential scrubbing is needed anywhere in the pipeline; all
-    // derived data (truncated output, spill output) originates from
-    // this single scrubbed source.
+    // Scrub both streams once at entry so every downstream path (on_empty, main) sees clean data.
+    // Scrubbing before keep_stderr filtering drops credential lines that matched a pattern —
+    // acceptable, since credentials must never appear. No later stage scrubs again: all derived
+    // output (truncated, spill) comes from this one source.
     let stderr = scrub_credentials(stderr);
     let output = scrub_credentials(output);
 
-    // Local closure capturing the trailing combine_output arguments (stderr,
-    // exit_code, keep_stderr) to reduce repetition across all call sites.
-    // Output is already scrubbed at pipeline entry.
+    // The trailing combine_output arguments, captured once; output is already scrubbed.
     let combine =
         |output: &str| combine_output(output, &stderr, exit_code, profile.keep_stderr.as_ref());
 
@@ -5119,10 +4386,8 @@ fn apply_profile_pipeline(
         processed = truncate_line_width(&processed, max);
     }
 
-    // Stage 4: line truncation (head/tail + max_lines).
-    // Returns pre-truncation output for spilling by finish_shell_output,
-    // so the complete content remains accessible even when truncation
-    // reduces the inline view to a snippet.
+    // Stage 4: line truncation (head/tail + max_lines), returning the pre-truncation output so the
+    // complete content stays reachable through the spill.
     let (truncated, pre_head_tail) = apply_line_truncation(&processed, profile);
     processed = truncated;
 
@@ -5130,9 +4395,8 @@ fn apply_profile_pipeline(
     if processed.trim().is_empty()
         && let Some(msg) = profile.on_empty
     {
-        // When on_fail_msg is set, use it (fully replacing the message
-        // including the "(failed)" suffix) to avoid contradictory output
-        // like "[cargo clippy: ok] (failed)".
+        // When on_fail_msg is set, use it (fully replacing the message including the "(failed)"
+        // suffix) to avoid contradictory output like "[cargo clippy: ok] (failed)".
         if exit_code != 0
             && let Some(fail_msg) = profile.on_fail_msg
         {
@@ -5144,12 +4408,11 @@ fn apply_profile_pipeline(
         return combine(&format!("{msg}{exit_note} ({secs:.1}s)"));
     }
 
-    // Stage 6: output transform — replaces processed output before combine/finish.
-    // This allows profiles to apply custom transformations (e.g., cargo test state
-    // machine, ls compaction) that operate on the full output after standard
-    // line-level processing has been applied.
-    // `standalone_only` profiles are already skipped at profile-selection time
-    // for chained commands, so the transform here is always applicable.
+    // Stage 6: output transform — replaces processed output before combine/finish. This allows
+    // profiles to apply custom transformations (e.g., cargo test state machine, ls compaction) that
+    // operate on the full output after standard line-level processing has been applied.
+    // `standalone_only` profiles are already skipped at profile-selection time for chained
+    // commands, so the transform here is always applicable.
     if let Some(transform) = profile.output_transform {
         processed = transform(&processed, exit_code);
     }
@@ -5158,9 +4421,8 @@ fn apply_profile_pipeline(
     finish_shell_output(combined, elapsed, pre_head_tail.as_deref())
 }
 
-/// Decode raw shell output bytes into text ([`windows_text::decode`]: this
-/// platform's own reading of a program's output) and strip ANSI escape
-/// sequences.
+/// Decode raw shell output bytes into text ([`windows_text::decode`]: this platform's own reading
+/// of a program's output) and strip ANSI escape sequences.
 ///
 /// This is the first step before further processing such as credential scrubbing
 /// ([`strip_and_scrub`]).
@@ -5168,21 +4430,16 @@ fn decode_and_strip_ansi(data: &[u8]) -> String {
     strip_ansi_escapes(&windows_text::decode(data))
 }
 
-/// Read a file the product itself had a program write — a background session's
-/// output file, the one such file an agent reads back through the read tool —
-/// the way the shell reads a program's output ([`windows_text::decode`]).
-///
-/// `None` for every other path, so the read tool keeps its own reading for the
-/// files an agent or the owner points it at: only a path named like the product's
-/// own output is a program's output here ([`bg::is_output_file`]).
+/// Read a file the product itself had a program write — a background session's output file, the one
+/// such file an agent reads back — the way the shell reads a program's output
+/// ([`windows_text::decode`]). `None` for every other path, so the read tool keeps its own reading
+/// of the files an agent or the owner points it at ([`bg::is_output_file`]).
 pub(crate) fn decode_session_output(path: &Path, bytes: &[u8]) -> Option<String> {
     bg::is_output_file(path).then(|| windows_text::decode(bytes))
 }
 
-/// Format the tool-facing exit-status note: `[exit status: N]`, or
-/// `[exit status: terminated by signal]` when the process was killed by a
-/// signal (exit code `None`). Shared by the foreground and background paths
-/// so the two renderings cannot drift.
+/// The tool-facing exit-status note: `[exit status: N]`, or `[exit status: terminated by signal]`
+/// for a signal death (code `None`). Shared by the foreground and background paths.
 pub(super) fn format_exit_status_note(exit_code: Option<i32>) -> String {
     match exit_code {
         Some(c) => format!("[exit status: {c}]"),
@@ -5190,17 +4447,12 @@ pub(super) fn format_exit_status_note(exit_code: Option<i32>) -> String {
     }
 }
 
-/// Decode raw shell output bytes ([`decode_and_strip_ansi`]'s reading), strip
-/// ANSI escape sequences, then scrub credentials.
-///
-/// Builds on [`decode_and_strip_ansi`] by additionally applying credential
-/// scrubbing. Use this whenever you need to process raw shell bytes into
-/// display-safe text.
+/// [`decode_and_strip_ansi`]'s reading plus credential scrubbing, for raw shell bytes on their way
+/// to display-safe text.
 fn strip_and_scrub(data: &[u8]) -> String {
     scrub_credentials(&decode_and_strip_ansi(data))
 }
 
-/// Truncate any single line exceeding `max_line_len` with a note.
 fn truncate_line_width(input: &str, max_line_len: usize) -> String {
     let mut result = String::with_capacity(input.len());
     for line in input.lines() {
@@ -5219,7 +4471,6 @@ fn truncate_line_width(input: &str, max_line_len: usize) -> String {
     result
 }
 
-/// Format the spill file header line shared by all spill hint producers.
 fn format_spill_header(path: &Path, byte_count: usize, line_count: usize) -> String {
     format!(
         "[Output saved to {} ({} bytes, {} lines)]\n\
@@ -5237,16 +4488,14 @@ const SPILL_PREVIEW_LINES: usize = 5;
 /// Bytes read from each end of a spilled file to fill those lines.
 const SPILL_PREVIEW_EDGE_BYTES: u64 = 8 * 1024;
 
-/// Widest line a summarised body keeps. Ten such lines plus their per-line notes
-/// and the marker stay inside [`TOOL_OUTPUT_BUDGET_BYTES`] with a normal workspace
-/// path in the header, so the summary is not truncated again downstream — which
-/// would cut away its own omitted-lines marker and head lines. The header is not
-/// counted: it is never bounded, since a clipped path would stop resolving.
+/// Widest line a summarised body keeps: ten of them plus their per-line notes and the marker stay
+/// inside [`TOOL_OUTPUT_BUDGET_BYTES`] with a normal workspace path in the header, so the summary
+/// is not truncated again downstream — which would cut away its own omitted-lines marker. The
+/// header is not counted: a clipped path would stop resolving.
 const SPILL_PREVIEW_LINE_BYTES: usize = 380;
 
-/// A spill summary: the header for `bytes`/`lines`, then `body` with each line
-/// kept to [`SPILL_PREVIEW_LINE_BYTES`]. The header is exempt — it is the path,
-/// printed twice, and the `view with` hint must resolve however deep the folder.
+/// A spill summary: the header for `bytes`/`lines`, then `body` with each line kept to
+/// [`SPILL_PREVIEW_LINE_BYTES`]. The header is exempt, so a deep path still resolves.
 fn bounded_body(path: &Path, bytes: usize, lines: usize, body: &str) -> String {
     format!(
         "{}{}",
@@ -5255,8 +4504,7 @@ fn bounded_body(path: &Path, bytes: usize, lines: usize, body: &str) -> String {
     )
 }
 
-/// Build a head/tail preview for large output that was spilled to a file, counted
-/// and summed up as the output itself.
+/// A head/tail preview for large output that was spilled to a file, counted as the output itself.
 fn format_spill_preview(output: &str, path: &Path) -> String {
     bounded_body(
         path,
@@ -5266,13 +4514,11 @@ fn format_spill_preview(output: &str, path: &Path) -> String {
     )
 }
 
-/// The inline summary for a run whose complete output is in [`Spilled`]: the
-/// header every spill uses, then the file's own first and last lines.
-///
-/// Read from the file, not from the captured streams: their tail stops at the
-/// capture cap, so a run that outgrew it would preview a middle as its end. The
-/// header counts are the file's raw bytes and lines in both branches, so the same
-/// file never reports two different sizes.
+/// The inline summary for a run whose complete output is in [`Spilled`]: the header every spill
+/// uses, then the file's own first and last lines. Read from the file, not the captured streams —
+/// their tail stops at the capture cap, so a run that outgrew it would preview a middle as its end.
+/// The header counts are the file's own bytes and lines in both branches, so one file never reports
+/// two sizes.
 fn file_spill_preview(spilled: &Spilled) -> String {
     let bytes = spilled.bytes as u64;
     if bytes <= SPILL_PREVIEW_EDGE_BYTES * 2 {
@@ -5300,14 +4546,14 @@ fn file_spill_preview(spilled: &Spilled) -> String {
         .join("\n");
     let tail_lines: Vec<&str> = tail.lines().collect();
     let tail = tail_lines[tail_lines.len().saturating_sub(SPILL_PREVIEW_LINES)..].join("\n");
-    // The edges are byte windows, so a line can arrive partial at either seam:
-    // the count then treats that line as shown, and a seam line's "more chars"
-    // note counts only what the window holds. The file the header names is exact.
+    // The edges are byte windows, so a line can arrive partial at either seam: the count then
+    // treats that line as shown, and a seam line's "more chars" note counts only what the window
+    // holds. The file the header names is exact.
     let omitted = spilled
         .lines()
         .saturating_sub(head.lines().count() + tail.lines().count());
-    // A file of a few very long lines has no whole line between the two edges,
-    // so there is no count to report — the gap is inside a line.
+    // A file of a few very long lines has no whole line between the two edges, so there is no count
+    // to report — the gap is inside a line.
     let marker = if omitted == 0 {
         "...".to_string()
     } else {
@@ -5321,11 +4567,10 @@ fn file_spill_preview(spilled: &Spilled) -> String {
     )
 }
 
-/// Up to `len` bytes of `path` from `start`, read the way the shell reads a
-/// program's output, since the file is raw bytes off the same pipes. Scrubbed like
-/// the inline result this preview replaces, even though the tool-output pass over
-/// the finished result would scrub it again: the preview is right on its own, not
-/// because of which tool happens to own the run. The file stays byte-complete.
+/// Up to `len` bytes of `path` from `start`, read as the shell reads a program's output, since the
+/// file is raw bytes off the same pipes. Scrubbed like the inline result it replaces, even though
+/// the tool-output pass would scrub it again: the preview is right on its own. The file stays
+/// byte-complete.
 fn read_window(path: &Path, start: u64, len: u64) -> Option<String> {
     use std::io::{Read as _, Seek as _};
 
@@ -5336,11 +4581,10 @@ fn read_window(path: &Path, start: u64, len: u64) -> Option<String> {
     Some(strip_and_scrub(&bytes))
 }
 
-/// Write `bytes` to a spill file and register the path as the current call's the
-/// instant the file exists, before a byte is written: a file written partway (a full
-/// disk, a killed write) is then the run's spill too, so [`cleanup_agent_spills`]
-/// removes it and nothing depends on a sweep noticing it. The partial file is removed
-/// here as well, so a call that fails leaves nothing behind either.
+/// Write `bytes` to a spill file and register the path as the current call's the instant the file
+/// exists, before a byte is written: a part-written file (a full disk, a killed write) is then the
+/// run's spill too, so [`cleanup_agent_spills`] removes it. A failed write removes the partial file
+/// here.
 pub(crate) fn write_owned_spill(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = std::fs::File::create(path)?;
     record_spill_owner(path.to_path_buf());
@@ -5352,7 +4596,6 @@ pub(crate) fn write_owned_spill(path: &std::path::Path, bytes: &[u8]) -> std::io
     Ok(())
 }
 
-/// Write content to the agent temp directory with the given filename.
 fn write_to_spill(content: &str, filename: &str) -> Option<std::path::PathBuf> {
     let dir = agent_temp_dir()?;
     let path = dir.join(filename);
@@ -5363,19 +4606,16 @@ fn write_to_spill(content: &str, filename: &str) -> Option<std::path::PathBuf> {
     Some(path)
 }
 
-/// Write output to a random spill file. The spill applies no filtering: callers
-/// that handle credential-bearing text scrub it before calling.
+/// Write output to a random spill file. No filtering: callers with credential-bearing text scrub
+/// first.
 fn spill_output(output: &str) -> Option<std::path::PathBuf> {
     let filename = crate::tools::path::format_spill_filename();
     write_to_spill(output, &filename)
 }
 
-/// If output exceeds threshold, spill to a temp file and return a preview.
-/// The full output is saved to a file; the inline preview is a short summary.
-///
-/// Reused by read-only tools (e.g. [`crate::tools::mahbot_debug`]) to keep
-/// large result sets out of the LLM context while still making them available
-/// on demand via the read path.
+/// Spill output past `threshold_bytes` to a temp file and return a short preview of it, the full
+/// text staying available through the read path. Reused by read-only tools
+/// ([`crate::tools::mahbot_debug`]) to keep large result sets out of the LLM context.
 pub(crate) fn try_spill_to_file(output: String, threshold_bytes: usize) -> String {
     if output.len() <= threshold_bytes {
         return output;
@@ -5399,39 +4639,25 @@ mod tests {
     use crate::util::test::wait_for_death;
     use crate::util::test::{assert_contains_not_contains, set_env_var};
 
-    // ── Table-driven test helpers ─────────────────────────────────────
-    // These helpers reduce boilerplate for process_shell_output and
-    // filter_cargo_test_output test groups. Each case carries its own
-    // assertions (contains, not_contains, eq) with a descriptive name
-    // so test failures show exactly which scenario broke.
+    // Table-driven helper: a case carries its own assertions (contains, not_contains, eq) and a
+    // descriptive name, so a failure shows exactly which scenario broke.
 
-    /// A test case for [`process_shell_output`] with multi-assertion support.
     #[derive(Default)]
     struct ShellOutputCase {
-        /// Human-readable name for failure diagnostics.
         name: &'static str,
-        /// Canonical/shell command string passed to select_profile.
         command: &'static str,
         stdout: &'static str,
-        /// Stderr input. Default: `""`.
         stderr: &'static str,
-        /// Exit code. Default: `0`.
         exit_code: i32,
-        /// Elapsed time in seconds. Default: `0.0`.
         elapsed_secs: f64,
-        /// Strings that must all be present in the output.
         contains: &'static [&'static str],
-        /// Strings that must all be absent from the output.
         not_contains: &'static [&'static str],
-        /// If set, asserts `result.trim() == eq` (leading/trailing whitespace
-        /// is stripped before comparison).
+        /// `eq`, if set, asserts `result.trim() == eq`.
         eq: Option<&'static str>,
     }
 
     #[derive(Default)]
-    /// A test case for [`filter_cargo_test_output`].
     struct CargoTestFilterCase {
-        /// Human-readable name for failure diagnostics.
         name: &'static str,
         output: &'static str,
         exit_code: i32,
@@ -5439,12 +4665,8 @@ mod tests {
         not_contains: &'static [&'static str],
     }
 
-    /// Run [`process_shell_output`] for each case and assert expectations.
-    ///
-    /// `contains` and `not_contains` are checked against the raw result.
-    /// `eq` (if set) compares against `result.trim()` — leading/trailing
-    /// whitespace is stripped, consistent with how profiles produce
-    /// on_empty messages (e.g. `"[cargo test: ok]"`).
+    /// Run [`process_shell_output`] per case and assert its expectations: `contains` and
+    /// `not_contains` against the raw result, `eq` against `result.trim()`.
     fn check_shell_output(cases: &[ShellOutputCase]) {
         for case in cases {
             let result = process_shell_output(
@@ -5466,16 +4688,13 @@ mod tests {
         }
     }
 
-    // ── Table-driven output selection ─────────────────────────────────
-    //
-    // One row per command shape `process_shell_output` is asked about: the
-    // command, the raw output a run would hand it, and what the formatted
-    // result must carry (and must not).
+    // One row per command shape `process_shell_output` is asked about: the command, the raw output
+    // a run would hand it, and what the formatted result must (and must not) carry.
 
     #[test]
     fn cargo_test_filter_cases() {
-        // Cargo test output filter state machine: the raw output a run hands it
-        // and the lines the filtered result must carry.
+        // Cargo test output filter: the raw output a run hands it and the lines the result must
+        // carry.
         let cases: &[CargoTestFilterCase] = &[
             CargoTestFilterCase {
                 name: "failure block captures failures and panic message",
@@ -5559,9 +4778,9 @@ mod tests {
     #[expect(clippy::too_many_lines)]
     #[test]
     fn profile_selection_cases() {
-        // Profile selection and dispatch: the profile a canonical command
-        // selects, the fallback for an unknown or builtin-only one, and chained
-        // commands dispatching on their first matching segment.
+        // Profile selection and dispatch: the profile a canonical command selects, the fallback for
+        // an unknown or builtin-only one, and chained commands dispatching on their first matching
+        // segment.
         let cases: &[ShellOutputCase] = &[
             ShellOutputCase {
                 name: "cargo --release test triggers state machine",
@@ -5611,8 +4830,8 @@ mod tests {
                 contains: &["test2 ... FAILED", "Compiling", "test1 ... ok"],
                 ..Default::default()
             },
-            // Regression: chained cargo test with compile errors and exit_code=0
-            // must NOT produce the misleading "[cargo test: ok]".
+            // Regression: a chained cargo test with compile errors and exit_code=0 must NOT produce
+            // the misleading "[cargo test: ok]".
             ShellOutputCase {
                 name: "chained cargo test compile error regression",
                 command: "cargo test --lib || true",
@@ -5629,11 +4848,9 @@ mod tests {
                 contains: &["commit", "Author"],
                 ..Default::default()
             },
-            // ── Multi-line commands (newline = command separator) ─────────
-            // Regression: newline splitting in the shared
-            // extract_command_segments changes is_chained, which disables
-            // standalone_only output transforms (compact_ls, cargo test state
-            // machine) for multi-line commands. Raw output must pass through.
+            // Regression: newline splitting changes `is_chained`, which disables standalone_only
+            // transforms (compact_ls, the cargo test machine) for multi-line commands — raw output
+            // must pass through.
             ShellOutputCase {
                 name: "multi-line ls skips compact_ls (newline = chained)",
                 command: "ls -la\ncat README.md",
@@ -5650,9 +4867,8 @@ mod tests {
                 not_contains: &["[cargo test: ok]"],
                 ..Default::default()
             },
-            // Heredoc bodies are removed before segmentation, so a heredoc
-            // command stays a single segment and keeps its profile (the cargo
-            // test state machine still applies — it is not skipped as chained).
+            // Heredoc bodies are removed before segmentation, so a heredoc command stays a single
+            // segment and keeps its profile (the cargo test machine still applies).
             ShellOutputCase {
                 name: "heredoc command stays single segment for profile selection",
                 command: "cargo test --lib <<EOF\nbody\nEOF",
@@ -5660,11 +4876,9 @@ mod tests {
                 eq: Some("test result: ok. 1 passed; 0 failed"),
                 ..Default::default()
             },
-            // Regression: a heredoc whose UNQUOTED body contains a
-            // command substitution emits that substitution as its own segment
-            // (it must remain scanned — bash executes `$()` in unquoted
-            // bodies), so the command becomes chained and standalone-only
-            // profiles (the cargo test state machine) are skipped.
+            // Regression: a heredoc whose UNQUOTED body contains a command substitution emits it as
+            // its own segment (bash executes `$()` in unquoted bodies), so the command becomes
+            // chained and standalone-only profiles are skipped.
             ShellOutputCase {
                 name: "heredoc with substitution body becomes chained",
                 command: "cargo test --lib <<EOF\n$(echo hi)\nEOF",
@@ -5673,7 +4887,6 @@ mod tests {
                 not_contains: &["[cargo test: ok]"],
                 ..Default::default()
             },
-            // ── npx-wrapped tools (profile selection) ─────────────────
             ShellOutputCase {
                 name: "npx eslint selects eslint profile",
                 command: "npx eslint .",
@@ -5714,7 +4927,6 @@ mod tests {
                 contains: &["some", "output"],
                 ..Default::default()
             },
-            // ── Named tool profiles ──
             ShellOutputCase {
                 name: "git diff no changes via on_empty",
                 command: "git diff",
@@ -5821,7 +5033,6 @@ mod tests {
                 contains: &["collected"],
                 ..Default::default()
             },
-            // ── `ls` compaction ──
             ShellOutputCase {
                 name: "empty directory shows (empty)",
                 command: "ls -la",
@@ -5869,7 +5080,6 @@ mod tests {
                 not_contains: &["Summary:"],
                 ..Default::default()
             },
-            // ── Cargo build/check ──
             ShellOutputCase {
                 name: "cargo build strips Compiling, preserves errors",
                 command: "cargo build",
@@ -5917,7 +5127,6 @@ mod tests {
                 contains: &["warning:"],
                 ..Default::default()
             },
-            // ── on_fail_msg tests ────────────────────────────────────
             ShellOutputCase {
                 name: "cargo clippy failure shows on_fail_msg (no (failed) suffix)",
                 command: "cargo clippy",
@@ -5962,9 +5171,8 @@ mod tests {
 
     #[test]
     fn mahbot_surface_lines_bypass_the_line_cap() {
-        // The chrome CLI emits ONE line of JSON; its profile must not apply
-        // GEN_FALLBACK's 500-byte line cap, which would truncate the envelope
-        // mid-JSON and drop the page content.
+        // The chrome CLI emits ONE line of JSON; its profile must not apply GEN_FALLBACK's 500-byte
+        // line cap, which would truncate the envelope mid-JSON and drop the page content.
         let envelope = format!(
             r#"{{"schema":1,"action":"open","ok":true,"kind":"ok","content":"{}","url":"https://example.com/"}}"#,
             "x".repeat(600)
@@ -5987,9 +5195,8 @@ mod tests {
             "envelope line must survive intact"
         );
 
-        // `mahbot audio transcribe` prints the transcript as ONE line, so the
-        // same cap would cut it off after the first 500 bytes — the harm the
-        // chrome case above exists to prevent.
+        // `mahbot audio transcribe` prints the transcript as ONE line, so the same cap would cut it
+        // off after 500 bytes — the harm the chrome case exists to prevent.
         let transcript = "x".repeat(600);
         let result = process_shell_output(
             "mahbot audio transcribe --input voice.wav",
@@ -6005,9 +5212,8 @@ mod tests {
             &["more chars on this line"],
         );
 
-        // The one profile covers the CLI's other prose families too, whose
-        // answers can be just as long a single line (a role or key listing): it
-        // must come through intact as well.
+        // The one profile covers the CLI's other prose families too, whose answers can be as long a
+        // single line (a role or key listing): it must come through intact as well.
         let prose = format!("custom-role `{}`: write, read, verify", "x".repeat(600));
         let result = process_shell_output(
             "mahbot config list-custom-roles",
@@ -6028,9 +5234,9 @@ mod tests {
         );
     }
 
-    /// The reduced fallback list still carries no credential-looking name: it
-    /// is what the product's own internal work runs in, and the stand-in for
-    /// an agent's command until the owner's environment has been read.
+    /// The reduced fallback still carries no credential-looking name: it is what the product's own
+    /// internal work runs in, and the stand-in for an agent's command until the owner's environment
+    /// is read.
     #[test]
     fn fallback_env_vars_carry_the_essentials_and_no_credentials() {
         for var in FALLBACK_ENV_VARS {
@@ -6044,13 +5250,12 @@ mod tests {
         assert!(FALLBACK_ENV_VARS.contains(&"TERM"));
     }
 
-    /// Run `env` through [`build_shell_command`] and return its variables keyed
-    /// by name, so an assertion about a name cannot be fooled by the same text
-    /// appearing inside some other value.
+    /// Run `env` through [`build_shell_command`] and key its variables by name, so an assertion
+    /// about a name cannot be fooled by the same text inside another value.
     #[cfg(unix)]
     async fn shell_env_vars(workspace: &Path) -> std::collections::HashMap<String, String> {
-        // Building the command reads `$CARGO_HOME` in the fallback branch;
-        // the shared lock keeps that from racing another test's env write.
+        // Building the command reads `$CARGO_HOME` in the fallback branch; the shared lock keeps
+        // that from racing another test's env write.
         let mut cmd = {
             let _guard = env_lock().lock().unwrap_poison();
             build_shell_command("env", workspace)
@@ -6063,15 +5268,13 @@ mod tests {
             .collect()
     }
 
-    /// Once the owner's environment has been read, the child runs in it: a
-    /// variable that exists only there reaches the child — credential-shaped
-    /// names included, nothing is filtered — and nothing the reduced fallback
-    /// would add is merged in (`TERM=dumb` is the tell). The private temp root
-    /// still wins over whatever the snapshot carried.
+    /// Once the owner's environment is read, the child runs in it: a variable existing only there
+    /// reaches it — credential-shaped names included, nothing filtered — and nothing the reduced
+    /// fallback would add is merged in (`TERM=dumb` is the tell). The private temp root still wins.
     ///
-    /// `#[serial]`: the snapshot is process-global, so a command another lane
-    /// spawns during this window runs in the fixture too — which is why the fixture
-    /// carries the `PATH` a real owner's environment always has.
+    /// `#[serial]`: the snapshot is process-global, so a command another lane spawns during this
+    /// window runs in the fixture too — which is why it carries the `PATH` a real owner's
+    /// environment has.
     #[cfg(unix)]
     #[serial_test::serial(shell_env)]
     #[tokio::test]
@@ -6081,8 +5284,8 @@ mod tests {
                 OsString::from("OWNER_ONLY"),
                 OsString::from("from-the-snapshot"),
             ),
-            // The owner's own environment is his to expose: a token in it is
-            // handed over as it is, because the command is his own work.
+            // The owner's own environment is his to expose: a token in it is handed over as it is,
+            // because the command is his own work.
             (
                 OsString::from("AWS_SECRET_ACCESS_KEY"),
                 OsString::from("owner-secret-value"),
@@ -6111,14 +5314,14 @@ mod tests {
             !vars.contains_key("TERM"),
             "the fallback must not be merged into the owner's environment: {vars:?}"
         );
-        // The data-location home is imposed even though the snapshot carried
-        // none: that is the exception the scratch-instance workflow relies on.
+        // The data-location home is imposed even though the snapshot carried none: that is the
+        // exception the scratch-instance workflow relies on.
         match std::env::var("HOME") {
             Ok(home) => assert_eq!(vars.get("HOME"), Some(&home), "{vars:?}"),
             Err(_) => assert!(vars.contains_key("HOME"), "{vars:?}"),
         }
-        // `sh` adds `PWD` and friends of its own; the pinned temp names are the
-        // product's and must survive them.
+        // `sh` adds `PWD` and friends of its own; the pinned temp names are the product's and must
+        // survive them.
         for (name, value) in crate::temp::shell_temp_vars() {
             assert_eq!(
                 vars.get(&name).map(String::as_str),
@@ -6128,11 +5331,10 @@ mod tests {
         }
     }
 
-    /// With no snapshot the child gets exactly the reduced fallback: baseline
-    /// values for its names, and nothing from this process's environment.
+    /// With no snapshot the child gets exactly the reduced fallback: baseline values for its names
+    /// and nothing from this process's environment.
     ///
-    /// `#[serial]`: another lane's snapshot is process-global, and this lane
-    /// asserts the absence of one.
+    /// `#[serial]`: another lane's snapshot is process-global, and this lane asserts its absence.
     #[cfg(unix)]
     #[serial_test::serial(shell_env)]
     #[tokio::test]
@@ -6151,17 +5353,17 @@ mod tests {
             "PATH must be in the fallback env"
         );
 
-        // Parent-process env vars outside the fallback list must NOT leak.
-        // CARGO_HOME is commonly set but is not in the list.
+        // Parent-process env vars outside the fallback list must NOT leak. CARGO_HOME is commonly
+        // set but is not in the list.
         assert!(
             !vars.contains_key("CARGO_HOME"),
             "CARGO_HOME must not leak into the child env: {vars:?}"
         );
     }
 
-    /// A direct program run takes its arguments as argv: nothing in them is
-    /// parsed as shell syntax, a non-zero exit is a completed run (reported with
-    /// the standard note), and the output is decoded like the shell's.
+    /// A direct program run takes its arguments as argv: nothing is parsed as shell syntax, a
+    /// non-zero exit is a completed run (reported with the standard note), and output is decoded
+    /// like the shell's.
     #[cfg(unix)]
     #[tokio::test]
     async fn run_program_with_timeout_passes_argv_and_annotates_exit() {
@@ -6173,8 +5375,8 @@ mod tests {
             Path::new("/bin/sh"),
             &[
                 "-c".to_string(),
-                // `$0` is the placeholder below; `$1` is the hostile-looking
-                // value, which must arrive verbatim rather than be executed.
+                // `$0` is the placeholder below; `$1` is the hostile-looking value, which must
+                // arrive verbatim rather than be executed.
                 "printf '%s' \"$1\"; exit 3".to_string(),
                 "sh".to_string(),
                 "a; echo pwned".to_string(),
@@ -6185,8 +5387,8 @@ mod tests {
         .await
         .expect("a completed run");
 
-        // The hostile-looking argument arrives verbatim as the only output
-        // line; the status note follows it as its own paragraph.
+        // The hostile-looking argument arrives verbatim as the only output line; the status note
+        // follows it as its own paragraph.
         assert_eq!(
             output.lines().collect::<Vec<_>>(),
             ["a; echo pwned", "", "[exit status: 3]"]
@@ -6195,15 +5397,14 @@ mod tests {
         assert_eq!(std::fs::read_dir(&spill_dir).map_or(0, Iterator::count), 0);
     }
 
-    /// A direct run past the inline budget keeps every byte it printed in a file
-    /// under the directory its caller named — including output beyond the
-    /// capture cap — and shows only the product's spill summary; two runs never
-    /// share a file, and the run-end cleanup leaves nothing behind.
+    /// A direct run past the inline budget keeps every byte it printed — output beyond the capture
+    /// cap included — in a file under the directory its caller named, and shows only the spill
+    /// summary; two runs never share a file, and the run-end cleanup leaves nothing behind.
     #[cfg(unix)]
     #[tokio::test]
     async fn run_program_with_timeout_spills_complete_output() {
-        /// A unique spill owner, so the run-end cleanup this test calls itself
-        /// can only reach files this test made.
+        /// A unique spill owner, so the run-end cleanup this test calls itself can only reach files
+        /// this test made.
         const OWNER: &str = "test_spill_owner";
 
         crate::agent::CURRENT_TOOL_AGENT_ID
@@ -6214,8 +5415,8 @@ mod tests {
 
                 let mut paths: Vec<String> = Vec::new();
                 for _ in 0..2 {
-                    // More than the per-stream capture cap, so the captured
-                    // streams alone could not hold it.
+                    // More than the per-stream capture cap, so the captured streams alone could not
+                    // hold it.
                     let output = run_program_with_timeout(
                         ws.as_path(),
                         Path::new("/bin/sh"),
@@ -6226,8 +5427,7 @@ mod tests {
                     .await
                     .expect("a completed run");
                     assert!(output.contains("[Output saved to "));
-                    // The run's status still follows a spilled result, as it
-                    // follows an inline one.
+                    // The run's status still follows a spilled result, as it follows an inline one.
                     assert_eq!(output.lines().last(), Some("[exit status: 3]"));
                     let path = output
                         .lines()
@@ -6248,9 +5448,8 @@ mod tests {
                     assert_eq!(file.lines().last(), Some("120000"));
                 }
 
-                // A file of very long lines: the preview stays inside the inline
-                // budget it mirrors, so a later truncation cannot cut away its
-                // own omitted-lines marker.
+                // A file of very long lines: the preview stays inside the inline budget it mirrors,
+                // so a later truncation cannot cut away its own omitted-lines marker.
                 let long = TempDir::new().expect("tempdir");
                 let long_ws = crate::workspace::test_ws(long.path());
                 let long_dir = long_ws.as_path().join("generated");
@@ -6280,9 +5479,8 @@ mod tests {
                 assert_eq!(file.lines().next().map(str::len), Some(2000));
                 paths.push(path.to_string());
 
-                // Owner-deletes-at-end: the caller's workspace keeps no file
-                // (the product's own `generated/` folder stays, as it does for
-                // media).
+                // Owner-deletes-at-end: the caller's workspace keeps no file (the product's own
+                // `generated/` folder stays, as it does for media).
                 cleanup_agent_spills(OWNER);
                 for path in &paths {
                     assert!(!Path::new(path).exists());
@@ -6294,9 +5492,8 @@ mod tests {
             .await;
     }
 
-    /// A direct program run reported as an outcome: output is raw and
-    /// un-annotated, and only the raw streams decide whether anything was
-    /// reported.
+    /// A direct program run reported as an outcome: output is raw and un-annotated, and only the
+    /// raw streams decide whether anything was reported.
     #[cfg(unix)]
     #[tokio::test]
     async fn run_program_outcome_reports_output_and_status_without_annotations() {
@@ -6316,8 +5513,7 @@ mod tests {
         assert!(!out.output.contains("[exit status"), "got: {}", out.output);
         assert_eq!(out.detail, "exit status 0");
 
-        // Non-zero exit is a failed outcome whose output is still just the
-        // program's own text.
+        // A non-zero exit is a failed outcome whose output is still just the program's own text.
         let out = run_program_outcome(
             ws.as_path(),
             Path::new("/bin/sh"),
@@ -6337,14 +5533,14 @@ mod tests {
         assert!(!out.has_output);
         assert!(out.output.is_empty());
 
-        // Whitespace-only output still counts as reported — the raw streams
-        // decide, not the trimmed text.
+        // Whitespace-only output still counts as reported — the raw streams decide, not the trimmed
+        // text.
         let out =
             run_program_outcome(ws.as_path(), Path::new("/bin/sh"), &sh_args("printf '\\n'")).await;
         assert!(out.has_output);
 
-        // ... and so does escape-sequence-only output — reported, even though
-        // the ANSI strip leaves nothing readable behind.
+        // ... and so does escape-sequence-only output, even though the ANSI strip leaves nothing
+        // readable.
         let out = run_program_outcome(
             ws.as_path(),
             Path::new("/bin/sh"),
@@ -6360,9 +5556,9 @@ mod tests {
         assert!(out.has_output);
         assert!(out.output.contains("hi"), "got: {}", out.output);
 
-        // The literal is split so this source does not itself look like a
-        // credential to output scrubbers; the control below proves the scrubber
-        // rewrites it, and that it therefore reaches the automation verbatim.
+        // The literal is split so this source does not look like a credential to output scrubbers;
+        // the control below proves the scrubber rewrites it and that it reaches the automation
+        // verbatim.
         let raw = concat!("API_KEY=", "abcd1234");
         assert!(
             scrub_credentials(raw).contains("*[REDACTED]"),
@@ -6382,9 +5578,9 @@ mod tests {
         );
     }
 
-    /// A run stopped by its ceiling is marked as such — the automation's verdict on
-    /// an unfinished check, as opposed to every other way a run can fail. The
-    /// ceiling is passed in, so the stop is reachable in milliseconds.
+    /// A run stopped by its ceiling is marked as such — the automation's verdict on an unfinished
+    /// check, not another way of failing. The ceiling is passed in, so the stop is reachable in
+    /// milliseconds.
     #[cfg(unix)]
     #[tokio::test]
     async fn run_program_outcome_marks_a_run_stopped_by_its_ceiling() {
@@ -6411,9 +5607,8 @@ mod tests {
         );
     }
 
-    /// A stream longer than the head holds keeps its end: a run's verdict is written
-    /// last, so the one thing an unbounded run may not lose to its own progress is
-    /// where it says how it ended.
+    /// A stream longer than the head holds keeps its end: a run's verdict is written last, so it
+    /// may not lose to its own progress where it says how it ended.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_flooded_stream_keeps_the_end_it_ended_with() {
@@ -6454,9 +5649,9 @@ mod tests {
         contains: &'static [&'static str],
     }
 
-    /// The shell tool's answer for a command: the call is `Ok`, the output is
-    /// the command's, and a non-zero exit still reaches the model as its own
-    /// status note — one table over the invocations.
+    /// The shell tool's answer for a command: the call is `Ok`, the output is the command's, and a
+    /// non-zero exit still reaches the model as its own status note — one table over the
+    /// invocations.
     #[tokio::test]
     async fn shell_tool_reports_output_and_status_cases() {
         let cases: &[ShellInvocationCase] = &[
@@ -6465,9 +5660,8 @@ mod tests {
                 command: "echo hello",
                 contains: &["hello"],
             },
-            // `test -f` exits 1 when the file does not exist, with no
-            // stdout/stderr; combined with `echo` this is stdout plus a non-zero
-            // exit without triggering a command-specific filter profile.
+            // `test -f` exits 1 when the file does not exist and prints nothing; with `echo` this
+            // is stdout plus a non-zero exit without triggering a command-specific filter profile.
             #[cfg(unix)]
             ShellInvocationCase {
                 name: "stdout with a non-zero exit is a success",
@@ -6497,10 +5691,8 @@ mod tests {
         }
     }
 
-    // ── Background mode (Full roles only) ─────────────────────────────
-
-    /// Run `shell_tool.execute(...)` inside the agent tool-batch context with a
-    /// background-session registry, so the background/stop arguments resolve.
+    /// Run `shell_tool.execute(...)` inside the agent tool-batch context with a background-session
+    /// registry, so the background/stop arguments resolve.
     async fn execute_with_bg_registry(
         shell_tool: &ShellTool,
         ws: &crate::Workspace,
@@ -6543,8 +5735,8 @@ mod tests {
         // The session is registered in the agent-scoped registry.
         assert!(sessions.contains(&path), "session must be registered");
 
-        // The read tool can read the output file (temp-area allowlist covers
-        // the .agent directory) — no allowlist changes were needed.
+        // The read tool can read the output file (temp-area allowlist covers the .agent directory)
+        // — no allowlist changes were needed.
         let content = crate::tools::ReadTool::general()
             .execute(&ws, json!({"path": path.to_string_lossy().to_string()}))
             .await
@@ -6626,8 +5818,8 @@ mod tests {
 
     #[tokio::test]
     async fn background_unavailable_without_agent_context() {
-        // No task-local registry (management diagnostics / tests context):
-        // background mode must fail loudly instead of leaking a process.
+        // No task-local registry (management diagnostics / tests context): background mode must
+        // fail loudly instead of leaking a process.
         let tmp = TempDir::new().expect("tempdir");
         let err = ShellTool::new(ShellMode::Full)
             .execute(
@@ -6642,9 +5834,9 @@ mod tests {
         );
     }
 
-    /// A run that can only end by being stopped: `sh` backgrounds a long sleep —
-    /// which inherits sh's process group — then waits, writing the sleep's pid to
-    /// `grandchild.pid` in `dir`. Returns that file and the prepared command.
+    /// A run that can only end by being stopped: `sh` backgrounds a long sleep (which inherits its
+    /// process group) and waits, writing the sleep's pid to `grandchild.pid` in `dir`. Returns that
+    /// file and the command.
     #[cfg(unix)]
     fn run_with_backgrounded_sleep(dir: &TempDir) -> (std::path::PathBuf, tokio::process::Command) {
         let pid_path = dir.path().join("grandchild.pid");
@@ -6665,23 +5857,21 @@ mod tests {
             .expect("valid PID from file")
     }
 
-    /// A run whose tree outgrows the memory ceiling is ended like a stop and
-    /// reported as a memory failure — never as a timeout. The ceiling is a tiny
-    /// injected value, never the real 80%, and the memory is allocated inside the
-    /// command (a shell variable holding a few tens of MiB), so the test process
-    /// itself allocates nothing near physical RAM.
+    /// A run whose tree outgrows the memory ceiling is ended like a stop and reported as a memory
+    /// failure, never as a timeout. The ceiling is a tiny injected value, never the real 80%, and
+    /// the memory is allocated inside the command, so the test process itself allocates nothing
+    /// near RAM.
     ///
-    /// The memory lives in a backgrounded *subshell*, not in the run's direct
-    /// child, so the sample has to reach a descendant to find it.
+    /// The memory lives in a backgrounded *subshell*, not the direct child, so the sample must
+    /// reach a descendant.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_run_over_the_memory_ceiling_is_killed_and_reported() {
-        /// The injected ceiling: small enough that the command below crosses it
-        /// long before the test machine's own 80% could be relevant.
+        /// The injected ceiling: small enough that the command below crosses it long before the
+        /// machine's 80%.
         const CEILING: u64 = 16 * 1024 * 1024;
-        /// What the subshell holds in a variable — 64 MiB, four times the
-        /// ceiling, and nothing at all against physical RAM. Non-NUL bytes
-        /// matter: a NUL is dropped by the shell and would never be counted.
+        /// What the subshell holds: 64 MiB, four times the ceiling and nothing against physical
+        /// RAM. Non-NUL bytes matter — a NUL is dropped by the shell and would never be counted.
         const PAYLOAD: usize = 64 * 1024 * 1024;
 
         let dir = TempDir::new().expect("tempdir");
@@ -6720,8 +5910,8 @@ mod tests {
             "the watchdog must not wait out the command: {elapsed:?}"
         );
 
-        // The reported failure's shape: the memory sentence first, then the
-        // timeout block's own fields, and never a timeout's wording.
+        // The reported failure's shape: the memory sentence first, then the timeout block's fields,
+        // never a timeout's wording.
         let msg = format_memory_error("test", elapsed, used, limit, None, &[], &[]);
         assert!(
             msg.starts_with("Shell command terminated: exceeded memory limit (used ~"),
@@ -6737,10 +5927,9 @@ mod tests {
         assert!(!msg.contains("timed out"), "msg: {msg}");
     }
 
-    /// A stop ends the command's whole process tree, not only its direct child:
-    /// the timeout path ends the run's containment, so a grandchild the command
-    /// backgrounded dies with it. This is the unix arm of [`Tree::terminate`];
-    /// Windows reaches the same outcome through its job object.
+    /// A stop ends the command's whole tree, not only its direct child: the timeout path ends the
+    /// run's containment, so a backgrounded grandchild dies with it (the unix arm of
+    /// [`Tree::terminate`]).
     #[cfg(unix)]
     #[tokio::test]
     async fn timeout_kills_the_command_process_tree() {
@@ -6765,9 +5954,8 @@ mod tests {
         wait_for_death(stopped_grandchild(&pid_path)).await;
     }
 
-    /// A run that is torn down (its future dropped — an abandoned tool call, a
-    /// force-cancelled drain) takes its whole process tree with it: the
-    /// kill-on-drop guard fires.
+    /// A run that is torn down (its future dropped — an abandoned call, a force-cancelled drain)
+    /// takes its whole process tree with it: the kill-on-drop guard fires.
     #[cfg(unix)]
     #[tokio::test]
     async fn dropping_the_run_kills_the_command_process_tree() {
@@ -6796,11 +5984,9 @@ mod tests {
         wait_for_death(stopped_grandchild(&pid_path)).await;
     }
 
-    /// A leftover process holding the output pipes open past the drain bound is
-    /// stopped together with everything the run started, at the moment it is
-    /// detected: the call is a plain completed command — the command's own exit
-    /// status and the output collected up to the detection — and nothing is left
-    /// behind.
+    /// A leftover holding the output pipes open past the drain bound is stopped with everything the
+    /// run started, at the detection: the call is a plain completed command — its own exit status
+    /// and the output collected up to then — and nothing is left behind.
     #[cfg(unix)]
     #[tokio::test]
     async fn output_drain_stops_the_leftover_it_detects() {
@@ -6808,8 +5994,8 @@ mod tests {
         let pid_path = dir.path().join("bg.pid");
         let pid_path_str = pid_path.to_str().expect("valid utf-8 path");
 
-        // Main command exits immediately; the backgrounded subshell inherits
-        // stdout/stderr (no redirect), so EOF never arrives after sh exits.
+        // The command exits immediately; the backgrounded subshell inherits stdout/stderr, so EOF
+        // never arrives.
         let cmd_str = format!("echo before-drain; sleep 5 & echo $! > {pid_path_str}");
         let mut cmd = build_shell_command(&cmd_str, dir.path());
 
@@ -6847,8 +6033,8 @@ mod tests {
         wait_for_death(pid).await;
     }
 
-    /// Short-lived backgrounded jobs that finish within the drain bound keep
-    /// working — the drain completes normally.
+    /// Short-lived backgrounded jobs that finish within the drain bound keep working: the drain
+    /// completes.
     #[cfg(unix)]
     #[tokio::test]
     async fn output_drain_completes_for_short_lived_background_job() {
@@ -6870,16 +6056,15 @@ mod tests {
         assert!(String::from_utf8_lossy(&stdout).contains("done"));
     }
 
-    /// A leftover process holding only ONE pipe (stdout EOFs, stderr hangs) still
-    /// reports the completed side and the command's status once the holder is
-    /// stopped, without re-polling the completed reader (tokio panics on JoinHandle
-    /// re-poll).
+    /// A leftover holding only ONE pipe (stdout EOFs, stderr hangs) still reports the completed
+    /// side and the command's status once the holder is stopped, without re-polling the completed
+    /// reader.
     #[cfg(unix)]
     #[tokio::test]
     async fn output_drain_keeps_the_completed_side_of_a_stopped_leftover() {
         let dir = TempDir::new().expect("tempdir");
-        // The backgrounded sleep redirects stdout (releasing the shell's
-        // stdout pipe → EOF) but inherits stderr, keeping it open past the bound.
+        // The backgrounded sleep redirects stdout (releasing that pipe → EOF) but inherits stderr
+        // past the bound.
         let mut cmd = build_shell_command("echo out; sleep 5 >/dev/null &", dir.path());
         let result = run_command_with_timeout(
             &mut cmd,
@@ -6901,10 +6086,9 @@ mod tests {
         );
     }
 
-    /// The [`LeftoverPolicy::Program`] path — the program paths' — ends the run's tree
-    /// at the drain bound: the leftover holder is killed, and the result carries both
-    /// the output collected up to it and the exit status the run had already produced
-    /// ([`ShellRunResult::EndedWithLeftovers`]).
+    /// The [`LeftoverPolicy::Program`] path ends the run's tree at the drain bound: the holder is
+    /// killed, and the result carries the output collected up to it and the status the run had
+    /// already produced.
     #[cfg(unix)]
     #[tokio::test]
     async fn the_end_policy_kills_the_leftover_holder() {
@@ -6942,11 +6126,9 @@ mod tests {
         wait_for_death(pid).await;
     }
 
-    /// A finished run whose leftover held its output pipes is judged by its own exit
-    /// status in both shapers of the shared machinery: the program outcome the
-    /// automations, the renderer and the browser probe read, and the annotated answer a
-    /// custom tool's script and the document kit read. A clean run is not retroactively
-    /// a failure, and a non-zero one keeps its own verdict.
+    /// A finished run whose leftover held its pipes is judged by its own exit status in both
+    /// shapers: the program outcome automations read and the annotated answer a custom tool reads.
+    /// A clean run is not retroactively a failure, and a non-zero one keeps its own verdict.
     #[cfg(unix)]
     #[test]
     fn a_finished_run_is_judged_by_its_own_status_whatever_held_the_pipes() {
@@ -6984,9 +6166,9 @@ mod tests {
         assert!(noted.contains("[exit status: 3]"), "got: {noted}");
     }
 
-    /// A command that exited 0 while a leftover held its output is a plain SUCCESS
-    /// through the tool: the leftover is stopped at the detection, so the call is the
-    /// command's own output and status — no leftover note, no drain error.
+    /// A command that exited 0 while a leftover held its output is a plain SUCCESS through the
+    /// tool: the leftover is stopped at the detection, so the call is the command's own output and
+    /// status.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_command_whose_leftover_was_stopped_is_a_plain_success() {
@@ -7011,11 +6193,10 @@ mod tests {
         );
     }
 
-    /// The residual case end to end: a leftover that left the run's tree survives the
-    /// stop, so the call keeps today's shape — the command's own status and output
-    /// plus the `[leftover process]` note. `set -m` puts the background job in its own
-    /// process group, which the run's group kill cannot reach; only a host whose `sh`
-    /// honours job control in `-c` (macOS's) can stage the escape.
+    /// The residual case end to end: a leftover that left the run's tree survives the stop, so the
+    /// call keeps its note plus the command's own status and output. `set -m` puts the job in its
+    /// own process group, which the group kill cannot reach; only a host whose `sh` honours job
+    /// control in `-c` can stage it.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn a_leftover_that_escaped_the_tree_keeps_the_note() {
@@ -7034,8 +6215,8 @@ mod tests {
             )
             .await;
 
-        // Nothing outlives the test, whatever the assertions below decide: the
-        // escapee is killed by its own pid before anything can panic.
+        // Nothing outlives the test: the escapee is killed by its own pid before anything can
+        // panic.
         let pid = std::fs::read_to_string(&pid_path)
             .ok()
             .and_then(|pid| pid.trim().parse::<i32>().ok());
@@ -7055,17 +6236,17 @@ mod tests {
         );
     }
 
-    /// A stop that took is not an incident: only the residual case writes the durable
-    /// warning row ([`crate::logs::record_stray_event`]), so a stopped leftover leaves
-    /// the log store as it found it.
+    /// A stop that took is not an incident: only the residual case writes the durable warning row
+    /// ([`crate::logs::record_stray_event`]), so a stopped leftover leaves the log store as it
+    /// found it.
     #[cfg(unix)]
     #[serial_test::serial(provider)] // the telemetry store seam is process-global
     #[tokio::test]
     async fn a_stopped_leftover_writes_no_warning_row() {
         let (store, _store_tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
         let _seam = crate::util::test::install_test_log_store(store.clone());
-        // The seam is live: one row of our own reaches the store by the very path a
-        // leftover's warning takes.
+        // The seam is live: one row of our own reaches the store by the very path a leftover's
+        // warning takes.
         crate::logs::record_stray_event(&crate::logs::StrayEvent {
             source: crate::logs::STRAY_SOURCE_SHELL,
             message: "seam probe",
@@ -7098,8 +6279,8 @@ mod tests {
         );
     }
 
-    /// The shell-sourced warning rows the log store holds for one workspace name —
-    /// what a reported leftover leaves behind ([`crate::logs::record_stray_event`]).
+    /// The shell-sourced warning rows the log store holds for one workspace name — what a reported
+    /// leftover leaves behind ([`crate::logs::record_stray_event`]).
     #[cfg(unix)]
     async fn stray_rows(store: &crate::logs::LogStore, workspace: &str) -> i64 {
         store
@@ -7113,16 +6294,14 @@ mod tests {
             .expect("count the leftover rows")
     }
 
-    /// A stop is judged by the channel closing, not by the containment: a pipe that
-    /// reaches EOF within the grace is a stop that took, and one still held is the
-    /// residual case, whose reader is kept draining
-    /// ([`Readers::retain_pending`]) for the leftover that holds it.
+    /// A stop is judged by the channel closing, not by the containment: a pipe reaching EOF within
+    /// the grace is a stop that took, and one still held is the residual case
+    /// ([`Readers::retain_pending`]).
     #[tokio::test]
     async fn a_stop_takes_only_when_the_channel_closes() {
         let cancel = tokio_util::sync::CancellationToken::new();
 
-        // Nothing holds this pipe's write end past the grace: EOF arrives, so the
-        // stop took.
+        // Nothing holds this pipe's write end past the grace: EOF arrives, so the stop took.
         let mut closed = Readers::default();
         let (pipe, mut write_end) = tokio::io::duplex(64);
         closed.push(
@@ -7141,8 +6320,8 @@ mod tests {
             "a channel that closed is a stop"
         );
 
-        // This one's write end stays open for the whole grace: the residual case,
-        // which keeps the reader draining for the leftover that holds it.
+        // This one's write end stays open for the whole grace: the residual case, which keeps the
+        // reader draining for the leftover that holds it.
         let mut held = Readers::default();
         let (pipe, _write_end) = tokio::io::duplex(64);
         held.push(
@@ -7157,18 +6336,14 @@ mod tests {
         );
     }
 
-    // ── Shell compression pipeline tests ────────────────────────────
-
     #[test]
     fn pipeline_credential_scrubbing_cases() {
-        // Pipeline entry scrubs both stdout and stderr; on_empty (Stage 5)
-        // also verifies scrubbing in stderr.
-        // Each case follows the same pattern: raw credentials not present,
-        // redacted form present, pipeline-specific content preserved.
+        // Pipeline entry scrubs both streams, and on_empty (Stage 5) verifies scrubbing in stderr.
+        // Each case: raw credentials absent, redacted form present, pipeline content preserved.
         let cases: &[ShellOutputCase] = &[
             ShellOutputCase {
-                // Stage 5 (on-empty): credentials from stderr are scrubbed
-                // (via git diff profile's on_empty message)
+                // Stage 5 (on-empty): credentials from stderr are scrubbed (via git diff's on_empty
+                // message).
                 name: "git diff on_empty scrubs credentials in stderr",
                 command: "git diff",
                 stderr: "api_key=abcdefghijklmnop12345678",
@@ -7178,9 +6353,8 @@ mod tests {
                 ..Default::default()
             },
             ShellOutputCase {
-                // Stage 5 (on-empty): credentials from stderr are scrubbed.
-                // Uses a `warning:` prefix so the line passes through the
-                // keep_stderr filter even on the failure path.
+                // Stage 5 (on-empty): credentials from stderr are scrubbed; the `warning:` prefix
+                // keeps the line past the keep_stderr filter on the failure path.
                 name: "on-empty scrubs credentials in stderr",
                 command: "tsc --noEmit",
                 stderr: "warning: api_key=abcdefghijklmnop12345678",
@@ -7190,9 +6364,8 @@ mod tests {
                 ..Default::default()
             },
             ShellOutputCase {
-                // Main pipeline path (all stages applied, no early-return):
-                // stdout credentials are scrubbed at pipeline entry before any
-                // downstream stage processes them.
+                // Main pipeline path (all stages, no early return): stdout credentials are scrubbed
+                // at entry, before any stage processes them.
                 name: "main pipeline scrubs credentials in stdout",
                 command: "echo test",
                 stdout: "API_KEY=abcdefghijklmnop12345678",
@@ -7204,12 +6377,10 @@ mod tests {
         check_shell_output(cases);
     }
 
-    /// The `PATH` of the reduced fallback environment covers the tool
-    /// directories a developer expects (`~/.cargo/bin`, `~/.npm-global/bin`,
-    /// Homebrew on macOS) and honors `$CARGO_HOME`. This is the fallback
-    /// `PATH` — what the product's internal work and an unread owner
-    /// environment get — not the owner's own `PATH`, which replaces it once a
-    /// read has succeeded.
+    /// The reduced fallback `PATH` covers the directories a developer expects (`~/.cargo/bin`,
+    /// `~/.npm-global/bin`, Homebrew on macOS) and honors `$CARGO_HOME`. It is the fallback — for
+    /// internal work and an unread owner environment — not the owner's own `PATH`, which replaces
+    /// it once read.
     #[test]
     fn resolved_shell_path_covers_tool_dirs() {
         #[cfg(unix)]
@@ -7219,8 +6390,8 @@ mod tests {
                 path.contains(".npm-global/bin"),
                 "PATH should include ~/.npm-global/bin for globally installed npm tools: {path}"
             );
-            // Belt-and-suspenders means ~/.cargo/bin is always added regardless
-            // of $CARGO_HOME, so it shows up in both CARGO_HOME cases below.
+            // Belt-and-suspenders: ~/.cargo/bin is always added regardless of $CARGO_HOME, so it
+            // appears in both cases.
             assert!(
                 path.contains(".cargo/bin"),
                 "PATH should include ~/.cargo/bin: {path}"
@@ -7229,8 +6400,8 @@ mod tests {
                 path.contains(".local/bin"),
                 "PATH should include the per-user programs directory ~/.local/bin, where the product installs itself: {path}"
             );
-            // The extra tool directories are prepended to the portable baseline,
-            // so a developer tool resolves before the system's own entries.
+            // The extra tool directories are prepended to the portable baseline, so a developer
+            // tool resolves first.
             let cargo = path
                 .find(".cargo/bin")
                 .expect("the cargo bin directory is in PATH");
@@ -7253,8 +6424,7 @@ mod tests {
                     "PATH should still include ~/.cargo/bin when CARGO_HOME is set (belt-and-suspenders): {path}"
                 );
             }
-            // $CARGO_HOME/bin and ~/.cargo/bin must deduplicate when they point
-            // to the same directory (skipped when no home directory exists).
+            // $CARGO_HOME/bin and ~/.cargo/bin must deduplicate when they are the same directory.
             if let Some(dirs) = UserDirs::new() {
                 let default_cargo_home = dirs
                     .home_dir()
@@ -7283,65 +6453,49 @@ mod tests {
         }
     }
 
-    // ── Chained command and canonical command tests ─────────────────
-
     #[test]
     fn canonical_command_cases() {
-        // Each case: (input, expected_output) — organized by theme.
-        // Adding a new case is one line; include an inline comment explaining why.
+        // Each case is (input, expected_output), grouped by theme; adding one is a line, with a
+        // comment why.
         let cases: &[(&str, &str)] = &[
-            // ── Path stripping ──────────────────────────────────────
             ("/usr/local/bin/cargo build", "cargo build"),
-            // ── Git global flags ────────────────────────────────────
             ("git -C /repo diff", "git diff"),
             ("git -c user.name=me log", "git log"),
             ("git -- diff", "git diff"), // -- is treated as a flag and skipped
-            // ── Shell prefix: sudo ──────────────────────────────────
             ("sudo cargo build", "cargo build"),
             ("sudo -E cargo build", "cargo build"), // -E flag between prefix and command
             ("sudo --preserve-env cargo build", "cargo build"), // --preserve-env flag
             ("sudo -E git -C /repo diff", "git diff"), // compound: multiple flags + subcommand
-            // ── Shell prefix: time ─────────────────────────────────
-            ("time -v cargo test", "cargo test"), // -v flag skipped
-            // ── cd (shell builtin) ─────────────────────────────────
-            ("cd", ""),      // all shell prefixes, no command → empty
+            ("time -v cargo test", "cargo test"),   // -v flag skipped
+            ("cd", ""),                             // all shell prefixes, no command → empty
             ("cd ..", ".."), // path segment only — won't match anything but shouldn't crash
-            // ── Package managers ───────────────────────────────────
             ("pnpm install", "pnpm install"),
             ("yarn add foo", "yarn add"),
-            // ── Cargo flags ────────────────────────────────────────
             ("cargo test --lib", "cargo test"),
             ("cargo --release build", "cargo build"),
-            // Only flags without values are skipped for non-git commands.
-            // --release and --verbose don't take values, so both are skipped.
+            // Only flags without values are skipped for non-git commands: --release and --verbose
+            // take none.
             ("cargo --release --verbose build", "cargo build"),
-            // ── Toolchain specifiers and stderr-capture suffixes ───
-            // `+nightly`-style toolchain specifiers and `2>&1`/`1>&2` suffixes
-            // must never become the parsed subcommand.
+            // `+nightly`-style toolchain specifiers and `2>&1`/`1>&2` suffixes must never become
+            // the subcommand.
             ("cargo +nightly build", "cargo build"),
             ("cargo +stable check", "cargo check"),
             ("cargo build 2>&1", "cargo build"),
             ("cargo --version 2>&1", "cargo"),
             ("git --version 2>&1", "git"),
             ("git status 2>&1", "git status"),
-            // ── Environment variable assignments ───────────────────
             ("CC=gcc make", "make"), // env assignment before command
             ("VAR=val cargo check", "cargo check"),
             ("CC=gcc CXX=g++ make -j4", "make"), // multiple env assignments
             ("CC=gcc", ""),                      // only env assignments, no command
             ("sudo CC=gcc make", "make"),        // prefix + env assignment + command
-            // ── pytest dead-branch documentation ──────────────────────
-            // These cases document why `python -m pytest` and
-            // `poetry run pytest` cannot match the pytest profile:
-            // canonical_command strips `-m` (flag), producing "python pytest"
-            // that doesn't start with "pytest"; and treats `run` as the
-            // subcommand of `poetry`, producing "poetry run".
+            // These cases document why `python -m pytest` and `poetry run pytest` cannot match the
+            // pytest profile: `-m` is stripped, leaving "python pytest", and `run` is read as
+            // poetry's subcommand, leaving "poetry run".
             ("python -m pytest tests/", "python pytest"),
             ("poetry run pytest tests/", "poetry run"),
-            // ── npx (shell prefix) ─────────────────────────────────────
-            // npx is a shell prefix, so it's stripped before command extraction.
-            // Tool-specific profiles (eslint, prettier, vitest, etc.) now match
-            // correctly instead of being shadowed by the generic npx catch-all.
+            // npx is a shell prefix, stripped before extraction, so tool-specific profiles (eslint,
+            // prettier, vitest) match instead of the generic npx catch-all.
             ("npx eslint", "eslint"),
             ("npx eslint .", "eslint ."),
             ("npx eslint --fix .", "eslint ."),
@@ -7363,7 +6517,6 @@ mod tests {
         }
     }
 
-    // ── check_outside_quotes ──────────────────────────────────────────
     // Pure quote-tracking state machine — escape handling is caller's concern.
 
     type QuoteStep = (char, bool, bool, bool);
@@ -7421,8 +6574,6 @@ mod tests {
         }
     }
 
-    // ── apply_line_truncation ─────────────────────────────────────────
-
     #[test]
     fn truncate_head_tail_triggers_sandwich_large_output() {
         let p = Profile::new("test").head(2).tail(2);
@@ -7455,8 +6606,7 @@ mod tests {
             result.ends_with("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             "should end with tail"
         );
-        // Also verify that adding max=N doesn't change behavior when
-        // head+tail+1 <= N (sandwich format is already smaller than cap).
+        // Also verify that adding max=N changes nothing when head+tail+1 <= N.
         let p2 = Profile::new("test").head(2).tail(2).max(100);
         let (result2, pre2) = apply_line_truncation(&output, &p2);
         assert!(pre2.is_some(), "should capture pre-truncation output");
@@ -7470,11 +6620,8 @@ mod tests {
         );
     }
 
-    // ── finish_shell_output unit tests ────────────────────────────────
-    // Credential scrubbing is now performed upstream at pipeline entry in
-    // `apply_profile_pipeline`, so `finish_shell_output` receives pre-scrubbed
-    // input.  These tests verify that non-scrubbing behavior (timing, spill,
-    // idempotence) remains correct.
+    // Scrubbing happens upstream at pipeline entry, so `finish_shell_output` receives pre-scrubbed
+    // input; these tests verify the non-scrubbing behaviour (timing, spill, idempotence).
 
     struct FinishCase {
         name: &'static str,
@@ -7536,11 +6683,9 @@ mod tests {
             },
         ];
         for case in cases {
-            // For pre-truncation spill path: repeat the string enough times to
-            // exceed TOOL_OUTPUT_BUDGET_BYTES, triggering the spill-to-file branch
-            // in finish_shell_output. The spill content is pre-scrubbed by
-            // apply_profile_pipeline before being passed to finish_shell_output.
-            // This test verifies that the spill hint is properly appended.
+            // For the pre-truncation spill path: repeat the string past TOOL_OUTPUT_BUDGET_BYTES to
+            // trigger the spill in `finish_shell_output` (content already scrubbed by
+            // `apply_profile_pipeline`), and verify the spill hint is appended.
             let pre_owned = case.pre.map(|s| s.repeat(TOOL_OUTPUT_BUDGET_BYTES + 1));
             let result = finish_shell_output(
                 case.combined.to_string(),
@@ -7554,9 +6699,8 @@ mod tests {
         }
     }
 
-    /// The Windows-only refusal decision, driven directly: the serve decision's
-    /// own refusal, a produced rewrite the read-only guard rejected, and `None`
-    /// everywhere else — on unix in particular, where the original command runs.
+    /// The Windows-only refusal decision, driven directly: the serve decision's own refusal, a
+    /// rewrite the read-only guard rejected, and `None` everywhere else — on unix in particular.
     #[test]
     fn unserved_refusal_is_windows_only_and_covers_both_cases() {
         let produced = grep_engine::GrepServe {
@@ -7571,8 +6715,8 @@ mod tests {
         assert!(unserved_refusal(ShellPlatform::Unix, &produced, false).is_none());
         assert!(unserved_refusal(ShellPlatform::Windows, &produced, true).is_none());
 
-        // Produced but not applied (the read-only guard rejected it): refused
-        // on Windows, with the guard rejection named as the cause.
+        // Produced but not applied (the guard rejected it): refused on Windows, with the rejection
+        // as the cause.
         let guard = unserved_refusal(ShellPlatform::Windows, &produced, false)
             .expect("a rejected rewrite is refused on Windows");
         assert!(guard.contains("read-only guard"), "{guard}");
@@ -7591,11 +6735,10 @@ mod tests {
         );
     }
 
-    /// An engine failure must be recognised from a completed run, and on
-    /// Windows from the refusal marker alone: a pipeline tail (`grep … | tail
-    /// -1`) carries the tail's exit status, so the sentinel code is masked
-    /// there and the run would otherwise look like an empty match set. On unix
-    /// the same run re-runs the original command, so the marker is ignored.
+    /// An engine failure must be recognised from a completed run, and on Windows from the refusal
+    /// marker alone: a pipeline tail carries the tail's exit status, masking the sentinel code, so
+    /// the run would otherwise look like an empty match set. On unix the same run re-runs the
+    /// original command.
     #[test]
     fn engine_failure_covers_the_masked_windows_sentinel() {
         let marker = grep_engine::ENGINE_REFUSAL_MARKER;
@@ -7618,16 +6761,16 @@ mod tests {
             "unix re-runs the original command instead of refusing"
         );
 
-        // Only a line that IS the marker counts: a served run whose matched
-        // line merely echoes the token is a result, not a refusal.
+        // Only a line that IS the marker counts: a served run whose matched line echoes the token
+        // is a result.
         let echoed = format!("f.txt:{marker}\n");
         assert!(
             engine_failure(Some(0), echoed.as_bytes(), ShellPlatform::Windows).is_none(),
             "a matched line carrying the token is not a refusal: {echoed:?}"
         );
 
-        // The cause is the line after the marker, never a served member's own
-        // stderr line that happens to come first.
+        // The cause is the line after the marker, never a served member's stderr line that happens
+        // to come first.
         let noisy = format!("f.txt: a line mentioning {reason}\n{marker}\nengine detail\n");
         assert!(
             matches!(
@@ -7637,8 +6780,8 @@ mod tests {
             "the marker's own detail line is the cause"
         );
 
-        // A sentinel exit needs no marker, and a marker with no detail line
-        // still yields a refusal with a generic cause.
+        // A sentinel exit needs no marker, and a marker with no detail line still yields a refusal
+        // with a generic cause.
         assert!(matches!(
             engine_failure(
                 Some(grep_engine::ENGINE_FAILED_EXIT),
@@ -7657,9 +6800,9 @@ mod tests {
         };
         assert!(bare.contains("could not serve"), "{bare}");
 
-        // A stale self-update binary is recognised by its own message on both
-        // platforms (its exit 1 is a legitimate grep no-match code) — with its
-        // message as the cause where the platform renders one.
+        // A stale self-update binary is recognised by its own message on both platforms (its exit 1
+        // is a legitimate grep no-match code) — with its message as the cause where the platform
+        // renders one.
         assert!(matches!(
             engine_failure(
                 Some(1),
@@ -7676,9 +6819,9 @@ mod tests {
             ),
             Some(EngineFailure::Refused(cause)) if cause.contains(grep_engine::STALE_BINARY_LOCK_MSG)
         ));
-        // The lock message is the cause wherever it sits in the stream, not the
-        // first line: a launch that meets the lock files its durable record first,
-        // so the boot channel's pointer line precedes it.
+        // The lock message is the cause wherever it sits in the stream, not the first line: a
+        // launch that meets the lock files its durable record first, so the boot channel's pointer
+        // line precedes it.
         let recorded = format!(
             "start-up failure recorded in C:\\Users\\owner\\.mahbot\\error.log\n\
              Error: {} (the instance lock is held)\n",
@@ -7697,8 +6840,8 @@ mod tests {
         }
     }
 
-    /// macOS only, the platform [`program_command`] acts on: the resolution it
-    /// performs and the non-forking start it buys.
+    /// macOS only, the platform [`program_command`] acts on: the resolution it performs and the
+    /// non-forking start it buys.
     #[cfg(target_os = "macos")]
     mod program_command_tests {
         use super::*;
@@ -7706,10 +6849,9 @@ mod tests {
         use std::path::PathBuf;
         use tempfile::TempDir;
 
-        /// An executable program named `name` under `dir`: a copy of a real Mach-O
-        /// binary, the only kind of file [`program_command`] names by its path — so
-        /// the fixture is one the kernel starts directly, and its permissions can be
-        /// narrowed where a case needs that.
+        /// An executable program named `name` under `dir`: a copy of a real Mach-O binary, the only
+        /// kind of file [`program_command`] names by its path — so the fixture is one the kernel
+        /// starts directly, and its permissions can be narrowed where a case needs that.
         fn program(dir: &Path, name: &str) -> PathBuf {
             let path = dir.join(name);
             std::fs::copy("/bin/echo", &path).expect("copy a real program");
@@ -7721,11 +6863,10 @@ mod tests {
             vec![(OsString::from("PATH"), OsString::from(value))]
         }
 
-        /// The bare word is resolved by the search list's own rules — the first
-        /// entry naming a program this user may start, an empty entry as the
-        /// commands directory, the default list where the environment carries none
-        /// — and every file the kernel does not start by itself keeps the bare
-        /// name. A name that already carries a separator is the caller's own
+        /// The bare word is resolved by the search list's own rules — the first entry naming a
+        /// program this user may start, an empty entry as the commands directory, the default list
+        /// where the environment carries none — and every file the kernel does not start by itself
+        /// keeps the bare name. A name that already carries a separator is the caller's own
         /// program, not one to look up.
         #[test]
         #[expect(clippy::too_many_lines)] // one straight-line case per resolution rule, each with its own fixture
@@ -7740,8 +6881,8 @@ mod tests {
                 "the search list finds the program"
             );
 
-            // An empty entry stands for the commands directory, which the caller
-            // passes as the child's own working directory.
+            // An empty entry stands for the commands directory, which the caller passes as the
+            // child's own working directory.
             let root = TempDir::new().expect("tempdir");
             let prog = program(root.path(), "prog");
             let cmd = program_command("prog", &search_path(""), Some(root.path()));
@@ -7759,9 +6900,8 @@ mod tests {
                 "an environment with no PATH gets the default search path"
             );
 
-            // A directory named like the program and a file without its execute
-            // bits are passed over; the program under the last entry is the one
-            // named.
+            // A directory named like the program and a file without its execute bits are passed
+            // over; the program under the last entry is the one named.
             let root = TempDir::new().expect("tempdir");
             std::fs::create_dir_all(root.path().join("as-dir").join("prog"))
                 .expect("directory named like the program");
@@ -7787,10 +6927,9 @@ mod tests {
                 "a directory and a non-executable file are skipped"
             );
 
-            // `execvp` asks whether *this* user may execute the file, not whether
-            // the mode's execute bits are set: someone else's executable is passed
-            // over and the search goes on, while root may start it and stops at the
-            // first entry.
+            // `execvp` asks whether *this* user may execute the file, not whether the mode's
+            // execute bits are set: someone else's executable is passed over and the search goes
+            // on, while root may start it and stops at the first entry.
             let root = TempDir::new().expect("tempdir");
             let not_ours = root.path().join("not-ours");
             std::fs::create_dir(&not_ours).expect("tempdir");
@@ -7827,8 +6966,8 @@ mod tests {
                 "nothing resolving leaves the bare name"
             );
 
-            // An executable the kernel cannot start: `execvp` re-runs it under
-            // `/bin/sh`, so it is not a program this path may name.
+            // An executable the kernel cannot start: `execvp` re-runs it under `/bin/sh`, so it is
+            // not a program this path may name.
             let root = TempDir::new().expect("tempdir");
             let empty = root.path().join("prog");
             std::fs::write(&empty, "").expect("write an empty fixture");
@@ -7842,8 +6981,8 @@ mod tests {
                 "an executable the kernel cannot start keeps the bare name"
             );
 
-            // A script with a valid interpreter line is exactly what the naming rule
-            // leaves to the forking start.
+            // A script with a valid interpreter line is exactly what the naming rule leaves to the
+            // forking start.
             let root = TempDir::new().expect("tempdir");
             let script = root.path().join("prog");
             std::fs::write(&script, "#!/bin/sh\nprintf '%s' \"$0\"\n").expect("write fixture");
@@ -7869,11 +7008,10 @@ mod tests {
             );
         }
 
-        /// The actual regression guard, and the one thing `Command`'s own getters
-        /// cannot show: `argv[0]`. A shell script cannot say — the kernel hands its
-        /// interpreter the script's own path as that — so the product's own shell
-        /// start is asked to print what it was called: the interpreter is named by an
-        /// absolute path, and still sees itself as bare `sh`.
+        /// The actual regression guard, and the one thing `Command`'s own getters cannot show:
+        /// `argv[0]`. A shell script cannot say — the kernel hands its interpreter the script's own
+        /// path as that — so the product's own shell start is asked to print what it was called:
+        /// the interpreter is named by an absolute path, and still sees itself as bare `sh`.
         #[tokio::test]
         async fn build_shell_command_names_sh_by_path_without_changing_its_argv0() {
             let dir = TempDir::new().expect("tempdir");

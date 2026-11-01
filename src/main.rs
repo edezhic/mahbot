@@ -1,22 +1,16 @@
-//! The product's entry point: the verb ladder that dispatches subcommands
-//! before the instance lock, the daemon's composition, and the iced dashboard
-//! it finally runs.
+//! The product's entry point: the verb ladder dispatched before the instance lock,
+//! the daemon's composition, and the iced dashboard it finally runs.
 //!
-//! The module tree is the library's; this file owns the wiring the library
-//! cannot do for itself — bootstrap, background-task spawn, the message
-//! pipeline, the shutdown drain — and the Telegram command surface. The work
-//! itself stays in the library. A Unix launch started from a terminal is
-//! detached from it before anything else the daemon does: the prompt comes back,
+//! The module tree is the library's; this file owns only the wiring the library
+//! cannot do for itself — bootstrap, background-task spawn, the message pipeline,
+//! the shutdown drain — and the Telegram command surface. A Unix launch started
+//! from a terminal is detached from it before anything else: the prompt comes back,
 //! the service keeps running in a session of its own, and what it would have
 //! printed lands in `<storage root>/daemon.log` (`mahbot::detach`). Built for the
-//! GUI subsystem so a Windows launch never puts a console window on the screen:
-//! the platform gives such a process no console of its own. How a shell treats
-//! it turns on the form of launch — at an interactive prompt it does not wait for
-//! such a program and does not hand its exit code back, while from a command
-//! file it waits. A Windows launch with no console loses this file's own prints —
-//! accepted, never fatal: they go through `mahbot::util::print_stdout` /
-//! `print_stderr`, where the policy lives. Conditional so the binary's own test
-//! harness stays a console program and `cargo test --bins` output stays visible.
+//! GUI subsystem so a Windows launch never puts a console window on the screen —
+//! such a process gets no console, so its own prints are lost (accepted, never
+//! fatal); they go through `mahbot::util::print_stdout` / `print_stderr`, where the
+//! policy lives. Conditional so the bin's test harness stays a console program.
 #![warn(clippy::pedantic)]
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
@@ -44,22 +38,15 @@ use mahbot::power::Report;
 use mahbot::session::clear_session;
 use mahbot::util::UnwrapPoison;
 use mahbot::{BotCommand, Channel, ChannelMessage, Role, Workspace};
-/// JetBrainsMono-Regular.ttf embedded for Iced dashboard default font.
 const JETBRAINS_MONO_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Regular.ttf");
 
-/// JetBrainsMono-Bold.ttf embedded for header text in the Iced dashboard.
 const JETBRAINS_MONO_BOLD_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Bold.ttf");
 
-/// JetBrainsMono-Italic.ttf embedded for italic narration text in the Iced dashboard.
 const JETBRAINS_MONO_ITALIC_FONT_BYTES: &[u8] = include_bytes!("gui/JetBrainsMono-Italic.ttf");
 
-/// Run [`bootstrap_mahbot`] and convert panics into `Err` so the dashboard shows
-/// a boot error instead of hanging on "Starting…" forever. A panic is recorded
-/// as a start-up failure like any other; the `Ok(Err(_))` arm is not recorded
-/// again, since the failing step already recorded it.
-///
-/// The log store the boot opened travels with the result — the dashboard's logs
-/// page is built from it, so it is handed over rather than parked in a global.
+/// Run [`bootstrap_mahbot`], converting panics into `Err` so the dashboard shows a boot error
+/// instead of hanging on "Starting…" (the `Ok(Err(_))` arm is not recorded again — the failing
+/// step already did). The log store travels with the result: the logs page is built from it.
 async fn bootstrap_mahbot_safe(
     start_paused: bool,
     slowdown: Option<Report>,
@@ -70,15 +57,15 @@ async fn bootstrap_mahbot_safe(
     {
         Ok(Ok(store)) => Ok(store),
         Ok(Err(e)) => {
-            // A boot that failed can never serve command-line operations, and a
-            // frontend must not hang forever waiting for one.
+            // A failed boot can never serve command-line operations, and a frontend must
+            // not hang forever waiting for one.
             mahbot::cli::mark_unavailable();
             Err(format!("{e:#}"))
         }
         Err(payload) => {
             let message = mahbot::util::panic_message(&*payload);
-            // Recorded like any other start-up failure; the error it returns is
-            // what the start-failure screen shows.
+            // Recorded like any other start-up failure; the error is what the start-failure
+            // screen shows.
             let boot_error = mahbot::boot::record_startup_failure(
                 "bootstrap",
                 mahbot::boot::startup_panic_error(&message),
@@ -89,31 +76,25 @@ async fn bootstrap_mahbot_safe(
     }
 }
 
-/// Async startup for `MahBot` — runs on Iced's Tokio runtime via a boot
-/// [`iced::Task`].
+/// Async startup, run on Iced's Tokio runtime via a boot [`iced::Task`].
 ///
-/// `start_paused` is the `mahbot paused` startup mode: every managed
-/// workspace is put on pause before the poll loop that claims work starts.
-///
-/// `slowdown` is what the platform answered when the daemon path asked for the
-/// slowdown exemption; it becomes the start-up line below.
+/// `start_paused` is the `mahbot paused` mode: every managed workspace is paused before the poll
+/// loop that claims work starts. `slowdown` is what the platform answered when the daemon path
+/// asked for the slowdown exemption.
 async fn bootstrap_mahbot(start_paused: bool, slowdown: Option<Report>) -> Result<LogStore> {
     mahbot::config::load_or_init()
         .await
         .map_err(|e| mahbot::boot::record_startup_failure("config::load_or_init", e))?;
 
-    // Bring the stores up in their one supported order — the pre-flight
-    // classification, the logs store, the process-global inits and the
-    // consolidated domain store. Shared with the store-lock check so the two
-    // cannot drift.
+    // The one supported store order — pre-flight classification, logs store, process-global
+    // inits, consolidated domain store. Shared with the store-lock check so the two cannot drift.
     let log_store = mahbot::boot::open_stores().await?;
 
     // The model-cache files of the removed embedder are retired on every start
     // until they are gone. After the stores, so the attempt is in the log.
     mahbot::boot::remove_retired_embedding_model_files();
 
-    // The platform exemption the start-up asked for, as an ordinary status line: an INFO
-    // row, so it is not a problem in the Issues view, written once per start with nothing
+    // An INFO status line rather than a problem: written once per start, with nothing
     // de-duplicating it. A platform that made no request says nothing.
     if let Some(report) = slowdown {
         info!(
@@ -123,51 +104,43 @@ async fn bootstrap_mahbot(start_paused: bool, slowdown: Option<Report>) -> Resul
         );
     }
 
-    // Start the CDC-driven chronicle subscriber (materializes ticket_chronicle
-    // transitions from ticket change events). Must run after the stores are up.
+    // Materializes ticket_chronicle transitions from ticket change events; needs the
+    // stores up.
     mahbot::pipeline::chronicle::start_subscriber();
 
-    // Config DB must be loaded before providers, so that API keys
-    // and model settings take effect.
+    // Before providers, so API keys and model settings take effect.
     mahbot::config::reload_from_db()
         .await
         .map_err(|e| mahbot::boot::record_startup_failure("config::reload_from_db", e))?;
 
-    // The login registration is kept true at every start: the installed copy owns
-    // the system's startup entry, so an install registers it, an update re-points
-    // it at the file that now runs, and the owner's decision is never overridden
-    // (see `mahbot::autostart`).
+    // Kept true at every start: an install registers the system's startup entry, an update
+    // re-points it at the file that now runs, and the owner's decision is never overridden
+    // (`mahbot::autostart`).
     mahbot::autostart::reconcile();
 
-    // The macOS local Qwen3-ASR recogniser is deliberately NOT loaded here: the
-    // model loads on the first use of the voice stack (a voice message, or the
-    // voice stack's own demand to listen) — see
-    // `mahbot::audio::local_transcriber::spawn_background_init` — so an install whose
-    // owner never enabled local speech loads nothing at start.
+    // The macOS local Qwen3-ASR recogniser is deliberately NOT loaded here: the model loads
+    // on first use of the voice stack (`audio::local_transcriber::spawn_background_init`), so
+    // an install that never enabled local speech loads nothing at start.
     mahbot::providers::init_global()
         .map_err(|e| mahbot::boot::record_startup_failure("providers::init_global", e))?;
 
-    // macOS-only TTS model load: try the cache first, otherwise spawn the
-    // background download. Only runs when TTS is enabled in config, to avoid an
-    // unnecessary ~400 MB download.
+    // TTS model load: cache first, else spawn the background download. Only when TTS is
+    // enabled, to avoid an unnecessary ~400 MB download.
     #[cfg(target_os = "macos")]
     if mahbot::audio::tts::is_config_enabled() {
-        // Open the OS audio output device for a TTS-enabled boot (matches the
-        // pre-change behavior where init_global opened it unconditionally).
+        // Matches the pre-change behaviour where init_global opened it unconditionally.
         let _ = mahbot::audio::tts::ensure_audio_output();
         if !mahbot::audio::tts::try_load_cached() {
             mahbot::audio::tts::spawn_download();
         }
     }
 
-    // `mahbot paused`: put every managed workspace on pause here. The stores
-    // are up and the poll loop that claims work is not spawned yet, so its first
-    // round already finds them paused and nothing gets claimed. This is the
-    // ordinary workspace pause — the same persisted flag and the same `set_paused`
-    // path as the dashboard toggle — so it survives restarts, and beyond the
-    // ordinary pause's effect (the ticket pipeline stands still) nothing else is
-    // stopped. A pause that cannot be written fails the launch: the daemon must
-    // never come up unpaused on a swallowed error.
+    // `mahbot paused`: every managed workspace is paused here, while the stores are up and
+    // the poll loop is not yet spawned, so its first round already finds them paused. This is
+    // the ordinary workspace pause — same persisted flag, same `set_paused` path as the
+    // dashboard toggle — so it survives restarts, and beyond the ticket pipeline standing
+    // still nothing else stops. A pause that cannot be written fails the launch: the daemon
+    // must never come up unpaused on a swallowed error.
     if start_paused {
         let workspaces = mahbot::workspace::store()
             .pause_all()
@@ -181,9 +154,8 @@ async fn bootstrap_mahbot(start_paused: bool, slowdown: Option<Report>) -> Resul
 
     spawn_background_tasks(log_store.clone());
 
-    // The instance is the whole product from here, so command-line operations
-    // may be served (an operation is a side effect that may route into the
-    // message pipeline, which must not land in a half-built instance).
+    // The instance is whole from here, so command-line operations may be served — they are
+    // side effects that may route into the message pipeline.
     mahbot::cli::mark_ready();
 
     info!(
@@ -191,15 +163,12 @@ async fn bootstrap_mahbot(start_paused: bool, slowdown: Option<Report>) -> Resul
         "MahBot initialized — dashboard ready"
     );
 
-    // The admin's "back online" notice is detached from startup, and so is the
-    // wait it takes for a transport to exist: a self-hosted start opens with the
-    // local Bot API server not yet published, and the notice leaves once it is.
+    // Detached from startup, as is the wait for a transport: a self-hosted start opens with
+    // the local Bot API server not yet published, and the notice leaves once it is.
     tokio::spawn(mahbot::self_update::announce_startup(start_paused));
 
-    // An update delivered by the release pipeline leaves its change list behind
-    // before the restart; this is the one place it reaches the admin assistant,
-    // through the same queue a message from the owner enters. Everything the
-    // notice settles is recorded inside, after it has been handed over.
+    // Reaches the admin assistant through the same queue a message from the owner enters;
+    // everything the notice settles is recorded inside, after the hand-over.
     tokio::spawn(mahbot::self_update::announce_update_to_assistant());
 
     Ok(log_store.as_ref().clone())
@@ -208,15 +177,10 @@ async fn bootstrap_mahbot(start_paused: bool, slowdown: Option<Report>) -> Resul
 /// Global `JoinSet` tracking all background task handles for clean shutdown.
 static BACKGROUND_TASKS: std::sync::Mutex<Option<JoinSet<()>>> = std::sync::Mutex::new(None);
 
-/// Spawn a cancellable background task that runs `fut` until the global
-/// shutdown token is cancelled. The future must return `()` — use
-/// [`race_shutdown`](mahbot::shutdown::race_shutdown) if you need to
-/// capture a return value.
-///
-/// Unlike a bare [`JoinSet::spawn`], this function catches panics inside
-/// `fut` and logs them via [`tracing::error!`] so that background tasks
-/// don't die silently. The `name` parameter identifies the task in the
-/// log message.
+/// Run `fut` until the global shutdown token is cancelled. The future must return `()` — use
+/// [`race_shutdown`](mahbot::shutdown::race_shutdown) to capture a value. Panics are caught and
+/// logged via [`tracing::error!`], so background tasks never die silently; `name` identifies
+/// the task.
 fn spawn_cancellable<F>(
     tasks: &mut JoinSet<()>,
     shutdown_token: &CancellationToken,
@@ -246,11 +210,9 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
     let mut tasks = JoinSet::<()>::new();
     let shutdown_token = mahbot::shutdown::shutdown_token();
 
-    // The owner's own shell environment, read as early as the product can: the
-    // first read starts here, and the loop re-reads it every 10 minutes so an
-    // agent's commands run in the environment the owner's own shell exports
-    // (see `mahbot::shell_env`). Commands use the reduced fallback until this
-    // succeeds, and never wait for it.
+    // The owner's own shell environment, read as early as possible and re-read every 10
+    // minutes, so an agent's commands run in the environment the owner's shell exports
+    // (`mahbot::shell_env`). Commands use the reduced fallback until it succeeds, never wait.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -266,27 +228,22 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
             "Session cleanup",
             mahbot::jobs::PURGE_CUTOFF_HOURS,
             |cutoff| async move {
-                // Stale-job purge FIRST: protected sessions only become eligible
-                // for the session TTL after the purge cascade removes their job
-                // rows. The session TTL derives its own, shorter window.
+                // Stale-job purge FIRST: protected sessions become eligible for the session
+                // TTL only after the purge cascade removes their job rows.
                 let purged = mahbot::jobs::purge_stale_jobs(&cutoff).await?;
                 let cleaned = mahbot::session::cleanup_old_transient_sessions().await?;
-                // Assistant generated/uploads keep-detection — after the purge
-                // so the jobs-state is final; assistant sessions are never
-                // transient, so keep-evidence is live regardless of ordering.
-                // (Research run folders are NOT swept here — `release_run_folder`
-                // is the single release point, invoked per-job by completion,
-                // the cancel sweep, and boot resume; crash leftovers are the OS
-                // temp sweep's or the periodic temp cleaner's job.)
+                // Assistant generated/uploads keep-detection, after the purge so the jobs state
+                // is final. Research run folders are NOT swept here — `release_run_folder` is the
+                // single release point; crash leftovers belong to the OS temp sweep or the
+                // periodic temp cleaner.
                 let media = mahbot::research_cleanup::sweep_media().await?;
                 Ok(purged + cleaned + media)
             },
         ),
     );
 
-    // Retention for the log store's accumulating telemetry — expired records are
-    // removed in bounded, paced batches so the store never stalls the work
-    // flowing through it (`mahbot::log_retention`).
+    // Expired telemetry records are removed in bounded, paced batches so the store never
+    // stalls the work flowing through it (`mahbot::log_retention`).
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -301,8 +258,8 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::channels::run_telegram_server_supervisor(),
     );
 
-    // The chat window's conversation cap, and the repair of what a store
-    // already holds past it (`mahbot::channels::chat_history`).
+    // The chat window's conversation cap, and the repair of what a store already holds past
+    // it (`mahbot::channels::chat_history`).
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -324,8 +281,8 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::pipeline::board::run_archive_cancelled_loop(),
     );
 
-    // Automation sweep: fires due automations back into the Assistant's personal
-    // session. The first tick acts as the boot-time overdue scan.
+    // Fires due automations back into the Assistant's personal session; the first tick is the
+    // boot-time overdue scan.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -333,9 +290,8 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::automations::run_automation_sweep_loop(),
     );
 
-    // Dead-session recovery: detects user-agent sessions that failed silently
-    // (user sent a message, no agent responded, no agent is running) and
-    // automatically re-triggers the agent.
+    // Detects user-agent sessions that failed silently (message sent, no agent responded, none
+    // running) and re-triggers the agent.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -343,18 +299,16 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::session::dead_session::run_dead_session_recovery_loop(),
     );
 
-    // Nightly workspace re-analysis: checks for new git commits and
-    // triggers rediscover during the 2-3 AM local time window, gated to
-    // at most one pass per 7 days (rolling, recorded at pass start).
+    // Triggers rediscover during the 2-3 AM local window, gated to at most one rolling pass
+    // per 7 days (recorded at pass start).
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
         "nightly-check",
         mahbot::workspace::run_nightly_check_loop(),
     );
-    // Nightly memory inventory: measures every account's memory file during the
-    // 3-4 AM local time window and asks the assistants whose file no longer
-    // fits into their context to clean up what they keep, once a night each.
+    // Measures every account's memory file during the 3-4 AM window and asks the assistants
+    // whose file no longer fits their context to clean up, once a night each.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -362,9 +316,8 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::memory_inventory::run_memory_inventory_loop(),
     );
 
-    // Periodic temp cleaner (Sanitation): reclaims the product's agents'
-    // abandoned temp artifacts. Its own loop, decoupled from workspace work,
-    // with a free-space-adaptive cadence (see `mahbot::temp`).
+    // Reclaims the agents' abandoned temp artifacts, on its own loop decoupled from workspace
+    // work, with a free-space-adaptive cadence (see `mahbot::temp`).
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -372,9 +325,8 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::temp::run_temp_cleanup_loop(),
     );
 
-    // The built-in low-disk notice: tells the admin assistant when the temp
-    // volume's free space falls below 5%, on a widening reminder ladder. It
-    // deletes nothing and keeps its own cadence (see `mahbot::disk_notice`).
+    // Tells the admin assistant when the temp volume's free space falls below 5%, on a
+    // widening reminder ladder. Deletes nothing (`mahbot::disk_notice`).
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -382,10 +334,8 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::disk_notice::run_low_disk_notice_loop(),
     );
 
-    // Debug IPC query endpoint: `mahbot debug` connects to this local socket
-    // (UDS on Unix, named pipe on Windows) to run read-only SQL against the
-    // live stores while an instance holds the lock. Binds after the stores
-    // (DOMAIN_CONN + LOG_STORE) are up.
+    // `mahbot debug` connects to this local socket (UDS on Unix, named pipe on Windows) to run
+    // read-only SQL while an instance holds the lock. Binds after the stores are up.
     let ipc_root = mahbot::config::CONFIG.global_storage_root();
     spawn_cancellable(&mut tasks, &shutdown_token, "debug-ipc", async move {
         mahbot::db::ipc::run_ipc_listener(&ipc_root, log_store.clone()).await;
@@ -399,9 +349,8 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::workspace_index::init_all_engines(),
     );
 
-    // Warm the computer tool's capture-channel probe once at boot so the cached
-    // availability result is ready before the first agent runs; the probe would
-    // otherwise run lazily on the first capture request.
+    // Warms the capture-channel probe once at boot so the cached availability result is ready
+    // before the first agent runs.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -409,11 +358,9 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::tools::computer::warm_capture_probe(),
     );
 
-    // Periodic refresh of the shared update-availability cache, which both the
-    // GUI update button and the Telegram `/update` menu read, so the two surfaces
-    // cannot diverge. Ticks immediately, then every 10 minutes, and every tick is
-    // also what starts the unattended update of a downloaded copy when the check
-    // finds a strictly newer release (see `mahbot::self_update`).
+    // Ticks immediately then every 10 minutes, so the GUI update button and the Telegram
+    // `/update` menu cannot diverge. A tick that finds a strictly newer release also starts the
+    // unattended update of a downloaded copy (`mahbot::self_update`).
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -421,22 +368,19 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::self_update::run_update_availability_refresh(),
     );
 
-    // A documented test-only hook drives a whole update with no window at all —
-    // see `mahbot::self_update`; it returns at once unless `MAHBOT_UPDATE_TO_VERSION`
-    // named the version to move to.
+    // A documented test-only hook drives a whole update with no window; it returns at once
+    // unless `MAHBOT_UPDATE_TO_VERSION` named a version.
     //
-    // Spawned detached rather than through `spawn_cancellable`: an update owns the
-    // drain hand-off itself — it begins the drain and *waits* for the shutdown
-    // token before checkpointing, releasing the lock and starting the replacement —
-    // so a task that gives way to that same token would be dropped at the one
-    // moment it must keep going. The Telegram-triggered update is spawned the same
-    // way, for the same reason.
+    // Spawned detached rather than through `spawn_cancellable`: an update owns the drain hand-off
+    // itself — it begins the drain and *waits* for the shutdown token before checkpointing,
+    // releasing the lock and starting the replacement — so a task yielding to that token would be
+    // dropped at the one moment it must keep going. The Telegram-triggered update is spawned the
+    // same way.
     tokio::spawn(mahbot::self_update::run_env_named_update());
 
-    // Chrome daemon health watchdog: classifies chrome-use health from the
-    // daemon-free status and auto-restarts with bounded backoff when it is
-    // down; wedges surface on real chrome calls (fail-fast) and wake this
-    // watchdog (chrome relay daemon only — never the mahbot service itself).
+    // Classifies chrome-use health from the daemon-free status and restarts with bounded
+    // backoff when it is down; wedges surface on real chrome calls (fail-fast) and wake this
+    // watchdog — the chrome relay daemon only, never the mahbot service.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -444,8 +388,8 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::tools::chrome_daemon::run_watchdog(),
     );
 
-    // Ended-run chrome session releases: the sessions the runs that ended handed
-    // over (`mahbot::tools::chrome_release` owns what a release does and trusts).
+    // The sessions the runs that ended handed over (`mahbot::tools::chrome_release` owns what
+    // a release does and trusts).
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -453,12 +397,10 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::tools::chrome_release::run_session_release_queue(),
     );
 
-    // The product's own tools — the chrome-use browser helper and the bun
-    // runtime. Both follow the shared start-time policy in
-    // `managed_bin::install_on_start`: a copy that is absent (or not executable)
-    // is installed straight away, while a copy in place is compared with the
-    // newest release only once the boot has settled and downloaded only when the
-    // versions differ. A non-fatal failure is retried on the next start.
+    // Shared start-time policy (`managed_bin::install_on_start`): an absent or non-executable
+    // copy is installed straight away, one in place is compared with the newest release once the
+    // boot has settled and downloaded only when the versions differ. A failure is retried on the
+    // next start.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -473,25 +415,20 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::tools::bun::run_bun_management(),
     );
 
-    // The product's own ffmpeg and ffprobe (`mahbot::ffmpeg`). Nothing about the
-    // build is compiled in: the newest build the product's own release stream offers
-    // is looked up and installed, and a build published later is picked up on a
-    // following start. A failure is recorded, retried on the next start, and never
-    // removes a copy that already works.
+    // Nothing about the build is compiled in: the newest build the release stream offers is
+    // looked up and installed, and one published later is picked up on a following start. A
+    // failure is recorded, retried on the next start, and never removes a working copy.
     spawn_cancellable(&mut tasks, &shutdown_token, "ffmpeg-install", async {
         mahbot::ffmpeg::install_on_start().await;
     });
 
-    // HyperFrames (`mahbot::hyperframes`): the renderer is installed from the npm
-    // registry on its first use and costs nothing until then; a copy already
-    // installed is brought to the newest release at start. A failure is recorded,
-    // retried on the next start, and never removes a copy that already works.
+    // Installed from the npm registry on first use and brought to the newest release at start.
+    // A failure is recorded and retried, never removing a working copy.
     spawn_cancellable(&mut tasks, &shutdown_token, "hyperframes-refresh", async {
         mahbot::hyperframes::refresh_on_start().await;
     });
 
-    // macOS-only voice-assistant pipeline: runs in the background, managing
-    // wake-word detection, command recording, transcription, and routing.
+    // Manages wake-word detection, command recording, transcription and routing.
     #[cfg(target_os = "macos")]
     spawn_cancellable(
         &mut tasks,
@@ -502,11 +439,8 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
 
     let rx = init_message_pipeline(&mut tasks, &shutdown_token);
 
-    // `run_message_dispatch_loop` runs unconditionally and exits only via the
-    // shutdown token: `MESSAGE_TX` (a process-lifetime `OnceLock` global set in
-    // `init_message_pipeline`) and the always-registered GUI listener hold
-    // sender clones, so `rx.recv()` never returns `None` (the `None => break`
-    // arm is unreachable in practice).
+    // Exits only via the shutdown token: `MESSAGE_TX` (set in `init_message_pipeline`) and the
+    // always-registered GUI listener hold sender clones, so `rx.recv()` never returns `None`.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -521,23 +455,18 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::pipeline::run_management(),
     );
 
-    // Listen for stop requests and drive the two-request drain protocol: signals
-    // on macOS/Linux, the console control handler on Windows (the sources are
-    // installed by `shutdown::install_stop_request_sources`). The first request begins the drain
-    // (wait_for_shutdown_signal calls drain_begin and keeps listening); the task
-    // returns only on a request that abandons the drain — a SECOND signal, or a
-    // force-cancel-class console request — which force-cancels it. Clean drain
-    // completion is driven by the drain-watch task below (fires the token when no
-    // in-flight agents or orchestrator calls remain).
+    // The two-request drain protocol: the first request begins the drain
+    // (`wait_for_shutdown_signal` keeps listening); the task returns only on one that abandons
+    // it — a SECOND signal, or a force-cancel-class console request. Clean completion is the
+    // drain-watch task's job below.
     tasks.spawn(async move {
         let result = AssertUnwindSafe(mahbot::shutdown::wait_for_shutdown_signal())
             .catch_unwind()
             .await;
         match result {
             Ok(Ok(cause)) => {
-                // Names the request that ended the drain, where the platform gives it a name
-                // (a Windows console request); the fallback is the literal this line always
-                // carried, for the second Unix signal.
+                // Names the request that ended the drain where the platform gives it a name;
+                // the fallback is the literal this line always carried, for the second Unix signal.
                 info!(
                     "{} — force-cancelling drain",
                     cause.unwrap_or("Second signal received")
@@ -556,18 +485,11 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         }
     });
 
-    // Drain-watch: while the drain flag is set, poll the agent registry AND
-    // the non-agent call registry. Drain-cut phase jobs intentionally leave
-    // their jobs status='launched' for the puller to re-drive at boot, so a
-    // jobs-table count cannot reach zero in the common drain — and even
-    // research jobs, which DO terminalize mid-drain via the partial-report
-    // path, tell us nothing about cut rounds — so the registries are the
-    // authoritative in-flight signal (orchestrator-only LLM calls — analysis
-    // consolidation, research synthesis — are tracked in NON_AGENT_CALLS; the
-    // research orchestrator holds a whole-run guard).
-    // Clean exit when both empty; force-cancel stragglers at the 10-minute
-    // cap (in-flight ops with >10 min remaining budget are guaranteed-aborted
-    // and boot-resume via status='launched').
+    // While the drain flag is set, poll the agent registry AND the non-agent call registry. A
+    // jobs-table count cannot do it: drain-cut phase jobs intentionally stay status='launched'
+    // for the boot puller, and research jobs that DO terminalize mid-drain say nothing about cut
+    // rounds. Clean exit when both empty; force-cancel stragglers at the 10-minute cap (ops with
+    // >10 min of budget left are guaranteed-aborted and boot-resumed).
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -575,29 +497,22 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::jobs::run_drain_watch(),
     );
 
-    // Periodic WAL checkpoint as hygiene: compact committed frames and bound
-    // WAL growth/reopen cost (committed data is fsync-durable at COMMIT
-    // regardless of checkpoints). Non-truncating (PASSIVE) below the WAL-size
-    // cap — TRUNCATE resets the shared WAL frame index, which is the
-    // live-writer corruption vector under live connections, so the periodic
-    // loop keeps it rare, and the engine itself refuses the reset while another
-    // connection holds the store, answering blocked rather than failing (see
-    // checkpoint::periodic_checkpoint_and_verify). The round runs every ten
-    // minutes and issues its upkeep on the store's own maintenance connection
-    // (db::Maintenance), so ordinary reads and writes do not wait for the writing
-    // connection behind it; a store that cannot give the round one has the round
-    // run on the writing connection instead, which is how every round ran before
-    // the maintenance connection existed.
+    // Periodic WAL checkpoint as hygiene: compacts committed frames and bounds WAL growth and
+    // reopen cost. Non-truncating (PASSIVE) below the WAL-size cap — TRUNCATE resets the shared
+    // WAL frame index, the live-writer corruption vector under live connections, so the loop
+    // keeps it rare and the engine refuses the reset while another connection holds the store
+    // (answering blocked, not failing) — see `checkpoint::periodic_checkpoint_and_verify`. The
+    // round runs every ten minutes on the store's maintenance connection (`db::Maintenance`), so
+    // ordinary reads and writes do not wait for the writer behind it; a store that cannot give
+    // the round one runs it on the writing connection.
     spawn_cancellable(&mut tasks, &shutdown_token, "auto-checkpoint", async {
         loop {
             if !mahbot::shutdown::sleep_or_shutdown_or_drain(Duration::from_mins(10)).await {
                 break;
             }
-            // The self-update path checkpoints all stores itself and cancels
-            // the shutdown token right after; skip a periodic round that would
-            // land inside the update handoff window. A round already in flight
-            // when the update starts can still finish — bounded to one
-            // iteration, since the next sleep breaks on the cancelled token.
+            // The self-update path checkpoints every store itself and cancels the shutdown
+            // token right after; a round already in flight when an update starts can still
+            // finish — bounded to one iteration, since the next sleep breaks on the token.
             if mahbot::self_update::update_is_finalizing() {
                 break;
             }
@@ -606,33 +521,28 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         }
     });
 
-    // Store handles so shutdown_after_dashboard can await completion.
+    // Kept so shutdown_after_dashboard can await completion.
     {
         let mut guard = BACKGROUND_TASKS.lock().unwrap_poison();
         let _ = guard.insert(tasks);
     }
 }
 
-/// Initialize the message pipeline: creates the shared mpsc channel,
-/// broadcast channel, channel registry, and spawns Telegram + GUI
-/// channel listeners. Returns the receiver half for [`run_message_dispatch_loop`].
+/// Creates the shared mpsc and broadcast channels and the channel registry, and spawns the
+/// Telegram + GUI listeners. Returns the receiver half for [`run_message_dispatch_loop`].
 fn init_message_pipeline(
     tasks: &mut JoinSet<()>,
     cancel: &CancellationToken,
 ) -> tokio::sync::mpsc::Receiver<ChannelMessage> {
-    // Create the shared message channel before any channel listeners are
-    // spawned. All channels push into the same tx; rx is consumed by the
-    // single `run_message_dispatch_loop` consumer. `ChannelMessage.channel`
-    // disambiguates origins.
+    // Before any listener is spawned: all channels push into the same tx, one
+    // `run_message_dispatch_loop` consumes rx, and `ChannelMessage.channel` disambiguates origins.
     let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(100);
 
-    // Store pipeline tx globally so GuiChannel can forward messages,
-    // and keep a local clone for channel listener registration below.
+    // Global so GuiChannel can forward messages; a local clone registers the listeners below.
     mahbot::MESSAGE_TX
         .set(tx.clone())
         .expect("MESSAGE_TX already set — should be first init");
 
-    // Clone tx for GuiChannel before it's consumed by the Telegram listener.
     let gui_pipeline_tx = tx.clone();
 
     // Create the chat broadcast channel (capacity 256 for burst tolerance).
@@ -641,15 +551,14 @@ fn init_message_pipeline(
         .set(chat_tx)
         .expect("CHAT_BROADCAST already set — should be first init");
 
-    // Nothing subscribes to CHAT_BROADCAST to speak: the only speech is the
-    // admin Assistant's `say` tool, which calls the engine itself. Initialize
-    // the channel registry (empty — channels register below).
+    // Nothing subscribes to CHAT_BROADCAST to speak — the only speech is the admin Assistant's
+    // `say` tool, which calls the engine itself. The registry starts empty; channels register
+    // below.
     let _ = mahbot::CHANNEL_REGISTRY.set(mahbot::ChannelRegistry::default());
 
-    // The Telegram channel starts as a task of its own: which Bot API it talks to
-    // (the cloud, or the product's own local server) is decided by the mode the
-    // owner chose, and a switch that the last shutdown interrupted is finished
-    // before any listener runs.
+    // A task of its own: which Bot API it talks to (cloud or the product's local server) is the
+    // mode the owner chose, and a switch the last shutdown interrupted is finished before any
+    // listener runs.
     spawn_cancellable(
         tasks,
         cancel,
@@ -657,8 +566,7 @@ fn init_message_pipeline(
         mahbot::channels::telegram::run_configured_channel(tx.clone()),
     );
 
-    // Always register the GUI channel — even in dashboard-only mode it provides
-    // the bridge between the Iced UI and the message pipeline.
+    // Always — even in dashboard-only mode it is the bridge between the Iced UI and the pipeline.
     {
         use mahbot::channels::GuiChannel;
         let (gui_channel, gui_tx) = GuiChannel::new();
@@ -675,10 +583,8 @@ fn init_message_pipeline(
         });
     }
 
-    // Register the voice channel so the message routing system can resolve the
-    // "voice" channel name when delivering agent responses. There is no
-    // listener — the voice pipeline runs its own mic-capture loop managed by
-    // `run_voice_pipeline` — and the whole voice pipeline is macOS-only.
+    // So routing can resolve the "voice" channel name when delivering agent responses. There
+    // is no listener: the voice pipeline runs its own mic loop (`run_voice_pipeline`, macOS only).
     #[cfg(target_os = "macos")]
     mahbot::channels::register_global();
 
@@ -686,27 +592,23 @@ fn init_message_pipeline(
 }
 
 async fn shutdown_after_dashboard() {
-    // The stop trace: names the last stop request the platform recorded, and keeps the
-    // "window close" wording when nothing was recorded — a stop that named no route (a Unix
-    // signal, a close that could not hide). This line is dropped outright and reaches no one
-    // — `shutdown::EXIT_TRIGGER` documents why, and what that leaves of a stop's reason.
+    // Names the last stop request the platform recorded, keeping the "window close" wording
+    // when nothing was. This line is dropped outright and reaches no one —
+    // `shutdown::EXIT_TRIGGER` documents why.
     info!(
         "{} — shutting down",
         mahbot::shutdown::exit_trigger().unwrap_or("window close")
     );
-    // No shutdown() here — the token is already cancelled whenever this function
-    // runs: the ordinary exit path (`save_and_exit`) fires it before leaving the
-    // iced runtime, and a drain path arrives with it fired already.
-    //
-    // The exits that run none of this are named once, in `shutdown`'s module docs; a new exit
-    // path that drops the runtime without firing the token belongs on that list.
+    // No shutdown() here — the token is already cancelled whenever this runs: the ordinary
+    // exit path (`save_and_exit`) fires it before leaving the iced runtime, and a drain path
+    // arrives with it fired. The exits that run none of this are named in `shutdown`'s module
+    // docs; a new exit path that drops the runtime without firing the token belongs there.
     mahbot::agent::registry::AGENT_REGISTRY.shutdown_all();
 
     let release = mahbot::tools::chrome_release::flush_ended_run_chrome_releases();
     match mahbot::shutdown::urgent_release_budget() {
-        // Only a stop the platform gave a kill deadline to (a Windows console close or
-        // session end) bounds the stage before the checkpoint; a cut is best-effort and
-        // the exit path carries on to it.
+        // Only a stop the platform gave a kill deadline to (a Windows console close or session
+        // end) bounds the stage before the checkpoint; a cut is best-effort.
         Some(budget) => {
             if tokio::time::timeout(budget, release).await.is_err() {
                 warn!("urgent shutdown: browser session release cut at its {budget:?} budget");
@@ -721,8 +623,8 @@ async fn shutdown_after_dashboard() {
         guard.take()
     };
 
-    // No budget here: these tasks live on the iced runtime, which is dropped before
-    // this path runs, so joining them is a sweep of already-cancelled work.
+    // These tasks live on the iced runtime, dropped before this path runs, so joining them is a
+    // sweep of already-cancelled work.
     if let Some(mut tasks) = maybe_tasks {
         while let Some(result) = tasks.join_next().await {
             match result {
@@ -737,46 +639,39 @@ async fn shutdown_after_dashboard() {
         }
     }
 
-    // Single-writer checkpoint: the iced runtime is gone, so no background
-    // writer is live. Relocated here from save_and_exit (which ran it while
-    // background writers were still active — contradicting single-writer).
+    // Single-writer checkpoint: the iced runtime is gone, so no background writer is live.
+    // Relocated from save_and_exit, which ran it while writers were still active.
     mahbot::db::checkpoint::checkpoint_all_databases().await;
 
-    // The bot's local Bot API server is a child of this process: it goes away
-    // with it, so the next start finds nothing to adopt and cannot end up with
-    // two pollers on one bot token.
+    // The local Bot API server is a child of this process: it goes away with it, so the next
+    // start finds nothing to adopt and cannot end up with two pollers on one bot token.
     mahbot::channels::stop_telegram_server().await;
 }
 
-/// A short-lived current-thread runtime for a command-line entry point: each of
-/// them runs one operation and exits, so nothing the daemon's own runtime carries
-/// is needed.
+/// A short-lived current-thread runtime for a command-line entry point: it runs one operation
+/// and exits.
 fn command_line_runtime() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?)
 }
 
-/// The words after the command word: what a dispatched entry point reads
-/// (`argv[0]` is the binary, `argv[1]` the word `mahbot::cli` resolved).
+/// The words after the command word (`argv[0]` is the binary, `argv[1]` the resolved word).
 fn command_line_args() -> Vec<String> {
     std::env::args().skip(2).collect()
 }
 
-// The verb ladder is deliberately one function: every dispatch is visible in one
-// place, and its words are `mahbot::cli`'s command table. Every entry point the
+// Deliberately one function: every dispatch is visible in one place. Every entry point the
 // process can be launched as is dispatched here.
 #[expect(clippy::too_many_lines)]
 fn main() -> Result<()> {
     mahbot::shutdown::install_fatal_signal_handlers();
     mahbot::shutdown::install_panic_hook();
 
-    // An argument the process cannot read as text can name no entry point and
-    // fill no value, and it must not be echoed either — the caller may have
-    // passed a secret with a mistyped byte. It is refused as the command line's
-    // own misuse here, before the verb ladder reads anything: the text-only
-    // reader the ladder uses would panic, which would both leave the four exit
-    // classes a script reads and print the very bytes that were passed.
+    // An argument that cannot be read as text can name no entry point and fill no value, and
+    // must not be echoed — the caller may have passed a secret with a mistyped byte. Refused
+    // before the ladder reads anything: the text-only reader would panic, both losing the four
+    // exit classes a script reads and printing the very bytes passed.
     if std::env::args_os()
         .skip(1)
         .any(|arg| arg.to_str().is_none())
@@ -784,23 +679,19 @@ fn main() -> Result<()> {
         std::process::exit(mahbot::cli::refuse_non_text_argument());
     }
 
-    // The command table (`mahbot::cli`) holds every first word this build has, the
-    // hidden verbs the shell tool and the environment reader spawn included. A word
-    // it has none for is the caller's own mistake, refused here — before the storage
-    // root, the temp root and the instance lock, so nothing is started, filed or
-    // waited on.
+    // The command table (`mahbot::cli`) holds every first word this build has, hidden verbs
+    // included. A word it has none for is the caller's mistake, refused here — before the
+    // storage root, the temp root and the instance lock.
     let Some(entry) = mahbot::cli::entry_point(std::env::args().nth(1).as_deref()) else {
         std::process::exit(mahbot::cli::refuse_unknown_entry_point());
     };
 
-    // Every entry point that is a command line runs its own frontend and exits,
-    // before the daemon's pre-boot steps: each has to work while an instance holds
-    // the lock taken below. What is left for the daemon is a bare launch, `paused`
-    // and `__login-start`, launch modes rather than command lines.
+    // Every command-line entry point runs its own frontend and exits before the daemon's
+    // pre-boot steps: each must work while an instance holds the lock. What is left for the
+    // daemon is a bare launch, `paused` and `__login-start`.
     let (start_paused, login_start) = match entry {
-        // Read-only SQL directly, with no GUI or instance setup. The surface that
-        // must work WHILE an instance holds the lock, hence before lock
-        // acquisition. No tracing init, no Iced.
+        // Read-only SQL with no GUI or instance setup — must work WHILE an instance holds the
+        // lock, hence before lock acquisition. No tracing init, no Iced.
         EntryPoint::Debug => {
             let rt = command_line_runtime()?;
             match rt.block_on(mahbot::db::debug::run_debug()) {
@@ -812,66 +703,54 @@ fn main() -> Result<()> {
             }
         }
 
-        // Served by the shell tool's transparent grep interception. Also before
-        // lock acquisition — an instance holds the lock, so a normally dispatched
-        // second process would fail.
+        // Served by the shell tool's transparent grep interception, so also before lock
+        // acquisition.
         EntryPoint::GrepEngine => {
             std::process::exit(mahbot::run_grep_engine(&command_line_args()));
         }
 
-        // The shell-env reader spawns this binary as a child of the owner's own
-        // shell, so it inherits exactly the environment that shell exported and
-        // prints it to stdout. It must touch neither the instance lock nor
-        // `temp::init_temp_root()` — nor tracing, nor the stores: an instance
-        // holds the lock, and the dumper's only job is to write its environment
-        // out.
+        // The shell-env reader spawns this as a child of the owner's own shell, so it inherits
+        // exactly that environment and prints it. It must touch neither the instance lock nor
+        // `temp::init_temp_root()` — nor tracing, nor the stores.
         EntryPoint::EnvDump => {
             std::process::exit(mahbot::shell_env::dump_environment(&command_line_args()));
         }
 
-        // Standalone benchmark: it must work while another instance holds the
-        // lock. It never opens a live store — the config-store lookup goes through
-        // that instance's debug channel while the location is held, is skipped
-        // with a printed notice when the location may be held but the channel
-        // cannot be reached, and reads the store directly only when nothing holds
-        // it.
+        // Standalone: must work while another instance holds the lock. It never opens a live
+        // store — the config-store lookup goes through that instance's debug channel, is skipped
+        // with a printed notice when the location may be held but the channel cannot be reached,
+        // and reads the store directly only when nothing holds it.
         EntryPoint::BenchOpenRouter => {
             let rt = command_line_runtime()?;
             std::process::exit(rt.block_on(mahbot::bench_openrouter::run_cli()));
         }
 
-        // The product's own speech engine on the command line — a recording into
-        // text, text into a spoken file. It touches only the speech models under
-        // the storage root (never a store, never the settings), so it works while
-        // the product is stopped and runs alongside it without disturbing it.
+        // A recording into text, text into a spoken file. It touches only the speech models
+        // under the storage root (never a store, never the settings), so it works while the
+        // product is stopped and alongside it.
         EntryPoint::Audio => {
             let rt = command_line_runtime()?;
             std::process::exit(rt.block_on(mahbot::run_audio_cli(&command_line_args())));
         }
 
-        // Browser automation over the shared chrome core. Runs alongside the
-        // instance (it uses its own session namespace); chrome-use resolves to the
-        // product's own copy at its standard install directory, which needs no
-        // config.
+        // Over the shared chrome core, alongside the instance (its own session namespace).
+        // chrome-use resolves to the product's own copy at its standard install directory.
         EntryPoint::Chrome => {
             let rt = command_line_runtime()?;
             std::process::exit(rt.block_on(mahbot::run_chrome_cli(&command_line_args())));
         }
 
-        // The command-line families (`mahbot <family> …`, every family
-        // `mahbot::cli::FAMILIES` publishes): frontends onto the product's own
-        // tools. The operations run IN the instance, which holds the lock, and this
-        // process never opens one of its stores.
+        // `mahbot <family> …`, every family `mahbot::cli::FAMILIES` publishes: frontends onto
+        // the product's own tools. The operations run IN the instance, and this process never
+        // opens one of its stores.
         EntryPoint::Family(cli) => {
             let rt = command_line_runtime()?;
             std::process::exit(rt.block_on(mahbot::cli::run(cli, &command_line_args())));
         }
 
-        // The help and version flags print and exit before the temp root and the
-        // lock, so they work while an instance holds it (and when it doesn't —
-        // otherwise they would boot the GUI). Only the exact first tokens are
-        // matched; a subcommand-level flag (`mahbot chrome -h` etc.) reaches its
-        // own frontend above.
+        // Print and exit before the temp root and the lock, so they work while an instance holds
+        // it — and when it doesn't, instead of booting the GUI. Only exact first tokens match; a
+        // subcommand-level flag reaches its own frontend above.
         EntryPoint::Help => {
             mahbot::util::print_stdout(mahbot::cli::TOP_LEVEL_USAGE);
             return Ok(());
@@ -881,89 +760,68 @@ fn main() -> Result<()> {
             return Ok(());
         }
 
-        // A startup mode, not a command line: the launch continues into the normal
-        // GUI startup with the flag that pauses every managed workspace before
-        // any background task starts (see `bootstrap_mahbot`).
+        // A startup mode, not a command line: the launch continues into the normal GUI startup
+        // with the flag that pauses every managed workspace before any background task starts.
         EntryPoint::Paused => (true, false),
-        // A login start is an ordinary daemon launch: it differs only in the window
-        // rule and in the second-launch rule below, where it is not a second launch.
+        // A login start is an ordinary daemon launch, differing only in the window rule and in
+        // the second-launch rule below.
         EntryPoint::LoginStart => (false, true),
         // A bare `mahbot`: the daemon.
         EntryPoint::Daemon => (false, false),
     };
 
-    // ── The daemon ──
-    //
-    // From the first instructions of the daemon's own start-up (as early as the launch
-    // can tell it is one, which is after the command word is read): a hangup or a
-    // suspending signal must never end the service, and the window this closes is the one
-    // before the signal task exists.
+    // From the first instructions of the daemon's start-up — as early as the launch can tell
+    // it is one — a hangup or a suspending signal must never end the service; this closes the
+    // window before the signal task exists.
     mahbot::shutdown::install_ignored_signals();
 
-    // Resolve the storage root before anything else: it is a pure environment read
-    // (`mahbot::config::default_config_dir`), the detach below names the log file in it,
-    // the instance lock is acquired under it before Iced starts, and the pre-boot steps
-    // are recorded against it. The process-global root is not set yet, and a note that
-    // only ever reached a terminal is lost with it — the durable record in
-    // `<root>/error.log` is what keeps such a step recoverable.
+    // Resolved before anything else: it is a pure environment read
+    // (`mahbot::config::default_config_dir`), the detach below names the log file in it, the
+    // instance lock is acquired under it, and pre-boot steps are recorded against it. The
+    // process-global root is not set yet, and a note that only ever reached a terminal is lost
+    // with it — the durable record in `<root>/error.log` keeps such a step recoverable.
     let storage_root = mahbot::config::default_config_dir()
         .map_err(|e| mahbot::boot::record_startup_failure("config::default_config_dir", e))?;
 
-    // Started from a terminal, the service is detached from it here: the prompt comes back,
-    // the service keeps running in a session of its own with none of the shell's streams,
-    // and everything it prints lands in `<root>/daemon.log` (`mahbot::detach`). Only that
-    // service goes on from here, and the launch that started it has printed its one line by
-    // then. A launch the terminal did not start — a pipe, a supervisor, the login
-    // registration, the update hand-off — carries on in the foreground exactly as before.
+    // Started from a terminal, the service detaches here: the prompt comes back, it runs in a
+    // session of its own with none of the shell's streams, and everything it prints lands in
+    // `<root>/daemon.log`. A launch the terminal did not start — a pipe, a supervisor, the
+    // login registration, the update hand-off — carries on in the foreground.
     mahbot::detach::detach_from_terminal(&storage_root)?;
 
-    // The platform's own exemption from slowing this process down because its window is
-    // not visible, asked for here — before anything else the daemon does, so it holds for
-    // the whole life of the service rather than from the moment the dashboard appears.
-    // Every command-line verb above is dispatched before this point on purpose, and a
-    // restart or a self-update comes back through here rather than carrying anything over.
-    // What came back travels into the boot task below, which reports it once the logs store
-    // can hold the line.
+    // Asked for before anything else the daemon does, so it holds for the whole life of the
+    // service. Every command-line verb above is dispatched before this point on purpose, and a
+    // restart or self-update comes back through here rather than carrying anything over. What
+    // came back travels into the boot task, which reports it once the logs store can hold it.
     let slowdown = mahbot::power::exempt_from_slowdown();
 
-    // Subscribe to the platform's stop requests before boot and before the interface
-    // exists; `shutdown` names the three sources.
+    // Before boot and before the interface exists; `shutdown` names the three sources.
     mahbot::shutdown::install_stop_request_sources();
 
-    // Consolidate ALL instance temp files under one private root
-    // (`/tmp/mahbot`, mode 0700; `<user temp>\mahbot` on Windows) and pin the
-    // platform's temp variables to it — BEFORE any temp use (config, logs,
-    // stores, shell children). The debug, __grep-engine, __env-dump,
-    // bench-openrouter, audio, chrome, the command-line families, help/version
-    // dispatches above and a refused unknown first word must NOT create the root
-    // (they exit before this point).
+    // ALL instance temp files under one private root (`/tmp/mahbot`, mode 0700; `<user
+    // temp>\mahbot` on Windows), with the platform's temp variables pinned to it — BEFORE any
+    // temp use. The dispatches above and a refused unknown first word must NOT create the root,
+    // exiting before this point.
     mahbot::temp::init_temp_root().map_err(|e| {
         let e = mahbot::boot::record_launch_failure(&storage_root, "temp::init_temp_root", e);
         mahbot::detach::report_failure(&e);
         e
     })?;
 
-    // Acquire the instance lock before Iced runtime starts.
-    // Stored in a global so the update flow can release/re-acquire it.
+    // Acquired before the Iced runtime starts and stored in a global so the update flow can
+    // release and re-acquire it.
     //
-    // A second launch of the product while one is running takes the other way out: the
-    // running copy's window comes up — it is the only way back to one a close hid — and this
-    // process exits 0. That only counts where the copy can be reached: an instance still
-    // booting has not bound its endpoint yet, and an update hand-off is not a second launch at
-    // all (it exists to take the location over). Everywhere else the launch is refused, and the
-    // refusal is filed in the durable failure record under the root resolved above (this is a
-    // pre-boot step, so the process-global root is not set yet), with its text passed through
-    // unchanged — the shell tool recognises a stale self-update binary by it
-    // (`self_update::second_instance_refusal`). A refusal leaves a Windows launch the platform
-    // gave no console and no standard streams (the double-click case) silent — only the filed
-    // block remains, and the runner's own-image step reads that same text off the pipe it wired
-    // — while a Unix launch started from a terminal has a launcher waiting on its word, and
-    // says the refusal there.
+    // A second launch while one is running takes the other way out: the running copy's window
+    // comes up — the only way back to one a close hid — and this process exits 0, wherever the
+    // copy can be reached: a booting instance has not bound its endpoint, and an update hand-off
+    // is not a second launch at all. Everywhere else the launch is refused, filed in the durable
+    // failure record under the root resolved above with its text unchanged — the shell tool
+    // recognises a stale self-update binary by it (`self_update::second_instance_refusal`). A
+    // Windows launch with no console stays silent; a Unix one from a terminal says it there.
     if let Err(refusal) = mahbot::self_update::acquire_lock(&storage_root) {
-        // A login start is not a second launch: the system asked for the product
-        // and one is already up, so this exits quietly — no window raised, no
-        // failure filed, exit 0. A location that could not be taken for any other
-        // reason is a real failure of the launch and is filed like one.
+        // A login start is not a second launch: the system asked and one is up, so this exits
+        // quietly — no window raised, no failure filed, exit 0. A location that could not be
+        // taken for any other reason is filed like a real failure.
         if login_start && mahbot::self_update::is_instance_refusal(&refusal) {
             mahbot::detach::report_already_running();
             return Ok(());
@@ -971,8 +829,8 @@ fn main() -> Result<()> {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         if !mahbot::self_update::is_handoff() && mahbot::db::ipc::request_window_show(&storage_root)
         {
-            // The copy that is up was reached and its window raised: the launch did what it
-            // came to do, and the terminal is told so — not that a service just started.
+            // The copy was reached and its window raised: the launch did what it came to do, and
+            // the terminal is told so — not that a service just started.
             mahbot::detach::report_already_running();
             return Ok(());
         }
@@ -981,71 +839,61 @@ fn main() -> Result<()> {
             "self_update::acquire_lock",
             refusal,
         );
-        // Where no window can be raised this refusal is the launch's whole answer, and the
-        // waiting terminal is where it is said; the filed block stays the durable half.
+        // Where no window can be raised this refusal is the launch's whole answer, said on the
+        // waiting terminal; the filed block stays the durable half.
         mahbot::detach::report_failure(&refusal);
         return Err(refusal);
     }
 
-    // The location is this process's: the service is up, and the launch that is waiting on
-    // its word prints the notice and gives the terminal back.
+    // The location is this process's: the launch waiting on its word prints the notice and
+    // gives the terminal back.
     mahbot::detach::report_running();
 
     // Read persisted window state (sync, before Iced runtime starts).
     let window_state = mahbot::gui::read_window_state();
 
-    // Initialise the git file-change broadcast before the iced application
-    // runs (matching LOG_BROADCAST), so the file-change subscription always
-    // has a source — an uninitialized one would end the subscription stream.
+    // Before the iced application runs (matching LOG_BROADCAST), so the file-change subscription
+    // always has a source — an uninitialized one would end the stream.
     mahbot::gui::init_git_file_change_tx();
-    // Initialise the git-commit broadcast so the pipeline-commit subscription
-    // always has a source (same convention as the file-change broadcast).
+    // Same convention: the pipeline-commit subscription always has a source.
     mahbot::gui::init_git_commit_tx();
-    // Warm the CDC ticket sender before the app runs so the board change
-    // subscription also has a source; otherwise it ends on the first frame and
-    // the board freezes at the initial snapshot (Iced never re-spawns it).
+    // Same, for the board change subscription: otherwise it ends on the first frame and the
+    // board freezes at the initial snapshot (Iced never re-spawns it).
     mahbot::gui::init_board_change_tx();
-    // Warm the CDC senders for the workspaces/users/user_channels subscriptions
-    // before the app runs (same immediately-ending-stream rationale as the
-    // board sender above).
+    // Same immediately-ending-stream rationale, for workspaces/users/user_channels.
     mahbot::gui::init_workspace_tx();
     mahbot::gui::init_users_tx();
     mahbot::gui::init_user_channels_tx();
-    // The runtime-change broadcast (agent registry / transcript / voice status)
-    // must have a source before the iced app runs, same convention.
+    // The runtime-change broadcast (agent registry / transcript / voice status), same convention.
     mahbot::gui::init_runtime_event_tx();
-    // The voice-recording broadcast the Home composer subscribes to, so a
-    // recording's transcript has somewhere to land (same convention).
+    // The voice-recording broadcast the Home composer subscribes to, so a transcript has
+    // somewhere to land.
     mahbot::gui::init_recording_tx();
 
     // The icon on the surfaces the window itself does not carry.
     mahbot::app_icon::install_desktop_integration();
 
-    // The ways into the window from outside it — the tray icon, a second launch, the Dock —
-    // and the product's only in-app quit. The channel first, so a gesture that arrives
-    // before the dashboard subscribes waits for it.
+    // The tray icon, a second launch and the Dock; plus the product's only in-app quit. The
+    // channel first, so a gesture arriving before the dashboard subscribes waits for it.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     mahbot::window_requests::init();
 
-    // The tray icon, where the platform has one: the click that brings the window up and
-    // the menu that quits. macOS creates the status item on its main thread once iced's
-    // own loop is running; Windows on a thread of its own. Never fatal (see `tray`).
+    // The click that brings the window up and the menu that quits. macOS creates the status item
+    // on its main thread once iced's loop runs; Windows on a thread of its own. Never fatal.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     mahbot::tray::install();
 
-    // A restart the updater made for a hidden window comes back hidden: the window is
-    // created invisible and nothing draws until the tray brings it up. A login start is
-    // hidden the same way; Linux has no windowless mode and opens its window as a hand
-    // launch does. An ordinary cold start always shows it.
+    // A restart the updater made for a hidden window comes back hidden: the window is created
+    // invisible and nothing draws until the tray brings it up. A login start is hidden the same
+    // way; Linux has no windowless mode. An ordinary cold start always shows it.
     let start_hidden = cfg!(any(target_os = "macos", target_os = "windows"))
         && (mahbot::self_update::starts_hidden() || login_start);
     mahbot::gui::app_window::set_hidden(start_hidden);
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     mahbot::gui::app_window::set_login_start(login_start);
 
-    // The geometry the window opens at, and the dashboard's own copy of it: the exit path
-    // persists the last size and position the window reported, and a fresh window's
-    // start-up width is settled by the board's first read (see `StartupWidth`).
+    // The exit path persists the last reported size and position, and a fresh window's start-up
+    // width is settled by the board's first read (see `StartupWidth`).
     let window_settings = dashboard_window_settings(&window_state, start_hidden);
     let run = iced::application(
         move || {
@@ -1072,18 +920,16 @@ fn main() -> Result<()> {
     .exit_on_close_request(false)
     .run();
 
-    // The interface is gone, so its tray icon goes with it: a Windows notification-area
-    // icon whose owner never removed it outlives the process as a stale one. An iced
-    // error is an exit as well. The self-update tail reaches the removal from its own
-    // thread instead (see `self_update`).
+    // A Windows notification-area icon whose owner never removed it outlives the process as a
+    // stale one. An iced error is an exit as well; the self-update tail reaches the removal from
+    // its own thread.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     mahbot::tray::remove();
-    // Returning here with an error leaves without the teardown below — one of the exits
-    // `shutdown`'s module docs name — and without the shutdown token fired: an iced error means
-    // the interface never ran, so there would be nothing to drain.
+    // Leaving with an error skips the teardown below — one of the exits `shutdown`'s module docs
+    // name — and leaves the token unfired: an iced error means the interface never ran.
     run.map_err(|e| anyhow::anyhow!("Iced application error: {e}"))?;
 
-    // Iced dropped its runtime; use a short-lived one for async teardown.
+    // Iced dropped its runtime; a short-lived one runs the async teardown.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1093,10 +939,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// The dashboard window's own settings: the geometry it opens with
-/// ([`mahbot::gui::WindowState::opening_size`], a saved one or the narrower
-/// default a fresh window starts with), whether it opens hidden, the frame the platform draws
-/// around it, and the icon and announced name the platform's identity surfaces need.
+/// The opening geometry ([`mahbot::gui::WindowState::opening_size`]), whether the window
+/// opens hidden, the platform's frame, and the icon and announced name its identity surfaces need.
 fn dashboard_window_settings(
     state: &mahbot::gui::WindowState,
     start_hidden: bool,
@@ -1104,46 +948,39 @@ fn dashboard_window_settings(
     iced::window::Settings {
         size: state.opening_size(),
         position: state.position(),
-        // A restart the updater made for a hidden window comes back hidden (see
-        // `self_update::starts_hidden`): the window is created without ever being shown, so
-        // nothing is drawn for it until the tray brings it up. macOS shows its window itself,
-        // once the title strip is hidden (`gui::app_window`), so iced leaves it hidden there and
-        // a hidden start is a window that is never shown.
+        // A hidden start is a window that is never shown. macOS shows its own window once the
+        // title strip is hidden (`gui::app_window`), so iced leaves it hidden there.
         visible: !start_hidden && cfg!(not(target_os = "macos")),
         min_size: Some(iced::Size::new(
             mahbot::gui::MIN_WINDOW_WIDTH,
             mahbot::gui::MIN_WINDOW_HEIGHT,
         )),
-        // The frame this platform draws around the window, or none where the app draws its own
-        // chrome instead: Windows keeps no frame and asks the system to round the corners of what
-        // is left — one request, which a system that does not know it ignores, so Windows 10
-        // keeps square corners. macOS keeps the system's titled window, the one shape the system
-        // rounds and shadows itself, with its whole title strip hidden (`gui::app_window`).
-        // Linux keeps the frame it draws.
+        // Windows keeps no frame and asks the system to round the corners of what is left — one
+        // request a system that does not know it ignores, so Windows 10 keeps square corners.
+        // macOS keeps the system's titled window with its whole title strip hidden
+        // (`gui::app_window`). Linux keeps the frame it draws.
         decorations: cfg!(not(target_os = "windows")),
         // macOS: the strip draws nothing and the content fills the window. The full-size content
-        // view is also what keeps the frame equal to the content rect, so the saved size and
-        // position (`gui::WindowState`) open exactly as they were saved.
+        // view also keeps the frame equal to the content rect, so the saved size and position
+        // open exactly as saved.
         #[cfg(target_os = "macos")]
         platform_specific: iced::window::settings::PlatformSpecific {
             title_hidden: true,
             titlebar_transparent: true,
             fullsize_content_view: true,
         },
-        // Windows: the whole request — the system's own corners (see `decorations`).
+        // Windows: the whole request — the system's own corners.
         #[cfg(target_os = "windows")]
         platform_specific: iced::window::settings::PlatformSpecific {
             corner_preference: iced::window::settings::platform::CornerPreference::Round,
             ..Default::default()
         },
-        // The window's own icon where the platform has one (the window's icon on X11,
-        // and on Windows the small one, the big one attached separately); macOS and
-        // Wayland carry no window icon and ignore it.
+        // The window's own icon where the platform has one (on Windows the small one, the big one
+        // attached separately); macOS and Wayland carry none and ignore it.
         icon: mahbot::app_icon::window_icon(),
-        // Linux: the name the window announces. A desktop environment matches it
-        // against the launcher entry's file name to know which entry — and so which
-        // icon — belongs to this window; with nothing announced no entry is ever
-        // associated with it.
+        // Linux: the name the window announces. A desktop environment matches it against the
+        // launcher entry's file name to pick the entry — and so the icon; with nothing announced
+        // no entry is associated.
         #[cfg(target_os = "linux")]
         platform_specific: iced::window::settings::PlatformSpecific {
             application_id: mahbot::app_icon::LINUX_APP_ID.to_owned(),
@@ -1153,10 +990,9 @@ fn dashboard_window_settings(
     }
 }
 
-/// Background cleanup loop adapter — runs every 10 minutes until cancelled
-/// or the graceful drain begins (stale purge must not race the drain).
-/// `cutoff_hours` is the window of the one step that takes the derived cutoff
-/// (the stale-job purge); other steps own theirs.
+/// Background cleanup loop adapter — every 10 minutes until cancelled or the graceful drain
+/// begins (stale purge must not race it). `cutoff_hours` is the window of the one step that
+/// takes the derived cutoff.
 async fn run_cleanup_loop<F, Fut>(label: &'static str, cutoff_hours: i64, cleanup: F)
 where
     F: Fn(String) -> Fut + Send + 'static,
@@ -1187,20 +1023,19 @@ async fn run_message_dispatch_loop(mut rx: tokio::sync::mpsc::Receiver<ChannelMe
             },
         };
 
-        // This classification decides what the control plane does itself; the
-        // burst collector's gate (`is_control_message`) is it plus the button
-        // press, so nothing handled here is ever collected into a burst.
+        // This classification decides what the control plane does itself; the burst collector's
+        // gate is it plus the button press, so nothing handled here is collected into a burst.
         match control_input(&msg) {
-            // An action payload is handled without the agent. Spawned so a slow
-            // catalog validation in set_image_model never stalls this loop.
+            // Handled without the agent; spawned so a slow catalog validation in set_image_model
+            // never stalls this loop.
             Some(ControlInput::Action(decoded)) => {
                 spawn(handle_action_callback(msg, decoded));
             }
             Some(ControlInput::Command(cmd)) => {
                 handle_bot_command(&msg, cmd).await;
             }
-            // An ordinary message — or a button press whose payload is neither an
-            // action nor a command — goes to the agent, as it always has.
+            // An ordinary message — or a button press that is neither action nor command — goes
+            // to the agent, as it always has.
             None => {
                 spawn(process_channel_message(msg));
             }
@@ -1208,26 +1043,23 @@ async fn run_message_dispatch_loop(mut rx: tokio::sync::mpsc::Receiver<ChannelMe
     }
 }
 
-/// Handle a bot command on Telegram, already classified and parsed by
-/// [`control_input`].
+/// Handle a bot command on Telegram, already classified and parsed by [`control_input`].
 async fn handle_bot_command(msg: &ChannelMessage, cmd: BotCommand) {
     match cmd {
         BotCommand::Start => handle_start_command(msg).await,
         BotCommand::Clear => handle_clear_session(msg).await,
-        // Media model selection is available to every user (models are stored
-        // per-user, and every user has the Assistant role).
+        // Available to every user: models are stored per-user, and every user has the Assistant
+        // role.
         BotCommand::ImageModels | BotCommand::VideoModels => {
             handle_models_command(msg, cmd == BotCommand::ImageModels).await;
         }
-        // `/agents` replies that there is nothing to switch (the Assistant is
-        // every account's only role).
+        // Replies that there is nothing to switch — the Assistant is every account's only role.
         BotCommand::Agents => handle_agents_command(msg).await,
-        // Global admin command: `/update` has its own dispatch path because it
-        // is workspace-independent and owns its own admin gate + availability
-        // pre-check.
+        // Has its own dispatch path because it is workspace-independent and owns its own admin
+        // gate and availability pre-check.
         BotCommand::Update => mahbot::self_update::handle_update_command(msg).await,
-        // Admin-gated commands: denial for guests. `/board` and `/archive` span
-        // every workspace and must neither read nor depend on an active one.
+        // Denial for guests. `/board` and `/archive` span every workspace and must not depend on
+        // an active one.
         BotCommand::Board | BotCommand::Archive => {
             if mahbot::users::is_admin(&msg.user_name).await {
                 if cmd == BotCommand::Board {
@@ -1242,14 +1074,13 @@ async fn handle_bot_command(msg: &ChannelMessage, cmd: BotCommand) {
     }
 }
 
-/// Send a plain-text reply directly on the Telegram channel (no router
-/// broadcast/persist — used for command responses, not agent replies).
+/// Plain-text reply straight on the Telegram channel — no router broadcast/persist, for
+/// command responses rather than agent replies.
 async fn send_telegram_reply(msg: &ChannelMessage, content: String) {
     mahbot::channels::telegram::send_reply(&msg.reply_target, &content).await;
 }
 
-/// Handle `/agents` — reply that there is nothing to switch: the Assistant is
-/// every account's only role.
+/// Reply that there is nothing to switch: the Assistant is every account's only role.
 async fn handle_agents_command(msg: &ChannelMessage) {
     send_telegram_reply(
         msg,
@@ -1258,9 +1089,8 @@ async fn handle_agents_command(msg: &ChannelMessage) {
     .await;
 }
 
-/// Handle `/start` command for Telegram — sends a per-user welcome message
-/// listing the commands available to the current admin state (no inline
-/// keyboard).
+/// A per-user welcome message listing the commands available to the current admin state (no
+/// inline keyboard).
 async fn handle_start_command(msg: &ChannelMessage) {
     let mut lines = vec![
         "\u{1F916} Welcome to MahBot!\n\nAvailable commands:".to_string(),
@@ -1272,12 +1102,10 @@ async fn handle_start_command(msg: &ChannelMessage) {
     send_telegram_reply(msg, lines.join("\n")).await;
 }
 
-/// Handle session clearing for `/clear` and the "Clear session" inline button —
-/// deletes the current session and confirms via the canonical delivery path.
+/// Deletes the current session and confirms via the canonical delivery path.
 async fn handle_clear_session(msg: &ChannelMessage) {
-    // Clear the session the user actually talks to: the same (role, workspace)
-    // resolution as routing — DB-selected workspace, the single Assistant role,
-    // and Assistant pinning.
+    // The session the user actually talks to: the same (role, workspace) resolution as routing —
+    // DB-selected workspace, the single Assistant role, Assistant pinning.
     let (effective_role, ws) = mahbot::users::resolve_session_target(&msg.user_name).await;
     let reply = match clear_session(&msg.user_name, effective_role.as_str(), &ws.name).await {
         Ok(reply) => reply,
@@ -1289,10 +1117,9 @@ async fn handle_clear_session(msg: &ChannelMessage) {
     deliver_clear_reply(&reply, msg, &ws, effective_role).await;
 }
 
-/// Deliver a session-clear confirmation via the router's raw `reply_target`
-/// path (broadcast + persist + transport). The caller passes the already
-/// effective role (Assistant pinning applied) so the confirmation bubble
-/// matches agent responses.
+/// Deliver via the router's raw `reply_target` path (broadcast + persist + transport). The
+/// caller passes the already effective role (Assistant pinning applied) so the bubble matches
+/// agent responses.
 async fn deliver_clear_reply(
     reply: &str,
     msg: &ChannelMessage,
@@ -1321,8 +1148,7 @@ async fn deliver_clear_reply(
     .await;
 }
 
-/// Handle `/image_models` / `/video_models` commands for Telegram — shows
-/// the image or video model selection keyboard.
+/// Show the image or video model selection keyboard.
 async fn handle_models_command(msg: &ChannelMessage, is_image: bool) {
     let reply_markup = build_models_keyboard(is_image, &msg.user_name).await;
     let content = if is_image {
@@ -1330,10 +1156,8 @@ async fn handle_models_command(msg: &ChannelMessage, is_image: bool) {
     } else {
         "Select a video model:".to_string()
     };
-    // Send directly through the channel so the inline_keyboard structure
-    // (rows of buttons) is preserved exactly — the router delivery path
-    // has no inline-keyboard support, so this bypasses it for multi-row
-    // replies like the model menus.
+    // Sent directly so the `inline_keyboard` structure (rows of buttons) survives exactly — the
+    // router's delivery path has no inline-keyboard support.
     if let Err(e) =
         mahbot::channels::telegram::send_direct(&msg.reply_target, content, Some(reply_markup))
             .await
@@ -1342,10 +1166,7 @@ async fn handle_models_command(msg: &ChannelMessage, is_image: bool) {
     }
 }
 
-/// Build inline keyboard for image or video model selection for `user_name`.
-///
-/// Returns the full Telegram `inline_keyboard` JSON array, where each element
-/// is a row (list of buttons in that row). Each button gets its own row,
+/// The full Telegram `inline_keyboard` JSON array: one button per row, each model on its own,
 /// followed by a clear-session button.
 async fn build_models_keyboard(is_image: bool, user_name: &str) -> serde_json::Value {
     let mut rows: Vec<serde_json::Value> = Vec::new();
@@ -1364,8 +1185,7 @@ async fn build_models_keyboard(is_image: bool, user_name: &str) -> serde_json::V
             "__act__set_video_model",
         )
     };
-    // Merge the active model into the rendered list when the list omits it,
-    // so the ✓ indicator unambiguously shows the active model.
+    // Merged in when the rendered list omits it, so the ✓ unambiguously shows the active model.
     if !models.iter().any(|m| m == &active) {
         models.push(active.clone());
     }
@@ -1399,15 +1219,10 @@ fn build_model_button_rows(
     }
 }
 
-// ── Admin commands (board / archive) ───────────────────────────────────────
-
-/// Handle `/board` — list every workspace's non-archived tickets in the exact
-/// order the GUI board column shows them (shared ordering helper), formatted by
-/// [`board_listing_text`](mahbot::channels::telegram::board_listing_text).
-///
-/// The listing spans every workspace, never the account's selected one: it
-/// neither reads nor depends on that selection. A long listing goes out across
-/// several messages through the channel's own chunking, as it always has.
+/// List every workspace's non-archived tickets in the GUI board column's order, formatted by
+/// [`board_listing_text`](mahbot::channels::telegram::board_listing_text). The listing spans
+/// every workspace and never the account's selected one; a long one goes out across several
+/// messages through the channel's own chunking.
 async fn handle_board_listing(msg: &ChannelMessage) {
     let tickets = match mahbot::pipeline::board::store()
         .list_all_tickets(None, None)
@@ -1427,14 +1242,11 @@ async fn handle_board_listing(msg: &ChannelMessage) {
     .await;
 }
 
-/// Handle `/archive` — archive every done and cancelled ticket in the
-/// installation, from every workspace. Like `/board` it is
-/// workspace-independent: the scope is the whole installation, and the admin's
-/// active workspace is neither read nor required.
+/// Archive every done and cancelled ticket in the installation, from every workspace.
+/// Workspace-independent like `/board`: the admin's active workspace is neither read nor required.
 async fn handle_archive_command(msg: &ChannelMessage) {
-    // `/archive foo` used to be read as a workspace-scoped archive with a
-    // stray argument. The command has no target at all, so the refusal says
-    // so.
+    // `/archive foo` used to be read as a workspace-scoped archive with a stray argument. The
+    // command has no target at all, so the refusal says so.
     let mut words = msg.content.split_whitespace();
     let cmd_word = words.next().unwrap_or_default();
     if words.next().is_some() {
@@ -1466,8 +1278,6 @@ async fn handle_archive_command(msg: &ChannelMessage) {
     }
 }
 
-/// Handle an action callback (`__act__` prefix).
-///
 /// Actions are processed inline without involving the Manager agent queue.
 async fn handle_action_callback(msg: ChannelMessage, decoded: (String, String)) {
     let (action, payload) = decoded;
@@ -1480,15 +1290,12 @@ async fn handle_action_callback(msg: ChannelMessage, decoded: (String, String)) 
             handle_set_model_action(&msg, &payload, "Video", false).await;
         }
         "clear_session" => {
-            // Acknowledge callback silently first (dismiss spinner)
             answer_telegram_callback(&msg, None).await;
             handle_clear_session(&msg).await;
         }
         _ => {
-            // Acknowledge callback queries to dismiss the Telegram loading
-            // spinner and surface a toast for unknown actions. This catches
-            // stale inline keyboards (e.g. a removed role-picker button) whose
-            // tap must not fail silently.
+            // Dismisses the loading spinner and surfaces a toast for unknown actions, so a stale
+            // inline keyboard (e.g. a removed role-picker button) never fails silently.
             answer_telegram_callback(
                 &msg,
                 Some("This action is no longer available.".to_string()),
@@ -1499,21 +1306,16 @@ async fn handle_action_callback(msg: ChannelMessage, decoded: (String, String)) 
     }
 }
 
-/// Serializes the per-user model-picker callbacks so rapid taps apply in tap
-/// order and each picker's in-place ✓ refresh lands on the row that actually
-/// won. It is held across the HTTP that follows a tap (the model write and the
-/// markup refresh), the accepted tradeoff for deterministic ordering —
-/// human-paced taps and the HTTP client timeout caps any stall. The tap's
-/// acknowledgement and posting a picker are not under it: neither is part of the
-/// order the taps must apply in.
+/// Serializes the per-user model-picker callbacks so rapid taps apply in tap order and each
+/// picker's in-place ✓ refresh lands on the row that won. Held across the HTTP that follows a tap
+/// (the model write and the markup refresh) — the accepted tradeoff for deterministic ordering,
+/// since human-paced taps and the client timeout cap any stall. The tap's acknowledgement and
+/// posting a picker are not under it: neither is part of the order.
 static PICKER_WRITE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
-/// Common handler for setting a per-user model via callback action.
-///
-/// Validates the payload (image models against the catalog, fail-open),
-/// writes the user's `image_gen_model`/`video_model` column, refreshes the
-/// pressed picker's ✓ in place on success, and acknowledges the callback
-/// with a toast.
+/// Validates the payload (image models against the catalog, fail-open), writes the user's
+/// `image_gen_model`/`video_model` column, refreshes the pressed picker's ✓ in place, and
+/// acknowledges with a toast.
 async fn handle_set_model_action(
     msg: &ChannelMessage,
     payload: &str,
@@ -1537,11 +1339,9 @@ async fn handle_set_model_action(
     answer_telegram_callback(msg, toast).await;
 }
 
-/// Best-effort in-place refresh of the pressed model picker: rebuild the
-/// keyboard and replace the one the callback's own message carries. Any failure
-/// (a callback without source-message identity, a deleted message, an identical
-/// keyboard, a transport error) is cosmetic — the pick is already applied, so
-/// the failure is logged at debug and skipped.
+/// Rebuild the keyboard and replace the one the callback's own message carries. Any failure (no
+/// source-message identity, a deleted message, an identical keyboard, a transport error) is
+/// cosmetic — the pick is applied — so it is logged at debug and skipped.
 async fn refresh_pressed_models_keyboard(msg: &ChannelMessage, is_image: bool) {
     let (Some(chat_id), Some(message_id)) = (&msg.chat_id, msg.message_id) else {
         return;
@@ -1557,12 +1357,9 @@ async fn refresh_pressed_models_keyboard(msg: &ChannelMessage, is_image: bool) {
     }
 }
 
-/// Validate and write one per-user model pick, returning the callback toast.
-/// Validation order: payload presence, image-model catalog check (fail-open
-/// when the catalog is unavailable — matching the generation tool's
-/// semantics), user existence (a stale keyboard tapped by an unknown sender
-/// must not mint a bare users row), then the direct column write (no config
-/// warmup).
+/// Validation order: payload presence, image-model catalog check (fail-open when the catalog is
+/// unavailable, matching the generation tool), then user existence (a stale keyboard tapped by an
+/// unknown sender must not mint a bare users row), then the direct column write (no config warmup).
 async fn set_user_model(
     user_name: &str,
     payload: &str,
@@ -1596,9 +1393,7 @@ async fn set_user_model(
     }
 }
 
-/// Acknowledge a Telegram callback query with an optional toast message.
-/// If the message doesn't have a `callback_query_id` (non-Telegram channel),
-/// this is a no-op.
+/// With no `callback_query_id` (a non-Telegram channel) this is a no-op.
 async fn answer_telegram_callback(msg: &ChannelMessage, toast: Option<String>) {
     let Some(cq_id) = &msg.callback_query_id else {
         return;
@@ -1613,17 +1408,14 @@ async fn answer_telegram_callback(msg: &ChannelMessage, toast: Option<String>) {
 }
 
 async fn process_channel_message(msg: ChannelMessage) {
-    // A collected burst arrives as one message whose `parts` are the individual
-    // messages in send order (see `channels::telegram_group`); a message that
-    // arrived on its own is the one-part case of the same flow, so both go
-    // through one path. Either way the parts are never empty — a lone message is
-    // wrapped into one, a collected burst always holds at least two.
+    // A collected burst is one message whose `parts` are the individual messages in send order
+    // (`channels::telegram_group`); a lone message is the one-part case of the same flow. Either
+    // way parts are never empty.
     let user_name = msg.user_name.clone();
     let channel = msg.channel.clone();
     let reply_target = msg.reply_target.clone();
-    // The urgency the surface decided when it took the mark off the text the
-    // user typed — the envelope carries it for a lone message, an album and a
-    // collected burst alike (see `channels::take_urgent`).
+    // The urgency the surface decided when it took the mark off the typed text; the envelope
+    // carries it for a lone message, an album and a burst alike (`channels::take_urgent`).
     let urgent = msg.urgent;
     let mut parts = if msg.parts.is_empty() {
         vec![msg]
@@ -1633,26 +1425,20 @@ async fn process_channel_message(msg: ChannelMessage) {
 
     let ws = mahbot::users::resolve_workspace_for_user_name(&user_name).await;
 
-    // Every account routes to the single Assistant role, and the Assistant
-    // always works in the user's personal workspace regardless of the selected
-    // workspace — resolved before enrichment and before the burst's workspace is
-    // set so uploads, broadcast, persist and chat_history stay consistent with
-    // the routed workspace.
+    // Every account routes to the single Assistant role, which always works in the user's
+    // personal workspace regardless of the selected one — resolved before enrichment and before
+    // the burst's workspace is set, so uploads, broadcast, persist and chat_history agree.
     let ws = mahbot::users::effective_workspace_for_role(mahbot::Role::Assistant, ws, &user_name);
 
-    // Populate workspace on every part so downstream broadcasts and
-    // chat_history writes carry the correct (effective) workspace.
+    // On every part, so downstream broadcasts and chat_history writes carry the effective one.
     for part in &mut parts {
         part.workspace.clone_from(&ws.name);
     }
 
-    // An urgent message cuts the assistant's running turn NOW — on staging,
-    // before anything about this message is understood, so the cut never waits
-    // for its attachments to be extracted or transcribed. The message itself is
-    // routed below once it is composed; the turn it creates answers it together
-    // with everything that was already waiting. The guard is held until that
-    // hand-over: dropping it — here or on a task that died first — ends the wait
-    // the announcement started.
+    // An urgent message cuts the assistant's running turn NOW — on staging, before anything about
+    // the message is understood, so the cut never waits for attachment extraction. The turn it
+    // creates answers it with everything already waiting. The guard is held until that hand-over:
+    // dropping it ends the wait the announcement started.
     let announcement = if urgent && !mahbot::shutdown::aborting() {
         mahbot::agent::message_router::announce_urgent(
             &mahbot::agent::message_router::user_message_agent_id(
@@ -1665,14 +1451,12 @@ async fn process_channel_message(msg: ChannelMessage) {
         None
     };
 
-    // The raw user-typed text of every part, so chat_history stores what the
-    // user wrote rather than the enriched form (which can carry large data URIs
-    // from image processing) — captured together with the log line, before
+    // The raw typed text of every part, so chat_history stores what the user wrote rather than the
+    // enriched form (which can carry large data URIs), captured with the log line before
     // enrichment rewrites the content.
     let mut originals = Vec::with_capacity(parts.len());
     for part in &parts {
-        // A dictated message is named without its content: the transcript is
-        // not written to the logs.
+        // A dictated message is named without its content: the transcript is not logged.
         if part.dictated {
             tracing::info!("💬 [{}] from {}: (dictated)", part.channel, part.user_name);
         } else {
@@ -1686,19 +1470,11 @@ async fn process_channel_message(msg: ChannelMessage) {
         originals.push(part.content.clone());
     }
 
-    // ── Media-marker enrichment (audio transcription, image processing) ──
-    // Runs BEFORE broadcast so the GUI receives the enriched form instead of
-    // raw `[AUDIO:path]` markers (on macOS the transcription text, elsewhere the
-    // honest "not supported" note). Media-marker enrichment turns images into
-    // native data-URI parts carrying the original bytes (re-encoded to a
-    // bounded JPEG only when they would exceed the encoded-payload cap) and
-    // videos into a workspace copy + transcription.
-    // The parts are independent and this is the expensive step — transcription,
-    // image decoding — so the whole burst is enriched at once, exactly as the
-    // parts were when each was its own task.
-    // Every routed turn is the Assistant's, so a workspace path is always
-    // attached: workspace copies and the video transcription it triggers
-    // are always seen.
+    // Before broadcast, so the GUI receives the enriched form instead of raw `[AUDIO:path]`
+    // markers. Images become native data-URI parts carrying the original bytes (re-encoded to a
+    // bounded JPEG only over the encoded-payload cap); videos become a workspace copy plus
+    // transcription. The parts are independent and this is the expensive step, so the whole burst
+    // is enriched at once.
     futures_util::future::join_all(
         parts
             .iter_mut()
@@ -1706,24 +1482,19 @@ async fn process_channel_message(msg: ChannelMessage) {
     )
     .await;
 
-    // ── Broadcast, persist, link enrichment, reply marker ───────────────
-    // Each part is handled on its own, in send order, so the user's own
-    // messages keep their exact appearance while the assistant receives the
-    // whole burst as one request below. The part bubbles appear once the
-    // slowest part of the burst is enriched, which is what keeps them in the
-    // order they were sent instead of interleaved with a late transcription.
+    // Each part in send order, so the user's own messages keep their exact appearance while the
+    // assistant receives the whole burst as one request below. The bubbles appear once the slowest
+    // part is enriched, which keeps them in send order instead of interleaved with a late
+    // transcription.
     for (part, original_content) in parts.iter_mut().zip(&originals) {
-        // Broadcast/mirror. `persist_content` decides what reaches chat
-        // history: the raw original text, or the data-URI-stripped enriched
-        // content when the markers name inbound attachments whose temp paths
-        // must not be persisted.
+        // Broadcast/mirror. `persist_content` decides what reaches chat history: the raw original
+        // text, or the data-URI-stripped content when the markers name inbound attachments whose
+        // temp paths must not be persisted.
         let content_for_history =
             mahbot::channels::persist_content(original_content, &part.content);
         broadcast_and_persist_incoming_message(part, &part.content, &content_for_history).await;
 
-        // ── Link enrichment (URL summaries for agent context) ─────────────
-        // Runs after broadcast so AI-generated summaries don't appear in the
-        // user's own message bubble.
+        // After broadcast, so AI summaries don't appear in the user's own bubble.
         let enriched = mahbot::channels::enrich_links(&part.content).await;
         if let Cow::Owned(s) = enriched {
             tracing::info!(
@@ -1734,10 +1505,8 @@ async fn process_channel_message(msg: ChannelMessage) {
             part.content = s;
         }
 
-        // ── Reply marker ────────────────────────────────────────────────
-        // Prepend the reply marker AFTER link enrichment (so URL summaries never
-        // see it) and BEFORE routing. Broadcast + persist ran above on the
-        // marker-free content, so the marker never reaches chat_history.
+        // Prepend AFTER link enrichment (so URL summaries never see it) and BEFORE routing.
+        // Broadcast + persist ran above on marker-free content.
         if let Some(reply) = part.reply_reference.clone() {
             part.content = mahbot::channels::apply_reply_marker(&part.content, &reply);
         }
@@ -1745,12 +1514,9 @@ async fn process_channel_message(msg: ChannelMessage) {
 
     let content = mahbot::channels::compose_group_content(parts);
 
-    // ── Route through the agent-ID message router ─────────────────
-    // Every account routes to the single Assistant, so there is no role to
-    // resolve — and no role-store read that could fail closed — before routing.
-    // Every message resolves to a deterministic agent ID and routes through the
-    // per-agent consumer loop: different agent IDs get different consumer
-    // loops = true parallelism. The whole burst is routed as one request.
+    // Every account routes to the single Assistant, so there is no role to resolve. Every message
+    // resolves to a deterministic agent ID and routes through the per-agent consumer loop —
+    // different IDs, different loops, true parallelism. The whole burst is one request.
     message_router::route_user_message(
         content,
         ws.name,
@@ -1761,6 +1527,6 @@ async fn process_channel_message(msg: ChannelMessage) {
         urgent,
     )
     .await;
-    // The message is in the queue: the turn cut for it can stop waiting.
+    // The message is queued: the turn cut for it can stop waiting.
     drop(announcement);
 }

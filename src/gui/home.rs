@@ -1,9 +1,6 @@
-//! Home page — native GUI chat interface for the app's own admin identity.
-//!
-//! The page is the app's own single conversation with the Assistant, living in
-//! the admin's personal workspace. The footer workspace picker selects the
-//! workspace the work that follows runs in — never the conversation, which is
-//! one chat in real time with full markdown rendering and typing indicators.
+//! Home page — native GUI chat interface for the app's own admin identity: one conversation
+//! with the Assistant in the admin's personal workspace. The footer workspace picker selects the
+//! workspace the work that follows runs in — never the conversation.
 
 use crate::ChatDirection;
 use crate::Role;
@@ -27,65 +24,57 @@ use super::menus::{ContextMenu, MenuItem};
 use super::theme;
 use super::widgets::{BubbleSide, align_bubble};
 
-/// Dedup-set prune trigger: when `seen_ids` grows past this many IDs, it is
-/// pruned down to the most recent [`DEDUP_RETAIN`] IDs.
+/// Dedup-set prune trigger: past this many IDs, `seen_ids` is pruned to the most recent
+/// [`DEDUP_RETAIN`].
 const DEDUP_PRUNE_THRESHOLD: usize = 500;
 
 /// Number of most-recent message IDs retained after a dedup-set prune.
 const DEDUP_RETAIN: usize = 200;
 
-/// Debounce window (ms) after a text/reply change before the draft is
-/// persisted to disk.
+/// Debounce window (ms) after a text/reply change before the draft is persisted to disk.
 const DRAFT_SETTLE_MS: u64 = 700;
 
-/// How soon after the page is drawn the composer takes the keyboard: long
-/// enough for the frame that shows it, short enough to be imperceptible.
+/// How soon after the page is drawn the composer takes the keyboard: long enough for the frame
+/// that shows it, short enough to be imperceptible.
 const FOCUS_TICK: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Scrollable ID for the chat message list, used for snap-to-end after
-/// history loads.
+/// Scrollable ID for the chat message list, used for snap-to-end after history loads.
 pub(super) const CHAT_SCROLL_ID: Id = Id::new("home_chat_scroll");
 
-/// Focus id for the chat composer editor, used to refocus it after selecting
-/// a reply target and when the page opens or is navigated to.
+/// Focus id for the composer editor, used to refocus it after selecting a reply target and when
+/// the page opens or is navigated to.
 const CHAT_COMPOSER_ID: Id = Id::new("home_chat_composer");
 
 /// A displayed chat message in the scroll view.
 #[derive(Debug, Clone)]
 struct DisplayMessage {
-    /// Row id in storage (`Some` for entries read from chat_history) or `None`
-    /// for what is only on screen — a live arrival, or the message the user is
-    /// sending. Only the `Some` entries are the stored history a load replaces.
+    /// Row id in storage (`Some` for entries read from chat_history) or `None` for what is only on
+    /// screen. Only the `Some` entries are the stored history a load replaces.
     pub id: Option<i64>,
     pub message_id: String,
     pub content: String,
     pub direction: ChatDirection,
     pub agent_role: Option<String>,
-    /// Timestamp for the relative-time label and for load reconciliation: the
-    /// stored row's own, or — for a message that is only on screen — the instant
-    /// of the event that produced it.
+    /// Timestamp for the relative-time label and for load reconciliation: the stored row's own, or
+    /// — for an on-screen-only message — the instant of the event that produced it.
     pub timestamp: Option<String>,
-    /// Reference to the message this message replies to, rendered as a quote
-    /// header. `None` for messages with no reply target.
+    /// Reference to the message this one replies to, rendered as a quote header.
     pub reply_reference: Option<ReplyReference>,
     /// Pre-parsed markdown items for rendering.
     pub md_items: Vec<iced::widget::markdown::Item>,
-    /// The body's attachments (pictures, named files), in body order — drawn as
-    /// one block above the text.
+    /// The body's attachments (pictures, named files), in body order, drawn as one block above
+    /// the text.
     pub attachments: Vec<super::media_markers::MediaAttachment>,
-    /// True when this is an optimistic placeholder pushed before the pipeline
-    /// confirmation arrives. The `ChatEvent::Message` handler replaces these.
+    /// True for an optimistic placeholder pushed before the pipeline confirmation arrives; the
+    /// `ChatEvent::Message` handler replaces these.
     pub is_optimistic: bool,
 }
 
-/// Build a [`DisplayMessage`] from raw parts. Media-preprocesses content and
-/// parses markdown; divider directions skip markdown (rendered as rules).
-/// `id` is `Some` for history-loaded entries, `None` for live/optimistic
-/// messages.
+/// Build a [`DisplayMessage`] from raw parts. Media-preprocesses content and parses markdown;
+/// divider directions skip markdown (rendered as rules).
 ///
-/// Markers resolve against the conversation's own workspace — Home shows the
-/// admin's personal conversation, so that is the root. Every message follows the
-/// same rule: a marker whose target is a reference becomes an attachment,
+/// Markers resolve against the conversation's own workspace — Home shows the admin's personal
+/// conversation, so that is the root. A marker whose target is a reference becomes an attachment,
 /// whatever its direction, and one whose file has gone still does.
 #[expect(clippy::too_many_arguments)]
 fn display_message(
@@ -143,8 +132,7 @@ impl From<ChatHistoryEntry> for DisplayMessage {
     }
 }
 
-/// The toast naming what an intake could not attach; nothing when it refused
-/// nothing.
+/// The toast naming what an intake could not attach; nothing when it refused nothing.
 fn refused_toast(refused: &[String]) -> Task<HomeMessage> {
     if refused.is_empty() {
         return Task::none();
@@ -154,8 +142,8 @@ fn refused_toast(refused: &[String]) -> Task<HomeMessage> {
     )))
 }
 
-/// Remove a send's staged copy on the runtime: a discard can land while a large
-/// staging copy is still running, so it must not hold the update thread.
+/// Remove a send's staged copy on the runtime: a discard can land while a large staging copy is
+/// still running, so it must not hold the update thread.
 fn discard_staged(dirs: Vec<String>) {
     if dirs.is_empty() {
         return;
@@ -163,28 +151,21 @@ fn discard_staged(dirs: Vec<String>) {
     tokio::spawn(async move { super::attachment::discard(&dirs).await });
 }
 
-/// Open the platform's own file chooser for the composer's attach button:
-/// several files at once, no type filtered (anything can be dropped on the
-/// window today), and a folder ignored by the intake. A cancelled chooser
-/// changes nothing. It is a native modal, so it runs on a blocking thread and
-/// the window keeps painting while it is up.
+/// Open the platform's own file chooser for the composer's attach button: several files at once,
+/// no type filtered, a folder ignored by the intake; a cancelled chooser changes nothing. Native
+/// modal, so it runs on a blocking thread and the window keeps painting.
 ///
-/// The dialog API has no failure of its own — a chooser that never appeared and
-/// a cancelled one both come back empty — so with neither a desktop portal nor
-/// `zenity` to run it, the button does nothing and says nothing. The failure
-/// that reaches the composer is the blocking thread dying, a platform dialog
-/// panic included.
+/// The dialog API has no failure of its own — a cancelled chooser and one that never appeared both
+/// come back empty — so with no portal and no `zenity` the button does nothing.
 async fn pick_attachment_files() -> Result<Option<Vec<std::path::PathBuf>>, String> {
     tokio::task::spawn_blocking(|| rfd::FileDialog::new().pick_files())
         .await
         .map_err(|error| format!("The file chooser could not be opened: {error}"))
 }
 
-/// Broadcast a transient GUI chat event via
-/// [`crate::channels::broadcast_chat_event`] with the constants shared by
-/// every GUI call site: the `"gui"` channel, no reply reference, a fresh
+/// Broadcast a transient GUI chat event via [`crate::channels::broadcast_chat_event`] with the
+/// constants shared by every GUI call site: the `"gui"` channel, no reply reference, a fresh
 /// timestamp, and the transient flag set (shown live, never persisted).
-/// Callers pass the user and the conversation's own workspace.
 fn broadcast_gui_transient(
     user: &str,
     workspace: &str,
@@ -209,11 +190,11 @@ fn broadcast_gui_transient(
     );
 }
 
-/// Derive the [`ReplyReference`] captured for a reply-to action. User messages
-/// are the admin's own, so they resolve to the admin's canonical name; agent
-/// messages use the shared author-label derivation. Author and snippet both get
-/// angle brackets stripped (the snippet via [`normalize_reply_text`], which also
-/// HTML-decodes, collapses newlines, maps media markers, and caps the text).
+/// Derive the [`ReplyReference`] captured for a reply-to action. User messages are the admin's
+/// own, so they resolve to the admin's canonical name; agent messages use the shared author-label
+/// derivation. Author and snippet both get angle brackets stripped (the snippet via
+/// [`normalize_reply_text`], which also HTML-decodes, collapses newlines, maps media markers and
+/// caps the text).
 #[must_use]
 fn reply_reference_for(
     direction: ChatDirection,
@@ -231,9 +212,8 @@ fn reply_reference_for(
     }
 }
 
-/// Shared lead row of both reply renderings: reply glyph and muted snippet,
-/// already spaced and center-aligned. Callers may `push` extra trailing
-/// elements (e.g. the dismiss button).
+/// Shared lead row of both reply renderings: reply glyph and muted snippet, already spaced and
+/// center-aligned. Callers may `push` extra trailing elements (e.g. the dismiss button).
 fn reply_lead_row(reply: &ReplyReference) -> iced::widget::Row<'_, HomeMessage> {
     row![
         lucide::reply::<iced::Theme, iced::Renderer>()
@@ -270,10 +250,9 @@ fn reply_preview(reply: &ReplyReference) -> Element<'_, HomeMessage> {
     .into()
 }
 
-/// Composer attach button: opens the platform's file chooser, so a file can be
-/// attached without knowing that dragging or pasting it works. It sits in the
-/// composer action toolbar before the send button and is inert while the
-/// composer itself is (the graceful drain disables both).
+/// Composer attach button: opens the platform's file chooser. It sits in the composer action
+/// toolbar before the send button and is inert while the composer is (the graceful drain disables
+/// both).
 fn attach_control(disabled: bool) -> Element<'static, HomeMessage> {
     super::widgets::icon_tooltip_button(
         lucide::paperclip::<iced::Theme, iced::Renderer>()
@@ -291,13 +270,10 @@ fn attach_control(disabled: bool) -> Element<'static, HomeMessage> {
     )
 }
 
-/// The composer action toolbar beyond the send button: the voice controls, then
-/// the attach control.
+/// The composer action toolbar beyond the send button: the voice controls, then the attach control.
 ///
-/// macOS-only, like the rest of the audio UI. `recording` is the caller's single
-/// derivation of "a recording the composer owns is running" — the same bool the
-/// send button's empty rule takes, so the controls and the button cannot
-/// disagree — and it covers both ways a recording starts.
+/// macOS-only. `recording` is the caller's single derivation of "a recording the composer owns is
+/// running" — the same bool the send button's empty rule takes, so the two cannot disagree.
 #[cfg(target_os = "macos")]
 fn composer_controls(
     voice_status: &crate::audio::voice::VoiceStatus,
@@ -305,8 +281,8 @@ fn composer_controls(
     draining: bool,
 ) -> Vec<Element<'static, HomeMessage>> {
     let mut controls = if recording {
-        // The recording replaces the mic; its cancel control discards it and
-        // leaves the field exactly as it is.
+        // The recording replaces the mic; its cancel control discards it and leaves the field as
+        // it is.
         vec![recording_dot(), cancel_recording_control()]
     } else {
         vec![mic_control(voice_status)]
@@ -318,18 +294,17 @@ fn composer_controls(
 /// Composer mic button: starts a voice recording for the Assistant.
 #[cfg(target_os = "macos")]
 fn mic_control(voice_status: &crate::audio::voice::VoiceStatus) -> Element<'static, HomeMessage> {
-    // The mic is busy while the pipeline owns it for a recording or any ASR —
-    // the button must not look active when a new recording would be rejected.
-    // (A recording the composer owns renders the dot, not this button.)
+    // The mic is busy while the pipeline owns it for a recording or any ASR — the button must
+    // not look active when a new recording would be rejected. (A composer-owned recording renders
+    // the dot, not this button.)
     let mic_busy = matches!(
         voice_status,
         crate::audio::voice::VoiceStatus::RecordingWakeWord
             | crate::audio::voice::VoiceStatus::RecordingButton
             | crate::audio::voice::VoiceStatus::Transcribing
     );
-    // With local transcription disabled the shared ASR model never loads,
-    // so a button recording can never start — present the control as
-    // unavailable instead of a loading state that can never complete.
+    // With local transcription disabled the shared ASR model never loads, so a button recording
+    // can never start — present the control as unavailable, not as a loading state.
     let transcription_disabled = crate::audio::voice::is_transcription_disabled();
     let recording_unavailable = mic_busy || transcription_disabled;
 
@@ -354,12 +329,11 @@ fn mic_control(voice_status: &crate::audio::voice::VoiceStatus) -> Element<'stat
     )
 }
 
-/// The recording indicator: a red dot fading out and back in while a recording
-/// runs. Passive — it takes no press and shows no tooltip.
+/// The recording indicator: a red dot fading in and out while a recording runs. Passive — no
+/// press, no tooltip.
 #[cfg(target_os = "macos")]
 fn recording_dot() -> Element<'static, HomeMessage> {
-    // Padded and centred in the row of icon buttons beside it: the dot stays a
-    // step smaller than their glyphs, as it always has.
+    // Padded and centred in the row of icon buttons beside it: a step smaller than their glyphs.
     container(super::pulse::pulse_dot(
         theme::composer_icon(theme::TEXT_10),
         theme::STATUS_ERROR,
@@ -368,8 +342,8 @@ fn recording_dot() -> Element<'static, HomeMessage> {
     .into()
 }
 
-/// Cancel control for the running recording — whichever way it started: it is
-/// dropped, and the field keeps its text and attachments exactly as they are.
+/// Cancel control for the running recording — whichever way it started: it is dropped, and the
+/// field keeps its text and attachments exactly as they are.
 #[cfg(target_os = "macos")]
 fn cancel_recording_control() -> Element<'static, HomeMessage> {
     super::widgets::icon_tooltip_button(
@@ -386,34 +360,25 @@ fn cancel_recording_control() -> Element<'static, HomeMessage> {
 
 #[derive(Debug, Clone)]
 pub enum HomeMessage {
-    /// The selected workspace changed (footer picker, Settings, or the
-    /// read-back of the stored selection). Recorded only: the conversation does
-    /// not depend on it.
+    /// The selected workspace changed (footer picker, Settings, or the read-back of the stored
+    /// selection). Recorded only: the conversation does not depend on it.
     WorkspaceChanged(String),
-    /// Text editor content changed.
     InputChanged(super::editor_widget::EditorAction),
-    /// Attachments joined the message being composed — pasted into the composer
-    /// or dropped anywhere over this page — and the names of the files the size
-    /// cap turned away, which the composer reports.
+    /// Attachments joined the message being composed, and the names the size cap turned away.
     Attach {
         attachments: Vec<super::attachment::Attachment>,
         refused: Vec<String>,
     },
-    /// The attach button asked for the platform's file chooser.
     PickAttachments,
-    /// The file chooser returned: the files picked, nothing for a cancelled
-    /// chooser, or why it could not open at all.
+    /// The file chooser returned: the files picked, nothing for a cancelled chooser, or why it
+    /// could not open.
     AttachmentsPicked(Result<Option<Vec<std::path::PathBuf>>, String>),
-    /// Remove the attachment at this index from the composer.
     RemoveAttachment(usize),
-    /// The page has been drawn — hand the keyboard to the composer.
     FocusComposerOnce,
-    /// Send button pressed or Enter key in editor.
     SendMessage,
-    /// The composer's attachments are staged (or the copy failed) and the send
-    /// continues here, off the update thread. `generation` names the send, so a
-    /// result for one that was cleared meanwhile delivers nothing; `voice` is
-    /// the dictated part the message leads with, when it has one.
+    /// The composer's attachments are staged (or the copy failed) and the send continues here, off
+    /// the update thread. `generation` names the send, so a result for one that was cleared
+    /// meanwhile delivers nothing; `voice` is the dictated part the message leads with.
     Staged {
         generation: u64,
         voice: Option<String>,
@@ -421,186 +386,145 @@ pub enum HomeMessage {
         attachments: Vec<super::attachment::Attachment>,
         result: Result<super::attachment::Staged, String>,
     },
-    /// The whole conversation loaded from the store — what the cap keeps for it
-    /// and nothing else, in one read. `generation` is the load counter the read
-    /// was issued under: a result whose generation is no longer current belongs
-    /// to a superseded load and is dropped.
+    /// The whole conversation loaded from the store, in one read. `generation` is the load counter
+    /// the read was issued under: a result whose generation is no longer current belongs to a
+    /// superseded load and is dropped.
     HistoryLoaded {
         entries: Vec<ChatHistoryEntry>,
         generation: u64,
     },
-    /// History load failed. Carries the generation the read was issued under, so
-    /// a failure from a superseded load is dropped.
-    HistoryLoadError { generation: u64, error: String },
-    /// Live chat event from CHAT_BROADCAST subscription.
+    /// History load failed. Carries the generation, so a failure from a superseded load is dropped.
+    HistoryLoadError {
+        generation: u64,
+        error: String,
+    },
     ChatEvent(crate::ChatEvent),
-    /// Stream lagged — resync needed.
     StreamLagged,
-    /// Scroll position changed in the chat scrollable.
     ScrollChanged(scrollable::Viewport),
-    /// Markdown link was clicked.
     LinkClicked(String),
-    /// A `[FILE:…]` reveal attempted from a transcript finished. `Ok` needs no
-    /// further action; an error becomes an error toast.
+    /// A `[FILE:…]` reveal finished: `Ok` needs no action, an error becomes an error toast.
     FileRevealed(Result<(), String>),
-    /// Reset session button pressed — reset session and display.
     ClearChat,
-    /// Copy a chat message's raw markdown content to the clipboard.
-    /// Carries the exact stored/transmitted text (original media markers
-    /// included), not the rendered view.
+    /// Copy a chat message's raw markdown content to the clipboard — the exact stored/transmitted
+    /// text (original media markers included), not the rendered view.
     CopyMessage(String),
-    /// Reply to a displayed chat message: capture its author + snippet as the
-    /// pending reply reference and focus the composer. Carries the message
-    /// identity needed to derive author/snippet (direction/agent_role/content)
-    /// without any id-based resolution — deliberately not the whole
-    /// [`DisplayMessage`], whose parsed markdown would be dead weight.
+    /// Reply to a displayed chat message: capture its author + snippet as the pending reply
+    /// reference and focus the composer. Carries what derives author/snippet
+    /// (direction/agent_role/content) — deliberately not the whole [`DisplayMessage`], whose parsed
+    /// markdown would be dead weight.
     ReplyTo {
         direction: ChatDirection,
         agent_role: Option<String>,
         content: String,
     },
-    /// Dismiss the pending reply preview (clears the captured reference).
     CancelReply,
-    /// A composer-draft debounce has settled — persist the current draft.
-    ///
-    /// `generation` is the debounce counter captured when the edit was staged;
-    /// a settle whose generation no longer matches the current counter is
-    /// stale and dropped, so per-keystroke and out-of-order writes are
-    /// impossible.
-    DraftSaveSettled { generation: u64 },
-    /// Chat history cleared successfully — divider inserted.
+    /// A composer-draft debounce has settled — persist the current draft. `generation` is the
+    /// counter captured when the edit was staged; a settle whose generation no longer matches is
+    /// stale and dropped, so per-keystroke and out-of-order writes are impossible.
+    DraftSaveSettled {
+        generation: u64,
+    },
     ChatCleared,
-    /// Chat history clear failed.
     ChatClearError(String),
     /// Toast notification to show via Dashboard.
     /// Intercepted by Dashboard; never reaches Home's own update handler.
     Toast(ToastMessage),
-    /// Typing indicator animation: cycles through 0, 1, 2 → ".", "..", "...".
     TypingTick,
-    /// Timeout safety net: if `sending` stays stuck for 30+ seconds,
-    /// auto-clear it. Carries the generation counter to prevent stale
-    /// timeouts from interfering with a fresh send.
+    /// Timeout safety net: if `sending` stays stuck for 30+ seconds, auto-clear it. Carries the
+    /// generation counter so a stale timeout cannot disturb a fresh send.
     SendingTimeout(u64),
-    /// Mic button clicked — start a voice message recording to the Assistant.
     #[cfg(target_os = "macos")]
     StartVoiceRecording,
-    /// Cancel control clicked: stop the recording and discard it, leaving the
-    /// field exactly as it is.
+    /// Cancel control clicked: stop the recording and discard it, leaving the field as it is.
     #[cfg(target_os = "macos")]
     StopVoiceRecordingDiscard,
-    /// Progress of a voice recording — whichever way it started: the field is
-    /// committed when it stops and the message goes out once the transcript
-    /// joins it.
+    /// Progress of a voice recording, whichever way it started: the field is committed when it
+    /// stops and the message goes out once the transcript joins it.
     #[cfg(target_os = "macos")]
     VoiceRecording(RecordingEvent),
-    /// The scripted onboarding exchange completed (provider configured) — re-run
-    /// the onboarding check (now firing the Phase-2 kickoff).
+    /// The scripted onboarding exchange completed (provider configured) — re-run the check, now
+    /// firing the Phase-2 kickoff.
     OnboardingScriptCompleted,
-    /// The scripted onboarding input was invalid — the script stays active.
     OnboardingScriptRePrompt,
-    /// The Phase-2 kickoff task finished (marker; the work is done inside the task).
     OnboardingKickoffDone,
 }
 
 pub struct HomeState {
-    /// The footer workspace picker's selection, recorded for the send path (the
-    /// workspace the work that follows runs in). The conversation does not
-    /// depend on it.
+    /// The footer workspace picker's selection, recorded for the send path (the workspace the work
+    /// that follows runs in). The conversation does not depend on it.
     selected_workspace: Option<String>,
-    /// Load counter for the conversation read: advanced by every load. A result
-    /// (success or failure) carrying a superseded generation is dropped, so a
-    /// slow load can never overwrite a newer one.
+    /// Load counter for the conversation read: advanced by every load. A result carrying a
+    /// superseded generation is dropped, so a slow load can never overwrite a newer one.
     history_gen: u64,
-    /// Displayed chat messages.
     messages: Vec<DisplayMessage>,
-    /// Deduplication set of seen message IDs.
     seen_ids: HashSet<String>,
-    /// Text editor content.
     editor_content: super::editor_widget::EditorBuffer,
-    /// Files and images attached to the next send. Not persisted with the
-    /// draft — a draft is text and its reply only.
+    /// Files and images attached to the next send. Not persisted with the draft — a draft is text
+    /// and its reply only.
     attachments: Vec<super::attachment::Attachment>,
-    /// The composer is to take the keyboard once this page has been drawn. A
-    /// focus operation applies to the frame that is already on screen, so it is
-    /// sent one tick later, never in the task that switched the page.
+    /// The composer is to take the keyboard once this page has been drawn: a focus operation
+    /// applies to the frame already on screen, so it is sent one tick later, never in the task that
+    /// switched the page.
     pending_focus: bool,
-    /// Whether a message is currently being sent / agent is responding.
     sending: bool,
-    /// Whether a typing indicator is active.
     typing: bool,
-    /// Typing animation dot cycle state: 0=".", 1="..", 2="...".
     typing_tick_state: u8,
-    /// Whether the Phase-1 scripted onboarding scenario is active (shown while
-    /// `provider_configured() == false`).
+    /// Whether the Phase-1 scripted onboarding scenario is active (`provider_configured()` is
+    /// false).
     onboarding_script_active: bool,
-    /// Names the send in flight, so a stale result is ignored: bumped when a
-    /// timeout guard is armed and when the conversation is cleared.
+    /// Names the send in flight, so a stale result is ignored: bumped when a timeout guard is armed
+    /// and when the conversation is cleared.
     sending_gen: u64,
-    /// Whether auto-scroll is enabled (user is scrolled to the bottom).
     auto_scroll_enabled: bool,
-    /// Undo/redo stack for the chat input text editor.
     undo_stack: super::common::UndoStack,
-    /// Captured {author, snippet} of the message being replied to. `Some`
-    /// while a reply preview is shown above the composer; cleared on send,
-    /// cancel, or chat clear.
+    /// Captured {author, snippet} of the message being replied to; `Some` while a reply preview is
+    /// shown above the composer, cleared on send, cancel or chat clear.
     pending_reply: Option<ReplyReference>,
-    /// Persisted composer draft (text + pending reply-to).
     drafts: Arc<crate::channels::chat_draft::DraftStore>,
-    /// Debounce state for the asynchronous draft persistence.
     draft_save: super::common::DebounceState,
-    /// Persistent failure of the last conversation read. Rendered in place of
-    /// the empty-chat hint so a failed read is never mistaken for a legitimately
-    /// empty history; cleared on the next successful load.
+    /// Persistent failure of the last conversation read, rendered in place of the empty-chat hint
+    /// so a failed read is never mistaken for an empty history; cleared on the next success.
     history_error: Option<String>,
-    /// The message a voice recording owns in the composer: a recording from its
-    /// start — the mic press or the wake word's — until the field is committed,
-    /// then the committed content until the transcript joins it (or the attempt
-    /// fails and it comes back). This is also what makes the recording the
-    /// composer's: the dot, the cancel control and the send press all read it, so
-    /// they can never disagree about whether a recording is running.
+    /// The message a voice recording owns in the composer: from the recording's start (the mic
+    /// press or the wake word's) until the field is committed, then the committed content until the
+    /// transcript joins it (or the attempt fails and it comes back). The dot, the cancel control
+    /// and the send press all read it, so they can never disagree about whether a recording runs.
     #[cfg(target_os = "macos")]
     voice_message: Option<VoiceMessage>,
-    /// When the composer last posted a discarded-recording notice, for the
-    /// notice window.
+    /// When the composer last posted a discarded-recording notice, for the notice window.
     #[cfg(target_os = "macos")]
     voice_notice_at: Option<std::time::Instant>,
-    /// When the composer last posted a lost-message notice, for its own window:
-    /// a discard must not silence a failure.
+    /// When the composer last posted a lost-message notice: a discard must not silence a failure.
     #[cfg(target_os = "macos")]
     voice_error_at: Option<std::time::Instant>,
 }
 
-/// The message a voice recording owns in the composer.
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
 enum VoiceMessage {
-    /// A recording owns the field: a press commits it, and the transcript that
-    /// follows completes the message.
+    /// A recording owns the field: a press commits it, and the transcript that follows completes
+    /// the message.
     Recording,
-    /// The press took the field's content; the message waits for the recording's
-    /// transcript (see [`HomeState::in_flight`] for what that lock means).
+    /// The press took the field's content; the message waits for the recording's transcript (see
+    /// [`HomeState::in_flight`] for what that lock means).
     Committed {
-        /// The typed text, trimmed — the length limit applies to it alone.
         text: String,
         attachments: Vec<super::attachment::Attachment>,
     },
 }
 
-/// A voice notice the composer posts, and the window it counts against — the
-/// same split the pipeline keeps between discards and failures.
+/// A voice notice the composer posts, and the window it counts against — the same split the
+/// pipeline keeps between discards and failures.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
 enum VoiceNotice {
-    /// A recording dropped for what it held (nothing said).
     Discarded(&'static str),
-    /// A recording whose message was lost.
     Failed(&'static str),
 }
 
-/// The content of a sent message: its dictated part first (already carrying the
-/// spoken marker), then the attachment markers, then the typed text — blank-line
-/// separated, so an ordinary send keeps its markers-then-caption shape and a
-/// voice message reads transcript → attachments → text.
+/// The content of a sent message: its dictated part first (already carrying the spoken marker),
+/// then the attachment markers, then the typed text — blank-line separated, so an ordinary send
+/// keeps its markers-then-caption shape and a voice message reads transcript → attachments → text.
 fn compose_content(voice: Option<&str>, markers: &str, text: &str) -> String {
     voice
         .into_iter()
@@ -610,11 +534,9 @@ fn compose_content(voice: Option<&str>, markers: &str, text: &str) -> String {
         .join("\n\n")
 }
 
-/// The instant a stored timestamp names, or `None` when it is absent or not a
-/// timestamp the clock produced. Compared as instants rather than as text: the
-/// strings `db::now()` writes vary in their fractional digits and carry an
-/// offset, so their text order is the clock's order only by accident of the
-/// format.
+/// The instant a stored timestamp names, or `None` when it is absent or not a timestamp the clock
+/// produced. Compared as instants, not as text: `db::now()` strings vary in fractional digits and
+/// carry an offset, so their text order is the clock's only by accident.
 fn instant(timestamp: Option<&str>) -> Option<DateTime<Utc>> {
     timestamp.and_then(|ts| crate::db::parse_utc_timestamp(ts).ok())
 }
@@ -653,55 +575,53 @@ impl HomeState {
         }
     }
 
-    /// Whether `workspace` is the admin's own personal workspace (`personal:admin`)
-    /// — the only workspace the conversation lives in, and therefore the test for
-    /// whether a live event belongs to it.
+    /// Whether `workspace` is the admin's own personal workspace (`personal:admin`) — the only
+    /// workspace the conversation lives in, and the test for whether a live event belongs to it.
     fn is_admin_personal_workspace(workspace: &str) -> bool {
         crate::users::personal_user_name(workspace).is_some_and(crate::users::is_admin_name)
     }
 
-    /// The workspace the conversation belongs to: the admin's own personal
-    /// space. The Assistant is pinned to it, so everything this chat receives —
-    /// the admin's own text, agent replies, the notice written when a turn fails
-    /// — is tagged with it, and nothing else is.
+    /// The workspace the conversation belongs to: the admin's own personal space. The Assistant is
+    /// pinned to it, so everything this chat receives — the admin's text, agent replies, the notice
+    /// written when a turn fails — is tagged with it, and nothing else is.
     fn conversation_workspace() -> String {
         crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME)
     }
 
-    /// The conversation's filesystem root: a relative marker target in this chat
-    /// names a file in the admin's personal workspace, and nothing else.
+    /// The conversation's filesystem root: a relative marker target in this chat names a file in
+    /// the admin's personal workspace, and nothing else.
     fn conversation_workspace_path() -> std::path::PathBuf {
         crate::users::personal_workspace_path(crate::users::ADMIN_USER_NAME)
     }
 
-    /// Open the app's own conversation: bring the persisted composer draft back
-    /// and load the conversation. This is the app-opening load route — the load
-    /// hangs off the screen opening, never off a selection arriving.
+    /// Open the app's own conversation: bring the persisted composer draft back and load the
+    /// conversation. This is the app-opening load route — the load hangs off the screen opening,
+    /// never off a selection arriving.
     pub fn open(&mut self) -> Task<HomeMessage> {
         self.restore_draft();
         self.arm_composer_focus();
         self.refresh_history()
     }
 
-    /// Give the composer the keyboard on the next frame — its focus is what lets
-    /// a paste land in the input without a click first.
+    /// Give the composer the keyboard on the next frame — its focus is what lets a paste land in
+    /// the input without a click first.
     pub(super) fn arm_composer_focus(&mut self) {
-        // The field is about to own the text-selection shortcuts; a transcript
-        // block left active by an earlier press must not also take them.
+        // The field is about to own the text-selection shortcuts; a transcript block left active
+        // by an earlier press must not also take them.
         super::selectable::deactivate();
         self.pending_focus = true;
     }
 
-    /// The load counter: a load was issued exactly when it advanced. Read by the
-    /// boot test, which proves the app opening is a load route.
+    /// The load counter: a load was issued exactly when it advanced. Read by the boot test, which
+    /// proves the app opening is a load route.
     #[cfg(test)]
     pub(crate) fn history_generation(&self) -> u64 {
         self.history_gen
     }
 
-    /// Load the conversation — the admin's own single chat, in their personal
-    /// workspace, independent of the selected workspace. One read carries the
-    /// whole of what the cap keeps for it: there is nothing older to fetch.
+    /// Load the conversation — the admin's own single chat, in their personal workspace,
+    /// independent of the selected workspace. One read carries the whole of what the cap keeps:
+    /// there is nothing older to fetch.
     fn refresh_history(&mut self) -> Task<HomeMessage> {
         self.history_gen = self.history_gen.wrapping_add(1);
         let generation = self.history_gen;
@@ -727,36 +647,30 @@ impl HomeState {
         )
     }
 
-    /// Replace the stored history with `entries` — the conversation just read.
-    /// What is on screen but not stored (the message being sent, the scripted
-    /// introduction) is kept, and nothing is ever shown twice; no task is issued
-    /// (the caller batches the snap and the onboarding check).
+    /// Replace the stored history with `entries`. What is on screen but not stored (the message
+    /// being sent, the scripted introduction) is kept, and nothing is ever shown twice; no task is
+    /// issued (the caller batches the snap and the onboarding check).
     fn replace_stored_history(&mut self, entries: Vec<ChatHistoryEntry>) {
         let mut kept: Vec<DisplayMessage> = std::mem::take(&mut self.messages)
             .into_iter()
             .filter(|m| m.id.is_none())
             .collect();
         let stored: Vec<DisplayMessage> = entries.into_iter().map(DisplayMessage::from).collect();
-        // Anything the page carries in its own right goes in favour of the
-        // stored copy: a live arrival and a pending send already confirmed both
-        // show under the pipeline's id.
+        // Anything the page carries in its own right goes in favour of the stored copy: a live
+        // arrival and a pending send already confirmed both show under the pipeline's id.
         let stored_ids: HashSet<&str> = stored.iter().map(|m| m.message_id.as_str()).collect();
-        // A pending send still shows under its local id, and a lag can drop
-        // exactly its confirmation — leaving the bubble while the page brings the
-        // row back under the pipeline's id. Matching the two is a heuristic: the
-        // row of that send is a page row with the user's own text, written from
-        // here, so not older than the bubble it confirms, while an older row with
-        // the same text is the user having sent that text before. A bubble the
-        // heuristic does not match — its row never written, or stored under a text
-        // enrichment rewrote — goes when its confirmation arrives, which drops it
-        // if the page already carries the row.
+        // A pending send still shows under its local id, and a lag can drop exactly its
+        // confirmation — leaving the bubble while the page brings the row back under the
+        // pipeline's id. Matching the two is a heuristic: the row of that send is a page row
+        // written from here, so not older than the bubble it confirms, while an older row with the
+        // same text is the user having sent it before. An unmatched bubble goes when its
+        // confirmation arrives.
         kept.retain(|msg| {
             if stored_ids.contains(msg.message_id.as_str()) {
                 return false;
             }
-            // Only a pending send is reconciled, and only against a bubble that
-            // carries the send's own instant — with nothing to compare, the
-            // bubble stays.
+            // Only a pending send is reconciled, and only against a bubble carrying the send's own
+            // instant — with nothing to compare, the bubble stays.
             if !msg.is_optimistic {
                 return true;
             }
@@ -791,8 +705,7 @@ impl HomeState {
     /// draft store and schedule a debounced persist after `delay_ms`.
     ///
     /// The in-memory mutation happens synchronously at schedule time — the
-    /// file write lags behind the debounce, so the in-memory draft is always
-    /// current.
+    /// file write lags behind the debounce, so the in-memory draft is always current.
     fn capture_draft(&mut self, delay_ms: u64) -> Task<HomeMessage> {
         if self.onboarding_script_active {
             return Task::none();
@@ -867,13 +780,10 @@ impl HomeState {
 
     /// Replace an optimistic placeholder with a confirmed pipeline message.
     ///
-    /// If `optimistic_id` matches a locally-inserted optimistic message
-    /// (`is_optimistic && message_id == optimistic_id`), swaps in the real
-    /// [`DisplayMessage`], marks the canonical ID as seen, clears `sending`,
-    /// and returns `Some(snap_task)` so the caller can early-return. When the
-    /// stored copy is already on screen (a load brought its row in under the
-    /// canonical ID) the bubble is the same message and is dropped instead.
-    /// Returns `None` when no replacement was performed.
+    /// If `optimistic_id` matches a locally-inserted optimistic message, swaps in the real
+    /// [`DisplayMessage`], marks the canonical ID as seen, clears `sending`, and returns
+    /// `Some(snap_task)` so the caller can early-return. When the stored copy is already on screen
+    /// the bubble is the same message and is dropped instead. `None` when nothing was replaced.
     #[expect(clippy::too_many_arguments)]
     fn replace_optimistic(
         &mut self,
@@ -924,12 +834,9 @@ impl HomeState {
         None
     }
 
-    /// Try to deduplicate a message by its ID.
-    ///
-    /// Returns `true` if the message was already seen (caller should bail).
-    /// Inserts fresh IDs into `seen_ids` and, once it exceeds
-    /// [`DEDUP_PRUNE_THRESHOLD`], prunes it to the most recent [`DEDUP_RETAIN`]
-    /// IDs.
+    /// Try to deduplicate a message by its ID: `true` when it was already seen (the caller should
+    /// bail). Fresh IDs go into `seen_ids`, which is pruned to the most recent [`DEDUP_RETAIN`]
+    /// once it exceeds [`DEDUP_PRUNE_THRESHOLD`].
     fn try_dedup(&mut self, message_id: &str) -> bool {
         if self.seen_ids.contains(message_id) {
             return true;
@@ -949,16 +856,13 @@ impl HomeState {
         false
     }
 
-    /// Update typing/sending state based on message direction and sender.
+    /// Update typing/sending state from a message's direction and sender.
     ///
-    /// * **Agent** responses for the admin → clear both `typing`
-    ///   and `sending` (the agent has replied).
-    /// * **User** message echo for the admin → clear `sending`
-    ///   only (re-enables the send button). Does **not** clear `typing`
-    ///   — the typing indicator persists until an agent response arrives.
+    /// An agent reply for the admin clears both `typing` and `sending`; the admin's own message
+    /// echo clears `sending` only — the typing indicator persists until an agent responds.
     ///
-    /// Does nothing when `workspace` is not the conversation's own: live work on
-    /// project tickets must not clear the conversation's typing/sending state.
+    /// Does nothing when `workspace` is not the conversation's own: live work on project tickets
+    /// must not clear the conversation's state.
     fn update_sending_state(&mut self, direction: ChatDirection, user_name: &str, workspace: &str) {
         if !Self::is_admin_personal_workspace(workspace) {
             return;
@@ -973,18 +877,13 @@ impl HomeState {
         }
     }
 
-    /// Append a chat message if it belongs to the conversation: the admin's own
-    /// chat in their personal workspace. Nothing else is ever shown here, so
-    /// what is shown live can never disagree with what a later load reads.
+    /// Append a chat message if it belongs to the conversation: the admin's own chat in their
+    /// personal workspace. Nothing else is shown here, so what is shown live can never disagree
+    /// with what a later load reads.
     ///
-    /// Does nothing when `user_name` is not the admin, or when `workspace` is
-    /// not the conversation's own (see [`Self::is_admin_personal_workspace`]).
-    /// Takes ownership of the message fields so the caller avoids extra
-    /// clones on the common (append) path.
-    ///
-    /// The caller should call [`maybe_snap()`](Self::maybe_snap)
-    /// unconditionally after this (snap is always safe when nothing was
-    /// appended).
+    /// Does nothing when `user_name` is not the admin or `workspace` is not the conversation's own.
+    /// Takes ownership of the fields to avoid extra clones; call
+    /// [`maybe_snap()`](Self::maybe_snap) unconditionally after this.
     #[expect(clippy::too_many_arguments)]
     fn append_message(
         &mut self,
@@ -1018,7 +917,6 @@ impl HomeState {
 
     #[expect(clippy::too_many_lines)]
     pub fn view(&self, draining: bool) -> Element<'_, HomeMessage> {
-        // ── Chat message area ────────────────────────────────────
         let chat_area = if self.messages.is_empty() {
             let empty_hint = if self.selected_workspace.is_none() {
                 "No workspace selected."
@@ -1044,14 +942,11 @@ impl HomeState {
                 .style(theme::base_container_style)
                 .into()
         } else {
-            // Build message bubbles with typing indicator.
             let mut children: Vec<Element<'_, HomeMessage>> = self
                 .messages
                 .iter()
                 .map(|msg| {
-                    // ── Divider marker ────────────────────────────────────
                     if msg.direction == ChatDirection::Divider {
-                        // Render as a horizontal rule with a label.
                         let label: Element<'_, HomeMessage> = container(
                             text("─ Session cleared ─")
                                 .color(theme::TEXT_MUTED)
@@ -1099,12 +994,10 @@ impl HomeState {
                         },
                     );
 
-                    // Build bubble body: role icon header for agents, or just content for users.
                     let bubble_body: Element<'_, HomeMessage> = if is_user {
                         content
                     } else {
-                        // Strip the numeric role suffix (e.g. "analyst_3" →
-                        // "analyst", shared with reply author labels) and parse.
+                        // Strip the numeric role suffix (e.g. "analyst_3" → "analyst").
                         let maybe_role = msg
                             .agent_role
                             .as_deref()
@@ -1162,14 +1055,10 @@ impl HomeState {
                             bubble.into()
                         };
 
-                    // Per-bubble context menu: right-clicking the bubble offers
-                    // copying the raw markdown content (the exact stored text
-                    // with original media markers) and replying to it (hidden on
-                    // optimistic placeholders; divider rows return earlier so
-                    // they never get a menu). Wrapping only the bubble region —
-                    // not the align_bubble row — keeps the spacer beside it a
-                    // fall-through: spacer/empty-space right-clicks reach the
-                    // outer "Reset session" menu in gui/mod.rs instead.
+                    // Per-bubble context menu: copy the raw markdown content and reply to it
+                    // (hidden on optimistic placeholders; divider rows return earlier). Wrapping
+                    // only the bubble region — not the align_bubble row — keeps the spacer beside
+                    // it a fall-through, so its right-clicks reach the outer menu.
                     let mut menu_items = vec![MenuItem::new(
                         "Copy message".into(),
                         HomeMessage::CopyMessage(msg.content.clone()),
@@ -1246,7 +1135,7 @@ impl HomeState {
         #[cfg(not(target_os = "macos"))]
         let recording = false;
 
-        // ── Input area ───────────────────────────────────────────
+        // Input area
         // Controls for the composer action toolbar — inert while the composer is
         // (a drain).
         #[cfg(target_os = "macos")]
@@ -1315,7 +1204,7 @@ impl HomeState {
             .width(Length::Fill)
             .into();
 
-        // ── Reply preview ────────────────────────────────────────
+        // Reply preview
         // Shown between the message list and the composer while a reply target
         // is pending; the dismiss control cancels it.
         let reply_preview: Element<'_, HomeMessage> = match &self.pending_reply {
@@ -1323,7 +1212,7 @@ impl HomeState {
             None => Space::new().height(0).into(),
         };
 
-        // ── Full layout ──────────────────────────────────────────
+        // Full layout
         column![chat_area, reply_preview, input_area,]
             .align_x(Alignment::End)
             .width(Length::Fill)
@@ -1500,8 +1389,7 @@ impl HomeState {
                 // `ChatCleared` callback issues reports its own outcome.
                 self.history_error = None;
                 // A load in flight describes the transcript this clear just
-                // dropped: superseding it keeps it from landing in front of the
-                // reload.
+                // dropped: superseding it keeps it from landing in front of the reload.
                 self.history_gen = self.history_gen.wrapping_add(1);
                 // A deliberate clear empties the screen (including a message
                 // being sent) and re-arms the no-provider script, so the reset
@@ -1698,8 +1586,7 @@ impl HomeState {
                 Task::none()
             }
             HomeMessage::Toast(_) => {
-                // Intercepted by the Dashboard (Toast → toast stack). No-op
-                // fallback.
+                // Intercepted by the Dashboard (Toast → toast stack). No-op fallback.
                 Task::none()
             }
             HomeMessage::LinkClicked(url) => {
@@ -1851,8 +1738,7 @@ impl HomeState {
 
     /// Take the composer's content for a send: validate it and empty the field.
     /// `has_voice` says the send carries a dictated part, which is content on its
-    /// own — a recording that captured nothing typed or attached still sends
-    /// itself.
+    /// own — a recording that captured nothing typed or attached still sends itself.
     fn take_composer_content(
         &mut self,
         has_voice: bool,
@@ -1954,10 +1840,9 @@ impl HomeState {
     /// Whether a send is in flight from the composer: an ordinary one, or a
     /// voice message whose transcript has not arrived yet.
     ///
-    /// A voice send puts nothing on the wire until its transcript joins it, so
-    /// `sending` — which the admin's own message echo clears — cannot stand for
-    /// that window; the committed message keeps the composer locked instead, with
-    /// no timeout, because transcribing may take as long as the recording did.
+    /// A voice send puts nothing on the wire until its transcript joins it, so `sending` cannot
+    /// stand for that window; the committed message keeps the composer locked instead, with no
+    /// timeout, because transcribing may take as long as the recording did.
     fn in_flight(&self) -> bool {
         #[cfg(target_os = "macos")]
         {
@@ -1977,8 +1862,7 @@ impl HomeState {
 
     /// Give a send that never reached the pipeline back to the composer: the
     /// attachments, the typed text when nothing has been typed since — put back
-    /// as a draft too, since sending cleared it — and no optimistic bubble left
-    /// behind.
+    /// as a draft too, since sending cleared it — and no optimistic bubble left behind.
     fn restore_send(
         &mut self,
         text: &str,
@@ -2032,15 +1916,11 @@ impl HomeState {
         let (typed, urgent) = crate::channels::take_urgent(trimmed);
         let content = compose_content(voice, &markers, &typed);
 
-        // Generate an optimistic ID for non-command messages so the Home page
-        // can display the user's message immediately and replace it when the
-        // pipeline confirmation arrives. Commands (starting with "/") are NOT
-        // optimistically shown because `handle_bot_command` intercepts
-        // them before the GUI broadcast in `process_channel_message` — the
-        // confirmation never arrives, so an optimistic entry would become an orphan.
-        // Read from what was typed, and only when it leads the message: removing
-        // the urgent mark must not turn a message into a command, and neither a
-        // dictated part nor attachment markers can make one.
+        // Generate an optimistic ID for non-command messages so the Home page can show the user's
+        // message at once and replace it when the pipeline confirms. A command is read from what
+        // was typed, only when it leads the message; it is NOT optimistically shown, because
+        // `handle_bot_command` intercepts it before the GUI broadcast and the confirmation never
+        // arrives, leaving an orphan entry.
         let is_command = voice.is_none() && markers.is_empty() && trimmed.starts_with('/');
         let optimistic_id = if is_command {
             None
@@ -2276,8 +2156,7 @@ impl HomeState {
                 Some(notice) => self.voice_notice(VoiceNotice::Discarded(notice)),
                 None => Task::none(),
             },
-            // Nothing was committed: the field keeps its own content and lost
-            // nothing.
+            // Nothing was committed: the field keeps its own content and lost nothing.
             Some(VoiceMessage::Recording) | None => Task::none(),
         }
     }
@@ -2438,7 +2317,7 @@ mod tests {
         );
     }
 
-    // ── Helpers ──────────────────────────────────────────────────────
+    // Helpers
 
     fn make_home_state(workspace: &str) -> HomeState {
         let mut state = HomeState::new();
@@ -2690,7 +2569,7 @@ mod tests {
         })
     }
 
-    // ── replace_optimistic ───────────────────────────────────────────
+    // replace_optimistic
 
     /// An optimistic composer bubble waiting for its confirmation.
     fn bubble(id: &str, content: &str) -> DisplayMessage {
@@ -2864,7 +2743,7 @@ mod tests {
         }
     }
 
-    // ── try_dedup ────────────────────────────────────────────────────
+    // try_dedup
 
     enum DedupSetup {
         Empty,
@@ -2936,7 +2815,7 @@ mod tests {
         }
     }
 
-    // ── update_sending_state ─────────────────────────────────────────
+    // update_sending_state
 
     struct SendingStateCase<'a> {
         name: &'static str,
@@ -2996,7 +2875,7 @@ mod tests {
         }
     }
 
-    // ── append_message ───────────────────────────────────────────────
+    // append_message
 
     #[test]
     fn append_message_takes_only_the_conversations_own_messages() {
@@ -3057,7 +2936,7 @@ mod tests {
         }
     }
 
-    // ── one conversation, scoped to the admin's personal workspace ───
+    // one conversation, scoped to the admin's personal workspace
 
     #[test]
     fn a_selection_change_leaves_the_conversation_alone() {
@@ -3137,7 +3016,7 @@ mod tests {
         assert!(!state.sending, "its own live traffic clears the send");
     }
 
-    // ── History reload reconciliation ────────────────────────────────
+    // History reload reconciliation
 
     /// A stored message the page already shows, with its row id.
     fn stored(id: &str, content: &str, db_id: i64) -> DisplayMessage {
@@ -3280,7 +3159,7 @@ mod tests {
         assert!(!state.sending, "it still frees the composer");
     }
 
-    // ── A stored row becomes a display message ────────────────────
+    // A stored row becomes a display message
 
     #[test]
     fn a_stored_entry_becomes_a_display_message() {
@@ -3397,7 +3276,7 @@ mod tests {
         }
     }
 
-    // ── Selection (shift+click / drag) ───────────────────────────────
+    // Selection (shift+click / drag)
 
     #[test]
     fn test_select_to_creates_selection() {
@@ -3420,7 +3299,7 @@ mod tests {
         );
     }
 
-    // ── send_message ─────────────────────────────────────────────────
+    // send_message
 
     #[test]
     fn send_message_sends_only_non_blank_text_and_returns_an_untaken_send() {
@@ -3445,7 +3324,7 @@ mod tests {
         }
     }
 
-    // ── Voice recording outcomes ─────────────────────────────────────
+    // Voice recording outcomes
 
     /// Put the composer where a mic press leaves it: a recording owns the field,
     /// which holds `text`. The returned receiver stands in for the pipeline that

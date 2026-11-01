@@ -8,7 +8,7 @@ use crate::gui::theme;
 /// Standard width of the small confirm/modal family.
 const CONFIRM_WIDTH: f32 = 400.0;
 
-/// The shared modal dialog container: fixed width, padding, elevated dialog chrome.
+/// Fixed width, padding, elevated dialog chrome.
 #[must_use]
 pub fn dialog_shell<'a, Message>(
     content: impl Into<Element<'a, Message>>,
@@ -21,7 +21,7 @@ pub fn dialog_shell<'a, Message>(
         .style(theme::dialog_container_style)
 }
 
-/// Standard confirm-dialog title: bold 16px primary text.
+/// Bold 16px primary text.
 #[must_use]
 pub fn dialog_title<'a>(
     title: impl Into<String>,
@@ -32,10 +32,9 @@ pub fn dialog_title<'a>(
         .font(theme::FONT_BOLD)
 }
 
-/// A dialog's heading with its corner close cross: `title` takes the width the
-/// compact cross in the bubble's top-right corner leaves, wrapping (or breaking
-/// a word that cannot fit) rather than running under it. The row is full width
-/// so the cross sits at the bubble's edge, not after the text.
+/// `title` takes the width the compact close cross in the corner leaves, wrapping (or breaking a
+/// word that cannot fit) rather than running under it. The row is full width so the cross sits at
+/// the bubble's edge.
 #[must_use]
 pub fn dialog_title_row<'a, Message: Clone + 'a>(
     title: iced::widget::Text<'a, iced::Theme, iced::Renderer>,
@@ -57,7 +56,7 @@ pub fn dialog_title_row<'a, Message: Clone + 'a>(
     .align_y(Alignment::Start)
 }
 
-/// Secondary-styled dialog body paragraph(s), separated by 8px gaps.
+/// Separated by 8px gaps.
 #[must_use]
 pub fn dialog_body<'a, Message: 'a>(
     paragraphs: impl IntoIterator<Item = impl Into<String>>,
@@ -103,8 +102,7 @@ impl<'a, Message> DialogAction<'a, Message> {
     }
 }
 
-/// Right-aligned dialog footer row: fill spacer followed by the buttons,
-/// 8px apart, vertically centered.
+/// Fill spacer followed by the buttons, 8px apart, vertically centered.
 #[must_use]
 pub fn dialog_footer_row<'a, Message: 'a>(
     buttons: impl IntoIterator<Item = Element<'a, Message>>,
@@ -119,10 +117,7 @@ pub fn dialog_footer_row<'a, Message: 'a>(
     footer
 }
 
-/// The shared confirmation dialog: title, body, right-aligned action buttons
-/// (8px apart) in the standard 400px modal shell.
-///
-/// `Message: Clone` is required by iced's `Button` → `Element` conversion.
+/// Title, body, right-aligned action buttons (8px apart) in the standard 400px modal shell.
 #[must_use]
 pub fn confirm_dialog<'a, Message: Clone + 'a>(
     title: impl Into<Element<'a, Message>>,

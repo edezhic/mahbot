@@ -1,15 +1,12 @@
 //! The switch between Telegram's cloud Bot API and the locally served one, as a
 //! journal that survives a crash.
 //!
-//! A switch is a sequence of steps with exactly one irreversible point in each
-//! direction: leaving the cloud (`logOut`) on the way in, and leaving the local
-//! server (`logOut` against it) on the way back. Everything before that point is
-//! safe to repeat; everything after it is safe to repeat too, provided the
-//! product never talks to the side it just left. The journal records the facts
-//! that cannot be re-derived — the side the switch started from, whether the cloud
-//! `logOut` was issued and whether it ran, and whether the bot has left the local
-//! server — so a resumed switch neither re-enters the cloud nor routes the
-//! transport to a server the bot is not logged into.
+//! A switch is a sequence of steps with exactly one irreversible point per direction:
+//! leaving the cloud (`logOut`) on the way in, and leaving the local server on the way
+//! back. The journal records the facts that cannot be re-derived — the side the switch
+//! started from, whether the cloud `logOut` was issued and ran, and whether the bot has
+//! left the local server — so a resumed switch neither re-enters the cloud nor routes
+//! the transport to a server the bot is not logged into.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,67 +18,57 @@ enum Step {
     Blocked(String),
     /// Worth another attempt.
     Retry(String),
-    /// The listener is still finishing the batch it held. The bot is being served
-    /// the whole time, so this is not a failure of the switch and must not spend a
-    /// retry: draining a large transfer is exactly what local mode is for.
+    /// The listener is still finishing the batch it held: the bot is served the whole time,
+    /// so this is not a failure and must not spend a retry.
     Draining(String),
 }
 
 /// The switch a crash interrupted, as the config row keeps it.
 #[derive(Default, Serialize, Deserialize)]
-// One flag per durable fact of the switch: each says whether a step that cannot
-// be re-derived has happened, and folding them into one state machine would lose
+// One flag per durable fact of the switch: folding them into one state machine would lose
 // the independent progress a resumed switch reads.
 #[expect(clippy::struct_excessive_bools)]
 pub(super) struct Journal {
-    /// The side the bot was on when the switch was requested. Recorded rather than
-    /// inferred: a switch back starts on the local server with neither leave
-    /// recorded, and its target alone cannot be told from a switch that has not
-    /// left the cloud yet.
+    /// The side the bot was on when the switch was requested. Recorded rather than inferred: a
+    /// switch back starts on the local server with neither leave recorded.
     #[serde(default)]
     pub(super) from: String,
     /// The mode being switched to.
     pub(super) target: String,
-    /// The cloud `logOut` request was issued. Its answer may have been lost with
-    /// the process, which is what tells a resumed attempt that an `Unauthorized`
-    /// answer means the bot has already left.
+    /// The cloud `logOut` request was issued. Its answer may have been lost with the process,
+    /// which is what tells a resumed attempt that `Unauthorized` means the bot has left.
     #[serde(default)]
     pub(super) cloud_logout_started: bool,
-    /// The bot has left the cloud. Never repeat the cloud `logOut`: a stray cloud
-    /// call re-logs the bot in there and splits its updates.
+    /// The bot has left the cloud. Never repeat the cloud `logOut`: a stray cloud call
+    /// re-logs the bot in there and splits its updates.
     #[serde(default)]
     pub(super) cloud_logged_out: bool,
     /// The bot has left the local server.
     #[serde(default)]
     pub(super) local_left: bool,
-    /// The intake record was cleared for this switch. Recorded rather than
-    /// inferred, so a purge that failed once is retried instead of leaving rows
-    /// whose `update_id`s would swallow the next server's events.
+    /// The intake record was cleared for this switch. Recorded so a failed purge is retried
+    /// instead of leaving rows whose `update_id`s would swallow the next server's events.
     #[serde(default)]
     pub(super) intake_cleared: bool,
     /// Why the switch is waiting for the owner.
     #[serde(default)]
     pub(super) blocked: Option<String>,
-    /// The `api_id`/`api_hash` fingerprint a rejection was about. A retry with the
-    /// same pair cannot succeed, so it is not attempted; a replaced one can, so it
-    /// is.
+    /// The `api_id`/`api_hash` fingerprint a rejection was about: a retry with the same pair
+    /// cannot succeed, so it is not attempted.
     #[serde(default)]
     pub(super) blocked_credentials: Option<String>,
     /// The single chat notice has been sent.
     #[serde(default)]
     pub(super) notice_sent: bool,
-    /// The completion message, kept until it reaches the owner. The switch steps
-    /// are all done by then, so a message that could not be delivered is retried
-    /// from here — clearing the journal first would lose it for good.
+    /// The completion message, kept until it reaches the owner: a message that could not be
+    /// delivered is retried from here — clearing the journal first would lose it.
     #[serde(default)]
     pub(super) notice: Option<String>,
-    /// The completion message needs no further attempt: it reached the owner, or the
-    /// attempts it is allowed ran out. Recorded before the journal is cleared, so a
-    /// clear that keeps failing cannot send the message again on the next tick.
+    /// The completion message needs no further attempt (it arrived, or its attempts ran out).
+    /// Recorded before the journal is cleared, so a failing clear cannot resend it.
     #[serde(default)]
     pub(super) notice_settled: bool,
-    /// Delivery attempts for [`Self::notice`]: an owner chat that cannot be reached
-    /// must not retry forever.
+    /// Delivery attempts for [`Self::notice`]: an unreachable owner chat must not retry forever.
     #[serde(default)]
     pub(super) notice_attempts: u32,
     /// Retryable attempts since the request.
@@ -95,18 +82,15 @@ impl Journal {
         Mode::parse(&self.from)
     }
 
-    /// The mode this switch is heading to; `None` for a row nothing wrote.
-    ///
-    /// Strict on purpose: an unreadable target must not be read as "back to the
-    /// cloud", which is the one direction that would route the transport to a
-    /// server the bot has left.
+    /// The mode this switch is heading to. Strict on purpose: an unreadable target must not be
+    /// read as "back to the cloud", the one direction that would route the transport to a server
+    /// the bot has left.
     pub(super) fn target_mode(&self) -> Option<Mode> {
         Mode::parse(&self.target)
     }
 
-    /// Whether the block may be reconsidered: a cause that is gone clears by
-    /// itself, while a rejected pair that was not replaced cannot be retried into
-    /// success.
+    /// Whether the block may be reconsidered: a cause that is gone clears by itself, while a
+    /// rejected pair that was not replaced cannot be retried into success.
     pub(super) fn block_may_clear(&self) -> bool {
         let Some(reason) = self.blocked.as_deref() else {
             return true;
@@ -117,12 +101,9 @@ impl Journal {
         self.blocked_credentials.as_deref() != Some(current_pair_fingerprint().as_str())
     }
 
-    /// Whether the intake record has to be cleared: once the bot has actually left
-    /// the side this journey started on. Its record is what dedupes the platform's
-    /// re-offers, so clearing it while the bot is still there would let an
-    /// unconfirmed update be processed a second time — and both servers number
-    /// updates independently, so the record of the side it left may not stand in
-    /// for the other's.
+    /// Whether the intake record has to be cleared: once the bot has actually left the side this
+    /// journey started on. Clearing it while the bot is still there would process an unconfirmed
+    /// update twice, and both servers number updates independently.
     pub(super) fn intake_must_be_purged(&self) -> bool {
         if self.intake_cleared {
             return false;
@@ -133,9 +114,8 @@ impl Journal {
         }
     }
 
-    /// Whether every step of the switch is done and only its chat message remains.
-    /// The journal is still there — it is what carries the message across a restart
-    /// — but nothing about the bot is in flight any more.
+    /// Whether every step is done and only the chat message remains: nothing about the bot is in
+    /// flight any more, but the journal carries the message across a restart.
     pub(super) fn finishing(&self) -> bool {
         self.notice.is_some() || self.notice_settled
     }
@@ -151,8 +131,7 @@ pub(super) fn pending() -> bool {
     current().is_some()
 }
 
-/// Whether the switch is waiting for the owner: a blocked switch is not retried
-/// on a tick — only the owner can clear what it is waiting for.
+/// Whether the switch is waiting for the owner: a blocked switch is not retried on a tick.
 pub(super) fn is_blocked() -> bool {
     current().is_some_and(|journal| journal.blocked.is_some())
 }
@@ -162,15 +141,15 @@ pub(super) fn finishing() -> bool {
     current().is_some_and(|journal| journal.finishing())
 }
 
-/// The fingerprint of the pair configured right now: what a rejection is remembered
-/// against, so corrected values are retried and unchanged ones are not.
+/// The fingerprint of the pair configured right now: corrected values are retried, unchanged
+/// ones are not.
 fn current_pair_fingerprint() -> String {
     let (api_id, api_hash) = super::credentials();
     super::server::credentials_fingerprint(&api_id, &api_hash)
 }
 
-/// Whether the switch is waiting for a pair Telegram has already refused: the one
-/// state in which starting a listener or a server cannot succeed.
+/// Whether the switch is waiting for a pair Telegram already refused: the one state in which
+/// starting a listener or a server cannot succeed.
 pub(super) fn waiting_on_rejected_pair() -> bool {
     current().is_some_and(|journal| journal.blocked.is_some() && !journal.block_may_clear())
 }
@@ -282,8 +261,7 @@ pub(super) async fn resume() {
         return;
     };
     // A switch whose steps are done and whose message has not gone out yet: only
-    // the message remains, and it is retried here rather than lost with the
-    // journal.
+    // the message remains, and it is retried here rather than lost with the journal.
     if journal.finishing() {
         finish_notice(&mut journal).await;
         return;
@@ -376,11 +354,9 @@ async fn block(journal: &mut Journal, reason: &str) {
 }
 
 /// What the owner is told when the switch cannot go on without him.
-///
-/// The sentence about reachability follows what is actually serving the bot: the
-/// side the journal records, and whether a listener is polling for it at all. A
-/// switch blocked before the cutover leaves the bot on the cloud, and telling the
-/// owner it is unreachable would be wrong.
+/// The sentence about reachability follows what serves the bot: the side the journal records,
+/// and whether a listener polls for it. A switch blocked before the cutover leaves the bot on
+/// the cloud, and calling it unreachable would be wrong.
 fn blocked_notice(reason: &str) -> String {
     let listening = crate::channel_registry().get("telegram").is_some();
     let reachability = match (super::serving_mode(), listening) {
@@ -394,9 +370,8 @@ fn blocked_notice(reason: &str) -> String {
             "The bot is served by the local Bot API server only: if that server cannot reach \
              Telegram, the bot is not reachable until that is fixed."
         }
-        // The same arm covers a server that is not running and one that runs but
-        // could not be logged in: either way nothing polls for the bot, so the
-        // sentence states that and leaves the cause to the one named above.
+        // The same arm covers a server that is not running and one that runs but could not be
+        // logged in: either way nothing polls for the bot.
         (Mode::Local, false) => {
             "The bot cannot be reached right now: nothing is polling for it until the cause \
              above is fixed."
@@ -412,10 +387,9 @@ fn blocked_notice(reason: &str) -> String {
 
 /// Whether a failed cloud `logOut` may be read as "the bot has already left".
 ///
-/// Only a resumed attempt can: its earlier request may have gone through before
-/// the process died, and the cloud answers `Unauthorized` to a bot that is out.
-/// The first attempt stays strict — there, `Unauthorized` is what tells a bot
-/// that never left apart from a token that never worked.
+/// Only a resumed attempt can: its earlier request may have gone through before the process
+/// died. The first attempt stays strict — there `Unauthorized` tells a bot that never left
+/// apart from a token that never worked.
 fn cloud_logout_done(resumed: bool, cause: &str) -> bool {
     resumed
         && api_cause(cause)
@@ -423,12 +397,10 @@ fn cloud_logout_done(resumed: bool, cause: &str) -> bool {
             .contains("unauthorized")
 }
 
-/// Put the cloud listener back after a failed step, while the bot is still on the
-/// cloud.
+/// Put the cloud listener back after a failed step, while the bot is still on the cloud.
 ///
-/// Nothing else rebuilds a listener for that side while the switch is pending, so a
-/// step that fails after the listener was taken away (the `logOut` itself, the
-/// write that records it) would otherwise leave the bot deaf until a retry.
+/// Nothing else rebuilds a listener for that side while the switch is pending, so a step that
+/// fails after the listener was taken away would otherwise leave the bot deaf until a retry.
 fn restore_cloud_listener() {
     // A listener that is already polling the cloud is what this asks for.
     if crate::channel_registry().get("telegram").is_some() {
@@ -442,15 +414,13 @@ fn restore_cloud_listener() {
 
 /// Take the bot out of the cloud, or leave the cloud serving it.
 ///
-/// Every step here runs before the cutover, so any failure leaves the bot where it
-/// was, and the listener is put back before the retry — except once the cloud has
-/// accepted the `logOut`, after which the bot is no longer there to listen for.
+/// Every step runs before the cutover, so any failure leaves the bot where it was, and the
+/// listener is put back before the retry — except once the cloud has accepted the `logOut`.
 async fn leave_cloud(journal: &mut Journal) -> Result<(), Step> {
     let result = release_cloud(journal).await;
-    // A failed write *after* the `logOut` succeeded is not a failure to leave: the
-    // in-memory journal records the leave, and restoring the listener there would
-    // send a token-bearing request to the cloud for a bot that has just left — the
-    // stray call that re-establishes its cloud session and splits its updates.
+    // A failed write *after* the `logOut` succeeded is not a failure to leave: the in-memory
+    // journal records the leave, and restoring the listener would send a token-bearing request to
+    // the cloud for a bot that has just left — the stray call that splits its updates.
     if matches!(result, Err(Step::Retry(_))) && !journal.cloud_logged_out {
         restore_cloud_listener();
     }
@@ -466,9 +436,8 @@ async fn release_cloud(journal: &mut Journal) -> Result<(), Step> {
     let Some(token) = crate::config::CONFIG.telegram_bot_token() else {
         return Err(Step::Blocked("Telegram has no bot token configured".into()));
     };
-    // The request is recorded before it is issued: a process killed between the
-    // answer and the journal write would otherwise re-issue a logOut the cloud has
-    // already carried out and read its `Unauthorized` as a failure forever.
+    // The request is recorded before it is issued: a process killed between the answer and the
+    // journal write would otherwise re-issue a `logOut` the cloud already carried out.
     let resumed = journal.cloud_logout_started;
     journal.cloud_logout_started = true;
     save(journal)
@@ -505,8 +474,8 @@ async fn to_local(journal: &mut Journal) -> Result<(), Step> {
     let (api_id, api_hash) = credentials();
     super::validate_credentials(&api_id, &api_hash).map_err(Step::Blocked)?;
     let fingerprint = super::server::credentials_fingerprint(&api_id, &api_hash);
-    // Installed, started and answering while the cloud keeps serving: this is the
-    // whole preparation, and it touches nothing the bot is using.
+    // Installed, started and answering while the cloud keeps serving: this touches nothing the
+    // bot is using.
     let instance = super::server::ensure(&fingerprint)
         .await
         .map_err(Step::Retry)?;
@@ -515,16 +484,14 @@ async fn to_local(journal: &mut Journal) -> Result<(), Step> {
         leave_cloud(journal).await?;
     }
 
-    // Published only now: the endpoint is what a listener may talk to, and a
-    // local listener must never exist before the bot has left the cloud. Publishing
-    // it earlier would also survive a failed switch as a base for a bot that never
-    // arrived there.
+    // Published only now: the endpoint is what a listener may talk to, and a local listener must
+    // never exist before the bot has left the cloud (a published one would also survive a failed
+    // switch).
     super::publish_endpoint(instance.port);
 
-    // The two servers number updates independently, so nothing recorded against
-    // one may stand in for the other's events. Cleared after the listener
-    // drained, so everything it could hand on already was; a row it left held is
-    // dropped rather than replayed against a server that never saw the event.
+    // The two servers number updates independently, so nothing recorded against one may stand in
+    // for the other's events. Cleared after the listener drained, so everything it could hand on
+    // already was.
     if journal.intake_must_be_purged() {
         crate::channels::telegram_intake::purge_all()
             .await
@@ -540,20 +507,15 @@ async fn to_local(journal: &mut Journal) -> Result<(), Step> {
     if let Err(e) = crate::channels::telegram::start_telegram_listener().await {
         let reason = e.to_string();
         if super::credentials_rejected(&reason) {
-            // Nothing local is serving the bot until the pair is corrected, so
-            // "starting…" would be a lie, and the cause is named now rather than
-            // after the server is stopped: the owner must not see a reason-less
-            // failure meanwhile. The server's own words are the cause
-            // ("Unauthorized: invalid api-id/api-hash").
+            // Nothing local is serving the bot until the pair is corrected, so the cause is named
+            // now rather than after the server is stopped — the server's own words.
             let cause = api_cause(&reason).to_string();
             set_status(|status| {
                 status.health = Health::Down;
                 status.last_error = Some(cause.clone());
             });
-            // The server caches a failed login for half an hour, so it goes away
-            // with the wrong pair: the next attempt starts it with the new one. Its
-            // endpoint goes with it, so no boot or supervisor tick builds a listener
-            // against a port that no longer serves anything.
+            // The server caches a failed login for half an hour, so it goes away with the wrong
+            // pair, and its endpoint goes with it so no tick builds a listener against a dead port.
             super::server::stop().await;
             return Err(Step::Blocked(cause));
         }
@@ -568,8 +530,8 @@ async fn to_local(journal: &mut Journal) -> Result<(), Step> {
         status.health = Health::Running;
         status.last_error = None;
     });
-    // Kept in the journal until it reaches the owner: this is the last step, so a
-    // message that failed here would otherwise be lost with the journal.
+    // Kept in the journal until it reaches the owner: this is the last step, so a message that
+    // failed here would otherwise be lost.
     journal.notice = Some(format!(
         "✅ MahBot is available again — now through its own local Telegram Bot API server \
          ({}). Large files no longer meet Telegram's cloud limits: up to 2000 MB can be sent, \
@@ -584,20 +546,16 @@ async fn to_local(journal: &mut Journal) -> Result<(), Step> {
 
 /// Switch the bot back onto the cloud, removing everything local.
 ///
-/// The local server's state is what ends its session, so the `logOut` against it
-/// is best-effort: a server that cannot reach Telegram, holds the wrong token or
-/// has already been left must not keep the owner from the one mode that works.
+/// The local server's `logOut` is best-effort: a server that cannot reach Telegram or holds
+/// the wrong token must not keep the owner from the one mode that works.
 async fn to_cloud(journal: &mut Journal) -> Result<(), Step> {
     crate::channels::telegram::stop_telegram_listener()
         .await
         .map_err(|e| Step::Draining(e.to_string()))?;
 
     if !journal.local_left {
-        // Only a bot the local server actually served can be left there: a switch
-        // that failed before the cutover published no endpoint and logged the bot
-        // in nowhere, so asking its server to log out would only fetch an
-        // `Unauthorized` and hold the switch up. The side the journey started from
-        // is that fact — `cloud_logged_out` belongs to the other direction.
+        // Only a bot the local server actually served can be left there: a switch that failed
+        // before the cutover published no endpoint. The side the journey started from is that fact.
         if journal.origin_mode() == Some(Mode::Local)
             && let (Some(base), Some(token)) = (
                 super::local_endpoint(),
@@ -607,9 +565,8 @@ async fn to_cloud(journal: &mut Journal) -> Result<(), Step> {
         {
             tracing::warn!(error = %e, "Telegram: the local server did not release the bot");
         }
-        // Recorded before the state goes away: once it is gone the bot cannot be
-        // asked to leave it again, and this flag is what lets the transport serve
-        // the cloud on a later attempt.
+        // Recorded before the state goes away: once gone the bot cannot be asked to leave again,
+        // and this flag is what lets the transport serve the cloud on a later attempt.
         journal.local_left = true;
         save(journal)
             .await
@@ -619,13 +576,10 @@ async fn to_cloud(journal: &mut Journal) -> Result<(), Step> {
     // Stops the process, removes its state and clears the endpoint it published.
     super::server::remove_state().await;
     if journal.intake_must_be_purged() {
-        // Both servers number updates independently: a row the local server's
-        // events left held must not swallow the cloud's next event as a re-offer,
-        // nor may the cloud's record stand in for one of the local server's. Only
-        // once the bot has actually left the local server, though — a revert of a
-        // switch that never cut over leaves the cloud record as the only thing
-        // deduping the platform's re-offers, and clearing it would process an
-        // update twice.
+        // Both servers number updates independently: a row the local server left held must not
+        // swallow the cloud's next event as a re-offer, and only once the bot has actually left it
+        // — a revert that never cut over leaves the cloud record as the only thing deduping
+        // re-offers.
         crate::channels::telegram_intake::purge_all()
             .await
             .map_err(|e| Step::Retry(format!("the intake record could not be cleared: {e}")))?;
@@ -641,9 +595,8 @@ async fn to_cloud(journal: &mut Journal) -> Result<(), Step> {
     }
 
     set_status(|status| status.health = Health::Starting);
-    // The cloud may refuse the bot for several minutes after it left: the
-    // attempt is repeated by the supervisor, and the journal keeps the switch
-    // pending in the meantime.
+    // The cloud may refuse the bot for several minutes after it left: the supervisor repeats the
+    // attempt, and the journal keeps the switch pending meanwhile.
     crate::channels::telegram::start_telegram_listener()
         .await
         .map_err(|e| {
@@ -667,18 +620,14 @@ async fn to_cloud(journal: &mut Journal) -> Result<(), Step> {
     Ok(())
 }
 
-/// How often the completion message is retried before it is dropped: the switch
-/// is over, and a journal kept for a message that cannot be delivered would keep
-/// the interface reporting a switch forever.
+/// How often the completion message is retried: a journal kept for an undeliverable message
+/// would keep the interface reporting a switch forever.
 const NOTICE_ATTEMPTS: u32 = 5;
 
-/// Send the completion message a finished switch left pending, then clear the
-/// journal — the switch steps never run again.
+/// Send the completion message a finished switch left pending, then clear the journal.
 ///
-/// Retrying is what keeps the one message the owner is promised from being lost
-/// with the journal. A settled message — sent, or dropped once its attempts ran out
-/// — is recorded before the journal goes, so a clear that fails cannot send it again
-/// on the next tick.
+/// Retrying keeps the one message the owner is promised from being lost with the journal. A
+/// settled message is recorded before the journal goes, so a failing clear cannot resend it.
 async fn finish_notice(journal: &mut Journal) {
     if let Some(text) = journal.notice.clone() {
         if !super::send_owner_notice(&text).await {
@@ -697,11 +646,9 @@ async fn finish_notice(journal: &mut Journal) {
             tracing::warn!(error = %e, "Telegram: the switch journal could not be saved");
         }
     }
-    // The mode row is written with the journal but not in the same statement: if
-    // that second write failed, the switch would clear with the product still
-    // naming the other side, and the supervisor would stop the server the bot is
-    // actually on. Asserted here, before the journal goes, and retried next tick if
-    // it fails.
+    // The mode row is written with the journal but not in the same statement: a failed second
+    // write would clear the journal with the product still naming the other side, and the
+    // supervisor would stop the server the bot is on. Asserted before the journal goes.
     if let Some(target) = journal.target_mode()
         && super::configured_mode() != target
     {
@@ -721,8 +668,7 @@ async fn finish_notice(journal: &mut Journal) {
     if let Err(e) = clear().await {
         tracing::warn!(error = %e, "Telegram: the switch journal could not be cleared");
     }
-    // The journal is what the interface reads the switch from, so the redraw has
-    // to follow its removal.
+    // The journal is what the interface reads the switch from, so the redraw follows its removal.
     crate::runtime_events::publish(crate::runtime_events::RuntimeEvent::TelegramLocal);
 }
 
@@ -730,9 +676,8 @@ async fn finish_notice(journal: &mut Journal) {
 mod tests {
     use super::*;
 
-    /// The switch's state machine, driven from the journal alone: forward, blocked,
-    /// retried, and back. This is the owner's only recovery path, so each transition
-    /// is stated here rather than discovered in the field.
+    /// The switch's state machine, driven from the journal alone: forward, blocked, retried, and
+    /// back — the owner's only recovery path.
     #[test]
     fn the_switch_walks_forward_blocks_retries_and_comes_back() {
         // Forward: cloud → local. Until the cloud is left, the cloud is what serves.
@@ -741,32 +686,31 @@ mod tests {
         assert_eq!(serving(&journal), Mode::Cloud);
         assert!(!journal.intake_must_be_purged());
 
-        // The cloud logOut went through: the bot is on the local server from then on,
-        // and only now may the intake record of the cloud's update ids go.
+        // The cloud logOut went through: the bot is on the local server from then on, and only now
+        // may the intake record of the cloud's update ids go.
         journal.cloud_logged_out = true;
         assert_eq!(serving(&journal), Mode::Local);
         assert!(journal.intake_must_be_purged());
         journal.intake_cleared = true;
         assert!(!journal.intake_must_be_purged());
 
-        // Telegram refused the pair: the switch waits, a retry with the same values is
-        // not attempted, and the same journal keeps the local side serving.
+        // Telegram refused the pair: the switch waits, a retry with the same values is not
+        // attempted, and the journal keeps the local side serving.
         journal.blocked = Some("Unauthorized: invalid api-id/api-hash".into());
         journal.blocked_credentials = Some(current_pair_fingerprint());
         assert!(!journal.block_may_clear());
         assert_eq!(serving(&journal), Mode::Local);
 
-        // A request for the direction already under way neither re-stamps the origin
-        // nor loses the facts: the bot stays where it is.
+        // A request for the direction already under way neither re-stamps the origin nor loses the
+        // facts.
         let retried = requested(Some(journal), Mode::Local, Mode::Local);
         assert_eq!(retried.origin_mode(), Some(Mode::Cloud));
         assert!(retried.cloud_logged_out);
         assert!(retried.blocked.is_none());
         assert_eq!(serving(&retried), Mode::Local);
 
-        // Back: local → cloud. A reversal is a new journey from the side the bot is
-        // on now, with its intake record unpurged again; the local server keeps
-        // serving until the bot has left it.
+        // Back: local → cloud. A reversal is a new journey from the side the bot is on now, with
+        // its intake record unpurged; the local server keeps serving until the bot has left it.
         let mut back = requested(Some(retried), Mode::Local, Mode::Cloud);
         assert_eq!(back.origin_mode(), Some(Mode::Local));
         assert!(
@@ -787,14 +731,13 @@ mod tests {
         back.intake_cleared = true;
         assert!(!back.intake_must_be_purged());
 
-        // A retried revert keeps its own origin and does not flip the side that
-        // serves: the bot never goes mute on a second attempt.
+        // A retried revert keeps its own origin and does not flip the serving side.
         let retried_back = requested(Some(back), Mode::Cloud, Mode::Cloud);
         assert_eq!(retried_back.origin_mode(), Some(Mode::Local));
         assert_eq!(serving(&retried_back), Mode::Cloud);
 
-        // A finished switch whose message is still pending is a settled mode: a new
-        // request starts its own message rather than inheriting the old one.
+        // A finished switch whose message is still pending is a settled mode: a new request starts
+        // its own message.
         let mut finished = retried_back;
         finished.notice = Some("the local server serves the bot now".into());
         let next = requested(Some(finished), Mode::Cloud, Mode::Local);
@@ -803,8 +746,8 @@ mod tests {
             "a new journey is not owed the previous journey's message"
         );
 
-        // A delivered message whose journal clear failed is still a settled switch —
-        // the next tick only retries the clear — and a new request starts afresh.
+        // A delivered message whose journal clear failed is still a settled switch; a new request
+        // starts afresh.
         let mut delivered = requested(None, Mode::Local, Mode::Cloud);
         delivered.notice_settled = true;
         assert!(delivered.notice.is_none());
@@ -819,9 +762,8 @@ mod tests {
         assert_eq!(serving(&forward_again), Mode::Cloud);
     }
 
-    /// A revert of a *settled* local mode — the ordinary way back, whose journal
-    /// starts empty: the bot is on the local server, so the local release and the
-    /// purge are both owed, and neither is keyed on the forward direction's facts.
+    /// A revert of a *settled* local mode — the ordinary way back, whose journal starts empty: the
+    /// local release and the purge are both owed.
     #[test]
     fn a_revert_from_a_settled_local_mode_releases_and_purges_the_local_side() {
         let mut journal = requested(None, Mode::Local, Mode::Cloud);
@@ -836,8 +778,7 @@ mod tests {
         assert!(journal.intake_must_be_purged());
     }
 
-    /// The serving side for a journal, with the configured mode set to its target —
-    /// what a completed request leaves behind.
+    /// The serving side for a journal, with the configured mode set to its target.
     fn serving(journal: &Journal) -> Mode {
         super::super::serving_from(
             journal.target_mode().expect("a journal names a target"),
@@ -847,14 +788,14 @@ mod tests {
 
     #[test]
     fn only_a_resumed_attempt_reads_unauthorized_as_already_out() {
-        // The first attempt must not mistake a token Telegram never accepted for a
-        // bot that has left.
+        // The first attempt must not mistake a token Telegram never accepted for a bot that has
+        // left.
         assert!(!cloud_logout_done(
             false,
             "Telegram rejected the bot token — Unauthorized"
         ));
-        // A resumed attempt follows a request whose answer was lost with the
-        // process: `Unauthorized` is the state the step asks for.
+        // A resumed attempt follows a request whose answer was lost: `Unauthorized` is the state
+        // the step asks for.
         assert!(cloud_logout_done(
             true,
             "Telegram rejected the bot token — Unauthorized"

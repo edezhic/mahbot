@@ -1,17 +1,14 @@
 //! The product's flag grammar, in one place.
 //!
-//! The command lines behind [`crate::cli`] (every family it publishes) and
-//! `mahbot audio` read a flag tail the same way: a token is
-//! `--<flag>`, `--<flag>=<value>` or `--<flag> <value>`, and a value is the very
-//! next token taken VERBATIM — so a value may itself look like a flag, and a
-//! value mistyped as a positional is never echoed back out. `-h`/`--help` asks
-//! for help where a FLAG could stand and never where a VALUE does. The refusals
-//! a token can meet are worded here too, so the frontends that share this module
-//! cannot drift apart in what they say about the same mistake.
+//! The command lines behind [`crate::cli`] and `mahbot audio` read a flag tail the same way: a
+//! token is `--<flag>`, `--<flag>=<value>` or `--<flag> <value>`, and a value is the very next
+//! token taken VERBATIM — so a value may itself look like a flag, and a value mistyped as a
+//! positional is never echoed back out. `-h`/`--help` asks for help where a FLAG could stand and
+//! never where a VALUE does. The refusals a token can meet are worded here too, so the frontends
+//! cannot drift apart.
 //!
-//! It is not every command line the product has. The browser-automation command
-//! ([`crate::chrome::cli`]) and the OpenRouter benchmark read their own flags and
-//! word their own refusals, and are left as they are.
+//! The browser-automation command ([`crate::chrome::cli`]) and the OpenRouter benchmark read
+//! their own flags and word their own refusals.
 
 /// Whether a token asks for help (`-h`/`--help`).
 pub(crate) fn is_help(token: &str) -> bool {
@@ -29,10 +26,8 @@ pub(crate) enum Token<'a> {
     },
 }
 
-/// Read one token of a flag tail.
-///
-/// `Err` is a token that is no flag at all — refused WITHOUT being echoed, so a
-/// value the caller forgot to give a flag to can never travel back out.
+/// Read one token of a flag tail. `Err` is a token that is no flag at all — refused WITHOUT being
+/// echoed, so a value the caller forgot to give a flag to can never travel back out.
 pub(crate) fn read_token(token: &str) -> Result<Token<'_>, String> {
     if is_help(token) {
         return Ok(Token::Help);
@@ -62,8 +57,7 @@ pub(crate) fn repeated_flag(name: &str) -> String {
     format!("flag '--{name}' was given more than once")
 }
 
-/// A flag standing without the value it takes — the form is spelled out, so the
-/// caller is told what to write and not only what was wrong.
+/// A flag standing without the value it takes — the form is spelled out for the caller.
 pub(crate) fn flag_value_missing(name: &str) -> String {
     format!("flag '--{name}' needs a value: '--{name} <value>'")
 }
