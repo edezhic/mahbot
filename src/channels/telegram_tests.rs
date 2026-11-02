@@ -1713,28 +1713,26 @@ fn attachment_content_format_rules() {
         assert!(!c.contains("[IMAGE:"), "{mime}: should not get [IMAGE:]");
         assert!(c.starts_with("[FILE:"), "{mime}: should use [FILE:]");
     }
-    // A sound file is transcribed where the local audio subsystem exists ([AUDIO:]) and handed over
-    // as an ordinary attachment ([FILE:]) where it does not — the marker follows the platform, not
-    // the extension.
-    let audio_marker = |path: &str| {
-        if cfg!(target_os = "macos") {
-            format!("[AUDIO:{path}]")
-        } else {
-            format!("[FILE:{path}]")
-        }
-    };
+    // A sound file and a recorded voice message both arrive as an [AUDIO:] marker, which the
+    // enrichment pass transcribes — the marker follows the kind, not the platform.
     let c = format_attachment_content(
         IncomingAttachmentKind::Audio,
         std::path::Path::new("/tmp/workspace/voice.ogg"),
         None,
     );
-    assert_eq!(c, audio_marker("/tmp/workspace/voice.ogg"));
+    assert_eq!(c, "[AUDIO:/tmp/workspace/voice.ogg]");
+    let c = format_attachment_content(
+        IncomingAttachmentKind::Voice,
+        std::path::Path::new("/tmp/workspace/note.oga"),
+        None,
+    );
+    assert_eq!(c, "[AUDIO:/tmp/workspace/note.oga]");
     let c = format_attachment_content(
         IncomingAttachmentKind::Audio,
         std::path::Path::new("/tmp/workspace/song.mp3"),
         Some("audio/mpeg"),
     );
-    assert_eq!(c, audio_marker("/tmp/workspace/song.mp3"));
+    assert_eq!(c, "[AUDIO:/tmp/workspace/song.mp3]");
     let c = format_attachment_content(
         IncomingAttachmentKind::Video,
         std::path::Path::new("/tmp/workspace/clip.mp4"),

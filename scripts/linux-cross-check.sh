@@ -5,7 +5,11 @@
 # Manual release-gate tool — not wired into any CI.
 #
 # Requires: zig, cargo-zigbuild (`brew install cargo-zigbuild`) and the target's
-# rust std (`rustup target add x86_64-unknown-linux-gnu`).
+# rust std (`rustup target add x86_64-unknown-linux-gnu`). The microphone's ALSA
+# backend is a Linux dependency of the product itself, so the build needs ALSA's
+# headers and pkg-config file for the target too: `brew install alsa-lib`, then
+# point PKG_CONFIG_PATH at it (`brew --prefix alsa-lib`/lib/pkgconfig). The export
+# below is what lets a pkg-config file found on the host answer for the target.
 #
 # Why not a plain `cargo zigbuild` run: cargo-zigbuild only supports build-like
 # subcommands (no `check`), and the check lane is what type-checks the test
@@ -18,6 +22,10 @@ set -eu
 cd "$(dirname -- "$0")/.." || exit 1
 
 TARGET=x86_64-unknown-linux-gnu
+# ALSA's pkg-config file is a host file answering for the target (the headers are
+# the same ones the target's libasound API declares), which pkg-config refuses by
+# default in a cross build.
+export PKG_CONFIG_ALLOW_CROSS=1
 command -v zig >/dev/null 2>&1 || { echo "zig not found" >&2; exit 1; }
 command -v cargo-zigbuild >/dev/null 2>&1 \
   || { echo "cargo-zigbuild not found: brew install cargo-zigbuild" >&2; exit 1; }

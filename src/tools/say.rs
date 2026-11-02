@@ -17,8 +17,8 @@
 //! user-activity state ([`crate::user_activity`]), and it comes last in the
 //! engine's gates so the answers for speech that cannot be produced at all keep precedence.
 //!
-//! macOS only, where the speech engine lives — the module is `cfg`-gated in
-//! `tools/mod.rs`, and the admin's Assistant is its only holder.
+//! macOS only, where speech synthesis lives (recognition runs on every platform) — the
+//! module is `cfg`-gated in `tools/mod.rs`, and the admin's Assistant is its only holder.
 
 use anyhow::Result;
 use async_trait::async_trait;

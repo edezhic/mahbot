@@ -179,14 +179,13 @@ pub struct ConfigData {
     /// is in progress or blocked, so its presence is what makes a crashed
     /// switch resumable.
     pub telegram_local_migration: Option<String>,
-    /// Enable local Qwen3-ASR audio transcription (macOS only — the audio
-    /// subsystem has no other platform support).
+    /// Enable local audio transcription (every platform).
     ///
     /// Absence of the row means enabled; catalog `69` writes `"false"` into
     /// every install that never wrote it, so an untouched installation ships
-    /// disabled. When enabled and the model is cached or can be downloaded,
-    /// audio transcription runs fully locally via the `qwen-asr` crate with
-    /// Qwen3-ASR-0.6B. Audio never leaves the machine.
+    /// disabled. When enabled and the model set is on disk or can be fetched,
+    /// audio transcription runs fully locally on the inference crate's
+    /// recognition pair (`crate::speech`). Audio never leaves the machine.
     ///
     /// Set to `"false"` to disable audio transcription entirely — audio markers
     /// are replaced with just the icon combo and the temp file is deleted, so

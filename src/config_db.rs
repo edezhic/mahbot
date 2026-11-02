@@ -3,7 +3,6 @@
 //! per-model provider order.
 
 use crate::config::ModelRouting;
-#[cfg(target_os = "macos")]
 use crate::config::{CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, CONFIG_KEY_VOICE_ENABLED};
 use crate::db::{self};
 use anyhow::Result;
@@ -105,8 +104,8 @@ impl ConfigStore {
     /// deletes the `audio_transcription_use_local` row (absence = enabled), disabling writes
     /// `"false"`; turning transcription OFF while the wake word was on deletes
     /// `voice_enabled` in the same transaction, so a failure rolls back both keys and the
-    /// settings UI can never diverge from the DB.
-    #[cfg(target_os = "macos")]
+    /// settings UI can never diverge from the DB. The cascade is macOS's alone — no other
+    /// platform has a wake word — and a caller elsewhere passes `false`.
     pub async fn set_transcription_toggle(
         &self,
         transcription_enabled: bool,

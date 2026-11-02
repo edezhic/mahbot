@@ -220,7 +220,7 @@ pub(super) fn window_at_point(x: i32, y: i32) -> Option<core::WindowAtPoint> {
         app_pid: Some(pid),
         app_name: app_name(pid, &title),
         title,
-        /// The frame is how the window the caller addressed is told apart from this one.
+        // The frame is how the window the caller addressed is told apart from this one.
         frame: surface_of(hwnd).ok(),
     })
 }

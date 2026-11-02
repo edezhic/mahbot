@@ -13,7 +13,6 @@ pub mod lock;
 pub(crate) mod macros;
 pub(crate) mod managed_bin;
 pub(crate) mod media_target;
-#[cfg(target_os = "macos")]
 pub(crate) mod model_state;
 pub(crate) mod owner_path;
 pub(crate) mod provenance;
@@ -339,6 +338,37 @@ pub(crate) fn hex_string(bytes: &[u8]) -> String {
         })
 }
 
+/// Verify a file's SHA-256 against the hex digest it is pinned to, streaming it rather
+/// than loading it (model files run to gigabytes). An empty `expected` skips the check —
+/// the "no hash configured" semantics every downloader in the product shares.
+pub(crate) fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let mut hasher = Sha256::new();
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open {} for SHA256 verification", path.display()))?;
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let actual = hex_string(&hasher.finalize());
+    if actual != expected {
+        anyhow::bail!(
+            "SHA256 mismatch for {}: expected {expected}, got {actual}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 #[must_use]
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     STANDARD.encode(bytes)
@@ -494,12 +524,14 @@ mod verbatim_prefix_tests {
     }
 }
 
-/// Resolve the shared `~/.mahbot/models/` directory via the CONFIG storage root; `None` if the root
-/// is not initialized yet. Per-model subdirectories are joined by each consumer (e.g. the
-/// macOS-only `crate::audio::models_subdir`). Because it follows the storage root, a
-/// `$HOME`-overridden sandbox resolves an empty models dir and re-downloads its model set instead
-/// of sharing the real cache.
+/// Resolve the per-user `~/.mahbot/models/` directory via the CONFIG storage root; `None` if the
+/// root is not initialized yet. Only the two macOS-only model sets live here now — spoken replies
+/// and the wake word's encoder (`crate::audio::models_subdir`); recognition reads the machine-wide
+/// root (`crate::speech::models`). Because it follows the storage root, a `$HOME`-overridden
+/// sandbox resolves an empty models dir and re-downloads its model set instead of sharing the real
+/// cache.
 #[must_use]
+#[cfg(target_os = "macos")]
 pub(crate) fn models_dir() -> Option<PathBuf> {
     crate::config::CONFIG
         .try_storage_root()
@@ -2221,5 +2253,34 @@ mod executable_tests {
             !is_executable(&txt_path),
             "File with .txt extension should not be executable"
         );
+    }
+}
+
+#[cfg(test)]
+mod verify_sha256_tests {
+    use super::verify_sha256;
+
+    fn digest(data: &[u8]) -> String {
+        use sha2::{Digest as _, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        super::hex_string(&hasher.finalize())
+    }
+
+    #[test]
+    fn a_file_is_checked_against_its_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.gguf");
+        std::fs::write(&path, b"test data").unwrap();
+        assert!(verify_sha256(&path, &digest(b"test data")).is_ok());
+        assert!(verify_sha256(&path, &digest(b"other data")).is_err());
+    }
+
+    #[test]
+    fn an_empty_pin_skips_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nonexistent.bin");
+        assert!(verify_sha256(&missing, "").is_ok());
+        assert!(verify_sha256(&missing, &digest(b"anything")).is_err());
     }
 }

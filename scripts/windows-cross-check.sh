@@ -27,9 +27,10 @@
 # `zig rc`. cargo-zigbuild supplies the equivalent wrappers for `cargo
 # zigbuild`, but it has no `check` subcommand, so the check lane needs its own.
 #
-# No dependency stand-in is needed: the local audio subsystem (and the speech
-# engine behind it) is macOS-only, so nothing audio-shaped is part of a Windows
-# build in the first place.
+# The microphone, the voice pipeline and speech recognition are part of a Windows
+# build too: `cpal` reaches WASAPI through `windows-sys`, and the inference crate
+# reaches DX12 through `wgpu`, so this lane is what keeps their Windows branches
+# compiled.
 set -eu
 
 # Repo root, regardless of the caller's cwd (script lives in scripts/).

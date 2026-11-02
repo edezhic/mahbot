@@ -90,10 +90,6 @@ async fn bootstrap_mahbot(start_paused: bool, slowdown: Option<Report>) -> Resul
     // inits, consolidated domain store. Shared with the store-lock check so the two cannot drift.
     let log_store = mahbot::boot::open_stores().await?;
 
-    // The model-cache files of the removed embedder are retired on every start
-    // until they are gone. After the stores, so the attempt is in the log.
-    mahbot::boot::remove_retired_embedding_model_files();
-
     // An INFO status line rather than a problem: written once per start, with nothing
     // de-duplicating it. A platform that made no request says nothing.
     if let Some(report) = slowdown {
@@ -118,9 +114,9 @@ async fn bootstrap_mahbot(start_paused: bool, slowdown: Option<Report>) -> Resul
     // (`mahbot::autostart`).
     mahbot::autostart::reconcile();
 
-    // The macOS local Qwen3-ASR recogniser is deliberately NOT loaded here: the model loads
-    // on first use of the voice stack (`audio::local_transcriber::spawn_background_init`), so
-    // an install that never enabled local speech loads nothing at start.
+    // Recognition is deliberately NOT loaded here: the model loads on first use on every
+    // platform (`mahbot::speech::spawn_background_init`), so an install that never records or
+    // receives audio loads nothing at start.
     mahbot::providers::init_global()
         .map_err(|e| mahbot::boot::record_startup_failure("providers::init_global", e))?;
 
@@ -428,8 +424,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::hyperframes::refresh_on_start().await;
     });
 
-    // Manages wake-word detection, command recording, transcription and routing.
-    #[cfg(target_os = "macos")]
+    // Manages command recording, transcription and routing — and, on macOS, wake-word detection.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -584,8 +579,7 @@ fn init_message_pipeline(
     }
 
     // So routing can resolve the "voice" channel name when delivering agent responses. There
-    // is no listener: the voice pipeline runs its own mic loop (`run_voice_pipeline`, macOS only).
-    #[cfg(target_os = "macos")]
+    // is no listener: the voice pipeline runs its own mic loop (`run_voice_pipeline`).
     mahbot::channels::register_global();
 
     rx
@@ -725,9 +719,9 @@ fn main() -> Result<()> {
             std::process::exit(rt.block_on(mahbot::bench_openrouter::run_cli()));
         }
 
-        // A recording into text, text into a spoken file. It touches only the speech models
-        // under the storage root (never a store, never the settings), so it works while the
-        // product is stopped and alongside it.
+        // A recording into text, text into a spoken file. It touches only the speech models —
+        // recognition's machine-wide set, synthesis's copy under the storage root — and never a
+        // store or the settings, so it works while the product is stopped and alongside it.
         EntryPoint::Audio => {
             let rt = command_line_runtime()?;
             std::process::exit(rt.block_on(mahbot::run_audio_cli(&command_line_args())));

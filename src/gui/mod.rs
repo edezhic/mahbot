@@ -63,7 +63,6 @@ use iced::{Alignment, Element, Length, Task};
 
 use crate::Role;
 use crate::Workspace;
-#[cfg(target_os = "macos")]
 use crate::audio::voice::VoiceStatus;
 
 use self::menus::ContextMenu;
@@ -160,10 +159,10 @@ pub fn init_runtime_event_tx() {
     crate::runtime_events::init_runtime_event_tx();
 }
 
-/// Warm the voice-recording broadcast (see [`init_board_change_tx`]); nothing to
-/// warm on a platform with no voice stack. Called from `main`.
+/// Warm the voice-recording broadcast (see [`init_board_change_tx`]): the composer records on
+/// every platform, and an uninitialized sender would end its subscription on the first poll.
+/// Called from `main`.
 pub fn init_recording_tx() {
-    #[cfg(target_os = "macos")]
     crate::audio::voice::init_recording_tx();
 }
 
@@ -3217,7 +3216,6 @@ impl Dashboard {
     /// status glyph ([`Self::voice_status_icon`]) with the bar's wording as its tooltip. The bar's
     /// resting label is left out — an idle listener is the normal condition — and an empty slot
     /// keeps its place, so no status change rebuilds the column below it.
-    #[cfg(target_os = "macos")]
     fn render_sidebar_voice() -> Element<'static, Message> {
         let status = crate::audio::voice::get_status();
         if matches!(status, VoiceStatus::Listening) {
@@ -3235,12 +3233,6 @@ impl Dashboard {
             None,
             RailEntry::Item,
         )
-    }
-
-    /// No audio subsystem, so no voice status to report.
-    #[cfg(not(target_os = "macos"))]
-    fn render_sidebar_voice() -> Element<'static, Message> {
-        Space::new().height(0).into()
     }
 
     /// The rail's running-agent indicators — one per role in the footer's order, then the
@@ -3772,29 +3764,35 @@ impl Dashboard {
     /// The wording for a [`VoiceStatus`], shared by the footer's label and the rail's tooltip,
     /// without the glyph [`Self::voice_status_icon`] draws. `None` for voice off, which both
     /// surfaces hide.
-    #[cfg(target_os = "macos")]
     fn voice_status_label(status: &VoiceStatus) -> Option<String> {
         Some(match status {
             VoiceStatus::Disabled => return None,
             VoiceStatus::Listening => "Listening".into(),
             VoiceStatus::LoadingModels => "Loading…".into(),
             VoiceStatus::ModelError => "⚠ Model error".into(),
-            VoiceStatus::RecordingWakeWord | VoiceStatus::RecordingButton => "Recording…".into(),
+            #[cfg(target_os = "macos")]
+            VoiceStatus::RecordingWakeWord => "Recording…".into(),
+            VoiceStatus::RecordingButton => "Recording…".into(),
             VoiceStatus::Transcribing => "Transcribing…".into(),
             VoiceStatus::MicPermissionDenied => "No mic access".into(),
             VoiceStatus::MicDisconnected => "Mic disconnected".into(),
+            #[cfg(target_os = "macos")]
             VoiceStatus::Enrolling { sample, total, .. } => format!("Enrolling {sample}/{total}"),
+            #[cfg(target_os = "macos")]
             VoiceStatus::ListeningDuringEnrollment { sample, total } => {
                 format!("Listen… {sample}/{total}")
             }
+            #[cfg(target_os = "macos")]
             VoiceStatus::WaitingForSilenceDuringEnrollment { sample, total } => {
                 format!("Wait… {sample}/{total}")
             }
+            #[cfg(target_os = "macos")]
             VoiceStatus::EnrollingNegatives {
                 accumulated_secs,
                 target_secs,
                 ..
             } => format!("Collecting negatives {accumulated_secs}s/{target_secs}s"),
+            #[cfg(target_os = "macos")]
             VoiceStatus::Enrolled => "✅ Enrolled".into(),
             VoiceStatus::Error(msg) => format!("Error: {msg}"),
         })
@@ -3802,7 +3800,6 @@ impl Dashboard {
 
     /// The footer's compact voice status: the glyph in front of its wording. A
     /// [`VoiceStatus::Error`] shows the actual error string.
-    #[cfg(target_os = "macos")]
     fn render_voice_status() -> Element<'static, Message> {
         let status = crate::audio::voice::get_status();
         let Some(label) = Self::voice_status_label(&status) else {
@@ -3812,7 +3809,6 @@ impl Dashboard {
     }
 
     /// The glyph in front of a [`VoiceStatus`]: `ear`, or `pen-line` while transcribing.
-    #[cfg(target_os = "macos")]
     fn voice_status_icon(
         status: &VoiceStatus,
     ) -> iced::widget::text::Text<'static, iced::Theme, iced::Renderer> {
@@ -3843,6 +3839,8 @@ impl Dashboard {
             .spacing(theme::SPACE_6)
             .align_y(Alignment::Center);
 
+        // The recording's own progress: what is being fetched for speech synthesis (macOS
+        // only) and what the microphone is doing (everywhere).
         #[cfg(target_os = "macos")]
         let center = row![
             self.render_tts_download_progress(),
@@ -3850,10 +3848,8 @@ impl Dashboard {
         ]
         .spacing(theme::SPACE_8)
         .align_y(Alignment::Center);
-        // Off macOS there is no audio subsystem, so the centre slot collapses to nothing —
-        // the footer row below is shared and stays untouched.
         #[cfg(not(target_os = "macos"))]
-        let center = Space::new().width(0);
+        let center = Self::render_voice_status();
 
         let right = Row::with_children(
             [Self::render_active_agents(), Self::render_non_agent_calls()]
@@ -3878,7 +3874,6 @@ impl Dashboard {
 }
 
 /// Muted 12px footer status label with side padding, optionally behind a glyph.
-#[cfg(target_os = "macos")]
 fn footer_status_label(
     label: String,
     icon: Option<iced::widget::text::Text<'static, iced::Theme, iced::Renderer>>,

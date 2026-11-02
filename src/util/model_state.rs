@@ -1,9 +1,10 @@
-//! Shared model-loading state machine wrapper for the macOS audio subsystem.
+//! Shared model-loading state machine wrapper: the lazy-load lifecycle every model set
+//! in this product goes through (Uninit→Loading→Ready/Failed).
 //!
-//! Extracted from the duplicated `AtomicU8` lifecycle blocks (Uninit→Loading→Ready/Failed)
-//! in `audio::tts` and `audio::local_transcriber`: [`ModelLoadGuard`] unifies the byte-
-//! identical Loading→Failed Drop guard that keeps a panicking background download from
-//! leaving the state stuck in `Loading`.
+//! Extracted from the duplicated `AtomicU8` lifecycle blocks in `audio::tts` and the
+//! wake word's encoder: [`ModelLoadGuard`] unifies the byte-identical Loading→Failed Drop
+//! guard that keeps a panicking background download from leaving the state stuck in
+//! `Loading`. `crate::speech` and `crate::audio::voice` use it too.
 //!
 //! Deliberate non-unifications: the per-module singletons keep their own container types
 //! (`OnceLock<RwLock<Option<_>>>` vs `Mutex<Option<_>>`) — unifying them would change

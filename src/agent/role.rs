@@ -151,6 +151,12 @@ impl std::str::FromStr for Role {
     }
 }
 
+/// The marker a transcript carries where the recogniser heard speech and read nothing, as
+/// the role prompts spell it: one substitution from the engine's own constant, so the
+/// wording the model is taught and the wording a transcript carries cannot drift.
+const UNTRANSCRIBED_MARKER: &[(&str, &str)] =
+    &[("{{untranscribed}}", crate::speech::UNTRANSCRIBED)];
+
 impl Role {
     /// Canonical role name as a `&'static str` (lowercase), via the [`strum::IntoStaticStr`]
     /// derive.
@@ -168,7 +174,10 @@ impl Role {
     /// Role description, loaded from the embedded prompt files.
     #[must_use]
     pub fn role_description(&self) -> String {
-        crate::prompt::load_prompt(&format!("role/{}.md", self.as_str()))
+        crate::prompt::substitute(
+            &crate::prompt::load_prompt(&format!("role/{}.md", self.as_str())),
+            UNTRANSCRIBED_MARKER,
+        )
     }
 
     /// Role description widened for the admin's Assistant: only the Assistant has a separate one
@@ -179,7 +188,10 @@ impl Role {
             let say_note = Self::say_tool_note();
             crate::prompt::substitute(
                 &crate::prompt::load_prompt("role/assistant_admin.md"),
-                &[("{{say_tool}}", say_note.trim())],
+                &[
+                    ("{{say_tool}}", say_note.trim()),
+                    ("{{untranscribed}}", crate::speech::UNTRANSCRIBED),
+                ],
             )
         } else {
             self.role_description()

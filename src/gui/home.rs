@@ -4,7 +4,6 @@
 
 use crate::ChatDirection;
 use crate::Role;
-#[cfg(target_os = "macos")]
 use crate::audio::voice::RecordingEvent;
 use crate::channels::ReplyReference;
 use crate::channels::chat_history::ChatHistoryEntry;
@@ -272,9 +271,8 @@ fn attach_control(disabled: bool) -> Element<'static, HomeMessage> {
 
 /// The composer action toolbar beyond the send button: the voice controls, then the attach control.
 ///
-/// macOS-only. `recording` is the caller's single derivation of "a recording the composer owns is
-/// running" — the same bool the send button's empty rule takes, so the two cannot disagree.
-#[cfg(target_os = "macos")]
+/// `recording` is the caller's single derivation of "a recording the composer owns is running" —
+/// the same bool the send button's empty rule takes, so the two cannot disagree.
 fn composer_controls(
     voice_status: &crate::audio::voice::VoiceStatus,
     recording: bool,
@@ -292,17 +290,11 @@ fn composer_controls(
 }
 
 /// Composer mic button: starts a voice recording for the Assistant.
-#[cfg(target_os = "macos")]
 fn mic_control(voice_status: &crate::audio::voice::VoiceStatus) -> Element<'static, HomeMessage> {
-    // The mic is busy while the pipeline owns it for a recording or any ASR — the button must
-    // not look active when a new recording would be rejected. (A composer-owned recording renders
-    // the dot, not this button.)
-    let mic_busy = matches!(
-        voice_status,
-        crate::audio::voice::VoiceStatus::RecordingWakeWord
-            | crate::audio::voice::VoiceStatus::RecordingButton
-            | crate::audio::voice::VoiceStatus::Transcribing
-    );
+    // The mic is busy while the pipeline owns it for a recording or any transcription — the button
+    // must not look active when a new recording would be rejected. (A composer-owned recording
+    // renders the dot, not this button.)
+    let mic_busy = voice_status.mic_busy();
     // With local transcription disabled the shared ASR model never loads, so a button recording
     // can never start — present the control as unavailable, not as a loading state.
     let transcription_disabled = crate::audio::voice::is_transcription_disabled();
@@ -331,7 +323,6 @@ fn mic_control(voice_status: &crate::audio::voice::VoiceStatus) -> Element<'stat
 
 /// The recording indicator: a red dot fading in and out while a recording runs. Passive — no
 /// press, no tooltip.
-#[cfg(target_os = "macos")]
 fn recording_dot() -> Element<'static, HomeMessage> {
     // Padded and centred in the row of icon buttons beside it: a step smaller than their glyphs.
     container(super::pulse::pulse_dot(
@@ -344,7 +335,6 @@ fn recording_dot() -> Element<'static, HomeMessage> {
 
 /// Cancel control for the running recording — whichever way it started: it is dropped, and the
 /// field keeps its text and attachments exactly as they are.
-#[cfg(target_os = "macos")]
 fn cancel_recording_control() -> Element<'static, HomeMessage> {
     super::widgets::icon_tooltip_button(
         lucide::circle_x::<iced::Theme, iced::Renderer>()
@@ -433,14 +423,11 @@ pub enum HomeMessage {
     /// Timeout safety net: if `sending` stays stuck for 30+ seconds, auto-clear it. Carries the
     /// generation counter so a stale timeout cannot disturb a fresh send.
     SendingTimeout(u64),
-    #[cfg(target_os = "macos")]
     StartVoiceRecording,
     /// Cancel control clicked: stop the recording and discard it, leaving the field as it is.
-    #[cfg(target_os = "macos")]
     StopVoiceRecordingDiscard,
     /// Progress of a voice recording, whichever way it started: the field is committed when it
     /// stops and the message goes out once the transcript joins it.
-    #[cfg(target_os = "macos")]
     VoiceRecording(RecordingEvent),
     /// The scripted onboarding exchange completed (provider configured) — re-run the check, now
     /// firing the Phase-2 kickoff.
@@ -489,17 +476,13 @@ pub struct HomeState {
     /// press or the wake word's) until the field is committed, then the committed content until the
     /// transcript joins it (or the attempt fails and it comes back). The dot, the cancel control
     /// and the send press all read it, so they can never disagree about whether a recording runs.
-    #[cfg(target_os = "macos")]
     voice_message: Option<VoiceMessage>,
     /// When the composer last posted a discarded-recording notice, for the notice window.
-    #[cfg(target_os = "macos")]
     voice_notice_at: Option<std::time::Instant>,
     /// When the composer last posted a lost-message notice: a discard must not silence a failure.
-    #[cfg(target_os = "macos")]
     voice_error_at: Option<std::time::Instant>,
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug)]
 enum VoiceMessage {
     /// A recording owns the field: a press commits it, and the transcript that follows completes
@@ -515,7 +498,6 @@ enum VoiceMessage {
 
 /// A voice notice the composer posts, and the window it counts against — the same split the
 /// pipeline keeps between discards and failures.
-#[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
 enum VoiceNotice {
     Discarded(&'static str),
@@ -566,11 +548,8 @@ impl HomeState {
             drafts: crate::channels::chat_draft::DraftStore::global().clone(),
             draft_save: super::common::DebounceState::new(),
             history_error: None,
-            #[cfg(target_os = "macos")]
             voice_message: None,
-            #[cfg(target_os = "macos")]
             voice_notice_at: None,
-            #[cfg(target_os = "macos")]
             voice_error_at: None,
         }
     }
@@ -1128,21 +1107,14 @@ impl HomeState {
 
         // The recording's own state decides the controls and the send button's
         // empty rule — the pipeline status only says whether the mic is free.
-        #[cfg(target_os = "macos")]
         let voice_status = crate::audio::voice::get_status();
-        #[cfg(target_os = "macos")]
         let recording = matches!(self.voice_message, Some(VoiceMessage::Recording));
-        #[cfg(not(target_os = "macos"))]
-        let recording = false;
 
         // Input area
         // Controls for the composer action toolbar — inert while the composer is
         // (a drain).
-        #[cfg(target_os = "macos")]
         let controls: Vec<Element<'_, HomeMessage>> =
             composer_controls(&voice_status, recording, draining);
-        #[cfg(not(target_os = "macos"))]
-        let controls: Vec<Element<'_, HomeMessage>> = vec![attach_control(draining)];
 
         // Composer strip matches the BG_BASE chat pane so the empty space around
         // the rounded bubble blends with the page instead of showing a gray panel;
@@ -1237,7 +1209,6 @@ impl HomeState {
 
         // A running recording's progress — the dot pulses on its own clock, so
         // no tick subscription is needed.
-        #[cfg(target_os = "macos")]
         subs.push(iced::Subscription::run(voice_recording_stream));
 
         iced::Subscription::batch(subs)
@@ -1373,7 +1344,6 @@ impl HomeState {
                 // recording still capturing ends here too — its cancel control
                 // went with the chat, so leaving it running would record into
                 // nothing that could stop it.
-                #[cfg(target_os = "macos")]
                 if let Some(VoiceMessage::Recording) = std::mem::take(&mut self.voice_message) {
                     crate::audio::voice::send_command(
                         crate::audio::voice::VoiceCommand::StopRecordingDiscard,
@@ -1624,7 +1594,6 @@ impl HomeState {
                 }
                 Task::none()
             }
-            #[cfg(target_os = "macos")]
             HomeMessage::StartVoiceRecording => {
                 // A window the composer already owns belongs to a running
                 // recording — whichever way it started — so this press adds
@@ -1650,7 +1619,6 @@ impl HomeState {
                 self.voice_message = Some(VoiceMessage::Recording);
                 Task::none()
             }
-            #[cfg(target_os = "macos")]
             HomeMessage::StopVoiceRecordingDiscard => {
                 // Only a still-capturing recording can be discarded: once the
                 // field is committed to its message, dropping the audio would
@@ -1667,7 +1635,6 @@ impl HomeState {
                 );
                 Task::none()
             }
-            #[cfg(target_os = "macos")]
             HomeMessage::VoiceRecording(event) => self.voice_recording(event),
             HomeMessage::OnboardingScriptCompleted => {
                 self.sending = false;
@@ -1686,7 +1653,6 @@ impl HomeState {
     /// whichever way it started — the press belongs to its message (see
     /// [`Self::send_voice_message`]).
     fn send_message(&mut self) -> Task<HomeMessage> {
-        #[cfg(target_os = "macos")]
         if self.voice_message.is_some() {
             return self.send_voice_message();
         }
@@ -1701,7 +1667,6 @@ impl HomeState {
     /// message is on its way with the field's content from this moment — and stop
     /// the recording, so its transcript joins that one message. A press after the
     /// commit finds the message already in flight and does nothing.
-    #[cfg(target_os = "macos")]
     fn send_voice_message(&mut self) -> Task<HomeMessage> {
         if matches!(self.voice_message, Some(VoiceMessage::Committed { .. })) {
             return Task::none();
@@ -1726,7 +1691,6 @@ impl HomeState {
     /// composer and waits for the transcript. Idempotent — a window that is
     /// already resolved is left alone, so the recording's own stop after a press
     /// finds it done.
-    #[cfg(target_os = "macos")]
     fn commit_voice_content(&mut self) -> Result<(), Task<HomeMessage>> {
         if !matches!(self.voice_message, Some(VoiceMessage::Recording)) {
             return Ok(());
@@ -1844,14 +1808,7 @@ impl HomeState {
     /// stand for that window; the committed message keeps the composer locked instead, with no
     /// timeout, because transcribing may take as long as the recording did.
     fn in_flight(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            self.sending || matches!(self.voice_message, Some(VoiceMessage::Committed { .. }))
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            self.sending
-        }
+        self.sending || matches!(self.voice_message, Some(VoiceMessage::Committed { .. }))
     }
 
     /// Put a send's attachments back in front of anything attached since.
@@ -2034,18 +1991,11 @@ impl HomeState {
         why: HomeMessage,
     ) -> Task<HomeMessage> {
         let restored = self.restore_send(text, attachments, optimistic_id);
-        #[cfg(target_os = "macos")]
         let lost = if has_voice {
             self.voice_notice(VoiceNotice::Failed(
                 crate::audio::voice::VOICE_UNSENT_NOTICE,
             ))
         } else {
-            Task::none()
-        };
-        // Nothing dictated exists off macOS: `has_voice` is always false here.
-        #[cfg(not(target_os = "macos"))]
-        let lost = {
-            let _ = has_voice;
             Task::none()
         };
         Task::batch([restored, Task::done(why), lost])
@@ -2062,7 +2012,6 @@ impl HomeState {
     /// class per [`crate::audio::voice::NOTICE_INTERVAL`] — the windows the
     /// pipeline's own notices keep, so a rapid repeat cannot become a stream and
     /// a discard cannot silence a failure.
-    #[cfg(target_os = "macos")]
     fn voice_notice(&mut self, notice: VoiceNotice) -> Task<HomeMessage> {
         let (at, message) = match notice {
             VoiceNotice::Discarded(message) => (&mut self.voice_notice_at, message),
@@ -2079,7 +2028,6 @@ impl HomeState {
     /// the recording owns: the transcript completes it, a silent recording leaves
     /// only the field's own content to send, and a lost one gives the field back
     /// and says why.
-    #[cfg(target_os = "macos")]
     fn voice_recording(&mut self, event: RecordingEvent) -> Task<HomeMessage> {
         match event {
             // A recording began — the wake word's; a mic press opens the window
@@ -2144,7 +2092,6 @@ impl HomeState {
     /// Resolve a recording that brought no words: what the press committed goes
     /// out as an ordinary message, and a message with nothing in it is reported
     /// as a discarded recording only when `discard` names the notice.
-    #[cfg(target_os = "macos")]
     fn send_without_words(&mut self, discard: Option<&'static str>) -> Task<HomeMessage> {
         match self.voice_message.take() {
             Some(VoiceMessage::Committed { text, attachments })
@@ -2268,7 +2215,6 @@ fn chat_stream_producer() -> impl futures_util::Stream<Item = HomeMessage> {
 /// Stream producer for a voice recording's progress: the composer commits
 /// the field as the recording stops and completes the message once the
 /// transcript is known.
-#[cfg(target_os = "macos")]
 fn voice_recording_stream() -> impl futures_util::Stream<Item = HomeMessage> {
     super::common::broadcast_stream_producer(16, &crate::audio::voice::RECORDING, |output, item| {
         // A lagged stream loses no press: the events are one per recording
@@ -3329,7 +3275,6 @@ mod tests {
     /// Put the composer where a mic press leaves it: a recording owns the field,
     /// which holds `text`. The returned receiver stands in for the pipeline that
     /// took the start, so a press's stop is taken too.
-    #[cfg(target_os = "macos")]
     fn a_recording_owns_the_field(
         state: &mut HomeState,
         text: &str,
@@ -3340,7 +3285,6 @@ mod tests {
     }
 
     /// The page after a press on a recording's field, and the pipeline's end.
-    #[cfg(target_os = "macos")]
     fn pressed(
         text: &str,
     ) -> (
@@ -3354,7 +3298,6 @@ mod tests {
     }
 
     /// The text the recording's message holds, when the field was committed to it.
-    #[cfg(target_os = "macos")]
     fn committed_text(state: &HomeState) -> Option<&str> {
         match &state.voice_message {
             Some(VoiceMessage::Committed { text, .. }) => Some(text),
@@ -3363,7 +3306,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
     #[serial_test::serial(voice)]
     fn a_wake_word_recording_takes_the_field_and_its_controls() {
         let mut state = make_home_state("ws1");
@@ -3384,7 +3326,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
     #[serial_test::serial(voice)]
     fn a_press_commits_the_field_to_the_recording_message() {
         let (state, _pipeline) = pressed("hello");
@@ -3394,7 +3335,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
     #[serial_test::serial(voice)]
     fn a_press_after_the_commit_does_nothing() {
         let (mut state, _pipeline) = pressed("hello");
@@ -3414,7 +3354,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
     #[serial_test::serial(voice)]
     fn a_transcript_completes_the_committed_message() {
         let (mut state, _pipeline) = pressed("hello");
@@ -3426,7 +3365,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
     #[serial_test::serial(voice)]
     fn a_silent_recording_sends_only_what_the_field_held() {
         let (mut state, _pipeline) = pressed("hello");
@@ -3441,7 +3379,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
     #[serial_test::serial(voice)]
     fn a_silent_recording_of_an_empty_field_reports_the_discard() {
         let mut state = make_home_state("ws1");
@@ -3453,7 +3390,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
     #[serial_test::serial(voice)]
     fn a_lost_recording_gives_the_field_back() {
         let (mut state, _pipeline) = pressed("hello");
@@ -3467,7 +3403,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
     #[serial_test::serial(voice)]
     fn a_recording_that_never_started_closes_its_message() {
         let mut state = make_home_state("ws1");
@@ -3479,7 +3414,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
     #[serial_test::serial(voice)]
     fn a_press_whose_recording_never_began_sends_the_field_it_committed() {
         let (mut state, _pipeline) = pressed("hello");
@@ -3494,7 +3428,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
     #[serial_test::serial(voice)]
     fn a_recording_never_shares_a_committed_message() {
         let (mut state, mut pipeline) = pressed("hello");

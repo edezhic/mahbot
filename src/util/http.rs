@@ -450,6 +450,10 @@ fn temp_sibling(dest: &Path) -> PathBuf {
 /// process (the daemon's, say) holds its own and is never touched. The names are
 /// [`temp_sibling`]'s, so the process id is read straight out of one.
 ///
+/// The walk is bounded to `dest`'s own name: a directory shared with another consumer
+/// (the machine-wide model root is one) holds their files too, and none of them can
+/// match this prefix.
+///
 /// [`download_verified`] runs this on a blocking thread: it walks a directory and
 /// probes pids, and every download in the process pays for it.
 fn sweep_abandoned_parts(dest: &Path) {
@@ -518,6 +522,39 @@ impl Drop for TempDownload {
     }
 }
 
+/// Create this fetch's part file, or take over one a dead process left at its name.
+///
+/// The name is [`temp_sibling`]'s, and its sequence never repeats within a process, so a
+/// file already sitting there was left by a process whose pid was later reused: it is
+/// not being written, and truncating it is what keeps one download from failing on
+/// another's corpse. Anything but a regular file is refused — a model directory is
+/// shared with other consumers, so a planted link must never be followed.
+async fn open_part(path: &Path) -> std::io::Result<tokio::fs::File> {
+    match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
+    {
+        Ok(file) => Ok(file),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let meta = tokio::fs::symlink_metadata(path).await?;
+            if !meta.file_type().is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("{} is not a regular file", path.display()),
+                ));
+            }
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .await
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// On every failure path the temp file is removed (a failed rename included); on success it is
 /// atomically renamed into place. A temp file a killed process left behind is taken by the next
 /// fetch of the same file, and the temp name is unique per fetcher, so a concurrent download of the
@@ -561,7 +598,7 @@ pub(crate) async fn download_verified(
     let _ = tokio::task::spawn_blocking(move || sweep_abandoned_parts(&sweep_dest)).await;
 
     let mut temp = TempDownload::new(temp_sibling(dest));
-    let mut file = tokio::fs::File::create(temp.path())
+    let mut file = open_part(temp.path())
         .await
         .context("Failed to create temp file")?;
 
@@ -734,5 +771,34 @@ mod tests {
         install_ring_provider();
         let _client = build_http_client(Duration::from_secs(5));
         let _ = build_download_client(Duration::from_mins(1)).expect("download client builds");
+    }
+
+    /// A leftover part file of this very pid — the pid-reuse case, where the name is
+    /// already taken by a process that is gone — is truncated rather than failing the fetch.
+    #[tokio::test]
+    async fn a_part_file_left_by_a_reused_pid_is_taken_over() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.gguf.part-1-0");
+        std::fs::write(&path, b"stale bytes").unwrap();
+        let mut file = open_part(&path)
+            .await
+            .expect("a leftover regular file is taken");
+        file.write_all(b"new").await.unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_part_file_that_is_a_link_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("somebody-elses");
+        std::fs::write(&target, b"keep").unwrap();
+        let path = dir.path().join("model.gguf.part-1-0");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(open_part(&path).await.is_err(), "a link is not a part file");
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
     }
 }

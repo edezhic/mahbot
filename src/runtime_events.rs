@@ -15,7 +15,6 @@ pub(crate) enum RuntimeEvent {
     /// The local Telegram Bot API server's state: health, mode, version or last error.
     TelegramLocal,
     /// The voice pipeline status value.
-    #[cfg(target_os = "macos")]
     VoiceStatus,
     /// The self-update availability cache: a release was found or is no longer offered.
     UpdateAvailability,

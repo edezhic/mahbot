@@ -1,7 +1,7 @@
 //! Provider-backed video transcription for channel enrichment: a video (via the ephemeral upload
 //! bridge's public URL) becomes a text description, so the main agent loop only ever sees text. Not
-//! the document converter and not local speech recognition — microphone audio on macOS goes through
-//! `crate::audio`.
+//! the document converter and not local speech recognition — a recording goes through
+//! `crate::speech`.
 
 use crate::util::UnwrapPoison;
 

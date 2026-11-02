@@ -1,12 +1,13 @@
 //! `mahbot audio` — the product's own speech engine on the command line.
 //!
 //! Two operations, both the product's own engine and nothing else: `transcribe` turns an existing
-//! recording into text on standard output, `speak` turns text into a spoken WAV file. Neither needs
+//! recording into text on standard output, `speak` turns text into a spoken WAV file. `transcribe`
+//! runs on every platform; `speak` only on macOS, where the speech synthesiser exists — elsewhere
+//! the operation stays listed and its execution is one refusal naming the platform. Neither needs
 //! the running product — this command line is dispatched before the instance lock — and neither
-//! touches its stores or settings: the only thing either reads or writes is the speech model set
-//! under the product's own data folder, obtained the way the product obtains it (once, saying so on
-//! standard error, no retry loop). The command compiles everywhere and refuses both operations
-//! where the engine does not exist, naming the platform.
+//! touches its stores or settings: recognition reads the machine-wide model folder
+//! ([`crate::speech`]) and nothing else, synthesis the product's own copy of its voices, each
+//! obtained the way the product obtains it (once, saying so on standard error, no retry loop).
 //!
 //! The product's speech-output switch is not this command's: it governs what the app says aloud,
 //! while these operations are explicit requests carrying their own voice, language and destination
@@ -18,15 +19,15 @@
 //! who judges. This command judges the words and the values they carry (a flag no operation takes,
 //! a recording the recogniser does not take, a value the engine has no such thing as, a destination
 //! it cannot write) — the caller's own misuse. What the ENGINE judges is a failed operation. What
-//! is missing to run at all — no engine here, or models that cannot be obtained — is the
-//! environment.
+//! is missing to run at all is the environment: a model folder that is not there or cannot be
+//! written, and — for `speak` alone — a platform with no synthesiser on it.
 //!
 //! The order is deliberate: the words first (an operation no word names, a flag this operation does
-//! not take, one given twice, one with no value), then the product's data folder, then what the
+//! not take, one given twice, one with no value), then what the caller handed over, then what the
 //! values mean to the engine — because a typo must not cost a model download. The models are
 //! obtained only after all of that, the work is done, and only then is anything printed or written.
-//! Where there is no engine (everywhere but macOS) both operations are one refusal naming the
-//! platform and no VALUE is judged: the engine is what judges a value, and there is none to ask.
+//! Where there is no synthesiser (everywhere but macOS) `speak` is one refusal naming the platform
+//! and no VALUE is judged: the engine is what judges a value, and there is none to ask.
 //!
 //! A read-only shell must never admit this family: `speak` writes a file at a path the caller
 //! names, so the guard the inspecting roles hold lists it among its refusals.
@@ -142,7 +143,7 @@ enum Invocation {
 /// engine's own vocabulary, read where the engine exists. Where there is none the refusal is the
 /// platform's and none of this is read — the request is spelled the same way everywhere and dropped
 /// unread.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), expect(dead_code))]
 struct Speak {
     text: String,
     voice: Option<String>,
@@ -245,21 +246,21 @@ fn parse(args: &[String]) -> Result<Invocation, String> {
 // What these operations are — one block for both helps, so a caller entering through one
 // operation's own help reads the same contract as one reading the family's.
 const ENGINE_HELP: &str = "\nA frontend onto the product's own speech engine: everything \
-     happens on this machine and nothing is sent anywhere. The engine needs the speech models \
-     under the product's own data folder and nothing else — not the product's settings, not its \
-     databases, and not the running product, so this works while it is stopped and running it \
-     while the product is up does not disturb it. The first use of an operation fetches the \
-     models it needs, once, saying so on standard error; if it cannot obtain them, it fails \
-     rather than trying again.\n\
+     happens on this machine and nothing is sent anywhere. The engine needs its model set and \
+     nothing else — recognition reads the machine-wide speech model folder, synthesis the \
+     product's own copy of its voices — not the product's settings, not its databases, and not \
+     the running product, so this works while it is stopped and running it while the product is \
+     up does not disturb it. The first use of an operation fetches the models it needs, once, \
+     saying so on standard error; if it cannot obtain them, it fails rather than trying again.\n\
      \nThe product's voice switches govern what the app itself speaks and transcribes; \
      these operations are explicit requests with their own voice, language and destination — \
      they neither need those switches nor change them.\n";
 
 /// The exit classes, word for word the numbering a script reads (see [`Exit`]).
 const EXIT_CLASS_HELP: &str = "\nExit codes:\n  0  the operation was carried out\n  1  the engine \
-     could not do the work\n  2  the environment — there is no speech engine on this platform, \
-     or its models cannot be obtained\n  3  this command was misused — what was asked for cannot \
-     be done as asked\n";
+     could not do the work\n  2  the environment — there is no speech synthesiser on this \
+     platform, or the models cannot be obtained\n  3  this command was misused — what was asked \
+     for cannot be done as asked\n";
 
 /// Where the two streams go — shared by both helps for the same reason.
 const OUTPUT_HELP: &str = "\nOutput:\n  stdout  transcribe: the recognised text, and nothing at \
@@ -269,15 +270,15 @@ const OUTPUT_HELP: &str = "\nOutput:\n  stdout  transcribe: the recognised text,
 
 /// The one thing about this command that is not the same everywhere — and the only place two
 /// classes meet, so the order between them is said here too.
-const PLATFORM_HELP: &str = "\nThe speech engine exists on macOS only: on a platform that has \
-     none, both operations say so and name it as the reason.\n\
+const PLATFORM_HELP: &str = "\nTranscription runs on every platform. Speech synthesis exists on \
+     macOS only: elsewhere 'speak' is one refusal naming the platform, and nothing is written.\n\
      \nThat is the one place where two of these classes meet, and which one is reported is \
      settled the same way everywhere, because the words are read before anything else is. An \
      invocation that is malformed — no operation, an operation no word names, an unknown or \
      repeated flag, a required flag left without a value — is the caller's own misuse on every \
      platform, since nothing about the engine was reached. Only once the invocation is well \
-     formed does the platform come into it: a platform with no engine is then the environment, \
-     and so is a value the engine would have judged, had there been one there to judge it.\n";
+     formed does the platform come into it: 'speak' where there is no synthesiser to run it is \
+     then the environment.\n";
 
 /// `mahbot audio -h`: what this command is and what a caller reads back from it.
 #[must_use]
@@ -367,7 +368,7 @@ fn operation_help(operation: Operation) -> String {
 }
 
 // `mahbot audio` — the process exit code. Help goes to stdout and the caller's misuse is answered
-// from the words alone. The two operations themselves live in [`engine`], one arm per platform.
+// from the words alone. The two operations themselves live in [`engine`].
 
 pub async fn run(args: &[String]) -> i32 {
     match parse(args) {
@@ -393,59 +394,32 @@ fn misuse(reason: &str) -> i32 {
     Exit::Usage.code()
 }
 
-// The speech engine is macOS-only, so everywhere else both operations are this one refusal. The
-// words are read before it is — a malformed invocation is still the caller's mistake here — while
-// no value is judged at all.
-#[cfg(not(target_os = "macos"))]
-fn no_engine() -> i32 {
-    print_stderr(&format!(
-        "mahbot audio: the speech engine is macOS-only — on {} there is none to run, so neither \
-         operation can be carried out here",
-        std::env::consts::OS
-    ));
-    Exit::Environment.code()
-}
-
-/// The two operations where there is no engine to run them: the same refusal, with the same entry
-/// points the arm below has, so the caller is one line either way.
-#[cfg(not(target_os = "macos"))]
-mod engine {
-    use super::{Speak, no_engine};
-    use std::path::Path;
-
-    #[expect(clippy::unused_async)] // the entry point the macOS arm has: there is nothing to await here
-    pub(super) async fn transcribe(_input: &Path) -> i32 {
-        no_engine()
-    }
-
-    #[expect(clippy::unused_async)] // the entry point the macOS arm has: there is nothing to await here
-    pub(super) async fn speak(_request: &Speak) -> i32 {
-        no_engine()
-    }
-}
-
-// The operations themselves, on the one platform with a speech engine: what the caller's values
-// mean to it, and the work each operation asks for.
-#[cfg(target_os = "macos")]
+// The operations themselves: `transcribe` is on every platform, `speak` only where a speech
+// synthesiser exists, so only the synthesis half of this module is gated.
 mod engine {
     use super::{Speak, misuse};
-    use crate::audio::local_transcriber::{self, InferenceTimedOut};
+    #[cfg(target_os = "macos")]
     use crate::audio::tts;
     use crate::cli::Exit;
+    use crate::speech::{
+        AUDIO_FORMATS, INFERENCE_TIMEOUT, InferenceTimedOut, ensure_ready_once, takes_audio,
+        transcribe_file_async,
+    };
     use crate::util::{print_stderr, print_stdout};
+    #[cfg(target_os = "macos")]
     use std::io::ErrorKind;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+    #[cfg(target_os = "macos")]
+    use std::path::PathBuf;
 
     /// How many names to try before giving up on picking a free one: the chosen name is a fresh
     /// identifier, so the first is free for any practical purpose — the loop makes "never collides"
     /// true in principle too.
+    #[cfg(target_os = "macos")]
     const CHOSEN_NAME_TRIES: usize = 3;
 
     /// `transcribe`: the recording into text on standard output.
     pub(super) async fn transcribe(input: &Path) -> i32 {
-        if let Some(code) = prepare() {
-            return code;
-        }
         // What the caller handed over, before anything is fetched: a typo must not cost a model
         // download. The type is read before anything is opened, because opening is what waits — a
         // FIFO named like a recording would hold it until somebody writes into it.
@@ -463,7 +437,7 @@ mod engine {
         // The recogniser's own rule, asked of the recogniser itself: a name it knows, or content
         // beginning with Ogg's magic. Opening is part of asking, so an unreadable input is the
         // caller's mistake, not a failed operation.
-        match local_transcriber::takes_audio(input) {
+        match takes_audio(input) {
             Err(e) => return misuse(&cannot_read(input, &e)),
             Ok(true) => {}
             Ok(false) => {
@@ -471,29 +445,23 @@ mod engine {
                     "'{}' is not a recording the local recogniser takes — it takes the names {}, \
                      and a name outside them only when the file's content is Ogg",
                     input.display(),
-                    listed(
-                        local_transcriber::AUDIO_FORMATS
-                            .iter()
-                            .map(|(name, _)| format!("'.{name}'")),
-                    ),
+                    listed(AUDIO_FORMATS.iter().map(|(name, _)| format!("'.{name}'"))),
                 ));
             }
         }
 
-        if let Err(e) = local_transcriber::ensure_ready_once(|dir| {
+        if let Err(e) = ensure_ready_once(|dir| {
             announce_fetch(dir, "recognition");
         })
         .await
         {
             print_stderr(&format!(
-                "mahbot audio: the recognition model cannot be obtained: {e:#}"
+                "mahbot audio: the recognition models cannot be made ready: {e:#}"
             ));
             return Exit::Environment.code();
         }
 
-        match local_transcriber::transcribe_file_async(input, local_transcriber::INFERENCE_TIMEOUT)
-            .await
-        {
+        match transcribe_file_async(input, INFERENCE_TIMEOUT).await {
             Ok(text) => {
                 // No speech found is an answer, not a failure: nothing at all on stdout, so a
                 // script can tell it from an empty line.
@@ -509,7 +477,7 @@ mod engine {
                     "mahbot audio: the recording is longer than the local recogniser will take — \
                      it reached the engine's own {}-minute inference bound, and nothing was \
                      transcribed rather than a transcript with a part of it missing",
-                    local_transcriber::INFERENCE_TIMEOUT.as_secs() / 60,
+                    INFERENCE_TIMEOUT.as_secs() / 60,
                 ));
                 Exit::Failed.code()
             }
@@ -523,6 +491,7 @@ mod engine {
     }
 
     /// `speak`: the text into a spoken file, where the caller says to write it.
+    #[cfg(target_os = "macos")]
     pub(super) async fn speak(request: &Speak) -> i32 {
         if let Some(code) = prepare() {
             return code;
@@ -588,22 +557,37 @@ mod engine {
         }
     }
 
+    /// `speak` where no synthesiser exists: one plain refusal naming the platform. The words are
+    /// read before it is — a malformed invocation is still the caller's mistake — while no value is
+    /// judged: the engine is what judges a value, and there is none to ask.
+    #[cfg(not(target_os = "macos"))]
+    #[expect(clippy::unused_async)] // the entry point the macOS arm has: there is nothing to await here
+    pub(super) async fn speak(_request: &Speak) -> i32 {
+        print_stderr(&format!(
+            "mahbot audio: speech synthesis is macOS-only — on {} there is none to run it",
+            std::env::consts::OS
+        ));
+        Exit::Environment.code()
+    }
+
     /// Say on standard error that a model set is being fetched — a command line has only its
     /// standard error. Said as a fetch begins (before the first byte), and only when one begins at
     /// all: a set already on disk is silent, a first use that downloads gigabytes is not.
     fn announce_fetch(dir: &Path, what: &str) {
         print_stderr(&format!(
-            "mahbot audio: fetching the {what} model into {} — the product's own copy of it, \
-             fetched once",
+            "mahbot audio: fetching the {what} model set into {} — fetched once, and only when it \
+             is not already there",
             dir.display()
         ));
     }
 
-    /// The first thing either operation does: point the product's own data folder at the caller's
-    /// home, the way the product resolves it at boot, because that is where the speech models live.
-    /// This is the ONE setting this command touches: no store is opened and no config field is
-    /// read. The root is process-global and it. `Some` is the exit class to return immediately, the
-    /// reason already told on standard error.
+    /// `speak`'s first step: point the product's own data folder at the caller's home, the way the
+    /// product resolves it at boot, because that is where the synthesis models and voices live.
+    /// Recognition needs none of this — its models sit at the machine-wide root
+    /// ([`crate::speech`]). This is the ONE setting this command touches: no store is opened and no
+    /// config field is read. The root is process-global and it. `Some` is the exit class to return
+    /// immediately, the reason already told on standard error.
+    #[cfg(target_os = "macos")]
     fn prepare() -> Option<i32> {
         match crate::config::default_config_dir() {
             Ok(root) => {
@@ -627,6 +611,7 @@ mod engine {
     /// `M1.json` are one voice — nothing else is accepted, because a voice the engine does not have
     /// must be refused rather than quietly replaced. An unnamed voice is the product's own, never a
     /// setting's.
+    #[cfg(target_os = "macos")]
     pub(super) fn resolve_voice(named: Option<&str>) -> Option<String> {
         let Some(named) = named else {
             return Some(tts::DEFAULT_VOICE_NAME.to_string());
@@ -643,6 +628,7 @@ mod engine {
 
     /// A style file's name without its extension: the way a caller and the engine's own list spell
     /// one voice.
+    #[cfg(target_os = "macos")]
     fn bare_name(style: &str) -> &str {
         style.strip_suffix(".json").unwrap_or(style)
     }
@@ -651,6 +637,7 @@ mod engine {
     /// it. The engine's codes are the product's spelling of a language, so a code is matched
     /// against them as it stands; an unnamed language is the engine's language-agnostic default,
     /// never the setting's value.
+    #[cfg(target_os = "macos")]
     pub(super) fn resolve_language(named: Option<&str>) -> Option<String> {
         let Some(named) = named else {
             return Some(crate::config::DEFAULT_TTS_LANGUAGE.to_string());
@@ -670,6 +657,7 @@ mod engine {
 
     /// Where the spoken file goes: the path the caller named, or a fresh name this command picks
     /// inside a directory he named.
+    #[cfg(target_os = "macos")]
     pub(super) enum Destination {
         /// The caller named the file itself.
         Named(PathBuf),
@@ -681,6 +669,7 @@ mod engine {
     /// Read what `--output` names, before anything is fetched or rendered. The name is also where
     /// the caller says which container he wants, and uncompressed WAV is the only one the product
     /// writes. The destination directory is the caller's to make: this command never creates one.
+    #[cfg(target_os = "macos")]
     pub(super) fn resolve_destination(output: &Path) -> Result<Destination, String> {
         if output.is_dir() {
             return Ok(Destination::Chosen(output.to_path_buf()));
@@ -736,6 +725,7 @@ mod engine {
 
     /// The refusal for a destination already taken, said the same way whether the name was checked
     /// before the work or lost the race at the create.
+    #[cfg(target_os = "macos")]
     fn already_exists(path: &Path) -> String {
         format!(
             "{} already exists — this command never overwrites a file",
@@ -745,12 +735,14 @@ mod engine {
 
     /// The refusal for audio that could not be written — the same whether the caller named the file
     /// or this command chose the name.
+    #[cfg(target_os = "macos")]
     fn cannot_write(path: &Path, e: &std::io::Error) -> String {
         format!("{} could not be written: {e}", path.display())
     }
 
     /// Write the rendered audio where the destination points, returning the path when this command
     /// picked the name.
+    #[cfg(target_os = "macos")]
     fn write_audio(destination: &Destination, wav: &[u8]) -> Result<Option<PathBuf>, String> {
         match destination {
             Destination::Named(path) => match write_new(path, wav) {
@@ -777,6 +769,7 @@ mod engine {
     /// Create `path` and write the audio into it. `create_new` makes "never overwritten" true even
     /// against a file that appeared a moment ago, and a failed write removes what it created — a
     /// failure leaves nothing behind.
+    #[cfg(target_os = "macos")]
     fn write_new(path: &Path, wav: &[u8]) -> std::io::Result<()> {
         use std::io::Write as _;
         let mut file = std::fs::OpenOptions::new()

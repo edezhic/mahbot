@@ -15,7 +15,6 @@ mod telegram_group;
 pub(crate) mod telegram_intake;
 pub(crate) mod telegram_local;
 pub use chat_history::run_cap_loop;
-#[cfg(target_os = "macos")]
 pub(crate) use enrichment::marked_transcript;
 pub use enrichment::{enrich_links, enrich_message};
 pub use reply::{ReplyReference, apply_reply_marker};
@@ -29,8 +28,6 @@ use crate::{Channel, ChannelMessage, ChatDirection, SendMessage};
 use async_trait::async_trait;
 use enrichment::has_inbound_temp_marker;
 use std::borrow::Cow;
-// The voice channel (macOS-only) is the only `Arc` user in this module.
-#[cfg(target_os = "macos")]
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -67,7 +64,7 @@ pub async fn stop_telegram_server() {
 
 /// Broadcast an agent response to CHAT_BROADCAST for live GUI display and persist it to
 /// chat_history. The canonical entry point for all agent responses: the delivery paths in
-/// [`crate::agent::message_router`] and the macOS voice notice in `crate::audio::voice`.
+/// [`crate::agent::message_router`] and the voice pipeline's notice in `crate::audio::voice`.
 ///
 /// No speech happens here or on any event this broadcasts: the only way the product speaks is
 /// the admin Assistant's `say` tool, which calls `crate::audio::tts` itself.
@@ -331,9 +328,8 @@ impl Channel for GuiChannel {
     }
 }
 
-// VoiceChannel (macOS-only): the transport for the macOS-only voice pipeline, its only producer,
-// so nothing resolves the `"voice"` channel name off macOS — the section is gated with the audio
-// subsystem it serves.
+// VoiceChannel: the transport for the voice pipeline, its only producer — the pipeline runs on
+// every platform, so the `"voice"` channel name always resolves.
 
 /// Registered so routing can resolve the `"voice"` channel name when delivering agent responses.
 ///
@@ -341,10 +337,8 @@ impl Channel for GuiChannel {
 /// standard delivery path, so `send()` is a no-op like [`GuiChannel`]. The voice pipeline runs
 /// its own mic-capture loop, and a recording's transcript never arrives through a channel
 /// listener: it joins the Home composer's message, delivered on the GUI channel.
-#[cfg(target_os = "macos")]
 struct VoiceChannel;
 
-#[cfg(target_os = "macos")]
 #[async_trait]
 impl Channel for VoiceChannel {
     /// No-op — voice has no outbound transport.
@@ -368,13 +362,11 @@ impl Channel for VoiceChannel {
 
 /// Called during bootstrap from `init_message_pipeline`; [`crate::CHANNEL_REGISTRY`] must
 /// already be set.
-#[cfg(target_os = "macos")]
 pub fn register_global() {
     let channel: Arc<dyn Channel> = Arc::new(VoiceChannel);
     crate::channel_registry().register(channel);
 }
 
-#[cfg(target_os = "macos")]
 #[cfg(test)]
 mod tests {
     use super::*;

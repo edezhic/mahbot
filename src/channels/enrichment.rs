@@ -4,8 +4,7 @@
 //! Media markers (`[IMAGE: ...]`, `[AUDIO: ...]`, `[VIDEO: ...]`, `[FILE: ...]`): an inbound
 //! local image becomes a native data-URI part carrying the original bytes, re-encoded to a
 //! bounded JPEG only when it would exceed the encoded-payload cap; audio is transcribed to
-//! text on macOS, where the audio subsystem lives (elsewhere the marker is annotated
-//! honestly); video is a workspace copy plus transcription; an inbound document is copied
+//! text; video is a workspace copy plus transcription; an inbound document is copied
 //! into the workspace and converted to text and images. Link enrichment prepends webpage
 //! summaries for URLs in the message.
 //!
@@ -49,29 +48,21 @@ static LINK_ENRICHER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The audio-transcription icon combo, used as the failure fallback and as the annotation for
 /// out-of-scope `[AUDIO:...]` markers that must never be read or deleted.
-#[cfg(target_os = "macos")]
 const AUDIO_ICON: &str = "🔊✍️";
 
 /// A transcribed message as presented: the icon combo, one space, then the text. The one
 /// definition of that form — an inbound audio attachment and a voice recording both go
 /// through it, so a spoken message reads the same however it arrived.
-#[cfg(target_os = "macos")]
 #[must_use]
 pub(crate) fn marked_transcript(text: &str) -> String {
     format!("{AUDIO_ICON} {text}")
 }
-
-/// For a platform with no local audio subsystem: the model gets an honest note instead of
-/// the bare icon macOS falls back to.
-#[cfg(not(target_os = "macos"))]
-const AUDIO_UNAVAILABLE: &str = "[Audio is not supported on this platform]";
 
 /// The content to embed for an `[AUDIO:...]` marker: the icon combo followed by the transcription.
 ///
 /// The audio file is a pure intermediate artifact — the caller deletes it regardless of
 /// outcome — so the returned string never contains its name or path. On failure just the
 /// icon combo is returned.
-#[cfg(target_os = "macos")]
 async fn transcribe_audio_marker(path: &str) -> String {
     let path_buf = std::path::PathBuf::from(path);
 
@@ -83,13 +74,10 @@ async fn transcribe_audio_marker(path: &str) -> String {
         != Some("false");
 
     if use_local {
-        match crate::audio::local_transcriber::transcribe_file_async(
-            &path_buf,
-            // 10-minute timeout for enrichment path — attached audio can be
-            // arbitrarily long (voice memos, meeting recordings, etc.).
-            crate::audio::local_transcriber::INFERENCE_TIMEOUT,
-        )
-        .await
+        // The 10-minute engine bound: attached audio can be arbitrarily long (voice memos,
+        // meeting recordings, etc.).
+        match crate::speech::transcribe_file_async(&path_buf, crate::speech::INFERENCE_TIMEOUT)
+            .await
         {
             Ok(text) => {
                 tracing::debug!("Local audio transcription succeeded");
@@ -462,11 +450,10 @@ async fn handle_video(
 
 /// The annotation to add and whether the source temp file may be deleted.
 ///
-/// macOS transcribes only this message's own inbound attachment; a recording above the
+/// Only this message's own inbound attachment is transcribed; a recording above the
 /// automatic-processing bound is saved to the workspace instead (only the local Bot API server
-/// could have delivered it, and receiving it means keeping it). Elsewhere an audio marker can
-/// only come from outside the attachment path, so it gets an honest note.
-#[cfg_attr(not(target_os = "macos"), expect(clippy::unused_async))]
+/// could have delivered it, and receiving it means keeping it). A marker naming anything else —
+/// one typed by the user — is annotated without a transcript and its file is never deleted.
 async fn handle_audio(
     path: &str,
     path_obj: &std::path::Path,
@@ -474,36 +461,24 @@ async fn handle_audio(
     staging_dirs: &[String],
     processing_bound: Option<u64>,
 ) -> (String, bool) {
-    #[cfg(target_os = "macos")]
-    {
-        if path_obj.is_file() && is_inbound_attachment(path_obj, staging_dirs).await {
-            if let Some(bound) = processing_bound
-                && too_large_to_process(path_obj, bound).await
-            {
-                let annotation =
-                    match save_media_to_workspace(path_obj, uploads_dir, "audio", "mp3").await {
-                        Some(saved) => saved.annotation,
-                        None => AUDIO_ICON.to_string(),
-                    };
-                return (annotation, true);
-            }
-            return (transcribe_audio_marker(path).await, true);
+    if path_obj.is_file() && is_inbound_attachment(path_obj, staging_dirs).await {
+        if let Some(bound) = processing_bound
+            && too_large_to_process(path_obj, bound).await
+        {
+            let annotation =
+                match save_media_to_workspace(path_obj, uploads_dir, "audio", "mp3").await {
+                    Some(saved) => saved.annotation,
+                    None => AUDIO_ICON.to_string(),
+                };
+            return (annotation, true);
         }
-        tracing::warn!(
-            %path,
-            "Audio marker is not an inbound attachment file — annotating without transcription"
-        );
-        (AUDIO_ICON.to_string(), false)
+        return (transcribe_audio_marker(path).await, true);
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (path_obj, uploads_dir, staging_dirs, processing_bound);
-        tracing::debug!(
-            %path,
-            "Audio marker on a platform with no local audio — annotating without transcription"
-        );
-        (AUDIO_UNAVAILABLE.to_string(), false)
-    }
+    tracing::warn!(
+        %path,
+        "Audio marker is not an inbound attachment file — annotating without transcription"
+    );
+    (AUDIO_ICON.to_string(), false)
 }
 
 /// The "[Video transcription of <name>]: <text>" annotation, using the original source
@@ -849,7 +824,7 @@ impl EnrichmentBatch {
 /// | Kind | Behavior |
 /// |------|----------|
 /// | IMAGE | data URI (original bytes, bounded-JPEG re-encode over the cap only) + in-scope copy |
-/// | AUDIO | transcription on macOS; an honest "not supported" note elsewhere |
+/// | AUDIO | transcription, or the icon combo when it fails or the file is out of scope |
 /// | VIDEO | workspace copy + `[Saved video: path]` + transcription |
 /// | FILE | workspace copy + extracted text and images; verbatim when out of scope |
 ///
@@ -923,8 +898,8 @@ pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&st
                 }
             }
             MediaMarkerKind::Audio => {
-                // macOS: only this message's own inbound attachment is transcribed or deleted;
-                // an out-of-scope marker degrades to the icon only.
+                // Only this message's own inbound attachment is transcribed or deleted; an
+                // out-of-scope marker degrades to the icon only.
                 let (annotation, delete_temp) = handle_audio(
                     path,
                     path_obj,
@@ -1250,24 +1225,13 @@ mod tests {
         );
     }
 
-    /// The transcription fallback icon on macOS (no transcriber in tests), and the honest
-    /// "not supported" note where no local audio subsystem exists.
-    #[cfg(target_os = "macos")]
-    fn audio_annotation() -> &'static str {
-        AUDIO_ICON
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn audio_annotation() -> &'static str {
-        AUDIO_UNAVAILABLE
-    }
-
+    /// A user-typed marker is out of scope, so it degrades to the icon combo (no engine in tests).
     #[tokio::test]
     async fn enrich_audio_annotation_and_strip() {
         let mut msg = test_msg("Listen [AUDIO:/tmp/audio_xyz.mp3] to this");
         enrich_message(&mut msg, None).await;
         assert!(
-            msg.content.contains(audio_annotation()),
+            msg.content.contains(AUDIO_ICON),
             "Audio annotation must be present, got: {}",
             msg.content
         );
@@ -1562,20 +1526,11 @@ mod tests {
         let mut msg = inbound_msg(7010, &format!("Audio: [AUDIO:{path_str}]"));
         enrich_message(&mut msg, None).await;
 
-        // macOS consumes this message's own inbound audio attachment, so the
-        // pure intermediate file is deleted even when transcription fails
-        // (there is no transcriber in tests). Where no local audio exists the
-        // marker is annotated honestly instead and nothing consumes the file.
-        #[cfg(target_os = "macos")]
+        // This message's own inbound audio attachment is consumed, so the pure intermediate
+        // file is deleted even when transcription fails (there is no engine in tests).
         assert!(
             !tmp.exists(),
             "Audio temp file must be deleted on transcription failure"
-        );
-        #[cfg(not(target_os = "macos"))]
-        assert!(
-            msg.content.contains(AUDIO_UNAVAILABLE),
-            "Audio marker must be annotated honestly, got: {}",
-            msg.content
         );
         // Defensive cleanup in case the assertion above fails.
         let _ = tokio::fs::remove_file(&tmp).await;

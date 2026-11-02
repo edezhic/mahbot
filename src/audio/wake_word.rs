@@ -3,9 +3,9 @@
 //! # Architecture
 //!
 //! The wake-word pipeline is built entirely on the Qwen3-ASR encoder features: no separate
-//! embedding model, no trainable head, no AGC/NS preprocessing. It reuses the exact same loaded ASR
-//! model instance as speech-to-text transcription
-//! ([`crate::audio::local_transcriber::shared_model_arc`]).
+//! embedding model, no trainable head, no AGC/NS preprocessing. It encodes on the same loaded
+//! weights the wake word's own encoder module loads
+//! ([`crate::audio::encoder::shared_model_arc`]).
 //!
 //! Feature extraction (per bounded ≤1 s window):
 //! 1. Take the trailing [`WINDOW_SAMPLES`] (12 160 samples ≈ 0.76 s) of mono

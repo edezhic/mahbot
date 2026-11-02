@@ -103,9 +103,12 @@ pub mod cli;
 // Loading and substitution for the embedded prompt assets.
 pub(crate) mod prompt;
 
-// Microphone-to-meaning on macOS: wake word, voice commands, local transcription.
-#[cfg(target_os = "macos")]
+// The microphone-to-meaning stack: capture, the voice command pipeline, and — on
+// macOS only — the wake word, spoken replies and their recording cues.
 pub mod audio;
+// Speech recognition on every platform: the recogniser, the machine-wide model set
+// it reads, and the transcript a recording turns into.
+pub(crate) mod speech;
 // The `mahbot audio` command line: a recording into text, text into a spoken file.
 pub(crate) mod audio_cli;
 // A hand-rolled ONNX executor sized for the four pinned TTS models.

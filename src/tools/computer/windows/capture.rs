@@ -4,7 +4,7 @@
 //! Routes, in order, per target:
 //!
 //! * a window — a `GraphicsCaptureItem` for the window (its own content), then a
-//! desktop `BitBlt` over the window's rect (what a person sees, occluders included);
+//!   desktop `BitBlt` over the window's rect (what a person sees, occluders included);
 //! * the screen — one capture item per display stitched into the virtual-desktop
 //!   rect, then a single desktop `BitBlt`.
 //!

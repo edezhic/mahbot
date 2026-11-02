@@ -32,7 +32,7 @@ pub(crate) mod rasterize_html;
 pub(crate) mod read;
 pub(crate) mod read_document;
 pub(crate) mod research;
-// One short phrase spoken aloud — macOS only, where the speech engine lives.
+// One short phrase spoken aloud — macOS only, where speech synthesis lives.
 #[cfg(target_os = "macos")]
 pub(crate) mod say;
 pub(crate) mod search;

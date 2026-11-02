@@ -3,8 +3,8 @@
 # MahBot's own installer for macOS and Linux.
 #
 # It downloads this system's ready-made release file, puts it in place, makes
-# the location visible to the owner's own shell, and starts the product. It
-# never builds anything.
+# the location visible to the owner's own shell, gives the speech models their
+# machine-wide home, and starts the product. It never builds anything.
 #
 # The release contract it mirrors — one contract in four places: this script, the
 # Windows one (`install.ps1`), the product's own updater (`src/self_update.rs`)
@@ -477,7 +477,39 @@ if [ -f "$LEGACY" ] && [ ! "$LEGACY" -ef "$DEST" ]; then
     fi
 fi
 
-# ── 7. Start the product ──────────────────────────────────────────────────
+# ── 7. Give the speech models their machine-wide home ─────────────────────
+
+# Recognition reads one fixed folder per system and never creates it: a missing
+# one is an error naming the path, never a substitute location. The folder is
+# outside what an ordinary user may create on Linux, so that one is created with
+# elevation, once, and handed to the account the product runs under; on macOS
+# `/Users/Shared` is world-writable and the folder is created as the owner.
+#
+# A failure here is said plainly and does not fail the install: the product still
+# runs, and only speech is refused (naming the path) until the folder exists.
+if [ "$OS" = macos ]; then
+    MODELS_DIR='/Users/Shared/MahBot/models'
+    if [ ! -d "$MODELS_DIR" ] && ! mkdir -p "$MODELS_DIR" 2>/dev/null; then
+        warn "the speech model folder $MODELS_DIR could not be created; speech recognition will refuse to run until it exists."
+    fi
+else
+    MODELS_DIR='/var/lib/mahbot/models'
+    # Absent, or there and not this account's to write — an earlier install by another
+    # account leaves it that way — is the same one elevated step.
+    if [ -d "$MODELS_DIR" ] && [ -w "$MODELS_DIR" ]; then
+        :
+    elif ! command -v sudo >/dev/null 2>&1; then
+        warn "sudo was not found, so $MODELS_DIR could not be created; speech recognition will refuse to run until it exists."
+    else
+        say "Creating $MODELS_DIR (your administrator password is needed once)."
+        if ! sudo mkdir -p "$MODELS_DIR" 2>/dev/null ||
+            ! sudo chown "$(id -u):$(id -g)" "$MODELS_DIR" 2>/dev/null; then
+            warn "$MODELS_DIR could not be created and given to this account; speech recognition will refuse to run until it exists."
+        fi
+    fi
+fi
+
+# ── 8. Start the product ──────────────────────────────────────────────────
 
 # The trap cannot clean up after an `exec` — it replaces this shell, and no trap
 # runs then — so the temporary directory goes now. The product itself hands this

@@ -7,7 +7,7 @@
 //!
 //! The operations are exactly three: [`probe`] (duration, upright dimensions, audio presence),
 //! [`extract_frames`] (JPEG frames at a given rate, longest side and count bounded) and
-//! [`extract_audio`] (the track re-encoded to 16 kHz mono WAV, what the local transcriber takes).
+//! [`extract_audio`] (the track re-encoded to 16 kHz mono WAV, what the recogniser takes).
 //!
 //! Each runs under its own [`Duration`] — the wait for the copy included — and every output lands
 //! in a [`tempfile::TempDir`] under the product's private temp root, never in the owner's
@@ -382,8 +382,8 @@ fn frames_args(input: &Path, into: Option<&Path>, options: &FrameOptions) -> Vec
     args
 }
 
-/// 16 kHz mono signed 16-bit PCM in a WAV container: what the local transcriber
-/// takes, whatever the source carried. `into` absent is [`classify`]'s replay.
+/// 16 kHz mono signed 16-bit PCM in a WAV container: what the recogniser takes,
+/// whatever the source carried. `into` absent is [`classify`]'s replay.
 fn audio_args(input: &Path, into: Option<&Path>) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         "-v".into(),

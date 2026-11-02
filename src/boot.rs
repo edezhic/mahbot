@@ -115,13 +115,13 @@ pub async fn open_stores() -> anyhow::Result<Arc<crate::logs::LogStore>> {
     // and must be recorded, not lost.
     crate::agent::message_router::init_global()
         .map_err(|e| record_startup_failure("agent::message_router::init_global", e))?;
+    // The microphone and the voice pipeline are on every platform; the wake word's own
+    // initialisation is inside it, gated with the wake word.
+    crate::audio::voice::init_global()
+        .map_err(|e| record_startup_failure("audio::voice::init_global", e))?;
     #[cfg(target_os = "macos")]
-    {
-        crate::audio::voice::init_global()
-            .map_err(|e| record_startup_failure("audio::voice::init_global", e))?;
-        crate::audio::tts::init_global()
-            .map_err(|e| record_startup_failure("audio::tts::init_global", e))?;
-    }
+    crate::audio::tts::init_global()
+        .map_err(|e| record_startup_failure("audio::tts::init_global", e))?;
     crate::db::init_all_stores()
         .await
         .map_err(|e| record_bring_up_failure(&root, "core", e))?;
@@ -252,43 +252,6 @@ pub fn startup_panic_error(message: &str) -> anyhow::Error {
     anyhow::anyhow!("Startup panicked: {message}")
 }
 
-/// A previous release downloaded these two files for the deleted embedder. The
-/// cache is shared with the audio models, so only these exact filenames are removed
-/// and nothing else in the directory is touched. A failure is logged, never fatal,
-/// and the next start retries.
-pub fn remove_retired_embedding_model_files() {
-    let Some(dir) = crate::util::models_dir() else {
-        return;
-    };
-    remove_retired_embedding_model_files_in(&dir);
-}
-
-/// The weights and its tokenizer, and the only names this product removes from the cache.
-const RETIRED_EMBEDDING_MODEL_FILES: [&str; 2] =
-    ["v5-nano-retrieval-Q4_K_M.gguf", "embed_tokenizer.json"];
-
-fn remove_retired_embedding_model_files_in(dir: &Path) {
-    for name in RETIRED_EMBEDDING_MODEL_FILES {
-        let path = dir.join(name);
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                tracing::info!(
-                    file = %path.display(),
-                    "Removed a retired text-embedding model file"
-                );
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                tracing::warn!(
-                    file = %path.display(),
-                    error = %e,
-                    "Could not remove a retired text-embedding model file; the next start retries"
-                );
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,40 +380,6 @@ mod tests {
             assert!(
                 body.contains(needle),
                 "error.log must contain {needle:?}: {body}"
-            );
-        }
-    }
-
-    /// Removes exactly the two files and leaves everything else in the shared cache
-    /// in place; a second start is a silent no-op. A private directory, so the test
-    /// can never reach the owner's real model cache (the ignored TTS end-to-end test
-    /// symlinks the test root's `models/` to it).
-    #[test]
-    fn only_the_retired_embedding_model_files_are_removed() {
-        let tmp = tempfile::TempDir::new().expect("temp dir for test");
-        let dir = tmp.path();
-        for name in [
-            "v5-nano-retrieval-Q4_K_M.gguf",
-            "embed_tokenizer.json",
-            "embeddinggemma-2-Q8_0.gguf",
-            "audio-model.bin",
-        ] {
-            std::fs::write(dir.join(name), b"x").expect("seed a cache file");
-        }
-
-        remove_retired_embedding_model_files_in(dir);
-        remove_retired_embedding_model_files_in(dir);
-
-        for name in ["v5-nano-retrieval-Q4_K_M.gguf", "embed_tokenizer.json"] {
-            assert!(
-                !dir.join(name).exists(),
-                "the retired model file {name} must be gone"
-            );
-        }
-        for name in ["embeddinggemma-2-Q8_0.gguf", "audio-model.bin"] {
-            assert!(
-                dir.join(name).exists(),
-                "no other file in the shared cache may be touched, missing {name}"
             );
         }
     }

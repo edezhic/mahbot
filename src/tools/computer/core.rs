@@ -4721,6 +4721,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     struct ShareCase {
         name: &'static str,
         call: u64,

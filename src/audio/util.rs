@@ -1,30 +1,24 @@
-//! Audio-subsystem utilities: PCM math and resampling, deterministic
-//! test-signal generation for the voice tests, embedding cosine similarity, and
-//! the streaming SHA-256 verifier the audio model downloads share.
+//! Audio-subsystem utilities: PCM resampling for the capture path, and the macOS
+//! side's embedding similarity and deterministic test-signal generators.
 //!
-//! These live here (not in `crate::util`) because the whole audio subsystem
-//! is macOS-only.
+//! These live here (not in `crate::util`) because they are the audio subsystem's
+//! own: the resampler serves the microphone stream on every platform, while the
+//! embedding similarity, the RMS helper and the signal generators belong to the
+//! wake word's enrollment and its tests, and are gated with it.
 
-use anyhow::{Context as _, Result};
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 use rand::RngExt;
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 use rand::SeedableRng;
-use sha2::{Digest, Sha256};
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
-
-use crate::util::hex_string;
 
 // PCM resampling
 
 /// Resample PCM audio from one sample rate to another using linear
 /// interpolation with a 3-tap binomial anti-aliasing filter for downsampling.
 ///
-/// This is the canonical implementation. All other resample call sites
-/// delegate to this one, except `audio::local_transcriber`, which uses
-/// `qwen_asr::audio::resample` directly.
+/// This is the canonical implementation: every call site delegates to it. The
+/// recogniser is not one of them — it hands the engine a file's own rate and the
+/// engine resamples ([`crate::speech::decode`]).
 ///
 /// When `from_rate > to_rate` (downsampling), a simple binomial low-pass filter
 /// is applied to attenuate frequencies above the new Nyquist before decimation.
@@ -41,8 +35,7 @@ use crate::util::hex_string;
 /// pre-filter — the filter only provides ~6 dB stopband attenuation. This is
 /// acceptable for speech processing and wake word training data augmentation.
 /// If aliasing artifacts prove problematic, a sinc-based resampler can be
-/// substituted here — all call sites except `local_transcriber` (which
-/// resamples via `qwen_asr` itself) benefit automatically.
+/// substituted here — every call site benefits automatically.
 #[must_use]
 #[expect(
     clippy::cast_possible_truncation,
@@ -88,94 +81,6 @@ pub(crate) fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> V
     output
 }
 
-// Shared model-integrity verifier
-
-/// Verify a file's SHA256 hash matches the expected hex string.
-///
-/// Shared model-integrity verifier extracted from the three near-identical
-/// private streaming copies in `audio::tts`, `audio::local_transcriber`, and
-/// `audio::voice` (whose empty-`expected` skip semantics and error wording had
-/// drifted).  Model-download integrity is security-adjacent, so the copies are
-/// consolidated here.
-///
-/// * If `expected` is empty, verification is skipped (returns `Ok`) — the
-///   canonical "no hash configured" semantics that won the reconciliation.
-/// * Uses streaming SHA256 via [`Sha256::update`] to avoid loading the entire
-///   file into memory (model files can be multiple GB).
-pub(crate) fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
-    if expected.is_empty() {
-        return Ok(()); // no hash configured — skip verification
-    }
-
-    let mut hasher = Sha256::new();
-    let mut file = File::open(path)
-        .with_context(|| format!("Failed to open {} for SHA256 verification", path.display()))?;
-    let mut buf = vec![0u8; 65536]; // 64 KB heap buffer
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let actual = hex_string(&hasher.finalize());
-    if actual != expected {
-        anyhow::bail!(
-            "SHA256 mismatch for {}: expected {expected}, got {actual}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-// Tests consolidated from the three former private copies (tts,
-// local_transcriber, voice).  The file-not-found error path is covered with a
-// NON-empty expected hash because the shared empty-hash skip returns Ok before
-// opening the file (sanctioned reconciliation of the transcriber's original
-// `verify_sha256(path, "").is_err()` assertion).
-
-#[cfg(test)]
-mod verify_sha256_tests {
-    use super::verify_sha256;
-
-    fn sha256_hex(data: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        crate::util::hex_string(&hasher.finalize())
-    }
-
-    #[test]
-    fn verify_sha256_cases() {
-        // Matching and mismatching hashes over a written file.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.bin");
-        std::fs::write(&path, b"test data").unwrap();
-        let hash = sha256_hex(b"test data");
-        assert!(
-            verify_sha256(&path, &hash).is_ok(),
-            "matching hash should pass"
-        );
-        assert!(
-            verify_sha256(&path, &sha256_hex(b"other data")).is_err(),
-            "mismatching hash should fail"
-        );
-
-        // Empty expected hash → Ok without opening the file (skip semantics).
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("nonexistent.bin");
-        assert!(
-            verify_sha256(&missing, "").is_ok(),
-            "empty hash should skip verification"
-        );
-        // The not-found error path requires a non-empty expected hash.
-        assert!(
-            verify_sha256(&missing, &sha256_hex(b"anything")).is_err(),
-            "missing file with non-empty hash should fail"
-        );
-    }
-}
-
 // Audio utility functions (canonical implementations)
 
 /// Generate pink noise (1/f spectrum) using the Voss-McCartney algorithm.
@@ -193,7 +98,7 @@ mod verify_sha256_tests {
 ///
 /// The canonical implementation uses 16 octaves (~3 dB/octave rolloff down
 /// to 0.03 Hz at 16 kHz) and the high-pass delta variant for DC-free output.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn generate_pink_noise(len: usize, mut rng: impl rand::Rng) -> Vec<f32> {
     const NUM_OCTAVES: usize = 16;
     let mut values = [0.0f32; NUM_OCTAVES];
@@ -231,7 +136,7 @@ pub(crate) fn generate_pink_noise(len: usize, mut rng: impl rand::Rng) -> Vec<f3
 ///
 /// Generates unit-RMS pink noise from a seeded RNG, scales it to the SNR
 /// target relative to the signal's own RMS, and clamps the mix to ±1.0.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn add_noise(pcm: &[f32], snr_db: f32, seed: u64) -> Vec<f32> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let signal_rms = compute_rms(pcm).max(1e-10);
@@ -249,7 +154,7 @@ pub(crate) fn add_noise(pcm: &[f32], snr_db: f32, seed: u64) -> Vec<f32> {
 ///
 /// DETERMINISTIC — no RNG involved. The gain is `10^(gain_db / 20)`.
 /// Negative values attenuate, positive values amplify.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn apply_gain(pcm: &[f32], gain_db: f32) -> Vec<f32> {
     let amp = 10.0_f32.powf(gain_db / 20.0);
     pcm.iter().map(|&s| s * amp).collect()
@@ -263,6 +168,7 @@ pub(crate) fn apply_gain(pcm: &[f32], gain_db: f32) -> Vec<f32> {
 /// divide-by-zero floor for degenerate all-zero input apply `.max(1e-10)` at
 /// the call site — it is deliberately NOT part of this function.
 #[expect(clippy::cast_precision_loss)]
+#[cfg(target_os = "macos")]
 pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
@@ -288,7 +194,7 @@ pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
 ///
 /// Speed-adjusted audio at the original `sample_rate`.
 #[must_use]
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -310,7 +216,7 @@ pub(crate) fn speed_perturbation(samples: &[f32], sample_rate: u32, factor: f32)
 // In-place regression net for speed perturbation, gain, noise, and pink noise.
 // The utilities are `cfg(test)`-gated, like the tests that exercise them.
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod audio_util_tests {
     use super::{add_noise, apply_gain, generate_pink_noise, speed_perturbation};
     use rand::SeedableRng;
@@ -447,6 +353,7 @@ mod audio_util_tests {
 /// enrolment prototype, negatives and anti-prototypes with it, and enrolment
 /// checks each utterance against the running centroid with it.
 #[must_use]
+#[cfg(target_os = "macos")]
 pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -476,7 +383,7 @@ pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     raw.clamp(0.0, 1.0)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod cosine_similarity_tests {
     use super::cosine_similarity;
 

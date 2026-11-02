@@ -17,8 +17,7 @@ exclude = [".DS_Store", "scripts"]
 
 [features]
 # Audio dev marker. A feature cannot be platform-gated, so off macOS it gates
-# nothing at all: every `voice-debug` site lives inside the macOS-only audio
-# subsystem.
+# nothing at all: its one site is the wake-word scoring, which only macOS has.
 voice-debug = []
 
 [[bin]]
@@ -55,6 +54,21 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 pulldown-cmark = "0.12"
 iced_anim = "0.3"
 iced_term = "0.8.0"
+
+# Speech recognition: the inference crate, taken from the sibling checkout by
+# path — no vendoring, no mirror, no second copy. It is not on crates.io, so this
+# dependency makes `cargo package`/`publish` fail until the crate is published and
+# this line becomes a version requirement; releases are cut after that, not before.
+mahbot-inference = { path = "../mahbot-rlx/crates/mahbot-inference" }
+# Microphone capture (`crate::audio::voice`): the platform's own host API —
+# CoreAudio, WASAPI, ALSA. The ALSA backend needs `libasound2-dev` (pkg-config
+# `alsa`) to build on Linux.
+cpal = "0.18"
+# The recogniser's input decoders: OGG/Opus (a Telegram voice note arrives as one),
+# and MP3 (an audio attachment). WAV is read by the product itself.
+ogg = "0.9"
+opus-decoder = "0.1"
+minimp3 = "0.5"
 
 # HTTP / WebSocket client
 # 0.13: `rustls-tls` feature is gone; the ring TLS provider is installed
@@ -317,23 +331,16 @@ windows = { version = "0.62", features = [
 candle-nn = { version = "0.11.0", features = ["accelerate"] }
 candle-core = "0.11.0"
 
-# ── Local audio subsystem (macOS only) ────────────────────────────────────
-# These exist only for `crate::audio`, which is itself macOS-only — the speech
-# engine behind local transcription and the wake word has no other platform
-# support, and no audio feature has a fallback anywhere. Linux and Windows
-# builds must not pull any of them in.
+# ── Speech synthesis and the wake word (macOS only) ───────────────────────
+# What is left of the macOS-only audio subsystem once recognition moved to
+# `crate::speech` and its own crate: the Qwen3-ASR encoder the wake word shares
+# (`crate::audio::encoder`), the TTS runtime and the recording cues.
 qwen-asr = { version = "0.11.0", default-features = false, features = ["blas", "vdsp"] }
+# The wake word's voice-activity detector (the recogniser's own lives in the inference
+# crate).
+earshot = "1.2"
 # Spoken-phrase playback and the wake-word recording cues.
 rodio = { version = "0.22", default-features = false, features = ["playback", "hound"] }
-# Neural voice activity detection (replaces RMS-based VAD).
-earshot = "1.2"
-# Microphone capture for the voice assistant.
-cpal = "0.18"
-# Audio decoding for local transcriber input (OGG/Opus → raw PCM).
-ogg = "0.9"
-opus-decoder = "0.1"
-# MP3 decoding.
-minimp3 = "0.5"
 
 # Computer Use tool (GUI observe/act): the live macOS backend's dependencies —
 # accessibility (AXUIElement), input synthesis (CGEvent) and capture
@@ -405,23 +412,63 @@ codegen-units = 256
 [profile.dev.package."*"]
 debug = false
 
-# qwen-asr (local speech-to-text — macOS only, like the rest of the audio
-# subsystem) is inference code: opt-level 3 + codegen-units 1 keeps
-# transcription fast enough for real-time voice use even in dev builds, where
-# the default opt-level 0 would make the ASR model noticeably slower. This
-# override is deliberately placed under `profile.dev` (not `profile.test`):
-# `[profile.test]` inherits `dev`, so test builds already share the same
-# optimized qwen-asr artifact. A separate `[profile.test.package.qwen-asr]`
-# override would produce a SECOND artifact fingerprint (2× disk, one-time full
-# recompile of qwen-asr per clean test run) without any runtime benefit — tests
-# exercise the same optimized code — and could regress warm test-cache reuse.
-# The dependency-compilation behavior of per-package test overrides was verified
-# empirically on cargo 1.97.1; the dev override already covers
-# tests, so no test override is added.
-# Inert on Linux/Windows, where the package is not in the graph at all.
+# The inference crate and the RLX graph under it are inference code: opt-level 3
+# keeps transcription fast enough for real-time voice in dev builds, where the
+# default opt-level 0 would make the ASR model noticeably slower. Deliberately
+# under `profile.dev`, not `profile.test`: `[profile.test]` inherits `dev`, so
+# test builds share the same optimized artifacts instead of fingerprinting a
+# second copy. Inert on a target where the package is not in the graph.
+#
+# The RLX entries are every `rlx-*` crate the inference crate's graph resolves to
+# (`cargo tree -p mahbot-inference | grep -o 'rlx-[a-z-]*'`): a new one is added here
+# when it appears, or it silently runs unoptimized in dev.
 [profile.dev.package.qwen-asr]
 opt-level = 3
 codegen-units = 1
+
+[profile.dev.package.mahbot-inference]
+opt-level = 3
+
+[profile.dev.package.rlx-autodiff]
+opt-level = 3
+[profile.dev.package.rlx-compile]
+opt-level = 3
+[profile.dev.package.rlx-cpu]
+opt-level = 3
+[profile.dev.package.rlx-dduf]
+opt-level = 3
+[profile.dev.package.rlx-driver]
+opt-level = 3
+[profile.dev.package.rlx-flow]
+opt-level = 3
+[profile.dev.package.rlx-fusion]
+opt-level = 3
+[profile.dev.package.rlx-gguf]
+opt-level = 3
+[profile.dev.package.rlx-gpu-dispatch]
+opt-level = 3
+[profile.dev.package.rlx-gpu-host]
+opt-level = 3
+[profile.dev.package.rlx-ir]
+opt-level = 3
+[profile.dev.package.rlx-macros]
+opt-level = 3
+[profile.dev.package.rlx-mlx-io]
+opt-level = 3
+[profile.dev.package.rlx-nemo]
+opt-level = 3
+[profile.dev.package.rlx-opt]
+opt-level = 3
+[profile.dev.package.rlx-pkg]
+opt-level = 3
+[profile.dev.package.rlx-runtime]
+opt-level = 3
+[profile.dev.package.rlx-torch-ckpt]
+opt-level = 3
+[profile.dev.package.rlx-unfuse]
+opt-level = 3
+[profile.dev.package.rlx-wgpu]
+opt-level = 3
 
 [profile.dev.build-override]
 opt-level = 0

@@ -1,9 +1,9 @@
 # MahBot's own installer for Windows.
 #
 # It downloads this system's ready-made release file, puts it in place, makes
-# the location visible to the owner's own environment and start menu, and starts
-# the product. It never builds anything, and needs nothing beyond what Windows
-# itself ships.
+# the location visible to the owner's own environment and start menu, gives the
+# speech models their machine-wide home, and starts the product. It never builds
+# anything, and needs nothing beyond what Windows itself ships.
 #
 # The release contract it mirrors — one contract in four places: this script, the
 # unix-like one (`install.sh`), the product's own updater (`src/self_update.rs`)
@@ -450,7 +450,25 @@ public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint M
         Write-Host 'Smart App Control is on, and it allows no exception for a single program: the only remedy is turning it off wholesale, and it also blocks the browser helper and the runtime MahBot installs.'
     }
 
-    # ── 9. Start the product ──────────────────────────────────────────────────
+    # ── 9. Give the speech models their machine-wide home ─────────────────────
+
+    # Recognition reads one fixed folder and never creates it: a missing one is an
+    # error naming the path, never a substitute location. A standard user may create
+    # a folder under ProgramData and write inside it, so no elevation is needed here;
+    # write access follows whoever created it, which is this account.
+    #
+    # A failure is said plainly and does not fail the install: the product still runs,
+    # and only speech is refused (naming the path) until the folder exists.
+    $ModelsDir = Join-Path $env:ProgramData 'MahBot\models'
+    if (-not (Test-Path -LiteralPath $ModelsDir -PathType Container)) {
+        try {
+            New-Item -ItemType Directory -Path $ModelsDir -Force | Out-Null
+        } catch {
+            Write-Host "the speech model folder $ModelsDir could not be created; speech recognition will refuse to run until it exists."
+        }
+    }
+
+    # ── 10. Start the product ─────────────────────────────────────────────────
 
     try {
         Start-Process -FilePath $InstalledExe

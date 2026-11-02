@@ -487,8 +487,8 @@ fn build_reply_reference(message: &serde_json::Value) -> Option<ReplyReference> 
 }
 
 /// The user-facing content for an inbound attachment: `[IMAGE:]` for a PNG/JPEG/ WebP, `[VIDEO:]`
-/// for video, `[AUDIO:]` for sound on macOS (a plain file elsewhere), `[FILE:]` otherwise — the
-/// bytes deciding when name and MIME do not.
+/// for video, `[AUDIO:]` for sound, `[FILE:]` otherwise — the bytes deciding when name and MIME do
+/// not.
 fn format_attachment_content(
     kind: IncomingAttachmentKind,
     local_path: &Path,
@@ -507,14 +507,9 @@ fn format_attachment_content(
             format!("[VIDEO:{}]", local_path.display())
         }
         IncomingAttachmentKind::Audio | IncomingAttachmentKind::Voice => {
-            // macOS transcribes this through the AUDIO marker; elsewhere it is an ordinary
-            // attachment (a recorded voice message is refused before it gets here).
-            let kind = if cfg!(target_os = "macos") {
-                "AUDIO"
-            } else {
-                "FILE"
-            };
-            format!("[{kind}:{}]", local_path.display())
+            // A recording and a sound file both arrive as an AUDIO marker, which enrichment
+            // transcribes.
+            format!("[AUDIO:{}]", local_path.display())
         }
         _ => {
             // Neither name nor MIME classified it, so the bytes decide — the same decodable- raster
@@ -1087,11 +1082,6 @@ const ATTACHMENT_UPLOAD_FAILED_REASON: &str = "the upload failed.";
 /// Reason when an addressed attachment never arrived. Static for the same reason as
 /// [`ATTACHMENT_UPLOAD_FAILED_REASON`]: the error may carry the URL.
 const ATTACHMENT_FETCH_FAILED_REASON: &str = "it could not be fetched or sent.";
-
-/// Reason when a recorded voice message arrives off macOS, where nothing can transcribe it: refused
-/// rather than handed on useless.
-#[cfg(not(target_os = "macos"))]
-const VOICE_UNSUPPORTED_REASON: &str = "voice messages are not supported on this platform";
 
 /// The local server's hand-over produced no usable file: one variant per fault, so the refusal
 /// reaches the owner as what happened — missing, outside, short — rather than one sentence for all
@@ -2136,10 +2126,9 @@ impl TelegramChannel {
     /// which the caller keeps the event held for. An attachment the bot cannot retrieve still
     /// yields a message, so the caption reaches the agent with the failure in it.
     ///
-    /// Off macOS a recorded voice message is refused before any fetch, nothing there being able to
-    /// transcribe it; an `audio` sound file takes the ordinary path. The whole preparation, fetch
-    /// included, is marked in [`TelegramChannel::preparations`], so the collector holds that
-    /// sender's group in that chat until the part is handed over.
+    /// A recorded voice message and an `audio` sound file both take the ordinary path. The whole
+    /// preparation, fetch included, is marked in [`TelegramChannel::preparations`], so the
+    /// collector holds that sender's group in that chat until the part is handed over.
     async fn try_parse_attachment_message(
         &self,
         update: &serde_json::Value,
@@ -2160,16 +2149,6 @@ impl TelegramChannel {
         // Held for the whole preparation, the fetch included, so the group this sender has open in
         // this chat waits for the part this call produces.
         let _preparing = self.preparations.begin(&ctx.user_name, &ctx.reply_target);
-
-        // No local audio here: a recorded voice message cannot be transcribed, so refuse it before
-        // anything is fetched. A sound file takes the path below.
-        #[cfg(not(target_os = "macos"))]
-        if attachment.kind == IncomingAttachmentKind::Voice {
-            return Ok(Some(
-                self.reject_voice_message(ctx, attachment.caption.as_deref(), attachment.urgent)
-                    .await,
-            ));
-        }
 
         // Declared-size gate: a file the mode in force cannot carry is refused before a transfer is
         // spent on it, in the words of the limit that applies here.
@@ -2302,23 +2281,6 @@ impl TelegramChannel {
             tracing::warn!(%notice, "Failed to send refusal notice: {e}");
         }
         ctx.into_channel_message(content, None)
-    }
-
-    /// Refuse a recorded voice message before the fetch, where no local audio exists. The note
-    /// names no file: the message has no name and the generated one has the wrong extension.
-    #[cfg(not(target_os = "macos"))]
-    async fn reject_voice_message(
-        &self,
-        ctx: MessageContext,
-        caption: Option<&str>,
-        urgent: bool,
-    ) -> ChannelMessage {
-        let notice = format!("Could not process the voice message: {VOICE_UNSUPPORTED_REASON}.");
-        let content =
-            attachment_rejection_content(None, NOT_RECEIVED, VOICE_UNSUPPORTED_REASON, caption);
-        let mut msg = self.refuse_with_notice(ctx, &notice, content).await;
-        msg.urgent = urgent;
-        msg
     }
 
     /// What Telegram says about a message being forwarded content: the modern `forward_origin`

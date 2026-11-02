@@ -42,8 +42,8 @@ Usage:
   mahbot paused          Launch the daemon with every managed workspace
                          paused (no ticket is claimed or advanced)
   mahbot audio <operation> [flags]
-                         Speech on the command line (macOS): a recording into
-                         text, text into a spoken WAV file
+                         Speech on the command line: a recording into text on
+                         every platform, text into a spoken WAV file (macOS)
   mahbot chrome <args>   Browser automation CLI over the shared chrome core
   mahbot debug           Read-only SQL query tool against the live stores
   mahbot bench-openrouter <args>

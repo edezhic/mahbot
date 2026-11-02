@@ -196,10 +196,10 @@ fn build_provider_and_transcriber(
 /// pre-warms the connection pool; `chat_scoped` must never observe an unset
 /// [`PROVIDER`], hence the swap-before-warmup ordering.
 ///
-/// The local Qwen3-ASR transcriber is not initialized here either: the model
-/// is loaded on first use — the voice stack's own demand
-/// ([`crate::audio::local_transcriber::spawn_background_init`]) or the first
-/// `ensure_loaded` from a consumer — so boot never preloads it.
+/// The local speech recogniser is not initialized here either: the model is
+/// loaded on first use — the voice stack's own demand
+/// ([`crate::speech::spawn_background_init`]) or the first transcription, which
+/// waits for that load — so boot never preloads it.
 pub fn init_global() -> anyhow::Result<()> {
     let config = CONFIG.snapshot();
     let (provider, media_transcriber) = build_provider_and_transcriber(&config);
@@ -254,9 +254,10 @@ pub(crate) async fn warmup_provider_from_config(
 /// duplicate network call; the provider-key persist arm passes `true` so
 /// the new credential's pool is pre-warmed in the background.
 ///
-/// The local Qwen3-ASR transcriber is deliberately not touched here: the model
-/// loads on first use (a voice message, or the voice stack's demand to listen),
-/// and a save that turns the setting on has its own load in the Settings toggle.
+/// The local speech recogniser is deliberately not touched here: the model loads on
+/// first use (a voice message, the composer's microphone, or the voice stack's demand
+/// to listen), and a save that turns the setting on has its own load in the Settings
+/// toggle.
 pub(crate) fn recreate_all(config: &crate::config::ConfigData, background_warmup: bool) {
     let (provider, media_transcriber) = build_provider_and_transcriber(config);
 

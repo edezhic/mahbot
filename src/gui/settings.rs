@@ -7,6 +7,7 @@
 use crate::Role;
 use crate::Workspace;
 use crate::channels::telegram_local::{self, Health, Mode};
+use crate::config::CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL;
 use crate::config::{
     CONFIG, CONFIG_KEY_AUTOUPDATE, CONFIG_KEY_DEEPSEEK_KEY, CONFIG_KEY_EXA_KEY,
     CONFIG_KEY_MANAGER_MODEL, CONFIG_KEY_PROVIDER_ENDPOINT, CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
@@ -15,16 +16,13 @@ use crate::config::{
     ConfigData, ModelRouting,
 };
 #[cfg(target_os = "macos")]
-use crate::config::{
-    CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, CONFIG_KEY_TTS_ENABLED, CONFIG_KEY_VOICE_ENABLED,
-};
+use crate::config::{CONFIG_KEY_TTS_ENABLED, CONFIG_KEY_VOICE_ENABLED};
 use crate::custom_role::{CustomRole, CustomRoleBehavior};
 use crate::tools::custom::ToolListing;
 use crate::tools::media_catalog::image::validate_image_model;
 use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
 
-#[cfg(target_os = "macos")]
 use iced::widget::Text;
 use iced::widget::text::IntoFragment;
 use iced::widget::{
@@ -404,20 +402,21 @@ pub enum SettingsMessage {
         model: String,
         ok: Result<(), String>,
     },
-    /// Toggle local transcription. OFF also turns Wake Word Detection off (both share the
-    /// loaded ASR model); ON kicks the model load/download in the background.
-    #[cfg(target_os = "macos")]
+    /// Toggle local transcription. OFF also turns Wake Word Detection off on macOS (both share
+    /// the loaded ASR model); ON kicks the model load/download in the background.
     TranscriptionToggle(bool),
-    /// The toggle persist's result: `voice_was_enabled` lets a failure roll both keys (and the
-    /// pipeline) back; `generation` drops results from a superseded toggle.
-    #[cfg(target_os = "macos")]
+    /// The toggle persist's result: the wake-word cascade flag lets a failure roll both keys
+    /// (and the pipeline) back; `generation` drops results from a superseded toggle.
     TranscriptionToggleResult {
         generation: u64,
-        voice_was_enabled: bool,
+        /// Whether this toggle cascaded Wake Word Detection off — a macOS-only cascade, so the
+        /// flag exists only there.
+        #[cfg(target_os = "macos")]
+        cascade_wake_word: bool,
         result: Result<(), String>,
     },
-    /// Retry the ASR model load after a terminal failure — re-toggling alone cannot recover.
-    #[cfg(target_os = "macos")]
+    /// Retry the recogniser's model load after a terminal failure — re-toggling alone cannot
+    /// recover.
     RetryTranscription,
     /// Toggle voice assistant on/off (immediately activates/deactivates the pipeline).
     #[cfg(target_os = "macos")]
@@ -462,7 +461,7 @@ const TEXT_INPUT_KEYS: &[&str] = &[
 
 /// Config keys rendered as discrete controls, persisted at once on change.
 /// `audio_transcription_use_local` is not one of them: it has its own transactional
-/// [`SettingsMessage::TranscriptionToggle`] persist path (macOS only).
+/// [`SettingsMessage::TranscriptionToggle`] persist path.
 const IMMEDIATE_KEYS: &[&str] = &[CONFIG_KEY_WEB_SEARCH_PROVIDER, CONFIG_KEY_AUTOUPDATE];
 
 const CONFIG_FIELD_PROVIDER_ENDPOINT: &str = "config:provider_endpoint";
@@ -580,7 +579,6 @@ pub struct SettingsState {
     voice_toggle_gen: u64,
     /// Generation counter for transcription toggles: bumped before each one, so stale
     /// results drop.
-    #[cfg(target_os = "macos")]
     transcription_toggle_gen: u64,
 
     /// Generation counter for TTS toggles: bumped before each one, so stale results drop.
@@ -598,6 +596,19 @@ fn sync_voice_state(enabled: bool) {
         crate::audio::voice::set_enabled(false);
         crate::audio::voice::send_command(crate::audio::voice::VoiceCommand::StopListening);
     }
+}
+
+/// Persist the transcription toggle: enabled → the row is deleted (absence = enabled), disabled →
+/// `"false"`. `cascade_voice_off` clears the wake word's row in the same transaction — only macOS
+/// has a wake word to cascade, so the flag is false everywhere else.
+async fn persist_transcription_toggle(
+    enabled: bool,
+    cascade_voice_off: bool,
+) -> Result<(), String> {
+    crate::config_db::store()
+        .set_transcription_toggle(enabled, cascade_voice_off)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The custom-role prompt editor's resizing range: it grows with its text up to the maximum
@@ -655,7 +666,6 @@ impl SettingsState {
             model_picker_inputs: std::array::from_fn(|_| SingleLineEditorState::new("")),
             #[cfg(target_os = "macos")]
             voice_toggle_gen: 0,
-            #[cfg(target_os = "macos")]
             transcription_toggle_gen: 0,
             #[cfg(target_os = "macos")]
             tts_toggle_gen: 0,
@@ -815,7 +825,6 @@ impl SettingsState {
 
     /// Mirror a config value into both `self.config` and the global `CONFIG`, so a refresh()
     /// cannot revert the change.
-    #[cfg(target_os = "macos")]
     fn set_both(&mut self, key: &str, value: &str) {
         let _ = self.config.set_string_field(key, value);
         let _ = crate::config::CONFIG.set_string_field(key, value);
@@ -1376,52 +1385,50 @@ impl SettingsState {
                 Task::none()
             }
 
-            #[cfg(target_os = "macos")]
             SettingsMessage::TranscriptionToggle(enabled) => {
                 self.transcription_toggle_gen += 1;
                 let generation = self.transcription_toggle_gen;
-                let voice_was_enabled = self.config.voice_enabled.as_deref() == Some("true");
+                // Turning transcription OFF also turns Wake Word Detection OFF: a cascade only
+                // macOS has a wake word to apply (they share the loaded recogniser).
+                let cascade_wake_word = cfg!(target_os = "macos")
+                    && !enabled
+                    && self.config.voice_enabled.as_deref() == Some("true");
                 // enabled → "" = absent row; disabled → "false": the persisted row semantics.
                 let transcription_value = if enabled { "" } else { "false" };
                 self.set_both(
                     CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL,
                     transcription_value,
                 );
-                // Turning transcription OFF also turns Wake Word Detection OFF (shared ASR model).
-                if !enabled && voice_was_enabled {
+                #[cfg(target_os = "macos")]
+                if cascade_wake_word {
                     self.set_both(CONFIG_KEY_VOICE_ENABLED, "");
                     sync_voice_state(false);
                 }
                 // Toggle ON: kick the model load/download now — cache first, else with retries.
                 // spawn_background_init claims Uninit→Loading with the same panic→Failed guard
                 // every background load uses, so a raw spawn could not strand it in Loading.
-                if enabled && !crate::audio::local_transcriber::is_loaded() {
-                    if !crate::audio::local_transcriber::retry_init() {
-                        crate::audio::local_transcriber::spawn_background_init();
+                if enabled && !crate::speech::is_loaded() {
+                    if !crate::speech::retry_init() {
+                        crate::speech::spawn_background_init();
                     }
                 }
                 // Wake the voice pipeline so it re-reads config: its 1s timer is parked while
                 // transcription is disabled, and a re-enable must re-resolve status and auto-start.
                 crate::audio::voice::send_command(crate::audio::voice::VoiceCommand::ConfigChanged);
                 Task::perform(
-                    async move {
-                        let store = crate::config_db::store();
-                        store
-                            .set_transcription_toggle(enabled, !enabled && voice_was_enabled)
-                            .await
-                            .map_err(|e| e.to_string())
-                    },
+                    persist_transcription_toggle(enabled, cascade_wake_word),
                     move |result| SettingsMessage::TranscriptionToggleResult {
                         generation,
-                        voice_was_enabled,
+                        #[cfg(target_os = "macos")]
+                        cascade_wake_word,
                         result,
                     },
                 )
             }
-            #[cfg(target_os = "macos")]
             SettingsMessage::TranscriptionToggleResult {
                 generation,
-                voice_was_enabled,
+                #[cfg(target_os = "macos")]
+                cascade_wake_word,
                 result,
             } => {
                 // Ignore results from a superseded toggle (rapid re-toggle).
@@ -1438,7 +1445,8 @@ impl SettingsState {
                         let restore = if currently_off { "" } else { "false" };
                         self.set_both(CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, restore);
                         // Restore the wake-word state the cascade disabled.
-                        if voice_was_enabled {
+                        #[cfg(target_os = "macos")]
+                        if cascade_wake_word {
                             self.set_both(CONFIG_KEY_VOICE_ENABLED, "true");
                             sync_voice_state(true);
                         }
@@ -1446,9 +1454,8 @@ impl SettingsState {
                     }
                 }
             }
-            #[cfg(target_os = "macos")]
             SettingsMessage::RetryTranscription => {
-                let _ = crate::audio::local_transcriber::retry_init();
+                let _ = crate::speech::retry_init();
                 Task::none()
             }
 
@@ -1791,14 +1798,11 @@ impl SettingsState {
             .push(Space::new().height(16))
             .push(self.integrations_section())
             .push(Space::new().height(16));
-        // Audio section — macOS only.
-        #[cfg(target_os = "macos")]
+        // Audio section: transcription everywhere, the wake word and text-to-speech on macOS.
         let config_sections = config_sections
             .push(self.audio_section())
             .push(Space::new().height(16));
-        // Users section — directly under Audio, or under whatever section
-        // precedes it where Audio is not shown. Pushed outside the macOS-only
-        // block so every build keeps it, and always before About.
+        // Users section — directly under Audio, and always before About.
         let config_sections = config_sections
             .push(self.users_section())
             .push(Space::new().height(16))
@@ -3378,25 +3382,21 @@ impl SettingsState {
         .into()
     }
 
-    // One 'Audio' section with three rows — Transcription, Wake Word Detection, Text to
-    // Speech — each with its toggle, inline status and a hover hint, plus the wake-word
-    // enrollment controls below. The section does not exist off macOS.
+    // One 'Audio' section: the Transcription row everywhere, plus — on macOS only — Wake Word
+    // Detection with its enrollment controls and Text to Speech, each with its toggle, inline
+    // status and a hover hint.
 
-    #[cfg(target_os = "macos")]
-    #[expect(clippy::too_many_lines)]
     fn audio_section(&self) -> Element<'_, SettingsMessage> {
         let transcription_enabled =
             self.config.audio_transcription_use_local.as_deref() != Some("false");
-        let voice_enabled = self.config.voice_enabled.as_deref() == Some("true");
-        let status = crate::audio::voice::get_status();
 
         let transcription_status: Element<'_, SettingsMessage> = if !transcription_enabled {
             disabled_status()
-        } else if crate::audio::local_transcriber::is_loaded() {
+        } else if crate::speech::is_loaded() {
             status_label("Ready")
-        } else if crate::audio::local_transcriber::is_failed() {
-            retry_status_row("Download failed", SettingsMessage::RetryTranscription)
-        } else if crate::audio::local_transcriber::is_loading() {
+        } else if crate::speech::is_failed() {
+            retry_status_row("Model unavailable", SettingsMessage::RetryTranscription)
+        } else if crate::speech::is_loading() {
             status_label("Loading…")
         } else {
             status_label("Loads on first use")
@@ -3414,6 +3414,24 @@ impl SettingsState {
             ),
             "Voice message transcription",
         );
+
+        let column = Column::new().push(transcription_row);
+        #[cfg(target_os = "macos")]
+        let column = self.macos_audio_rows(column, transcription_enabled);
+        section("Audio", column)
+    }
+
+    /// The Audio rows only macOS has — Wake Word Detection with its enrollment controls, and Text
+    /// to Speech: the wake-word encoder and the speech synthesiser exist on no other platform.
+    #[cfg(target_os = "macos")]
+    #[expect(clippy::too_many_lines)]
+    fn macos_audio_rows<'a>(
+        &'a self,
+        mut column: Column<'a, SettingsMessage>,
+        transcription_enabled: bool,
+    ) -> Column<'a, SettingsMessage> {
+        let voice_enabled = self.config.voice_enabled.as_deref() == Some("true");
+        let status = crate::audio::voice::get_status();
 
         // Live status: voice status changes are broadcast as runtime-change events, so the
         // rendered pipeline state is current after each one. With transcription off the status
@@ -3615,10 +3633,8 @@ impl SettingsState {
             _ => None,
         };
 
-        let mut column = Column::new()
-            .push(transcription_row)
-            .push(wake_row)
-            .push(tts_row);
+        column = column.push(wake_row);
+        column = column.push(tts_row);
         if voice_enabled && transcription_enabled {
             column = column.push(Space::new().height(8));
             column = column.push(enroll_btn);
@@ -3627,7 +3643,7 @@ impl SettingsState {
             column = column.push(ui);
         }
 
-        section("Audio", column)
+        column
     }
 
     fn integrations_section(&self) -> Element<'_, SettingsMessage> {
@@ -4034,7 +4050,6 @@ fn inline_label<'a>(
 }
 
 /// Plain-text inline status cell at the default size: the audio-row status arms.
-#[cfg(target_os = "macos")]
 fn status_label<'a>(msg: impl IntoFragment<'a>) -> Element<'a, SettingsMessage> {
     Text::new(msg).size(theme::TEXT_13).into()
 }
@@ -4051,7 +4066,6 @@ fn inline_warning(msg: &str, left_pad: f32) -> Element<'_, SettingsMessage> {
 }
 
 /// The gray "Disabled" inline status label shared by the audio rows.
-#[cfg(target_os = "macos")]
 fn disabled_status() -> Element<'static, SettingsMessage> {
     text("Disabled")
         .size(theme::TEXT_13)
@@ -4061,7 +4075,6 @@ fn disabled_status() -> Element<'static, SettingsMessage> {
 
 /// A hover hint over the whole strip of a settings row: the row is stretched to the column
 /// so the hint answers the title, the toggle, the status and the empty tail alike.
-#[cfg(target_os = "macos")]
 fn row_hint<'a>(
     row: Element<'a, SettingsMessage>,
     hint: &'static str,
@@ -4069,8 +4082,7 @@ fn row_hint<'a>(
     widgets::tooltip_hint(container(row).width(Length::Fill), hint)
 }
 
-/// Toggle plus inline status side by side: the frame of the three audio rows.
-#[cfg(target_os = "macos")]
+/// Toggle plus inline status side by side: the frame of the audio rows.
 fn toggle_status_row<'a>(
     toggler: impl Into<Element<'a, SettingsMessage>>,
     status: impl Into<Element<'a, SettingsMessage>>,
@@ -4085,7 +4097,6 @@ fn toggle_status_row<'a>(
 }
 
 /// Inline "status label + Retry" row for a failed download / model load.
-#[cfg(target_os = "macos")]
 fn retry_status_row(
     label: &'static str,
     on_retry: SettingsMessage,
