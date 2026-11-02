@@ -683,9 +683,9 @@ impl ConfigReload {
             .cloned()
     }
 
-    /// The effective routing: the stored order (Settings → Provider Routing)
-    /// wins, else [`default_model_routing`], so a cleared field behaves exactly
-    /// as if that provider had been set.
+    /// The effective routing: the stored order (Settings → Provider → Models settings →
+    /// Provider Routing) wins, else [`default_model_routing`], so a cleared field behaves
+    /// exactly as if that provider had been set.
     #[must_use]
     pub(crate) fn model_routing(&self, model: &str) -> ModelRouting {
         // No stored order → the model's default provider; see `default_model_routing`.

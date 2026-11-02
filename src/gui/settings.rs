@@ -275,13 +275,15 @@ fn picker_list_key(t: ModelPickerTarget) -> &'static str {
 /// Whether a field belongs to the Models popup: a failed save there reopens it, so its
 /// inline error is never hidden behind a closed window.
 fn is_model_setting_field(field: &str) -> bool {
-    matches!(
-        field,
-        CONFIG_FIELD_IMAGE_GEN_MODELS | CONFIG_FIELD_VIDEO_MODELS
-    ) || matches!(
-        field.strip_prefix("config:"),
-        Some(CONFIG_KEY_MANAGER_MODEL | CONFIG_KEY_WORKER_MODEL)
-    )
+    field.starts_with("routing_order:")
+        || matches!(
+            field,
+            CONFIG_FIELD_IMAGE_GEN_MODELS | CONFIG_FIELD_VIDEO_MODELS
+        )
+        || matches!(
+            field.strip_prefix("config:"),
+            Some(CONFIG_KEY_MANAGER_MODEL | CONFIG_KEY_WORKER_MODEL)
+        )
 }
 
 /// Which password field the visibility toggle applies to.
@@ -713,7 +715,7 @@ impl SettingsState {
     }
 
     /// Ensure a routing-order editor exists for the two routable slots
-    /// (manager + worker), the set reflected by [`Self::routing_section`].
+    /// (manager + worker), the set reflected by [`Self::routing_group`].
     ///
     /// Insert-if-absent: an existing routing editor's undo stack and caret are
     /// never reset, so a model that already has a routing row keeps its editor
@@ -1789,15 +1791,6 @@ impl SettingsState {
             .push(Space::new().height(16))
             .push(self.integrations_section())
             .push(Space::new().height(16));
-        // With a custom chat endpoint active, provider routing is a no-op —
-        // hide the section entirely.
-        let config_sections = if !self.custom_endpoint_active_ui() {
-            config_sections
-                .push(self.routing_section())
-                .push(Space::new().height(16))
-        } else {
-            config_sections
-        };
         // Audio section — macOS only.
         #[cfg(target_os = "macos")]
         let config_sections = config_sections
@@ -3296,7 +3289,8 @@ impl SettingsState {
             Column::with_children(rows)
                 .spacing(theme::SPACE_4)
                 .push(Space::new().height(theme::SPACE_4))
-                // The model slots and lists live only in the popup this opens.
+                // The model slots, the model lists and provider routing live only in the
+                // popup this opens.
                 .push(
                     button(text("Models settings").size(theme::TEXT_12))
                         .style(theme::button_secondary)
@@ -3305,10 +3299,11 @@ impl SettingsState {
         )
     }
 
-    /// The model settings: the two model slots and the two model lists, with their add/remove
-    /// controls and inline errors. Rendered only inside the Models settings popup.
+    /// The model settings: the two model slots, their provider routing, and the two model
+    /// lists, with their add/remove controls and inline errors. Rendered only inside the
+    /// Models settings popup.
     fn models_body(&self) -> Column<'_, SettingsMessage> {
-        column![
+        let mut body = column![
             self.config_model_slot_field(
                 crate::config::DEFAULT_MANAGER_MODEL,
                 CONFIG_KEY_MANAGER_MODEL,
@@ -3319,10 +3314,19 @@ impl SettingsState {
                 CONFIG_KEY_WORKER_MODEL,
                 "Analyst, Worker, QA, Reviewer, Sanitation",
             ),
-            Space::new().height(12),
-            widgets::section_subheading("Image Generation"),
-            Space::new().height(2),
-            model_picker_list(
+        ]
+        .spacing(theme::SPACE_4);
+        if let Some(routing) = self.routing_group() {
+            body = body
+                .push(Space::new().height(12))
+                .push(widgets::section_subheading("Provider Routing"))
+                .push(Space::new().height(2))
+                .push(routing);
+        }
+        body.push(Space::new().height(12))
+            .push(widgets::section_subheading("Image Generation"))
+            .push(Space::new().height(2))
+            .push(model_picker_list(
                 ModelPickerTarget::ImageGen,
                 self.config.image_gen_models.as_deref(),
                 &self.model_picker_inputs[ModelPickerTarget::ImageGen.idx()],
@@ -3330,11 +3334,11 @@ impl SettingsState {
                 self.field_errors
                     .get(CONFIG_FIELD_IMAGE_GEN_MODELS)
                     .map(String::as_str),
-            ),
-            Space::new().height(12),
-            widgets::section_subheading("Video Generation"),
-            Space::new().height(2),
-            model_picker_list(
+            ))
+            .push(Space::new().height(12))
+            .push(widgets::section_subheading("Video Generation"))
+            .push(Space::new().height(2))
+            .push(model_picker_list(
                 ModelPickerTarget::Video,
                 self.config.video_models.as_deref(),
                 &self.model_picker_inputs[ModelPickerTarget::Video.idx()],
@@ -3342,9 +3346,7 @@ impl SettingsState {
                 self.field_errors
                     .get(CONFIG_FIELD_VIDEO_MODELS)
                     .map(String::as_str),
-            ),
-        ]
-        .spacing(theme::SPACE_4)
+            ))
     }
 
     /// The Models settings popup: the model body kept within the room the window leaves under
@@ -3906,61 +3908,62 @@ impl SettingsState {
         .into()
     }
 
-    fn routing_section(&self) -> Element<'_, SettingsMessage> {
-        // Only the two model slots are routed; saved rows for other models are inert orphans.
-        let model_names = routing_slots(&self.config);
-
-        let mut rows: Vec<Element<'_, SettingsMessage>> = Vec::new();
-        for (i, model_name) in model_names.iter().enumerate() {
-            // `section_impl` clamps content spacing to 4px, so a 4px spacer row between pairs
-            // yields the 12px group gap while each label sits tight (2px) above its own input.
-            if i > 0 {
-                rows.push(Space::new().height(4).into());
-            }
-            let display_name = model_name.clone();
-            let order_model = model_name.clone();
-            let order_field = format!("routing_order:{model_name}");
-            let order_submit = SettingsMessage::ConfigFieldSettleNow {
-                field: order_field.clone(),
-            };
-            let order_error = self.field_errors.get(&order_field).map(String::as_str);
-            // Placeholder: the provider an empty field falls back to, as the request carries.
-            let placeholder = crate::config::default_model_routing(model_name).unwrap_or("");
-            let order_input: Element<'_, SettingsMessage> = widgets::single_line_editor(
-                &self.field_editor(&order_field).buffer,
-                placeholder,
-                true,
-                Length::Fill,
-                Some(Id::from(order_field.clone())),
-                move |action| {
-                    if matches!(action, EditorAction::Submit) {
-                        order_submit.clone()
-                    } else {
-                        SettingsMessage::ModelRoutingOrder {
-                            model: order_model.clone(),
-                            action,
-                        }
-                    }
-                },
-            );
-
-            let row = column![
-                // Model name label (read-only), the same face as the image and video rows.
-                text(display_name).size(theme::TEXT_12),
-                order_input,
-            ]
-            .spacing(theme::SPACE_2);
-
-            rows.push(if let Some(err) = order_error {
-                column![row, inline_error(err, 0.0)]
-                    .spacing(theme::SPACE_2)
-                    .into()
-            } else {
-                row.into()
-            });
+    /// The provider routing rows: the saved provider order per routable model slot. None while
+    /// a custom chat endpoint is in use — routing is then a no-op.
+    fn routing_group(&self) -> Option<Element<'_, SettingsMessage>> {
+        if self.custom_endpoint_active_ui() {
+            return None;
         }
 
-        section("OpenRouter Provider Routing", Column::from_iter(rows))
+        let rows: Vec<Element<'_, SettingsMessage>> = routing_slots(&self.config)
+            .into_iter()
+            .map(|model| {
+                let field = format!("routing_order:{model}");
+                let order_model = model.clone();
+                let order_submit = SettingsMessage::ConfigFieldSettleNow {
+                    field: field.clone(),
+                };
+                let order_error = self.field_errors.get(&field).map(String::as_str);
+                // Placeholder: the provider an empty field falls back to, as the request carries.
+                let order_input: Element<'_, SettingsMessage> = widgets::single_line_editor(
+                    &self.field_editor(&field).buffer,
+                    crate::config::default_model_routing(&model).unwrap_or(""),
+                    true,
+                    Length::Fill,
+                    Some(Id::from(field.clone())),
+                    move |action| {
+                        if matches!(action, EditorAction::Submit) {
+                            order_submit.clone()
+                        } else {
+                            SettingsMessage::ModelRoutingOrder {
+                                model: order_model.clone(),
+                                action,
+                            }
+                        }
+                    },
+                );
+
+                let row = column![
+                    // Model name label (read-only), the same face as the image and video rows.
+                    text(model)
+                        .size(theme::TEXT_12)
+                        .width(Length::Fill)
+                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+                    order_input,
+                ]
+                .spacing(theme::SPACE_2);
+
+                if let Some(err) = order_error {
+                    column![row, inline_error(err, 0.0)]
+                        .spacing(theme::SPACE_2)
+                        .into()
+                } else {
+                    row.into()
+                }
+            })
+            .collect();
+
+        Some(Column::with_children(rows).spacing(theme::SPACE_4).into())
     }
 }
 
@@ -4900,13 +4903,13 @@ mod tests {
     ///
     /// The routing-row editor state is keyed by the current manager/worker
     /// model, but that editor was only created for the models present when the
-    /// page loaded. Typing a different model re-keyed [`SettingsState::routing_section`]
+    /// page loaded. Typing a different model re-keyed [`SettingsState::routing_group`]
     /// to a model with no editor, and the render-time lookup panicked. The fix
     /// seeds routing editors (insert-if-absent) at every manager/worker model
     /// mutation window and makes the render lookup panic-free.
     ///
     /// Exercises the routing render path directly (no voice/audio pipeline) by
-    /// calling `routing_section()` and dropping the returned Element before
+    /// calling `routing_group()` and dropping the returned Element before
     /// mutating state again.
     #[expect(clippy::too_many_lines)] // long but linear state-transition fixture
     #[test]
@@ -4941,7 +4944,7 @@ mod tests {
             Some(String::new()),
             "mid-edit: routing row seeded for the newly-typed model"
         );
-        let _ = state.routing_section(); // must not panic
+        let _ = state.routing_group(); // must not panic
 
         // Saved routing order is displayed, not replaced by empty.
         let _ = state.update(SettingsMessage::ConfigField {
@@ -4956,7 +4959,7 @@ mod tests {
             Some("SavedOrder".into()),
             "a model with a saved routing order shows that order"
         );
-        let _ = state.routing_section(); // must not panic
+        let _ = state.routing_group(); // must not panic
 
         // Post-persist window: the injectable persist result applies the
         // canonical value and the existing routing editor keeps its text/undo.
@@ -4986,7 +4989,7 @@ mod tests {
             Some("SavedOrder".into()),
             "post-persist: the routing editor is not reset to empty"
         );
-        let _ = state.routing_section(); // must not panic
+        let _ = state.routing_group(); // must not panic
 
         // A routing-order persist whose value already matches the editor must
         // NOT rewrite the editor (which would drop its undo stack / caret).
@@ -5006,7 +5009,7 @@ mod tests {
             Some("SavedOrder".into()),
             "routing-order persist with identical value preserves the editor (undo/caret kept)"
         );
-        let _ = state.routing_section(); // must not panic
+        let _ = state.routing_group(); // must not panic
 
         // Clear-to-empty coercion: whitespace falls back to the default
         // manager model, whose routing row renders without a panic.
@@ -5019,7 +5022,7 @@ mod tests {
             state.field_editors.contains_key(&default_field),
             "clear-to-empty coerces to the default manager model; its routing row is seeded"
         );
-        let _ = state.routing_section(); // must not panic
+        let _ = state.routing_group(); // must not panic
 
         // Worker model edit seeds its own routing row; manager==worker
         // collapses into a single routing row (no duplicates).
@@ -5047,7 +5050,7 @@ mod tests {
             .filter(|k| k.starts_with("routing_order:common-model"))
             .count();
         assert_eq!(deduped, 1, "manager==worker dedups to a single routing row");
-        let _ = state.routing_section(); // must not panic
+        let _ = state.routing_group(); // must not panic
     }
 
     /// Closing the Models settings popup is not a cancel, but a model save that
@@ -5098,6 +5101,17 @@ mod tests {
         let _ = state.models_dialog(); // must not panic
 
         close(&mut state);
+        let _ = state.update(SettingsMessage::ConfigFieldSaveResult {
+            field: "routing_order:vendor/model".into(),
+            generation: 0,
+            result: Err("refused".into()),
+        });
+        assert!(
+            state.models_popup_open,
+            "a failed provider-routing save reopens the popup"
+        );
+
+        close(&mut state);
         let _ = state.update(SettingsMessage::ModelPickerAddResult {
             target: ModelPickerTarget::ImageGen,
             model: "vendor/text-only".into(),
@@ -5120,7 +5134,7 @@ mod tests {
                 None,
             ),
             (
-                "the routing section hides while a custom endpoint is staged",
+                "provider routing hides while a custom endpoint is staged",
                 Some("http://localhost:11434/v1"),
                 None,
             ),
@@ -5138,7 +5152,10 @@ mod tests {
             let mut state = SettingsState::new();
             assert_eq!(state.config.provider_endpoint, None, "case {name}: unset");
             assert!(!state.custom_revealed, "case {name}: closed");
-            assert!(!state.custom_endpoint_active_ui(), "case {name}: routing");
+            assert!(
+                state.routing_group().is_some(),
+                "case {name}: routing shown"
+            );
 
             // ON reveals only: nothing persisted, no settle armed, the snapshot untouched.
             let _task = state.update(SettingsMessage::CustomEndpointToggle(true));
@@ -5152,6 +5169,10 @@ mod tests {
                     value: url.into(),
                 });
                 assert!(state.custom_endpoint_active_ui(), "case {name}: staged");
+                assert!(
+                    state.routing_group().is_none(),
+                    "case {name}: routing hidden"
+                );
             }
             if let Some(key) = staged_key {
                 let _ = state.update(SettingsMessage::ConfigField {
@@ -5175,6 +5196,7 @@ mod tests {
             );
             assert!(state.field_gen.contains_key(kp), "case {name}: armed");
             assert!(!state.custom_endpoint_active_ui(), "case {name}: back");
+            assert!(state.routing_group().is_some(), "case {name}: routing back");
 
             // A failed endpoint save re-closes the section and surfaces in the bottom banner.
             let _task = state.update(SettingsMessage::CustomEndpointToggle(true));
