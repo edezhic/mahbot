@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::git::commands::{parse_numstat_lines, run_git_output};
-use crate::pipeline::board::{Ticket, TicketComment, TicketPhase};
+use crate::pipeline::board::{Ticket, TicketComment, TicketLabel, TicketPhase};
 
 use iced::widget::{Column, Row, Space, button, column, container, markdown, row, text, tooltip};
 use iced::{Alignment, Element, Length, Task};
@@ -702,6 +702,11 @@ impl BoardState {
         tooltip_hint(pill, "Priority")
     }
 
+    fn label_badge<'a>(label: TicketLabel, metrics: PillMetrics) -> Element<'a, BoardMessage> {
+        let (fg, bg) = theme::ticket_label_color(label);
+        badge_pill(label.to_string(), (fg, bg), metrics)
+    }
+
     fn bounce_badge<'a>(
         bounce_count: i64,
         icon_size: f32,
@@ -1318,6 +1323,7 @@ impl BoardState {
 
         let mut badge_row = row![
             Self::priority_badge(ticket.priority, PILL_COMPACT),
+            Self::label_badge(ticket.label, PILL_COMPACT),
             Self::phase_badge(ticket.phase, PILL_COMPACT),
         ]
         .spacing(theme::SPACE_6);
@@ -1706,6 +1712,7 @@ impl BoardState {
             {
                 let mut badges = vec![
                     Self::priority_badge(ticket.priority, PILL_MODAL),
+                    Self::label_badge(ticket.label, PILL_MODAL),
                     Self::phase_badge(ticket.phase, PILL_MODAL),
                 ];
                 if let Some(bounce) =
@@ -1715,7 +1722,10 @@ impl BoardState {
                 }
                 badges.push(Space::new().width(Length::Fill).into());
                 badges.push(icon_row.into());
+                // `Fill` on the row, not just the spacer: a `Shrink` row sizes from its
+                // children, which leaves the spacer at zero and the actions after the chips.
                 Row::from_vec(badges)
+                    .width(Length::Fill)
                     .align_y(Alignment::Center)
                     .spacing(theme::SPACE_8)
                     .padding([theme::PAD_4, 0.0])

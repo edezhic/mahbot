@@ -7,7 +7,7 @@ use iced::border;
 use iced::widget::{checkbox, container, pick_list, scrollable, toggler};
 
 use crate::WorkspaceStatus;
-use crate::pipeline::board::TicketPhase;
+use crate::pipeline::board::{TicketLabel, TicketPhase};
 
 use iced_fonts::lucide;
 use std::sync::atomic::AtomicBool;
@@ -382,6 +382,26 @@ pub fn ticket_priority_color(priority: i64) -> (Color, Color) {
         _ => (
             Color::from_rgb(0.753, 0.816, 0.753),
             Color::from_rgb(0.114, 0.176, 0.114),
+        ),
+    }
+}
+
+/// The ticket's classification label as a `(foreground, background)` tuple — the badge-pill
+/// convention shared with `widgets::badge_pill`.
+#[must_use]
+pub const fn ticket_label_color(label: TicketLabel) -> (Color, Color) {
+    match label {
+        TicketLabel::Feat => (
+            Color::from_rgb(0.706, 0.878, 0.847),
+            Color::from_rgb(0.078, 0.239, 0.224),
+        ),
+        TicketLabel::Fix => (
+            Color::from_rgb(0.902, 0.780, 0.812),
+            Color::from_rgb(0.310, 0.153, 0.184),
+        ),
+        TicketLabel::Maint => (
+            Color::from_rgb(0.741, 0.741, 0.741),
+            Color::from_rgb(0.227, 0.227, 0.227),
         ),
     }
 }

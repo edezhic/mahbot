@@ -251,8 +251,9 @@ pub struct Ticket {
     /// Whether this ticket has been archived (hidden from normal listings).
     pub is_archived: bool,
     pub priority: i64,
-    /// Classification label, fixed at creation and never written again. It prefixes every commit
-    /// the pipeline makes for the ticket and decides whether the release changelog keeps it.
+    /// Classification label, fixed at creation and never written again. Shown as a chip on the
+    /// ticket's card and detail popup, it prefixes every commit the pipeline makes for the ticket
+    /// and decides whether the release changelog keeps it.
     pub label: TicketLabel,
     /// HEAD hash of the content the code reviewers were handed, as written by
     /// `verification::record_reviewed_base` for a round whose review ran and which then moved the
@@ -416,8 +417,9 @@ impl Ticket {
 ///
 /// Stated once, at creation (see [`CreateTicketTool`](crate::tools::ticket::CreateTicketTool));
 /// no writer updates it afterwards, so it never changes for the ticket's whole life. The product
-/// reads it only for the `[feat] `/`[fix] `/`[maint] ` prefix it puts on the ticket's pipeline
-/// commits. Stored like [`TicketPhase`]: lowercase snake_case matching the DB column values.
+/// shows it as a chip on the ticket's card and detail popup, and prefixes every pipeline commit
+/// subject with `[feat] `/`[fix] `/`[maint] `. Stored like [`TicketPhase`]: lowercase snake_case
+/// matching the DB column values.
 #[derive(Debug, Clone, Copy, PartialEq, strum::Display, strum::AsRefStr, strum::EnumIter)]
 #[strum(serialize_all = "snake_case")]
 pub enum TicketLabel {

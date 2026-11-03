@@ -365,10 +365,16 @@ pub fn badge_pill<'a, Message: 'a>(
     colors: (Color, Color),
     metrics: PillMetrics,
 ) -> Element<'a, Message> {
-    container(text(label).size(metrics.text_size).color(colors.0))
-        .padding(metrics.padding)
-        .style(theme::pill_style(colors.1))
-        .into()
+    container(
+        text(label)
+            .size(metrics.text_size)
+            .color(colors.0)
+            // Pill labels are chips: a squeezed row must not wrap one onto a second line.
+            .wrapping(iced::widget::text::Wrapping::None),
+    )
+    .padding(metrics.padding)
+    .style(theme::pill_style(colors.1))
+    .into()
 }
 
 /// Page/panel section heading: JetBrains Mono, 16px, secondary text color.
