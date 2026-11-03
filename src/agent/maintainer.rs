@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use std::fmt::Write;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use futures_util::future::join_all;
 
@@ -105,7 +105,7 @@ pub async fn run_maintainer_loop() {
         };
 
         if workspaces.is_empty() {
-            info!("Maintainer: no workspaces configured, skipping cycle");
+            debug!("Maintainer: no workspaces configured, skipping cycle");
             continue;
         }
 
