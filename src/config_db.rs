@@ -104,8 +104,7 @@ impl ConfigStore {
     /// deletes the `audio_transcription_use_local` row (absence = enabled), disabling writes
     /// `"false"`; turning transcription OFF while the wake word was on deletes
     /// `voice_enabled` in the same transaction, so a failure rolls back both keys and the
-    /// settings UI can never diverge from the DB. The cascade is macOS's alone — no other
-    /// platform has a wake word — and a caller elsewhere passes `false`.
+    /// settings UI can never diverge from the DB.
     pub async fn set_transcription_toggle(
         &self,
         transcription_enabled: bool,

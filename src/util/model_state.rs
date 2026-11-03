@@ -1,10 +1,9 @@
 //! Shared model-loading state machine wrapper: the lazy-load lifecycle every model set
 //! in this product goes through (Uninit→Loading→Ready/Failed).
 //!
-//! Extracted from the duplicated `AtomicU8` lifecycle blocks in the speech engines and the
-//! wake word's encoder: [`ModelLoadGuard`] unifies the byte-identical Loading→Failed Drop
-//! guard that keeps a panicking background load from leaving the state stuck in `Loading`.
-//! `crate::speech` and `crate::audio::voice` use it.
+//! Extracted from the duplicated `AtomicU8` lifecycle blocks in the speech engines:
+//! [`ModelLoadGuard`] unifies the byte-identical Loading→Failed Drop guard that keeps a
+//! panicking background load from leaving the state stuck in `Loading`. `crate::speech` uses it.
 //!
 //! Deliberate non-unifications: the per-module singletons keep their own container types
 //! (`OnceLock<RwLock<Option<_>>>` vs `Mutex<Option<_>>`) — unifying them would change

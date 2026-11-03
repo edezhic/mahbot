@@ -524,19 +524,6 @@ mod verbatim_prefix_tests {
     }
 }
 
-/// Resolve the per-user `~/.mahbot/models/` directory via the CONFIG storage root; `None` if the
-/// root is not initialized yet. Only the macOS wake word's encoder lives here
-/// (`crate::audio::models_subdir`); recognition and spoken replies read the machine-wide root
-/// (`crate::speech::models`). Because it follows the storage root, a `$HOME`-overridden sandbox
-/// resolves an empty models dir and re-downloads its model set instead of sharing the real cache.
-#[must_use]
-#[cfg(target_os = "macos")]
-pub(crate) fn models_dir() -> Option<PathBuf> {
-    crate::config::CONFIG
-        .try_storage_root()
-        .map(|root| root.join("models"))
-}
-
 /// Write a JSON record to `path` atomically: the whole payload to a sibling `json.tmp`, then a
 /// rename. A reader never sees a torn file, and a crash — a self-update kill included — leaves
 /// the previous record in place rather than half of a new one. The caller owns the payload and

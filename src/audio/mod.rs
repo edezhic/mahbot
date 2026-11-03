@@ -1,33 +1,20 @@
-//! Audio: the microphone and the voice command pipeline, the machine's audio output, and, on
-//! macOS only, wake word detection and its recording cues.
+//! Audio: the microphone, the voice command pipeline, wake-word detection and the machine's audio
+//! output.
 //!
 //! Capture goes through the platform's own host API (`cpal`: CoreAudio, WASAPI, ALSA), so the
 //! microphone and the pipeline that turns a recording into a composer message are on every
 //! platform. Recognition and spoken replies are not part of this subsystem: both live in
-//! [`crate::speech`] and are on every platform too.
+//! [`crate::speech`].
 //!
-//! macOS keeps what has no other-platform support: the wake word ([`wake_word`], encoding on
-//! the Qwen3-ASR encoder of [`encoder`]) and the wake-word recording cues ([`cue`]).
-//!
-//! Wake word detection runs entirely on the Qwen3-ASR encoder — no separate
-//! embedding model, no trainable head, no AGC/NS preprocessing.
+//! The wake word ([`wake_word`]) is on every platform too: it feeds VAD-gated windows to the
+//! inference crate's listener and acts on the decision, and its recording cues ([`cue`]) play
+//! through the shared output device.
 
-#[cfg(target_os = "macos")]
 pub(crate) mod cue;
-#[cfg(target_os = "macos")]
-pub(crate) mod encoder;
 pub(crate) mod output;
 pub(crate) mod util;
 pub mod voice;
-#[cfg(target_os = "macos")]
 pub(crate) mod wake_word;
-
-/// The per-user `~/.mahbot/models/` subdirectory the wake word's encoder owns. Recognition and
-/// spoken replies read the machine-wide root ([`crate::speech::models`]).
-#[cfg(target_os = "macos")]
-pub(crate) fn models_subdir(name: &str) -> Option<std::path::PathBuf> {
-    crate::util::models_dir().map(|dir| dir.join(name))
-}
 
 /// Open the speech output device at start when the owner has speech output on. No model is
 /// touched: both engines load on first use, and a phrase is not refused while a cold device
@@ -38,14 +25,15 @@ pub fn open_speech_output_if_enabled() {
     }
 }
 
-/// The old synthesiser's per-user model tree, deleted once: nothing reads it now, and its
-/// weights are hundreds of megabytes. A failure is said plainly — the tree is dead weight, not
-/// a reason to refuse anything.
-#[cfg(target_os = "macos")]
+/// The retired per-user model tree, deleted once: the old encoder, its weights, the cache file
+/// beside them and the orphan embedding model. Nothing reads that folder now — recognition and
+/// synthesis use the machine-wide root ([`crate::speech::models`]) — and its weights are
+/// gigabytes. A failure is said plainly: the tree is dead weight, not a reason to refuse anything.
 pub(crate) fn remove_retired_models() {
-    let Some(dir) = models_subdir("supertonic3") else {
+    let Some(root) = crate::config::CONFIG.try_storage_root() else {
         return;
     };
+    let dir = root.join("models");
     if !dir.exists() {
         return;
     }

@@ -44,7 +44,8 @@ pub(crate) fn root() -> Result<PathBuf> {
 /// its own fetch, so one engine never waits on the other's gigabytes.
 #[derive(Clone, Copy)]
 pub(crate) enum Purpose {
-    /// The recogniser's pair and the audio tagger every recognition call depends on.
+    /// The recogniser's pair and the audio tagger every recognition call depends on. The wake
+    /// word's listener runs on the same pair, so enabling it fetches this set too.
     Recognition,
     /// The synthesiser's talker pair.
     Synthesis,

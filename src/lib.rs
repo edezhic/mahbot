@@ -103,8 +103,8 @@ pub mod cli;
 // Loading and substitution for the embedded prompt assets.
 pub(crate) mod prompt;
 
-// The microphone-to-meaning stack: capture, the voice command pipeline, the machine's audio
-// output, and — on macOS only — the wake word and its recording cues.
+// The microphone-to-meaning stack: capture, the voice command pipeline, the wake word, and the
+// machine's audio output.
 pub mod audio;
 // The product's own speech engines on every platform: recognition, spoken replies, and the
 // machine-wide model set both read.

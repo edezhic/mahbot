@@ -417,7 +417,7 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::hyperframes::refresh_on_start().await;
     });
 
-    // Manages command recording, transcription and routing — and, on macOS, wake-word detection.
+    // Manages command recording, transcription, routing and wake-word detection.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,

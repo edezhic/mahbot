@@ -1,46 +1,34 @@
-//! Voice Assistant — the microphone and the voice command pipeline, and, on macOS only, wake
-//! word detection.
+//! Voice Assistant — the microphone, the voice command pipeline and wake-word detection.
 //!
 //! Every platform has the microphone (cpal) and the pipeline that turns a recording into a
 //! composer message: a press starts it, the press (or the ten-minute cap) ends it, and the
 //! recording goes to the recogniser in [`crate::speech`], which is where transcription lives now.
 //!
-//! macOS adds the wake word: Earshot VAD → a 1024-dim [`encode_window`] embedding of the trailing
-//! ≤1 s of VAD-gated speech, scored by cosine against the enrolled prototype → rolling-sum
-//! detection → command recording → the same recognition → the composer message. Wake word reuses
-//! the Qwen3-ASR encoder ([`crate::audio::encoder`]) and needs transcription enabled
-//! (`audio_transcription_use_local != "false"`); the pipeline runs unconditionally as a boot
-//! background task, with no agent loop.
+//! The wake word is on every platform too: Earshot VAD → the trailing [`WINDOW_SAMPLES`] (0.76 s)
+//! of VAD-gated speech → two consecutive windows embedded in one pass by the inference crate's
+//! listener → the engine's rolling decision → command recording → the same recognition → the
+//! composer message. It needs transcription enabled (`audio_transcription_use_local != "false"`);
+//! the pipeline runs unconditionally as a boot background task, with no agent loop.
 //!
-//! Each scoring step encodes the trailing [`WINDOW_SAMPLES`] (12 160 samples ≈ 0.76 s) of the
-//! VAD-gated speech window, once per [`SCORE_STRIDE_SAMPLES`] (2560 ≈ 160 ms, 16 mel frames ×
-//! 160-sample stride); the raw ring is capped at [`AUDIO_BUFFER_MAX`] (~2.0 s) and dropped on a
-//! fire, and a fire counts only near the start of its speech segment
-//! ([`WAKE_WORD_MAX_SEGMENT_STEPS`]).  Enrollment embeds ~10 utterances into their L2-normalized
-//! mean (no trainable head) and calibrates the cosine floor on owner and ambient negatives; it
-//! persists under `wake_word_templates` in the v2 schema, v1 records being rejected.
+//! One scoring step covers one window per [`SCORE_STRIDE_SAMPLES`] (2560 ≈ 160 ms) of speech; two
+//! windows are batched per encoder pass, which resolves a fire up to one stride later. The raw
+//! ring is capped at [`AUDIO_BUFFER_MAX`] (~2.0 s) and dropped on a fire, and a fire counts only
+//! near the start of its speech segment ([`wake::WAKE_WORD_MAX_SEGMENT_STEPS`]). Enrollment
+//! embeds ~10 utterances one clip at a time; the engine builds the prototype and calibration and
+//! the record persists under `wake_word_templates` in schema 3, older records being refused.
 
-#[cfg(target_os = "macos")]
 use crate::audio::cue::{self, Cue};
-#[cfg(target_os = "macos")]
-use crate::audio::util::cosine_similarity;
-#[cfg(target_os = "macos")]
-use crate::audio::wake_word::{
-    self, ENROLLMENT_CONSISTENCY_MIN_FRACTION, ENROLLMENT_CONSISTENCY_MIN_SIMILARITY,
-    MIN_ENROLLMENT_UTTERANCES, WAKE_WORD_EMBEDDING_DIM, WINDOW_SAMPLES, WakeWordEnrollment,
-    calibrate_negatives, encode_window, normalized_centroid,
-};
+use crate::audio::wake_word::{self, Detection, WakeDetector, WakeWordEnrollment};
 use crate::config::CONFIG;
-#[cfg(target_os = "macos")]
-use crate::config::CONFIG_KEY_WAKE_WORD_TEMPLATES;
-#[cfg(target_os = "macos")]
+use crate::config::{CONFIG_KEY_VOICE_ENABLED, CONFIG_KEY_WAKE_WORD_TEMPLATES};
 use crate::db;
 use crate::runtime_events::RuntimeEvent;
 use crate::util::UnwrapPoison;
 use crate::util::model_state::ModelState;
 use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-#[cfg(target_os = "macos")]
+use mahbot_inference::listen::{SCORE_STRIDE_SAMPLES, WINDOW_SAMPLES};
+use mahbot_inference::wake;
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -52,50 +40,43 @@ const SAMPLE_RATE: u32 = 16_000;
 
 /// Convert a sample count to milliseconds (truncating integer division —
 /// callers rely on exact threshold semantics).
-#[cfg(target_os = "macos")]
 #[must_use]
 fn samples_to_ms(len: usize, rate: u32) -> u64 {
     (len as u64 * 1000) / u64::from(rate)
 }
 
 /// Frame size for VAD / quality frames (512 samples = 32ms at 16kHz).
-#[cfg(target_os = "macos")]
 const FRAME_LENGTH: usize = 512;
 
 /// Hop between VAD frames (256 samples at 16 kHz): the VAD iteration stride and silence tracking.
-/// The Qwen3-ASR mel frontend strides its own 160 samples (10 ms) — [`HOP_LENGTH`] does not
-/// affect mel frame spacing.
-#[cfg(target_os = "macos")]
+/// The inference crate's mel frontend strides its own 160 samples (10 ms) — [`HOP_LENGTH`] does
+/// not affect mel frame spacing.
 const HOP_LENGTH: usize = 256;
 
 /// Maximum command recording duration (10 minutes).
 const MAX_RECORD_SECS: usize = 600;
 
 /// Minimum silence duration before stopping a wake-word command recording.
-#[cfg(target_os = "macos")]
 const COMMAND_SILENCE_DURATION: Duration = Duration::from_millis(1500);
 
 /// Silence threshold in samples, derived from [`COMMAND_SILENCE_DURATION`] × sample rate so it
 /// cannot silently drift if either changes.
-#[cfg(target_os = "macos")]
 const SILENCE_THRESHOLD_SAMPLES: usize =
     (COMMAND_SILENCE_DURATION.as_millis() as usize * SAMPLE_RATE as usize) / 1000;
 
 /// Enrollment/segmentation silence threshold (~304ms = 19 hops × 256 samples), aligned to
 /// [`SEGMENT_TIMEOUT_HOPS`] so training and inference find the same utterance boundaries.
 /// [`SILENCE_THRESHOLD_SAMPLES`] stays the command-recording one, where 1.5s suits phrasing.
-#[cfg(target_os = "macos")]
 const ENROLLMENT_SILENCE_THRESHOLD_SAMPLES: usize = SEGMENT_TIMEOUT_HOPS * HOP_LENGTH;
 
 /// Silence threshold (200ms) before the "Keep silent to confirm…" hint — wider than one frame
 /// (16ms) so the UI transitions even under scheduling jitter.
-#[cfg(target_os = "macos")]
 const SILENCE_UI_GATE_SAMPLES: usize = 200 * SAMPLE_RATE as usize / 1000;
 
 /// Capacity of the microphone channel feeding the pipeline: 32 chunks × 512 samples ≈ 1 s.  A
 /// full channel drops chunks at
-/// [`try_send`](tokio::sync::mpsc::Sender::try_send) while the pipeline is blocked (encoder
-/// inference in [`handle_wake_word_detection`]), so memory stays bounded.
+/// [`try_send`](tokio::sync::mpsc::Sender::try_send) while the pipeline is blocked (a wake-word
+/// pass in [`handle_wake_word_detection`]), so memory stays bounded.
 ///
 /// The policy is drop-newest: buffered audio lags ~1 s but stays temporally contiguous, so VAD,
 /// windowing and scoring still see consistent segments.  A wake word arriving entirely inside the
@@ -104,12 +85,10 @@ const MIC_CHANNEL_CAPACITY: usize = 32;
 
 /// Non-VAD audio before the enrollment "speak louder" warning (~5s); see the frame threshold
 /// derived from it below.
-#[cfg(target_os = "macos")]
 const ENROLLMENT_NO_SPEECH_DURATION: Duration = Duration::from_secs(5);
 
 /// The same window in frames, each iteration consuming [`HOP_LENGTH`] new samples, so the
 /// threshold survives frame or hop changes.
-#[cfg(target_os = "macos")]
 const ENROLLMENT_NO_SPEECH_TIMEOUT_FRAMES: usize =
     (ENROLLMENT_NO_SPEECH_DURATION.as_millis() as usize * SAMPLE_RATE as usize)
         / (HOP_LENGTH * 1000);
@@ -117,58 +96,45 @@ const ENROLLMENT_NO_SPEECH_TIMEOUT_FRAMES: usize =
 /// Consecutive VAD-negative hops before a detection segment boundary fires (~300 ms at 16 ms/hop).
 /// The boundary resets the rolling score window and adaptive threshold, so scores cannot
 /// accumulate across separate utterances.
-#[cfg(target_os = "macos")]
 const SEGMENT_TIMEOUT_HOPS: usize = 19;
 
-#[cfg(target_os = "macos")]
 const NUM_ENROLLMENT_SAMPLES: usize = 10;
 
-#[cfg(target_os = "macos")]
 const MIN_NEGATIVE_AUDIO_LEN: usize = SAMPLE_RATE as usize / 2;
 
 /// Maximum number of ambient negative audio chunks retained in memory.
-#[cfg(target_os = "macos")]
 const MAX_NEGATIVE_AUDIO_CHUNKS: usize = 100;
 
-/// Maximum automatic retry cycles after a terminal model load failure.  One cycle is a full
-/// load-or-download chain (up to 12 download attempts × 1.88 GB in the encoder's retry loop),
-/// and the self-healing path stays inside this budget so a persistently failing download cannot
-/// loop forever (retry → 12 attempts → Failed → 30 s → retry → …).  Past it the pipeline stops
-/// auto-retrying: the user presses the GUI retry button
-/// ([`VoiceCommand::RetryModelLoading`], which bypasses the budget) or restarts.
+/// Maximum automatic retry cycles after a terminal model load failure. One cycle is a full
+/// load-or-download chain (the model set's own fetch retry loop), and the self-healing path stays
+/// inside this budget so a persistently failing download cannot loop forever (retry → Failed →
+/// 30 s → retry → …). Past it the pipeline stops auto-retrying: the user presses the GUI retry
+/// button ([`VoiceCommand::RetryModelLoading`], which bypasses the budget) or restarts.
 const MAX_AUTO_MODEL_RETRY_CYCLES: u32 = 3;
 
 /// Target VAD-positive speech seconds for Phase 3 owner-negative collection: enough real audio
 /// for calibration data and anti-prototypes while keeping the per-user phase short.
-#[cfg(target_os = "macos")]
 const NEGATIVES_TARGET_SECONDS: usize = 15;
 
 /// Memory cap for owner-negative chunks (~22.5 s of 16 kHz f32 audio).
 /// Auto-derived from [`NEGATIVES_TARGET_SECONDS`] (× 1.5 headroom).
-#[cfg(target_os = "macos")]
 const MAX_OWNER_NEGATIVE_SAMPLES: usize = SAMPLE_RATE as usize * NEGATIVES_TARGET_SECONDS * 3 / 2;
 
 /// Wall-clock timeout for Phase 3 owner-negative collection.
-#[cfg(target_os = "macos")]
 const PHASE3_TIMEOUT_SECS: u64 = 120;
 
 /// Clipping detection threshold for enrollment quality scoring.
-#[cfg(target_os = "macos")]
 const ENROLLMENT_QUALITY_CLIPPING_THRESHOLD: f32 = 0.999;
 
 /// Minimum acceptable enrollment utterance duration in milliseconds.
-#[cfg(target_os = "macos")]
 pub(crate) const ENROLLMENT_QUALITY_DURATION_MIN_MS: u64 = 400;
 
 /// Maximum acceptable enrollment utterance duration in milliseconds.
-#[cfg(target_os = "macos")]
 pub(crate) const ENROLLMENT_QUALITY_DURATION_MAX_MS: u64 = 2000;
 
 /// Fraction of utterances that must pass the enrollment self-test for the model to be accepted.
-#[cfg(target_os = "macos")]
 const ENROLLMENT_QUALITY_SELF_TEST_MIN_FRACTION: f32 = 0.8;
 
-#[cfg(target_os = "macos")]
 const ENROLLMENT_PROMPTS: &[(&str, usize)] = &[
     ("Say it normally", 3),
     ("Say it a bit further from the mic", 3),
@@ -176,248 +142,29 @@ const ENROLLMENT_PROMPTS: &[(&str, usize)] = &[
     ("Say it with your normal morning voice", 2),
 ];
 
-// Scoring geometry, re-calibrated for the 1024-dim cosine soft scores of
-// [`crate::audio::wake_word::encode_window`] + [`Calibration::soft_score`]: the old thresholds
-// scored a sigmoid Conv1D head, whose outputs sat far above these.  The floor is derived
-// parametrically from the negative mean/std ([`Calibration::soft_floor`]) and anchored at
-// [`POS_MATCH_COSINE_ANCHOR`] ([`Calibration::fire_soft`]), so a hotter negative pool never
-// crushes recall.
-
-/// Detection window: the trailing 0.76 s (12 160 samples) of the VAD-gated speech window — the
-/// [`WINDOW_SAMPLES`] geometry enrollment encodes.
-#[cfg(target_os = "macos")]
-const WAKE_WORD_WINDOW_SAMPLES: usize = WINDOW_SAMPLES;
-
-/// Scoring stride: 16 mel frames × 160-sample mel stride = 2560 samples ≈ 160 ms.  The encoder
-/// forward is heavy, so the stride is widened to keep the real-time budget sane; the rolling
-/// window (N=3) still spans ~0.5 s of speech.
-#[cfg(target_os = "macos")]
-const SCORE_STRIDE_SAMPLES: usize =
-    crate::audio::wake_word::SCORE_STRIDE_MEL_FRAMES * qwen_asr::config::HOP_LENGTH;
-
 /// Cap for the raw audio ring (~2.0 s): one [`WINDOW_SAMPLES`] window plus up to eight scoring
-/// strides (8 × 2560), so the VAD loop always has recent audio to consume while older samples
-/// drain.  Only the VAD reads it — the detection→recording handoff drops it wholesale.
-#[cfg(target_os = "macos")]
+/// strides, so the VAD loop always has recent audio to consume while older samples drain. Only the
+/// VAD reads it — the detection→recording handoff drops it wholesale.
 const AUDIO_BUFFER_MAX: usize = WINDOW_SAMPLES + 8 * SCORE_STRIDE_SAMPLES;
 
-/// Audio discarded at the start of a wake-word recording (0.2 s).  Everything captured before the
-/// fire is dropped outright, and this covers the detection lag plus the start cue ([`Cue::Start`],
-/// ~70 ms, which the still-open microphone captures).  The price is the opening of the command —
-/// up to ~0.5 s when detection lands late — traded for keeping the trigger phrase out of the
-/// recognition input; a trailing fragment survives if the phrase is still being spoken at the fire.
-/// Fixed product behaviour — there is no switch.
-#[cfg(target_os = "macos")]
+/// Audio discarded at the start of a wake-word recording: the start cue ([`Cue::Start`], ~70 ms,
+/// which the still-open microphone captures) and the opening of the command, at the price of that
+/// opening. The trigger phrase is kept out by dropping the pre-fire ring at the handoff, not by
+/// this window; the batched detection delay needs no extra room because it elapses before the
+/// recording starts. Fixed product behaviour — there is no switch.
 const POST_FIRE_DISCARD_SAMPLES: usize = 200 * SAMPLE_RATE as usize / 1000;
 
-/// Cooldown after a detection, so a rapid consecutive false trigger cannot follow.
-#[cfg(target_os = "macos")]
-const WAKE_WORD_COOLDOWN: Duration = Duration::from_secs(3);
-
-/// One stride-gated scoring step, recorded in the activation trace: ~160 ms each
-/// ([`SCORE_STRIDE_SAMPLES`]), so N=3 covers ~480 ms.
-#[cfg(target_os = "macos")]
-const ROLLING_WINDOW_N: usize = 3;
-
-/// Maximum position at which a fire is accepted, in stride-gated scoring steps since the first
-/// step of the current speech segment.  A segment starts at the first speech after
-/// [`SEGMENT_TIMEOUT_HOPS`] of silence ends the previous one, ends when silence returns; one step
-/// ≈ 160 ms, so six steps cover roughly the first 1.0 s of the segment.
-///
-/// Six is the owner's trade: the tighter window removes substantially more false fires.  Measured
-/// price against the earlier eight-step (~1.3 s) window: recognition 43/50 against 46/50 (two of
-/// the three lost commands were previously-firing wake-only clips, the third
-/// command-plus-other-speech), synthetic false accepts 19 of 121 against 36 of 121, and 15 merged
-/// fires (19 raw events) on the hour of real audio against 18 merged (22 raw).  Fixed product
-/// behaviour — there is no switch.
-#[cfg(target_os = "macos")]
-const WAKE_WORD_MAX_SEGMENT_STEPS: usize = 6;
-
-/// Number of recent per-frame scores to track for adaptive threshold
-/// statistics. At ~160 ms per frame, N=15 covers ~2.4 seconds of context.
-#[cfg(target_os = "macos")]
-const ADAPTIVE_WINDOW_N: usize = 15;
-
-/// Default k multiplier for the adaptive threshold (mean + k × std).
-#[cfg(target_os = "macos")]
-const ADAPTIVE_K_DEFAULT: f32 = 2.5;
-
-/// Ceiling the adaptive threshold must never exceed.  It sits above the anchored positive range:
-/// genuine 3-frame rolling sums stay ~1.5-2.5 across the whole derived floor range [0.55, 0.80],
-/// so 2.60 leaves headroom for a genuine wake while capping threshold drift from noise.
-#[cfg(target_os = "macos")]
-const ADAPTIVE_CEILING: f32 = 2.60;
-
-/// Bootstrap frames fed the static threshold while the adaptive window fills.
-#[cfg(target_os = "macos")]
-const ADAPTIVE_BOOTSTRAP_FRAMES: usize = 5;
-
-/// Static (non-adaptive) geometry, co-derived from the enrollment calibration: the rolling-sum
-/// firing threshold (`ROLLING_WINDOW_N × Calibration::fire_soft()`) and the per-frame reset line
-/// (`Calibration::reset_soft()`).  Without calibration the legacy operating point applies
-/// (threshold 1.65, reset ≈0.35).
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy)]
-struct DetectionGeometry {
-    static_threshold: f32,
-    reset: f32,
-}
-
-#[cfg(target_os = "macos")]
-impl DetectionGeometry {
-    fn for_enrollment(enrollment: Option<&WakeWordEnrollment>) -> Self {
-        let default_cal = crate::audio::wake_word::Calibration::default();
-        let cal = enrollment.map_or(&default_cal, |e| &e.calibration);
-        #[expect(clippy::cast_precision_loss)] // ROLLING_WINDOW_N ≤ 3 — exact in f32
-        Self {
-            static_threshold: (ROLLING_WINDOW_N as f32) * cal.fire_soft(),
-            reset: cal.reset_soft(),
-        }
-    }
-}
-
-/// Run one per-frame soft score through the rolling window and decide whether detection fires:
-/// true when the rolling sum reaches the geometry static threshold (co-derived from the enrollment
-/// calibration).  A score below [`DetectionGeometry::reset`] clears the window entirely, so noise
-/// cannot accumulate slowly.  The window is NOT cleared on fire — the caller owns full pipeline
-/// cleanup.  Pure: only `score_window` is modified, so it is testable without models or a pipeline.
-#[cfg(target_os = "macos")]
-fn process_wake_word_score(
-    total_score: f32,
-    score_window: &mut Vec<f32>,
-    geometry: DetectionGeometry,
-    adaptive_threshold_override: Option<f32>,
-) -> (bool, f32) {
-    let reset = geometry.reset;
-    if total_score < reset {
-        // Far from matching — clear the whole window, so noise cannot accumulate slowly.
-        if !score_window.is_empty() {
-            debug!(
-                "Wake word match lost: total_score={total_score:.4} < reset ({reset:.4}) \
-                 (window reset, had {} scores)",
-                score_window.len(),
-            );
-        }
-        score_window.clear();
-        (false, 0.0)
-    } else {
-        score_window.push(total_score);
-        while score_window.len() > ROLLING_WINDOW_N {
-            score_window.remove(0);
-        }
-
-        let rolling_sum: f32 = score_window.iter().sum();
-        let threshold = adaptive_threshold_override.unwrap_or(geometry.static_threshold);
-
-        debug!(
-            "Wake word score: total_score={total_score:.4} rolling_sum={rolling_sum:.4}/ \
-             threshold={threshold:.2} window={}",
-            score_window.len(),
-        );
-
-        if rolling_sum >= threshold {
-            info!(
-                "Wake word detected! rolling_sum={rolling_sum:.4} >= {threshold:.2} \
-                 (window={} scores)",
-                score_window.len(),
-            );
-            (true, rolling_sum)
-        } else {
-            (false, rolling_sum)
-        }
-    }
-}
-
-/// Score one window embedding: the cosine soft score against the enrolled prototype
-/// ([`WakeWordEnrollment::soft_score`]), fed or peeked into the adaptive threshold, then through
-/// the rolling window of [`process_wake_word_score`].  Shared by the live pipeline
-/// ([`handle_wake_word_detection`]) and the enrollment self-test ([`run_enrollment_self_test`]).
-/// Scoring is speaker-blind and this function adds no gate of its own — the live pipeline
-/// additionally requires the fire to sit within [`WAKE_WORD_MAX_SEGMENT_STEPS`] steps of the
-/// segment start.
-///
-/// Returns `(fired, rolling_sum, total_score, effective_threshold)`: `rolling_sum` is 0.0 when the
-/// window was just reset, `total_score` is 0.0 with no enrollment (detection then impossible), and
-/// `effective_threshold` is the adaptive value post-bootstrap, else the static one.  `score_window`
-/// persists across calls; `enrollment == None` disables detection and `adaptive_state == None` the
-/// adaptive adjustment.
-#[cfg(target_os = "macos")]
-fn score_single_embedding(
-    embedding: &[f32],
-    enrollment: Option<&WakeWordEnrollment>,
-    score_window: &mut Vec<f32>,
-    mut adaptive_state: Option<&mut AdaptiveThresholdState>,
-    adaptive_k: f32,
-) -> (bool, f32, f32, f32) {
-    // Cosine soft score against the enrolled prototype; with no enrollment the score is 0.0 and no
-    // detection is possible.
-    let total_score = enrollment.map_or(0.0, |enr| enr.soft_score(embedding));
-
-    // Detection geometry is co-derived from the enrollment calibration (static firing threshold and
-    // per-frame reset line); with no enrollment the default legacy calibration applies.
-    let geometry = DetectionGeometry::for_enrollment(enrollment);
-
-    // Feed only background scores to the adaptive threshold, so it learns the noise floor instead
-    // of being contaminated by the scores it is meant to detect. Frames below `geometry.reset` are
-    // clearly not the wake word; wake-word-like frames peek() instead, which returns the threshold
-    // without updating statistics — otherwise high scores inflate the threshold and block the
-    // detection they should allow. The same rule governs bootstrap: peek() answers `None` there, so
-    // the static threshold stays in effect and a high-scoring utterance legitimately keeps
-    // bootstrap alive. No wake-word-like score ever enters the statistics, so residual
-    // contamination cannot survive the soft reset.
-    let adaptive_override = adaptive_state.as_mut().and_then(|state| {
-        if total_score < geometry.reset {
-            state.feed(total_score, adaptive_k, geometry.static_threshold)
-        } else {
-            state.peek(adaptive_k, geometry.static_threshold)
-        }
-    });
-
-    let effective_threshold = adaptive_override.unwrap_or(geometry.static_threshold);
-
-    let (detected, rolling_sum) =
-        process_wake_word_score(total_score, score_window, geometry, adaptive_override);
-
-    // With the `voice-debug` feature, log every per-frame total_score, whether it passed the reset
-    // threshold, and the resulting rolling sum; the gate keeps it zero-overhead otherwise.
-    #[cfg(feature = "voice-debug")]
-    {
-        let passed_threshold = total_score >= geometry.reset;
-        let below_note = if passed_threshold {
-            ""
-        } else {
-            " (below reset threshold — window reset)"
-        };
-        info!("VOICE_DEBUG: total_score={total_score:.4}{below_note} rolling_sum={rolling_sum:.4}",);
-    }
-
-    // Immediate fire: no gate beyond the threshold crossing — the segment-position cut is the
-    // caller.
-    (detected, rolling_sum, total_score, effective_threshold)
-}
-
 /// VAD speech threshold, unified for both enrollment and streaming detection.
-#[cfg(target_os = "macos")]
 const VAD_THRESHOLD: f32 = 0.5;
 
 /// Consecutive VAD-positive frames before `utterance_had_speech` during enrollment: 1, matching
 /// streaming detection, which starts accumulating at its first positive frame.
-#[cfg(target_os = "macos")]
 const ENROLLMENT_VAD_CONSECUTIVE_REQUIRED: usize = 1;
 
 /// Global Earshot detector.  Behind a mutex because `predict_f32` takes ~5-6 µs, so contention is
 /// negligible; its internal state (768-sample ring buffer, pre-emphasis filter, 3-frame feature
 /// context) must stay in sync with the stream.  Created once in [`init_global`].
-#[cfg(target_os = "macos")]
 static VAD_DETECTOR: OnceLock<std::sync::Mutex<earshot::Detector>> = OnceLock::new();
-
-/// Whether wake word inference can run: it encodes on the wake word's own Qwen3-ASR encoder, so
-/// this is whether that model is loaded.
-#[cfg(target_os = "macos")]
-#[must_use]
-fn models_ready() -> bool {
-    crate::audio::encoder::is_loaded()
-}
 
 /// Whether local transcription is disabled by config (`audio_transcription_use_local == "false"`).
 /// Nothing loads the recogniser while it is disabled, so no recording can be transcribed —
@@ -440,8 +187,7 @@ fn resolved_model_status(state: ModelState, voice_enabled: bool) -> VoiceStatus 
         ModelState::Failed => VoiceStatus::ModelError,
         ModelState::Loading => VoiceStatus::LoadingModels,
         ModelState::Ready => {
-            // Listening is the wake word's own state, and only macOS has a wake word.
-            if voice_enabled && cfg!(target_os = "macos") {
+            if voice_enabled {
                 VoiceStatus::Listening
             } else {
                 VoiceStatus::Disabled
@@ -451,52 +197,28 @@ fn resolved_model_status(state: ModelState, voice_enabled: bool) -> VoiceStatus 
     }
 }
 
-/// Status resolved from the live recogniser state machine.
+/// Status resolved from the live recogniser state machine. A model failure outranks the
+/// re-enrolment message — the retry surface must stay reachable — and an enrolment the engine
+/// cannot score outranks every other model state: the owner has to enrol again before listening
+/// can start.
 fn current_model_status() -> VoiceStatus {
+    if crate::speech::is_failed() {
+        return VoiceStatus::ModelError;
+    }
+    if enrollment_unusable() {
+        return VoiceStatus::ReenrollRequired;
+    }
     resolved_model_status(crate::speech::state(), is_enabled())
 }
 
 /// Demand the recogniser for a recording and report the load it starts: nothing preloads it, so a
 /// demand is the first use, and without this the footer would show nothing while it loads. A no-op
-/// once ready. The wake word's encoder is a loader of its own and is demanded where listening
-/// starts ([`demand_encoder`]).
+/// once ready. The wake word listens through the same engine, so a demand covers both.
 fn demand_transcriber() {
     crate::speech::spawn_background_init();
     if crate::speech::is_loading() {
         set_status(VoiceStatus::LoadingModels);
     }
-}
-
-/// Demand the wake word's encoder, which is what listening needs: its weights are a folder of
-/// their own, so a button recording — which needs only the recogniser — must not fetch them.
-#[cfg(target_os = "macos")]
-fn demand_encoder() {
-    crate::audio::encoder::spawn_background_init();
-    if crate::audio::encoder::is_loading() {
-        set_status(VoiceStatus::LoadingModels);
-    }
-}
-
-/// Retry both loaders after a terminal failure: the recogniser on every platform, and the wake
-/// word's encoder on macOS. `true` when either took the retry.
-fn retry_model_loads() -> bool {
-    let recogniser = crate::speech::retry_init();
-    #[cfg(target_os = "macos")]
-    let encoder = crate::audio::encoder::retry_init();
-    #[cfg(not(target_os = "macos"))]
-    let encoder = false;
-    recogniser || encoder
-}
-
-/// Whether a loader the pipeline depends on is terminally failed: the recogniser always, and the
-/// wake word's encoder while the wake word is on — an encoder nobody asked for must not put the
-/// composer into an error state.
-fn models_failed() -> bool {
-    #[cfg(target_os = "macos")]
-    if is_enabled() && crate::audio::encoder::is_failed() {
-        return true;
-    }
-    crate::speech::is_failed()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -506,7 +228,6 @@ pub enum VoiceStatus {
     ModelError,
     Listening,
     /// A recording the wake word started: it ends itself on silence, and the composer ends it too.
-    #[cfg(target_os = "macos")]
     RecordingWakeWord,
     /// A recording started from the composer mic button: same mechanism, no silence end, and
     /// wake-word listening paused while it runs.
@@ -519,33 +240,31 @@ pub enum VoiceStatus {
     MicDisconnected,
     /// Enrolled, waiting for the next sample (`sample` of `total`, `duration_ms` of the last
     /// utterance, per-utterance `quality`).
-    #[cfg(target_os = "macos")]
     Enrolling {
         sample: usize,
         total: usize,
         duration_ms: u64,
         quality: Option<UtteranceQuality>,
     },
-    #[cfg(target_os = "macos")]
     ListeningDuringEnrollment {
         sample: usize,
         total: usize,
     },
-    #[cfg(target_os = "macos")]
     WaitingForSilenceDuringEnrollment {
         sample: usize,
         total: usize,
     },
     /// Collecting owner-general speech as negatives (Phase 3): `accumulated_secs` of VAD-positive
     /// speech towards `target_secs`, `wall_clock_elapsed` since the phase started.
-    #[cfg(target_os = "macos")]
     EnrollingNegatives {
         accumulated_secs: usize,
         target_secs: usize,
         wall_clock_elapsed: u64,
     },
-    #[cfg(target_os = "macos")]
     Enrolled,
+    /// The stored enrolment is from the old encoder and the engine cannot score it. The toggle is
+    /// off and stays off until a new enrolment succeeds.
+    ReenrollRequired,
     Error(String),
 }
 
@@ -555,16 +274,13 @@ impl VoiceStatus {
     /// owns renders its own dot, not the button.)
     #[must_use]
     pub fn mic_busy(&self) -> bool {
-        // The wake word's recording is a status only macOS produces.
-        #[cfg(target_os = "macos")]
-        if matches!(self, Self::RecordingWakeWord) {
-            return true;
-        }
-        matches!(self, Self::RecordingButton | Self::Transcribing)
+        matches!(
+            self,
+            Self::RecordingWakeWord | Self::RecordingButton | Self::Transcribing
+        )
     }
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum QualityLevel {
     Good,       // score > 0.7
@@ -572,7 +288,6 @@ pub enum QualityLevel {
     Poor,       // score < 0.4
 }
 
-#[cfg(target_os = "macos")]
 impl QualityLevel {
     fn from_score(score: f32) -> Self {
         if score > 0.7 {
@@ -594,7 +309,6 @@ impl QualityLevel {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct UtteranceQuality {
     pub score: f32,
@@ -612,33 +326,28 @@ static VOICE_PIPELINE: OnceLock<RwLock<VoicePipelineState>> = OnceLock::new();
 struct VoicePipelineState {
     enabled: bool,
     status: VoiceStatus,
-    /// Enrolled wake-word prototype + calibration (v2 schema).  `None` before
-    /// a successful enrollment.
-    #[cfg(target_os = "macos")]
+    /// The enrolled prototype + calibration (schema 3). `None` before a successful enrollment.
     enrollment: Option<WakeWordEnrollment>,
-    /// Per-utterance 1024-dim L2-normalized window embeddings collected
-    /// during enrollment (one entry per accepted utterance).
-    #[cfg(target_os = "macos")]
+    /// The stored enrolment came from the old encoder and the engine cannot score it: the toggle
+    /// is off and listening refuses until a new enrolment succeeds.
+    enrollment_unusable: bool,
+    /// Per-utterance L2-normalized window embeddings collected during enrollment (one entry per
+    /// accepted utterance).
     enrollment_embeddings: Vec<Vec<f32>>,
     /// Ambient non-wake-word chunks (pre-enrollment noise and inter-utterance silence), encoded at
     /// finalization into real negative examples.
-    #[cfg(target_os = "macos")]
     negative_audio_chunks: Vec<Vec<f32>>,
     /// Owner-negative chunks from Phase 3 (~15 s of VAD-positive general speech), embedded at
     /// finalization; preserved across Full/Soft resets, cleared on Cancel.
-    #[cfg(target_os = "macos")]
     owner_negative_chunks: Vec<Vec<f32>>,
     /// Whether Phase 2 finished (all [`NUM_ENROLLMENT_SAMPLES`] utterances in): the main loop reads
     /// it to start the Phase 2→3 transition. Cleared on Cancel.
-    #[cfg(target_os = "macos")]
     utterances_collected: bool,
     /// Accepted utterances so far, read by the UI counter and the finalization trigger.
-    #[cfg(target_os = "macos")]
     enrolled_utterance_count: usize,
     cmd_tx: Option<mpsc::UnboundedSender<VoiceCommand>>,
 }
 
-#[cfg(target_os = "macos")]
 impl VoicePipelineState {
     /// Clear the enrollment accumulators (embeddings + counter); called on [`ResetLevel::Cancel`]
     /// and by tests.
@@ -649,19 +358,28 @@ impl VoicePipelineState {
         self.enrolled_utterance_count = 0;
         self.utterances_collected = false;
     }
+
+    /// The status a stopped pipeline rests in: a refused enrolment outranks the switch, so the
+    /// re-enrolment message survives every stop. `when_enabled` is what an enabled pipeline shows
+    /// (listening, or a lost microphone); an off switch shows [`VoiceStatus::Disabled`].
+    fn resting_status(&self, when_enabled: VoiceStatus) -> VoiceStatus {
+        if self.enrollment_unusable {
+            VoiceStatus::ReenrollRequired
+        } else if self.enabled {
+            when_enabled
+        } else {
+            VoiceStatus::Disabled
+        }
+    }
 }
 
 #[derive(Debug)]
 pub enum VoiceCommand {
-    #[cfg(target_os = "macos")]
     StartListening,
     StopListening,
-    #[cfg(target_os = "macos")]
     StartEnrollment,
-    #[cfg(target_os = "macos")]
     CancelEnrollment,
-    /// Retry loading the models after a terminal failure (the recogniser, and the wake word's
-    /// encoder on macOS).
+    /// Retry loading the recogniser after a terminal failure.
     RetryModelLoading,
     /// Start a recording from the composer mic button, pausing wake-word listening meanwhile.
     StartRecording,
@@ -682,25 +400,19 @@ fn voice_state() -> &'static RwLock<VoicePipelineState> {
 
 /// Initialize the voice pipeline state. Called during startup.
 pub fn init_global() -> Result<()> {
-    // The VAD is the wake word's own, on macOS.
-    #[cfg(target_os = "macos")]
+    // The VAD is the wake word's own.
     VAD_DETECTOR.get_or_init(|| std::sync::Mutex::new(earshot::Detector::default()));
 
     VOICE_PIPELINE
         .set(RwLock::new(VoicePipelineState {
             enabled: false,
             status: VoiceStatus::Disabled,
-            #[cfg(target_os = "macos")]
             enrollment: None,
-            #[cfg(target_os = "macos")]
+            enrollment_unusable: false,
             enrollment_embeddings: Vec::new(),
-            #[cfg(target_os = "macos")]
             negative_audio_chunks: Vec::new(),
-            #[cfg(target_os = "macos")]
             owner_negative_chunks: Vec::new(),
-            #[cfg(target_os = "macos")]
             enrolled_utterance_count: 0,
-            #[cfg(target_os = "macos")]
             utterances_collected: false,
             cmd_tx: None,
         }))
@@ -721,7 +433,6 @@ enum RecordingOrigin {
     /// Started from the composer mic button; only the composer controls end it.
     Button,
     /// Started by the wake word; it also ends itself on silence.
-    #[cfg(target_os = "macos")]
     WakeWord,
 }
 
@@ -808,16 +519,15 @@ pub(crate) const NOTICE_INTERVAL: Duration = Duration::from_secs(10);
 /// configuration is permanent, so it is checked here directly.
 #[must_use]
 pub fn recording_blocked_reason() -> Option<&'static str> {
-    // Local transcription disabled ⇒ the shared ASR model never loads ⇒ no recording can start:
+    // Local transcription disabled ⇒ the shared recogniser never loads ⇒ no recording can start:
     // surface the configuration, not a loading state that can never complete.
     if is_transcription_disabled() {
         return Some("Voice recording unavailable — local transcription is disabled");
     }
     match get_status() {
-        VoiceStatus::Transcribing => Some("A voice message is already being processed"),
-        #[cfg(target_os = "macos")]
-        VoiceStatus::RecordingWakeWord => Some("A voice message is already being processed"),
-        #[cfg(target_os = "macos")]
+        VoiceStatus::Transcribing | VoiceStatus::RecordingWakeWord => {
+            Some("A voice message is already being processed")
+        }
         VoiceStatus::Enrolling { .. }
         | VoiceStatus::ListeningDuringEnrollment { .. }
         | VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
@@ -829,15 +539,18 @@ pub fn recording_blocked_reason() -> Option<&'static str> {
 }
 
 #[must_use]
-fn is_enabled() -> bool {
-    voice_state().read().unwrap_poison().enabled
+pub(crate) fn is_enabled() -> bool {
+    VOICE_PIPELINE
+        .get()
+        .is_some_and(|state| state.read().unwrap_poison().enabled)
 }
 
 pub fn set_enabled(enabled: bool) {
     let mut state = voice_state().write().unwrap_poison();
     state.enabled = enabled;
     if !enabled {
-        set_status_and_notify(&mut state, VoiceStatus::Disabled);
+        let status = state.resting_status(VoiceStatus::Disabled);
+        set_status_and_notify(&mut state, status);
     }
 }
 
@@ -845,8 +558,16 @@ fn set_status(status: VoiceStatus) {
     set_status_and_notify(&mut voice_state().write().unwrap_poison(), status);
 }
 
+/// Resolve and write the resting status under one lock, so a concurrent toggle change cannot be
+/// overwritten by a stale read.
+fn set_resting_status(when_enabled: VoiceStatus) {
+    let mut state = voice_state().write().unwrap_poison();
+    let status = state.resting_status(when_enabled);
+    set_status_and_notify(&mut state, status);
+}
+
 /// Write a new status, broadcasting [`RuntimeEvent::VoiceStatus`] only on a real change: enrollment
-/// variants (macOS) update per sample and would otherwise emit continuously.
+/// variants update per sample and would otherwise emit continuously.
 fn set_status_and_notify(state: &mut VoicePipelineState, status: VoiceStatus) {
     if state.status != status {
         state.status = status;
@@ -855,16 +576,33 @@ fn set_status_and_notify(state: &mut VoicePipelineState, status: VoiceStatus) {
 }
 
 /// The currently active wake word enrollment (prototype + calibration).
-#[cfg(target_os = "macos")]
 #[must_use]
 pub(crate) fn get_enrollment() -> Option<WakeWordEnrollment> {
     voice_state().read().unwrap_poison().enrollment.clone()
 }
 
-#[cfg(target_os = "macos")]
 fn set_enrollment(enrollment: WakeWordEnrollment) {
     let mut state = voice_state().write().unwrap_poison();
     state.enrollment = Some(enrollment);
+    state.enrollment_unusable = false;
+}
+
+/// Whether the stored enrolment is from the old encoder and cannot be scored: the toggle is off
+/// and listening refuses until the owner enrols again.
+#[must_use]
+pub(crate) fn enrollment_unusable() -> bool {
+    VOICE_PIPELINE
+        .get()
+        .is_some_and(|state| state.read().unwrap_poison().enrollment_unusable)
+}
+
+/// Mark the stored enrolment unusable and switch the wake toggle off.
+fn retire_enrollment() {
+    let mut state = voice_state().write().unwrap_poison();
+    state.enrollment = None;
+    state.enrollment_unusable = true;
+    state.enabled = false;
+    set_status_and_notify(&mut state, VoiceStatus::ReenrollRequired);
 }
 
 /// Queue a command, returning whether a pipeline is running to take it.  A no-op before the
@@ -896,7 +634,6 @@ pub(crate) fn install_test_command_receiver() -> mpsc::UnboundedReceiver<VoiceCo
 /// [`enrollment_is_speech`] a context-local one so a mode transition cannot contaminate the
 /// enrollment decision. Every 256-sample chunk goes through the detector, even once speech is
 /// found, to keep its ring buffer and pre-emphasis state in sync with the stream.
-#[cfg(target_os = "macos")]
 fn is_speech_with_detector(
     samples: &[f32],
     detector: &mut earshot::Detector,
@@ -946,7 +683,6 @@ fn is_speech_with_detector(
 }
 
 /// VAD check at a configurable threshold: locks the global [`VAD_DETECTOR`].
-#[cfg(target_os = "macos")]
 fn is_speech_with_threshold(samples: &[f32], threshold: f32) -> bool {
     let detector = VAD_DETECTOR.get_or_init(|| std::sync::Mutex::new(earshot::Detector::default()));
     let mut detector = detector.lock().unwrap_poison();
@@ -955,7 +691,6 @@ fn is_speech_with_threshold(samples: &[f32], threshold: f32) -> bool {
 
 /// Enrollment/negatives VAD decision: prefer the context-local detector so a mode transition
 /// cannot contaminate it; fall back to the global one when enrollment VAD is not initialised.
-#[cfg(target_os = "macos")]
 fn enrollment_is_speech(
     enrollment_vad: &mut Option<earshot::Detector>,
     threshold: f32,
@@ -969,7 +704,6 @@ fn enrollment_is_speech(
 
 /// Reset the detector internal state (ring buffer, feature context) when the audio source changes,
 /// so stale context cannot contaminate a new stream.
-#[cfg(target_os = "macos")]
 fn reset_vad() {
     if let Some(detector) = VAD_DETECTOR.get()
         && let Ok(mut d) = detector.lock()
@@ -1217,7 +951,6 @@ async fn transcribe_audio(samples: &[f32]) -> Result<String> {
 /// [400ms, 2000ms]), clipping (25%, penalised on any sample at i16::MAX) and SNR (25%).  SNR uses
 /// `noise_rms` — the real pre-speech floor captured from the raw ring — when present, else the
 /// energy-based heuristic.
-#[cfg(target_os = "macos")]
 #[expect(clippy::cast_precision_loss)]
 fn compute_utterance_quality(samples: &[f32], noise_rms: Option<f32>) -> UtteranceQuality {
     let duration_ms = samples_to_ms(samples.len(), SAMPLE_RATE);
@@ -1275,7 +1008,6 @@ fn compute_utterance_quality(samples: &[f32], noise_rms: Option<f32>) -> Utteran
 /// Energy-based SNR, no neural model: frames the audio into 512-sample windows, takes the top 40%
 /// RMS frames as speech and the bottom 40% as noise (the middle 20% is transition), and returns
 /// the ratio in dB clamped to [0, 40] to avoid extremes from synthetic signals.
-#[cfg(target_os = "macos")]
 #[expect(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -1320,69 +1052,7 @@ fn estimate_snr_energy(samples: &[f32]) -> f32 {
     snr.clamp(0.0, 40.0)
 }
 
-/// Self-test the enrolled prototype against the enrollment buffer: run each utterance embedding
-/// through [`score_single_embedding`] with a fresh score window and no adaptive state.  An
-/// utterance triggers if its rolling sum crosses the detection threshold at any point.  `Ok(())`
-/// when enough trigger, else `Err` with a user-facing message.
-#[cfg(target_os = "macos")]
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-fn run_enrollment_self_test(
-    utterance_embeddings: &[Vec<f32>],
-    enrollment: &WakeWordEnrollment,
-) -> Result<(), String> {
-    if utterance_embeddings.is_empty() {
-        return Err("Self-test skipped: no enrollment samples".to_string());
-    }
-
-    let mut passed = 0usize;
-
-    for embedding in utterance_embeddings {
-        // Fresh simulation per utterance, no cross-utterance state. The embedding is fed
-        // ROLLING_WINDOW_N times: the streaming pipeline sees the phrase across ~3 stride-gated
-        // encodings (a ~0.5 s phrase spans 3 windows at 160 ms), and one embedding could only ever
-        // sum to a single soft score (max 1.0), which never reaches the static threshold.
-        let mut score_window = Vec::new();
-        let mut detected_this = false;
-        for _ in 0..ROLLING_WINDOW_N {
-            let (detected, _, _, _) = score_single_embedding(
-                embedding,
-                Some(enrollment),
-                &mut score_window,
-                None, // no adaptive threshold during enrollment self-test
-                ADAPTIVE_K_DEFAULT,
-            );
-            if detected {
-                detected_this = true;
-                break;
-            }
-        }
-        if detected_this {
-            // Enrollment recognises the phrase in utterances the user just spoke.
-            crate::user_activity::report_activity();
-            passed += 1;
-        }
-    }
-
-    let required = (utterance_embeddings.len() as f32 * ENROLLMENT_QUALITY_SELF_TEST_MIN_FRACTION)
-        .ceil() as usize;
-
-    if passed < required {
-        Err(format!(
-            "Self-test failed: only {passed}/{} utterances triggered detection (need ≥{required}). \
-             Try re-enrolling with clearer, more consistent speech.",
-            utterance_embeddings.len(),
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 /// Guidance for the utterance at this 0-based index.
-#[cfg(target_os = "macos")]
 #[must_use]
 pub fn enrollment_prompt_for_sample(sample: usize) -> &'static str {
     let mut cumulative = 0;
@@ -1397,7 +1067,6 @@ pub fn enrollment_prompt_for_sample(sample: usize) -> &'static str {
 
 /// Segmentation parameters for [`segment_utterances_by_vad`]: the four module constants that are
 /// identical at every call site, bundled so the signature has 3 parameters instead of 8.
-#[cfg(target_os = "macos")]
 struct VadSegmentationConfig {
     frame_length: usize,
     hop_length: usize,
@@ -1409,7 +1078,6 @@ struct VadSegmentationConfig {
 
 /// Default config for [`segment_utterances_by_vad`]: no context padding (matching streaming) and
 /// the [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`] threshold aligned to [`SEGMENT_TIMEOUT_HOPS`].
-#[cfg(target_os = "macos")]
 const DEFAULT_VAD_SEGMENTATION_CONFIG: VadSegmentationConfig = VadSegmentationConfig {
     frame_length: FRAME_LENGTH,
     hop_length: HOP_LENGTH,
@@ -1424,7 +1092,6 @@ const DEFAULT_VAD_SEGMENTATION_CONFIG: VadSegmentationConfig = VadSegmentationCo
 /// then `config.silence_threshold_samples` of VAD-negative audio ends the utterance, which is
 /// emitted with internal state reset. No context padding, so segmentation matches streaming; the
 /// result is raw audio segments (**not** VAD-subsampled) in detection order.
-#[cfg(target_os = "macos")]
 fn segment_utterances_by_vad(
     raw_audio: &[f32],
     vad_decisions: &[bool],
@@ -1497,128 +1164,6 @@ fn segment_utterances_by_vad(
     utterances
 }
 
-// Adaptive threshold state
-
-/// Running mean/std of the recent per-frame soft scores, kept as O(1) sum/sum_sq over the last
-/// [`ADAPTIVE_WINDOW_N`].  The threshold is `(mean + k × std) × ROLLING_WINDOW_N`: the scaling into
-/// rolling-sum space is what matches [`process_wake_word_score`], and without it the adaptive value
-/// (max ~1.0 + k × std) could never reach the rolling sum and the feature would be a no-op.  The
-/// result is clamped between the caller's safe harbor (the per-enrollment static threshold) and
-/// [`ADAPTIVE_CEILING`]; the first [`ADAPTIVE_BOOTSTRAP_FRAMES`] frames return `None`, telling the
-/// caller to use the static threshold while the window fills.
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone)]
-struct AdaptiveThresholdState {
-    scores: Vec<f32>,
-    sum: f32,
-    sum_sq: f32,
-    bootstrap_count: usize,
-}
-
-#[cfg(target_os = "macos")]
-impl AdaptiveThresholdState {
-    fn new() -> Self {
-        Self {
-            scores: Vec::with_capacity(ADAPTIVE_WINDOW_N),
-            sum: 0.0,
-            sum_sq: 0.0,
-            bootstrap_count: 0,
-        }
-    }
-
-    /// Feed a per-frame soft score (range [0,1]), scaled by [`ROLLING_WINDOW_N`] into the
-    /// rolling-sum space [0,3] where detection compares. `None` during the first
-    /// [`ADAPTIVE_BOOTSTRAP_FRAMES`] frames (use the static threshold); after that
-    /// `Some(threshold)`, already clamped to `[harbor, ADAPTIVE_CEILING]` in rolling-sum space,
-    /// where `harbor` is the caller's per-enrollment static threshold — the anti-feedback-loop
-    /// property.
-    fn feed(&mut self, score: f32, k: f32, harbor: f32) -> Option<f32> {
-        if self.scores.len() >= ADAPTIVE_WINDOW_N {
-            let oldest = self.scores.remove(0);
-            self.sum -= oldest;
-            self.sum_sq -= oldest * oldest;
-        }
-        self.scores.push(score);
-        self.sum += score;
-        self.sum_sq += score * score;
-
-        if self.bootstrap_count < ADAPTIVE_BOOTSTRAP_FRAMES {
-            self.bootstrap_count += 1;
-            return None;
-        }
-
-        let threshold = self.compute_threshold(k, harbor);
-
-        Some(threshold)
-    }
-
-    /// Clamped adaptive threshold from the current statistics; the window must be non-empty
-    /// (checked by the caller). Shared by [`feed`](Self::feed) and [`peek`](Self::peek).
-    #[expect(clippy::cast_precision_loss)]
-    fn compute_threshold(&self, k: f32, harbor: f32) -> f32 {
-        let n = self.scores.len() as f32;
-        let mean = self.sum / n;
-        // Population variance (divide by n, not n-1) — stable for a fixed-size window.
-        let variance = (self.sum_sq / n) - (mean * mean);
-        let std = variance.max(0.0).sqrt();
-
-        // Scale per-frame [0,1] to rolling-sum [0,ROLLING_WINDOW_N] space, so the threshold is
-        // comparable to the sum used by process_wake_word_score.
-        #[expect(clippy::cast_precision_loss)]
-        let adaptive = (mean + k * std) * ROLLING_WINDOW_N as f32;
-
-        // Lower bound is the caller's safe harbor (the per-enrollment static threshold), upper the
-        // ceiling. `clamp()` propagates NaN where the old `max()` chain returned the harbor:
-        // unreachable with finite scores, but the semantics differ.
-        adaptive.clamp(harbor, ADAPTIVE_CEILING)
-    }
-
-    /// The threshold for the current statistics without updating them: `None` during bootstrap or
-    /// with an empty window, else the same clamped value [`feed`](Self::feed) gives. This is how
-    /// wake-word-like frames avoid contaminating the background statistics.
-    fn peek(&self, k: f32, harbor: f32) -> Option<f32> {
-        if self.bootstrap_count < ADAPTIVE_BOOTSTRAP_FRAMES {
-            return None;
-        }
-        if self.scores.is_empty() {
-            return None;
-        }
-        Some(self.compute_threshold(k, harbor))
-    }
-
-    /// Whether the tracker is still bootstrapping (the first [`ADAPTIVE_BOOTSTRAP_FRAMES`]
-    /// below-reset frames since the score-only feed rule). Production callers no longer consult it
-    /// — [`peek`](Self::peek) returns `None` during bootstrap — it exists for unit tests.
-    #[cfg(test)]
-    fn is_bootstrapping(&self) -> bool {
-        self.bootstrap_count < ADAPTIVE_BOOTSTRAP_FRAMES
-    }
-
-    fn reset(&mut self) {
-        self.scores.clear();
-        self.sum = 0.0;
-        self.sum_sq = 0.0;
-        self.bootstrap_count = 0;
-    }
-
-    /// A pre-warmed state past bootstrap, seeded with near-silence scores so the threshold is
-    /// active from the start; the ~0.03 seed clamps immediately to `harbor`, as real audio from
-    /// silence does.
-    #[cfg(test)]
-    fn warmed(harbor: f32) -> Self {
-        let mut state = Self::new();
-        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            state.feed(0.033, ADAPTIVE_K_DEFAULT, harbor);
-        }
-        state
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.scores.len()
-    }
-}
-
 enum StartAttempt {
     Started,
     /// A recording was already running and owns the composer field: nothing is reported, so its
@@ -1628,10 +1173,8 @@ enum StartAttempt {
     Refused(Option<&'static str>),
 }
 
-/// The wake word's own pipeline state — detection, scoring, enrollment and the Phase 3
-/// negative collection. Only macOS has a wake word, so the whole block is gated once here
-/// instead of field by field.
-#[cfg(target_os = "macos")]
+/// The wake word's own pipeline state: the VAD capture, enrollment and the Phase 3 negative
+/// collection, plus the detector that owns the engine-side streaming wiring.
 struct Wake {
     /// Wake-word recording: samples still to drop from the front before any reaches recognition
     /// ([`POST_FIRE_DISCARD_SAMPLES`]); armed by the detection handoff.
@@ -1660,28 +1203,23 @@ struct Wake {
     /// `Some(earshot::Detector::default())` from start to end or cancel.
     enrollment_vad: Option<earshot::Detector>,
     /// Raw audio ring for wake-word detection, capped at [`AUDIO_BUFFER_MAX`] and walked by the VAD
-    /// loop via [`Wake::vad_cursor`]; scoring encodes the VAD-gated [`Wake::speech_window`], never
-    /// this buffer.
+    /// loop via [`Wake::vad_cursor`].
     audio_buffer: Vec<f32>,
-    /// VAD-gated speech-only window for encoder scoring: only the [`HOP_LENGTH`] hops the VAD
-    /// called speech, capped at [`WAKE_WORD_WINDOW_SAMPLES`] (draining the front). Enrollment
-    /// encodes VAD-segmented speech-only utterances, so scoring the same kind of window keeps the
-    /// cosine distributions aligned — raw trailing audio dilutes the embedding with context/silence
-    /// and shifts detection cosines ~0.05-0.08 below enrollment, letting confusables through.
-    speech_window: Vec<f32>,
     /// Samples at the FRONT of [`Wake::audio_buffer`] already consumed: the loop advances this
     /// cursor instead of draining, so the ring keeps the whole trailing window even after every
     /// frame was checked.
     vad_cursor: usize,
-    /// Samples since the last scoring step, reset after each encode; at [`SCORE_STRIDE_SAMPLES`]
-    /// with speech seen, the pipeline encodes and scores.
-    last_score_sample_count: usize,
+    /// Consecutive VAD-negative hops since the last positive frame; at [`SEGMENT_TIMEOUT_HOPS`]
+    /// (~300 ms) the per-segment detection state resets.
+    segment_silence_hops: usize,
+    /// The live detector for the active enrolment: the gated window, the paired encoder passes,
+    /// the rolling score, the adaptive threshold, the segment clock and the cooldown. `None`
+    /// before an enrolment the engine can score.
+    detector: Option<WakeDetector>,
     /// Completed enrollment utterances awaiting the main loop, which pops one per tick and runs
     /// [`handle_enrollment_sample`].  A queue rather than a single `Option`, so several utterances
     /// completing within one mic frame are all preserved.
     enrollment_pending: VecDeque<Vec<f32>>,
-    /// Last detection time, for the cooldown that prevents rapid consecutive false triggers.
-    last_wake_word_detection: Option<Instant>,
     /// Pre-speech noise RMS captured at the first sustained speech, from the raw audio ring so the
     /// SNR reflects the true room floor; consumed and reset to `None` by
     /// [`handle_enrollment_sample`].
@@ -1702,26 +1240,11 @@ struct Wake {
     phase3_processed: usize,
     /// Wall-clock start of Phase 3, for the [`PHASE3_TIMEOUT_SECS`] finalize-anyway timeout.
     phase3_start_time: Option<Instant>,
-    /// Per-frame soft scores from the cosine-prototype scorer, one per scoring step.
-    score_window: Vec<f32>,
-    /// Consecutive VAD-negative hops since the last positive frame; at [`SEGMENT_TIMEOUT_HOPS`]
-    /// (~300 ms) the per-segment detection state resets.
-    segment_silence_hops: usize,
-    /// Stride-gated scoring steps since the first step of the current speech segment — every step
-    /// counts, even ones re-scoring unchanged audio during a pause. Cleared where the segment ends
-    /// and wherever a detection is handled, so a fire is accepted only while this is ≤
-    /// [`WAKE_WORD_MAX_SEGMENT_STEPS`].
-    segment_score_steps: usize,
-    /// Adaptive threshold tracker for the rolling score window.
-    adaptive_threshold: AdaptiveThresholdState,
-    /// Adaptive threshold k multiplier (fixed at [`ADAPTIVE_K_DEFAULT`]).
-    adaptive_k: f32,
     /// Non-VAD audio during enrollment (pre-speech ambient noise, inter-utterance silence), saved
     /// as a negative example at speech onset.
     negative_audio_buf: Vec<f32>,
 }
 
-#[cfg(target_os = "macos")]
 impl Wake {
     fn new() -> Self {
         Self {
@@ -1737,25 +1260,25 @@ impl Wake {
             vad_threshold: VAD_THRESHOLD,
             enrollment_vad: None,
             audio_buffer: Vec::new(),
-            speech_window: Vec::new(),
             vad_cursor: 0,
-            last_score_sample_count: 0,
+            segment_silence_hops: 0,
+            detector: None,
             enrollment_pending: VecDeque::new(),
-            last_wake_word_detection: None,
             noise_rms_estimate: None,
             phase3_audio_buf: Vec::new(),
             phase3_silence_samples: 0,
             negatives_speech_samples: 0,
             phase3_processed: 0,
             phase3_start_time: None,
-            score_window: Vec::new(),
-            segment_silence_hops: 0,
-            segment_score_steps: 0,
-            adaptive_threshold: AdaptiveThresholdState::new(),
-            // Fixed default — no config key backs this field.
-            adaptive_k: ADAPTIVE_K_DEFAULT,
             negative_audio_buf: Vec::new(),
         }
+    }
+
+    /// Build the detector for the active enrolment, if the engine can score one.
+    fn rebuild_detector(&mut self) {
+        self.detector = get_enrollment()
+            .filter(WakeWordEnrollment::usable)
+            .map(|record| WakeDetector::new(record.engine()));
     }
 }
 
@@ -1775,11 +1298,13 @@ struct PipelineCtx {
     /// Silence by audio sample count, not wall-clock, so load and processing delays cannot skew the
     /// cutoff.
     silence_sample_count: usize,
-    /// The wake word's own state (macOS only).
-    #[cfg(target_os = "macos")]
+    /// The wake word's own state.
     wake: Wake,
     enrollment_mode: bool,
     auto_start_pending: bool,
+    /// An enrollment was requested while the recogniser was still loading: the pipeline starts it
+    /// as soon as the engine is ready. Unlike [`auto_start_pending`] it never starts listening.
+    enrollment_start_pending: bool,
     /// Last automatic retry time, debouncing the retry path against the 1-second tick while a
     /// loader sits in [`ModelState::Failed`].
     last_model_retry: Option<Instant>,
@@ -1801,9 +1326,7 @@ enum ResetLevel {
     Full,
     /// The wake word's lighter reset: keeps the VAD continuity and the cooldown a detection
     /// handoff must not lose.
-    #[cfg(target_os = "macos")]
     Soft,
-    #[cfg(target_os = "macos")]
     Cancel,
 }
 
@@ -1818,12 +1341,12 @@ impl PipelineCtx {
             silence_sample_count: 0,
             enrollment_mode: false,
             auto_start_pending: CONFIG.voice_enabled().as_deref() == Some("true"),
+            enrollment_start_pending: false,
             last_model_retry: None,
             collecting_negatives: false,
             refractory_until: None,
             last_voice_notice_time: None,
             auto_model_retries_left: MAX_AUTO_MODEL_RETRY_CYCLES,
-            #[cfg(target_os = "macos")]
             wake: Wake::new(),
         }
     }
@@ -1842,7 +1365,6 @@ impl PipelineCtx {
     /// recording and detection buffers while preserving VAD continuity, `vad_threshold` and the
     /// cooldown timestamp, so the trigger cannot immediately re-fire. The caller owns the status
     /// (Listening after a normal end, Enrolling after an aborted recording).
-    #[cfg(target_os = "macos")]
     fn take_wake_recording(&mut self) -> (Vec<f32>, bool) {
         let had_speech = self.wake.recording_had_speech;
         let cmd_buf = std::mem::take(&mut self.command_buffer);
@@ -1853,7 +1375,6 @@ impl PipelineCtx {
 
     /// Drop a wake-word recording's buffers while keeping VAD continuity, and play the end cue its
     /// stop owes.
-    #[cfg(target_os = "macos")]
     fn end_wake_state(&mut self) {
         self.reset_pipeline_state(ResetLevel::Soft);
         cue::play(Cue::End);
@@ -1863,7 +1384,6 @@ impl PipelineCtx {
     /// lost microphone. Cancel is the only level that clears the global accumulators, and it also
     /// clears `collecting_negatives`: those are what the Phase 2→3 and 3→4 gates read. The VAD is
     /// left alone, so its noise-floor estimate carries into detection; the caller owns the status.
-    #[cfg(target_os = "macos")]
     fn end_enrollment_attempt(&mut self) {
         self.reset_pipeline_state(ResetLevel::Cancel);
         self.enrollment_mode = false;
@@ -1871,42 +1391,31 @@ impl PipelineCtx {
 
     /// Parameterised reset. It only clears state and never publishes an outcome — a caller ending a
     /// recording reports that itself ([`Self::abandon_recording`]) in wording matching what
-    /// happened. Audio buffers, the counters, enrollment/segment state and the Phase 3 fields clear
-    /// at every level. `vad_threshold`, `enrollment_vad` and `last_wake_word_detection` are reset
-    /// by Full and Cancel but preserved by Soft, as are `auto_start_pending`, `recording` and
-    /// `resume_listening_after_recording`; `reset_vad()` runs on Full only, and the global
-    /// enrollments are cleared by Cancel alone. `refractory_until`, the notice/retry stamps, `mic`,
-    /// `is_listening` and `enrollment_mode` are never touched.
-    #[cfg_attr(
-        not(target_os = "macos"),
-        expect(
-            unused_variables,
-            reason = "the level only decides how much of the wake word's state is kept"
-        )
-    )]
+    /// happened. Audio buffers, counters, enrollment state and the Phase 3 fields clear at every
+    /// level, and the enrollment VAD is dropped so modes cannot contaminate each other. Soft keeps
+    /// the VAD state, `vad_threshold`, the detector's adaptive state and cooldown,
+    /// `auto_start_pending`, the running recording and `resume_listening_after_recording`; Full
+    /// clears the cooldown and `auto_start_pending` and drops the recording, and both Full and
+    /// Cancel reset the VAD and the detector's adaptive state. Cancel also clears the global
+    /// enrollment accumulators. `reset_vad()` runs on Full only. `refractory_until`, the notice and
+    /// retry stamps, `mic`, `is_listening` and `enrollment_mode` are never touched.
     fn reset_pipeline_state(&mut self, level: ResetLevel) {
         self.command_buffer.clear();
         self.silence_sample_count = 0;
         self.collecting_negatives = false;
         // The wake word's buffers, counters and detection state are its own half of the reset.
-        #[cfg(target_os = "macos")]
         self.reset_wake_word_state(level);
     }
 
     /// The wake word's half of [`Self::reset_pipeline_state`]: audio rings, detection and
     /// enrollment state, and the Phase 3 fields, at the level the caller asked for.
-    #[cfg(target_os = "macos")]
     fn reset_wake_word_state(&mut self, level: ResetLevel) {
         self.wake.audio_buffer.clear();
-        self.wake.speech_window.clear();
         self.wake.vad_cursor = 0;
         self.wake.post_fire_discard_samples = 0;
         self.wake.recording_had_speech = false;
-        self.wake.score_window.clear();
         self.wake.negative_audio_buf.clear();
         self.wake.segment_silence_hops = 0;
-        self.wake.segment_score_steps = 0;
-        self.wake.last_score_sample_count = 0;
 
         self.wake.utterance_had_speech = false;
         self.wake.utterance_silence_samples = 0;
@@ -1928,68 +1437,30 @@ impl PipelineCtx {
         self.wake.enrollment_vad = None;
 
         match level {
+            // Soft keeps the adaptive state and the cooldown; it clears the rolling-window state so
+            // stale scores cannot cross utterances (Soft runs on the detection→recording handoff).
+            ResetLevel::Soft => {
+                if let Some(detector) = &mut self.wake.detector {
+                    detector.soft_reset();
+                }
+            }
             ResetLevel::Full => {
                 self.wake.vad_threshold = VAD_THRESHOLD;
-                self.wake.last_wake_word_detection = None;
                 self.auto_start_pending = false;
                 self.recording = None;
                 reset_vad();
-                self.wake.adaptive_threshold.reset();
-            }
-            ResetLevel::Soft => {
-                // Soft preserves VAD state, `vad_threshold`, the cooldown, `auto_start_pending`,
-                // the running recording and the global enrollments, and clears the rolling-window
-                // state so stale scores cannot cross utterances (Soft runs on the
-                // detection→recording handoff).
+                if let Some(detector) = &mut self.wake.detector {
+                    detector.reset_stream();
+                }
             }
             ResetLevel::Cancel => {
                 self.wake.vad_threshold = VAD_THRESHOLD;
-                self.wake.last_wake_word_detection = None;
-                self.wake.adaptive_threshold.reset();
+                if let Some(detector) = &mut self.wake.detector {
+                    detector.reset_stream();
+                }
 
                 voice_state().write().unwrap_poison().reset_enrollment();
             }
-        }
-    }
-
-    /// Reset all per-segment detection state at a VAD-driven utterance boundary
-    /// ([`SEGMENT_TIMEOUT_HOPS`] ≈ 300 ms of VAD-negative hops): the score window and adaptive
-    /// threshold (both per-segment, so a brief re-bootstrap is acceptable), the silence counter and
-    /// the score-step clock, which must start the next segment at position 1. This stops soft
-    /// scores and rolling sums accumulating across utterances — a structural source of false
-    /// triggers. The raw ring and VAD cursor are cleared with them so the trailing window cannot
-    /// span the boundary; `audio_buffer` (the drain handles its overlap), VAD state,
-    /// `vad_threshold`, the cooldown and `recording` are preserved.
-    #[cfg(target_os = "macos")]
-    fn reset_detection_segment(&mut self) {
-        self.wake.score_window.clear();
-
-        self.wake.adaptive_threshold.reset();
-
-        self.wake.segment_silence_hops = 0;
-        self.wake.segment_score_steps = 0;
-
-        self.wake.audio_buffer.clear();
-        self.wake.speech_window.clear();
-        self.wake.vad_cursor = 0;
-        self.wake.last_score_sample_count = 0;
-    }
-
-    /// Segment boundary check, called from [`handle_wake_word_detection`] after the VAD loop with
-    /// the accumulated `hop_count` of consecutive VAD-negative frames. At [`SEGMENT_TIMEOUT_HOPS`]
-    /// it resets the per-segment detection state, so soft scores and rolling sums cannot accumulate
-    /// across utterances; below it the counter is persisted in
-    /// [`segment_silence_hops`](Wake::segment_silence_hops) for the next call.
-    #[cfg(target_os = "macos")]
-    fn handle_segment_boundary(&mut self, hop_count: usize) {
-        if hop_count >= SEGMENT_TIMEOUT_HOPS {
-            // Re-check not-recording: a just-fired detection must NOT be reset — the handoff in
-            // handle_wake_word_detection completes the transition.
-            if self.recording.is_none() {
-                self.reset_detection_segment();
-            }
-        } else {
-            self.wake.segment_silence_hops = hop_count;
         }
     }
 
@@ -2032,7 +1503,6 @@ impl PipelineCtx {
         broadcast_notice(msg).await;
     }
 
-    #[cfg(target_os = "macos")]
     fn handle_start_listening(&mut self) {
         // While the composer's own recording runs, defer wake-word listening until it ends (mutual
         // exclusion); the resume flag makes `end_button_recording` start listening afterwards.
@@ -2056,43 +1526,60 @@ impl PipelineCtx {
             warn!("Ignoring start_listening — voice assistant is disabled");
             return;
         }
-        if !models_ready() {
-            // The encoder is still loading — mark pending so check_auto_start retries when it is
-            // ready; this is NOT set on mic failure, which would retry forever. A previously
+        // An enrolment from the old encoder cannot be scored: the toggle is off, and turning it on
+        // goes back to the re-enrolment message instead of opening the microphone.
+        if enrollment_unusable() {
+            self.auto_start_pending = false;
+            set_enabled(false);
+            return;
+        }
+        if !crate::speech::is_loaded() {
+            // The recogniser is still loading — mark pending so check_auto_start retries when it
+            // is ready; this is NOT set on mic failure, which would retry forever. A previously
             // failed load (ModelError trap) is retried immediately, so the user need not restart
-            // the app. Nothing preloads the encoder, so a start is also what demands it.
-            demand_encoder();
-            if crate::audio::encoder::is_failed() {
-                warn!("The wake word's encoder previously failed — triggering retry...");
+            // the app. Nothing preloads the engine, so a start is also what demands it.
+            demand_transcriber();
+            if crate::speech::is_failed() {
+                warn!("The recogniser previously failed — triggering retry...");
                 self.try_retry_models();
             }
             self.auto_start_pending = true;
             warn!("Voice models not ready yet");
             return;
         }
-        if !self.is_listening {
-            // A recording holding nothing but its own microphone cannot outlive this start: report
-            // it here, where the reason is known.
-            self.abandon_recording("*Voice: recording discarded — wake-word listening started*");
-            self.reset_pipeline_state(ResetLevel::Full);
-            self.mic = None;
-            match start_microphone() {
-                Ok(mic) => {
-                    self.mic = Some(mic);
-                    self.is_listening = true;
-                    set_status(VoiceStatus::Listening);
-                    info!("Voice pipeline: started listening");
-                    // Open the cue device now, while nothing is recorded: a cold open on the
-                    // detection path would delay the start cue past the opening the recording
-                    // discards, leaking it into recognized audio.
-                    cue::warm_up();
-                }
-                Err(e) => {
-                    warn!("Failed to start microphone: {e}");
-                    set_status(mic_start_failure(&e));
-                    // auto_start_pending stays cleared: re-opening the device is the user's own
-                    // action ([`VoiceStatus::MicDisconnected`]), never an automatic retry.
-                }
+        if !self.is_listening
+            && self.open_session_microphone(
+                "*Voice: recording discarded — wake-word listening started*",
+            )
+        {
+            set_status(VoiceStatus::Listening);
+            info!("Voice pipeline: started listening");
+        }
+    }
+
+    /// Open the microphone for a session (wake-word listening or enrolment), returning whether the
+    /// device opened. A recording cannot coexist with a session, so it is reported lost first
+    /// (`notice` says why); then the per-stream state and the old stream go before the new one
+    /// opens — one input at a time — and the cue device warms while nothing is recorded.
+    fn open_session_microphone(&mut self, notice: &'static str) -> bool {
+        self.abandon_recording(notice);
+        self.reset_pipeline_state(ResetLevel::Full);
+        self.mic = None;
+        match start_microphone() {
+            Ok(mic) => {
+                self.mic = Some(mic);
+                self.is_listening = true;
+                // A cold cue open on the detection path would delay the start cue past the opening
+                // the recording discards, leaking it into recognized audio.
+                cue::warm_up();
+                true
+            }
+            Err(e) => {
+                warn!("Failed to start microphone: {e}");
+                set_status(mic_start_failure(&e));
+                // auto_start_pending stays cleared: re-opening the device is the user's own
+                // action ([`VoiceStatus::MicDisconnected`]), never an automatic retry.
+                false
             }
         }
     }
@@ -2106,7 +1593,7 @@ impl PipelineCtx {
         // belong to the helper, which is a no-op when nothing records.
         self.abandon_recording(notice);
         // Full reset: the mic stream is torn down, so the old VAD state no longer represents the
-        // next acoustic environment. Global enrollment accumulators (macOS) are deliberately
+        // next acoustic environment. Global enrollment accumulators are deliberately
         // preserved here — toggle-off/on keeps mid-enrollment progress — so a caller that must end
         // an attempt cancels it explicitly.
         self.reset_pipeline_state(ResetLevel::Full);
@@ -2116,10 +1603,11 @@ impl PipelineCtx {
         self.mic = None;
     }
 
-    /// Stop the microphone — the wake word's on macOS — and tear down pipeline state.
+    /// Stop the microphone — the wake word's — and tear down pipeline state.
     fn handle_stop_listening(&mut self) {
+        self.enrollment_start_pending = false;
         self.teardown_microphone("*Voice: recording discarded — voice assistant turned off*");
-        set_status(VoiceStatus::Disabled);
+        set_resting_status(VoiceStatus::Disabled);
         info!("Voice pipeline: stopped listening");
     }
 
@@ -2129,40 +1617,57 @@ impl PipelineCtx {
     /// everything it collected dropped, so its gates cannot complete it later. Nothing is re-armed:
     /// re-opening is the user's own action ([`VoiceStatus::MicDisconnected`]).
     fn handle_microphone_lost(&mut self) {
-        #[cfg(target_os = "macos")]
+        // A loss during an enrolment attempt is the device's problem, so it is reported as such
+        // rather than hidden behind the refusal resting state; the re-enrol button stays available
+        // either way.
+        let enrolling = self.enrollment_mode;
+        self.enrollment_start_pending = false;
         self.end_enrollment_attempt();
         self.teardown_microphone("*Voice: recording discarded — microphone disconnected*");
-        // Read the switch and write the status under one lock: a user turning voice off here keeps
-        // the Disabled state their action wrote, never a stale one.
-        {
-            let mut state = voice_state().write().unwrap_poison();
-            let status = if state.enabled {
-                VoiceStatus::MicDisconnected
-            } else {
-                VoiceStatus::Disabled
-            };
-            set_status_and_notify(&mut state, status);
+        if enrolling {
+            set_status(VoiceStatus::MicDisconnected);
+        } else {
+            set_resting_status(VoiceStatus::MicDisconnected);
         }
         info!("Voice pipeline: microphone unavailable — voice input stopped");
     }
 
-    /// Start an enrollment, aborting the recording it cannot coexist with.
-    #[cfg(target_os = "macos")]
+    /// Start an enrollment, aborting the recording it cannot coexist with. The recogniser is
+    /// demanded here when it is not loaded yet — the re-enrolment path has the wake toggle off, so
+    /// no listening start has asked for it — and the enrollment begins as soon as it is ready.
     fn handle_start_enrollment(&mut self) {
-        if !self.is_listening {
-            warn!("Cannot start enrollment: microphone not running");
-            set_status(VoiceStatus::Error(
-                "Microphone not running — enable Voice first".to_string(),
-            ));
+        // The wake word shares the recogniser, and nothing loads it while transcription is off.
+        if is_transcription_disabled() {
+            self.enrollment_start_pending = false;
+            warn!("Cannot start enrollment — local transcription disabled");
             return;
         }
+        // A listening session already implies a loaded recogniser; only the re-enrolment path
+        // (toggle off, no listening session) has to demand and wait for it.
+        if !crate::speech::is_loaded() && !self.is_listening {
+            self.enrollment_start_pending = true;
+            demand_transcriber();
+            return;
+        }
+        self.enrollment_start_pending = false;
+        self.begin_enrollment();
+    }
 
-        // No recording can coexist with enrollment: the router gives enrollment priority, so a
-        // recording buffer would starve (its auto-send cap never fires) and later resume as
-        // garbage. Abandoning it also ends a wake-word recording cue.
-        if self.abandon_recording("*Voice: recording discarded — enrollment started*") {
+    /// The enrollment itself, once the recogniser is ready.
+    fn begin_enrollment(&mut self) {
+        // The re-enrolment path has no listening session: open the microphone for the enrollment
+        // alone, and the end of the attempt closes it again while the toggle is off. A listening
+        // session already owns the microphone, so only the recording it cannot coexist with is
+        // abandoned there: the router gives enrollment priority, so that buffer would starve (its
+        // auto-send cap never fires) and later resume as garbage. Abandoning it also ends a
+        // wake-word recording cue.
+        if !self.is_listening {
+            if !self.open_session_microphone("*Voice: recording discarded — enrollment started*")
+            {
+                return;
+            }
+        } else if self.abandon_recording("*Voice: recording discarded — enrollment started*") {
             warn!("Aborting the recording — enrollment started");
-            self.resume_listening_after_recording = false;
         }
 
         // Resume existing progress if there is any (an interrupted session keeps its global
@@ -2199,10 +1704,13 @@ impl PipelineCtx {
         );
     }
 
-    #[cfg(target_os = "macos")]
     fn handle_cancel_enrollment(&mut self) {
+        self.enrollment_start_pending = false;
         self.end_enrollment_attempt();
-        set_status(if self.is_listening {
+        if !is_enabled() && self.is_listening {
+            self.stop_microphone();
+        }
+        set_resting_status(if self.is_listening {
             VoiceStatus::Listening
         } else {
             VoiceStatus::Disabled
@@ -2210,10 +1718,14 @@ impl PipelineCtx {
         info!("Voice pipeline: enrollment cancelled");
     }
 
+    /// Tear the microphone down without owning the status: the caller decides what the owner sees.
+    fn stop_microphone(&mut self) {
+        self.teardown_microphone("*Voice: recording discarded — enrollment ended*");
+    }
+
     /// Phase 2 → Phase 3, when `utterances_collected` and not yet `collecting_negatives`.  The VAD
     /// threshold is already unified, so nothing switches; stale pending utterances are drained, the
     /// negative buffer and silence counters cleared, and the Phase 3 flags set.
-    #[cfg(target_os = "macos")]
     fn transition_to_phase3(&mut self) {
         if !self.wake.enrollment_pending.is_empty() {
             warn!(
@@ -2245,6 +1757,7 @@ impl PipelineCtx {
     fn handle_shutdown(&mut self) {
         self.abandon_recording("*Voice: recording discarded — voice assistant stopped*");
         self.resume_listening_after_recording = false;
+        self.enrollment_start_pending = false;
         self.mic = None;
     }
 
@@ -2274,11 +1787,11 @@ impl PipelineCtx {
             warn!("Cannot start a recording — one is already running");
             return StartAttempt::AlreadyRecording;
         }
-        if self.enrollment_mode || self.collecting_negatives {
+        if self.enrollment_mode || self.collecting_negatives || self.enrollment_start_pending {
             warn!("Cannot start a voice recording during enrollment");
             return StartAttempt::Refused(None);
         }
-        // With local transcription disabled the shared ASR model never loads (or is gone after a
+        // With local transcription disabled the shared recogniser never loads (or is gone after a
         // restart): surface the configuration, not a loading state that can never complete. The
         // guard is unconditional, mirroring [`recording_blocked_reason`], so a still-loaded
         // in-memory model cannot contradict it.
@@ -2350,7 +1863,6 @@ impl PipelineCtx {
                     self.end_button_recording();
                 }
             }
-            #[cfg(target_os = "macos")]
             Some(RecordingOrigin::WakeWord) => {
                 let (cmd_buf, had_speech) = self.take_wake_recording();
                 if send {
@@ -2418,7 +1930,6 @@ impl PipelineCtx {
 
     /// Finish a wake-word recording that ended itself (silence, the cap) or was ended from the
     /// composer: its transcript joins the field, which the composer sends as one message.
-    #[cfg(target_os = "macos")]
     async fn finish_wake_recording(&mut self, cmd_buf: Vec<f32>, had_speech: bool) {
         // Nothing was said, so nothing joins the field: publishing that leaves the composer window,
         // its text and attachments exactly as they were.
@@ -2453,10 +1964,11 @@ impl PipelineCtx {
         let Some(origin) = self.recording.take() else {
             return false;
         };
+        // A discarded recording never resumes listening.
+        self.resume_listening_after_recording = false;
         // A wake-word recording ends like any other: its buffers go and its end cue plays. A button
         // recording owes no cue — the press that started it never got one.
         match origin {
-            #[cfg(target_os = "macos")]
             RecordingOrigin::WakeWord => self.end_wake_state(),
             RecordingOrigin::Button => {
                 self.command_buffer.clear();
@@ -2471,11 +1983,10 @@ impl PipelineCtx {
     /// `resume_listening_after_recording` says so, else tear down the recording-only mic.
     fn end_button_recording(&mut self) {
         self.recording = None;
-        // Only the wake word resumes a microphone by itself: off macOS the request is consumed and
-        // the recording-only mic is torn down below, exactly as when nothing asked to resume.
+        // Only the wake word resumes a microphone by itself: with no wake session the request is
+        // consumed and the recording-only mic is torn down below.
         if self.resume_listening_after_recording {
             self.resume_listening_after_recording = false;
-            #[cfg(target_os = "macos")]
             {
                 if self.is_listening {
                     // Wake-word mic still running: clear recording buffers, keep VAD continuity,
@@ -2509,7 +2020,7 @@ impl PipelineCtx {
         self.full_reset_preserving_auto_start();
         self.is_listening = false;
         self.mic = None;
-        set_status(VoiceStatus::Disabled);
+        set_resting_status(VoiceStatus::Disabled);
         debug!("Voice pipeline: recording ended");
     }
 
@@ -2523,7 +2034,7 @@ impl PipelineCtx {
         {
             return false;
         }
-        if retry_model_loads() {
+        if crate::speech::retry_init() {
             self.last_model_retry = Some(Instant::now());
             set_status(VoiceStatus::LoadingModels);
             true
@@ -2553,37 +2064,38 @@ impl PipelineCtx {
         }
     }
 
-    #[cfg(target_os = "macos")]
     fn check_auto_start(&mut self) {
         // One-shot auto-start, only while `auto_start_pending` (set at pipeline creation, or by
         // handle_start_listening when models were not ready); cleared after the first attempt, so a
         // mic failure cannot retry forever. Failed-state recovery has two paths:
         // handle_start_listening() retries immediately on an explicit start, and the post-select
         // block in run_voice_pipeline retries every iteration, debounced to 30 s. Once the
-        // encoder is Ready this picks it up through the pending flag; nothing loads while
+        // recogniser is Ready this picks it up through the pending flag; nothing loads while
         // transcription is disabled, and past `Uninit` the demand is a cheap no-op.
-        if self.auto_start_pending && !models_ready() && !is_transcription_disabled() {
-            demand_encoder();
+        if self.auto_start_pending && !crate::speech::is_loaded() && !is_transcription_disabled() {
+            demand_transcriber();
         }
-        if self.auto_start_pending && models_ready() && !self.is_listening {
+        if self.auto_start_pending
+            && crate::speech::is_loaded()
+            && !self.is_listening
+            && !enrollment_unusable()
+        {
             self.auto_start_pending = false;
             send_command(VoiceCommand::StartListening);
         }
     }
 }
 
-/// Schedule the transition back to [`VoiceStatus::Listening`] 1.5 s after a successful
-/// finalization, respecting the global shutdown token so it cannot write stale state after exit.
-#[cfg(target_os = "macos")]
-fn schedule_listening_transition(ctx: &mut PipelineCtx) {
-    ctx.end_enrollment_attempt();
-    // Schedule transition to Listening after showing "Enrolled" for 1.5s.
-    tokio::spawn(async {
+/// Leave [`VoiceStatus::Enrolled`] for `target` 1.5 s after a successful finalization, so the
+/// confirmation is visible first; respects the global shutdown token so it cannot write stale state
+/// after exit.
+fn schedule_after_enrolled(target: VoiceStatus) {
+    tokio::spawn(async move {
         let shutdown_token = crate::shutdown::shutdown_token();
         tokio::select! {
             () = tokio::time::sleep(Duration::from_millis(1500)) => {
                 if matches!(get_status(), VoiceStatus::Enrolled) {
-                    set_status(VoiceStatus::Listening);
+                    set_status(target);
                 }
             }
             () = shutdown_token.cancelled() => {
@@ -2593,87 +2105,26 @@ fn schedule_listening_transition(ctx: &mut PipelineCtx) {
     });
 }
 
-/// Encode raw PCM chunks through the shared encoder into 1024-dim L2-normalized window embeddings,
-/// each over its trailing ≤1 s. CPU-bound, so it runs in `spawn_blocking`; failed chunks are
-/// skipped.
-#[cfg(target_os = "macos")]
+/// Embed raw PCM chunks one clip at a time. CPU-bound, so it runs in `spawn_blocking`; failed
+/// chunks are skipped.
 async fn extract_negative_embeddings(chunks: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
     if chunks.is_empty() {
         return Vec::new();
     }
-    let Some(model) = crate::audio::encoder::shared_model_arc() else {
-        warn!("extract_negative_embeddings: the encoder is not loaded");
-        return Vec::new();
-    };
-    tokio::task::spawn_blocking(move || {
-        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
-        for chunk in &chunks {
-            match encode_window(&model, chunk) {
-                Ok(emb) => embeddings.push(emb),
-                Err(e) => {
-                    warn!(
-                        "Failed to encode negative chunk ({} samples): {e} — skipping",
-                        chunk.len(),
-                    );
-                }
-            }
-        }
-        embeddings
-    })
-    .await
-    .unwrap_or_else(|e| {
-        warn!("Negative embedding task panicked: {e}");
-        Vec::new()
-    })
+    tokio::task::spawn_blocking(move || crate::speech::embed_clips(&chunks))
+        .await
+        .unwrap_or_else(|e| {
+            warn!("Negative embedding task panicked: {e}");
+            Vec::new()
+        })
 }
 
-/// Centroid-consistency gate for the enrollment set: the prototype is the L2-normalized mean of the
-/// accepted embeddings, and it needs ≥ [`MIN_ENROLLMENT_UTTERANCES`] (5) utterances with at least
-/// ceil(N × [`ENROLLMENT_CONSISTENCY_MIN_FRACTION`]) of them at cosine ≥
-/// [`ENROLLMENT_CONSISTENCY_MIN_SIMILARITY`] (0.70) to the centroid.  Pure, so the gate is testable
-/// without the ASR model; `Ok(prototype)` on pass, else `Err` with a user-facing message.
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-#[cfg(target_os = "macos")]
-fn enrollment_consistency_check(utterance_embeddings: &[Vec<f32>]) -> Result<Vec<f32>, String> {
-    if utterance_embeddings.len() < MIN_ENROLLMENT_UTTERANCES {
-        return Err(format!(
-            "Only {} enrollment utterances collected (need ≥{MIN_ENROLLMENT_UTTERANCES}). \
-             Speak clearly and close to the microphone.",
-            utterance_embeddings.len(),
-        ));
-    }
-    let dim = WAKE_WORD_EMBEDDING_DIM;
-    let centroid = normalized_centroid(utterance_embeddings)
-        .map_err(|got| format!("Utterance embedding has dim {got} (expected {dim})"))?;
-
-    let required =
-        (utterance_embeddings.len() as f32 * ENROLLMENT_CONSISTENCY_MIN_FRACTION).ceil() as usize;
-    let passed = utterance_embeddings
-        .iter()
-        .filter(|emb| cosine_similarity(emb, &centroid) >= ENROLLMENT_CONSISTENCY_MIN_SIMILARITY)
-        .count();
-    if passed < required {
-        return Err(format!(
-            "Only {passed}/{} enrollment utterances match the prototype \
-             (need ≥{required} at cosine ≥ {ENROLLMENT_CONSISTENCY_MIN_SIMILARITY}). \
-             Try re-enrolling with clearer, more consistent speech.",
-            utterance_embeddings.len(),
-        ));
-    }
-    Ok(centroid)
-}
-
-/// Finalize enrollment — build the prototype, calibrate against negatives, self-test, persist the
-/// v2 record — after Phase 3 completes or times out. `true` on success; on failure the cause is
+/// Finalize enrollment — the engine's prototype and calibration, the self-test, the schema-3
+/// record — after Phase 3 completes or times out. `true` on success; on failure the cause is
 /// logged, `false` returned, and the caller ends the attempt via
 /// [`PipelineCtx::end_enrollment_attempt`].
-#[cfg(target_os = "macos")]
 async fn finalize_enrollment_pipeline() -> bool {
-    if !models_ready() {
+    if !crate::speech::is_loaded() {
         warn!("finalize_enrollment_pipeline: models not ready");
         return false;
     }
@@ -2687,8 +2138,8 @@ async fn finalize_enrollment_pipeline() -> bool {
         )
     };
 
-    // Consistency gate → the L2-normalized prototype (centroid) used for calibration.
-    let prototype = match enrollment_consistency_check(&utterance_embeddings) {
+    // Consistency gate → the L2-normalized prototype the calibration is measured against.
+    let prototype = match wake_word::consistency_check(&utterance_embeddings) {
         Ok(proto) => proto,
         Err(msg) => {
             warn!("Enrollment finalization failed: {msg}");
@@ -2697,34 +2148,15 @@ async fn finalize_enrollment_pipeline() -> bool {
         }
     };
 
-    // Negative sources are the Phase 3 owner-negative chunks and the ambient non-wake-word chunks.
-    // The old Conv1D training set used TTS confusable/unrelated phrases; the prototype-cosine
-    // pipeline calibrates on real recordings only, which is simpler and enough for the cosine
-    // floor. The two encode batches are independent `spawn_blocking` tasks sharing the read-only
-    // model `Arc` (per-call scratch buffers make concurrent forwards safe), so they run in
-    // parallel.
-    let owner_fut = async {
-        if owner_negative_chunks.is_empty() {
-            Vec::new()
-        } else {
-            extract_negative_embeddings(owner_negative_chunks).await
-        }
-    };
-    let ambient_fut = async {
-        if negative_audio_chunks.is_empty() {
-            Vec::new()
-        } else {
-            extract_negative_embeddings(negative_audio_chunks).await
-        }
-    };
-    let (owner_embs, ambient_embs) = tokio::join!(owner_fut, ambient_fut);
+    // The two negative sources are the Phase 3 owner speech and the ambient non-wake-word chunks;
+    // both are embedded one clip at a time through the one listener.
+    let mut negative_chunks = owner_negative_chunks;
+    negative_chunks.extend(negative_audio_chunks);
+    let negative_embeddings = extract_negative_embeddings(negative_chunks).await;
     info!(
-        "Enrollment: encoded {} owner-negative + {} ambient-negative embeddings",
-        owner_embs.len(),
-        ambient_embs.len(),
+        "Enrollment: encoded {} negative embeddings",
+        negative_embeddings.len(),
     );
-    let mut negative_embeddings: Vec<Vec<f32>> = owner_embs;
-    negative_embeddings.extend(ambient_embs);
 
     {
         let mut state = voice_state().write().unwrap_poison();
@@ -2732,20 +2164,16 @@ async fn finalize_enrollment_pipeline() -> bool {
         state.owner_negative_chunks.clear();
     }
 
-    let calibration = calibrate_negatives(&prototype, &negative_embeddings);
+    let calibration = wake::calibrate_negatives(&prototype, &negative_embeddings);
     // Keep the original creation timestamp (re-enrollment does not reset it); `trained_at` is now.
     let created_at = get_enrollment()
         .filter(|e| !e.created_at.is_empty())
         .map_or_else(db::now, |e| e.created_at.clone());
     let trained_at = db::now();
 
-    let Some(enrollment) = WakeWordEnrollment::build(
-        &utterance_embeddings,
-        calibration,
-        &negative_embeddings,
-        created_at,
-        trained_at,
-    ) else {
+    let Some(enrollment) =
+        wake_word::build_enrollment(&utterance_embeddings, calibration, &negative_embeddings)
+    else {
         warn!("Enrollment finalization failed: could not build enrollment record");
         set_status(VoiceStatus::Error(
             "Enrollment failed — please re-enroll".to_string(),
@@ -2762,9 +2190,11 @@ async fn finalize_enrollment_pipeline() -> bool {
         return false;
     }
 
-    // Self-test: ≥80% of accepted utterances must trigger with a fresh window and no adaptive
-    // state.
-    if let Err(e) = run_enrollment_self_test(&utterance_embeddings, &enrollment) {
+    if let Err(e) = wake_word::self_test(
+        &utterance_embeddings,
+        &enrollment,
+        ENROLLMENT_QUALITY_SELF_TEST_MIN_FRACTION,
+    ) {
         warn!("Enrollment self-test failed — model rejected: {e}.  Re-enrollment required.");
         set_status(VoiceStatus::Error(format!(
             "Enrollment validation failed: {e}.  Please try again with clearer speech."
@@ -2773,9 +2203,10 @@ async fn finalize_enrollment_pipeline() -> bool {
     }
     info!("Enrollment self-test: passed — deploying model");
 
-    set_enrollment(enrollment.clone());
+    let record = WakeWordEnrollment::from_engine(&enrollment, created_at, trained_at);
+    set_enrollment(record.clone());
 
-    if !persist_enrollment(&enrollment).await {
+    if !persist_enrollment(&record).await {
         warn!("Enrollment persisted to memory but failed to save to config DB");
         // The enrollment is live in memory until exit — name the saving failure, not a wake-word
         // one.
@@ -2808,32 +2239,33 @@ pub async fn run_voice_pipeline() {
         state.cmd_tx = Some(cmd_tx);
     }
 
-    // Load the persisted enrollment (v2 schema).
-    #[cfg(target_os = "macos")]
+    // Load the persisted enrollment (schema 3). A record from the old encoder is refused, never
+    // migrated: the toggle switches itself off and the owner enrols again.
     if let Some(json) = CONFIG.wake_word_templates() {
         match serde_json::from_str::<WakeWordEnrollment>(&json) {
-            Ok(enr)
-                if enr.schema_version == wake_word::ENROLLMENT_SCHEMA_VERSION
-                    && enr.embedding_dim == WAKE_WORD_EMBEDDING_DIM
-                    && enr.prototype.len() == WAKE_WORD_EMBEDDING_DIM =>
-            {
-                set_enrollment(enr);
-                info!("Loaded wake word enrollment (v2)");
+            Ok(record) if record.usable() => {
+                set_enrollment(record);
+                info!("Loaded wake word enrollment");
             }
             Ok(_) | Err(_) => {
-                // v1 classifier records and unparseable JSON are rejected outright — no migration,
-                // re-enroll.
                 warn!(
-                    "Stored wake word enrollment is incompatible or legacy (v1). \
-                     Re-enrollment required."
+                    "Stored wake word enrollment is from the old encoder or unreadable — \
+                     re-enrolment required."
                 );
+                retire_enrollment();
+                // The toggle is off from now on; persist that so a restart does not try again.
+                if let Err(e) =
+                    crate::config::persist_settled_string_field(CONFIG_KEY_VOICE_ENABLED, "").await
+                {
+                    warn!("Could not persist the wake toggle off: {e}");
+                }
             }
         }
     }
 
     // The status resolves from the recogniser's state via [`resolved_model_status`], re-resolved by
     // the periodic wake-up so the UI cannot hang on LoadingModels. Transcription disabled ⇒ the
-    // wake word is disabled too (macOS), since nothing it encodes with ever loads: surface Disabled
+    // wake word is disabled too, since nothing it encodes with ever loads: surface Disabled
     // (not LoadingModels, which would hang) and skip auto-start.
     let transcription_disabled = is_transcription_disabled();
     if transcription_disabled {
@@ -2843,15 +2275,15 @@ pub async fn run_voice_pipeline() {
     }
 
     let mut ctx = PipelineCtx::new();
-    // A wake-word auto-start is the wake word's own: it waits for the encoder, which is macOS only.
-    #[cfg(target_os = "macos")]
-    if ctx.auto_start_pending && !transcription_disabled {
+    ctx.wake.rebuild_detector();
+    // A wake-word auto-start is the wake word's own: it waits for the recogniser. An unusable
+    // enrolment never auto-starts.
+    if ctx.auto_start_pending && !transcription_disabled && !enrollment_unusable() {
         set_enabled(true);
         info!("Voice assistant enabled in config — will auto-start when models are ready");
     }
 
     // Auto-start now if models are loaded, instead of waiting for the first select! timeout.
-    #[cfg(target_os = "macos")]
     ctx.check_auto_start();
 
     loop {
@@ -2864,18 +2296,15 @@ pub async fn run_voice_pipeline() {
 
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    #[cfg(target_os = "macos")]
                     Some(VoiceCommand::StartListening) => ctx.handle_start_listening(),
                     // The recording a stop or enrollment aborts is reported to the composer, which
                     // shows the reason.
                     Some(VoiceCommand::StopListening) => ctx.handle_stop_listening(),
-                    #[cfg(target_os = "macos")]
                     Some(VoiceCommand::StartEnrollment) => ctx.handle_start_enrollment(),
-                    #[cfg(target_os = "macos")]
                     Some(VoiceCommand::CancelEnrollment) => ctx.handle_cancel_enrollment(),
                     Some(VoiceCommand::RetryModelLoading) => {
                         // Explicit retry from GUI — bypass debounce.
-                        if retry_model_loads() {
+                        if crate::speech::retry_init() {
                             ctx.last_model_retry = Some(Instant::now());
                             set_status(VoiceStatus::LoadingModels);
                         } else {
@@ -2902,19 +2331,18 @@ pub async fn run_voice_pipeline() {
                             && matches!(get_status(), VoiceStatus::Disabled)
                         {
                             // Auto-start was deferred at boot; re-arm so voice reaches Listening
-                            // once the ASR model loads.
+                            // once the recogniser loads.
                             if ctx.auto_start_pending {
                                 set_enabled(true);
                             }
                             // Voice enabled while transcription was disabled: the rejected
                             // StartListening cleared the pending start, so re-arm it.
-                            if is_enabled() && !ctx.is_listening {
+                            if is_enabled() && !ctx.is_listening && !enrollment_unusable() {
                                 ctx.auto_start_pending = true;
                             }
                             set_status(current_model_status());
                             // Fire StartListening now if models are ready; the pending flag keeps
                             // it armed otherwise.
-                            #[cfg(target_os = "macos")]
                             ctx.check_auto_start();
                         }
                     }
@@ -2944,9 +2372,8 @@ pub async fn run_voice_pipeline() {
                     continue;
                 }
 
-                // Samples flow RAW to the mode dispatch: the old AGC/NS preprocessor is gone, the
-                // encoder pipeline needs no preprocessing and enrollment SNR uses the raw floor.
-                #[cfg(target_os = "macos")]
+                // Samples flow RAW to the mode dispatch: there is no preprocessing, and enrollment
+                // SNR uses the raw floor.
                 {
                     if ctx.collecting_negatives {
                         handle_negative_collection_audio(&samples, &mut ctx);
@@ -2969,12 +2396,6 @@ pub async fn run_voice_pipeline() {
                         }
                     }
                 }
-                // Without a wake word there is one kind of recording: the composer's, which keeps
-                // everything until the press or the cap ends it.
-                #[cfg(not(target_os = "macos"))]
-                if ctx.recording.is_some() {
-                    ctx.handle_button_recording_audio(&samples).await;
-                }
             }
 
             // Periodic wake-up, so auto-recovery fires when a loader finishes loading or turns
@@ -2994,11 +2415,13 @@ pub async fn run_voice_pipeline() {
                 // [`resolved_model_status`] the startup block uses, so the footer can never hang on
                 // "Loading…" — Listening when voice is on, Disabled when not, whatever started the
                 // load.
-                if models_failed() {
+                if crate::speech::is_failed() {
                     if !matches!(get_status(), VoiceStatus::ModelError) {
                         set_status(VoiceStatus::ModelError);
                     }
-                } else if matches!(get_status(), VoiceStatus::LoadingModels) {
+                } else if matches!(get_status(), VoiceStatus::LoadingModels)
+                    && !ctx.enrollment_start_pending
+                {
                     let resolved = current_model_status();
                     if !matches!(resolved, VoiceStatus::LoadingModels) {
                         set_status(resolved);
@@ -3012,13 +2435,12 @@ pub async fn run_voice_pipeline() {
         // [`MAX_AUTO_MODEL_RETRY_CYCLES`] so a failing download cannot loop forever). It runs
         // regardless of auto_start_pending, so the error state heals even when voice is toggled
         // manually.
-        if models_failed() {
+        if crate::speech::is_failed() {
             ctx.try_retry_models_auto();
         }
 
-        // The wake word's own phases (macOS only): owner-negative collection after the tenth
+        // The wake word's own phases: owner-negative collection after the tenth
         // utterance, then finalization on target speech time or the wall-clock timeout.
-        #[cfg(target_os = "macos")]
         run_enrollment_phases(&mut ctx).await;
 
         // Error → Listening once the refractory period elapses, checked non-blocking in the main
@@ -3026,7 +2448,6 @@ pub async fn run_voice_pipeline() {
         ctx.check_refractory_period();
 
         // Auto-start when models become ready (async load case).
-        #[cfg(target_os = "macos")]
         ctx.check_auto_start();
     }
 
@@ -3035,9 +2456,17 @@ pub async fn run_voice_pipeline() {
 
 /// The wake word's own phases of the pipeline loop: the Phase 2→3 transition once the tenth
 /// utterance is in, the Phase 3 collection and finalization, and one completed enrollment utterance
-/// per tick through the encoder.
-#[cfg(target_os = "macos")]
+/// per tick through the listener.
 async fn run_enrollment_phases(ctx: &mut PipelineCtx) {
+    // An enrollment requested while the recogniser was loading starts now.
+    if ctx.enrollment_start_pending && is_transcription_disabled() {
+        ctx.enrollment_start_pending = false;
+    }
+    if ctx.enrollment_start_pending && crate::speech::is_loaded() {
+        ctx.enrollment_start_pending = false;
+        ctx.begin_enrollment();
+    }
+
     // After all 10 utterances, transition automatically to owner-negative collection.
     let utterances_collected = voice_state().read().unwrap_poison().utterances_collected;
     if utterances_collected && !ctx.collecting_negatives {
@@ -3081,16 +2510,30 @@ async fn run_enrollment_phases(ctx: &mut PipelineCtx) {
                 },
             );
 
-            // Build and persist the enrollment.
+            // Build and persist the enrollment. The detector is rebuilt from whatever record is
+            // active: a successful build, or the previous one when this attempt failed.
             let success = finalize_enrollment_pipeline().await;
+            ctx.wake.rebuild_detector();
 
             if success {
-                set_status(VoiceStatus::Enrolled);
-                schedule_listening_transition(ctx);
+                if is_enabled() {
+                    ctx.end_enrollment_attempt();
+                    set_status(VoiceStatus::Enrolled);
+                    schedule_after_enrolled(VoiceStatus::Listening);
+                } else {
+                    // Re-enrolment ran with the toggle off: the microphone was opened for it alone
+                    // and is closed again, leaving the toggle ready to be turned on.
+                    ctx.stop_microphone();
+                    set_status(VoiceStatus::Enrolled);
+                    schedule_after_enrolled(VoiceStatus::Disabled);
+                }
             } else {
                 // A failed finalization ends the attempt like a successful one — leaving it open
                 // re-enters finalization on every mic chunk.
                 ctx.end_enrollment_attempt();
+                if !is_enabled() {
+                    ctx.stop_microphone();
+                }
             }
         } else {
             // Update status with current progress.
@@ -3109,7 +2552,7 @@ async fn run_enrollment_phases(ctx: &mut PipelineCtx) {
 
     // Process pending enrollment utterances, accumulated inline to avoid a race with the command
     // channel; a `VecDeque` keeps every utterance when several complete within one mic frame (one
-    // popped per tick). The encoder forward uses `spawn_blocking`. Phase 2 only — Phase 3 handles
+    // popped per tick). The embedding pass uses `spawn_blocking`. Phase 2 only — Phase 3 handles
     // its audio independently.
     if !utterances_collected && let Some(samples) = ctx.wake.enrollment_pending.pop_front() {
         let noise_rms = ctx.wake.noise_rms_estimate.take();
@@ -3117,11 +2560,23 @@ async fn run_enrollment_phases(ctx: &mut PipelineCtx) {
     }
 }
 
+/// Write a string config field and warn when `set_string_field` does not recognise the key — the
+/// macro's `stringify!` arms have drifted from the call site.
+fn set_config_string(field: &'static str, value: &str) -> bool {
+    if CONFIG.set_string_field(field, value) {
+        return true;
+    }
+    warn!(
+        "Failed to update CONFIG field {field}: set_string_field does not recognize the key — it \
+         may have drifted from the `stringify!` arms"
+    );
+    false
+}
+
 /// Persist an enrollment to the config DB and update the in-memory CONFIG, so GUI snapshot readers
 /// and a pipeline restart see it — the per-field persist paths never write `wake_word_templates`.
 /// Failures are logged; `true` only when both the DB write and the CONFIG update succeeded, since
 /// the only caller ends the attempt on `false` and leaves the enrollment in memory for the session.
-#[cfg(target_os = "macos")]
 async fn persist_enrollment(enrollment: &WakeWordEnrollment) -> bool {
     let Ok(json) = serde_json::to_string(enrollment) else {
         warn!("Failed to serialize wake word enrollment for persistence");
@@ -3132,25 +2587,18 @@ async fn persist_enrollment(enrollment: &WakeWordEnrollment) -> bool {
         warn!("Failed to persist wake word enrollment: {e}");
         return false;
     }
-    if !CONFIG.set_string_field(CONFIG_KEY_WAKE_WORD_TEMPLATES, &json) {
-        warn!(
-            "Failed to update CONFIG with wake word enrollment (key not recognized by \
-             set_string_field — it may have drifted from the `stringify!` arms)"
-        );
-        return false;
-    }
-    true
+    set_config_string(CONFIG_KEY_WAKE_WORD_TEMPLATES, &json)
 }
 
 /// Audio during wake-word command recording (post-detection). The opening
 /// [`POST_FIRE_DISCARD_SAMPLES`] are dropped, so recognition starts after the trigger — the
-/// pre-fire audio is already gone, and only a phrase tail survives a fire that landed mid-phrase.
+/// pre-fire ring was dropped wholesale at the handoff, so only the phrase still being spoken when
+/// the recording starts can reach it.
 /// The rest accumulates into `command_buffer`, silence tracked by sample count (not wall-clock, so
 /// load cannot skew the cutoff), and the recording stops after [`SILENCE_THRESHOLD_SAMPLES`] of
 /// silence or the [`MAX_RECORD_SECS`] cap, then transcribes and publishes. A recording whose
 /// retained audio holds no speech delivers nothing at all; a button recording never reaches this
 /// gate.
-#[cfg(target_os = "macos")]
 #[expect(clippy::cast_precision_loss)]
 async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
     // Discard the armed opening before keeping anything — but still feed it to the VAD: the
@@ -3200,9 +2648,8 @@ async fn handle_recording_audio(samples: Vec<f32>, ctx: &mut PipelineCtx) {
 }
 
 /// Reject an enrollment utterance shorter than 400ms: that drops noise blips and coughs while
-/// accepting any real wake word. The floor is wall-clock duration, since the encoder produces
+/// accepting any real wake word. The floor is wall-clock duration, since the engine produces
 /// exactly one window embedding per utterance and 400 ms is well below the ~1s a wake word needs.
-#[cfg(target_os = "macos")]
 fn check_enrollment_utterance_length(duration_ms: u64) -> Result<(), String> {
     if duration_ms < ENROLLMENT_QUALITY_DURATION_MIN_MS {
         Err(format!(
@@ -3213,13 +2660,12 @@ fn check_enrollment_utterance_length(duration_ms: u64) -> Result<(), String> {
     }
 }
 
-/// Encode a completed enrollment utterance and store its 1024-dim embedding. Encoded ONCE — the
+/// Embed a completed enrollment utterance and store its window embedding. Encoded once — the
 /// prototype-cosine pipeline needs no PCM augmentation; utterances under 400 ms are rejected and
 /// the enrollment status is updated with per-utterance quality.
-#[cfg(target_os = "macos")]
 #[expect(clippy::cast_precision_loss)]
 async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
-    if !models_ready() {
+    if !crate::speech::is_loaded() {
         warn!("Models not ready for enrollment");
         return;
     }
@@ -3232,14 +2678,10 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
         return;
     }
 
-    // Quality is assessed before `samples` moves into the encoder task.
+    // Quality is assessed before `samples` moves into the embedding task.
     let quality = compute_utterance_quality(&samples, noise_rms);
 
-    let Some(model) = crate::audio::encoder::shared_model_arc() else {
-        warn!("The encoder is not loaded — skipping enrollment sample");
-        return;
-    };
-    let embedding = tokio::task::spawn_blocking(move || encode_window(&model, &samples))
+    let embedding = tokio::task::spawn_blocking(move || crate::speech::embed_clip(&samples))
         .await
         .unwrap_or_else(|e| Err(anyhow!("Enrollment encode task panicked: {e}")));
     let embedding = match embedding {
@@ -3279,162 +2721,107 @@ async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
     }
 }
 
-/// Append `samples` to `buf`, draining the front past `cap`; returns how many were drained so
-/// callers can shift their cursors.
-#[cfg(target_os = "macos")]
-fn push_capped(buf: &mut Vec<f32>, samples: &[f32], cap: usize) -> usize {
-    buf.extend_from_slice(samples);
-    let excess = buf.len().saturating_sub(cap);
-    buf.drain(..excess);
-    excess
+/// One wake-word encoder pass: two consecutive windows share it, and a lone window at a segment
+/// close is embedded on its own. CPU-bound, so it runs inside [`crate::util::with_block_in_place`].
+fn embed_windows(windows: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+    crate::util::with_block_in_place(|| match windows {
+        [one] => crate::speech::embed_clip(one).map(|embedding| vec![embedding]),
+        [first, second] => crate::speech::embed_pair(first, second).map(Vec::from),
+        _ => anyhow::bail!("a wake-word pass carries one or two windows"),
+    })
 }
 
-/// Handle a chunk of raw mic audio during wake-word detection. Within [`WAKE_WORD_COOLDOWN`] of a
-/// detection, audio only accumulates into the raw ring ([`AUDIO_BUFFER_MAX`]). Each [`HOP_LENGTH`]
-/// hop then goes to the global Earshot VAD, which counts per-segment silence and lets
-/// [`PipelineCtx::handle_segment_boundary`] reset the segment at [`SEGMENT_TIMEOUT_HOPS`] (never
-/// while recording); no mel frames are built — the raw ring is the VAD input only. When
-/// [`SCORE_STRIDE_SAMPLES`] have been processed since the last step and either speech was seen in
-/// this call or the rolling window is mid-utterance, the trailing ≤1 s of the VAD-gated
-/// [`Wake::speech_window`] is encoded ([`crate::audio::wake_word::encode_window`]) and
-/// scored ([`score_single_embedding`]); a fire counts only within the first
-/// [`WAKE_WORD_MAX_SEGMENT_STEPS`] steps of the segment ([`Wake::segment_score_steps`]) and
-/// a later match is refused. On detection the raw ring is dropped — all of it is pre-fire audio —
-/// and the recording discards its own opening ([`POST_FIRE_DISCARD_SAMPLES`]).
-#[cfg(target_os = "macos")]
+/// Handle a chunk of raw mic audio during wake-word detection. Within [`wake_word::WAKE_WORD_COOLDOWN`]
+/// of a detection, audio only accumulates into the raw ring ([`AUDIO_BUFFER_MAX`]). Each
+/// [`HOP_LENGTH`] hop then goes to the global Earshot VAD, which counts per-segment silence; at
+/// [`SEGMENT_TIMEOUT_HOPS`] the segment closes and its queued window is scored before the state is
+/// cleared. A window is queued every [`SCORE_STRIDE_SAMPLES`] of speech, and two
+/// consecutive windows are embedded in one pass; a fire counts only within the first
+/// [`wake::WAKE_WORD_MAX_SEGMENT_STEPS`] windows of its segment. On detection the raw ring is
+/// dropped wholesale — it holds the trigger phrase plus the stride a paired pass waited for — and
+/// the recording discards its own opening ([`POST_FIRE_DISCARD_SAMPLES`]).
 fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
     // Cooldown: skip ALL processing for the chunk, so a rapid consecutive false trigger cannot
     // follow. Audio still accumulates into `audio_buffer` (capped), so the pipeline has data the
     // moment the cooldown expires.
-    if let Some(last) = ctx.wake.last_wake_word_detection
-        && last.elapsed() < WAKE_WORD_COOLDOWN
+    if ctx
+        .wake
+        .detector
+        .as_ref()
+        .is_some_and(WakeDetector::cooldown_active)
     {
-        debug!(
-            "Wake word cooldown active ({}ms elapsed)",
-            last.elapsed().as_millis()
-        );
-        push_capped(&mut ctx.wake.audio_buffer, samples, AUDIO_BUFFER_MAX);
+        debug!("Wake word cooldown active");
+        wake_word::push_capped(&mut ctx.wake.audio_buffer, samples, AUDIO_BUFFER_MAX);
         return;
     }
 
-    let excess = push_capped(&mut ctx.wake.audio_buffer, samples, AUDIO_BUFFER_MAX);
+    let excess = wake_word::push_capped(&mut ctx.wake.audio_buffer, samples, AUDIO_BUFFER_MAX);
     ctx.wake.vad_cursor = ctx.wake.vad_cursor.saturating_sub(excess);
 
     // Iterate [`HOP_LENGTH`] frames over the UNCONSUMED audio (from `vad_cursor`), feeding each
     // frame's NEW hop to the global VAD: the 512-sample frame overlaps the previous by 256, and
-    // feeding the full frame would double-feed and corrupt Earshot's ring buffer. No mel frames are
-    // built — this loop only tracks speech and per-segment silence, and scoring encodes the
-    // VAD-gated `speech_window`, not this ring. The ring is NOT drained: `vad_cursor` marks the
-    // consumed prefix and the overlap tail (up to [`FRAME_LENGTH`] - [`HOP_LENGTH`]) must survive
-    // into the next call.
-    let mut speech_seen_this_call = false;
+    // feeding the full frame would double-feed and corrupt Earshot's ring buffer. The ring is NOT
+    // drained: `vad_cursor` marks the consumed prefix and the overlap tail (up to
+    // [`FRAME_LENGTH`] - [`HOP_LENGTH`]) must survive into the next call.
+    let mut speech_seen = false;
     // Seeded with the count from previous calls, so the VAD-negative hop counter stays continuous.
     let mut hop_count = ctx.wake.segment_silence_hops;
-
     while ctx.wake.vad_cursor + FRAME_LENGTH <= ctx.wake.audio_buffer.len() {
         let frame = &ctx.wake.audio_buffer[ctx.wake.vad_cursor..ctx.wake.vad_cursor + FRAME_LENGTH];
-        // The global [`VAD_DETECTOR`] keeps continuous noise-floor and ring state across the live
-        // stream.
         let is_speech = is_speech_with_threshold(&frame[..HOP_LENGTH], VAD_THRESHOLD);
         if is_speech {
-            speech_seen_this_call = true;
+            speech_seen = true;
             hop_count = 0;
-            // Append only the VAD-positive hop, so the encoder sees speech-only audio like
-            // enrollment utterances; capped at [`WAKE_WORD_WINDOW_SAMPLES`], draining the front.
-            push_capped(
-                &mut ctx.wake.speech_window,
-                &frame[..HOP_LENGTH],
-                WAKE_WORD_WINDOW_SAMPLES,
-            );
         } else {
             hop_count += 1;
         }
+        if let Some(detector) = ctx.wake.detector.as_mut() {
+            detector.note_hop(&frame[..HOP_LENGTH], is_speech);
+        }
         ctx.wake.vad_cursor += HOP_LENGTH;
-        ctx.wake.last_score_sample_count += HOP_LENGTH;
     }
 
-    // Reset the rolling window and adaptive threshold once consecutive silence reaches
-    // [`SEGMENT_TIMEOUT_HOPS`], so scores cannot accumulate across utterances. Runs BEFORE scoring,
-    // so a just-fired boundary starts a fresh segment.
-    ctx.handle_segment_boundary(hop_count);
-
-    // Score when [`SCORE_STRIDE_SAMPLES`] were processed since the last encode AND speech was seen
-    // in this call, or the rolling window is non-empty (mid-utterance continuation across a VAD
-    // gap).
-    if ctx.recording.is_none()
-        && ctx.wake.last_score_sample_count >= SCORE_STRIDE_SAMPLES
-        && (speech_seen_this_call || !ctx.wake.score_window.is_empty())
+    let mut detection = Detection::default();
     {
-        ctx.wake.last_score_sample_count = 0;
-
-        // No enrollment installed → skip the step: the heavy 18-layer forward is gated behind both
-        // the enrollment and the model, so listening without a deployed wake word does no
-        // per-stride encoding.
-        let Some(enrollment) = voice_state().read().unwrap_poison().enrollment.clone() else {
+        let wake = &mut ctx.wake;
+        let Some(detector) = wake.detector.as_mut() else {
             return;
         };
+        if hop_count >= SEGMENT_TIMEOUT_HOPS {
+            wake.segment_silence_hops = 0;
+            // Everything queued was produced in the segment that is closing, so it is scored in
+            // that state before the rolling window and the adaptive state are cleared.
+            detection = detector.close_segment(embed_windows);
+            wake.audio_buffer.clear();
+            wake.vad_cursor = 0;
+        } else {
+            wake.segment_silence_hops = hop_count;
+        }
 
-        let Some(model) = crate::audio::encoder::shared_model_arc() else {
-            // The encoder is not loaded — no scoring this step; the status is handled elsewhere.
-            return;
-        };
-
-        // The segment clock the fire-position cut reads advances only on steps that really score: a
-        // stride that bailed out above must not shorten the accept window.
-        ctx.wake.segment_score_steps += 1;
-
-        // Take the trailing ≤[`WAKE_WORD_WINDOW_SAMPLES`] of the VAD-gated speech window, not the
-        // raw ring: speech-only audio keeps the cosine distribution aligned with enrollment, while
-        // raw trailing audio dilutes the embedding and shifts positives below the calibration
-        // floor.
-        let start = ctx
-            .wake
-            .speech_window
-            .len()
-            .saturating_sub(WAKE_WORD_WINDOW_SAMPLES);
-        let window = &ctx.wake.speech_window[start..];
-
-        let embedding = crate::util::with_block_in_place(|| encode_window(&model, window));
-        match embedding {
-            Ok(embedding) => {
-                let (detected, ..) = score_single_embedding(
-                    &embedding,
-                    Some(&enrollment),
-                    &mut ctx.wake.score_window,
-                    Some(&mut ctx.wake.adaptive_threshold),
-                    ctx.wake.adaptive_k,
-                );
-
-                // A recognised phrase is a person at the computer, even when the
-                // position gate below refuses the fire.
-                if detected {
-                    crate::user_activity::report_activity();
-                }
-
-                // A fire counts only near the start of its segment; past that position the match is
-                // inert (the position only grows within a segment, so a refused match stays refused
-                // until a boundary or a handled detection clears the count).
-                if detected && ctx.wake.segment_score_steps <= WAKE_WORD_MAX_SEGMENT_STEPS {
-                    // Fire now — the handoff below completes the transition to recording.
-                    ctx.recording = Some(RecordingOrigin::WakeWord);
-                    publish_recording(RecordingEvent::Started);
-                    ctx.wake.last_wake_word_detection = Some(Instant::now());
-                    set_status(VoiceStatus::RecordingWakeWord);
-                }
-            }
-            Err(e) => {
-                warn!("Wake word window encoding failed: {e}");
-            }
+        detector.take_stride(speech_seen);
+        if detector.pair_ready() {
+            let resolved = detector.resolve(embed_windows);
+            detection.heard |= resolved.heard;
+            detection.fired |= resolved.fired;
         }
     }
 
-    // Detection→recording handoff: the ring is dropped, not seeded into the recording — everything
-    // it holds predates the fire, trigger phrase included, and the command must start after the
-    // phrase (a trailing fragment can survive when the phrase is still being spoken at the fire). A
-    // Soft reset clears the detection state (ring, speech window, score window) while preserving
-    // VAD continuity, the adaptive threshold and the cooldown; the recording then discards its own
-    // opening.
-    if ctx.recording.is_some() {
+    // A recognised phrase is a person at the computer, even when the segment clock refuses the
+    // fire.
+    if detection.heard {
+        crate::user_activity::report_activity();
+    }
+
+    if detection.fired {
+        ctx.recording = Some(RecordingOrigin::WakeWord);
+        publish_recording(RecordingEvent::Started);
+        set_status(VoiceStatus::RecordingWakeWord);
+        // Detection→recording handoff: the ring is dropped wholesale, not seeded into the
+        // recording — it holds the trigger phrase and, because a paired pass resolves up to one
+        // stride late, that stride too; the command must start after the phrase. A Soft reset
+        // clears the detection state (ring, gated window, queued windows, rolling scores) while
+        // preserving VAD continuity, the adaptive state and the cooldown; the recording then
+        // discards its own opening.
         ctx.reset_pipeline_state(ResetLevel::Soft);
         ctx.wake.post_fire_discard_samples = POST_FIRE_DISCARD_SAMPLES;
     }
@@ -3451,7 +2838,6 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
 /// the detection pipeline, and utterance end follows [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`]
 /// (~304ms), matching the detection-side segment timeout. No speech for ~5 s raises the "speak
 /// louder" warning; the status otherwise tracks the phase.
-#[cfg(target_os = "macos")]
 #[expect(clippy::too_many_lines)] // `ctx.wake.` pushes the frame loop past the line cap
 fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize, total: usize) {
     ctx.wake.audio_buffer.extend_from_slice(samples);
@@ -3622,7 +3008,6 @@ fn handle_enrollment_audio(samples: &[f32], ctx: &mut PipelineCtx, sample: usize
 
 /// Append an owner-negative chunk under the [`MAX_OWNER_NEGATIVE_SAMPLES`] cap (dropping with a
 /// warning); `label` distinguishes the final residual buffer from speech segments in that warning.
-#[cfg(target_os = "macos")]
 fn push_owner_negative_chunk(chunk: Vec<f32>, label: &str) {
     let mut state = voice_state().write().unwrap_poison();
     let total_samples: usize = state
@@ -3644,7 +3029,6 @@ fn push_owner_negative_chunk(chunk: Vec<f32>, label: &str) {
 
 /// Outcome of one [`process_phase3_frames`] pass: the accumulation state carried across mic chunks
 /// plus the segments finalized in the pass.
-#[cfg(target_os = "macos")]
 struct Phase3Progress {
     /// Samples at the head of the buffer already fed to the VAD (next unprocessed frame start).
     processed: usize,
@@ -3673,7 +3057,6 @@ struct Phase3Progress {
 /// chunks; when one fires, the segment is pushed and the drain removes everything up to it, and the
 /// silence-run reset keeps later pushes aligned. `buf` is the caller-extended audio buffer, drained
 /// in place.
-#[cfg(target_os = "macos")]
 fn process_phase3_frames(
     buf: &mut Vec<f32>,
     processed: usize,
@@ -3747,7 +3130,6 @@ fn process_phase3_frames(
 /// `voice_state().owner_negative_chunks` via [`push_owner_negative_chunk`] (which enforces the
 /// memory cap) so they survive mic resets. `negatives_speech_samples` advances by this call
 /// VAD-positive frames.
-#[cfg(target_os = "macos")]
 fn handle_negative_collection_audio(samples: &[f32], ctx: &mut PipelineCtx) {
     ctx.wake.phase3_audio_buf.extend_from_slice(samples);
     let progress = process_phase3_frames(
@@ -3777,7 +3159,6 @@ mod tests {
     /// instead of the default ~304 ms ≈ 4864 samples, see
     /// [`ENROLLMENT_SILENCE_THRESHOLD_SAMPLES`]) so tests don't need
     /// prohibitively long audio buffers.
-    #[cfg(target_os = "macos")]
     const TEST_VAD_CONFIG: VadSegmentationConfig = VadSegmentationConfig {
         frame_length: FRAME_LENGTH,
         hop_length: HOP_LENGTH,
@@ -3787,13 +3168,11 @@ mod tests {
 
     /// Build a raw audio buffer long enough for `n_frames` frames at
     /// [`HOP_LENGTH`] stride with [`FRAME_LENGTH`] window size.
-    #[cfg(target_os = "macos")]
     fn audio_for_frames(n_frames: usize) -> Vec<f32> {
         let last_end = (n_frames.saturating_sub(1)) * HOP_LENGTH + FRAME_LENGTH;
         vec![0.0f32; last_end]
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn segment_utterances_by_vad_table() {
         // Table-driven coverage of [`segment_utterances_by_vad`].  Each case
@@ -4005,7 +3384,6 @@ mod tests {
     /// [`PipelineCtx::end_button_recording`] resolves three starting states: a
     /// wake-word assistant to return to, a recording-only mic to tear down, and
     /// a pending auto-start that teardown must not cancel.
-    #[cfg(target_os = "macos")]
     #[test]
     #[serial_test::serial(voice)]
     fn the_end_press_consumes_the_resume_request_and_leaves_the_mic_as_it_was() {
@@ -4091,7 +3469,6 @@ mod tests {
     /// A loss abandons the attempt completely — nothing may be built or stored
     /// from it later — and voice rests on the user's switch: listening when it
     /// is on, Disabled when it is off.
-    #[cfg(target_os = "macos")]
     #[test]
     #[serial_test::serial(voice)]
     fn microphone_loss_abandons_the_attempt_and_rests_on_the_switch() {
@@ -4160,7 +3537,6 @@ mod tests {
         assert!(matches!(get_status(), VoiceStatus::Disabled));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     #[serial_test::serial(voice)]
     fn recording_aborted_when_enrollment_starts() {
@@ -4180,6 +3556,35 @@ mod tests {
         assert!(!ctx.resume_listening_after_recording);
         assert!(ctx.command_buffer.is_empty());
         assert!(ctx.enrollment_mode);
+    }
+
+    /// A refused enrolment: the toggle switches itself off, the status asks for a new enrolment,
+    /// and turning listening on again does not open the microphone.
+    #[test]
+    #[serial_test::serial(voice)]
+    fn an_unusable_enrolment_switches_the_toggle_off_and_refuses_listening() {
+        let _ = init_global();
+        let saved = voice_state().read().unwrap_poison().enrollment.clone();
+        retire_enrollment();
+        assert!(!is_enabled());
+        assert!(enrollment_unusable());
+        assert!(matches!(get_status(), VoiceStatus::ReenrollRequired));
+
+        // Turning it on goes back to the same message instead of listening.
+        set_enabled(true);
+        let mut ctx = PipelineCtx::new();
+        ctx.handle_start_listening();
+        assert!(!is_enabled());
+        assert!(!ctx.is_listening);
+        assert!(ctx.mic.is_none());
+        assert!(matches!(get_status(), VoiceStatus::ReenrollRequired));
+
+        // Leave the process-global state as the test found it.
+        let mut state = voice_state().write().unwrap_poison();
+        state.enrollment = saved;
+        state.enrollment_unusable = false;
+        state.enabled = false;
+        set_status_and_notify(&mut state, VoiceStatus::Disabled);
     }
 
     /// The composer's message is resolved by an event, never by silence: a start
@@ -4215,7 +3620,6 @@ mod tests {
 
     /// A wake-word recording that caught no speech resolves the composer's window
     /// without taking the field: nothing was said, so nothing joins it.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     #[serial_test::serial(voice)]
     async fn a_silent_wake_recording_leaves_the_field_alone() {
@@ -4237,7 +3641,6 @@ mod tests {
     /// The composer's cross, at both origins: the recording is dropped and the
     /// composer reports nothing on its own — it closed its window on the same
     /// press. A button recording takes the recording-only mic with it.
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     #[serial_test::serial(voice)]
     async fn a_discarded_recording_clears_its_buffer_and_reports_nothing() {
@@ -4346,462 +3749,15 @@ mod tests {
         }
     }
 
-    // Pure unit tests for the z-score adaptive threshold tracker.  Uses
-    // synthetic per-frame scores — no models or voice pipeline state.
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn adaptive_bootstrap_boundary_and_clamps() {
-        let harbor = legacy_geometry().static_threshold;
-
-        // bootstrap boundary: every feed during bootstrap returns None; the
-        // frame that completes bootstrap returns Some.
-        let mut state = AdaptiveThresholdState::new();
-        for i in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            assert!(
-                state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor).is_none(),
-                "bootstrap: feed frame {i} should return None",
-            );
-        }
-        assert!(
-            state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor).is_some(),
-            "bootstrap: feed should return Some after bootstrap",
-        );
-
-        // safe-harbor clamp: constant low scores (0.1) yield a low adaptive
-        // value (~0.3) that must be overridden by the caller's static
-        // detection threshold.
-        let mut state = AdaptiveThresholdState::new();
-        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            state.feed(0.1, ADAPTIVE_K_DEFAULT, harbor);
-        }
-        let threshold = state
-            .feed(0.1, ADAPTIVE_K_DEFAULT, harbor)
-            .expect("should return Some after bootstrap");
-        assert!(
-            (threshold - harbor).abs() < 0.01,
-            "safe-harbor clamp: threshold {threshold} should equal safe harbor {harbor}",
-        );
-
-        // warmed() initializes with near-silence scores (~0.033), and its first
-        // feed exits bootstrap with the same safe-harbor clamp.
-        let mut state = AdaptiveThresholdState::warmed(harbor);
-        let threshold = state
-            .feed(0.033, ADAPTIVE_K_DEFAULT, harbor)
-            .expect("warmed() should exit bootstrap");
-        assert!(
-            (threshold - harbor).abs() < 0.01,
-            "warmed(): threshold {threshold} should equal safe harbor {harbor}",
-        );
-        assert_eq!(state.len(), ADAPTIVE_BOOTSTRAP_FRAMES + 1);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn adaptive_ceiling_and_window_eviction() {
-        let harbor = legacy_geometry().static_threshold;
-
-        // ceiling clamp: high-variance scores cap at ADAPTIVE_CEILING. With
-        // alternating 1.0/0.0 scores: mean=0.5, std≈0.5, k=2.5, so
-        // adaptive = (0.5 + 2.5 × 0.5) × 3 = 5.25 → capped at 2.60.
-        let mut state = AdaptiveThresholdState::new();
-        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            state.feed(0.99, ADAPTIVE_K_DEFAULT, harbor);
-        }
-        for i in ADAPTIVE_BOOTSTRAP_FRAMES..ADAPTIVE_WINDOW_N {
-            let score = if i % 2 == 0 { 1.0 } else { 0.0 };
-            state.feed(score, ADAPTIVE_K_DEFAULT, harbor);
-        }
-        let threshold = state
-            .feed(1.0, ADAPTIVE_K_DEFAULT, harbor)
-            .expect("should return Some after bootstrap");
-        assert!(
-            (threshold - ADAPTIVE_CEILING).abs() < 0.01,
-            "ceiling clamp: threshold {threshold} should equal ceiling {ADAPTIVE_CEILING}",
-        );
-
-        // window eviction: after filling the window and cycling scores, the
-        // sum/sum_sq statistics must produce the correct mean (k=0 so the
-        // adaptive value is mean × ROLLING_WINDOW_N, clamped to [harbor, ceiling]).
-        let mut state = AdaptiveThresholdState::new();
-        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
-        }
-        for _ in ADAPTIVE_BOOTSTRAP_FRAMES..ADAPTIVE_WINDOW_N {
-            state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
-        }
-        #[expect(clippy::cast_precision_loss)] // small test constants — exact in f32
-        let window_n = ADAPTIVE_WINDOW_N as f32;
-        #[expect(clippy::cast_precision_loss)] // small test constant — exact in f32
-        let rolling_n = ROLLING_WINDOW_N as f32;
-        let expected_mean = (window_n - 1.0) * 0.5 / window_n + 1.0 / window_n;
-        let threshold = state.feed(1.0, 0.0, harbor).expect("should return Some");
-        let expected_raw = expected_mean * rolling_n;
-        let clamped = expected_raw.clamp(harbor, ADAPTIVE_CEILING);
-        assert!(
-            (threshold - clamped).abs() < 0.001,
-            "window eviction: threshold {threshold} should match expected clamped value {clamped} (raw={expected_raw})",
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn adaptive_reset_and_peek() {
-        let harbor = legacy_geometry().static_threshold;
-
-        // reset() empties the window, so the next feed re-enters bootstrap and
-        // peek() answers nothing.
-        let mut state = AdaptiveThresholdState::new();
-        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
-        }
-        assert!(state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor).is_some());
-        assert_eq!(state.len(), ADAPTIVE_BOOTSTRAP_FRAMES + 1);
-
-        state.reset();
-
-        assert_eq!(state.len(), 0, "reset: window should be empty");
-        assert!(
-            state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor).is_none(),
-            "reset: first feed should return None (re-enters bootstrap)",
-        );
-        assert!(
-            state.peek(ADAPTIVE_K_DEFAULT, harbor).is_none(),
-            "reset: peek should return None (empty window)",
-        );
-
-        // peek() must not change scores, sum, sum_sq, or bootstrap_count.
-        let mut state = AdaptiveThresholdState::new();
-        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
-        }
-        state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor); // non-bootstrap state
-        let before_scores = state.scores.clone();
-        let before_sum = state.sum;
-        let before_sum_sq = state.sum_sq;
-        let before_bootstrap = state.bootstrap_count;
-        for _ in 0..3 {
-            let _ = state.peek(ADAPTIVE_K_DEFAULT, harbor);
-        }
-        assert_eq!(state.scores, before_scores, "peek must not modify scores");
-        assert!(
-            (state.sum - before_sum).abs() < f32::EPSILON,
-            "peek must not modify sum",
-        );
-        assert!(
-            (state.sum_sq - before_sum_sq).abs() < f32::EPSILON,
-            "peek must not modify sum_sq",
-        );
-        assert_eq!(
-            state.bootstrap_count, before_bootstrap,
-            "peek must not modify bootstrap_count",
-        );
-
-        // peek() agrees with feed() on the same state.
-        let mut state = AdaptiveThresholdState::new();
-        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
-        }
-        state.feed(0.7, ADAPTIVE_K_DEFAULT, harbor);
-        let feed_threshold = state.feed(0.3, ADAPTIVE_K_DEFAULT, harbor);
-        let peek_threshold = state.peek(ADAPTIVE_K_DEFAULT, harbor);
-        assert_eq!(
-            feed_threshold, peek_threshold,
-            "peek must agree with feed on the same state",
-        );
-
-        // peek() clamps to safe harbor on constant low scores (0.1) and its
-        // threshold lies within [harbor, ceiling].
-        let mut state = AdaptiveThresholdState::new();
-        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            state.feed(0.1, ADAPTIVE_K_DEFAULT, harbor);
-        }
-        let threshold = state
-            .peek(ADAPTIVE_K_DEFAULT, harbor)
-            .expect("peek should return Some after bootstrap");
-        assert!(
-            (threshold - harbor).abs() < 0.01,
-            "safe-harbor clamp: peek threshold {threshold} should equal safe harbor {harbor}",
-        );
-        let mut state = AdaptiveThresholdState::new();
-        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES {
-            state.feed(0.5, ADAPTIVE_K_DEFAULT, harbor);
-        }
-        let threshold = state
-            .peek(ADAPTIVE_K_DEFAULT, harbor)
-            .expect("Some after bootstrap");
-        assert!(
-            (harbor..=ADAPTIVE_CEILING).contains(&threshold),
-            "valid range: peek threshold {threshold} must be within [{harbor}, {ADAPTIVE_CEILING}]",
-        );
-    }
-
-    // Pure rolling-window scoring — no models, no pipeline state.
-
-    /// Detection geometry for an enrollment with no calibration — the legacy
-    /// operating point (static threshold 3 × 0.55 = 1.65, reset
-    /// 0.64 × 0.55 ≈ 0.352).
-    #[cfg(target_os = "macos")]
-    fn legacy_geometry() -> DetectionGeometry {
-        DetectionGeometry::for_enrollment(None)
-    }
-
-    /// The rolling window's three rules: a below-reset score clears it, frames
-    /// accumulate to the static threshold, and an adaptive override raises the bar.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn process_wake_word_score_clears_fires_and_honours_the_override() {
-        let geometry = legacy_geometry();
-
-        let mut window = vec![0.9, 0.8, 0.7];
-        let (detected, rolling) =
-            process_wake_word_score(geometry.reset - 0.01, &mut window, geometry, None);
-        assert!(!detected);
-        #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
-        {
-            assert_eq!(rolling, 0.0);
-        }
-        assert!(
-            window.is_empty(),
-            "below-reset score must clear the rolling window"
-        );
-
-        // static threshold = 3 × 0.55 = 1.65 → need 3 frames summing to ≥1.65.
-        let mut window = Vec::new();
-        for score in [0.7, 0.7] {
-            let (detected, _) = process_wake_word_score(score, &mut window, geometry, None);
-            assert!(!detected, "2 frames of 0.7 must not fire (sum 1.4 < 1.65)");
-        }
-        let (detected, rolling) = process_wake_word_score(0.7, &mut window, geometry, None);
-        assert!(detected, "3 frames of 0.7 must fire (sum 2.1 ≥ 1.65)");
-        assert!(
-            (rolling - 2.1).abs() < 1e-6,
-            "rolling sum should be 2.1, got {rolling}"
-        );
-
-        // A high adaptive override (3.0) must suppress detection even when
-        // three 0.7 frames would otherwise fire (sum 2.1 < 3.0).
-        let mut window = Vec::new();
-        for _ in 0..3 {
-            let (detected, _) = process_wake_word_score(0.7, &mut window, geometry, Some(3.0));
-            assert!(!detected, "adaptive override must raise the detection bar");
-        }
-    }
-
-    // The new encoder pipeline scores each window embedding as the cosine
-    // soft score against the enrolled prototype.  These tests use synthetic
-    // L2-normalized embeddings and a synthetic enrollment.
-
     /// Basis embedding: dim `d` = 1.0, everything else 0.0 (unit norm).
-    #[cfg(target_os = "macos")]
-    fn basis_embedding(d: usize) -> Vec<f32> {
-        let mut v = vec![0.0; WAKE_WORD_EMBEDDING_DIM];
-        if d < WAKE_WORD_EMBEDDING_DIM {
+    fn basis_embedding(d: usize, dim: usize) -> Vec<f32> {
+        let mut v = vec![0.0; dim];
+        if d < dim {
             v[d] = 1.0;
         }
         v
     }
 
-    /// Build a synthetic enrollment whose prototype points along basis dim 0.
-    #[cfg(target_os = "macos")]
-    fn synthetic_enrollment(n_utterances: usize) -> WakeWordEnrollment {
-        let emb = basis_embedding(0);
-        WakeWordEnrollment::build(
-            &vec![emb; n_utterances],
-            crate::audio::wake_word::Calibration::default(),
-            &[],
-            String::new(),
-            String::new(),
-        )
-        .expect("synthetic enrollment")
-    }
-
-    /// The cosine-prototype scorer's decisions: without an enrollment nothing
-    /// scores, a prototype match fires after the rolling window fills, and a
-    /// below-reset frame clears the window and feeds only the background statistics.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn score_single_embedding_fires_on_a_match_and_resets_without_one() {
-        // Without an enrollment no detection is possible: total_score = 0.0
-        // and the window is reset (0.0 < the default reset threshold).
-        let mut window = vec![0.9, 0.8];
-        let emb = crate::audio::wake_word::l2_normalize(&vec![1.0; WAKE_WORD_EMBEDDING_DIM]);
-        let (detected, rolling, total, _) =
-            score_single_embedding(&emb, None, &mut window, None, ADAPTIVE_K_DEFAULT);
-        assert!(!detected);
-        #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
-        {
-            assert_eq!(total, 0.0);
-        }
-        #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
-        {
-            assert_eq!(rolling, 0.0);
-        }
-        assert!(
-            window.is_empty(),
-            "zero score must reset the rolling window"
-        );
-
-        // A perfect match against the prototype (cosine 1.0 → soft score 1.0
-        // with the default floor) must fire detection after 3 frames.
-        let enrollment = synthetic_enrollment(MIN_ENROLLMENT_UTTERANCES);
-        let mut window = Vec::new();
-        let mut adaptive = AdaptiveThresholdState::new();
-        let emb = basis_embedding(0);
-        let mut detected = false;
-        for _ in 0..ROLLING_WINDOW_N {
-            let (d, _, total, _) = score_single_embedding(
-                &emb,
-                Some(&enrollment),
-                &mut window,
-                Some(&mut adaptive),
-                ADAPTIVE_K_DEFAULT,
-            );
-            assert!(
-                total >= legacy_geometry().reset,
-                "a prototype match must score above the reset threshold"
-            );
-            detected = d;
-        }
-        assert!(
-            detected,
-            "3 consecutive high-cosine frames must fire detection"
-        );
-
-        // An orthogonal embedding (basis 1 vs prototype basis 0) → cosine 0 →
-        // soft score 0.0 (clamped) → below reset → clears the window and feeds
-        // the adaptive statistics.
-        let mut window = vec![0.9, 0.8];
-        let mut adaptive = AdaptiveThresholdState::new();
-        let (detected, rolling, total, _) = score_single_embedding(
-            &basis_embedding(1),
-            Some(&enrollment),
-            &mut window,
-            Some(&mut adaptive),
-            ADAPTIVE_K_DEFAULT,
-        );
-        assert!(!detected);
-        assert!(total < legacy_geometry().reset);
-        #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
-        {
-            assert_eq!(rolling, 0.0);
-        }
-        assert!(window.is_empty(), "low score must reset the rolling window");
-        assert_eq!(
-            adaptive.len(),
-            1,
-            "background score must feed the adaptive window"
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn static_geometry_anchors_hot_floors() {
-        // A hot negative pool (mean 0.80, std 0.06) saturates the derived
-        // floor at MAX_SOFT_FLOOR (0.80) and anchors the fire factor at
-        // (0.89−0.80)/0.20 = 0.45 → static rolling threshold 3 × 0.45 = 1.35.
-        let hot_cal = crate::audio::wake_word::Calibration {
-            neg_mean: 0.80,
-            neg_std: 0.06,
-            neg_p99: 0.97,
-            n_negatives: 200,
-        };
-        let enrollment = WakeWordEnrollment::build(
-            &vec![basis_embedding(0); MIN_ENROLLMENT_UTTERANCES],
-            hot_cal,
-            &[],
-            String::new(),
-            String::new(),
-        )
-        .expect("synthetic hot enrollment");
-
-        let geometry = DetectionGeometry::for_enrollment(Some(&enrollment));
-        assert!(
-            (geometry.static_threshold - 1.35).abs() < 1e-3,
-            "static threshold should be ≈1.35, got {}",
-            geometry.static_threshold,
-        );
-        assert!(
-            (geometry.reset - 0.288).abs() < 1e-3,
-            "reset should be ≈0.288, got {}",
-            geometry.reset,
-        );
-
-        // A negative at the pooled mean (cosine 0.80) maps to soft ≈0 through
-        // the enrollment's soft_score path (no anti-prototypes → pure floor mapping).
-        let mut neg_at_mean = basis_embedding(0);
-        neg_at_mean[1] = 0.75; // cosine ≈ 1/√(1+0.5625) = 0.80
-        let neg_at_mean = crate::audio::wake_word::l2_normalize(&neg_at_mean);
-        assert!(
-            enrollment.soft_score(&neg_at_mean) < 0.01,
-            "a negative at the pooled mean must map to soft ≈0",
-        );
-
-        // A strong frame (cosine ≈0.97 → soft ≈0.85) must NOT fire on a
-        // single frame (0.85 < 1.35 — the multi-frame temporal guard survives
-        // the anchor) but 3 such frames DO fire.
-        let mut strong = basis_embedding(0);
-        strong[1] = 0.25; // cosine ≈ 1/√(1+0.0625) ≈ 0.970
-        let strong = crate::audio::wake_word::l2_normalize(&strong);
-        let mut window = Vec::new();
-        let (single, _, total_score, _) = score_single_embedding(
-            &strong,
-            Some(&enrollment),
-            &mut window,
-            None,
-            ADAPTIVE_K_DEFAULT,
-        );
-        assert!(
-            total_score >= geometry.reset,
-            "a strong hot frame must accumulate (above reset)",
-        );
-        assert!(
-            !single,
-            "a single strong frame must not fire (rolling sum < static threshold)",
-        );
-        window.clear();
-        let mut detected = false;
-        for _ in 0..ROLLING_WINDOW_N {
-            let (d, _, _, _) = score_single_embedding(
-                &strong,
-                Some(&enrollment),
-                &mut window,
-                None,
-                ADAPTIVE_K_DEFAULT,
-            );
-            detected = d;
-        }
-        assert!(detected, "3 consecutive hot frames must fire detection");
-
-        // The adaptive harbor is the enrollment's static threshold: after
-        // bootstrapping on pure background, the effective threshold must
-        // never drop below the static firing bar.
-        window.clear();
-        let mut adaptive = AdaptiveThresholdState::new();
-        let mut effective_min = f32::MAX;
-        for _ in 0..ADAPTIVE_BOOTSTRAP_FRAMES + 2 {
-            let (_, _, _, effective) = score_single_embedding(
-                &neg_at_mean,
-                Some(&enrollment),
-                &mut window,
-                Some(&mut adaptive),
-                ADAPTIVE_K_DEFAULT,
-            );
-            effective_min = effective_min.min(effective);
-        }
-        assert!(
-            effective_min >= geometry.static_threshold - 1e-4,
-            "adaptive threshold must be harbored at the static threshold \
-             ({effective_min} < {})",
-            geometry.static_threshold,
-        );
-    }
-
-    // The centroid gate is a pure function so it is testable without the ASR
-    // model.  Uses basis embeddings: utterances on basis 0 form a consistent
-    // cluster; utterances on other bases are outliers.
-
-    #[cfg(target_os = "macos")]
     #[test]
     fn consistency_gate_table() {
         // Centroid gate is pure: basis-0 embeddings form a consistent cluster,
@@ -4842,22 +3798,22 @@ mod tests {
             },
             Case {
                 name: "rejects_wrong_dimension",
-                basis0: MIN_ENROLLMENT_UTTERANCES,
+                basis0: mahbot_inference::wake::MIN_ENROLLMENT_UTTERANCES,
                 basis1: 0,
                 bad_dim_at: Some(0),
-                expected_error_fragment: Some("expected 1024"),
+                expected_error_fragment: Some("8 wide"),
             },
         ];
 
         for case in &cases {
             let mut embs: Vec<Vec<f32>> = Vec::with_capacity(case.basis0 + case.basis1);
-            embs.extend(std::iter::repeat_n(basis_embedding(0), case.basis0));
-            embs.extend(std::iter::repeat_n(basis_embedding(1), case.basis1));
+            embs.extend(std::iter::repeat_n(basis_embedding(0, 8), case.basis0));
+            embs.extend(std::iter::repeat_n(basis_embedding(1, 8), case.basis1));
             if let Some(idx) = case.bad_dim_at {
                 embs[idx] = vec![0.5; 64];
             }
             match (
-                enrollment_consistency_check(&embs),
+                wake_word::consistency_check(&embs),
                 case.expected_error_fragment,
             ) {
                 (Ok(_), None) => {}
@@ -4878,7 +3834,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn compute_utterance_quality_short_utterance_scores_zero_duration() {
         // A 100ms blip is below the 400ms floor → duration score 0.  The
@@ -4898,7 +3853,6 @@ mod tests {
 
     /// Helper: build a PipelineCtx with non-default values in all mutable
     /// fields that reset_pipeline_state may touch.
-    #[cfg(target_os = "macos")]
     fn ctx_with_populated_buffers() -> PipelineCtx {
         let mut ctx = PipelineCtx::new();
         ctx.wake.audio_buffer = vec![0.5; 100];
@@ -4906,8 +3860,6 @@ mod tests {
         ctx.silence_sample_count = 1000;
         ctx.wake.post_fire_discard_samples = 1000;
         ctx.wake.recording_had_speech = true;
-        ctx.wake.score_window = vec![0.5; 5];
-        ctx.wake.last_score_sample_count = 512;
         ctx.wake.negative_audio_buf = vec![0.5; 50];
         ctx.wake.frame_vad = vec![true; 3];
         ctx.wake.frame_raw_audio = vec![0.5; 200];
@@ -4926,25 +3878,19 @@ mod tests {
         ctx.wake.phase3_start_time =
             Some(Instant::now().checked_sub(Duration::from_secs(10)).unwrap());
         ctx.wake.vad_threshold = 0.75;
-        ctx.wake.last_wake_word_detection =
-            Some(Instant::now().checked_sub(Duration::from_secs(5)).unwrap());
         ctx.auto_start_pending = true;
         ctx.recording = Some(RecordingOrigin::WakeWord);
-        ctx.wake.segment_score_steps = 7;
         ctx
     }
 
     /// Assert that all audio accumulators and enrollment-state fields are
     /// cleared — the common post-reset invariant shared by all level variants.
-    #[cfg(target_os = "macos")]
     fn assert_buffers_cleared(ctx: &PipelineCtx) {
         assert!(ctx.wake.audio_buffer.is_empty());
         assert!(ctx.command_buffer.is_empty());
         assert_eq!(ctx.silence_sample_count, 0);
         assert_eq!(ctx.wake.post_fire_discard_samples, 0);
         assert!(!ctx.wake.recording_had_speech);
-        assert!(ctx.wake.score_window.is_empty());
-        assert_eq!(ctx.wake.last_score_sample_count, 0);
         assert!(ctx.wake.negative_audio_buf.is_empty());
 
         assert!(ctx.wake.frame_vad.is_empty());
@@ -4961,10 +3907,6 @@ mod tests {
         assert_eq!(
             ctx.wake.segment_silence_hops, 0,
             "segment_silence_hops must be cleared by all reset levels"
-        );
-        assert_eq!(
-            ctx.wake.segment_score_steps, 0,
-            "segment_score_steps must be cleared by all reset levels"
         );
 
         assert!(
@@ -4993,7 +3935,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     #[serial_test::serial(voice)]
     fn reset_full_clears_all_buffers_and_state() {
@@ -5024,7 +3965,6 @@ mod tests {
         {
             assert_eq!(ctx.wake.vad_threshold, VAD_THRESHOLD);
         }
-        assert!(ctx.wake.last_wake_word_detection.is_none());
         assert!(!ctx.auto_start_pending);
         assert!(ctx.recording.is_none());
 
@@ -5039,7 +3979,6 @@ mod tests {
         assert_eq!(state.negative_audio_chunks.len(), 1);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     #[serial_test::serial(voice)]
     fn reset_soft_and_cancel_differ_in_scope() {
@@ -5057,7 +3996,6 @@ mod tests {
         }
 
         let saved_threshold = ctx.wake.vad_threshold; // 0.75
-        let saved_cooldown = ctx.wake.last_wake_word_detection;
         let saved_auto_start = ctx.auto_start_pending;
         let saved_recording = ctx.recording;
 
@@ -5070,7 +4008,6 @@ mod tests {
         {
             assert_eq!(ctx.wake.vad_threshold, saved_threshold);
         }
-        assert_eq!(ctx.wake.last_wake_word_detection, saved_cooldown);
         assert_eq!(ctx.auto_start_pending, saved_auto_start);
         assert_eq!(ctx.recording, saved_recording);
 
@@ -5080,8 +4017,8 @@ mod tests {
         assert_eq!(state.negative_audio_chunks, saved_chunks);
         drop(state);
 
-        // Cancel clears vad_threshold, the detection cooldown and the global
-        // accumulators, while the handler-managed flags still survive.
+        // Cancel clears vad_threshold and the global accumulators, while the
+        // handler-managed flags still survive.
         let mut ctx = ctx_with_populated_buffers();
         ctx.reset_pipeline_state(ResetLevel::Cancel);
 
@@ -5091,7 +4028,6 @@ mod tests {
         {
             assert_eq!(ctx.wake.vad_threshold, VAD_THRESHOLD);
         }
-        assert!(ctx.wake.last_wake_word_detection.is_none());
         assert_eq!(ctx.auto_start_pending, saved_auto_start);
         assert_eq!(ctx.recording, saved_recording);
 
@@ -5100,7 +4036,6 @@ mod tests {
         assert!(state.negative_audio_chunks.is_empty());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     #[serial_test::serial(voice)]
     fn reset_levels_preserve_session_ux_state() {
@@ -5133,7 +4068,6 @@ mod tests {
     // earshot neural detector is not deterministic on synthetic audio, so
     // decisions are supplied directly.
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn phase3_chunks_are_full_speech_segments_across_mic_chunks() {
         // Deterministic VAD via decision-coded audio: hops of +1.0 are speech,
@@ -5206,7 +4140,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn phase3_negative_collection_audio_counts_1_to_1_through_pipeline() {
         const CHUNK_SAMPLES: usize = SAMPLE_RATE as usize / 2; // 0.5 s
@@ -5258,123 +4191,6 @@ mod tests {
         #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
         {
             assert!(ctx.wake.phase3_audio_buf.iter().all(|&s| s == 0.1));
-        }
-    }
-
-    // Tests the extracted segment boundary check logic with the encoder
-    // pipeline signature `(&mut self, hop_count: usize)`.
-
-    /// At the hop threshold the boundary fires and resets the per-segment
-    /// state; below it the state persists, and a recording in progress skips
-    /// the reset entirely.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn handle_segment_boundary_table() {
-        struct Case {
-            name: &'static str,
-            /// Silence hops accumulated before the call.
-            initial_hops: usize,
-            hop_count: usize,
-            recording: bool,
-            boundary_fires: bool,
-            /// Silence hops the call must leave behind.
-            hops_after: usize,
-        }
-
-        let cases = [
-            Case {
-                name: "at_threshold_fires",
-                initial_hops: 10,
-                hop_count: SEGMENT_TIMEOUT_HOPS,
-                recording: false,
-                boundary_fires: true,
-                hops_after: 0,
-            },
-            Case {
-                name: "below_threshold_persists",
-                initial_hops: 10,
-                hop_count: SEGMENT_TIMEOUT_HOPS - 1,
-                recording: false,
-                boundary_fires: false,
-                hops_after: SEGMENT_TIMEOUT_HOPS - 1,
-            },
-            Case {
-                // A just-fired detection (is_recording) must NOT be reset by
-                // the boundary check — the detection→recording handoff
-                // completes the transition and owns the state.
-                name: "recording_skips_the_reset",
-                initial_hops: 0,
-                hop_count: SEGMENT_TIMEOUT_HOPS,
-                recording: true,
-                boundary_fires: false,
-                hops_after: 0,
-            },
-        ];
-
-        for case in cases {
-            let mut ctx = PipelineCtx::new();
-            ctx.recording = case.recording.then_some(RecordingOrigin::WakeWord);
-            ctx.wake.score_window = vec![0.5; 5];
-            ctx.wake.segment_silence_hops = case.initial_hops;
-            ctx.wake.segment_score_steps = 7;
-
-            // Complete adaptive threshold bootstrap so the reset-to-bootstrapping
-            // assertion is meaningful (not trivially true from PipelineCtx::new()).
-            {
-                let mut at = AdaptiveThresholdState::new();
-                for _ in 0..=ADAPTIVE_BOOTSTRAP_FRAMES {
-                    at.feed(0.5, ADAPTIVE_K_DEFAULT, legacy_geometry().static_threshold);
-                }
-                assert!(
-                    !at.is_bootstrapping(),
-                    "adaptive threshold must exit bootstrap after {} feeds",
-                    ADAPTIVE_BOOTSTRAP_FRAMES + 1
-                );
-                ctx.wake.adaptive_threshold = at;
-            }
-
-            ctx.handle_segment_boundary(case.hop_count);
-
-            assert_eq!(
-                ctx.wake.segment_silence_hops, case.hops_after,
-                "case {}: silence hop counter",
-                case.name,
-            );
-            if case.boundary_fires {
-                assert!(
-                    ctx.wake.score_window.is_empty(),
-                    "case {}: score window",
-                    case.name
-                );
-                assert_eq!(
-                    ctx.wake.segment_score_steps, 0,
-                    "case {}: segment_score_steps must be reset at the boundary",
-                    case.name,
-                );
-                assert!(
-                    ctx.wake.adaptive_threshold.is_bootstrapping(),
-                    "case {}: adaptive_threshold must be reset (re-enter bootstrap)",
-                    case.name,
-                );
-            } else {
-                assert!(
-                    !ctx.wake.score_window.is_empty(),
-                    "case {}: score_window must survive inside a segment",
-                    case.name,
-                );
-                assert!(
-                    !ctx.wake.adaptive_threshold.is_bootstrapping(),
-                    "case {}: adaptive_threshold must survive inside a segment",
-                    case.name,
-                );
-                if !case.recording {
-                    assert_eq!(
-                        ctx.wake.segment_score_steps, 7,
-                        "case {}: segment_score_steps must persist inside a continuing segment",
-                        case.name,
-                    );
-                }
-            }
         }
     }
 }

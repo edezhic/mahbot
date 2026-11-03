@@ -189,15 +189,14 @@ pub struct ConfigData {
     /// are replaced with just the icon combo and the temp file is deleted, so
     /// voice messages are not recoverable.
     pub audio_transcription_use_local: Option<String>,
-    /// Voice assistant (wake word detection and commands) on macOS; `"true"` enables
-    /// voice mode.
+    /// Voice assistant (wake word detection and commands); `"true"` enables voice mode.
     pub voice_enabled: Option<String>,
     /// Enable speech output for the admin's Assistant (default: `"false"`). Set to
     /// `"true"` to let it speak short updates aloud through the `say` tool on this
     /// machine. Nothing is ever read aloud on its own.
     pub tts_enabled: Option<String>,
-    /// JSON wake word enrollment (v2: prototype + calibration), macOS only. Owned exclusively by
-    /// the voice pipeline.
+    /// JSON wake word enrollment (schema 3: prototype + calibration). Owned exclusively by the
+    /// voice pipeline; an older record is refused and the owner enrols again.
     pub wake_word_templates: Option<String>,
     /// Onboarding state machine: "init" | "finished".
     /// Absent = Init (fresh install). Set by the onboarding flow; existing

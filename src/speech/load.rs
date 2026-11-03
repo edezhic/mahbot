@@ -4,8 +4,9 @@
 //! explicit retry.
 //!
 //! The state is [`crate::util::model_state::ModelState`]: Uninit → Loading → Ready / Failed.
-//! One engine handle exists per [`Lazy`], and its mutex is held for a whole pass — the
-//! discipline both engines keep. A caller that needs an engine either waits out a load already
+//! One engine handle exists per [`Lazy`], cloned out from under its lock rather than held across
+//! a pass; serialisation is each engine's own — the synthesiser's single pass lock, the
+//! recogniser's one per consumer. A caller that needs an engine either waits out a load already
 //! in flight ([`Lazy::ensure_loaded`]) or is answered from the state; a fetch is never waited
 //! for.
 

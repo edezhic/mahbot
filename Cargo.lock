@@ -4145,7 +4145,6 @@ dependencies = [
  "percent-encoding",
  "pulldown-cmark",
  "quick-xml 0.39.4",
- "qwen-asr",
  "rand 0.10.2",
  "regex",
  "reqwest",
@@ -6000,15 +5999,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b9ae9230368"
 dependencies = [
  "proc-macro2",
-]
-
-[[package]]
-name = "qwen-asr"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f2d649ea1585c574469353ac89a891d53548c7b9422034f8e1b14743632606f"
-dependencies = [
- "libc",
 ]
 
 [[package]]

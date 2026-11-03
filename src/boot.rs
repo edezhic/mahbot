@@ -1,6 +1,6 @@
 //! Process start-up: the store bring-up sequence ([`open_stores`]), the retirement
-//! of the old synthesiser's model files, and the diagnostics emitted before the
-//! tracing layer exists. A diagnostic goes to stderr at once, timestamped
+//! of the superseded per-user speech model tree, and the diagnostics emitted before
+//! the tracing layer exists. A diagnostic goes to stderr at once, timestamped
 //! locally so a line kept in `daemon.log` or `update.log` is time-attributable, and
 //! is buffered for replay into the logs store (the GUI boot log) once tracing is live.
 //!
@@ -115,13 +115,11 @@ pub async fn open_stores() -> anyhow::Result<Arc<crate::logs::LogStore>> {
     // and must be recorded, not lost.
     crate::agent::message_router::init_global()
         .map_err(|e| record_startup_failure("agent::message_router::init_global", e))?;
-    // The microphone and the voice pipeline are on every platform; the wake word's own
-    // initialisation is inside it, gated with the wake word.
+    // The microphone, the voice pipeline and the wake word.
     crate::audio::voice::init_global()
         .map_err(|e| record_startup_failure("audio::voice::init_global", e))?;
-    // The old synthesiser's per-user weights are dead weight now: delete the tree once, off the
-    // boot path. Nothing reads it any more, and a failure only leaves it there.
-    #[cfg(target_os = "macos")]
+    // The retired per-user model tree is dead weight now: delete it once, off the boot path.
+    // Nothing reads it any more, and a failure only leaves it there.
     drop(tokio::task::spawn_blocking(
         crate::audio::remove_retired_models,
     ));

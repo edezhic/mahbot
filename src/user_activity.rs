@@ -35,10 +35,6 @@ static LAST_REPORT: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// A source saw the user: last activity is now. Called by the wake word at the moment it
 /// recognises the spoken phrase.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(dead_code, reason = "the only reporter is the macOS wake word")
-)]
 pub(crate) fn report_activity() {
     *LAST_REPORT.lock().unwrap_poison() = Some(Instant::now());
 }

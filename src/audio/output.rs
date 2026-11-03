@@ -74,10 +74,6 @@ pub(crate) fn ensure_audio_output() -> bool {
 
 /// [`ensure_audio_output`] for the wake-word cues, except that a failed open is not warned
 /// about: a host without audio output stays silent.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(dead_code, reason = "the only caller is the macOS wake-word cue")
-)]
 pub(crate) fn ensure_audio_output_silent() -> bool {
     open(false)
 }

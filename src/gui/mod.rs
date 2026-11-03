@@ -3678,38 +3678,33 @@ impl Dashboard {
     }
 
     /// The wording for a [`VoiceStatus`], shared by the footer's label and the rail's tooltip,
-    /// without the glyph [`Self::voice_status_icon`] draws. `None` for voice off, which both
-    /// surfaces hide.
+    /// without the glyph [`Self::voice_status_icon`] draws. `None` for a plain voice-off, which
+    /// both surfaces hide; [`VoiceStatus::ReenrollRequired`] keeps its label even though the toggle
+    /// is off, because it names the action the owner has to take.
     fn voice_status_label(status: &VoiceStatus) -> Option<String> {
         Some(match status {
             VoiceStatus::Disabled => return None,
             VoiceStatus::Listening => "Listening".into(),
             VoiceStatus::LoadingModels => "Loading…".into(),
             VoiceStatus::ModelError => "⚠ Model error".into(),
-            #[cfg(target_os = "macos")]
-            VoiceStatus::RecordingWakeWord => "Recording…".into(),
-            VoiceStatus::RecordingButton => "Recording…".into(),
+            VoiceStatus::RecordingWakeWord | VoiceStatus::RecordingButton => "Recording…".into(),
             VoiceStatus::Transcribing => "Transcribing…".into(),
             VoiceStatus::MicPermissionDenied => "No mic access".into(),
             VoiceStatus::MicDisconnected => "Mic disconnected".into(),
-            #[cfg(target_os = "macos")]
             VoiceStatus::Enrolling { sample, total, .. } => format!("Enrolling {sample}/{total}"),
-            #[cfg(target_os = "macos")]
             VoiceStatus::ListeningDuringEnrollment { sample, total } => {
                 format!("Listen… {sample}/{total}")
             }
-            #[cfg(target_os = "macos")]
             VoiceStatus::WaitingForSilenceDuringEnrollment { sample, total } => {
                 format!("Wait… {sample}/{total}")
             }
-            #[cfg(target_os = "macos")]
             VoiceStatus::EnrollingNegatives {
                 accumulated_secs,
                 target_secs,
                 ..
             } => format!("Collecting negatives {accumulated_secs}s/{target_secs}s"),
-            #[cfg(target_os = "macos")]
             VoiceStatus::Enrolled => "✅ Enrolled".into(),
+            VoiceStatus::ReenrollRequired => "Enrol again".into(),
             VoiceStatus::Error(msg) => format!("Error: {msg}"),
         })
     }

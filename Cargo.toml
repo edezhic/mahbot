@@ -16,8 +16,7 @@ resolver = "2"
 exclude = [".DS_Store", "scripts"]
 
 [features]
-# Audio dev marker. A feature cannot be platform-gated, so off macOS it gates
-# nothing at all: its one site is the wake-word scoring, which only macOS has.
+# Audio dev marker: logs every wake-word score the engine's decision produced.
 voice-debug = []
 
 [[bin]]
@@ -65,6 +64,9 @@ mahbot-inference = { path = "../mahbot-rlx/crates/mahbot-inference" }
 # CoreAudio, WASAPI, ALSA. The ALSA backend needs `libasound2-dev` (pkg-config
 # `alsa`) to build on Linux.
 cpal = "0.18"
+# The wake word's voice-activity detector (the recogniser's own lives in the inference
+# crate).
+earshot = "1.2"
 # Spoken-phrase playback and the wake-word recording cues: both play through one
 # shared output device on the same host API, and a WAV cue is decoded by `hound`.
 rodio = { version = "0.22", default-features = false, features = ["playback", "hound"] }
@@ -331,15 +333,6 @@ windows = { version = "0.62", features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# ── The wake word (macOS only) ────────────────────────────────────────────
-# What is left of the macOS-only audio subsystem now that recognition and spoken
-# replies run on the inference crate on every platform: the Qwen3-ASR encoder the
-# wake word runs on (`crate::audio::encoder`) and its voice-activity detector.
-qwen-asr = { version = "0.11.0", default-features = false, features = ["blas", "vdsp"] }
-# The wake word's voice-activity detector (the recogniser's own lives in the inference
-# crate).
-earshot = "1.2"
-
 # Computer Use tool (GUI observe/act): the live macOS backend's dependencies —
 # accessibility (AXUIElement), input synthesis (CGEvent) and capture
 # (ScreenCaptureKit). Version-aligned objc2 family — the same 0.6.x/0.3.x series
@@ -420,10 +413,6 @@ debug = false
 # The RLX entries are every `rlx-*` crate the inference crate's graph resolves to
 # (`cargo tree -p mahbot-inference | grep -o 'rlx-[a-z-]*'`): a new one is added here
 # when it appears, or it silently runs unoptimized in dev.
-[profile.dev.package.qwen-asr]
-opt-level = 3
-codegen-units = 1
-
 [profile.dev.package.mahbot-inference]
 opt-level = 3
 

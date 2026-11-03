@@ -1,19 +1,24 @@
-//! The recogniser: one lazily-opened engine over the machine-wide model set, and the transcript
-//! a recording turns into.
+//! The recogniser: one lazily-opened engine over the machine-wide model set, the transcript a
+//! recording turns into, and the wake word's window listener over the same pair.
 //!
 //! Nothing loads at boot. The first operation that needs the engine loads it — the first voice
-//! message, the composer's microphone, or the Settings toggle — either from the files on disk
-//! or by fetching them first ([`crate::speech::models`]), through the shared lifecycle of
-//! [`crate::speech::load`]. One transcription runs at a time: the engine is a single `&mut`
-//! handle, and the mutex is held for the whole pass. The memory a pass peaks at is given back
-//! after it ([`mahbot_inference::release_process_memory`]), which is what keeps a resident
-//! dashboard from holding a recognition pass's peak for the rest of the day.
+//! message, the composer's microphone, the Settings toggle or the wake word — either from the files
+//! on disk or by fetching them first ([`crate::speech::models`]), through the shared lifecycle of
+//! [`crate::speech::load`]. The two consumers sit behind separate mutexes: one transcription runs
+//! at a time, and a wake-word pass never waits out a transcription (or the other way round). The
+//! memory a transcription pass peaks at is given back after it
+//! ([`mahbot_inference::release_process_memory`]), which is what keeps a resident dashboard from
+//! holding a recognition pass's peak for the rest of the day.
 
 use crate::util::UnwrapPoison;
 use crate::util::model_state::ModelState;
 use anyhow::{Context as _, Result};
+use mahbot_inference::ced::{CED_MODEL, Tagger};
+use mahbot_inference::listen::{Listener, PAIR};
+use mahbot_inference::loader::{Pair, Role};
 use mahbot_inference::transcribe::{SPEECH_LABELS, Transcriber, Transcription};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::speech::decode;
@@ -51,11 +56,39 @@ impl std::error::Error for InferenceTimedOut {}
 /// own guard documents as the default for a run holding a recognition pair.
 const CEILING_MIB: u64 = mahbot_inference::guard::DEFAULT_MAX_RSS_MIB;
 
-/// The product's one recogniser: the pair and the audio tagger, both resolved from the
-/// machine-wide root.
-static ENGINE: Lazy<Transcriber> = Lazy::new(Purpose::Recognition, || {
-    Transcriber::open_product(CEILING_MIB)
-});
+/// The product's one recogniser: the recognition pair, the tagger every recognition call depends
+/// on, and the wake word's listener over the same pair — one copy of the weights, two consumers.
+static ENGINE: Lazy<Recogniser> = Lazy::new(Purpose::Recognition, open_recogniser);
+
+/// The recogniser's two consumers over one loaded pair: transcription and the wake word's window
+/// listener. Each sits behind its own mutex, so a wake pass never waits out a transcription (or
+/// the other way round).
+struct Recogniser {
+    transcriber: Arc<Mutex<Transcriber>>,
+    listener: Arc<Mutex<Listener>>,
+}
+
+/// Map the pair, open the tagger and build both consumers. Runs off the async threads: it maps
+/// gigabytes and compiles graphs.
+fn open_recogniser() -> Result<Recogniser> {
+    let pair = Arc::new(Pair::of_role(Role::Recognition)?);
+    let tagger = Tagger::open(&models::root()?.join(CED_MODEL))?;
+    let transcriber = Transcriber::open(Arc::clone(&pair), tagger, CEILING_MIB)?;
+    Ok(Recogniser {
+        transcriber: Arc::new(Mutex::new(transcriber)),
+        listener: Arc::new(Mutex::new(Listener::new(pair))),
+    })
+}
+
+/// One consumer handle of the loaded recogniser, or the error naming why it is not there.
+fn consumer<T>(pick: impl FnOnce(&Recogniser) -> Arc<Mutex<T>>) -> Result<Arc<Mutex<T>>> {
+    let engine = ENGINE.engine().context("the recogniser is not loaded")?;
+    let handle = {
+        let engine = engine.lock().unwrap_poison();
+        pick(&engine)
+    };
+    Ok(handle)
+}
 
 /// The recogniser's lifecycle state, for callers resolving a user-facing status from it
 /// (nothing preloads, so "not loaded" alone cannot tell a load in flight from none started).
@@ -122,10 +155,10 @@ pub(crate) async fn transcribe_samples(
         "{}",
         models::unloaded_message(&dir, Purpose::Recognition, is_failed())
     );
-    let engine = ENGINE.engine().context("the recogniser is not loaded")?;
+    let transcriber = consumer(|recogniser| Arc::clone(&recogniser.transcriber))?;
 
     let pass = tokio::task::spawn_blocking(move || {
-        let mut engine = engine.lock().unwrap_poison();
+        let mut engine = transcriber.lock().unwrap_poison();
         let result = engine
             .transcribe(&samples, rate)
             .map(|result| compose(&result));
@@ -148,6 +181,42 @@ pub(crate) async fn transcribe_samples(
         Ok(Err(join)) => Err(anyhow::anyhow!("Inference task panicked: {join}")),
         Err(_elapsed) => Err(anyhow::Error::new(InferenceTimedOut)),
     }
+}
+
+/// One clip into its window embedding — enrolment and the negative pool embed a clip at a time.
+pub(crate) fn embed_clip(samples: &[f32]) -> Result<Vec<f32>> {
+    let listener = consumer(|recogniser| Arc::clone(&recogniser.listener))?;
+    let mut listener = listener.lock().unwrap_poison();
+    listener.embed(samples)
+}
+
+/// Two consecutive windows in one pass through the encoder — the wake word's batch.
+pub(crate) fn embed_pair(first: &[f32], second: &[f32]) -> Result<[Vec<f32>; PAIR]> {
+    let listener = consumer(|recogniser| Arc::clone(&recogniser.listener))?;
+    let mut listener = listener.lock().unwrap_poison();
+    listener.embed_pair(first, second)
+}
+
+/// A batch of clips embedded one at a time; a clip that fails is skipped with a warning.
+pub(crate) fn embed_clips(clips: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    let Ok(listener) = consumer(|recogniser| Arc::clone(&recogniser.listener)) else {
+        tracing::warn!("embed_clips: the recogniser is not loaded");
+        return Vec::new();
+    };
+    let mut listener = listener.lock().unwrap_poison();
+    clips
+        .iter()
+        .filter_map(|clip| match listener.embed(clip) {
+            Ok(embedding) => Some(embedding),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to embed a {}-sample clip: {e} — skipping",
+                    clip.len()
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 /// The words a result holds, in order, with [`UNTRANSCRIBED`] wherever the engine
