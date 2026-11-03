@@ -1,12 +1,12 @@
 //! Wake-word recording cues: the two short sounds the hands-free voice path plays when a recording
 //! starts and stops. They are the product's own samples — two assets embedded in the binary and
 //! played through the machine's normal audio output — so they never consult an OS sound API,
-//! library, theme or preference. Cue playback deliberately bypasses [`crate::audio::tts`]'s
-//! spoken-phrase path: the cues play with speech output off, and must not raise the TTS playback
-//! flag that makes the voice pipeline drop microphone audio. A host without an audio output device
-//! is skipped silently.
+//! library, theme or preference. Cue playback deliberately bypasses the spoken-phrase path of
+//! [`crate::speech::synth`]: the cues play with speech output off, and must not raise the
+//! speaking flag that makes the voice pipeline drop microphone audio. A host without an audio
+//! output device is skipped silently.
 
-use crate::audio::tts;
+use crate::audio::output;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -66,10 +66,10 @@ pub fn warm_up() {
 /// silently and latches a failure, so a host without audio output neither warns nor re-probes a
 /// costly open.
 fn output_mixer() -> Option<rodio::mixer::Mixer> {
-    if !NO_OUTPUT.load(Ordering::Relaxed) && !tts::ensure_audio_output_silent() {
+    if !NO_OUTPUT.load(Ordering::Relaxed) && !output::ensure_audio_output_silent() {
         NO_OUTPUT.store(true, Ordering::Relaxed);
     }
-    tts::playback_mixer()
+    output::mixer()
 }
 
 #[cfg(test)]

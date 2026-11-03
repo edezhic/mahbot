@@ -91,8 +91,6 @@ const FRESH_INSTALL_IMAGE_GEN_MODELS: &str = "google/gemini-nano-banana-2.1\nmic
 /// the curated set the live install ships.
 const FRESH_INSTALL_VIDEO_MODELS: &str = "bytedance/seedance-2.0-mini\nminimax/hailuo-3";
 
-pub(crate) const DEFAULT_TTS_LANGUAGE: &str = "na";
-
 /// A per-model provider routing rule.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelRouting {
@@ -194,14 +192,10 @@ pub struct ConfigData {
     /// Voice assistant (wake word detection and commands) on macOS; `"true"` enables
     /// voice mode.
     pub voice_enabled: Option<String>,
-    /// Enable speech output for the admin's Assistant (default: `"false"`;
-    /// macOS only). Set to `"true"` to let it speak short updates aloud through
-    /// the `say` tool on this machine. Nothing is ever read aloud on its own.
+    /// Enable speech output for the admin's Assistant (default: `"false"`). Set to
+    /// `"true"` to let it speak short updates aloud through the `say` tool on this
+    /// machine. Nothing is ever read aloud on its own.
     pub tts_enabled: Option<String>,
-    /// macOS only. Supported codes: en, ko, ja, ar, bg, cs, da, de, el, es, et, fi, fr, hi, hr,
-    /// hu, id, it, lt, lv, nl, pl, pt, ro, ru, sk, sl, sv, tr, uk, vi, na. The default `"na"`
-    /// works for any language; `"en"` gives optimal English pronunciation.
-    pub tts_language: Option<String>,
     /// JSON wake word enrollment (v2: prototype + calibration), macOS only. Owned exclusively by
     /// the voice pipeline.
     pub wake_word_templates: Option<String>,
@@ -394,7 +388,6 @@ string_config_fields! {
     audio_transcription_use_local [non_empty],
     voice_enabled [non_empty],
     tts_enabled [non_empty],
-    tts_language [or(DEFAULT_TTS_LANGUAGE)],
     wake_word_templates [non_empty],
     onboarding_state [non_empty],
     autolaunch [non_empty],

@@ -103,17 +103,14 @@ pub mod cli;
 // Loading and substitution for the embedded prompt assets.
 pub(crate) mod prompt;
 
-// The microphone-to-meaning stack: capture, the voice command pipeline, and — on
-// macOS only — the wake word, spoken replies and their recording cues.
+// The microphone-to-meaning stack: capture, the voice command pipeline, the machine's audio
+// output, and — on macOS only — the wake word and its recording cues.
 pub mod audio;
-// Speech recognition on every platform: the recogniser, the machine-wide model set
-// it reads, and the transcript a recording turns into.
+// The product's own speech engines on every platform: recognition, spoken replies, and the
+// machine-wide model set both read.
 pub(crate) mod speech;
 // The `mahbot audio` command line: a recording into text, text into a spoken file.
 pub(crate) mod audio_cli;
-// A hand-rolled ONNX executor sized for the four pinned TTS models.
-#[cfg(target_os = "macos")]
-pub(crate) mod onnx;
 
 // Handing the terminal back, with what it would have printed going to `daemon.log`.
 pub mod detach;
@@ -139,13 +136,6 @@ pub mod shutdown;
 pub mod temp;
 // Who is at the computer right now: the machine-wide active/absent state and its
 // input reader.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(
-        dead_code,
-        reason = "the absence check and the wake word's report live in the macOS audio subsystem"
-    )
-)]
 pub(crate) mod user_activity;
 
 // The cancel action behind the `analyze` tool, confined to the caller's own runs.

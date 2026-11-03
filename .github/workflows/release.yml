@@ -163,8 +163,8 @@ jobs:
       - uses: actions/checkout@v4
 
       # The GUI stack's dependencies probe for these. The base itself is the image,
-      # so the file links against the glibc that image ships. `libasound2-dev` is the
-      # microphone's ALSA backend (the product captures audio on Linux too), and
+      # so the file links against the glibc that image ships. `libasound2-dev` is ALSA's
+      # own headers: the microphone and speech playback reach it through cpal, and
       # `libasound2` ships in the image, so nothing extra travels with the file.
       - name: Install the Linux build prerequisites
         if: runner.os == 'Linux'

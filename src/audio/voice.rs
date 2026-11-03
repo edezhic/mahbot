@@ -908,8 +908,9 @@ fn is_speech_with_detector(
 
     let mut any_speech = false;
 
-    // Clamp samples to [-1, 1] before the detector: TTS audio and capture can overflow slightly,
-    // which trips earshot debug_assert! in debug builds.
+    // Clamp samples to [-1, 1] before the detector: speech playback the microphone picks up
+    // and capture itself can overflow slightly, which trips earshot debug_assert! in debug
+    // builds.
     let clamp_frame = |frame: &[f32]| -> [f32; 256] {
         let mut clamped = [0.0f32; 256];
         for (i, &s) in frame.iter().enumerate() {
@@ -2935,12 +2936,11 @@ pub async fn run_voice_pipeline() {
                     continue;
                 };
 
-                // TTS playback gate (macOS only): while spoken replies play, skip ALL processing
-                // for the chunk, so TTS echo cannot contaminate the VAD ring buffer, the window
-                // embeddings, scoring, enrollment or the recording. The gate stays active for the
-                // reverb tail (see `crate::audio::tts::PLAYBACK_REVERB_TAIL_MS`).
-                #[cfg(target_os = "macos")]
-                if crate::audio::tts::is_playback_active() {
+                // The echo gate: while a spoken phrase plays, skip ALL processing for the chunk,
+                // so the product's own speech cannot contaminate the VAD ring buffer, the window
+                // embeddings, scoring, enrollment or the recording. The gate stays raised for the
+                // reverb tail (`crate::audio::output::SPEAKING_TAIL`).
+                if crate::audio::output::is_speaking() {
                     continue;
                 }
 

@@ -114,22 +114,15 @@ async fn bootstrap_mahbot(start_paused: bool, slowdown: Option<Report>) -> Resul
     // (`mahbot::autostart`).
     mahbot::autostart::reconcile();
 
-    // Recognition is deliberately NOT loaded here: the model loads on first use on every
-    // platform (`mahbot::speech::spawn_background_init`), so an install that never records or
-    // receives audio loads nothing at start.
+    // Recognition and spoken replies are deliberately NOT loaded here: each engine loads on
+    // first use on every platform (`mahbot::speech::engine`, `mahbot::speech::synth`), so an
+    // install that never records or speaks loads nothing at start.
     mahbot::providers::init_global()
         .map_err(|e| mahbot::boot::record_startup_failure("providers::init_global", e))?;
 
-    // TTS model load: cache first, else spawn the background download. Only when TTS is
-    // enabled, to avoid an unnecessary ~400 MB download.
-    #[cfg(target_os = "macos")]
-    if mahbot::audio::tts::is_config_enabled() {
-        // Matches the pre-change behaviour where init_global opened it unconditionally.
-        let _ = mahbot::audio::tts::ensure_audio_output();
-        if !mahbot::audio::tts::try_load_cached() {
-            mahbot::audio::tts::spawn_download();
-        }
-    }
+    // The speech output device is opened at start when the owner has it on, so the first phrase
+    // is not refused while a cold device open runs. No model is loaded here.
+    mahbot::audio::open_speech_output_if_enabled();
 
     // `mahbot paused`: every managed workspace is paused here, while the stores are up and
     // the poll loop is not yet spawned, so its first round already finds them paused. This is
@@ -720,8 +713,8 @@ fn main() -> Result<()> {
         }
 
         // A recording into text, text into a spoken file. It touches only the speech models —
-        // recognition's machine-wide set, synthesis's copy under the storage root — and never a
-        // store or the settings, so it works while the product is stopped and alongside it.
+        // the one machine-wide set both engines read — and never a store or the settings, so it
+        // works while the product is stopped and alongside it.
         EntryPoint::Audio => {
             let rt = command_line_runtime()?;
             std::process::exit(rt.block_on(mahbot::run_audio_cli(&command_line_args())));

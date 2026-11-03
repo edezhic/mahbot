@@ -479,9 +479,9 @@ fi
 
 # ── 7. Give the speech models their machine-wide home ─────────────────────
 
-# Recognition reads one fixed folder per system and never creates it: a missing
-# one is an error naming the path, never a substitute location. The folder is
-# outside what an ordinary user may create on Linux, so that one is created with
+# Both speech engines read one fixed folder per system and never create it: a
+# missing one is an error naming the path, never a substitute location. The folder
+# is outside what an ordinary user may create on Linux, so that one is created with
 # elevation, once, and handed to the account the product runs under; on macOS
 # `/Users/Shared` is world-writable and the folder is created as the owner.
 #
@@ -490,7 +490,7 @@ fi
 if [ "$OS" = macos ]; then
     MODELS_DIR='/Users/Shared/MahBot/models'
     if [ ! -d "$MODELS_DIR" ] && ! mkdir -p "$MODELS_DIR" 2>/dev/null; then
-        warn "the speech model folder $MODELS_DIR could not be created; speech recognition will refuse to run until it exists."
+        warn "the speech model folder $MODELS_DIR could not be created; speech will refuse to run until it exists."
     fi
 else
     MODELS_DIR='/var/lib/mahbot/models'
@@ -499,12 +499,12 @@ else
     if [ -d "$MODELS_DIR" ] && [ -w "$MODELS_DIR" ]; then
         :
     elif ! command -v sudo >/dev/null 2>&1; then
-        warn "sudo was not found, so $MODELS_DIR could not be created; speech recognition will refuse to run until it exists."
+        warn "sudo was not found, so $MODELS_DIR could not be created; speech will refuse to run until it exists."
     else
         say "Creating $MODELS_DIR (your administrator password is needed once)."
         if ! sudo mkdir -p "$MODELS_DIR" 2>/dev/null ||
             ! sudo chown "$(id -u):$(id -g)" "$MODELS_DIR" 2>/dev/null; then
-            warn "$MODELS_DIR could not be created and given to this account; speech recognition will refuse to run until it exists."
+            warn "$MODELS_DIR could not be created and given to this account; speech will refuse to run until it exists."
         fi
     fi
 fi

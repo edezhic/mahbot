@@ -452,8 +452,8 @@ public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint M
 
     # ── 9. Give the speech models their machine-wide home ─────────────────────
 
-    # Recognition reads one fixed folder and never creates it: a missing one is an
-    # error naming the path, never a substitute location. A standard user may create
+    # Both speech engines read one fixed folder and never create it: a missing one is
+    # an error naming the path, never a substitute location. A standard user may create
     # a folder under ProgramData and write inside it, so no elevation is needed here;
     # write access follows whoever created it, which is this account.
     #
@@ -464,7 +464,7 @@ public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint M
         try {
             New-Item -ItemType Directory -Path $ModelsDir -Force | Out-Null
         } catch {
-            Write-Host "the speech model folder $ModelsDir could not be created; speech recognition will refuse to run until it exists."
+            Write-Host "the speech model folder $ModelsDir could not be created; speech will refuse to run until it exists."
         }
     }
 

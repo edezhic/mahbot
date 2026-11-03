@@ -27,10 +27,10 @@
 # `zig rc`. cargo-zigbuild supplies the equivalent wrappers for `cargo
 # zigbuild`, but it has no `check` subcommand, so the check lane needs its own.
 #
-# The microphone, the voice pipeline and speech recognition are part of a Windows
-# build too: `cpal` reaches WASAPI through `windows-sys`, and the inference crate
-# reaches DX12 through `wgpu`, so this lane is what keeps their Windows branches
-# compiled.
+# The microphone, the voice pipeline, speech recognition and spoken replies are part
+# of a Windows build too: `cpal` and `rodio` reach WASAPI through `windows-sys`, and
+# the inference crate reaches DX12 through `wgpu`, so this lane is what keeps their
+# Windows branches compiled.
 set -eu
 
 # Repo root, regardless of the caller's cwd (script lives in scripts/).

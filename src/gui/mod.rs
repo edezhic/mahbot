@@ -432,8 +432,6 @@ pub enum Message {
         path: Option<String>,
     },
     CloseDiffModal,
-    #[cfg(target_os = "macos")]
-    TtsDownloadEvent(crate::audio::tts::TtsDownloadEvent),
 }
 
 /// Let [`Dashboard::update`] intercept Toast and LinkClicked messages before
@@ -685,10 +683,6 @@ pub struct Dashboard {
     foreign_diff_state: diff::DiffState,
 
     git_state: git::GitState,
-
-    /// Current TTS download progress: (file_name, progress 0.0–1.0).
-    #[cfg(target_os = "macos")]
-    tts_download_progress: Option<(String, f32)>,
 }
 
 impl Dashboard {
@@ -734,8 +728,6 @@ impl Dashboard {
             foreign_workspace: None,
             foreign_diff_state: diff::DiffState::new(),
             git_state: git::GitState::new(),
-            #[cfg(target_os = "macos")]
-            tts_download_progress: None,
         }
     }
 
@@ -1805,45 +1797,6 @@ impl Dashboard {
                 Task::none()
             }
             Message::Nop => Task::none(),
-            #[cfg(target_os = "macos")]
-            Message::TtsDownloadEvent(event) => self.handle_tts_download_event(event),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[expect(clippy::cast_precision_loss)]
-    fn handle_tts_download_event(
-        &mut self,
-        event: crate::audio::tts::TtsDownloadEvent,
-    ) -> Task<Message> {
-        match event {
-            crate::audio::tts::TtsDownloadEvent::FileStarted { name, .. } => {
-                self.tts_download_progress = Some((name, 0.0));
-                Task::none()
-            }
-            crate::audio::tts::TtsDownloadEvent::FileProgress {
-                name,
-                bytes_downloaded,
-                total_bytes,
-            } => {
-                let progress = if total_bytes > 0 {
-                    (bytes_downloaded as f32 / total_bytes as f32).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                self.tts_download_progress = Some((name, progress));
-                Task::none()
-            }
-            crate::audio::tts::TtsDownloadEvent::FileCompleted { name } => {
-                // Mark the file as fully done; next FileStarted will show the next file.
-                self.tts_download_progress = Some((name, 1.0));
-                Task::none()
-            }
-            crate::audio::tts::TtsDownloadEvent::Complete
-            | crate::audio::tts::TtsDownloadEvent::Failed { .. } => {
-                self.tts_download_progress = None;
-                Task::none()
-            }
         }
     }
 
@@ -2679,8 +2632,6 @@ impl Dashboard {
             // Coalesces agent/non-agent registry, live transcript and voice-status
             // broadcasts into one re-render, driving Running Agents and the footer.
             iced::Subscription::run(runtime_change_subscription),
-            #[cfg(target_os = "macos")]
-            iced::Subscription::run(tts_download_subscription).map(Message::TtsDownloadEvent),
             // The diff state's own shortcuts and auto-refresh, only while its view is
             // open: the foreign view owns it while shown, so the two never both subscribe.
             if self.foreign_workspace.is_some() {
@@ -2770,28 +2721,6 @@ fn window_requests_subscription() -> impl futures_util::Stream<Item = Message> {
             }
         }
     })
-}
-
-/// The TTS download broadcast as [`Message::TtsDownloadEvent`]. An uninitialized source yields
-/// an empty stream rather than panicking (`tts::init_global` precedes GUI startup).
-#[cfg(target_os = "macos")]
-fn tts_download_subscription()
--> impl futures_util::Stream<Item = crate::audio::tts::TtsDownloadEvent> {
-    use iced::futures::channel::mpsc;
-    common::broadcast_stream_producer(
-        1,
-        &crate::audio::tts::DOWNLOAD_EVENTS,
-        |output: &mut mpsc::Sender<crate::audio::tts::TtsDownloadEvent>,
-         event: Option<crate::audio::tts::TtsDownloadEvent>| {
-            Box::pin(async move {
-                // Best-effort: drop events when the GUI channel is full, and lagged
-                // progress slots (the next event is the current state).
-                if let Some(event) = event {
-                    let _ = output.try_send(event);
-                }
-            })
-        },
-    )
 }
 
 /// Emits [`Message::RuntimeChanged`] (coalesced) when a source the GUI renders directly
@@ -3748,19 +3677,6 @@ impl Dashboard {
         Some(Self::non_agent_calls(theme::TEXT_14)?.footer())
     }
 
-    /// The TTS download progress in the footer's centre: the current file and its percentage
-    /// (e.g. "duration_predictor.onnx 83%").
-    #[cfg(target_os = "macos")]
-    fn render_tts_download_progress(&self) -> Element<'_, Message> {
-        let Some((file_name, progress)) = &self.tts_download_progress else {
-            return Space::new().width(0).into();
-        };
-        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let pct = (progress * 100.0).round() as u32;
-        let label = format!("TTS: {file_name} {pct}%");
-        footer_status_label(label, None)
-    }
-
     /// The wording for a [`VoiceStatus`], shared by the footer's label and the rail's tooltip,
     /// without the glyph [`Self::voice_status_icon`] draws. `None` for voice off, which both
     /// surfaces hide.
@@ -3839,16 +3755,7 @@ impl Dashboard {
             .spacing(theme::SPACE_6)
             .align_y(Alignment::Center);
 
-        // The recording's own progress: what is being fetched for speech synthesis (macOS
-        // only) and what the microphone is doing (everywhere).
-        #[cfg(target_os = "macos")]
-        let center = row![
-            self.render_tts_download_progress(),
-            Self::render_voice_status(),
-        ]
-        .spacing(theme::SPACE_8)
-        .align_y(Alignment::Center);
-        #[cfg(not(target_os = "macos"))]
+        // What the microphone is doing: the pipeline's state.
         let center = Self::render_voice_status();
 
         let right = Row::with_children(

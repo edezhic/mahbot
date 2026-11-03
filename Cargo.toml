@@ -55,15 +55,19 @@ pulldown-cmark = "0.12"
 iced_anim = "0.3"
 iced_term = "0.8.0"
 
-# Speech recognition: the inference crate, taken from the sibling checkout by
-# path — no vendoring, no mirror, no second copy. It is not on crates.io, so this
-# dependency makes `cargo package`/`publish` fail until the crate is published and
-# this line becomes a version requirement; releases are cut after that, not before.
+# The speech engines — recognition and spoken replies — and their models: the
+# inference crate, taken from the sibling checkout by path — no vendoring, no
+# mirror, no second copy. It is not on crates.io, so this dependency makes
+# `cargo package`/`publish` fail until the crate is published and this line becomes
+# a version requirement; releases are cut after that, not before.
 mahbot-inference = { path = "../mahbot-rlx/crates/mahbot-inference" }
 # Microphone capture (`crate::audio::voice`): the platform's own host API —
 # CoreAudio, WASAPI, ALSA. The ALSA backend needs `libasound2-dev` (pkg-config
 # `alsa`) to build on Linux.
 cpal = "0.18"
+# Spoken-phrase playback and the wake-word recording cues: both play through one
+# shared output device on the same host API, and a WAV cue is decoded by `hound`.
+rodio = { version = "0.22", default-features = false, features = ["playback", "hound"] }
 # The recogniser's input decoders: OGG/Opus (a Telegram voice note arrives as one),
 # and MP3 (an audio attachment). WAV is read by the product itself.
 ogg = "0.9"
@@ -119,8 +123,9 @@ semver = "1"
 tempfile = "3"
 # Unicode name comparison: `unicode-normalization` (canonical decomposition) and
 # `unicase` (full case folding) give the caseless matching the account-name rule
-# compares by (src/users.rs). The former also serves the macOS TTS NFKD fold, and
-# the latter is already a `mime_guess` dependency — neither is a new crate.
+# compares by (src/users.rs). The former also serves the spoken text's NFKD fold
+# (src/speech/synth.rs), and the latter is already a `mime_guess` dependency —
+# neither is a new crate.
 # 2.10 is the floor on purpose: 2.9.0 emits three-character folds rotated
 # (`ﬃ` folded to `iff`), the very collision the account-name rule catches.
 unicode-normalization = "0.1"
@@ -210,9 +215,8 @@ tree-sitter-c = "0.24"
 tree-sitter-sequel = "0.3"
 tree-sitter-md = { version = "0.5.3", features = ["parser"] }
 
-# Managed bun runtime release archive extraction (zip, DEFLATE-compressed).
-# Promoted from candle's transitive dep (the exact major is already in the lock).
-# Also the container format for `.docx` ingestion.
+# Managed bun runtime release archive extraction (zip, DEFLATE-compressed), and
+# the container format for `.docx` ingestion.
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # Rasterizing an SVG or a PDF page: a pure-Rust in-process engine for the tool's
@@ -327,20 +331,14 @@ windows = { version = "0.62", features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# Acceleration-carrying candle for the TTS ONNX runtime.
-candle-nn = { version = "0.11.0", features = ["accelerate"] }
-candle-core = "0.11.0"
-
-# ── Speech synthesis and the wake word (macOS only) ───────────────────────
-# What is left of the macOS-only audio subsystem once recognition moved to
-# `crate::speech` and its own crate: the Qwen3-ASR encoder the wake word shares
-# (`crate::audio::encoder`), the TTS runtime and the recording cues.
+# ── The wake word (macOS only) ────────────────────────────────────────────
+# What is left of the macOS-only audio subsystem now that recognition and spoken
+# replies run on the inference crate on every platform: the Qwen3-ASR encoder the
+# wake word runs on (`crate::audio::encoder`) and its voice-activity detector.
 qwen-asr = { version = "0.11.0", default-features = false, features = ["blas", "vdsp"] }
 # The wake word's voice-activity detector (the recogniser's own lives in the inference
 # crate).
 earshot = "1.2"
-# Spoken-phrase playback and the wake-word recording cues.
-rodio = { version = "0.22", default-features = false, features = ["playback", "hound"] }
 
 # Computer Use tool (GUI observe/act): the live macOS backend's dependencies —
 # accessibility (AXUIElement), input synthesis (CGEvent) and capture

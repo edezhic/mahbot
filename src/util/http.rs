@@ -393,10 +393,6 @@ pub(crate) fn build_download_client(total_timeout: Duration) -> anyhow::Result<r
 pub(crate) enum DownloadSizeCheck {
     /// Require downloaded bytes to equal the Content-Length header (when present).
     Exact,
-    /// Require at least `min_bytes` downloaded (for servers that omit Content-Length).
-    /// Only the macOS-only TTS model download uses this policy.
-    #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
-    Min(u64),
     /// No size validation.
     None,
 }
@@ -632,10 +628,7 @@ pub(crate) async fn download_verified(
                 );
             }
         }
-        DownloadSizeCheck::Min(min) if downloaded < min => {
-            anyhow::bail!("Downloaded file too small: {downloaded} bytes");
-        }
-        DownloadSizeCheck::Min(_) | DownloadSizeCheck::None => {}
+        DownloadSizeCheck::None => {}
     }
 
     if let Some(h) = hasher {
@@ -786,6 +779,9 @@ mod tests {
             .await
             .expect("a leftover regular file is taken");
         file.write_all(b"new").await.unwrap();
+        // A tokio file buffers its writes: without this the bytes may never reach the disk
+        // before the handle is dropped.
+        file.flush().await.unwrap();
         drop(file);
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }

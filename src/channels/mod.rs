@@ -67,7 +67,7 @@ pub async fn stop_telegram_server() {
 /// [`crate::agent::message_router`] and the voice pipeline's notice in `crate::audio::voice`.
 ///
 /// No speech happens here or on any event this broadcasts: the only way the product speaks is
-/// the admin Assistant's `say` tool, which calls `crate::audio::tts` itself.
+/// the admin Assistant's `say` tool, which calls `crate::speech::synth` itself.
 ///
 /// Primitive fields rather than [`crate::SendMessage`], so the per-agent consumer loop can call
 /// it with a [`crate::users::UserRecord`].

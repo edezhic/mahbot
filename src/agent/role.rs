@@ -185,7 +185,7 @@ impl Role {
     #[must_use]
     pub fn role_description_for(&self, is_admin: bool) -> String {
         if *self == Role::Assistant && is_admin {
-            let say_note = Self::say_tool_note();
+            let say_note = crate::prompt::load_prompt("role/assistant_admin_say.md");
             crate::prompt::substitute(
                 &crate::prompt::load_prompt("role/assistant_admin.md"),
                 &[
@@ -195,17 +195,6 @@ impl Role {
             )
         } else {
             self.role_description()
-        }
-    }
-
-    /// The admin Assistant's note about the `say` tool, spliced into `role/assistant_admin.md`
-    /// where the tool exists: a platform without the speech engine offers neither the tool nor the
-    /// sentence.
-    fn say_tool_note() -> String {
-        if cfg!(target_os = "macos") {
-            crate::prompt::load_prompt("role/assistant_admin_say.md")
-        } else {
-            String::new()
         }
     }
 
@@ -245,7 +234,6 @@ impl Role {
 use crate::Tool;
 use crate::Workspace;
 use crate::config::CONFIG;
-#[cfg(target_os = "macos")]
 use crate::tools::SayTool;
 use crate::tools::path::PathAccess;
 use crate::tools::{
@@ -366,9 +354,7 @@ impl Role {
             // The admin's own project view: list / add / board / ticket / comment / pause / resume.
             t.push(Box::new(WorkspaceTool));
             // The voice: one short phrase spoken aloud, for the admin's own Assistant only — a
-            // custom role is never offered it, and a platform without the speech engine builds no
-            // tool at all.
-            #[cfg(target_os = "macos")]
+            // custom role is never offered it.
             t.push(Box::new(SayTool));
         }
         t
@@ -989,7 +975,7 @@ mod tests {
         type Rule = (&'static str, fn(crate::Role, bool) -> bool);
 
         let ws = crate::workspace::test_ws("test");
-        let mut rules: Vec<Rule> = vec![
+        let rules: Vec<Rule> = vec![
             ("mahbot_config", admin_assistant),
             ("mahbot_debug", admin_assistant),
             ("workspace", admin_assistant),
@@ -997,12 +983,8 @@ mod tests {
             ("custom", any_assistant),
             ("document", any_assistant),
             ("sleep", assistant_or_manager),
+            ("say", admin_assistant),
         ];
-        // `cfg!`, not `#[cfg]`: the macOS-only row must not leave `rules` unmutated elsewhere,
-        // which is a denied lint.
-        if cfg!(target_os = "macos") {
-            rules.push(("say", admin_assistant));
-        }
         for (name, may_hold) in rules {
             for role in Role::iter() {
                 for is_admin in [false, true] {
@@ -1020,7 +1002,6 @@ mod tests {
                 }
             }
         }
-        #[cfg(target_os = "macos")]
         assert!(
             !Role::custom_role_tool_catalog().contains(&"say"),
             "a custom role must not be offered the voice"

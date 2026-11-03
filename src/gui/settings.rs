@@ -8,15 +8,15 @@ use crate::Role;
 use crate::Workspace;
 use crate::channels::telegram_local::{self, Health, Mode};
 use crate::config::CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL;
+#[cfg(target_os = "macos")]
+use crate::config::CONFIG_KEY_VOICE_ENABLED;
 use crate::config::{
     CONFIG, CONFIG_KEY_AUTOUPDATE, CONFIG_KEY_DEEPSEEK_KEY, CONFIG_KEY_EXA_KEY,
     CONFIG_KEY_MANAGER_MODEL, CONFIG_KEY_PROVIDER_ENDPOINT, CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
     CONFIG_KEY_PROVIDER_KEY, CONFIG_KEY_TELEGRAM_API_HASH, CONFIG_KEY_TELEGRAM_API_ID,
-    CONFIG_KEY_TELEGRAM_BOT_TOKEN, CONFIG_KEY_WEB_SEARCH_PROVIDER, CONFIG_KEY_WORKER_MODEL,
-    ConfigData, ModelRouting,
+    CONFIG_KEY_TELEGRAM_BOT_TOKEN, CONFIG_KEY_TTS_ENABLED, CONFIG_KEY_WEB_SEARCH_PROVIDER,
+    CONFIG_KEY_WORKER_MODEL, ConfigData, ModelRouting,
 };
-#[cfg(target_os = "macos")]
-use crate::config::{CONFIG_KEY_TTS_ENABLED, CONFIG_KEY_VOICE_ENABLED};
 use crate::custom_role::{CustomRole, CustomRoleBehavior};
 use crate::tools::custom::ToolListing;
 use crate::tools::media_catalog::image::validate_image_model;
@@ -432,15 +432,12 @@ pub enum SettingsMessage {
     /// Retry loading voice models after a [`VoiceStatus::ModelError`].
     #[cfg(target_os = "macos")]
     RetryVoiceModels,
-    /// Toggle TTS on/off (persisted to config DB).
-    #[cfg(target_os = "macos")]
+    /// Toggle speech output on/off (persisted to config DB).
     TtsToggle(bool),
     /// The persist's result: the `u64` generation drops results from superseded toggles
     /// (compared against [`SettingsState::tts_toggle_gen`]).
-    #[cfg(target_os = "macos")]
     TtsToggleResult(u64, Result<(), String>),
-    /// Retry TTS model download after a permanent failure.
-    #[cfg(target_os = "macos")]
+    /// Retry the synthesiser's model load after a terminal failure.
     TtsRetryModels,
 }
 
@@ -581,8 +578,8 @@ pub struct SettingsState {
     /// results drop.
     transcription_toggle_gen: u64,
 
-    /// Generation counter for TTS toggles: bumped before each one, so stale results drop.
-    #[cfg(target_os = "macos")]
+    /// Generation counter for speech-output toggles: bumped before each one, so stale results
+    /// drop.
     tts_toggle_gen: u64,
 }
 
@@ -667,7 +664,6 @@ impl SettingsState {
             #[cfg(target_os = "macos")]
             voice_toggle_gen: 0,
             transcription_toggle_gen: 0,
-            #[cfg(target_os = "macos")]
             tts_toggle_gen: 0,
         };
         state.resync_field_editors();
@@ -832,13 +828,12 @@ impl SettingsState {
 
     /// Mirror a toggle as `"true"`/`""` (the empty string keeps the `non_empty` accessor
     /// collapsing to None = disabled).
-    #[cfg(target_os = "macos")]
     fn set_toggle(&mut self, key: &str, enabled: bool) {
         self.set_both(key, if enabled { "true" } else { "" });
     }
 
-    /// Shared voice/TTS toggle arm: mirror, fire the side effect, bump generation, persist.
-    #[cfg(target_os = "macos")]
+    /// Shared voice/speech-output toggle arm: mirror, fire the side effect, bump generation,
+    /// persist.
     fn run_toggle(
         &mut self,
         key: &'static str,
@@ -866,9 +861,8 @@ impl SettingsState {
         )
     }
 
-    /// Shared voice/TTS result arm: stale generations are ignored; a DB error reverts both
-    /// snapshots and the pipeline via `on_revert`.
-    #[cfg(target_os = "macos")]
+    /// Shared voice/speech-output result arm: stale generations are ignored; a DB error reverts
+    /// both snapshots and the pipeline via `on_revert`.
     fn handle_toggle_result(
         &mut self,
         key: &str,
@@ -1479,7 +1473,6 @@ impl SettingsState {
                 |c| &c.voice_enabled,
                 sync_voice_state,
             ),
-            #[cfg(target_os = "macos")]
             SettingsMessage::TtsToggle(enabled) => self.run_toggle(
                 CONFIG_KEY_TTS_ENABLED,
                 enabled,
@@ -1491,15 +1484,16 @@ impl SettingsState {
                 |enabled| {
                     if enabled {
                         // Open the OS audio output device so playback works without a restart.
-                        let _ = crate::audio::tts::ensure_audio_output();
+                        let _ = crate::audio::output::ensure_audio_output();
                     }
-                    // ON with uncached models downloads them, retrying ModelState::Failed.
-                    if enabled && !crate::audio::tts::try_load_cached() {
-                        crate::audio::tts::spawn_or_retry_download();
+                    // ON with an unloaded model set starts the load-or-fetch chain now.
+                    if enabled && !crate::speech::synth::is_loaded() {
+                        if !crate::speech::synth::retry_init() {
+                            crate::speech::synth::spawn_background_init();
+                        }
                     }
                 },
             ),
-            #[cfg(target_os = "macos")]
             SettingsMessage::TtsToggleResult(g, result) => self.handle_toggle_result(
                 CONFIG_KEY_TTS_ENABLED,
                 g,
@@ -1508,9 +1502,8 @@ impl SettingsState {
                 |c| &c.tts_enabled,
                 |_| {},
             ),
-            #[cfg(target_os = "macos")]
             SettingsMessage::TtsRetryModels => {
-                let _ = crate::audio::tts::retry_download();
+                let _ = crate::speech::synth::retry_init();
                 Task::none()
             }
             #[cfg(target_os = "macos")]
@@ -1798,7 +1791,7 @@ impl SettingsState {
             .push(Space::new().height(16))
             .push(self.integrations_section())
             .push(Space::new().height(16));
-        // Audio section: transcription everywhere, the wake word and text-to-speech on macOS.
+        // Audio section: transcription and speech output everywhere, the wake word on macOS.
         let config_sections = config_sections
             .push(self.audio_section())
             .push(Space::new().height(16));
@@ -3382,9 +3375,9 @@ impl SettingsState {
         .into()
     }
 
-    // One 'Audio' section: the Transcription row everywhere, plus — on macOS only — Wake Word
-    // Detection with its enrollment controls and Text to Speech, each with its toggle, inline
-    // status and a hover hint.
+    // One 'Audio' section: the Transcription and Text to Speech rows everywhere, plus — on macOS
+    // only — Wake Word Detection with its enrollment controls. Each row carries its toggle, an
+    // inline status and a hover hint.
 
     fn audio_section(&self) -> Element<'_, SettingsMessage> {
         let transcription_enabled =
@@ -3418,11 +3411,49 @@ impl SettingsState {
         let column = Column::new().push(transcription_row);
         #[cfg(target_os = "macos")]
         let column = self.macos_audio_rows(column, transcription_enabled);
+        let column = column.push(self.tts_row());
         section("Audio", column)
     }
 
-    /// The Audio rows only macOS has — Wake Word Detection with its enrollment controls, and Text
-    /// to Speech: the wake-word encoder and the speech synthesiser exist on no other platform.
+    /// The speech-output row: the toggle, and the engine's state in the same words the
+    /// transcription row uses — ready, loading, or a failure with its retry.
+    fn tts_row(&self) -> Element<'_, SettingsMessage> {
+        let enabled = self.config.tts_enabled.as_deref() == Some("true");
+        let status: Element<'_, SettingsMessage> = if !enabled {
+            disabled_status()
+        } else if crate::speech::synth::is_loaded() {
+            if crate::audio::output::audio_output_ready() {
+                status_label("Ready")
+            } else {
+                Text::new("No audio output device")
+                    .size(theme::TEXT_13)
+                    .color(theme::STATUS_ERROR)
+                    .into()
+            }
+        } else if crate::speech::synth::is_failed() {
+            retry_status_row("Model unavailable", SettingsMessage::TtsRetryModels)
+        } else if crate::speech::synth::is_loading() {
+            status_label("Loading…")
+        } else {
+            status_label("Loads on first use")
+        };
+        row_hint(
+            field_row(
+                "Text to Speech",
+                toggle_status_row(
+                    toggler(enabled)
+                        .on_toggle(SettingsMessage::TtsToggle)
+                        .style(theme::toggler_style),
+                    status,
+                ),
+                None,
+            ),
+            "Let assistant talk",
+        )
+    }
+
+    /// The Audio rows only macOS has — Wake Word Detection with its enrollment controls: the
+    /// wake-word encoder exists on no other platform.
     #[cfg(target_os = "macos")]
     #[expect(clippy::too_many_lines)]
     fn macos_audio_rows<'a>(
@@ -3488,40 +3519,6 @@ impl SettingsState {
                 None,
             ),
             "Listen for the command",
-        );
-
-        let tts_enabled = self.config.tts_enabled.as_deref() == Some("true");
-        let tts_ready = crate::audio::tts::models_ready();
-        let tts_failed = crate::audio::tts::download_failed();
-        let audio_ok = crate::audio::tts::audio_output_ready();
-        let tts_status: Element<'_, SettingsMessage> = if !tts_enabled {
-            disabled_status()
-        } else if tts_ready {
-            if audio_ok {
-                status_label("Ready")
-            } else {
-                Text::new("No audio output device")
-                    .size(theme::TEXT_13)
-                    .color(theme::STATUS_ERROR)
-                    .into()
-            }
-        } else if tts_failed {
-            retry_status_row("Model download failed", SettingsMessage::TtsRetryModels)
-        } else {
-            status_label("Downloading models…")
-        };
-        let tts_row = row_hint(
-            field_row(
-                "Text to Speech",
-                toggle_status_row(
-                    toggler(tts_enabled)
-                        .on_toggle(SettingsMessage::TtsToggle)
-                        .style(theme::toggler_style),
-                    tts_status,
-                ),
-                None,
-            ),
-            "Let assistant talk",
         );
 
         let enroll_btn: Element<'_, SettingsMessage> = if voice_enabled && transcription_enabled {
@@ -3634,7 +3631,6 @@ impl SettingsState {
         };
 
         column = column.push(wake_row);
-        column = column.push(tts_row);
         if voice_enabled && transcription_enabled {
             column = column.push(Space::new().height(8));
             column = column.push(enroll_btn);
@@ -4472,9 +4468,7 @@ mod tests {
 
     /// Parameterised by message constructors and field accessors so the same 7-scenario
     /// sequence (toggle ON, stale result, DB error revert, re-toggle, successful persist,
-    /// stale-old-gen, toggle OFF + revert) runs once per toggle. macOS only: both toggles
-    /// drive the audio pipeline.
-    #[cfg(target_os = "macos")]
+    /// stale-old-gen, toggle OFF + revert) runs once per toggle.
     fn assert_toggle_gen_counter_and_rollback(
         toggle_on: impl Fn(bool) -> SettingsMessage,
         toggle_result: impl Fn(u64, Result<(), String>) -> SettingsMessage,
@@ -4590,12 +4584,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[serial_test::serial(speech)]
     fn tts_toggle_generation_counter_and_rollback() {
-        // Set TTS state to READY so that toggling ON does not trigger
-        // spawn_or_retry_download() (which requires a Tokio runtime).  The
-        // model download logic is tested separately — this test focuses on
-        // the generation-counter and rollback behaviour.
+        // Pin the synthesiser READY so that toggling ON starts no load (which requires a Tokio
+        // runtime): this test is about the generation counter and the rollback. The state is
+        // shared with the speech tests — hence the same serial key — and left unloaded again,
+        // which is where a test binary always starts (no test may reach the machine-wide set).
         assert_toggle_gen_counter_and_rollback(
             SettingsMessage::TtsToggle,
             SettingsMessage::TtsToggleResult,
@@ -4606,9 +4600,10 @@ mod tests {
                 // test isolation issues (other tests may have set it in global CONFIG).
                 let _ = s.config.set_string_field("tts_enabled", "");
                 s.config.normalize();
-                crate::audio::tts::test_set_state(2); // ModelState::Ready
+                crate::speech::synth::test_set_state(crate::util::model_state::ModelState::Ready);
             },
         );
+        crate::speech::synth::test_set_state(crate::util::model_state::ModelState::Uninit);
     }
 
     // The switch reports the system's answer and nothing else: it never asserts a

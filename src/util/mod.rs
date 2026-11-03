@@ -525,11 +525,10 @@ mod verbatim_prefix_tests {
 }
 
 /// Resolve the per-user `~/.mahbot/models/` directory via the CONFIG storage root; `None` if the
-/// root is not initialized yet. Only the two macOS-only model sets live here now — spoken replies
-/// and the wake word's encoder (`crate::audio::models_subdir`); recognition reads the machine-wide
-/// root (`crate::speech::models`). Because it follows the storage root, a `$HOME`-overridden
-/// sandbox resolves an empty models dir and re-downloads its model set instead of sharing the real
-/// cache.
+/// root is not initialized yet. Only the macOS wake word's encoder lives here
+/// (`crate::audio::models_subdir`); recognition and spoken replies read the machine-wide root
+/// (`crate::speech::models`). Because it follows the storage root, a `$HOME`-overridden sandbox
+/// resolves an empty models dir and re-downloads its model set instead of sharing the real cache.
 #[must_use]
 #[cfg(target_os = "macos")]
 pub(crate) fn models_dir() -> Option<PathBuf> {

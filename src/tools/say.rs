@@ -2,30 +2,29 @@
 //!
 //! The product speaks nothing by itself — a reply, an automation or a confirmation
 //! reaches the engine only when the Assistant asks for it here. The phrase is
-//! handed to [`crate::audio::tts::say_phrase`], which renders and plays it in the
-//! background: the call returns at once, and a newer phrase replaces one still
-//! being spoken.
+//! handed to [`crate::speech::synth::say_phrase`], which renders it and returns: the
+//! waveform then plays in the background, and a newer phrase stops the one being
+//! spoken.
 //!
 //! A phrase is one short sentence, not a reading: anything over
 //! [`MAX_PHRASE_CHARS`] is refused rather than spoken. Every refusal — too long,
-//! speech output switched off, engine not up, nobody at the computer — is this
-//! tool's ordinary answer, not a failure: the Assistant did nothing wrong, and
-//! each one says what to do instead. The engine's own bring-up (download, device
-//! open) is kicked on the side and never waited for.
+//! speech output switched off, engine not up, nobody at the computer, a text the
+//! engine would not speak — is this tool's ordinary answer, not a failure: the
+//! Assistant did nothing wrong, and each one says what to do instead. The engine's
+//! own bring-up (fetch, device open) is kicked on the side and never waited for.
 //!
 //! The refusal for an absent user is the tool's one use of the machine-wide
 //! user-activity state ([`crate::user_activity`]), and it comes last in the
 //! engine's gates so the answers for speech that cannot be produced at all keep precedence.
 //!
-//! macOS only, where speech synthesis lives (recognition runs on every platform) — the
-//! module is `cfg`-gated in `tools/mod.rs`, and the admin's Assistant is its only holder.
+//! The admin's Assistant is the tool's only holder.
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 
 use crate::Workspace;
-use crate::audio::tts::{self, NotReady, SayOutcome};
+use crate::speech::synth::{self, NotReady, SayOutcome};
 use crate::tools::Tool;
 
 /// The longest phrase spoken: a spoken note is one short sentence, counted as
@@ -72,7 +71,7 @@ impl Tool for SayTool {
                  phrase of at most {MAX_PHRASE_CHARS} characters — long text is not read aloud."
             ));
         }
-        Ok(match tts::say_phrase(text) {
+        Ok(match synth::say_phrase(text).await {
             SayOutcome::Speaking => "Spoken: the phrase plays now.".into(),
             SayOutcome::SpeechOff => {
                 "Nothing was spoken: the user has speech output turned off right now.".into()
@@ -83,6 +82,7 @@ impl Tool for SayTool {
             SayOutcome::NotReady(reason) => {
                 format!("Nothing was spoken: {}.", not_ready_reason(&reason))
             }
+            SayOutcome::Failed(reason) => format!("Nothing was spoken: {reason}"),
         })
     }
 }
@@ -95,7 +95,7 @@ fn not_ready_reason(reason: &NotReady) -> &'static str {
             "the speech models are not loaded yet, and they are being prepared in the background"
         }
         NotReady::DownloadFailed => {
-            "the speech models could not be downloaded — a retry is running in the background"
+            "the speech models failed to load — a retry is running in the background"
         }
         NotReady::NoAudioDevice => "this machine has no audio output device",
     }
@@ -123,7 +123,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(tts)]
+    #[serial_test::serial(speech)]
     async fn a_phrase_over_the_limit_is_refused_by_visible_characters() {
         let too_long = say(json!({ "text": "a".repeat(101) })).await;
         assert!(
@@ -144,7 +144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(tts)]
+    #[serial_test::serial(speech)]
     async fn a_call_without_text_says_so() {
         assert!(
             say(json!({})).await.contains("`text` is required"),
