@@ -10,9 +10,9 @@
 //! file draws; a remote, undecodable, missing or oversized target shows its `🖼️` label instead —
 //! never raw base64, never a blank), and inside code the source stays visible as written;
 //! `[AUDIO:…]`/`[VIDEO:…]`/`[FILE:…]` an emoji plus the file name, whose click reveals the file in
-//! the OS file manager; `[Audio transcription of …]`/`[Video transcription of …]` an emoji plus
-//! the transcribed text; `[Saved image: …]` nothing (the image renders from its data-URI marker);
-//! `[Saved video: …]` the clip name (there is no separate video renderer).
+//! the OS file manager; `[Audio transcription of …]`/`[Video transcription of …]` (legacy persisted
+//! forms) an emoji plus the transcribed text; `[Saved image: …]` nothing (the image renders from its
+//! data-URI marker); `[Saved video: …]` the clip name (there is no separate video renderer).
 //!
 //! # When a marker is an attachment
 //!
@@ -104,8 +104,8 @@ impl Preprocessed {
 /// each one. `workspace` is the root relative marker targets name a file in; `None` leaves each
 /// target to the module's rule as written.
 pub(crate) fn preprocess(content: &str, workspace: Option<&Path>) -> Preprocessed {
-    // Order matters: the transcription annotations contain the words "Audio" and "Video",
-    // which overlap the raw `[AUDIO:...]`/`[VIDEO:...]` patterns. Handle them first.
+    // Order matters: the transcription annotations contain the words "Audio" and "Video", which
+    // overlap the raw `[AUDIO:...]`/`[VIDEO:...]` patterns. Handle them first.
     let s = replace_saved_annotations(&replace_transcription(content));
     if !MEDIA_MARKER_RE.is_match(&s) && !s.contains("![") {
         return Preprocessed {
@@ -136,9 +136,10 @@ pub(crate) fn parse_body(
     )
 }
 
-/// `[Audio transcription of {filename}]: {text}` → 🔊, `[Video transcription of …]` → 🎬. The
-/// audio form is a legacy annotation (only persisted rows carry it); the video form comes from
-/// `enrich_message`. Only the annotation header is replaced.
+/// `[Audio transcription of {filename}]: {text}` → 🔊, `[Video transcription of …]` → 🎬. Both are
+/// legacy annotations: only rows persisted before media understanding reached the timeline carry
+/// them, so the markers stay rendered rather than showing those old rows as raw text. Only the
+/// annotation header is replaced.
 fn replace_transcription(s: &str) -> String {
     static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"\[(Audio|Video) transcription of [^\]]+\]:\s*")
@@ -1063,22 +1064,22 @@ mod tests {
                 Vec::new(),
             ),
             (
-                "renders every line of a multiline video transcription under 🎬 and leaves following message content untouched",
-                "[Video transcription of clip.mp4]: Line one\nLine two\n\nEdit this".into(),
-                "🎬 Line one\nLine two\n\nEdit this",
-                Vec::new(),
-            ),
-            (
-                "video-transcription format contains Video and is handled before the [VIDEO:...] pattern",
-                "[Video transcription of clip.mp4]: hi there [VIDEO:video.mp4]".into(),
-                "🎬 hi there",
-                vec![clip("video.mp4")],
-            ),
-            (
                 "audio-transcription format contains Audio and is handled before the [AUDIO:...] pattern",
                 "[Audio transcription of msg.ogg]: hi there [AUDIO:recording.ogg]".into(),
                 "🔊 hi there",
                 vec![snd("recording.ogg")],
+            ),
+            (
+                "replaces a legacy video transcription block",
+                "[Video transcription of clip.mp4]: A dog runs across the room.".into(),
+                "🎬 A dog runs across the room.",
+                Vec::new(),
+            ),
+            (
+                "video-transcription format contains Video and is handled before the [VIDEO:...] pattern",
+                "[Video transcription of clip.mp4]: a dog [VIDEO:other.mp4]".into(),
+                "🎬 a dog",
+                vec![clip("other.mp4")],
             ),
             (
                 "separates mixed image/audio/video markers from the text around them",
@@ -1126,13 +1127,6 @@ mod tests {
                 "turns a saved video annotation into a visible clip label",
                 "Clip [Saved video: /uploads/clip.mp4] here".into(),
                 "Clip 🎬 Video: clip.mp4 here",
-                Vec::new(),
-            ),
-            (
-                "keeps the saved video clip visible alongside its transcription",
-                "[Video transcription of clip.mp4]: Line one\n\n[Saved video: /uploads/clip.mp4]"
-                    .into(),
-                "🎬 Line one\n\n🎬 Video: clip.mp4",
                 Vec::new(),
             ),
         ];

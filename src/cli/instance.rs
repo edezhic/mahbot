@@ -87,12 +87,11 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
     let user_name = crate::users::ADMIN_USER_NAME.to_string();
     let channel = crate::cli::CHANNEL.to_string();
     let tracking = Some(crate::agent::registry::AgentTracking {
-        agent_id: "cli".to_string(),
-        generation: 0,
         role: "cli".to_string(),
-        workspace: ws.name.clone(),
         ticket: String::new(),
     });
+    // The caller's id the tools attribute their own records to; a command line is one caller.
+    let agent_id = Some("cli".to_string());
 
     let args = call.args.clone();
     let started = Instant::now();
@@ -110,8 +109,15 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
                             .scope(channel, async {
                                 crate::agent::CURRENT_TOOL_AGENT_TRACKING
                                     .scope(tracking, async {
-                                        crate::agent::CURRENT_TOOL_OUTPUT_DIR
-                                            .scope(output_dir, tool.execute_answer(&ws, args))
+                                        crate::agent::CURRENT_TOOL_AGENT_ID
+                                            .scope(agent_id, async {
+                                                crate::agent::CURRENT_TOOL_OUTPUT_DIR
+                                                    .scope(
+                                                        output_dir,
+                                                        tool.execute_answer(&ws, args),
+                                                    )
+                                                    .await
+                                            })
                                             .await
                                     })
                                     .await

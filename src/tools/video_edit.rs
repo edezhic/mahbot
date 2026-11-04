@@ -431,6 +431,12 @@ fn parse_mvhd_duration(
     i64::try_from(ms).ok()
 }
 
+/// The containers the editing provider takes as an uploaded clip. Narrower than the product's own
+/// [`crate::util::VIDEO_EXTENSIONS`], which is what an arrival reads: a local clip is uploaded as
+/// `video/mp4`, so a container outside this set would be refused by the provider after the upload
+/// was paid for.
+const UPLOADABLE_CLIPS: &[&str] = &["mp4", "mov", "mkv", "avi", "webm"];
+
 /// Resolve the video reference: public URL as-is, local file → pre-flight validation
 /// (containment, extension, size, duration gate) → upload bridge.
 async fn resolve_video_source(
@@ -445,9 +451,10 @@ async fn resolve_video_source(
     // Only clips already inside the workspace media dirs may be uploaded — arbitrary local files
     // are an exfiltration risk.
     let canonical = super::resolve_local_media_path(video_url, ws, "clip").await?;
-    if !crate::util::is_video_extension(&canonical) {
+    if !crate::util::has_extension(&canonical, UPLOADABLE_CLIPS) {
         anyhow::bail!(
-            "Local clip must have a recognized video extension (mp4, mov, mkv, avi, webm), got: {}",
+            "Local clip must be one of {} for the editing provider, got: {}",
+            UPLOADABLE_CLIPS.join(", "),
             canonical.display()
         );
     }
@@ -510,9 +517,9 @@ impl Tool for VideoEditTool {
     }
 
     fn preserve_full_output(&self) -> bool {
-        // Result is the marker plus an LLM transcription capped at
-        // 2048 tokens/3-min timeout that can exceed the 5 KB budget —
-        // the Assistant needs the full description to reason about its output.
+        // The result is the marker plus the clip's timeline — the frames as pictures of four with
+        // their marks, the speech with marks and text — which can exceed the 5 KB budget: the
+        // Assistant needs the whole timeline to reason about its own output.
         true
     }
 
@@ -567,6 +574,33 @@ impl Tool for VideoEditTool {
         ws: &crate::Workspace,
         args: serde_json::Value,
     ) -> anyhow::Result<String> {
+        let (marker, path) = self.edit(ws, args).await?;
+        Ok(
+            super::video_output(marker, &path, super::TimelinePictures::TextOnly)
+                .await
+                .text,
+        )
+    }
+
+    async fn execute_with_payloads(
+        &self,
+        ws: &crate::Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<crate::tools::ToolOutput> {
+        let (marker, path) = self.edit(ws, args).await?;
+        Ok(super::video_output(marker, &path, super::TimelinePictures::Attached).await)
+    }
+}
+
+impl VideoEditTool {
+    /// The job itself: validate, submit, poll, download, save — answering the `[VIDEO:path]`
+    /// marker and the file it names, so the one run serves both the text-only and the
+    /// payload-carrying answer.
+    async fn edit(
+        &self,
+        ws: &crate::Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<(String, std::path::PathBuf)> {
         // Empty strings are treated as absent optionals (a blank field carries
         // no intent and must not trigger mode/exclusivity validation).
         let video_url = super::get_opt_str(&args, "video_url").filter(|s| !s.is_empty());
@@ -664,11 +698,11 @@ impl Tool for VideoEditTool {
         let video_bytes =
             super::fetch_async_video(&api_base, &body, super::VideoJobLabels::EDIT).await?;
 
-        // Save to the caller's output directory and format the media marker. The marker stays
-        // first; the transcription is appended for the Assistant to reason about its own output.
+        // Save to the caller's output directory and format the media marker; the caller appends
+        // the clip's own timeline.
         let output_path = super::save_generated_file(ws, &video_bytes, "video", "mp4").await?;
         let marker = self.format_media_result(&output_path);
-        Ok(super::format_video_result(marker, &output_path).await)
+        Ok((marker, output_path))
     }
 }
 

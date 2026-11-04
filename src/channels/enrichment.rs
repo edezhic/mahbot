@@ -4,7 +4,7 @@
 //! Media markers (`[IMAGE: ...]`, `[AUDIO: ...]`, `[VIDEO: ...]`, `[FILE: ...]`): an inbound
 //! local image becomes a native data-URI part carrying the original bytes, re-encoded to a
 //! bounded JPEG only when it would exceed the encoded-payload cap; audio is transcribed to
-//! text; video is a workspace copy plus transcription; an inbound document is copied
+//! text; video is a workspace copy plus its timeline; an inbound document is copied
 //! into the workspace and converted to text and images. Link enrichment prepends webpage
 //! summaries for URLs in the message.
 //!
@@ -21,7 +21,7 @@
 //! Entry points are [`enrich_message`] and [`enrich_links`]; [`has_inbound_temp_marker`] is
 //! called by `channels::persist_content` to decide what is persisted to chat history.
 //! [`enrich_message`] takes the workspace whose `uploads/` receives saved full-resolution
-//! copies (`None` disables copies) — the path that makes video transcription possible.
+//! copies (`None` disables copies) — the path that makes a clip's timeline possible.
 
 use crate::ChannelMessage;
 use crate::document::{DocOutcome, INLINE_TEXT_MAX_CHARS, convert_document_file};
@@ -66,14 +66,7 @@ pub(crate) fn marked_transcript(text: &str) -> String {
 async fn transcribe_audio_marker(path: &str) -> String {
     let path_buf = std::path::PathBuf::from(path);
 
-    // Default to enabled; only explicitly "false" disables local transcription.
-    let use_local = crate::config::CONFIG
-        .snapshot()
-        .audio_transcription_use_local
-        .as_deref()
-        != Some("false");
-
-    if use_local {
+    if !crate::audio::voice::is_transcription_disabled() {
         // The 10-minute engine bound: attached audio can be arbitrarily long (voice memos,
         // meeting recordings, etc.).
         match crate::speech::transcribe_file_async(&path_buf, crate::speech::INFERENCE_TIMEOUT)
@@ -100,11 +93,11 @@ async fn transcribe_audio_marker(path: &str) -> String {
 
 /// Whether `path` is above the size automatic processing stops at.
 ///
-/// `bound` is the transport's own limit, and only the Telegram receive path has
-/// one: a file above it could only have arrived through the local Bot API server,
-/// and receiving such a file means saving it — a phone video is hundreds of
-/// megabytes, and uploading or decoding one is not part of receiving it. Every
-/// other producer (the desktop composer) has its own file cap and no such bound.
+/// `bound` is the transport's own limit, and only the Telegram receive path has one: a file above
+/// it could only have arrived through the local Bot API server, and receiving such a file means
+/// saving it. The bound stays on the conversions that read the whole file into memory — a document,
+/// or a recording the recogniser decodes in process. A video is not one of them: its timeline is
+/// decoded from the file on disk, a piece at a time, so every inbound video gets one.
 async fn too_large_to_process(path: &std::path::Path, bound: u64) -> bool {
     tokio::fs::metadata(path)
         .await
@@ -379,22 +372,23 @@ fn is_staging_dir_name(name: &str) -> bool {
 
 /// The replacement text, whether the source temp file was copied into the workspace uploads
 /// (so the agent can feed the clip to the video-edit flow) and can be cleaned up, and the
-/// optional "[Video transcription of <name>]: <text>" annotation. HTTP(S) URLs, missing files
-/// and out-of-scope paths degrade to plain annotations; in-scope inbound attachments are
-/// always cleaned up.
+/// optional timeline annotation. HTTP(S) URLs, missing files and out-of-scope paths degrade to
+/// plain annotations; in-scope inbound attachments are always cleaned up.
 struct VideoAction {
     replacement: String,
     delete_temp: bool,
-    transcription: Option<String>,
+    /// The clip's timeline in both forms: the model's carries its pictures as ordinary
+    /// `[IMAGE:]` markers, the owner's bubble shows the timeline text alone.
+    timeline: Option<Annotation>,
 }
 
 impl VideoAction {
-    /// No workspace copy, no transcription.
+    /// No workspace copy, no timeline.
     fn annotation(replacement: String) -> Self {
         Self {
             replacement,
             delete_temp: false,
-            transcription: None,
+            timeline: None,
         }
     }
 }
@@ -403,9 +397,7 @@ async fn handle_video(
     path: &str,
     path_obj: &std::path::Path,
     uploads_dir: Option<&std::path::Path>,
-    workspace: &str,
     staging_dirs: &[String],
-    processing_bound: Option<u64>,
 ) -> VideoAction {
     if is_http_url(path) {
         return VideoAction::annotation(format!("[Video link: {path}]"));
@@ -419,32 +411,45 @@ async fn handle_video(
         return VideoAction::annotation(format!("[Video attached: {}]", file_name_or_path(path)));
     }
     if let Some(saved) = save_media_to_workspace(path_obj, uploads_dir, "video", "mp4").await {
-        // Transcribe the persistent workspace copy, never the temp file. The annotation keeps
-        // the original Telegram filename; any failure degrades to the plain `[Saved video: ...]`
-        // annotation. A file only the local server could deliver is saved and left alone.
-        let transcription = if let Some(bound) = processing_bound
-            && too_large_to_process(&saved.dest, bound).await
-        {
-            tracing::info!(
-                path = %saved.dest.display(),
-                "Video saved without transcription: larger than the automatic-processing bound"
-            );
-            None
-        } else {
-            transcribe_saved_video(&saved.dest, file_name_or_path(path), workspace).await
-        };
+        // Read the persistent workspace copy, never the temp file. A failure becomes the
+        // timeline's own sentence, carried beside the `[Saved video: ...]` annotation. Every
+        // inbound video gets one, whatever its size: the timeline decodes from the file on disk
+        // rather than holding it in memory, and a read has no bound of its own.
         return VideoAction {
             replacement: saved.annotation,
             delete_temp: true,
-            transcription,
+            timeline: Some(video_timeline(&saved.dest).await),
         };
     }
-    // Copy failed (or no uploads dir): annotate without transcription, but the in-scope temp
-    // file is still a pure intermediate and is cleaned up.
+    // Copy failed (or no uploads dir): annotate without a timeline, but the in-scope temp file is
+    // still a pure intermediate and is cleaned up.
     VideoAction {
         replacement: format!("[Video attached: {}]", file_name_or_path(path)),
         delete_temp: true,
-        transcription: None,
+        timeline: None,
+    }
+}
+
+/// The clip's timeline as the message carries it: what the model reads — the timeline text, the
+/// line naming the frames each picture holds, then its pictures as ordinary `[IMAGE:]` markers —
+/// and what the owner's own bubble shows, which is the same timeline without the pictures. A
+/// failure says what happened — a decode failure, a missing sound track and a failed recognition
+/// are different sentences.
+async fn video_timeline(path: &std::path::Path) -> Annotation {
+    match crate::media::read(path, crate::media::Window::Overview).await {
+        Ok(reading) => {
+            let (model, attached) = crate::media::inline(&reading).await;
+            // The bubble attaches no pictures, so it shows the timeline as it stands — and only
+            // a reading that really inlined one needs that second form.
+            Annotation {
+                display: attached.then_some(reading.text),
+                model,
+            }
+        }
+        Err(error) => Annotation {
+            model: error.unreadable(),
+            display: None,
+        },
     }
 }
 
@@ -479,20 +484,6 @@ async fn handle_audio(
         "Audio marker is not an inbound attachment file — annotating without transcription"
     );
     (AUDIO_ICON.to_string(), false)
-}
-
-/// The "[Video transcription of <name>]: <text>" annotation, using the original source
-/// `file_name`. Fail-open: `None` (plain annotation) when transcription fails — unavailable
-/// transcriber, unsupported format, upload or model error, timeout, empty output; the overall
-/// timeout lives inside `providers::transcribe_video_file`, bounding both callers. `workspace`
-/// names the workspace for telemetry and the live non-agent call row.
-async fn transcribe_saved_video(
-    path: &std::path::Path,
-    file_name: &str,
-    workspace: &str,
-) -> Option<String> {
-    let text = crate::providers::transcribe_video_file(path, Some(workspace)).await?;
-    Some(format!("[Video transcription of {file_name}]: {text}"))
 }
 
 /// An inbound attachment the receive path saved under the daemon's Telegram temp dir. Returns
@@ -558,7 +549,7 @@ async fn handle_file(
         } else {
             ""
         };
-        batch.annotations.push(format!(
+        batch.annotate(format!(
             "[File {name}: received but not converted (larger than the {} MB the bot reads \
              automatically){saved}]",
             bound.div_ceil(1024 * 1024)
@@ -586,17 +577,17 @@ async fn handle_file(
             // failure as an absence — is left out. Anything else the conversion read (a comment,
             // a filled field value) is content and is delivered regardless.
             if !all_page_text_lost || !text.trim().is_empty() {
-                batch.annotations.push(
+                batch.annotate(
                     extracted_text_annotation(uploads_dir, name, &text, images.kept > 0).await,
                 );
             }
             // The report of what the reading did not show leads the notes, as in the read tool's
             // answer: a kind and its count ahead of the detail of each loss.
             for line in unshown.lines() {
-                batch.annotations.push(format!("[File {name}: {line}]"));
+                batch.annotate(format!("[File {name}: {line}]"));
             }
             for note in notes {
-                batch.annotations.push(format!("[File {name}: {note}]"));
+                batch.annotate(format!("[File {name}: {note}]"));
             }
             // A description, annotation or form list can carry the text while no page produced
             // any: the reading still says so, naming an image only when one was delivered.
@@ -606,20 +597,20 @@ async fn handle_file(
                 } else {
                     crate::document::NO_TEXT_LAYER_NOTE
                 };
-                batch.annotations.push(format!("[File {name}: {note}]"));
+                batch.annotate(format!("[File {name}: {note}]"));
             }
             batch.appended_markers.extend(images.replacements);
             batch.upload_annotations.extend(images.uploads);
             batch.files_to_delete.extend(images.deletes);
             if images.unreadable > 0 {
-                batch.annotations.push(format!(
+                batch.annotate(format!(
                     "[File {name}: {} extracted image(s) could not be read]",
                     images.unreadable
                 ));
             }
         }
         DocOutcome::Unreadable { reason } => {
-            batch.annotations.push(format!("[File {name}: {reason}]"));
+            batch.annotate(format!("[File {name}: {reason}]"));
         }
         DocOutcome::Unsupported => {
             // The copy is what the agent would open, so claim it is openable only when it landed
@@ -629,7 +620,7 @@ async fn handle_file(
             } else {
                 ""
             };
-            batch.annotations.push(format!(
+            batch.annotate(format!(
                 "[File {name}: received but not converted (unsupported format){saved}]"
             ));
         }
@@ -734,11 +725,31 @@ async fn extracted_text_annotation(
     )
 }
 
+/// One line the enriched message carries ahead of its body.
+struct Annotation {
+    /// What the model reads: a clip's timeline carries its pictures as ordinary `[IMAGE:]`
+    /// markers.
+    model: String,
+    /// What the owner's own bubble shows instead, when it differs — the same line without the
+    /// pictures. Usually it does not, and then nothing is kept for it.
+    display: Option<String>,
+}
+
+impl Annotation {
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn display(&self) -> &str {
+        self.display.as_deref().unwrap_or(&self.model)
+    }
+}
+
 /// What the finished message gets prepended/appended, and which temp artifacts the pass consumed.
 #[derive(Default)]
 struct EnrichmentBatch {
     /// Annotation blocks prepended to the finished message.
-    annotations: Vec<String>,
+    annotations: Vec<Annotation>,
     /// `[Saved ...]` upload annotations appended to the body.
     upload_annotations: Vec<String>,
     /// `[IMAGE:data:...]` parts a FILE ingestion extracted, appended after the marker loop
@@ -750,10 +761,19 @@ struct EnrichmentBatch {
 }
 
 impl EnrichmentBatch {
+    /// One line both forms share.
+    fn annotate(&mut self, text: String) {
+        self.annotations.push(Annotation {
+            model: text,
+            display: None,
+        });
+    }
+
     /// Delete the queued artifacts and the message's staging directories, then assemble the
     /// enriched content: append the native parts, strip the handled markers, prepend the
-    /// annotations.
-    async fn finish(self, mut body: String, staging_dirs: &[String]) -> String {
+    /// annotations. Both forms are returned — the model's, then the owner's bubble's when an
+    /// annotation differs between them.
+    async fn finish(self, mut body: String, staging_dirs: &[String]) -> (String, Option<String>) {
         // Deletion errors are logged; a file already gone is not an error.
         for file_path in &self.files_to_delete {
             if let Err(e) = tokio::fs::remove_file(file_path).await
@@ -805,16 +825,25 @@ impl EnrichmentBatch {
 
         // Prepend the accumulated text descriptions: transcribed AUDIO content, VIDEO
         // annotations and a FILE's extracted text. Prepending rather than inlining at the marker
-        // keeps marker-shaped text inside a document away from the strip pass above.
-        if self.annotations.is_empty() {
-            return cleaned;
-        }
-        let prefix = self.annotations.join("\n");
-        if cleaned.is_empty() {
-            prefix
-        } else {
-            format!("{prefix}\n\n{cleaned}")
-        }
+        // keeps marker-shaped text inside a document away from the strip pass above. The owner's
+        // form is built only when an annotation differs from it — usually only a clip's does.
+        let content = composed(&self.annotations, &cleaned, Annotation::model);
+        let display = self
+            .annotations
+            .iter()
+            .any(|annotation| annotation.display.is_some())
+            .then(|| composed(&self.annotations, &cleaned, Annotation::display));
+        (content, display)
+    }
+}
+
+/// The message as one form reads it: the annotations, then the body.
+fn composed(annotations: &[Annotation], body: &str, pick: fn(&Annotation) -> &str) -> String {
+    let prefix = annotations.iter().map(pick).collect::<Vec<_>>().join("\n");
+    match (prefix.is_empty(), body.is_empty()) {
+        (true, _) => body.to_string(),
+        (false, true) => prefix,
+        (false, false) => format!("{prefix}\n\n{body}"),
     }
 }
 
@@ -825,7 +854,7 @@ impl EnrichmentBatch {
 /// |------|----------|
 /// | IMAGE | data URI (original bytes, bounded-JPEG re-encode over the cap only) + in-scope copy |
 /// | AUDIO | transcription, or the icon combo when it fails or the file is out of scope |
-/// | VIDEO | workspace copy + `[Saved video: path]` + transcription |
+/// | VIDEO | workspace copy + `[Saved video: path]` + the clip's timeline |
 /// | FILE | workspace copy + extracted text and images; verbatim when out of scope |
 ///
 /// The kinds this pass consumed (AUDIO, VIDEO) are then stripped and the annotations prepended;
@@ -840,9 +869,10 @@ pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&st
     // The staging directories this message's producer created: the Telegram receive path or the
     // desktop composer. Empty when it has no attachment.
     let staging_dirs = msg.attachment_dirs.clone();
-    // Automatic processing stops at the carrying transport's bound, and only the Telegram side
-    // has one: a file above the cloud's download limit can only have come through the local Bot
-    // API server, and receiving it means keeping it.
+    // Automatic processing stops at the carrying transport's bound for the conversions that read
+    // the whole file into memory — a document, or a recording the recogniser decodes in process.
+    // Only the Telegram side has one: a file above the cloud's download limit can only have come
+    // through the local Bot API server, and receiving it means keeping it.
     let processing_bound = (msg.channel == "telegram")
         .then_some(crate::channels::telegram::TELEGRAM_MAX_FILE_DOWNLOAD_BYTES);
 
@@ -908,7 +938,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&st
                     processing_bound,
                 )
                 .await;
-                batch.annotations.push(annotation);
+                batch.annotate(annotation);
                 if delete_temp {
                     batch.files_to_delete.push(path_obj.to_path_buf());
                 }
@@ -917,19 +947,11 @@ pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&st
                 let VideoAction {
                     replacement,
                     delete_temp,
-                    transcription,
-                } = handle_video(
-                    path,
-                    path_obj,
-                    uploads_dir.as_deref(),
-                    &msg.workspace,
-                    &staging_dirs,
-                    processing_bound,
-                )
-                .await;
+                    timeline,
+                } = handle_video(path, path_obj, uploads_dir.as_deref(), &staging_dirs).await;
                 result = result.replacen(whole.as_str(), &replacement, 1);
-                if let Some(annotation) = transcription {
-                    batch.annotations.push(annotation);
+                if let Some(timeline) = timeline {
+                    batch.annotations.push(timeline);
                 }
                 if delete_temp {
                     batch.files_to_delete.push(path_obj.to_path_buf());
@@ -938,7 +960,9 @@ pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&st
         }
     }
 
-    msg.content = batch.finish(result, &staging_dirs).await;
+    let (content, display) = batch.finish(result, &staging_dirs).await;
+    msg.display_content = display;
+    msg.content = content;
 }
 
 /// A marker naming a path under the daemon's Telegram temp root.
@@ -1090,6 +1114,7 @@ mod tests {
             user_name: "test".into(),
             reply_target: "test".into(),
             content: content.to_string(),
+            display_content: None,
             channel: "test".into(),
             workspace: "test".into(),
             optimistic_id: None,
@@ -1324,7 +1349,10 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 
+    // The read reaches the process-global ffmpeg install (root and the failed-attempt latch), which
+    // the install tests own: this one takes their key so the two cannot interleave.
     #[tokio::test]
+    #[serial_test::serial(ffmpeg_releases)]
     async fn enrich_video_with_workspace_copies_and_annotates() {
         let tmp_root = crate::util::test::test_root().join("test_enrich_video_ws");
         let ws_path = tmp_root.join("myworkspace");
@@ -1358,6 +1386,17 @@ mod tests {
             !msg.content.contains("[VIDEO:"),
             "VIDEO marker must be stripped"
         );
+        // The fixture's bytes are a bare header, so the read cannot produce a timeline: it is the
+        // distinguishable failure sentence instead. Which one depends on the machine — a managed
+        // ffmpeg that is present reports the decode, one that is not reports itself — so only the
+        // envelope is asserted.
+        assert!(
+            msg.content.contains("The clip could not be read: "),
+            "Timeline failure must be annotated, got: {}",
+            msg.content
+        );
+        // A failed timeline has no pictures, so the two forms are the same.
+        assert!(msg.display_content.is_none());
         assert!(
             !tmp_video.exists(),
             "Temp video file must be deleted after enrichment"
@@ -2056,9 +2095,8 @@ mod tests {
 
     #[tokio::test]
     async fn enrich_video_without_workspace_deletes_in_scope_temp() {
-        // No workspace path: the video gets a plain annotation and no
-        // transcription, but the in-scope inbound attachment is still a pure
-        // intermediate artifact and must be cleaned up.
+        // No workspace path: the video gets a plain annotation and no timeline, but the in-scope
+        // inbound attachment is still a pure intermediate artifact and must be cleaned up.
         let (_msg_dir, tmp_video) = inbound_attachment_fixture(7004, "clip.mp4", b"fake mp4").await;
         let video_path_str = tmp_video.to_string_lossy().to_string();
 

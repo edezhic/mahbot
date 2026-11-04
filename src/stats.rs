@@ -454,29 +454,6 @@ pub(crate) fn record_llm_attempt_failure(
     ));
 }
 
-/// Emit one per-attempt `llm_failures` row from explicit metadata — for
-/// single-shot calls outside the `ChatRequest` retry pipeline (raw-HTTP media
-/// transcription), which carry no [`crate::retry::RetryFailureRecord`].
-pub(crate) fn record_llm_attempt_failure_meta(
-    call: &LlmCallMeta,
-    operation_id: &str,
-    failure_class: &str,
-    error_chain: &str,
-    attempt_started: std::time::Instant,
-) {
-    let outcome = LlmAttemptOutcome {
-        attempt: 1,
-        attempt_duration_ms: elapsed_ms(Some(attempt_started)),
-        failure_class: failure_class.to_string(),
-        finish_reason: None,
-        retry_after_ms: None,
-        error_chain: error_chain.to_string(),
-    };
-    crate::telemetry::enqueue(crate::telemetry::TelemetryRecord::LlmFailure(
-        llm_failure_row(operation_id, call, outcome),
-    ));
-}
-
 /// Elapsed milliseconds since `started`, if tracked.
 fn elapsed_ms(started: Option<std::time::Instant>) -> Option<u64> {
     started.and_then(|t| u64::try_from(t.elapsed().as_millis()).ok())

@@ -23,9 +23,9 @@
 //! llama.cpp, vLLM, LiteLLM) is honored at runtime and falls back to
 //! OpenRouter when unset. `provider_endpoint_key` is that endpoint's own
 //! optional key — many servers are keyless — and is **only** ever sent to it,
-//! never to OpenRouter. Media features (image/video generation, catalogs,
-//! transcription) always use `DEFAULT_PROVIDER_ENDPOINT` + `provider_key`
-//! regardless of the custom chat endpoint.
+//! never to OpenRouter. Media features (image/video generation, catalogs) always
+//! use `DEFAULT_PROVIDER_ENDPOINT` + `provider_key` regardless of the custom chat
+//! endpoint.
 //!
 //! [`ConfigReload::role_model`] maps `Role::Manager`, `Assistant`, `Discovery`,
 //! `Engineer` and `Maintainer` to the manager slot; every other role to the
@@ -74,8 +74,6 @@ const OLD_DEFAULT_WORKER_MODELS: &[&str] = &[
     "deepseek/deepseek-v4-flash-vision-exp",
     "deepseek/deepseek-v4-flash-0731",
 ];
-// Fixed (not user-configurable) and always targets OpenRouter.
-pub(crate) const VIDEO_TRANSCRIPTION_MODEL: &str = "qwen/qwen3.8-flash";
 
 /// Used by every account with no explicit pick. The retired predecessor
 /// (`google/gemini-3.1-flash-image`) is rewritten out of the stored picker list and every
@@ -185,9 +183,12 @@ pub struct ConfigData {
     /// audio transcription runs fully locally on the inference crate's
     /// recognition pair (`crate::speech`). Audio never leaves the machine.
     ///
-    /// Set to `"false"` to disable audio transcription entirely — audio markers
-    /// are replaced with just the icon combo and the temp file is deleted, so
-    /// voice messages are not recoverable.
+    /// Set to `"false"` to keep the recogniser's words out of what the model reads:
+    /// an audio marker is replaced with just the icon combo and its temp file is
+    /// deleted, so a voice message is not recoverable. The recogniser itself still
+    /// runs where its output is not words — a video's or a recording's sound
+    /// labels come from the same pass, and a media timeline keeps its frames and
+    /// its labels while leaving the speech lines out.
     pub audio_transcription_use_local: Option<String>,
     /// Voice assistant (wake word detection and commands); `"true"` enables voice mode.
     pub voice_enabled: Option<String>,
@@ -474,7 +475,7 @@ fn resolve_list_or(list_field: Option<&str>, default_value: &str) -> Vec<String>
 /// empty input normalizes to `""`.
 ///
 /// SSoT: a change here intentionally moves fetch-URL construction at every call
-/// site (catalog, transcribe, compatible provider).
+/// site (catalog, compatible provider).
 #[must_use]
 pub(crate) fn normalize_endpoint_url(url: &str) -> String {
     let t = url.trim().trim_end_matches('/');

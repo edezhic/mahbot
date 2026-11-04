@@ -108,15 +108,12 @@ pub struct AgentHandle {
     pub paused: bool,
 }
 
-/// Agent identity + registry generation propagated to tool execution via a task-local, so
-/// tool-internal LLM calls can attribute themselves to the owning agent's card and telemetry.
-/// `None` outside an agent run.
+/// The caller's identity for the records a tool makes about itself — a stray event's log row.
+/// The agent id is [`crate::agent::CURRENT_TOOL_AGENT_ID`]'s and is read from there, never carried
+/// twice. `None` outside an agent run.
 #[derive(Clone, Debug)]
 pub(crate) struct AgentTracking {
-    pub agent_id: String,
-    pub generation: u64,
     pub role: String,
-    pub workspace: String,
     /// The ticket the run works on — empty when it has none. The log row's ticket scope for a
     /// record that never travels through the agent's span.
     pub ticket: String,
@@ -459,7 +456,7 @@ static NEXT_ENTRY_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct NonAgentCallHandle {
     /// Call kind — the same purpose string the call's `ChatRequestMeta` uses (e.g.
-    /// `"consolidate"`, `"synthesis"`, `"media_transcription"`).
+    /// `"consolidate"`, `"synthesis"`, `"cli_command"`).
     pub kind: &'static str,
     pub workspace: String,
     pub started_at: DateTime<Utc>,
@@ -581,6 +578,8 @@ pub(crate) fn call_kind_label(kind: &str) -> &'static str {
         "confirm_links" => "Research link confirmation",
         "research_wrap_up" => "Research wrap-up",
         "research_orchestrator" => "Research orchestrator",
+        // The provider transcription path is gone, but the rows it left are not: they keep their
+        // label on the page.
         "media_transcription" => "Media transcription",
         "cli_command" => "Command line",
         _ => "Other LLM work",

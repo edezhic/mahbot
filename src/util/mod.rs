@@ -188,20 +188,20 @@ mod data_uri_strip_tests {
 /// image-strip path so a stripped message reads cleanly.
 pub(crate) const INJECTED_IMAGE_TAG: &str = "<injected-tool-result-image>";
 
-/// Compose the synthetic User-role message carrying the images one tool round injected: the
-/// provenance tag followed by one `[IMAGE:{data_uri}]` marker per image.
+/// Compose the synthetic User-role message carrying the images one round attached: the provenance
+/// tag, then one marker per picture, in the order they were attached. Every marker is an
+/// `[IMAGE:…]`: the conversation keeps the picture like any other it was sent.
 ///
 /// One message per round, not per image: the provider-input-image strip rewrites only the most
 /// recent User-role message, so batching keeps every image of the round clearable when the provider
-/// rejects one —
-/// including the images it did not object to, since that request is the one that failed. failed.
+/// rejects one — including the images it did not object to, since that request is the one that
+/// failed.
 #[must_use]
-pub(crate) fn injected_image_user_message(data_uris: &[String]) -> String {
+pub(crate) fn injected_image_user_message(markers: &[String]) -> String {
     let mut message = String::from(INJECTED_IMAGE_TAG);
-    for data_uri in data_uris {
-        message.push_str("\n[IMAGE:");
-        message.push_str(data_uri);
-        message.push(']');
+    for marker in markers {
+        message.push('\n');
+        message.push_str(marker);
     }
     message
 }
@@ -676,8 +676,12 @@ fn mime_for_raster_bytes(bytes: &[u8]) -> Option<String> {
 
 pub(crate) async fn local_image_to_data_uri(path: &std::path::Path) -> anyhow::Result<String> {
     let bytes = tokio::fs::read(path).await?;
-    let mime = mime_for_raster_bytes(&bytes).unwrap_or_else(|| mime_for_extension(path).to_owned());
-    Ok(format!("data:{mime};base64,{}", STANDARD.encode(&bytes)))
+    Ok(data_uri_of(path, &bytes))
+}
+
+fn data_uri_of(path: &std::path::Path, bytes: &[u8]) -> String {
+    let mime = mime_for_raster_bytes(bytes).unwrap_or_else(|| mime_for_extension(path).to_owned());
+    format!("data:{mime};base64,{}", STANDARD.encode(bytes))
 }
 
 /// Longest-side cap for each bounded-JPEG re-encode in this module: the shared
@@ -732,7 +736,7 @@ pub(crate) async fn local_image_to_compressed_data_uri_with_meta(
     let bytes = tokio::fs::read(path).await?;
     let (out, width, height, format) = with_block_in_place(|| compress_inbound_image(&bytes))?;
     Ok(CompressedImageMeta {
-        data_uri: format!("{JPEG_DATA_URI_PREFIX}{}", STANDARD.encode(&out)),
+        data_uri: jpeg_data_uri(&out),
         width,
         height,
         format,
@@ -846,6 +850,12 @@ const REFERENCE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_mi
 
 const JPEG_DATA_URI_PREFIX: &str = "data:image/jpeg;base64,";
 
+/// JPEG bytes as the data URI an `[IMAGE:]` marker carries.
+#[must_use]
+pub(crate) fn jpeg_data_uri(bytes: &[u8]) -> String {
+    format!("{JPEG_DATA_URI_PREFIX}{}", STANDARD.encode(bytes))
+}
+
 /// Compression ladder: (downscale factor, JPEG quality) steps, mildest first. A same-format PNG
 /// re-encode can GROW the file (+3% measured), so every step crosses to JPEG with alpha flattened;
 /// later steps downscale. The ladder is a small fixed bound (~6 steps).
@@ -892,7 +902,7 @@ impl ReferenceImage {
         let out =
             with_block_in_place(|| compress_reference_step(&self.source_bytes, self.next_step))?;
         self.next_step += 1;
-        self.data_uri = format!("{JPEG_DATA_URI_PREFIX}{}", STANDARD.encode(&out));
+        self.data_uri = jpeg_data_uri(&out);
         Ok(())
     }
 
@@ -974,7 +984,7 @@ pub(crate) async fn load_reference_image(
         let out = with_block_in_place(|| compress_reference_step(&bytes, step))?;
         if out.len() as u64 <= max_bytes {
             return Ok(ReferenceImage {
-                data_uri: format!("{JPEG_DATA_URI_PREFIX}{}", STANDARD.encode(&out)),
+                data_uri: jpeg_data_uri(&out),
                 source_bytes: bytes,
                 next_step: step + 1,
             });
@@ -1077,13 +1087,21 @@ fn flatten_alpha_onto_white(img: &image::DynamicImage) -> image::RgbImage {
     rgb
 }
 
-pub(crate) const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "avi", "webm"];
+/// The containers a picture stream rides in, by name — what an arrival calls a video before the
+/// probe settles what the file holds. `.ts` and `.mts` are deliberately absent: they are source
+/// files here, and one must not pay a probe — or a refusal — on every read.
+pub(crate) const VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "m4v", "mov", "mkv", "avi", "webm", "flv", "wmv", "mpg", "mpeg", "ogv", "3gp", "3g2",
+    "vob", "rm", "rmvb", "asf", "f4v", "divx", "m2ts",
+];
 
-/// Video formats the transcription provider accepts by URL — narrower than [`VIDEO_EXTENSIONS`],
-/// which also admits mkv/avi for local editing; unsupported formats fall back to the plain
-/// annotation. The upload uses the extension-derived MIME, so every whitelisted format is served
-/// its real content type.
-const TRANSCRIBABLE_VIDEO_EXTENSIONS: &[&str] = &["mp4", "mpeg", "mov", "webm"];
+/// The containers a sound track rides in, as the managed ffmpeg reads them — the counterpart of
+/// [`VIDEO_EXTENSIONS`] for the media path. Distinct from `speech::AUDIO_FORMATS`, which is what the
+/// in-process decoder takes; a name only decides whether the probe is asked at all.
+pub(crate) const AUDIO_EXTENSIONS: &[&str] = &[
+    "wav", "mp3", "ogg", "oga", "m4a", "m4b", "aac", "flac", "opus", "wma", "aiff", "aif", "amr",
+    "caf", "ac3",
+];
 
 /// Recognized image extensions for video_edit image inputs (reference images and frame anchors),
 /// matching the Telegram routing list for PNG/JPEG/WebP — the only locally decodable codecs — plus
@@ -1135,8 +1153,8 @@ pub(crate) fn is_video_extension(path: &std::path::Path) -> bool {
 }
 
 #[must_use]
-pub(crate) fn is_transcribable_video(path: &std::path::Path) -> bool {
-    has_extension(path, TRANSCRIBABLE_VIDEO_EXTENSIONS)
+pub(crate) fn is_audio_extension(path: &std::path::Path) -> bool {
+    has_extension(path, AUDIO_EXTENSIONS)
 }
 
 #[must_use]

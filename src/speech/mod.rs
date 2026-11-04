@@ -7,11 +7,12 @@
 //! needs is fetched.
 //!
 //! Recognition is lazy on every platform: the surfaces are the composer's microphone, a
-//! Telegram voice note or audio attachment, the audio recorded after the wake word, and
-//! `mahbot audio transcribe`. The wake word shares the recognition pair's weights through its own
-//! window listener ([`engine::embed_pair`]), so listening never loads a second copy.
-//! Synthesis is the admin Assistant's `say` tool and `mahbot audio speak`; nothing is ever spoken
-//! on its own.
+//! Telegram voice note or audio attachment, the audio recorded after the wake word,
+//! `mahbot audio transcribe`, and a media read — a video's or a recording's sound track, which is
+//! transcribed in pieces with timestamps and sound labels. The wake word shares the recognition
+//! pair's weights through its own window listener ([`engine::embed_pair`]), so listening never
+//! loads a second copy. Synthesis is the admin Assistant's `say` tool and `mahbot audio speak`;
+//! nothing is ever spoken on its own.
 
 pub(crate) mod decode;
 pub(crate) mod engine;
@@ -21,7 +22,8 @@ pub(crate) mod synth;
 
 pub(crate) use decode::{AUDIO_FORMATS, takes_audio};
 pub(crate) use engine::{
-    INFERENCE_TIMEOUT, InferenceTimedOut, UNTRANSCRIBED, embed_clip, embed_clips, embed_pair,
-    ensure_ready_once, is_failed, is_loaded, is_loading, retry_init, spawn_background_init, state,
-    transcribe_file_async, transcribe_samples,
+    INFERENCE_TIMEOUT, InferenceTimedOut, Interrupted, Segment, UNTRANSCRIBED, Unreadable,
+    embed_clip, embed_clips, embed_pair, ensure_ready_once, is_failed, is_loaded, is_loading,
+    is_silence_label, is_speech_label, retry_init, spawn_background_init, state,
+    transcribe_file_async, transcribe_pieces, transcribe_samples,
 };

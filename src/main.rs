@@ -1459,8 +1459,8 @@ async fn process_channel_message(msg: ChannelMessage) {
 
     // Before broadcast, so the GUI receives the enriched form instead of raw `[AUDIO:path]`
     // markers. Images become native data-URI parts carrying the original bytes (re-encoded to a
-    // bounded JPEG only over the encoded-payload cap); videos become a workspace copy plus
-    // transcription. The parts are independent and this is the expensive step, so the whole burst
+    // bounded JPEG only over the encoded-payload cap); videos become a workspace copy plus the
+    // clip's timeline. The parts are independent and this is the expensive step, so the whole burst
     // is enriched at once.
     futures_util::future::join_all(
         parts
@@ -1474,12 +1474,13 @@ async fn process_channel_message(msg: ChannelMessage) {
     // part is enriched, which keeps them in send order instead of interleaved with a late
     // transcription.
     for (part, original_content) in parts.iter_mut().zip(&originals) {
-        // Broadcast/mirror. `persist_content` decides what reaches chat history: the raw original
-        // text, or the data-URI-stripped content when the markers name inbound attachments whose
-        // temp paths must not be persisted.
-        let content_for_history =
-            mahbot::channels::persist_content(original_content, &part.content);
-        broadcast_and_persist_incoming_message(part, &part.content, &content_for_history).await;
+        // Broadcast/mirror. The owner's bubble shows the display form — a clip's timeline without
+        // the frames the model reads as pictures. `persist_content` decides what reaches chat
+        // history: the raw original text, or the data-URI-stripped content when the markers name
+        // inbound attachments whose temp paths must not be persisted.
+        let display = part.display_content.as_deref().unwrap_or(&part.content);
+        let content_for_history = mahbot::channels::persist_content(original_content, display);
+        broadcast_and_persist_incoming_message(part, display, &content_for_history).await;
 
         // After broadcast, so AI summaries don't appear in the user's own bubble.
         let enriched = mahbot::channels::enrich_links(&part.content).await;

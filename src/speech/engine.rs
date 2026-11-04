@@ -16,19 +16,21 @@ use anyhow::{Context as _, Result};
 use mahbot_inference::ced::{CED_MODEL, Tagger};
 use mahbot_inference::listen::{Listener, PAIR};
 use mahbot_inference::loader::{Pair, Role};
-use mahbot_inference::transcribe::{SPEECH_LABELS, Transcriber, Transcription};
+use mahbot_inference::transcribe::{Region, SPEECH_LABELS, Transcriber};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::speech::decode;
 use crate::speech::load::Lazy;
 use crate::speech::models::{self, Purpose};
 
-/// Default bound on one transcription (10 minutes): short clips finish in seconds,
-/// long recordings in minutes, and a hung inference must not occupy a blocking
-/// thread forever. Shared by the voice pipeline, the audio-enrichment path and
-/// `mahbot audio transcribe`, which answers this bound in its own words.
+/// The bound on one recognition pass (10 minutes), counted from the moment the caller asks — a read
+/// that queues behind another pass waits inside it, never on top of it: short clips finish in
+/// seconds, long recordings in minutes, and a hung inference must not occupy a blocking thread for
+/// ever. The voice pipeline, the audio-enrichment path and `mahbot audio transcribe` pass it as
+/// their whole bound and answer it in their own words; a media read's pass has its own, longer
+/// bound and takes this one as the grace for the piece still in flight.
 pub(crate) const INFERENCE_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// What a transcript carries where the engine heard speech and read nothing. A run of
@@ -51,6 +53,36 @@ impl std::fmt::Display for InferenceTimedOut {
 }
 
 impl std::error::Error for InferenceTimedOut {}
+
+/// The product stopped while a pass was queued or running.
+///
+/// A type rather than a message, so a caller can tell a stop from a bound and from a failure of
+/// the recording — a draining product reads nothing, and nothing about the file is wrong.
+#[derive(Debug)]
+pub(crate) struct Interrupted;
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the product is stopping")
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
+/// A piece of a recording the product's own decoder could not read.
+///
+/// A type rather than a message, so a caller can tell a piece that could not be decoded from one
+/// the recogniser failed on: the first is a fact about the file, the second about the reading.
+#[derive(Debug)]
+pub(crate) struct Unreadable;
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the sound could not be decoded")
+    }
+}
+
+impl std::error::Error for Unreadable {}
 
 /// The resident-set ceiling an input is refused against — the figure the engine's
 /// own guard documents as the default for a run holding a recognition pair.
@@ -137,6 +169,54 @@ pub(crate) async fn transcribe_file_async(path: &Path, timeout: Duration) -> Res
     transcribe_samples(samples, rate, timeout).await
 }
 
+/// One region of a recording: where it is, and what was heard there.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Segment {
+    /// Seconds from the start of the recording.
+    pub(crate) start: f64,
+    pub(crate) end: f64,
+    /// The words read here — `Some` exactly when the recogniser read words.
+    pub(crate) text: Option<String>,
+    /// The sound labeller's class, on a region no reading produced.
+    pub(crate) label: Option<String>,
+}
+
+/// What one engine pass read: the regions of the pieces it got through, how many of the pieces it
+/// was given those were — fewer when its bound cut the pass between pieces — and why it stopped
+/// when a piece could not be read at all.
+pub(crate) struct Read {
+    pub(crate) regions: Vec<Segment>,
+    pub(crate) pieces: usize,
+    /// The piece the pass could not read, with everything before it kept: a caller that can cache
+    /// progress decides whether the failure is its own.
+    pub(crate) failure: Option<anyhow::Error>,
+}
+
+/// Pieces of one recording, each with its own start offset in seconds, read in one run before
+/// `deadline`: the engine is loaded once and its peak given back once.
+pub(crate) async fn transcribe_pieces(
+    pieces: &[(PathBuf, f64)],
+    deadline: Instant,
+) -> Result<Read> {
+    if pieces.is_empty() {
+        return Ok(Read {
+            regions: Vec::new(),
+            pieces: 0,
+            failure: None,
+        });
+    }
+    let pieces = pieces
+        .iter()
+        .map(|(path, offset)| Piece::File {
+            path: path.clone(),
+            offset: *offset,
+        })
+        .collect();
+    // A media read caches every finished piece, so the one still in flight when the pass deadline
+    // fires may finish: a piece's own bound is the grace it is allowed.
+    read_pieces(pieces, deadline, INFERENCE_TIMEOUT).await
+}
+
 /// Audio already in memory into words: the composer's microphone recording and the audio
 /// recorded after the wake word, neither of which has a file to go through.
 pub(crate) async fn transcribe_samples(
@@ -145,6 +225,38 @@ pub(crate) async fn transcribe_samples(
     timeout: Duration,
 ) -> Result<String> {
     anyhow::ensure!(!samples.is_empty(), "the recording holds no samples");
+    let pieces = vec![Piece::Memory { samples, rate }];
+    // Nothing is cached here and there is no next look: the bound is the whole bound.
+    let read = read_pieces(pieces, Instant::now() + timeout, Duration::ZERO).await?;
+    Ok(compose(&read.regions))
+}
+
+/// One piece of a batch: what to read, and where it starts in the recording it came from.
+enum Piece {
+    /// A file, decoded inside the blocking pass, and its offset in seconds.
+    File { path: PathBuf, offset: f64 },
+    /// Audio already in memory at its own rate — one whole recording, so at offset zero.
+    Memory { samples: Vec<f32>, rate: u32 },
+}
+
+/// One transcription pass at a time, held by the pass rather than by its caller: a caller that
+/// reaches its own deadline returns, and the pass it started keeps the engine (and this permit)
+/// until it really stops — so the next read waits for it rather than running beside it.
+static PASS: LazyLock<Arc<tokio::sync::Mutex<()>>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
+
+/// Read every piece in one pass over the loaded engine: the batch is loaded once, decoded
+/// and transcribed in one blocking task, and its peak given back once when the pass ends. The pass
+/// stops between pieces once `deadline` has passed, so a long recording leaves its unread pieces to
+/// the next look instead of holding its caller for ever.
+///
+/// `deadline` is the caller's own whole bound, counted from the moment it asked: the wait for the
+/// permit is inside it, so a hung pass can neither outlive its own deadline nor hold a later read
+/// for the life of the process. `grace` is how much longer the one piece still in flight may run
+/// once the deadline has passed: a media read allows a piece's own bound because it caches every
+/// finished piece and resumes from there, while a caller with nowhere to resume from allows none,
+/// so its bound is its wall bound.
+async fn read_pieces(pieces: Vec<Piece>, deadline: Instant, grace: Duration) -> Result<Read> {
     // The machine-wide root before anything else: a missing one is a failure naming the
     // path, never a substitute location.
     let dir = models::root()?;
@@ -157,29 +269,126 @@ pub(crate) async fn transcribe_samples(
     );
     let transcriber = consumer(|recogniser| Arc::clone(&recogniser.transcriber))?;
 
+    let shutdown = crate::shutdown::shutdown_token();
+    let pass_guard = tokio::select! {
+        pass = PASS.clone().lock_owned() => pass,
+        () = shutdown.cancelled() => {
+            return Err(anyhow::Error::new(Interrupted));
+        }
+        // A pass already running holds the engine; this one must not outlive its own deadline
+        // waiting for it.
+        () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            return Err(anyhow::Error::new(InferenceTimedOut));
+        }
+    };
+    if Instant::now() >= deadline {
+        return Err(anyhow::Error::new(InferenceTimedOut));
+    }
     let pass = tokio::task::spawn_blocking(move || {
+        // The guard rides with the pass, so the engine stays taken until this task really ends —
+        // a caller that gave up at its own deadline cannot let a second pass start alongside it.
+        let _pass = pass_guard;
         let mut engine = transcriber.lock().unwrap_poison();
-        let result = engine
-            .transcribe(&samples, rate)
-            .map(|result| compose(&result));
+        let result = read_all(&mut engine, pieces, deadline);
         // The pass is over: hand its peak back rather than holding it for the life of
         // the process. The next pass recompiles, which is the accepted price.
         mahbot_inference::release_process_memory();
         result
     });
 
-    let shutdown = crate::shutdown::shutdown_token();
+    // The pass stops itself at the deadline; the one piece still in flight is the grace this
+    // wrapper allows before a hung engine is reported instead of waited on for ever.
+    let abandon = tokio::time::Instant::from_std(deadline + grace);
     let outcome = tokio::select! {
-        joined = tokio::time::timeout(timeout, pass) => joined,
+        joined = tokio::time::timeout_at(abandon, pass) => joined,
         () = shutdown.cancelled() => {
-            anyhow::bail!("Shutdown during audio transcription");
+            return Err(anyhow::Error::new(Interrupted));
         }
     };
     match outcome {
-        Ok(Ok(Ok(text))) => Ok(text),
-        Ok(Ok(Err(e))) => Err(e.context("the recording could not be transcribed")),
+        // Nothing read at all is this caller's failure; anything read before the failing piece is
+        // handed back for the caller to keep.
+        Ok(Ok(read)) if read.pieces == 0 && read.failure.is_some() => {
+            let failure = read
+                .failure
+                .unwrap_or_else(|| anyhow::anyhow!("no piece was read"));
+            Err(failure.context("the recording could not be transcribed"))
+        }
+        Ok(Ok(read)) => Ok(read),
         Ok(Err(join)) => Err(anyhow::anyhow!("Inference task panicked: {join}")),
         Err(_elapsed) => Err(anyhow::Error::new(InferenceTimedOut)),
+    }
+}
+
+/// Read every piece in one run over the locked engine, each region moved into the whole
+/// recording's own time base, stopping between pieces at `deadline` and at the first piece that
+/// cannot be read — which is reported rather than thrown away with the pieces already read.
+fn read_all(engine: &mut Transcriber, pieces: Vec<Piece>, deadline: Instant) -> Read {
+    let mut read = Read {
+        regions: Vec::new(),
+        pieces: 0,
+        failure: None,
+    };
+    for piece in pieces {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match read_piece(engine, piece) {
+            Ok(regions) => {
+                read.pieces += 1;
+                read.regions.extend(regions);
+            }
+            Err(error) => {
+                read.failure = Some(error);
+                break;
+            }
+        }
+    }
+    read
+}
+
+/// One piece into regions of the whole recording.
+fn read_piece(engine: &mut Transcriber, piece: Piece) -> Result<Vec<Segment>> {
+    let (samples, rate, offset) = match piece {
+        Piece::File { path, offset } => {
+            let (samples, rate) = decode::decode_audio_to_mono_f32(&path).map_err(|error| {
+                // The path is an extracted temp file, not the owner's: the log keeps the chain,
+                // the caller gets the typed failure.
+                tracing::warn!(path = %path.display(), %error, "A transcribed piece could not be decoded");
+                anyhow::Error::new(Unreadable)
+            })?;
+            (samples, rate, offset)
+        }
+        Piece::Memory { samples, rate } => (samples, rate, 0.0),
+    };
+    // A piece cut past the end of the sound (a track that stops before its container does) holds
+    // nothing to read: it contributes no region rather than failing the whole track.
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+    let heard = engine.transcribe(&samples, rate)?;
+    // The regions are marked at the transcription's own rate, which is the engine's analysis rate
+    // rather than the piece's: a 44.1 kHz file is resampled before it is cut.
+    Ok(heard
+        .regions
+        .into_iter()
+        .map(|region| segment(offset, heard.sample_rate, region))
+        .collect())
+}
+
+/// One region of a piece as a segment of the whole recording: the marks moved by the piece's
+/// own offset, so a windowed read says where in the file it was heard.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a sample index is exact in f64 far past any recording a machine can hold"
+)]
+fn segment(offset: f64, rate: u32, region: Region) -> Segment {
+    let at = |samples: usize| offset + samples as f64 / f64::from(rate);
+    Segment {
+        start: at(region.start),
+        end: at(region.end),
+        text: region.text,
+        label: region.label,
     }
 }
 
@@ -219,18 +428,18 @@ pub(crate) fn embed_clips(clips: &[Vec<f32>]) -> Vec<Vec<f32>> {
         .collect()
 }
 
-/// The words a result holds, in order, with [`UNTRANSCRIBED`] wherever the engine
+/// The words a batch holds, in order, with [`UNTRANSCRIBED`] wherever the engine
 /// heard speech and read nothing. Silence and non-speech audio contribute nothing, so a
 /// recording that holds no speech yields an empty text; a stretch of unread speech is one
 /// marker however many regions it was cut into.
-fn compose(result: &Transcription) -> String {
+fn compose(segments: &[Segment]) -> String {
     let mut text = String::new();
     let mut marked = false;
-    for region in &result.regions {
-        if let Some(read) = &region.text {
+    for segment in segments {
+        if let Some(read) = &segment.text {
             push_words(&mut text, read);
             marked = false;
-        } else if region.label.as_deref().is_some_and(speaks_words) {
+        } else if segment.label.as_deref().is_some_and(is_speech_label) {
             if !marked {
                 push_words(&mut text, UNTRANSCRIBED);
             }
@@ -255,54 +464,53 @@ fn push_words(into: &mut String, words: &str) {
 
 /// Whether a tagger label says the audio there is speech or singing — the engine's own
 /// list, so the marker follows the same rule its readings do.
-fn speaks_words(label: &str) -> bool {
+pub(crate) fn is_speech_label(label: &str) -> bool {
     let label = label.trim();
     SPEECH_LABELS
         .iter()
         .any(|class| label.eq_ignore_ascii_case(class))
 }
 
+/// The tagger's class for a stretch with nothing to hear.
+const SILENCE_LABEL: &str = "Silence";
+
+/// Whether a tagger label says the audio there is silence — the counterpart of
+/// [`is_speech_label`], kept beside it so both class rules live with the engine's own vocabulary
+/// and a renamed class cannot slip past one of them.
+pub(crate) fn is_silence_label(label: &str) -> bool {
+    label.trim().eq_ignore_ascii_case(SILENCE_LABEL)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mahbot_inference::transcribe::Region;
 
-    fn region(start: usize, end: usize, text: Option<&str>, label: Option<&str>) -> Region {
-        Region {
+    fn heard(start: f64, end: f64, text: Option<&str>, label: Option<&str>) -> Segment {
+        Segment {
             start,
             end,
             text: text.map(str::to_string),
             label: label.map(str::to_string),
-            read: text.is_some(),
-        }
-    }
-
-    fn result(regions: Vec<Region>) -> Transcription {
-        Transcription {
-            sample_rate: 16_000,
-            samples: regions.last().map_or(0, |region| region.end),
-            gain: 1.0,
-            regions,
         }
     }
 
     #[test]
     fn a_recording_of_silence_yields_nothing() {
-        let text = compose(&result(vec![region(0, 16_000, None, Some("Silence"))]));
+        let text = compose(&[heard(0.0, 1.0, None, Some("Silence"))]);
         assert_eq!(text, "");
-        let text = compose(&result(vec![region(0, 16_000, None, Some("Music"))]));
+        let text = compose(&[heard(0.0, 1.0, None, Some("Music"))]);
         assert_eq!(text, "");
     }
 
     #[test]
     fn unread_speech_is_marked_once_per_stretch() {
-        let text = compose(&result(vec![
-            region(0, 1_000, Some("hello there"), None),
-            region(1_000, 2_000, None, Some("Speech")),
-            region(2_000, 3_000, None, Some("Male speech, man speaking")),
-            region(3_000, 4_000, Some("how are you"), None),
-            region(4_000, 5_000, None, Some("Speech")),
-        ]));
+        let text = compose(&[
+            heard(0.0, 1.0, Some("hello there"), None),
+            heard(1.0, 2.0, None, Some("Speech")),
+            heard(2.0, 3.0, None, Some("Male speech, man speaking")),
+            heard(3.0, 4.0, Some("how are you"), None),
+            heard(4.0, 5.0, None, Some("Speech")),
+        ]);
         assert_eq!(
             text,
             format!("hello there {UNTRANSCRIBED} how are you {UNTRANSCRIBED}")
@@ -311,18 +519,17 @@ mod tests {
 
     #[test]
     fn two_unread_stretches_apart_are_two_markers() {
-        let text = compose(&result(vec![
-            region(0, 1_000, None, Some("Speech")),
-            region(1_000, 2_000, None, Some("Music")),
-            region(2_000, 3_000, None, Some("Speech")),
-        ]));
+        let text = compose(&[
+            heard(0.0, 1.0, None, Some("Speech")),
+            heard(1.0, 2.0, None, Some("Music")),
+            heard(2.0, 3.0, None, Some("Speech")),
+        ]);
         assert_eq!(text, format!("{UNTRANSCRIBED} {UNTRANSCRIBED}"));
     }
 
     #[test]
     fn a_recording_the_engine_could_not_read_still_says_so() {
-        let text = compose(&result(vec![region(0, 16_000, None, Some("Speech"))]));
+        let text = compose(&[heard(0.0, 1.0, None, Some("Speech"))]);
         assert_eq!(text, UNTRANSCRIBED);
-        assert!(!text.trim().is_empty(), "the marker is visible text");
     }
 }

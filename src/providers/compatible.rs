@@ -408,7 +408,7 @@ fn to_message_content(role: ChatRole, content: &str) -> MessageContent {
         return MessageContent::Text(content.to_string());
     }
 
-    // Fast path: avoid regex work when there are no IMAGE markers at all.
+    // Fast path: avoid regex work when there is no IMAGE marker at all.
     if !crate::util::has_media_marker(content, crate::util::MediaMarkerKind::Image) {
         return MessageContent::Text(content.to_string());
     }

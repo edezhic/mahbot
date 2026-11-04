@@ -83,17 +83,25 @@ pub(crate) struct ToolRecordAttribution {
 /// agent run, ticket empty when the run has none. Read here, synchronously — no
 /// task-local is in scope where the row is written.
 pub(crate) fn tool_record_attribution() -> ToolRecordAttribution {
-    CURRENT_TOOL_AGENT_TRACKING
-        .try_with(|t| {
-            t.as_ref().map(|t| ToolRecordAttribution {
-                agent_id: t.agent_id.clone(),
-                agent_role: t.role.clone(),
-                ticket: t.ticket.clone(),
-            })
+    let identity = CURRENT_TOOL_AGENT_TRACKING
+        .try_with(|tracking| {
+            tracking
+                .as_ref()
+                .map(|tracking| (tracking.role.clone(), tracking.ticket.clone()))
         })
         .ok()
-        .flatten()
-        .unwrap_or_default()
+        .flatten();
+    let Some((agent_role, ticket)) = identity else {
+        return ToolRecordAttribution::default();
+    };
+    ToolRecordAttribution {
+        agent_id: CURRENT_TOOL_AGENT_ID
+            .try_with(Option::clone)
+            .unwrap_or_default()
+            .unwrap_or_default(),
+        agent_role,
+        ticket,
+    }
 }
 
 /// Synchronous read of [`CURRENT_TOOL_CHANNEL`]. Same contract as [`tool_user_name`].
@@ -152,10 +160,9 @@ tokio::task_local! {
     /// The caller's id, so the shell tool attributes its spill files to the owning
     /// agent (deleted when the run ends). `None` outside an agent run.
     pub(crate) static CURRENT_TOOL_AGENT_ID: Option<String>;
-    /// The caller's registry identity + generation, so tool-internal LLM calls
-    /// (media transcription in video results) attribute to the owning Running
-    /// Agents card and telemetry. `None` outside an agent run — such calls
-    /// register in [`crate::agent::registry::NON_AGENT_CALLS`] instead.
+    /// The caller's role and ticket, for the record a tool makes about itself — a
+    /// stray event's log row. The agent id is `CURRENT_TOOL_AGENT_ID`'s. `None`
+    /// outside an agent run.
     pub(crate) static CURRENT_TOOL_AGENT_TRACKING:
         Option<crate::agent::registry::AgentTracking>;
     /// The caller's custom-role launch, so a tool dispatching a durable round
@@ -210,6 +217,7 @@ fn interrupted_outcome() -> ToolExecutionOutcome {
         success: true,
         image_payloads: Vec::new(),
         text_is_content: false,
+        preserve_text: false,
         suspended: false,
         ends_turn: false,
     }
@@ -367,9 +375,13 @@ async fn tool_result_content(
     seen: &mut Option<std::collections::HashSet<String>>,
     history: &[ChatMessage],
 ) -> (String, Vec<ImagePayload>) {
-    let formatted = match find_tool(tools, call_name) {
-        Some(t) => t.format_output(&outcome.output),
-        None => crate::util::truncate_tool_output(&outcome.output),
+    let formatted = if outcome.preserve_text {
+        outcome.output.clone()
+    } else {
+        match find_tool(tools, call_name) {
+            Some(t) => t.format_output(&outcome.output),
+            None => crate::util::truncate_tool_output(&outcome.output),
+        }
     };
 
     // The outcome's own payloads (read, image_gen) take precedence; otherwise derive one
@@ -406,6 +418,8 @@ async fn tool_result_content(
 
 /// The single synthetic User-role message carrying a round's fresh tool images;
 /// `None` when the round attached nothing.
+///
+/// A video's pictures are ordinary images: attached and stored like any other.
 fn injected_images_message(
     agent_id: &str,
     role: crate::Role,
@@ -414,7 +428,7 @@ fn injected_images_message(
     if payloads.is_empty() {
         return None;
     }
-    let mut data_uris = Vec::with_capacity(payloads.len());
+    let mut markers = Vec::with_capacity(payloads.len());
     for payload in payloads {
         tracing::debug!(
             agent_id,
@@ -422,10 +436,10 @@ fn injected_images_message(
             path = %payload.path,
             "Injecting tool image as a synthetic user message"
         );
-        data_uris.push(payload.data_uri);
+        markers.push(format!("[IMAGE:{}]", payload.data_uri));
     }
     Some(ChatMessage::user(crate::util::injected_image_user_message(
-        &data_uris,
+        &markers,
     )))
 }
 
@@ -1491,10 +1505,7 @@ impl Agent {
         let background_sessions = Some(self.background_sessions.clone());
         let agent_id = Some(self.agent_id.clone());
         let agent_tracking = Some(crate::agent::registry::AgentTracking {
-            agent_id: self.agent_id.clone(),
-            generation: self.generation,
             role: self.role.as_str().to_string(),
-            workspace: self.workspace.name.clone(),
             ticket: self
                 .ticket
                 .as_ref()
@@ -1553,6 +1564,7 @@ impl Agent {
                 // No payloads and no derivation on a failure: the flag is unread.
                 image_payloads: Vec::new(),
                 text_is_content: false,
+                preserve_text: false,
                 suspended: false,
                 ends_turn: false,
             },
@@ -1646,6 +1658,7 @@ impl Agent {
                                 success: true,
                                 image_payloads: result.image_payloads,
                                 text_is_content: result.text_is_content,
+                                preserve_text: result.preserve_text,
                                 suspended: false,
                                 ends_turn: tool.ends_turn_on_success(),
                             },
@@ -1672,6 +1685,7 @@ impl Agent {
                                     success: false,
                                     image_payloads: Vec::new(),
                                     text_is_content: false,
+                                    preserve_text: false,
                                     suspended: true,
                                     ends_turn: false,
                                 },
@@ -3234,6 +3248,7 @@ mod tests {
                     success: o.success,
                     image_payloads: Vec::new(),
                     text_is_content: false,
+                    preserve_text: false,
                     suspended: false,
                     ends_turn: false,
                 })
@@ -5196,6 +5211,7 @@ mod tests {
                     source: crate::tools::ImagePayloadSource::Read,
                 }],
                 text_is_content: false,
+                preserve_text: false,
                 suspended: false,
                 ends_turn: false,
             },
@@ -5213,6 +5229,7 @@ mod tests {
                     source: crate::tools::ImagePayloadSource::Read,
                 }],
                 text_is_content: false,
+                preserve_text: false,
                 suspended: false,
                 ends_turn: false,
             },
@@ -5332,6 +5349,7 @@ mod tests {
                     source: crate::tools::ImagePayloadSource::Read,
                 }],
                 text_is_content: false,
+                preserve_text: false,
                 suspended: false,
                 ends_turn: false,
             },
@@ -5349,6 +5367,7 @@ mod tests {
                     source: crate::tools::ImagePayloadSource::Read,
                 }],
                 text_is_content: false,
+                preserve_text: false,
                 suspended: false,
                 ends_turn: false,
             },
@@ -5433,6 +5452,7 @@ mod tests {
                 success: true,
                 image_payloads: vec![payload("a1"), payload("a2")],
                 text_is_content: false,
+                preserve_text: false,
                 suspended: false,
                 ends_turn: false,
             },
@@ -5441,6 +5461,7 @@ mod tests {
                 success: true,
                 image_payloads: vec![payload("b1")],
                 text_is_content: false,
+                preserve_text: false,
                 suspended: false,
                 ends_turn: false,
             },
@@ -5475,6 +5496,21 @@ mod tests {
         }
     }
 
+    /// The persisted content of the history's tool results, parsed out of their JSON envelope.
+    fn tool_result_texts(history: &[ChatMessage]) -> Vec<String> {
+        history
+            .iter()
+            .filter(|m| m.role == crate::ChatRole::Tool)
+            .map(|m| {
+                let v: serde_json::Value =
+                    serde_json::from_str(&m.content).expect("tool result is valid JSON");
+                crate::util::json::get_str(&v, "content")
+                    .expect("tool result has content")
+                    .to_string()
+            })
+            .collect()
+    }
+
     /// The content side of the image invariant: a result whose text is content — a
     /// document's extracted text — is neither read as a claim nor replaced by an
     /// annotation. A marker inside it stays literal and injects nothing, while a real
@@ -5502,6 +5538,7 @@ mod tests {
             success: true,
             image_payloads: Vec::new(),
             text_is_content: true,
+            preserve_text: false,
             suspended: false,
             ends_turn: false,
         }];
@@ -5512,17 +5549,7 @@ mod tests {
             .expect("commit_tool_results must succeed");
 
         let history = agent.session.history();
-        let tool_result = history
-            .iter()
-            .find(|m| m.role == crate::ChatRole::Tool)
-            .map(|m| {
-                let v: serde_json::Value =
-                    serde_json::from_str(&m.content).expect("tool result is valid JSON");
-                crate::util::json::get_str(&v, "content")
-                    .expect("tool result has content")
-                    .to_string()
-            })
-            .expect("the tool result is persisted");
+        let tool_result = tool_result_texts(history).remove(0);
         assert!(
             tool_result.contains(&marker),
             "a marker inside content text stays literal: {tool_result:?}"
@@ -5555,6 +5582,7 @@ mod tests {
                 source: crate::tools::ImagePayloadSource::Generated,
             }],
             text_is_content: true,
+            preserve_text: false,
             suspended: false,
             ends_turn: false,
         }];
@@ -5565,17 +5593,7 @@ mod tests {
             .expect("commit_tool_results must succeed");
 
         let history = agent.session.history();
-        let tool_result = history
-            .iter()
-            .find(|m| m.role == crate::ChatRole::Tool)
-            .map(|m| {
-                let v: serde_json::Value =
-                    serde_json::from_str(&m.content).expect("tool result is valid JSON");
-                crate::util::json::get_str(&v, "content")
-                    .expect("tool result has content")
-                    .to_string()
-            })
-            .expect("the tool result is persisted");
+        let tool_result = tool_result_texts(history).remove(0);
         assert_eq!(
             tool_result,
             "[scan.pdf: no text could be extracted — the content was provided as images]\n\
@@ -5620,6 +5638,7 @@ mod tests {
             success: true,
             image_payloads: Vec::new(),
             text_is_content: false,
+            preserve_text: false,
             suspended: false,
             ends_turn: false,
         }];

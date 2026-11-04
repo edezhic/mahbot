@@ -5,31 +5,31 @@
 //! path — is never run: every command here is the absolute path of the product's own build, and
 //! no `PATH` lookup is ever made.
 //!
-//! The operations are exactly three: [`probe`] (duration, upright dimensions, audio presence),
-//! [`extract_frames`] (JPEG frames at a given rate, longest side and count bounded) and
-//! [`extract_audio`] (the track re-encoded to 16 kHz mono WAV, what the recogniser takes).
+//! The operations are exactly three: [`probe`] (duration, upright dimensions, audio presence, the
+//! file's own size), [`extract_frames`] (one JPEG at each mark asked for, each fitting a bounded
+//! side, written at one quality) and [`extract_audio`] (a stretch of the track re-encoded
+//! to 16 kHz mono WAV, what the recogniser takes). A stretch is asked for as input options, so it is
+//! seeked to rather than decoded up to.
 //!
-//! Each runs under its own [`Duration`] — the wait for the copy included — and every output lands
-//! in a [`tempfile::TempDir`] under the product's private temp root, never in the owner's
-//! workspace, carried by the returned guard, so dropping the result removes the files.
+//! Each runs under its own [`Duration`], and every output lands in a [`tempfile::TempDir`] under the
+//! product's private temp root, never in the owner's workspace, carried by the returned guard, so
+//! dropping the result removes the files. A first call installs the pair first, under the download
+//! client's own bounds — a copy that cannot be obtained is a missing tool, not a decode that ran
+//! out of time.
 //!
 //! Failures are typed and deliberately distinct: [`FfmpegError::Unavailable`] is the product's own
 //! half not being usable, while [`FfmpegError::Undecodable`], [`FfmpegError::NoVideoTrack`] and
 //! [`FfmpegError::NoAudioTrack`] are facts about the file. None of that can be read off the tools'
 //! exit statuses, so a failed decode is settled by asking the file again.
 
-// The items only this module's own operations use carry `expect(dead_code)` rather than a
-// module-wide `allow`: `expect` turns their first caller outside this module into a build error
-// that must remove the annotation with it.
 mod install;
 mod probe;
 
 pub use install::install_on_start;
 
 use std::ffi::OsString;
-use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::process::Command;
 
@@ -38,7 +38,7 @@ use install::Binaries;
 /// How long reading a file's facts may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long extracting frames may take: a bounded count out of a bounded side.
+/// How long the whole frame extraction may take: one seek and one picture per mark.
 const FRAMES_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long extracting the audio may take: a long recording is decoded in full.
@@ -56,6 +56,30 @@ pub(crate) struct ClipInfo {
     /// The upright size of the first video stream — what a person watching the file sees.
     pub(crate) dimensions: Option<(u32, u32)>,
     pub(crate) has_audio: bool,
+    /// The picture stream's own length, when the container declares one: it can stop before its
+    /// container does, and a frame asked for past its end is a seek that yields nothing.
+    pub(crate) picture: Option<Duration>,
+    /// The sound track's own length, when the container declares one: a track can stop before its
+    /// container does, and a piece cut past its end holds nothing to read.
+    pub(crate) sound: Option<Duration>,
+    /// The file's own size in bytes.
+    pub(crate) bytes: u64,
+}
+
+impl ClipInfo {
+    /// The sound track's own length — never the container's, which can run past the track: a piece
+    /// cut past the track's end holds nothing to read, and a transcript cannot claim to reach it.
+    #[must_use]
+    pub(crate) fn sound_length(&self) -> Duration {
+        self.sound.unwrap_or(self.duration)
+    }
+
+    /// The picture stream's own length — never the container's, which can run past it: frames are
+    /// planned over the pictures, and a mark past the last one costs a seek and yields nothing.
+    #[must_use]
+    pub(crate) fn picture_length(&self) -> Duration {
+        self.picture.unwrap_or(self.duration)
+    }
 }
 
 /// Why a video operation could not answer.
@@ -71,25 +95,23 @@ pub(crate) enum FfmpegError {
     InvalidOptions(&'static str),
 }
 
-/// Frames extracted from one file, removed when this guard is dropped.
-#[cfg_attr(not(test), expect(dead_code))]
+/// Frames extracted from one file, each with the second it was taken at, removed when this guard
+/// is dropped.
 #[derive(Debug)]
 pub(crate) struct Frames {
     _dir: tempfile::TempDir,
-    paths: Vec<PathBuf>,
+    frames: Vec<(PathBuf, f64)>,
 }
 
 impl Frames {
-    /// The frames in playback order. Empty when the file itself carries none.
-    #[cfg_attr(not(test), expect(dead_code))]
+    /// The frames in playback order, each with its mark. Empty when the file itself carries none.
     #[must_use]
-    pub(crate) fn paths(&self) -> &[PathBuf] {
-        &self.paths
+    pub(crate) fn frames(&self) -> &[(PathBuf, f64)] {
+        &self.frames
     }
 }
 
 /// One file's audio as 16 kHz mono WAV, removed when this guard is dropped.
-#[cfg_attr(not(test), expect(dead_code))]
 #[derive(Debug)]
 pub(crate) struct Audio {
     _dir: tempfile::TempDir,
@@ -97,7 +119,6 @@ pub(crate) struct Audio {
 }
 
 impl Audio {
-    #[cfg_attr(not(test), expect(dead_code))]
     #[must_use]
     pub(crate) fn path(&self) -> &Path {
         &self.path
@@ -105,111 +126,148 @@ impl Audio {
 }
 
 /// The bounds frame extraction is given.
-#[cfg_attr(not(test), expect(dead_code))]
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct FrameOptions {
-    /// How many frames of source material per second to keep.
-    pub(crate) fps: f64,
+pub(crate) struct FrameOptions<'a> {
+    /// The seconds to take a frame at, in playback order.
+    pub(crate) marks: &'a [f64],
     /// The longest side of a written frame, in pixels. The aspect ratio is kept.
     pub(crate) max_side: u32,
-    /// The most frames to write.
-    pub(crate) max_frames: u32,
 }
+
+/// The JPEG quality every frame is written at, on ffmpeg's 1–100 scale. A frame is read rather
+/// than displayed, which is why 80 is the quality asked for.
+pub(crate) const FRAME_QUALITY: u8 = 80;
+
+/// The mjpeg quantiser for [`FRAME_QUALITY`], on ffmpeg's 2 (best) to 31 (worst) scale — inverted,
+/// so 100 lands on 2 and 0 on 31.
+const FRAME_QUANTISER: u32 = 31 - FRAME_QUALITY as u32 * 29 / 100;
 
 /// The product's own pair, installed on first use — the crate's one entry to them.
 pub(crate) async fn binaries() -> Result<Binaries, String> {
     install::ensure_installed().await
 }
 
-/// Duration, upright dimensions and audio presence of one file.
+/// Duration, upright dimensions, audio presence and size of one file.
 pub(crate) async fn probe(path: &Path) -> Result<ClipInfo, FfmpegError> {
-    bounded(PROBE_TIMEOUT, async {
-        let bin = binaries().await.map_err(FfmpegError::Unavailable)?;
-        probe_with(&bin.ffprobe, path).await
-    })
-    .await
+    let bin = binaries().await.map_err(FfmpegError::Unavailable)?;
+    // `probe_with` carries the bound itself, as every tool run does.
+    probe_with(&bin.ffprobe, path).await
 }
 
-/// JPEG frames of `input` at [`FrameOptions::fps`], each fitting the bounded side, at most the
-/// requested count.
-#[cfg_attr(not(test), expect(dead_code))]
+/// One JPEG per mark — the frame at that second, fitting the bounded side — each taken by seeking
+/// to its mark, so a long clip costs a seek apiece rather than a decode of everything before it.
 pub(crate) async fn extract_frames(
     input: &Path,
-    options: FrameOptions,
+    options: FrameOptions<'_>,
 ) -> Result<Frames, FfmpegError> {
-    if !(options.fps.is_finite() && options.fps > 0.0) {
-        return Err(FfmpegError::InvalidOptions(
-            "the frame rate must be greater than zero",
-        ));
+    if options.marks.is_empty() {
+        return Err(FfmpegError::InvalidOptions("no frames were asked for"));
     }
     if options.max_side < 2 {
         return Err(FfmpegError::InvalidOptions(
             "the longest side must be at least two pixels",
         ));
     }
-    if options.max_frames == 0 {
-        return Err(FfmpegError::InvalidOptions("no frames were asked for"));
-    }
 
-    bounded(FRAMES_TIMEOUT, async {
-        let bin = binaries().await.map_err(FfmpegError::Unavailable)?;
-        let dir = scratch()?;
-        let args = frames_args(input, Some(dir.path()), &options);
-        let output = run_tool(&bin.ffmpeg, &args, FRAMES_TIMEOUT).await?;
-        if !output.success {
-            tracing::debug!("ffmpeg wrote no frames: {}", output.stderr.trim());
-            return Err(classify(&bin, input, Decode::Frames(&options)).await);
+    let bin = binaries().await.map_err(FfmpegError::Unavailable)?;
+    let dir = scratch()?;
+    let deadline = Instant::now() + FRAMES_TIMEOUT;
+    let mut frames = Vec::with_capacity(options.marks.len());
+    let mut ran_out = false;
+    for (index, at) in options.marks.iter().enumerate() {
+        let into = dir.path().join(format!("frame-{index:05}.jpg"));
+        // The bound is the whole extraction's, shared out. Running out of it keeps the frames
+        // already taken: a long clip is worth what it managed, not nothing.
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            ran_out = true;
+            break;
         }
-        let paths = frames_in(dir.path())?;
-        Ok(Frames { _dir: dir, paths })
-    })
-    .await
+        let args = frame_args(input, *at, Some(&into), options.max_side);
+        match run_tool(&bin.ffmpeg, &args, left).await {
+            Ok(output) if output.success && tokio::fs::try_exists(&into).await.unwrap_or(false) => {
+                frames.push((into, *at));
+            }
+            // A mark the file has no picture at — past the last frame, or a picture stream that
+            // stops before its container does — is not a frame, and is not the read's failure.
+            Ok(output) => {
+                tracing::debug!("ffmpeg wrote no frame at {at}: {}", output.stderr.trim());
+            }
+            Err(FfmpegError::TimedOut) => {
+                ran_out = true;
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    // The bound is the product's own limit, not a fact about the file: what it cut short is the
+    // answer, and nothing taken at all is the timeout it is.
+    if ran_out {
+        return if frames.is_empty() {
+            Err(FfmpegError::TimedOut)
+        } else {
+            Ok(Frames { _dir: dir, frames })
+        };
+    }
+    // Nothing at all is settled against the file: a clip that cannot be decoded is not the same
+    // answer as one that is merely shorter than its container. The first mark stands for them all
+    // — every one was tried and wrote nothing, and the replay is a seek like any other.
+    if frames.is_empty() {
+        let replay = Decode::Frames {
+            at: options.marks[0],
+            side: options.max_side,
+        };
+        return Err(classify(&bin, input, replay).await);
+    }
+    Ok(Frames { _dir: dir, frames })
 }
 
-/// The audio track of `input` as 16 kHz mono WAV.
-#[cfg_attr(not(test), expect(dead_code))]
-pub(crate) async fn extract_audio(input: &Path) -> Result<Audio, FfmpegError> {
-    bounded(AUDIO_TIMEOUT, async {
-        let bin = binaries().await.map_err(FfmpegError::Unavailable)?;
+/// The audio track of `input` — the whole file, or `window` of it — as 16 kHz mono WAV.
+pub(crate) async fn extract_audio(
+    input: &Path,
+    window: Option<(Duration, Duration)>,
+) -> Result<Audio, FfmpegError> {
+    let bin = binaries().await.map_err(FfmpegError::Unavailable)?;
+    // The copy is obtained before the bound, and the bound covers the classification too.
+    tokio::time::timeout(AUDIO_TIMEOUT, async {
         let dir = scratch()?;
         let path = dir.path().join("audio.wav");
-        let args = audio_args(input, Some(&path));
+        let args = audio_args(input, window, Some(&path));
         let output = run_tool(&bin.ffmpeg, &args, AUDIO_TIMEOUT).await?;
         if !output.success {
             tracing::debug!("ffmpeg extracted no audio: {}", output.stderr.trim());
-            return Err(classify(&bin, input, Decode::Audio).await);
+            return Err(classify(&bin, input, Decode::Audio(window)).await);
         }
         Ok(Audio { _dir: dir, path })
     })
     .await
-}
-
-/// Run one operation under its own bound, the wait for its copy included: a first call installs
-/// the pair, and a missing copy is [`FfmpegError::Unavailable`].
-async fn bounded<T, F>(bound: Duration, operation: F) -> Result<T, FfmpegError>
-where
-    F: Future<Output = Result<T, FfmpegError>>,
-{
-    tokio::time::timeout(bound, operation)
-        .await
-        .map_err(|_| FfmpegError::TimedOut)?
+    .map_err(|_| FfmpegError::TimedOut)?
 }
 
 /// `ffprobe`'s answer for one file, or [`FfmpegError::Undecodable`] when the file cannot be read.
+///
+/// The file's own size is the one fact `ffprobe` does not report, so it is taken from the file
+/// itself: a file that cannot be stat'ed is a file that cannot be read.
 async fn probe_with(ffprobe: &Path, path: &Path) -> Result<ClipInfo, FfmpegError> {
     let output = run_tool(ffprobe, &probe_args(path), PROBE_TIMEOUT).await?;
-    let Some(info) = probe::parse(&output.stdout) else {
+    let Some(mut info) = probe::parse(&output.stdout) else {
         tracing::debug!("ffprobe could not read the file: {}", output.stderr.trim());
         return Err(FfmpegError::Undecodable);
     };
+    info.bytes = tokio::fs::metadata(path)
+        .await
+        .map_err(|_| FfmpegError::Undecodable)?
+        .len();
     Ok(info)
 }
 
 /// The decode an operation was attempting, so a failure can be replayed as it was.
 #[derive(Debug, Clone, Copy)]
-enum Decode<'a> {
-    Frames(&'a FrameOptions),
-    Audio,
+enum Decode {
+    /// One frame at `at` seconds, fitting `side` pixels.
+    Frames { at: f64, side: u32 },
+    /// The audio track, over the stretch it was asked for.
+    Audio(Option<(Duration, Duration)>),
 }
 
 /// Why a decode failed: a file the tools cannot read at all is undecodable, a readable file that
@@ -217,19 +275,19 @@ enum Decode<'a> {
 /// product's own output was what failed.
 ///
 /// The order matters, and none of it can be read off `ffmpeg`'s exit status. The file is asked
-/// instead: its tracks first, then the operation's own decode replayed over the whole file with
+/// instead: its tracks first, then the operation's own decode replayed over the same stretch with
 /// nowhere to write — so a file that survives exactly what just failed on it failed on the
 /// product's side.
-async fn classify(bin: &Binaries, input: &Path, decode: Decode<'_>) -> FfmpegError {
+async fn classify(bin: &Binaries, input: &Path, decode: Decode) -> FfmpegError {
     let info = match probe_with(&bin.ffprobe, input).await {
         Err(error) => return error,
         Ok(info) => info,
     };
     let (replay, timeout) = match decode {
-        Decode::Frames(_) if info.dimensions.is_none() => return FfmpegError::NoVideoTrack,
-        Decode::Audio if !info.has_audio => return FfmpegError::NoAudioTrack,
-        Decode::Frames(options) => (frames_args(input, None, options), FRAMES_TIMEOUT),
-        Decode::Audio => (audio_args(input, None), AUDIO_TIMEOUT),
+        Decode::Frames { .. } if info.dimensions.is_none() => return FfmpegError::NoVideoTrack,
+        Decode::Audio(_) if !info.has_audio => return FfmpegError::NoAudioTrack,
+        Decode::Frames { at, side } => (frame_args(input, at, None, side), FRAMES_TIMEOUT),
+        Decode::Audio(window) => (audio_args(input, window, None), AUDIO_TIMEOUT),
     };
     match run_tool(&bin.ffmpeg, &replay, timeout).await {
         Ok(output) if output.success => {
@@ -312,27 +370,6 @@ fn scratch() -> Result<tempfile::TempDir, FfmpegError> {
     })
 }
 
-/// The frames a successful decode wrote, in playback order.
-fn frames_in(dir: &Path) -> Result<Vec<PathBuf>, FfmpegError> {
-    let entries = std::fs::read_dir(dir).map_err(|e| {
-        FfmpegError::Unavailable(format!(
-            "the extracted frames could not be listed ({})",
-            e.kind()
-        ))
-    })?;
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("jpg"))
-        })
-        .collect();
-    // `ffmpeg` numbers the files through the output pattern, so the names sort into playback order.
-    paths.sort();
-    Ok(paths)
-}
-
 fn probe_args(input: &Path) -> Vec<OsString> {
     vec![
         "-v".into(),
@@ -345,37 +382,46 @@ fn probe_args(input: &Path) -> Vec<OsString> {
     ]
 }
 
-/// `fps` first, so the rate is taken from the source timeline, then one fit into a square box,
-/// then the even sides the JPEG encoder needs. With `into` absent the same decode runs with
-/// nowhere to write — how [`classify`] replays one that failed.
-fn frames_args(input: &Path, into: Option<&Path>, options: &FrameOptions) -> Vec<OsString> {
-    let side = options.max_side;
+/// The stretch to sample, as input options before `-i`: the decoder starts where it was asked
+/// instead of reading everything up to it. Fractional seconds, the form `ffmpeg` parses.
+fn window_args(window: Option<(Duration, Duration)>) -> Vec<OsString> {
+    window.map_or_else(Vec::new, |(start, length)| {
+        vec![
+            "-ss".into(),
+            format!("{:.3}", start.as_secs_f64()).into(),
+            "-t".into(),
+            format!("{:.3}", length.as_secs_f64()).into(),
+        ]
+    })
+}
+
+/// One frame at `at` seconds: the seek is an input option, so the decoder starts at the mark and
+/// stops after one picture instead of reading everything up to it. One fit into a square box, then
+/// the even sides the JPEG encoder needs. With `into` absent the same decode runs with nowhere to
+/// write — how [`classify`] replays one that failed.
+fn frame_args(input: &Path, at: f64, into: Option<&Path>, side: u32) -> Vec<OsString> {
     let filter = format!(
-        "fps={},scale={side}:{side}:force_original_aspect_ratio=decrease,\
-         scale=trunc(iw/2)*2:trunc(ih/2)*2",
-        options.fps
+        "scale={side}:{side}:force_original_aspect_ratio=decrease,\
+         scale=trunc(iw/2)*2:trunc(ih/2)*2"
     );
-    let mut args: Vec<OsString> = vec![
-        "-v".into(),
-        "error".into(),
-        "-nostdin".into(),
-        "-y".into(),
+    let mut args: Vec<OsString> = vec!["-v".into(), "error".into(), "-nostdin".into(), "-y".into()];
+    args.extend([
+        "-ss".into(),
+        format!("{at:.3}").into(),
         "-i".into(),
         input.into(),
         "-vf".into(),
         filter.into(),
         "-frames:v".into(),
-        options.max_frames.to_string().into(),
-    ];
+        "1".into(),
+    ]);
     match into {
-        Some(dir) => args.extend([
-            // `-q:v` runs 2..31 with lower the better: 3 sits near the top, because a
-            // frame is read rather than displayed.
+        Some(path) => args.extend([
             "-q:v".into(),
-            "3".into(),
+            FRAME_QUANTISER.to_string().into(),
             "-f".into(),
             "image2".into(),
-            dir.join("frame-%05d.jpg").into(),
+            path.into(),
         ]),
         None => args.extend(["-f".into(), "null".into(), "-".into()]),
     }
@@ -384,12 +430,14 @@ fn frames_args(input: &Path, into: Option<&Path>, options: &FrameOptions) -> Vec
 
 /// 16 kHz mono signed 16-bit PCM in a WAV container: what the recogniser takes,
 /// whatever the source carried. `into` absent is [`classify`]'s replay.
-fn audio_args(input: &Path, into: Option<&Path>) -> Vec<OsString> {
-    let mut args: Vec<OsString> = vec![
-        "-v".into(),
-        "error".into(),
-        "-nostdin".into(),
-        "-y".into(),
+fn audio_args(
+    input: &Path,
+    window: Option<(Duration, Duration)>,
+    into: Option<&Path>,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["-v".into(), "error".into(), "-nostdin".into(), "-y".into()];
+    args.extend(window_args(window));
+    args.extend([
         "-i".into(),
         input.into(),
         "-vn".into(),
@@ -401,7 +449,7 @@ fn audio_args(input: &Path, into: Option<&Path>) -> Vec<OsString> {
         "16000".into(),
         "-c:a".into(),
         "pcm_s16le".into(),
-    ];
+    ]);
     match into {
         Some(output) => args.extend(["-f".into(), "wav".into(), output.into()]),
         None => args.extend(["-f".into(), "null".into(), "-".into()]),
@@ -425,6 +473,9 @@ impl ReleasesHook {
         // SAFETY: the caller holds the environment lock, and this guard is dropped
         // before it.
         unsafe { std::env::set_var(install::RELEASES_URL_ENV, base) };
+        // A test that failed to reach a stream leaves that failure behind process-wide; this
+        // hook's own host is a fresh attempt.
+        install::forget_failed_attempt();
         Self(previous)
     }
 }
@@ -451,43 +502,75 @@ mod tests {
     use super::*;
 
     /// The replay [`classify`] settles a failure with is the operation's own decode —
-    /// the whole file, the same filters and bounds — with only the sink swapped for one
+    /// the same mark, the same filter and bound — with only the sink swapped for one
     /// that writes nothing. A shorter replay would blame a file that merely fails
     /// further in than the replay looked.
     #[test]
     fn the_replay_is_the_whole_decode_with_nothing_to_write() {
         let input = Path::new("/media/clip.mp4");
+        let marks = [2.0, 4.5];
         let options = FrameOptions {
-            fps: 2.0,
+            marks: &marks,
             max_side: 320,
-            max_frames: 5,
+        };
+        let at = |args: &[OsString], flag: &str| {
+            args.iter()
+                .position(|arg| arg.to_str() == Some(flag))
+                .unwrap_or_else(|| panic!("{flag} is missing from {args:?}"))
         };
 
-        let frames = frames_args(input, Some(Path::new("/scratch")), &options);
-        let replay = frames_args(input, None, &options);
-        // The sinks: `-q:v 3 -f image2 <pattern>` and `-f null -`.
-        let decode = frames.len() - 5;
-        assert_eq!(&frames[..decode], &replay[..replay.len() - 3]);
+        let frame = frame_args(
+            input,
+            marks[0],
+            Some(Path::new("/scratch/frame-00000.jpg")),
+            options.max_side,
+        );
+        let replay = frame_args(input, marks[0], None, options.max_side);
+        // The sinks: `-q:v <quantiser> -f image2 <path>` and `-f null -`.
+        assert_eq!(&frame[..frame.len() - 5], &replay[..replay.len() - 3]);
+        // The mark is an input option: `-ss` comes before `-i`, so the decoder starts at the
+        // second instead of reading everything up to it — and the replay carries it too, or it
+        // would blame a file for a stretch it never read.
+        for args in [frame.as_slice(), replay.as_slice()] {
+            assert!(
+                at(args, "-ss") < at(args, "-i"),
+                "the seek is an input option"
+            );
+            assert_eq!(args[at(args, "-ss") + 1].to_str(), Some("2.000"));
+            assert_eq!(args[at(args, "-frames:v") + 1].to_str(), Some("1"));
+        }
 
-        let audio = audio_args(input, Some(Path::new("/scratch/audio.wav")));
-        let replay = audio_args(input, None);
+        let audio = audio_args(input, None, Some(Path::new("/scratch/audio.wav")));
+        let replay = audio_args(input, None, None);
         // The sinks: `-f wav <path>` and `-f null -`.
         assert_eq!(&audio[..audio.len() - 3], &replay[..replay.len() - 3]);
+
+        // A window is an input option: `-ss` and `-t` come before `-i`.
+        let window = Some((Duration::from_secs(2), Duration::from_millis(1500)));
+        let audio = audio_args(input, window, Some(Path::new("/scratch/audio.wav")));
+        let replay = audio_args(input, window, None);
+        for args in [audio.as_slice(), replay.as_slice()] {
+            assert!(at(args, "-ss") < at(args, "-i"));
+            assert!(at(args, "-t") < at(args, "-i"));
+            assert_eq!(args[at(args, "-ss") + 1].to_str(), Some("2.000"));
+            assert_eq!(args[at(args, "-t") + 1].to_str(), Some("1.500"));
+        }
+        assert_eq!(&audio[..at(&audio, "-i")], &replay[..at(&replay, "-i")]);
     }
 
-    /// The live exercise of the three operations, against a real `ffmpeg` and real
-    /// files. It is opt-in because the product's own copy comes from a release
-    /// stream, which no plain `cargo test` run carries:
+    /// The live exercise of the three operations — and of the reading mode built on them —
+    /// against a real `ffmpeg` and real files. It is opt-in because the product's own copy comes
+    /// from a release stream, which no plain `cargo test` run carries:
     ///
     /// ```text MAHBOT_FFMPEG_LIVE_BIN=/opt/homebrew/bin \ cargo test --lib ffmpeg::tests --
     /// --ignored --test-threads=1 ```
     ///
     /// The named directory's `ffmpeg` and `ffprobe` stand in for the product's own
-    /// pair under a throwaway `HOME`, which is why the run must be single-threaded:
-    /// `HOME` is what the install root resolves from. The clips are made by the same
-    /// binary: one with audio, one without, one rotated, one that is not a video.
+    /// pair under a throwaway install root, which is why the run must be single-threaded:
+    /// the root is process-wide. The clips are made by the same binary: one with audio,
+    /// one without, one whose sound outlasts its pictures, one rotated, one that is not a video.
     #[ignore = "requires MAHBOT_FFMPEG_LIVE_BIN: a directory holding a real ffmpeg and ffprobe"]
-    #[serial_test::serial(ffmpeg_live)] // relocates HOME, points the release hook
+    #[serial_test::serial(ffmpeg_live)] // relocates the install root, points the release hook
     #[tokio::test]
     async fn the_three_operations_on_real_files() {
         let host = PathBuf::from(
@@ -495,11 +578,10 @@ mod tests {
                 .expect("MAHBOT_FFMPEG_LIVE_BIN names a directory holding ffmpeg and ffprobe"),
         );
         let home = tempfile::tempdir().expect("temp home");
-        let _home = crate::util::test::set_env_var("HOME", home.path().to_str());
+        let root = home.path().join(".mahbot/ffmpeg");
+        let _root = crate::util::test::set_env_var(install::ROOT_ENV, root.to_str());
         let _hook = ReleasesHook::at("http://127.0.0.1:1");
-        let bin = home
-            .path()
-            .join(".mahbot/ffmpeg")
+        let bin = root
             // Any parsable tag: a copy in place is what the operations use, and the
             // name only says which build it is.
             .join("ffmpeg-v7.1-mahbot.2")
@@ -580,19 +662,23 @@ mod tests {
 
         assert_eq!(probe(&broken).await.err(), Some(FfmpegError::Undecodable));
 
+        let marks = [0.0, 0.5, 1.0];
         let frames = extract_frames(
             &good,
             FrameOptions {
-                fps: 2.0,
+                marks: &marks,
                 max_side: 320,
-                max_frames: 3,
             },
         )
         .await
         .expect("frames come out");
-        assert_eq!(frames.paths().len(), 3, "the count bound is honoured");
-        let first = frames.paths()[0].clone();
-        for path in frames.paths() {
+        assert_eq!(frames.frames().len(), 3, "one frame per mark");
+        assert!(
+            (frames.frames()[2].1 - 1.0).abs() < f64::EPSILON,
+            "each frame carries its mark"
+        );
+        let first = frames.frames()[0].0.clone();
+        for (path, _) in frames.frames() {
             assert_eq!(path.extension(), Some(OsStr::new("jpg")));
             let image = image::load_from_memory(&std::fs::read(path).expect("read a frame"))
                 .expect("a JPEG");
@@ -605,13 +691,58 @@ mod tests {
         drop(frames);
         assert!(!first.exists(), "dropping the guard removes the frames");
 
+        // A mark the file has no picture at is skipped, not fatal: the frames before it are kept,
+        // and the clip is not reported as one the product cannot read.
+        let past_the_end = [0.0, 0.5, 1.0, 5.0];
+        let frames = extract_frames(
+            &good,
+            FrameOptions {
+                marks: &past_the_end,
+                max_side: 320,
+            },
+        )
+        .await
+        .expect("the frames before the missing mark come out");
+        assert_eq!(frames.frames().len(), 3, "the mark past the end is skipped");
+
+        // A picture stream that stops before its container does says so, which is what keeps
+        // frames from being planned past its last picture.
+        let soundy = media.path().join("soundy.mp4");
+        make(
+            &host,
+            &soundy,
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=25:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=5",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+            ],
+        );
+        let uneven = probe(&soundy).await.expect("the uneven clip probes");
+        assert_eq!(uneven.duration.as_secs(), 5, "the container's own length");
+        assert_eq!(
+            uneven.picture.map(|picture| picture.as_secs()),
+            Some(2),
+            "the picture stream's own length"
+        );
+        assert_eq!(uneven.sound.map(|sound| sound.as_secs()), Some(5));
+
         assert_eq!(
             extract_frames(
                 &broken,
                 FrameOptions {
-                    fps: 1.0,
+                    marks: &[0.0],
                     max_side: 320,
-                    max_frames: 3
                 }
             )
             .await
@@ -623,23 +754,19 @@ mod tests {
         // failure on the product's own side is a different one, and the file that
         // proves it here is the clip the frames above came out of.
         let pair = binaries().await.expect("the copy in place is used");
-        let options = FrameOptions {
-            fps: 1.0,
-            max_side: 320,
-            max_frames: 3,
-        };
-        let product_side = classify(&pair, &good, Decode::Frames(&options)).await;
+        let options = Decode::Frames { at: 0.0, side: 320 };
+        let product_side = classify(&pair, &good, options).await;
         assert!(
             matches!(product_side, FfmpegError::Unavailable(ref reason) if !reason.is_empty()),
             "{product_side:?}"
         );
         assert_eq!(
-            classify(&pair, &broken, Decode::Frames(&options)).await,
+            classify(&pair, &broken, options).await,
             FfmpegError::Undecodable,
             "the same call still names the file that cannot be read"
         );
 
-        let audio = extract_audio(&good).await.expect("audio comes out");
+        let audio = extract_audio(&good, None).await.expect("audio comes out");
         let wav = std::fs::read(audio.path()).expect("read the WAV");
         // The `fmt ` chunk: mono at byte 22, 16 kHz at byte 24, little-endian.
         assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 1, "mono");
@@ -659,12 +786,64 @@ mod tests {
         // The two failure classes stay different: a file without an audio track is
         // not the same answer as a file that cannot be decoded.
         assert_eq!(
-            extract_audio(&silent).await.err(),
+            extract_audio(&silent, None).await.err(),
             Some(FfmpegError::NoAudioTrack)
         );
         assert_eq!(
-            extract_audio(&broken).await.err(),
+            extract_audio(&broken, None).await.err(),
             Some(FfmpegError::Undecodable)
+        );
+
+        // The reading mode over the same clip — the one path no other surface can drive without a
+        // provider: a window samples its own seconds at two frames a second, and a window past the
+        // last picture plans none instead of blaming a decode.
+        let window = |start: f64, length: f64| crate::media::Window::Span {
+            start,
+            length: Some(length),
+        };
+        let reading = crate::media::read(&silent, window(0.5, 1.0))
+            .await
+            .expect("a silent clip reads");
+        // The marks tell the window's two frames apart, though both fall inside the same second.
+        assert!(
+            reading.text.contains("0:00.5 [frame 1]"),
+            "{}",
+            reading.text
+        );
+        assert!(reading.text.contains("0:01 [frame 2]"), "{}", reading.text);
+        assert!(
+            reading.text.contains("This video has no sound track."),
+            "{}",
+            reading.text
+        );
+        // Both frames go into one picture: the arrival form says which frames it holds, and the
+        // read tool's own form carries the mapping on the picture's annotation instead — the
+        // timeline itself never claims a picture.
+        let (model, attached) = crate::media::inline(&reading).await;
+        assert!(attached);
+        assert!(model.contains("picture 1: frames 1–2"), "{model}");
+        let (text, payloads) =
+            crate::tools::timeline_output(reading, crate::tools::TimelinePictures::Attached).await;
+        assert!(!text.contains("picture 1"), "{text}");
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(
+            payloads[0].note.as_deref(),
+            Some("picture 1 of 1: frames 1–2")
+        );
+
+        let past = crate::media::read(&silent, window(5.0, 1.0))
+            .await
+            .expect("a window past the end still answers");
+        assert!(
+            past.pictures().await.is_empty(),
+            "there is no picture there"
+        );
+        // The second the read asked for, not the end it was clamped to.
+        assert!(
+            past.text
+                .contains("The read starts at 0:05, past the end of the 0:02 file."),
+            "{}",
+            past.text
         );
 
         // No copy and an unreachable release: the answer says so instead of hanging

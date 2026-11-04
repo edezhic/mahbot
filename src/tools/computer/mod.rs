@@ -853,6 +853,7 @@ impl Tool for ComputerTool {
             text,
             image_payloads,
             text_is_content: true,
+            preserve_text: false,
         })
     }
 }

@@ -519,10 +519,9 @@ mod tests {
         let _ = store.delete_kv("provider_endpoint_key").await;
         // Restore the global CONFIG on exit: the persist below mutates it.
         let original = crate::config::CONFIG.snapshot();
-        // The persist path rebuilds the provider/transcriber singletons too —
-        // snapshot them so the test leaves the process globals untouched.
+        // The persist path rebuilds the provider singleton too — snapshot it
+        // so the test leaves the process global untouched.
         let prev_provider = crate::providers::snapshot_provider_for_test();
-        let prev_transcriber = crate::providers::snapshot_transcriber_for_test();
 
         let outcome = crate::config::persist_settled_string_field(
             "provider_endpoint",
@@ -547,12 +546,11 @@ mod tests {
             "saved despite being unreachable"
         );
 
-        // Clean up the shared store and restore the global CONFIG +
-        // provider/transcriber singletons.
+        // Clean up the shared store and restore the global CONFIG + provider
+        // singleton.
         let _ = store.delete_kv("provider_endpoint").await;
         let _ = store.delete_kv("provider_endpoint_key").await;
         crate::config::CONFIG.swap(original);
         crate::providers::restore_provider_for_test(prev_provider);
-        crate::providers::restore_transcriber_for_test(prev_transcriber);
     }
 }

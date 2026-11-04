@@ -269,7 +269,7 @@ fn read_parameters_schema(path_desc: &str) -> serde_json::Value {
             "mode": {
                 "type": "string",
                 "enum": ["content", "symbols", "zoom"],
-                "description": "Read mode. 'content' (default): line-numbered file read — large outputs are truncated to a ~5 KB budget — or, for a raster image (PNG, JPEG, WebP), attaches it to the conversation as a native image instead; a PDF or Office document (Word, Excel, PowerPoint) is converted to text instead of its raw bytes (the tool description says what a converted document yields). 'symbols': list all top-level AST symbols with line ranges. 'zoom': extract a single symbol's source by name. 'symbols'/'zoom' work for supported code formats only.",
+                "description": "Read mode. 'content' (default): line-numbered file read — large outputs are truncated to a ~5 KB budget — or, for a raster image (PNG, JPEG, WebP), attaches it to the conversation as a native image instead; a PDF or Office document (Word, Excel, PowerPoint) is converted to text instead of its raw bytes (the tool description says what a converted document yields); a video or a recording is read as a timeline of frames, speech and sound labels instead of lossy text. 'symbols': list all top-level AST symbols with line ranges. 'zoom': extract a single symbol's source by name. 'symbols'/'zoom' work for supported code formats only.",
                 "default": "content"
             },
             "symbol": {
@@ -279,13 +279,12 @@ fn read_parameters_schema(path_desc: &str) -> serde_json::Value {
             },
             "offset": {
                 "type": "integer",
-                "description": "Starting line number (1-based, default: 1). Not used for a converted document.",
-                "default": 1,
-                "minimum": 1
+                "description": "Starting line number for a text read (1-based, default: 1), or the start second for a video or a recording. Omit it and `limit` for the whole clip at overview density (frames across all of it, transcript capped at ten minutes); give either to read a window of seconds. Not used for a converted document.",
+                "minimum": 0
             },
             "limit": {
                 "type": "integer",
-                "description": "Maximum number of lines to return (default: all). Not used for a converted document.",
+                "description": "Maximum number of lines to return for a text read (default: all), or how many seconds of a video or a recording (to the end of the file when omitted). Not used for a converted document.",
                 "minimum": 1
             }
         }),
@@ -434,6 +433,15 @@ impl Tool for ReadTool {
             && !super::path::is_wildcard_read(ws.as_path(), path, self.access).await
         {
             let res = resolve_content_read(ws, path, self.access).await?;
+            // A directory is listed, whatever it happens to be named.
+            if crate::media::is_media_path(&res.path) {
+                let directory = tokio::fs::metadata(&res.path)
+                    .await
+                    .is_ok_and(|meta| meta.is_dir());
+                if !directory {
+                    return media_read(&res, &args).await;
+                }
+            }
             // A read that is not a document has paid one extra metadata + 16-byte
             // head read for the sniff; sharing the converter's own detection
             // (rather than an extension pre-filter that could drift from it) is
@@ -520,6 +528,61 @@ fn finish_read_body(resolved_path: &Path, body: String, recovery_note: Option<&s
     super::with_recovery_note(recovery_note, body)
 }
 
+/// A media read: the timeline the product's own ffmpeg and recogniser produce, with a video's
+/// frames attached to the conversation. A video is read because it is a video, so neither the
+/// text size gate nor the text output budget applies to it.
+async fn media_read(
+    res: &ResolvedRead,
+    args: &serde_json::Value,
+) -> anyhow::Result<crate::tools::ToolOutput> {
+    let reading = media_reading(&res.path, args).await?;
+    let (text, image_payloads) =
+        crate::tools::timeline_output(reading, crate::tools::TimelinePictures::Attached).await;
+    Ok(crate::tools::ToolOutput {
+        text: finish_read_body(&res.path, text, res.recovery_note.as_deref()),
+        image_payloads,
+        text_is_content: true,
+        // A timeline, not lines: the text budget would cut it mid-clip.
+        preserve_text: true,
+    })
+}
+
+/// Read one media file for the tool and for the command line's reader alike, so the two cannot
+/// drift on the failure they report.
+async fn media_reading(
+    path: &Path,
+    args: &serde_json::Value,
+) -> anyhow::Result<crate::media::Reading> {
+    crate::media::read(path, media_window(args)?)
+        .await
+        .map_err(|error| anyhow::anyhow!("{}", error.message()))
+}
+
+/// The window a media read covers: `offset` is the start second and `limit` how many seconds —
+/// a different meaning from a text read's lines. Neither names a stretch: the whole clip at
+/// overview density. Either does, so an explicit `offset: 0` reads the whole clip as a window.
+fn media_window(args: &serde_json::Value) -> anyhow::Result<crate::media::Window> {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a second count is exact in f64 far past any recording a machine can hold"
+    )]
+    let seconds = |value: Option<u64>| value.map(|seconds| seconds as f64);
+    let start = super::get_opt_u64(args, "offset")?;
+    // A window of no seconds is not a window: refused like any other bad argument, so nothing
+    // describes an empty stretch as silent.
+    let length = match super::get_opt_u64(args, "limit")? {
+        Some(0) => anyhow::bail!("usage: `limit` is how many seconds to read — at least 1"),
+        length => length,
+    };
+    Ok(match (start, length) {
+        (None, None) => crate::media::Window::Overview,
+        (start, length) => crate::media::Window::Span {
+            start: seconds(start).unwrap_or(0.0),
+            length: seconds(length),
+        },
+    })
+}
+
 /// Read a resolved file path (content, symbols, or zoom mode) — the shared tail
 /// of a non-document read: [`execute_read`] and the command line's document
 /// reader both return through it for a file the converter did not take, so a
@@ -536,6 +599,11 @@ pub(super) async fn read_resolved(
         .map_err(|e| path_io_error(resolved_path, &e, "Failed to read file metadata"))?;
     if meta.is_dir() {
         return list_directory(resolved_path).await;
+    }
+    // The read tool returns media before it reaches here; the command line's reader does not.
+    if read_mode(args) == ReadMode::Content && crate::media::is_media_path(resolved_path) {
+        let reading = media_reading(resolved_path, args).await?;
+        return Ok(finish_read_body(resolved_path, reading.text, recovery_note));
     }
     super::check_size_within(&meta, super::MAX_FILE_SIZE_BYTES, "File too large")?;
 
@@ -1162,6 +1230,37 @@ mod tests {
         }
         let path = dir.path().to_path_buf();
         (dir, path)
+    }
+
+    #[test]
+    fn a_media_window_reads_seconds_and_refuses_an_empty_one() {
+        assert!(matches!(
+            media_window(&serde_json::json!({})).expect("the whole clip"),
+            crate::media::Window::Overview
+        ));
+        // An explicit zero start is a window over the whole clip, not the overview: the caller
+        // asked for a window.
+        let crate::media::Window::Span { start, length } =
+            media_window(&serde_json::json!({"offset": 0})).expect("a window")
+        else {
+            panic!("a start second is a window");
+        };
+        assert!((start - 0.0).abs() < f64::EPSILON);
+        assert_eq!(length, None);
+        let crate::media::Window::Span { start, length } =
+            media_window(&serde_json::json!({"offset": 7, "limit": 3})).expect("a window")
+        else {
+            panic!("a start second is a window");
+        };
+        assert!((start - 7.0).abs() < f64::EPSILON);
+        assert_eq!(length, Some(3.0));
+        // A window of no seconds is refused, never described as a silent stretch.
+        assert!(
+            media_window(&serde_json::json!({"limit": 0}))
+                .expect_err("zero seconds is not a window")
+                .to_string()
+                .starts_with("usage:")
+        );
     }
 
     /// Every extension in the canonical tree-sitter mapping (`supported_extensions`)

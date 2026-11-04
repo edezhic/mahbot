@@ -1122,7 +1122,7 @@ pub(crate) fn envelope_attr(value: &str) -> String {
 
 /// A tool call's textual result together with the images it produced — what
 /// [`crate::Tool::execute_with_payloads`] returns.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct ToolOutput {
     /// The tool's textual result.
     pub text: String,
@@ -1135,13 +1135,16 @@ pub(crate) struct ToolOutput {
     /// an injected image. `true` for the read tool's converted document, the computer tool and the
     /// picture tool's batch report.
     pub text_is_content: bool,
+    /// Whether `text` must reach the model whole: a media read is a timeline, not lines, and the
+    /// text budget would cut it mid-clip. The call knows its answer is a timeline; the tool's
+    /// [`Tool::format_output`] sees only the answer.
+    pub preserve_text: bool,
 }
 
 /// Pair a textual result with the image payload of [`Tool::image_payload`] — the tail of the
 /// default `execute_with_payloads`, shared with the read tool's override so the two cannot drift.
-/// The text is flagged as a claim about the image whether or not a payload comes back: a media tool
-/// names the file it wrote, the read tool the file it read. Tools whose text IS the result bypass
-/// this helper.
+/// The text is flagged as a claim about the image whether or not a payload comes back: the read
+/// tool names the file it read. Tools whose text IS the result bypass this helper.
 pub(crate) async fn with_image_payload<T: Tool + ?Sized>(
     tool: &T,
     text: String,
@@ -1152,6 +1155,7 @@ pub(crate) async fn with_image_payload<T: Tool + ?Sized>(
         text,
         image_payloads: tool.image_payload(ws, args).await.into_iter().collect(),
         text_is_content: false,
+        preserve_text: false,
     }
 }
 
@@ -1165,6 +1169,8 @@ pub(crate) struct ToolExecutionOutcome {
     pub image_payloads: Vec<ImagePayload>,
     /// The tool's own [`ToolOutput::text_is_content`], carried through unchanged.
     pub text_is_content: bool,
+    /// The tool's own [`ToolOutput::preserve_text`], carried through unchanged.
+    pub preserve_text: bool,
     /// `true` when the tool's durable work was drain-cut and its result is intentionally absent:
     /// the commit skips such outcomes, so the call stays dangling until the resume-completion
     /// settles it.
@@ -1189,6 +1195,8 @@ pub(crate) enum ImagePayloadSource {
     /// Screen capture from the computer tool, injected as a native image for the agent's own
     /// analysis.
     Computer,
+    /// A video's timeline as pictures of four frames each.
+    Grid,
 }
 
 impl ImagePayloadSource {
@@ -1200,6 +1208,7 @@ impl ImagePayloadSource {
             Self::Generated => "Generated image file",
             Self::Chrome => "Chrome screenshot",
             Self::Computer => "Computer screenshot",
+            Self::Grid => "Video frame grid",
         }
     }
 }
@@ -1526,17 +1535,79 @@ async fn save_generated_file(
     Ok(output_path)
 }
 
-/// Format a video tool result: the `[VIDEO:path]` marker first, then a "Video content:" line when
-/// the shared transcription succeeds. Fail-open: marker-only on any failure.
-pub(crate) async fn format_video_result(marker: String, output_path: &std::path::Path) -> String {
-    match crate::providers::transcribe_video_file(output_path, None).await {
-        Some(text) => format!("{marker}\n\nVideo content: {text}"),
-        None => marker,
+/// How a video tool's answer carries the timeline's pictures.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TimelinePictures {
+    /// As the images the agent loop attaches, after the text.
+    Attached,
+    /// Not at all: the command line's own run takes the text alone, so it neither encodes the
+    /// pictures nor claims them.
+    TextOnly,
+}
+
+/// A reading as a tool shows it: the timeline and, when the pictures are attached, one payload
+/// apiece whose annotation names the frames it holds — so the mapping reaches the model with the
+/// image itself, and a picture the loop dedups still says which frames it holds. The one place the
+/// two go together, so the read tool and the video tools cannot drift.
+pub(crate) async fn timeline_output(
+    reading: crate::media::Reading,
+    pictures: TimelinePictures,
+) -> (String, Vec<ImagePayload>) {
+    match pictures {
+        TimelinePictures::Attached => {
+            let composed = reading.pictures().await;
+            let count = composed.len();
+            let payloads = composed
+                .into_iter()
+                .enumerate()
+                .map(|(index, picture)| {
+                    let note = format!(
+                        "picture {} of {count}: {}",
+                        index + 1,
+                        picture.frames_text()
+                    );
+                    ImagePayload {
+                        path: reading.path.display().to_string(),
+                        data_uri: picture.data_uri,
+                        width: picture.size.0,
+                        height: picture.size.1,
+                        format: "JPEG".to_string(),
+                        recovery_note: None,
+                        note: Some(note),
+                        source: ImagePayloadSource::Grid,
+                    }
+                })
+                .collect();
+            (reading.text, payloads)
+        }
+        TimelinePictures::TextOnly => (reading.text, Vec::new()),
     }
 }
 
-// Wall-clock deadline for an async-video job (1 hour), shared by video_gen and video_edit.
+/// A produced video's answer: what the surface says about the clip — the `[VIDEO:path]` marker, or
+/// a render's marker and facts — then the clip's own timeline.
+pub(crate) async fn video_output(
+    prefix: String,
+    path: &std::path::Path,
+    pictures: TimelinePictures,
+) -> ToolOutput {
+    let (text, image_payloads) =
+        match crate::media::read(path, crate::media::Window::Overview).await {
+            Ok(reading) => timeline_output(reading, pictures).await,
+            Err(error) => (error.unreadable(), Vec::new()),
+        };
+    ToolOutput {
+        text: format!("{prefix}\n\n{text}"),
+        image_payloads,
+        // The prefix and the timeline are the result; the pictures are attached as payloads after
+        // them.
+        text_is_content: true,
+        // Every caller keeps its whole answer through `preserve_full_output`.
+        ..ToolOutput::default()
+    }
+}
 
+/// Wall-clock deadline for an async-video job (1 hour), shared by video_gen and video_edit.
 const VIDEO_JOB_TIMEOUT: Duration = Duration::from_hours(1);
 
 /// Polling interval between video job status checks (30 s).

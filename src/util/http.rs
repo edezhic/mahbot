@@ -38,7 +38,7 @@ static IMAGE_GEN_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 /// no key is configured (missing or empty) — callers must surface that as a clear error rather than
 /// send a blank `"Bearer "` header and get an opaque 401. Used by
 /// [`crate::tools::image_gen::ImageGenTool`] and, through the provider request helpers below, by
-/// the video and transcription paths; a future OpenRouter media tool should reuse it too.
+/// the video paths; a future OpenRouter media tool should reuse it too.
 #[must_use]
 pub fn bearer_auth_header() -> Option<String> {
     let key = crate::config::CONFIG.provider_key()?;

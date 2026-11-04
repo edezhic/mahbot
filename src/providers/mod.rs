@@ -7,7 +7,6 @@
 pub(crate) mod compatible;
 pub(crate) mod error_class;
 pub(crate) mod reasoning;
-pub(crate) mod transcribe;
 
 pub(crate) use reasoning::plaintext_for_display;
 
@@ -38,9 +37,6 @@ pub(crate) fn test_request(
 }
 
 use std::sync::{Arc, RwLock};
-
-use crate::providers::transcribe::MediaTranscriber;
-pub(crate) use crate::providers::transcribe::transcribe_video_file;
 
 use crate::retry::{FailureClass, RetryFailureRecord};
 use compatible::OpenAiCompatibleProvider;
@@ -146,9 +142,6 @@ pub(crate) fn provider_routing_json(order: &str) -> Option<serde_json::Value> {
 /// Wrapped in `Arc` so we can clone-and-drop the lock before awaiting.
 static PROVIDER: RwLock<Option<Arc<dyn Provider>>> = RwLock::new(None);
 
-/// Global media transcriber (vision model for video descriptions).
-static MEDIA_TRANSCRIBER: RwLock<Option<MediaTranscriber>> = RwLock::new(None);
-
 /// Spawn a non-fatal background provider warmup.
 ///
 /// The provider is Arc-cloned so the task outlives the caller; the endpoint
@@ -163,33 +156,24 @@ fn spawn_warmup(provider: Arc<dyn Provider>, config: &crate::config::ConfigData)
     });
 }
 
-/// Build the provider and media transcriber from config (synchronous, no I/O).
+/// Build the provider from config (synchronous, no I/O).
 ///
 /// Extracted from the shared setup logic so both the boot path ([`init_global`])
-/// and the config-save path ([`recreate_all`]) construct the singletons once
+/// and the config-save path ([`recreate_all`]) construct the singleton once
 /// and differ only in warmup handling.
-fn build_provider_and_transcriber(
-    config: &crate::config::ConfigData,
-) -> (Arc<dyn Provider>, Option<MediaTranscriber>) {
+fn build_provider(config: &crate::config::ConfigData) -> Arc<dyn Provider> {
     // The effective endpoint + credential come from config: a custom
     // chat-completions endpoint when one is persisted, else the
     // default OpenRouter endpoint + OpenRouter key. The custom endpoint's own
     // key (if any) is used only for the custom endpoint — never the OpenRouter key.
     let endpoint = crate::config::effective_chat_endpoint(config);
     let credential = crate::config::chat_credential(config);
-    let provider: Arc<dyn Provider> =
-        create_provider(credential.as_deref(), Some(&endpoint)).into();
-
-    // Construct the transcriber eagerly — purely synchronous CPU work with no
-    // I/O, so there's no reason to wait until after the warmup HTTP call.
-    let media_transcriber = build_media_transcriber(config);
-
-    (provider, media_transcriber)
+    create_provider(credential.as_deref(), Some(&endpoint)).into()
 }
 
-/// Initialize the global provider and transcriber singletons from CONFIG.
+/// Initialize the global provider singleton from CONFIG.
 ///
-/// Non-blocking by design: the globals are swapped in
+/// Non-blocking by design: the global is swapped in
 /// BEFORE the warmup HTTP round-trip so boot never waits on it (worst case the
 /// endpoint is blackholed for minutes — a failure is non-fatal, retries happen
 /// at request time). The warmup runs as a detached background task and only
@@ -202,11 +186,10 @@ fn build_provider_and_transcriber(
 /// waits for that load — so boot never preloads it.
 pub fn init_global() -> anyhow::Result<()> {
     let config = CONFIG.snapshot();
-    let (provider, media_transcriber) = build_provider_and_transcriber(&config);
+    let provider = build_provider(&config);
 
-    // Swap both globals now — warmup is a pool pre-warm, not a readiness gate.
+    // Swap the global now — warmup is a pool pre-warm, not a readiness gate.
     *PROVIDER.write().unwrap_poison() = Some(provider.clone());
-    *MEDIA_TRANSCRIBER.write().unwrap_poison() = media_transcriber;
 
     // Background warmup (non-fatal).
     spawn_warmup(provider, &config);
@@ -214,11 +197,11 @@ pub fn init_global() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Warm up a provider from a config snapshot without swapping globals.
+/// Warm up a provider from a config snapshot without swapping the global.
 ///
 /// Returns `Ok(())` if the new API key, endpoint, and models are valid
 /// (the provider responds to a warmup request). Does **not** modify the
-/// global `PROVIDER` or `MEDIA_TRANSCRIBER`.
+/// global `PROVIDER`.
 ///
 /// Best-effort reachability probe: the persist path
 /// ([`crate::config::persist_settled_string_field`]) warns on failure
@@ -236,13 +219,13 @@ pub(crate) async fn warmup_provider_from_config(
     Ok(())
 }
 
-/// Recreate all provider and transcriber singletons from the given config.
+/// Recreate the provider singleton from the given config.
 ///
 /// Called after a GUI-driven config save to make provider key/endpoint/model
 /// changes take effect without restart.
 ///
 /// The runtime MUST switch to the newly saved endpoint even when it is
-/// unreachable: the singletons are swapped in BEFORE the
+/// unreachable: the singleton is swapped in BEFORE the
 /// warmup, which then runs as a non-fatal background task (mirroring
 /// [`init_global`]) unless `background_warmup` is false. A failed warmup
 /// never leaves the old provider live — only structural validation and DB
@@ -259,14 +242,13 @@ pub(crate) async fn warmup_provider_from_config(
 /// to listen), and a save that turns the setting on has its own load in the Settings
 /// toggle.
 pub(crate) fn recreate_all(config: &crate::config::ConfigData, background_warmup: bool) {
-    let (provider, media_transcriber) = build_provider_and_transcriber(config);
+    let provider = build_provider(config);
 
-    // Config-save path: swap the globals FIRST so the runtime switches to the
+    // Config-save path: swap the global FIRST so the runtime switches to the
     // new endpoint even when it is unreachable. The warmup is
     // then a non-fatal background pool pre-warm, exactly like boot.
     *PROVIDER.write().unwrap_poison() = Some(provider.clone());
-    *MEDIA_TRANSCRIBER.write().unwrap_poison() = media_transcriber;
-    tracing::info!("Provider and transcriber singletons recreated");
+    tracing::info!("Provider singleton recreated");
 
     if background_warmup {
         // The new provider may be unreachable right now (self-hosted endpoint
@@ -274,13 +256,6 @@ pub(crate) fn recreate_all(config: &crate::config::ConfigData, background_warmup
         // time, and the saved value stands regardless.
         spawn_warmup(provider, config);
     }
-}
-
-/// Get the global media transcriber, if a provider key is configured
-/// (used for video transcription).
-#[must_use]
-pub(crate) fn media_transcriber() -> Option<MediaTranscriber> {
-    MEDIA_TRANSCRIBER.read().unwrap_poison().clone()
 }
 
 /// Single-attempt scoped chat for the outer retry loops (see [`crate::retry`]).
@@ -343,19 +318,6 @@ pub(crate) fn snapshot_provider_for_test() -> Option<Arc<dyn Provider>> {
     PROVIDER.read().unwrap_poison().clone()
 }
 
-/// Snapshot the current global media transcriber for later restore (test
-/// isolation — pairs with [`restore_transcriber_for_test`]).
-#[cfg(test)]
-pub(crate) fn snapshot_transcriber_for_test() -> Option<MediaTranscriber> {
-    MEDIA_TRANSCRIBER.read().unwrap_poison().clone()
-}
-
-/// Restore a previously snapshotted global media transcriber (test isolation).
-#[cfg(test)]
-pub(crate) fn restore_transcriber_for_test(previous: Option<MediaTranscriber>) {
-    *MEDIA_TRANSCRIBER.write().unwrap_poison() = previous;
-}
-
 /// Create a resilient OpenAI-compatible provider from flat config.
 ///
 /// Identity headers (`X-Title`, `HTTP-Referrer`) are sent unconditionally
@@ -392,21 +354,6 @@ pub(crate) fn create_provider(api_key: Option<&str>, endpoint: Option<&str>) -> 
         .with_extra_headers(headers);
 
     Box::new(base)
-}
-
-/// Build the media transcriber from a config snapshot (synchronous, no I/O).
-///
-/// The video-transcription model is hardcoded (`VIDEO_TRANSCRIPTION_MODEL`) and
-/// media always targets the default OpenRouter endpoint regardless of a custom
-/// chat endpoint; the request never carries a routing block. Returns `None`
-/// when no API key is configured (no video transcription possible).
-#[must_use]
-fn build_media_transcriber(config: &crate::config::ConfigData) -> Option<MediaTranscriber> {
-    config.provider_key.as_deref().and_then(trimmed_or_none)?;
-    Some(MediaTranscriber::new(
-        crate::config::DEFAULT_PROVIDER_ENDPOINT.to_string(),
-        crate::config::VIDEO_TRANSCRIPTION_MODEL.to_string(),
-    ))
 }
 
 // Tests

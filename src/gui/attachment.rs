@@ -2,8 +2,8 @@
 //!
 //! A send stages them the way the Telegram receive path stages inbound media — bytes copied into
 //! one directory under [`crate::util::telegram_files_root`] — so the message carries the same
-//! `[IMAGE:…]` / `[FILE:…]` markers and `attachment_dirs` entry, and `channels::enrich_message`
-//! hands it to the agent with no channel-side special case.
+//! `[IMAGE:…]` / `[VIDEO:…]` / `[FILE:…]` markers and `attachment_dirs` entry, and
+//! `channels::enrich_message` hands it to the agent with no channel-side special case.
 
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -48,9 +48,29 @@ pub struct Attachment {
     pub name: String,
     /// The bytes to deliver, read only when the message is sent.
     pub source: Source,
-    /// Deliver as `[IMAGE:…]` (a raster the receive path would treat as an image) rather than
-    /// `[FILE:…]`.
-    pub is_image: bool,
+    pub kind: Kind,
+}
+
+/// What a staged attachment is delivered as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A raster the receive path routes on the `[IMAGE:…]` marker.
+    Image,
+    /// A clip whose `[VIDEO:…]` marker makes the enrichment pass read its timeline.
+    Video,
+    /// An opaque workspace file, delivered as `[FILE:…]`.
+    File,
+}
+
+impl Kind {
+    /// The marker the staged message carries for this kind.
+    fn marker(self) -> crate::util::MediaMarkerKind {
+        match self {
+            Self::Image => crate::util::MediaMarkerKind::Image,
+            Self::Video => crate::util::MediaMarkerKind::Video,
+            Self::File => crate::util::MediaMarkerKind::File,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -94,12 +114,18 @@ impl Attachment {
         }
         // The receive path's own list decides: an image here must be an image there, or delivery
         // refuses it.
-        let is_image =
-            crate::util::has_extension(path, crate::channels::telegram::IMAGE_EXTENSIONS);
+        let kind = if crate::util::has_extension(path, crate::channels::telegram::IMAGE_EXTENSIONS)
+        {
+            Kind::Image
+        } else if crate::util::is_video_extension(path) {
+            Kind::Video
+        } else {
+            Kind::File
+        };
         Ok(Self {
             name: name.to_string(),
             source: Source::File(path.to_path_buf()),
-            is_image,
+            kind,
         })
     }
 
@@ -111,7 +137,7 @@ impl Attachment {
         Ok(Self {
             name,
             source: Source::Bytes(image::Handle::from_bytes(bytes)),
-            is_image: true,
+            kind: Kind::Image,
         })
     }
 }
@@ -146,7 +172,7 @@ pub(crate) async fn stage(attachments: &[Attachment]) -> Result<Staged, String> 
         match write_attachment(&dir, attachment).await {
             Ok(path) => markers.push(format!(
                 "[{}:{}]",
-                if attachment.is_image { "IMAGE" } else { "FILE" },
+                attachment.kind.marker().token(),
                 path.display()
             )),
             Err(message) => {
@@ -252,14 +278,14 @@ static PASTED_PREVIEWS: LazyLock<Mutex<BoundedLruCache<iced::advanced::image::Id
 /// The tile-sized preview of a picture attachment, decoded and cached the first time its tile is
 /// drawn: iced's handle, and the width the tile takes at [`PREVIEW_HEIGHT`]. `None` for a document
 /// — and for a picture that is gone or is not a raster this product decodes — which [`chip`] then
-/// draws as a file. Never touches [`Attachment::is_image`], so what is sent does not depend on
-/// whether the picture happens to decode.
+/// draws as a file. Never touches [`Attachment::kind`], so what is sent does not depend on whether
+/// the picture happens to decode.
 #[expect(
     clippy::cast_precision_loss,
     reason = "a tile is a couple of hundred pixels wide"
 )]
 fn preview(attachment: &Attachment) -> Option<(image::Handle, f32)> {
-    if !attachment.is_image {
+    if attachment.kind != Kind::Image {
         return None;
     }
     let handle = match &attachment.source {

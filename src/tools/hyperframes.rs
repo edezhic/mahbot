@@ -135,28 +135,50 @@ impl Tool for HyperframesTool {
     }
 
     fn preserve_full_output(&self) -> bool {
-        // The instruction documents must arrive whole, and this tool's own answers are short by
-        // construction, so nothing else grows unbounded.
+        // The instruction documents and a render's timeline must arrive whole.
         true
     }
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
-        match super::get_str(&args, "action")? {
-            "instructions" => Ok(crate::prompt::load_prompt(
-                "tool/hyperframes_instructions.md",
-            )),
-            "reference" => Self::reference(&args),
-            "inspect" => self.inspect(ws, &args).await,
-            "render" => self.render(ws, &args).await,
-            other => anyhow::bail!(
-                "usage: unknown action {other:?} — hint: use one of {}",
-                ALL.join(", ")
-            ),
-        }
+        Ok(self
+            .answer(ws, args, super::TimelinePictures::TextOnly)
+            .await?
+            .text)
+    }
+
+    /// The render's pictures are attached: a render is the editing tools' output, so it goes down
+    /// the same path as every other video. The other actions have no pictures of their own.
+    async fn execute_with_payloads(
+        &self,
+        ws: &Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<super::ToolOutput> {
+        self.answer(ws, args, super::TimelinePictures::Attached)
+            .await
     }
 }
 
 impl HyperframesTool {
+    /// The tool's answer for one action: a document, a check, or a render with its timeline.
+    async fn answer(
+        &self,
+        ws: &Workspace,
+        args: serde_json::Value,
+        pictures: super::TimelinePictures,
+    ) -> anyhow::Result<super::ToolOutput> {
+        let text = match super::get_str(&args, "action")? {
+            "instructions" => crate::prompt::load_prompt("tool/hyperframes_instructions.md"),
+            "reference" => Self::reference(&args)?,
+            "inspect" => self.inspect(ws, &args).await?,
+            "render" => return self.render(ws, &args, pictures).await,
+            other => anyhow::bail!(
+                "usage: unknown action {other:?} — hint: use one of {}",
+                ALL.join(", ")
+            ),
+        };
+        Ok(super::with_image_payload(self, text, ws, &args).await)
+    }
+
     /// `reference` — one deep document, fetched only when the agent asks for it.
     fn reference(args: &serde_json::Value) -> anyhow::Result<String> {
         let topic = super::get_str(args, "topic")?;
@@ -181,7 +203,12 @@ impl HyperframesTool {
 
     /// `render` — resolve both sides, hand the vendor one request, and answer the
     /// file it wrote.
-    async fn render(&self, ws: &Workspace, args: &serde_json::Value) -> anyhow::Result<String> {
+    async fn render(
+        &self,
+        ws: &Workspace,
+        args: &serde_json::Value,
+        pictures: super::TimelinePictures,
+    ) -> anyhow::Result<super::ToolOutput> {
         let requested = super::get_str(args, "composition")?;
         let format = format_arg(args)?;
         let quality = quality_arg(args)?;
@@ -230,7 +257,7 @@ impl HyperframesTool {
         // before the renderer started left, and any file it wrote that no player could open.
         let rendered = rendered.map_err(|reason| anyhow::anyhow!(reason))?;
         Ok(self
-            .rendered_result(&reserved.keep(), format, fps, rendered)
+            .rendered_result(&reserved.keep(), format, fps, rendered, pictures)
             .await)
     }
 
@@ -295,17 +322,19 @@ impl HyperframesTool {
     }
 
     /// The tool's answer for a file that was written: the marker, one sentence of facts from the
-    /// probe, then whatever notes the render earned. A file the probe could not read keeps the
-    /// marker and the notes; the facts are best-effort, the marker is not.
+    /// probe, whatever notes the render earned, then the clip's timeline and its pictures — a
+    /// render is the editing tools' output, so it goes down the same path as every other video.
+    /// A file the probe could not read keeps the marker and the notes; the facts are best-effort,
+    /// the marker is not.
     async fn rendered_result(
         &self,
         output: &Path,
         format: Format,
         fps: Option<&str>,
         rendered: Rendered,
-    ) -> String {
-        let marker = self.format_media_result(output);
-        let mut answer = marker;
+        pictures: super::TimelinePictures,
+    ) -> super::ToolOutput {
+        let mut prefix = self.format_media_result(output);
         if let Some(video) = rendered.info {
             let (width, height) = video.size;
             let mut sentence = format!(
@@ -322,13 +351,13 @@ impl HyperframesTool {
                     format.spelling().to_uppercase(),
                     super::listing::human_readable_size(meta.len())
                 );
-                let _ = write!(answer, "\n\n{sentence}");
+                let _ = write!(prefix, "\n\n{sentence}");
             }
         }
         if let Some(note) = rendered.notes {
-            let _ = write!(answer, "\n\n{note}");
+            let _ = write!(prefix, "\n\n{note}");
         }
-        answer
+        super::video_output(prefix, output, pictures).await
     }
 }
 

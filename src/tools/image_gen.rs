@@ -184,6 +184,7 @@ impl ImageGenTool {
             text: self.answer(&outcomes)?,
             image_payloads: self.payloads(&outcomes).await,
             text_is_content: true,
+            preserve_text: false,
         })
     }
 

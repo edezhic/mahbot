@@ -167,8 +167,10 @@ const ENROLLMENT_VAD_CONSECUTIVE_REQUIRED: usize = 1;
 static VAD_DETECTOR: OnceLock<std::sync::Mutex<earshot::Detector>> = OnceLock::new();
 
 /// Whether local transcription is disabled by config (`audio_transcription_use_local == "false"`).
-/// Nothing loads the recogniser while it is disabled, so no recording can be transcribed —
-/// callers must surface the configuration, not a loading state that cannot complete.
+/// Nothing a recording is *for* loads the recogniser while it is disabled, so no recording can be
+/// transcribed — callers must surface the configuration, not a loading state that cannot complete.
+/// A media read is the one exception: the sound labels come from the same engine, so it runs and
+/// the timeline leaves its words out ([`crate::media`]).
 #[must_use]
 pub fn is_transcription_disabled() -> bool {
     crate::config::CONFIG

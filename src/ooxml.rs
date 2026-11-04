@@ -67,9 +67,6 @@ const PPT_MODERN_AUTHORS_PART: &str = "ppt/authors.xml";
 /// as images, with the reason, because that is what they are.
 const EMBEDDED_EXTRA_IMAGE_EXTENSIONS: &[&str] =
     &["gif", "bmp", "dib", "tif", "tiff", "ico", "jfif"];
-/// Video extensions beyond the product's recognized ones ([`crate::util::VIDEO_EXTENSIONS`]):
-/// only a document's media directory carries these.
-const EMBEDDED_EXTRA_VIDEO_EXTENSIONS: &[&str] = &["m4v", "wmv", "mpg", "mpeg"];
 /// Extensions of the audio a package embeds.
 const EMBEDDED_AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "wav", "m4a", "aac", "ogg", "oga", "wma", "flac", "mid", "midi",
@@ -1007,9 +1004,7 @@ fn package_media(file_name: &str) -> PackageMedia {
         PackageMedia::Image
     } else if crate::util::has_extension(path, DRAWING_EXTENSIONS) {
         PackageMedia::Unshown(UnshownKind::Drawing)
-    } else if crate::util::is_video_extension(path)
-        || crate::util::has_extension(path, EMBEDDED_EXTRA_VIDEO_EXTENSIONS)
-    {
+    } else if crate::util::is_video_extension(path) {
         PackageMedia::Unshown(UnshownKind::Video)
     } else if crate::util::has_extension(path, EMBEDDED_AUDIO_EXTENSIONS) {
         PackageMedia::Unshown(UnshownKind::Audio)

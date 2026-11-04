@@ -30,8 +30,9 @@ impl Tool for VideoGenTool {
     }
 
     fn preserve_full_output(&self) -> bool {
-        // The result is the marker plus an LLM transcription capped at 2048 tokens/3-min that can
-        // exceed the 5 KB budget: the Assistant needs the full description.
+        // The result is the marker plus the clip's timeline — the frames as pictures of four with
+        // their marks, the speech with marks and text — which can exceed the 5 KB budget: the
+        // Assistant needs the whole timeline to reason about its own output.
         true
     }
 
@@ -83,6 +84,32 @@ impl Tool for VideoGenTool {
         ws: &crate::Workspace,
         args: serde_json::Value,
     ) -> anyhow::Result<String> {
+        let (marker, path) = self.generate(ws, args).await?;
+        Ok(
+            super::video_output(marker, &path, super::TimelinePictures::TextOnly)
+                .await
+                .text,
+        )
+    }
+
+    async fn execute_with_payloads(
+        &self,
+        ws: &crate::Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<crate::tools::ToolOutput> {
+        let (marker, path) = self.generate(ws, args).await?;
+        Ok(super::video_output(marker, &path, super::TimelinePictures::Attached).await)
+    }
+}
+
+impl VideoGenTool {
+    /// The job itself: submit, poll, download, save — answering the `[VIDEO:path]` marker and the
+    /// file it names, so the one run serves both the text-only and the payload-carrying answer.
+    async fn generate(
+        &self,
+        ws: &crate::Workspace,
+        args: serde_json::Value,
+    ) -> anyhow::Result<(String, std::path::PathBuf)> {
         let prompt = super::get_str(&args, "prompt")?;
 
         let user_name = crate::agent::tool_user_name();
@@ -140,10 +167,10 @@ impl Tool for VideoGenTool {
         let video_bytes =
             super::fetch_async_video(&api_base, &body, super::VideoJobLabels::GENERATION).await?;
 
-        // Save to the caller's output directory and format the media marker. The marker stays
-        // first; the transcription is appended (fail-open: marker-only on failure).
+        // Save to the caller's output directory and format the media marker; the caller appends
+        // the clip's own timeline.
         let output_path = super::save_generated_file(ws, &video_bytes, "video", "mp4").await?;
         let marker = self.format_media_result(&output_path);
-        Ok(super::format_video_result(marker, &output_path).await)
+        Ok((marker, output_path))
     }
 }

@@ -275,6 +275,7 @@ impl MessageContext {
             user_name: self.user_name,
             reply_target: self.reply_target,
             content,
+            display_content: None,
             channel: "telegram".to_string(),
             workspace: String::new(),
             optimistic_id: None,

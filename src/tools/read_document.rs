@@ -373,6 +373,7 @@ fn plain_answer(res: &super::read::ResolvedRead, reason: &str) -> ToolOutput {
         ),
         image_payloads: Vec::new(),
         text_is_content: true,
+        preserve_text: false,
     }
 }
 
@@ -559,6 +560,7 @@ async fn compose_output(
         text: compose(&text_block, listing),
         image_payloads: attached,
         text_is_content: true,
+        preserve_text: false,
     }
 }
 

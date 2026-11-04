@@ -1472,7 +1472,7 @@ mod tests {
     }
 
     fn injected_image() -> ChatMessage {
-        let marker = "data:image/png;base64,xxx".to_string();
+        let marker = format!("[IMAGE:{}]", "data:image/png;base64,xxx");
         ChatMessage::user(crate::util::injected_image_user_message(&[marker]))
     }
 

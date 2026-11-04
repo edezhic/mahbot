@@ -8,7 +8,10 @@ use std::time::Duration;
 use super::ClipInfo;
 
 /// The facts [`ClipInfo`] needs from one `-print_format json` document, or `None` when it
-/// describes no usable stream and no duration.
+/// describes no duration at all. A document with a duration and no stream is a container the
+/// product can read that holds neither a picture nor a sound track — a fact about the file, not a
+/// failure to read it. The file's own size is not in the document, so `bytes` is left zero for the
+/// probe to fill from the file.
 ///
 /// A corrupt or foreign file makes `ffprobe` print an empty object — sometimes with a zero exit
 /// status — so an empty answer is what "cannot be decoded" looks like here.
@@ -20,11 +23,21 @@ pub(super) fn parse(json: &[u8]) -> Option<ClipInfo> {
     let mut has_audio = false;
     let mut dimensions: Option<(u32, u32)> = None;
     let mut streamed: Option<f64> = None;
+    let mut pictured: Option<f64> = None;
+    let mut sounded: Option<f64> = None;
     for stream in streams {
         match stream["codec_type"].as_str() {
-            Some("audio") => has_audio = true,
+            Some("audio") => {
+                has_audio = true;
+                if let Some(seconds) = seconds(stream["duration"].as_str()) {
+                    sounded = Some(sounded.map_or(seconds, |longest| longest.max(seconds)));
+                }
+            }
             // Cover art rides in a video stream of its own; it is not the file's video.
             Some("video") if stream["disposition"]["attached_pic"].as_u64() != Some(1) => {
+                if let Some(seconds) = seconds(stream["duration"].as_str()) {
+                    pictured = Some(pictured.map_or(seconds, |longest| longest.max(seconds)));
+                }
                 if dimensions.is_none()
                     && let (Some(width), Some(height)) =
                         (side(&stream["width"]), side(&stream["height"]))
@@ -41,13 +54,20 @@ pub(super) fn parse(json: &[u8]) -> Option<ClipInfo> {
 
     let duration = seconds(document["format"]["duration"].as_str()).or(streamed)?;
     let duration = Duration::try_from_secs_f64(duration).ok()?;
-    if !has_audio && dimensions.is_none() {
-        return None;
-    }
+    // Either track can stop before its container does; the stream's own length is what says so.
+    let stream_length = |seconds: Option<f64>| {
+        seconds
+            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+            .map(|length| length.min(duration))
+    };
     Some(ClipInfo {
         duration,
         dimensions,
         has_audio,
+        picture: stream_length(pictured),
+        sound: stream_length(sounded),
+        // The file's own size is not in the JSON: the probe reads it from the file itself.
+        bytes: 0,
     })
 }
 
@@ -113,6 +133,8 @@ mod tests {
         assert_eq!(info.duration, Duration::from_millis(2008));
         assert_eq!(info.dimensions, Some((1280, 720)));
         assert!(info.has_audio);
+        // No stream declares a length: the container's is the only one there is.
+        assert_eq!(info.sound, None);
 
         // An audio file with embedded artwork: the picture rides in a video stream.
         let cover = r#"{
@@ -163,11 +185,31 @@ mod tests {
         assert_eq!(parse(b"{\n\n}"), None);
         assert_eq!(parse(b""), None);
         assert_eq!(parse(b"not json at all"), None);
-        assert_eq!(parse(br#"{"format": {"duration": "2.0"}}"#), None);
+        // A container it can time but that holds neither stream: a fact about the file, kept
+        // apart from a file it cannot read at all.
+        let empty = parse(br#"{"format": {"duration": "2.0"}}"#).expect("a timed container");
+        assert_eq!(empty.duration, Duration::from_secs(2));
+        assert_eq!(empty.dimensions, None);
+        assert!(!empty.has_audio);
         // A duration a `Duration` cannot hold: crafted media must not take the parse down.
         let absurd = br#"{"streams": [{"codec_type": "video", "width": 2, "height": 2}],
                           "format": {"duration": "1e30"}}"#;
         assert_eq!(parse(absurd), None, "a duration no Duration holds");
+    }
+
+    #[test]
+    fn a_stream_that_stops_early_reports_its_own_length() {
+        let document = br#"{
+            "streams": [
+                {"codec_type": "video", "width": 640, "height": 480, "duration": "5.000000"},
+                {"codec_type": "audio", "duration": "10.000000"}
+            ],
+            "format": {"duration": "40.000000"}
+        }"#;
+        let info = parse(document).expect("a readable container");
+        assert_eq!(info.duration, Duration::from_secs(40));
+        assert_eq!(info.sound, Some(Duration::from_secs(10)));
+        assert_eq!(info.picture, Some(Duration::from_secs(5)));
     }
 
     #[test]

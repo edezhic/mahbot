@@ -55,6 +55,9 @@ pub(crate) mod reader_output;
 
 // The product's own ffmpeg and ffprobe, never the owner's copy, for probing and frames.
 pub mod ffmpeg;
+// What a video or a recording says: frames as pictures of four, a timestamped transcript, sound
+// labels, and the one timeline a model reads them as.
+pub(crate) mod media;
 // HyperFrames, the HTML renderer: installed by the managed bun, run with its own browser.
 pub mod hyperframes;
 
@@ -448,6 +451,10 @@ pub struct ChannelMessage {
     pub user_name: String,
     pub reply_target: String,
     pub content: String,
+    /// What the owner's own bubble shows, when it differs from [`content`](Self::content): a
+    /// video's timeline reaches the model with its pictures as ordinary `[IMAGE:]` markers, and
+    /// the bubble shows the same timeline without the pictures. `None` means the two are the same.
+    pub display_content: Option<String>,
     /// The channel this message originated from (e.g. `"telegram"`, `"gui"`).
     pub channel: String,
     pub workspace: String,
@@ -1317,7 +1324,10 @@ pub(crate) trait Tool: Send + Sync {
     /// Format tool results for embedding into the conversation history (native tool-call
     /// mode and degraded text mode alike). The default is head+tail truncation via
     /// [`crate::util::truncate_tool_output`] (a ~5 KB trigger, with the omission marker
-    /// additional to it); override to summarize more smartly.
+    /// additional to it); override to summarize more smartly. A tool whose every answer must be
+    /// kept whole says so with [`Tool::preserve_full_output`]; one call whose answer must not be
+    /// cut — a media timeline — says so on its own
+    /// [`crate::tools::ToolOutput::preserve_text`].
     fn format_output(&self, output: &str) -> String {
         if self.preserve_full_output() {
             output.to_string()
@@ -1511,8 +1521,8 @@ pub(crate) const DEFAULT_MAX_TOKENS: u32 = 32_000;
 #[derive(Debug, Clone)]
 pub(crate) struct ChatRequestMeta {
     /// Purpose tag: "agent" (agent loop incl. direct chat / discovery / sub-agents /
-    /// maintainer), "extraction", "summarize", "consolidate", "research_wrap_up",
-    /// "media_transcription"; "agent-continuation" / "summarize-continuation" tag the
+    /// maintainer), "extraction", "summarize", "consolidate", "research_wrap_up";
+    /// "agent-continuation" / "summarize-continuation" tag the
     /// operation-level reasoning-only-stop recovery issued by
     /// [`crate::agent::Agent::recover_reasoning_only_stop`] — one row per continuation
     /// operation, with `retry_attempts` carrying the attempt count.

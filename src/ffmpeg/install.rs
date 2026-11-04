@@ -116,12 +116,28 @@ pub(crate) struct Binaries {
     pub(crate) ffprobe: PathBuf,
 }
 
+/// Test hook: the install root, so a check never writes into the developer's own `~/.mahbot/ffmpeg`.
+#[cfg(test)]
+pub(super) const ROOT_ENV: &str = "MAHBOT_FFMPEG_ROOT";
+
 /// One subdirectory per tag inside the product's configuration directory — never the
-/// daemon's swept temp root, never a package-manager directory.
+/// daemon's swept temp root, never a package-manager directory. A test run's root is the test
+/// root unless the check named its own: `cargo test` must never install into a live product.
+#[cfg_attr(
+    test,
+    expect(clippy::unnecessary_wraps, reason = "the test root always resolves")
+)]
 fn root() -> Result<PathBuf, String> {
-    crate::config::default_config_dir()
-        .map(|dir| dir.join("ffmpeg"))
-        .map_err(|_| "the product's configuration directory is unavailable".to_string())
+    #[cfg(test)]
+    let dir = std::env::var_os(ROOT_ENV).map_or_else(
+        || crate::util::test::test_root().join("ffmpeg"),
+        PathBuf::from,
+    );
+    #[cfg(not(test))]
+    let dir = crate::config::default_config_dir()
+        .map_err(|_| "the product's configuration directory is unavailable".to_string())?
+        .join("ffmpeg");
+    Ok(dir)
 }
 
 /// The newest usable copy under `root` by (upstream version, build revision). A
@@ -307,6 +323,13 @@ fn recorded(reason: String) -> String {
     reason
 }
 
+/// Forget the one failed attempt this process remembers: a test that points the stream at its own
+/// host must not inherit an earlier test's failure.
+#[cfg(test)]
+pub(super) fn forget_failed_attempt() {
+    *ATTEMPT_FAILURE.lock().unwrap_poison() = None;
+}
+
 /// The highest (upstream version, build revision) among the releases carrying this
 /// platform's archive.
 ///
@@ -416,11 +439,18 @@ async fn install(root: &Path, build: &Build) -> Result<(), String> {
 
 /// The repository's `releases/download` for the assets, its API `releases` for the
 /// listing, or the test hook's stand-in answering both.
+#[cfg_attr(
+    test,
+    expect(unused_variables, reason = "the test default names no host or path")
+)]
 fn stream_url(host: &str, path: &str) -> String {
-    match std::env::var(RELEASES_URL_ENV) {
-        Ok(base) => base.trim_end_matches('/').to_string(),
-        Err(_) => format!("{host}/{}/{path}", managed_bin::release_repo()),
-    }
+    #[cfg(not(test))]
+    let default = format!("{host}/{}/{path}", managed_bin::release_repo());
+    // A test run never fetches a release: with no hook set, the base is a host nothing answers
+    // on, so an install fails at once with the reason instead of reaching the network.
+    #[cfg(test)]
+    let default = "http://127.0.0.1:1".to_string();
+    std::env::var(RELEASES_URL_ENV).map_or(default, |base| base.trim_end_matches('/').to_string())
 }
 
 /// The two binaries under `bin/`, the licence material at the root — the layout [`binaries_at`]
@@ -1125,14 +1155,14 @@ mod tests {
         Some(head.lines().next()?.split_whitespace().nth(1)?.to_string())
     }
 
-    /// A throwaway install root — `$HOME/.mahbot/ffmpeg` — with `HOME` relocated while the
-    /// guard lives.
+    /// A throwaway install root with the check's own override pointing at it while the guard
+    /// lives.
     #[cfg(unix)]
     fn temp_root() -> (tempfile::TempDir, crate::util::test::EnvVarGuard, PathBuf) {
-        let home = tempfile::tempdir().expect("temp home");
-        let guard = crate::util::test::set_env_var("HOME", home.path().to_str());
-        let root = root().expect("the install root resolves under the temp home");
-        (home, guard, root)
+        let dir = tempfile::tempdir().expect("temp install root");
+        let guard = crate::util::test::set_env_var(ROOT_ENV, dir.path().to_str());
+        let root = root().expect("the install root resolves under the temp root");
+        (dir, guard, root)
     }
 
     /// The newest build this host has an archive for is installed, a following start has

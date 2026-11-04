@@ -2529,6 +2529,7 @@ fn test_msg(user_name: &str, content: &str, channel: &str, reply_target: &str) -
         user_name: user_name.to_string(),
         reply_target: reply_target.to_string(),
         content: content.to_string(),
+        display_content: None,
         channel: channel.to_string(),
         workspace: "test".to_string(),
         optimistic_id: None,

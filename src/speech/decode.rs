@@ -6,7 +6,8 @@
 //! one table of that rule — the decoder dispatches through it, [`takes_audio`]
 //! accepts a file by it and a caller's refusal lists it — so a format can never be
 //! taken by one and refused by another. A file under a name outside the table is
-//! taken when its bytes begin with OGG's magic.
+//! taken when its bytes begin with OGG's magic. This is the in-process decoder's table;
+//! what the managed ffmpeg reads as a sound track is `crate::util::AUDIO_EXTENSIONS`.
 
 use anyhow::{Context as _, Result, bail};
 use std::path::Path;
@@ -48,7 +49,8 @@ pub(crate) fn takes_audio(path: &Path) -> std::io::Result<bool> {
     Ok(std::io::Read::read_exact(&mut file, &mut magic).is_ok_and(|()| magic == *b"OggS"))
 }
 
-/// Decode any supported file to mono f32 at its own sample rate.
+/// Decode any supported file to mono f32 at its own sample rate. A file that declares its format
+/// but holds no frames decodes to nothing: silence is not a failure to read it.
 pub(crate) fn decode_audio_to_mono_f32(path: &Path) -> Result<(Vec<f32>, u32)> {
     let format = format_for(path);
 
@@ -134,8 +136,11 @@ fn decode_wav(data: &[u8], path: &Path) -> Result<(Vec<f32>, u32)> {
         );
     }
     let frames = len / (width * usize::from(channels));
+    // A WAV whose data chunk holds no frames is a valid file holding no sound — a piece cut past
+    // the end of the track is exactly that — so it decodes to nothing rather than failing the
+    // recording it was cut from.
     if frames == 0 {
-        bail!("{} holds no audio", path.display());
+        return Ok((Vec::new(), rate));
     }
     let channels = usize::from(channels);
     let mut samples = Vec::with_capacity(frames);
@@ -353,6 +358,19 @@ mod tests {
             assert_eq!(read, rate, "{bits}-bit format {format}");
             assert_eq!(samples.len(), 400);
         }
+    }
+
+    #[test]
+    fn a_wav_with_no_frames_decodes_to_nothing() {
+        // What ffmpeg writes for a piece cut past the end of the sound: a valid WAV whose data
+        // chunk is empty. It holds no sound, which is not a failure to read it.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("a.wav");
+        std::fs::write(&path, wav(16, 1, 1, 16_000, 0)).expect("a wav");
+        let (samples, rate) =
+            decode_audio_to_mono_f32(&path).expect("an empty wav is not an error");
+        assert!(samples.is_empty());
+        assert_eq!(rate, 16_000);
     }
 
     #[test]
