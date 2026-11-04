@@ -1049,9 +1049,11 @@ async fn consumer_loop(
             continue;
         };
 
-        // Sleep-ended turn: the Assistant deliberately went silent — deliver nothing (no
-        // empty bubble, no emoji), but still confirm the at-least-once pending-jobs boundary.
-        if agent.sleep_ended {
+        // A turn that delivers nothing: a sleep ended it deliberately, or an urgent message
+        // cut it — the phrase is in the session, the chat and every bound channel get nothing
+        // (no empty bubble, no emoji). The at-least-once pending-jobs boundary is still
+        // confirmed.
+        if agent.sleep_ended || agent.turn_state.interrupted {
             confirm_turn_delivery(&queued).await;
             confirm_pending_delivery(&job).await;
             continue;

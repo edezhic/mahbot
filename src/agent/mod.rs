@@ -202,10 +202,10 @@ pub(crate) const RETRY_EXHAUSTION_MARKER: &str = "exhausted retry budget";
 /// the compaction is abandoned exactly as before: full history kept, owner not disturbed.
 const SUMMARIZE_ATTEMPTS: u32 = 3;
 
-/// The interrupted turn's whole reply, delivered on the urgent message's surface
-/// and recorded, so both sides see the turn was cut short instead of answered.
-const URGENT_INTERRUPT_NOTICE: &str =
-    "⏹️ Interrupted: an urgent message arrived, so I stopped that turn.";
+/// The interrupted turn's whole entry in the session — the only place the interruption is
+/// recorded. The chat and every bound channel get nothing: the turn simply ends, and the
+/// urgent message is answered as the next turn.
+const URGENT_INTERRUPT_ENTRY: &str = "interrupted by the user";
 
 /// The result a call the urgent interrupt cut is settled with: an ordinary tool
 /// result — not a failure — claiming no knowledge of the call's effect.
@@ -1200,11 +1200,11 @@ impl Agent {
             // the current group completes and no new LLM call starts. The round resumes at
             // boot from the job row.
             Self::bail_on_shutdown()?;
-            // Urgent-message interrupt: not a cancellation — the turn ends with its notice
-            // as its reply, every result already committed. Checked after shutdown/drain
-            // (their priority is unchanged) and before another model call.
+            // Urgent-message interrupt: not a cancellation — the turn ends here, every
+            // result already committed, with the phrase as its only session entry. Checked
+            // after shutdown/drain (their priority is unchanged) and before another model call.
             if self.interrupt_token.is_cancelled() {
-                return Ok(self.notice_interruption());
+                return Ok(self.end_interrupted_turn());
             }
             if tool_rounds >= MAX_TOOL_ROUNDS {
                 anyhow::bail!(
@@ -1225,7 +1225,7 @@ impl Agent {
             let interrupt = self.interrupt_token.clone();
             let llm_result = tokio::select! {
                 biased;
-                () = interrupt.cancelled() => return Ok(self.notice_interruption()),
+                () = interrupt.cancelled() => return Ok(self.end_interrupted_turn()),
                 result = self.llm_call() => result,
             };
             if tool_rounds == 0
@@ -1344,24 +1344,26 @@ impl Agent {
                 return Ok(String::new());
             }
 
-            // The cut round's results are committed, so the interruption is answered
-            // by its notice instead of another round. A successful sleep returned
-            // above: that round concluded inside its only call, so nothing was cut.
+            // The cut round's results are committed, so the interruption ends the turn here
+            // instead of another round. A successful sleep returned above: that round
+            // concluded inside its only call, so nothing was cut.
             if cut || self.interrupt_token.is_cancelled() {
-                return Ok(self.notice_interruption());
+                return Ok(self.end_interrupted_turn());
             }
 
             tool_rounds += 1;
         }
     }
 
-    /// End this turn on an urgent-message interrupt: record the notice as the turn's
-    /// reply and hand it back for delivery on the urgent message's surface. The
-    /// interrupted answer is abandoned — nothing of it is delivered later.
-    fn notice_interruption(&mut self) -> String {
+    /// End this turn on an urgent-message interrupt: record the phrase as the session entry
+    /// and hand back an empty reply. [`TurnState::interrupted`] keeps the router from
+    /// delivering anything — no chat row, no channel message. The interrupted answer is
+    /// abandoned: nothing of it is delivered later.
+    fn end_interrupted_turn(&mut self) -> String {
         self.session
-            .push_assistant(URGENT_INTERRUPT_NOTICE.to_string());
-        URGENT_INTERRUPT_NOTICE.to_string()
+            .push_assistant(URGENT_INTERRUPT_ENTRY.to_string());
+        self.turn_state.interrupted = true;
+        String::new()
     }
 
     /// Execute a batch of tool calls respecting side-effect ordering: read-only
@@ -6426,11 +6428,12 @@ mod tests {
     }
 
     /// A turn cut by an urgent message: the returned call keeps its result, the in-flight
-    /// one settles with the fixed interrupted result, nothing is replayed, and the notice
-    /// is the whole reply — not a failure, not a cancellation.
+    /// one settles with the fixed interrupted result, nothing is replayed, and the phrase is
+    /// the session's whole record of the interruption — the reply is empty, not a failure,
+    /// not a cancellation.
     #[tokio::test]
     #[serial_test::serial(provider, drain)]
-    async fn urgent_interrupt_settles_the_cut_round_with_the_notice() {
+    async fn urgent_interrupt_records_the_phrase_and_returns_no_reply() {
         crate::util::test::init_test_stores().await;
         let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let fake = std::sync::Arc::new(FakeProvider::new().ok_text_and_tool_calls(
@@ -6470,8 +6473,12 @@ mod tests {
         let (agent, answer) = turn.await.expect("the turn task must not panic");
         assert_eq!(
             answer.expect("an interrupted turn is not a failure"),
-            URGENT_INTERRUPT_NOTICE,
-            "the notice is the whole reply of the turn the cut abandoned"
+            "",
+            "the turn hands back no reply: nothing is delivered"
+        );
+        assert!(
+            agent.turn_state.interrupted,
+            "the router must skip delivery for this turn"
         );
         assert!(
             !agent.cancel_token.is_cancelled(),
@@ -6502,8 +6509,8 @@ mod tests {
         );
         assert_eq!(
             history.last().map(|message| message.content.as_str()),
-            Some(URGENT_INTERRUPT_NOTICE),
-            "the notice is recorded in the conversation"
+            Some("interrupted by the user"),
+            "the phrase is the session's whole record of the interruption"
         );
         assert!(
             agent.session.pending_tool_frame().is_none(),

@@ -830,15 +830,17 @@ pub(crate) struct ToolCallRecord {
     pub error_message: Option<String>,
 }
 
-/// The per-turn verdict the post-delivery summarization gate reads:
-/// [`Agent::work`] fills `settled_tool_results` (and reads it for its own pre-turn
-/// gate), then the per-session consumer loop reads it once the reply is delivered
-/// (see [`crate::agent::Agent::maybe_summarize_after_delivery`]).
+/// The per-turn state the consumer loop and the post-delivery summarization gate read:
+/// [`Agent::work`] fills it, then the per-session consumer loop reads it once the turn is
+/// over (see [`crate::agent::Agent::maybe_summarize_after_delivery`]).
 #[derive(Default)]
 pub(crate) struct TurnState {
     /// The turn settled previously dangling tool results — the trail a resume is
     /// recovered from, which a compaction's retention window would drop.
     pub(crate) settled_tool_results: bool,
+    /// An urgent message cut the turn: its session entry is the phrase alone, and the
+    /// consumer loop delivers nothing — no chat row, no channel message.
+    pub(crate) interrupted: bool,
 }
 
 /// How a failed agent run was classified when it failed — the snapshot kept on
@@ -935,7 +937,7 @@ pub struct Agent {
     /// the folder's baseline — its changes stay pending for the next recorded message.
     /// Read by [`crate::agent::run_agent`], set in [`crate::Agent::work`].
     pub(crate) turn_recorded: bool,
-    /// Per-turn state the post-delivery gate reads — see [`TurnState`].
+    /// Per-turn state the consumer loop and the post-delivery gate read — see [`TurnState`].
     pub(crate) turn_state: TurnState,
     /// Background shell sessions (Full shell roles only), force-killed on teardown
     /// ([`Drop`]) — see [`crate::tools::shell::BackgroundSessions`]. Reachable from the
@@ -943,7 +945,7 @@ pub struct Agent {
     background_sessions: std::sync::Arc<crate::tools::shell::BackgroundSessions>,
     /// Fired by [`crate::agent::registry::AgentRegistry::interrupt`] on an urgent user
     /// message: the turn is cut where it stands — a pending model request or tool call
-    /// is dropped — and ends with its interruption notice instead of an answer. Never a
+    /// is dropped — and ends with [`TurnState::interrupted`] set instead of an answer. Never a
     /// cancellation: [`Self::cancel_token`] is untouched, so the turn still settles its
     /// tool results and finalizes its session. One token per turn, so an urgent message
     /// interrupts at most the turn it cuts.
