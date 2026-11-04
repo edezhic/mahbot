@@ -119,7 +119,7 @@ pub async fn run_maintainer_loop() {
                     return false;
                 }
                 if ws.status != WorkspaceStatus::Ready {
-                    info!(workspace = %ws.name, status = %ws.status, "Maintainer: skipping — workspace not ready");
+                    debug!(workspace = %ws.name, status = %ws.status, "Maintainer: skipping — workspace not ready");
                     return false;
                 }
                 true
@@ -441,7 +441,7 @@ async fn is_maintainer_pipeline_full(ws: &Workspace) -> bool {
     };
 
     if pre_dev_count >= MAX_PRE_DEV_TICKETS {
-        info!(
+        debug!(
             workspace = %ws.name,
             pre_dev = pre_dev_count,
             "Maintainer: skipping — pre-development pipeline has >= {} tickets",
