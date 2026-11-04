@@ -408,53 +408,57 @@ debug = false
 # default opt-level 0 would make the ASR model noticeably slower. Deliberately
 # under `profile.dev`, not `profile.test`: `[profile.test]` inherits `dev`, so
 # test builds share the same optimized artifacts instead of fingerprinting a
-# second copy. Inert on a target where the package is not in the graph.
+# second copy.
 #
-# The RLX entries are every `rlx-*` crate the inference crate's graph resolves to
-# (`cargo tree -p mahbot-inference | grep -o 'rlx-[a-z-]*'`): a new one is added here
-# when it appears, or it silently runs unoptimized in dev.
+# The keys are the package names the inference crate's graph resolves to:
+#   cargo tree -p mahbot-inference --prefix none | awk '{print $1}' | grep '^mahbot-rlx' | sort -u
+# Anchored to the package-name column, so the sibling checkout's directory path
+# cannot contribute a name. A family package missing here runs unoptimized in
+# dev; a stale key costs a warning on every build.
 [profile.dev.package.mahbot-inference]
 opt-level = 3
 
-[profile.dev.package.rlx-autodiff]
+[profile.dev.package.mahbot-rlx-autodiff]
 opt-level = 3
-[profile.dev.package.rlx-compile]
+[profile.dev.package.mahbot-rlx-compile]
 opt-level = 3
-[profile.dev.package.rlx-cpu]
+[profile.dev.package.mahbot-rlx-cpu]
 opt-level = 3
-[profile.dev.package.rlx-dduf]
+[profile.dev.package.mahbot-rlx-dduf]
 opt-level = 3
-[profile.dev.package.rlx-driver]
+[profile.dev.package.mahbot-rlx-driver]
 opt-level = 3
-[profile.dev.package.rlx-flow]
+[profile.dev.package.mahbot-rlx-flow]
 opt-level = 3
-[profile.dev.package.rlx-fusion]
+[profile.dev.package.mahbot-rlx-fusion]
 opt-level = 3
-[profile.dev.package.rlx-gguf]
+[profile.dev.package.mahbot-rlx-gguf]
 opt-level = 3
-[profile.dev.package.rlx-gpu-dispatch]
+[profile.dev.package.mahbot-rlx-gpu-dispatch]
 opt-level = 3
-[profile.dev.package.rlx-gpu-host]
+[profile.dev.package.mahbot-rlx-gpu-host]
 opt-level = 3
-[profile.dev.package.rlx-ir]
+[profile.dev.package.mahbot-rlx-ir]
 opt-level = 3
-[profile.dev.package.rlx-macros]
+[profile.dev.package.mahbot-rlx-macros]
 opt-level = 3
-[profile.dev.package.rlx-mlx-io]
+[profile.dev.package.mahbot-rlx-mlx-io]
 opt-level = 3
-[profile.dev.package.rlx-nemo]
+[profile.dev.package.mahbot-rlx-nemo]
 opt-level = 3
-[profile.dev.package.rlx-opt]
+[profile.dev.package.mahbot-rlx-opt]
 opt-level = 3
-[profile.dev.package.rlx-pkg]
+[profile.dev.package.mahbot-rlx-pkg]
 opt-level = 3
-[profile.dev.package.rlx-runtime]
+[profile.dev.package.mahbot-rlx-runtime]
 opt-level = 3
-[profile.dev.package.rlx-torch-ckpt]
+[profile.dev.package.mahbot-rlx-torch-ckpt]
 opt-level = 3
-[profile.dev.package.rlx-unfuse]
+[profile.dev.package.mahbot-rlx-unfuse]
 opt-level = 3
-[profile.dev.package.rlx-wgpu]
+[profile.dev.package.mahbot-rlx-wgpu]
+opt-level = 3
+[profile.dev.package.mahbot-rlxsl]
 opt-level = 3
 
 [profile.dev.build-override]
