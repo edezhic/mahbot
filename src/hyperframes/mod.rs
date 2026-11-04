@@ -8,21 +8,30 @@
 //! shebang and would start a real Node, which the product never installs. The renderer gets the
 //! product's own tools instead of the host's: its Chrome for Testing headless shell ([`browser`],
 //! downloaded once on the first render) and the product's ffmpeg/ffprobe pair ([`crate::ffmpeg`]),
-//! each by absolute path. Telemetry is off on both channels the vendor honours, the vendor's skill
-//! tree is never installed or registered, and its update machinery is left alone since the
-//! start-time task keeps a copy current ([`install`]). Only `render` and `lint` are reachable, so
-//! no vendor subcommand can reach the host through this module. Rendered pages do reach the network
-//! — a CDN script, a web font, a remote image is fetched while the composition loads — and nothing
-//! blocks that: it is the page's own traffic. Every run gets the product's install directory as its
-//! working directory, never the owner's workspace: bun would load `<cwd>/.env` and
-//! `<cwd>/bunfig.toml` from it otherwise, and the vendor reads `<cwd>/.env` itself. A composition
-//! is always an absolute path. A render has no wall-clock ceiling: its length is the composition's.
-//! The memory watchdog, capture bounds and leftover policy every other run is held to still apply
-//! ([`crate::tools::shell`]). A render's verdict is its artifact: a file the product's own ffprobe
-//! reads is the result — whatever the exit status, output size or printed envelope — and a run that
-//! wrote no such file is a failure carrying the renderer's diagnosis. What the product or the
-//! renderer had to say afterwards (a stop, a bad end, a failed cleanup, an unanswerable probe) is
-//! passed on as a note beside it, so none of it costs the agent a video.
+//! each by absolute path. A render switches the renderer's fast-capture path off with the vendor's
+//! `--experimental-fast-capture=false`: that path draws the composition into a canvas, and from
+//! Chrome 155 the canvas must be marked `content="drawable"` where the renderer still writes the old
+//! `layoutsubtree` attribute. Its check only asks whether `drawElementImage` exists — which it does
+//! — so the path engages and dies mid-capture instead of falling back to screenshots. The lever is a
+//! flag, not the vendor's environment variable, so a release that stops honouring it brings the
+//! capture path back and the render fails visibly, rather than the product silently drifting onto a
+//! path that cannot work here. Screenshot capture costs render time and nothing else; the
+//! optimisation can return when the renderer emits the current form of the canvas markup.
+//! Telemetry is off on both channels the vendor honours, the vendor's skill tree is never installed
+//! or registered, and its update machinery is left alone since the start-time task keeps a copy
+//! current ([`install`]). Only `render` and `lint` are reachable, so no vendor subcommand can reach
+//! the host through this module. Rendered pages do reach the network — a CDN script, a web font, a
+//! remote image is fetched while the composition loads — and nothing blocks that: it is the page's
+//! own traffic. Every run gets the product's install directory as its working directory, never the
+//! owner's workspace: bun would load `<cwd>/.env` and `<cwd>/bunfig.toml` from it otherwise, and the
+//! vendor reads `<cwd>/.env` itself. A composition is always an absolute path. A render has no
+//! wall-clock ceiling: its length is the composition's. The memory watchdog, capture bounds and
+//! leftover policy every other run is held to still apply ([`crate::tools::shell`]). A render's
+//! verdict is its artifact: a file the product's own ffprobe reads is the result — whatever the exit
+//! status, output size or printed envelope — and a run that wrote no such file is a failure carrying
+//! the renderer's diagnosis. What the product or the renderer had to say afterwards (a stop, a bad
+//! end, a failed cleanup, an unanswerable probe) is passed on as a note beside it, so none of it
+//! costs the agent a video.
 
 mod browser;
 mod install;
@@ -323,6 +332,9 @@ pub(crate) async fn render(request: RenderRequest<'_>) -> Result<Rendered, Strin
         args.push("--resolution".to_string());
         args.push(resolution.to_string());
     }
+    // The capture path this browser cannot run; a flag, not an environment variable, so a release
+    // that drops it fails the render instead of quietly restoring that path (see the module docs).
+    args.push("--experimental-fast-capture=false".to_string());
     args.push("--json".to_string());
 
     let outcome = run(&runtime.bun, &args, &runtime.extra, None).await?;
