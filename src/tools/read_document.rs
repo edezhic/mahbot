@@ -1,11 +1,12 @@
 //! Document reads: what the shared converter ([`crate::document`]) extracts from
 //! is converted here and delivered two ways from ONE reading — the read tool's
 //! (extracted text inlined, or spilled when it does not fit the tool output
-//! budget, extracted rasters attached as images) and the command line's (the
-//! whole text and every raster written into a folder of their own). Detection,
-//! conversion, scrubbing and the reader's wording are shared; only the delivery
-//! is the caller's own — how many images it hands over, and the command line's
-//! lack of any length limit.
+//! budget, at most [`crate::document::MAX_READ_PICTURES`] extracted pictures
+//! attached as images) and the command line's (the whole text and every raster
+//! written into a folder of their own). Detection, conversion, scrubbing and the
+//! reader's wording are shared; only the delivery is the caller's own — the read
+//! tool attaches a bounded number of pictures and reports the rest, and the
+//! command line has no length limit at all.
 //!
 //! The read tool's artifacts (a page raster, an embedded image, a spilled text
 //! body) are per-call intermediates in a uniquely named `read_<nonce>` directory,
@@ -27,12 +28,6 @@ use crate::tools::path::PathAccess;
 use crate::tools::{ImagePayload, ImagePayloadSource, ToolOutput};
 use anyhow::Context;
 use std::path::{Path, PathBuf};
-
-/// Maximum converted images attached as native images in one call: a many-page
-/// scan must not flood the conversation or a provider's per-request image cap.
-/// Over it the paths are the delivery — or the folder holding them, when the
-/// listing would not fit the answer.
-const MAX_INJECTED_IMAGES: usize = 5;
 
 /// Bytes read from the head of the file for the format sniff: every arm of
 /// [`crate::document::needs_extraction`] is magic-local, and a CFB container —
@@ -248,12 +243,12 @@ async fn write_command_line_reading(
     // Every image is written, so every one was delivered — the basis the
     // reader's no-text sentence names images on. The ordinary read of an empty
     // file produces an empty body, and that empty answer is the reader's own.
-    let images_delivered = !reading.images.is_empty();
+    let images_complete = !reading.images.is_empty();
     let mut report = Vec::new();
     if is_document && reading.text.is_empty() && !reading.all_page_text_lost {
-        report.push(no_text_line(&display, images_delivered));
+        report.push(no_text_line(&display, images_complete));
     }
-    report.extend(reading_notes(&display, &reading, images_delivered));
+    report.extend(reading_notes(&display, &reading, images_complete));
 
     let answer = if produced.is_empty() {
         // Nothing was written: the folder goes away and the reader's own words
@@ -328,28 +323,17 @@ async fn ordinary_reading(res: &super::read::ResolvedRead) -> anyhow::Result<Con
     })
 }
 
-/// The reader's no-text sentence: the one naming images only when an image was
-/// actually delivered.
-fn no_text_line(display: &str, images_delivered: bool) -> String {
-    answer_line(
-        display,
-        if images_delivered {
-            crate::document::NO_TEXT_LAYER_NOTE
-        } else {
-            crate::document::NO_TEXT_NOTE
-        },
-    )
+/// The reader's no-text sentence: the one naming images only when every picture
+/// the reading produced was actually delivered.
+fn no_text_line(display: &str, images_complete: bool) -> String {
+    answer_line(display, crate::document::no_text_note(images_complete))
 }
 
 /// The reader's own notes for one reading, in its order: what the reading found
 /// and did not show, its own notes, then — when no page produced text — the
 /// no-text sentence. Empty when every page's text was lost: the notes already say
 /// so, and "no text" would report a reader failure as a document with none.
-fn reading_notes(
-    display: &str,
-    reading: &ConvertedDocument,
-    images_delivered: bool,
-) -> Vec<String> {
+fn reading_notes(display: &str, reading: &ConvertedDocument, images_complete: bool) -> Vec<String> {
     let mut notes: Vec<String> = reading
         .unshown
         .lines()
@@ -358,7 +342,7 @@ fn reading_notes(
         .map(|body| answer_line(display, body))
         .collect();
     if !reading.page_text && !reading.all_page_text_lost && !reading.text.is_empty() {
-        notes.push(no_text_line(display, images_delivered));
+        notes.push(no_text_line(display, images_complete));
     }
     notes
 }
@@ -421,15 +405,12 @@ async fn peek_head(path: &Path) -> Option<Vec<u8>> {
     Some(head[..filled].to_vec())
 }
 
-/// The payloads a reading's rasters became, and how many could not be encoded.
-/// Over the per-call cap nothing is attached; an image that cannot be encoded is
-/// counted rather than failing the call, because the document itself was read.
+/// The payloads a reading's pictures became, and how many could not be encoded.
+/// An image that cannot be encoded is counted rather than failing the call,
+/// because the document itself was read.
 async fn attach_images(images: &[PathBuf]) -> (Vec<ImagePayload>, usize) {
     let mut attached = Vec::new();
     let mut unattached = 0usize;
-    if images.len() > MAX_INJECTED_IMAGES {
-        return (attached, unattached);
-    }
     // The payloads carry no recovery note: a document answer is content, so its
     // text block already opens with that note and repeating it on every image
     // annotation would say the same thing 1+N times.
@@ -456,16 +437,21 @@ async fn attach_images(images: &[PathBuf]) -> (Vec<ImagePayload>, usize) {
     (attached, unattached)
 }
 
-/// Turn a converted reading into the read tool's result: attach the rasters when
-/// there are few enough, and say what was delivered and what the reading did not show.
+/// Turn a converted reading into the read tool's result: attach the pictures
+/// [`crate::document::MAX_READ_PICTURES`] allows, and say what was delivered and
+/// what the reading did not show.
 async fn compose_output(
     res: &super::read::ResolvedRead,
     dir: &Path,
     reading: ConvertedDocument,
 ) -> ToolOutput {
     let display = res.path.display().to_string();
-    let over_cap = reading.images.len() > MAX_INJECTED_IMAGES;
-    let (attached, unattached) = attach_images(&reading.images).await;
+    let (pictures, left_out) = crate::document::attachable_pictures(&reading.images);
+    let (attached, unattached) = attach_images(pictures).await;
+    // "The content was provided as images" is only true when every picture the
+    // reading produced is attached; with some left out, the plain sentence plus
+    // the limit's own note say what actually happened.
+    let images_complete = !attached.is_empty() && left_out == 0;
 
     let mut text_block = if reading.text.is_empty() {
         // The reader failed on every page it was asked for: the notes below name
@@ -474,10 +460,7 @@ async fn compose_output(
         if reading.all_page_text_lost {
             String::new()
         } else {
-            // The plain sentence is the honest one unless an image was actually
-            // attached: none produced, all over the cap, and none encodable all
-            // read the same way.
-            no_text_line(&display, !attached.is_empty())
+            no_text_line(&display, images_complete)
         }
     } else {
         format!(
@@ -486,7 +469,13 @@ async fn compose_output(
             reading.text
         )
     };
-    let mut trailing = reading_notes(&display, &reading, !attached.is_empty());
+    let mut trailing = reading_notes(&display, &reading, images_complete);
+    if left_out > 0 {
+        trailing.push(answer_line(
+            &display,
+            crate::document::left_out_pictures_note(reading.images.len(), left_out),
+        ));
+    }
     if unattached > 0 {
         // Not the inbound sentence ("could not be read"): there the image
         // pipeline rejected an image it was handed, here the image could not be
@@ -499,65 +488,31 @@ async fn compose_output(
             ),
         ));
     }
-    // Paths are preferred and stay unenclosed so they can be copied straight into
-    // another call; the folder line is the fallback when they would not fit.
-    let (full_listing, folder_listing) = if over_cap {
-        let head = format!(
-            "[{display}: {} extracted image(s) were not attached ({MAX_INJECTED_IMAGES} is the per-call limit);",
-            reading.images.len()
-        );
-        let mut listing = vec![format!("{head} read them individually as images:]")];
-        listing.extend(
-            reading
-                .images
-                .iter()
-                .map(|image| image.display().to_string()),
-        );
-        let folder = vec![format!(
-            "{head} they are all in {} — list that folder, then read the images you need.]",
-            dir.display()
-        )];
-        (listing, folder)
-    } else {
-        (Vec::new(), Vec::new())
-    };
 
     // The whole answer — text block and recovery note included — must fit the
     // shared tool output budget, or `format_output` truncates it mid-answer. (The
     // per-image annotations the agent loop appends afterwards are outside this
-    // budget; they are bounded by the per-call image cap.) Candidates, in order:
-    // the paths (never a partial listing — the formatter would drop paths from
-    // its middle), the folder line, then both again with the text spilled.
-    let compose = |text_block: &str, listing: &[String]| {
-        let mut lines: Vec<&str> = Vec::with_capacity(2 + trailing.len() + listing.len());
+    // budget; they are bounded by the picture limit.) The text is spilled when
+    // the answer would not fit.
+    let compose = |text_block: &str| {
+        let mut lines: Vec<&str> = Vec::with_capacity(1 + trailing.len());
         // Empty only when every page's text failed: the notes are then the whole
         // answer's opening.
         if !text_block.is_empty() {
             lines.push(text_block);
         }
         lines.extend(trailing.iter().map(String::as_str));
-        lines.extend(listing.iter().map(String::as_str));
         crate::tools::with_recovery_note(res.recovery_note.as_deref(), lines.join("\n"))
     };
-    let fits = |text_block: &str, listing: &[String]| {
-        compose(text_block, listing).len() <= crate::util::TOOL_OUTPUT_BUDGET_BYTES
-    };
-    let pick_listing = |text_block: &str| {
-        if fits(text_block, &full_listing) {
-            &full_listing
-        } else {
-            &folder_listing
-        }
-    };
-    let mut listing = pick_listing(&text_block);
-    if !fits(&text_block, listing) && !reading.text.is_empty() {
+    let mut text = compose(&text_block);
+    if text.len() > crate::util::TOOL_OUTPUT_BUDGET_BYTES && !reading.text.is_empty() {
         text_block = spill_text(dir, &display, &reading.text).await;
-        listing = pick_listing(&text_block);
+        text = compose(&text_block);
     }
 
     // The answer is content, never a claim about its images.
     ToolOutput {
-        text: compose(&text_block, listing),
+        text,
         image_payloads: attached,
         text_is_content: true,
         preserve_text: false,
@@ -756,8 +711,8 @@ mod tests {
 
     /// A text-free Word package and what its reading must say: a document with
     /// neither text nor images says the plain sentence (never "could not be
-    /// read" for a document that converted fine), and one whose images are all
-    /// over the cap points at the folder instead of claiming they were attached.
+    /// read" for a document that converted fine), and one whose pictures the
+    /// limit cuts short never claims its content was provided as images.
     struct TextFreeCase {
         name: &'static str,
         file: &'static str,
@@ -766,8 +721,8 @@ mod tests {
         present: &'static [&'static str],
         /// Substrings the answer must not carry.
         absent: &'static [&'static str],
-        /// How many image paths the over-the-cap envelope must list.
-        listed: Option<usize>,
+        /// How many of the document's pictures the answer attaches.
+        attached: usize,
     }
 
     #[tokio::test]
@@ -780,26 +735,28 @@ mod tests {
                 fixture: zip_fixture(&[("word/document.xml", EMPTY_DOCX_BODY)]),
                 present: &["empty.docx: no text could be extracted]"],
                 absent: &[],
-                listed: None,
+                attached: 0,
             },
             TextFreeCase {
-                name: "media_over_the_cap_is_attached_nothing",
+                name: "pictures_at_the_limit_are_all_attached",
                 file: "scanned.docx",
                 fixture: docx_with_images(EMPTY_DOCX_BODY, 6),
-                present: &["scanned.docx: no text could be extracted]\n"],
-                // Images that were not attached are not called attached.
-                absent: &[crate::document::NO_TEXT_LAYER_NOTE],
-                listed: None,
+                present: &[
+                    "scanned.docx: no text could be extracted — the content was provided as images]",
+                ],
+                absent: &["left out by the"],
+                attached: 6,
             },
             TextFreeCase {
-                name: "over_the_cap_images_are_delivered_as_paths",
-                file: "report.docx",
-                fixture: docx_with_images(DOCX_BODY, 6),
+                name: "pictures_over_the_limit_leave_the_no_text_claim_out",
+                file: "long_scan.docx",
+                fixture: docx_with_images(EMPTY_DOCX_BODY, 7),
                 present: &[
-                    "6 extracted image(s) were not attached (5 is the per-call limit); read them individually as images:]",
+                    "long_scan.docx: no text could be extracted]\n",
+                    "7 pictures in the document; 1 left out by the 6-picture limit]",
                 ],
-                absent: &[],
-                listed: Some(6),
+                absent: &[crate::document::NO_TEXT_LAYER_NOTE],
+                attached: 6,
             },
         ];
         for case in cases {
@@ -807,10 +764,12 @@ mod tests {
             let out = convert(&owner, &ws, case.file, PathAccess::Allowlisted)
                 .await
                 .unwrap_or_else(|| panic!("{}: a .docx is a document", case.name));
-            assert!(
-                out.image_payloads.is_empty(),
-                "{}: nothing may be attached: {}",
+            assert_eq!(
+                out.image_payloads.len(),
+                case.attached,
+                "{}: the answer attaches {} picture(s): {}",
                 case.name,
+                case.attached,
                 out.text
             );
             for expected in case.present {
@@ -829,29 +788,40 @@ mod tests {
                     out.text
                 );
             }
-            let Some(expected) = case.listed else {
-                continue;
-            };
-            let listed: Vec<&str> = out
-                .text
-                .lines()
-                .skip_while(|line| !line.contains("were not attached"))
-                .skip(1)
-                .collect();
-            assert_eq!(
-                listed.len(),
-                expected,
-                "{}: one line per produced image: {listed:?}",
-                case.name
-            );
-            assert!(
-                listed
-                    .iter()
-                    .all(|path| std::path::Path::new(path).is_absolute()),
-                "{}: each image is named by its absolute path: {listed:?}",
-                case.name
-            );
         }
+    }
+
+    /// A document with text and more pictures than the limit: the first six are
+    /// attached, and the answer counts the pictures the document holds and the
+    /// ones the limit left out — never naming them as a loss the reading found.
+    #[tokio::test]
+    async fn pictures_over_the_limit_are_counted_not_attached() {
+        let owner = SpillOwner::new();
+        let fixture = docx_with_images(DOCX_BODY, 7);
+        let (_dir, ws) = temp_workspace(&[("report.docx", &fixture)]);
+
+        let out = convert(&owner, &ws, "report.docx", PathAccess::Allowlisted)
+            .await
+            .expect("a .docx is a document");
+        assert_eq!(out.image_payloads.len(), 6, "{}", out.text);
+        assert!(
+            out.text.contains(
+                "report.docx: 7 pictures in the document; 1 left out by the 6-picture \
+                 limit]"
+            ),
+            "the answer counts what it left out: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("not shown]"),
+            "the limit is not a loss the reading found: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("page_"),
+            "the pictures left out are not named by their paths: {}",
+            out.text
+        );
     }
 
     /// The read tool's own resolution and delivery do not bypass the page's visible
@@ -1217,9 +1187,9 @@ mod tests {
         );
     }
 
-    /// A long text next to more images than the per-call cap: the answer still
-    /// has to fit the budget it is formatted against, so the text is spilled
-    /// (whole) rather than truncated by the formatter with nothing to recover it.
+    /// A long text next to a full set of pictures: the answer still has to fit
+    /// the budget it is formatted against, so the text is spilled (whole) rather
+    /// than truncated by the formatter with nothing to recover it.
     #[tokio::test]
     async fn long_text_with_many_images_is_spilled_not_truncated() {
         let filler = "lorem ipsum dolor sit amet ".repeat(1_200);
@@ -1251,12 +1221,9 @@ mod tests {
             "the spill file holds the whole text, head to tail"
         );
         assert_eq!(
-            out.text
-                .lines()
-                .filter(|line| std::path::Path::new(line).extension() == Some("png".as_ref()))
-                .count(),
+            out.image_payloads.len(),
             6,
-            "spilling the text frees room for the per-image paths again: {}",
+            "spilling the text never costs the document's pictures: {}",
             out.text
         );
     }

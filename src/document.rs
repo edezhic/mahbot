@@ -105,13 +105,49 @@ static DOCUMENT_CONVERSIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::co
 // `[<source>: ...]` prefix (a file name and a path respectively), so the sentence a model
 // reads for the same situation cannot drift between them.
 
-/// Body of the note shown when a reading produced no page text but delivered images of it.
+/// Most pictures one read attaches to the conversation. Every attached picture stays in it
+/// and is sent again on later turns, so a many-page scan must not flood it; the reading
+/// reports the pictures it left out. The command line writes files to a folder rather than
+/// pictures into a conversation and is not bound by this.
+pub(crate) const MAX_READ_PICTURES: usize = 6;
+
+/// Body of the note shown when a reading produced no page text but delivered images of it —
+/// true only when it delivered all of them, never when [`MAX_READ_PICTURES`] left some out.
 pub(crate) const NO_TEXT_LAYER_NOTE: &str =
     "no text could be extracted — the content was provided as images";
 
 /// Body of the note shown when a reading produced no page text and no image: the text it
 /// did return is only the document's own description or form list.
 pub(crate) const NO_TEXT_NOTE: &str = "no text could be extracted";
+
+/// The no-text sentence for a reading whose pictures were — or were not — all delivered:
+/// [`NO_TEXT_LAYER_NOTE`] is a completeness claim [`MAX_READ_PICTURES`] can falsify.
+#[must_use]
+pub(crate) fn no_text_note(images_complete: bool) -> &'static str {
+    if images_complete {
+        NO_TEXT_LAYER_NOTE
+    } else {
+        NO_TEXT_NOTE
+    }
+}
+
+/// The pictures of one reading a delivery attaches — the first [`MAX_READ_PICTURES`] the
+/// converter produced, in its own order — and how many it produced beyond them.
+#[must_use]
+pub(crate) fn attachable_pictures(images: &[PathBuf]) -> (&[PathBuf], usize) {
+    let (attached, left_out) = images.split_at(images.len().min(MAX_READ_PICTURES));
+    (attached, left_out.len())
+}
+
+/// Body of the note reporting the pictures [`MAX_READ_PICTURES`] left out of one reading:
+/// what the document holds and how many the limit kept back. Deliberately not the wording of
+/// [`Unshown`], whose kinds are content the reading itself could not show.
+#[must_use]
+pub(crate) fn left_out_pictures_note(total: usize, left_out: usize) -> String {
+    format!(
+        "{total} pictures in the document; {left_out} left out by the {MAX_READ_PICTURES}-picture limit"
+    )
+}
 
 /// Body of the note pointing at the file `path` holding extracted text too long to inline.
 #[must_use]

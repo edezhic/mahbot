@@ -5,7 +5,8 @@
 //! local image becomes a native data-URI part carrying the original bytes, re-encoded to a
 //! bounded JPEG only when it would exceed the encoded-payload cap; audio is transcribed to
 //! text; video is a workspace copy plus its timeline; an inbound document is copied
-//! into the workspace and converted to text and images. Link enrichment prepends webpage
+//! into the workspace and converted to text and its first
+//! [`crate::document::MAX_READ_PICTURES`] pictures. Link enrichment prepends webpage
 //! summaries for URLs in the message.
 //!
 //! **Containment invariant**: every local read, copy and delete is scoped to the message's
@@ -571,14 +572,18 @@ async fn handle_file(
         } => {
             // The IMAGE pipeline runs before the annotations are composed, because whether an
             // image was delivered decides how the no-text sentence reads.
-            let images = deliver_document_images(images, uploads_dir, staging_dirs).await;
+            let delivered =
+                deliver_document_images(name, &images, uploads_dir, staging_dirs, batch).await;
+            // "The content was provided as images" is only true when every picture the reading
+            // produced was delivered.
+            let images_complete = delivered.kept > 0 && delivered.left_out == 0;
             // The reader failed on every page, so the pages carry no text: the notes below name
             // them and the "no text could be extracted" sentence — which would report a reader
             // failure as an absence — is left out. Anything else the conversion read (a comment,
             // a filled field value) is content and is delivered regardless.
             if !all_page_text_lost || !text.trim().is_empty() {
                 batch.annotate(
-                    extracted_text_annotation(uploads_dir, name, &text, images.kept > 0).await,
+                    extracted_text_annotation(uploads_dir, name, &text, images_complete).await,
                 );
             }
             // The report of what the reading did not show leads the notes, as in the read tool's
@@ -592,21 +597,8 @@ async fn handle_file(
             // A description, annotation or form list can carry the text while no page produced
             // any: the reading still says so, naming an image only when one was delivered.
             if !page_text && !all_page_text_lost && !text.trim().is_empty() {
-                let note = if images.kept == 0 {
-                    crate::document::NO_TEXT_NOTE
-                } else {
-                    crate::document::NO_TEXT_LAYER_NOTE
-                };
+                let note = crate::document::no_text_note(images_complete);
                 batch.annotate(format!("[File {name}: {note}]"));
-            }
-            batch.appended_markers.extend(images.replacements);
-            batch.upload_annotations.extend(images.uploads);
-            batch.files_to_delete.extend(images.deletes);
-            if images.unreadable > 0 {
-                batch.annotate(format!(
-                    "[File {name}: {} extracted image(s) could not be read]",
-                    images.unreadable
-                ));
             }
         }
         DocOutcome::Unreadable { reason } => {
@@ -629,39 +621,37 @@ async fn handle_file(
 }
 
 /// Delivered through the ordinary IMAGE pipeline: a native data-URI part plus a workspace copy,
-/// so the model sees them and the agent can reopen them. A rejected image is counted into one
-/// note, like the converter's skipped-media note; the batch effects are applied by the caller.
+/// so the model sees them and the agent can reopen them. Only the pictures the shared limit
+/// allows are delivered; the ones it left out and the ones the pipeline rejected are each
+/// counted into one note, like the converter's skipped-media note. The batch effects are
+/// applied here.
 struct DeliveredImages {
     /// How many images the model actually received.
     kept: usize,
-    unreadable: usize,
-    replacements: Vec<String>,
-    uploads: Vec<String>,
-    deletes: Vec<std::path::PathBuf>,
+    /// How many pictures the document held beyond the limit.
+    left_out: usize,
 }
 
 async fn deliver_document_images(
-    images: Vec<std::path::PathBuf>,
+    name: &str,
+    images: &[std::path::PathBuf],
     uploads_dir: &std::path::Path,
     staging_dirs: &[String],
+    batch: &mut EnrichmentBatch,
 ) -> DeliveredImages {
-    let mut delivered = DeliveredImages {
-        kept: 0,
-        unreadable: 0,
-        replacements: Vec::new(),
-        uploads: Vec::new(),
-        deletes: Vec::new(),
-    };
-    for image in images {
+    let (pictures, left_out) = crate::document::attachable_pictures(images);
+    let mut delivered = DeliveredImages { kept: 0, left_out };
+    let mut unreadable = 0usize;
+    for image in pictures {
         let image_path = image.to_string_lossy().to_string();
-        match handle_image(&image_path, &image, Some(uploads_dir), staging_dirs).await {
+        match handle_image(&image_path, image, Some(uploads_dir), staging_dirs).await {
             ImageAction::Keep => delivered.kept += 1,
             ImageAction::Invalid { delete_temp } => {
                 // A temp artifact written by this pass, so the note must not name it — the file
                 // is deleted right below.
-                delivered.unreadable += 1;
+                unreadable += 1;
                 if delete_temp {
-                    delivered.deletes.push(image);
+                    batch.files_to_delete.push(image.clone());
                 }
             }
             ImageAction::Replace {
@@ -670,35 +660,51 @@ async fn deliver_document_images(
                 delete_temp,
             } => {
                 delivered.kept += 1;
-                delivered.replacements.push(replacement);
+                batch.appended_markers.push(replacement);
                 if let Some(annotation) = upload_annotation {
-                    delivered.uploads.push(annotation);
+                    batch.upload_annotations.push(annotation);
                 }
                 if delete_temp {
-                    delivered.deletes.push(image);
+                    batch.files_to_delete.push(image.clone());
                 }
             }
         }
+    }
+    if left_out > 0 {
+        // Never delivered, so their only copy is this pass's own temp artifact: consumed here
+        // rather than left for the OS temp sweep.
+        batch
+            .files_to_delete
+            .extend(images[pictures.len()..].iter().cloned());
+        batch.annotate(format!(
+            "[File {name}: {}]",
+            crate::document::left_out_pictures_note(images.len(), left_out)
+        ));
+    }
+    if unreadable > 0 {
+        batch.annotate(format!(
+            "[File {name}: {unreadable} extracted image(s) could not be read]"
+        ));
     }
     delivered
 }
 
 /// Short text is inlined; longer text is spilled to `<uploads>/<stem>.extracted.txt` and the
 /// annotation points at that file, so a book-sized document cannot blow up the message. Empty
-/// text (a scanned, image-only document) names the delivered images instead.
+/// text (a scanned, image-only document) names the delivered images instead — only when the
+/// read delivered all of them, never when the picture limit left some out.
 async fn extracted_text_annotation(
     uploads_dir: &std::path::Path,
     name: &str,
     text: &str,
-    has_images: bool,
+    images_complete: bool,
 ) -> String {
     let text = text.trim();
     if text.is_empty() {
-        return if has_images {
-            format!("[File {name}: {}]", crate::document::NO_TEXT_LAYER_NOTE)
-        } else {
-            format!("[File {name}: {}]", crate::document::NO_TEXT_NOTE)
-        };
+        return format!(
+            "[File {name}: {}]",
+            crate::document::no_text_note(images_complete)
+        );
     }
     let char_count = text.chars().count();
     if char_count <= INLINE_TEXT_MAX_CHARS {
@@ -1686,6 +1692,59 @@ mod tests {
                 .contains("[File clip.docx: 1 embedded video(s) not shown]"),
             "the report must reach the inbound answer too, got: {}",
             msg.content
+        );
+        let _ = tokio::fs::remove_dir_all(&tmp_root).await;
+    }
+
+    /// A document holding more pictures than one read may attach: the attachment
+    /// path delivers the first six and says how many the document holds and how
+    /// many the limit left out — the same count the read tool's answer carries —
+    /// and never claims a partial delivery was its whole content provided as
+    /// images.
+    #[tokio::test]
+    async fn enrich_file_delivers_at_most_six_document_pictures() {
+        use crate::ooxml::test_fixtures::zip_fixture;
+        const EMPTY_BODY: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body></w:body></w:document>"#;
+        let png = crate::util::test::noisy_png(16, 16);
+        let names: Vec<String> = (1..=7)
+            .map(|page| format!("word/media/page_{page}.png"))
+            .collect();
+        let mut entries: Vec<(&str, &[u8])> = vec![("word/document.xml", EMPTY_BODY)];
+        entries.extend(names.iter().map(|name| (name.as_str(), png.as_slice())));
+        let package = zip_fixture(&entries);
+        let (tmp_root, ws_path, msg_dir, attachment) =
+            inbound_ingest_fixture("test_enrich_document_pictures", 7041, "scan.docx", &package)
+                .await;
+        let marker = format!("Read [FILE:{}] please", attachment.display());
+
+        let mut msg = inbound_msg(7041, &marker);
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
+
+        assert_eq!(
+            msg.content.matches("[IMAGE:data:image/png;base64,").count(),
+            6,
+            "one read attaches at most six pictures, got: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains(
+                "[File scan.docx: 7 pictures in the document; 1 left out by the 6-picture \
+                 limit]"
+            ),
+            "the answer must count what it left out, got: {}",
+            msg.content
+        );
+        assert!(
+            !msg.content.contains(crate::document::NO_TEXT_LAYER_NOTE),
+            "a partial delivery is not its whole content provided as images, got: {}",
+            msg.content
+        );
+        // The pictures left out are this pass's own artifacts: consumed, so nothing lingers
+        // beside the (deleted) attachment.
+        assert!(
+            !msg_dir.exists(),
+            "the per-message directory must be emptied and deleted"
         );
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
