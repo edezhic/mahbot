@@ -968,19 +968,10 @@ fn parse_attachment_markers(
 /// the text: `[FILE:...]` carries a canonical path while the media kinds carry the resolved one, so
 /// a correct marker and its repaired twin would otherwise read as two files.
 fn already_attached(attachments: &[TelegramAttachment], target: &str) -> bool {
-    let key = attachment_key(target);
+    let key = media_target::file_key(Path::new(target));
     attachments
         .iter()
-        .any(|attachment| attachment_key(&attachment.target) == key)
-}
-
-/// What makes two delivered targets one file: a local path is canonicalized on both sides, an
-/// address is its own text (canonicalizing one fails anyway).
-fn attachment_key(target: &str) -> PathBuf {
-    if is_http_url(target) {
-        return PathBuf::from(target);
-    }
-    std::fs::canonicalize(target).unwrap_or_else(|_| PathBuf::from(target))
+        .any(|attachment| media_target::file_key(Path::new(&attachment.target)) == key)
 }
 
 pub(crate) const CLOUD_API_BASE: &str = "https://api.telegram.org";

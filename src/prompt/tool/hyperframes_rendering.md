@@ -37,7 +37,7 @@ Image sequences and HLS are not offered: both produce a folder, and this product
 
 ## The result
 
-The result starts with a `[VIDEO:path]` marker — put it in your reply to send the video — followed by what was produced: duration, pixel size, container and file size, and the frame rate when you gave `fps` as a whole number. When the product or the renderer had something to say after the file was written — a stop, a run that ended badly, a failed step after the write, a probe that could not check it — a further sentence says so; the video is still the result.
+The result starts with a `[VIDEO:path]` marker — put it in your reply to send the video; when a turn rendered several videos, only the ones your reply names are sent — the rest staying where they were produced, and a reply naming none of them sending all of them — followed by what was produced: duration, pixel size, container and file size, and the frame rate when you gave `fps` as a whole number. When the product or the renderer had something to say after the file was written — a stop, a run that ended badly, a failed step after the write, a probe that could not check it — a further sentence says so; the video is still the result.
 
 ## The machine side
 

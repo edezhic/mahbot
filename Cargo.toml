@@ -49,7 +49,8 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 # The same markdown parser iced_widget uses (resolved to the lock's 0.12.2 —
 # no new crates). The Sessions transcript pre-scans it to find HTML regions
 # (angle-bracket tag blocks) and escape only those, so they render as literal
-# text instead of being dropped at parse time.
+# text instead of being dropped at parse time; `util::markdown` classifies the
+# regions that view draws as code, where a media marker is source text.
 pulldown-cmark = "0.12"
 iced_anim = "0.3"
 iced_term = "0.8.0"

@@ -23,17 +23,7 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
-/// Markdown options iced's `markdown::parse` runs with (iced_widget
-/// `src/markdown.rs`, `parse_with`). [`escape_html_blocks`] and the soft-break
-/// scan in [`hard_breaks`] both use this exact set so they classify regions
-/// identically to the real parse; keep in sync if iced's defaults change.
-pub(crate) fn iced_markdown_options() -> pulldown_cmark::Options {
-    pulldown_cmark::Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
-        | pulldown_cmark::Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS
-        | pulldown_cmark::Options::ENABLE_TABLES
-        | pulldown_cmark::Options::ENABLE_STRIKETHROUGH
-        | pulldown_cmark::Options::ENABLE_TASKLISTS
-}
+use crate::util::markdown::iced_markdown_options;
 
 /// Escape `<` → `&lt;` only inside the regions the markdown parser classifies
 /// as HTML (block-level `Event::Html` plus inline `Event::InlineHtml`), so

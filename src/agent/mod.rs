@@ -4,8 +4,9 @@
 //! reads and publishes (`role`, `registry`, `message_router`, `skills`,
 //! `extraction`, `maintainer`) — not the conversation store of `crate::session`.
 
+use std::collections::HashSet;
 use std::fmt::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,6 +19,7 @@ use crate::tools::{
     ImagePayload, ToolExecutionOutcome, find_tool, format_tool_failure_feedback,
     normalize_tool_call, scrub_tool_output,
 };
+use crate::util::media_target;
 use crate::util::{
     MEDIA_MARKER_RE, MediaMarkerKind, UnwrapPoison, parse_media_marker, scrub_credentials,
 };
@@ -229,15 +231,14 @@ fn interrupted_outcome() -> ToolExecutionOutcome {
 type CompletePendingToolCallsFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>;
 
-/// `(marker_prefix, path)` for every successful media tool outcome carrying its
-/// [`Tool::media_marker`] (e.g. `[IMAGE:path]`); failed outcomes and non-media
-/// tools are skipped. Limitation: a path containing `]` is truncated by the regex
-/// — harmless, media tools write safe temporary names.
+/// `(kind, path)` for every successful media tool outcome carrying its [`Tool::media_marker`]
+/// (e.g. `[IMAGE:path]`); failed outcomes and non-media tools are skipped. Limitation: a path
+/// containing `]` is truncated by the regex — harmless, media tools write safe temporary names.
 fn extract_media_from_outcomes(
     tools: &[Box<dyn Tool>],
     tool_calls: &[ToolCall],
     outcomes: &[ToolExecutionOutcome],
-) -> Vec<(&'static str, String)> {
+) -> Vec<(MediaMarkerKind, String)> {
     let mut paths = Vec::new();
     for (call, outcome) in tool_calls.iter().zip(outcomes.iter()) {
         if !outcome.success {
@@ -256,7 +257,7 @@ fn extract_media_from_outcomes(
             let (captured_kind, path) = parse_media_marker(&caps);
             if captured_kind.token() == marker {
                 matched = true;
-                paths.push((marker_prefix, path.to_string()));
+                paths.push((captured_kind, path.to_string()));
             }
         }
         if matched {
@@ -280,6 +281,62 @@ fn extract_media_from_outcomes(
         }
     }
     paths
+}
+
+/// Append the turn's media markers the reply did not already name.
+///
+/// A video render (`video_gen`, `video_edit`, `hyperframes`) reaches the user only when the reply
+/// names it — by any kind, in any path form — or when it names none of the turn's video renders,
+/// the safety net for a model that forgot its markers. The renders it left out stay where they
+/// were produced, reachable from the workspace. Other kinds keep today's append, and one file is
+/// never attached twice.
+fn append_turn_media(
+    reply: &mut String,
+    accumulated: &[(MediaMarkerKind, String)],
+    roots: &[PathBuf],
+) {
+    if accumulated.is_empty() {
+        return;
+    }
+    let written: Vec<(MediaMarkerKind, String)> = crate::util::markers_outside_code(reply)
+        .into_iter()
+        .map(|(kind, path)| (kind, path.to_string()))
+        .collect();
+    let named: HashSet<PathBuf> = written
+        .iter()
+        .filter_map(|(_, path)| media_target::target_file_key(path, roots))
+        .collect();
+    let keys: Vec<Option<PathBuf>> = accumulated
+        .iter()
+        .map(|(_, path)| media_target::target_file_key(path, roots))
+        .collect();
+    let video_named = accumulated.iter().zip(&keys).any(|((kind, _), key)| {
+        *kind == MediaMarkerKind::Video && key.as_ref().is_some_and(|key| named.contains(key))
+    });
+    let mut attached = HashSet::new();
+    let mut withheld = 0usize;
+    for ((kind, path), key) in accumulated.iter().zip(&keys) {
+        let already_named = key.as_ref().is_some_and(|key| named.contains(key));
+        if video_named && *kind == MediaMarkerKind::Video {
+            withheld += usize::from(!already_named);
+            continue;
+        }
+        let written_already = already_named
+            || written
+                .iter()
+                .any(|(written_kind, written_path)| written_kind == kind && written_path == path);
+        let first_of_its_file = key.as_ref().is_none_or(|key| attached.insert(key.clone()));
+        if !written_already && first_of_its_file {
+            let _ = write!(reply, "\n[{}:{path}]", kind.token());
+        }
+    }
+    if withheld > 0 {
+        tracing::debug!(
+            withheld,
+            "the reply names its video render — the turn's other video renders stay where they \
+             were produced"
+        );
+    }
 }
 
 /// Count DISTINCT data-URI image markers in the session's user messages — the
@@ -1156,7 +1213,7 @@ impl Agent {
     #[expect(clippy::too_many_lines)] // the round loop with its cut and drain gates
     async fn llm_loop(&mut self) -> anyhow::Result<String> {
         let mut tool_rounds = 0usize;
-        let mut accumulated_media_paths: Vec<(&'static str, String)> = Vec::new();
+        let mut accumulated_media_paths: Vec<(MediaMarkerKind, String)> = Vec::new();
         loop {
             if self.cancel_token.is_cancelled() {
                 anyhow::bail!("Agent cancelled");
@@ -1250,13 +1307,13 @@ impl Agent {
 
             if tool_calls.is_empty() {
                 self.session.push_assistant(history_content);
-                // Append any pending media markers the model may have omitted
-                for (marker_prefix, path) in &accumulated_media_paths {
-                    let marker = format!("{marker_prefix}{path}]");
-                    if !display_text.contains(&marker) {
-                        let _ = write!(display_text, "\n{marker}");
-                    }
-                }
+                let roots = [PathBuf::from(&self.workspace.path)];
+                // The marker gates `stat`, `read_dir` and `canonicalize` on local files, so this
+                // runs off the async worker, as delivery's own marker parse does.
+                display_text = crate::util::with_block_in_place(|| {
+                    append_turn_media(&mut display_text, &accumulated_media_paths, &roots);
+                    display_text
+                });
                 return Ok(display_text);
             }
 
@@ -3082,7 +3139,7 @@ mod tests {
             msg: &'static str,
             tools: Vec<ToolDef>,
             outcomes: Vec<OutcomeDef>,
-            expected: Vec<(&'static str, &'static str)>,
+            expected: Vec<(MediaMarkerKind, &'static str)>,
         }
 
         let cases = vec![
@@ -3097,7 +3154,7 @@ mod tests {
                     output: "[IMAGE:/tmp/img.png]",
                     success: true,
                 }],
-                expected: vec![("[IMAGE:", "/tmp/img.png")],
+                expected: vec![(MediaMarkerKind::Image, "/tmp/img.png")],
             },
             // A bare marker prefix yields an empty path, which the filter rejects.
             TestCase {
@@ -3190,7 +3247,10 @@ mod tests {
                         success: true,
                     },
                 ],
-                expected: vec![("[IMAGE:", "/tmp/img.png"), ("[VIDEO:", "/tmp/vid.mp4")],
+                expected: vec![
+                    (MediaMarkerKind::Image, "/tmp/img.png"),
+                    (MediaMarkerKind::Video, "/tmp/vid.mp4"),
+                ],
             },
         ];
 
@@ -3241,7 +3301,7 @@ mod tests {
                 })
                 .collect();
 
-            let expected: Vec<(&'static str, String)> = case
+            let expected: Vec<(MediaMarkerKind, String)> = case
                 .expected
                 .iter()
                 .map(|(n, p)| (*n, p.to_string()))
@@ -3250,6 +3310,94 @@ mod tests {
             let result = extract_media_from_outcomes(&tools, &calls, &outcomes);
             assert_eq!(result, expected, "case '{}': {}", case.name, case.msg);
         }
+    }
+
+    /// Three real video renders of one turn, so a marker's path resolves and canonicalizes.
+    fn three_renders(root: &Path) -> Vec<(MediaMarkerKind, String)> {
+        let generated = root.join("generated");
+        std::fs::create_dir_all(&generated).expect("generated dir");
+        ["draft.mp4", "final.mp4", "old.mp4"]
+            .iter()
+            .map(|name| {
+                let path = generated.join(name);
+                std::fs::write(&path, b"clip").expect("write clip");
+                (MediaMarkerKind::Video, path.display().to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn append_turn_media_delivers_only_the_named_video_renders() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        let roots = [root.clone()];
+        let renders = three_renders(&root);
+        let final_path = &renders[1].1;
+
+        // Naming one render delivers it and withholds the turn's other two.
+        let mut reply = format!("Here is the cut you asked for.\n[VIDEO:{final_path}]");
+        let as_written = reply.clone();
+        append_turn_media(&mut reply, &renders, &roots);
+        assert_eq!(reply, as_written, "only the named render is delivered");
+
+        // Naming none delivers every render, as before.
+        let mut reply = "Three versions are ready.".to_string();
+        append_turn_media(&mut reply, &renders, &roots);
+        assert_eq!(reply.matches("[VIDEO:").count(), 3, "{reply}");
+
+        // A relative marker, another kind and a repaired directory all name the same file.
+        for named in [
+            "[VIDEO:generated/final.mp4] is the one.".to_string(),
+            format!("[FILE:{final_path}]"),
+            "[VIDEO:generate/final.mp4] is the one.".to_string(),
+        ] {
+            let mut reply = named.clone();
+            append_turn_media(&mut reply, &renders, &roots);
+            assert_eq!(
+                reply, named,
+                "{named} names the file, so nothing is attached twice"
+            );
+        }
+
+        // A marker inside code is source text, so it names nothing: every render is delivered,
+        // even when the fenced marker spells a render's path exactly.
+        for quoted in [
+            format!("```\n[VIDEO:{final_path}]\n```"),
+            format!("The marker `[VIDEO:{final_path}]` sends a clip."),
+        ] {
+            let mut reply = quoted;
+            append_turn_media(&mut reply, &renders, &roots);
+            assert_eq!(reply.matches("[VIDEO:").count(), 4, "{reply}");
+        }
+
+        // A marker for a file of another turn names nothing of this one.
+        let mut reply = "[VIDEO:/elsewhere/previous.mp4]".to_string();
+        append_turn_media(&mut reply, &renders, &roots);
+        assert_eq!(reply.matches("[VIDEO:").count(), 4, "{reply}");
+
+        // Another kind still reaches the user while the named video render is withheld.
+        let poster = root.join("generated/poster.png");
+        std::fs::write(&poster, b"png").expect("write poster");
+        let mut accumulated = renders.clone();
+        accumulated.push((MediaMarkerKind::Image, poster.display().to_string()));
+        let mut reply = format!("[VIDEO:{final_path}]");
+        append_turn_media(&mut reply, &accumulated, &roots);
+        assert!(reply.contains("[IMAGE:"), "{reply}");
+        assert_eq!(reply.matches("[VIDEO:").count(), 1, "{reply}");
+
+        // One file is never attached twice.
+        let mut reply = String::new();
+        append_turn_media(
+            &mut reply,
+            &[renders[0].clone(), renders[0].clone()],
+            &roots,
+        );
+        assert_eq!(reply.matches("[VIDEO:").count(), 1, "{reply}");
+
+        // A turn with no renders leaves the reply untouched.
+        let mut reply = "Nothing was rendered.".to_string();
+        append_turn_media(&mut reply, &[], &roots);
+        assert_eq!(reply, "Nothing was rendered.");
     }
 
     #[tokio::test]
@@ -5653,7 +5801,7 @@ mod tests {
         let media = extract_media_from_outcomes(&agent.tools, &tool_calls, &outcomes);
         assert_eq!(
             media,
-            vec![("[IMAGE:", abs.display().to_string())],
+            vec![(MediaMarkerKind::Image, abs.display().to_string())],
             "marker preserved for user delivery: {media:?}"
         );
 

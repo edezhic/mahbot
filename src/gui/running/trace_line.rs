@@ -5,7 +5,7 @@
 //! budget so it never reads as a mid-phrase cut. Markdown syntax is stripped first; characters
 //! that belong to code (an underscore inside an identifier, a `__dunder__` name) stay.
 
-use crate::gui::markdown_breaks;
+use crate::util::markdown::iced_markdown_options;
 
 /// Character budget of the line: one record, ellipsis included. A longer line still wraps.
 const MAX_LINE_CHARS: usize = 200;
@@ -96,8 +96,7 @@ fn plain_text(text: &str) -> String {
     let mut boundary = false;
     let mut code_block = false;
     for (event, span) in
-        pulldown_cmark::Parser::new_ext(text, markdown_breaks::iced_markdown_options())
-            .into_offset_iter()
+        pulldown_cmark::Parser::new_ext(text, iced_markdown_options()).into_offset_iter()
     {
         match event {
             Event::Start(Tag::CodeBlock(_)) => code_block = true,

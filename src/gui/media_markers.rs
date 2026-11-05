@@ -54,7 +54,7 @@ use std::time::SystemTime;
 
 use super::{selectable, theme, widgets};
 use crate::gui::markdown_breaks;
-use crate::gui::markdown_breaks::iced_markdown_options;
+use crate::util::markdown::iced_markdown_options;
 use crate::util::media_target::{self, MarkerTarget};
 use crate::util::{
     MEDIA_MARKER_RE, MediaMarkerKind, UnwrapPoison, file_name_or_path, parse_media_marker,
@@ -311,7 +311,9 @@ enum Replacement {
 
 /// One `into_offset_iter` pass over the body with iced's parser options — the parser the
 /// markdown view runs — collecting the byte ranges of its code (where marker syntax is source) and
-/// the edits its markdown pictures become.
+/// the edits its markdown pictures become. The same code rule decides what a reply names when it is
+/// delivered ([`crate::util::markdown::code_ranges`]): one pass here, one there, never a different
+/// classification.
 ///
 /// An agent writes `![alt](url)` directly, and the parser would draw it as an `Image` item that
 /// swallows the text collected before it, so it leaves the text here too. A picture needs no code

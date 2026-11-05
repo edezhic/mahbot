@@ -12,6 +12,7 @@ pub(crate) mod leftover_channels;
 pub mod lock;
 pub(crate) mod macros;
 pub(crate) mod managed_bin;
+pub(crate) mod markdown;
 pub(crate) mod media_target;
 pub(crate) mod model_state;
 pub(crate) mod owner_path;
@@ -117,6 +118,21 @@ pub(crate) fn parse_media_marker<'h>(caps: &regex::Captures<'h>) -> (MediaMarker
         .expect("parse_media_marker: expected 'path' group")
         .as_str();
     (kind, path)
+}
+
+/// The media markers a message carries outside markdown code, as the kind and the path slice —
+/// inside code a marker is source text the user reads, not an attachment.
+#[must_use]
+pub(crate) fn markers_outside_code(text: &str) -> Vec<(MediaMarkerKind, &str)> {
+    let code = markdown::code_ranges(text);
+    MEDIA_MARKER_RE
+        .captures_iter(text)
+        .filter(|caps| {
+            let whole = caps.get(0).expect("the whole match is always present");
+            !code.iter().any(|range| range.contains(&whole.start()))
+        })
+        .map(|caps| parse_media_marker(&caps))
+        .collect()
 }
 
 /// Placeholder that replaces an inline image data URI wherever bounded, displayable text is
