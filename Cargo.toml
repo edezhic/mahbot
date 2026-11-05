@@ -55,11 +55,11 @@ iced_anim = "0.3"
 iced_term = "0.8.0"
 
 # The speech engines — recognition and spoken replies — and their models: the
-# inference crate, taken from the sibling checkout by path — no vendoring, no
-# mirror, no second copy. It is not on crates.io, so this dependency makes
-# `cargo package`/`publish` fail until the crate is published and this line becomes
-# a version requirement; releases are cut after that, not before.
-mahbot-inference = { path = "../mahbot-rlx/crates/mahbot-inference" }
+# inference crate from crates.io, pinned to one exact release so the build is a
+# published, checksummed artifact rather than a sibling checkout's working tree.
+# Exact on purpose: a range over a pre-release also admits later releases of the
+# same series. The family it depends on rides the same release, held by Cargo.lock.
+mahbot-inference = "=0.2.18-mahbot.2"
 # Microphone capture (`crate::audio::voice`): the platform's own host API —
 # CoreAudio, WASAPI, ALSA. The ALSA backend needs `libasound2-dev` (pkg-config
 # `alsa`) to build on Linux.
@@ -412,9 +412,8 @@ debug = false
 #
 # The keys are the package names the inference crate's graph resolves to:
 #   cargo tree -p mahbot-inference --prefix none | awk '{print $1}' | grep '^mahbot-rlx' | sort -u
-# Anchored to the package-name column, so the sibling checkout's directory path
-# cannot contribute a name. A family package missing here runs unoptimized in
-# dev; a stale key costs a warning on every build.
+# Anchored to the package-name column. A family package missing here runs
+# unoptimized in dev; a stale key costs a warning on every build.
 [profile.dev.package.mahbot-inference]
 opt-level = 3
 
