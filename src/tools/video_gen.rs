@@ -3,9 +3,13 @@
 //!
 //! Not video editing (`video_edit`) and not local encoding.
 
+use super::media_catalog::video::VideoModelInfo;
 use crate::Tool;
 use async_trait::async_trait;
 use serde_json::json;
+
+/// The resolution asked for when the caller names none: the omni default's native tier.
+const DEFAULT_RESOLUTION: &str = "720p";
 
 /// Tool for generating videos via OpenRouter's async videos API: submit, poll, download, and
 /// return the path so the agent can send it via `[VIDEO:path]` in its reply.
@@ -17,6 +21,62 @@ fn set_opt<T: Into<serde_json::Value>>(body: &mut serde_json::Value, key: &str, 
     if let Some(v) = value {
         body[key] = v.into();
     }
+}
+
+/// The submit body: the model and prompt plus every optional parameter the caller named, with
+/// `resolution` already resolved by [`requested_resolution`].
+fn request_body(
+    model: &str,
+    args: &serde_json::Value,
+    resolution: Option<String>,
+) -> anyhow::Result<serde_json::Value> {
+    let mut body = json!({
+        "model": model,
+        "prompt": super::get_str(args, "prompt")?,
+    });
+    set_opt(&mut body, "duration", super::get_opt_i64(args, "duration")?);
+    set_opt(&mut body, "resolution", resolution);
+    set_opt(
+        &mut body,
+        "aspect_ratio",
+        super::get_opt_str(args, "aspect_ratio"),
+    );
+    set_opt(&mut body, "size", super::get_opt_str(args, "size"));
+    set_opt(
+        &mut body,
+        "generate_audio",
+        super::get_opt_bool(args, "generate_audio")?,
+    );
+    set_opt(&mut body, "seed", super::get_opt_i64(args, "seed")?);
+    Ok(body)
+}
+
+/// The resolution the request must name: the caller's own verbatim, else [`DEFAULT_RESOLUTION`]
+/// when the caller named neither a resolution nor an exact size — the two say the same thing —
+/// and the model's declared capabilities offer it.
+fn requested_resolution(args: &serde_json::Value, info: Option<&VideoModelInfo>) -> Option<String> {
+    if let Some(named) = super::get_opt_str(args, "resolution") {
+        return Some(named.to_string());
+    }
+    if super::get_opt_str(args, "size").is_some() {
+        return None;
+    }
+    if !offers_default(info) {
+        return None;
+    }
+    Some(DEFAULT_RESOLUTION.to_string())
+}
+
+/// Whether the model declares [`DEFAULT_RESOLUTION`], compared by value so another spelling
+/// (`720P`) counts. No catalog entry, no declared resolutions, or a set without the tier all
+/// answer `false`, leaving the request exactly as it is today.
+fn offers_default(info: Option<&VideoModelInfo>) -> bool {
+    info.and_then(|info| info.resolutions.as_ref())
+        .is_some_and(|resolutions| {
+            resolutions
+                .iter()
+                .any(|r| r.eq_ignore_ascii_case(DEFAULT_RESOLUTION))
+        })
 }
 
 #[async_trait]
@@ -110,34 +170,16 @@ impl VideoGenTool {
         ws: &crate::Workspace,
         args: serde_json::Value,
     ) -> anyhow::Result<(String, std::path::PathBuf)> {
-        let prompt = super::get_str(&args, "prompt")?;
-
         let user_name = crate::agent::tool_user_name();
         let model = crate::users::resolve_video_model(&user_name).await;
-
-        let duration = super::get_opt_i64(&args, "duration")?;
-        let resolution = super::get_opt_str(&args, "resolution");
-        let aspect_ratio = super::get_opt_str(&args, "aspect_ratio");
-        let size = super::get_opt_str(&args, "size");
-        let generate_audio = super::get_opt_bool(&args, "generate_audio")?;
-        let seed = super::get_opt_i64(&args, "seed")?;
 
         // Build the API base URL (strip /chat/completions if present). Video generation always
         // targets OpenRouter — a custom chat endpoint never serves video models.
         let api_base = crate::providers::ensure_base_url(crate::config::DEFAULT_PROVIDER_ENDPOINT);
 
-        // Build the video generation request body
-        let mut body = json!({
-            "model": model,
-            "prompt": prompt,
-        });
-
-        set_opt(&mut body, "duration", duration);
-        set_opt(&mut body, "resolution", resolution);
-        set_opt(&mut body, "aspect_ratio", aspect_ratio);
-        set_opt(&mut body, "size", size);
-        set_opt(&mut body, "generate_audio", generate_audio);
-        set_opt(&mut body, "seed", seed);
+        let catalog = super::media_catalog::video::get_catalog().await;
+        let info = catalog.as_deref().and_then(|catalog| catalog.find(&model));
+        let mut body = request_body(&model, &args, requested_resolution(&args, info))?;
 
         // Reference-load failures are hard errors — never silently degrade to text-to-video.
         // `get_str_array` rejects malformed values instead of dropping them.
@@ -172,5 +214,58 @@ impl VideoGenTool {
         let output_path = super::save_generated_file(ws, &video_bytes, "video", "mp4").await?;
         let marker = self.format_media_result(&output_path);
         Ok((marker, output_path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn declaring(resolutions: &[&str]) -> VideoModelInfo {
+        VideoModelInfo {
+            resolutions: Some(resolutions.iter().map(|r| (*r).to_string()).collect()),
+            ..VideoModelInfo::default()
+        }
+    }
+
+    #[test]
+    fn default_resolution_needs_the_model_to_declare_it() {
+        assert!(offers_default(Some(&declaring(&["480p", "720p"]))));
+        assert!(
+            offers_default(Some(&declaring(&["720P"]))),
+            "the comparison is by value, not by spelling"
+        );
+        assert!(
+            !offers_default(Some(&declaring(&["2K"]))),
+            "a model without the tier keeps today's request"
+        );
+        assert!(!offers_default(Some(&VideoModelInfo::default())));
+        assert!(!offers_default(None), "no catalog entry offers nothing");
+    }
+
+    #[test]
+    fn a_named_resolution_or_size_leaves_the_request_alone() {
+        let named = json!({ "resolution": "1080p" });
+        assert_eq!(
+            requested_resolution(&named, Some(&declaring(&["720p"]))).as_deref(),
+            Some("1080p"),
+            "the caller's own value wins verbatim"
+        );
+        let sized = json!({ "size": "1280x720" });
+        assert_eq!(
+            requested_resolution(&sized, Some(&declaring(&["720p"]))),
+            None,
+            "a size says the same thing as a resolution, so none is added"
+        );
+    }
+
+    #[test]
+    fn body_carries_the_resolution_it_is_given() {
+        let args = json!({ "prompt": "a wave", "duration": 5 });
+        let body = request_body("m", &args, Some(DEFAULT_RESOLUTION.to_string())).unwrap();
+        assert_eq!(body["resolution"], DEFAULT_RESOLUTION);
+        assert_eq!(body["duration"], 5);
+        let body = request_body("m", &args, None).unwrap();
+        assert!(body.get("resolution").is_none());
     }
 }

@@ -79,15 +79,17 @@ const OLD_DEFAULT_WORKER_MODELS: &[&str] = &[
 /// (`google/gemini-3.1-flash-image`) is rewritten out of the stored picker list and every
 /// account's pick by catalog entry `50`.
 pub(crate) const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-nano-banana-2.1";
-pub(crate) const DEFAULT_VIDEO_MODEL: &str = "minimax/hailuo-3";
+/// Used by every account with no explicit pick; a stored pick is never rewritten.
+pub(crate) const DEFAULT_VIDEO_MODEL: &str = "google/gemini-omni-1.2-flash";
 
 /// Fresh-install seeded image-generation model list: newline-separated, in picker order; mirrors
 /// the curated set the live install ships.
 const FRESH_INSTALL_IMAGE_GEN_MODELS: &str = "google/gemini-nano-banana-2.1\nmicrosoft/mai-image-2.6\nopenai/gpt-image-2.5-sunburst\nqwen/qwen-image-3-pro";
 
-/// Fresh-install seeded video-generation model list: newline-separated, in picker order; mirrors
-/// the curated set the live install ships.
-const FRESH_INSTALL_VIDEO_MODELS: &str = "bytedance/seedance-2.0-mini\nminimax/hailuo-3";
+/// Fresh-install seeded video-generation model list: newline-separated, in picker order, the
+/// default model first (as in the image list).
+const FRESH_INSTALL_VIDEO_MODELS: &str =
+    "google/gemini-omni-1.2-flash\nbytedance/seedance-2.0-mini\nminimax/hailuo-3";
 
 /// A per-model provider routing rule.
 #[derive(Debug, Clone, PartialEq)]
@@ -1540,7 +1542,8 @@ mod tests {
                 ),
                 (
                     "video_models".to_string(),
-                    "bytedance/seedance-2.0-mini\nminimax/hailuo-3".to_string()
+                    "google/gemini-omni-1.2-flash\nbytedance/seedance-2.0-mini\nminimax/hailuo-3"
+                        .to_string()
                 ),
             ],
             "a fresh config database must hold catalog 69's transcription row plus the fresh-install defaults"

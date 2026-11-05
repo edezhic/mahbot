@@ -27,7 +27,7 @@ const MAX_REFERENCE_IMAGES: usize = 9;
 /// The active model is user-switchable via `/video_models`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VideoEditModel {
-    /// minimax/hailuo-3 (default): 5-15s output, 2K fixed, always audio, no seed.
+    /// minimax/hailuo-3: 5-15s output, 2K fixed, always audio, no seed.
     Hailuo3,
     /// runway/aleph-2: output mirrors input, preserves audio, seed best-effort.
     Aleph2,
