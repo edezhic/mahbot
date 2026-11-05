@@ -11,7 +11,7 @@ use crate::util::media_target::{self, MarkerTarget, MediaTarget};
 use crate::util::{
     MEDIA_MARKER_RE, MediaMarkerKind, UnwrapPoison, is_http_url, parse_media_marker,
 };
-use crate::{Channel, ChannelMessage, RefusedMarker, SendMessage, SendOutcome};
+use crate::{Channel, ChannelMessage, RefusedMarker, SendFailure, SendMessage, SendOutcome};
 use anyhow::Context;
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
@@ -720,18 +720,20 @@ const MARKER_ISSUE_TARGET: &str = "media-marker";
 /// pointer to what was tried, not a copy of it.
 const MARKER_RECORD_PATH_MAX_CHARS: usize = 400;
 
-/// The path a record quotes for a marker, bounded: the target as written, minus what only an
-/// address carries. `None` for an inline payload, which names no path to record.
+/// The path a refusal quotes and records, bounded: the target as written, minus what only an
+/// address carries. `None` for an inline payload, which names no path. A refusal computes it once,
+/// so the note to the conversation and the Issues-view row name the same path.
 fn recorded_path(target: &str) -> Option<String> {
     media_target::recordable_target(target)
         .map(|path| crate::util::truncate(&path, MARKER_RECORD_PATH_MAX_CHARS))
 }
 
 /// Record one local marker's refusal in the Issues view — the durable trace of a delivery that
-/// failed — with the path as written and the reason. `path` is the local target that failed, and
-/// `file_roots` the workspaces it may belong to.
-fn record_marker_refusal(target: &str, reason: &str, path: &Path, file_roots: &[PathBuf]) {
-    let Some(written) = recorded_path(target) else {
+/// failed — with the path as written and the reason. `written` is the path the refusal quotes,
+/// computed once by the caller; `path` is the local target that failed, and `file_roots` the
+/// workspaces it may belong to.
+fn record_marker_refusal(written: Option<&str>, reason: &str, path: &Path, file_roots: &[PathBuf]) {
+    let Some(written) = written else {
         return;
     };
     crate::logs::record_warn_row(
@@ -849,15 +851,12 @@ struct MarkerRepair {
 }
 
 /// The refusal one undeliverable marker produces: the marker as written (bounded, credential-free)
-/// and the reason. An inline payload names no path, so it is quoted by kind alone.
-fn refused_marker(kind: MediaMarkerKind, target: &str, reason: &str) -> RefusedMarker {
-    let marker = match media_target::recordable_target(target) {
-        Some(written) if !media_target::is_inline_payload(target) => format!(
-            "[{}:{}]",
-            kind.token(),
-            crate::util::truncate(&written, MARKER_RECORD_PATH_MAX_CHARS)
-        ),
-        _ => format!("[{}]", kind.token()),
+/// and the reason. `written` is the path the refusal record keeps, already bounded, so the note can
+/// never name something other than what was recorded.
+fn refused_marker(kind: MediaMarkerKind, written: Option<&str>, reason: &str) -> RefusedMarker {
+    let marker = match written {
+        Some(written) => format!("[{}:{written}]", kind.token()),
+        None => format!("[{}]", kind.token()),
     };
     RefusedMarker {
         marker,
@@ -875,8 +874,11 @@ fn refused(
     path: &Path,
     file_roots: &[PathBuf],
 ) -> MarkerOutcome {
-    record_marker_refusal(target, reason, path, file_roots);
-    MarkerOutcome::Refuse(refused_marker(kind, target, reason))
+    // One bounded, credential-free path is shared by the record and the note, so the note names
+    // exactly what was recorded.
+    let written = recorded_path(target);
+    record_marker_refusal(written.as_deref(), reason, path, file_roots);
+    MarkerOutcome::Refuse(refused_marker(kind, written.as_deref(), reason))
 }
 
 /// Decide one marker: the target is placed, then the kind's own gate decides whether it can be
@@ -893,14 +895,15 @@ fn marker_outcome(
             // A data URI has no name worth quoting: name the kind instead.
             return MarkerOutcome::Refuse(refused_marker(
                 marker_kind,
-                target,
+                None,
                 media_target::INLINE_PAYLOAD_REASON,
             ));
         }
         MarkerTarget::Remote => {
+            let written = recorded_path(target);
             return match media_target::remote_marker(marker_kind, target) {
                 media_target::RemoteMarker::Refused(reason) => {
-                    MarkerOutcome::Refuse(refused_marker(marker_kind, target, reason))
+                    MarkerOutcome::Refuse(refused_marker(marker_kind, written.as_deref(), reason))
                 }
                 media_target::RemoteMarker::Deliverable => MarkerOutcome::Attach {
                     target: target.to_string(),
@@ -3687,7 +3690,7 @@ impl Channel for TelegramChannel {
         self
     }
 
-    async fn send(&self, message: &SendMessage) -> anyhow::Result<SendOutcome> {
+    async fn send(&self, message: &SendMessage) -> Result<SendOutcome, SendFailure> {
         let content = message.content.trim();
         if content.is_empty() {
             tracing::warn!("TelegramChannel: attempted to send empty message – skipping");
@@ -3710,19 +3713,35 @@ impl Channel for TelegramChannel {
             return self
                 .send_text_chunks(content, chat_id, thread_id, message.reply_markup.clone())
                 .await
-                .map(|()| SendOutcome::default());
+                .map(|()| SendOutcome::default())
+                .map_err(|error| SendFailure {
+                    error,
+                    delivered: false,
+                    refused: Vec::new(),
+                });
         }
 
-        // A refused marker leaves nothing in the delivered body: the conversation that wrote it is
-        // told instead, so the owner gets neither a broken attachment nor a notice about one.
+        // A refused marker leaves nothing in the delivered body — the conversation that wrote it
+        // is told instead — so the owner gets no broken attachment. An attachment that fails after
+        // acceptance is reported in the chat by the loop below.
+        let mut delivered = false;
         if !text_without_markers.is_empty() {
-            self.send_text_chunks(
-                &text_without_markers,
-                chat_id,
-                thread_id,
-                message.reply_markup.clone(),
-            )
-            .await?;
+            if let Err(error) = self
+                .send_text_chunks(
+                    &text_without_markers,
+                    chat_id,
+                    thread_id,
+                    message.reply_markup.clone(),
+                )
+                .await
+            {
+                return Err(SendFailure {
+                    error,
+                    delivered: false,
+                    refused: refusals,
+                });
+            }
+            delivered = true;
         }
 
         // One failed attachment must not cost the user the others: every failure is surfaced
@@ -3761,7 +3780,11 @@ impl Channel for TelegramChannel {
         }
 
         match first_error {
-            Some(e) => Err(e),
+            Some(error) => Err(SendFailure {
+                error,
+                delivered,
+                refused: refusals,
+            }),
             None => Ok(SendOutcome { refused: refusals }),
         }
     }
@@ -4135,14 +4158,14 @@ pub async fn send_direct(
         file_roots: Vec::new(),
     };
     if let Some(channel) = crate::channel_registry().get("telegram") {
-        return channel.send(&reply).await.map(|_| ());
+        return channel.send(&reply).await.map(|_| ()).map_err(Into::into);
     }
     let token = crate::config::CONFIG
         .telegram_bot_token()
         .ok_or_else(|| anyhow::anyhow!("Telegram channel not found in registry"))?;
     let channel = TelegramChannel::from_config(token)
         .ok_or_else(|| anyhow::anyhow!("the Bot API this mode serves has no endpoint"))?;
-    channel.send(&reply).await.map(|_| ())
+    channel.send(&reply).await.map(|_| ()).map_err(Into::into)
 }
 
 /// Best-effort plain-text send through the registered channel, for replies and notifications.

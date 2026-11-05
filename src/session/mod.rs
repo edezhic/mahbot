@@ -977,11 +977,12 @@ impl SessionStore {
     }
 
     pub(crate) async fn delete(&self, agent_id: &str) -> Result<bool> {
-        // Every deletion path (`/clear`, the Sessions page, the maintainer's self-cleanup) goes
-        // through here, so this is where a launch folder's search engine is released
-        // (`workspace_index::release_path_named_engine`) and where the computer tool's session ends
-        // (`tools::computer::end_session`). Read the recorded folder before the rows go; the engine
-        // is released only for a real removal.
+        // Every deletion path (`/clear`, the Sessions page, the maintainer's self-cleanup, a
+        // discarded pipeline session) goes through here, so this is where a launch folder's search
+        // engine is released (`workspace_index::release_path_named_engine`), where the computer
+        // tool's session ends (`tools::computer::end_session`), and where the conversation's
+        // announcement memory is forgotten with its rows. Read the recorded folder before the rows
+        // go; the engine is released only for a real removal.
         let workspace = self.session_workspace_name(agent_id).await;
         let tx = self.conn.begin_tx().await?;
         let deleted = tx
@@ -997,6 +998,7 @@ impl SessionStore {
         .await?;
         tx.commit().await?;
         crate::tools::computer::end_session(agent_id);
+        crate::agent::message_router::forget_announced_media_failures(agent_id);
         if deleted > 0
             && let Some(workspace) = workspace
         {
@@ -1507,7 +1509,8 @@ const TRANSIENT_SESSION_TTL_HOURS: i64 = 2;
 ///
 /// Both `sessions` and `session_metadata` are cleaned up in a single transaction, and the purged
 /// rows' launch folders are released with them — this is where a one-off custom-role run's search
-/// engine dies ([`crate::workspace_index::release_path_named_engine`]).
+/// engine dies ([`crate::workspace_index::release_path_named_engine`]). This purge is the other
+/// path that ends a conversation without `delete`, so it forgets the announced markers too.
 pub async fn cleanup_old_transient_sessions() -> Result<u64> {
     let cutoff = (Utc::now() - ChronoDuration::hours(TRANSIENT_SESSION_TTL_HOURS)).to_rfc3339();
     let session_store = store();
@@ -1540,14 +1543,21 @@ pub async fn cleanup_old_transient_sessions() -> Result<u64> {
     // The launch folders of the rows about to go: a one-off custom-role run's engine is held for
     // the run and referenced by nothing else (`workspace_index::release_path_named_engine`), and
     // this bulk purge is the one path that ends such a session without going through `delete`.
-    let purged_folders: Vec<String> = tx
+    // The agent id travels with it so the conversation's announcement memory is forgotten too.
+    let purged: Vec<(String, Option<String>)> = tx
         .query(
-            &format!("SELECT workspace_name FROM session_metadata WHERE {safety_predicate}"),
+            &format!(
+                "SELECT agent_id, workspace_name FROM session_metadata WHERE {safety_predicate}"
+            ),
             build_params.clone(),
         )
         .await?
         .iter()
-        .filter_map(|row| row.get::<Option<String>>(0).ok().flatten())
+        .filter_map(|row| {
+            let agent_id = row.get::<String>(0).ok()?;
+            let workspace = row.get::<Option<String>>(1).ok().flatten();
+            Some((agent_id, workspace))
+        })
         .collect();
 
     tx.execute(
@@ -1570,9 +1580,12 @@ pub async fn cleanup_old_transient_sessions() -> Result<u64> {
     tx.commit().await?;
 
     // After the commit: the purged sessions are gone, so the launch folders they named are no
-    // longer referenced by anything.
-    for workspace in purged_folders {
-        crate::workspace_index::release_path_named_engine(&workspace);
+    // longer referenced by anything, and their conversations are new again.
+    for (agent_id, workspace) in purged {
+        crate::agent::message_router::forget_announced_media_failures(&agent_id);
+        if let Some(workspace) = workspace {
+            crate::workspace_index::release_path_named_engine(&workspace);
+        }
     }
 
     Ok(deleted)
@@ -1745,7 +1758,6 @@ pub async fn clear_session(user_name: &str, role: &str, ws_name: &str) -> anyhow
     let agent_id = resolve_agent_id(user_name, role, ws_name);
     crate::jobs::abandon_session_jobs(&agent_id).await?;
     crate::session::store().delete(&agent_id).await?;
-    crate::agent::message_router::forget_announced_media_failures(&agent_id);
     Ok("Session cleared. Starting fresh.".to_string())
 }
 

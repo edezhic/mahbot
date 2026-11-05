@@ -410,13 +410,14 @@ pub(crate) fn marker_name(target: &str) -> String {
 
 /// The target as a durable record may keep it: a local path as written, without what only an
 /// address carries (its query, fragment and userinfo). `None` for an inline payload — a `data:`
-/// URI names no path, and its text is a payload rather than something to record. The caller
-/// bounds the result.
+/// URI or its omitted-placeholder form names no path, and its text is a payload rather than
+/// something to record. The caller bounds the result.
 #[must_use]
 pub(crate) fn recordable_target(target: &str) -> Option<Cow<'_, str>> {
     let target = target.trim();
-    // Every other reader takes a scheme as written, so a `DATA:`-cased payload is guarded here.
-    if target.to_ascii_lowercase().starts_with("data:") {
+    // An inline payload names no path, and every other reader takes a scheme as written, so a
+    // `DATA:`-cased payload is guarded here too.
+    if target.to_ascii_lowercase().starts_with("data:") || is_inline_payload(target) {
         return None;
     }
     Some(without_credentials(target))
@@ -442,8 +443,9 @@ fn without_credentials(target: &str) -> Cow<'_, str> {
 }
 
 /// The refusal wording shared by the transport's post-accept failure notices and the desktop
-/// display layer. A marker refusal no longer reaches the user: the conversation that wrote it is
-/// told instead, and the note quotes the reason, not this line.
+/// display layer. A marker refused for delivery is left out of the delivered body, and the
+/// conversation that wrote it is told instead — the note quotes the reason, not this line. The
+/// desktop still draws this line where it refuses a marker itself.
 #[must_use]
 pub(crate) fn marker_refusal(name: &str, reason: &str) -> String {
     format!("Could not send \"{name}\": {reason}")

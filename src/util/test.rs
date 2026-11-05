@@ -379,7 +379,10 @@ impl SpyChannel {
 
 #[async_trait::async_trait]
 impl crate::Channel for SpyChannel {
-    async fn send(&self, message: &crate::SendMessage) -> anyhow::Result<crate::SendOutcome> {
+    async fn send(
+        &self,
+        message: &crate::SendMessage,
+    ) -> Result<crate::SendOutcome, crate::SendFailure> {
         self.sent.lock().unwrap_poison().push(message.clone());
         Ok(crate::SendOutcome::default())
     }

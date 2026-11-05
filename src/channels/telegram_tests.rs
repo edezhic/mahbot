@@ -1116,9 +1116,10 @@ async fn an_unfetchable_video_address_is_reported_not_pasted_as_a_link() {
     );
 }
 
-/// A marker naming a missing file leaves nothing in the delivered body: the owner gets neither a
-/// notice nor a broken attachment, and the failure is reported back for the conversation that
-/// wrote it. A message that is nothing but the failed marker sends nothing at all.
+/// A marker naming a missing file leaves nothing in the delivered body: the conversation that
+/// wrote it is told instead, so the owner gets no broken attachment, and the failure is reported
+/// back for that conversation. A message that is nothing but the failed marker sends nothing at
+/// all.
 #[tokio::test]
 async fn a_refused_marker_leaves_no_notice_in_the_delivered_message() {
     crate::users::test_util::init_test_store().await;
@@ -1158,6 +1159,41 @@ async fn a_refused_marker_leaves_no_notice_in_the_delivered_message() {
         fake.sent_texts(),
         vec!["Here it is"],
         "a message that is only the failed marker sends nothing"
+    );
+}
+
+/// An attachment that fails after a refused marker still returns the report: the text went out,
+/// so the failure says the owner received the reply and only the attachment was lost.
+#[tokio::test]
+async fn a_failed_attachment_still_carries_the_refused_marker_report() {
+    crate::users::test_util::init_test_store().await;
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let telegram = TelegramChannel::new_with("token-a".into(), fake.base.clone(), false);
+    let dir = tempfile::tempdir().unwrap();
+    let roots = vec![dir.path().to_path_buf()];
+
+    let failure = telegram
+        .send(&SendMessage {
+            content: "Here it is [FILE:missing.pdf] [VIDEO:http://127.0.0.1:1/clip.mp4]"
+                .to_string(),
+            recipient: "42".to_string(),
+            reply_markup: None,
+            file_roots: roots,
+        })
+        .await
+        .expect_err("the attachment failure is reported");
+
+    assert_eq!(
+        refusal_lines(&failure.refused),
+        vec!["[FILE:missing.pdf]: file not found."]
+    );
+    assert!(
+        failure.delivered,
+        "the text went out before the attachment failed"
+    );
+    assert!(
+        fake.sent_texts().iter().any(|text| text == "Here it is"),
+        "the chat received the body text"
     );
 }
 

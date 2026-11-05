@@ -24,7 +24,7 @@ pub use telegram_group::compose_group_content;
 use crate::channels::chat_history::ChatHistoryInsert;
 use crate::db;
 use crate::util::UnwrapPoison;
-use crate::{Channel, ChannelMessage, ChatDirection, SendMessage, SendOutcome};
+use crate::{Channel, ChannelMessage, ChatDirection, SendFailure, SendMessage, SendOutcome};
 use async_trait::async_trait;
 use enrichment::has_inbound_temp_marker;
 use std::borrow::Cow;
@@ -287,7 +287,7 @@ impl GuiChannel {
 impl Channel for GuiChannel {
     /// Pure transport — broadcast and persistence are handled centrally by
     /// [`broadcast_and_persist_agent_response`].
-    async fn send(&self, _message: &SendMessage) -> anyhow::Result<SendOutcome> {
+    async fn send(&self, _message: &SendMessage) -> Result<SendOutcome, SendFailure> {
         Ok(SendOutcome::default())
     }
 
@@ -342,7 +342,7 @@ struct VoiceChannel;
 #[async_trait]
 impl Channel for VoiceChannel {
     /// No-op — voice has no outbound transport.
-    async fn send(&self, _message: &SendMessage) -> anyhow::Result<SendOutcome> {
+    async fn send(&self, _message: &SendMessage) -> Result<SendOutcome, SendFailure> {
         Ok(SendOutcome::default())
     }
 

@@ -539,9 +539,35 @@ pub struct SendOutcome {
     pub refused: Vec<RefusedMarker>,
 }
 
+/// A send that failed, carrying what it did before the failure: the markers it refused, and
+/// whether the message's text reached the owner. A transport that fails on one attachment has still
+/// delivered the text, and the note about a refused marker must say which happened — otherwise the
+/// assistant resends only the file and the reply's text is lost.
+#[derive(Debug)]
+pub struct SendFailure {
+    pub error: anyhow::Error,
+    /// Whether the message body reached the owner before the failure.
+    pub delivered: bool,
+    /// The markers refused before the failure, in the order they were found.
+    pub refused: Vec<RefusedMarker>,
+}
+
+impl std::fmt::Display for SendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+impl std::error::Error for SendFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
 #[async_trait]
 pub trait Channel: Send + Sync {
-    async fn send(&self, message: &SendMessage) -> anyhow::Result<SendOutcome>;
+    /// The error carries the refusals collected before the failure, so no caller can lose them.
+    async fn send(&self, message: &SendMessage) -> Result<SendOutcome, SendFailure>;
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
     fn name(&self) -> &'static str;
 

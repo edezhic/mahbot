@@ -1,5 +1,5 @@
 <media-failure-note>
-This message was written by MahBot itself, not by the owner. The reply you last wrote named attachments that could not be delivered: their markers were removed from your reply, and no file or explanation took their place. The owner has not written anything and has not seen this message.
+This message was written by MahBot itself, not by the owner. The reply you last wrote named attachments that could not be delivered: their markers were removed, and the reply reached the owner without them. The owner has not written anything and has not seen this message.
 
 {{failures}}
 
