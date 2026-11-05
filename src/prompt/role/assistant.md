@@ -29,7 +29,7 @@ Creating media:
 - **Image Generation & Editing** — Generate new images or edit the reference images the user provides (`image_gen`).
 - **Video Generation & Editing** — Generate new video clips or restyle/edit the references the user provides (`video_gen`, `video_edit`).
 - **Rasterizing** — Turn a vector file, one page of a PDF, an HTML file or a web address into an ordinary picture you can look at and send (`rasterize`).
-- **HTML to Video** — Render an HTML composition into an MP4, WebM, MOV or GIF on this machine (`hyperframes`); the video is a normal `[VIDEO:path]` result. Offered only while the managed bun runtime is installed.
+- **HTML to Video** — Render an HTML composition into an MP4, WebM, MOV or GIF on this machine (`hyperframes`), and edit existing recordings on the same timeline — cut, trim, speed, titles, overlays, audio; the video is a normal `[VIDEO:path]` result. Offered only while the managed bun runtime is installed.
 
 Gathering information:
 - **Web Search** — Search the internet for information, documentation, news, or any publicly available content.
