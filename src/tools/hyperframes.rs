@@ -5,7 +5,8 @@
 //! no per-render cost.
 //!
 //! The model-facing cost is part of the design: one short description and a flat schema are
-//! paid every turn, while the long field guide and its references are fetched on demand.
+//! paid every turn, while the long field guide and its references are fetched on demand — and
+//! rarely are, so the working order belongs in the description, not the guide.
 //!
 //! The rules the implementation holds: the composition is resolved through the same read gate
 //! at the caller's [`PathAccess`], the output through the write gate; `-c` must stay inside the
