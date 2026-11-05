@@ -1,6 +1,7 @@
 //! Markdown classification shared by the chat render and the delivery path: the parser options
-//! iced's markdown view runs with, and the regions it draws as source code — where a media marker
-//! is text the user reads, not an attachment.
+//! iced's markdown view runs with, and the one pass that finds the regions it draws as source code
+//! — where a media marker is text the user reads, not an attachment — and the markdown pictures it
+//! draws in place of their syntax.
 
 use std::ops::Range;
 
@@ -16,12 +17,24 @@ pub(crate) fn iced_markdown_options() -> pulldown_cmark::Options {
         | pulldown_cmark::Options::ENABLE_TASKLISTS
 }
 
-/// Byte ranges of `text` the parser draws as source code: fenced and indented blocks, and inline
-/// spans.
+/// What one [`scan`] pass finds for its consumers: the code regions, and the markdown pictures the
+/// desktop draws as attachments instead of their syntax.
+pub(crate) struct MarkdownScan {
+    /// Byte ranges drawn as source code: fenced and indented blocks, and inline spans.
+    pub code: Vec<Range<usize>>,
+    /// Byte ranges of markdown pictures (`![alt](url)`), each with the destination as written.
+    pub pictures: Vec<(Range<usize>, String)>,
+}
+
+/// One `into_offset_iter` pass over `text` with iced's parser options — the parser the markdown
+/// view runs. It is the single classification of the code regions, shared by the desktop's render
+/// and the delivery decision, and the only parse either of them makes to reach it.
 #[must_use]
-pub(crate) fn code_ranges(text: &str) -> Vec<Range<usize>> {
+pub(crate) fn scan(text: &str) -> MarkdownScan {
     let mut code = Vec::new();
+    let mut pictures = Vec::new();
     let mut block: Option<usize> = None;
+    let mut picture: Option<(usize, String)> = None;
     for (event, range) in
         pulldown_cmark::Parser::new_ext(text, iced_markdown_options()).into_offset_iter()
     {
@@ -35,8 +48,16 @@ pub(crate) fn code_ranges(text: &str) -> Vec<Range<usize>> {
                     code.push(start..range.end);
                 }
             }
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Image { dest_url, .. }) => {
+                picture = Some((range.start, dest_url.into_string()));
+            }
+            pulldown_cmark::Event::End(pulldown_cmark::TagEnd::Image) => {
+                if let Some((start, dest)) = picture.take() {
+                    pictures.push((start..range.end, dest));
+                }
+            }
             _ => {}
         }
     }
-    code
+    MarkdownScan { code, pictures }
 }

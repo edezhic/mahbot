@@ -1,0 +1,1 @@
+When a turn rendered several videos, only the ones your reply names are sent — the rest stay where they were produced — so name the version you mean; a reply that names none of them sends every render of the turn.

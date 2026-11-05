@@ -270,22 +270,17 @@ pub(crate) fn is_inline_payload(target: &str) -> bool {
 
 /// The identity two targets share when they name one file: a local target resolved the way
 /// delivery resolves it — a relative one joined to the workspace that has it, a clearly misspelled
-/// directory repaired — then [`file_key`]. An address and an inline payload name no local file and
-/// answer `None`, as does prose that names nothing (`[IMAGE:path]` with no workspace file of that
-/// name).
+/// directory repaired — then [`crate::util::canonical_or_self`]. An address and an inline payload
+/// name no local file and answer `None`, as does prose that names nothing (`[IMAGE:path]` with no
+/// workspace file of that name).
 #[must_use]
 pub(crate) fn target_file_key(target: &str, roots: &[PathBuf]) -> Option<PathBuf> {
     let MarkerTarget::Local(path) = resolve_marker_target(target, roots) else {
         return None;
     };
-    let path = repaired_local_target(&path).unwrap_or(path);
-    Some(file_key(&path))
-}
-
-/// What makes two paths one file: canonicalized when it exists, as written otherwise.
-#[must_use]
-pub(crate) fn file_key(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    Some(crate::util::canonical_or_self(
+        &repaired_local_target(&path).unwrap_or(path),
+    ))
 }
 
 /// True when a target names something: it has a path separator, or its last segment carries an
@@ -679,7 +674,7 @@ fn is_decodable_local_raster(target: &str) -> bool {
     };
     // Canonicalize so the same file reached through different spellings (the /tmp →
     // /private/tmp symlink) shares one cache slot.
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical = crate::util::canonical_or_self(path);
     let key = (canonical.clone(), mtime);
     {
         let cache = LOCAL_RASTER_DECODE_CACHE.lock().unwrap_poison();

@@ -124,7 +124,7 @@ pub(crate) fn parse_media_marker<'h>(caps: &regex::Captures<'h>) -> (MediaMarker
 /// inside code a marker is source text the user reads, not an attachment.
 #[must_use]
 pub(crate) fn markers_outside_code(text: &str) -> Vec<(MediaMarkerKind, &str)> {
-    let code = markdown::code_ranges(text);
+    let code = markdown::scan(text).code;
     MEDIA_MARKER_RE
         .captures_iter(text)
         .filter(|caps| {
@@ -482,6 +482,9 @@ pub(crate) fn strip_suffix_ignoring_case<'a>(s: &'a str, suffix: &str) -> Option
         .then(|| &s[..cut])
 }
 
+/// What makes two paths one file: canonicalized when it exists, as written otherwise. Every file
+/// identity — a decode-cache key, two markers naming one target — is compared through this, so two
+/// spellings of one path never read as two files.
 #[must_use]
 pub(crate) fn canonical_or_self(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())

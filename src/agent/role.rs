@@ -154,8 +154,7 @@ impl std::str::FromStr for Role {
 /// The marker a transcript carries where the recogniser heard speech and read nothing, as
 /// the role prompts spell it: one substitution from the engine's own constant, so the
 /// wording the model is taught and the wording a transcript carries cannot drift.
-const UNTRANSCRIBED_MARKER: &[(&str, &str)] =
-    &[("{{untranscribed}}", crate::speech::UNTRANSCRIBED)];
+const UNTRANSCRIBED: (&str, &str) = ("{{untranscribed}}", crate::speech::UNTRANSCRIBED);
 
 impl Role {
     /// Canonical role name as a `&'static str` (lowercase), via the [`strum::IntoStaticStr`]
@@ -174,9 +173,10 @@ impl Role {
     /// Role description, loaded from the embedded prompt files.
     #[must_use]
     pub fn role_description(&self) -> String {
+        let media_delivery = crate::prompt::media_delivery();
         crate::prompt::substitute(
             &crate::prompt::load_prompt(&format!("role/{}.md", self.as_str())),
-            UNTRANSCRIBED_MARKER,
+            &[UNTRANSCRIBED, ("{{media_delivery}}", &media_delivery)],
         )
     }
 
@@ -186,11 +186,13 @@ impl Role {
     pub fn role_description_for(&self, is_admin: bool) -> String {
         if *self == Role::Assistant && is_admin {
             let say_note = crate::prompt::load_prompt("role/assistant_admin_say.md");
+            let media_delivery = crate::prompt::media_delivery();
             crate::prompt::substitute(
                 &crate::prompt::load_prompt("role/assistant_admin.md"),
                 &[
                     ("{{say_tool}}", say_note.trim()),
-                    ("{{untranscribed}}", crate::speech::UNTRANSCRIBED),
+                    UNTRANSCRIBED,
+                    ("{{media_delivery}}", &media_delivery),
                 ],
             )
         } else {

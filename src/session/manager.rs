@@ -92,7 +92,9 @@ pub(crate) struct PendingToolFrame {
 }
 
 /// Render the fixed system block a custom role's prompt opens with: this launch's folder and the
-/// system. Nothing else — the role itself is the administrator's authorial text
+/// system, plus the render-delivery rule every agent that can render is taught
+/// ([`crate::prompt::media_delivery`]) — a custom role may be granted the video tools, and learns
+/// nothing from the built-in role prompts. The role itself is the administrator's authorial text
 /// ([`crate::Launch::prompt`]), which follows as the second system part. A launch in a different
 /// folder re-renders it (see [`Session::append_turn_message`]).
 fn custom_role_block(ws: &Workspace) -> String {
@@ -101,6 +103,7 @@ fn custom_role_block(ws: &Workspace) -> String {
         &[
             ("{{workspace}}", &ws.as_path().display().to_string()),
             ("{{operating_system}}", std::env::consts::OS),
+            ("{{media_delivery}}", &crate::prompt::media_delivery()),
         ],
     )
 }
@@ -2286,5 +2289,16 @@ mod tests {
             "the rest of the workspace context must still render"
         );
         assert!(messages.iter().all(|m| !m.content.contains(MEMORY)));
+    }
+
+    /// A custom role never sees a built-in role prompt, so the fixed block is the only place its
+    /// session can learn the render-delivery rule — and a key left unsubstituted would reach the
+    /// model as literal text.
+    #[test]
+    fn custom_role_block_carries_the_render_delivery_rule() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let block = custom_role_block(&crate::Workspace::from_path(dir.path()));
+        assert!(block.contains(&crate::prompt::media_delivery()));
+        assert!(!crate::prompt::TEMPLATE_RE.is_match(&block));
     }
 }

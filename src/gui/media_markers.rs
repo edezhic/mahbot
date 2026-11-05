@@ -54,7 +54,6 @@ use std::time::SystemTime;
 
 use super::{selectable, theme, widgets};
 use crate::gui::markdown_breaks;
-use crate::util::markdown::iced_markdown_options;
 use crate::util::media_target::{self, MarkerTarget};
 use crate::util::{
     MEDIA_MARKER_RE, MediaMarkerKind, UnwrapPoison, file_name_or_path, parse_media_marker,
@@ -309,57 +308,30 @@ enum Replacement {
     Attachment(MediaAttachment),
 }
 
-/// One `into_offset_iter` pass over the body with iced's parser options — the parser the
-/// markdown view runs — collecting the byte ranges of its code (where marker syntax is source) and
-/// the edits its markdown pictures become. The same code rule decides what a reply names when it is
-/// delivered ([`crate::util::markdown::code_ranges`]): one pass here, one there, never a different
-/// classification.
+/// The desktop's share of the one [`crate::util::markdown::scan`] pass: its code regions, where
+/// marker syntax is source, and the edits its markdown pictures become.
 ///
 /// An agent writes `![alt](url)` directly, and the parser would draw it as an `Image` item that
 /// swallows the text collected before it, so it leaves the text here too. A picture needs no code
 /// check: this same scan is the render's.
 fn scan(text: &str) -> (Vec<Range<usize>>, Vec<Edit>) {
-    let mut code = Vec::new();
-    let mut pictures = Vec::new();
-    let mut block: Option<usize> = None;
-    let mut picture: Option<(usize, String)> = None;
-    for (event, range) in
-        pulldown_cmark::Parser::new_ext(text, iced_markdown_options()).into_offset_iter()
-    {
-        match event {
-            pulldown_cmark::Event::Code(_) => code.push(range),
-            pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(_)) => {
-                block = Some(range.start);
-            }
-            pulldown_cmark::Event::End(pulldown_cmark::TagEnd::CodeBlock) => {
-                if let Some(start) = block.take() {
-                    code.push(start..range.end);
-                }
-            }
-            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Image { dest_url, .. }) => {
-                picture = Some((range.start, dest_url.into_string()));
-            }
-            pulldown_cmark::Event::End(pulldown_cmark::TagEnd::Image) => {
-                let Some((start, dest)) = picture.take() else {
-                    continue;
-                };
-                let dest = dest.trim();
-                // A picture with no destination can never draw and would still reach the
-                // parser as an `Image` item, so its source goes without an attachment.
-                let replacement = if dest.is_empty() {
-                    Replacement::Text(String::new())
-                } else {
-                    Replacement::Attachment(picture_attachment(dest, None))
-                };
-                pictures.push(Edit {
-                    range: start..range.end,
-                    replacement,
-                });
-            }
-            _ => {}
-        }
-    }
-    (code, pictures)
+    let markdown = crate::util::markdown::scan(text);
+    let pictures = markdown
+        .pictures
+        .into_iter()
+        .map(|(range, dest)| {
+            let dest = dest.trim();
+            // A picture with no destination can never draw and would still reach the parser as
+            // an `Image` item, so its source goes without an attachment.
+            let replacement = if dest.is_empty() {
+                Replacement::Text(String::new())
+            } else {
+                Replacement::Attachment(picture_attachment(dest, None))
+            };
+            Edit { range, replacement }
+        })
+        .collect();
+    (markdown.code, pictures)
 }
 
 /// The edits the body's `[KIND:…]` markers become, in body order, through the canonical
@@ -683,7 +655,7 @@ fn local_path_image_handle(path: &str) -> Option<image::Handle> {
         return None;
     }
     let mtime = meta.modified().ok()?;
-    let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let canonical = crate::util::canonical_or_self(p);
     cached_image(&LOCAL_IMAGE_CACHE, &(canonical.clone(), mtime), || {
         std::fs::read(&canonical)
             .ok()

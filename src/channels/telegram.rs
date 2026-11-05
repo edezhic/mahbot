@@ -987,10 +987,10 @@ fn parse_attachment_markers(
     // marker is not what records a repair.
     let mut recorded: HashSet<PathBuf> = HashSet::new();
     for repair in repairs {
-        let key = media_target::file_key(&repair.repaired);
+        let key = crate::util::canonical_or_self(&repair.repaired);
         let delivered = attachments
             .iter()
-            .any(|attachment| media_target::file_key(Path::new(&attachment.target)) == key);
+            .any(|attachment| crate::util::canonical_or_self(Path::new(&attachment.target)) == key);
         if delivered && recorded.insert(key) {
             record_marker_repair(&repair.written, &repair.repaired, file_roots);
         }
@@ -1003,10 +1003,10 @@ fn parse_attachment_markers(
 /// the text: `[FILE:...]` carries a canonical path while the media kinds carry the resolved one, so
 /// a correct marker and its repaired twin would otherwise read as two files.
 fn already_attached(attachments: &[TelegramAttachment], target: &str) -> bool {
-    let key = media_target::file_key(Path::new(target));
+    let key = crate::util::canonical_or_self(Path::new(target));
     attachments
         .iter()
-        .any(|attachment| media_target::file_key(Path::new(&attachment.target)) == key)
+        .any(|attachment| crate::util::canonical_or_self(Path::new(&attachment.target)) == key)
 }
 
 pub(crate) const CLOUD_API_BASE: &str = "https://api.telegram.org";
