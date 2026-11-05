@@ -6,8 +6,10 @@
 //! local path — a relative one resolved against the workspace the message belongs to, exactly
 //! as `[FILE:…]` targets are. It reads a scheme as written, so only a canonical lowercase
 //! http(s) target is an address, and it performs no containment: only `[FILE:…]` is
-//! workspace-confined; the other kinds deliberately accept any location on disk. What a
-//! placed target becomes is decided here too — [`local_refusal`] gates delivery (Telegram,
+//! workspace-confined; the other kinds deliberately accept any location on disk. A local path
+//! that does not exist is offered [`repaired_local_target`] next: one directory component the
+//! sender clearly misspelled is corrected, and a file name never is. What a placed target
+//! becomes is decided here too — [`local_refusal`] gates delivery (Telegram,
 //! which must ship bytes), [`remote_marker`] and [`inline_marker_refusal`] answer wherever a
 //! marker of an unservable kind is refused, and [`marker_refusal`] words the refusal, shared
 //! so it reads the same wherever shown.
@@ -15,14 +17,15 @@
 //! Consumers deciding whether a target is a "real image" use
 //! [`classify_media_image_target`] (Telegram and enrichment, which offload the blocking decode
 //! off the async path). Two deliberately do not: the GUI render path (a full decode would run
-//! on the render thread — the display layer decides from [`resolve_marker_target`] whether a
-//! marker is a row, reading no bytes, and the viewer does the bounded decode itself) and the
-//! provider's agent-context scanner (`compatible.rs`, which must never read a local file
-//! during request serialization and calls [`is_native_data_uri`] directly). No
-//! workspace-boundary containment — a valid raster anywhere on disk is valid. Local files are
-//! validated by a real raster decode (memoized per canonical path + mtime), remote URLs by
-//! well-formedness. A `data:...` URI is NOT classified here: it is an inline payload
-//! validated by its own [`is_native_data_uri`] gate, which only the provider uses directly.
+//! on the render thread — the display layer decides from [`resolve_marker_target`] and
+//! [`repaired_local_target`] whether a marker is a row, decoding nothing, and the viewer does
+//! the bounded decode itself) and the provider's agent-context scanner (`compatible.rs`, which
+//! must never read a local file during request serialization and calls [`is_native_data_uri`]
+//! directly). No workspace-boundary containment — a valid raster anywhere on disk is valid.
+//! Local files are validated by a real raster decode (memoized per canonical path + mtime),
+//! remote URLs by well-formedness. A `data:...` URI is NOT classified here: it is an inline
+//! payload validated by its own [`is_native_data_uri`] gate, which only the provider uses
+//! directly.
 
 use crate::util::{MediaMarkerKind, UnwrapPoison};
 use base64::{
@@ -31,8 +34,9 @@ use base64::{
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 /// A classified `[IMAGE:...]` marker target: what consumers match on. The value itself
@@ -135,6 +139,125 @@ pub(crate) fn resolve_marker_target(target: &str, roots: &[PathBuf]) -> MarkerTa
             .first()
             .map_or_else(|| raw.to_path_buf(), |root| root.join(raw)),
     )
+}
+
+/// How far ahead of the next candidate the nearest directory must be: a second one an edit behind
+/// the best is a crowded field, not a clear intent, so nothing is guessed.
+const REPAIR_MARGIN: usize = 2;
+
+/// The existing file a local target names when exactly one directory component in it is a
+/// misspelled name: the deepest component that does not exist is compared with the directories
+/// beside it, and the single clearly-nearest one is substituted when the remainder of the path
+/// exists under it. `None` when the path exists as written, when the missing component is the
+/// file's own name — a wrong name is a wrong file, never a repair — when no directory beside it
+/// comes near, when more than one does, or when the rest of the path is not there.
+///
+/// This is the one repair both delivery and the desktop's display layer apply, so a marker they
+/// show is the same file.
+#[must_use]
+pub(crate) fn repaired_local_target(path: &Path) -> Option<PathBuf> {
+    // A trailing separator names a directory, so repairing it would turn it into the file of that
+    // name — never the marker's meaning.
+    if !path.is_absolute() || path.to_string_lossy().ends_with(['/', '\\']) || !is_missing(path) {
+        return None;
+    }
+    let components: Vec<Component<'_>> = path.components().collect();
+    let mut prefix = PathBuf::new();
+    let missing = components.iter().position(|component| {
+        prefix.push(component);
+        is_missing(&prefix)
+    })?;
+    // A drive, a root, `.` or `..` is not a name a sender mistyped; the last component is the
+    // file's own name; and a `..` in what follows names a directory the substitution did not
+    // produce, so it is no longer the path as written.
+    if !matches!(components[missing], Component::Normal(_))
+        || missing + 1 == components.len()
+        || components[missing + 1..].contains(&Component::ParentDir)
+    {
+        return None;
+    }
+    let name = components[missing].as_os_str().to_str()?;
+    let directory: PathBuf = components[..missing].iter().collect();
+    let candidate = unique_near_directory(&directory, name)?;
+    let repaired = directory
+        .join(candidate)
+        .join(components[missing + 1..].iter().collect::<PathBuf>());
+    // The rest of the path must be there as written, or the substitution is not the one meant.
+    std::fs::metadata(&repaired).is_ok().then_some(repaired)
+}
+
+/// True when nothing at `path` exists at all. The entry itself is asked (`lstat`), so a symlink
+/// whose target is gone is a link that exists, not a mistyped name, and a failed `stat` of any
+/// other kind is not a missing file either — the distinction [`local_target_refusal`] draws.
+fn is_missing(path: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// The one directory in `directory` that `name` is a clear misspelling of, judged by
+/// [`edit_distance_within`] over [`crate::util::caseless_name_key`] so case and composition are
+/// not the typo. The nearest must be within half the name's length and the next-nearest at least
+/// [`REPAIR_MARGIN`] edits behind it.
+fn unique_near_directory(directory: &Path, name: &str) -> Option<OsString> {
+    let written: Vec<char> = crate::util::caseless_name_key(name).chars().collect();
+    let limit = (written.len() / 2).max(1);
+    let mut best: Option<(usize, OsString)> = None;
+    let mut runner_up = usize::MAX;
+    for entry in std::fs::read_dir(directory).ok()?.flatten() {
+        // Only a directory can stand where the mistyped component stood, and the entry is followed
+        // (`stat`) the way the repaired path itself will be, so a directory a link names counts.
+        if !entry.metadata().is_ok_and(|meta| meta.is_dir()) {
+            continue;
+        }
+        let candidate = entry.file_name();
+        let Some(text) = candidate.to_str() else {
+            continue;
+        };
+        let lowered: Vec<char> = crate::util::caseless_name_key(text).chars().collect();
+        let Some(distance) = edit_distance_within(&written, &lowered, limit) else {
+            continue;
+        };
+        match &best {
+            Some((best_distance, _)) if *best_distance <= distance => {
+                runner_up = runner_up.min(distance);
+            }
+            _ => {
+                if let Some((best_distance, _)) = best.replace((distance, candidate)) {
+                    runner_up = runner_up.min(best_distance);
+                }
+            }
+        }
+    }
+    let (distance, candidate) = best?;
+    (runner_up >= distance + REPAIR_MARGIN).then_some(candidate)
+}
+
+/// The Levenshtein distance between `a` and `b` when it is at most `limit`, `None` otherwise. A
+/// row whose every cell is past the limit cannot come back under it, so a long name costs a band
+/// rather than a full matrix against every neighbour.
+fn edit_distance_within(a: &[char], b: &[char], limit: usize) -> Option<usize> {
+    if a.len().abs_diff(b.len()) > limit {
+        return None;
+    }
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0_usize; b.len() + 1];
+    for (row, from) in a.iter().enumerate() {
+        current[0] = row + 1;
+        let mut row_best = current[0];
+        for (column, to) in b.iter().enumerate() {
+            current[column + 1] = (previous[column + 1] + 1)
+                .min(current[column] + 1)
+                .min(previous[column] + usize::from(from != to));
+            row_best = row_best.min(current[column + 1]);
+        }
+        if row_best > limit {
+            return None;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    (previous[b.len()] <= limit).then_some(previous[b.len()])
 }
 
 /// True when `target` is a value rather than a location: a `data:` payload, or the placeholder
@@ -264,10 +387,29 @@ pub(crate) fn marker_name(target: &str) -> String {
     )
 }
 
+/// The target as a durable record may keep it: a local path as written, without what only an
+/// address carries (its query, fragment and userinfo). `None` for an inline payload — a `data:`
+/// URI names no path, and its text is a payload rather than something to record. The caller
+/// bounds the result.
+#[must_use]
+pub(crate) fn recordable_target(target: &str) -> Option<Cow<'_, str>> {
+    let target = target.trim();
+    // Every other reader takes a scheme as written, so a `DATA:`-cased payload is guarded here.
+    if target.to_ascii_lowercase().starts_with("data:") {
+        return None;
+    }
+    Some(without_credentials(target))
+}
+
 /// `target` without what can carry credentials but names nothing: an address's query, fragment
-/// and authority userinfo. Only an address has them — a local path keeps its own `#` and `?`.
+/// and authority userinfo. Only an address has them — a local path keeps its own `#` and `?` —
+/// and a protocol-relative one (`//user:pass@host/x`) carries them too.
 fn without_credentials(target: &str) -> Cow<'_, str> {
-    let Some((scheme, rest)) = target.split_once("://") else {
+    let (prefix, rest) = if let Some((scheme, rest)) = target.split_once("://") {
+        (&target[..scheme.len() + 3], rest)
+    } else if let Some(rest) = target.strip_prefix("//") {
+        ("//", rest)
+    } else {
         return Cow::Borrowed(target);
     };
     let without_value = rest.split(['?', '#']).next().unwrap_or(rest);
@@ -275,7 +417,7 @@ fn without_credentials(target: &str) -> Cow<'_, str> {
     let host = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
-    Cow::Owned(format!("{scheme}://{host}/{path}"))
+    Cow::Owned(format!("{prefix}{host}/{path}"))
 }
 
 /// The notice a user reads where a marker could not be delivered. The desktop display layer
@@ -805,6 +947,98 @@ mod tests {
         assert_eq!(marker_name("generated/some-poster.png"), "some-poster.png");
         // A local name keeps its own `#` and `?`: only an address has a payload.
         assert_eq!(marker_name("generated/poster#2.png"), "poster#2.png");
+
+        // A record keeps the whole path, and strips the same address parts: a scheme-written
+        // target is still a path here, so a credential in it must not be stored.
+        assert_eq!(
+            recordable_target("/tmp/a.png").as_deref(),
+            Some("/tmp/a.png")
+        );
+        assert_eq!(
+            recordable_target("HTTPS://user:pass@cdn.example.com/a.png?token=s3cret").as_deref(),
+            Some("HTTPS://cdn.example.com/a.png")
+        );
+        // A protocol-relative target carries the same userinfo.
+        assert_eq!(
+            recordable_target("//user:pass@cdn.example.com/a.png?token=s3cret").as_deref(),
+            Some("//cdn.example.com/a.png")
+        );
+        // An inline payload names no path, in any casing.
+        assert_eq!(recordable_target("data:image/png;base64,AAAA"), None);
+        assert_eq!(recordable_target("DATA:image/png;base64,AAAA"), None);
+    }
+
+    #[test]
+    fn a_mistyped_directory_resolves_to_the_file_it_meant() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let generated = root.join("userspaces").join("lyuba").join("generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        let png = generated.join("shot.png");
+        std::fs::write(&png, b"png").unwrap();
+
+        // The typo is in an ancestor directory, and the rest of the path exists as written.
+        let ancestor_typo = root
+            .join("userseas")
+            .join("lyuba")
+            .join("generated")
+            .join("shot.png");
+        assert_eq!(repaired_local_target(&ancestor_typo), Some(png.clone()));
+
+        // The same repair one level down.
+        let parent_typo = root
+            .join("userspaces")
+            .join("lyuba")
+            .join("generatd")
+            .join("shot.png");
+        assert_eq!(repaired_local_target(&parent_typo), Some(png.clone()));
+
+        // A path that exists as written is never repaired, and the last component is the file's
+        // own name: a similar name is a different file.
+        assert_eq!(repaired_local_target(&png), None);
+        assert_eq!(repaired_local_target(&generated.join("shot.pgn")), None);
+        // A trailing separator names a directory: repairing it would deliver a file of that name.
+        assert_eq!(
+            repaired_local_target(&PathBuf::from(format!("{}/", png.display()))),
+            None
+        );
+        // A `..` after the mistyped component names a directory the substitution did not produce.
+        assert_eq!(
+            repaired_local_target(&root.join("userseas").join("..").join("shot.png")),
+            None
+        );
+
+        // A component with no near neighbour, and a repair whose remainder is not there.
+        assert_eq!(
+            repaired_local_target(&root.join("zzzz").join("shot.png")),
+            None
+        );
+        assert_eq!(
+            repaired_local_target(&root.join("userseas").join("lyuba").join("gone.png")),
+            None
+        );
+
+        // An extra component is not a mistyped one: repairing it leaves the rest of the path
+        // missing, so nothing is guessed.
+        assert_eq!(
+            repaired_local_target(
+                &root
+                    .join("userseas")
+                    .join("userspaces")
+                    .join("lyuba")
+                    .join("generated")
+                    .join("shot.png")
+            ),
+            None
+        );
+
+        // Two equally near directories could be meant: nothing is guessed.
+        std::fs::create_dir_all(root.join("alpha")).unwrap();
+        std::fs::create_dir_all(root.join("alphb")).unwrap();
+        assert_eq!(
+            repaired_local_target(&root.join("alphx").join("shot.png")),
+            None
+        );
     }
 
     #[test]

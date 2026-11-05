@@ -33,8 +33,6 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 use tracing::{error, warn};
-use unicase::UniCase;
-use unicode_normalization::UnicodeNormalization;
 
 /// Sentinel that `extract_sender_user_name` substitutes for senders without an @username.
 /// Nobody can hold it: binding it is refused and it never matches a sender (such a sender
@@ -914,14 +912,6 @@ pub(crate) fn name_taken_message(name: &str) -> String {
     format!("A user named '{name}' already exists")
 }
 
-/// `NFD(toCasefold(NFD(name)))`, the Unicode canonical caseless matching: the full fold, so `ß`
-/// and `ss` (and `ﬃ` and `ffi`) are one key, and canonical decomposition, so composed and
-/// decomposed accents are one key.
-fn caseless_name_key(name: &str) -> String {
-    let decomposed: String = name.nfd().collect();
-    UniCase::new(decomposed).to_folded_case().nfd().collect()
-}
-
 /// The one place the collision rule lives, judged by [`UserStore::add_user`] and the desktop's
 /// add-user dialog. `existing` is the caller's reading of the stored names; the reserved admin name
 /// counts whether or not its row is in that reading. A byte-identical name collides here too — the
@@ -930,10 +920,10 @@ pub(crate) fn collides_with_existing<'a>(
     name: &str,
     existing: impl IntoIterator<Item = &'a str>,
 ) -> bool {
-    let key = caseless_name_key(name);
+    let key = crate::util::caseless_name_key(name);
     std::iter::once(ADMIN_USER_NAME)
         .chain(existing)
-        .any(|existing| caseless_name_key(existing) == key)
+        .any(|existing| crate::util::caseless_name_key(existing) == key)
 }
 
 /// The name is the only unbounded part of the taken-name line, so this keeps it one line.

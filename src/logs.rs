@@ -347,6 +347,30 @@ impl LogStore {
 /// process with no logs store (the `mahbot chrome` CLI dispatches before [`init_tracing`] runs)
 /// records nothing.
 pub(crate) fn record_stray_event(event: &StrayEvent<'_>) {
+    record_warn_row(
+        event.source,
+        event.message,
+        serde_json::json!({
+            "detail": event.recipe,
+            "scope": event.scope,
+            "session": event.session,
+            "duration_ms": event.duration_ms,
+        }),
+        event.workspace,
+    );
+}
+
+/// File ONE durable `WARN` row of its own in the Issues view, straight through the telemetry
+/// queue — never the batching tracing writer — for a fact that must outlive the call that
+/// produced it. `fields` is the row's own object and `workspace` a path or a name, normalised
+/// here. Never deduped, unlike [`record_issue_once`]: each call is one occurrence, and counting
+/// them is what the row is for. Fail-open: a process with no logs store files nothing.
+pub(crate) fn record_warn_row(
+    target: &str,
+    message: &str,
+    fields: serde_json::Value,
+    workspace: &str,
+) {
     if !crate::telemetry::recording() {
         return;
     }
@@ -354,15 +378,10 @@ pub(crate) fn record_stray_event(event: &StrayEvent<'_>) {
     crate::telemetry::enqueue(crate::telemetry::TelemetryRecord::StrayEvent(LogEntry {
         timestamp: crate::db::now(),
         level: "WARN".to_string(),
-        target: event.source.to_string(),
-        message: event.message.to_string(),
-        fields: serde_json::json!({
-            "detail": event.recipe,
-            "scope": event.scope,
-            "session": event.session,
-            "duration_ms": event.duration_ms,
-        }),
-        workspace: workspace_name(event.workspace),
+        target: target.to_string(),
+        message: message.to_string(),
+        fields,
+        workspace: workspace_name(workspace),
         agent_id: attribution.agent_id,
         agent_role: attribution.agent_role,
         ticket: attribution.ticket,

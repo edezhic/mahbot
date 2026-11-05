@@ -81,7 +81,8 @@ pub(crate) enum TelemetryRecord {
     GrepTelemetry(GrepTelemetryRow),
     /// A session's tool calls, or the one row a command-line operation contributes.
     ToolCalls(ToolCallBatch),
-    /// The warning row an unexpected shell or browser event leaves (`logs`).
+    /// One warning row of its own (`logs`) — an event that outlived its call, or a media
+    /// marker's refusal or repair.
     StrayEvent(LogEntry),
 }
 

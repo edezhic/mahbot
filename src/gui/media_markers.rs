@@ -24,7 +24,9 @@
 //! word, `<path in your workspace>` — stays text, and so do a malformed address and one of a
 //! scheme the product cannot show. A reference stays one when its file is gone: the row draws and
 //! a click behaves like any missing file (a bare word is a reference only while a workspace file
-//! of that name is — the resolver's existence probe, not a display decision). Only a reference
+//! of that name is — the resolver's existence probe, not a display decision). A local reference
+//! one clearly-misspelled directory away from an existing file shows that file, the repair
+//! delivery applies too ([`media_target::repaired_local_target`]). Only a reference
 //! that cannot be attached *as that kind* becomes a [`media_target::marker_refusal`] notice.
 //!
 //! # Canonical marker pattern
@@ -174,11 +176,16 @@ fn render_marker(kind: MediaMarkerKind, target: &str, roots: &[PathBuf]) -> Opti
                 Replacement::Attachment(delivered_marker(kind, &target, None))
             }
         }),
-        MarkerTarget::Local(path) => Some(Replacement::Attachment(delivered_marker(
-            kind,
-            &target,
-            Some(&path.to_string_lossy()),
-        ))),
+        MarkerTarget::Local(path) => {
+            // The one repair delivery applies too, so a repaired marker shows the file it meant
+            // instead of a row pointing at a path that is not there.
+            let path = media_target::repaired_local_target(&path).unwrap_or(path);
+            Some(Replacement::Attachment(delivered_marker(
+                kind,
+                &target,
+                Some(&path.to_string_lossy()),
+            )))
+        }
     }
 }
 

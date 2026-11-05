@@ -1203,6 +1203,19 @@ pub(crate) fn file_name_or_path(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+/// `NFD(toCasefold(NFD(name)))`, the Unicode canonical caseless matching: the full fold, so `ß`
+/// and `ss` (and `ﬃ` and `ffi`) are one key, and canonical decomposition, so composed and
+/// decomposed accents are one key. Two names are the same name exactly when their keys are.
+#[must_use]
+pub(crate) fn caseless_name_key(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
+    let decomposed: String = name.nfd().collect();
+    unicase::UniCase::new(decomposed)
+        .to_folded_case()
+        .nfd()
+        .collect()
+}
+
 /// Whether `character` is a break a text stack may start a line at: the mandatory breaks of UAX
 /// #14. A rendered answer's lines come from untrusted text, so escaping must account for every one.
 #[must_use]

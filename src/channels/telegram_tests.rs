@@ -412,6 +412,88 @@ fn a_relative_media_marker_resolves_against_the_messages_workspace() {
     assert_eq!(att[0].target, relayed.to_string_lossy());
 }
 
+/// A marker whose only defect is a mistyped directory is delivered from the file it meant, a
+/// mistyped file name is refused rather than guessed at, and a file the message would deliver more
+/// than once goes out once.
+#[test]
+fn a_mistyped_directory_is_delivered_and_a_mistyped_name_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let generated = root.join("userspaces").join("lyuba").join("generated");
+    std::fs::create_dir_all(&generated).unwrap();
+    let png = generated.join("shot.png");
+    write_test_png(&png);
+    let roots = vec![root.to_path_buf()];
+    let typo = root
+        .join("userseas")
+        .join("lyuba")
+        .join("generated")
+        .join("shot.png");
+
+    let (cleaned, att, refusals) = parse_attachment_markers(
+        &format!("Look [IMAGE:{}]", typo.display()),
+        &roots,
+        TransferLimits::CLOUD,
+    );
+    assert_eq!(cleaned, "Look");
+    assert!(refusals.is_empty());
+    assert_eq!(att.len(), 1);
+    assert_eq!(att[0].target, png.to_string_lossy());
+
+    // `[FILE:]` is workspace-confined: the repair is judged by the roots like any other path, so
+    // it never makes an outside file deliverable.
+    let (_, att, refusals) = parse_attachment_markers(
+        &format!("[FILE:{}]", typo.display()),
+        &roots,
+        TransferLimits::CLOUD,
+    );
+    assert!(refusals.is_empty());
+    assert_eq!(att.len(), 1);
+    assert_eq!(
+        att[0].target,
+        canonical_without_verbatim_prefix(&png).to_string_lossy()
+    );
+    let elsewhere = tempfile::tempdir().unwrap();
+    let (_, att, refusals) = parse_attachment_markers(
+        &format!("[FILE:{}]", typo.display()),
+        &[elsewhere.path().to_path_buf()],
+        TransferLimits::CLOUD,
+    );
+    assert!(att.is_empty());
+    assert_eq!(
+        refusals,
+        vec!["Could not send \"shot.png\": it is outside your workspace."]
+    );
+
+    // The repaired marker and the correct one name one file, whichever kind each is written as.
+    let (_, att, refusals) = parse_attachment_markers(
+        &format!(
+            "[IMAGE:{}] [FILE:{}] [IMAGE:{}]",
+            typo.display(),
+            typo.display(),
+            png.display()
+        ),
+        &roots,
+        TransferLimits::CLOUD,
+    );
+    assert!(refusals.is_empty());
+    assert_eq!(att.len(), 1, "one file, one attachment");
+
+    // A mistyped file name is a different file: similar names are the norm here, so nothing is
+    // guessed and the refusal stands.
+    let name_typo = generated.join("shot.pgn");
+    let (_, att, refusals) = parse_attachment_markers(
+        &format!("[IMAGE:{}]", name_typo.display()),
+        &roots,
+        TransferLimits::CLOUD,
+    );
+    assert!(att.is_empty());
+    assert_eq!(
+        refusals,
+        vec!["Could not send \"shot.pgn\": file not found."]
+    );
+}
+
 /// One refused marker does not stop the others in the same message: every valid target is attached
 /// and only the failing one leaves a notice, in body order.
 #[test]

@@ -709,17 +709,94 @@ fn video_upload_name(url: &str, content_type: Option<&str>) -> String {
 /// The refusal only a `[FILE:...]` marker produces: the other kinds accept any location on disk.
 const OUTSIDE_WORKSPACE_REASON: &str = "it is outside your workspace.";
 
+/// The Issues-view record a refused local marker leaves: the path as written and why.
+const MARKER_REFUSED_MESSAGE: &str = "a media marker was refused";
+/// The Issues-view record a marker delivered through a directory repair leaves: the path as
+/// written and where it was delivered from.
+const MARKER_REPAIRED_MESSAGE: &str = "a media marker's directory was repaired";
+/// What the record's `target` column names — the surface that reported it.
+const MARKER_ISSUE_TARGET: &str = "media-marker";
+/// The longest path a marker record keeps: a marker may carry an arbitrary blob, and the row is a
+/// pointer to what was tried, not a copy of it.
+const MARKER_RECORD_PATH_MAX_CHARS: usize = 400;
+
+/// Why one local marker could not be delivered: the reason the Issues view records, and the notice
+/// the user reads where the marker was.
+struct LocalRefusal {
+    reason: String,
+    notice: String,
+}
+
+/// The path a record quotes for a marker, bounded: the target as written, minus what only an
+/// address carries. `None` for an inline payload, which names no path to record.
+fn recorded_path(target: &str) -> Option<String> {
+    media_target::recordable_target(target)
+        .map(|path| crate::util::truncate(&path, MARKER_RECORD_PATH_MAX_CHARS))
+}
+
+/// Record one local marker's refusal in the Issues view — the durable trace of a delivery that
+/// failed — with the path as written and the reason. `path` is the local target that failed, and
+/// `file_roots` the workspaces it may belong to.
+fn record_marker_refusal(target: &str, reason: &str, path: &Path, file_roots: &[PathBuf]) {
+    let Some(written) = recorded_path(target) else {
+        return;
+    };
+    crate::logs::record_warn_row(
+        MARKER_ISSUE_TARGET,
+        MARKER_REFUSED_MESSAGE,
+        serde_json::json!({ "path": written, "reason": reason }),
+        &workspace_of(path, file_roots),
+    );
+}
+
+/// Record one repair in the Issues view: a delivery from a path the marker did not name is
+/// otherwise invisible, so this row is how a repair is counted and explained.
+fn record_marker_repair(target: &str, repaired: &Path, file_roots: &[PathBuf]) {
+    let Some(written) = recorded_path(target) else {
+        return;
+    };
+    crate::logs::record_warn_row(
+        MARKER_ISSUE_TARGET,
+        MARKER_REPAIRED_MESSAGE,
+        serde_json::json!({
+            "path": written,
+            "repaired_to": crate::util::truncate(
+                &repaired.to_string_lossy(),
+                MARKER_RECORD_PATH_MAX_CHARS,
+            ),
+        }),
+        &workspace_of(repaired, file_roots),
+    );
+}
+
+/// The workspace a marker belongs to: the root holding its target — a relative target resolves
+/// against the first root that has it, so a relayed marker belongs to the workspace it came from
+/// — else the authoring agent's root. [`crate::logs`] normalises a path to the workspace's name.
+fn workspace_of(path: &Path, file_roots: &[PathBuf]) -> String {
+    file_roots
+        .iter()
+        .find(|root| path.starts_with(root))
+        .or_else(|| file_roots.first())
+        .map(|root| root.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// Resolve an outbound `[FILE:...]` target within the roots that authorize it. The target is
 /// canonicalized (a symlink cannot smuggle a file out) and must be inside a root BEFORE the
-/// existence, directory and size checks, so a refusal discloses none of them. `Err` is the notice
-/// naming a bounded last component.
+/// existence, directory and size checks, so a refusal discloses none of them. `Err` carries the
+/// reason recorded and the notice naming a bounded last component.
 fn resolve_file_target(
     path: &Path,
     file_roots: &[PathBuf],
     upload_max: u64,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, LocalRefusal> {
     let name = media_target::marker_name(&path.to_string_lossy());
-    let refuse = |reason: &str| Err(media_target::marker_refusal(&name, reason));
+    let refuse = |reason: &str| {
+        Err(LocalRefusal {
+            reason: reason.to_string(),
+            notice: media_target::marker_refusal(&name, reason),
+        })
+    };
 
     // Nothing authorizes a local file without a workspace: a relative target never found a root.
     if file_roots.is_empty() {
@@ -749,13 +826,15 @@ fn resolve_file_target(
         return refuse(media_target::DIRECTORY_REASON);
     }
     if meta.len() > upload_max {
-        return refuse(
-            &UploadTooLarge {
-                size: meta.len(),
-                max: upload_max,
-            }
-            .to_string(),
-        );
+        let too_large = UploadTooLarge {
+            size: meta.len(),
+            max: upload_max,
+        }
+        .to_string();
+        return Err(LocalRefusal {
+            notice: media_target::marker_refusal(&name, &too_large),
+            reason: too_large,
+        });
     }
 
     // The plain spelling, not the platform's verbatim form: this becomes `target`.
@@ -772,9 +851,17 @@ enum MarkerOutcome {
     Refuse(String),
 }
 
-/// The refusal for an undeliverable target, named by its bounded last component.
-fn refused(target: &str, reason: &str) -> MarkerOutcome {
-    MarkerOutcome::Refuse(media_target::marker_refusal_for(target, reason))
+/// The refusal for an undeliverable local target: recorded in the Issues view, and shown where
+/// the marker was. Only a local target reaches here — an address or a payload is refused without
+/// a record.
+fn refused(
+    target: &str,
+    refusal: LocalRefusal,
+    path: &Path,
+    file_roots: &[PathBuf],
+) -> MarkerOutcome {
+    record_marker_refusal(target, &refusal.reason, path, file_roots);
+    MarkerOutcome::Refuse(refusal.notice)
 }
 
 /// Decide one marker: the target is placed, then the kind's own gate decides whether it can be
@@ -802,26 +889,49 @@ fn marker_outcome(
         MarkerTarget::Local(path) => path,
     };
 
+    // A marker whose only defect is a mistyped directory names a file that exists: the repair is
+    // the same one the desktop's display layer applies, and it happens before the kind's gate so
+    // that gate judges the file actually meant (and, for `[FILE:]`, the path actually delivered).
+    let repaired = media_target::repaired_local_target(&path);
+    let delivered = repaired.as_deref().unwrap_or(&path);
+    // A repair is recorded only where the gate delivers the file: a path the gate refuses is
+    // refused as written, and the row never discloses what lay outside the workspace.
+    let attach = |delivered_target: String| {
+        if let Some(repaired) = &repaired {
+            record_marker_repair(target, repaired, file_roots);
+        }
+        MarkerOutcome::Attach(delivered_target)
+    };
+
     if marker_kind == MediaMarkerKind::File {
-        return match resolve_file_target(&path, file_roots, limits.upload) {
-            Ok(canonical) => MarkerOutcome::Attach(canonical.to_string_lossy().into_owned()),
-            Err(notice) => MarkerOutcome::Refuse(notice),
+        return match resolve_file_target(delivered, file_roots, limits.upload) {
+            Ok(canonical) => attach(canonical.to_string_lossy().into_owned()),
+            Err(refusal) => refused(target, refusal, delivered, file_roots),
         };
     }
 
     // Only `[FILE:...]` is workspace-confined; the kind's own gate still applies (an image marker
     // needs a raster signature). Nothing is decoded here — a local image goes out as a document, so
     // a large valid raster is delivered, not refused.
-    if let Some(reason) = media_target::local_refusal(marker_kind, &path) {
-        return refused(target, reason);
+    if let Some(reason) = media_target::local_refusal(marker_kind, delivered) {
+        return refused(
+            target,
+            LocalRefusal {
+                reason: reason.to_string(),
+                notice: media_target::marker_refusal_for(target, reason),
+            },
+            delivered,
+            file_roots,
+        );
     }
-    MarkerOutcome::Attach(path.to_string_lossy().into_owned())
+    attach(delivered.to_string_lossy().into_owned())
 }
 
 /// Parse `[KIND:path]` markers, returning the text with them removed, the attachments, and the
 /// user-facing refusals. Targets resolve against `file_roots`; markers are independent, so one
 /// refusal costs the user neither the others nor the surrounding text. A bare word naming no file
-/// stays as prose.
+/// stays as prose. A file the message would deliver more than once — written twice, or once
+/// mistyped and once correctly — is delivered once.
 fn parse_attachment_markers(
     message: &str,
     file_roots: &[PathBuf],
@@ -836,10 +946,12 @@ fn parse_attachment_markers(
             match marker_outcome(marker_kind, path.trim(), file_roots, limits) {
                 MarkerOutcome::Literal => caps.get_match().as_str().to_string(),
                 MarkerOutcome::Attach(target) => {
-                    attachments.push(TelegramAttachment {
-                        kind: TelegramAttachmentKind::from(marker_kind),
-                        target,
-                    });
+                    if !already_attached(&attachments, &target) {
+                        attachments.push(TelegramAttachment {
+                            kind: TelegramAttachmentKind::from(marker_kind),
+                            target,
+                        });
+                    }
                     String::new()
                 }
                 MarkerOutcome::Refuse(notice) => {
@@ -851,6 +963,25 @@ fn parse_attachment_markers(
         .to_string();
 
     (cleaned.trim().to_string(), attachments, refusals)
+}
+
+/// Whether this message already delivers `target`. The comparison is on the file itself, not on
+/// the text: `[FILE:...]` carries a canonical path while the media kinds carry the resolved one, so
+/// a correct marker and its repaired twin would otherwise read as two files.
+fn already_attached(attachments: &[TelegramAttachment], target: &str) -> bool {
+    let key = attachment_key(target);
+    attachments
+        .iter()
+        .any(|attachment| attachment_key(&attachment.target) == key)
+}
+
+/// What makes two delivered targets one file: a local path is canonicalized on both sides, an
+/// address is its own text (canonicalizing one fails anyway).
+fn attachment_key(target: &str) -> PathBuf {
+    if is_http_url(target) {
+        return PathBuf::from(target);
+    }
+    std::fs::canonicalize(target).unwrap_or_else(|_| PathBuf::from(target))
 }
 
 pub(crate) const CLOUD_API_BASE: &str = "https://api.telegram.org";
