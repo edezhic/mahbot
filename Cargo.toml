@@ -75,7 +75,9 @@ rodio = { version = "0.22", default-features = false, features = ["playback", "h
 # and MP3 (an audio attachment). WAV is read by the product itself.
 ogg = "0.9"
 opus-decoder = "0.1"
-minimp3 = "0.5"
+# 0.6 vendors the minimp3 header that detects MSVC ARM64; 0.5's header predates
+# that fix and fails to compile the C decoder for `aarch64-pc-windows-msvc`.
+minimp3 = "0.6"
 
 # HTTP / WebSocket client
 # 0.13: `rustls-tls` feature is gone; the ring TLS provider is installed
