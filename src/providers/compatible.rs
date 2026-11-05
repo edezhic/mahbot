@@ -1852,6 +1852,43 @@ mod tests {
         }
     }
 
+    /// The picture cap holds at the wire: a conversation over the cap serializes at most
+    /// [`crate::session::SUMMARIZATION_IMAGE_COUNT`] image parts, and the newest picture is one of
+    /// them.
+    #[test]
+    fn the_picture_cap_bounds_the_image_parts_a_request_serializes() {
+        let uri = tiny_png_data_uri();
+        let total = crate::session::SUMMARIZATION_IMAGE_COUNT + 11;
+        let mut messages: Vec<ChatMessage> = (0..total)
+            .map(|serial| ChatMessage::user(format!("shot {serial} [IMAGE:{uri}]")))
+            .collect();
+        crate::session::image_cap::apply(&mut messages, None);
+
+        let image_parts = |message: &ChatMessage| {
+            serde_json::to_value(to_message_content(message.role, &message.content))
+                .unwrap()
+                .as_array()
+                .map_or(0, |parts| {
+                    parts
+                        .iter()
+                        .filter(|part| part["type"] == "image_url")
+                        .count()
+                })
+        };
+        let parts: usize = messages.iter().map(image_parts).sum();
+        assert!(
+            parts <= crate::session::SUMMARIZATION_IMAGE_COUNT,
+            "{parts}"
+        );
+        assert_eq!(
+            parts,
+            total - 2 * crate::session::image_cap::RETIRE_BATCH,
+            "two whole batches stepped aside"
+        );
+        assert_eq!(image_parts(&messages[total - 1]), 1, "the newest is sent");
+        assert_eq!(image_parts(&messages[0]), 0, "the oldest is the note");
+    }
+
     /// A user turn's `[IMAGE:<data uri>]` marker is the image itself: it becomes an
     /// OpenAI image part with the prose around it as text, in any casing, and the
     /// same turn converted for the native frame carries the same part. A marker

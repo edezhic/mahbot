@@ -38,6 +38,9 @@ use crate::{ChatMessage, ChatRequest, ExtractionValidator};
 ///
 /// Terminal failure is [`RetryExhausted`] — it carries the last-attempt raw text (`last_raw`, for
 /// verdict-extraction ticket comments) plus the per-attempt diagnostics trail.
+///
+/// The history is bounded by the request picture cap before the first attempt, so every retry sends
+/// the same bounded request.
 pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
     history: &[ChatMessage],
     extraction_prompt: &str,
@@ -52,6 +55,9 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
     if !extraction_prompt.is_empty() {
         extraction_history.push(ChatMessage::user(extraction_prompt));
     }
+    // No session behind this history, so `None` counts it. Bounded once here, so every retry below
+    // sends the same bounded request.
+    crate::session::image_cap::apply(&mut extraction_history, None);
 
     // Telemetry record request: the recorded request derives from params so recorded metadata can
     // never diverge from the bytes actually sent. Only the telemetry fields are read from it —

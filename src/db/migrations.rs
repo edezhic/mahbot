@@ -110,8 +110,12 @@
 //! a ticket is created. Every ticket already in the database — including the
 //! ones the Maintainer filed — is backfilled as `feat`, and a fresh install
 //! gets the column from entry `24`'s `CREATE TABLE`, so this is a no-op there.
+//! `78` adds the nullable `session_metadata.image_count` column — the pictures
+//! the session's history holds, so a request is kept under the picture cap
+//! without walking the whole history; NULL is "never counted" and the next use
+//! establishes it from the loaded history (likewise a no-op on fresh installs).
 //!
-//! Future schema changes resume the chain at id `78` with monotonically
+//! Future schema changes resume the chain at id `79` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -227,7 +231,8 @@ CREATE TABLE IF NOT EXISTS session_metadata (
     launch_stopped TEXT,
     reply_to       TEXT,
     context_block_len INTEGER,
-    user_activity  TEXT
+    user_activity  TEXT,
+    image_count    INTEGER
 );
 CREATE TABLE IF NOT EXISTS session_personal_changes (
     agent_id TEXT PRIMARY KEY REFERENCES session_metadata(agent_id) ON DELETE CASCADE,
@@ -1294,6 +1299,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         target: TargetDb::Core,
         body: MigrationBody::Rust(add_tickets_label),
     },
+    Migration {
+        id: "78",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_session_metadata_image_count),
+    },
 ];
 
 /// Apply the catalog to `conn` for one physical database. Each SQL entry's
@@ -2322,6 +2332,20 @@ async fn run_add_tickets_label(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "tickets", "label", "TEXT NOT NULL DEFAULT 'feat'").await
 }
 
+fn add_session_metadata_image_count(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_add_session_metadata_image_count(conn))
+}
+
+/// Catalog `78`: add the nullable `session_metadata.image_count` column — how many pictures the
+/// session's history holds, so a model request is kept under the picture cap without walking the
+/// whole history. NULL means never counted (a session that predates the column) and is established
+/// from the loaded history on first use. Fresh installs get the column from entry `24`'s
+/// `CREATE TABLE`, so the probe makes this a no-op there. Guarded by [`add_column_if_missing`], so
+/// this body is idempotent (non-transactional like every Rust body, re-runnable until recorded).
+async fn run_add_session_metadata_image_count(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "session_metadata", "image_count", "INTEGER").await
+}
+
 fn add_alarms_command(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
     Box::pin(run_add_alarms_command(conn))
 }
@@ -3102,6 +3126,7 @@ mod tests {
                 "reply_to",
                 "context_block_len",
                 "user_activity",
+                "image_count",
             ],
         ),
         ("session_personal_changes", &["agent_id", "baseline"]),
@@ -4238,10 +4263,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
                 "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
                 "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
-                "70", "72", "73", "74", "75", "76", "77"
+                "70", "72", "73", "74", "75", "76", "77", "78"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–77 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–78 tail exactly"
         );
     }
 
@@ -4928,7 +4953,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
             "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
-            "70", "72", "73", "74", "75", "76", "77",
+            "70", "72", "73", "74", "75", "76", "77", "78",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -4937,7 +4962,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–77"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–78"
         );
 
         // Only the tables named here change shape (`72` makes one appear under
@@ -5022,10 +5047,12 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_sm_cols.push("reply_to".to_string());
         expected_sm_cols.push("context_block_len".to_string());
         expected_sm_cols.push("user_activity".to_string());
+        expected_sm_cols.push("image_count".to_string());
         assert_eq!(
             after_sm_cols["session_metadata"], expected_sm_cols,
             "reopen must append exactly created_at/sleep_ended/custom_role/custom_identifier/\
-             launch_stopped/reply_to/context_block_len/user_activity to session_metadata columns"
+             launch_stopped/reply_to/context_block_len/user_activity/image_count to session_metadata \
+             columns"
         );
         let after_users_cols = column_sets(&conn, &["users"]).await;
         let mut expected_users_cols = before.cols["users"].clone();
@@ -5342,7 +5369,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
             "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
-            "70", "72", "73", "74", "75", "76", "77",
+            "70", "72", "73", "74", "75", "76", "77", "78",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -5351,7 +5378,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–77"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–78"
         );
 
         let after_users_cols = column_names(&conn, "users").await;

@@ -1260,10 +1260,15 @@ impl ImagePayload {
         self.annotation("Image content attached to the conversation as a native image.")
     }
 
-    /// Tool-result annotation for a DEDUPED repeat read: the image is already attached.
+    /// Tool-result annotation for a DEDUPED repeat read: the image is in the conversation already
+    /// and is not attached again. It deliberately claims no presence in the request — the picture
+    /// cap may have retired it.
     #[must_use]
     pub(crate) fn already_attached_annotation(&self) -> String {
-        self.annotation("Image content is already attached to the conversation as a native image.")
+        self.annotation(
+            "Image content is already in the conversation as a native image and is not attached \
+             again.",
+        )
     }
 
     /// Render the annotation shared by both variants: `{opener} {path} ({w}x{h}, {format}).
@@ -1875,7 +1880,7 @@ mod tests {
             dup.starts_with("Generated image file /gen/img.png"),
             "dup: {dup}"
         );
-        assert!(dup.contains("already attached"), "dup: {dup}");
+        assert!(dup.contains("already in the conversation"), "dup: {dup}");
 
         // A tool-specific note rides on its own line after the attachment
         // sentence; without one the annotation is exactly the sentence above.

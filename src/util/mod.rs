@@ -124,6 +124,17 @@ pub(crate) fn parse_media_marker<'h>(caps: &regex::Captures<'h>) -> (MediaMarker
 /// the byte count that follows is display-only.
 pub(crate) const DATA_URI_OMITTED_PREFIX: &str = "<data-uri omitted";
 
+/// The note a picture leaves behind when it is not delivered: the marker's byte size, so the model
+/// can see a picture was attached at this point and how big it was. Shared by [`strip_data_uris`]
+/// and the request picture cap ([`crate::session::image_cap`]), so there is one omission shape.
+#[must_use]
+pub(crate) fn data_uri_omitted_note(marker: &str) -> String {
+    format!(
+        "[IMAGE:{DATA_URI_OMITTED_PREFIX} ({} bytes)>]",
+        marker.len()
+    )
+}
+
 /// Strip unbounded data-URI payloads from `[IMAGE:...]` media markers, replacing them with a
 /// byte-count placeholder.
 ///
@@ -140,10 +151,7 @@ pub(crate) fn strip_data_uris(text: &str) -> String {
         .replace_all(text, |caps: &regex::Captures| {
             let (kind, path) = parse_media_marker(caps);
             if kind == MediaMarkerKind::Image && path.starts_with("data:image/") {
-                format!(
-                    "[IMAGE:{DATA_URI_OMITTED_PREFIX} ({} bytes)>]",
-                    caps.get_match().as_str().len()
-                )
+                data_uri_omitted_note(caps.get_match().as_str())
             } else {
                 caps.get_match().as_str().to_string()
             }

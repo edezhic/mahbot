@@ -44,6 +44,11 @@ pub(crate) struct Session {
     /// sessions that never recorded a value (approved no-backfill semantics) and for sessions whose
     /// value the last compaction cleared.
     token_length: Option<u64>,
+    /// Pictures the conversation holds — [`crate::session::image_cap`]'s gate, so the common
+    /// at-or-below-cap request costs no history walk. Kept in step with `history` at every mutation
+    /// and recorded in `session_metadata.image_count`; established from the loaded history on first
+    /// use (`None` there = never counted).
+    image_count: usize,
     /// Shared lock-free holder this session publishes live transcript snapshots into; `None` when
     /// the session is not attached to a running agent (tests, detached sessions). Set by
     /// [`attach_transcript`](Self::attach_transcript) from `Agent::new`.
@@ -114,6 +119,46 @@ impl Session {
         // the start of the turn; `None` (never recorded) is treated as below the summarization
         // threshold.
         self.token_length = crate::session::store().get_token_length(agent_id).await;
+
+        // The recorded picture count gates the request cap; a session that predates the column (or
+        // whose count a truncate cleared) is counted here once, so the per-round check stays a
+        // comparison.
+        // The count is established from a strict read: `load` above fails open to an empty history,
+        // and recording that as the count would let every later over-cap request through.
+        self.image_count = match crate::session::store().get_image_count(agent_id).await {
+            Some(count) => count,
+            None => match crate::session::store().load_checked(agent_id).await {
+                Ok(history) => {
+                    let count = crate::session::image_cap::count(&history);
+                    // Record only for a session that has rows: the write would otherwise create a
+                    // `session_metadata` row for an empty session (and resurrect one `/clear`
+                    // removed). The first append records the count with its rows.
+                    if !history.is_empty()
+                        && let Err(e) = crate::session::store()
+                            .set_image_count(agent_id, count)
+                            .await
+                    {
+                        // Fail open: the in-memory count is still right for this turn, and the next
+                        // init retries the record.
+                        tracing::warn!(
+                            agent_id = %agent_id,
+                            error = %e,
+                            "Failed to record the session's picture count"
+                        );
+                    }
+                    count
+                }
+                // Unrecorded: the next init establishes it rather than trusting a partial read.
+                Err(e) => {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        error = %e,
+                        "Failed to read the history for the session's picture count"
+                    );
+                    crate::session::image_cap::count(&self.history)
+                }
+            },
+        };
 
         // All loaded history above is persisted — record the prefix so finalize appends only new
         // output.
@@ -237,7 +282,7 @@ impl Session {
                 crate::session::store()
                     .batch_append_with_context(agent_id, &msgs, meta)
                     .await?;
-                self.history.extend(msgs);
+                self.take_persisted(msgs);
 
                 if matches!(role, Role::Assistant) {
                     Self::persist_active_models_snapshot(agent_id, &snapshot).await;
@@ -285,7 +330,7 @@ impl Session {
                 if let Some(snapshot) = new_snapshot {
                     Self::persist_active_models_snapshot(agent_id, &snapshot).await;
                 }
-                self.history.push(user_msg);
+                self.take_persisted(std::iter::once(user_msg));
             }
             // Recorded only once the append landed, so a failed write cannot silently swallow the
             // change.
@@ -416,11 +461,24 @@ impl Session {
         self.token_length
     }
 
+    /// Pictures the conversation holds (see the field doc).
+    #[must_use]
+    pub(crate) fn image_count(&self) -> usize {
+        self.image_count
+    }
+
     /// Update the in-memory length after a successful agent call. The durable write is the caller's
     /// ([`crate::Agent::record_session_usage`]).
     pub(crate) fn set_token_length(&mut self, token_length: Option<u64>) {
         self.token_length = token_length;
         self.publish_transcript();
+    }
+
+    /// Take persisted messages into the live history, keeping the picture count in step.
+    fn take_persisted(&mut self, messages: impl IntoIterator<Item = ChatMessage>) {
+        let from = self.history.len();
+        self.history.extend(messages);
+        self.image_count += crate::session::image_cap::count(&self.history[from..]);
     }
 
     /// Append an assistant message (final response or intermediate tool-call) to in-memory history
@@ -448,7 +506,9 @@ impl Session {
             .batch_append(agent_id, &batch)
             .await?;
         self.persisted_len += batch.len();
-        self.history.extend_from_slice(messages);
+        // The store's increment counted the flushed tail plus `messages`; the tail was counted here
+        // when it was pushed, so only `messages` is new.
+        self.take_persisted(messages.iter().cloned());
         self.publish_transcript();
         Ok(())
     }
@@ -526,15 +586,19 @@ impl Session {
             );
             return Ok(());
         };
+        // The rows after the frame are dropped and replaced by the replayed sequence: take their
+        // pictures out before the truncate, then count each replayed row as it lands.
+        let dropped = crate::session::image_cap::count(&self.history[frame_idx + 1..]);
         self.history.truncate(frame_idx + 1);
+        self.image_count = self.image_count.saturating_sub(dropped);
         for row in settled {
             let role = row.role.parse::<ChatRole>().map_err(|e| {
                 anyhow::anyhow!("settled session role {} is invalid: {e}", row.role)
             })?;
-            self.history.push(ChatMessage {
+            self.take_persisted(std::iter::once(ChatMessage {
                 role,
                 content: row.content,
-            });
+            }));
         }
         self.persisted_len = self.history.len();
         self.publish_transcript();
@@ -544,7 +608,7 @@ impl Session {
     /// Deliver `messages` to memory without persisting them (store append failed); the next
     /// successful persist flushes them in order.
     pub(crate) fn push_messages_unpersisted(&mut self, messages: &[ChatMessage]) {
-        self.history.extend_from_slice(messages);
+        self.take_persisted(messages.iter().cloned());
         self.publish_transcript();
     }
 
@@ -576,7 +640,24 @@ impl Session {
         crate::session::store()
             .rewrite_last_user_message(agent_id, &content)
             .await?;
+        // The swap changes only this message's pictures (the strip removes them), so the live count
+        // moves by that delta; the durable value follows, and a failed write only costs the next
+        // init a recount — the strip itself already landed.
+        let previous = crate::session::image_cap::count(std::slice::from_ref(&self.history[idx]));
         self.history[idx].content = content;
+        let replacement =
+            crate::session::image_cap::count(std::slice::from_ref(&self.history[idx]));
+        self.image_count = self.image_count.saturating_sub(previous) + replacement;
+        if let Err(e) = crate::session::store()
+            .set_image_count(agent_id, self.image_count)
+            .await
+        {
+            tracing::warn!(
+                agent_id = %agent_id,
+                error = %e,
+                "Failed to record the stripped message's picture count"
+            );
+        }
         self.publish_transcript();
         Ok(RewriteOutcome::Rewritten)
     }
@@ -665,6 +746,8 @@ impl Session {
         }
         self.history = compacted;
         self.persisted_len = self.history.len();
+        // The store SET the same absolute count from the rows it wrote.
+        self.image_count = crate::session::image_cap::count(&self.history);
         // The store cleared the length in the same transaction; the product shows no count until
         // the reply.
         self.token_length = None;

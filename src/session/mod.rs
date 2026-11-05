@@ -6,6 +6,7 @@
 mod activity;
 mod compaction_dump;
 pub mod dead_session;
+pub(crate) mod image_cap;
 pub(crate) mod image_strip;
 mod manager;
 pub(crate) mod personal_changes;
@@ -31,10 +32,16 @@ use std::borrow::Cow;
 /// across the 250K–1M windows models ship with.
 pub(crate) const SUMMARIZATION_THRESHOLD: u64 = 200_000;
 
-/// Image-accumulation trigger: DISTINCT `data:image/*` markers in user messages. The count is a
-/// prefix-gate superset of the markers promoted to provider vision parts — never undercounts, but
-/// a malformed payload may count. `>=` (unlike the strict token threshold) because images are a
-/// hard floor on context quality regardless of how a provider tokenizes them.
+/// Image-accumulation trigger: DISTINCT `data:image/*` markers in user messages. `>=` (unlike the
+/// strict token threshold) because images are a hard floor on context quality regardless of how a
+/// provider tokenizes them.
+///
+/// Request cap ([`image_cap`]): the pictures ONE REQUEST may carry, counted by OCCURRENCE — a
+/// provider refuses a request past its own undocumented limit, so this bounds what is sent, not
+/// what the conversation keeps. 20 sits well below the only limit ever observed (30).
+///
+/// Both count a prefix-gate superset of the markers promoted to provider vision parts: never
+/// undercounts, but a malformed payload may count. An editor of one predicate must check the other.
 pub(crate) const SUMMARIZATION_IMAGE_COUNT: usize = 20;
 
 /// Latest user messages / assistant answers kept per side after compaction.
@@ -314,9 +321,9 @@ impl<'a> BatchMetadata<'a> {
 /// (shared by [`SessionStore::append_messages`]).
 ///
 /// `meta.context` set means the describing columns are written atomically with the messages,
-/// closing the atomicity gap of separate context writes. `replace` picks the message_count
-/// semantics: `false` increments by the batch length, `true` SETs it — a shared increment would
-/// double-count the compaction path, whose old rows are gone before the insert.
+/// closing the atomicity gap of separate context writes. `replace` picks the count semantics:
+/// `false` increments by the batch, `true` SETs it — a shared increment would double-count the
+/// compaction path, whose old rows are gone before the insert.
 async fn insert_messages_in_transaction(
     tx: &TxGuard<'_>,
     agent_id: &str,
@@ -339,39 +346,44 @@ async fn insert_messages_in_transaction(
     }
     // Message count = the number of `sessions` rows for this agent (system prompts, tool-call
     // frames and tool results all count — one row per message, matching the historical COUNT
-    // semantics). The INSERT branches rely on `NOT NULL DEFAULT 0` for rows created elsewhere.
+    // semantics). The batch's pictures land in the SAME statement: the row must be created with
+    // both counts, because an increment on a NULL `image_count` would keep it unknown forever.
     let count = i64::try_from(messages.len()).context("message batch exceeds i64")?;
+    let images = i64::try_from(image_cap::count(messages)).context("image count exceeds i64")?;
     match meta.context {
         Some((channel, user_name, workspace_name, role)) => {
             // `created_at` stamps the session_metadata row only on creation; the update branch
             // below must never touch it.
             let created_at = now.clone();
-            let count_clause = message_count_clause(replace);
+            let message_clause = counter_clause(MetadataColumn::MessageCount, 3, replace);
+            let image_clause = counter_clause(MetadataColumn::ImageCount, 4, replace);
             tx.upsert_row(
                 &format!(
-                    "UPDATE session_metadata SET last_activity = ?2, channel = ?4, \
-                     user_name = ?5, workspace_name = ?6, role = ?7, {count_clause} \
-                     WHERE agent_id = ?1"
+                    "UPDATE session_metadata SET last_activity = ?2, channel = ?5, \
+                     user_name = ?6, workspace_name = ?7, role = ?8, {message_clause}, \
+                     {image_clause} WHERE agent_id = ?1"
                 ),
                 || {
                     params![
                         agent_id,
                         now.as_str(),
                         count,
+                        images,
                         channel,
                         user_name,
                         workspace_name,
                         role,
                     ]
                 },
-                "INSERT INTO session_metadata (agent_id, last_activity, message_count, \
+                "INSERT INTO session_metadata (agent_id, last_activity, message_count, image_count, \
                  channel, user_name, workspace_name, role, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
                  ON CONFLICT(agent_id) DO NOTHING",
                 params![
                     agent_id,
                     now.as_str(),
                     count,
+                    images,
                     channel,
                     user_name,
                     workspace_name,
@@ -381,7 +393,7 @@ async fn insert_messages_in_transaction(
             )
             .await?;
         }
-        None => upsert_message_count(tx, agent_id, count, &now, replace).await?,
+        None => upsert_counts(tx, agent_id, count, images, &now, replace).await?,
     }
     // A batch that wrote the leading context block records its length in the SAME transaction, so
     // a failed write can never leave a recorded length that disagrees with the block.
@@ -404,15 +416,15 @@ async fn insert_messages_in_transaction(
     Ok(())
 }
 
-/// The message-count clause shared by both `session_metadata` write paths: `replace=true`
-/// overwrites (the old rows were already deleted, so a shared increment would double-count),
-/// `replace=false` appends. The batch length is bound as `?3` on both. Kept separate from
-/// [`SessionStore::set_metadata_value`], which deliberately never touches `last_activity`.
-fn message_count_clause(replace: bool) -> &'static str {
+/// One `session_metadata` counter's SET fragment: `replace=true` overwrites (the old rows were
+/// already deleted, so a shared increment would double-count), `replace=false` adds. `param` is the
+/// bound value's index.
+fn counter_clause(column: MetadataColumn, param: usize, replace: bool) -> String {
+    let col = column.as_str();
     if replace {
-        "message_count = ?3"
+        format!("{col} = ?{param}")
     } else {
-        "message_count = message_count + ?3"
+        format!("{col} = {col} + ?{param}")
     }
 }
 
@@ -440,28 +452,31 @@ async fn set_metadata_value_in_tx(
     Ok(())
 }
 
-/// Upsert the context-free `session_metadata` count row: `last_activity` is stamped,
-/// `message_count` is added on append/settle (`replace=false`) or overwritten on the replace path.
-/// `created_at` is INSERT-only — it stamps the session's creation time and the update never
-/// touches it.
-async fn upsert_message_count(
+/// Upsert both `session_metadata` counts in a caller-owned transaction: `last_activity` is stamped,
+/// each column is added on append/settle (`replace=false`) or overwritten on the rewrite path
+/// (`replace=true`). `created_at` is INSERT-only. Both counts are written together because the row
+/// creation must carry them: a NULL `image_count` stays NULL under an increment, so a row created by
+/// a message-only write would never learn its pictures.
+async fn upsert_counts(
     tx: &TxGuard<'_>,
     agent_id: &str,
-    count: i64,
+    messages: i64,
+    images: i64,
     now: &str,
     replace: bool,
 ) -> Result<()> {
-    let count_clause = message_count_clause(replace);
+    let message_clause = counter_clause(MetadataColumn::MessageCount, 3, replace);
+    let image_clause = counter_clause(MetadataColumn::ImageCount, 4, replace);
     tx.upsert_row(
         &format!(
-            "UPDATE session_metadata SET last_activity = ?2, {count_clause} \
+            "UPDATE session_metadata SET last_activity = ?2, {message_clause}, {image_clause} \
              WHERE agent_id = ?1"
         ),
-        || params![agent_id, now, count],
-        "INSERT INTO session_metadata (agent_id, last_activity, message_count, created_at) \
-         VALUES (?1, ?2, ?3, ?4) \
+        || params![agent_id, now, messages, images],
+        "INSERT INTO session_metadata (agent_id, last_activity, message_count, image_count, \
+         created_at) VALUES (?1, ?2, ?3, ?4, ?5) \
          ON CONFLICT(agent_id) DO NOTHING",
-        params![agent_id, now, count, now],
+        params![agent_id, now, messages, images, now],
     )
     .await?;
     Ok(())
@@ -567,6 +582,7 @@ fn session_message_from_row(row: &Row) -> Result<ChatMessage> {
 
 /// A `session_metadata` column the read/write helpers may target; the closed enum makes the
 /// `format!` interpolation compile-time safe.
+#[derive(Clone, Copy)]
 enum MetadataColumn {
     ActiveModels,
     UserActivity,
@@ -578,10 +594,12 @@ enum MetadataColumn {
     LaunchStopped,
     WorkspaceName,
     ContextBlockLen,
+    MessageCount,
+    ImageCount,
 }
 
 impl MetadataColumn {
-    fn as_str(&self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             Self::ActiveModels => "active_models",
             Self::UserActivity => "user_activity",
@@ -593,6 +611,8 @@ impl MetadataColumn {
             Self::LaunchStopped => "launch_stopped",
             Self::WorkspaceName => "workspace_name",
             Self::ContextBlockLen => "context_block_len",
+            Self::MessageCount => "message_count",
+            Self::ImageCount => "image_count",
         }
     }
 }
@@ -940,13 +960,18 @@ impl SessionStore {
             .context("insert settled session row")?;
         }
 
-        // Message count: the captured rows were deleted and re-inserted (net zero); the new results
-        // and follow-up rows add exactly `results.len() + follow_up.len()`.
+        // Counts: the captured rows were deleted and re-inserted (net zero); the new results and
+        // follow-up rows add exactly `results.len() + follow_up.len()` messages, and only the
+        // follow-up rows (synthetic user image messages) add pictures. A captured row the sequence
+        // cannot place leaves the picture count high — the safe direction, since a high count only
+        // costs the walk.
         let count = i64::try_from(results.len() + follow_up.len())
             .context("settle result count exceeds i64")?;
-        upsert_message_count(tx, agent_id, count, &now, false)
+        let images = i64::try_from(image_cap::count(follow_up))
+            .context("follow-up image count exceeds i64")?;
+        upsert_counts(tx, agent_id, count, images, &now, false)
             .await
-            .context("bump settle message count")?;
+            .context("bump settle counts")?;
 
         Ok(sequence)
     }
@@ -987,7 +1012,8 @@ impl SessionStore {
     /// Deliberately unguarded — no coordination with a running agent. Accepted: a cut can leave an
     /// in-flight round committing tool results without their frame row, and a tail the dead-session
     /// poller treats as resumable (`last_activity` is untouched on purpose). `token_length` is left
-    /// stale — a recount is not free and summarizing early is intended.
+    /// stale — a recount is not free and summarizing early is intended; the picture count is left
+    /// unknown for the same reason, re-established from the loaded history on the next use.
     pub(crate) async fn truncate_from(&self, agent_id: &str, index: usize) -> Result<usize> {
         let offset = i64::try_from(index).context("truncate index exceeds i64")?;
         let tx = self.conn.begin_tx().await?;
@@ -1004,6 +1030,13 @@ impl SessionStore {
                 "UPDATE session_metadata SET message_count = MAX(message_count - ?2, 0) \
                  WHERE agent_id = ?1",
                 params![agent_id, removed],
+            )
+            .await?;
+            // Back to "never counted": the deleted rows may have carried pictures, and NULL makes
+            // the next use establish the value from what the history actually holds.
+            tx.execute(
+                "UPDATE session_metadata SET image_count = NULL WHERE agent_id = ?1",
+                params![agent_id],
             )
             .await?;
         }
@@ -1288,6 +1321,29 @@ impl SessionStore {
             |row| {
                 row.get::<Option<i64>>(0)
                     .map(|opt| opt.and_then(|v| u64::try_from(v).ok()))
+            },
+        )
+        .await
+    }
+
+    /// Record the pictures the session's history holds (absolute, see [`crate::session::image_cap`]).
+    async fn set_image_count(&self, agent_id: &str, count: usize) -> Result<()> {
+        // turso binds integers as i64 — a history's picture count is far below i64::MAX.
+        let bound = i64::try_from(count).context("image count exceeds i64")?;
+        self.set_metadata_value(agent_id, MetadataColumn::ImageCount, bound.into())
+            .await
+    }
+
+    /// The pictures the session's persisted history holds; `None` when the session predates the
+    /// count and has not been used since.
+    async fn get_image_count(&self, agent_id: &str) -> Option<usize> {
+        self.get_metadata_value(
+            agent_id,
+            MetadataColumn::ImageCount,
+            "Failed to read session image count",
+            |row| {
+                row.get::<Option<i64>>(0)
+                    .map(|opt| opt.and_then(|v| usize::try_from(v).ok()))
             },
         )
         .await
@@ -2217,6 +2273,51 @@ mod tests {
             .unwrap();
         assert_eq!(count(&k).await, 4);
         assert_eq!(store().load(&k).await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn image_count_follows_the_rows_and_init_establishes_an_unknown_value() {
+        crate::util::test::init_test_stores().await;
+        let k = unique_key();
+        let picture = "[IMAGE:data:image/png;base64,AAAA]";
+
+        // Production order: the turn's init runs before any message lands. An empty session gets no
+        // `session_metadata` row — the first append writes it with the count in the same
+        // transaction, so an empty session never surfaces in the session list.
+        let mut session = Session::default();
+        session.init(&k).await.unwrap();
+        assert_eq!(session.image_count(), 0);
+        assert_eq!(store().get_image_count(&k).await, None);
+
+        store()
+            .batch_append(
+                &k,
+                &[
+                    ChatMessage::user(format!("first {picture}")),
+                    ChatMessage::user(format!("second {picture}")),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store().get_image_count(&k).await,
+            Some(2),
+            "the batch's pictures are recorded with its rows"
+        );
+
+        let mut session = Session::default();
+        session.init(&k).await.unwrap();
+        assert_eq!(session.image_count(), 2);
+
+        // A count the truncate path cleared reads as unknown and is re-established from the loaded
+        // history on the next init.
+        assert_eq!(store().truncate_from(&k, 1).await.unwrap(), 1);
+        assert_eq!(store().get_image_count(&k).await, None);
+
+        let mut session = Session::default();
+        session.init(&k).await.unwrap();
+        assert_eq!(session.image_count(), 1);
+        assert_eq!(store().get_image_count(&k).await, Some(1));
     }
 
     #[tokio::test]

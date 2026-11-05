@@ -282,38 +282,13 @@ fn extract_media_from_outcomes(
     paths
 }
 
-/// Values carried by `[IMAGE:...]` markers in the session's User-role messages —
-/// the only role whose images are promoted to provider vision parts.
-fn user_image_marker_values(history: &[ChatMessage]) -> impl Iterator<Item = &str> {
-    history
-        .iter()
-        .filter(|msg| msg.role == crate::ChatRole::User)
-        .flat_map(|msg| {
-            MEDIA_MARKER_RE
-                .captures_iter(&msg.content)
-                .filter_map(|caps| {
-                    let (kind, path) = parse_media_marker(&caps);
-                    (kind == MediaMarkerKind::Image).then_some(path)
-                })
-        })
-}
-
-/// The dedup key for synthetic image injection: `[IMAGE:...]` values already in
-/// the session's user messages, so a repeat read of an attached image (same marker
-/// value) is not injected again.
-fn existing_image_marker_values(history: &[ChatMessage]) -> std::collections::HashSet<String> {
-    user_image_marker_values(history)
-        .map(str::to_string)
-        .collect()
-}
-
 /// Count DISTINCT data-URI image markers in the session's user messages — the
 /// second summarization trigger ([`crate::session::SUMMARIZATION_IMAGE_COUNT`]).
 /// The `data:image/` pre-gate keeps the per-turn scan cheap and never undercounts
 /// (every vision-promoted marker carries that prefix); it is a deliberate
 /// superset, so an invalid `data:image/*` payload may be counted too.
 fn session_image_marker_count(history: &[ChatMessage]) -> usize {
-    user_image_marker_values(history)
+    crate::session::image_cap::user_image_values(history)
         .filter(|value| value.starts_with("data:image/"))
         .collect::<std::collections::HashSet<_>>()
         .len()
@@ -365,9 +340,10 @@ async fn derive_image_payload_from_marker(output: &str) -> Option<ImagePayload> 
 /// appendix and its markers literal; a claim is replaced by them. `format_output`
 /// (or the truncation fallback) runs first, then the outcome's own payloads take
 /// precedence over one derived from a real on-disk `[IMAGE:path]` marker. The dedup
-/// key `seen` (lazily from `history`) decides fresh/attached; the returned vec is
-/// every FRESH attachment, injected as ONE synthetic user message. Payloads are
-/// taken, not copied — they carry base64 data URIs.
+/// key `seen` (lazily the pictures `history` would still send) decides fresh/attached,
+/// so a picture the request cap retired is attached again instead of being reported as
+/// present. The returned vec is every FRESH attachment, injected as ONE synthetic user
+/// message. Payloads are taken, not copied — they carry base64 data URIs.
 async fn tool_result_content(
     tools: &[Box<dyn Tool>],
     call_name: &str,
@@ -396,7 +372,7 @@ async fn tool_result_content(
         return (formatted, Vec::new());
     }
 
-    let seen = seen.get_or_insert_with(|| existing_image_marker_values(history));
+    let seen = seen.get_or_insert_with(|| crate::session::image_cap::sent_picture_values(history));
     let mut fresh = Vec::with_capacity(payloads.len());
     let mut annotations = Vec::with_capacity(payloads.len());
     for payload in payloads {
@@ -2206,7 +2182,16 @@ impl Agent {
     /// Every call site for the same conversation *must* use exactly the same parameter
     /// sources — model, reasoning_effort, tools (critically tools!) and routing — or the
     /// provider recomputes the whole KV-cache prefix.
-    fn build_chat_request(&self, messages: Vec<ChatMessage>, purpose: &'static str) -> ChatRequest {
+    ///
+    /// The request never carries more pictures than [`crate::session::SUMMARIZATION_IMAGE_COUNT`]:
+    /// the session's recorded count gates the walk, and the oldest pictures step aside in place
+    /// ([`crate::session::image_cap`]), so the conversation itself is untouched.
+    fn build_chat_request(
+        &self,
+        mut messages: Vec<ChatMessage>,
+        purpose: &'static str,
+    ) -> ChatRequest {
+        crate::session::image_cap::apply(&mut messages, Some(self.session.image_count()));
         ChatRequest {
             meta: Some(crate::ChatRequestMeta {
                 purpose,
@@ -4895,6 +4880,45 @@ mod tests {
         }
     }
 
+    /// The cap holds on the request the agent actually sends: the conversation keeps every picture,
+    /// the request carries the newest ones and no more, and the retired ones read as the omission
+    /// note.
+    #[tokio::test]
+    async fn build_chat_request_bounds_the_pictures_it_sends() {
+        crate::util::test::init_test_stores().await;
+        let mut agent = make_agent_with_role(vec![], crate::Role::Assistant);
+        let total = crate::session::SUMMARIZATION_IMAGE_COUNT + 11;
+        let pictures: Vec<ChatMessage> = (0..total)
+            .map(|serial| {
+                ChatMessage::user(format!(
+                    "shot {serial} [IMAGE:data:image/png;base64,{serial:0>8}]"
+                ))
+            })
+            .collect();
+        agent.session.push_messages_unpersisted(&pictures);
+
+        let request = agent.build_chat_request(agent.session.history().to_vec(), "agent");
+
+        // Past thirty pictures the cap is crossed twice over, so two whole batches step aside.
+        assert_eq!(
+            crate::session::image_cap::count(&request.messages),
+            total - 2 * crate::session::image_cap::RETIRE_BATCH
+        );
+        assert!(
+            request.messages[total - 1]
+                .content
+                .contains("data:image/png;base64,00000030"),
+            "the newest picture is always among the ones sent"
+        );
+        assert!(!request.messages[0].content.contains("data:image/"));
+        assert!(request.messages[0].content.contains("data-uri omitted"));
+        assert_eq!(
+            crate::session::image_cap::count(agent.session.history()),
+            total,
+            "the conversation itself keeps every picture"
+        );
+    }
+
     /// The observed provider rejection body (OpenRouter HTTP 400
     /// `data_inspection_failed`, image variant).
     const IMAGE_REJECTION_BODY: &str = r#"{"error":{"message":"Input image data may contain inappropriate content.","code":"data_inspection_failed","type":"invalid_request_error"}}"#;
@@ -5098,26 +5122,6 @@ mod tests {
         );
     }
 
-    /// IMAGE marker data-URIs from user messages — the injection dedup key. AUDIO/VIDEO
-    /// markers and plain text are ignored.
-    #[test]
-    fn existing_image_marker_values_extracts_image_markers() {
-        let history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("[IMAGE:data:image/jpeg;base64,aaa] see this"),
-            ChatMessage::assistant("ok"),
-            ChatMessage::user("plain text, no marker"),
-            ChatMessage::user("[AUDIO:data:audio/ogg;base64,zzz]"),
-        ];
-        let set = existing_image_marker_values(&history);
-        assert_eq!(
-            set.len(),
-            1,
-            "only IMAGE markers are collected, got: {set:?}"
-        );
-        assert!(set.contains("data:image/jpeg;base64,aaa"));
-    }
-
     /// DISTINCT `data:image/`-prefixed IMAGE markers in User-role messages. The gate is
     /// prefix-only: real PNG data-URIs count, duplicates collapse, file paths, non-IMAGE
     /// kinds and assistant messages do not.
@@ -5177,7 +5181,7 @@ mod tests {
         crate::util::test::init_test_stores().await;
 
         let mut agent = make_agent(vec![]);
-        // Seed a prior round: an image with this data-URI is already attached.
+        // Seed a prior round: an image with this data-URI is already in the conversation.
         agent.session.push_messages_unpersisted(&[ChatMessage::user(
             "[IMAGE:data:image/jpeg;base64,prior]",
         )]);
@@ -5293,7 +5297,7 @@ mod tests {
             .count();
         assert_eq!(fresh_count, 1, "a fresh image is injected exactly once");
         // The text comes from the payload metadata: the deduped read returns the
-        // 'already attached' reference, the fresh one the 'attached' wording. Content is a
+        // 'already in the conversation' reference, the fresh one the 'attached' wording. Content is a
         // JSON envelope, so parse out the `content` field.
         let tool_results: Vec<String> = history
             .iter()
@@ -5309,7 +5313,7 @@ mod tests {
         assert_eq!(
             tool_results,
             vec![
-                "Read image file /a.png (1x1, PNG). Image content is already attached to the conversation as a native image.",
+                "Read image file /a.png (1x1, PNG). Image content is already in the conversation as a native image and is not attached again.",
                 "Read image file /b.png (1x1, PNG). Image content attached to the conversation as a native image.",
             ],
             "unexpected tool-result text: {tool_results:?}"
@@ -5414,7 +5418,7 @@ mod tests {
             "first read claims a fresh attachment: {tool_results:?}"
         );
         assert!(
-            tool_results[1].contains("already attached to the conversation"),
+            tool_results[1].contains("already in the conversation"),
             "second read returns a reference: {tool_results:?}"
         );
     }
