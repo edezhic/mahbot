@@ -3,10 +3,11 @@
 //!
 //! Every record here is one nobody on the performing path consumes — a model call's row, a failed
 //! attempt's row, an intercepted search's usage row, the batch a session's tool calls finalize
-//! into, a command-line operation's row, and the warning row an unexpected shell or browser event
-//! leaves. They all land in the log store, whose ONE connection also serves that store's periodic
-//! pass, its log-line writer and its views: awaiting such a write parks the work that merely
-//! reported on itself until whatever holds that connection lets go.
+//! into, a command-line operation's row, and a warning row of its own (an event that outlived its
+//! call, or a media marker's refusal or repair). They all land in the log store, whose ONE
+//! connection also serves that store's periodic pass, its log-line writer and its views: awaiting
+//! such a write parks the work that merely reported on itself until whatever holds that connection
+//! lets go.
 //!
 //! So producing one is an [`enqueue`] and never a wait. The facts are read where they happen —
 //! including the instant the record describes, stamped then and never at write time — and one
@@ -83,7 +84,7 @@ pub(crate) enum TelemetryRecord {
     ToolCalls(ToolCallBatch),
     /// One warning row of its own (`logs`) — an event that outlived its call, or a media
     /// marker's refusal or repair.
-    StrayEvent(LogEntry),
+    WarningRow(LogEntry),
 }
 
 impl TelemetryRecord {
@@ -96,7 +97,7 @@ impl TelemetryRecord {
             text.map_or(0, String::len)
         }
 
-        /// The text a stored JSON value takes, counted without building it — a stray event's
+        /// The text a stored JSON value takes, counted without building it — a warning row's
         /// `fields` hold unbounded text, so the bound has to see it. A lower bound: JSON's
         /// punctuation and escapes are not counted.
         fn json_len(value: &serde_json::Value) -> usize {
@@ -165,7 +166,7 @@ impl TelemetryRecord {
                         })
                         .sum::<usize>()
             }
-            Self::StrayEvent(entry) => {
+            Self::WarningRow(entry) => {
                 entry.timestamp.len()
                     + entry.level.len()
                     + entry.target.len()
@@ -394,7 +395,7 @@ async fn write(store: &LogStore, record: TelemetryRecord) {
                 )
                 .await
         }
-        TelemetryRecord::StrayEvent(entry) => store.insert_batch(std::slice::from_ref(entry)).await,
+        TelemetryRecord::WarningRow(entry) => store.insert_batch(std::slice::from_ref(entry)).await,
     };
     if let Err(error) = outcome {
         note_write_failure(&record, &error);
@@ -426,10 +427,10 @@ fn note_write_failure(record: &TelemetryRecord, error: &anyhow::Error) {
                 "cli: failed to record the command-line operation"
             ),
         },
-        TelemetryRecord::StrayEvent(entry) => tracing::debug!(
+        TelemetryRecord::WarningRow(entry) => tracing::debug!(
             error = %error,
             target = %entry.target,
-            "could not persist the leftover-process record"
+            "could not persist the warning row"
         ),
     }
 }
@@ -519,7 +520,7 @@ mod tests {
 
     /// A log row the Logs views' clear can cover, at `level`, naming `message`.
     fn log_row(level: &str, message: &str) -> TelemetryRecord {
-        TelemetryRecord::StrayEvent(LogEntry {
+        TelemetryRecord::WarningRow(LogEntry {
             timestamp: crate::db::now(),
             level: level.to_string(),
             target: "shell".to_string(),

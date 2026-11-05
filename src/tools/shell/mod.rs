@@ -2682,7 +2682,7 @@ impl ShellTool {
                         // occurrence, shown on Logs → Issues: the stop recipe (shown to the agent
                         // only in Full mode), the containment it names, the run's elapsed time and
                         // the calling agent's own attribution (see
-                        // [`crate::logs::record_stray_event`]).
+                        // [`crate::logs::record_warn_row`]).
                         let scope_text = scope.map_or_else(String::new, |pid| pid.to_string());
                         crate::logs::record_stray_event(&crate::logs::StrayEvent {
                             source: crate::logs::STRAY_SOURCE_SHELL,

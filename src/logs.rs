@@ -220,7 +220,7 @@ impl LogStore {
         let levels = level_filter.map_or_else(Vec::new, level_names);
         crate::telemetry::wipe(
             |record| match record {
-                crate::telemetry::TelemetryRecord::StrayEvent(entry) => {
+                crate::telemetry::TelemetryRecord::WarningRow(entry) => {
                     // Keep only a row this scope leaves in the store.
                     !level_in_scope(&levels, &entry.level)
                 }
@@ -341,11 +341,8 @@ impl LogStore {
 /// Record one event that outlived its call as ONE row of its own: a `WARN` row, which the
 /// Issues view shows and retention keeps, and which the tracing writer never carries because
 /// that writer batches lines. The row says what happened and carries the recipe that stops it.
-///
-/// It is attributed to the calling agent here ([`crate::agent::tool_record_attribution`]) rather
-/// than by the caller, and handed to [`crate::telemetry`] like the rest of the by-products. A
-/// process with no logs store (the `mahbot chrome` CLI dispatches before [`init_tracing`] runs)
-/// records nothing.
+/// Filed through [`record_warn_row`], so a process with no logs store (the `mahbot chrome` CLI
+/// dispatches before [`init_tracing`] runs) records nothing.
 pub(crate) fn record_stray_event(event: &StrayEvent<'_>) {
     record_warn_row(
         event.source,
@@ -363,8 +360,10 @@ pub(crate) fn record_stray_event(event: &StrayEvent<'_>) {
 /// File ONE durable `WARN` row of its own in the Issues view, straight through the telemetry
 /// queue — never the batching tracing writer — for a fact that must outlive the call that
 /// produced it. `fields` is the row's own object and `workspace` a path or a name, normalised
-/// here. Never deduped, unlike [`record_issue_once`]: each call is one occurrence, and counting
-/// them is what the row is for. Fail-open: a process with no logs store files nothing.
+/// here. The row is attributed to the calling agent here
+/// ([`crate::agent::tool_record_attribution`]), never by the caller. Never deduped, unlike
+/// [`record_issue_once`]: each call is one occurrence, and counting them is what the row is for.
+/// Fail-open: a process with no logs store files nothing.
 pub(crate) fn record_warn_row(
     target: &str,
     message: &str,
@@ -375,7 +374,7 @@ pub(crate) fn record_warn_row(
         return;
     }
     let attribution = crate::agent::tool_record_attribution();
-    crate::telemetry::enqueue(crate::telemetry::TelemetryRecord::StrayEvent(LogEntry {
+    crate::telemetry::enqueue(crate::telemetry::TelemetryRecord::WarningRow(LogEntry {
         timestamp: crate::db::now(),
         level: "WARN".to_string(),
         target: target.to_string(),

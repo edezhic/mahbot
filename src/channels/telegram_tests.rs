@@ -505,6 +505,185 @@ fn a_mistyped_directory_is_delivered_and_a_mistyped_name_is_refused() {
     );
 }
 
+/// One delivered file leaves one repair record, however many kinds or spellings named it, and a
+/// repaired marker the kind's gate refuses leaves none: the row counts deliveries, not markers.
+#[tokio::test]
+#[serial_test::serial(provider)] // the telemetry store seam is process-global
+async fn a_delivered_file_leaves_one_repair_record() {
+    let (store, _store_tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
+    let _seam = crate::util::test::install_test_log_store(store.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let generated = root.join("userspaces").join("lyuba").join("generated");
+    std::fs::create_dir_all(&generated).unwrap();
+    let png = generated.join("shot.png");
+    write_test_png(&png);
+    std::fs::write(generated.join("clip.mp4"), b"fake-mp4").unwrap();
+    let roots = vec![root.to_path_buf()];
+    let typo = root
+        .join("userseas")
+        .join("lyuba")
+        .join("generated")
+        .join("shot.png");
+    let other_typo = root
+        .join("userspacse")
+        .join("lyuba")
+        .join("generated")
+        .join("shot.png");
+
+    // Two kinds, two spellings, one file: one attachment and one repair record.
+    let (_, att, refusals) = parse_attachment_markers(
+        &format!(
+            "[IMAGE:{}] [FILE:{}] [IMAGE:{}]",
+            typo.display(),
+            typo.display(),
+            other_typo.display()
+        ),
+        &roots,
+        TransferLimits::CLOUD,
+    );
+    assert!(refusals.is_empty());
+    assert_eq!(att.len(), 1, "one file, one attachment");
+    crate::telemetry::drain_for_test().await;
+    let repair_rows = marker_row_workspaces(&store, MARKER_REPAIRED_MESSAGE, &typo).await;
+    assert_eq!(repair_rows.len(), 1, "one file, one repair record");
+    assert_eq!(
+        repair_rows[0],
+        root.file_name().unwrap().to_string_lossy().into_owned(),
+        "the row belongs to the workspace holding the file"
+    );
+
+    // A correct marker first and a repaired twin after still names one delivered file: one row.
+    let (_, att, refusals) = parse_attachment_markers(
+        &format!("[IMAGE:{}] [IMAGE:{}]", png.display(), other_typo.display()),
+        &roots,
+        TransferLimits::CLOUD,
+    );
+    assert!(refusals.is_empty());
+    assert_eq!(att.len(), 1);
+    crate::telemetry::drain_for_test().await;
+    assert_eq!(
+        marker_row_workspaces(&store, MARKER_REPAIRED_MESSAGE, &other_typo)
+            .await
+            .len(),
+        1,
+        "a repaired twin of a delivered file is still one repair"
+    );
+
+    // Repaired, then refused by the kind's gate: nothing was delivered, so no repair row.
+    let clip_typo = root
+        .join("userseas")
+        .join("lyuba")
+        .join("generated")
+        .join("clip.mp4");
+    let (_, att, refusals) = parse_attachment_markers(
+        &format!("[IMAGE:{}]", clip_typo.display()),
+        &roots,
+        TransferLimits::CLOUD,
+    );
+    assert!(att.is_empty());
+    assert_eq!(refusals.len(), 1);
+    crate::telemetry::drain_for_test().await;
+    assert!(
+        marker_row_workspaces(&store, MARKER_REPAIRED_MESSAGE, &clip_typo)
+            .await
+            .is_empty(),
+        "a repaired marker the gate refused is not a repair"
+    );
+}
+
+/// A marker record for a path under no workspace carries no workspace at all, rather than an
+/// unrelated one: the per-workspace counts stay honest. A repair outside every root is the same.
+#[tokio::test]
+#[serial_test::serial(provider)] // the telemetry store seam is process-global
+async fn a_marker_record_outside_every_workspace_carries_no_workspace() {
+    let (store, _store_tmp) = crate::open_test_store!(crate::logs::LogStore, "log");
+    let _seam = crate::util::test::install_test_log_store(store.clone());
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let roots = vec![workspace.path().to_path_buf()];
+
+    let missing = outside.path().join("gone.png");
+    let (_, att, refusals) = parse_attachment_markers(
+        &format!("[IMAGE:{}]", missing.display()),
+        &roots,
+        TransferLimits::CLOUD,
+    );
+    assert!(att.is_empty());
+    assert_eq!(refusals.len(), 1);
+
+    let pictures = outside.path().join("pictures");
+    std::fs::create_dir(&pictures).unwrap();
+    write_test_png(&pictures.join("shot.png"));
+    let typo = outside.path().join("picturrs").join("shot.png");
+    let (_, att, refusals) = parse_attachment_markers(
+        &format!("[IMAGE:{}]", typo.display()),
+        &roots,
+        TransferLimits::CLOUD,
+    );
+    assert!(refusals.is_empty());
+    assert_eq!(att.len(), 1);
+
+    crate::telemetry::drain_for_test().await;
+    assert_eq!(
+        marker_row_workspaces(&store, MARKER_REFUSED_MESSAGE, &missing).await,
+        vec![String::new()],
+        "a refusal under no workspace names none"
+    );
+    assert_eq!(
+        marker_row_workspaces(&store, MARKER_REPAIRED_MESSAGE, &typo).await,
+        vec![String::new()],
+        "a repair under no workspace names none"
+    );
+
+    // A `..` cannot smuggle an outside path into a workspace's count.
+    let escaped = workspace
+        .path()
+        .join("..")
+        .join(outside.path().file_name().unwrap())
+        .join("gone.png");
+    let (_, att, refusals) = parse_attachment_markers(
+        &format!("[IMAGE:{}]", escaped.display()),
+        &roots,
+        TransferLimits::CLOUD,
+    );
+    assert!(att.is_empty());
+    assert_eq!(refusals.len(), 1);
+    crate::telemetry::drain_for_test().await;
+    assert_eq!(
+        marker_row_workspaces(&store, MARKER_REFUSED_MESSAGE, &escaped).await,
+        vec![String::new()],
+        "a `..` does not make an outside path belong to the workspace it is spelled under"
+    );
+}
+
+/// The workspaces of the marker rows whose message is `message` and whose fields name `path`.
+/// Filtered by the test-unique path: the telemetry seam is process-global, so a concurrent test
+/// recording a marker of its own must not be counted here.
+async fn marker_row_workspaces(
+    store: &crate::logs::LogStore,
+    message: &str,
+    path: &std::path::Path,
+) -> Vec<String> {
+    let needle = path.to_string_lossy();
+    let rows = store
+        .conn
+        .query(
+            "SELECT workspace, fields FROM logs WHERE message = ?1",
+            crate::db::params![message],
+        )
+        .await
+        .expect("read the marker rows");
+    rows.iter()
+        .filter_map(|row| {
+            let fields = row.get::<String>(1).ok()?;
+            fields
+                .contains(needle.as_ref())
+                .then(|| row.get::<String>(0).unwrap_or_default())
+        })
+        .collect()
+}
+
 /// One refused marker does not stop the others in the same message: every valid target is attached
 /// and only the failing one is reported, in body order.
 #[test]

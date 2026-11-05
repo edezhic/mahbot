@@ -147,7 +147,7 @@ pub(crate) fn resolve_marker_target(target: &str, roots: &[PathBuf]) -> MarkerTa
 const REPAIR_MARGIN: usize = 2;
 
 /// The existing file a local target names when exactly one directory component in it is a
-/// misspelled name: the deepest component that does not exist is compared with the directories
+/// misspelled name: the first component that does not exist is compared with the directories
 /// beside it, and the single clearly-nearest one is substituted when the remainder of the path
 /// exists under it. `None` when the path exists as written, when the missing component is the
 /// file's own name — a wrong name is a wrong file, never a repair — when no directory beside it
@@ -209,7 +209,7 @@ fn unique_near_directory(directory: &Path, name: &str) -> Option<OsString> {
     for entry in std::fs::read_dir(directory).ok()?.flatten() {
         // Only a directory can stand where the mistyped component stood, and the entry is followed
         // (`stat`) the way the repaired path itself will be, so a directory a link names counts.
-        if !entry.metadata().is_ok_and(|meta| meta.is_dir()) {
+        if !std::fs::metadata(entry.path()).is_ok_and(|meta| meta.is_dir()) {
             continue;
         }
         let candidate = entry.file_name();
@@ -1053,13 +1053,30 @@ mod tests {
             None
         );
 
-        // Two equally near directories could be meant: nothing is guessed.
+        // Two equally near directories could be meant: nothing is guessed. Both candidates hold
+        // the file, so the ambiguity guard alone is what refuses the repair.
         std::fs::create_dir_all(root.join("alpha")).unwrap();
         std::fs::create_dir_all(root.join("alphb")).unwrap();
+        std::fs::write(root.join("alpha").join("shot.png"), b"png").unwrap();
+        std::fs::write(root.join("alphb").join("shot.png"), b"png").unwrap();
         assert_eq!(
             repaired_local_target(&root.join("alphx").join("shot.png")),
             None
         );
+
+        // A directory reached through a link is a candidate like any other directory: the entry is
+        // followed, and the repaired path resolves through the link.
+        #[cfg(unix)]
+        {
+            let storage = root.join("storage");
+            std::fs::create_dir_all(&storage).unwrap();
+            std::fs::write(storage.join("shot.png"), b"png").unwrap();
+            std::os::unix::fs::symlink(&storage, root.join("pictures")).unwrap();
+            assert_eq!(
+                repaired_local_target(&root.join("picturrs").join("shot.png")),
+                Some(root.join("pictures").join("shot.png"))
+            );
+        }
     }
 
     #[test]

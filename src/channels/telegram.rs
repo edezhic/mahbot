@@ -763,13 +763,16 @@ fn record_marker_repair(target: &str, repaired: &Path, file_roots: &[PathBuf]) {
 }
 
 /// The workspace a marker belongs to: the root holding its target — a relative target resolves
-/// against the first root that has it, so a relayed marker belongs to the workspace it came from
-/// — else the authoring agent's root. [`crate::logs`] normalises a path to the workspace's name.
+/// against the first root that has it, so a relayed marker belongs to the workspace it came from.
+/// Empty when no root holds it: a path outside every workspace is recorded with no workspace,
+/// never attributed to one that does not contain it. The path is lexically normalized first, so a
+/// `..` cannot smuggle an outside path into a workspace's count. [`crate::logs`] normalises a path
+/// to the workspace's name.
 fn workspace_of(path: &Path, file_roots: &[PathBuf]) -> String {
+    let normalized = crate::tools::path::normalize_path(path);
     file_roots
         .iter()
-        .find(|root| path.starts_with(root))
-        .or_else(|| file_roots.first())
+        .find(|root| crate::util::is_within(&normalized, root))
         .map(|root| root.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
@@ -828,10 +831,21 @@ fn resolve_file_target(
 enum MarkerOutcome {
     /// A bare word naming no file — prose explaining the syntax. Kept as written.
     Literal,
-    /// Delivered from this target: an address, or a resolved absolute path.
-    Attach(String),
+    /// Delivered from this target: an address, or a resolved absolute path. `repair` is set when
+    /// the target was placed through a corrected directory.
+    Attach {
+        target: String,
+        repair: Option<MarkerRepair>,
+    },
     /// Undeliverable: the marker the conversation is told about.
     Refuse(RefusedMarker),
+}
+
+/// A marker delivered from a path it did not name: the target as written, and the file the
+/// corrected directory names.
+struct MarkerRepair {
+    written: String,
+    repaired: PathBuf,
 }
 
 /// The refusal one undeliverable marker produces: the marker as written (bounded, credential-free)
@@ -888,9 +902,10 @@ fn marker_outcome(
                 media_target::RemoteMarker::Refused(reason) => {
                     MarkerOutcome::Refuse(refused_marker(marker_kind, target, reason))
                 }
-                media_target::RemoteMarker::Deliverable => {
-                    MarkerOutcome::Attach(target.to_string())
-                }
+                media_target::RemoteMarker::Deliverable => MarkerOutcome::Attach {
+                    target: target.to_string(),
+                    repair: None,
+                },
             };
         }
         MarkerTarget::Local(path) => path,
@@ -899,15 +914,16 @@ fn marker_outcome(
     // A marker whose only defect is a mistyped directory names a file that exists: the repair is
     // the same one the desktop's display layer applies, and it happens before the kind's gate so
     // that gate judges the file actually meant (and, for `[FILE:]`, the path actually delivered).
+    // The repair travels with a delivered attachment; a refusal records the marker as written and
+    // discloses nothing about what the repair found.
     let repaired = media_target::repaired_local_target(&path);
     let delivered = repaired.as_deref().unwrap_or(&path);
-    // A repair is recorded only where the gate delivers the file: a path the gate refuses is
-    // refused as written, and the row never discloses what lay outside the workspace.
-    let attach = |delivered_target: String| {
-        if let Some(repaired) = &repaired {
-            record_marker_repair(target, repaired, file_roots);
-        }
-        MarkerOutcome::Attach(delivered_target)
+    let attach = |delivered_target: String| MarkerOutcome::Attach {
+        target: delivered_target,
+        repair: repaired.as_ref().map(|repaired| MarkerRepair {
+            written: target.to_string(),
+            repaired: repaired.clone(),
+        }),
     };
 
     if marker_kind == MediaMarkerKind::File {
@@ -930,7 +946,7 @@ fn marker_outcome(
 /// markers that were refused. Targets resolve against `file_roots`; markers are independent, so one
 /// refusal costs the user neither the others nor the surrounding text. A bare word naming no file
 /// stays as prose. A file the message would deliver more than once — written twice, or once
-/// mistyped and once correctly — is delivered once.
+/// mistyped and once correctly — is delivered once, and leaves one repair record.
 fn parse_attachment_markers(
     message: &str,
     file_roots: &[PathBuf],
@@ -938,13 +954,15 @@ fn parse_attachment_markers(
 ) -> (String, Vec<TelegramAttachment>, Vec<RefusedMarker>) {
     let mut attachments: Vec<TelegramAttachment> = Vec::new();
     let mut refusals: Vec<RefusedMarker> = Vec::new();
+    let mut repairs: Vec<MarkerRepair> = Vec::new();
 
     let cleaned = MEDIA_MARKER_RE
         .replace_all(message, |caps: &regex::Captures| {
             let (marker_kind, path) = parse_media_marker(caps);
             match marker_outcome(marker_kind, path.trim(), file_roots, limits) {
                 MarkerOutcome::Literal => caps.get_match().as_str().to_string(),
-                MarkerOutcome::Attach(target) => {
+                MarkerOutcome::Attach { target, repair } => {
+                    repairs.extend(repair);
                     if !already_attached(&attachments, &target) {
                         attachments.push(TelegramAttachment {
                             kind: TelegramAttachmentKind::from(marker_kind),
@@ -960,6 +978,20 @@ fn parse_attachment_markers(
             }
         })
         .to_string();
+
+    // One repair record per delivered file: the same file named under two kinds, or misspelled
+    // twice, is one delivery. A repaired marker the gate refused never reaches this list, so that
+    // marker is not what records a repair.
+    let mut recorded: HashSet<PathBuf> = HashSet::new();
+    for repair in repairs {
+        let key = media_target::file_key(&repair.repaired);
+        let delivered = attachments
+            .iter()
+            .any(|attachment| media_target::file_key(Path::new(&attachment.target)) == key);
+        if delivered && recorded.insert(key) {
+            record_marker_repair(&repair.written, &repair.repaired, file_roots);
+        }
+    }
 
     (cleaned.trim().to_string(), attachments, refusals)
 }

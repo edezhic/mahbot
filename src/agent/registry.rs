@@ -108,9 +108,9 @@ pub struct AgentHandle {
     pub paused: bool,
 }
 
-/// The caller's identity for the records a tool makes about itself — a stray event's log row.
-/// The agent id is [`crate::agent::CURRENT_TOOL_AGENT_ID`]'s and is read from there, never carried
-/// twice. `None` outside an agent run.
+/// The caller's identity for the warning row a tool makes about itself. The agent id is
+/// [`crate::agent::CURRENT_TOOL_AGENT_ID`]'s and is read from there, never carried twice. `None`
+/// outside an agent run.
 #[derive(Clone, Debug)]
 pub(crate) struct AgentTracking {
     pub role: String,

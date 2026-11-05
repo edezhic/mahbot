@@ -81,7 +81,7 @@ pub(crate) struct ToolRecordAttribution {
     pub ticket: String,
 }
 
-/// The attribution [`crate::logs::record_stray_event`] rows carry: empty outside an
+/// The attribution [`crate::logs::record_warn_row`] rows carry: empty outside an
 /// agent run, ticket empty when the run has none. Read here, synchronously — no
 /// task-local is in scope where the row is written.
 pub(crate) fn tool_record_attribution() -> ToolRecordAttribution {
@@ -162,9 +162,8 @@ tokio::task_local! {
     /// The caller's id, so the shell tool attributes its spill files to the owning
     /// agent (deleted when the run ends). `None` outside an agent run.
     pub(crate) static CURRENT_TOOL_AGENT_ID: Option<String>;
-    /// The caller's role and ticket, for the record a tool makes about itself — a
-    /// stray event's log row. The agent id is `CURRENT_TOOL_AGENT_ID`'s. `None`
-    /// outside an agent run.
+    /// The caller's role and ticket, for the warning row a tool makes about itself.
+    /// The agent id is `CURRENT_TOOL_AGENT_ID`'s. `None` outside an agent run.
     pub(crate) static CURRENT_TOOL_AGENT_TRACKING:
         Option<crate::agent::registry::AgentTracking>;
     /// The caller's custom-role launch, so a tool dispatching a durable round
