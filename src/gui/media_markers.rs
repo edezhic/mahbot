@@ -171,7 +171,9 @@ fn render_marker(kind: MediaMarkerKind, target: &str, roots: &[PathBuf]) -> Opti
             }
         }),
         MarkerTarget::Remote => Some(match media_target::remote_marker(kind, &target) {
-            media_target::RemoteMarker::Refused(notice) => Replacement::Text(notice),
+            media_target::RemoteMarker::Refused(reason) => {
+                Replacement::Text(media_target::marker_refusal_for(&target, reason))
+            }
             media_target::RemoteMarker::Deliverable => {
                 Replacement::Attachment(delivered_marker(kind, &target, None))
             }

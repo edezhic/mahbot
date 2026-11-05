@@ -8,8 +8,8 @@
 
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -20,7 +20,7 @@ use crate::channels::{
 use crate::db;
 use crate::users::UserRecord;
 use crate::util::UnwrapPoison;
-use crate::{Channel, ChatEvent, Role, SendMessage};
+use crate::{Channel, ChatEvent, RefusedMarker, Role, SendMessage};
 
 /// Emoji sent when an agent finishes with no response (LLM error, retry exhaustion,
 /// context overflow) — never when cancelled or shutting down. Language-agnostic.
@@ -1230,7 +1230,8 @@ fn broadcast_typing(users: &[UserRecord], workspace: &str, is_typing: bool) {
 
 /// Outcome of attempting to deliver a response on a single channel.
 enum DeliverOutcome {
-    Sent,
+    /// Sent; the markers this transport refused, if any.
+    Sent(Vec<RefusedMarker>),
     /// Recipient is not reachable on this channel.
     Unresolvable,
     /// Transport send failed.
@@ -1259,7 +1260,7 @@ async fn deliver_on_channel(
         })
         .await
     {
-        Ok(()) => DeliverOutcome::Sent,
+        Ok(outcome) => DeliverOutcome::Sent(outcome.refused),
         Err(e) => DeliverOutcome::Failed(e),
     }
 }
@@ -1466,14 +1467,17 @@ async fn route_worker_branch_envelope(content: String, asker: Option<&Asker>) {
 /// Transport-deliver `response` to every channel binding of `users` (broadcast and
 /// chat_history persistence happen at the call sites). Logs an unresolvable recipient (warn —
 /// persisted but not transport-delivered) and a transport failure (error) per binding.
-/// `workspace` names the workspace in the no-channels diagnostic.
+/// `workspace` names the workspace in the no-channels diagnostic. Returns every marker the
+/// transports refused, one entry per occurrence, so the caller can tell the conversation that
+/// wrote it.
 async fn deliver_response_over_channels(
     response: &str,
     users: &[UserRecord],
     role: Role,
     workspace: &str,
     file_roots: &[std::path::PathBuf],
-) {
+) -> Vec<RefusedMarker> {
+    let mut refused = Vec::new();
     let channels = crate::channel_registry().list();
     if channels.is_empty() {
         let user_names = users
@@ -1487,7 +1491,7 @@ async fn deliver_response_over_channels(
             users = %user_names,
             "Message router: no channels registered"
         );
-        return;
+        return refused;
     }
 
     for (channel_name, channel) in &channels {
@@ -1520,11 +1524,12 @@ async fn deliver_response_over_channels(
                         channel_name,
                         user.name,
                     ),
-                    DeliverOutcome::Sent => {}
+                    DeliverOutcome::Sent(refused_here) => refused.extend(refused_here),
                 }
             }
         }
     }
+    refused
 }
 
 /// Deliver a response to a single registered user, broadcasting it to ALL of the user's
@@ -1550,7 +1555,7 @@ async fn deliver_single_user_response(
     )
     .await;
 
-    deliver_response_over_channels(
+    let refused = deliver_response_over_channels(
         response,
         std::slice::from_ref(user),
         *role,
@@ -1558,6 +1563,7 @@ async fn deliver_single_user_response(
         file_roots,
     )
     .await;
+    announce_refused_attachments(job, refused);
 }
 
 /// Deliver a response to an unregistered user (no [`UserRecord`] in the users DB), falling
@@ -1613,8 +1619,86 @@ pub async fn deliver_unregistered_user_response(
             user = %user_name,
             "Message router [{role}]: failed to send response to unregistered user: {e}",
         ),
-        DeliverOutcome::Sent => {}
+        DeliverOutcome::Sent(refused) => announce_refused_attachments(job, refused),
     }
+}
+
+/// The prompt asset carrying the note a conversation receives when a reply it wrote named
+/// attachments the transport could not deliver.
+const MEDIA_FAILURE_NOTE_ASSET: &str = "media_failure_note.md";
+
+/// How many failed markers one conversation remembers as announced. Past this the oldest is
+/// forgotten: a conversation that accumulated this many distinct failures has a problem a note
+/// stream cannot fix.
+const ANNOUNCED_MEDIA_FAILURES_PER_CONVERSATION: usize = 64;
+
+/// Targets already announced to a conversation, in arrival order. In memory: a restart announces
+/// at most once more, which is cheaper than a durable table for a notice whose whole point is not
+/// to repeat itself.
+static ANNOUNCED_MEDIA_FAILURES: LazyLock<Mutex<HashMap<String, VecDeque<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Forget what `agent_id`'s conversation has been told about failed attachments: a cleared session
+/// is a new conversation, and its first refusal is news again.
+pub(crate) fn forget_announced_media_failures(agent_id: &str) {
+    ANNOUNCED_MEDIA_FAILURES
+        .lock()
+        .unwrap_poison()
+        .remove(agent_id);
+}
+
+/// Tell the conversation that wrote `refused` which of its attachments could not be delivered: one
+/// note listing every failure not already announced to it. A repeat of an announced target is left
+/// unannounced — the conversation has already been told.
+fn announce_refused_attachments(job: &AgentJob, refused: Vec<RefusedMarker>) {
+    if refused.is_empty() {
+        return;
+    }
+    let role = job.role;
+    let agent_id = user_message_agent_id(&job.user_name, role, &job.workspace_name);
+    let fresh: Vec<RefusedMarker> = {
+        let mut announced = ANNOUNCED_MEDIA_FAILURES.lock().unwrap_poison();
+        let entry = announced.entry(agent_id.clone()).or_default();
+        refused
+            .into_iter()
+            .filter(|failure| {
+                if entry.contains(&failure.marker) {
+                    return false;
+                }
+                entry.push_back(failure.marker.clone());
+                if entry.len() > ANNOUNCED_MEDIA_FAILURES_PER_CONVERSATION {
+                    entry.pop_front();
+                }
+                true
+            })
+            .collect()
+    };
+    if fresh.is_empty() {
+        return;
+    }
+    let failures = fresh
+        .iter()
+        .map(|failure| format!("- {}: {}", failure.marker, failure.reason))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = crate::prompt::substitute(
+        &crate::prompt::load_prompt(MEDIA_FAILURE_NOTE_ASSET),
+        &[("{{failures}}", &failures)],
+    );
+    // The note runs in the same conversation, with the same relayed origin, so a path it quotes
+    // resolves exactly as the reply that wrote it did.
+    let mut notice = user_message_job(
+        content,
+        job.workspace_name.clone(),
+        job.user_name.clone(),
+        "gui".to_string(),
+        role,
+        None,
+    );
+    notice
+        .originating_workspace
+        .clone_from(&job.originating_workspace);
+    route(&agent_id, notice);
 }
 
 /// Resolve a single user by name with a targeted query instead of loading all users.
@@ -2109,6 +2193,42 @@ mod tests {
             !captured.is_empty(),
             "spy channel should have captured at least one broadcast send",
         );
+    }
+
+    /// A refused marker is announced once to the conversation that wrote it: the note names the
+    /// marker and its reason and carries the conversation's own workspace and relayed origin. A
+    /// repeat of the same target is recorded by the transport and not announced again.
+    #[tokio::test]
+    #[serial_test::serial(provider)]
+    async fn a_refused_marker_is_announced_once_to_the_conversation_that_wrote_it() {
+        let _ = init_global();
+        let user = format!("_media_note_{}", crate::generate_suffix());
+        let workspace = crate::users::personal_workspace_name(&user);
+        let agent_id = user_message_agent_id(&user, Role::Assistant, &workspace);
+        let mut rx = register_agent(&agent_id);
+        let mut job = make_job(Role::Assistant, &workspace, &user, "gui");
+        job.originating_workspace = Some("project".to_string());
+        let failure = RefusedMarker {
+            marker: "[FILE:generated/report.pdf]".to_string(),
+            reason: "file not found.".to_string(),
+        };
+
+        announce_refused_attachments(&job, vec![failure.clone()]);
+
+        let notice = rx.try_recv().expect("the conversation is told");
+        assert!(notice.content.contains("[FILE:generated/report.pdf]"));
+        assert!(notice.content.contains("file not found."));
+        assert_eq!(notice.workspace_name, workspace);
+        assert_eq!(notice.originating_workspace.as_deref(), Some("project"));
+
+        announce_refused_attachments(&job, vec![failure]);
+        assert!(
+            rx.try_recv().is_err(),
+            "a target already announced is not announced again"
+        );
+
+        forget_announced_media_failures(&agent_id);
+        unregister_agent(&agent_id);
     }
 
     #[test]

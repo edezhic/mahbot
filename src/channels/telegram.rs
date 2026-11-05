@@ -11,7 +11,7 @@ use crate::util::media_target::{self, MarkerTarget, MediaTarget};
 use crate::util::{
     MEDIA_MARKER_RE, MediaMarkerKind, UnwrapPoison, is_http_url, parse_media_marker,
 };
-use crate::{Channel, ChannelMessage, SendMessage};
+use crate::{Channel, ChannelMessage, RefusedMarker, SendMessage, SendOutcome};
 use anyhow::Context;
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
@@ -720,13 +720,6 @@ const MARKER_ISSUE_TARGET: &str = "media-marker";
 /// pointer to what was tried, not a copy of it.
 const MARKER_RECORD_PATH_MAX_CHARS: usize = 400;
 
-/// Why one local marker could not be delivered: the reason the Issues view records, and the notice
-/// the user reads where the marker was.
-struct LocalRefusal {
-    reason: String,
-    notice: String,
-}
-
 /// The path a record quotes for a marker, bounded: the target as written, minus what only an
 /// address carries. `None` for an inline payload, which names no path to record.
 fn recorded_path(target: &str) -> Option<String> {
@@ -783,20 +776,14 @@ fn workspace_of(path: &Path, file_roots: &[PathBuf]) -> String {
 
 /// Resolve an outbound `[FILE:...]` target within the roots that authorize it. The target is
 /// canonicalized (a symlink cannot smuggle a file out) and must be inside a root BEFORE the
-/// existence, directory and size checks, so a refusal discloses none of them. `Err` carries the
-/// reason recorded and the notice naming a bounded last component.
+/// existence, directory and size checks, so a refusal discloses none of them. `Err` is why the
+/// target was refused.
 fn resolve_file_target(
     path: &Path,
     file_roots: &[PathBuf],
     upload_max: u64,
-) -> Result<PathBuf, LocalRefusal> {
-    let name = media_target::marker_name(&path.to_string_lossy());
-    let refuse = |reason: &str| {
-        Err(LocalRefusal {
-            reason: reason.to_string(),
-            notice: media_target::marker_refusal(&name, reason),
-        })
-    };
+) -> Result<PathBuf, String> {
+    let refuse = |reason: &str| Err(reason.to_string());
 
     // Nothing authorizes a local file without a workspace: a relative target never found a root.
     if file_roots.is_empty() {
@@ -826,15 +813,11 @@ fn resolve_file_target(
         return refuse(media_target::DIRECTORY_REASON);
     }
     if meta.len() > upload_max {
-        let too_large = UploadTooLarge {
+        return Err(UploadTooLarge {
             size: meta.len(),
             max: upload_max,
         }
-        .to_string();
-        return Err(LocalRefusal {
-            notice: media_target::marker_refusal(&name, &too_large),
-            reason: too_large,
-        });
+        .to_string());
     }
 
     // The plain spelling, not the platform's verbatim form: this becomes `target`.
@@ -847,21 +830,39 @@ enum MarkerOutcome {
     Literal,
     /// Delivered from this target: an address, or a resolved absolute path.
     Attach(String),
-    /// Undeliverable: the user reads this notice where the marker was.
-    Refuse(String),
+    /// Undeliverable: the marker the conversation is told about.
+    Refuse(RefusedMarker),
 }
 
-/// The refusal for an undeliverable local target: recorded in the Issues view, and shown where
-/// the marker was. Only a local target reaches here — an address or a payload is refused without
-/// a record.
+/// The refusal one undeliverable marker produces: the marker as written (bounded, credential-free)
+/// and the reason. An inline payload names no path, so it is quoted by kind alone.
+fn refused_marker(kind: MediaMarkerKind, target: &str, reason: &str) -> RefusedMarker {
+    let marker = match media_target::recordable_target(target) {
+        Some(written) if !media_target::is_inline_payload(target) => format!(
+            "[{}:{}]",
+            kind.token(),
+            crate::util::truncate(&written, MARKER_RECORD_PATH_MAX_CHARS)
+        ),
+        _ => format!("[{}]", kind.token()),
+    };
+    RefusedMarker {
+        marker,
+        reason: reason.to_string(),
+    }
+}
+
+/// The refusal for an undeliverable local target: recorded in the Issues view and returned for the
+/// conversation that wrote it. Only a local target reaches here — an address or a payload is
+/// refused without a record.
 fn refused(
     target: &str,
-    refusal: LocalRefusal,
+    kind: MediaMarkerKind,
+    reason: &str,
     path: &Path,
     file_roots: &[PathBuf],
 ) -> MarkerOutcome {
-    record_marker_refusal(target, &refusal.reason, path, file_roots);
-    MarkerOutcome::Refuse(refusal.notice)
+    record_marker_refusal(target, reason, path, file_roots);
+    MarkerOutcome::Refuse(refused_marker(kind, target, reason))
 }
 
 /// Decide one marker: the target is placed, then the kind's own gate decides whether it can be
@@ -876,11 +877,17 @@ fn marker_outcome(
         MarkerTarget::NotAReference => return MarkerOutcome::Literal,
         MarkerTarget::Inline => {
             // A data URI has no name worth quoting: name the kind instead.
-            return MarkerOutcome::Refuse(media_target::inline_marker_refusal(marker_kind));
+            return MarkerOutcome::Refuse(refused_marker(
+                marker_kind,
+                target,
+                media_target::INLINE_PAYLOAD_REASON,
+            ));
         }
         MarkerTarget::Remote => {
             return match media_target::remote_marker(marker_kind, target) {
-                media_target::RemoteMarker::Refused(notice) => MarkerOutcome::Refuse(notice),
+                media_target::RemoteMarker::Refused(reason) => {
+                    MarkerOutcome::Refuse(refused_marker(marker_kind, target, reason))
+                }
                 media_target::RemoteMarker::Deliverable => {
                     MarkerOutcome::Attach(target.to_string())
                 }
@@ -906,7 +913,7 @@ fn marker_outcome(
     if marker_kind == MediaMarkerKind::File {
         return match resolve_file_target(delivered, file_roots, limits.upload) {
             Ok(canonical) => attach(canonical.to_string_lossy().into_owned()),
-            Err(refusal) => refused(target, refusal, delivered, file_roots),
+            Err(reason) => refused(target, marker_kind, &reason, delivered, file_roots),
         };
     }
 
@@ -914,21 +921,13 @@ fn marker_outcome(
     // needs a raster signature). Nothing is decoded here — a local image goes out as a document, so
     // a large valid raster is delivered, not refused.
     if let Some(reason) = media_target::local_refusal(marker_kind, delivered) {
-        return refused(
-            target,
-            LocalRefusal {
-                reason: reason.to_string(),
-                notice: media_target::marker_refusal_for(target, reason),
-            },
-            delivered,
-            file_roots,
-        );
+        return refused(target, marker_kind, reason, delivered, file_roots);
     }
     attach(delivered.to_string_lossy().into_owned())
 }
 
 /// Parse `[KIND:path]` markers, returning the text with them removed, the attachments, and the
-/// user-facing refusals. Targets resolve against `file_roots`; markers are independent, so one
+/// markers that were refused. Targets resolve against `file_roots`; markers are independent, so one
 /// refusal costs the user neither the others nor the surrounding text. A bare word naming no file
 /// stays as prose. A file the message would deliver more than once — written twice, or once
 /// mistyped and once correctly — is delivered once.
@@ -936,9 +935,9 @@ fn parse_attachment_markers(
     message: &str,
     file_roots: &[PathBuf],
     limits: TransferLimits,
-) -> (String, Vec<TelegramAttachment>, Vec<String>) {
+) -> (String, Vec<TelegramAttachment>, Vec<RefusedMarker>) {
     let mut attachments: Vec<TelegramAttachment> = Vec::new();
-    let mut refusals: Vec<String> = Vec::new();
+    let mut refusals: Vec<RefusedMarker> = Vec::new();
 
     let cleaned = MEDIA_MARKER_RE
         .replace_all(message, |caps: &regex::Captures| {
@@ -3665,11 +3664,11 @@ impl Channel for TelegramChannel {
         self
     }
 
-    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<SendOutcome> {
         let content = message.content.trim();
         if content.is_empty() {
             tracing::warn!("TelegramChannel: attempted to send empty message – skipping");
-            return Ok(()); // nothing to send, not an error
+            return Ok(SendOutcome::default()); // nothing to send, not an error
         }
 
         let (chat_id, thread_id) = parse_recipient(&message.recipient);
@@ -3687,26 +3686,20 @@ impl Channel for TelegramChannel {
         if attachments.is_empty() && refusals.is_empty() {
             return self
                 .send_text_chunks(content, chat_id, thread_id, message.reply_markup.clone())
-                .await;
+                .await
+                .map(|()| SendOutcome::default());
         }
 
-        // Refusal notices ride in the same body as the model's remaining text: a separate
-        // best-effort send would lose the file, the marker AND the explanation on a transient
-        // failure, while the body send's `?` makes it a real delivery error.
-        let body = if refusals.is_empty() {
-            text_without_markers
-        } else {
-            let notices = refusals.join("\n\n");
-            if text_without_markers.is_empty() {
-                notices
-            } else {
-                format!("{text_without_markers}\n\n{notices}")
-            }
-        };
-
-        if !body.is_empty() {
-            self.send_text_chunks(&body, chat_id, thread_id, message.reply_markup.clone())
-                .await?;
+        // A refused marker leaves nothing in the delivered body: the conversation that wrote it is
+        // told instead, so the owner gets neither a broken attachment nor a notice about one.
+        if !text_without_markers.is_empty() {
+            self.send_text_chunks(
+                &text_without_markers,
+                chat_id,
+                thread_id,
+                message.reply_markup.clone(),
+            )
+            .await?;
         }
 
         // One failed attachment must not cost the user the others: every failure is surfaced
@@ -3746,7 +3739,7 @@ impl Channel for TelegramChannel {
 
         match first_error {
             Some(e) => Err(e),
-            None => Ok(()),
+            None => Ok(SendOutcome { refused: refusals }),
         }
     }
 
@@ -4119,14 +4112,14 @@ pub async fn send_direct(
         file_roots: Vec::new(),
     };
     if let Some(channel) = crate::channel_registry().get("telegram") {
-        return channel.send(&reply).await;
+        return channel.send(&reply).await.map(|_| ());
     }
     let token = crate::config::CONFIG
         .telegram_bot_token()
         .ok_or_else(|| anyhow::anyhow!("Telegram channel not found in registry"))?;
     let channel = TelegramChannel::from_config(token)
         .ok_or_else(|| anyhow::anyhow!("the Bot API this mode serves has no endpoint"))?;
-    channel.send(&reply).await
+    channel.send(&reply).await.map(|_| ())
 }
 
 /// Best-effort plain-text send through the registered channel, for replies and notifications.

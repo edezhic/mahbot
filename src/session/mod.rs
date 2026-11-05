@@ -1745,6 +1745,7 @@ pub async fn clear_session(user_name: &str, role: &str, ws_name: &str) -> anyhow
     let agent_id = resolve_agent_id(user_name, role, ws_name);
     crate::jobs::abandon_session_jobs(&agent_id).await?;
     crate::session::store().delete(&agent_id).await?;
+    crate::agent::message_router::forget_announced_media_failures(&agent_id);
     Ok("Session cleared. Starting fresh.".to_string())
 }
 

@@ -26,6 +26,14 @@ fn test_update(overrides: &[(&str, serde_json::Value)]) -> serde_json::Value {
     update
 }
 
+/// The rendering of each refusal the failure note carries, for the assertions below.
+fn refusal_lines(refused: &[crate::RefusedMarker]) -> Vec<String> {
+    refused
+        .iter()
+        .map(|refusal| format!("{}: {}", refusal.marker, refusal.reason))
+        .collect()
+}
+
 async fn test_channel() -> TelegramChannel {
     crate::users::test_util::init_test_store().await;
     TelegramChannel::new_with("token".into(), CLOUD_API_BASE.to_string(), false)
@@ -330,8 +338,8 @@ fn parse_attachment_markers_attach_known_targets_and_refuse_the_rest() {
     assert_eq!(cleaned, "");
     assert!(att.is_empty());
     assert_eq!(
-        refusals,
-        vec!["Could not send \"x.png\": it is not a valid address."]
+        refusal_lines(&refusals),
+        vec!["[IMAGE:https://example.com:bad/x.png]: it is not a valid address."]
     );
 
     let (cleaned, att, refusals) =
@@ -362,8 +370,8 @@ fn parse_attachment_markers_attach_known_targets_and_refuse_the_rest() {
     assert_eq!(cleaned, "");
     assert!(att.is_empty(), "a non-raster image marker must not attach");
     assert_eq!(
-        refusals,
-        vec!["Could not send \"note.txt\": it is not an image."]
+        refusal_lines(&refusals),
+        vec![format!("[IMAGE:{}]: it is not an image.", nonimg.display())]
     );
 }
 
@@ -461,8 +469,11 @@ fn a_mistyped_directory_is_delivered_and_a_mistyped_name_is_refused() {
     );
     assert!(att.is_empty());
     assert_eq!(
-        refusals,
-        vec!["Could not send \"shot.png\": it is outside your workspace."]
+        refusal_lines(&refusals),
+        vec![format!(
+            "[FILE:{}]: it is outside your workspace.",
+            typo.display()
+        )]
     );
 
     // The repaired marker and the correct one name one file, whichever kind each is written as.
@@ -489,13 +500,13 @@ fn a_mistyped_directory_is_delivered_and_a_mistyped_name_is_refused() {
     );
     assert!(att.is_empty());
     assert_eq!(
-        refusals,
-        vec!["Could not send \"shot.pgn\": file not found."]
+        refusal_lines(&refusals),
+        vec![format!("[IMAGE:{}]: file not found.", name_typo.display())]
     );
 }
 
 /// One refused marker does not stop the others in the same message: every valid target is attached
-/// and only the failing one leaves a notice, in body order.
+/// and only the failing one is reported, in body order.
 #[test]
 fn one_refused_marker_does_not_cost_the_others() {
     let dir = tempfile::tempdir().unwrap();
@@ -518,11 +529,14 @@ fn one_refused_marker_does_not_cost_the_others() {
     assert_eq!(att.len(), 2);
     assert_eq!(att[0].target, png.to_string_lossy());
     assert_eq!(att[1].kind, TelegramAttachmentKind::Video);
-    assert_eq!(refusals, vec!["Could not send \"a.png\": file not found."]);
+    assert_eq!(
+        refusal_lines(&refusals),
+        vec!["[IMAGE:missing/a.png]: file not found."]
+    );
 }
 
 /// `[FILE:...]` is local-only: it resolves against the authorizing workspace roots, carries the
-/// CANONICAL path, and turns every refusal into a notice naming the file.
+/// CANONICAL path, and reports every refusal with the marker as written.
 #[test]
 fn parse_file_markers_resolve_within_workspace_roots() {
     let dir = tempfile::tempdir().unwrap();
@@ -577,18 +591,16 @@ fn parse_file_markers_resolve_within_workspace_roots() {
     );
     assert_eq!(cleaned, "");
     assert!(att.is_empty());
-    assert_eq!(
-        refusals,
-        vec!["Could not send \"secret.txt\": it is outside your workspace."]
-    );
+    let outside_marker = format!("[FILE:{}]: it is outside your workspace.", escape.display());
+    assert_eq!(refusal_lines(&refusals), vec![outside_marker]);
 
     let (cleaned, att, refusals) =
         parse_attachment_markers("[FILE:missing.pdf]", &roots, TransferLimits::CLOUD);
     assert_eq!(cleaned, "");
     assert!(att.is_empty());
     assert_eq!(
-        refusals,
-        vec!["Could not send \"missing.pdf\": file not found."]
+        refusal_lines(&refusals),
+        vec!["[FILE:missing.pdf]: file not found."]
     );
 
     let sub = dir.path().join("reports");
@@ -600,8 +612,8 @@ fn parse_file_markers_resolve_within_workspace_roots() {
     );
     assert!(att.is_empty());
     assert_eq!(
-        refusals,
-        vec!["Could not send \"reports\": it is a directory."]
+        refusal_lines(&refusals),
+        vec![format!("[FILE:{}]: it is a directory.", sub.display())]
     );
 
     let (cleaned, att, refusals) =
@@ -609,8 +621,8 @@ fn parse_file_markers_resolve_within_workspace_roots() {
     assert_eq!(cleaned, "");
     assert!(att.is_empty());
     assert_eq!(
-        refusals,
-        vec!["Could not send \"y.pdf\": an address is not a local file."]
+        refusal_lines(&refusals),
+        vec!["[FILE:http://x/y.pdf]: an address is not a local file."]
     );
 
     // No roots → no workspace to authorize a local file (the plain-text/mirror sends).
@@ -621,19 +633,20 @@ fn parse_file_markers_resolve_within_workspace_roots() {
     );
     assert_eq!(cleaned, "");
     assert!(att.is_empty());
-    assert_eq!(
-        refusals,
-        vec!["Could not send \"specs.pdf\": the message's workspace is unknown."]
+    let unknown = format!(
+        "[FILE:{}]: the message's workspace is unknown.",
+        pdf.display()
     );
+    assert_eq!(refusal_lines(&refusals), vec![unknown]);
 
-    // An inline payload is not a file to hand over, and the notice never echoes it back.
+    // An inline payload is not a file to hand over, and the marker never echoes it back.
     let blob = format!("[FILE:data:application/pdf;base64,{}]", "A".repeat(500));
     let (cleaned, att, refusals) = parse_attachment_markers(&blob, &roots, TransferLimits::CLOUD);
     assert_eq!(cleaned, "");
     assert!(att.is_empty());
     assert_eq!(
-        refusals,
-        vec!["Could not send \"file\": it carries an inline payload, not a file."]
+        refusal_lines(&refusals),
+        vec!["[FILE]: it carries an inline payload, not a file."]
     );
 }
 
@@ -657,8 +670,11 @@ fn parse_file_markers_refuse_symlink_out_of_workspace() {
     assert_eq!(cleaned, "");
     assert!(att.is_empty());
     assert_eq!(
-        refusals,
-        vec!["Could not send \"link.txt\": it is outside your workspace."]
+        refusal_lines(&refusals),
+        vec![format!(
+            "[FILE:{}]: it is outside your workspace.",
+            link.display()
+        )]
     );
 }
 
@@ -918,6 +934,51 @@ async fn an_unfetchable_video_address_is_reported_not_pasted_as_a_link() {
     assert_eq!(
         fake.sent_texts(),
         vec!["Could not send &quot;clip.mp4&quot;: it could not be fetched or sent."]
+    );
+}
+
+/// A marker naming a missing file leaves nothing in the delivered body: the owner gets neither a
+/// notice nor a broken attachment, and the failure is reported back for the conversation that
+/// wrote it. A message that is nothing but the failed marker sends nothing at all.
+#[tokio::test]
+async fn a_refused_marker_leaves_no_notice_in_the_delivered_message() {
+    crate::users::test_util::init_test_store().await;
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let telegram = TelegramChannel::new_with("token-a".into(), fake.base.clone(), false);
+    let dir = tempfile::tempdir().unwrap();
+    let roots = vec![dir.path().to_path_buf()];
+
+    let outcome = telegram
+        .send(&SendMessage {
+            content: "Here it is [FILE:missing.pdf]".to_string(),
+            recipient: "42".to_string(),
+            reply_markup: None,
+            file_roots: roots.clone(),
+        })
+        .await
+        .expect("the surrounding text is delivered");
+
+    assert_eq!(
+        refusal_lines(&outcome.refused),
+        vec!["[FILE:missing.pdf]: file not found."]
+    );
+    assert_eq!(fake.sent_texts(), vec!["Here it is"]);
+
+    let outcome = telegram
+        .send(&SendMessage {
+            content: "[FILE:missing.pdf]".to_string(),
+            recipient: "42".to_string(),
+            reply_markup: None,
+            file_roots: roots,
+        })
+        .await
+        .expect("nothing to deliver is not an error");
+
+    assert_eq!(outcome.refused.len(), 1);
+    assert_eq!(
+        fake.sent_texts(),
+        vec!["Here it is"],
+        "a message that is only the failed marker sends nothing"
     );
 }
 

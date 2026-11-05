@@ -523,9 +523,25 @@ pub struct SendMessage {
     pub file_roots: Vec<std::path::PathBuf>,
 }
 
+/// One media marker a transport could not attach, reported so the conversation that wrote it can
+/// be told. `marker` is the marker as the reply wrote it — bounded, and without an address's
+/// credentials — or just `[KIND]` for an inline payload, which names no path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedMarker {
+    pub marker: String,
+    /// Why it could not be delivered, in the same words the display layer uses.
+    pub reason: String,
+}
+
+/// What one transport send did besides delivering: the markers it refused.
+#[derive(Debug, Clone, Default)]
+pub struct SendOutcome {
+    pub refused: Vec<RefusedMarker>,
+}
+
 #[async_trait]
 pub trait Channel: Send + Sync {
-    async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<SendOutcome>;
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
     fn name(&self) -> &'static str;
 

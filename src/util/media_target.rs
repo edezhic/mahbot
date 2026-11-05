@@ -11,8 +11,8 @@
 //! sender clearly misspelled is corrected, and a file name never is. What a placed target
 //! becomes is decided here too — [`local_refusal`] gates delivery (Telegram,
 //! which must ship bytes), [`remote_marker`] and [`inline_marker_refusal`] answer wherever a
-//! marker of an unservable kind is refused, and [`marker_refusal`] words the refusal, shared
-//! so it reads the same wherever shown.
+//! marker of an unservable kind is refused, and [`marker_refusal`] words the refusal shared by
+//! the display layer and the transport's post-accept failure notices.
 //!
 //! Consumers deciding whether a target is a "real image" use
 //! [`classify_media_image_target`] (Telegram and enrichment, which offload the blocking decode
@@ -282,8 +282,8 @@ fn names_a_reference(target: &str) -> bool {
 pub(crate) enum RemoteMarker {
     /// The address is the whole target; the surface renders its own form of it.
     Deliverable,
-    /// Not a supported target for this kind: the notice a user reads instead.
-    Refused(String),
+    /// Not a supported target for this kind: why it was refused.
+    Refused(&'static str),
 }
 
 /// Judge an http(s) address for `kind`: a `[FILE:…]` address is never a local file, and an
@@ -298,7 +298,7 @@ pub(crate) fn remote_marker(kind: MediaMarkerKind, target: &str) -> RemoteMarker
             return RemoteMarker::Deliverable;
         }
     };
-    RemoteMarker::Refused(marker_refusal_for(target, reason))
+    RemoteMarker::Refused(reason)
 }
 
 /// The notice for a target that is a value rather than a location: an inline payload cannot be
@@ -420,9 +420,9 @@ fn without_credentials(target: &str) -> Cow<'_, str> {
     Cow::Owned(format!("{prefix}{host}/{path}"))
 }
 
-/// The notice a user reads where a marker could not be delivered. The desktop display layer
-/// quotes the same wording for targets it cannot attach as the kind they claim, while a
-/// reference whose file is gone keeps its row there.
+/// The refusal wording shared by the transport's post-accept failure notices and the desktop
+/// display layer. A marker refusal no longer reaches the user: the conversation that wrote it is
+/// told instead, and the note quotes the reason, not this line.
 #[must_use]
 pub(crate) fn marker_refusal(name: &str, reason: &str) -> String {
     format!("Could not send \"{name}\": {reason}")
