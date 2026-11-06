@@ -861,6 +861,9 @@ fn main() -> Result<()> {
 
     // Read persisted window state (sync, before Iced runtime starts).
     let window_state = mahbot::gui::read_window_state();
+    // The work area of the screen a fresh window opens on, which caps a fresh size: read before
+    // iced's event loop exists (see `mahbot::gui::screen`).
+    let work_area = mahbot::gui::screen::work_area();
 
     // Before the iced application runs (matching LOG_BROADCAST), so the file-change subscription
     // always has a source — an uninitialized one would end the stream.
@@ -904,11 +907,11 @@ fn main() -> Result<()> {
 
     // The exit path persists the last reported size and position, and a fresh window's start-up
     // width is settled by the board's first read (see `StartupWidth`).
-    let window_settings = dashboard_window_settings(&window_state, start_hidden);
+    let window_settings = dashboard_window_settings(&window_state, work_area, start_hidden);
     let run = iced::application(
         move || {
             (
-                Dashboard::loading(&window_state),
+                Dashboard::loading(&window_state, work_area),
                 iced::Task::perform(
                     bootstrap_mahbot_safe(start_paused, slowdown),
                     DashboardMessage::Boot,
@@ -949,14 +952,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// The opening geometry ([`mahbot::gui::WindowState::opening_size`]), whether the window
-/// opens hidden, the platform's frame, and the icon and announced name its identity surfaces need.
+/// The opening geometry ([`mahbot::gui::WindowState::opening_size`], capped to the screen's
+/// `work_area`), whether the window opens hidden, the platform's frame, and the icon and announced
+/// name its identity surfaces need.
 fn dashboard_window_settings(
     state: &mahbot::gui::WindowState,
+    work_area: Option<iced::Size>,
     start_hidden: bool,
 ) -> iced::window::Settings {
     iced::window::Settings {
-        size: state.opening_size(),
+        size: state.opening_size(work_area),
         position: state.position(),
         // A hidden start is a window that is never shown. macOS shows its own window once the
         // title strip is hidden (`gui::app_window`), so iced leaves it hidden there.

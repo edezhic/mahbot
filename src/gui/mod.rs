@@ -32,6 +32,8 @@ pub(crate) mod menus;
 pub(crate) mod pasteboard;
 pub(crate) mod pulse;
 pub(crate) mod running;
+/// The screen a fresh window opens on, which bounds its size (see its docs).
+pub mod screen;
 pub(crate) mod selectable;
 pub(crate) mod session_view;
 pub(crate) mod sessions;
@@ -598,7 +600,7 @@ pub(crate) fn is_dashboard_shortcut(
 
 /// Where the window's one start-up width decision stands. A fresh window opens without the
 /// ticket column's width ([`WindowState::opening_size`]), because a fresh board normally has
-/// nothing to show; the board's first read takes the default width back when the column is drawn
+/// nothing to show; the board's first read takes the fresh width back when the column is drawn
 /// after all. Nothing resizes the window later: a column appearing changes the layout only.
 #[derive(Clone, Copy)]
 enum StartupWidth {
@@ -626,6 +628,9 @@ pub struct Dashboard {
     last_position: iced::Point,
     /// Where the one start-up width decision stands (see [`StartupWidth`]).
     startup_width: StartupWidth,
+    /// The fresh window's size with its ticket column ([`fresh_size`]): the width the start-up
+    /// decision widens to, at the height the window has by then.
+    startup_size: iced::Size,
     toasts: Vec<Toast>,
 
     /// Per-workspace records keyed by name, rebuilt whole from the store on
@@ -687,22 +692,24 @@ pub struct Dashboard {
 
 impl Dashboard {
     /// The dashboard before its boot task finishes. `window` is the geometry it opens with
-    /// (`WindowState::opening_size`); a fresh one leaves the start-up width owed.
+    /// (`WindowState::opening_size`, which `work_area` caps); a fresh one leaves the start-up width
+    /// owed.
     #[must_use]
-    pub fn loading(window: &WindowState) -> Self {
+    pub fn loading(window: &WindowState, work_area: Option<iced::Size>) -> Self {
         Self {
             ready: false,
             boot_error: None,
             exit_after_boot: false,
             page: Page::Home,
             log_store: None,
-            last_size: window.opening_size(),
+            last_size: window.opening_size(work_area),
             last_position: iced::Point::new(-1.0, -1.0),
             startup_width: if window.restored {
                 StartupWidth::Settled
             } else {
                 StartupWidth::AwaitingReport
             },
+            startup_size: fresh_size(work_area),
             toasts: Vec::new(),
             workspaces: HashMap::new(),
             workspaces_error: None,
@@ -842,15 +849,18 @@ impl Dashboard {
     }
 
     /// The one start-up width decision, taken on the board's first read ([`StartupWidth`]): a board
-    /// with nothing to show keeps the narrow opening, one that draws the column takes the default
-    /// width back.
+    /// with nothing to show keeps the narrow opening, one that draws the column takes the fresh
+    /// width back, its work-area cap included.
     fn take_startup_width(&mut self) -> Option<iced::Size> {
         let owed = !matches!(self.startup_width, StartupWidth::Settled);
         self.startup_width = StartupWidth::Settled;
         if !owed || self.board_state.has_nothing_to_show() {
             return None;
         }
-        Some(iced::Size::new(DEFAULT_WINDOW_WIDTH, self.last_size.height))
+        Some(iced::Size::new(
+            self.startup_size.width,
+            self.last_size.height,
+        ))
     }
 
     fn settle_startup_width(&mut self) -> Task<Message> {
@@ -3819,16 +3829,16 @@ impl WindowState {
         iced::window::Position::Specific(iced::Point::new(self.x as f32, self.y as f32))
     }
 
-    /// The size the window opens at: a saved geometry as saved, a fresh one without the ticket
-    /// column's share, so the chat's line length is the one it has beside the column in the
-    /// default window (the board's first read then settles the one width decision,
+    /// The size the window opens at: a saved geometry exactly as saved, a fresh one from
+    /// [`fresh_size`] without the ticket column's share, so the chat's line length is the one it
+    /// has beside the column (the board's first read then settles the one width decision,
     /// [`StartupWidth`]).
     #[must_use]
-    pub fn opening_size(&self) -> iced::Size {
-        let full = iced::Size::new(self.width, self.height);
+    pub fn opening_size(&self, work_area: Option<iced::Size>) -> iced::Size {
         if self.restored {
-            return full;
+            return iced::Size::new(self.width, self.height);
         }
+        let full = fresh_size(work_area);
         iced::Size::new(
             (full.width - ticket_column_share(full.width)).max(MIN_WINDOW_WIDTH),
             full.height,
@@ -3837,13 +3847,31 @@ impl WindowState {
 }
 
 /// The window's default size in px, sized for Home with its ticket column beside the chat.
-const DEFAULT_WINDOW_WIDTH: f32 = 1500.0;
-const DEFAULT_WINDOW_HEIGHT: f32 = 800.0;
+const DEFAULT_WINDOW_WIDTH: f32 = 1200.0;
+const DEFAULT_WINDOW_HEIGHT: f32 = 760.0;
 
-/// The window's minimum size, shared with the platform settings so the width
-/// [`WindowState::opening_size`] derives stays a usable window.
+/// The share of the screen's work area a fresh window may take on either side; the minimum below
+/// wins over it.
+const WORK_AREA_SHARE: f32 = 0.8;
+
+/// The window's minimum size, shared with the platform settings so neither the width
+/// [`WindowState::opening_size`] derives nor [`fresh_size`]'s cap goes below a usable window.
 pub const MIN_WINDOW_WIDTH: f32 = 800.0;
 pub const MIN_WINDOW_HEIGHT: f32 = 500.0;
+
+/// The fresh window's size with its ticket column: the default, capped to [`WORK_AREA_SHARE`] of
+/// the screen's work area on each side — the minimum wins over the cap — and left uncapped where
+/// the platform reports no work area.
+#[must_use]
+fn fresh_size(work_area: Option<iced::Size>) -> iced::Size {
+    let (width, height) = work_area.map_or((DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT), |area| {
+        (
+            DEFAULT_WINDOW_WIDTH.min(area.width * WORK_AREA_SHARE),
+            DEFAULT_WINDOW_HEIGHT.min(area.height * WORK_AREA_SHARE),
+        )
+    });
+    iced::Size::new(width.max(MIN_WINDOW_WIDTH), height.max(MIN_WINDOW_HEIGHT))
+}
 
 /// The width the ticket column takes of a window `width` px wide: its portion of the content
 /// area beside the nav rail, which is what the chat gains back when the column is absent.
@@ -4173,7 +4201,7 @@ mod tests {
 
     /// A ready dashboard, so the post-ready handlers run instead of the `!ready` guard.
     fn ready_dashboard() -> Dashboard {
-        let mut dash = Dashboard::loading(&WindowState::default());
+        let mut dash = Dashboard::loading(&WindowState::default(), None);
         dash.ready = true;
         dash
     }
@@ -4337,19 +4365,19 @@ mod tests {
             (
                 "the rounded width stays owed",
                 None,
-                vec![Resize(1067.0, 800.0), Resize(1067.0, 800.0)],
+                vec![Resize(857.0, 760.0), Resize(857.0, 760.0)],
                 ("owed", default),
             ),
             (
                 "a height-only drag is not a width",
                 None,
-                vec![Resize(1067.0, 800.0), Resize(1067.0, 700.0)],
+                vec![Resize(857.0, 760.0), Resize(857.0, 700.0)],
                 ("owed", Some(iced::Size::new(DEFAULT_WINDOW_WIDTH, 700.0))),
             ),
             (
                 "a width the user drags is the user's",
                 None,
-                vec![Resize(1067.0, 800.0), Resize(900.0, 800.0)],
+                vec![Resize(857.0, 760.0), Resize(900.0, 760.0)],
                 ("settled", None),
             ),
             (
@@ -4360,9 +4388,9 @@ mod tests {
             ),
         ] {
             let window = window.unwrap_or_default();
-            let mut dash = Dashboard::loading(&window);
+            let mut dash = Dashboard::loading(&window, None);
             dash.ready = true;
-            assert_eq!(dash.last_size, window.opening_size(), "case {name}");
+            assert_eq!(dash.last_size, window.opening_size(None), "case {name}");
             for step in steps {
                 match step {
                     Direct(read) => drop(dash.board_state.update(read)),
@@ -4380,6 +4408,78 @@ mod tests {
             assert_eq!((state, taken), expected, "case {name}");
             assert_eq!(dash.take_startup_width(), None, "case {name}: once");
         }
+    }
+
+    /// A fresh window's size: the default, capped to 80% of the screen's work area on each side,
+    /// with the minimum winning over the cap; a saved geometry is never measured.
+    #[test]
+    fn fresh_window_size_cases() {
+        let area = |width: f32, height: f32| Some(iced::Size::new(width, height));
+        for (name, work_area, expected) in [
+            ("no work area reported", None, (1200.0, 760.0)),
+            (
+                "a work area larger than the default",
+                area(2560.0, 1440.0),
+                (1200.0, 760.0),
+            ),
+            (
+                "a work area whose 80% is between the minimum and the default",
+                area(1400.0, 900.0),
+                (1120.0, 720.0),
+            ),
+            (
+                "a work area whose 80% is smaller",
+                area(1000.0, 1000.0),
+                (800.0, 760.0),
+            ),
+            (
+                "a work area below the minimum",
+                area(640.0, 480.0),
+                (800.0, 500.0),
+            ),
+        ] {
+            let size = fresh_size(work_area);
+            assert_eq!((size.width, size.height), expected, "case {name}");
+        }
+
+        // The fresh window opens without the ticket column's share — (1200 - 56) * 3/10.
+        let fresh = WindowState::default();
+        let opening = fresh.opening_size(None);
+        assert!(
+            (opening.width - 856.8).abs() < 0.01 && (opening.height - 760.0).abs() < 0.01,
+            "{opening:?}"
+        );
+
+        // A saved geometry opens exactly as saved, however the screen is sized.
+        let saved = WindowState {
+            width: 2000.0,
+            height: 1400.0,
+            x: 10,
+            y: 10,
+            restored: true,
+        };
+        let opening = saved.opening_size(area(1000.0, 1000.0));
+        assert_eq!((opening.width, opening.height), (2000.0, 1400.0));
+    }
+
+    /// The start-up width's target is the fresh size, so the work area's cap reaches the widen too.
+    #[test]
+    fn the_start_up_width_follows_the_work_area() {
+        let area = Some(iced::Size::new(1400.0, 900.0));
+        let mut dash = Dashboard::loading(&WindowState::default(), area);
+        dash.ready = true;
+        // The narrow opening: 1120 - (1120 - 56) * 3/10.
+        let opening = dash.last_size;
+        assert!(
+            (opening.width - 800.8).abs() < 0.01 && (opening.height - 720.0).abs() < 0.01,
+            "{opening:?}"
+        );
+        drop(dash.board_state.update(board_with_a_ticket()));
+        assert_eq!(
+            dash.take_startup_width(),
+            Some(iced::Size::new(1120.0, 720.0)),
+            "the capped widen"
+        );
     }
 
     /// The conversation's first load hangs off the app opening, never off a workspace selection.
@@ -4484,7 +4584,7 @@ mod tests {
             dash.workspaces = ws_map("ws1");
             for step in steps {
                 match step {
-                    Booting => dash = Dashboard::loading(&WindowState::default()),
+                    Booting => dash = Dashboard::loading(&WindowState::default(), None),
                     Map(names) => dash.workspaces = ws_map(names),
                     Select(selected) => drop(dash.apply_workspace_selection(selected)),
                     Bump(generation) => dash.workspaces_reload_gen = generation,

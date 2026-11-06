@@ -368,8 +368,9 @@ objc2-core-graphics = "0.3"
 # text-only clipboard exposes. `NSStatusItem`/`NSStatusBarButton` carry the tray icon's
 # status item and its image (`NSButton`/`NSControl`/`NSResponder`/`NSView` behind them),
 # `NSEvent` reads the plain click its button keeps from the view, and `NSWindow` brings
-# the dashboard window forward for that click.
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSBitmapImageRep", "NSButton", "NSControl", "NSEvent", "NSGraphics", "NSImage", "NSImageRep", "NSPasteboard", "NSResponder", "NSRunningApplication", "NSStatusBarButton", "NSStatusItem", "NSView", "NSWindow", "NSWorkspace"] }
+# the dashboard window forward for that click. `NSScreen` answers the work area a fresh
+# window's size is capped to (`gui::screen`).
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSBitmapImageRep", "NSButton", "NSControl", "NSEvent", "NSGraphics", "NSImage", "NSImageRep", "NSPasteboard", "NSResponder", "NSRunningApplication", "NSScreen", "NSStatusBarButton", "NSStatusItem", "NSView", "NSWindow", "NSWorkspace"] }
 objc2-application-services = "0.3"
 objc2-screen-capture-kit = "0.3"
 block2 = "0.6"
@@ -382,7 +383,8 @@ dispatch2 = "0.3"
 atspi = { version = "0.30", default-features = false, features = ["proxies", "wrappers", "tokio"] }
 enigo = { version = "0.6", default-features = false, features = ["x11rb"] }
 # The `screensaver` feature adds the screen-saver extension's idle time — how long
-# since the X server last saw input, read by `user_activity::os_idle`.
+# since the X server last saw input, read by `user_activity::os_idle`. The same client
+# reads the desktop's `_NET_WORKAREA`, which caps a fresh window's size (`gui::screen`).
 x11rb = { version = "0.13", features = ["screensaver"] }
 zbus = "5"
 # Boxes the async AT-SPI tree walk (already a transitive zbus dependency — same
