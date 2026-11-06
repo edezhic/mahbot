@@ -685,9 +685,9 @@ impl SettingsState {
         })
     }
 
-    /// Re-sync the config text editors from the snapshot, on construction and page entry. A
-    /// value identical to what the editor already shows is not rewritten (that would reset the
-    /// caret and undo stack); routing editors are seeded insert-if-absent.
+    /// Re-sync every field editor from the snapshot, on construction and page entry. A value
+    /// identical to what the editor already shows is not rewritten (that would reset the caret
+    /// and undo stack).
     fn resync_field_editors(&mut self) {
         for key in TEXT_INPUT_KEYS {
             let field = format!("config:{key}");
@@ -705,26 +705,26 @@ impl SettingsState {
                 })
                 .or_insert_with(|| SingleLineEditorState::new(&value));
         }
-        self.seed_routing_editors();
+        self.resync_routing_editors();
     }
 
-    /// Ensure a routing-order editor exists for the two routable slots
-    /// (manager + worker), the set reflected by [`Self::routing_group`].
-    ///
-    /// Insert-if-absent: an existing routing editor's undo stack and caret are
-    /// never reset, so a model that already has a routing row keeps its editor
-    /// state across refreshes and model-value changes. Values are read from the
-    /// editable snapshot's model routings. Called from every window that can
-    /// change the manager/worker model (staging, persist result, refresh).
-    fn seed_routing_editors(&mut self) {
+    /// Re-sync the routing-order editors for the two routable slots (manager + worker), the set
+    /// [`Self::routing_group`] renders: create a missing editor, and write the saved order into
+    /// an editor showing something else — the saved order is the display's only source. The
+    /// editors are first created before the config is read from the DB, so an editor created
+    /// against the empty default must still be corrected once the saved value arrives.
+    fn resync_routing_editors(&mut self) {
         for model in routing_slots(&self.config) {
             let field = format!("routing_order:{model}");
-            if self.field_editors.contains_key(&field) {
-                continue;
-            }
             let value = routing_order_of(&self.config, &model).unwrap_or_default();
             self.field_editors
-                .insert(field, SingleLineEditorState::new(&value));
+                .entry(field)
+                .and_modify(|e| {
+                    if e.text() != value {
+                        e.set_text(&value);
+                    }
+                })
+                .or_insert_with(|| SingleLineEditorState::new(&value));
         }
     }
 
@@ -771,20 +771,28 @@ impl SettingsState {
         let field = format!("config:{key}");
         self.field_errors.remove(&field);
         let submit = matches!(action, EditorAction::Submit);
-        let changes_text = action.changes_text();
-        let value = {
-            let initial = self.staged_value(&field).unwrap_or_default();
-            let editor = self.field_editor_mut(&field, &initial);
-            editor.apply_action(action);
-            editor.text()
-        };
+        let (value, changed) = self.apply_field_action(&field, action);
         if submit {
             self.settle_now(&field, value)
-        } else if changes_text {
+        } else if changed {
             self.update(SettingsMessage::ConfigField { key, value })
         } else {
             Task::none()
         }
+    }
+
+    /// Apply an editor action to a field's buffer, returning the resulting text and whether the
+    /// buffer changed at all. A key that leaves the text as it was (Backspace at the start of a
+    /// field, Delete at its end) stages nothing: it must never settle into a persist of the
+    /// value that is already saved.
+    fn apply_field_action(&mut self, field: &str, action: EditorAction) -> (String, bool) {
+        let initial = self.staged_value(field).unwrap_or_default();
+        let editor = self.field_editor_mut(field, &initial);
+        let before = editor.text();
+        editor.apply_action(action);
+        let after = editor.text();
+        let changed = before != after;
+        (after, changed)
     }
 
     /// Whether a genuinely non-default custom endpoint is staged or persisted (normalized —
@@ -969,10 +977,10 @@ impl SettingsState {
             let _ = self
                 .config
                 .set_string_field(key, value.as_deref().unwrap_or_default());
-            // A model change re-keys the routing rows: seed the routing editor for the applied
-            // model so the rows render without a missing-editor panic.
+            // A model change re-keys the routing rows: sync the routing editors so the rows
+            // render without a missing-editor panic.
             if matches!(key, CONFIG_KEY_MANAGER_MODEL | CONFIG_KEY_WORKER_MODEL) {
-                self.seed_routing_editors();
+                self.resync_routing_editors();
             }
         }
     }
@@ -1023,10 +1031,10 @@ impl SettingsState {
         match msg {
             SettingsMessage::ConfigField { key, value } => {
                 let _ = self.config.set_string_field(key, &value);
-                // A model change re-keys the routing rows: seed the routing editor for the new
-                // model before the next render, so a mid-keystroke name keeps its row.
+                // A model change re-keys the routing rows: sync the routing editors before the
+                // next render, so a mid-keystroke name keeps its row.
                 if matches!(key, CONFIG_KEY_MANAGER_MODEL | CONFIG_KEY_WORKER_MODEL) {
-                    self.seed_routing_editors();
+                    self.resync_routing_editors();
                 }
                 let field = format!("config:{key}");
                 self.field_errors.remove(&field);
@@ -1178,14 +1186,9 @@ impl SettingsState {
                 let field = format!("routing_order:{model}");
                 self.field_errors.remove(&field);
                 let submit = matches!(action, EditorAction::Submit);
-                let changes_text = action.changes_text();
-                let order = {
-                    let initial = self.staged_value(&field).unwrap_or_default();
-                    let editor = self.field_editor_mut(&field, &initial);
-                    editor.apply_action(action);
-                    editor.text()
-                };
-                if changes_text || submit {
+                let (order, changed) = self.apply_field_action(&field, action);
+                if changed || submit {
+                    // Stage in the snapshot so the row renders the typed order before the persist.
                     let order_opt = Some(order.clone()).filter(|s| !s.is_empty());
                     ModelRouting::upsert(&mut self.config.model_routings, model, |mr| {
                         mr.provider_order = order_opt;
@@ -1193,7 +1196,7 @@ impl SettingsState {
                 }
                 if submit {
                     self.settle_now(&field, order)
-                } else if changes_text {
+                } else if changed {
                     self.schedule_settle(&field, order, SETTLE_MS)
                 } else {
                     Task::none()
@@ -4897,8 +4900,8 @@ mod tests {
     /// model, but that editor was only created for the models present when the
     /// page loaded. Typing a different model re-keyed [`SettingsState::routing_group`]
     /// to a model with no editor, and the render-time lookup panicked. The fix
-    /// seeds routing editors (insert-if-absent) at every manager/worker model
-    /// mutation window and makes the render lookup panic-free.
+    /// syncs routing editors at every manager/worker model mutation window and
+    /// makes the render lookup panic-free.
     ///
     /// Exercises the routing render path directly (no voice/audio pipeline) by
     /// calling `routing_group()` and dropping the returned Element before
@@ -5043,6 +5046,55 @@ mod tests {
             .count();
         assert_eq!(deduped, 1, "manager==worker dedups to a single routing row");
         let _ = state.routing_group(); // must not panic
+    }
+
+    /// The routing editors are created in `Dashboard::loading`, before
+    /// `config::reload_from_db` fills the snapshot, so an editor first created against the
+    /// empty default must be corrected once the saved order arrives. An empty field reads as
+    /// "no override" (the placeholder shows the default provider), and any keystroke in it
+    /// settles that empty value into the delete-if-empty persist.
+    #[test]
+    fn routing_editors_show_the_saved_order_after_the_config_is_read() {
+        let mut state = SettingsState::new();
+        state.config = ConfigData {
+            manager_model: Some("vendor/model".into()),
+            worker_model: Some("vendor/model".into()),
+            ..ConfigData::STRUCT_FIELDS_DEFAULT
+        };
+        state.field_editors = HashMap::new();
+        state.resync_field_editors();
+        assert_eq!(
+            state.field_editor("routing_order:vendor/model").text(),
+            "",
+            "pre-boot: nothing saved, so the field is empty"
+        );
+
+        // The config read from the DB arrives with this model's saved order.
+        state.config.model_routings = vec![ModelRouting {
+            model: "vendor/model".into(),
+            provider_order: Some("provider-a".into()),
+        }];
+        state.resync_field_editors();
+        assert_eq!(
+            state.field_editor("routing_order:vendor/model").text(),
+            "provider-a",
+            "page entry shows the saved order instead of the pre-boot empty seed"
+        );
+
+        // A keystroke that changes nothing (Backspace at the caret's start) schedules no
+        // persist at all, so the saved order cannot be erased by it.
+        let _ = state.update(SettingsMessage::ModelRoutingOrder {
+            model: "vendor/model".into(),
+            action: EditorAction::Backspace,
+        });
+        assert_eq!(
+            state.field_editor("routing_order:vendor/model").text(),
+            "provider-a"
+        );
+        assert!(
+            !state.field_gen.contains_key("routing_order:vendor/model"),
+            "a no-op keystroke stages nothing"
+        );
     }
 
     /// Closing the Models settings popup is not a cancel, but a model save that
