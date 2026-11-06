@@ -167,6 +167,12 @@ pub use audio_cli::run as run_audio_cli;
 /// instance lock — browser automation that runs alongside the daemon).
 pub use chrome::cli::run_cli as run_chrome_cli;
 
+/// The speech model integrity check, run once per start as a background task.
+pub use speech::verify_models_once as verify_speech_models_once;
+
+/// The speech engine idle release, run as a background task.
+pub use speech::run_idle_release as run_speech_idle_release;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

@@ -23,6 +23,7 @@ use crate::config::CONFIG;
 use crate::config::{CONFIG_KEY_VOICE_ENABLED, CONFIG_KEY_WAKE_WORD_TEMPLATES};
 use crate::db;
 use crate::runtime_events::RuntimeEvent;
+use crate::speech::ListeningTier;
 use crate::util::UnwrapPoison;
 use crate::util::model_state::ModelState;
 use anyhow::{Context, Result, anyhow};
@@ -105,7 +106,7 @@ const MIN_NEGATIVE_AUDIO_LEN: usize = SAMPLE_RATE as usize / 2;
 /// Maximum number of ambient negative audio chunks retained in memory.
 const MAX_NEGATIVE_AUDIO_CHUNKS: usize = 100;
 
-/// Maximum automatic retry cycles after a terminal model load failure. One cycle is a full
+/// Maximum automatic retry cycles after a model load failure. One cycle is a full
 /// load-or-download chain (the model set's own fetch retry loop), and the self-healing path stays
 /// inside this budget so a persistently failing download cannot loop forever (retry → Failed →
 /// 30 s → retry → …). Past it the pipeline stops auto-retrying: the user presses the GUI retry
@@ -179,23 +180,69 @@ pub fn is_transcription_disabled() -> bool {
         == Some("false")
 }
 
-/// Resolve the voice status from the recogniser's state — pure, shared by the pipeline startup block
-/// and its periodic wake-up so the two can never drift: failed → [`VoiceStatus::ModelError`]
-/// (terminal); ready → [`VoiceStatus::Listening`] when voice is enabled, [`VoiceStatus::Disabled`]
-/// when not; loading → [`VoiceStatus::LoadingModels`] (the wake-up keeps polling until terminal);
-/// uninitialised → [`VoiceStatus::Disabled`], since the recogniser is a first-use load.
+/// Whether the wake word should be running: the same three conditions [`handle_start_listening`]
+/// checks — transcription on, the pipeline's switch on (which carries an unusable enrolment's
+/// forced-off), and a stored enrolment the engine can score — as one answer for callers that do
+/// not need to report which one failed. The idle release keeps the listening tier resident only
+/// while this is true.
+fn wake_word_enabled() -> bool {
+    !is_transcription_disabled() && is_enabled() && !enrollment_unusable()
+}
+
+/// What the wake word and an enrolment need from the listening tier. The tier is the wake word's
+/// and an enrolment's own; nothing else holds it.
+#[must_use]
+pub fn listening_tier() -> ListeningTier {
+    if enrollment_in_progress() {
+        ListeningTier::Busy
+    } else if wake_word_enabled() || enrollment_start_pending() {
+        ListeningTier::Needed
+    } else {
+        ListeningTier::Idle
+    }
+}
+
+/// Whether an enrolment is embedding through the listening tier right now: such a tier is never
+/// taken from under it, not even for the process-wide clear.
+fn enrollment_in_progress() -> bool {
+    matches!(
+        get_status(),
+        VoiceStatus::Enrolling { .. }
+            | VoiceStatus::ListeningDuringEnrollment { .. }
+            | VoiceStatus::WaitingForSilenceDuringEnrollment { .. }
+            | VoiceStatus::EnrollingNegatives { .. }
+    )
+}
+
+/// Whether an enrolment was requested while the recogniser was loading: it starts as soon as the
+/// engine is ready, so the tier is needed even before the first enrolment status is written.
+fn enrollment_start_pending() -> bool {
+    voice_state()
+        .read()
+        .unwrap_poison()
+        .enrollment_start_pending
+}
+
+fn set_enrollment_start_pending(pending: bool) {
+    voice_state()
+        .write()
+        .unwrap_poison()
+        .enrollment_start_pending = pending;
+}
+
+/// Resolve the voice status from the listening tier's state — pure, shared by the pipeline
+/// startup block and its periodic wake-up so the two can never drift: failed →
+/// [`VoiceStatus::ModelError`] (the retry surface; the next start tries again); ready →
+/// [`VoiceStatus::Listening`] when voice is enabled, [`VoiceStatus::Disabled`] when not; loading →
+/// [`VoiceStatus::LoadingModels`] (the wake-up keeps polling until the load settles);
+/// uninitialised or released → [`VoiceStatus::Disabled`], since the tier is a first-use load,
+/// released only when nothing needs it.
 fn resolved_model_status(state: ModelState, voice_enabled: bool) -> VoiceStatus {
     match state {
         ModelState::Failed => VoiceStatus::ModelError,
         ModelState::Loading => VoiceStatus::LoadingModels,
-        ModelState::Ready => {
-            if voice_enabled {
-                VoiceStatus::Listening
-            } else {
-                VoiceStatus::Disabled
-            }
-        }
-        ModelState::Uninit => VoiceStatus::Disabled,
+        ModelState::Ready if voice_enabled => VoiceStatus::Listening,
+        ModelState::Ready | ModelState::Released | ModelState::Uninit => VoiceStatus::Disabled,
     }
 }
 
@@ -204,21 +251,28 @@ fn resolved_model_status(state: ModelState, voice_enabled: bool) -> VoiceStatus 
 /// cannot score outranks every other model state: the owner has to enrol again before listening
 /// can start.
 fn current_model_status() -> VoiceStatus {
-    if crate::speech::is_failed() {
+    if crate::speech::is_listening_failed() {
         return VoiceStatus::ModelError;
     }
     if enrollment_unusable() {
         return VoiceStatus::ReenrollRequired;
     }
-    resolved_model_status(crate::speech::state(), is_enabled())
+    resolved_model_status(crate::speech::listening_state(), is_enabled())
 }
 
-/// Demand the recogniser for a recording and report the load it starts: nothing preloads it, so a
-/// demand is the first use, and without this the footer would show nothing while it loads. A no-op
-/// once ready. The wake word listens through the same engine, so a demand covers both.
+/// Demand the full engine for a recording that will be transcribed: the load overlaps the
+/// recording, so the end of it does not wait on a cold engine.
 fn demand_transcriber() {
-    crate::speech::spawn_background_init();
-    if crate::speech::is_loading() {
+    crate::speech::spawn_transcriber_init();
+}
+
+/// Demand the listening tier for the wake word and report the load it starts: nothing
+/// preloads it, so a demand is the first use, and without this the footer would show nothing
+/// while it loads. A no-op once ready; a released tier is requested again, which is what keeps
+/// the wake word firing.
+fn demand_encoder() {
+    crate::speech::spawn_listening_init();
+    if crate::speech::is_listening_loading() {
         set_status(VoiceStatus::LoadingModels);
     }
 }
@@ -325,9 +379,15 @@ pub struct UtteranceQuality {
 
 static VOICE_PIPELINE: OnceLock<RwLock<VoicePipelineState>> = OnceLock::new();
 
+/// The pipeline's process-wide state: independent switches, not a state machine.
+#[expect(clippy::struct_excessive_bools)]
 struct VoicePipelineState {
     enabled: bool,
     status: VoiceStatus,
+    /// An enrolment was requested while the recogniser was still loading: the pipeline starts it
+    /// as soon as the engine is ready. The listening tier is needed while this is set, so a clear
+    /// can never strand the enrolment it is waiting for.
+    enrollment_start_pending: bool,
     /// The enrolled prototype + calibration (schema 3). `None` before a successful enrollment.
     enrollment: Option<WakeWordEnrollment>,
     /// The stored enrolment came from the old encoder and the engine cannot score it: the toggle
@@ -381,7 +441,7 @@ pub enum VoiceCommand {
     StopListening,
     StartEnrollment,
     CancelEnrollment,
-    /// Retry loading the recogniser after a terminal failure.
+    /// Retry loading the recogniser after a failure.
     RetryModelLoading,
     /// Start a recording from the composer mic button, pausing wake-word listening meanwhile.
     StartRecording,
@@ -409,6 +469,7 @@ pub fn init_global() -> Result<()> {
         .set(RwLock::new(VoicePipelineState {
             enabled: false,
             status: VoiceStatus::Disabled,
+            enrollment_start_pending: false,
             enrollment: None,
             enrollment_unusable: false,
             enrollment_embeddings: Vec::new(),
@@ -1304,9 +1365,6 @@ struct PipelineCtx {
     wake: Wake,
     enrollment_mode: bool,
     auto_start_pending: bool,
-    /// An enrollment was requested while the recogniser was still loading: the pipeline starts it
-    /// as soon as the engine is ready. Unlike [`auto_start_pending`] it never starts listening.
-    enrollment_start_pending: bool,
     /// Last automatic retry time, debouncing the retry path against the 1-second tick while a
     /// loader sits in [`ModelState::Failed`].
     last_model_retry: Option<Instant>,
@@ -1343,7 +1401,6 @@ impl PipelineCtx {
             silence_sample_count: 0,
             enrollment_mode: false,
             auto_start_pending: CONFIG.voice_enabled().as_deref() == Some("true"),
-            enrollment_start_pending: false,
             last_model_retry: None,
             collecting_negatives: false,
             refractory_until: None,
@@ -1535,13 +1592,14 @@ impl PipelineCtx {
             set_enabled(false);
             return;
         }
-        if !crate::speech::is_loaded() {
-            // The recogniser is still loading — mark pending so check_auto_start retries when it
-            // is ready; this is NOT set on mic failure, which would retry forever. A previously
+        if !crate::speech::is_listening_loaded() {
+            // The listening tier is still loading — mark pending so check_auto_start retries when
+            // it is ready; this is NOT set on mic failure, which would retry forever. A previously
             // failed load (ModelError trap) is retried immediately, so the user need not restart
-            // the app. Nothing preloads the engine, so a start is also what demands it.
-            demand_transcriber();
-            if crate::speech::is_failed() {
+            // the app. Nothing preloads the tier, so a start is also what demands it — including
+            // a tier that was released for being idle.
+            demand_encoder();
+            if crate::speech::is_listening_failed() {
                 warn!("The recogniser previously failed — triggering retry...");
                 self.try_retry_models();
             }
@@ -1607,7 +1665,7 @@ impl PipelineCtx {
 
     /// Stop the microphone — the wake word's — and tear down pipeline state.
     fn handle_stop_listening(&mut self) {
-        self.enrollment_start_pending = false;
+        set_enrollment_start_pending(false);
         self.teardown_microphone("*Voice: recording discarded — voice assistant turned off*");
         set_resting_status(VoiceStatus::Disabled);
         info!("Voice pipeline: stopped listening");
@@ -1623,7 +1681,7 @@ impl PipelineCtx {
         // rather than hidden behind the refusal resting state; the re-enrol button stays available
         // either way.
         let enrolling = self.enrollment_mode;
-        self.enrollment_start_pending = false;
+        set_enrollment_start_pending(false);
         self.end_enrollment_attempt();
         self.teardown_microphone("*Voice: recording discarded — microphone disconnected*");
         if enrolling {
@@ -1640,19 +1698,21 @@ impl PipelineCtx {
     fn handle_start_enrollment(&mut self) {
         // The wake word shares the recogniser, and nothing loads it while transcription is off.
         if is_transcription_disabled() {
-            self.enrollment_start_pending = false;
+            set_enrollment_start_pending(false);
             warn!("Cannot start enrollment — local transcription disabled");
             return;
         }
-        // A listening session already implies a loaded recogniser; only the re-enrolment path
+        // A listening session already implies a loaded listening tier; only the re-enrolment path
         // (toggle off, no listening session) has to demand and wait for it.
-        if !crate::speech::is_loaded() && !self.is_listening {
-            self.enrollment_start_pending = true;
-            demand_transcriber();
+        if !crate::speech::is_listening_loaded() && !self.is_listening {
+            set_enrollment_start_pending(true);
+            demand_encoder();
             return;
         }
-        self.enrollment_start_pending = false;
+        // Cleared after the attempt begins, so the tier stays needed through the enrolment's own
+        // status write.
         self.begin_enrollment();
+        set_enrollment_start_pending(false);
     }
 
     /// The enrollment itself, once the recogniser is ready.
@@ -1707,7 +1767,7 @@ impl PipelineCtx {
     }
 
     fn handle_cancel_enrollment(&mut self) {
-        self.enrollment_start_pending = false;
+        set_enrollment_start_pending(false);
         self.end_enrollment_attempt();
         if !is_enabled() && self.is_listening {
             self.stop_microphone();
@@ -1759,7 +1819,7 @@ impl PipelineCtx {
     fn handle_shutdown(&mut self) {
         self.abandon_recording("*Voice: recording discarded — voice assistant stopped*");
         self.resume_listening_after_recording = false;
-        self.enrollment_start_pending = false;
+        set_enrollment_start_pending(false);
         self.mic = None;
     }
 
@@ -1789,7 +1849,7 @@ impl PipelineCtx {
             warn!("Cannot start a recording — one is already running");
             return StartAttempt::AlreadyRecording;
         }
-        if self.enrollment_mode || self.collecting_negatives || self.enrollment_start_pending {
+        if self.enrollment_mode || self.collecting_negatives || enrollment_start_pending() {
             warn!("Cannot start a voice recording during enrollment");
             return StartAttempt::Refused(None);
         }
@@ -1803,12 +1863,16 @@ impl PipelineCtx {
                 "Voice recording unavailable — local transcription is disabled",
             ));
         }
-        // A recogniser that failed to load is the one case a recording cannot end well: say that.
-        if crate::speech::is_failed() {
+        // A recogniser that failed to load is the one case a recording cannot end well: start the
+        // load again and say that. The full engine is what transcribes the recording, so its state
+        // is the one that matters here — the listening tier's is the wake word's. The refusal
+        // itself carries the reason; the footer is left to the wake word's status, which recovers
+        // on its own.
+        if crate::speech::is_transcriber_failed() {
             warn!("Cannot start a voice recording — the local speech model failed to load");
-            set_status(VoiceStatus::ModelError);
+            crate::speech::retry_transcription();
             return StartAttempt::Refused(Some(
-                "Voice unavailable — the local speech model failed to load; retry it in Settings",
+                "Voice unavailable — the local speech model failed to load; retrying it",
             ));
         }
         // Recording needs no recogniser — transcription loads it on use and waits (see
@@ -2027,7 +2091,7 @@ impl PipelineCtx {
     }
 
     /// Retry loading the models, at most once every 30 seconds, so the periodic 1-second wake-up
-    /// cannot start a retry storm. `true` when a retry was initiated.
+    /// cannot start a retry storm. `true` when the retry ran.
     fn try_retry_models(&mut self) -> bool {
         let cooldown = Duration::from_secs(30);
         if self
@@ -2036,13 +2100,10 @@ impl PipelineCtx {
         {
             return false;
         }
-        if crate::speech::retry_init() {
-            self.last_model_retry = Some(Instant::now());
-            set_status(VoiceStatus::LoadingModels);
-            true
-        } else {
-            false
-        }
+        crate::speech::retry_listening();
+        self.last_model_retry = Some(Instant::now());
+        set_status(VoiceStatus::LoadingModels);
+        true
     }
 
     /// Self-healing retry, bounded so a persistently failing download cannot loop forever. Unlike
@@ -2072,13 +2133,19 @@ impl PipelineCtx {
         // mic failure cannot retry forever. Failed-state recovery has two paths:
         // handle_start_listening() retries immediately on an explicit start, and the post-select
         // block in run_voice_pipeline retries every iteration, debounced to 30 s. Once the
-        // recogniser is Ready this picks it up through the pending flag; nothing loads while
-        // transcription is disabled, and past `Uninit` the demand is a cheap no-op.
-        if self.auto_start_pending && !crate::speech::is_loaded() && !is_transcription_disabled() {
-            demand_transcriber();
+        // listening tier is Ready this picks it up through the pending flag; nothing loads while
+        // transcription is disabled, and past `Uninit`/`Released` the demand is a cheap no-op.
+        //
+        // A listening session keeps its tier too: one released for being idle (or a load that
+        // failed) is requested again here, so the wake word can never score against nothing.
+        if (self.auto_start_pending || self.is_listening)
+            && !crate::speech::is_listening_loaded()
+            && !is_transcription_disabled()
+        {
+            demand_encoder();
         }
         if self.auto_start_pending
-            && crate::speech::is_loaded()
+            && crate::speech::is_listening_loaded()
             && !self.is_listening
             && !enrollment_unusable()
         {
@@ -2126,7 +2193,7 @@ async fn extract_negative_embeddings(chunks: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
 /// logged, `false` returned, and the caller ends the attempt via
 /// [`PipelineCtx::end_enrollment_attempt`].
 async fn finalize_enrollment_pipeline() -> bool {
-    if !crate::speech::is_loaded() {
+    if !crate::speech::is_listening_loaded() {
         warn!("finalize_enrollment_pipeline: models not ready");
         return false;
     }
@@ -2306,12 +2373,9 @@ pub async fn run_voice_pipeline() {
                     Some(VoiceCommand::CancelEnrollment) => ctx.handle_cancel_enrollment(),
                     Some(VoiceCommand::RetryModelLoading) => {
                         // Explicit retry from GUI — bypass debounce.
-                        if crate::speech::retry_init() {
-                            ctx.last_model_retry = Some(Instant::now());
-                            set_status(VoiceStatus::LoadingModels);
-                        } else {
-                            warn!("RetryModelLoading: no loader is in the Failed state");
-                        }
+                        crate::speech::retry_listening();
+                        ctx.last_model_retry = Some(Instant::now());
+                        set_status(VoiceStatus::LoadingModels);
                     }
                     Some(VoiceCommand::StartRecording) => {
                         if let Some(msg) = ctx.handle_start_button_recording() {
@@ -2413,16 +2477,16 @@ pub async fn run_voice_pipeline() {
             } => {
                 // Light polling. A load failure surfaces ModelError from ANY status (a load
                 // started by the Settings toggle must not be hidden while voice is off). Otherwise
-                // LoadingModels resolves to its terminal state through the same
+                // LoadingModels resolves to its resting state through the same
                 // [`resolved_model_status`] the startup block uses, so the footer can never hang on
                 // "Loading…" — Listening when voice is on, Disabled when not, whatever started the
                 // load.
-                if crate::speech::is_failed() {
+                if crate::speech::is_listening_failed() {
                     if !matches!(get_status(), VoiceStatus::ModelError) {
                         set_status(VoiceStatus::ModelError);
                     }
                 } else if matches!(get_status(), VoiceStatus::LoadingModels)
-                    && !ctx.enrollment_start_pending
+                    && !enrollment_start_pending()
                 {
                     let resolved = current_model_status();
                     if !matches!(resolved, VoiceStatus::LoadingModels) {
@@ -2437,7 +2501,7 @@ pub async fn run_voice_pipeline() {
         // [`MAX_AUTO_MODEL_RETRY_CYCLES`] so a failing download cannot loop forever). It runs
         // regardless of auto_start_pending, so the error state heals even when voice is toggled
         // manually.
-        if crate::speech::is_failed() {
+        if crate::speech::is_listening_failed() {
             ctx.try_retry_models_auto();
         }
 
@@ -2461,12 +2525,14 @@ pub async fn run_voice_pipeline() {
 /// per tick through the listener.
 async fn run_enrollment_phases(ctx: &mut PipelineCtx) {
     // An enrollment requested while the recogniser was loading starts now.
-    if ctx.enrollment_start_pending && is_transcription_disabled() {
-        ctx.enrollment_start_pending = false;
+    if enrollment_start_pending() && is_transcription_disabled() {
+        set_enrollment_start_pending(false);
     }
-    if ctx.enrollment_start_pending && crate::speech::is_loaded() {
-        ctx.enrollment_start_pending = false;
+    if enrollment_start_pending() && crate::speech::is_listening_loaded() {
+        // Cleared after the attempt begins, so the tier stays needed through the enrolment's own
+        // status write.
         ctx.begin_enrollment();
+        set_enrollment_start_pending(false);
     }
 
     // After all 10 utterances, transition automatically to owner-negative collection.
@@ -2667,7 +2733,7 @@ fn check_enrollment_utterance_length(duration_ms: u64) -> Result<(), String> {
 /// the enrollment status is updated with per-utterance quality.
 #[expect(clippy::cast_precision_loss)]
 async fn handle_enrollment_sample(samples: Vec<f32>, noise_rms: Option<f32>) {
-    if !crate::speech::is_loaded() {
+    if !crate::speech::is_listening_loaded() {
         warn!("Models not ready for enrollment");
         return;
     }
@@ -2818,6 +2884,9 @@ fn handle_wake_word_detection(samples: &[f32], ctx: &mut PipelineCtx) {
         ctx.recording = Some(RecordingOrigin::WakeWord);
         publish_recording(RecordingEvent::Started);
         set_status(VoiceStatus::RecordingWakeWord);
+        // The command will be transcribed, so the full engine starts loading now, while the
+        // person is still speaking: the end of the recording then does not wait on a cold load.
+        demand_transcriber();
         // Detection→recording handoff: the ring is dropped wholesale, not seeded into the
         // recording — it holds the trigger phrase and, because a paired pass resolves up to one
         // stride late, that stride too; the command must start after the phrase. A Soft reset
@@ -3681,8 +3750,9 @@ mod tests {
     // No serial marker needed: the helper reads no global state.
 
     /// One rule over every state and both toggle positions: a failed load is
-    /// terminal, a load in flight is waited on, an unstarted recogniser is not
-    /// reported, and Ready resolves by the user's switch.
+    /// reported as such (and retried by the next start), a load in flight is
+    /// waited on, an unstarted recogniser is not reported, and Ready resolves by
+    /// the user's switch.
     #[test]
     fn resolved_model_status_follows_the_load_and_the_switch() {
         for enabled in [true, false] {
@@ -3691,7 +3761,7 @@ mod tests {
                     resolved_model_status(ModelState::Failed, enabled),
                     VoiceStatus::ModelError
                 ),
-                "a failed load is terminal, never Disabled or LoadingModels (enabled={enabled})",
+                "a failed load is reported, never Disabled or LoadingModels (enabled={enabled})",
             );
             assert!(
                 matches!(
@@ -3716,6 +3786,12 @@ mod tests {
         // loading finishes with the switch off.
         assert!(matches!(
             resolved_model_status(ModelState::Ready, false),
+            VoiceStatus::Disabled
+        ));
+        // A released tier is not a footer state: with the switch on it is dropped only for the
+        // process-wide clear, which requests it again at once.
+        assert!(matches!(
+            resolved_model_status(ModelState::Released, true),
             VoiceStatus::Disabled
         ));
     }

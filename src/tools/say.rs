@@ -8,14 +8,16 @@
 //!
 //! A phrase is one short sentence, not a reading: anything over
 //! [`MAX_PHRASE_CHARS`] is refused rather than spoken. Every refusal — too long,
-//! speech output switched off, engine not up, nobody at the computer, a text the
+//! speech output switched off, the models absent, nobody at the computer, a text the
 //! engine would not speak — is this tool's ordinary answer, not a failure: the
-//! Assistant did nothing wrong, and each one says what to do instead. The engine's
-//! own bring-up (fetch, device open) is kicked on the side and never waited for.
+//! Assistant did nothing wrong, and each one says what to do instead. An engine that
+//! is merely released or still loading is waited for; only an absent model set (whose
+//! fetch runs in the background), a set that failed to load, and the device open are
+//! not.
 //!
 //! The refusal for an absent user is the tool's one use of the machine-wide
-//! user-activity state ([`crate::user_activity`]), and it comes last in the
-//! engine's gates so the answers for speech that cannot be produced at all keep precedence.
+//! user-activity state ([`crate::user_activity`]), and it comes before the engine is
+//! asked for, so a phrase spoken to an empty room never pays a cold load.
 //!
 //! The admin's Assistant is the tool's only holder.
 
@@ -88,14 +90,15 @@ impl Tool for SayTool {
 }
 
 /// The reason a not-ready engine gives, worded as the model reads it: what is
-/// missing, and the bring-up the call left running in the background.
+/// missing, and what the next use does about it.
 fn not_ready_reason(reason: &NotReady) -> &'static str {
     match reason {
         NotReady::ModelsMissing => {
-            "the speech models are not loaded yet, and they are being prepared in the background"
+            "the speech models are not on this machine yet, and they are being fetched in the \
+             background"
         }
-        NotReady::DownloadFailed => {
-            "the speech models failed to load — a retry is running in the background"
+        NotReady::LoadFailed => {
+            "the speech models could not be loaded; the next attempt loads them again"
         }
         NotReady::NoAudioDevice => "this machine has no audio output device",
     }

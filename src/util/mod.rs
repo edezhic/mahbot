@@ -363,19 +363,18 @@ pub(crate) fn hex_string(bytes: &[u8]) -> String {
 }
 
 /// Verify a file's SHA-256 against the hex digest it is pinned to, streaming it rather
-/// than loading it (model files run to gigabytes). An empty `expected` skips the check —
-/// the "no hash configured" semantics every downloader in the product shares.
+/// than loading it (model files run to gigabytes).
+///
+/// Hashed with `ring`, which uses the machine's own SHA-256 instructions: the speech model
+/// check runs once per start over gigabytes, and a portable digest (sha2's default on arm64)
+/// runs at a fifth of that. A download keeps sha2, hashing each piece as it arrives.
 pub(crate) fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
-    use sha2::{Digest as _, Sha256};
     use std::io::Read as _;
 
-    if expected.is_empty() {
-        return Ok(());
-    }
-    let mut hasher = Sha256::new();
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("Failed to open {} for SHA256 verification", path.display()))?;
-    let mut buf = vec![0u8; 65536];
+    let mut buf = vec![0u8; 1 << 20];
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
@@ -383,7 +382,7 @@ pub(crate) fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
         }
         hasher.update(&buf[..n]);
     }
-    let actual = hex_string(&hasher.finalize());
+    let actual = hex_string(hasher.finish().as_ref());
     if actual != expected {
         anyhow::bail!(
             "SHA256 mismatch for {}: expected {expected}, got {actual}",
@@ -2318,13 +2317,5 @@ mod verify_sha256_tests {
         std::fs::write(&path, b"test data").unwrap();
         assert!(verify_sha256(&path, &digest(b"test data")).is_ok());
         assert!(verify_sha256(&path, &digest(b"other data")).is_err());
-    }
-
-    #[test]
-    fn an_empty_pin_skips_the_check() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("nonexistent.bin");
-        assert!(verify_sha256(&missing, "").is_ok());
-        assert!(verify_sha256(&missing, &digest(b"anything")).is_err());
     }
 }

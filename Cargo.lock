@@ -4150,6 +4150,7 @@ dependencies = [
  "reqwest",
  "resvg",
  "rfd",
+ "ring",
  "rodio",
  "rust-embed",
  "rustls",

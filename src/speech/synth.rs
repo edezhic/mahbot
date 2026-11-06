@@ -11,13 +11,15 @@
 //!
 //! Nothing is spoken by itself: an assistant reply, an automation or a confirmation reaches
 //! the engine only through a `say` call. A phrase is then spoken when speech output is enabled
-//! ([`is_config_enabled`]), the model set is loaded, an output device could be opened, and
+//! ([`is_config_enabled`]), the model set can be loaded, an output device could be opened, and
 //! someone is at the computer ([`crate::user_activity`]) — a phrase is not spoken to an empty
 //! room. A newer phrase stops the one being spoken.
 //!
-//! Nothing loads at boot and nothing is unloaded by policy: the model set is fetched the first
-//! time a phrase needs it ([`crate::speech::models`], the same machine-wide folder recognition
-//! reads), and the memory a render peaks at is given back after it.
+//! Nothing loads at boot: the model set is fetched the first time a phrase needs it
+//! ([`crate::speech::models`], the same machine-wide folder recognition reads), and the engine
+//! is released after five idle minutes, so nothing stays resident between phrases. The first
+//! phrase after a release waits for the load — the tool call blocks for it — rather than being
+//! refused.
 
 use crate::config::CONFIG;
 use crate::util::UnwrapPoison;
@@ -25,14 +27,15 @@ use anyhow::{Context as _, Result};
 use mahbot_inference::loader::{Pair, Role};
 use mahbot_inference::synth::Synthesis;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::audio::output;
 use crate::speech::load::Lazy;
-use crate::speech::models::Purpose;
+use crate::speech::models::{self, Purpose};
+use crate::util::model_state::ModelState;
 
 /// The engine's waveform rate: mono 24 kHz, the sound half's own rate.
 const SAMPLE_RATE: u32 = mahbot_inference::synth::SAMPLE_RATE;
@@ -46,7 +49,7 @@ const PLAYBACK_POLL: Duration = Duration::from_millis(50);
 const PLAYBACK_WAIT_LIMIT: Duration = Duration::from_secs(30);
 
 /// The product's one synthesiser: the talker pair from the machine-wide root.
-static ENGINE: Lazy<Synthesis> = Lazy::new(Purpose::Synthesis, || {
+pub(crate) static ENGINE: Lazy<Synthesis> = Lazy::new(Purpose::Synthesis, || {
     Synthesis::new(Arc::new(Pair::of_role(Role::Synthesis)?))
 });
 
@@ -68,7 +71,9 @@ pub(crate) enum SayOutcome {
 /// Why the engine could not speak a phrase right now.
 pub(crate) enum NotReady {
     ModelsMissing,
-    DownloadFailed,
+    /// The set could not be loaded: an open failed, or the set is not on this machine. Never the
+    /// end — a set on disk is opened again by the next use, and a missing one is fetched again.
+    LoadFailed,
     NoAudioDevice,
 }
 
@@ -79,28 +84,14 @@ pub(crate) fn is_config_enabled() -> bool {
     CONFIG.tts_enabled().as_deref() == Some("true")
 }
 
-pub(crate) fn is_loaded() -> bool {
-    ENGINE.is_loaded()
+/// The engine's lifecycle state: what the settings row reports.
+pub(crate) fn state() -> ModelState {
+    ENGINE.state()
 }
 
-pub(crate) fn is_loading() -> bool {
-    ENGINE.is_loading()
-}
-
-pub(crate) fn is_failed() -> bool {
-    ENGINE.is_failed()
-}
-
-/// Retry after a terminal `Failed` state: reset it and re-run the background chain. Returns
-/// `true` when a retry was initiated.
-pub(crate) fn retry_init() -> bool {
-    ENGINE.retry_init()
-}
-
-/// Demand the engine: start the load-or-fetch chain in the background. A no-op when it is
-/// already ready, already loading, or terminally failed.
-pub(crate) fn spawn_background_init() {
-    ENGINE.spawn_background_init();
+/// Retry the engine after a `Failed` state, or start it when it has not been asked for yet.
+pub(crate) fn retry() {
+    ENGINE.retry();
 }
 
 /// Test-only: pin the lifecycle state, for a caller exercising the states a real load takes
@@ -120,23 +111,19 @@ pub(crate) async fn ensure_ready_once(announce: impl FnOnce(&Path)) -> Result<()
 /// Speak one short phrase for the admin's Assistant, and return once it has been rendered: the
 /// waveform then plays in the background. This is the product's whole speech output.
 ///
-/// Whatever is missing is brought up on the side and never waited for: a model set that is not
-/// loaded starts the same load-or-fetch chain, and a device that is not open is opened on the
-/// blocking pool, because enumerating output devices can stall. A text the engine refuses is
-/// answered as such — nothing is spoken and the reason says why.
+/// A phrase is not spoken to an empty room, and that is decided before the engine is asked for,
+/// so an absent owner never pays a cold load. An engine that is not loaded is loaded and waited
+/// for — the first phrase after an idle release is spoken after it, and one whose load failed
+/// over files on disk is opened again by this same call — while a model set that is absent
+/// starts its fetch in the background and is refused. A text the engine refuses is answered as
+/// such — nothing is spoken and the reason says why.
 pub(crate) async fn say_phrase(text: &str) -> SayOutcome {
     if !is_config_enabled() {
         return SayOutcome::SpeechOff;
     }
-    // Read before the retry below resets a failed fetch to a fresh attempt.
-    let fetch_failed = is_failed();
-    if !is_loaded() {
-        spawn_or_retry_download();
-        return SayOutcome::NotReady(if fetch_failed {
-            NotReady::DownloadFailed
-        } else {
-            NotReady::ModelsMissing
-        });
+    // Before the load: a phrase spoken to an empty room must not pay a cold load.
+    if crate::user_activity::is_absent() {
+        return SayOutcome::Absent;
     }
     if !output::audio_output_ready() {
         // Detached on purpose: the open outlives this answer, and a blocking task cannot be
@@ -144,15 +131,21 @@ pub(crate) async fn say_phrase(text: &str) -> SayOutcome {
         drop(tokio::task::spawn_blocking(output::ensure_audio_output));
         return SayOutcome::NotReady(NotReady::NoAudioDevice);
     }
-    // Last, so the answers above keep precedence: absence only stops speech that would
-    // otherwise be produced.
-    if crate::user_activity::is_absent() {
-        return SayOutcome::Absent;
-    }
+    let Ok(dir) = models::root() else {
+        return SayOutcome::NotReady(NotReady::ModelsMissing);
+    };
+    // A load on disk is waited out, not refused: a refusal is for a set that cannot be loaded.
+    let Some(engine) = ENGINE.acquire(&dir).await else {
+        return SayOutcome::NotReady(if state() == ModelState::Failed {
+            NotReady::LoadFailed
+        } else {
+            NotReady::ModelsMissing
+        });
+    };
     // A newer phrase takes over from the one being spoken, and from one still rendering: the
     // playback loop of the older one sees this before its next poll.
     let generation = GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
-    match render(text).await {
+    match render(engine, text).await {
         Ok(samples) => {
             tokio::spawn(play(samples, generation));
             SayOutcome::Speaking
@@ -169,35 +162,24 @@ pub(crate) async fn say_phrase(text: &str) -> SayOutcome {
     }
 }
 
-/// Bring the engine up in the background after a phrase found it not loaded: a terminal
-/// failure takes a fresh attempt, anything else only a load that has not started.
-fn spawn_or_retry_download() {
-    if !retry_init() {
-        spawn_background_init();
-    }
-}
-
 /// Render `text` to the spoken file's bytes: the product's own preparation and one engine call,
 /// written as uncompressed 16-bit mono WAV at the engine's own rate.
 pub(crate) async fn render_speech_wav(text: &str) -> Result<Vec<u8>> {
-    let samples = render(text).await?;
+    let engine = ENGINE
+        .acquire(&models::root()?)
+        .await
+        .context("the speech model set is not on this machine yet, or it failed to load")?;
+    let samples = render(engine, text).await?;
     wav(&samples, SAMPLE_RATE)
 }
 
 /// One text through the engine: the product's preparation, then the whole text in one call.
-async fn render(text: &str) -> Result<Vec<f32>> {
+async fn render(engine: Arc<Mutex<Synthesis>>, text: &str) -> Result<Vec<f32>> {
     let processed = preprocess_text(text);
-    let engine = ENGINE
-        .engine()
-        .context("the speech synthesiser is not loaded")?;
 
     let pass = tokio::task::spawn_blocking(move || {
         let mut engine = engine.lock().unwrap_poison();
-        let result = engine.synthesize(&processed, rand::random());
-        // The pass is over: hand its peak back rather than holding it for the life of the
-        // process, exactly as a recognition pass does.
-        mahbot_inference::release_process_memory();
-        result
+        engine.synthesize(&processed, rand::random())
     });
 
     let shutdown = crate::shutdown::shutdown_token();
@@ -437,7 +419,6 @@ fn has_ending_punctuation(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::model_state::ModelState;
 
     #[test]
     fn test_has_ending_punctuation() {
@@ -528,20 +509,17 @@ mod tests {
 
     // say_phrase
     //
-    // What the tool's one entry point answers while speech is off and while the model set is
-    // not loaded. Neither case reaches the audio device, and neither starts a fetch.
+    // What the tool's one entry point answers while speech is off: it reaches neither the
+    // engine nor the audio device.
 
-    /// Run `say_phrase` under a known config and state, restoring both afterwards.
-    async fn say_under(config: &str, state: ModelState) -> SayOutcome {
+    /// Run `say_phrase` under a known config, restoring it afterwards.
+    async fn say_under(config: &str) -> SayOutcome {
         let snapshot = CONFIG.snapshot();
-        let previous = ENGINE.state();
         assert!(
             CONFIG.set_string_field("tts_enabled", config),
             "tts_enabled is a known config key"
         );
-        ENGINE.test_set_state(state);
         let outcome = say_phrase("A short phrase.").await;
-        ENGINE.test_set_state(previous);
         CONFIG.swap(snapshot);
         outcome
     }
@@ -551,27 +529,9 @@ mod tests {
     async fn say_refuses_while_speech_is_off() {
         for config in ["", "false"] {
             assert!(
-                matches!(
-                    say_under(config, ModelState::Ready).await,
-                    SayOutcome::SpeechOff
-                ),
+                matches!(say_under(config).await, SayOutcome::SpeechOff),
                 "`tts_enabled = '{config}'` must be reported as speech output off"
             );
         }
-    }
-
-    /// Not-ready is an answer like the others: a set still loading is never waited for inside
-    /// the call. Only the loading state is pinned here — a failed or unstarted set would kick a
-    /// fetch, which a test must not do.
-    #[tokio::test]
-    #[serial_test::serial(speech)]
-    async fn say_reports_a_model_set_that_is_not_loaded() {
-        assert!(
-            matches!(
-                say_under("true", ModelState::Loading).await,
-                SayOutcome::NotReady(NotReady::ModelsMissing)
-            ),
-            "a loading model set must be reported as missing, not waited for"
-        );
     }
 }

@@ -1,14 +1,16 @@
-//! The recogniser: one lazily-opened engine over the machine-wide model set, the transcript a
-//! recording turns into, and the wake word's window listener over the same pair.
+//! The recogniser: the machine-wide model set behind two tiers, the transcript a recording turns
+//! into, and the wake word's window listener.
 //!
-//! Nothing loads at boot. The first operation that needs the engine loads it — the first voice
-//! message, the composer's microphone, the Settings toggle or the wake word — either from the files
-//! on disk or by fetching them first ([`crate::speech::models`]), through the shared lifecycle of
-//! [`crate::speech::load`]. The two consumers sit behind separate mutexes: one transcription runs
-//! at a time, and a wake-word pass never waits out a transcription (or the other way round). The
-//! memory a transcription pass peaks at is given back after it
-//! ([`mahbot_inference::release_process_memory`]), which is what keeps a resident dashboard from
-//! holding a recognition pass's peak for the rest of the day.
+//! Nothing loads at boot. The listening tier ([`ENCODER`]) is the pair and the window listener
+//! over it — all the wake word needs, and the only part kept resident while it is enabled. The
+//! full engine ([`TRANSCRIBER`]) adds the tagger, the tokenizer and the recognition graphs, and
+//! loads on the first transcription. Both open the one [`shared_pair`], so keeping both loaded
+//! never duplicates the weights. [`crate::speech::run_idle_release`] drops the full engine after
+//! five idle minutes, and the listening tier too once the wake word no longer needs it; the
+//! process-wide clear drops the listening tier for the instant it runs and requests it again, so
+//! no pooled copy of the weights outlives an engine. The two consumers sit behind separate
+//! mutexes: one transcription runs at a time, and a wake-word pass never waits out a transcription
+//! (or the other way round).
 
 use crate::util::UnwrapPoison;
 use crate::util::model_state::ModelState;
@@ -18,7 +20,7 @@ use mahbot_inference::listen::{Listener, PAIR};
 use mahbot_inference::loader::{Pair, Role};
 use mahbot_inference::transcribe::{Region, SPEECH_LABELS, Transcriber};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::speech::decode;
@@ -88,75 +90,110 @@ impl std::error::Error for Unreadable {}
 /// own guard documents as the default for a run holding a recognition pair.
 const CEILING_MIB: u64 = mahbot_inference::guard::DEFAULT_MAX_RSS_MIB;
 
-/// The product's one recogniser: the recognition pair, the tagger every recognition call depends
-/// on, and the wake word's listener over the same pair — one copy of the weights, two consumers.
-static ENGINE: Lazy<Recogniser> = Lazy::new(Purpose::Recognition, open_recogniser);
+/// The listening tier: the recognition pair and the window listener over it. This is all the
+/// wake word needs, and the only recognition state kept resident while the wake word is enabled.
+pub(crate) static ENCODER: Lazy<Listener> = Lazy::new(Purpose::Listening, open_listener);
 
-/// The recogniser's two consumers over one loaded pair: transcription and the wake word's window
-/// listener. Each sits behind its own mutex, so a wake pass never waits out a transcription (or
-/// the other way round).
-struct Recogniser {
-    transcriber: Arc<Mutex<Transcriber>>,
-    listener: Arc<Mutex<Listener>>,
-}
+/// The full recognition engine: the tagger, the tokenizer and the graphs a transcription needs.
+/// Loaded by the first transcription and released after five idle minutes.
+pub(crate) static TRANSCRIBER: Lazy<Transcriber> =
+    Lazy::new(Purpose::Recognition, open_transcriber);
 
-/// Map the pair, open the tagger and build both consumers. Runs off the async threads: it maps
-/// gigabytes and compiles graphs.
-fn open_recogniser() -> Result<Recogniser> {
+/// The recognition pair, mapped once and shared by both tiers: a second [`Pair`] over the same
+/// files is a second set of weights on the device. Held weakly, so the pair goes when its last
+/// user does.
+fn shared_pair() -> Result<Arc<Pair>> {
+    static SLOT: Mutex<Option<Weak<Pair>>> = Mutex::new(None);
+    let mut slot = SLOT.lock().unwrap_poison();
+    if let Some(pair) = slot.as_ref().and_then(Weak::upgrade) {
+        return Ok(pair);
+    }
     let pair = Arc::new(Pair::of_role(Role::Recognition)?);
+    *slot = Some(Arc::downgrade(&pair));
+    Ok(pair)
+}
+
+/// Map the pair and open the window listener over it. Runs off the async threads: it maps
+/// gigabytes and compiles the front end.
+fn open_listener() -> Result<Listener> {
+    let mut listener = Listener::new(shared_pair()?);
+    // Build both wake word front ends here, not on their first pass: a pass runs inline on the
+    // pipeline's blocking path, and a load that reported itself ready would otherwise leave it
+    // compiling and uploading there. The embeddings are discarded; a failure is left to the pass.
+    for warm in [
+        listener.embed_pair(&[], &[]).map(drop),
+        listener.embed(&[]).map(drop),
+    ] {
+        if let Err(e) = warm {
+            tracing::warn!("the listening front end did not warm up: {e:#}");
+        }
+    }
+    Ok(listener)
+}
+
+/// Map the shared pair, open the tagger and build the full engine. Runs off the async threads.
+fn open_transcriber() -> Result<Transcriber> {
+    let pair = shared_pair()?;
     let tagger = Tagger::open(&models::root()?.join(CED_MODEL))?;
-    let transcriber = Transcriber::open(Arc::clone(&pair), tagger, CEILING_MIB)?;
-    Ok(Recogniser {
-        transcriber: Arc::new(Mutex::new(transcriber)),
-        listener: Arc::new(Mutex::new(Listener::new(pair))),
-    })
+    Transcriber::open(pair, tagger, CEILING_MIB)
 }
 
-/// One consumer handle of the loaded recogniser, or the error naming why it is not there.
-fn consumer<T>(pick: impl FnOnce(&Recogniser) -> Arc<Mutex<T>>) -> Result<Arc<Mutex<T>>> {
-    let engine = ENGINE.engine().context("the recogniser is not loaded")?;
-    let handle = {
-        let engine = engine.lock().unwrap_poison();
-        pick(&engine)
-    };
-    Ok(handle)
-}
-
-/// The recogniser's lifecycle state, for callers resolving a user-facing status from it
+/// The listening tier's lifecycle state, for callers resolving a user-facing status from it
 /// (nothing preloads, so "not loaded" alone cannot tell a load in flight from none started).
-pub(crate) fn state() -> ModelState {
-    ENGINE.state()
+pub(crate) fn listening_state() -> ModelState {
+    ENCODER.state()
 }
 
-pub(crate) fn is_loaded() -> bool {
-    ENGINE.is_loaded()
+pub(crate) fn is_listening_loaded() -> bool {
+    ENCODER.is_loaded()
 }
 
-pub(crate) fn is_loading() -> bool {
-    ENGINE.is_loading()
+pub(crate) fn is_listening_loading() -> bool {
+    ENCODER.is_loading()
 }
 
-pub(crate) fn is_failed() -> bool {
-    ENGINE.is_failed()
+pub(crate) fn is_listening_failed() -> bool {
+    ENCODER.is_failed()
 }
 
-/// Retry after a terminal `Failed` state: reset it and re-run the background chain.
-/// Returns `true` when a retry was initiated.
-pub(crate) fn retry_init() -> bool {
-    ENGINE.retry_init()
+/// Retry the listening tier after a `Failed` state, or start it when it has not been asked for
+/// yet: a load that failed must never stay off until the owner opens Settings.
+pub(crate) fn retry_listening() {
+    ENCODER.retry();
 }
 
-/// Demand the engine: start the load-or-fetch chain in the background. A no-op when it is
-/// already ready, already loading, or terminally failed.
-pub(crate) fn spawn_background_init() {
-    ENGINE.spawn_background_init();
+/// Demand the listening tier: start the load-or-fetch chain in the background. A no-op when it
+/// is already ready or loading; a released tier is requested again.
+pub(crate) fn spawn_listening_init() {
+    ENCODER.spawn_background_init();
+}
+
+/// The full engine's lifecycle state: what a transcription surface reports.
+pub(crate) fn transcriber_state() -> ModelState {
+    TRANSCRIBER.state()
+}
+
+pub(crate) fn is_transcriber_failed() -> bool {
+    TRANSCRIBER.is_failed()
+}
+
+/// Retry the full engine after a `Failed` state, or start it when it has not been asked for
+/// yet.
+pub(crate) fn retry_transcription() {
+    TRANSCRIBER.retry();
+}
+
+/// Demand the full engine: a recording that will be transcribed starts its load now, so the
+/// load overlaps the recording instead of answering the end of it with a wait.
+pub(crate) fn spawn_transcriber_init() {
+    TRANSCRIBER.spawn_background_init();
 }
 
 /// Obtain the set once, with a notice before a fetch that really begins, and open the
 /// engine — the command line's own entry point: one attempt, no retry loop, and a
 /// failure is the caller's to report.
 pub(crate) async fn ensure_ready_once(announce: impl FnOnce(&Path)) -> Result<()> {
-    ENGINE.ensure_ready_once(announce).await
+    TRANSCRIBER.ensure_ready_once(announce).await
 }
 
 /// One recording into words: the whole file, decoded and then read by the engine.
@@ -193,7 +230,7 @@ pub(crate) struct Read {
 }
 
 /// Pieces of one recording, each with its own start offset in seconds, read in one run before
-/// `deadline`: the engine is loaded once and its peak given back once.
+/// `deadline`: the engine is loaded once and used for the whole batch.
 pub(crate) async fn transcribe_pieces(
     pieces: &[(PathBuf, f64)],
     deadline: Instant,
@@ -245,10 +282,10 @@ enum Piece {
 static PASS: LazyLock<Arc<tokio::sync::Mutex<()>>> =
     LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
-/// Read every piece in one pass over the loaded engine: the batch is loaded once, decoded
-/// and transcribed in one blocking task, and its peak given back once when the pass ends. The pass
-/// stops between pieces once `deadline` has passed, so a long recording leaves its unread pieces to
-/// the next look instead of holding its caller for ever.
+/// Read every piece in one pass over the loaded engine: the batch is decoded and transcribed in
+/// one blocking task, with the engine loaded once for the whole batch. The pass stops between
+/// pieces once `deadline` has passed, so a long recording leaves its unread pieces to the next
+/// look instead of holding its caller for ever.
 ///
 /// `deadline` is the caller's own whole bound, counted from the moment it asked: the wait for the
 /// permit is inside it, so a hung pass can neither outlive its own deadline nor hold a later read
@@ -262,12 +299,12 @@ async fn read_pieces(pieces: Vec<Piece>, deadline: Instant, grace: Duration) -> 
     let dir = models::root()?;
     // Nothing preloads the engine: the first operation that needs it loads it here (the
     // ordinary case is the set on disk) or waits out the load a voice press started.
-    anyhow::ensure!(
-        ENGINE.ensure_loaded(&dir).await,
-        "{}",
-        models::unloaded_message(&dir, Purpose::Recognition, is_failed())
-    );
-    let transcriber = consumer(|recogniser| Arc::clone(&recogniser.transcriber))?;
+    let Some(transcriber) = TRANSCRIBER.acquire(&dir).await else {
+        anyhow::bail!(
+            "{}",
+            models::unloaded_message(&dir, Purpose::Recognition, is_transcriber_failed())
+        );
+    };
 
     let shutdown = crate::shutdown::shutdown_token();
     let pass_guard = tokio::select! {
@@ -289,11 +326,7 @@ async fn read_pieces(pieces: Vec<Piece>, deadline: Instant, grace: Duration) -> 
         // a caller that gave up at its own deadline cannot let a second pass start alongside it.
         let _pass = pass_guard;
         let mut engine = transcriber.lock().unwrap_poison();
-        let result = read_all(&mut engine, pieces, deadline);
-        // The pass is over: hand its peak back rather than holding it for the life of
-        // the process. The next pass recompiles, which is the accepted price.
-        mahbot_inference::release_process_memory();
-        result
+        read_all(&mut engine, pieces, deadline)
     });
 
     // The pass stops itself at the deadline; the one piece still in flight is the grace this
@@ -392,24 +425,32 @@ fn segment(offset: f64, rate: u32, region: Region) -> Segment {
     }
 }
 
+/// The loaded window listener, or the error naming why it is not there. Taking it counts as a
+/// use, so an enrolment keeps the listening tier alive.
+fn listener() -> Result<Arc<Mutex<Listener>>> {
+    ENCODER
+        .engine()
+        .context("the listening engine is not loaded")
+}
+
 /// One clip into its window embedding — enrolment and the negative pool embed a clip at a time.
 pub(crate) fn embed_clip(samples: &[f32]) -> Result<Vec<f32>> {
-    let listener = consumer(|recogniser| Arc::clone(&recogniser.listener))?;
+    let listener = listener()?;
     let mut listener = listener.lock().unwrap_poison();
     listener.embed(samples)
 }
 
 /// Two consecutive windows in one pass through the encoder — the wake word's batch.
 pub(crate) fn embed_pair(first: &[f32], second: &[f32]) -> Result<[Vec<f32>; PAIR]> {
-    let listener = consumer(|recogniser| Arc::clone(&recogniser.listener))?;
+    let listener = listener()?;
     let mut listener = listener.lock().unwrap_poison();
     listener.embed_pair(first, second)
 }
 
 /// A batch of clips embedded one at a time; a clip that fails is skipped with a warning.
 pub(crate) fn embed_clips(clips: &[Vec<f32>]) -> Vec<Vec<f32>> {
-    let Ok(listener) = consumer(|recogniser| Arc::clone(&recogniser.listener)) else {
-        tracing::warn!("embed_clips: the recogniser is not loaded");
+    let Ok(listener) = listener() else {
+        tracing::warn!("embed_clips: the listening engine is not loaded");
         return Vec::new();
     };
     let mut listener = listener.lock().unwrap_poison();

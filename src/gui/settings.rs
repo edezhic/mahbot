@@ -19,6 +19,7 @@ use crate::config::{
 use crate::custom_role::{CustomRole, CustomRoleBehavior};
 use crate::tools::custom::ToolListing;
 use crate::tools::media_catalog::image::validate_image_model;
+use crate::util::model_state::ModelState;
 use crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
 use strum::{EnumCount, IntoEnumIterator};
 
@@ -412,8 +413,7 @@ pub enum SettingsMessage {
         cascade_wake_word: bool,
         result: Result<(), String>,
     },
-    /// Retry the recogniser's model load after a terminal failure — re-toggling alone cannot
-    /// recover.
+    /// Retry the recogniser's model load after a failure — re-toggling alone cannot recover.
     RetryTranscription,
     /// Toggle voice assistant on/off (immediately activates/deactivates the pipeline).
     VoiceToggle(bool),
@@ -429,7 +429,7 @@ pub enum SettingsMessage {
     /// The persist's result: the `u64` generation drops results from superseded toggles
     /// (compared against [`SettingsState::tts_toggle_gen`]).
     TtsToggleResult(u64, Result<(), String>),
-    /// Retry the synthesiser's model load after a terminal failure.
+    /// Retry the synthesiser's model load after a failure.
     TtsRetryModels,
 }
 
@@ -1384,16 +1384,9 @@ impl SettingsState {
                     self.set_both(CONFIG_KEY_VOICE_ENABLED, "");
                     sync_voice_state(false);
                 }
-                // Toggle ON: kick the model load/download now — cache first, else with retries.
-                // spawn_background_init claims Uninit→Loading with the same panic→Failed guard
-                // every background load uses, so a raw spawn could not strand it in Loading.
-                if enabled && !crate::speech::is_loaded() {
-                    if !crate::speech::retry_init() {
-                        crate::speech::spawn_background_init();
-                    }
-                }
-                // Wake the voice pipeline so it re-reads config: its 1s timer is parked while
-                // transcription is disabled, and a re-enable must re-resolve status and auto-start.
+                // The pipeline's `ConfigChanged` wakes it, re-arms auto-start and demands the
+                // listening tier when the wake word is on — the one place the load decision is
+                // made. The full engine waits for its first transcription.
                 crate::audio::voice::send_command(crate::audio::voice::VoiceCommand::ConfigChanged);
                 Task::perform(
                     persist_transcription_toggle(enabled, cascade_wake_word),
@@ -1432,7 +1425,7 @@ impl SettingsState {
                 }
             }
             SettingsMessage::RetryTranscription => {
-                let _ = crate::speech::retry_init();
+                crate::speech::retry_transcription();
                 Task::none()
             }
 
@@ -1477,10 +1470,8 @@ impl SettingsState {
                         let _ = crate::audio::output::ensure_audio_output();
                     }
                     // ON with an unloaded model set starts the load-or-fetch chain now.
-                    if enabled && !crate::speech::synth::is_loaded() {
-                        if !crate::speech::synth::retry_init() {
-                            crate::speech::synth::spawn_background_init();
-                        }
+                    if enabled && crate::speech::synth::state() != ModelState::Ready {
+                        crate::speech::synth::retry();
                     }
                 },
             ),
@@ -1493,7 +1484,7 @@ impl SettingsState {
                 |_| {},
             ),
             SettingsMessage::TtsRetryModels => {
-                let _ = crate::speech::synth::retry_init();
+                crate::speech::synth::retry();
                 Task::none()
             }
             SettingsMessage::StartVoiceEnrollment => {
@@ -3371,14 +3362,17 @@ impl SettingsState {
 
         let transcription_status: Element<'_, SettingsMessage> = if !transcription_enabled {
             disabled_status()
-        } else if crate::speech::is_loaded() {
-            status_label("Ready")
-        } else if crate::speech::is_failed() {
-            retry_status_row("Model unavailable", SettingsMessage::RetryTranscription)
-        } else if crate::speech::is_loading() {
-            status_label("Loading…")
         } else {
-            status_label("Loads on first use")
+            match crate::speech::transcriber_state() {
+                ModelState::Ready => status_label("Ready"),
+                ModelState::Failed => {
+                    retry_status_row("Model unavailable", SettingsMessage::RetryTranscription)
+                }
+                ModelState::Loading => status_label("Loading…"),
+                // Released for being idle, not switched off: the next use loads it again.
+                ModelState::Released => status_label("Released — loads on first use"),
+                ModelState::Uninit => status_label("Loads on first use"),
+            }
         };
         let transcription_row = row_hint(
             field_row(
@@ -3400,27 +3394,32 @@ impl SettingsState {
         section("Audio", column)
     }
 
-    /// The speech-output row: the toggle, and the engine's state in the same words the
-    /// transcription row uses — ready, loading, or a failure with its retry.
+    /// The speech-output row: the toggle, and the engine's state in the same words and the same
+    /// shape the transcription row uses — ready, loading, released, or a failure with its retry.
     fn tts_row(&self) -> Element<'_, SettingsMessage> {
         let enabled = self.config.tts_enabled.as_deref() == Some("true");
         let status: Element<'_, SettingsMessage> = if !enabled {
             disabled_status()
-        } else if crate::speech::synth::is_loaded() {
-            if crate::audio::output::audio_output_ready() {
-                status_label("Ready")
-            } else {
-                Text::new("No audio output device")
-                    .size(theme::TEXT_13)
-                    .color(theme::STATUS_ERROR)
-                    .into()
-            }
-        } else if crate::speech::synth::is_failed() {
-            retry_status_row("Model unavailable", SettingsMessage::TtsRetryModels)
-        } else if crate::speech::synth::is_loading() {
-            status_label("Loading…")
         } else {
-            status_label("Loads on first use")
+            match crate::speech::synth::state() {
+                ModelState::Ready => {
+                    if crate::audio::output::audio_output_ready() {
+                        status_label("Ready")
+                    } else {
+                        Text::new("No audio output device")
+                            .size(theme::TEXT_13)
+                            .color(theme::STATUS_ERROR)
+                            .into()
+                    }
+                }
+                ModelState::Failed => {
+                    retry_status_row("Model unavailable", SettingsMessage::TtsRetryModels)
+                }
+                ModelState::Loading => status_label("Loading…"),
+                // Released for being idle, not switched off: the next phrase loads it again.
+                ModelState::Released => status_label("Released — loads on first use"),
+                ModelState::Uninit => status_label("Loads on first use"),
+            }
         };
         row_hint(
             field_row(

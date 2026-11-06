@@ -7,9 +7,10 @@
 //!
 //! Inside it the product knows exactly the file names of the sets it fetches, taken from the
 //! engine's published table rather than restated here. A purpose fetches its own set and
-//! nothing else, so spoken replies never make recognition require, verify or download their
-//! weights, and the other way round. The folder is never enumerated for model files, so
-//! anything else in it — the other consumer's corpus folders above all — is never read,
+//! nothing else — the wake word's listening tier takes the pair alone, and the tagger arrives
+//! with the first transcription — so spoken replies never make recognition require, verify or
+//! download their weights, and the other way round. The folder is never enumerated for model
+//! files, so anything else in it — the other consumer's corpus folders above all — is never read,
 //! written, overwritten or removed; the one other name touched is a part file of the
 //! product's own (`<name>.part-<pid>-<seq>`) that a killed fetch left behind.
 //!
@@ -17,11 +18,18 @@
 //! in other repositories with other bytes, so each entry carries its own source and pin.
 //! What a file *is* — body, projector or tagger — comes from its own metadata: the engine
 //! refuses a pair whose halves do not belong together, so a swap is caught there.
+//!
+//! The digest is checked once per process start, in the background ([`check_once`]), and the
+//! result is remembered: a load only stats the files, so the first use of an engine never pays
+//! a multi-gigabyte hash. A file the check finds wrong is recorded, and the next load fetches
+//! it again; a missing file is left to the on-demand fetch, so a start never downloads.
 
+use crate::util::UnwrapPoison;
 use anyhow::{Context as _, Result, bail};
 use mahbot_inference::ced::CED_MODEL;
 use mahbot_inference::loader::{self, Role};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -44,8 +52,9 @@ pub(crate) fn root() -> Result<PathBuf> {
 /// its own fetch, so one engine never waits on the other's gigabytes.
 #[derive(Clone, Copy)]
 pub(crate) enum Purpose {
-    /// The recogniser's pair and the audio tagger every recognition call depends on. The wake
-    /// word's listener runs on the same pair, so enabling it fetches this set too.
+    /// The recognition pair alone: all the wake word's listening tier loads.
+    Listening,
+    /// The recognition pair plus the audio tagger every transcription depends on.
     Recognition,
     /// The synthesiser's talker pair.
     Synthesis,
@@ -55,6 +64,7 @@ impl Purpose {
     /// The name a log line leads with.
     pub(crate) const fn title(self) -> &'static str {
         match self {
+            Self::Listening => "Speech recognition (listening)",
             Self::Recognition => "Speech recognition",
             Self::Synthesis => "Speech synthesis",
         }
@@ -63,7 +73,7 @@ impl Purpose {
     /// What the set is, as a failure speaks of it.
     pub(crate) const fn what(self) -> &'static str {
         match self {
-            Self::Recognition => "speech",
+            Self::Listening | Self::Recognition => "speech",
             Self::Synthesis => "speech synthesis",
         }
     }
@@ -84,14 +94,19 @@ struct ModelFile {
 /// The files one purpose fetches.
 fn model_files(purpose: Purpose) -> Result<Vec<ModelFile>> {
     match purpose {
-        Purpose::Recognition => recognition_files(),
-        Purpose::Synthesis => synthesis_files(),
+        Purpose::Listening => recognition_pair(),
+        Purpose::Recognition => {
+            let mut files = recognition_pair()?;
+            files.push(tagger());
+            Ok(files)
+        }
+        Purpose::Synthesis => synthesis_pair(),
     }
 }
 
-/// The recognition body and its projector, plus the audio tagger every recognition call
-/// depends on.
-fn recognition_files() -> Result<Vec<ModelFile>> {
+/// The recognition body and its projector: the pair the listening tier and a transcription both
+/// open.
+fn recognition_pair() -> Result<Vec<ModelFile>> {
     let Some((body, projector)) = loader::pair_files(Role::Recognition) else {
         bail!("the inference crate publishes no recognition pair");
     };
@@ -110,21 +125,25 @@ fn recognition_files() -> Result<Vec<ModelFile>> {
             url: "https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF/resolve/36a678687ba7d07a74ca70ccb0e36902e005fb80/mmproj-Qwen3-ASR-1.7B-Q8_0.gguf",
             timeout: LARGE_FILE_TIMEOUT,
         },
-        ModelFile {
-            name: CED_MODEL,
-            bytes: 43_707_680,
-            sha256: "c391ed8697a1b08d7c1a463e4940a5c3a2f670e0544ab0d8ee23b544583602a8",
-            url: "https://huggingface.co/mudler/ced-gguf/resolve/b5e9a4aad6438763c8da16079d77563fbed35c65/ced-small-f16.gguf",
-            timeout: SMALL_FILE_TIMEOUT,
-        },
     ])
+}
+
+/// The audio tagger a transcription depends on; the wake word never reads it.
+fn tagger() -> ModelFile {
+    ModelFile {
+        name: CED_MODEL,
+        bytes: 43_707_680,
+        sha256: "c391ed8697a1b08d7c1a463e4940a5c3a2f670e0544ab0d8ee23b544583602a8",
+        url: "https://huggingface.co/mudler/ced-gguf/resolve/b5e9a4aad6438763c8da16079d77563fbed35c65/ced-small-f16.gguf",
+        timeout: SMALL_FILE_TIMEOUT,
+    }
 }
 
 /// The synthesiser's talker pair: the body and its projector, both from the one repository
 /// that publishes them under exactly these names. The repository carries no model card, so the
 /// digest is the whole provenance — and the projector's role is in its metadata, so the
 /// recognition projector can never stand in for it.
-fn synthesis_files() -> Result<Vec<ModelFile>> {
+fn synthesis_pair() -> Result<Vec<ModelFile>> {
     let Some((body, projector)) = loader::pair_files(Role::Synthesis) else {
         bail!("the inference crate publishes no synthesis pair");
     };
@@ -157,56 +176,94 @@ const RETIRED: &[&str] = &[];
 const LARGE_FILE_TIMEOUT: Duration = Duration::from_mins(30);
 const SMALL_FILE_TIMEOUT: Duration = Duration::from_mins(5);
 
-/// Whether one purpose's whole set is on disk at its pinned size. Cheap (a stat per file) and
-/// no digest, so it answers "is a load worth attempting" rather than "are the bytes right" —
-/// [`ensure_in`] is what answers the second.
-pub(crate) fn present(dir: &Path, purpose: Purpose) -> bool {
+/// Files the once-per-start check found not to match their pins. The fetch path downloads them
+/// again; nothing hashes a load for the rest of the process's life.
+static BAD: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+fn is_bad(name: &'static str) -> bool {
+    BAD.lock().unwrap_poison().contains(&name)
+}
+
+fn mark_bad(name: &'static str) {
+    let mut bad = BAD.lock().unwrap_poison();
+    if !bad.contains(&name) {
+        bad.push(name);
+    }
+}
+
+fn clear_bad(name: &'static str) {
+    BAD.lock().unwrap_poison().retain(|bad| *bad != name);
+}
+
+/// Whether a purpose's set is worth loading: every file at its pinned size and none known to be
+/// the wrong bytes. The size is a stat; the bytes are [`check_once`]'s business, so a load never
+/// hashes. A set needed before the check finishes is judged on its sizes alone.
+pub(crate) fn usable(dir: &Path, purpose: Purpose) -> bool {
     model_files(purpose).is_ok_and(|files| {
         files
             .iter()
-            .all(|file| size_of(&file_at(dir, file)) == Some(file.bytes))
+            .all(|file| size_of(&file_at(dir, file)) == Some(file.bytes) && !is_bad(file.name))
     })
 }
 
-/// Verify one purpose's set against its pins and fetch nothing: the check the awaited path
-/// makes, where a wrong file is a failure naming it rather than a download in the caller's way.
-pub(crate) async fn verify_set(dir: &Path, purpose: Purpose) -> Result<()> {
-    if !dir.is_dir() {
-        bail!(
-            "the model directory {} does not exist — the installer creates it",
-            dir.display()
-        );
-    }
-    for file in &model_files(purpose)? {
-        let path = file_at(dir, file);
-        match verify(&path, file).await {
-            Ok(()) => {}
-            Err(Why::Missing) => bail!(
-                "{} is not there — the product fetches the model set into the directory the \
-                 installer creates",
-                path.display()
-            ),
-            Err(Why::Mismatch(why)) => {
-                bail!("{} does not match its pin ({why})", path.display());
+/// Hash every model file that is present, once per process start, off the request path. Nothing
+/// is fetched: a missing file is the on-demand fetch's business, and a file that does not match
+/// its pin is recorded so the next load fetches it again. A set needed before this finishes
+/// still loads on its size alone, so the check never delays a request.
+pub async fn check_once() {
+    let Ok(dir) = root() else { return };
+    let started = std::time::Instant::now();
+    // `Recognition` is the superset of `Listening`: the pair is hashed once, with the tagger.
+    for purpose in [Purpose::Recognition, Purpose::Synthesis] {
+        let Ok(files) = model_files(purpose) else {
+            continue;
+        };
+        for file in files {
+            let path = file_at(&dir, &file);
+            match verify(&path, &file).await {
+                // Absent: the first use fetches it, and the fetch verifies as it streams.
+                Ok(()) | Err(Why::Missing) => {}
+                Err(Why::Mismatch(why)) => {
+                    warn!(
+                        file = %path.display(),
+                        "The model file does not match its pin ({why}); the next load fetches it again"
+                    );
+                    mark_bad(file.name);
+                }
             }
         }
     }
-    Ok(())
+    info!(
+        "Speech model integrity checked in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
 }
 
-/// Make one purpose's set usable under `dir`: every file checked against its pin, and the ones
-/// missing or not matching fetched. `fetch_starting` is called with `dir` before the first
-/// byte of a fetch that really begins, so a caller binds its notice to a real download.
+/// Make one purpose's set usable under `dir`: a file at its pinned size and not known to be the
+/// wrong bytes is kept, and the ones missing, mis-sized or known wrong are fetched.
+/// `fetch_starting` is called with `dir` before the first byte of a fetch that really begins, so
+/// a caller binds its notice to a real download.
 ///
-/// A file that does not match its pin and cannot be fetched again is an error naming
-/// its path — the engine verifies nothing itself, so this is the only place a wrong
-/// file is caught.
+/// Nothing here hashes: the digest is [`check_once`]'s once-per-start business, and a download
+/// verifies as it streams. A file that cannot be fetched is an error naming its path.
+///
+/// One fetch per set family runs at a time: the two recognition tiers share the pair, and a
+/// second fetch of the same gigabytes is pure waste. A tier that arrives during a fetch waits for
+/// it and then finds the files in place.
 pub(crate) async fn ensure_in(
     dir: &Path,
     purpose: Purpose,
     client: &reqwest::Client,
     fetch_starting: &mut impl FnMut(&Path),
 ) -> Result<()> {
+    static RECOGNITION_FETCH: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+    static SYNTHESIS_FETCH: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+    let _one_fetch = match purpose {
+        Purpose::Listening | Purpose::Recognition => RECOGNITION_FETCH.lock().await,
+        Purpose::Synthesis => SYNTHESIS_FETCH.lock().await,
+    };
     if !dir.is_dir() {
         bail!(
             "the model directory {} does not exist — the installer creates it",
@@ -218,16 +275,19 @@ pub(crate) async fn ensure_in(
     let files = model_files(purpose)?;
     for file in &files {
         let path = file_at(dir, file);
-        match verify(&path, file).await {
-            Ok(()) => continue,
-            Err(Why::Missing) => {}
-            Err(Why::Mismatch(why)) => warn!(
+        let size_matches = size_of(&path) == Some(file.bytes);
+        if size_matches && !is_bad(file.name) {
+            continue;
+        }
+        if size_matches {
+            warn!(
                 file = %path.display(),
-                "The model file does not match its pin ({why}), fetching it again"
-            ),
+                "The model file does not match its pin, fetching it again"
+            );
         }
         fetch_starting(dir);
         download(client, file, &path).await?;
+        clear_bad(file.name);
     }
     Ok(())
 }
@@ -238,7 +298,8 @@ enum Why {
     Mismatch(String),
 }
 
-/// Check one file against its pin: the size first (instant), then the digest.
+/// Check one file against its pin: the size first (instant), then the digest. Only the
+/// once-per-start check calls this; a load never hashes.
 async fn verify(path: &Path, file: &ModelFile) -> Result<(), Why> {
     match size_of(path) {
         None => return Err(Why::Missing),
@@ -322,7 +383,7 @@ pub(crate) fn download_client() -> Result<reqwest::Client> {
         .context("Failed to create HTTP client for model download")
 }
 
-/// Why a set is not usable, in the terms the caller reports: a terminal load failure and a load
+/// Why a set is not usable, in the terms the caller reports: a failed load and a load
 /// still in progress are different news for someone who just spoke. Both name the directory the
 /// set lives in, so the failure carries the path rather than sending the owner to the log for it.
 pub(crate) fn unloaded_message(dir: &Path, purpose: Purpose, failed: bool) -> String {
@@ -340,6 +401,18 @@ pub(crate) fn unloaded_message(dir: &Path, purpose: Purpose, failed: bool) -> St
     }
 }
 
+/// A purpose's set on disk at its pinned sizes, for a test that needs [`usable`] without
+/// gigabytes: the files are sparse.
+#[cfg(test)]
+pub(crate) fn write_sparse_set(dir: &Path, purpose: Purpose) {
+    for file in model_files(purpose).expect("a published set") {
+        std::fs::File::create(dir.join(file.name))
+            .expect("a file")
+            .set_len(file.bytes)
+            .expect("a file of the pinned size");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,8 +423,12 @@ mod tests {
 
     #[test]
     fn the_table_names_what_the_engine_opens() {
-        let files = model_files(Purpose::Recognition).expect("the recognition pair is published");
+        let files = model_files(Purpose::Listening).expect("the recognition pair is published");
         let (body, projector) = loader::pair_files(Role::Recognition).expect("a pair");
+        assert_eq!(files[0].name, body);
+        assert_eq!(files[1].name, projector);
+
+        let files = model_files(Purpose::Recognition).expect("the recognition set is published");
         assert_eq!(files[0].name, body);
         assert_eq!(files[1].name, projector);
         assert_eq!(files[2].name, CED_MODEL);
@@ -361,7 +438,7 @@ mod tests {
         assert_eq!(files[0].name, body);
         assert_eq!(files[1].name, projector);
 
-        for purpose in [Purpose::Recognition, Purpose::Synthesis] {
+        for purpose in [Purpose::Listening, Purpose::Recognition, Purpose::Synthesis] {
             for file in &model_files(purpose).expect("a published set") {
                 assert_eq!(file.sha256.len(), 64, "{} has a digest", file.name);
                 assert!(file.bytes > 0, "{} has a size", file.name);
@@ -372,29 +449,31 @@ mod tests {
         }
     }
 
-    /// A purpose fetches its own set and nothing else: the two engines share one folder, never
-    /// one requirement. Sizes are all `present` reads, so the files are sparse.
+    /// A purpose fetches its own set and nothing else: the engines share one folder, never one
+    /// requirement. The wake word's tier takes the pair and never pulls the tagger.
     #[test]
     fn a_purpose_does_not_require_the_other_set() {
         let dir = scratch();
-        for purpose in [Purpose::Recognition, Purpose::Synthesis] {
-            for file in &model_files(purpose).expect("a published set") {
-                let path = dir.path().join(file.name);
-                std::fs::File::create(&path)
-                    .expect("a file")
-                    .set_len(file.bytes)
-                    .expect("a file of the pinned size");
-            }
-            assert!(
-                present(dir.path(), purpose),
-                "{} is complete",
-                purpose.title()
-            );
-        }
+        write_sparse_set(dir.path(), Purpose::Listening);
+        assert!(usable(dir.path(), Purpose::Listening));
+        assert!(
+            !usable(dir.path(), Purpose::Recognition),
+            "the listening tier's pair does not satisfy a transcription, which needs the tagger"
+        );
+
+        write_sparse_set(dir.path(), Purpose::Recognition);
+        assert!(usable(dir.path(), Purpose::Recognition));
+        assert!(
+            !usable(dir.path(), Purpose::Synthesis),
+            "recognition never requires the talker"
+        );
+
+        write_sparse_set(dir.path(), Purpose::Synthesis);
+        assert!(usable(dir.path(), Purpose::Synthesis));
         let synthesis = model_files(Purpose::Synthesis).expect("the pair");
         std::fs::remove_file(dir.path().join(synthesis[0].name)).expect("remove");
-        assert!(present(dir.path(), Purpose::Recognition));
-        assert!(!present(dir.path(), Purpose::Synthesis));
+        assert!(usable(dir.path(), Purpose::Recognition));
+        assert!(!usable(dir.path(), Purpose::Synthesis));
     }
 
     #[tokio::test]
@@ -425,7 +504,7 @@ mod tests {
             _ => panic!("a file of the wrong size is a mismatch"),
         }
         assert!(
-            !present(dir.path(), Purpose::Recognition),
+            !usable(dir.path(), Purpose::Recognition),
             "an unusable set is not present"
         );
     }

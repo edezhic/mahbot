@@ -1,16 +1,9 @@
-//! Shared model-loading state machine wrapper: the lazy-load lifecycle every model set
-//! in this product goes through (Uninit→Loading→Ready/Failed).
+//! The speech engines' lazy-load lifecycle: Uninit → Loading → Ready → Released / Failed, as one
+//! atomic state, and [`ModelLoadGuard`] — the Loading→Failed Drop guard that keeps a panicking
+//! background load from leaving the state stuck in `Loading`. `crate::speech::load` is its only
+//! user.
 //!
-//! Extracted from the duplicated `AtomicU8` lifecycle blocks in the speech engines:
-//! [`ModelLoadGuard`] unifies the byte-identical Loading→Failed Drop guard that keeps a
-//! panicking background load from leaving the state stuck in `Loading`. `crate::speech` uses it.
-//!
-//! Deliberate non-unifications: the per-module singletons keep their own container types
-//! (`OnceLock<RwLock<Option<_>>>` vs `Mutex<Option<_>>`) — unifying them would change
-//! poisoning/init-once/contention semantics.
-//!
-//! Memory ordering is preserved exactly: `Acquire` loads, `Release` stores,
-//! `AcqRel`/`Acquire` compare-exchange.
+//! Memory ordering: `Acquire` loads, `Release` stores, `AcqRel`/`Acquire` compare-exchange.
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Model loading state with type-safe atomic access.
@@ -21,6 +14,10 @@ pub(crate) enum ModelState {
     Loading = 1,
     Ready = 2,
     Failed = 3,
+    /// The engine was loaded and has since been dropped for being idle: the next use loads it
+    /// again. Distinct from [`ModelState::Uninit`], so a surface can say the engine is released
+    /// rather than that it was never started.
+    Released = 4,
 }
 
 impl ModelState {
@@ -31,6 +28,7 @@ impl ModelState {
             1 => Self::Loading,
             2 => Self::Ready,
             3 => Self::Failed,
+            4 => Self::Released,
             _ => Self::Uninit,
         }
     }

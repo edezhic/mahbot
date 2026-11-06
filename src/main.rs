@@ -116,7 +116,9 @@ async fn bootstrap_mahbot(start_paused: bool, slowdown: Option<Report>) -> Resul
 
     // Recognition and spoken replies are deliberately NOT loaded here: each engine loads on
     // first use on every platform (`mahbot::speech::engine`, `mahbot::speech::synth`), so an
-    // install that never records or speaks loads nothing at start.
+    // install that never records or speaks loads nothing at start. The model files that are
+    // present are hashed once per start by the `speech-integrity` background task
+    // (`spawn_background_tasks`), off the request path, so no load ever pays for the digest.
     mahbot::providers::init_global()
         .map_err(|e| mahbot::boot::record_startup_failure("providers::init_global", e))?;
 
@@ -417,12 +419,33 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::hyperframes::refresh_on_start().await;
     });
 
+    // Hashes the speech model files that are already present, once per start and off the request
+    // path: a load only stats them, so the first use of an engine never pays a multi-gigabyte
+    // digest. Nothing is fetched here — a missing file keeps its on-demand download.
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "speech-integrity",
+        mahbot::verify_speech_models_once(),
+    );
+
     // Manages command recording, transcription, routing and wake-word detection.
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
         "voice-pipeline",
         mahbot::audio::voice::run_voice_pipeline(),
+    );
+
+    // Drops a speech engine that has had no use for five minutes, and hands the released weights
+    // back once the whole process is cold. The wake word's listening tier is kept while the wake
+    // word or an enrolment needs it, apart from the instant a clear re-requests it; everything
+    // else goes.
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "speech-idle-release",
+        mahbot::run_speech_idle_release(mahbot::audio::voice::listening_tier),
     );
 
     let rx = init_message_pipeline(&mut tasks, &shutdown_token);

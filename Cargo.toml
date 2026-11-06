@@ -188,6 +188,11 @@ ignore = "0.4"
 # SHA256 for downloaded-artifact checksum verification, and the Windows debug
 # endpoint's location-derived pipe name (see src/db/ipc.rs)
 sha2 = "0.10"
+# SHA-256 at the machine's own hashing speed: the speech model check hashes
+# gigabytes once per start, and on arm64 sha2's default path is portable
+# software (a fifth of this). Already built for rustls's ring provider, so
+# this adds no build work.
+ring = "0.17"
 paste = "1.0"
 
 # Enum derive helpers

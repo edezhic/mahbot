@@ -182,7 +182,7 @@ fn build_provider(config: &crate::config::ConfigData) -> Arc<dyn Provider> {
 ///
 /// The local speech recogniser is not initialized here either: the model is
 /// loaded on first use — the voice stack's own demand
-/// ([`crate::speech::spawn_background_init`]) or the first transcription, which
+/// ([`crate::speech::spawn_listening_init`]) or the first transcription, which
 /// waits for that load — so boot never preloads it.
 pub fn init_global() -> anyhow::Result<()> {
     let config = CONFIG.snapshot();
