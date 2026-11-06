@@ -26,7 +26,6 @@ use crate::Role;
 use crate::Workspace;
 use crate::WorkspaceStatus;
 use crate::db::{self, TxGuard};
-use crate::git::commands::run_git_output;
 use crate::util::UnwrapPoison;
 use anyhow::{Context as _, Result};
 use std::collections::HashSet;
@@ -1077,21 +1076,7 @@ pub(crate) async fn ensure_personal_workspace(name: &str) -> Result<()> {
             .with_context(|| format!("create the folder {}", path.display()))?;
     }
     // `git init` only when there is no repo yet; non-fatal on failure.
-    if path.join(".git").exists() {
-        return Ok(());
-    }
-    match run_git_output(&path, &["init", "-q"]).await {
-        Ok(o) if o.status.success() => {}
-        Ok(_) => warn!(
-            path = %path.display(),
-            "git init failed for personal workspace (git may not be installed)"
-        ),
-        Err(e) => warn!(
-            path = %path.display(),
-            error = %e,
-            "git init failed for personal workspace"
-        ),
-    }
+    crate::git::commands::init_repo_if_absent(&path).await;
     Ok(())
 }
 

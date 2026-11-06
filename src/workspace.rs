@@ -921,6 +921,11 @@ impl WorkspaceStore {
         // defaults to 0 in the schema — the pickup reads the live value.
         // Clear any stale cooldown from a previously-deleted same-name row.
         clear_pending_pickup_cooldown(name);
+        // The folder becomes a repository so the pipeline can commit its work. An existing
+        // repository is left alone, a failed init never fails the add, and the init runs after
+        // the INSERT (a rejected add must not touch the folder) but before the index below, so
+        // the engine is built with the repository already in place.
+        crate::git::commands::init_repo_if_absent(std::path::Path::new(&ws.path)).await;
         // Eagerly initialize the shared search engine for this workspace.
         if let Err(e) =
             crate::workspace_index::get_or_init_engine(name, std::path::Path::new(&ws.path))
@@ -2323,6 +2328,56 @@ mod tests {
             fetched.status,
             WorkspaceStatus::Pending,
             "Persisted workspace must have status = pending"
+        );
+    }
+
+    /// Adding a folder makes it a repository with nothing committed in it, and adding a folder
+    /// that already is a repository leaves that repository exactly as it was.
+    #[tokio::test]
+    #[serial_test::serial(config_persist)] // swaps the process-global CONFIG
+    async fn add_initialises_a_repository_only_when_the_folder_has_none() {
+        let (store, _tmp) = test_store().await;
+        crate::workspace_index::init_global();
+        let _ = crate::config::CONFIG.try_set_storage_root(crate::util::test::test_root().clone());
+        crate::config::CONFIG.swap(crate::config::ConfigData::STRUCT_FIELDS_DEFAULT);
+
+        // A folder without a repository: `git init` writes `.git` and commits nothing.
+        let fresh = TempDir::new().expect("temp dir for workspace path");
+        store
+            .add("add_git_fresh", fresh.path().to_str().unwrap())
+            .await
+            .expect("add workspace");
+        let entries: Vec<_> = std::fs::read_dir(fresh.path())
+            .expect("read the added folder")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            [std::ffi::OsString::from(".git")],
+            "`git init` must be all the add creates in the folder"
+        );
+        assert!(
+            crate::git::commands::run_git_command(fresh.path(), &["rev-parse", "HEAD"])
+                .await
+                .is_err(),
+            "the initialised repository must have no commit"
+        );
+
+        // A folder that already is a repository: untouched — same HEAD, nothing re-initialised.
+        let (_repo, repo_path) = crate::util::test::init_temp_repo();
+        let head_before = crate::git::commands::run_git_command(&repo_path, &["rev-parse", "HEAD"])
+            .await
+            .expect("read HEAD before the add");
+        store
+            .add("add_git_existing", repo_path.to_str().unwrap())
+            .await
+            .expect("add existing repository");
+        let head_after = crate::git::commands::run_git_command(&repo_path, &["rev-parse", "HEAD"])
+            .await
+            .expect("read HEAD after the add");
+        assert_eq!(
+            head_before, head_after,
+            "an existing repository must be left exactly as it was"
         );
     }
 

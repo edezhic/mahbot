@@ -99,6 +99,22 @@ pub fn is_git_repo(path: &Path) -> bool {
     path.join(".git").exists()
 }
 
+/// Make `path` a repository unless it already is one. Nothing is committed, and nothing beyond
+/// what `git init` itself writes is created.
+///
+/// Best-effort by design: callers need the folder, not the repository, so a failure (git not
+/// installed, folder not writable) is a warning and leaves the folder usable.
+pub(crate) async fn init_repo_if_absent(path: &Path) {
+    if is_git_repo(path) {
+        return;
+    }
+    match run_git_output(path, &["init", "-q"]).await {
+        Ok(output) if output.status.success() => {}
+        Ok(_) => warn!(path = %path.display(), "git init failed (git may not be installed)"),
+        Err(e) => warn!(path = %path.display(), error = %e, "git init failed"),
+    }
+}
+
 /// Run `git show -m <hash> --no-color --find-renames --format=` — the diff a historical
 /// commit introduced. `-m` splits merges into per-parent diffs, so the same path may
 /// appear once per parent in the tree; that is expected. `--format=` drops the log header.
