@@ -388,13 +388,12 @@ async fn missing_dirs(dir: Option<&Path>) -> Vec<PathBuf> {
     missing
 }
 
-/// Remove the directories this call created, deepest first and only while they are empty: a
-/// directory the user filled in the meantime stays, and nothing is ever removed recursively.
+/// Remove the empty directories this call created, deepest first. Every one is attempted, so a
+/// level that cannot go — one the user filled in the meantime — does not keep its parents. Only
+/// emptiness lets a directory go; nothing is ever removed recursively.
 async fn remove_created_dirs(created: &[PathBuf]) {
     for dir in created {
-        if tokio::fs::remove_dir(dir).await.is_err() {
-            break;
-        }
+        let _ = tokio::fs::remove_dir(dir).await;
     }
 }
 
@@ -405,8 +404,8 @@ async fn remove_created_dirs(created: &[PathBuf]) {
 /// The existence probe and the rename are two syscalls, so a name created exactly between them
 /// is replaced. That window is real — the user edits this folder in parallel with the agent's
 /// turn — and it is accepted: std has no portable exclusive rename, and a copy-then-unlink
-/// fallback would trade the window for a non-atomic move. A move that fails after its
-/// destination folder was created removes those folders again (see [`remove_created_dirs`]).
+/// fallback would trade the window for a non-atomic move. A move that fails after creating its
+/// destination folder removes the empty levels again (see [`remove_created_dirs`]).
 async fn place(root: &Path, source: &Item, target: &Path, verb: &str) -> Result<()> {
     let absolute = root.join(target);
     if absolute == source.absolute {
@@ -440,7 +439,7 @@ async fn place(root: &Path, source: &Item, target: &Path, verb: &str) -> Result<
     {
         remove_created_dirs(&created).await;
         anyhow::bail!(
-            "cannot {verb} {}: the destination folder is unwritable: {e}",
+            "cannot {verb} {}: the destination folder cannot be created: {e}",
             source.relative.display()
         );
     }
@@ -767,9 +766,10 @@ mod tests {
         }
     }
 
-    /// Nothing existing is overwritten, and a rename that only changes the case still works.
+    /// A taken destination is refused rather than replaced — best-effort only, since the probe
+    /// and the rename are two syscalls — and a rename that only changes the case still works.
     #[tokio::test]
-    async fn nothing_is_overwritten_and_a_case_only_rename_still_works() {
+    async fn a_taken_destination_is_refused_and_a_case_only_rename_still_works() {
         let (_dir, root, ws) = setup();
         let err = run(
             &ws,
@@ -971,31 +971,48 @@ mod tests {
             root.join("notes/old.md").exists(),
             "the source must stay put"
         );
-        std::fs::write(root.join("MEMORY.md"), "memory again").unwrap();
     }
 
-    /// A move that fails after its destination folder was created leaves no empty folders: only
-    /// the directories this call made go, and only while they are empty.
+    /// A move that fails leaves no empty folder this call created behind, whether the rename is
+    /// what fails or the destination folder's own creation stops partway. Only empty directories
+    /// go, so one that was already there, or that the user filled, stays.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_failed_move_leaves_no_created_folders_behind() {
         let (_dir, root, ws) = setup();
         let too_long = format!("{}.md", "x".repeat(256));
-        let err = run(
+        run(
             &ws,
             json!({"operation": "move", "path": "notes/old.md", "to": "album/deep", "name": too_long}),
         )
         .await
         .expect_err("a name past NAME_MAX cannot be created");
-        assert!(!err.to_string().is_empty(), "{err}");
         assert!(
             !root.join("album").exists(),
             "the folders this call made must be gone"
+        );
+
+        // The folder's own creation can stop after the levels above the failing one.
+        let unreachable = format!("vault/{}/inner", "y".repeat(256));
+        let err = run(
+            &ws,
+            json!({"operation": "move", "path": "notes/old.md", "to": unreachable}),
+        )
+        .await
+        .expect_err("a folder name past NAME_MAX cannot be created");
+        assert!(
+            err.to_string().contains("cannot be created"),
+            "the folder itself must be what failed, got: {err}"
+        );
+        assert!(
+            !root.join("vault").exists(),
+            "the level made before the failure must be gone too"
         );
         assert!(
             root.join("notes/old.md").exists(),
             "the source must stay put"
         );
+
         // A folder that was already there is not this call's to remove.
         std::fs::create_dir_all(root.join("album/deep")).unwrap();
         std::fs::write(root.join("album/deep/keep.md"), "keep").unwrap();
