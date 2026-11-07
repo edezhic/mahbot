@@ -61,9 +61,9 @@ Usage:
                          produce one with its document tool
   mahbot image gen [flags]
                          Produce a picture with the RUNNING product's picture tool
-  mahbot video <gen|edit> [flags]
+  mahbot video gen [flags]
                          Produce or edit a clip with the RUNNING product's video
-                         tools
+                         tool
   mahbot rasterize [flags]
                          Turn a file into an ordinary picture with the RUNNING
                          product's rasterizer
@@ -204,14 +204,13 @@ impl Exit {
     }
 }
 
-/// One command-line family: the frontend onto one capability of the product — one
-/// of its tools, or the pair of tools that share a capability.
+/// One command-line family: the frontend onto one capability of the product, carried by
+/// exactly one of its tools.
 pub(crate) struct Family {
     /// The command-line word (`mahbot <word> …`).
     pub(crate) word: &'static str,
-    /// The product tools this family fronts, in the order its help lists them —
-    /// both video tools where a capability is split across two.
-    pub(crate) tools: &'static [&'static str],
+    /// The one product tool this family fronts.
+    pub(crate) tool: &'static str,
     /// The protocol value this family's operation frames carry: the generation of
     /// the surface it needs. A family the channel has already served carries
     /// [`CALL_STORE_BASE`](crate::db::ipc::CALL_STORE_BASE) and keeps working
@@ -229,21 +228,19 @@ pub(crate) struct Family {
 /// What follows a family's word on the command line.
 pub(crate) enum Surface {
     /// `mahbot <word> <operation> [flags]`: one operation per sub-command, each
-    /// running one of the family's tools — or, in one case, the product's own
-    /// reader ([`DOCUMENT_READ`]).
+    /// running the family's tool — or, in one case, the product's own reader
+    /// ([`DOCUMENT_READ`]).
     Operations(&'static [Operation]),
     /// The family IS its operation: `mahbot <word> [flags]`, no operation word at
     /// all, and the args carry no `action` key.
     Standalone(&'static [Flag]),
 }
 
-/// One command-line operation: the tool it runs and, where the tool has one, the
-/// action it runs it under.
+/// One command-line operation: the action it runs (where the tool has one) and its
+/// flags. It runs the family's tool ([`Family::tool`]).
 pub(crate) struct Operation {
-    /// The tool this operation runs — one of the family's own.
-    pub(crate) tool: &'static str,
     /// The tool's own `action` value, or `None` where the tool takes no action
-    /// (the picture tool and both video tools): the operation then IS that tool.
+    /// (the picture tool and the video tool): the operation then IS that tool.
     /// [`DOCUMENT_READ`] is the one action no tool holds.
     pub(crate) action: Option<&'static str>,
     /// One line for the family's help and the operation's own help.
@@ -259,10 +256,10 @@ pub(crate) struct Operation {
 fn operation_word(family: &Family, operation: &Operation) -> String {
     match operation.action {
         Some(action) => action.replace('_', "-"),
-        None => operation
+        None => family
             .tool
             .strip_prefix(family.word)
-            .unwrap_or(operation.tool)
+            .unwrap_or(family.tool)
             .trim_start_matches('_')
             .replace('_', "-"),
     }
@@ -447,13 +444,12 @@ pub(crate) const DOCUMENT_READ: &str = "read";
 pub(crate) const FAMILIES: &[Family] = &[
     Family {
         word: "config",
-        tools: &["mahbot_config"],
+        tool: "mahbot_config",
         protocol: crate::db::ipc::CALL_STORE_BASE,
         purpose: "Set the running product up — its Telegram bot, its users and \
                   their tool grants, web search, custom roles",
         surface: Surface::Operations(&[
             Operation {
-                tool: "mahbot_config",
                 action: Some("setup_telegram_bot"),
                 purpose: "Save the Telegram bot token from BotFather",
                 flags: &[Flag {
@@ -464,7 +460,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 }],
             },
             Operation {
-                tool: "mahbot_config",
                 action: Some("bind_telegram"),
                 purpose: "Bind your own Telegram account, so the bot's messages reach you",
                 flags: &[Flag {
@@ -476,7 +471,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 }],
             },
             Operation {
-                tool: "mahbot_config",
                 action: Some("add_user"),
                 purpose: "Create a guest account and bind its Telegram account",
                 flags: &[
@@ -497,7 +491,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
             Operation {
-                tool: "mahbot_config",
                 action: Some("setup_web_search"),
                 purpose: "Choose the web-search provider and store its API key",
                 flags: &[
@@ -516,19 +509,16 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
             Operation {
-                tool: "mahbot_config",
                 action: Some("grant_tool"),
                 purpose: "Give a user one of your custom tools",
                 flags: &[USER_FLAG, CUSTOM_TOOL_FLAG],
             },
             Operation {
-                tool: "mahbot_config",
                 action: Some("revoke_tool"),
                 purpose: "Take one of your custom tools back from a user",
                 flags: &[USER_FLAG, CUSTOM_TOOL_FLAG],
             },
             Operation {
-                tool: "mahbot_config",
                 action: Some("list_grants"),
                 purpose: "List the custom tools granted to a user, or to every user",
                 flags: &[Flag {
@@ -539,7 +529,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 }],
             },
             Operation {
-                tool: "mahbot_config",
                 action: Some("create_custom_role"),
                 purpose: "Create a custom role from a prompt",
                 flags: &[
@@ -574,7 +563,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
             Operation {
-                tool: "mahbot_config",
                 action: Some("update_custom_role"),
                 purpose: "Change a custom role's prompt, tools or behaviour",
                 flags: &[
@@ -607,13 +595,11 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
             Operation {
-                tool: "mahbot_config",
                 action: Some("list_custom_roles"),
                 purpose: "List the custom roles",
                 flags: &[],
             },
             Operation {
-                tool: "mahbot_config",
                 action: Some("delete_custom_role"),
                 purpose: "Delete a custom role",
                 flags: &[Flag {
@@ -627,12 +613,11 @@ pub(crate) const FAMILIES: &[Family] = &[
     },
     Family {
         word: "workspace",
-        tools: &["workspace"],
+        tool: "workspace",
         protocol: crate::db::ipc::CALL_STORE_BASE,
         purpose: "Work with the running product's workspaces, their tickets and their board",
         surface: Surface::Operations(&[
             Operation {
-                tool: "workspace",
                 action: Some("list"),
                 purpose: "List the managed workspaces",
                 flags: &[Flag {
@@ -643,7 +628,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 }],
             },
             Operation {
-                tool: "workspace",
                 action: Some("add"),
                 purpose: "Add a software project directory as a managed workspace",
                 flags: &[
@@ -669,7 +653,6 @@ pub(crate) const FAMILIES: &[Family] = &[
             // refuses a stray field so a fleet-wide write can never be widened by
             // accident, so never invent one and never send a `null`.
             Operation {
-                tool: "workspace",
                 action: Some("pause"),
                 purpose: "Freeze one managed workspace, or every one when none is named",
                 flags: &[Flag {
@@ -684,7 +667,6 @@ pub(crate) const FAMILIES: &[Family] = &[
             },
             // See `pause`: the same fleet-wide rule, the same absent key.
             Operation {
-                tool: "workspace",
                 action: Some("resume"),
                 purpose: "Resume one managed workspace, or every one when none is named",
                 flags: &[Flag {
@@ -698,7 +680,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 }],
             },
             Operation {
-                tool: "workspace",
                 action: Some("board"),
                 purpose: "List the tickets of one workspace, or of every one, by phase",
                 flags: &[
@@ -718,7 +699,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
             Operation {
-                tool: "workspace",
                 action: Some("ticket"),
                 purpose: "Show one ticket",
                 flags: &[
@@ -739,7 +719,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
             Operation {
-                tool: "workspace",
                 action: Some("comment"),
                 purpose: "Leave a clarification note on a ticket",
                 flags: &[
@@ -761,7 +740,7 @@ pub(crate) const FAMILIES: &[Family] = &[
     },
     Family {
         word: "send",
-        tools: &["send"],
+        tool: "send",
         // This build's own family: a product built before it answers the call as a
         // failed operation, so it carries the current value and is refused as the
         // environment's class instead.
@@ -818,7 +797,7 @@ pub(crate) const FAMILIES: &[Family] = &[
     // assistant can already do. What it adds is the DESTINATION ([`FlagKind::Destination`]).
     Family {
         word: "document",
-        tools: &["document"],
+        tool: "document",
         // This build's own families: a product built before them serves no such
         // tool, so the call comes back as the environment's class — nothing ran —
         // rather than as a failed operation.
@@ -827,14 +806,12 @@ pub(crate) const FAMILIES: &[Family] = &[
                   tool — write, fill a template, edit an Office file, and every PDF operation",
         surface: Surface::Operations(&[
             Operation {
-                tool: "document",
                 action: Some(DOCUMENT_READ),
                 purpose: "Read a document with the running product's own reader: its full text and \
                           every image it produces, in a folder of their own",
                 flags: &[DOCUMENT_PATH_FLAG, DOCUMENT_FILE_NAME_FLAG, OUTPUT_DIR_FLAG],
             },
             Operation {
-                tool: "document",
                 action: Some("create"),
                 purpose: "Write a new file: docx/pptx/pdf blocks, or xlsx sheets",
                 flags: &[
@@ -850,7 +827,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
             Operation {
-                tool: "document",
                 action: Some("fill_template"),
                 purpose: "Fill a copy of your own .docx/.pptx/.xlsx sample's placeholders",
                 flags: &[
@@ -861,7 +837,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
             Operation {
-                tool: "document",
                 action: Some("docx_edit"),
                 purpose: "Edit a .docx/.docm",
                 flags: &[
@@ -872,7 +847,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
             Operation {
-                tool: "document",
                 action: Some("xlsx_edit"),
                 purpose: "Edit an .xlsx/.xlsm",
                 flags: &[
@@ -883,7 +857,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
             Operation {
-                tool: "document",
                 action: Some("pptx_edit"),
                 purpose: "Edit a .pptx/.pptm",
                 flags: &[
@@ -894,7 +867,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
             Operation {
-                tool: "document",
                 action: Some("pdf_merge"),
                 purpose: "Merge PDFs into one new file",
                 flags: &[
@@ -905,7 +877,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
             Operation {
-                tool: "document",
                 action: Some("pdf_split"),
                 purpose: "Split a PDF, one produced file per page entry",
                 flags: &[
@@ -917,7 +888,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
             Operation {
-                tool: "document",
                 action: Some("pdf_rotate"),
                 purpose: "Add a rotation to a PDF's pages",
                 flags: &[
@@ -930,7 +900,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
             Operation {
-                tool: "document",
                 action: Some("pdf_crop"),
                 purpose: "Crop a PDF page's visible area",
                 flags: &[
@@ -943,7 +912,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
             Operation {
-                tool: "document",
                 action: Some("pdf_resize"),
                 purpose: "Resize a PDF page, scaling its content to fit",
                 flags: &[
@@ -957,7 +925,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
             Operation {
-                tool: "document",
                 action: Some("pdf_text"),
                 purpose: "Draw text on a PDF's pages, as page content rather than an annotation",
                 flags: &[
@@ -977,7 +944,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
             Operation {
-                tool: "document",
                 action: Some("pdf_image"),
                 purpose: "Place a PNG or JPEG on a PDF's pages, as page content rather than an \
                           annotation",
@@ -995,7 +961,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
             Operation {
-                tool: "document",
                 action: Some("pdf_form_fill"),
                 purpose: "Fill a PDF's form fields into a copy",
                 flags: &[
@@ -1011,11 +976,10 @@ pub(crate) const FAMILIES: &[Family] = &[
     },
     Family {
         word: "image",
-        tools: &["image_gen"],
+        tool: "image_gen",
         protocol: crate::db::ipc::CALL_STORE,
         purpose: "Produce a picture with the running product's own picture tool",
         surface: Surface::Operations(&[Operation {
-            tool: "image_gen",
             action: None,
             purpose: "Produce a picture from a description, or from reference pictures",
             flags: &[
@@ -1029,46 +993,36 @@ pub(crate) const FAMILIES: &[Family] = &[
     },
     Family {
         word: "video",
-        tools: &["video_gen", "video_edit"],
+        tool: "video_gen",
+        // A product one build behind ignores `video_url` on `video gen` and bills a new clip
+        // instead of editing one. Accepted, like every argument a served family gains: the CLI
+        // and the daemon are one binary, so a skew is an upgraded binary beside a daemon that has
+        // not restarted, never a shipped pair.
         protocol: crate::db::ipc::CALL_STORE,
-        purpose: "Produce or edit a clip with the running product's own video tools",
-        surface: Surface::Operations(&[
-            Operation {
-                tool: "video_gen",
-                action: None,
-                purpose: "Produce a clip from a description, or from a reference picture",
-                flags: &[
-                    VIDEO_PROMPT_FLAG,
-                    VIDEO_IMAGES_FLAG,
-                    VIDEO_DURATION_FLAG,
-                    VIDEO_RESOLUTION_FLAG,
-                    VIDEO_ASPECT_RATIO_FLAG,
-                    VIDEO_SIZE_FLAG,
-                    VIDEO_GENERATE_AUDIO_FLAG,
-                    VIDEO_SEED_FLAG,
-                    OUTPUT_DIR_FLAG,
-                ],
-            },
-            Operation {
-                tool: "video_edit",
-                action: None,
-                purpose: "Edit a clip: restyle it from a description, or give its first and \
-                          last frames",
-                flags: &[
-                    EDIT_VIDEO_URL_FLAG,
-                    EDIT_INSTRUCTION_FLAG,
-                    EDIT_DURATION_FLAG,
-                    EDIT_IMAGES_FLAG,
-                    EDIT_FIRST_FRAME_FLAG,
-                    EDIT_LAST_FRAME_FLAG,
-                    OUTPUT_DIR_FLAG,
-                ],
-            },
-        ]),
+        purpose: "Produce a clip from a description, or from a reference — a clip to edit, a \
+                  picture to start from, or its first and last frames",
+        surface: Surface::Operations(&[Operation {
+            action: None,
+            purpose: "Produce a new clip, or edit a clip the caller references",
+            flags: &[
+                VIDEO_PROMPT_FLAG,
+                VIDEO_URL_FLAG,
+                VIDEO_IMAGES_FLAG,
+                VIDEO_DURATION_FLAG,
+                VIDEO_RESOLUTION_FLAG,
+                VIDEO_ASPECT_RATIO_FLAG,
+                VIDEO_SIZE_FLAG,
+                VIDEO_GENERATE_AUDIO_FLAG,
+                VIDEO_SEED_FLAG,
+                VIDEO_FIRST_FRAME_FLAG,
+                VIDEO_LAST_FRAME_FLAG,
+                OUTPUT_DIR_FLAG,
+            ],
+        }]),
     },
     Family {
         word: "rasterize",
-        tools: &["rasterize"],
+        tool: "rasterize",
         protocol: crate::db::ipc::CALL_STORE,
         purpose: "Turn a file into an ordinary picture with the running product's own rasterizer",
         surface: Surface::Standalone(&[RASTER_PATH_FLAG, RASTER_PAGE_FLAG, OUTPUT_DIR_FLAG]),
@@ -1354,100 +1308,81 @@ const VIDEO_PROMPT_FLAG: Flag = Flag {
     arg: "prompt",
     kind: FlagKind::Value,
     secret: false,
-    purpose: "The text description of the clip to produce (required)",
+    purpose: "The text description of the clip to produce, or of the edit to apply (required)",
 };
 
 const VIDEO_IMAGES_FLAG: Flag = Flag {
     arg: "images",
     kind: FlagKind::PathList,
     secret: false,
-    purpose: "The path of ONE reference picture to start the clip from — at most one is \
-              accepted, and given it the request is picture-to-clip rather than \
-              text-to-clip",
+    purpose: "The path of ONE local picture (uploads/ or generated/, never a URL) to start a \
+              new clip from — or, with a clip to edit, of a picture guiding the edit: repeat \
+              once per picture, up to nine, or name a file holding them as a JSON array with \
+              '@<file>'; those may be local paths or public https URLs",
 };
 
 const VIDEO_DURATION_FLAG: Flag = Flag {
     arg: "duration",
     kind: FlagKind::Number,
     secret: false,
-    purpose: "The clip's length in seconds — the values the account's own model takes are the \
-              ones it takes",
+    purpose: "The clip's length in seconds — a new clip's, or an edit's; the values the \
+              account's own model takes are the ones it takes",
 };
 
 const VIDEO_RESOLUTION_FLAG: Flag = Flag {
     arg: "resolution",
     kind: FlagKind::Value,
     secret: false,
-    purpose: "The resolution to ask the model for, as that model states it",
+    purpose: "A new clip's resolution, as the model states it — refused with a clip to edit or \
+              frame anchors",
 };
 
 const VIDEO_ASPECT_RATIO_FLAG: Flag = Flag {
     arg: "aspect_ratio",
     kind: FlagKind::Value,
     secret: false,
-    purpose: "The aspect ratio to ask the model for, as that model states it",
+    purpose: "A new clip's aspect ratio, as the model states it — refused with a clip to edit \
+              or frame anchors",
 };
 
 const VIDEO_SIZE_FLAG: Flag = Flag {
     arg: "size",
     kind: FlagKind::Value,
     secret: false,
-    purpose: "The exact size, as WxH (like '1280x720')",
+    purpose: "A new clip's exact size, as WxH (like '1280x720') — refused with a clip to edit \
+              or frame anchors",
 };
 
 const VIDEO_GENERATE_AUDIO_FLAG: Flag = Flag {
     arg: "generate_audio",
     kind: FlagKind::Present,
     secret: false,
-    purpose: "Ask for an audio track, where the model offers one — omitted, the model's own \
-              default applies and `=false` asks for a silent clip",
+    purpose: "Ask a new clip for an audio track, where the model offers one — omitted, the \
+              model's own default applies and `=false` asks for a silent clip; refused with a \
+              clip to edit or frame anchors",
 };
 
 const VIDEO_SEED_FLAG: Flag = Flag {
     arg: "seed",
     kind: FlagKind::Number,
     secret: false,
-    purpose: "The seed for a repeatable generation",
+    purpose: "A new clip's seed for a repeatable generation — refused with a clip to edit or \
+              frame anchors",
 };
 
-/// The editing video tool's `video_url` argument: the clip to edit, and the
-/// restyling form's own input.
-const EDIT_VIDEO_URL_FLAG: Flag = Flag {
+/// The video tool's `video_url` argument: the clip to edit, and the edit
+/// form's own input.
+const VIDEO_URL_FLAG: Flag = Flag {
     arg: "video_url",
     kind: FlagKind::Path,
     secret: false,
-    purpose: "The clip to edit: a local path or a public https URL — required for a restyle, \
-              and mutually exclusive with the first and last frames",
-};
-
-const EDIT_INSTRUCTION_FLAG: Flag = Flag {
-    arg: "instruction",
-    kind: FlagKind::Value,
-    secret: false,
-    purpose: "The edit to apply, described in words (required)",
-};
-
-const EDIT_DURATION_FLAG: Flag = Flag {
-    arg: "duration",
-    kind: FlagKind::Number,
-    secret: false,
-    purpose: "The produced clip's length in seconds — the values the account's own model takes \
-              are the ones it takes",
-};
-
-/// The editing video tool's `images` argument: the reference pictures that guide
-/// a restyle.
-const EDIT_IMAGES_FLAG: Flag = Flag {
-    arg: "images",
-    kind: FlagKind::PathList,
-    secret: false,
-    purpose: "One reference picture guiding the restyle, by local path or public https URL; \
-              repeat once per picture, or name a file holding them as a JSON array with \
-              '@<file>' — needs a clip, and excludes the first and last frames",
+    purpose: "The clip to edit: a local path or a public https URL — given it the call edits \
+              that clip; omitted, a new clip is generated; mutually exclusive with the first \
+              and last frames",
 };
 
 /// The frame-anchor form's first anchor.
-const EDIT_FIRST_FRAME_FLAG: Flag = Flag {
+const VIDEO_FIRST_FRAME_FLAG: Flag = Flag {
     arg: "first_frame",
     kind: FlagKind::Path,
     secret: false,
@@ -1456,7 +1391,7 @@ const EDIT_FIRST_FRAME_FLAG: Flag = Flag {
 };
 
 /// The frame-anchor form's second anchor.
-const EDIT_LAST_FRAME_FLAG: Flag = Flag {
+const VIDEO_LAST_FRAME_FLAG: Flag = Flag {
     arg: "last_frame",
     kind: FlagKind::Path,
     secret: false,
@@ -1558,9 +1493,7 @@ pub(crate) fn fronts_tool(tool: &str) -> bool {
 
 /// Every tool the families front, in registry order.
 fn family_tools() -> impl Iterator<Item = &'static str> {
-    FAMILIES
-        .iter()
-        .flat_map(|family| family.tools.iter().copied())
+    FAMILIES.iter().map(|family| family.tool)
 }
 
 /// The family words, in the order the top-level help lists them.
@@ -2199,7 +2132,7 @@ fn operation_help(family: &Family, operation: &Operation) -> String {
 /// itself, so nothing is sent.
 pub async fn run(cli: Cli, args: &[String]) -> i32 {
     let family = cli.0;
-    let (tool, mut parsed) = match family.surface {
+    let mut parsed = match family.surface {
         Surface::Operations(operations) => {
             let Some(named) = args.first().map(String::as_str) else {
                 return misuse(family, "no operation was given");
@@ -2215,7 +2148,7 @@ pub async fn run(cli: Cli, args: &[String]) -> i32 {
                 return misuse(family, &format!("unknown operation '{named}'"));
             };
             match parse_flags(operation.action, named, operation.flags, &args[1..]) {
-                Ok(Tail::Call(parsed)) => (operation.tool, parsed),
+                Ok(Tail::Call(parsed)) => parsed,
                 // A `-h` where a flag could stand is this operation's help — the rule
                 // the browser-automation command follows too, turning a would-be usage
                 // error into help. Where a VALUE stands it is that value instead (see
@@ -2231,21 +2164,16 @@ pub async fn run(cli: Cli, args: &[String]) -> i32 {
         // first token is already a flag: a bare `mahbot send` sends nothing and the
         // product refuses it as the missing message — a failed operation, since this
         // frontend never judges what the tool requires.
-        Surface::Standalone(flags) => {
-            let tool = *family
-                .tools
-                .first()
-                .expect("a standalone family fronts exactly one tool");
-            match parse_flags(None, family.word, flags, args) {
-                Ok(Tail::Call(parsed)) => (tool, parsed),
-                Ok(Tail::Help) => {
-                    crate::util::print_stdout(&family_help(family));
-                    return Exit::Ok.code();
-                }
-                Err(reason) => return misuse(family, &reason),
+        Surface::Standalone(flags) => match parse_flags(None, family.word, flags, args) {
+            Ok(Tail::Call(parsed)) => parsed,
+            Ok(Tail::Help) => {
+                crate::util::print_stdout(&family_help(family));
+                return Exit::Ok.code();
             }
-        }
+            Err(reason) => return misuse(family, &reason),
+        },
     };
+    let tool = family.tool;
 
     // The picture tool's flags are one generation's settings, and this asks for one
     // picture: it builds that generation itself.
@@ -2674,7 +2602,10 @@ mod tests {
 
     /// The arguments one command line can fill: the tool's whole top-level set, or —
     /// where actions declare their own — the action's entry plus those beside it.
-    fn argument_schema(operation: &Operation) -> serde_json::Map<String, serde_json::Value> {
+    fn argument_schema(
+        family: &Family,
+        operation: &Operation,
+    ) -> serde_json::Map<String, serde_json::Value> {
         // The reader is no tool action: its arguments are the two inputs the reading takes.
         if operation.action == Some(DOCUMENT_READ) {
             return ["path", "file_name"]
@@ -2682,7 +2613,7 @@ mod tests {
                 .map(|name| (name.to_string(), serde_json::json!({ "type": "string" })))
                 .collect();
         }
-        let schema = tool_schema(operation.tool);
+        let schema = tool_schema(family.tool);
         let top = schema["properties"]
             .as_object()
             .expect("the tool's properties")
@@ -2692,7 +2623,7 @@ mod tests {
         };
         // An enum-shaped action states only WHICH action runs: its arguments
         // stand beside it at the tool's top level.
-        if !declares_per_action_arguments(operation.tool) {
+        if !declares_per_action_arguments(family.tool) {
             return top.into_iter().filter(|(key, _)| key != "action").collect();
         }
         let entries = schema["properties"]["action"]["oneOf"]
@@ -2704,7 +2635,7 @@ mod tests {
             .unwrap_or_else(|| {
                 panic!(
                     "'{}' has no schema entry for action '{action}'",
-                    operation.tool
+                    family.tool
                 )
             });
         let declared = entry["properties"]
@@ -2808,43 +2739,23 @@ mod tests {
         }
     }
 
-    /// Every operation names a tool its family fronts, and the words are derived and
-    /// unique: two operations could derive the same word (an action kebab-cased, a
-    /// tool's own name with the family word dropped) and the first would shadow the
-    /// second in `run`'s lookup. A standalone family has no operation word at all.
+    /// The words are derived and unique: two operations could derive the same word
+    /// (an action kebab-cased, a tool's own name with the family word dropped) and
+    /// the first would shadow the second in `run`'s lookup. A standalone family has
+    /// no operation word at all, and its tool takes no `action`.
     #[test]
-    fn every_family_fronts_its_tools_under_unique_words() {
+    fn every_family_derives_unique_operation_words() {
         for family in FAMILIES {
-            assert!(
-                !family.tools.is_empty(),
-                "the '{}' family fronts no tool at all",
-                family.word
-            );
             let Surface::Operations(operations) = family.surface else {
-                assert_eq!(
-                    family.tools.len(),
-                    1,
-                    "the standalone '{}' family is its own operation, so it fronts one tool",
-                    family.word
-                );
                 assert!(
-                    tool_schema(family.tools[0])["properties"]
+                    tool_schema(family.tool)["properties"]
                         .get("action")
                         .is_none(),
                     "'{}' publishes no operation, but its tool takes an `action`",
-                    family.tools[0]
+                    family.tool
                 );
                 continue;
             };
-            for operation in operations {
-                assert!(
-                    family.tools.contains(&operation.tool),
-                    "'mahbot {} {}' runs '{}', which the family does not front",
-                    family.word,
-                    operation_word(family, operation),
-                    operation.tool
-                );
-            }
             let words: Vec<String> = operations
                 .iter()
                 .map(|operation| operation_word(family, operation))
@@ -2873,54 +2784,50 @@ mod tests {
             let Surface::Operations(operations) = family.surface else {
                 continue;
             };
-            for tool in family.tools {
-                let ours: Vec<Option<&str>> = operations
-                    .iter()
-                    // The reader is no tool action: it is pinned in its own test.
-                    .filter(|operation| {
-                        !(operation.tool == "document" && operation.action == Some(DOCUMENT_READ))
-                    })
-                    .filter(|operation| operation.tool == *tool)
-                    .map(|operation| operation.action)
-                    .collect();
+            let tool = family.tool;
+            let ours: Vec<Option<&str>> = operations
+                .iter()
+                // The reader is no tool action: it is pinned in its own test.
+                .filter(|operation| operation.action != Some(DOCUMENT_READ))
+                .map(|operation| operation.action)
+                .collect();
+            assert!(
+                !ours.is_empty(),
+                "'{tool}' is fronted by 'mahbot {}' but no operation runs it",
+                family.word
+            );
+            let schema = tool_schema(tool);
+            let taken: Vec<&str> = ours.iter().flatten().copied().collect();
+            if taken.is_empty() {
                 assert!(
-                    !ours.is_empty(),
-                    "'{tool}' is fronted by 'mahbot {}' but no operation runs it",
-                    family.word
+                    schema["properties"].get("action").is_none(),
+                    "'{tool}' takes an `action`, so its operations must name one"
                 );
-                let schema = tool_schema(tool);
-                let taken: Vec<&str> = ours.iter().flatten().copied().collect();
-                if taken.is_empty() {
-                    assert!(
-                        schema["properties"].get("action").is_none(),
-                        "'{tool}' takes an `action`, so its operations must name one"
-                    );
-                    continue;
-                }
-                assert_eq!(
-                    taken.len(),
-                    ours.len(),
-                    "one of '{tool}'s command lines names an action where another does not"
-                );
-                let mut theirs: Vec<&str> = tool_actions(&schema);
-                assert!(
-                    duplicates(taken.iter().copied()).is_empty(),
-                    "the '{}' command line repeats an action of '{tool}'",
-                    family.word
-                );
-                assert!(
-                    duplicates(theirs.iter().copied()).is_empty(),
-                    "'{tool}' repeats an action"
-                );
-                let mut ours = taken;
-                ours.sort_unstable();
-                theirs.sort_unstable();
-                assert_eq!(
-                    ours, theirs,
-                    "'mahbot {}' must expose exactly the actions of its tool '{tool}'",
-                    family.word
-                );
+                continue;
             }
+            assert_eq!(
+                taken.len(),
+                ours.len(),
+                "one of '{tool}'s command lines names an action where another does not"
+            );
+            let mut theirs: Vec<&str> = tool_actions(&schema);
+            assert!(
+                duplicates(taken.iter().copied()).is_empty(),
+                "the '{}' command line repeats an action of '{tool}'",
+                family.word
+            );
+            assert!(
+                duplicates(theirs.iter().copied()).is_empty(),
+                "'{tool}' repeats an action"
+            );
+            let mut ours = taken;
+            ours.sort_unstable();
+            theirs.sort_unstable();
+            assert_eq!(
+                ours, theirs,
+                "'mahbot {}' must expose exactly the actions of its tool '{tool}'",
+                family.word
+            );
         }
     }
 
@@ -2944,13 +2851,13 @@ mod tests {
             1,
             "exactly one operation must name the reader's action"
         );
-        let (family, operation) = readers[0];
+        let (family, _) = readers[0];
         assert_eq!(
             family.word, "document",
             "the reader belongs to the document family"
         );
         assert_eq!(
-            operation.tool, "document",
+            family.tool, "document",
             "the reader is served by the document tool"
         );
         assert!(
@@ -2977,11 +2884,11 @@ mod tests {
                     family.word
                 );
                 assert_eq!(
-                    operation.tool,
+                    family.tool,
                     format!("{}_{held}", family.word),
                     "'mahbot {} {word}' must be its tool '{}' with the family word dropped",
                     family.word,
-                    operation.tool
+                    family.tool
                 );
             }
         }
@@ -3126,13 +3033,13 @@ mod tests {
                 .iter()
                 .map(|operation| CommandLine {
                     called: format!("{} {}", family.word, operation_word(family, operation)),
-                    tool: operation.tool,
-                    arguments: argument_schema(operation),
+                    tool: family.tool,
+                    arguments: argument_schema(family, operation),
                     flags: operation.flags,
                 })
                 .collect(),
             Surface::Standalone(flags) => {
-                let tool = family.tools[0];
+                let tool = family.tool;
                 vec![CommandLine {
                     called: family.word.to_string(),
                     tool,
@@ -3266,46 +3173,45 @@ mod tests {
     fn every_tool_argument_has_a_command_line_form() {
         for family in FAMILIES {
             let lines = command_lines(family);
-            for tool in family.tools {
-                let strict = declares_per_action_arguments(tool);
-                let mut reachable: Vec<&str> = Vec::new();
-                let mut declared: Vec<&str> = Vec::new();
-                for line in lines.iter().filter(|line| line.tool == *tool) {
-                    // Its generation argument is this frontend's OWN shape, never a flag.
-                    let line_reachable: Vec<&str> = line
-                        .flags
-                        .iter()
-                        .filter(|flag| !matches!(flag.kind, FlagKind::Destination))
-                        .map(|flag| flag.arg)
-                        .chain(line.generation())
-                        .collect();
-                    let line_declared: Vec<&str> = line
-                        .arguments
-                        .keys()
-                        .map(String::as_str)
-                        .filter(|key| *key != "action")
-                        .chain(line.generation())
-                        .collect();
-                    if strict {
-                        for argument in &line_declared {
-                            assert!(
-                                line_reachable.contains(argument),
-                                "'{argument}' of '{tool}' has no command-line form on 'mahbot {}'",
-                                line.called
-                            );
-                        }
-                    }
-                    reachable.extend(line_reachable);
-                    declared.extend(line_declared);
-                }
-                if !strict {
-                    for argument in &declared {
+            let tool = family.tool;
+            let strict = declares_per_action_arguments(tool);
+            let mut reachable: Vec<&str> = Vec::new();
+            let mut declared: Vec<&str> = Vec::new();
+            for line in lines.iter().filter(|line| line.tool == tool) {
+                // Its generation argument is this frontend's OWN shape, never a flag.
+                let line_reachable: Vec<&str> = line
+                    .flags
+                    .iter()
+                    .filter(|flag| !matches!(flag.kind, FlagKind::Destination))
+                    .map(|flag| flag.arg)
+                    .chain(line.generation())
+                    .collect();
+                let line_declared: Vec<&str> = line
+                    .arguments
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|key| *key != "action")
+                    .chain(line.generation())
+                    .collect();
+                if strict {
+                    for argument in &line_declared {
                         assert!(
-                            reachable.contains(argument),
+                            line_reachable.contains(argument),
                             "'{argument}' of '{tool}' has no command-line form on 'mahbot {}'",
-                            family.word
+                            line.called
                         );
                     }
+                }
+                reachable.extend(line_reachable);
+                declared.extend(line_declared);
+            }
+            if !strict {
+                for argument in &declared {
+                    assert!(
+                        reachable.contains(argument),
+                        "'{argument}' of '{tool}' has no command-line form on 'mahbot {}'",
+                        family.word
+                    );
                 }
             }
         }
@@ -3853,9 +3759,9 @@ mod tests {
         // A flag whose value may be a URL leaves a URL alone.
         let p = parsed(
             "video",
-            "edit",
+            "gen",
             &[
-                "--instruction",
+                "--prompt",
                 "restyle it",
                 "--video-url",
                 "https://example.test/clip.mp4",
@@ -4055,9 +3961,9 @@ mod tests {
         // A URL is not a path at all.
         let p = parsed(
             "video",
-            "edit",
+            "gen",
             &[
-                "--instruction",
+                "--prompt",
                 "restyle",
                 "--video-url",
                 "https://example.test/x.mp4",
@@ -4118,7 +4024,7 @@ mod tests {
                 .expect("a path without a NUL");
             // SAFETY: `mkfifo` takes a NUL-terminated path and a mode.
             if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } == 0 {
-                let reason = parse("video", "edit", &["--video-url", &fifo.to_string_lossy()])
+                let reason = parse("video", "gen", &["--video-url", &fifo.to_string_lossy()])
                     .err()
                     .expect("a pipe is not a reference file");
                 assert!(reason.contains("regular file"), "{reason}");

@@ -859,8 +859,9 @@ fn compress_jpeg_core(
     Ok((out, width, height))
 }
 
-/// Input-size ceiling for the reference-image compression path (aligned with video_edit's 50 MB
-/// cap): over-cap files are read fully before compression, so this bounds pathological inputs.
+/// Input-size ceiling for the reference-image compression path (aligned with the video tool's
+/// 50 MB clip cap): over-cap files are read fully before compression, so this bounds
+/// pathological inputs.
 const MAX_REFERENCE_INPUT_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Combined input-size ceiling across all references of one request: the per-image ceiling does not
@@ -1129,9 +1130,9 @@ pub(crate) const AUDIO_EXTENSIONS: &[&str] = &[
     "caf", "ac3",
 ];
 
-/// Recognized image extensions for video_edit image inputs (reference images and frame anchors),
-/// matching the Telegram routing list for PNG/JPEG/WebP — the only locally decodable codecs — plus
-/// heic/heif, passed to the provider unmangled (never locally decoded).
+/// Recognized image extensions for the video tool's image inputs (reference images and frame
+/// anchors), matching the Telegram routing list for PNG/JPEG/WebP — the only locally decodable
+/// codecs — plus heic/heif, passed to the provider unmangled (never locally decoded).
 pub(crate) const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "heic", "heif"];
 
 /// The product-level cap on one file wherever the product bounds one: the composer's attach limit,

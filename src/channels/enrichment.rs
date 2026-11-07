@@ -372,7 +372,7 @@ fn is_staging_dir_name(name: &str) -> bool {
 }
 
 /// The replacement text, whether the source temp file was copied into the workspace uploads
-/// (so the agent can feed the clip to the video-edit flow) and can be cleaned up, and the
+/// (so the agent can feed the clip to the video tool as the one to edit) and can be cleaned up, and the
 /// optional timeline annotation. HTTP(S) URLs, missing files and out-of-scope paths degrade to
 /// plain annotations; in-scope inbound attachments are always cleaned up.
 struct VideoAction {
@@ -1375,8 +1375,8 @@ mod tests {
         let mut msg = inbound_msg(7003, &format!("Edit this clip: [VIDEO:{video_path_str}]"));
         enrich_message(&mut msg, Some(ws_path.as_path())).await;
 
-        // The annotation points at the workspace uploads copy, so the agent can feed it to
-        // video_edit.
+        // The annotation points at the workspace uploads copy, so the agent can feed it to the
+        // video tool as the clip to edit.
         assert!(
             msg.content.contains("[Saved video:"),
             "Video upload annotation must be present, got: {}",

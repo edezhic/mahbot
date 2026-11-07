@@ -42,6 +42,20 @@ Every composition builds one paused timeline and registers it under its own id, 
 
 A longer video is a project folder: `index.html` as the root composition, scene files under `compositions/`, media and fonts under `assets/`. A scene file wraps its style, markup and script in `<template>` and is mounted from the root by `data-composition-src`, with the host, the scene root and `window.__timelines[...]` all sharing the same id.
 
+## Editing an existing recording
+
+Copy the recording into the composition's project folder (`assets/recording.mp4`) and reference it by that relative path — never a link that expires or needs a login.
+
+Lay the recording out as segments, one `<video>` each: `<video class="clip" src="assets/recording.mp4" muted playsinline data-start="0" data-duration="4.5" data-media-start="12"></video>`. `data-start` is where the segment sits on the output timeline, `data-duration` is how long it shows, `data-media-start` is the in-point into the recording — a cut is the gap between two segments, a trim a shorter `data-duration` or a later `data-media-start`.
+
+Retime a segment with `data-playback-rate`, a constant source-speed multiplier.
+
+Sound is its own `<audio id="music" src="assets/music.mp3" data-start="0" data-duration="30" data-media-start="0">`, with its own start, duration and in-point, so music or voice sits on a separate track from the picture; a segment that keeps its own sound carries `data-has-audio="true"` instead of `muted`.
+
+Titles and overlays are their own `.clip` elements, above the picture in paint order (`z-index`).
+
+The root's `data-duration` is the finished length. To move or scale a video, animate a wrapper around it, not the video itself.
+
 ## The three rules that break renders
 
 1. **Everything visible is a function of timeline time.** No `Date.now()`, no unseeded `Math.random()`, no `setTimeout`, no `repeat: -1`, no network fetches at runtime, never `play()`, `pause()` or seek media. A frame must be reproducible from its timestamp alone.

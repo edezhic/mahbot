@@ -284,7 +284,7 @@ fn extract_media_from_outcomes(
 
 /// Append the turn's media markers the reply did not already name.
 ///
-/// A video render (`video_gen`, `video_edit`, `hyperframes`) reaches the user only when the reply
+/// A video render (`video_gen`, `hyperframes`) reaches the user only when the reply
 /// names it — by any kind, in any path form — or when it names none of the turn's video renders,
 /// the safety net for a model that forgot its markers. The renders it left out stay where they
 /// were produced, reachable from the workspace. Other kinds keep today's append, and one file is

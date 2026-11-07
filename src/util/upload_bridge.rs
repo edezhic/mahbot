@@ -1,4 +1,4 @@
-//! Ephemeral anonymous media upload bridge (video_edit local clips and image inputs).
+//! Ephemeral anonymous media upload bridge (a video tool's local clip and image inputs).
 //!
 //! Uploads a local media file to the first available host in a fallback chain and returns a
 //! GET-verified public HTTPS URL for OpenRouter `input_references`. All uploads are ephemeral;
@@ -34,7 +34,7 @@ struct UploadRequest<'a> {
 type Uploader<'a> =
     fn(&'a UploadRequest<'a>) -> futures_util::future::BoxFuture<'a, anyhow::Result<String>>;
 
-/// The multipart form always declares `video/mp4` — every video_edit clip on this path is mp4 —
+/// The multipart form always declares `video/mp4` — every clip uploaded on this path is mp4 —
 /// and the verified URL must be served back as `video/*` regardless of container.
 pub(crate) async fn upload_video_ephemeral(path: &std::path::Path) -> anyhow::Result<String> {
     upload_ephemeral(path, "video/mp4", "video/").await

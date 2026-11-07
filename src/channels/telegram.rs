@@ -529,7 +529,7 @@ fn format_attachment_content(
 }
 
 /// Give a Video-kind or `video/*` attachment a recognized video extension: the GIF picker sends MP4
-/// bytes named ".gif", which would bounce at video_edit's extension guard.
+/// bytes named ".gif", which would bounce at the video tool's clip extension guard.
 fn normalize_video_filename(
     kind: IncomingAttachmentKind,
     filename: &str,

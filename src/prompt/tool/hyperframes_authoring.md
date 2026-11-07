@@ -38,7 +38,7 @@ Every timed element is `class="clip"` with `data-start` and `data-duration`, in 
 | `data-composition-src` | Mounts a scene file at this host. |
 | `data-variable-values` | A JSON object of per-mount variable overrides for one scene host. |
 | `data-media-start` | Offset into the source media — a trim point. |
-| `data-playback-rate` | Constant speed, 0.1–10. |
+| `data-playback-rate` | Constant source-speed multiplier. |
 | `data-has-audio="true"` | Keeps a `<video>`'s own sound. A timed `<video>` with neither this nor `muted` fails lint. |
 | `data-volume`, `data-fade-in`, `data-fade-out` | Gain (`1` is 0 dB, up to `3.98` = +12 dB) and linear edge fades, multiplied on top of the gain. |
 | The vendor's layout family — `data-layout-name`, `data-layout-check`, `data-layout-ignore`, the `data-layout-allow-*` waivers (`-overflow`, `-overlap`, `-occlusion`, `-caption-zone`, `-orbit`), `data-layout-boundary`, `data-layout-bleed` | Read only by the vendor's `inspect`, `check`, `layout` and `snapshot` commands. This tool runs `render` and `lint`, so none of them changes anything it produces. |

@@ -244,7 +244,7 @@ use crate::tools::{
     GetTicketTool, HyperframesTool, ImageGenTool, ListAutomationsTool, ListTicketsTool,
     MahbotConfigTool, MahbotDebugTool, RasterizeTool, ReadTool, RemoveAutomationTool,
     SearchArchivedTicketsTool, SearchTool, SendTool, ShellMode, ShellTool, SleepTool,
-    UpdateTicketTool, VideoEditTool, VideoGenTool, WebSearchTool, WorkspaceTool,
+    UpdateTicketTool, VideoGenTool, WebSearchTool, WorkspaceTool,
 };
 
 /// Tools in the admin Assistant's set that a custom role is never offered or built: the `computer`
@@ -320,7 +320,6 @@ impl Role {
             // Media tools serve every Assistant alike: the models they use resolve per-user.
             Box::new(ImageGenTool),
             Box::new(VideoGenTool),
-            Box::new(VideoEditTool),
             // The rasterizer serves every account: it reads the file and its resources under the
             // caller's own access and writes into that caller's workspace.
             Box::new(RasterizeTool::new(file_access)),

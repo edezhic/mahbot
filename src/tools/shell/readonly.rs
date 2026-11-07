@@ -6058,7 +6058,7 @@ mod tests {
             ("mahbot image gen --prompt a cat", false),
             ("mahbot video gen --prompt a cat", false),
             (
-                "mahbot video edit --video-url /tmp/x.mp4 --instruction restyle it",
+                "mahbot video gen --prompt restyle it --video-url /tmp/x.mp4",
                 false,
             ),
             ("mahbot rasterize --path /tmp/x.svg", false),

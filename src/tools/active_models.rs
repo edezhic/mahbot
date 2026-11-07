@@ -3,7 +3,7 @@
 //!
 //! The block is injected into Assistant sessions at session start and re-emitted after
 //! compaction; only typed catalog fields are rendered — never raw model name/description
-//! strings. Static per-model video-edit nuances render whenever the active video model
+//! strings. Static per-model editing nuances render whenever the active video model
 //! matches, independently of catalog availability; the remaining sections are omitted
 //! (fail-open) when their catalog is unavailable and the static tool schema applies.
 
@@ -75,7 +75,7 @@ impl ModelKind {
 
 /// Render the full block for `user_name`'s active models, or `None` when no section
 /// renders. Image and video render independently — an unavailable catalog suppresses only
-/// its own section, and static video-edit nuances still render without a catalog entry. The
+/// its own section, and static editing nuances still render without a catalog entry. The
 /// returned snapshot records exactly which ids were rendered; the persisted baseline must
 /// never be re-derived from the live per-user resolution.
 pub(crate) async fn render_block(user_name: &str) -> Option<(String, ModelSnapshot)> {
@@ -129,7 +129,7 @@ pub(crate) async fn render_section(kind: ModelKind, model: &str) -> Option<Strin
                 .and_then(|info| render_image_section(model, info))
         }
         ModelKind::Video => {
-            // Static per-model edit nuances render even without a catalog (fail-open must
+            // Static per-model editing nuances render even without a catalog (fail-open must
             // not drop nuance text on a model switch).
             let catalog = video::get_catalog().await;
             let info = catalog.as_ref().and_then(|c| c.find(model));
@@ -189,7 +189,7 @@ fn render_image_section(model: &str, info: &ImageModelInfo) -> Option<String> {
 }
 
 /// The declared video capabilities (typed fields, named as the `video_gen` schema) plus the
-/// static per-model video-edit nuances. `None` when the model declares no capability fields
+/// static per-model editing nuances. `None` when the model declares no capability fields
 /// and no nuance data. Rendering is derived from the buffer: the header is the whole prefix
 /// written before any field, so a helper collapsing the repeated `- label: …` lines must
 /// write to the buffer and return nothing, never a flag.
@@ -245,7 +245,7 @@ fn render_video_section(model: &str, info: Option<&VideoModelInfo>) -> Option<St
             let _ = writeln!(out, "- seed: {}", if seed { "yes" } else { "no" });
         }
     }
-    if let Some(nuance) = crate::tools::video_edit::video_edit_nuances(model) {
+    if let Some(nuance) = crate::tools::video_gen::video_model_nuances(model) {
         let _ = writeln!(out, "- editing: {nuance}");
     }
     (out.len() > header).then_some(out)

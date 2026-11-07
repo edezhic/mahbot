@@ -893,7 +893,7 @@ impl Session {
 
         // Assistant sessions carry the <active-models-opts> block: the active
         // image/video models' parameter envelope, rendered from the live
-        // catalogs plus static per-model video-edit nuances. Fail-open — no
+        // catalogs plus static per-model editing nuances. Fail-open — no
         // block when nothing renders (catalogs unavailable, no nuances).
         let mut snapshot = ModelSnapshot::default();
         if matches!(role, Role::Assistant)

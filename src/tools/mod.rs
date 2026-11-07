@@ -40,7 +40,6 @@ pub(crate) mod send;
 pub(crate) mod shell;
 pub(crate) mod sleep;
 pub(crate) mod ticket;
-pub(crate) mod video_edit;
 pub(crate) mod video_gen;
 pub(crate) mod web_search;
 pub(crate) mod workspace;
@@ -177,7 +176,6 @@ pub(crate) use sleep::SleepTool;
 pub(crate) use ticket::{
     AddCommentTool, CreateTicketTool, GetTicketTool, ListTicketsTool, UpdateTicketTool,
 };
-pub(crate) use video_edit::VideoEditTool;
 pub(crate) use video_gen::VideoGenTool;
 pub(crate) use web_search::WebSearchTool;
 pub(crate) use workspace::WorkspaceTool;
@@ -1436,7 +1434,7 @@ pub(crate) fn output_directory(ws: &Workspace, fallback: &str) -> PathBuf {
 }
 
 /// Canonicalize a local media path and confine it to the workspace's `uploads/` (attachments) and
-/// `generated/` (tool outputs) dirs — the shared rule for video_edit's local inputs and the
+/// `generated/` (tool outputs) dirs — the shared rule for the video tool's local inputs and the
 /// generation tools' reference images. The confinement is the AGENTS' rule: the command line is the
 /// owner, whose shell already reaches any file, so it is skipped there. The file must exist, be
 /// regular and be canonicalized for every caller: what is given is read with no timeout, so a pipe
@@ -1612,14 +1610,14 @@ pub(crate) async fn video_output(
     }
 }
 
-/// Wall-clock deadline for an async-video job (1 hour), shared by video_gen and video_edit.
+/// Wall-clock deadline for an async-video job (1 hour).
 const VIDEO_JOB_TIMEOUT: Duration = Duration::from_hours(1);
 
 /// Polling interval between video job status checks (30 s).
 const VIDEO_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Kind-dependent labels for an OpenRouter async-video job, kept separate so every user-facing
-/// string stays byte-identical with the pre-refactor tools.
+/// Kind-dependent labels for an OpenRouter async-video job: an edit is named apart from a fresh
+/// generation, so every message says which one was asked for.
 struct VideoJobLabels {
     /// "Video generation" / "Video edit" — submission/poll HTTP contexts,
     /// tracing, "failed" and timeout bails.
@@ -2116,10 +2114,9 @@ mod tests {
 
     #[test]
     fn all_media_tools_implement_media_marker() {
-        let tools: [(&str, Box<dyn Tool>); 6] = [
+        let tools: [(&str, Box<dyn Tool>); 5] = [
             ("ImageGenTool", Box::new(ImageGenTool)),
             ("VideoGenTool", Box::new(VideoGenTool)),
-            ("VideoEditTool", Box::new(VideoEditTool)),
             (
                 "DocumentTool",
                 Box::new(DocumentTool::new(path::PathAccess::Workspace)),
@@ -2227,7 +2224,7 @@ mod tests {
         }
     }
 
-    /// The shared rule for video_edit's local inputs and the generation tools' reference images:
+    /// The shared rule for the video tool's local inputs and the generation tools' reference images:
     /// only the workspace's `uploads/` and `generated/` dirs are reachable, and anywhere else is
     /// refused.
     #[tokio::test]
