@@ -239,8 +239,8 @@ use crate::config::CONFIG;
 use crate::tools::SayTool;
 use crate::tools::path::PathAccess;
 use crate::tools::{
-    AddAutomationTool, AddCommentTool, Addressee, AnalyzeDepth, AnalyzeTool, ArchiveTool,
-    ChromeTool, ComputerTool, CreateTicketTool, CustomTool, DispatchMode, DocumentTool, EditTool,
+    AddAutomationTool, AddCommentTool, Addressee, AnalyzeDepth, AnalyzeTool, ChromeTool,
+    ComputerTool, CreateTicketTool, CustomTool, DispatchMode, DocumentTool, EditTool, FilesTool,
     GetTicketTool, HyperframesTool, ImageGenTool, ListAutomationsTool, ListTicketsTool,
     MahbotConfigTool, MahbotDebugTool, RasterizeTool, ReadTool, RemoveAutomationTool,
     SearchArchivedTicketsTool, SearchTool, SendTool, ShellMode, ShellTool, SleepTool,
@@ -291,9 +291,9 @@ impl Role {
     }
 
     /// The Assistant's static core tool set: the admin's own minus `web_search` ([`Role::tools`]
-    /// appends that afterwards), plus the guest-only `archive`. `is_admin` widens it with the
+    /// appends that afterwards), plus the guest-only `files`. `is_admin` widens it with the
     /// admin-only shell, send, computer, config, pipeline and voice tools, and narrows it in one
-    /// place — `archive`, which exists only because a guest has no shell. A custom role's
+    /// place — `files`, which exists only because a guest has no shell. A custom role's
     /// derivation starts from this set minus [`CUSTOM_ROLE_WITHHELD_TOOLS`].
     fn assistant_core_tools(is_admin: bool) -> Vec<Box<dyn Tool>> {
         // The optional `place` argument belongs to the admin's Assistant: a guest's round always
@@ -328,9 +328,9 @@ impl Role {
             Box::new(DocumentTool::new(file_access)),
             Box::new(HyperframesTool::new(file_access)),
         ];
-        // A guest's Assistant has no shell, so moving a stale file aside needs a tool of its own.
+        // A guest's Assistant has no shell, so arranging its own files needs a tool of its own.
         if !is_admin {
-            t.push(Box::new(ArchiveTool));
+            t.push(Box::new(FilesTool));
         }
         // The grant-gated forwarding tool: the grant (or admin rights) decides what each call may
         // reach.
@@ -375,7 +375,7 @@ impl Role {
     /// operation is confined to it, except that the archive search spans the installation and
     /// `get_ticket` opens a prefixed ID from any workspace. `is_admin` widens the Assistant's set
     /// with `shell`, `send`, `computer`, `mahbot_config`, `mahbot_debug`, `workspace` and (on
-    /// macOS) `say`, and removes the guest-only `archive`; every other role's set is byte-identical
+    /// macOS) `say`, and removes the guest-only `files`; every other role's set is byte-identical
     /// whatever its value. `computer` is offered where the platform can serve it and `say` where
     /// the speech engine lives — [`Tool::is_advertised`] decides the rest. `chrome_sessions` is the
     /// run-scoped tracker shared with the agent's `ChromeTool`, so every session the run opens is
@@ -870,14 +870,14 @@ mod tests {
                 "the admin's Assistant toolset must contain '{name}'"
             );
         }
-        // `archive` is the guest's alone: the admin's Assistant moves files with its shell.
+        // `files` is the guest's alone: the admin's Assistant moves files with its shell.
         assert!(
-            guest.iter().any(|t| t.name() == "archive"),
-            "a guest's Assistant needs `archive`: it has no shell to move a file out of the way"
+            guest.iter().any(|t| t.name() == "files"),
+            "a guest's Assistant needs `files`: it has no shell to arrange its own files"
         );
         assert!(
-            !admin.iter().any(|t| t.name() == "archive"),
-            "the admin's Assistant must not advertise `archive` — its shell already moves files"
+            !admin.iter().any(|t| t.name() == "files"),
+            "the admin's Assistant must not advertise `files` — its shell already moves files"
         );
         // The read boundary is what the model is told — the tool's own description, not a
         // restatement in its parameter schema: a guest only reaches the personal workspace; the
@@ -968,6 +968,9 @@ mod tests {
         fn any_assistant(role: crate::Role, _is_admin: bool) -> bool {
             role == crate::Role::Assistant
         }
+        fn guest_assistant(role: crate::Role, is_admin: bool) -> bool {
+            role == crate::Role::Assistant && !is_admin
+        }
         fn assistant_or_manager(role: crate::Role, _is_admin: bool) -> bool {
             matches!(role, crate::Role::Assistant | crate::Role::Manager)
         }
@@ -983,6 +986,7 @@ mod tests {
             ("computer", admin_assistant),
             ("custom", any_assistant),
             ("document", any_assistant),
+            ("files", guest_assistant),
             ("sleep", assistant_or_manager),
             ("say", admin_assistant),
         ];

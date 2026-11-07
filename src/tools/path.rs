@@ -515,6 +515,36 @@ pub(crate) fn is_path_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
         .any(|root| crate::util::is_within(&normalized, root))
 }
 
+/// Directories the product keeps to itself inside any workspace, at any depth: the repository's
+/// own `.git`, the compaction store, the HyperFrames renderer's state and the secret store.
+const CLOSED_DIRS: &[&str] = &[".git", ".compaction", ".hyperframes", ".secrets"];
+
+/// The custom-tool catalogue's own directory, closed at the top level of a workspace only.
+const CLOSED_TOP_DIR: &str = "shared";
+
+/// The product-owned area a workspace-relative path lies in, if any: [`CLOSED_DIRS`] at any
+/// depth and `shared/` at the top. What the product keeps for itself is never moved, removed or
+/// attached to a generation, so the tools that do those refuse these. The match ignores case: a
+/// case-insensitive volume spells one folder many ways.
+#[must_use]
+pub(crate) fn closed_area(relative: &Path) -> Option<&'static str> {
+    for (depth, component) in relative.components().enumerate() {
+        let Some(name) = component.as_os_str().to_str() else {
+            continue;
+        };
+        if depth == 0 && name.eq_ignore_ascii_case(CLOSED_TOP_DIR) {
+            return Some(CLOSED_TOP_DIR);
+        }
+        if let Some(closed) = CLOSED_DIRS
+            .iter()
+            .find(|dir| dir.eq_ignore_ascii_case(name))
+        {
+            return Some(closed);
+        }
+    }
+    None
+}
+
 /// The canonical allowed temp/scratch roots (shared by the read-path allowlists and the
 /// read-only shell guard).
 #[must_use]

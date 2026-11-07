@@ -387,8 +387,8 @@ async fn resolve_video_source(
     if crate::util::is_http_url(video_url) {
         return Ok(video_url.to_string());
     }
-    // Only clips already inside the workspace media dirs may be uploaded — arbitrary local files
-    // are an exfiltration risk.
+    // Only clips already inside the caller's own workspace may be uploaded — an arbitrary local
+    // file is an exfiltration risk.
     let canonical = super::resolve_local_media_path(video_url, ws, "clip").await?;
     if !crate::util::has_extension(&canonical, UPLOADABLE_CLIPS) {
         anyhow::bail!(
@@ -408,7 +408,7 @@ async fn resolve_video_source(
 }
 
 /// Resolve an image input: public URL (GET-validated — a broken reference bills anyway) or a
-/// local file in workspace uploads or generated. `label` names the input in error messages.
+/// local file inside the caller's workspace. `label` names the input in error messages.
 async fn resolve_image_input(
     input: &str,
     ws: &crate::Workspace,
@@ -757,16 +757,16 @@ impl Tool for VideoGenTool {
                 },
                 "video_url": {
                     "type": "string",
-                    "description": "The clip to edit: a public HTTPS URL, or a local path from the workspace uploads dir (shown as [Saved video: /path] in the chat) or the generated dir (shown as [VIDEO:path]). Present, the call edits that clip; omitted, a new clip is generated. Mutually exclusive with first_frame/last_frame"
+                    "description": "The clip to edit: a public HTTPS URL, or a local path inside the caller's workspace (an attachment is shown as [Saved video: /path] in the chat, a previous call's output as [VIDEO:path]). Present, the call edits that clip; omitted, a new clip is generated. Mutually exclusive with first_frame/last_frame"
                 },
                 "images": {
                     "type": "array",
                     "items": { "type": "string" },
                     "maxItems": MAX_REFERENCE_IMAGES,
                     "description": format!(
-                        "A new clip's start picture (ONE, a local path from the workspace uploads \
-                         dir — received attachments — or the generated dir — previously generated \
-                         media; never a URL), or an edit's guiding pictures (up to \
+                        "A new clip's start picture (ONE, a local path inside the caller's own \
+                         workspace — an attachment, a previous output, or a file the caller filed \
+                         itself — never a URL), or an edit's guiding pictures (up to \
                          {MAX_REFERENCE_IMAGES}, those local paths or public HTTPS URLs) for \
                          style/subject/identity. An edit's guiding pictures are JPG/JPEG/PNG/WEBP/\
                          HEIC/HEIF, at most 30 MB each. Mutually exclusive with \
@@ -800,11 +800,11 @@ impl Tool for VideoGenTool {
                 },
                 "first_frame": {
                     "type": "string",
-                    "description": "Path or public HTTPS URL of an image to use as the exact first frame (image-to-video) — JPG/JPEG/PNG/WEBP/HEIC/HEIF, at most 30 MB. Local paths are accepted from the workspace uploads dir (received attachments) or the generated dir (previously generated images). Mutually exclusive with video_url and images"
+                    "description": "Path or public HTTPS URL of an image to use as the exact first frame (image-to-video) — JPG/JPEG/PNG/WEBP/HEIC/HEIF, at most 30 MB. A local path must be a file inside the caller's own workspace. Mutually exclusive with video_url and images"
                 },
                 "last_frame": {
                     "type": "string",
-                    "description": "Path or public HTTPS URL of an image to use as the exact last frame (image-to-video) — JPG/JPEG/PNG/WEBP/HEIC/HEIF, at most 30 MB. Local paths are accepted from the workspace uploads dir (received attachments) or the generated dir (previously generated images). Mutually exclusive with video_url and images"
+                    "description": "Path or public HTTPS URL of an image to use as the exact last frame (image-to-video) — JPG/JPEG/PNG/WEBP/HEIC/HEIF, at most 30 MB. A local path must be a file inside the caller's own workspace. Mutually exclusive with video_url and images"
                 }
             }),
             &["prompt"],

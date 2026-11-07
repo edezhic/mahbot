@@ -60,7 +60,7 @@ impl Tool for ImageGenTool {
                             "images": {
                                 "type": "array",
                                 "items": { "type": "string" },
-                                "description": "Paths to this generation's reference images for image-to-image generation (local paths are accepted only from the workspace uploads dir — received attachments — or the generated dir — previously generated images); none makes it text-to-image"
+                                "description": "Paths to this generation's reference images for image-to-image generation (a local path must be a file inside the caller's own workspace — an attachment, a previous output, or a file the caller filed itself — and a relative one resolves against the workspace root); none makes it text-to-image"
                             },
                             "aspect_ratio": {
                                 "type": "string",
@@ -3685,8 +3685,9 @@ mod tests {
         let upload = uploads.join("ref.png");
         std::fs::write(&upload, crate::util::test::noisy_png(2, 2)).expect("reference");
         let upload = upload.to_string_lossy().into_owned();
-        // The file exists, but outside the two directories a generation may read one from.
-        let outside = dir.path().join("outside.png");
+        // The file exists, but outside the caller's workspace, so no generation may read it.
+        let elsewhere = tempfile::TempDir::new().expect("tempdir");
+        let outside = elsewhere.path().join("outside.png");
         std::fs::write(&outside, crate::util::test::noisy_png(2, 2)).expect("reference");
         let outside = outside.to_string_lossy().into_owned();
         let mut too_many: Vec<serde_json::Value> = (0..MAX_GENERATIONS)

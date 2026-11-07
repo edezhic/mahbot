@@ -3,7 +3,6 @@
 use anyhow::Context;
 pub(crate) mod active_models;
 pub(crate) mod analyze;
-pub(crate) mod archive;
 pub(crate) mod automations;
 pub mod bun;
 pub mod chrome;
@@ -18,6 +17,7 @@ pub(crate) mod custom;
 pub(crate) mod delegation;
 pub(crate) mod document;
 pub(crate) mod edit;
+pub(crate) mod files;
 pub(crate) mod grants;
 pub(crate) mod hyperframes;
 pub(crate) mod image_gen;
@@ -154,13 +154,13 @@ pub(crate) fn fit_request_body_budget(
 }
 
 pub(crate) use analyze::{AnalyzeDepth, AnalyzeTool, DispatchMode};
-pub(crate) use archive::ArchiveTool;
 pub(crate) use automations::{AddAutomationTool, ListAutomationsTool, RemoveAutomationTool};
 pub(crate) use chrome::ChromeTool;
 pub(crate) use computer::ComputerTool;
 pub(crate) use custom::CustomTool;
 pub(crate) use document::DocumentTool;
 pub(crate) use edit::EditTool;
+pub(crate) use files::FilesTool;
 pub(crate) use hyperframes::HyperframesTool;
 pub(crate) use image_gen::ImageGenTool;
 pub(crate) use mahbot_config::MahbotConfigTool;
@@ -184,7 +184,7 @@ use crate::agent::message_router::{AgentJob, MessageKind};
 use crate::{Tool, Workspace};
 use futures_util::FutureExt;
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::util::json::{
@@ -1433,22 +1433,30 @@ pub(crate) fn output_directory(ws: &Workspace, fallback: &str) -> PathBuf {
     crate::agent::tool_output_dir().unwrap_or_else(|| ws.as_path().join(fallback))
 }
 
-/// Canonicalize a local media path and confine it to the workspace's `uploads/` (attachments) and
-/// `generated/` (tool outputs) dirs — the shared rule for the video tool's local inputs and the
-/// generation tools' reference images. The confinement is the AGENTS' rule: the command line is the
-/// owner, whose shell already reaches any file, so it is skipped there. The file must exist, be
-/// regular and be canonicalized for every caller: what is given is read with no timeout, so a pipe
-/// would hold the daemon and its flight guard forever, and nothing is opened or sniffed to decide
-/// it. A relative input resolves against the process CWD, not the workspace.
+/// Canonicalize a local media path and confine it to the caller's own workspace — the shared rule
+/// for the video tool's local inputs and the generation tools' reference images. Any image or video
+/// the caller keeps in its workspace is a valid reference, wherever the caller filed it; the areas
+/// the product keeps to itself ([`path::closed_area`]) are refused. The confinement is the AGENTS'
+/// rule: the command line is the owner, whose shell already reaches any file, so it is skipped
+/// there. The file must exist, be regular and be canonicalized for every caller: what is given is
+/// read with no timeout, so a pipe would hold the daemon and its flight guard forever, and nothing
+/// is opened or sniffed to decide it. A relative input resolves against the workspace root.
 pub(crate) async fn resolve_local_media_path(
     input: &str,
     ws: &Workspace,
     kind: &str,
 ) -> anyhow::Result<PathBuf> {
+    let root = crate::stored_workspace_path(ws.as_path());
+    let spelled = Path::new(input);
+    let candidate = if spelled.is_absolute() {
+        spelled.to_path_buf()
+    } else {
+        root.join(spelled)
+    };
     // The plain spelling, not the platform's verbatim form: this value is read by
     // the callers and echoed into the refusal text the agent sees.
     let canonical = crate::util::strip_verbatim_prefix(
-        &tokio::fs::canonicalize(input)
+        &tokio::fs::canonicalize(&candidate)
             .await
             .with_context(|| format!("Local {kind} not found: {input}"))?,
     );
@@ -1467,21 +1475,29 @@ pub(crate) async fn resolve_local_media_path(
     if crate::agent::tool_command_line() {
         return Ok(canonical);
     }
-    let roots: Vec<PathBuf> = ["uploads", GENERATED_DIR]
-        .iter()
-        .map(|d| ws.as_path().join(d))
-        .filter_map(|r| std::fs::canonicalize(&r).ok())
-        .collect();
-    if !path::is_path_under_roots(&canonical, &roots) {
+    if !path::is_path_under_roots(&canonical, std::slice::from_ref(&root)) {
         tracing::warn!(
             path = %canonical.display(),
-            "Local {kind} rejected: not inside workspace uploads or generated dirs"
+            "Local {kind} rejected: outside the caller's workspace"
         );
         anyhow::bail!(
-            "forbidden: local {kind} must be inside the workspace uploads directory \
-             (received media attachments) or the generated directory (previously \
-             generated media), got: {} — hint: move the file into the workspace \
-             uploads directory and retry",
+            "forbidden: a local {kind} must be a file inside your own workspace, got: {} — hint: \
+             copy the file into your workspace first",
+            canonical.display()
+        );
+    }
+    if let Some(area) = canonical
+        .strip_prefix(&root)
+        .ok()
+        .and_then(path::closed_area)
+    {
+        tracing::warn!(
+            path = %canonical.display(),
+            "Local {kind} rejected: inside the closed `{area}` area"
+        );
+        anyhow::bail!(
+            "forbidden: a local {kind} must be a file inside your own workspace, got: {} — \
+             `{area}/` is closed to every tool",
             canonical.display()
         );
     }
@@ -2173,8 +2189,11 @@ mod tests {
             std::fs::write(&path, b"media").unwrap();
             path
         };
-        let outside = write("outside/picture.png");
         let inside = write("generated/clip.mp4");
+        // A second workspace stands for everything the caller does not own.
+        let elsewhere = TempDir::new().expect("tempdir");
+        let outside = elsewhere.path().join("picture.png");
+        std::fs::write(&outside, b"media").unwrap();
 
         assert!(
             resolve_local_media_path(&outside.to_string_lossy(), &ws, "clip")
@@ -2194,10 +2213,10 @@ mod tests {
             })
             .await
             .expect("a command-line call takes the file the caller named");
-        assert!(
-            taken.ends_with("outside/picture.png"),
-            "the resolved path is the caller's own file: {}",
-            taken.display()
+        assert_eq!(
+            taken,
+            crate::util::strip_verbatim_prefix(&outside.canonicalize().unwrap()),
+            "the resolved path is the caller's own file"
         );
 
         #[cfg(unix)]
@@ -2225,10 +2244,10 @@ mod tests {
     }
 
     /// The shared rule for the video tool's local inputs and the generation tools' reference images:
-    /// only the workspace's `uploads/` and `generated/` dirs are reachable, and anywhere else is
-    /// refused.
+    /// any file inside the caller's own workspace is a reference, wherever the caller filed it, and
+    /// the workspace's closed areas and everything outside it are refused.
     #[tokio::test]
-    async fn resolve_local_media_path_confines_to_uploads_and_generated() {
+    async fn resolve_local_media_path_confines_to_the_callers_workspace() {
         let tmp = TempDir::new().expect("tempdir");
         let ws = crate::Workspace::from_path(tmp.path());
         let write = |name: &str| {
@@ -2238,36 +2257,45 @@ mod tests {
             path.to_string_lossy().to_string()
         };
 
+        for accepted in [
+            "generated/image_1.png",
+            "uploads/clip.mp4",
+            "album/photo.png",
+            "album/2026/clip.mp4",
+            "at-the-top.png",
+        ] {
+            assert!(
+                resolve_local_media_path(&write(accepted), &ws, "clip")
+                    .await
+                    .is_ok(),
+                "{accepted} is inside the workspace and must be taken"
+            );
+        }
+
+        // A relative spelling resolves against the workspace, not the daemon's own directory.
         assert!(
-            resolve_local_media_path(&write("generated/image_1.png"), &ws, "image")
-                .await
-                .is_ok()
-        );
-        assert!(
-            resolve_local_media_path(&write("uploads/clip.mp4"), &ws, "clip")
+            resolve_local_media_path("album/photo.png", &ws, "clip")
                 .await
                 .is_ok()
         );
 
-        let err = resolve_local_media_path(&write("config.toml"), &ws, "clip")
+        for closed in ["shared/tool.ts", ".git/photo.png", ".hyperframes/state.png"] {
+            let err = resolve_local_media_path(&write(closed), &ws, "clip")
+                .await
+                .expect_err("a closed area is never a reference");
+            assert!(err.to_string().contains("closed to every tool"), "{err}");
+        }
+
+        let elsewhere = TempDir::new().expect("tempdir");
+        let outside = elsewhere.path().join("clip.mp4");
+        std::fs::write(&outside, b"media").unwrap();
+        let err = resolve_local_media_path(&outside.to_string_lossy(), &ws, "clip")
             .await
-            .expect_err("a file outside uploads/generated must be refused");
+            .expect_err("a file outside the workspace must be refused");
         assert!(
             err.to_string()
-                .contains("must be inside the workspace uploads directory"),
+                .contains("must be a file inside your own workspace"),
             "unexpected error: {err}"
-        );
-
-        // A workspace with neither dir refuses everything — a missing dir
-        // cannot contain a canonicalized file, so the rule fails closed.
-        let bare = TempDir::new().expect("tempdir");
-        let bare_ws = crate::Workspace::from_path(bare.path());
-        let root_file = bare.path().join("clip.mp4");
-        std::fs::write(&root_file, b"media").unwrap();
-        assert!(
-            resolve_local_media_path(&root_file.to_string_lossy(), &bare_ws, "clip")
-                .await
-                .is_err()
         );
     }
 
