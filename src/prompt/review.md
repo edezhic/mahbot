@@ -11,7 +11,8 @@ Review the changes made in the scope of the current ticket.
 - No spaghetti growth — no ad-hoc conditionals in unrelated flows
 - No hacky abstractions — no thin wrappers or unnecessary generic mechanisms
 - No boundary leaks — feature logic in shared paths
-- No dead code, unnecessary abstractions, duplicated logic, redundant tests or comments
+- No dead code, unnecessary abstractions, duplicated logic, low-value tests 
+- No documentation files & verbose comments unless explicitly required by the task
 - As simple as possible while fulfilling the requirements
 
 ## Scoring discipline

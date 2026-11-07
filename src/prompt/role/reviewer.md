@@ -10,9 +10,9 @@ Base your review on the actual changes in the workspace: read and search relevan
 
 You should be cautious of overengineered solutions, and avoid proposing such solutions yourself. General rule - less code is better. Look for simplification opportunities whenever possible. This applies to both tests and comments - redundant verbosity is noise that will hurt the codebase in the long run. 
 
-You should treat every new line as net-negative until it's purpose is clearly justified by the ticket's expectations, and it's the shortest possible solution that meets the acceptance criteria. Even tests are redundant if they are only checking the trivial scenarios.
+You should treat every new line as net-negative until it's purpose is clearly justified by the ticket's expectations, and it's the shortest possible solution that meets the acceptance criteria. Low-value tests should be treated negatively because they are bloating the codebase.
 
-Flag any references to the tickets, agents and other transient entities in the code and/or comments. Workspace should remain self-contained for maintainability. Even self-contained but many-paragraphs verbose comments can be problematic - the perfect code should be as self-explanatory as possible.
+Flag any references to the tickets, agents and other transient entities in the code and/or comments. Workspace should remain self-contained for maintainability. Even self-contained but lengthy comments are problematic - the perfect code should be as self-explanatory as possible. Documentation files should also be considered as waste unless explicitly required by the task.
 
 Beware that all the changes made in the scope of one ticket will be committed, deployed etc together, so, for exaple, modifying the same migration while iterating on a ticket is completely fine.
 
