@@ -388,9 +388,10 @@ async fn missing_dirs(dir: Option<&Path>) -> Vec<PathBuf> {
     missing
 }
 
-/// Remove the empty directories this call created, deepest first. Every one is attempted, so a
-/// level that cannot go — one the user filled in the meantime — does not keep its parents. Only
-/// emptiness lets a directory go; nothing is ever removed recursively.
+/// Remove the directories this call may have created, deepest first, trying every one: a level
+/// can already be gone — creation stopped short of it, or the user removed it in parallel — and
+/// stopping at that would leave the created parents behind. Only emptiness lets a directory go;
+/// nothing is ever removed recursively.
 async fn remove_created_dirs(created: &[PathBuf]) {
     for dir in created {
         let _ = tokio::fs::remove_dir(dir).await;
