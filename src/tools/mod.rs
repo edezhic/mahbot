@@ -188,8 +188,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::util::json::{
-    get_bool, get_object, get_opt_bool, get_opt_i64, get_opt_str, get_opt_str_strict, get_opt_u64,
-    get_str, get_str_array, get_usize, wrong_type,
+    get_bool, get_object, get_opt_bool, get_opt_i64, get_opt_named_str, get_opt_str,
+    get_opt_str_strict, get_opt_u64, get_str, get_str_array, get_usize, wrong_type,
 };
 
 /// The shared `message` argument of `analyze` and `send`: required, non-empty once trimmed.

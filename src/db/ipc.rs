@@ -14,13 +14,15 @@
 //! window up.
 //!
 //! The compatibility rule is why the operation rides the old frame: an operation frame carries a
-//! magic `store` value — the generation its family declares ([`CALL_STORE`] / [`CALL_STORE_BASE`]),
-//! never a store name — so a product that does not know it parses the frame as a diagnostic query
-//! and refuses it as an unknown store: an honest "this product does not serve that here" rather
-//! than a protocol complaint. A new frame type could be parsed as something else and answered
-//! misleadingly; a superset of the old frame is the only shape that degrades honestly. The value
-//! belongs to the FAMILY, so a family already served keeps working one build behind and only a
-//! family added since carries an unknown value. This build serves every generation
+//! magic `store` value — the generation its family declares ([`CALL_STORE`] /
+//! [`CALL_STORE_BASE`] / [`CALL_STORE_VIDEO`]), never a store name — so a product that does not
+//! know it parses the frame as a diagnostic query and refuses it as an unknown store: an honest
+//! "this product does not serve that here" rather than a protocol complaint. A new frame type
+//! could be parsed as something else and answered misleadingly; a superset of the old frame is the
+//! only shape that degrades honestly. The value belongs to the FAMILY, so a family whose surface
+//! has not changed keeps working one build behind; a family added since — or one whose surface
+//! gained arguments a product built before it would ignore — carries a value that product does not
+//! know, so the call is refused instead of misanswered. This build serves every generation
 //! ([`CALL_STORES`]); its frontend sends the one its family declares.
 //! The call channel is same-user-only, like the diagnostic one, and FAIL-CLOSED: when the socket
 //! could not be restricted to the instance's own user, queries keep working and operations are
@@ -185,18 +187,23 @@ pub(crate) struct IpcRequest {
     pub call: Option<CallRequest>,
 }
 
-/// The CURRENT operation-frame PROTOCOL value: what a family this build adds carries, so a product
-/// built before it refuses the frame as an unknown store — the environment's class, and the truth
-/// (nothing ran) — instead of answering a call it cannot carry out. Bump it when such a family is
-/// added.
+/// The protocol value a family ADDED to the channel carries: a product built before the family
+/// refuses the frame as an unknown store — the environment's class, and the truth (nothing ran) —
+/// instead of answering a call it cannot carry out.
 pub(crate) const CALL_STORE: &str = "cli2";
 
 /// The value every family the channel has already served carries: any product that knows the
 /// operation channel serves it, so those families keep working one build behind.
 pub(crate) const CALL_STORE_BASE: &str = "cli";
 
+/// The value the video family carries since its surface gained the reference, frame-anchor and
+/// reference-image arguments: a product built before them would answer the frame while ignoring
+/// the arguments it does not read, billing a fresh clip where an edit was asked for. A family
+/// whose surface CHANGED carries a value of its own for the same reason a new family does.
+pub(crate) const CALL_STORE_VIDEO: &str = "cli3";
+
 /// Every protocol value this build serves — one per generation of the command line's surface.
-pub(crate) const CALL_STORES: &[&str] = &[CALL_STORE, CALL_STORE_BASE];
+pub(crate) const CALL_STORES: &[&str] = &[CALL_STORE, CALL_STORE_BASE, CALL_STORE_VIDEO];
 
 /// The store value a second launch's frame names: not a store, and nothing is queried — the frame
 /// asks the interface to bring its window up and is answered when it took it. A product that does

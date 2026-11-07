@@ -212,12 +212,12 @@ pub(crate) struct Family {
     /// The one product tool this family fronts.
     pub(crate) tool: &'static str,
     /// The protocol value this family's operation frames carry: the generation of
-    /// the surface it needs. A family the channel has already served carries
+    /// the surface it needs. A family whose surface has not changed carries
     /// [`CALL_STORE_BASE`](crate::db::ipc::CALL_STORE_BASE) and keeps working
-    /// against a product one build behind; a family this build adds carries the
-    /// current one, so a product that does not know it refuses the call as the
-    /// environment's class instead of answering it as a failed operation (see
-    /// [`crate::db::ipc`]).
+    /// against a product one build behind; a family added since, or one whose
+    /// surface gained arguments an older product would ignore, carries a newer
+    /// value, so a product that does not know it refuses the call as the
+    /// environment's class instead of misanswering it (see [`crate::db::ipc`]).
     pub(crate) protocol: &'static str,
     /// One line for `mahbot -h`, and the family's own help opening on it.
     pub(crate) purpose: &'static str,
@@ -309,8 +309,8 @@ fn produces_files(family: &Family) -> bool {
     }
 }
 
-/// The words a family answers to, as a usage line states them: the operations'
-/// own sub-command words where the family's tools take no `action`, `<operation>`
+/// The words a family answers to, as a usage line states them: the operation's
+/// own sub-command word where the family's tool takes no `action`, `<operation>`
 /// where an `action` picks one, `[flags]` alone where the family IS its
 /// operation — derived from the registry, so no help can advertise a stale word
 /// (`every_entry_point_is_listed_in_the_top_level_usage`).
@@ -318,22 +318,14 @@ fn produces_files(family: &Family) -> bool {
 fn family_syntax(family: &Family) -> String {
     match family.surface {
         Surface::Standalone(_) => format!("mahbot {} [flags]", family.word),
-        Surface::Operations(operations) => {
-            let words: Vec<String> = operations
-                .iter()
-                .map(|operation| operation_word(family, operation))
-                .collect();
-            match (
-                operations
-                    .iter()
-                    .all(|operation| operation.action.is_none()),
-                words.as_slice(),
-            ) {
-                (true, [word]) => format!("mahbot {} {word} [flags]", family.word),
-                (true, words) => format!("mahbot {} <{}> [flags]", family.word, words.join("|")),
-                (false, _) => format!("mahbot {} <operation> [flags]", family.word),
-            }
-        }
+        // A second action-less operation would derive the same word (see `operation_word`), so
+        // the registry holds at most one; a family gaining a second brings its own form with it.
+        Surface::Operations([operation]) if operation.action.is_none() => format!(
+            "mahbot {} {} [flags]",
+            family.word,
+            operation_word(family, operation)
+        ),
+        Surface::Operations(_) => format!("mahbot {} <operation> [flags]", family.word),
     }
 }
 
@@ -438,8 +430,8 @@ impl FlagKind {
 pub(crate) const DOCUMENT_READ: &str = "read";
 
 /// The command lines this file fronts: the admin Assistant's own toolset — the
-/// tools each family's `tools` names, and nothing else the owner holds is reachable
-/// through the channel. Words are derived from here ([`family_words`],
+/// tool each family names, and nothing else the owner holds is reachable through
+/// the channel. Words are derived from here ([`family_words`],
 /// [`producing_families`]), so no surface keeps a list of its own to go stale.
 pub(crate) const FAMILIES: &[Family] = &[
     Family {
@@ -994,11 +986,11 @@ pub(crate) const FAMILIES: &[Family] = &[
     Family {
         word: "video",
         tool: "video_gen",
-        // A product one build behind ignores `video_url` on `video gen` and bills a new clip
-        // instead of editing one. Accepted, like every argument a served family gains: the CLI
-        // and the daemon are one binary, so a skew is an upgraded binary beside a daemon that has
-        // not restarted, never a shipped pair.
-        protocol: crate::db::ipc::CALL_STORE,
+        // The video family's surface gained the reference, frame-anchor and reference-image
+        // arguments. A product one build behind accepts the frame and ignores them, billing a
+        // fresh clip where an edit was asked for; its own generation makes that a refusal (the
+        // environment's class — nothing ran) instead of a wrong, paid operation.
+        protocol: crate::db::ipc::CALL_STORE_VIDEO,
         purpose: "Produce a clip from a description, or from a reference — a clip to edit, a \
                   picture to start from, or its first and last frames",
         surface: Surface::Operations(&[Operation {
@@ -3177,7 +3169,7 @@ mod tests {
             let strict = declares_per_action_arguments(tool);
             let mut reachable: Vec<&str> = Vec::new();
             let mut declared: Vec<&str> = Vec::new();
-            for line in lines.iter().filter(|line| line.tool == tool) {
+            for line in &lines {
                 // Its generation argument is this frontend's OWN shape, never a flag.
                 let line_reachable: Vec<&str> = line
                     .flags
@@ -3230,9 +3222,9 @@ mod tests {
                 cli.protocol
             );
         }
-        // Only a family THIS build adds carries the current value: one the channel has
-        // already served keeps the older value, so a product one build behind still
-        // serves it. The list is the checkpoint for that decision.
+        // Only a family whose surface this build added or changed carries a newer value: one the
+        // channel has already served keeps the older value, so a product one build behind still
+        // serves it. The lists are the checkpoint for that decision.
         let current: Vec<&str> = FAMILIES
             .iter()
             .filter(|cli| cli.protocol == crate::db::ipc::CALL_STORE)
@@ -3240,8 +3232,18 @@ mod tests {
             .collect();
         assert_eq!(
             current,
-            vec!["send", "document", "image", "video", "rasterize"],
-            "the families this build adds"
+            vec!["send", "document", "image", "rasterize"],
+            "the families the channel's second generation added"
+        );
+        let changed: Vec<&str> = FAMILIES
+            .iter()
+            .filter(|cli| cli.protocol == crate::db::ipc::CALL_STORE_VIDEO)
+            .map(|cli| cli.word)
+            .collect();
+        assert_eq!(
+            changed,
+            vec!["video"],
+            "the family whose surface changed after the channel had served it"
         );
     }
 

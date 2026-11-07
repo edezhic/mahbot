@@ -138,16 +138,6 @@ impl Shape {
     }
 }
 
-/// One optional string input, read strictly: absent or explicit `null` is no input, a present
-/// non-string is a wrong-type refusal, and a present empty string is a refusal too — it names
-/// nothing, and treating it as absent would change the shape of a call that bills.
-fn named_input<'a>(args: &'a serde_json::Value, key: &str) -> anyhow::Result<Option<&'a str>> {
-    match super::get_opt_str_strict(args, key)? {
-        Some("") => anyhow::bail!("`{key}` is empty. Give it a value, or leave the argument out."),
-        named => Ok(named),
-    }
-}
-
 /// One parsed call: the shape it asks for and every value that shape accepts.
 #[derive(Debug)]
 struct Request<'a> {
@@ -188,7 +178,7 @@ impl<'a> Request<'a> {
         }
         // A present input names a real one or is a refusal: an empty value would otherwise read
         // as absent and silently turn the call into a different, paid shape.
-        let video_url = named_input(args, "video_url")?;
+        let video_url = super::get_opt_named_str(args, "video_url")?;
         let images: Vec<String> = super::get_str_array(args, "images")?;
         if let Some(empty) = images.iter().position(String::is_empty) {
             anyhow::bail!(
@@ -196,8 +186,8 @@ impl<'a> Request<'a> {
                 empty + 1
             );
         }
-        let first_frame = named_input(args, "first_frame")?;
-        let last_frame = named_input(args, "last_frame")?;
+        let first_frame = super::get_opt_named_str(args, "first_frame")?;
+        let last_frame = super::get_opt_named_str(args, "last_frame")?;
         let shape = match (video_url, first_frame.is_some() || last_frame.is_some()) {
             (Some(_), true) => anyhow::bail!(
                 "A video reference and frame anchors are mutually exclusive — a request cannot \
@@ -215,9 +205,12 @@ impl<'a> Request<'a> {
             first_frame,
             last_frame,
             duration: super::get_opt_i64(args, "duration")?,
-            resolution: super::get_opt_str(args, "resolution"),
-            aspect_ratio: super::get_opt_str(args, "aspect_ratio"),
-            size: super::get_opt_str(args, "size"),
+            // The generation-only parameters are read as strictly as the shape-deciding inputs:
+            // a wrong-typed or empty value is refused rather than dropped, which would render the
+            // clip with defaults and hide the mistake behind a bill.
+            resolution: super::get_opt_named_str(args, "resolution")?,
+            aspect_ratio: super::get_opt_named_str(args, "aspect_ratio")?,
+            size: super::get_opt_named_str(args, "size")?,
             generate_audio: super::get_opt_bool(args, "generate_audio")?,
             seed: super::get_opt_i64(args, "seed")?,
         };
@@ -710,7 +703,7 @@ async fn request_body(
                     "image_url": { "url": url }
                 }));
             }
-            body["input_references"] = json!(references);
+            body[super::INPUT_REFERENCES_KEY] = json!(references);
         }
     }
     // seedance-2.5 edit tasks require 'auto' — omit the field (schema-valid) instead of
@@ -972,6 +965,9 @@ mod tests {
             json!({"prompt": "p", "first_frame": ""}),
             json!({"prompt": "p", "last_frame": ""}),
             json!({"prompt": "p", "images": ["a.png", ""]}),
+            json!({"prompt": "p", "resolution": ""}),
+            json!({"prompt": "p", "aspect_ratio": ""}),
+            json!({"prompt": "p", "size": ""}),
         ] {
             let empty = refusal(&args);
             assert!(empty.contains("empty"), "{empty}");
@@ -983,11 +979,29 @@ mod tests {
                 json!({"prompt": "p", "last_frame": ["l.png"]}),
                 "last_frame",
             ),
+            // A generation-only parameter of the wrong type is refused, never dropped: a clip
+            // rendered with the default would hide the mistake behind a bill.
+            (json!({"prompt": "p", "resolution": 720}), "resolution"),
+            (
+                json!({"prompt": "p", "aspect_ratio": ["16:9"]}),
+                "aspect_ratio",
+            ),
+            (json!({"prompt": "p", "size": 1280}), "size"),
         ] {
             let wrong = refusal(&args);
             assert!(wrong.contains(named), "{wrong}");
             assert!(wrong.contains("a string"), "{wrong}");
         }
+        // An explicit null is absence, never a value — the same rule as the shape-deciding inputs.
+        assert_eq!(
+            shape(&json!({
+                "prompt": "p",
+                "resolution": null,
+                "aspect_ratio": null,
+                "size": null,
+            })),
+            Shape::Generate
+        );
     }
 
     #[test]

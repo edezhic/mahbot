@@ -96,6 +96,19 @@ pub(crate) fn get_opt_str_strict<'a>(val: &'a Value, key: &str) -> anyhow::Resul
     }
 }
 
+/// Extract an optional string field that must NAME something: absent or explicit
+/// null is no input, a present non-string is a wrong-type usage error, and an
+/// empty string is refused too — read as absent it would silently change what the
+/// call asks for.
+pub(crate) fn get_opt_named_str<'a>(val: &'a Value, key: &str) -> anyhow::Result<Option<&'a str>> {
+    match get_opt_str_strict(val, key)? {
+        Some("") => Err(anyhow::anyhow!(
+            "`{key}` is empty. Give it a value, or leave the argument out."
+        )),
+        named => Ok(named),
+    }
+}
+
 /// Extract a boolean field with default value.
 ///
 /// Absent or null yields `default`; a present non-boolean is a usage error.
@@ -347,7 +360,8 @@ mod tests {
 #[cfg(test)]
 mod arg_extraction_tests {
     use super::{
-        get_bool, get_opt_bool, get_opt_i64, get_opt_str, get_opt_u64, get_str_array, get_usize,
+        get_bool, get_opt_bool, get_opt_i64, get_opt_named_str, get_opt_str, get_opt_u64,
+        get_str_array, get_usize,
     };
     use serde_json::{Value, json};
 
@@ -419,6 +433,20 @@ mod arg_extraction_tests {
             assert!(err.contains(expected_phrase), "helper {helper}: got: {err}");
             assert!(err.contains(found_phrase), "helper {helper}: got: {err}");
         }
+    }
+
+    /// A named input is read strictly: absent or null is no input, a wrong type or an
+    /// empty string is refused.
+    #[test]
+    fn named_inputs_are_read_strictly() {
+        let val = json!({ "absent": null, "empty": "", "text": "value", "wrong": 7 });
+        assert_eq!(get_opt_named_str(&val, "missing").unwrap(), None);
+        assert_eq!(get_opt_named_str(&val, "absent").unwrap(), None);
+        assert_eq!(get_opt_named_str(&val, "text").unwrap(), Some("value"));
+        let empty = get_opt_named_str(&val, "empty").unwrap_err().to_string();
+        assert!(empty.contains("empty"), "{empty}");
+        let wrong = get_opt_named_str(&val, "wrong").unwrap_err().to_string();
+        assert!(wrong.contains("must be a string"), "{wrong}");
     }
 
     /// Happy paths: valid values round-trip, including a bool overriding its default.

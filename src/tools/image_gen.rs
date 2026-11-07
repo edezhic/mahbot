@@ -378,8 +378,10 @@ impl ImageGenTool {
         own_model: &str,
         picker: &[String],
     ) -> anyhow::Result<Prepared> {
-        let aspect_ratio_arg = super::get_opt_str(entry, "aspect_ratio");
-        let size_arg = super::get_opt_str(entry, "size");
+        // A setting is a value or a refusal: a wrong-typed or empty one would be dropped and the
+        // picture rendered with defaults, hiding the mistake behind a paid generation.
+        let aspect_ratio_arg = super::get_opt_named_str(entry, "aspect_ratio")?;
+        let size_arg = super::get_opt_named_str(entry, "size")?;
         let images: Vec<String> = super::get_str_array(entry, "images")?;
 
         // Confine every reference before any other filesystem or provider access: a refused path
@@ -1978,6 +1980,27 @@ mod tests {
                     case.name
                 );
             }
+        }
+    }
+
+    /// A generation's settings are read strictly, before anything is planned or sent: a
+    /// wrong-typed or empty one is refused instead of dropped, so a picture is never rendered
+    /// with defaults over the caller's mistake.
+    #[tokio::test]
+    async fn a_generation_setting_is_a_value_or_a_refusal() {
+        let ws = crate::workspace::test_ws("image-gen-strict-settings");
+        for (entry, key) in [
+            (json!({ "aspect_ratio": 7 }), "aspect_ratio"),
+            (json!({ "aspect_ratio": "" }), "aspect_ratio"),
+            (json!({ "size": ["1K"] }), "size"),
+            (json!({ "size": "" }), "size"),
+        ] {
+            let err = ImageGenTool
+                .prepare(&ws, &entry, "any/model", &[])
+                .await
+                .err()
+                .expect("a refused setting");
+            assert!(err.to_string().contains(key), "{key}: {err}");
         }
     }
 
