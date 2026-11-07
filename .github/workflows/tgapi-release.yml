@@ -151,9 +151,10 @@ jobs:
             -DZLIB_USE_STATIC_LIBS=TRUE
 
       # The floor is pinned, not taken from the image: the macOS 14 image set it
-      # to 14.0 on its own, a newer one sets its own, and the archive would
-      # quietly stop running on the systems the product runs on. The installer
-      # checks no macOS version, so nothing else would notice.
+      # to 14.0 on its own and a newer one sets its own. It covers this build's
+      # own code — OpenSSL and zlib are Homebrew's archives, built for the
+      # image's own macOS — and nothing compares the result, so a drift would go
+      # unnoticed until the archive failed to start.
       - name: Configure (macOS)
         if: runner.os == 'macOS'
         run: |
