@@ -17,8 +17,10 @@
 //! is only logged, there is no report archive.
 //!
 //! `sweep_media` deletes generated/uploads files no media-keeping session mentions (keep-detection
-//! is session-based, except that a file a live run still owns is never a candidate). It is
-//! orthogonal to run cleanup and stays in the periodic cleanup loop.
+//! is session-based, except that a file a live run still owns is never a candidate) once their own
+//! mtime is a day old: a fresh artifact is never touched, and a stamp that cannot be read or lies
+//! in the future keeps the file. It is orthogonal to run cleanup and stays in the periodic cleanup
+//! loop.
 
 use crate::Workspace;
 use crate::config;
@@ -27,6 +29,7 @@ use crate::tools::shell::is_live_spill_name;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 /// Command-dump cap (bytes, soft — newest-wins) for the run's raw unfiltered shell history. The
 /// dump is intent for the Sanitation cleanup agent, not a report body, so the cap is generous.
@@ -38,6 +41,11 @@ pub(crate) const COMMAND_DUMP_FILE: &str = "commands.dump";
 /// Per-tick media-keeping-session scan budget (bytes of session content): typical bases (~3 MB) fit
 /// in one tick, pathological growth is cut across ticks.
 const MEDIA_SCAN_BUDGET_BYTES: usize = 10 * 1024 * 1024;
+/// Age floor for a media deletion: only a file whose OWN mtime is at least this old is a
+/// candidate. A batch of intermediates (video frames, conversion passes) is named only partly in
+/// the chat, so the rest must outlive the tick that produced them — accepted consequence: personal
+/// `generated`/`uploads` hold fresh media for a day.
+const MEDIA_MIN_AGE: Duration = Duration::from_hours(24);
 /// Video extensions for case-insensitive keep-matching.
 const MEDIA_VIDEO_EXTS: &[&str] = &[".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"];
 
@@ -915,7 +923,8 @@ async fn sweep_user_media(
 }
 
 /// The deletion phase of a covered user's sweep: remove every generated/uploads
-/// file no stored session mentions and no live run still owns.
+/// file no stored session mentions, no live run still owns, and whose own mtime is
+/// at least [`MEDIA_MIN_AGE`] old.
 async fn sweep_unmentioned_files(user_path: &Path, content: &str) -> u64 {
     // Basename uniqueness across this user's generated+uploads UNION (exact,
     // case-sensitive) — the only path for basename matching.
@@ -943,8 +952,16 @@ async fn sweep_unmentioned_files(user_path: &Path, content: &str) -> u64 {
     // Lowercase the keep-set ONCE — the video case-insensitive fallback reuses it
     // for every file (no O(files × content) re-allocation).
     let content_lower = content.to_ascii_lowercase();
+    // One clock read for the pass. The age floor is checked BEFORE the keep-set
+    // scan (a young file's mention lookup would be wasted work) but AFTER the
+    // union count above: a fresh file still makes its basename ambiguous, so the
+    // mention rule for its older namesakes is unchanged.
+    let now = SystemTime::now();
     let mut deleted = 0u64;
     for f in files {
+        if !past_age_floor(&f, now).await {
+            continue;
+        }
         if is_kept(&f, content, &content_lower, &base_counts) {
             continue;
         }
@@ -961,6 +978,18 @@ async fn sweep_unmentioned_files(user_path: &Path, content: &str) -> u64 {
         }
     }
     deleted
+}
+
+/// Is `file` at least [`MEDIA_MIN_AGE`] old by its OWN mtime? Undatable means kept: a stamp the
+/// platform will not report, or one in the future (clock skew, a restored file), is not an age we
+/// can act on, and deleting what cannot be dated is the unsafe direction.
+async fn past_age_floor(file: &Path, now: SystemTime) -> bool {
+    tokio::fs::symlink_metadata(file)
+        .await
+        .ok()
+        .and_then(|md| md.modified().ok())
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age >= MEDIA_MIN_AGE)
 }
 
 /// Keep-detection for one file: mentioned by basename when that basename is
@@ -1018,13 +1047,33 @@ mod tests {
         userspaces
     }
 
-    /// Write placeholder files under `userspaces/{user}/generated`.
+    /// Set a fixture's mtime — the sweep's only age input.
+    fn set_mtime(path: &Path, when: SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    /// Backdate a fixture past [`MEDIA_MIN_AGE`]: only then is it a deletion candidate.
+    fn backdate(path: &Path) {
+        set_mtime(
+            path,
+            SystemTime::now() - MEDIA_MIN_AGE - Duration::from_mins(1),
+        );
+    }
+
+    /// Write placeholder files under `userspaces/{user}/generated`, backdated past the age floor
+    /// so each one is a deletion candidate.
     async fn write_gen_files(userspaces: &Path, user: &str, names: &[&str]) -> Vec<PathBuf> {
         let gdir = userspaces.join(user).join("generated");
         let mut out = Vec::with_capacity(names.len());
         for n in names {
             let p = gdir.join(n);
             tokio::fs::write(&p, "x").await.unwrap();
+            backdate(&p);
             out.push(p);
         }
         out
@@ -1041,6 +1090,7 @@ mod tests {
         let orphan = &files[1];
         let upload_orphan = up.join("photo_1.jpg");
         tokio::fs::write(&upload_orphan, "x").await.unwrap();
+        backdate(&upload_orphan);
 
         // One assistant session mentioning the first file by absolute path.
         let session = format!("[IMAGE:{}]", mentioned.canonicalize().unwrap().display());
@@ -1056,8 +1106,10 @@ mod tests {
         // A second pass after a NEW assistant-session mention: the freshly
         // mentioned orphan stays; the still-unmentioned image_3 is deleted.
         tokio::fs::write(&orphan, "x").await.unwrap();
+        backdate(orphan);
         let image3 = files[0].parent().unwrap().join("image_3.png");
         tokio::fs::write(&image3, "x").await.unwrap();
+        backdate(&image3);
         let conn = &crate::session::store().conn;
         let now = crate::db::now();
         conn.execute(
@@ -1074,6 +1126,98 @@ mod tests {
         let n = sweep_media_at(userspaces.path()).await.unwrap();
         assert_eq!(n, 1, "only the unmentioned image_3 deleted");
         assert!(orphan.exists(), "now-mentioned orphan kept");
+    }
+
+    /// The age floor: an unmentioned file younger than a day is never a candidate, and becomes one
+    /// once its own mtime passes the floor.
+    #[tokio::test]
+    #[serial_test::serial(media_sweep)] // shared MEDIA_CURSORS static + session store
+    async fn sweep_media_spares_files_younger_than_the_age_floor() {
+        let userspaces = media_fixture("young").await;
+        let fresh = userspaces
+            .path()
+            .join("young")
+            .join("generated")
+            .join("frame_1.png");
+        tokio::fs::write(&fresh, "x").await.unwrap();
+        insert_assistant_session("assistant_young", "young", "no file mentions").await;
+        reset_media_cursors().await;
+        assert_eq!(
+            sweep_media_at(userspaces.path()).await.unwrap(),
+            0,
+            "a fresh unmentioned file is not a candidate"
+        );
+        assert!(fresh.exists());
+
+        // Past the floor it is an ordinary unmentioned file: deleted on the next covered pass.
+        backdate(&fresh);
+        assert_eq!(sweep_media_at(userspaces.path()).await.unwrap(), 1);
+        assert!(!fresh.exists());
+    }
+
+    /// The floor's boundary and its undatable direction: exactly a day old is a candidate, a second
+    /// younger is not, and a stamp the sweep cannot date (future — clock skew, a restored file — or
+    /// no metadata at all) keeps the file.
+    #[tokio::test]
+    async fn media_age_floor_boundary_and_undatable_stamps() {
+        let td = tempfile::tempdir().unwrap();
+        let file = td.path().join("frame.png");
+        tokio::fs::write(&file, "x").await.unwrap();
+        let mtime = tokio::fs::metadata(&file)
+            .await
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(!past_age_floor(&file, mtime).await, "just written");
+        assert!(!past_age_floor(&file, mtime + MEDIA_MIN_AGE - Duration::from_secs(1)).await);
+        assert!(
+            past_age_floor(&file, mtime + MEDIA_MIN_AGE).await,
+            "exactly a day old is a candidate"
+        );
+
+        // A future stamp (clock skew, a restored file) is undatable: kept. The stored stamp is
+        // asserted, or a filesystem clamping it would hide the branch below.
+        set_mtime(&file, SystemTime::now() + Duration::from_hours(1));
+        assert!(
+            tokio::fs::metadata(&file)
+                .await
+                .unwrap()
+                .modified()
+                .unwrap()
+                > SystemTime::now()
+        );
+        assert!(
+            !past_age_floor(&file, SystemTime::now()).await,
+            "a future stamp is undatable — kept"
+        );
+        assert!(
+            !past_age_floor(&td.path().join("gone.png"), SystemTime::now()).await,
+            "no metadata — kept"
+        );
+    }
+
+    /// A fresh namesake keeps an OLD unmentioned file: the union count is taken before the age
+    /// floor, so a young file makes the basename ambiguous exactly as it did before the floor.
+    #[tokio::test]
+    #[serial_test::serial(media_sweep)] // shared MEDIA_CURSORS static + session store
+    async fn sweep_media_fresh_namesake_still_makes_an_old_file_ambiguous() {
+        let userspaces = media_fixture("twin").await;
+        let old = write_gen_files(userspaces.path(), "twin", &["frame.png"]).await;
+        let fresh = userspaces
+            .path()
+            .join("twin")
+            .join("uploads")
+            .join("frame.png");
+        tokio::fs::write(&fresh, "x").await.unwrap();
+        insert_assistant_session("assistant_twin", "twin", "no file mentions").await;
+        reset_media_cursors().await;
+        assert_eq!(
+            sweep_media_at(userspaces.path()).await.unwrap(),
+            0,
+            "an ambiguous basename keeps both, young or old"
+        );
+        assert!(old[0].exists());
+        assert!(fresh.exists());
     }
 
     /// A file a live run owns is kept even though no stored session mentions it:
@@ -1451,6 +1595,7 @@ mod tests {
         tokio::fs::create_dir_all(&bgen).await.unwrap();
         let bf = bgen.join("bob_pic.png");
         tokio::fs::write(&bf, "x").await.unwrap();
+        backdate(&bf);
         // bob's sessions mention alice's a1 by absolute path — that must NOT
         // keep alice's files (keep-sets are per-user).
         insert_assistant_session(
@@ -1662,6 +1807,8 @@ mod tests {
         let u = up.join("pic.png");
         tokio::fs::write(&g, "x").await.unwrap();
         tokio::fs::write(&u, "x").await.unwrap();
+        backdate(&g);
+        backdate(&u);
         // A bare basename mention is ambiguous (duplicate across the
         // generated+uploads UNION) — the design's safe direction keeps BOTH:
         // the mention cannot be
@@ -1800,10 +1947,12 @@ mod tests {
         // would otherwise collect (and delete) real files outside the root,
         // violating "never delete a file whose mention was not scanned" at
         // the filesystem level. The symlink itself is also never a deletion
-        // candidate (skipped by the no-follow walk).
+        // candidate (skipped by the no-follow walk). The victim is backdated: a
+        // fresh one would be spared by the age floor, hiding a follow-walk.
         let outside = tempfile::tempdir().unwrap();
         let victim = outside.path().join("victim.png");
         tokio::fs::write(&victim, "x").await.unwrap();
+        backdate(&victim);
         let link = userspaces
             .path()
             .join("sym")
@@ -1839,9 +1988,11 @@ mod tests {
         // The generated/ dir ITSELF is a symlink to an outside tree: read_dir
         // on the top-level path would resolve it, so the entry-level no-follow
         // inside list_files cannot catch it — the symlink_metadata guard must.
+        // The victim is backdated so only that guard can keep it.
         let outside = tempfile::tempdir().unwrap();
         let victim = outside.path().join("victim.png");
         tokio::fs::write(&victim, "x").await.unwrap();
+        backdate(&victim);
         let gen_dir = userspaces.path().join("topsym").join("generated");
         tokio::fs::remove_dir_all(&gen_dir).await.unwrap();
         symlink(outside.path(), &gen_dir).unwrap();
@@ -1853,6 +2004,8 @@ mod tests {
         let orphan = up.join("orphan.png");
         tokio::fs::write(&kept, "x").await.unwrap();
         tokio::fs::write(&orphan, "x").await.unwrap();
+        backdate(&kept);
+        backdate(&orphan);
         insert_assistant_session(
             "assistant_topsym",
             "topsym",

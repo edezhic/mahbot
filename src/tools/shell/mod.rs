@@ -3351,7 +3351,8 @@ pub(crate) fn agent_temp_dir() -> Option<std::path::PathBuf> {
 /// complete-output file and the read tool's per-call conversion directories. Owner-deletes-at-end
 /// ([`cleanup_agent_spills`]); a file created after that, or left by a crash, falls to the OS temp
 /// sweep and the periodic temp cleaner — and, inside a user's `generated/` folder, to the media
-/// sweep once no stored session mentions it. [`is_live_spill_name`] spares a live run's file.
+/// sweep once it is a day old and no stored session mentions it. [`is_live_spill_name`] spares a
+/// live run's file.
 static SPILL_OWNERS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, Vec<std::path::PathBuf>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -3388,9 +3389,9 @@ fn record_spill_owner_as(owner: &str, path: std::path::PathBuf) {
 
 /// Whether a live run owns a file named `name`. The media sweep keeps only what stored session
 /// content mentions, but a running turn's file reaches that content only after its result is
-/// recorded. The check matches by file name (paths differ in canonicalization), may spare another
-/// user's same-named file for a tick — the safe direction — and is asked only for files about to be
-/// deleted.
+/// recorded — and a run outliving the sweep's day-long age floor must still not lose it. The check
+/// matches by file name (paths differ in canonicalization), may spare another user's same-named
+/// file for a tick — the safe direction — and is asked only for files about to be deleted.
 pub(crate) fn is_live_spill_name(name: &OsStr) -> bool {
     SPILL_OWNERS
         .lock()

@@ -224,9 +224,9 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
                 let purged = mahbot::jobs::purge_stale_jobs(&cutoff).await?;
                 let cleaned = mahbot::session::cleanup_old_transient_sessions().await?;
                 // Assistant generated/uploads keep-detection, after the purge so the jobs state
-                // is final. Research run folders are NOT swept here — `release_run_folder` is the
-                // single release point; crash leftovers belong to the OS temp sweep or the
-                // periodic temp cleaner.
+                // is final; a file younger than a day is never a candidate. Research run folders
+                // are NOT swept here — `release_run_folder` is the single release point; crash
+                // leftovers belong to the OS temp sweep or the periodic temp cleaner.
                 let media = mahbot::research_cleanup::sweep_media().await?;
                 Ok(purged + cleaned + media)
             },

@@ -14,12 +14,12 @@
 //! workspace-only one writes them into the daemon temp service area
 //! ([`crate::tools::shell::agent_temp_dir`]); the workspace-only read, which
 //! cannot open temp paths, into its caller's workspace `uploads/` (a re-read
-//! re-converts). What a crash leaves
-//! behind is reclaimed there too — by the OS temp sweep and the periodic temp
-//! cleaner in the first case, by the workspace media sweep in the second, which
-//! removes the leftover files but not the empty directory. That `uploads/` parent
-//! stays in place (the inbound attachment copy writes it too, so removing it
-//! could race that writer), and nothing is written beside the document.
+//! re-converts). What a crash leaves behind is reclaimed there too — by the OS temp
+//! sweep and the periodic temp cleaner in the first case, by the workspace media sweep
+//! in the second, which removes the leftover files once they are a day old but not the
+//! empty directory. That `uploads/` parent stays in place (the inbound attachment copy
+//! writes it too, so removing it could race that writer), and nothing is written beside
+//! the document.
 
 use crate::Workspace;
 use crate::document::DocOutcome;

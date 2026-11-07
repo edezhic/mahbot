@@ -2335,10 +2335,10 @@ pub(crate) fn resolve_output_dir(named: Option<&str>) -> Result<String, String> 
 ///
 /// The roots come from [`crate::temp`] — the module that owns where the product's
 /// cleaner may act, so the two cannot disagree — plus its data directory, whose
-/// stores, personal-workspace `generated`/`uploads` (emptied by its media sweep)
-/// and document-kit scratch are its own. The test is on the RESOLVED path, so a
-/// link into one of them is refused all the same ([`crate::util::is_within`]), and
-/// a machine's temp area is refused as a whole.
+/// stores, personal-workspace `generated`/`uploads` (swept by its media sweep once a
+/// day old) and document-kit scratch are its own. The test is on the RESOLVED path,
+/// so a link into one of them is refused all the same ([`crate::util::is_within`]),
+/// and a machine's temp area is refused as a whole.
 fn cleanup_governed(dir: &std::path::Path) -> Option<&'static str> {
     const DATA_DIR: &str = "the product's own data directory, where it keeps its own files";
     const TEMP: &str = "the product's own temporary area, which its cleanup keeps empty";
