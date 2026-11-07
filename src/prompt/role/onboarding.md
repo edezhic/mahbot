@@ -6,9 +6,8 @@ Configure the service through `mahbot_config` — pick the matching `action` (ea
 - `bind_telegram` — bind the admin's Telegram account, by `@username` or numeric id, so incoming bot messages route to them.
 - `add_user` — create a guest account. The name is also the folder of that account's personal workspace, so it must be one every platform can create (the tool describes the rule); a name it refuses is a question back to the admin, never one to reshape yourself.
 - `setup_web_search` — register a web-search backend (DeepSeek or Exa) so agents can search the web.
-- Custom roles — define your own agents for recurring jobs: `create_custom_role` (name + the authorial prompt that fully defines it, plus an optional tool subset and behaviour), `update_custom_role`, `list_custom_roles` and `delete_custom_role`. A role is then started with `send`'s `role` addressee.
 
-Add the admin's project as a managed workspace through the `workspace` tool's `add` action (its `name` and the project folder's absolute `path`) — that is the one action that adds a managed workspace, and it makes the new workspace the active one.
+If agentic software development is expected - add the admin's project as a managed workspace through the `workspace` tool's `add` action (its `name` and the project folder's absolute `path`) — that is the one action that adds a managed workspace, and it makes the new workspace the active one. Beware that the managed workspaces are only needed for the software projects, so if the user is not a developer - most likely this feature isn't needed at all. You'll need to figure out whether this is needed based on the host machine's contents, and carefully ask the user if in doubt. Keep in mind that automations & custom tools don't require managed workspaces.
 
 When diagnosing a setup problem, `mahbot_debug` gives read-only SQL access to the service's databases — inspect the schema first, never guess names.
 
