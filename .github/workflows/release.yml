@@ -8,12 +8,12 @@
 # released rather than failing.
 #
 # The six legs, each built natively on the platform's own machine with its own
-# toolchain — nothing is built on the owner's machine. The floor is named by the
-# image and then set in the build, so the files run on the widely used systems of
-# recent years and not on the newest ones only:
+# toolchain — nothing is built on the owner's machine. The floor is set in the
+# build for macOS and is the image's own glibc on Linux, so the files run on the
+# widely used systems of recent years and not on the newest ones only:
 #
 #   x86_64-apple-darwin       macos-15-intel    macOS 14.0 floor
-#   aarch64-apple-darwin      macos-14          macOS 14.0 floor
+#   aarch64-apple-darwin      macos-15          macOS 14.0 floor
 #   x86_64-unknown-linux-gnu  ubuntu-22.04      glibc 2.35
 #   aarch64-unknown-linux-gnu ubuntu-22.04-arm  glibc 2.35
 #   x86_64-pc-windows-msvc    windows-2022      C runtime inside the file
@@ -135,7 +135,7 @@ jobs:
             target_arch: x86_64
             ext: tar.gz
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             target_os: macos
             target_arch: aarch64
             ext: tar.gz

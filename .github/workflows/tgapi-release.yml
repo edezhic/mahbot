@@ -90,11 +90,12 @@ jobs:
           - runner: ubuntu-22.04-arm
             target_os: linux
             target_arch: aarch64
-          - runner: macos-14
+          - runner: macos-15
             target_os: macos
             target_arch: aarch64
-          # Intel macOS. `macos-13` has been retired, so the image `release.yml`
-          # already builds its own x86_64 file on is the one used here.
+          # Intel macOS. The older Intel images have been retired, so the image
+          # `release.yml` already builds its own x86_64 file on is the one used
+          # here.
           - runner: macos-15-intel
             target_os: macos
             target_arch: x86_64
@@ -149,12 +150,17 @@ jobs:
             -DOPENSSL_USE_STATIC_LIBS=TRUE \
             -DZLIB_USE_STATIC_LIBS=TRUE
 
+      # The floor is pinned, not taken from the image: the macOS 14 image set it
+      # to 14.0 on its own, a newer one sets its own, and the archive would
+      # quietly stop running on the systems the product runs on. The installer
+      # checks no macOS version, so nothing else would notice.
       - name: Configure (macOS)
         if: runner.os == 'macOS'
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/install" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
             -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
             -DOPENSSL_USE_STATIC_LIBS=TRUE \
             -DZLIB_ROOT="$(brew --prefix zlib)" \

@@ -331,12 +331,13 @@ jobs:
             target_arch: aarch64
           # The floor is `-mmacosx-version-min` in the build step below, not the
           # image: the image only supplies the toolchain, so a newer one still
-          # builds the same macOS 14.0 archive (`macos-14` is being retired).
+          # builds the same macOS 14.0 archive (the macOS 14 image is retired).
           - runner: macos-15
             target_os: macos
             target_arch: aarch64
-          # Intel macOS. `macos-13` has been retired, so the image `release.yml`
-          # already builds its own x86_64 file on is the one used here.
+          # Intel macOS. The older Intel images have been retired, so the image
+          # `release.yml` already builds its own x86_64 file on is the one used
+          # here.
           - runner: macos-15-intel
             target_os: macos
             target_arch: x86_64
