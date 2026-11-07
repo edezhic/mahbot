@@ -4,10 +4,11 @@
 //! built: the guest Assistant's workspace-only frame, the pipeline roles' read
 //! allowlist (temp files, dependency caches) and the admin Assistant's unrestricted access.
 //!
-//! Two product rules hold whatever the level. The service's own live stores are
-//! refused by location ([`StoreFile`]) for every read and every write. A write is
-//! refused inside a managed workspace too, but that second rule binds only the
-//! unrestricted writer ([`unrestricted_write_refusal`]).
+//! Two product rules hold whatever the level: the service's own live stores are refused by
+//! location ([`StoreFile`]) for every read and every write, and a write never puts a directory
+//! where the workspace keeps its memory ([`refuse_memory_directory`]). A write is also refused
+//! inside a managed workspace, but that rule binds only the unrestricted writer
+//! ([`unrestricted_write_refusal`]).
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
@@ -85,7 +86,9 @@ async fn resolve_directory_read_fallback(full_path: &Path) -> Option<PathBuf> {
 ///
 /// For every access but [`PathAccess::Unrestricted`], validation is
 /// [`is_path_safe_for_workspace`] (pre- and post-canonicalization): the write stays inside
-/// the workspace, where the extra *read* paths are not writable either.
+/// the workspace, where the extra *read* paths are not writable either. Whatever the access, a
+/// path that would put a directory at the root memory file's name is refused first
+/// ([`refuse_memory_directory`]).
 ///
 /// 1. Canonicalize the **parent** directory only — the file itself may not exist yet.
 /// 2. Symlink check: if the target exists and is a symlink, refuse (reading resolves
@@ -101,6 +104,8 @@ pub(crate) async fn resolve_write_target(
     access: PathAccess,
 ) -> anyhow::Result<PathBuf> {
     let full_path = resolve_tool_path_with_base(path, workspace_root, access)?;
+
+    refuse_memory_directory(workspace_root, &full_path, path)?;
 
     if access == PathAccess::Unrestricted {
         return resolve_unrestricted_write(workspace_root, &full_path, path, ensure_parent).await;
@@ -170,6 +175,26 @@ pub(crate) async fn resolve_write_target(
     refuse_non_regular_target(&resolved_target, path).await?;
 
     Ok(resolved_target)
+}
+
+/// The workspace's memory is a file, never a folder: a write under its name would create a
+/// directory where the memory must live, after which the memory can never be written again and
+/// the workspace context silently skips it. Refused for every caller, before anything is created.
+fn refuse_memory_directory(
+    workspace_root: &Path,
+    full_path: &Path,
+    requested: &str,
+) -> anyhow::Result<()> {
+    let full = normalize_path(&crate::util::strip_verbatim_prefix(full_path));
+    let frame = normalize_path(&crate::util::strip_verbatim_prefix(workspace_root));
+    if full.strip_prefix(&frame).is_ok_and(under_root_memory) {
+        anyhow::bail!(
+            "forbidden: cannot write to {requested}: `{}` is the workspace's memory file, not a \
+             folder — hint: write inside a directory of its own",
+            crate::prompt::MEMORY_FILE
+        );
+    }
+    Ok(())
 }
 
 /// Refuse a write whose target already exists as anything but a regular file: a device, a
@@ -1238,6 +1263,45 @@ fn resolve_tool_path_with_base(
 /// home — [`crate::util::expand_tilde`] would answer it with `$HOME/user…`.
 fn is_foreign_tilde(path: &str) -> bool {
     path.starts_with('~') && path != "~" && !path.starts_with("~/")
+}
+
+/// Whether the workspace-relative path is the root memory file itself, in any spelling the
+/// volume accepts.
+#[must_use]
+pub(crate) fn is_root_memory_file(relative: &Path) -> bool {
+    let mut components = relative.components();
+    let first = components.next().and_then(|c| c.as_os_str().to_str());
+    first.is_some_and(|name| name.eq_ignore_ascii_case(crate::prompt::MEMORY_FILE))
+        && components.next().is_none()
+}
+
+/// Whether the path runs through the root memory file's name, so a write would put a directory
+/// where the workspace keeps its memory. Only the top level is protected: `notes/MEMORY.md` is
+/// an ordinary file name.
+#[must_use]
+pub(crate) fn under_root_memory(relative: &Path) -> bool {
+    let mut components = relative.components();
+    let first = components.next().and_then(|c| c.as_os_str().to_str());
+    first.is_some_and(|name| name.eq_ignore_ascii_case(crate::prompt::MEMORY_FILE))
+        && components.next().is_some()
+}
+
+/// Resolve a spelled path into the workspace frame for a workspace-only caller, returning its
+/// workspace-relative spelling. The spelling is the read and edit tools' own: `~` is the
+/// workspace root, `~user` and `..` are refused, and an absolute path must already be inside
+/// `workspace_root`.
+pub(crate) fn resolve_workspace_relative(
+    workspace_root: &Path,
+    spelled: &str,
+) -> anyhow::Result<PathBuf> {
+    if !is_path_safe_for_workspace(spelled, workspace_root) {
+        anyhow::bail!("{spelled} is outside the workspace");
+    }
+    let full = resolve_tool_path_with_base(spelled, workspace_root, PathAccess::Workspace)?;
+    normalize_path(&full)
+        .strip_prefix(normalize_path(workspace_root))
+        .map(Path::to_path_buf)
+        .map_err(|_| anyhow::anyhow!("{spelled} is outside the workspace"))
 }
 
 #[cfg(test)]
@@ -2773,6 +2837,68 @@ mod tests {
         assert_eq!(resolved.file_name().unwrap(), "new_file.rs");
         // The file should NOT exist yet
         assert!(!resolved.exists(), "File should not exist yet");
+    }
+
+    /// The root memory file is never a folder: a write that runs through its name is refused
+    /// before any directory is created, while a deeper `MEMORY.md` stays an ordinary name.
+    #[tokio::test]
+    async fn the_memory_file_never_becomes_a_directory() {
+        let (_tmp, ws) = test_workspace().await;
+        for spelled in [
+            "MEMORY.md/notes.md",
+            "memory.md/notes.md",
+            "./MEMORY.md/notes.md",
+            "notes/../MEMORY.md/notes.md",
+        ] {
+            let err = resolve_write_target(&ws, spelled, true, PathAccess::Workspace)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("memory file"), "{err}");
+            assert!(
+                !ws.join("MEMORY.md").exists(),
+                "nothing may be created at the memory file's place"
+            );
+        }
+
+        let deeper = resolve_write_target(&ws, "notes/MEMORY.md", true, PathAccess::Workspace)
+            .await
+            .expect("a deeper MEMORY.md is an ordinary file name");
+        assert!(deeper.ends_with("notes/MEMORY.md"), "{deeper:?}");
+        let memory = resolve_write_target(&ws, "MEMORY.md", false, PathAccess::Workspace)
+            .await
+            .expect("the memory file itself stays writable");
+        assert_eq!(memory, ws.join("MEMORY.md"));
+    }
+
+    /// One spelling for every workspace-only tool: `~` is the root, `..` and `~user` are refused.
+    #[tokio::test]
+    async fn workspace_relative_uses_the_shared_spelling() {
+        let (_tmp, ws) = test_workspace().await;
+        for root_spelling in ["~", "", ".", "./"] {
+            assert_eq!(
+                resolve_workspace_relative(&ws, root_spelling).unwrap(),
+                PathBuf::new(),
+                "{root_spelling}"
+            );
+        }
+        assert_eq!(
+            resolve_workspace_relative(&ws, "./notes//a.md").unwrap(),
+            PathBuf::from("notes/a.md")
+        );
+        let absolute = ws.join("notes/a.md");
+        assert_eq!(
+            resolve_workspace_relative(&ws, &absolute.to_string_lossy()).unwrap(),
+            PathBuf::from("notes/a.md")
+        );
+
+        for refused in ["..", "../x", "notes/../../x", "x/../archive", "/elsewhere"] {
+            let err = resolve_workspace_relative(&ws, refused)
+                .expect_err("a traversal or a foreign absolute path is refused");
+            assert!(
+                err.to_string().contains("outside the workspace"),
+                "{refused}: {err}"
+            );
+        }
     }
 
     #[tokio::test]

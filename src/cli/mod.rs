@@ -1307,10 +1307,10 @@ const VIDEO_IMAGES_FLAG: Flag = Flag {
     arg: "images",
     kind: FlagKind::PathList,
     secret: false,
-    purpose: "The path of ONE local picture (uploads/ or generated/, never a URL) to start a \
-              new clip from — or, with a clip to edit, of a picture guiding the edit: repeat \
-              once per picture, up to nine, or name a file holding them as a JSON array with \
-              '@<file>'; those may be local paths or public https URLs",
+    purpose: "The path of ONE local picture to start a new clip from — or, with a clip to edit, \
+              of a picture guiding the edit: repeat once per picture, up to nine, or name a file \
+              holding them as a JSON array with '@<file>'. A new clip's start picture is a local \
+              file only; an edit's guiding pictures may also be public https URLs",
 };
 
 const VIDEO_DURATION_FLAG: Flag = Flag {

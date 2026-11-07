@@ -7,8 +7,9 @@
 //! `agent/role.rs`).
 //!
 //! Every operation is a real filesystem rename or removal, so the frame is enforced on both
-//! sides: the source is resolved without following a symlink, the destination is refused
-//! inside the product's own folders, and nothing that already exists is ever overwritten.
+//! sides: the source is resolved without following a symlink, the destination is refused inside
+//! the product's own folders, and a taken destination name is refused rather than replaced —
+//! best-effort only, since the probe and the rename are two syscalls (see [`place`]).
 
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
@@ -17,15 +18,24 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 
-use super::path::{closed_area, normalize_path};
+use super::path::{
+    closed_area, is_root_memory_file, resolve_workspace_relative, under_root_memory,
+};
 use crate::{Tool, Workspace};
 
 /// The dated shelf an item can be moved onto instead of a folder of the caller's own.
 const ARCHIVE_DIR: &str = "archive";
 
 /// Top-level folders that are not operands themselves, though what they hold is. `generated/`
-/// and `uploads/` are the media sweep's own two folders, so neither is a destination either.
+/// and `uploads/` are the media sweep's own two folders, so neither is a destination either;
+/// `archive/` is entered only through its own destination or from inside itself.
 const SERVICE_AREAS: &[&str] = &["generated", "uploads", ARCHIVE_DIR];
+
+/// Whether `area` is one the media sweep empties — the two that take neither a rename nor a new
+/// arrival. `archive/` is the one service area the sweep never visits.
+fn is_swept(area: &str) -> bool {
+    !area.eq_ignore_ascii_case(ARCHIVE_DIR)
+}
 
 /// How many entries a partly failed delete names before it stops listing.
 const REMAINS_NAMED: usize = 20;
@@ -48,11 +58,11 @@ impl Tool for FilesTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "The one file or folder to act on, relative to your workspace root."
+                    "description": "The one file or folder to act on, relative to your workspace root (`~` is that root)."
                 },
                 "to": {
                     "type": "string",
-                    "description": "`move` only: the destination folder, created when it is missing; `.` or an empty value is the top of your workspace, and `archive` is today's dated folder under archive/."
+                    "description": "`move` only: the destination folder inside your workspace, created when it is missing; a relative path resolves against your workspace root, `~` and `.` are that root, an empty value is its top level, and `archive` is today's dated folder under archive/. `..` is refused."
                 },
                 "name": {
                     "type": "string",
@@ -115,18 +125,9 @@ async fn resolve_item(root: &Path, spelled: &str) -> Result<Item> {
     })
 }
 
-/// The workspace-relative spelling of `spelled`: a relative path is joined to the root, an
-/// absolute one must already be inside it, and `..` never escapes.
+/// The workspace-relative spelling of `spelled`, in the one spelling every file tool uses.
 fn workspace_relative(root: &Path, spelled: &str) -> Result<PathBuf> {
-    let expanded = crate::util::expand_tilde(spelled);
-    let absolute = if expanded.is_absolute() {
-        expanded
-    } else {
-        root.join(expanded)
-    };
-    normalize_path(&absolute)
-        .strip_prefix(root)
-        .map(Path::to_path_buf)
+    resolve_workspace_relative(root, spelled)
         .map_err(|_| anyhow::anyhow!("{spelled} is outside your personal workspace"))
 }
 
@@ -161,14 +162,6 @@ fn first_area(relative: &Path) -> Option<&'static str> {
         .find(|area| area.eq_ignore_ascii_case(first))
 }
 
-/// Whether the path is the workspace's own root memory file, in any spelling the volume accepts.
-fn is_root_memory(relative: &Path) -> bool {
-    let mut components = relative.components();
-    let first = components.next().and_then(|c| c.as_os_str().to_str());
-    components.next().is_none()
-        && first.is_some_and(|name| name.eq_ignore_ascii_case(crate::prompt::MEMORY_FILE))
-}
-
 /// The service area this exact path names — the folder itself, not what it holds.
 fn exact_area(relative: &Path) -> Option<&'static str> {
     let area = first_area(relative)?;
@@ -182,7 +175,7 @@ async fn refuse_source(source: &Item, verb: &str) -> Result<()> {
     if source.relative.as_os_str().is_empty() {
         anyhow::bail!("cannot {verb}: that is the workspace itself");
     }
-    if is_root_memory(&source.relative) {
+    if is_root_memory_file(&source.relative) {
         anyhow::bail!(
             "cannot {verb} {}: the memory is corrected, not moved aside — edit the stale part out \
              of it instead",
@@ -217,10 +210,16 @@ fn refuse_reserved(target: &Path) -> Result<()> {
             "cannot put it there: `{area}/` is kept by the product and closed to this tool"
         );
     }
-    if is_root_memory(target) {
+    if is_root_memory_file(target) {
         anyhow::bail!(
             "cannot put it there: `{}` is the workspace's own memory file — correct it in place \
              instead",
+            crate::prompt::MEMORY_FILE
+        );
+    }
+    if under_root_memory(target) {
+        anyhow::bail!(
+            "cannot put it there: `{}` is the workspace's memory file, not a folder",
             crate::prompt::MEMORY_FILE
         );
     }
@@ -235,18 +234,18 @@ fn refuse_destination(source: &Path, target: &Path) -> Result<()> {
     let Some(area) = first_area(target) else {
         return Ok(());
     };
-    if area == ARCHIVE_DIR {
-        if first_area(source) == Some(ARCHIVE_DIR) {
-            return Ok(());
-        }
+    if is_swept(area) {
         anyhow::bail!(
-            "cannot put it there: `archive/` takes an item through the `archive` destination, \
-             which shelves it under today's date"
+            "cannot put it there: `{area}/` is one of the two folders the media sweep empties — \
+             move the item into a folder of your own instead"
         );
     }
+    if first_area(source).is_some_and(|area| !is_swept(area)) {
+        return Ok(());
+    }
     anyhow::bail!(
-        "cannot put it there: `{area}/` is one of the two folders the media sweep empties — move \
-         the item into a folder of your own instead"
+        "cannot put it there: `archive/` takes an item through the `archive` destination, which \
+         shelves it under today's date"
     )
 }
 
@@ -301,14 +300,15 @@ async fn same_entry(left: &Path, right: &Path) -> bool {
 async fn move_item(root: &Path, source: &Item, args: &serde_json::Value) -> Result<String> {
     refuse_source(source, "move").await?;
     let to = arg(args, "to");
+    let folder = workspace_relative(root, &to)?;
     let name = optional_name(args)?;
-    let archive = normalize_path(Path::new(&to))
+    let archive = folder
         .to_str()
         .is_some_and(|spelled| spelled.eq_ignore_ascii_case(ARCHIVE_DIR));
     let mut target = if archive {
         // What came from a swept folder keeps its provenance under the day's own folder; an
         // item already on the shelf is shelved under its bare name rather than nested again.
-        let mirrored = if first_area(&source.relative) == Some(ARCHIVE_DIR) {
+        let mirrored = if first_area(&source.relative).is_some_and(|area| !is_swept(area)) {
             PathBuf::from(source.relative.file_name().unwrap_or_default())
         } else {
             source.relative.clone()
@@ -317,7 +317,6 @@ async fn move_item(root: &Path, source: &Item, args: &serde_json::Value) -> Resu
             .join(chrono::Local::now().format("%Y-%m-%d").to_string())
             .join(mirrored)
     } else {
-        let folder = workspace_relative(root, &to)?;
         let target_name: &OsStr = match &name {
             Some(name) => OsStr::new(name),
             None => source.relative.file_name().unwrap_or_default(),
@@ -343,7 +342,7 @@ async fn move_item(root: &Path, source: &Item, args: &serde_json::Value) -> Resu
 /// Rename one item in place.
 async fn rename_item(root: &Path, source: &Item, args: &serde_json::Value) -> Result<String> {
     refuse_source(source, "rename").await?;
-    if matches!(first_area(&source.relative), Some("generated" | "uploads")) {
+    if first_area(&source.relative).is_some_and(is_swept) {
         anyhow::bail!(
             "cannot rename {}: `generated/` and `uploads/` are temporary — move the item into a \
              folder of your own under the name you want instead",
@@ -374,13 +373,40 @@ async fn rename_item(root: &Path, source: &Item, args: &serde_json::Value) -> Re
     ))
 }
 
-/// The move itself, shared by `move` and `rename`: nothing existing is overwritten, a folder
-/// never lands inside itself, the destination folder is created when it is missing, and the
-/// link refusal is applied to the whole destination chain.
+/// The directories a `create_dir_all` under `dir` would create, innermost first — what this
+/// call may remove again when the move fails.
+async fn missing_dirs(dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    let mut probe = dir;
+    while let Some(path) = probe {
+        if tokio::fs::symlink_metadata(path).await.is_ok() {
+            break;
+        }
+        missing.push(path.to_path_buf());
+        probe = path.parent();
+    }
+    missing
+}
+
+/// Remove the directories this call created, deepest first and only while they are empty: a
+/// directory the user filled in the meantime stays, and nothing is ever removed recursively.
+async fn remove_created_dirs(created: &[PathBuf]) {
+    for dir in created {
+        if tokio::fs::remove_dir(dir).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// The move itself, shared by `move` and `rename`: a taken destination is a refusal, a folder
+/// never lands inside itself, the destination folder is created when it is missing, and the link
+/// refusal is applied to the whole destination chain.
 ///
-/// The existence probe and the rename are two syscalls, so only a concurrent creator landing
-/// exactly between them could be replaced; nothing in the product writes to that folder while an
-/// agent's turn runs.
+/// The existence probe and the rename are two syscalls, so a name created exactly between them
+/// is replaced. That window is real — the user edits this folder in parallel with the agent's
+/// turn — and it is accepted: std has no portable exclusive rename, and a copy-then-unlink
+/// fallback would trade the window for a non-atomic move. A move that fails after its
+/// destination folder was created removes those folders again (see [`remove_created_dirs`]).
 async fn place(root: &Path, source: &Item, target: &Path, verb: &str) -> Result<()> {
     let absolute = root.join(target);
     if absolute == source.absolute {
@@ -408,17 +434,21 @@ async fn place(root: &Path, source: &Item, target: &Path, verb: &str) -> Result<
         );
     }
     refuse_symlinks(root, target).await?;
-    if let Some(parent) = absolute.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            anyhow::anyhow!(
-                "cannot {verb} {}: the destination folder is unwritable: {e}",
-                source.relative.display()
-            )
-        })?;
+    let created = missing_dirs(absolute.parent()).await;
+    if let Some(parent) = absolute.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        remove_created_dirs(&created).await;
+        anyhow::bail!(
+            "cannot {verb} {}: the destination folder is unwritable: {e}",
+            source.relative.display()
+        );
     }
-    tokio::fs::rename(&source.absolute, &absolute)
-        .await
-        .map_err(|e| anyhow::anyhow!("cannot {verb} {}: {e}", source.relative.display()))
+    if let Err(e) = tokio::fs::rename(&source.absolute, &absolute).await {
+        remove_created_dirs(&created).await;
+        anyhow::bail!("cannot {verb} {}: {e}", source.relative.display());
+    }
+    Ok(())
 }
 
 /// Delete one item for good: a file, or a folder whole with everything inside it. There is no
@@ -884,6 +914,18 @@ mod tests {
                 .unwrap_err(),
             "memory file",
         );
+        // The fixture's memory file is present here, so a refusal proves the name rule itself
+        // rather than a parent that happens to be unwritable.
+        refused(
+            run(
+                &ws,
+                json!({"operation": "move", "path": "notes/old.md", "to": "MEMORY.md"}),
+            )
+            .await
+            .unwrap_err(),
+            "memory file",
+        );
+        assert!(!root.join("MEMORY.md").is_dir());
 
         #[cfg(unix)]
         {
@@ -901,6 +943,98 @@ mod tests {
             assert!(root.join("notes/old.md").exists());
             assert!(!root.join("generated/old.md").exists());
         }
+    }
+
+    /// A move onto the memory file's own name is refused before any directory is made: the
+    /// memory must stay writable, which it is not once a folder takes its place.
+    #[tokio::test]
+    async fn the_memory_file_never_becomes_a_destination_folder() {
+        let (_dir, root, ws) = setup();
+        std::fs::remove_file(root.join("MEMORY.md")).unwrap();
+        for destination in ["MEMORY.md", "memory.md", "MEMORY.md/notes"] {
+            let err = run(
+                &ws,
+                json!({"operation": "move", "path": "notes/old.md", "to": destination}),
+            )
+            .await
+            .expect_err("the memory file's name is not a destination");
+            assert!(
+                err.to_string().contains("memory file"),
+                "{destination}: {err}"
+            );
+            assert!(
+                !root.join("MEMORY.md").exists(),
+                "{destination} created a directory"
+            );
+        }
+        assert!(
+            root.join("notes/old.md").exists(),
+            "the source must stay put"
+        );
+        std::fs::write(root.join("MEMORY.md"), "memory again").unwrap();
+    }
+
+    /// A move that fails after its destination folder was created leaves no empty folders: only
+    /// the directories this call made go, and only while they are empty.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_move_leaves_no_created_folders_behind() {
+        let (_dir, root, ws) = setup();
+        let too_long = format!("{}.md", "x".repeat(256));
+        let err = run(
+            &ws,
+            json!({"operation": "move", "path": "notes/old.md", "to": "album/deep", "name": too_long}),
+        )
+        .await
+        .expect_err("a name past NAME_MAX cannot be created");
+        assert!(!err.to_string().is_empty(), "{err}");
+        assert!(
+            !root.join("album").exists(),
+            "the folders this call made must be gone"
+        );
+        assert!(
+            root.join("notes/old.md").exists(),
+            "the source must stay put"
+        );
+        // A folder that was already there is not this call's to remove.
+        std::fs::create_dir_all(root.join("album/deep")).unwrap();
+        std::fs::write(root.join("album/deep/keep.md"), "keep").unwrap();
+        let _ = run(
+            &ws,
+            json!({"operation": "move", "path": "notes/keep.md", "to": "album/deep", "name": too_long}),
+        )
+        .await;
+        assert_eq!(read(&root, "album/deep/keep.md"), "keep");
+        assert!(root.join("album/deep").exists());
+    }
+
+    /// One path spelling for every file tool: `~` is the workspace root and `..` is refused,
+    /// the archive destination included.
+    #[tokio::test]
+    async fn paths_are_spelled_like_every_other_file_tool() {
+        let (_dir, root, ws) = setup();
+        assert_eq!(
+            run(
+                &ws,
+                json!({"operation": "move", "path": "notes/old.md", "to": "~"})
+            )
+            .await
+            .unwrap(),
+            "Moved notes/old.md → old.md"
+        );
+        assert_eq!(read(&root, "old.md"), "old");
+        for args in [
+            json!({"operation": "move", "path": "notes/keep.md", "to": "x/../archive"}),
+            json!({"operation": "move", "path": "notes/keep.md", "to": ".."}),
+            json!({"operation": "delete", "path": "../outside.md"}),
+        ] {
+            let err = run(&ws, args.clone()).await.expect_err("`..` is refused");
+            assert!(
+                err.to_string().contains("outside your personal workspace"),
+                "{args}: {err}"
+            );
+        }
+        assert!(root.join("notes/keep.md").exists());
     }
 
     /// A managed workspace has no personal folder to arrange, and the tool says so.
