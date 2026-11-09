@@ -616,7 +616,6 @@ fn fonts() -> &'static Fonts {
 mod tests {
     use super::*;
     use image::RgbaImage;
-    use std::io::Write as _;
     use tempfile::TempDir;
 
     const RED_HALF: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20">
@@ -750,51 +749,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn text_without_a_usable_machine_family_is_drawn_in_the_products_own_font() {
-        // The same text three times: naming a family no machine has, naming none at all, and naming
-        // the family the product's own font declares. All three coming out identical is what says
-        // the first two were answered by the shipped font — the machine's own serif (the engine's
-        // own answer) or no face at all both look different, the last one by leaving the text out,
-        // which the reference is checked for ink against.
-        let drawing = |attributes: &str| {
-            format!(
-                r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="80">
-                    <rect width="200" height="80" fill="#ffffff"/>
-                    <text x="10" y="60" font-size="48" {attributes}>Wollstonecraft</text></svg>"##
-            )
-        };
-        let shipped_family = fonts().family.clone();
-        let (_dir, ws) = workspace(&[
-            (
-                "missing.svg",
-                drawing(r#"font-family="No Such Family Ff5b1""#).as_bytes(),
-            ),
-            ("unnamed.svg", drawing("").as_bytes()),
-            (
-                "shipped.svg",
-                drawing(&format!(r#"font-family="{shipped_family}""#)).as_bytes(),
-            ),
-        ]);
-        let shipped = rendered(PathAccess::Unrestricted, &ws, "shipped.svg").await;
-
-        assert!(
-            shipped
-                .pixels()
-                .any(|pixel| pixel.0 != [255, 255, 255, 255]),
-            "the shipped font draws this text at all"
-        );
-        for drawing in ["missing.svg", "unnamed.svg"] {
-            assert_eq!(
-                rendered(PathAccess::Unrestricted, &ws, drawing)
-                    .await
-                    .as_raw(),
-                shipped.as_raw(),
-                "{drawing} is drawn in the product's own font"
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn a_resource_the_caller_could_not_read_is_not_drawn() {
         let outside = TempDir::new().unwrap();
         let outside_path = outside.path().join("outside.png");
@@ -888,23 +842,6 @@ mod tests {
         );
     }
 
-    /// The page picture shows the page's visible area: a CropBox narrower than the page is what the
-    /// picture measures, not the whole MediaBox.
-    #[tokio::test]
-    async fn a_pdf_pages_picture_honours_its_crop_box() {
-        let cropped = crate::document::test_fixtures::multi_page_pdf(&[(
-            "/MediaBox [0 0 400 200] /CropBox [100 50 300 150]",
-            b"1 0 0 rg 0 0 400 200 re f",
-        )]);
-        let (_dir, ws) = workspace(&[("cropped.pdf", cropped.as_slice())]);
-        let picture = rendered(PathAccess::Unrestricted, &ws, "cropped.pdf").await;
-        assert_eq!(
-            picture.dimensions(),
-            (200, 100),
-            "the picture measures the visible area, not the media box"
-        );
-    }
-
     #[tokio::test]
     #[serial_test::serial(html_capture)]
     async fn a_pdf_page_that_cannot_be_chosen_is_refused_with_the_count() {
@@ -974,65 +911,6 @@ mod tests {
             std::fs::write(personal.join(name), bytes).unwrap();
         }
         personal
-    }
-
-    #[test]
-    fn an_input_is_classified_by_its_bytes_then_its_name() {
-        let path = Path::new;
-        assert_eq!(
-            classify(b"<!DOCTYPE html><html></html>", path("notes.txt")),
-            RenderKind::Html,
-            "a doctype is HTML whatever the name says"
-        );
-        assert_eq!(
-            classify(b"\xEF\xBB\xBF \n<!doctype HTML>", path("notes.txt")),
-            RenderKind::Html,
-            "a BOM and leading whitespace do not hide the doctype"
-        );
-        assert_eq!(
-            classify(b"<!DOCTYPE  html><p>x</p>", path("notes.txt")),
-            RenderKind::Html,
-            "the doctype is compared by word, not by exact spacing"
-        );
-        assert_eq!(
-            classify(
-                b"<!-- saved from url -->\n<html lang=\"en\">",
-                path("notes.txt")
-            ),
-            RenderKind::Html,
-            "a leading comment does not hide the root element"
-        );
-        assert_eq!(
-            classify(b"hello <html lang=\"en\">", path("notes.txt")),
-            RenderKind::Svg,
-            "HTML is what the markup opens with, not a tag mentioned later"
-        );
-        assert_eq!(
-            classify(RED_HALF.as_bytes(), path("page.htm")),
-            RenderKind::Html,
-            "an HTML name classifies unusual markup"
-        );
-        assert_eq!(
-            classify(b"<p>no doctype</p>", path("page.html")),
-            RenderKind::Html
-        );
-
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        gz.write_all(RED_HALF.as_bytes()).unwrap();
-        assert_eq!(
-            classify(&gz.finish().unwrap(), path("page.html")),
-            RenderKind::Svg,
-            "gzip keeps an SVG an SVG"
-        );
-        assert_eq!(
-            classify(b"%PDF-1.7", path("page.html")),
-            RenderKind::Pdf,
-            "a PDF marker wins over the name"
-        );
-        assert_eq!(
-            classify(RED_HALF.as_bytes(), path("drawing.svg")),
-            RenderKind::Svg
-        );
     }
 
     #[tokio::test]

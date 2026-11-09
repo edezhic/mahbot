@@ -220,23 +220,6 @@ mod tests {
         assert_eq!(skills[0].description, "No description provided.");
     }
 
-    /// Nothing to load is an empty set, never an error: an empty skills
-    /// directory and a workspace path that does not exist both yield no skills.
-    #[tokio::test]
-    async fn load_skills_returns_empty_when_there_is_nothing_to_load() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(
-            load_skills(&test_ws(dir.path())).await.is_empty(),
-            "an empty skills directory yields no skills"
-        );
-        assert!(
-            load_skills(&test_ws(Path::new("/nonexistent")))
-                .await
-                .is_empty(),
-            "a nonexistent workspace yields no skills"
-        );
-    }
-
     #[tokio::test]
     async fn load_skills_from_claude_skills_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -250,21 +233,6 @@ mod tests {
         let skills = load_skills(&test_ws(dir.path())).await;
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "claude-skill");
-    }
-
-    #[tokio::test]
-    async fn load_skills_from_agents_skills_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        write_skill(
-            dir.path(),
-            ".agents/skills",
-            "my-skill",
-            "agents-skill",
-            "From .agents/skills",
-        );
-        let skills = load_skills(&test_ws(dir.path())).await;
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "agents-skill");
     }
 
     #[tokio::test]

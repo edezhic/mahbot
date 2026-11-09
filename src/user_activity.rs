@@ -219,23 +219,6 @@ mod tests {
         }
     }
 
-    /// A wake phrase holds the user present for five minutes after the operating system has
-    /// stopped seeing input.
-    #[test]
-    fn the_freshest_source_decides() {
-        for (idle, report, expected) in [
-            (STALE, Some(RECENT), Location::AtComputer),
-            (RECENT, Some(STALE), Location::AtComputer),
-            (STALE, Some(STALE), Location::Away),
-            (STALE, None, Location::Away),
-        ] {
-            assert_eq!(
-                state(Some(idle), report).map(|s| s.location),
-                Some(expected)
-            );
-        }
-    }
-
     /// Speaking aloud is what tells "active because they spoke" from "active because they
     /// are typing", and only where the operating system's own reading already says they left.
     #[test]

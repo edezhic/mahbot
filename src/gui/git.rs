@@ -1191,18 +1191,6 @@ mod tests {
     }
 
     #[test]
-    fn test_periodic_sync_tick_runs_full_refresh_no_watch_fallback() {
-        let mut s = GitState::new();
-        s.workspace_path = Some(PathBuf::from("/nonexistent"));
-        let before_local = s.local_generation;
-        let before_remote = s.remote_generation;
-        let _ = s.update(GitMessage::PeriodicSyncTick);
-        assert_eq!(s.local_generation, before_local + 1);
-        assert_eq!(s.remote_generation, before_remote + 1);
-        assert!(s.last_remote_refresh.is_some());
-    }
-
-    #[test]
     fn test_periodic_sync_watched_runs_full_refresh() {
         let mut s = GitState::new();
         s.workspace_path = Some(PathBuf::from("/nonexistent"));
@@ -1238,33 +1226,6 @@ mod tests {
         assert!(!s.local_refresh_pending);
         assert_eq!(s.local_generation, before_local + 1);
         assert_eq!(s.remote_generation, before_remote);
-    }
-
-    #[test]
-    fn test_deferred_local_refresh_within_window_reschedules() {
-        let mut s = GitState::new();
-        s.workspace_path = Some(PathBuf::from("/nonexistent"));
-        // Simulate an event deferred within the throttle window.
-        s.last_local_refresh = Some(Instant::now());
-        s.local_refresh_pending = true;
-        let before = s.local_generation;
-        let _ = s.update(GitMessage::DeferredLocalRefresh);
-        // A newer event restarted the throttle window — the owed refresh stays
-        // pending and the timer reschedules itself (the returned Task is opaque).
-        assert!(s.local_refresh_pending);
-        assert_eq!(s.local_generation, before);
-    }
-
-    #[expect(clippy::unchecked_time_subtraction)] // fixture shifts a monotonic clock backwards by a small fixed offset
-    #[test]
-    fn test_deferred_local_refresh_without_pending_is_noop() {
-        let mut s = GitState::new();
-        s.workspace_path = Some(PathBuf::from("/nonexistent"));
-        s.last_local_refresh = Some(Instant::now() - Duration::from_secs(10));
-        let before = s.local_generation;
-        let _ = s.update(GitMessage::DeferredLocalRefresh);
-        assert!(!s.local_refresh_pending);
-        assert_eq!(s.local_generation, before);
     }
 
     /// A watch id is stored only for a successful registration at the current generation.

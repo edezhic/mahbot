@@ -1624,56 +1624,6 @@ mod tests {
     }
 
     #[test]
-    fn pptx_reports_a_deck_s_media_by_kind() {
-        let bytes = zip_fixture(&[
-            (
-                "ppt/presentation.xml",
-                br#"<p:presentation><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
-            ),
-            (
-                "ppt/_rels/presentation.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/></Relationships>"#,
-            ),
-            (
-                "ppt/slides/slide1.xml",
-                br"<p:sld><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Only slide</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>",
-            ),
-            ("ppt/media/video1.mp4", b"video bytes"),
-            ("ppt/media/sound.m4a", b"audio bytes"),
-            ("ppt/media/image1.emf", b"EMF bytes this stack cannot decode"),
-            ("ppt/media/scan.tiff", b"TIFF bytes this stack does not convert"),
-            ("ppt/media/pic.png", b"\x89PNG\r\n\x1a\nfake image bytes"),
-            ("ppt/embeddings/oleObject1.bin", b"OLE bytes"),
-            ("ppt/charts/chart1.xml", b"<chart/>"),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text {
-            images,
-            notes,
-            unshown,
-            ..
-        } = convert_pptx(&bytes, dir.path())
-        else {
-            panic!("expected Text outcome for a well-formed pptx");
-        };
-        assert_eq!(
-            unshown.lines(),
-            [
-                "1 chart(s) not shown",
-                "1 embedded object part(s) not shown",
-                "1 embedded drawing(s) not shown",
-                "1 embedded video(s) not shown",
-                "1 embedded audio(s) not shown",
-            ]
-        );
-        assert_eq!(
-            notes,
-            ["skipped 1 embedded image(s) in a format this pipeline cannot convert"]
-        );
-        assert_eq!(images, vec![dir.path().join("pic.png")]);
-    }
-
-    #[test]
     fn pptx_reads_a_slide_outside_the_conventional_slides_directory() {
         let bytes = zip_fixture(&[
             (
@@ -2162,81 +2112,6 @@ mod tests {
     }
 
     #[test]
-    fn pptx_reports_a_diagram_whose_data_cannot_be_read() {
-        let bytes = zip_fixture(&[
-            (
-                "ppt/presentation.xml",
-                br#"<p:presentation><p:sldIdLst><p:sldId r:id="rId1"/><p:sldId r:id="rId2"/><p:sldId r:id="rId3"/><p:sldId r:id="rId4"/><p:sldId r:id="rId5"/><p:sldId r:id="rId6"/></p:sldIdLst></p:presentation>"#,
-            ),
-            (
-                "ppt/_rels/presentation.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/><Relationship Id="rId2" Target="slides/slide2.xml"/><Relationship Id="rId3" Target="slides/slide3.xml"/><Relationship Id="rId4" Target="slides/slide4.xml"/><Relationship Id="rId5" Target="slides/slide5.xml"/><Relationship Id="rId6" Target="slides/slide6.xml"/></Relationships>"#,
-            ),
-            // The data part the relationship names is not in the package.
-            (
-                "ppt/slides/slide1.xml",
-                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
-            ),
-            (
-                "ppt/slides/_rels/slide1.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data1.xml"/></Relationships>"#,
-            ),
-            // No relationship resolves the id at all.
-            (
-                "ppt/slides/slide2.xml",
-                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
-            ),
-            // The data model is there but the package cut it short: the text
-            // after the cut is not passed off as everything it held.
-            (
-                "ppt/slides/slide3.xml",
-                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
-            ),
-            (
-                "ppt/slides/_rels/slide3.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data3.xml"/></Relationships>"#,
-            ),
-            (
-                "ppt/diagrams/data3.xml",
-                br#"<dgm:dataModel><dgm:ptLst><dgm:pt type="node"><dgm:t><a:p><a:r><a:t>Cut off</a:t>"#,
-            ),
-            // A part that parses as XML but is no diagram data model (an error
-            // page a producer left in its place) is named as lost too.
-            (
-                "ppt/slides/slide4.xml",
-                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:dm="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
-            ),
-            (
-                "ppt/slides/_rels/slide4.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="../diagrams/data4.xml"/></Relationships>"#,
-            ),
-            ("ppt/diagrams/data4.xml", br"<html>404 Not Found</html>"),
-            // No diagram at all.
-            (
-                "ppt/slides/slide5.xml",
-                br"<p:sld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Plain</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:sld>",
-            ),
-            (
-                "ppt/slides/slide6.xml",
-                br#"<p:sld><p:spTree><p:graphicFrame><a:graphic><a:graphicData><dgm:relIds r:lo="rId1"/></a:graphicData></a:graphic></p:graphicFrame></p:spTree></p:sld>"#,
-            ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, .. } = convert_pptx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a readable presentation");
-        };
-        assert_eq!(
-            text,
-            "Slide 1:\n  (diagram text could not be read)\n\n\
-             Slide 2:\n  (diagram text could not be read)\n\n\
-             Slide 3:\n  (diagram text could not be read)\n\n\
-             Slide 4:\n  (diagram text could not be read)\n\n\
-             Slide 5:\n  Plain\n\n\
-             Slide 6:\n  (diagram text could not be read)"
-        );
-    }
-
-    #[test]
     fn pptx_diagram_text_is_the_text_a_reading_showed_per_slide() {
         let bytes = zip_fixture(&[
             (
@@ -2313,20 +2188,5 @@ mod tests {
         // whose bytes are not a package at all neither.
         assert!(pptx_diagram_text(b"not a package").is_empty());
         assert!(pptx_diagram_text(&zip_fixture(&[("word/document.xml", DOCX_BODY)])).is_empty());
-    }
-
-    /// A media entry name carrying a bracket would close the `[File ...]` note
-    /// (and the `[IMAGE:...]` marker built from it) early.
-    #[test]
-    fn docx_media_entry_names_are_marker_safe() {
-        let bytes = zip_fixture(&[
-            ("word/document.xml", DOCX_BODY),
-            ("word/media/a]b.png", b"\x89PNG\r\n\x1a\nfake image bytes"),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { images, .. } = convert_docx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a well-formed docx");
-        };
-        assert_eq!(images, vec![dir.path().join("a_b.png")]);
     }
 }

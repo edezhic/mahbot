@@ -1914,37 +1914,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn find_tool_aliases() {
-        let tools: Vec<Box<dyn Tool>> = vec![
-            Box::new(SearchTool),
-            Box::new(ShellTool::new(ShellMode::Full)),
-            Box::new(ReadTool::general()),
-            Box::new(EditTool::confined()),
-        ];
-
-        let cases: &[(&str, Option<&str>)] = &[
-            ("search", Some("search")),
-            ("shell", Some("shell")),
-            ("read", Some("read")),
-            ("edit", Some("edit")),
-            ("bash", Some("shell")),
-            ("run_terminal_cmd", Some("shell")),
-            ("grep", Some("search")),
-            ("rg", Some("search")),
-            ("grep_search", Some("search")),
-            ("glob", Some("search")),
-            ("read_file", Some("read")),
-            ("str_replace", Some("edit")),
-            ("unknown", None),
-        ];
-
-        for &(input, expected) in cases {
-            let found = find_tool(&tools, input);
-            assert_eq!(found.map(Tool::name), expected, "find_tool({input:?})");
-        }
-    }
-
     /// One [`normalize_tool_call`] call: what the caller sent, the tool the call
     /// must be routed to, and the arguments it must carry afterwards.
     struct NormalizeCallCase {

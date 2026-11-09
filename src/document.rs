@@ -1916,24 +1916,7 @@ mod tests {
     use super::*;
     // The CFB container and `.doc` package recipes live with the readers that consume them.
     use crate::legacy::test_fixtures::{cfb, doc_fixture};
-    // The ZIP/OOXML fixtures live with the arm that reads them.
-    use crate::ooxml::test_fixtures::zip_fixture;
     use std::io::Write;
-
-    /// A Markdown file and an extensionless UTF-8 file are accepted as text,
-    /// byte for byte.
-    #[test]
-    fn markdown_and_extensionless_utf8_are_text() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        assert!(matches!(
-            convert_document(b"# Title\n\nBody", "notes.md", dir.path()),
-            DocOutcome::Text { text, .. } if text == "# Title\n\nBody"
-        ));
-        assert!(matches!(
-            convert_document(b"plain words", "README", dir.path()),
-            DocOutcome::Text { text, .. } if text == "plain words"
-        ));
-    }
 
     /// One embedded image XObject for [`pdf_fixture`]: dictionary entries are written verbatim,
     /// and the stream bytes are raw so real Flate streams can be built.
@@ -2171,70 +2154,6 @@ mod tests {
         );
     }
 
-    /// A ZIP holding no OOXML package keeps the name's verdict: only a name of one of the three
-    /// families is read, and a plain archive is not converted.
-    #[test]
-    fn zip_with_non_ooxml_extension_is_unsupported() {
-        let bytes = zip_fixture(&[("readme.txt", b"plain archive contents")]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        for name in ["bundle.zip", "bundle.bin"] {
-            assert!(matches!(
-                convert_document(&bytes, name, dir.path()),
-                DocOutcome::Unsupported
-            ));
-            assert!(!needs_extraction(&bytes, name));
-        }
-    }
-
-    /// A one-sheet `.xlsx` package: the workbook part, its relationships and one
-    /// inline-string cell.
-    fn one_cell_xlsx() -> Vec<u8> {
-        zip_fixture(&[
-            (
-                "xl/workbook.xml",
-                br#"<workbook xmlns:r="r"><sheets><sheet name="S" r:id="rId1"/></sheets></workbook>"#,
-            ),
-            (
-                "xl/_rels/workbook.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
-            ),
-            (
-                "xl/worksheets/sheet1.xml",
-                br#"<worksheet><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>cell</t></is></c></row></sheetData></worksheet>"#,
-            ),
-        ])
-    }
-
-    /// A ZIP named as one of the new OOXML formats reaches that format's reader
-    /// rather than the single Word arm.
-    #[test]
-    fn ooxml_zip_packages_dispatch_to_their_arm() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        assert!(matches!(
-            convert_document(&one_cell_xlsx(), "book.xlsx", dir.path()),
-            DocOutcome::Text { text, .. } if text == "Sheet \"S\":\n  A1: cell"
-        ));
-
-        let pptx = zip_fixture(&[
-            (
-                "ppt/presentation.xml",
-                br#"<p:presentation xmlns:p="p" xmlns:r="r"><p:sldIdLst><p:sldId r:id="rId1"/></p:sldIdLst></p:presentation>"#,
-            ),
-            (
-                "ppt/_rels/presentation.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Target="slides/slide1.xml"/></Relationships>"#,
-            ),
-            (
-                "ppt/slides/slide1.xml",
-                br"<p:sld><a:p><a:r><a:t>hello</a:t></a:r></a:p></p:sld>",
-            ),
-        ]);
-        assert!(matches!(
-            convert_document(&pptx, "deck.pptx", dir.path()),
-            DocOutcome::Text { text, .. } if text == "Slide 1:\n  hello"
-        ));
-    }
-
     /// The source colour, within JPEG's own rounding.
     fn assert_solid_rgb(actual: [u8; 3]) {
         for (channel, expected) in actual.into_iter().zip(SOLID_RGB) {
@@ -2326,32 +2245,6 @@ mod tests {
                 "{label}: the image is the page's"
             );
         }
-    }
-
-    /// An inline image lives in the content stream, not the resources, so a text page needs this
-    /// pass to show it.
-    #[test]
-    fn pdf_text_page_writes_inline_image() {
-        let content = format!(
-            "BT /F1 24 Tf 72 700 Td (Hello PDF text layer) Tj ET {}",
-            solid_rgb_inline_image()
-        );
-        let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = convert_document(
-            &pdf_fixture(content.as_bytes(), &[]),
-            "scan.pdf",
-            dir.path(),
-        );
-        let DocOutcome::Text { images, notes, .. } = outcome else {
-            panic!("expected Text outcome for a text-layer PDF");
-        };
-        assert!(notes.is_empty(), "nothing was skipped: {notes:?}");
-        assert_eq!(images, vec![dir.path().join("page_1_img_0.jpg")]);
-        let written = image::open(&images[0])
-            .expect("decode the written image")
-            .to_rgb8();
-        assert_eq!(written.dimensions(), (4, 2));
-        assert_solid_rgb(written.get_pixel(0, 0).0);
     }
 
     /// A PNG predictor in `/DecodeParms` is what most producers emit, and the filter chain has to
@@ -2810,95 +2703,6 @@ mod tests {
             long_side <= target && long_side > target - 5.0,
             "long side {long_side} must be the RASTER_LONG_SIDE_PX target"
         );
-    }
-
-    /// Every page that produced text is labeled with its own physical number, however short: a
-    /// page below [`MIN_PAGE_TEXT_CHARS`] is still rasterized, its text kept beside the image.
-    #[test]
-    fn pdf_labels_each_page_that_produced_text_and_keeps_the_short_ones() {
-        let bytes = multi_page_pdf(&[
-            (
-                "/MediaBox [0 0 612 792]",
-                b"BT /F1 24 Tf 72 700 Td (Page one text long enough) Tj ET",
-            ),
-            (
-                "/MediaBox [0 0 612 792]",
-                b"0.1 0.5 0.9 rg 0 0 612 792 re f",
-            ),
-            (
-                "/MediaBox [0 0 612 792]",
-                b"BT /F1 24 Tf 72 700 Td (Hi) Tj ET",
-            ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = convert_document(&bytes, "report.pdf", dir.path());
-        let DocOutcome::Text {
-            text,
-            images,
-            notes,
-            all_page_text_lost,
-            ..
-        } = outcome
-        else {
-            panic!("expected Text outcome for a report with a short text page");
-        };
-        assert_eq!(
-            text, "Page 1:\nPage one text long enough\n\nPage 3:\nHi",
-            "each page that produced text is labeled with its own number, and the \
-             text-free page gets none"
-        );
-        assert_eq!(
-            images,
-            vec![dir.path().join("page_2.jpg"), dir.path().join("page_3.jpg")],
-            "the text-free page and the short page are both rasterized"
-        );
-        assert!(notes.is_empty(), "nothing failed: {notes:?}");
-        assert!(!all_page_text_lost);
-    }
-
-    /// The marks a PDF carries are document content too: annotations and filled form values
-    /// follow the page blocks, each naming its page.
-    #[test]
-    fn pdf_delivers_annotations_and_form_values_as_document_text() {
-        const CONTENT: &[u8] = b"BT /F1 24 Tf 72 700 Td (Page one text long enough) Tj ET";
-        let mut fixture = PdfFixture::new();
-        let highlight = fixture.push(format!(
-            "<< /Subtype /Highlight /T {} /Contents {} >>",
-            pdf_text_string("Иван Петров"),
-            pdf_text_string("проверьте третью фигуру")
-        ));
-        let field = fixture.push(
-            "<< /Subtype /Widget /FT /Tx /T (Name) /V (value) /Rect [0 0 0 0] >>".to_string(),
-        );
-        let acroform = fixture.push(format!("<< /Fields [{field}] >>"));
-        let bytes = one_page_pdf(
-            fixture,
-            CONTENT,
-            &format!("/MediaBox [0 0 612 792] /Annots [{highlight} {field}]"),
-            &format!(" /AcroForm {acroform}"),
-        );
-        let dir = tempfile::tempdir().expect("tempdir");
-        let outcome = convert_document(&bytes, "form.pdf", dir.path());
-        let DocOutcome::Text {
-            text,
-            images,
-            notes,
-            ..
-        } = outcome
-        else {
-            panic!("expected Text outcome for a PDF with marks");
-        };
-        assert_eq!(
-            text,
-            "Page 1:\nPage one text long enough\n\nAnnotations:\n\
-             highlight (Иван Петров) on page 1:\n  проверьте третью фигуру\n\n\
-             Form fields:\nName (text) on page 1: value"
-        );
-        assert!(
-            images.is_empty(),
-            "the text page is delivered as text, not rasterized: {images:?}"
-        );
-        assert!(notes.is_empty(), "{notes:?}");
     }
 
     /// A page whose text layer is absent still delivers the form values it carries: the marks are

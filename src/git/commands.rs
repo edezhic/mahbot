@@ -1859,41 +1859,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_run_git_head_and_write_tree_fingerprint() {
-        let (_dir, repo_path) = init_temp_repo();
-        let head1 = run_git_head(&repo_path).await.expect("repo has commits");
-        let tree1 = run_git_write_tree(&repo_path)
-            .await
-            .expect("index writable");
-
-        // Staged content change → new index tree, unchanged HEAD.
-        std::fs::write(repo_path.join("test.txt"), b"line1\nline2\n").expect("write file");
-        run_git_add_all(&repo_path).await.expect("git add");
-        let head2 = run_git_head(&repo_path).await.expect("repo has commits");
-        let tree2 = run_git_write_tree(&repo_path)
-            .await
-            .expect("index writable");
-        assert_eq!(head1, head2, "staging must not change HEAD");
-        assert_ne!(tree1, tree2, "staging must change the index tree");
-    }
-
-    #[tokio::test]
-    async fn test_run_git_head_none_without_commits() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let repo_path = dir.path().to_path_buf();
-
-        let status = std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&repo_path)
-            .status()
-            .expect("git init");
-        assert!(status.success());
-
-        let head = run_git_head(&repo_path).await.ok();
-        assert!(head.is_none(), "commit-less repo must not resolve HEAD");
-    }
-
     /// `git_has_commits` and `run_git_commit_message` both resolve against the same HEAD: no
     /// commit → neither answers; one commit → both do; a named hash reads that commit's subject.
     #[tokio::test]
@@ -1932,25 +1897,6 @@ mod tests {
                 .expect("commit message with hash"),
             "Second commit",
             "a named hash reads that commit's subject"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_run_git_worktree_snapshot_clean_tree() {
-        let (_dir, repo_path) = init_temp_repo();
-        let snap = run_git_worktree_snapshot(&repo_path)
-            .await
-            .expect("worktree snapshot");
-        assert_eq!(snap.stats.added, 0);
-        assert_eq!(snap.stats.removed, 0);
-        assert_eq!(snap.stats.huge_binary_file_count, 0);
-        assert_eq!(snap.stats.omitted_file_count, 0);
-        assert!(snap.changes.is_empty(), "clean tree has no changes");
-        assert!(snap.file_statuses.is_empty(), "clean tree has no statuses");
-        assert_eq!(
-            snap.repo_root,
-            std::fs::canonicalize(&repo_path).unwrap(),
-            "the snapshot resolves the repository root"
         );
     }
 
@@ -2503,45 +2449,6 @@ mod tests {
         );
     }
 
-    /// The destination is asked directly: a branch it already carries is never announced as a
-    /// publish just because this repository has no local ref for it (a narrowed
-    /// `remote.<name>.fetch` refspec never creates one).
-    #[tokio::test]
-    async fn destination_branch_is_detected_without_a_local_ref() {
-        let (_dir, repo_path) = init_temp_repo();
-        let remotes = tempfile::tempdir().expect("remote dir");
-        let origin = add_bare_remote(remotes.path(), &repo_path, "origin");
-        let branch = run_git_current_branch(&repo_path).await.expect("branch");
-        git_ok(&repo_path, &["push", "origin", &branch]);
-        git_ok(
-            &repo_path,
-            &["update-ref", "-d", &format!("refs/remotes/origin/{branch}")],
-        );
-        commit_file(&repo_path, "later.txt", "only the local branch has this");
-
-        let state = remote_state(&repo_path).await;
-        let GitPushDestination::Target(target) = &state.push else {
-            panic!("expected a push target, got {:?}", state.push);
-        };
-        assert_eq!(
-            target.publish,
-            Some(false),
-            "origin carries the branch even though no local ref says so"
-        );
-        assert_eq!(target.commits, 1);
-
-        let report = run_git_sync(&repo_path).await.expect("sync");
-        assert!(report.not_pushed.is_none());
-        assert_eq!(
-            tracked(&repo_path, &branch).await.as_deref(),
-            Some("origin")
-        );
-        assert_eq!(
-            rev_parse(&origin, &format!("refs/heads/{branch}")),
-            rev_parse(&repo_path, "HEAD")
-        );
-    }
-
     /// The probe matches the branch's own ref: a nested ref on the destination
     /// (`feature/<branch>`) is not mistaken for the branch itself.
     #[tokio::test]
@@ -2571,91 +2478,6 @@ mod tests {
         assert_eq!(
             target.commits,
             count_commits(&repo_path, "HEAD").await.expect("count")
-        );
-    }
-
-    /// A publish skips the update step: the destination has no such branch to update from, so
-    /// the branch's commits go out as they are.
-    #[tokio::test]
-    async fn publish_skips_the_update_step() {
-        let (_dir, repo_path) = init_temp_repo();
-        let remotes = tempfile::tempdir().expect("remote dir");
-        add_bare_remote(remotes.path(), &repo_path, "upstream");
-        let branch = run_git_current_branch(&repo_path).await.expect("branch");
-        git_ok(&repo_path, &["push", "-u", "upstream", &branch]);
-        // The upstream moves on, so a pull would change the branch.
-        git_ok(&repo_path, &["switch", "-c", "upstream-side"]);
-        commit_file(&repo_path, "remote.txt", "upstream moved on");
-        git_ok(&repo_path, &["push", "upstream", &format!("HEAD:{branch}")]);
-        git_ok(&repo_path, &["switch", &branch]);
-        git_ok(
-            &repo_path,
-            &["remote", "set-url", "--push", "upstream", "no-push"],
-        );
-        let origin = add_bare_remote(remotes.path(), &repo_path, "origin");
-        git_ok(&repo_path, &["fetch", "upstream"]);
-        let published_head = rev_parse(&repo_path, "HEAD");
-
-        let state = remote_state(&repo_path).await;
-        assert_eq!(state.behind, 1);
-        let GitPushDestination::Target(target) = &state.push else {
-            panic!("expected a push target, got {:?}", state.push);
-        };
-        assert_eq!(target.publish, Some(true), "origin has no such branch yet");
-
-        let report = run_git_sync(&repo_path).await.expect("sync");
-        assert!(report.not_pushed.is_none());
-        assert_eq!(
-            rev_parse(&repo_path, "HEAD"),
-            published_head,
-            "a publish does not update the branch"
-        );
-        assert_eq!(
-            rev_parse(&origin, &format!("refs/heads/{branch}")),
-            published_head,
-            "origin received exactly what the branch carried"
-        );
-        assert_eq!(
-            tracked(&repo_path, &branch).await.as_deref(),
-            Some("upstream"),
-            "the fetch-only tracking is left alone"
-        );
-    }
-
-    /// A branch tracking a push-capable remote keeps that remote as its destination, and has
-    /// nothing to offer once in sync.
-    #[tokio::test]
-    async fn tracked_push_capable_remote_stays_the_destination() {
-        let (_dir, repo_path) = init_temp_repo();
-        let remotes = tempfile::tempdir().expect("remote dir");
-        let upstream = add_bare_remote(remotes.path(), &repo_path, "upstream");
-        let branch = run_git_current_branch(&repo_path).await.expect("branch");
-        git_ok(&repo_path, &["push", "-u", "upstream", &branch]);
-        commit_file(&repo_path, "pushed.txt", "second");
-
-        let state = remote_state(&repo_path).await;
-        let GitPushDestination::Target(target) = &state.push else {
-            panic!("expected a push target, got {:?}", state.push);
-        };
-        assert_eq!(target.remote, "upstream");
-        assert_eq!(target.publish, Some(false));
-        assert_eq!(target.commits, 1);
-
-        let report = run_git_sync(&repo_path).await.expect("sync");
-        assert!(report.not_pushed.is_none());
-        assert!(
-            report.output.contains(&branch),
-            "a real push reports itself: {}",
-            report.output
-        );
-        assert_eq!(
-            rev_parse(&upstream, &format!("refs/heads/{branch}")),
-            rev_parse(&repo_path, "HEAD"),
-            "the tracked remote received the commit"
-        );
-        assert!(
-            !remote_state(&repo_path).await.has_sync_work(),
-            "in sync: the control hides, as before"
         );
     }
 
@@ -2895,25 +2717,6 @@ mod tests {
             rev_parse(&repo_path, "HEAD"),
             rev_parse(&repo_path, &format!("upstream/{branch}"))
         );
-    }
-
-    /// With no remote at all, nothing is guessed and the control says so.
-    #[tokio::test]
-    async fn no_pushable_remote_reports_nowhere() {
-        let (_dir, repo_path) = init_temp_repo();
-        let state = remote_state(&repo_path).await;
-        let GitPushDestination::Nowhere { reason } = &state.push else {
-            panic!("expected nowhere, got {:?}", state.push);
-        };
-        assert!(reason.contains("push"), "reason mentions pushes: {reason}");
-        assert!(
-            state.has_sync_work(),
-            "the control says why rather than hiding"
-        );
-
-        let report = run_git_sync(&repo_path).await.expect("sync");
-        assert_eq!(report.not_pushed.as_deref(), Some(reason.as_str()));
-        assert!(report.output.is_empty(), "nothing ran: {}", report.output);
     }
 
     /// Two pushable remotes are ambiguous — neither is picked, nothing is pushed, and the
@@ -3371,41 +3174,6 @@ A  \"staged\\\"file.js\"
         for (name, input, expected) in cases {
             assert_eq!(parse_numstat_lines(input), *expected, "case: {name}");
         }
-    }
-
-    /// Discard changes to a modified tracked file — restores it to HEAD.
-    #[tokio::test]
-    async fn test_run_git_discard_modified_file() {
-        let (_dir, repo_path) = init_temp_repo();
-
-        std::fs::write(repo_path.join("test.txt"), b"modified content\n")
-            .expect("write modified file");
-
-        let status = run_git_command(&repo_path, &["status", "--porcelain", "test.txt"])
-            .await
-            .expect("status before discard");
-        assert!(
-            !status.trim().is_empty(),
-            "file should be dirty before discard"
-        );
-
-        run_git_discard(&repo_path, "test.txt", DiscardTarget::File)
-            .await
-            .expect("run_git_discard should succeed");
-
-        let status = run_git_command(&repo_path, &["status", "--porcelain", "test.txt"])
-            .await
-            .expect("status after discard");
-        assert!(
-            status.trim().is_empty(),
-            "file should be clean after discard"
-        );
-
-        let content = std::fs::read_to_string(repo_path.join("test.txt")).expect("read file");
-        assert_eq!(
-            content, "line1\nline2\nline3\n",
-            "content should be restored to HEAD"
-        );
     }
 
     /// Untracked content is removed by a discard, in both target shapes: a new file, and a

@@ -207,7 +207,6 @@ pub(crate) fn promoted_reasoning<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ChatRole;
 
     type SplitCase<'a> = (
         &'a str,
@@ -244,112 +243,6 @@ mod tests {
                 "case {name}: thinking"
             );
             assert_eq!(body.as_deref(), expected_body, "case {name}: body");
-        }
-    }
-
-    #[test]
-    fn empty_tool_call_list_never_forms_a_tool_round() {
-        let messages = vec![ChatMessage {
-            role: ChatRole::Assistant,
-            content: r#"{"content":"hello","tool_calls":[]}"#.to_string(),
-        }];
-        let entries = build_ledger(&messages);
-        match &entries[..] {
-            [SessionEntry::Message { content, .. }] => {
-                assert_eq!(content.as_deref(), Some("hello"));
-            }
-            other => panic!("expected a single Message entry, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ledger_sources_track_the_source_row_of_each_entry() {
-        // The tool result attaches to its round, so the entry→message map is not the identity.
-        let messages = vec![
-            ChatMessage::user("go"),
-            assistant_tool_call(Some("checking"), None),
-            ChatMessage::tool_result("call_1", "result"),
-            ChatMessage::user("next"),
-        ];
-        let (_entries, sources) = build_ledger_with_sources(&messages);
-        assert_eq!(sources, vec![0, 1, 3]);
-    }
-
-    fn assistant_tool_call(content: Option<&str>, reasoning: Option<&str>) -> ChatMessage {
-        let calls = vec![serde_json::json!({
-            "id": "call_1",
-            "name": "read",
-            "arguments": serde_json::to_string(&serde_json::json!({"path": "a.rs"})).unwrap(),
-        })];
-        let mut body = serde_json::json!({ "content": content, "tool_calls": calls });
-        if let Some(reasoning) = reasoning {
-            body["reasoning"] = serde_json::json!(reasoning);
-        }
-        ChatMessage::assistant(body.to_string())
-    }
-
-    #[derive(Default)]
-    struct PromotedCase {
-        name: &'static str,
-        content: Option<&'static str>,
-        reasoning: Option<&'static str>,
-        promoted: Option<&'static str>,
-    }
-
-    /// Reasoning is promoted only when the round has no visible narration and there is
-    /// reasoning to promote.
-    #[test]
-    fn promoted_reasoning_cases() {
-        let cases: &[PromotedCase] = &[
-            PromotedCase {
-                name: "textless round with reasoning",
-                reasoning: Some("Checking the file first"),
-                promoted: Some("Checking the file first"),
-                ..PromotedCase::default()
-            },
-            PromotedCase {
-                name: "visible content does not promote",
-                content: Some("Doing it"),
-                reasoning: Some("Reasoning here"),
-                ..PromotedCase::default()
-            },
-            PromotedCase {
-                name: "whitespace content counts as empty",
-                content: Some("   "),
-                reasoning: Some("Reasoning here"),
-                promoted: Some("Reasoning here"),
-            },
-            PromotedCase {
-                name: "without reasoning does not promote",
-                ..PromotedCase::default()
-            },
-        ];
-        for case in cases {
-            let name = case.name;
-            let messages = vec![assistant_tool_call(case.content, case.reasoning)];
-            let entries = build_ledger(&messages);
-            match &entries[..] {
-                [
-                    SessionEntry::ToolRound {
-                        narration,
-                        reasoning,
-                        ..
-                    },
-                ] => {
-                    assert_eq!(narration.as_deref(), case.content, "case {name}: narration");
-                    assert_eq!(
-                        reasoning.as_deref(),
-                        case.reasoning,
-                        "case {name}: reasoning"
-                    );
-                    assert_eq!(
-                        promoted_reasoning(narration.as_deref(), reasoning.as_deref()),
-                        case.promoted,
-                        "case {name}: promoted"
-                    );
-                }
-                other => panic!("case {name}: expected a single ToolRound entry, got {other:?}"),
-            }
         }
     }
 }

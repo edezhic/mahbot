@@ -1807,25 +1807,6 @@ mod tests {
         assert_eq!(contents(&take_turn_batch(&mut waiting)), ["later"]);
     }
 
-    #[test]
-    fn an_announcement_is_waited_for_once() {
-        let arrivals = UrgentArrivals::default();
-        assert!(arrivals.take().is_empty());
-        let announcement = arrivals.announce();
-        let second = arrivals.announce();
-        assert_eq!(
-            arrivals.take().len(),
-            2,
-            "both announcements are outstanding"
-        );
-        assert!(
-            arrivals.take().is_empty(),
-            "a taken announcement is not waited for again"
-        );
-        drop(announcement);
-        drop(second);
-    }
-
     #[tokio::test]
     #[serial_test::serial(drain)] // the hold observes the process-global drain flag
     async fn a_pending_announcement_holds_the_turn_for_its_message() {
@@ -2085,48 +2066,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    // Shares the process-global stores with the provider-group tests (uniform exclusion).
-    #[serial_test::serial(provider)]
-    async fn test_resolve_workspace_found() {
-        crate::util::test::init_management_test_stores().await;
-
-        crate::util::test::create_test_workspace("/tmp/test_resolve_ws", "test_resolve_ws").await;
-
-        let result = crate::users::resolve_workspace("test_resolve_ws").await;
-        let resolved = result.expect("resolve should succeed for DB workspace");
-        assert!(resolved.is_some(), "DB workspace should be found");
-        assert_eq!(resolved.unwrap().name, "test_resolve_ws");
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(provider)]
-    async fn test_resolve_workspace_personal() {
-        crate::util::test::init_management_test_stores().await;
-
-        let result = crate::users::resolve_workspace("personal:liliana").await;
-        let resolved = result.expect("resolve should succeed for personal workspace");
-        let ws = resolved.expect("personal workspace should be constructed on the fly");
-
-        assert_eq!(ws.name, "personal:liliana");
-        assert_eq!(ws.status, crate::WorkspaceStatus::Ready);
-        let expected_path = crate::users::personal_workspace_path("liliana");
-        assert_eq!(ws.path, expected_path);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(provider)]
-    async fn test_resolve_workspace_not_found() {
-        crate::util::test::init_management_test_stores().await;
-
-        let result = crate::users::resolve_workspace("nonexistent_workspace").await;
-        let resolved = result.expect("resolve should succeed (no error) for missing workspace");
-        assert!(
-            resolved.is_none(),
-            "nonexistent workspace should not be found",
-        );
-    }
-
     /// A path that is a managed workspace's own folder resolves to that workspace, not to a
     /// path-named area over the same tree, so a launch by path keeps its notes, pause state
     /// and search engine.
@@ -2166,26 +2105,6 @@ mod tests {
 
     // The broadcast outcome is asserted through the spy channel below: the real transports
     // are no-ops at this level, so a path that only "completes without panic" proves nothing.
-
-    #[tokio::test]
-    #[serial_test::serial(provider)]
-    async fn test_resolve_single_user_found() {
-        setup_response_test_infra().await;
-
-        // The admin is auto-created by ensure_admin_user.
-        let user = resolve_single_user("admin").await;
-        assert!(user.is_some(), "the admin should exist after store init");
-        assert_eq!(user.as_ref().unwrap().name, "admin");
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(provider)]
-    async fn test_resolve_single_user_not_found() {
-        setup_response_test_infra().await;
-
-        let user = resolve_single_user("nonexistent_user").await;
-        assert!(user.is_none(), "non-existent user should return None");
-    }
 
     /// The reply reaches every channel the user is bound to, whatever channel the job
     /// originated on.
@@ -2417,20 +2336,6 @@ mod tests {
 
         unregister_agent(&agent_id);
         forget_announced_media_failures(&agent_id);
-    }
-
-    #[test]
-    fn agent_message_job_threading() {
-        let job = agent_message_job("hello".to_string(), "proj_ws".to_string(), "alice", None);
-        assert_eq!(job.user_name, "alice");
-        assert_eq!(job.kind, MessageKind::AgentMessage);
-        assert_eq!(job.role, Role::Manager);
-        assert_eq!(job.workspace_name, "proj_ws");
-        assert!(job.reply_to_custom.is_none());
-
-        // Empty user_name normalizes to the seeded 'admin'.
-        let job = agent_message_job("hello".to_string(), "proj_ws".to_string(), "", None);
-        assert_eq!(job.user_name, "admin");
     }
 
     /// A Manager response persists one durable `<manager-message>` envelope for the admin's

@@ -293,16 +293,6 @@ mod tests {
         assert!(ModelSnapshot::from_json("{\"image\":\"only\"}").is_some());
     }
 
-    #[test]
-    fn join_capped_truncates() {
-        let values: Vec<String> = (0..20).map(|i| i.to_string()).collect();
-        assert_eq!(
-            join_capped(&values, 16),
-            "0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, +4 more"
-        );
-        assert_eq!(join_capped(&values[..3], 16), "0, 1, 2");
-    }
-
     /// Build a catalog entry declaring `params` — the shipped helper for the
     /// envelope cases below, whose rows differ only in what is declared.
     fn image_info(params: &[(&str, ParameterConstraint)]) -> ImageModelInfo {

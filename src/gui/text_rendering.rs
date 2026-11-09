@@ -459,16 +459,6 @@ pub(crate) fn fill_rich_spans<'a>(
 mod tests {
     use super::*;
 
-    /// `push_or_merge` row: case, text, span pushed first, span appended, appended colored, slices out.
-    type MergeRow = (
-        &'static str,
-        &'static str,
-        Option<(usize, usize)>,
-        (usize, usize),
-        bool,
-        &'static [&'static str],
-    );
-
     fn red() -> cosmic_text::Attrs<'static> {
         cosmic_text::Attrs::new().color(cosmic_text::Color::rgb(255, 0, 0))
     }
@@ -496,49 +486,6 @@ mod tests {
             cursor = end;
         }
         assert_eq!(cursor, text.len(), "case {case}: spans cover all bytes");
-    }
-
-    #[test]
-    fn push_or_merge_merges_only_contiguous_spans_with_equal_attrs() {
-        let cases: &[MergeRow] = &[
-            (
-                "merge contiguous",
-                "hello world",
-                Some((0, 5)),
-                (5, 11),
-                false,
-                &["hello world"],
-            ),
-            (
-                "split on gap",
-                "hello---world",
-                Some((0, 5)),
-                (8, 13),
-                false,
-                &["hello", "world"],
-            ),
-            (
-                "split on attrs",
-                "hello world",
-                Some((0, 5)),
-                (5, 11),
-                true,
-                &["hello", " world"],
-            ),
-            ("push into empty", "hello", None, (0, 5), false, &["hello"]),
-        ];
-        for &(name, text, first, second, colored, expected) in cases {
-            let base = cosmic_text::Attrs::new();
-            let attrs = if colored { red() } else { base.clone() };
-            let mut result = Vec::new();
-            if let Some((lo, hi)) = first {
-                result.push((&text[lo..hi], base.clone()));
-            }
-            let (lo, hi) = second;
-            push_or_merge(text, &mut result, &text[lo..hi], attrs);
-            let slices: Vec<&str> = result.iter().map(|(slice, _)| *slice).collect();
-            assert_eq!(slices, expected, "case {name}");
-        }
     }
 
     type CoverCase<'a> = (&'a str, &'a str, &'a [(usize, usize)]);

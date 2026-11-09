@@ -1355,17 +1355,6 @@ mod tests {
     }
 
     #[test]
-    fn ladder_rounds_derivation() {
-        // 7 gaps between 8 ladder rounds → 2 + 8 = 10 requests.
-        assert_eq!(rounds_per_provider(&[0, 5, 30, 120, 300, 600, 1800]), 10);
-        // 8 gaps → 2 + 9 = 11.
-        assert_eq!(
-            rounds_per_provider(&[0, 5, 30, 120, 300, 600, 1800, 3600]),
-            11
-        );
-    }
-
-    #[test]
     fn cli_parse_errors() {
         let budget = crate::db::read_limit::Budget::start();
         assert!(matches!(

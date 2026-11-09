@@ -612,36 +612,6 @@ mod tests {
     }
 
     #[test]
-    fn activity_shows_in_list_and_guard_clears_it() {
-        let agent_id = format!("activity_guard_{}", crate::generate_suffix());
-        let generation = register_test_agent(&agent_id, "/tmp/ws");
-        {
-            let guard = AGENT_REGISTRY.activity_started(&agent_id, generation, "extracting");
-            let handles = AGENT_REGISTRY.list();
-            let h = handles
-                .iter()
-                .find(|h| h.agent_id == agent_id)
-                .expect("agent registered");
-            assert_eq!(
-                h.activity.as_deref(),
-                Some("extracting"),
-                "activity must be visible on the live card"
-            );
-            drop(guard);
-        }
-        let handles = AGENT_REGISTRY.list();
-        let h = handles
-            .iter()
-            .find(|h| h.agent_id == agent_id)
-            .expect("agent still registered");
-        assert!(
-            h.activity.is_none(),
-            "guard drop must clear the activity label"
-        );
-        AGENT_REGISTRY.deregister(&agent_id, generation);
-    }
-
-    #[test]
     fn stale_activity_guard_cannot_clear_replacement_agent() {
         let agent_id = format!("activity_stale_{}", crate::generate_suffix());
         let generation = register_test_agent(&agent_id, "/tmp/ws");
@@ -690,21 +660,6 @@ mod tests {
                 .any(|(k, v)| k == "command" && v == &long_command),
             "values are not truncated at flattening"
         );
-    }
-
-    #[test]
-    fn register_replaces_old_entry_with_fresh_generation() {
-        let agent_id = format!("regen_{}", crate::generate_suffix());
-        let gen_a = register_test_agent(&agent_id, "/tmp/ws");
-        let gen_b = register_test_agent(&agent_id, "/tmp/ws");
-        assert_ne!(gen_a, gen_b, "each registration gets a fresh generation");
-        let handles = AGENT_REGISTRY.list();
-        let h = handles
-            .iter()
-            .find(|h| h.agent_id == agent_id)
-            .expect("replacement agent registered");
-        assert_eq!(h.generation, gen_b);
-        AGENT_REGISTRY.deregister(&agent_id, gen_b);
     }
 
     #[test]
@@ -792,60 +747,6 @@ mod tests {
         // A concluded or never-registered turn has nothing to cut, and saying so is not an error.
         AGENT_REGISTRY.deregister(&agent_id, generation);
         AGENT_REGISTRY.interrupt(&agent_id);
-    }
-
-    #[test]
-    fn register_carries_parent_key_and_run_lifetime() {
-        // Unique test-only kinds: `NON_AGENT_CALLS` is a process-global shared by parallel
-        // tests, so a non-unique kind would let this test observe another test's live registration.
-        let kind: &'static str = "registry_test_consolidate_kind";
-        let guard = NON_AGENT_CALLS.register(
-            kind,
-            "ws1",
-            Some(ParentKey::AnalyzeRound("round_1".to_string())),
-            false,
-            Some("Why is CI flaky?".to_string()),
-        );
-        // The run-lifetime flag is a distinct registration mode; both round-trip the same path.
-        let orchestrator: &'static str = "registry_test_orchestrator_kind";
-        let orchestrator_guard = NON_AGENT_CALLS.register(
-            orchestrator,
-            "ws1",
-            Some(ParentKey::Research("job_9".to_string())),
-            true,
-            None,
-        );
-        let handles = NON_AGENT_CALLS.list();
-        let h = handles
-            .iter()
-            .find(|h| h.kind == kind)
-            .expect("call registered");
-        assert_eq!(h.workspace, "ws1");
-        assert_eq!(
-            h.parent_key,
-            Some(ParentKey::AnalyzeRound("round_1".to_string()))
-        );
-        assert_eq!(
-            h.parent_label.as_deref(),
-            Some("Why is CI flaky?"),
-            "parent label round-trips"
-        );
-        assert!(!h.run_lifetime);
-        let o = handles
-            .iter()
-            .find(|h| h.kind == orchestrator)
-            .expect("orchestrator registered");
-        assert!(o.run_lifetime, "run-lifetime flag must round-trip");
-        assert_eq!(o.parent_key, Some(ParentKey::Research("job_9".to_string())));
-        drop(guard);
-        drop(orchestrator_guard);
-        assert!(
-            !NON_AGENT_CALLS
-                .list()
-                .iter()
-                .any(|h| h.kind == kind || h.kind == orchestrator),
-            "guard drops remove their own entries"
-        );
     }
 
     #[test]

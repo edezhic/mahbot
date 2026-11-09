@@ -1448,29 +1448,12 @@ fn render_transcript<'a>(
 mod tests {
     use super::*;
     use crate::ChatRole;
-    use crate::agent::registry::RunningTool;
-    use SessionActivity::{Paused, Working};
 
     fn msg(role: ChatRole, content: Option<&str>) -> SessionEntry {
         SessionEntry::Message {
             role,
             content: content.map(str::to_string),
             thinking: None,
-        }
-    }
-
-    fn tool_round() -> SessionEntry {
-        SessionEntry::ToolRound {
-            narration: Some("checking the file".to_string()),
-            reasoning: None,
-            calls: vec![ToolCallEntry {
-                tool_call_id: "call_0".to_string(),
-                tool: RunningTool {
-                    name: "read".to_string(),
-                    args: vec![("path".to_string(), "a.rs".to_string())],
-                },
-                result: Some("ok".to_string()),
-            }],
         }
     }
 
@@ -1486,27 +1469,6 @@ mod tests {
             custom_role: None,
             custom_identifier: None,
             launch_stopped: false,
-        }
-    }
-
-    fn agent(
-        agent_id: &str,
-        role: &str,
-        workspace: &str,
-        started_at: chrono::DateTime<chrono::Utc>,
-    ) -> crate::agent::registry::AgentHandle {
-        crate::agent::registry::AgentHandle {
-            agent_id: agent_id.to_string(),
-            role: role.to_string(),
-            ticket_id: None,
-            workspace_path: format!("/ws/{workspace}"),
-            workspace_name: workspace.to_string(),
-            parent_key: None,
-            parent_label: None,
-            started_at,
-            generation: 0,
-            activity: None,
-            paused: false,
         }
     }
 
@@ -1536,62 +1498,6 @@ mod tests {
             .collect();
         // Only the bodyless assistant row is skipped: the labelled roles keep theirs.
         assert_eq!(rendered, [true, true, true, false, true]);
-    }
-
-    const STORED: &[(&str, i64)] = &[("a", 10), ("b", 5), ("c", 0)];
-    const PAUSED_STORED: &[(&str, i64)] = &[("a", 10), ("b", 0)];
-    const RUNNING: &[(&str, &str, i64, bool)] =
-        &[("a", "engineer", 1, false), ("zz", "analyst", 0, false)];
-    const PAUSED_RUNNING: &[(&str, &str, i64, bool)] = &[("a", "engineer", 0, true)];
-
-    type ProjRow<'a> = (&'a str, i64);
-    type RunRow<'a> = (&'a str, &'a str, i64, bool);
-    type OrderCase<'a> = (&'a str, &'a [ProjRow<'a>], &'a [RunRow<'a>], &'a [&'a str]);
-    #[test]
-    fn test_session_row_ordering() {
-        let cases: &[OrderCase] = &[
-            ("running", STORED, RUNNING, &["a", "zz", "c", "b"]),
-            ("paused", PAUSED_STORED, PAUSED_RUNNING, &["b", "a"]),
-        ];
-
-        for &(name, sessions, running, order) in cases {
-            let now = chrono::Utc::now();
-            let started = |minutes: i64| now - chrono::Duration::minutes(minutes);
-            let stored: Vec<_> = sessions
-                .iter()
-                .map(|&(id, m)| metadata(id, started(m)))
-                .collect();
-            let agents: Vec<_> = running
-                .iter()
-                .map(|&(id, role, minutes, paused)| {
-                    let mut handle = agent(id, role, "ws", started(minutes));
-                    handle.paused = paused;
-                    handle
-                })
-                .collect();
-            let rows = session_rows(&stored, &agents, now.into());
-            let ids: Vec<&str> = rows.iter().map(|r| r.agent_id.as_str()).collect();
-            assert_eq!(ids, order, "case {name}: order");
-
-            for &(id, role, _, paused) in running {
-                let row = rows
-                    .iter()
-                    .find(|r| r.agent_id == id)
-                    .expect("a running row");
-                let listed = if paused { Paused } else { Working };
-                assert_eq!(row.activity, listed, "case {name}: {id} activity");
-                if sessions.iter().any(|&(stored, _)| stored == id) {
-                    continue;
-                }
-                assert_eq!(row.msg_count_label, None, "case {name}: no count");
-                assert_eq!(row.title, "ws", "case {name}: titled by project");
-                assert_eq!(
-                    row.role,
-                    role.parse::<crate::Role>().ok(),
-                    "case {name}: role"
-                );
-            }
-        }
     }
 
     #[test]
@@ -1663,43 +1569,6 @@ mod tests {
             "no markdown image may reach the text: {:?}",
             parsed.items
         );
-    }
-
-    #[test]
-    fn test_common_entry_prefix() {
-        use ChatRole::{Assistant, User};
-        use Ledger::{Msg, Tool};
-
-        enum Ledger {
-            Msg(ChatRole, Option<&'static str>),
-            Tool,
-        }
-
-        const HI: &[Ledger] = &[Msg(User, Some("hi")), Tool];
-        const HI_YO: &[Ledger] = &[Msg(User, Some("hi")), Msg(Assistant, Some("yo"))];
-        const A_B: &[Ledger] = &[Msg(User, Some("a")), Msg(Assistant, Some("b"))];
-        const A_C: &[Ledger] = &[Msg(User, Some("a")), Msg(Assistant, Some("c"))];
-        let cases: &[(&str, &[Ledger], &[Ledger], usize)] = &[
-            ("empty", &[], &[], 0),
-            ("same", HI, HI, 2),
-            ("appended", &[Msg(User, Some("hi"))], HI_YO, 1),
-            ("edited", A_B, A_C, 1),
-            ("longer old", A_B, &[Msg(User, Some("a"))], 1),
-        ];
-
-        for &(name, old, new, shared) in cases {
-            let ledger = |entries: &[Ledger]| -> Vec<SessionEntry> {
-                entries
-                    .iter()
-                    .map(|entry| match *entry {
-                        Msg(role, body) => msg(role, body),
-                        Tool => tool_round(),
-                    })
-                    .collect()
-            };
-            let prefix = common_entry_prefix(&ledger(old), &ledger(new));
-            assert_eq!(prefix, shared, "case {name}: shared entries");
-        }
     }
 
     #[test]

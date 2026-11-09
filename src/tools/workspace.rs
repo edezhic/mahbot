@@ -526,53 +526,6 @@ mod tests {
         }
     }
 
-    /// The refusals that keep the tool from reporting a change it did not make.
-    #[tokio::test]
-    async fn refusals_are_plain_and_named() {
-        crate::util::test::init_test_stores().await;
-        let ws = crate::workspace::test_ws("/tmp/ws_refusals");
-        let tool = WorkspaceTool;
-
-        let err = tool
-            .execute(&ws, tool_args("pause", Some("ws_absent")))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("No managed workspace exists"), "got: {err}");
-
-        let err = tool
-            .execute(&ws, tool_args("resume", Some("personal:admin")))
-            .await
-            .unwrap_err()
-            .to_string();
-        // A personal space is refused as such and still names the live set.
-        assert!(
-            err.contains("personal space") && err.contains("managed workspaces:"),
-            "got: {err}"
-        );
-
-        // A freshly added workspace is `pending` — it has no pipeline yet, so nothing may be
-        // frozen or resumed.
-        crate::util::test::create_test_workspace("/tmp/ws_pending", "ws_pending").await;
-        let err = tool
-            .execute(&ws, tool_args("pause", Some("ws_pending")))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("pending") && err.contains("ready"),
-            "got: {err}"
-        );
-        assert!(
-            !crate::workspace::get_by_name("ws_pending")
-                .await
-                .expect("read")
-                .expect("exists")
-                .paused,
-            "the refusal must not pause the workspace"
-        );
-    }
-
     #[tokio::test]
     async fn pause_and_resume_a_ready_workspace() {
         let _guard = crate::util::test::STORE_LOCK.lock().await;

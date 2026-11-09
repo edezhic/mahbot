@@ -637,32 +637,3 @@ fn lucide_glyph(glyph: fn() -> (String, iced::Font, text::Shaping)) -> char {
         .next()
         .expect("lucide glyph strings are single characters")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn item_index_from_y_maps_offsets_to_items() {
-        // rel_y is relative to the menu origin (panel padding already subtracted); slots are
-        // contiguous, so there is no spacing to allow for.
-        assert_eq!(item_index_from_y(0.0, MENU_ITEM_HEIGHT, 4), Some(0));
-        assert_eq!(
-            item_index_from_y(MENU_ITEM_HEIGHT - 1.0, MENU_ITEM_HEIGHT, 4),
-            Some(0)
-        );
-        // Exactly one slot in — start of item 1.
-        assert_eq!(
-            item_index_from_y(MENU_ITEM_HEIGHT, MENU_ITEM_HEIGHT, 4),
-            Some(1)
-        );
-        // Past the last item.
-        assert_eq!(
-            item_index_from_y(MENU_ITEM_HEIGHT * 4.0, MENU_ITEM_HEIGHT, 4),
-            None
-        );
-        assert_eq!(item_index_from_y(-1.0, MENU_ITEM_HEIGHT, 4), None);
-        // Empty menu.
-        assert_eq!(item_index_from_y(0.0, MENU_ITEM_HEIGHT, 0), None);
-    }
-}

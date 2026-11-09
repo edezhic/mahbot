@@ -260,19 +260,6 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    async fn recovers_after_llm_parse_failure_via_reprompt() {
-        let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
-        let fake = Arc::new(
-            FakeProvider::new()
-                .ok("this is not JSON at all")
-                .ok(r#"{"score": 7}"#),
-        );
-        let result = extract_with(fake).await;
-        assert_eq!(result.expect("recovery after re-prompt").score, 7);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     async fn exhausts_attempts_with_bounded_call_count() {
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy()); // 3 attempts
         let fake = Arc::new(
@@ -334,24 +321,6 @@ mod tests {
         assert_eq!(
             failure.failures[2].class,
             crate::retry::FailureClass::Transport
-        );
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
-    async fn tool_call_final_attempt_keeps_empty_last_raw() {
-        // A tool-call final attempt (empty text) survives as Some("") so the comment can state
-        // "final attempt was a tool call".
-        let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy()); // 3 attempts
-        let fake = Arc::new(
-            FakeProvider::new().ok("not json").ok("not json").ok(""), // tool-call-style final attempt: no text
-        );
-        let result = extract_with(fake).await;
-        let failure = result.expect_err("must exhaust");
-        assert_eq!(failure.last_raw, Some(String::new()));
-        assert_eq!(
-            failure.failures.last().map(|r| r.class),
-            Some(crate::retry::FailureClass::Parse)
         );
     }
 

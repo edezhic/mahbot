@@ -742,16 +742,6 @@ impl TicketFixture {
         self
     }
 
-    pub(crate) fn created_at(mut self, created_at: &str) -> Self {
-        self.0.created_at = created_at.into();
-        self
-    }
-
-    pub(crate) fn done_at(mut self, done_at: Option<&str>) -> Self {
-        self.0.done_at = done_at.map(str::to_string);
-        self
-    }
-
     pub(crate) fn comment(mut self, role: &str, content: &str, created_at: &str) -> Self {
         self.0.comments.push(TicketComment {
             role: role.into(),

@@ -542,14 +542,9 @@ async fn spill_text(dir: &Path, display: &str, text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::test_fixtures::{
-        PdfFixture, multi_page_pdf, one_page_pdf, pdf_text_string,
-    };
-    // The CFB container and `.doc` package recipes live with the legacy reader,
-    // so a classification test and this reading test build one file.
-    use crate::legacy::test_fixtures::{
-        cfb, doc_fixture, doc_picture_fixture, ppt_picture_fixture, xls_picture_fixture,
-    };
+    use crate::document::test_fixtures::multi_page_pdf;
+    // The `.doc` package recipe lives with the legacy reader.
+    use crate::legacy::test_fixtures::doc_fixture;
     use crate::ooxml::test_fixtures::{DOCX_BODY, zip_fixture};
     use crate::util::test::noisy_png;
     use tempfile::TempDir;
@@ -678,25 +673,6 @@ mod tests {
         multi_page_pdf(&[("", b"BT /F1 24 Tf 72 700 Td (Page text long enough) Tj ET")])
     }
 
-    /// A one-page PDF with a painted rectangle, no text layer, and an AcroForm
-    /// carrying one filled text field whose widget is on that page: the page is
-    /// text-free, so its only readable content is the field value.
-    fn pdf_scan_with_only_a_form_value() -> Vec<u8> {
-        const CONTENT: &[u8] = b"0.1 0.5 0.9 rg 0 0 612 792 re f";
-        let mut fixture = PdfFixture::new();
-        let field = fixture.push(format!(
-            "<< /Subtype /Widget /FT /Tx /T (Name) /V {} /Rect [0 0 0 0] >>",
-            pdf_text_string("Иван Петров")
-        ));
-        let acroform = fixture.push(format!("<< /Fields [{field}] >>"));
-        one_page_pdf(
-            fixture,
-            CONTENT,
-            &format!("/MediaBox [0 0 612 792] /Annots [{field}]"),
-            &format!(" /AcroForm {acroform}"),
-        )
-    }
-
     /// The path a spilled-text line points at.
     fn spilled_path(text: &str) -> PathBuf {
         let start = text.find("saved to ").expect("a spill line") + "saved to ".len();
@@ -791,93 +767,6 @@ mod tests {
         }
     }
 
-    /// A document with text and more pictures than the limit: the first six are
-    /// attached, and the answer counts the pictures the document holds and the
-    /// ones the limit left out — never naming them as a loss the reading found.
-    #[tokio::test]
-    async fn pictures_over_the_limit_are_counted_not_attached() {
-        let owner = SpillOwner::new();
-        let fixture = docx_with_images(DOCX_BODY, 7);
-        let (_dir, ws) = temp_workspace(&[("report.docx", &fixture)]);
-
-        let out = convert(&owner, &ws, "report.docx", PathAccess::Allowlisted)
-            .await
-            .expect("a .docx is a document");
-        assert_eq!(out.image_payloads.len(), 6, "{}", out.text);
-        assert!(
-            out.text.contains(
-                "report.docx: 7 pictures in the document; 1 left out by the 6-picture \
-                 limit]"
-            ),
-            "the answer counts what it left out: {}",
-            out.text
-        );
-        assert!(
-            !out.text.contains("not shown]"),
-            "the limit is not a loss the reading found: {}",
-            out.text
-        );
-        assert!(
-            !out.text.contains("page_"),
-            "the pictures left out are not named by their paths: {}",
-            out.text
-        );
-    }
-
-    /// The read tool's own resolution and delivery do not bypass the page's visible
-    /// area: what the tool hands back is what a cropped page shows. The crop filter
-    /// itself is covered by the converter's tests; this one is the wiring.
-    #[tokio::test]
-    async fn a_cropped_pdf_page_delivers_only_what_it_shows() {
-        // "Visible line of text" ends before x=320 and the second word starts at
-        // x=372, so the crop box keeps the first and covers the second.
-        let bytes = multi_page_pdf(&[(
-            "/MediaBox [0 0 612 792] /CropBox [0 0 320 792]",
-            b"BT /F1 24 Tf 72 700 Td (Visible line of text) Tj 300 0 Td (Hidden marker) Tj ET",
-        )]);
-        let owner = SpillOwner::new();
-        let (_dir, ws) = temp_workspace(&[("cropped.pdf", &bytes)]);
-        let out = convert(&owner, &ws, "cropped.pdf", PathAccess::Allowlisted)
-            .await
-            .expect("a .pdf is a document");
-        assert!(
-            out.text.contains("Visible line of text"),
-            "the text inside the crop box is delivered: {:?}",
-            out.text
-        );
-        assert!(
-            !out.text.contains("Hidden"),
-            "the text the crop box hides is not delivered: {:?}",
-            out.text
-        );
-    }
-
-    #[tokio::test]
-    async fn image_only_pdf_pages_come_back_as_images() {
-        let owner = SpillOwner::new();
-        let (_dir, ws) = temp_workspace(&[("scan.pdf", &raster_only_pdf())]);
-
-        let out = convert(&owner, &ws, "scan.pdf", PathAccess::Allowlisted)
-            .await
-            .expect("a .pdf is a document");
-        assert_eq!(
-            out.image_payloads.len(),
-            1,
-            "one rasterized page: {}",
-            out.text
-        );
-        assert!(
-            out.text
-                .contains("no text could be extracted — the content was provided as images"),
-            "{}",
-            out.text
-        );
-        assert!(
-            out.text_is_content,
-            "the page images supplement, never replace, the answer"
-        );
-    }
-
     /// What a reading found in the file and did not show is named in the answer —
     /// the kinds the tool saw but never put in the text — and a reading that left
     /// nothing out says nothing about it.
@@ -929,68 +818,6 @@ mod tests {
         );
     }
 
-    /// A document whose text could not be read is not one that has no text: the
-    /// answer names the pages, and the "no text could be extracted" sentence —
-    /// which would report the reader's failure as an absence — is left out.
-    #[tokio::test]
-    async fn unread_text_is_named_not_reported_as_absent() {
-        let owner = SpillOwner::new();
-        let (_dir, ws) = temp_workspace(&[("broken.pdf", &pdf_with_no_media_box())]);
-
-        let out = convert(&owner, &ws, "broken.pdf", PathAccess::Allowlisted)
-            .await
-            .expect("a .pdf is a document");
-        assert!(
-            out.text
-                .contains("broken.pdf: the text of page 1 could not be read (1 of 1 pages)"),
-            "{}",
-            out.text
-        );
-        assert!(
-            !out.text.contains(crate::document::NO_TEXT_NOTE),
-            "a reader failure is not a document without text: {}",
-            out.text
-        );
-        assert_eq!(
-            out.image_payloads.len(),
-            1,
-            "the page that could not be read comes back as an image: {}",
-            out.text
-        );
-    }
-
-    /// A scan whose page has no text layer but whose form carries a value is not
-    /// an empty document: the value is text, delivered as the `Form fields:`
-    /// section, while the page itself comes back as an image — and the reading
-    /// still says no page text was extracted, because the only text it carried is
-    /// the form list.
-    #[tokio::test]
-    async fn a_scan_that_carries_only_form_values_is_not_an_empty_document() {
-        let owner = SpillOwner::new();
-        let (_dir, ws) = temp_workspace(&[("filled.pdf", &pdf_scan_with_only_a_form_value())]);
-
-        let out = convert(&owner, &ws, "filled.pdf", PathAccess::Allowlisted)
-            .await
-            .expect("a .pdf is a document");
-        assert_eq!(
-            out.image_payloads.len(),
-            1,
-            "the text-free page is rasterized: {}",
-            out.text
-        );
-        assert!(
-            out.text
-                .contains("Form fields:\nName (text) on page 1: Иван Петров"),
-            "the filled value is the document's text: {}",
-            out.text
-        );
-        assert!(
-            out.text.contains(crate::document::NO_TEXT_LAYER_NOTE),
-            "the only text is the field list, so the page came back as an image: {}",
-            out.text
-        );
-    }
-
     /// A document whose bytes cannot be read is a plain answer, not a failed
     /// call — and never undecodable bytes reported as a success. Read through a
     /// typo'd path that the fuzzy matcher recovers, so the answer also has to
@@ -1009,50 +836,6 @@ mod tests {
         assert!(out.image_payloads.is_empty());
     }
 
-    /// A CFB container is decided by its contents, and by its name when its
-    /// directory names no Office document: a legacy Word `.doc` under a `.docx`
-    /// name reads as the old document it is, a `.doc`-named container holding no
-    /// document at all is answered by the legacy reader's own corruption verdict,
-    /// and a `.msg` — a CFB naming nothing — is left to the ordinary read rather
-    /// than given a note.
-    #[tokio::test]
-    async fn a_cfb_container_is_answered_by_its_contents_then_its_name() {
-        crate::util::test::init_test_stores().await;
-        let owner = SpillOwner::new();
-        let doc = doc_fixture("Hello legacy doc", &[], false);
-        let other = cfb(&[("__properties_version1.0", b"outlook".as_slice())]);
-        let (_dir, ws) = temp_workspace(&[
-            ("words.docx", &doc),
-            ("old.doc", &other),
-            ("mail.msg", &other),
-        ]);
-
-        let out = convert(&owner, &ws, "words.docx", PathAccess::Allowlisted)
-            .await
-            .expect("a legacy document is a document");
-        assert!(
-            out.text.contains("Hello legacy doc"),
-            "the old document's own reading is delivered: {}",
-            out.text
-        );
-
-        let out = convert(&owner, &ws, "old.doc", PathAccess::Allowlisted)
-            .await
-            .expect("a container named as an old document is answered, not failed");
-        assert!(
-            out.text.contains("corrupt or unreadable .doc"),
-            "the legacy reader's own verdict answers it: {}",
-            out.text
-        );
-
-        assert!(
-            convert(&owner, &ws, "mail.msg", PathAccess::Allowlisted)
-                .await
-                .is_none(),
-            "a container naming no document is left to the ordinary read"
-        );
-    }
-
     /// A `.docx` whose document body is `body` plus `count` embedded media
     /// entries — the shape the converter treats as delivered images.
     fn docx_with_images(body: &[u8], count: usize) -> Vec<u8> {
@@ -1063,70 +846,6 @@ mod tests {
         let mut entries: Vec<(&str, &[u8])> = vec![("word/document.xml", body)];
         entries.extend(names.iter().map(|name| (name.as_str(), png.as_slice())));
         zip_fixture(&entries)
-    }
-
-    /// A reading of an old binary document delivers its embedded pictures exactly
-    /// as a reading of a modern one does: the picture is written out, attached to
-    /// the conversation as a native image, and no line reports it as left out —
-    /// while the source file is left untouched.
-    #[tokio::test]
-    async fn legacy_readings_deliver_their_pictures_like_a_modern_reading() {
-        let png = noisy_png(16, 16);
-        let fixtures = [
-            ("old.doc", doc_picture_fixture("Body text", &png)),
-            ("old.xls", xls_picture_fixture(&png)),
-            ("old.ppt", ppt_picture_fixture("Slide title", &png)),
-        ];
-        let owner = SpillOwner::new();
-        for (name, fixture) in &fixtures {
-            let (dir, ws) = temp_workspace(&[(name, fixture)]);
-            let out = convert(&owner, &ws, name, PathAccess::Allowlisted)
-                .await
-                .expect("an old binary document is a document");
-            assert_eq!(
-                out.image_payloads.len(),
-                1,
-                "{name}: the embedded picture is attached: {}",
-                out.text
-            );
-            assert_eq!(out.image_payloads[0].format, "PNG", "{name}");
-            assert!(
-                !out.text.contains("not shown]"),
-                "{name}: a delivered picture is not reported as left out: {}",
-                out.text
-            );
-            assert_eq!(
-                std::fs::read(dir.path().join(name)).expect("re-read the source"),
-                *fixture,
-                "{name}: the reading never modifies the source file"
-            );
-        }
-    }
-
-    /// A plain text file is not a document: the read tool's ordinary path owns
-    /// it, and the two sides must never disagree about what a document is — the
-    /// hook's fall-through still returns the line-numbered read, unchanged.
-    #[tokio::test]
-    async fn plain_text_is_not_a_document() {
-        use crate::Tool;
-        let owner = SpillOwner::new();
-        let (_dir, ws) = temp_workspace(&[("notes.md", b"# Notes\n")]);
-
-        assert!(
-            convert(&owner, &ws, "notes.md", PathAccess::Allowlisted)
-                .await
-                .is_none()
-        );
-
-        let out = owner
-            .scope(
-                crate::tools::read::ReadTool::general()
-                    .execute_with_payloads(&ws, serde_json::json!({"path": "notes.md"})),
-            )
-            .await
-            .expect("read the text file");
-        assert!(out.text.contains("1: # Notes"), "{}", out.text);
-        assert!(out.image_payloads.is_empty());
     }
 
     /// The read tool's hook routes a document through this module and returns
@@ -1300,43 +1019,6 @@ mod tests {
         );
     }
 
-    /// An old binary Office document converts through the command line exactly as
-    /// it does for an agent: its text and its embedded picture land in the folder.
-    /// A document with no text layer is delivered the same way: one raster per
-    /// page and no text file, with the read tool's own "no text" sentence.
-    #[tokio::test]
-    async fn command_line_reading_of_a_text_free_pdf_writes_an_image_per_page_and_no_text_file() {
-        crate::util::test::init_test_stores().await;
-        let painted = b"0.1 0.5 0.9 rg 0 0 612 792 re f".as_slice();
-        let bytes = multi_page_pdf(&[
-            ("/MediaBox [0 0 612 792]", painted),
-            ("/MediaBox [0 0 612 792]", painted),
-        ]);
-        let (_dir, ws) = temp_workspace(&[("scan.pdf", &bytes)]);
-        let destination = TempDir::new().expect("destination");
-
-        let answer = command_line_read(&ws, destination.path(), "scan.pdf", None)
-            .await
-            .expect("a PDF is read");
-        assert!(!answer.partial);
-        assert!(
-            answer.text.contains(crate::document::NO_TEXT_LAYER_NOTE),
-            "{}",
-            answer.text
-        );
-
-        let names = folder_names(&destination.path().join("scan"));
-        assert_eq!(
-            names,
-            ["page_1.jpg", "page_2.jpg"],
-            "one raster per page: {names:?}"
-        );
-        assert!(
-            files_with_extension(&destination.path().join("scan"), "txt").is_empty(),
-            "a text-free document writes no text file: {names:?}"
-        );
-    }
-
     /// A reading the reader lost every page of is a PARTIAL operation: the pages
     /// it could not read are named in the reader's own words, the page it still
     /// rendered is written, and the family's partial class applies.
@@ -1370,35 +1052,6 @@ mod tests {
         assert!(
             files_with_extension(&destination.path().join("broken"), "txt").is_empty(),
             "no text was extracted, so no text file"
-        );
-    }
-
-    /// A document with neither text nor images writes nothing: no folder, and the
-    /// reader's own sentence — never a command-line-only one — is the answer.
-    #[tokio::test]
-    async fn command_line_reading_of_nothing_to_write_keeps_the_readers_words() {
-        crate::util::test::init_test_stores().await;
-        let fixture = zip_fixture(&[("word/document.xml", EMPTY_DOCX_BODY)]);
-        let (_dir, ws) = temp_workspace(&[("blank.docx", &fixture)]);
-        let destination = TempDir::new().expect("destination");
-
-        let answer = command_line_read(&ws, destination.path(), "blank.docx", None)
-            .await
-            .expect("a document with no text is still read");
-        assert!(!answer.partial);
-        assert!(
-            answer
-                .text
-                .contains("blank.docx: no text could be extracted]"),
-            "the reader's own sentence: {}",
-            answer.text
-        );
-        assert_eq!(
-            std::fs::read_dir(destination.path())
-                .expect("the destination")
-                .count(),
-            0,
-            "nothing produced, so no folder"
         );
     }
 

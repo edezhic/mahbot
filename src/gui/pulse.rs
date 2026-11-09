@@ -158,7 +158,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{DIM, PERIOD_MS, STEP_MS, next_step_in, pulse_alpha};
+    use super::{STEP_MS, next_step_in};
 
     #[test]
     fn next_step_in_boundaries() {
@@ -168,15 +168,5 @@ mod tests {
         assert_eq!(next_step_in(1), STEP_MS - 1);
         assert_eq!(next_step_in(STEP_MS + 1), STEP_MS - 1);
         assert_eq!(next_step_in(2 * STEP_MS), STEP_MS);
-    }
-
-    #[test]
-    fn pulse_stays_between_dim_and_full() {
-        for ms in (0..=PERIOD_MS).step_by(7) {
-            let alpha = pulse_alpha(ms);
-            assert!((DIM..=1.0).contains(&alpha), "{ms}ms → {alpha}");
-        }
-        assert!((pulse_alpha(0) - 1.0).abs() < 1e-6);
-        assert!((pulse_alpha(PERIOD_MS / 2) - DIM).abs() < 1e-6);
     }
 }

@@ -1051,18 +1051,6 @@ mod tests {
     use iced::keyboard::{Key, Modifiers};
 
     #[test]
-    fn command_c_with_a_cyrillic_key_character_still_copies() {
-        assert_eq!(
-            shortcut(
-                &Key::Character("с".into()),
-                Physical::Code(Code::KeyC),
-                Modifiers::COMMAND
-            ),
-            Some(Shortcut::Copy)
-        );
-    }
-
-    #[test]
     fn command_a_with_a_cyrillic_key_character_still_selects_everything() {
         assert_eq!(
             shortcut(

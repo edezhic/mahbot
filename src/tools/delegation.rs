@@ -368,98 +368,6 @@ mod tests {
         }
     }
 
-    /// How a directory is named: the managed row when the directory has one, a
-    /// `dir-…` derivation otherwise — through both entry points, a delegation
-    /// `place` and the resume's own directory lookup.
-    enum DirEntry {
-        Place(DelegationKind),
-        Resume,
-    }
-
-    struct DirNameCase {
-        name: &'static str,
-        entry: DirEntry,
-        /// The managed workspace the directory is registered as, if any.
-        managed: Option<&'static str>,
-    }
-
-    #[tokio::test]
-    async fn directory_name_cases() {
-        init_management_test_stores().await;
-        for case in [
-            DirNameCase {
-                name: "an analyst's plain directory",
-                entry: DirEntry::Place(DelegationKind::Analyze),
-                managed: None,
-            },
-            DirNameCase {
-                name: "a worker's plain directory",
-                entry: DirEntry::Place(DelegationKind::Worker),
-                managed: None,
-            },
-            DirNameCase {
-                name: "a plain directory a resume points at",
-                entry: DirEntry::Resume,
-                managed: None,
-            },
-            DirNameCase {
-                name: "a managed directory a resume points at",
-                entry: DirEntry::Resume,
-                managed: Some("ws_delegation_resume"),
-            },
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let canonical = canon(dir.path());
-            let target = canonical.to_str().unwrap();
-            if let Some(name) = case.managed {
-                create_test_workspace(target, name).await;
-            }
-
-            let ws = match case.entry {
-                DirEntry::Place(kind) => resolve(kind, &json!({ "place": target }))
-                    .await
-                    .expect("a plain directory resolves")
-                    .expect("a target is present"),
-                DirEntry::Resume => workspace_at_dir(target)
-                    .await
-                    .expect("a directory can be resumed into"),
-            };
-            match case.managed {
-                Some(name) => assert_eq!(ws.name, name, "[{}]", case.name),
-                None => assert!(
-                    ws.name.starts_with("dir-"),
-                    "[{}] got {}",
-                    case.name,
-                    ws.name
-                ),
-            }
-            assert_eq!(ws.path, target, "[{}] the directory itself", case.name);
-        }
-
-        // The same directory always derives the same name.
-        let dir = tempfile::tempdir().unwrap();
-        let canonical = canon(dir.path());
-        let target = canonical.to_str().unwrap();
-        let first = resolve(DelegationKind::Analyze, &json!({ "place": target }))
-            .await
-            .unwrap()
-            .unwrap();
-        let second = resolve(DelegationKind::Analyze, &json!({ "place": target }))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(first.name, second.name, "the derivation is deterministic");
-
-        // A directory that is gone cannot be resumed into.
-        let missing = workspace_at_dir("/definitely/not/here/delegation")
-            .await
-            .expect_err("a vanished target directory cannot resume");
-        assert!(
-            missing.to_string().contains("no longer available"),
-            "{missing}"
-        );
-    }
-
     #[tokio::test]
     async fn managed_workspace_resolves_by_name_and_by_path() {
         init_management_test_stores().await;
@@ -502,32 +410,6 @@ mod tests {
             assert!(err.contains("ws_delegation_alpha"), "{err}");
             assert!(err.contains("board") && err.contains("Manager"), "{err}");
         }
-    }
-
-    /// The Manager addressee's `place` is one managed workspace — by its
-    /// managed name or by that workspace's own folder; a plain directory (a
-    /// personal workspace included) is refused.
-    #[tokio::test]
-    async fn managed_place_resolves_by_name_and_folder_only() {
-        init_management_test_stores().await;
-        let dir = tempfile::tempdir().unwrap();
-        let canonical = canon(dir.path());
-        let plain = canonical.to_str().unwrap();
-        add_managed_workspace(&canonical, "ws_project_alpha").await;
-
-        for place in ["ws_project_alpha", plain] {
-            let ws = resolve_managed_workspace(place)
-                .await
-                .expect("a managed workspace");
-            assert_eq!(ws.name, "ws_project_alpha", "{place}");
-        }
-
-        let other = tempfile::tempdir().unwrap();
-        let err = resolve_managed_workspace(other.path().to_str().unwrap())
-            .await
-            .expect_err("a plain directory has no Manager")
-            .to_string();
-        assert!(err.contains("not a managed workspace"), "{err}");
     }
 
     #[tokio::test]

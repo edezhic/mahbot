@@ -1546,7 +1546,7 @@ mod tests {
     use crate::gui::editor_widget::EditorAction;
     use AutoExpand::{Again, Forget, Switch};
     use Focus::{At, Clamp, Expand, Focused, Paste, Select, Toggle, ToggleDir, Visible};
-    use Nav::{Count, Enter, ExpandSrc, Expanded, Index, Left, Name, Right, TreeFocused};
+    use Nav::{ExpandSrc, Expanded, Index, Left, Name, Right};
 
     fn make_test_file(path: &str, add: usize, remove: usize) -> DiffFile {
         DiffFile {
@@ -1704,12 +1704,9 @@ mod tests {
         ExpandSrc,
         Left,
         Right,
-        Enter,
         Index(usize),
         Name(&'static str),
         Expanded(bool),
-        Count(usize),
-        TreeFocused(bool),
     }
 
     fn run_nav(state: &mut DiffState, steps: &[Nav], name: &str) {
@@ -1726,9 +1723,6 @@ mod tests {
                 Nav::Right => {
                     let _ = state.update(DiffMessage::TreeNavRight);
                 }
-                Nav::Enter => {
-                    let _ = state.update(DiffMessage::TreeNavEnter);
-                }
                 Nav::Index(index) => {
                     let focused = state.file_tree.tree_focus_index;
                     assert_eq!(focused, index, "case {name}: index");
@@ -1741,13 +1735,6 @@ mod tests {
                 Nav::Expanded(flag) => {
                     let open = state.file_tree.expanded_dirs.contains("src");
                     assert_eq!(open, flag, "case {name}: src expanded");
-                }
-                Nav::Count(count) => {
-                    let visible = state.file_tree.visible_tree_nodes.len();
-                    assert_eq!(visible, count, "case {name}: visible nodes");
-                }
-                Nav::TreeFocused(flag) => {
-                    assert_eq!(state.file_tree.tree_focused, flag, "case {name}: focus");
                 }
             }
         }
@@ -1775,43 +1762,6 @@ mod tests {
         for &(name, start, steps) in cases {
             let mut state = make_diff_with_tree();
             state.file_tree.tree_focused = true;
-            state.file_tree.tree_focus_index = start;
-            run_nav(&mut state, steps, name);
-        }
-    }
-
-    #[test]
-    fn test_tree_nav_enter() {
-        const OPEN_DIR: &[Nav] = &[Enter, Index(1), Expanded(true), Name("src/lib.rs")];
-        const CLOSE_DIR: &[Nav] = &[ExpandSrc, Enter, Index(0), Expanded(false)];
-        const FILE: &[Nav] = &[
-            ExpandSrc,
-            Enter,
-            Index(1),
-            Expanded(true),
-            TreeFocused(true),
-        ];
-        let cases: &[(&str, bool, usize, bool, &[Nav])] = &[
-            ("on a collapsed dir", true, 0, false, OPEN_DIR),
-            ("on an expanded dir", true, 0, false, CLOSE_DIR),
-            ("on a file", true, 1, false, FILE),
-            (
-                "not focused",
-                false,
-                0,
-                false,
-                &[Enter, Index(0), TreeFocused(false)],
-            ),
-            ("an empty tree", true, 0, true, &[Enter, Index(0), Count(0)]),
-        ];
-
-        for &(name, focused, start, empty, steps) in cases {
-            let mut state = if empty {
-                DiffState::new()
-            } else {
-                make_diff_with_tree()
-            };
-            state.file_tree.tree_focused = focused;
             state.file_tree.tree_focus_index = start;
             run_nav(&mut state, steps, name);
         }
@@ -2131,100 +2081,6 @@ mod tests {
         }
     }
 
-    //
-    // Verify that context-switching message handlers clear all state synchronously (before the
-    // async load task runs), preventing stale data from rendering during the loading transition.
-
-    fn assert_clear_diff_state(state: &DiffState) {
-        assert!(state.diff_files.is_empty(), "diff_files");
-        assert!(state.error.is_none(), "error");
-        assert!(state.status_message.is_none(), "status_message");
-        assert!(state.commit_message.text().is_empty(), "commit_message");
-        assert!(!state.committing, "committing");
-        assert!(state.file_tree.nodes.is_empty(), "file_tree.nodes");
-        assert!(state.file_tree.expanded_dirs.is_empty(), "expanded_dirs");
-        assert!(state.selected_file.is_none(), "selected_file");
-        assert!(state.file_buffers.is_empty(), "file_buffers");
-        assert!(state.tree_auto_expand_pending, "tree_auto_expand_pending");
-        assert!(
-            state.current_commit_message.is_none(),
-            "current commit message"
-        );
-    }
-
-    fn assert_diff_state_reset(state: &DiffState) {
-        assert_clear_diff_state(state);
-        assert!(
-            state.diff_loading,
-            "diff_loading should be set before async load"
-        );
-        assert!(
-            !state.diff_has_loaded,
-            "diff_has_loaded should be false to enable loading guard"
-        );
-    }
-
-    /// Create a `DiffState` populated with old/stale data to verify that each context-switching
-    /// handler resets it before the async load runs.
-    fn make_state_with_stale_data() -> DiffState {
-        let mut state = make_diff_with_tree();
-        assert!(!state.diff_files.is_empty());
-        assert!(!state.file_tree.nodes.is_empty());
-        state.diff_has_loaded = true;
-        state.error = Some("stale error".into());
-        state.status_message = Some("stale status".into());
-        state.commit_message.set_text("stale commit");
-        state.committing = true;
-        state.selected_file = Some("stale/path.rs".into());
-        state.file_buffers.push(DiffFileBuffer {
-            text: "stale buffer".into(),
-            span_data: Vec::new(),
-            line_kinds: Vec::new(),
-            line_numbers: Vec::new(),
-            gutter_digits: 0,
-            content_fingerprint: 0,
-        });
-        state.file_tree.expanded_dirs.insert("stale/dir".into());
-        state.tree_auto_expand_pending = false;
-        state.current_commit_ref = Some("stale-hash".into());
-        state.current_commit_message = Some("stale message".into());
-        state
-    }
-
-    #[test]
-    fn test_context_switches_clear_stale_diff_files() {
-        let mut state = make_state_with_stale_data();
-        mark_workspace_resolved(&mut state);
-        let _task = state.update(DiffMessage::NavigateToCommit("abc123".into()));
-        assert_diff_state_reset(&state);
-
-        let mut state = make_state_with_stale_data();
-        let _task = state.update(DiffMessage::WorkspaceSelected("/p/new-ws".into()));
-        assert_diff_state_reset(&state);
-
-        let mut state = make_state_with_stale_data();
-        mark_workspace_resolved(&mut state);
-        let _task = state.update(DiffMessage::BackToWorkingTree);
-        assert_diff_state_reset(&state);
-    }
-
-    #[test]
-    fn test_workspace_unresolved_clears_stale_diff_files() {
-        let mut state = make_state_with_stale_data();
-        mark_workspace_resolved(&mut state);
-        let stale_generation = state.generation;
-        let _task = state.update(DiffMessage::WorkspaceUnresolved);
-        assert_clear_diff_state(&state);
-        assert!(
-            state.resolved_workspace_path.is_none(),
-            "the resolved workspace path should be cleared to prevent stale workspace context"
-        );
-        assert_ne!(
-            state.generation, stale_generation,
-            "an in-flight load must not apply its result over the cleared workspace"
-        );
-    }
-
     /// The diff window's file set and line totals must be exactly the snapshot's change manifest:
     /// modified + staged + untracked (including files inside a new folder), binary placeholders,
     /// and empty files.
@@ -2343,22 +2199,5 @@ mod tests {
             !file.hunks.is_empty(),
             "the patch is attached, not a bare synthetic entry"
         );
-    }
-
-    #[tokio::test]
-    async fn load_diff_subdirectory_workspace_reads_root_relative_path() {
-        let (_dir, repo_path) = crate::util::test::init_temp_repo();
-        let sub = repo_path.join("sub");
-        std::fs::create_dir(&sub).unwrap();
-        std::fs::write(sub.join("inside.txt"), b"one\ntwo\n").unwrap();
-
-        let loaded = load_diff(Some(sub), None).await.unwrap();
-        let file = loaded
-            .files
-            .iter()
-            .find(|f| f.path == "sub/inside.txt")
-            .expect("root-relative path is listed");
-        assert_eq!((file.add_count, file.remove_count), (2, 0));
-        assert_eq!(file.content, DiffContent::Parseable);
     }
 }

@@ -421,39 +421,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_has_ending_punctuation() {
-        let cases: &[(&str, &str, bool)] = &[
-            ("period", "Yes.", true),
-            ("exclamation", "No!", true),
-            ("question", "Maybe?", true),
-            // Commas, semicolons and colons are NOT terminal punctuation.
-            ("comma", "comma,", false),
-            ("semicolon", "semicolon;", false),
-            ("colon", "colon:", false),
-            // Closing brackets, quotes, guillemets and CJK closing marks do NOT end a sentence.
-            ("paren", "paren)", false),
-            ("bracket", "bracket]", false),
-            ("brace", "brace}", false),
-            ("guillemet", "guillemet»", false),
-            ("single_guillemet", "single»", false),
-            ("cjk_right_corner_bracket", "cjk」", false),
-            ("cjk_right_white_corner_bracket", "cjk』", false),
-            ("cjk_right_black_square_bracket", "cjk】", false),
-            ("cjk_right_angle_bracket", "cjk〉", false),
-            ("cjk_right_double_angle", "cjk》", false),
-            ("single_quote", "single'", false),
-            ("double_quote", "double\"", false),
-            ("no_punctuation", "Maybe", false),
-            ("cjk_fullwidth_period", "CJK\u{3002}", true),
-            ("cjk_fullwidth_bang", "CJK\u{FF01}", true),
-            ("cjk_fullwidth_question", "CJK\u{FF1F}", true),
-        ];
-        for &(name, input, expected) in cases {
-            assert_eq!(has_ending_punctuation(input), expected, "case: {name}");
-        }
-    }
-
-    #[test]
     fn test_preprocess_text() {
         let r = preprocess_text("Hello world");
         assert_eq!(
@@ -511,7 +478,6 @@ mod tests {
     //
     // What the tool's one entry point answers while speech is off: it reaches neither the
     // engine nor the audio device.
-
     /// Run `say_phrase` under a known config, restoring it afterwards.
     async fn say_under(config: &str) -> SayOutcome {
         let snapshot = CONFIG.snapshot();

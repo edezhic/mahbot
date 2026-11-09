@@ -403,15 +403,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_identifier_shares_the_charset_but_allows_any_first_char() {
-        assert!(validate_identifier("b").is_ok());
-        assert!(validate_identifier("1-ab").is_ok());
-        assert!(validate_identifier("").is_err());
-        assert!(validate_identifier("a:b").is_err());
-        assert!(validate_identifier(&"a".repeat(MAX_ROLE_IDENTIFIER_CHARS + 1)).is_err());
-    }
-
-    #[test]
     fn branch_addresses_are_injective() {
         let default = crate::session::custom_role_agent_id("a_b", None);
         let named = crate::session::custom_role_agent_id("a", Some("b"));

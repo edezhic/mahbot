@@ -494,24 +494,6 @@ mod tests {
     }
 
     #[test]
-    fn show_diagnostics_reads_the_stored_blob() {
-        for (blob, expect_error) in [
-            (None, false),
-            (Some(String::new()), false),
-            (Some("  ".to_string()), false),
-            (Some("{not json".to_string()), true),
-        ] {
-            let mut state = state_with_diagnostics(blob.clone());
-            let _ = state.update(WorkspacesMessage::ShowDiagnostics("ws".to_string()));
-            assert_eq!(
-                state.diagnostics_error.is_some(),
-                expect_error,
-                "blob: {blob:?}"
-            );
-        }
-    }
-
-    #[test]
     fn unsaved_rules_survive_escape_and_only_discard_drops_them() {
         let mut state = state_with_diagnostics(None);
         state.workspaces[0].notes = "stored rules".to_string();

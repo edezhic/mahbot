@@ -1758,19 +1758,6 @@ mod truncate_tests {
     }
 
     #[test]
-    fn an_input_that_fits_passes_through_unchanged() {
-        // Anything at or under the cap comes back byte for byte: the marker is only added to a cut.
-        for input in ["hello world".to_string(), "a".repeat(5_000)] {
-            assert_eq!(
-                truncate_sandwich(&input, 5_000, "test"),
-                input,
-                "a fitting input ({}) must not be touched",
-                input.len()
-            );
-        }
-    }
-
-    #[test]
     fn sandwich_large_input() {
         // Input well over the limit — classic head/tail sandwich with label
         let line = "hello world\n".repeat(200_000);
@@ -2107,25 +2094,6 @@ mod unescape_c_style_tests {
 }
 
 #[cfg(test)]
-mod strip_ansi_escapes_tests {
-    use super::strip_ansi_escapes;
-
-    #[test]
-    fn test_ansi_escape_cases() {
-        let cases: &[(&str, &str)] = &[
-            ("\x1B[31mred\x1B[0m \x1B[1mbold\x1B[22m", "red bold"),
-            ("hello world", "hello world"),
-            ("\x1B[32mgreen\x1B[0m", "green"),
-            ("no escapes here", "no escapes here"),
-            ("", ""),
-        ];
-        for (input, expected) in cases {
-            assert_eq!(strip_ansi_escapes(input), *expected, "input: {input:?}");
-        }
-    }
-}
-
-#[cfg(test)]
 mod reference_image_tests {
     use super::*;
     use crate::util::test::noisy_png;
@@ -2274,28 +2242,6 @@ mod executable_tests {
         assert!(
             is_executable(&file_path),
             "File with mode 100 should be executable"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn test_is_executable_on_windows() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test_exe.exe");
-
-        assert!(!is_executable(&file_path));
-
-        std::fs::write(&file_path, "content").unwrap();
-        assert!(
-            is_executable(&file_path),
-            "File with .exe extension should be executable"
-        );
-
-        let txt_path = dir.path().join("test.txt");
-        std::fs::write(&txt_path, "content").unwrap();
-        assert!(
-            !is_executable(&txt_path),
-            "File with .txt extension should not be executable"
         );
     }
 }

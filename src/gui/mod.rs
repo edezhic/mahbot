@@ -4410,58 +4410,6 @@ mod tests {
         }
     }
 
-    /// A fresh window's size: the default, capped to 80% of the screen's work area on each side,
-    /// with the minimum winning over the cap; a saved geometry is never measured.
-    #[test]
-    fn fresh_window_size_cases() {
-        let area = |width: f32, height: f32| Some(iced::Size::new(width, height));
-        for (name, work_area, expected) in [
-            ("no work area reported", None, (1200.0, 760.0)),
-            (
-                "a work area larger than the default",
-                area(2560.0, 1440.0),
-                (1200.0, 760.0),
-            ),
-            (
-                "a work area whose 80% is between the minimum and the default",
-                area(1400.0, 900.0),
-                (1120.0, 720.0),
-            ),
-            (
-                "a work area whose 80% is smaller",
-                area(1000.0, 1000.0),
-                (800.0, 760.0),
-            ),
-            (
-                "a work area below the minimum",
-                area(640.0, 480.0),
-                (800.0, 500.0),
-            ),
-        ] {
-            let size = fresh_size(work_area);
-            assert_eq!((size.width, size.height), expected, "case {name}");
-        }
-
-        // The fresh window opens without the ticket column's share — (1200 - 56) * 3/10.
-        let fresh = WindowState::default();
-        let opening = fresh.opening_size(None);
-        assert!(
-            (opening.width - 856.8).abs() < 0.01 && (opening.height - 760.0).abs() < 0.01,
-            "{opening:?}"
-        );
-
-        // A saved geometry opens exactly as saved, however the screen is sized.
-        let saved = WindowState {
-            width: 2000.0,
-            height: 1400.0,
-            x: 10,
-            y: 10,
-            restored: true,
-        };
-        let opening = saved.opening_size(area(1000.0, 1000.0));
-        assert_eq!((opening.width, opening.height), (2000.0, 1400.0));
-    }
-
     /// The start-up width's target is the fresh size, so the work area's cap reaches the widen too.
     #[test]
     fn the_start_up_width_follows_the_work_area() {

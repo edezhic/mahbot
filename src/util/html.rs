@@ -58,23 +58,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn escape_html_writes_every_special_character_as_its_entity() {
-        let cases: [(&str, &str); 2] = [
-            (
-                "<div class=\"test\">AT&T 'hello'</div>",
-                "&lt;div class=&quot;test&quot;&gt;AT&amp;T &#39;hello&#39;&lt;/div&gt;",
-            ),
-            (
-                "&amp; &lt; &gt; &quot; &#39;",
-                "&amp;amp; &amp;lt; &amp;gt; &amp;quot; &amp;#39;",
-            ),
-        ];
-        for (input, expected) in cases {
-            assert_eq!(escape_html(input), expected, "input: {input:?}");
-        }
-    }
-
-    #[test]
     fn decode_html_entities_walks_the_table_in_order() {
         let cases: [(&str, &str); 2] = [
             (

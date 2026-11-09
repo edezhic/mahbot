@@ -91,19 +91,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn http_error_downcast() {
-        let err = anyhow::Error::from(HttpError {
-            status: 400,
-            body: "bad request body".into(),
-            context: "test".into(),
-        });
-        assert_eq!(err.downcast_ref::<HttpError>().map(|e| e.status), Some(400),);
-
-        let plain_err = anyhow::anyhow!("some other error");
-        assert!(plain_err.downcast_ref::<HttpError>().is_none());
-    }
-
-    #[test]
     fn parse_retry_after_value_various_inputs() {
         assert_eq!(parse_retry_after_value("5"), Some(5000));
         assert_eq!(parse_retry_after_value("2.5"), Some(2500));

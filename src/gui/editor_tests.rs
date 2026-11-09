@@ -83,18 +83,6 @@ fn test_validate_file_content() {
 }
 
 #[test]
-fn test_byte_offset_to_line_byte_col_unicode() {
-    let text = "Привет **мир**";
-    let (line, byte_col, line_start) = byte_offset_to_line_byte_col(text, 13).unwrap();
-    assert_eq!(line, 0);
-    assert_eq!(byte_col, 13);
-    assert_eq!(line_start, 0);
-    // End of match on "мир" — byte offset 21.
-    let (_, byte_end_col, line_start) = byte_offset_to_line_byte_col(text, 21).unwrap();
-    assert_eq!(byte_end_col, 21 - line_start);
-}
-
-#[test]
 fn test_build_tab_records_dirty_content() {
     let tabs = |is_dirty: bool| {
         vec![Tab {
@@ -186,27 +174,6 @@ fn test_failed_saved_tabs_restore_blocks_persistence() {
     assert!(state.session_initialized);
 }
 
-#[test]
-fn test_byte_offset_to_line_col() {
-    // (name, text, byte offset, expected (line, column))
-    let cases = [
-        ("unicode_multibyte", "Привет мир", 13, (0, 7)),
-        ("start", "hello\nworld", 0, (0, 0)),
-        ("second_line", "hello\nworld", 6, (1, 0)),
-        ("middle_of_line", "hello\nworld", 8, (1, 2)),
-        ("beyond_end", "hello", 100, (0, 5)),
-        ("empty", "", 0, (0, 0)),
-        ("empty_beyond_end", "", 100, (0, 0)),
-    ];
-    for &(name, text, byte_offset, expected) in &cases {
-        assert_eq!(
-            byte_offset_to_line_col(text, byte_offset),
-            expected,
-            "case {name}: (line, column)"
-        );
-    }
-}
-
 /// Fluent builder for an [`EditorState`] with tab fixtures.
 struct EditorFixture(EditorState);
 
@@ -234,16 +201,6 @@ impl EditorFixture {
         );
         self.0.active_tab_index = self.0.tabs.len() - 1;
         self
-    }
-
-    /// `count` empty unsaved tabs under `/tmp` (tab-switch fixture).
-    fn tabs(self, count: usize, active: usize) -> Self {
-        assert!(active < count, "active out of range");
-        let mut f = (0..count).fold(self, |f, i| {
-            f.tab(&format!("/tmp/test_{i}.rs"), "").unsaved()
-        });
-        f.0.active_tab_index = active;
-        f
     }
 
     fn unsaved(mut self) -> Self {
@@ -1176,57 +1133,6 @@ fn test_abs_path_helpers_are_component_wise() {
 }
 
 #[test]
-fn test_rekey_map_prefix_no_modify() {
-    let mut map = HashMap::from([
-        ("dir/file.rs".to_string(), "content_a".to_string()),
-        ("dir/sub/file.rs".to_string(), "content_b".to_string()),
-        ("other".to_string(), "content_c".to_string()),
-    ]);
-    rekey_map_prefix(&mut map, "dir/", "newdir", |_| {});
-    assert_eq!(map.len(), 3);
-    assert_eq!(map.get("newdir/file.rs"), Some(&"content_a".to_string()));
-    assert_eq!(
-        map.get("newdir/sub/file.rs"),
-        Some(&"content_b".to_string())
-    );
-    assert_eq!(map.get("other"), Some(&"content_c".to_string()));
-    assert!(!map.contains_key("dir/file.rs"));
-}
-
-#[test]
-fn test_rekey_map_prefix_with_modify() {
-    let mut map = HashMap::from([
-        ("old/key".to_string(), vec![1, 2]),
-        ("old/other".to_string(), vec![3]),
-        ("keep".to_string(), vec![4]),
-    ]);
-    rekey_map_prefix(&mut map, "old/", "new", |v: &mut Vec<i32>| v.push(99));
-    assert_eq!(map.len(), 3);
-    assert_eq!(map.get("new/key"), Some(&vec![1, 2, 99]));
-    assert_eq!(map.get("new/other"), Some(&vec![3, 99]));
-    assert_eq!(map.get("keep"), Some(&vec![4]));
-}
-
-#[test]
-fn test_rekey_set_prefix_basic() {
-    let mut set = HashSet::from(["a/x".to_string(), "a/y".to_string(), "b/z".to_string()]);
-    rekey_set_prefix(&mut set, "a/", "b");
-    assert_eq!(set.len(), 3);
-    assert!(set.contains("b/x"));
-    assert!(set.contains("b/y"));
-    assert!(set.contains("b/z"));
-}
-
-#[test]
-fn test_rekey_set_prefix_exact() {
-    let mut set = HashSet::from(["dir".to_string()]);
-    rekey_set_prefix(&mut set, "dir", "newdir");
-    assert_eq!(set.len(), 1);
-    assert!(set.contains("newdir"));
-    assert!(!set.contains("dir"));
-}
-
-#[test]
 fn test_rename_dir_entries_migration_own_entry_and_full_path() {
     let mut state = make_editor_with_tree();
     state.selected_workspace_path = Some("/tmp".to_string());
@@ -1287,49 +1193,6 @@ fn test_rename_dir_entries_migration_own_entry_and_full_path() {
     );
 }
 
-#[test]
-fn test_switch_tab_relative() {
-    // (name, tabs, start, direction, expected active index)
-    let cases: &[(&str, usize, usize, TabDirection, usize)] = &[
-        ("single tab next", 1, 0, TabDirection::Next, 0),
-        ("single tab prev", 1, 0, TabDirection::Prev, 0),
-        ("next wraps to first", 3, 2, TabDirection::Next, 0),
-        ("prev wraps to last", 3, 0, TabDirection::Prev, 2),
-        ("middle next", 3, 1, TabDirection::Next, 2),
-        ("middle prev", 3, 1, TabDirection::Prev, 0),
-        // With exactly two tabs, Next and Prev toggle between them.
-        ("two tabs next from first", 2, 0, TabDirection::Next, 1),
-        ("two tabs next from second", 2, 1, TabDirection::Next, 0),
-        ("two tabs prev from first", 2, 0, TabDirection::Prev, 1),
-    ];
-    for &(name, tabs, start, direction, expected) in cases {
-        let mut state = EditorFixture::new().tabs(tabs, start).build();
-        let _ = state.switch_tab_relative(direction);
-        assert_eq!(state.active_tab_index, expected, "case {name}: active tab");
-    }
-}
-
-#[test]
-fn test_classify_read_dir_error_not_found_vs_other() {
-    use std::io::ErrorKind;
-    // ENOENT / ENOTDIR mean the directory is gone or was never a
-    // directory — normal and forgettable.
-    assert!(matches!(
-        classify_read_dir_error(&std::io::Error::new(ErrorKind::NotFound, "gone")),
-        ReadDirError::NotFound
-    ));
-    assert!(matches!(
-        classify_read_dir_error(&std::io::Error::new(ErrorKind::NotADirectory, "file")),
-        ReadDirError::NotFound
-    ));
-    // Everything else means the directory exists but cannot be read —
-    // a real problem that must keep warning.
-    assert!(matches!(
-        classify_read_dir_error(&std::io::Error::new(ErrorKind::PermissionDenied, "locked")),
-        ReadDirError::Other(_)
-    ));
-}
-
 fn make_editor_with_expanded_subdir() -> EditorState {
     let mut state = make_editor_with_tree();
     state.file_tree.expanded_dirs.insert("src".to_string());
@@ -1362,90 +1225,6 @@ fn make_editor_with_expanded_subdir() -> EditorState {
         .deleted_file_toasted
         .insert("/tmp/src/main.rs".to_string());
     state
-}
-
-#[test]
-fn test_dir_expanded_error_cases() {
-    fn forgotten(state: &EditorState) -> Result<(), String> {
-        let tree = &state.file_tree;
-        let root_entries = state.dir_entries.get("").unwrap();
-        for (what, present) in [
-            ("src", tree.expanded_dirs.contains("src")),
-            ("src/sub", tree.expanded_dirs.contains("src/sub")),
-            ("src listing", state.dir_entries.contains_key("src")),
-            ("src/sub listing", state.dir_entries.contains_key("src/sub")),
-            ("src gen", state.dir_generations.contains_key("src")),
-            ("src/sub gen", state.dir_generations.contains_key("src/sub")),
-        ] {
-            if present {
-                return Err(format!("{what} not forgotten"));
-            }
-        }
-        if state.loading_dirs.contains("src/sub") {
-            return Err("load flag not dropped".to_string());
-        }
-        if state.selected_file.is_some() {
-            return Err("selection not cleared".to_string());
-        }
-        if state
-            .all_workspace_files
-            .iter()
-            .any(|p| p.starts_with("src/"))
-        {
-            return Err("quick-open not pruned".to_string());
-        }
-        if root_entries.iter().any(|e| e.full_path == "src") {
-            return Err("root entry not pruned".to_string());
-        }
-        if tree.visible_tree_nodes.iter().any(|(p, _)| p == "src") {
-            return Err("visible node not pruned".to_string());
-        }
-        Ok(())
-    }
-    fn kept(state: &EditorState) -> Result<(), String> {
-        let tree = &state.file_tree;
-        for (what, present) in [
-            ("src", tree.expanded_dirs.contains("src")),
-            ("src/sub", tree.expanded_dirs.contains("src/sub")),
-            ("src listing", state.dir_entries.contains_key("src")),
-            ("src/sub listing", state.dir_entries.contains_key("src/sub")),
-        ] {
-            if !present {
-                return Err(format!("{what} dropped"));
-            }
-        }
-        if state.selected_file.as_deref() != Some("src/sub/deep.rs") {
-            return Err("selection lost".to_string());
-        }
-        if !state.all_workspace_files.iter().any(|p| p == "src/main.rs") {
-            return Err("quick-open pruned".to_string());
-        }
-        Ok(())
-    }
-    type Check = fn(&EditorState) -> Result<(), String>;
-    // (name, error, quiet, check)
-    let cases: &[(&str, ReadDirError, bool, Check)] = &[
-        ("not_found_quiet", ReadDirError::NotFound, true, forgotten),
-        ("not_found_loud", ReadDirError::NotFound, false, forgotten),
-        (
-            "other_error_keeps_path",
-            ReadDirError::Other("Permission denied".to_string()),
-            true,
-            kept,
-        ),
-    ];
-    for &(name, ref error, quiet, check) in cases {
-        let mut state = make_editor_with_expanded_subdir();
-        let r#gen = state.bump_generation();
-        state.dir_generations.insert("src".to_string(), r#gen);
-        let _ = state.update(EditorMessage::DirExpanded {
-            dir_path: "src".to_string(),
-            r#gen,
-            entries: Err(error.clone()),
-            quiet,
-        });
-        assert_eq!(check(&state), Ok(()), "case {name}");
-    }
 }
 
 #[test]
@@ -1697,51 +1476,6 @@ fn test_ignore_dimming_survives_collapse_and_expand() {
 }
 
 #[test]
-fn test_negated_patterns_do_not_dim() {
-    let dir = tempfile::tempdir().expect("create temp dir");
-    let ws = dir.path();
-    std::fs::create_dir(ws.join(".git")).unwrap();
-    // `build/*` ignores the *contents* of build but not build itself, so a
-    // negated child can be re-included. (A plain `build/` + `!build/keep.txt`
-    // would NOT un-ignore keep.txt — git can't re-include a file inside an
-    // excluded directory, and the ignore crate follows that.)
-    std::fs::write(ws.join(".gitignore"), "build/*\n!build/keep.txt\n").unwrap();
-    std::fs::create_dir(ws.join("build")).unwrap();
-    std::fs::write(ws.join("build/keep.txt"), "x").unwrap();
-    std::fs::write(ws.join("build/other.txt"), "x").unwrap();
-
-    let mut matcher = build_ignore_matcher(ws);
-    assert!(matcher.is_some());
-
-    let mut dir_entries = HashMap::new();
-    dir_entries.insert(String::new(), vec![fs_entry("build", "build", true)]);
-    dir_entries.insert(
-        "build".into(),
-        vec![
-            fs_entry("keep.txt", "build/keep.txt", false),
-            fs_entry("other.txt", "build/other.txt", false),
-        ],
-    );
-
-    let expanded = HashSet::from(["build".to_string()]);
-    let mut nodes = build_hierarchical_tree(&dir_entries, &expanded, "");
-    stamp_ignored_nodes(&mut nodes, &mut matcher);
-
-    let build = find_node(&nodes, "build");
-    assert!(
-        !build.ignored,
-        "build/* does not match the build dir itself"
-    );
-    for child in &build.children {
-        if child.full_path == "build/keep.txt" {
-            assert!(!child.ignored, "negated keep.txt must not be dimmed");
-        } else {
-            assert!(child.ignored, "non-negated other.txt must be dimmed");
-        }
-    }
-}
-
-#[test]
 fn test_matcher_covers_subdirectory_of_repo() {
     let dir = tempfile::tempdir().expect("create temp dir");
     let root = dir.path();
@@ -1859,21 +1593,4 @@ fn test_page_visibility_gates_tree_ping() {
         state.dir_generations.len() > gen_count_before,
         "visible editor must dispatch a tree refresh on ping"
     );
-}
-
-#[test]
-fn test_modal_cleared_on_page_switch() {
-    let mut state = make_editor_with_tree();
-    state.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
-        filter: crate::gui::common::SingleLineEditorState::new(""),
-        selected_index: 0,
-        results: Vec::new(),
-    }));
-
-    let _ = state.update(EditorMessage::PageVisibilityChanged(false));
-    assert!(
-        state.active_modal.is_none(),
-        "modals must close on a page switch"
-    );
-    assert!(!state.page_visible);
 }

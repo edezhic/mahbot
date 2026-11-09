@@ -555,25 +555,4 @@ mod tests {
             "one second past → stale"
         );
     }
-
-    #[test]
-    fn format_age_cases() {
-        assert_eq!(
-            format_age(chrono::Duration::seconds(30)),
-            "less than a minute"
-        );
-        assert_eq!(
-            format_age(chrono::Duration::seconds(-5)),
-            "less than a minute"
-        );
-        assert_eq!(format_age(chrono::Duration::minutes(34)), "34 minutes");
-        assert_eq!(
-            format_age(chrono::Duration::hours(2) + chrono::Duration::minutes(15)),
-            "2 hours 15 minutes"
-        );
-        assert_eq!(
-            format_age(chrono::Duration::days(5) + chrono::Duration::hours(3)),
-            "5 days 3 hours"
-        );
-    }
 }

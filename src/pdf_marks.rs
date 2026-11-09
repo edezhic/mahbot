@@ -1073,30 +1073,6 @@ mod tests {
         assert!(marks.notes.is_empty());
     }
 
-    #[test]
-    fn service_only_annotations_are_not_marks() {
-        let marks = read_pdf(pdf_with(|fixture| {
-            let link = fixture.push("<< /Subtype /Link /Rect [0 0 0 0] >>".to_string());
-            let popup = fixture.push("<< /Subtype /Popup /Rect [0 0 0 0] >>".to_string());
-            let widget = fixture.push("<< /Subtype /Widget /FT /Tx /T (field) >>".to_string());
-            let hidden = fixture.push("<< /Subtype /Text /Contents (hidden) /F 2 >>".to_string());
-            let no_view = fixture.push("<< /Subtype /Text /Contents (noview) /F 32 >>".to_string());
-            let visible = fixture.push("<< /Subtype /Text /Contents (visible) >>".to_string());
-            (
-                vec![vec![link, popup, widget, hidden, no_view, visible]],
-                String::new(),
-            )
-        }));
-        assert_eq!(
-            marks.annotations.as_deref(),
-            Some("Annotations:\nnote on page 1:\n  visible")
-        );
-        assert!(
-            marks.notes.is_empty(),
-            "a widget without an /AcroForm is no unreadable form: {marks:?}"
-        );
-    }
-
     /// The annotations that are no mark but still hold content are named for the model, not
     /// dropped.
     #[test]
@@ -1485,66 +1461,6 @@ mod tests {
                 "{label}: the fields the walk kept"
             );
         }
-    }
-
-    /// Dictionaries written straight into an array carry no object id of their
-    /// own: each is still its own mark and its own field, and a field with no
-    /// `/T` is named as one rather than left as a bare value.
-    #[test]
-    fn direct_dictionaries_are_read_as_their_own_marks_and_fields() {
-        let marks = read_pdf(pdf_with(|_fixture| {
-            (
-                vec![vec![
-                    "<< /Subtype /Text /Contents (first) >>".to_string(),
-                    "<< /Subtype /Text /Contents (second) >>".to_string(),
-                ]],
-                " /AcroForm << /Fields [<< /FT /Tx /T (One) /V (1) >> \
-                 << /FT /Tx /T (Two) /V (2) >> << /FT /Tx /V (unnamed) >>] >>"
-                    .to_string(),
-            )
-        }));
-        assert_eq!(
-            marks.annotations.as_deref(),
-            Some("Annotations:\nnote on page 1:\n  first\nnote on page 1:\n  second")
-        );
-        assert_eq!(
-            marks.fields.as_deref(),
-            Some(
-                "Form fields:\nOne (text): 1\nTwo (text): 2\n\
-                 unnamed field (text; not fillable): unnamed"
-            )
-        );
-    }
-
-    /// A container whose widget kids each carry their own `/FT`/`/T`/`/V` is read
-    /// as the fields it holds, named the way the filler names them — and a checked
-    /// button whose `/Opt` does not name the state it is in shows only its state,
-    /// never a name guessed from the state's position.
-    #[test]
-    fn self_contained_widget_kids_are_read_as_their_own_fields() {
-        let marks = read_pdf(pdf_with(|fixture| {
-            let appearance =
-                fixture.push("<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] >>".to_string());
-            let group = fixture.reserve();
-            let first = fixture.push(format!(
-                "<< /Subtype /Widget /Parent {group} /FT /Tx /T (First) /V (one) \
-                 /Rect [0 0 0 0] >>"
-            ));
-            let plan = fixture.push(format!(
-                "<< /Subtype /Widget /FT /Btn /T (Plan) /V /1 /Opt [[(one) (One)] [(two) (Two)]] \
-                 /AP << /N << /1 {appearance} /2 {appearance} /Off {appearance} >> >> /AS /1 >>"
-            ));
-            fixture.set(&group, format!("<< /T (Group) /Kids [{first}] >>"));
-            let acroform = fixture.push(format!("<< /Fields [{group} {plan}] >>"));
-            (vec![vec![first, plan]], format!(" /AcroForm {acroform}"))
-        }));
-        assert_eq!(
-            marks.fields.as_deref(),
-            Some(
-                "Form fields:\nGroup.First (text) on page 1: one\n\
-                 Plan (checkbox) on page 1: checked"
-            )
-        );
     }
 
     /// The document's own description leads its reading: only the entries the

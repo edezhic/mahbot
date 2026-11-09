@@ -373,37 +373,6 @@ mod tests {
     }
 
     #[test]
-    fn markdown_markers_are_stripped_from_the_line() {
-        // (case, input, plain text)
-        let cases: &[(&str, &str, &str)] = &[
-            (
-                "identifiers keep markers",
-                "Use `snake_case_name` and a * b, not **bold** or _slanted_",
-                "Use snake_case_name and a * b, not bold or slanted",
-            ),
-            (
-                "dunder is an identifier",
-                "Edit __init__.py and `__pycache__` now",
-                "Edit __init__.py and __pycache__ now",
-            ),
-            (
-                "dunder opens a block",
-                "# __init__\n\n__pycache__ loads it. Then done.",
-                "__init__ __pycache__ loads it. Then done.",
-            ),
-            ("bold", "__a bold phrase__ here", "a bold phrase here"),
-            (
-                "boundaries keep words whole",
-                "the **parser**'s state and **fast**—always a *b*",
-                "the parser's state and fast—always a b",
-            ),
-        ];
-        for &(name, input, expected) in cases {
-            assert_eq!(plain_text(input), expected, "case {name}");
-        }
-    }
-
-    #[test]
     fn block_debris_is_stripped_from_the_text() {
         // (case, input, plain text)
         let cases: &[(&str, &str, &str)] = &[

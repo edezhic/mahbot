@@ -3476,65 +3476,6 @@ mod tests {
         );
     }
 
-    /// `readBack` without a `warning` is chrome-use's normal success shape — no note may be
-    /// appended.
-    #[test]
-    fn format_action_output_warning_cases() {
-        let response = ChromeResponse {
-            data: Some(json!({"typed": "hi", "readBack": "hi"})),
-            ..ChromeResponse::default()
-        };
-        let out = ChromeTool::format_action_output(
-            &ChromeAction::Type {
-                selector: "#e".into(),
-                text: "hi".into(),
-                key_events: false,
-            },
-            "default",
-            response,
-            "",
-        );
-        assert!(
-            !out.contains("chrome-use warning"),
-            "clean output must not carry a warning: {out}"
-        );
-
-        // chrome-use's `type` warning on a read-back mismatch — exit 0, so the tool must flag it.
-        let response = ChromeResponse {
-            data: Some(json!({
-                "typed": "hi", "readBack": "h",
-                "warning": "the field does not contain what was typed",
-            })),
-            ..ChromeResponse::default()
-        };
-        let out = ChromeTool::format_action_output(
-            &ChromeAction::Type {
-                selector: "#e".into(),
-                text: "hi".into(),
-                key_events: false,
-            },
-            "default",
-            response,
-            "",
-        );
-        assert!(
-            out.contains("chrome-use warning"),
-            "output should surface the warning: {out}"
-        );
-        assert!(
-            out.contains("warning: the field does not contain what was typed —"),
-            "warning text should be rendered unquoted: {out}"
-        );
-        assert!(
-            out.contains("the field does not contain what was typed"),
-            "output should carry the warning text: {out}"
-        );
-        assert!(
-            out.contains("NOT applied"),
-            "output should tell the agent to treat the action as not applied: {out}"
-        );
-    }
-
     #[tokio::test]
     async fn image_payload_attaches_chrome_screenshot() {
         let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));

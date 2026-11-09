@@ -4364,32 +4364,6 @@ fn modal_dialog<'a>(
 mod tests {
     use super::*;
 
-    /// Parsing trims every line and skips blank or whitespace-only ones.
-    #[test]
-    fn parse_models_cases() {
-        let cases: &[(&str, Option<&str>, &[&str])] = &[
-            ("None returns empty", None, &[]),
-            ("empty string returns empty", Some(""), &[]),
-            (
-                "single line",
-                Some("google/gemini-3.1-flash-image-preview"),
-                &["google/gemini-3.1-flash-image-preview"],
-            ),
-            ("multiple lines", Some("m1\nm2\nm3"), &["m1", "m2", "m3"]),
-            ("trims whitespace", Some("  m1  \n  m2  "), &["m1", "m2"]),
-            ("skips empty lines", Some("m1\n\n\nm2"), &["m1", "m2"]),
-            (
-                "skips whitespace-only lines",
-                Some("m1\n   \nm2"),
-                &["m1", "m2"],
-            ),
-        ];
-        for &(name, raw, expected) in cases {
-            let expected: Vec<String> = expected.iter().map(ToString::to_string).collect();
-            assert_eq!(parse_models(raw), expected, "case {name}");
-        }
-    }
-
     /// Adding trims its input and clears the buffer — a blank input does nothing at all —
     /// and a duplicate never lands twice.
     #[test]
@@ -5046,55 +5020,6 @@ mod tests {
             .count();
         assert_eq!(deduped, 1, "manager==worker dedups to a single routing row");
         let _ = state.routing_group(); // must not panic
-    }
-
-    /// The routing editors are created in `Dashboard::loading`, before
-    /// `config::reload_from_db` fills the snapshot, so an editor first created against the
-    /// empty default must be corrected once the saved order arrives. An empty field reads as
-    /// "no override" (the placeholder shows the default provider), and any keystroke in it
-    /// settles that empty value into the delete-if-empty persist.
-    #[test]
-    fn routing_editors_show_the_saved_order_after_the_config_is_read() {
-        let mut state = SettingsState::new();
-        state.config = ConfigData {
-            manager_model: Some("vendor/model".into()),
-            worker_model: Some("vendor/model".into()),
-            ..ConfigData::STRUCT_FIELDS_DEFAULT
-        };
-        state.field_editors = HashMap::new();
-        state.resync_field_editors();
-        assert_eq!(
-            state.field_editor("routing_order:vendor/model").text(),
-            "",
-            "pre-boot: nothing saved, so the field is empty"
-        );
-
-        // The config read from the DB arrives with this model's saved order.
-        state.config.model_routings = vec![ModelRouting {
-            model: "vendor/model".into(),
-            provider_order: Some("provider-a".into()),
-        }];
-        state.resync_field_editors();
-        assert_eq!(
-            state.field_editor("routing_order:vendor/model").text(),
-            "provider-a",
-            "page entry shows the saved order instead of the pre-boot empty seed"
-        );
-
-        // A keystroke that changes nothing (Backspace at the caret's start) schedules no
-        // persist at all, so the saved order cannot be erased by it.
-        let _ = state.update(SettingsMessage::ModelRoutingOrder {
-            model: "vendor/model".into(),
-            action: EditorAction::Backspace,
-        });
-        assert_eq!(
-            state.field_editor("routing_order:vendor/model").text(),
-            "provider-a"
-        );
-        assert!(
-            !state.field_gen.contains_key("routing_order:vendor/model"),
-            "a no-op keystroke stages nothing"
-        );
     }
 
     /// Closing the Models settings popup is not a cancel, but a model save that

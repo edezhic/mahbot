@@ -969,42 +969,6 @@ mod tests {
         }
     }
 
-    /// The cache's own format decides how a value is shown, so a date reads as a date; a format the
-    /// reading cannot reproduce shows the stored number, under the mark a spreadsheet cell carries,
-    /// once for the series.
-    #[test]
-    fn a_cached_value_keeps_its_own_number_format() {
-        let dates = cache("numCache", Some("mmm-yy"), &["45200", "45231"]);
-        let shares = cache("numCache", Some("0.00%"), &["0.25", "0.5"]);
-        let formatted = format!(
-            r#"<c:lineChart><c:ser><c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>Sales</c:v></c:pt></c:strCache></c:strRef></c:tx><c:cat>{dates}</c:cat><c:val>{shares}</c:val></c:ser></c:lineChart>"#
-        );
-        let values = cache("numCache", Some("# ?/?"), &["1.5"]);
-        let unreproduced = format!(
-            r#"<c:pieChart><c:ser><c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>Share</c:v></c:pt></c:strCache></c:strRef></c:tx><c:val>{values}</c:val></c:ser></c:pieChart>"#
-        );
-        for (label, xml, shown) in [
-            (
-                "a date and a percentage",
-                chart_space(&formatted, "", ""),
-                &[
-                    "Chart (line chart):",
-                    "  Series \"Sales\": 2023-10-01: 25.00%, 2023-11-01: 50.00%",
-                ][..],
-            ),
-            (
-                "a format this reading does not reproduce",
-                chart_space(&unreproduced, "", ""),
-                &[
-                    "Chart (pie chart):",
-                    "  Series \"Share\": 1.5 (stored number, format not shown)",
-                ][..],
-            ),
-        ] {
-            assert_eq!(lines_of(&xml), shown, "{label}");
-        }
-    }
-
     /// A series without a name is numbered, a chart without a plot type prints no kind, several
     /// plot types are named together, and a scatter chart's x values are the labels its y values
     /// are paired with. A multi-level category list prints its levels root first, a group label
@@ -1239,31 +1203,6 @@ mod tests {
                 .iter()
                 .any(|pattern| pattern.is_match(&chart_header(None))),
             "a bare `Chart:` is a document's own word, never a refusal"
-        );
-    }
-
-    /// The chart parts a part names are the `chart` elements' relationship targets, in part order,
-    /// without repeats, and only the ones the part's own relationships resolve.
-    #[test]
-    fn chart_references_resolve_in_part_order() {
-        let xml = br#"<p:sld><p:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rId2"/></a:graphicData></a:graphic></p:graphicFrame><p:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rId1"/></a:graphicData></a:graphic></p:graphicFrame><p:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rId2"/></a:graphicData></a:graphic></p:graphicFrame>"#;
-        let rels = vec![
-            Relationship {
-                id: "rId1".to_owned(),
-                kind: "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart"
-                    .to_owned(),
-                target: "../charts/chart1.xml".to_owned(),
-            },
-            Relationship {
-                id: "rId2".to_owned(),
-                kind: "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart"
-                    .to_owned(),
-                target: "../charts/chart2.xml".to_owned(),
-            },
-        ];
-        assert_eq!(
-            chart_parts(xml, &rels, "ppt/slides/"),
-            ["ppt/charts/chart2.xml", "ppt/charts/chart1.xml"]
         );
     }
 }

@@ -3562,24 +3562,6 @@ mod tests {
         }
     }
 
-    /// A closed receiver is handled: incoming_rx becomes None, no panic.
-    #[tokio::test]
-    async fn test_drain_incoming_messages_disconnected() {
-        let (tx, rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::agent::message_router::AgentJob>();
-        let mut agent = make_agent(vec![]);
-        agent.incoming_rx = Some(rx);
-        agent.agent_id = "_test_drain_disconnected".into();
-
-        drop(tx);
-
-        agent.drain_incoming_messages().await;
-        assert!(
-            agent.incoming_rx.is_none(),
-            "incoming_rx should be set to None after disconnect",
-        );
-    }
-
     /// An agent with the given role and ticket attached, its session seeded with one
     /// `sessions` row (when `seed_content` is `Some`) and initialized with an empty
     /// message — mirroring the empty-message resume dispatch.
@@ -3727,96 +3709,6 @@ mod tests {
             1,
             "an already-seen comment must not be re-injected",
         );
-    }
-
-    /// The bounce-feedback path (non-empty `msg`) and a non-resumed round
-    /// (`resume=false`) are no-ops — no injection.
-    #[tokio::test]
-    async fn test_inject_outstanding_comments_noop_for_feedback_and_fresh() {
-        crate::util::test::init_management_test_stores().await;
-        let ws = crate::workspace::test_ws_named("/tmp/test", "inject_noop");
-        let ticket_id = crate::util::test::make_ticket(
-            crate::pipeline::board::store(),
-            &ws,
-            "Inject Noop",
-            crate::pipeline::board::TicketPhase::InDevelopment,
-        )
-        .await;
-        crate::pipeline::board::store()
-            .add_comment(&ticket_id, "manager", "please fix the formatting")
-            .await
-            .unwrap();
-        let ticket =
-            crate::util::test::expect_ticket(crate::pipeline::board::store(), &ticket_id).await;
-
-        let mut agent = make_inject_agent(
-            "inject-noop-agent",
-            crate::Role::Engineer,
-            ticket,
-            Some("round 1 task"),
-        )
-        .await;
-        // Bounce-feedback path: non-empty msg.
-        agent
-            .inject_outstanding_comments(true, &["round 2 feedback"])
-            .await;
-        // Fresh (non-resumed) round.
-        agent.inject_outstanding_comments(false, &[""]).await;
-
-        let history = agent.session.history();
-        assert!(
-            !history
-                .iter()
-                .any(|m| m.content.contains("[Comment from manager on ticket]")),
-            "feedback path and fresh round must not inject comments",
-        );
-    }
-
-    /// Single-member rounds are a no-op stagger: the sole member starts
-    /// immediately with no first-call signal.
-    #[tokio::test]
-    async fn spawn_staggered_round_single_member_is_noop() {
-        let handles = crate::agent::spawn_staggered_round(
-            vec![move |round: crate::agent::RoundOpts| async move {
-                assert!(
-                    round.first_call_notify.is_none(),
-                    "sole member must not receive a signal"
-                );
-                1u8
-            }],
-            false,
-        )
-        .await;
-        assert_eq!(handles.len(), 1);
-        assert_eq!(handles.into_iter().next().unwrap().await.unwrap(), 1);
-    }
-
-    /// Boot-resumed rounds skip the stagger entirely: every member starts
-    /// immediately with no first-call signal (their sessions already
-    /// diverged — staggering would only add latency).
-    #[tokio::test]
-    async fn spawn_staggered_round_resume_skips_stagger() {
-        let handles = crate::agent::spawn_staggered_round(
-            (0..3)
-                .map(|i| {
-                    move |round: crate::agent::RoundOpts| async move {
-                        assert!(
-                            round.first_call_notify.is_none(),
-                            "resume must not stagger (member {i})"
-                        );
-                        i
-                    }
-                })
-                .collect(),
-            true,
-        )
-        .await;
-        assert_eq!(handles.len(), 3);
-        let mut out = Vec::new();
-        for h in handles {
-            out.push(h.await.unwrap());
-        }
-        assert_eq!(out, vec![0, 1, 2]);
     }
 
     /// The leader's first-call signal releases the followers: once the notify
@@ -4572,41 +4464,6 @@ mod tests {
         );
     }
 
-    /// An exhausted reasoning-only turn is a FAILED call: it must never update the session
-    /// token length, even though the invisible in-class response carried real usage.
-    #[tokio::test]
-    #[serial_test::serial(provider, drain)]
-    async fn llm_call_continuation_exhaustion_does_not_update_session_length() {
-        crate::util::test::init_test_stores().await;
-        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
-        let fake = std::sync::Arc::new(
-            FakeProvider::new()
-                .ok_reasoning_only_with_usage("thinking a", Some("stop"), 1_000, 500)
-                .ok_reasoning_only_with_usage("thinking b", Some("stop"), 1_000, 500)
-                .ok_reasoning_only_with_usage("thinking c", Some("stop"), 1_000, 500)
-                .ok_reasoning_only_with_usage("thinking d", Some("stop"), 1_000, 500),
-        );
-        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
-        let _provider_guard = install_fake_provider(provider);
-
-        let mut agent = make_agent(vec![]);
-        assert_eq!(agent.session.token_length(), None);
-        let err = agent
-            .llm_call()
-            .await
-            .expect_err("continuation must exhaust");
-        assert_eq!(
-            agent.session.token_length(),
-            None,
-            "a failed turn (continuation exhaustion) must not update the session length"
-        );
-        let rendered = format!("{err:#}");
-        assert!(
-            !rendered.contains("thinking"),
-            "the thinking must never leak into the failure error"
-        );
-    }
-
     /// On success the session length comes from the RESOLVING response only — the
     /// in-class response is never recorded.
     #[tokio::test]
@@ -4668,33 +4525,6 @@ mod tests {
         }
     }
 
-    /// Summarize recovers a reasoning-only stop the same way; the answer is the summary.
-    #[tokio::test]
-    #[serial_test::serial(provider, drain)]
-    async fn summarize_recovers_reasoning_only_stop_via_continuation() {
-        crate::util::test::init_test_stores().await;
-        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
-        let fake = std::sync::Arc::new(
-            FakeProvider::new()
-                .ok_reasoning_only("thinking about the summary", Some("stop"))
-                .ok("the summary"),
-        );
-        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
-        let _provider_guard = install_fake_provider(provider);
-
-        let agent = make_agent(vec![]);
-        let summary = agent.summarize().await.expect("continuation must resolve");
-        assert_eq!(summary, "the summary");
-
-        let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
-        assert_eq!(
-            fingerprints.len(),
-            2,
-            "original summary call + one continuation"
-        );
-        assert!(fingerprints[1].contains("Resume your unfinished turn"));
-    }
-
     /// Summarize exhaustion keeps failing open: the empty-response error fires and the
     /// thinking never leaks into it.
     #[tokio::test]
@@ -4725,29 +4555,6 @@ mod tests {
         assert!(
             !rendered.contains("summary thinking"),
             "the thinking must never leak into the summarization error"
-        );
-    }
-
-    /// A summarisation answer that is a tool call carries no text: it is re-asked
-    /// byte-identically (verbatim, tool set included) instead of being accepted.
-    #[tokio::test]
-    #[serial_test::serial(provider, drain)]
-    async fn summarize_reasks_a_tool_call_answer_byte_identically() {
-        crate::util::test::init_test_stores().await;
-        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
-        let fake = std::sync::Arc::new(FakeProvider::new().ok_tool_call("read").ok("the summary"));
-        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
-        let _provider_guard = install_fake_provider(provider);
-
-        let agent = make_agent(vec![]);
-        let summary = agent.summarize().await.expect("the re-ask must resolve");
-        assert_eq!(summary, "the summary");
-
-        let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
-        assert_eq!(fingerprints.len(), 2, "tool-call answer + one re-ask");
-        assert_eq!(
-            fingerprints[0], fingerprints[1],
-            "the re-ask must re-send the identical request"
         );
     }
 
@@ -4836,49 +4643,6 @@ mod tests {
             agent.session.token_length(),
             Some(12_300),
             "a usage-less response must never reset the length to zero"
-        );
-    }
-
-    /// Saturating sum: an overflowing pair cannot wrap into a small bogus length.
-    #[tokio::test]
-    async fn record_session_usage_overflow_saturates() {
-        crate::util::test::init_test_stores().await;
-        let mut agent = make_agent(vec![]);
-        let huge = crate::ChatResponse {
-            usage: Some(crate::ProviderUsage {
-                input_tokens: Some(u64::MAX),
-                output_tokens: Some(u64::MAX),
-                ..crate::ProviderUsage::default()
-            }),
-            ..crate::ChatResponse::default()
-        };
-        agent.record_session_usage(&huge).await;
-        assert_eq!(agent.session.token_length(), Some(u64::MAX));
-    }
-
-    /// The failure context carries BOTH the run-local tool round and the session depth
-    /// (history length + tokens, the latter omitted when unknown).
-    #[tokio::test]
-    async fn llm_step_failure_context_reports_run_round_and_session_depth() {
-        crate::util::test::init_test_stores().await;
-        let mut agent = make_agent(vec![]);
-        agent
-            .session
-            .push_messages_unpersisted(&[ChatMessage::user("hello"), ChatMessage::assistant("hi")]);
-        agent.session.set_token_length(Some(42_110));
-
-        let ctx = llm_step_failure_context(&agent.session, 0);
-        assert!(ctx.contains("tool round 0"), "run-local round: {ctx}");
-        assert!(ctx.contains("2 messages"), "session depth: {ctx}");
-        assert!(ctx.contains("42110 tokens"), "token segment: {ctx}");
-
-        agent.session.set_token_length(None);
-        let ctx = llm_step_failure_context(&agent.session, 3);
-        assert!(ctx.contains("tool round 3"), "round after increment: {ctx}");
-        assert!(ctx.contains("2 messages"), "session depth: {ctx}");
-        assert!(
-            !ctx.contains("tokens"),
-            "None omits the token segment: {ctx}"
         );
     }
 

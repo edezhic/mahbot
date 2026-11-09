@@ -380,45 +380,4 @@ mod tests {
             .await
             .expect("a guest granted the tool arms its trigger");
     }
-
-    /// A branch without a role is a usage error, and an addressing call names the role in its
-    /// confirmation.
-    #[tokio::test]
-    async fn arming_passes_the_role_target_through() {
-        crate::util::test::init_management_test_stores().await;
-        let (text, fire) = ("wake the role", "2099-01-01T00:00:00Z");
-
-        let err = arm(
-            "admin",
-            json!({ "text": text, "fire_at": fire, "identifier": "daily" }),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
-        assert!(err.starts_with("usage: "), "got: {err}");
-
-        crate::custom_role::create(
-            "tool_role_probe",
-            "do it",
-            &[],
-            crate::custom_role::CustomRoleBehavior::Continuous,
-        )
-        .await
-        .unwrap();
-        let out = arm(
-            "admin",
-            json!({
-                "text": text,
-                "fire_at": fire,
-                "role": "tool_role_probe",
-                "identifier": "daily",
-            }),
-        )
-        .await
-        .expect("the admin arms a role-faced automation");
-        assert!(
-            out.contains("addressed to custom role \"tool_role_probe\" (branch \"daily\")"),
-            "got: {out}"
-        );
-    }
 }

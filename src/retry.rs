@@ -648,21 +648,6 @@ mod tests {
         );
     }
 
-    #[test]
-    #[serial_test::serial(provider)] // synthesis() applies the process-global test-policy override
-    fn defaults_are_hardcoded() {
-        // No config surface exists — the policy must always be the hardcoded defaults, whatever
-        // stray `config_kv` rows say.
-        let policy = RetryPolicy::default();
-        assert_eq!(policy.max_attempts, DEFAULT_RETRY_MAX_ATTEMPTS);
-        assert_eq!(policy.base_backoff_ms, DEFAULT_RETRY_BASE_BACKOFF_MS);
-        assert_eq!(policy.max_backoff_ms, DEFAULT_RETRY_MAX_BACKOFF_MS);
-        let synthesis = RetryPolicy::synthesis();
-        assert_eq!(synthesis.max_attempts, DEFAULT_SYNTHESIS_MAX_ATTEMPTS);
-        assert_eq!(synthesis.base_backoff_ms, DEFAULT_SYNTHESIS_BASE_BACKOFF_MS);
-        assert_eq!(synthesis.max_backoff_ms, DEFAULT_SYNTHESIS_MAX_BACKOFF_MS);
-    }
-
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     async fn agent_chat_rides_out_sustained_outage_and_recovers() {

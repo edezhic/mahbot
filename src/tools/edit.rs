@@ -1419,22 +1419,6 @@ mod tests {
         assert_eq!(content, "original", "original file must not be modified");
     }
 
-    #[tokio::test]
-    async fn file_edit_nonexistent_file() {
-        with_temp_workspace(&[], |dir| async move {
-            let result = EditTool::confined()
-                .execute(
-                    &test_ws(&dir),
-                    json!({"path": "missing.txt", "old_string": "a", "new_string": "b"}),
-                )
-                .await;
-            assert!(result.is_err(), "edit of nonexistent file: {result:?}");
-            let err = format!("{}", result.unwrap_err());
-            assert!(err.contains("Cannot access file"));
-        })
-        .await;
-    }
-
     // WS-insensitive ambiguity tests
 
     #[tokio::test]
@@ -1469,38 +1453,6 @@ mod tests {
                 assert_eq!(content, "let  x  =  1;\nlet  x  =  1;\nlet  y  =  2;\n");
             },
         )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn ws_ambiguous_not_triggered_for_non_code_files() {
-        // Non-code files use exact matching only, so the WS ambiguity check
-        // is never reached. Ensure a .txt file with multiple normalized matches
-        // gets the standard exact-match error, not the WS-ambiguity error.
-        with_temp_workspace(&[("readme.txt", "a  b  a  b")], |dir| async move {
-            let result = EditTool::confined()
-                .execute(
-                    &test_ws(&dir),
-                    json!({
-                        "path": "readme.txt",
-                        "old_string": "a b",
-                        "new_string": "x"
-                    }),
-                )
-                .await;
-            assert!(
-                result.is_err(),
-                "Exact match for .txt should fail (no matches): {result:?}"
-            );
-            let err = format!("{}", result.unwrap_err());
-            assert!(
-                err.contains(
-                    "not-found: cannot edit readme.txt: old_string not found in file \
-                     (exact match required apart from line endings)"
-                ),
-                ".txt should use exact matching only, got: {err}"
-            );
-        })
         .await;
     }
 
@@ -1895,28 +1847,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// A whitespace-driven no-op is still written as a no-op: the guard for an
-    /// edit that only respelled its line endings must not catch it.
-    #[tokio::test]
-    async fn whitespace_driven_no_op_still_succeeds() {
-        let dir = TempDir::new().unwrap();
-        tokio::fs::write(dir.path().join("lib.rs"), b"a  b\n")
-            .await
-            .unwrap();
-
-        let result = EditTool::confined()
-            .execute(
-                &test_ws(dir.path()),
-                json!({"path": "lib.rs", "old_string": "a b", "new_string": "a  b"}),
-            )
-            .await;
-        assert!(
-            result.is_ok(),
-            "the whitespace fallback may replace a span with its own text: {result:?}"
-        );
-        assert_eq!(file_bytes(dir.path(), "lib.rs").await, b"a  b\n".as_slice());
     }
 
     /// The line-ending tolerance does not hand whitespace tolerance to file

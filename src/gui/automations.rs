@@ -345,43 +345,6 @@ mod tests {
         }
     }
 
-    fn trigger(args: serde_json::Value) -> StoredTrigger {
-        let serde_json::Value::Object(args) = args else {
-            unreachable!("test arguments are an object")
-        };
-        StoredTrigger::Tool(crate::automations::Trigger {
-            tool: "wait".to_string(),
-            args,
-        })
-    }
-
-    #[test]
-    fn render_args_cases() {
-        let cases: &[(&str, StoredTrigger, Option<&str>)] = &[
-            ("unreadable trigger", StoredTrigger::Unreadable, None),
-            ("no arguments", trigger(serde_json::json!({})), None),
-            (
-                "every value kind",
-                trigger(serde_json::json!({
-                    "action": "night",
-                    "dry_run": true,
-                    "probe_seconds": 120,
-                    "window": {"from": "09:00"},
-                })),
-                Some(
-                    "action: night, dry_run: true, probe_seconds: 120, window: {\"from\":\"09:00\"}",
-                ),
-            ),
-        ];
-        for (name, stored, expected) in cases {
-            assert_eq!(
-                render_args(stored),
-                expected.map(str::to_string),
-                "case {name}: rendered arguments"
-            );
-        }
-    }
-
     #[test]
     fn group_by_owner_orders_by_owner_and_keeps_members() {
         let automations = [

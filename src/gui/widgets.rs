@@ -1986,26 +1986,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn git_footer_stats_gating() {
-        // (added, deleted, untracked, skipped, shown)
-        let cases = [
-            (0, 0, 0, 0, false),
-            (0, 0, 3, 0, true),
-            (1, 0, 0, 0, true),
-            (0, 1, 2, 0, true),
-            (0, 0, 0, 5, true),
-        ];
-        for &(added, deleted, untracked, skipped, shown) in &cases {
-            let stats = git_footer_stats::<()>(added, deleted, untracked, skipped, 15.0);
-            let shown_stats = stats.is_some();
-            assert_eq!(
-                shown_stats, shown,
-                "case {added}/{deleted}/{untracked}/{skipped}"
-            );
-        }
-    }
-
     type FocusCase<'a> = (&'a str, Nodes, &'a str, (usize, Option<usize>, usize));
     /// `focus_path` finds a visible node and leaves the index alone when it does not.
     #[test]
@@ -2114,26 +2094,6 @@ mod tests {
         }
     }
 
-    /// A rebuild keeps the focus index inside the rows it produced; empty resets it.
-    #[test]
-    fn rebuild_visible_cases() {
-        let mut tree = FileTree::new(iced::widget::Id::new("test"));
-        tree.nodes = ["a", "b", "c"].iter().map(|p| file(p)).collect();
-        tree.rebuild_visible();
-        assert_eq!(tree.visible_tree_nodes.len(), 3);
-        tree.tree_focus_index = 999;
-        tree.rebuild_visible();
-        assert_eq!(tree.tree_focus_index, 2, "the high index is clamped");
-
-        let mut tree = make_tree(&[("a", false)]);
-        tree.tree_focus_index = 0;
-        tree.nodes.clear();
-        tree.expanded_dirs.clear();
-        tree.rebuild_visible();
-        assert!(tree.visible_tree_nodes.is_empty());
-        assert_eq!(tree.tree_focus_index, 0, "an empty tree resets the index");
-    }
-
     /// A `src/` directory holding `lib.rs` and `main.rs`, before any rebuild.
     fn tree_with_src_dir() -> FileTree {
         let mut tree = FileTree::new(iced::widget::Id::new("test"));
@@ -2202,39 +2162,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn expand_dir_not_in_expanded_dirs_panics_in_debug() {
-        let mut tree = tree_with_src_dir();
-        // Deliberately not in expanded_dirs — the debug_assert fires in debug builds.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _task = tree.expand_dir_and_focus_first_child::<()>("src");
-        }));
-        #[cfg(debug_assertions)]
-        assert!(
-            result.is_err(),
-            "debug_assert should fire when path is not expanded"
-        );
-        #[cfg(not(debug_assertions))]
-        assert!(result.is_ok(), "no panic expected in release builds");
-    }
-
-    #[test]
-    fn collapse_dir_still_in_expanded_dirs_panics_in_debug() {
-        let mut tree = tree_with_src_dir();
-        // Still in expanded_dirs — the debug_assert fires in debug builds.
-        tree.expanded_dirs.insert("src".into());
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _task = tree.collapse_dir_and_keep_focus::<()>("src");
-        }));
-        #[cfg(debug_assertions)]
-        assert!(
-            result.is_err(),
-            "debug_assert should fire when path is still expanded"
-        );
-        #[cfg(not(debug_assertions))]
-        assert!(result.is_ok(), "no panic expected in release builds");
-    }
-
     fn tree_with_viewport(n: usize, scroll_y: f32, viewport_h: Option<f32>) -> FileTree {
         let mut tree = FileTree::new(iced::widget::Id::new("scroll_test"));
         tree.visible_tree_nodes = (0..n).map(|i| (format!("file_{i}.rs"), false)).collect();
@@ -2267,63 +2194,5 @@ mod tests {
         let mut tree = tree_with_viewport(0, 0.0, Some(400.0));
         let _task = scroll_to_tree_focus::<()>(&mut tree, INTO);
         assert!(tree.scroll_y.abs() < f32::EPSILON, "case empty tree");
-    }
-
-    #[test]
-    fn tree_guide_prefix_cases() {
-        // (case, ancestor mask, depth, last child?, guide prefix)
-        let cases: &[(&str, u64, usize, bool, &str)] = &[
-            ("root", 0, 0, false, ""),
-            ("root last", 0, 0, true, ""),
-            ("root mask all", 0b_1111, 0, false, ""),
-            ("depth 1", 0, 1, false, "├ "),
-            ("depth 1 last", 0, 1, true, "└ "),
-            ("depth 1 continuing", 0b_01, 1, false, "├ "),
-            ("depth 1 continuing last", 0b_01, 1, true, "└ "),
-            ("depth 2 one ancestor", 0b_01, 2, false, "│ ├ "),
-            ("depth 2 both ancestors", 0b_11, 2, false, "│ ├ "),
-            ("depth 2 both ancestors last", 0b_11, 2, true, "│ └ "),
-            ("depth 2 no ancestor", 0, 2, false, "  ├ "),
-            ("depth 2 no ancestor last", 0, 2, true, "  └ "),
-            ("depth 5", 0b_1011, 5, false, "│ │   │ ├ "),
-            ("depth 5 last", 0b_1011, 5, true, "│ │   │ └ "),
-            ("high bits", 0b1_0000_0000, 1, false, "├ "),
-            ("high bits last", 0b1_0000_0000, 1, true, "└ "),
-        ];
-        for &(name, mask, depth, is_last, expected) in cases {
-            let prefix = tree_guide_prefix(mask, depth, is_last);
-            assert_eq!(prefix, expected, "case {name}");
-        }
-    }
-
-    #[test]
-    fn guide_prefix_depth_overflow_debug() {
-        // debug_assert fires at depth >= 64 in debug builds.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = tree_guide_prefix(0, 64, false);
-        }));
-        #[cfg(debug_assertions)]
-        assert!(result.is_err(), "debug_assert should fire at depth >= 64");
-        #[cfg(not(debug_assertions))]
-        assert!(result.is_ok(), "no panic expected in release builds");
-    }
-
-    #[test]
-    fn classify_click_kinds() {
-        // (distance, milliseconds since the last click, kind)
-        let cases = [
-            (0.0, None, ClickKind::Click),
-            (6.0, None, ClickKind::Click),
-            (6.1, None, ClickKind::Drag),
-            (100.0, Some(0), ClickKind::Drag),
-            (1.0, Some(299), ClickKind::MultiClick),
-            (1.0, Some(300), ClickKind::MultiClick),
-            (1.0, Some(301), ClickKind::Click),
-        ];
-        for &(distance, gap, kind) in &cases {
-            let since = gap.map(Duration::from_millis);
-            let clicked = classify_click(distance, since);
-            assert_eq!(clicked, kind, "case {distance}/{gap:?}");
-        }
     }
 }

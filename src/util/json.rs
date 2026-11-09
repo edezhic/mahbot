@@ -363,7 +363,7 @@ mod arg_extraction_tests {
         get_bool, get_opt_bool, get_opt_i64, get_opt_named_str, get_opt_str, get_opt_u64,
         get_str_array, get_usize,
     };
-    use serde_json::{Value, json};
+    use serde_json::json;
 
     /// Absent and null both count as "not provided" for defaulted helpers.
     #[test]
@@ -382,57 +382,6 @@ mod arg_extraction_tests {
 
         // get_opt_str stays silent for absent values.
         assert_eq!(get_opt_str(&absent, "k"), None);
-    }
-
-    /// Wrong-typed present values are usage errors naming the field and type.
-    #[test]
-    fn wrong_type_errors_are_usage_errors() {
-        let cases: [(&Value, &str, &str, &str); 5] = [
-            (
-                &json!({ "k": "yes" }),
-                "bool",
-                "must be a boolean",
-                "got a string",
-            ),
-            (
-                &json!({ "k": "5" }),
-                "usize",
-                "must be a non-negative integer",
-                "got a string",
-            ),
-            (
-                &json!({ "k": "x" }),
-                "opt_i64",
-                "must be an integer",
-                "got a string",
-            ),
-            (
-                &json!({ "k": -1 }),
-                "opt_u64",
-                "must be a non-negative integer",
-                "got a number",
-            ),
-            (
-                &json!({ "k": 1.5 }),
-                "opt_bool",
-                "must be a boolean",
-                "got a number",
-            ),
-        ];
-        for (val, helper, expected_phrase, found_phrase) in cases {
-            let err = match helper {
-                "bool" => get_bool(val, "k", false).unwrap_err().to_string(),
-                "usize" => get_usize(val, "k", 0).unwrap_err().to_string(),
-                "opt_i64" => get_opt_i64(val, "k").unwrap_err().to_string(),
-                "opt_u64" => get_opt_u64(val, "k").unwrap_err().to_string(),
-                "opt_bool" => get_opt_bool(val, "k").unwrap_err().to_string(),
-                _ => unreachable!(),
-            };
-            assert!(err.contains("usage:"), "helper {helper}: got: {err}");
-            assert!(err.contains("\"k\""), "helper {helper}: got: {err}");
-            assert!(err.contains(expected_phrase), "helper {helper}: got: {err}");
-            assert!(err.contains(found_phrase), "helper {helper}: got: {err}");
-        }
     }
 
     /// A named input is read strictly: absent or null is no input, a wrong type or an

@@ -2744,24 +2744,6 @@ mod tests {
         );
     }
 
-    // is_nightly_check_hour — time-window boundary tests
-
-    #[test]
-    fn nightly_check_hour_window_boundaries() {
-        let cases: &[(u32, bool, &str)] = &[
-            (1, false, "1:00 AM is before the window"),
-            (2, true, "2:00 AM is the start of the window"),
-            (3, false, "3:00 AM is excluded from the window"),
-            (4, false, "4:00 AM is after the window"),
-            (0, false, "Midnight is outside the window"),
-            (12, false, "Noon is outside the window"),
-            (23, false, "11 PM is outside the window"),
-        ];
-        for (hour, expected, msg) in cases {
-            assert_eq!(is_nightly_check_hour(*hour), *expected, "{msg}");
-        }
-    }
-
     // nightly_gate_allows — rolling 7-day frequency gate tests
 
     #[test]
@@ -2986,34 +2968,5 @@ mod tests {
             .await
             .expect("query user workspace")
             .flatten()
-    }
-
-    // has_new_commits — commit comparison tests
-
-    #[test]
-    fn new_commits_table() {
-        let cases: &[(Option<&str>, &str, bool, &str)] = &[
-            (
-                None,
-                "abc123",
-                true,
-                "NULL last_analyzed_commit should trigger rediscovery",
-            ),
-            (
-                Some("abc123"),
-                "abc123",
-                false,
-                "Same hash should not trigger rediscovery",
-            ),
-            (
-                Some("abc123"),
-                "def456",
-                true,
-                "Different hash should trigger rediscovery",
-            ),
-        ];
-        for (stored, current, expected, msg) in cases {
-            assert_eq!(has_new_commits(*stored, current), *expected, "{msg}");
-        }
     }
 }

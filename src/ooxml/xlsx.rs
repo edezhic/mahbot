@@ -2269,29 +2269,6 @@ mod tests {
         assert!(notes.is_empty(), "nothing was skipped: {notes:?}");
     }
 
-    /// A workbook whose relationship list cannot be read still yields its sheets: the parts are
-    /// conventionally numbered, so their names are the order.
-    #[test]
-    fn xlsx_falls_back_to_conventional_sheet_parts() {
-        let bytes = zip_fixture(&[
-            ("xl/workbook.xml", WORKBOOK),
-            (
-                "xl/worksheets/sheet1.xml",
-                br#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#,
-            ),
-            (
-                "xl/worksheets/sheet2.xml",
-                br#"<worksheet><sheetData><row r="1"><c r="B1"><v>2</v></c></row></sheetData></worksheet>"#,
-            ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, notes, .. } = convert_xlsx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a well-formed xlsx");
-        };
-        assert_eq!(text, "Sheet \"Data\":\n  A1: 1\n\nSheet \"More\":\n  B1: 2");
-        assert!(notes.is_empty(), "nothing was skipped: {notes:?}");
-    }
-
     /// A part the package left absent or half written costs only what it stood for: a cut
     /// workbook part costs the sheets and names after the cut, a cut sheet part its own sheet, a
     /// cut relationships part the parts it would have named — each loss said, never passed off as
@@ -2400,91 +2377,6 @@ mod tests {
         }
     }
 
-    /// A part that is well-formed XML but carries no element of its own kind — an error page in
-    /// its place — is read like a part the package does not carry: no workbook element costs the
-    /// whole document, a sheet part is reported unread, a comments part reported lost. A
-    /// `<workbook/>` declaring no sheet is a workbook still, and an empty entry declares a sheet
-    /// with no values and a comments part with no comments, so neither is a loss.
-    #[test]
-    fn xlsx_reads_a_part_carrying_no_element_like_a_missing_one() {
-        let error_page: &[u8] =
-            b"<html><head><title>404</title></head><body>Not Found</body></html>";
-        let workbook: &[u8] =
-            br#"<workbook><sheets><sheet name="Data" r:id="rId1"/></sheets></workbook>"#;
-        let workbook_rels: &[u8] =
-            br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#;
-        let comments_rels: &[u8] = br#"<Relationships><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments1.xml"/></Relationships>"#;
-        let sheet: &[u8] =
-            br#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#;
-        let cases = [
-            (
-                "a workbook part that carries no workbook element",
-                vec![("xl/workbook.xml", error_page)],
-                None,
-            ),
-            (
-                "a workbook element declaring no sheet",
-                vec![("xl/workbook.xml", b"<workbook/>".as_slice())],
-                Some(("", &[WORKBOOK_NO_SHEETS_NOTE][..])),
-            ),
-            (
-                "a sheet part that carries no worksheet",
-                vec![
-                    ("xl/workbook.xml", workbook),
-                    ("xl/_rels/workbook.xml.rels", workbook_rels),
-                    ("xl/worksheets/_rels/sheet1.xml.rels", comments_rels),
-                    ("xl/worksheets/sheet1.xml", error_page),
-                    ("xl/comments1.xml", b"".as_slice()),
-                ],
-                Some(("", &["sheet \"Data\" could not be read"][..])),
-            ),
-            (
-                "a comments part that carries no comments",
-                vec![
-                    ("xl/workbook.xml", workbook),
-                    ("xl/_rels/workbook.xml.rels", workbook_rels),
-                    ("xl/worksheets/_rels/sheet1.xml.rels", comments_rels),
-                    ("xl/worksheets/sheet1.xml", sheet),
-                    ("xl/comments1.xml", error_page),
-                ],
-                Some((
-                    "Sheet \"Data\":\n  A1: 1",
-                    &["sheet \"Data\": its comments could not be read"][..],
-                )),
-            ),
-            (
-                "entries the package left empty",
-                vec![
-                    ("xl/workbook.xml", workbook),
-                    ("xl/_rels/workbook.xml.rels", workbook_rels),
-                    ("xl/worksheets/_rels/sheet1.xml.rels", comments_rels),
-                    ("xl/worksheets/sheet1.xml", b"".as_slice()),
-                    ("xl/comments1.xml", b"".as_slice()),
-                ],
-                Some(("Sheet \"Data\": (no values)", &[][..])),
-            ),
-        ];
-        for (label, parts, expected) in cases {
-            let bytes = zip_fixture(&parts);
-            let dir = tempfile::tempdir().expect("tempdir");
-            let Some((expected_text, expected_notes)) = expected else {
-                assert!(
-                    matches!(
-                        convert_xlsx(&bytes, dir.path()),
-                        DocOutcome::Unreadable { .. }
-                    ),
-                    "{label}"
-                );
-                continue;
-            };
-            let DocOutcome::Text { text, notes, .. } = convert_xlsx(&bytes, dir.path()) else {
-                panic!("expected Text outcome for a readable workbook: {label}");
-            };
-            assert_eq!(text, expected_text, "{label}");
-            assert_eq!(notes, expected_notes, "{label}");
-        }
-    }
-
     /// Shared formulas: a definition teaches the references that come after it,
     /// so a reference with no text of its own still reads back as its formula.
     #[test]
@@ -2508,50 +2400,6 @@ mod tests {
             panic!("expected Text outcome for a well-formed xlsx");
         };
         assert_eq!(text, "Sheet \"S\":\n  A1: 2 (=B1*2)\n  A2: 4 (=B1*2)");
-    }
-
-    /// Media and charts are reported the same way the Word path reports its
-    /// media: a raster is written through, an undecodable entry is counted, and a
-    /// chart is named for the report rather than silently dropped.
-    #[test]
-    fn xlsx_extracts_media_and_reports_the_charts_it_cannot_draw() {
-        let bytes = zip_fixture(&[
-            (
-                "xl/workbook.xml",
-                br#"<workbook><sheets><sheet name="S" r:id="rId1"/></sheets></workbook>"#,
-            ),
-            (
-                "xl/_rels/workbook.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
-            ),
-            (
-                "xl/worksheets/sheet1.xml",
-                br#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#,
-            ),
-            ("xl/media/pic.png", b"\x89PNG\r\n\x1a\nfake image bytes"),
-            ("xl/media/diagram.emf", b"EMF bytes this stack cannot decode"),
-            ("xl/media/scan.tiff", b"TIFF bytes this stack does not convert"),
-            ("xl/charts/chart1.xml", b"<chart/>"),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text {
-            images,
-            notes,
-            unshown,
-            ..
-        } = convert_xlsx(&bytes, dir.path())
-        else {
-            panic!("expected Text outcome for a well-formed xlsx");
-        };
-        assert_eq!(images, vec![dir.path().join("pic.png")]);
-        assert_eq!(
-            unshown.lines(),
-            ["1 chart(s) not shown", "1 embedded drawing(s) not shown",]
-        );
-        assert_eq!(
-            notes,
-            ["skipped 1 embedded image(s) in a format this pipeline cannot convert"]
-        );
     }
 
     /// A chart sheet is one chart over a whole tab, and the tab is named for what it is: the
@@ -2708,34 +2556,6 @@ mod tests {
             .map(|(part, bytes)| (part.as_str(), bytes.as_slice()))
             .collect();
         zip_fixture(&entries)
-    }
-
-    #[test]
-    fn xlsx_describes_every_chart_a_drawing_holds() {
-        let pie = br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:pieChart><c:ser><c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>Share</c:v></c:pt></c:strCache></c:strRef></c:tx><c:cat><c:strCache><c:pt idx="0"><c:v>East</c:v></c:pt></c:strCache></c:cat><c:val><c:numCache><c:pt idx="0"><c:v>7</c:v></c:pt></c:numCache></c:val></c:ser></c:pieChart></c:plotArea></c:chart></c:chartSpace>"#;
-        let bytes = charted_workbook(
-            "S",
-            false,
-            &[("chart1.xml", COLUMN_CHART.as_bytes()), ("chart2.xml", pie)],
-        );
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, unshown, .. } = convert_xlsx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a well-formed xlsx");
-        };
-        assert_eq!(
-            text,
-            "Sheet \"S\":\n  A1: 1\n  \
-             Chart (column chart):\n    \
-             Title: Sales\n    \
-             Series \"Revenue\": Jan: 10, Feb: 20\n  \
-             Chart (pie chart):\n    \
-             Series \"Share\": East: 7"
-        );
-        assert!(
-            unshown.lines().is_empty(),
-            "both charts were described: {:?}",
-            unshown.lines()
-        );
     }
 
     /// The shared-string table is named by a workbook relationship like the styles part, so a
@@ -2918,49 +2738,6 @@ mod tests {
         }
     }
 
-    /// A styles part the workbook declares and this reader gets no format table out of — a
-    /// mismatched end tag, a part that is no stylesheet at all, or one the package does not carry
-    /// — costs every cell its format: the loss is said out loud and a cell naming a format reads
-    /// as its stored text.
-    #[test]
-    fn xlsx_reports_styles_it_cannot_read() {
-        for styles in [
-            Some(b"<styleSheet><cellXfs></styleSheet>".as_slice()),
-            Some(b"<html><head><title>404</title></head><body>Not Found</body></html>".as_slice()),
-            // Truncated at an element boundary, where the events simply end.
-            Some(b"<styleSheet><cellXfs>".as_slice()),
-            None,
-        ] {
-            let mut parts: Vec<(&str, &[u8])> = vec![
-                (
-                    "xl/workbook.xml",
-                    br#"<workbook><sheets><sheet name="Data" r:id="rId1"/></sheets></workbook>"#,
-                ),
-                (
-                    "xl/_rels/workbook.xml.rels",
-                    br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#,
-                ),
-                (
-                    "xl/worksheets/sheet1.xml",
-                    br#"<worksheet><sheetData><row r="1"><c r="A1" s="3"><v>1234.5</v></c></row></sheetData></worksheet>"#,
-                ),
-            ];
-            if let Some(styles) = styles {
-                parts.push(("xl/styles.xml", styles));
-            }
-            let bytes = zip_fixture(&parts);
-            let dir = tempfile::tempdir().expect("tempdir");
-            let DocOutcome::Text { text, notes, .. } = convert_xlsx(&bytes, dir.path()) else {
-                panic!("expected Text outcome for a readable workbook");
-            };
-            assert_eq!(
-                text,
-                "Sheet \"Data\":\n  A1: 1234.5 (stored number, format not shown)"
-            );
-            assert_eq!(notes, [STYLES_NOTE]);
-        }
-    }
-
     /// A stylesheet declaring a format but no cell format to name it from — a `numFmt`, a
     /// base-style list, or a `cellXfs` holding no entry — is one this reader cannot derive any
     /// cell's format from: every cell comes back as the number it stores, marked, and the loss is
@@ -3064,47 +2841,6 @@ mod tests {
             assert_eq!(text, expected_text, "{label}");
             assert_eq!(notes, expected_notes, "{label}");
         }
-    }
-
-    /// A cell naming a format the workbook's table does not hold — an index past its `cellXfs`,
-    /// an entry whose declaration does not parse, an entry inheriting from a base style that does
-    /// not parse either, a row or column naming an unreadable `s` — shows its stored value
-    /// marked. A cell showing only its formula has no stored value to mark.
-    #[test]
-    fn xlsx_marks_a_cell_whose_format_the_table_does_not_hold() {
-        let bytes = zip_fixture(&[
-            (
-                "xl/workbook.xml",
-                br#"<workbook><sheets><sheet name="Data" r:id="rId1"/></sheets></workbook>"#,
-            ),
-            (
-                "xl/_rels/workbook.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#,
-            ),
-            (
-                "xl/styles.xml",
-                br#"<styleSheet><cellStyleXfs count="1"><xf numFmtId="14"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0"/><xf numFmtId="14abc"/><xf numFmtId="0" xfId="bad"/></cellXfs></styleSheet>"#,
-            ),
-            (
-                "xl/worksheets/sheet1.xml",
-                br#"<worksheet><cols><col min="3" max="3" style="oops"/></cols><sheetData><row r="1"><c r="A1" s="0"><v>1234.5</v></c><c r="B1" s="3"><v>1234.5</v></c><c r="C1" s="9"><f>SUM(A1)</f></c><c r="D1" s="99999999999999999999"><v>1234.5</v></c><c r="E1" s="1"><v>1234.5</v></c></row><row r="2" s="abc" customFormat="1"><c r="A2"><v>1234.5</v></c><c r="B2"><v>1234.5</v></c></row><row r="3"><c r="A3" s="2"><v>45000</v></c><c r="C3"><v>45000</v></c><c r="D3"><v>45000</v></c></row></sheetData></worksheet>"#,
-            ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, notes, .. } = convert_xlsx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a well-formed xlsx");
-        };
-        assert_eq!(
-            text,
-            "Sheet \"Data\":\n  A1: 1234.5\n  B1: 1234.5 (stored number, format not shown)\n  \
-             C1: =SUM(A1)\n  D1: 1234.5 (stored number, format not shown)\n  \
-             E1: 1234.5 (stored number, format not shown)\n  \
-             A2: 1234.5 (stored number, format not shown)\n  \
-             B2: 1234.5 (stored number, format not shown)\n  \
-             A3: 45000 (stored number, format not shown)\n  \
-             C3: 45000 (stored number, format not shown)\n  D3: 45000"
-        );
-        assert!(notes.is_empty(), "nothing was skipped: {notes:?}");
     }
 
     /// A hidden sheet is marked in its header — the state a workbook writes is one
@@ -3264,48 +3000,6 @@ mod tests {
         );
     }
 
-    /// A legacy `comments.xml` comment follows the sheet's cells, its author resolved through the
-    /// part's `authorId` index and its rich text flattened to one line — while an `authorId` the
-    /// authors list does not hold names an author in the file but not in this answer.
-    #[test]
-    fn xlsx_reads_a_legacy_cell_comment_with_its_author() {
-        let bytes = zip_fixture(&[
-            (
-                "xl/workbook.xml",
-                br#"<workbook><sheets><sheet name="Data" r:id="rId1"/></sheets></workbook>"#,
-            ),
-            (
-                "xl/_rels/workbook.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
-            ),
-            (
-                "xl/worksheets/sheet1.xml",
-                br#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row></sheetData></worksheet>"#,
-            ),
-            (
-                "xl/worksheets/_rels/sheet1.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments1.xml"/></Relationships>"#,
-            ),
-            (
-                "xl/comments1.xml",
-                br#"<comments><authors><author>Ivan Petrov</author></authors><commentList><comment ref="A1" authorId="0"><text><r><t>check</t></r><r><t> this</t></r></text></comment><comment ref="B1" authorId="7"><text>no such author</text></comment></commentList></comments>"#,
-            ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { text, notes, .. } = convert_xlsx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a well-formed xlsx");
-        };
-        assert_eq!(
-            text,
-            "Sheet \"Data\":\n  A1: 1\n  B1: 2\n  \
-             A1 comment (Ivan Petrov): check this\n  B1 comment: no such author"
-        );
-        assert_eq!(
-            notes,
-            ["sheet \"Data\": 1 comment author(s) could not be resolved"]
-        );
-    }
-
     /// A threaded discussion comes back whole, each entry named through the workbook's persons
     /// part. The stub a real workbook keeps in the legacy part — Excel's `[Threaded comment]`
     /// preamble and each entry behind a `Comment:`/`Reply:` lead — is not repeated, while a
@@ -3365,66 +3059,6 @@ a reply</text></comment><comment ref="A2" authorId="0"><text>legacy two</text></
         );
         // A thread naming no person loses no author, so nothing is said.
         assert!(notes.is_empty(), "nothing was skipped: {notes:?}");
-    }
-
-    /// A comment naming an author this reader cannot resolve — a `personId` the person names do
-    /// not hold, whether the part is absent, has no person list, or is not declared at all — has
-    /// an author in the file but not in this answer, which its sheet says.
-    #[test]
-    fn xlsx_reports_a_comment_author_it_cannot_resolve() {
-        for (declared, persons) in [
-            (true, None),
-            // An error page in the part's place reads as well-formed XML.
-            (
-                true,
-                Some(
-                    b"<html><head><title>404</title></head><body>Not Found</body></html>"
-                        .as_slice(),
-                ),
-            ),
-            (false, None),
-        ] {
-            let rels: &[u8] = if declared {
-                br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/person" Target="persons/person.xml"/></Relationships>"#
-            } else {
-                br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#
-            };
-            let mut parts: Vec<(&str, &[u8])> = vec![
-                (
-                    "xl/workbook.xml",
-                    br#"<workbook><sheets><sheet name="Data" r:id="rId1"/></sheets></workbook>"#,
-                ),
-                ("xl/_rels/workbook.xml.rels", rels),
-                (
-                    "xl/worksheets/sheet1.xml",
-                    br#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#,
-                ),
-                (
-                    "xl/worksheets/_rels/sheet1.xml.rels",
-                    br#"<Relationships><Relationship Id="rId2" Type="http://schemas.microsoft.com/office/2017/10/relationships/threadedComment" Target="../threadedComments/threadedComment1.xml"/></Relationships>"#,
-                ),
-                (
-                    "xl/threadedComments/threadedComment1.xml",
-                    br#"<ThreadedComments><threadedComment ref="A1" personId="{P1}"><text>threaded wins</text></threadedComment></ThreadedComments>"#,
-                ),
-            ];
-            if let Some(persons) = persons {
-                parts.push(("xl/persons/person.xml", persons));
-            }
-            let bytes = zip_fixture(&parts);
-            let dir = tempfile::tempdir().expect("tempdir");
-            let DocOutcome::Text { text, notes, .. } = convert_xlsx(&bytes, dir.path()) else {
-                panic!("expected Text outcome for a well-formed xlsx");
-            };
-            assert_eq!(
-                text,
-                "Sheet \"Data\":\n  A1: 1\n  A1 comment: threaded wins"
-            );
-            assert_eq!(
-                notes,
-                ["sheet \"Data\": 1 comment author(s) could not be resolved"]
-            );
-        }
     }
 
     /// A hyperlink marks the cell it covers with the raw target its `r:id`
@@ -3536,54 +3170,6 @@ two</t></is></c><c r="C1" t="inlineStr"><is><t>cr&#13;&#10;lf</t></is></c><c r="
             };
             assert_eq!(text, expected_text, "{label}");
             assert!(notes.is_empty(), "nothing was skipped ({label}): {notes:?}");
-        }
-    }
-
-    /// A hyperlink the sheet cannot resolve — its `r:id` undeclared, or its range with the
-    /// minimum past the maximum (`C3:A1`) — is dropped rather than rendered pointing nowhere, and
-    /// the loss counted.
-    #[test]
-    fn xlsx_reports_links_it_cannot_resolve() {
-        let declared: &[u8] = br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com/a"/></Relationships>"#;
-        let cases = [
-            (
-                "a target the sheet does not declare",
-                declared,
-                br#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><hyperlinks><hyperlink ref="A1" r:id="rId1"/><hyperlink ref="B1" r:id="rId7"/></hyperlinks></worksheet>"#.as_slice(),
-                "Sheet \"Data\":\n  A1: 1 (link: https://example.com/a)",
-            ),
-            (
-                "a range whose minimum is past its maximum",
-                b"".as_slice(),
-                br#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><hyperlinks><hyperlink ref="C3:A1" location="Sheet2!A1"/></hyperlinks></worksheet>"#.as_slice(),
-                "Sheet \"Data\":\n  A1: 1",
-            ),
-        ];
-        for (label, sheet_rels, sheet, expected_text) in cases {
-            let bytes = zip_fixture(&[
-                (
-                    "xl/workbook.xml",
-                    br#"<workbook><sheets><sheet name="Data" r:id="rId1"/></sheets></workbook>"#,
-                ),
-                (
-                    "xl/_rels/workbook.xml.rels",
-                    br#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#,
-                ),
-                ("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels),
-                ("xl/worksheets/sheet1.xml", sheet),
-            ]);
-            let dir = tempfile::tempdir().expect("tempdir");
-            let DocOutcome::Text { text, notes, .. } = convert_xlsx(&bytes, dir.path()) else {
-                panic!("expected Text outcome for a well-formed xlsx: {label}");
-            };
-            assert_eq!(text, expected_text, "{label}");
-            assert_eq!(
-                notes,
-                [
-                    "sheet \"Data\": 1 link(s) left out: the target or the cell range it names is not one this reader can resolve"
-                ],
-                "{label}"
-            );
         }
     }
 

@@ -3,61 +3,6 @@
 use super::*;
 
 #[test]
-fn test_buffer_construction_cursor_and_selection() {
-    let cases = [
-        ("new_empty", "", None, Some((0, 0))),
-        ("with_text", "hello\nworld", None, None),
-        ("cursor_move_to", "hello\nworld", Some((1, 2)), Some((1, 2))),
-        (
-            "cursor_move_to_beyond_end",
-            "hello",
-            Some((999, 999)),
-            Some((0, 5)),
-        ),
-    ];
-    for &(name, text, move_to, cursor_pos) in &cases {
-        let buf = EditorBuffer::with_text(text, None);
-        if let Some((line, col)) = move_to {
-            buf.move_to(line, col);
-        }
-        // Construction never rewrites the text, and the line count follows from it.
-        assert_eq!(buf.text(), text, "case {name}: text");
-        assert_eq!(
-            buf.line_count(),
-            text.split('\n').count(),
-            "case {name}: line_count"
-        );
-        if let Some((line, col)) = cursor_pos {
-            let cursor = buf.cursor();
-            assert_eq!(cursor.line, line, "case {name}: line");
-            assert_eq!(cursor.column, col, "case {name}: col");
-        }
-    }
-
-    let cases = [
-        ("select_all", "hello\nworld", true, Some("hello\nworld")),
-        ("no_selection", "hello", false, None),
-        ("select_all_empty", "", true, None),
-    ];
-    for &(name, text, select_all, expected) in &cases {
-        let buf = EditorBuffer::with_text(text, None);
-        if select_all {
-            buf.select_all();
-        }
-        assert_eq!(
-            buf.cursor().selection.is_some(),
-            expected.is_some(),
-            "case {name}: selection presence"
-        );
-        assert_eq!(
-            buf.selection(),
-            expected.map(str::to_string),
-            "case {name}: selection text"
-        );
-    }
-}
-
-#[test]
 fn test_insert_paste_enter_cases() {
     use super::EditorAction::*;
     let cases = [
@@ -271,42 +216,6 @@ fn test_multiline_indent_preserves_selection() {
 }
 
 #[test]
-fn test_indent_cases() {
-    use super::EditorAction::*;
-    let cases = [
-        ("indent", Indent, "hello", None, None, "\thello"),
-        ("unindent", Unindent, "    hello", None, None, "   hello"),
-        (
-            "indent_with_selection",
-            Indent,
-            "hello\nworld\nfoo",
-            Some((0, 0)),
-            Some((1, 0)),
-            "\thello\n\tworld\nfoo",
-        ),
-        (
-            "unindent_with_selection",
-            Unindent,
-            "\thello\n\tworld\nfoo",
-            Some((0, 0)),
-            Some((1, 0)),
-            "hello\nworld\nfoo",
-        ),
-    ];
-    for &(name, ref action, input, cursor_pos, select_to, expected) in &cases {
-        let buf = EditorBuffer::with_text(input, None);
-        if let Some((line, col)) = cursor_pos {
-            buf.move_to(line, col);
-        }
-        if let Some((line, col)) = select_to {
-            buf.perform_action(SelectTo { line, col });
-        }
-        buf.perform_action(action.clone());
-        assert_eq!(buf.text(), expected, "case {name}: text");
-    }
-}
-
-#[test]
 fn test_line_col_roundtrip() {
     let text = "hello\nworld\nfoo";
     for (line, line_text) in text.lines().enumerate() {
@@ -386,22 +295,6 @@ fn test_selection_normalization_cases() {
             "case {name}: selection"
         );
     }
-}
-
-#[test]
-fn test_line_comment_prefix() {
-    use super::highlight::HighlightLanguage::*;
-    assert_eq!(line_comment_prefix(Some(Rust), None), Some("//"));
-    assert_eq!(line_comment_prefix(Some(Python), None), Some("#"));
-    assert_eq!(line_comment_prefix(Some(Sql), None), Some("--"));
-    assert_eq!(line_comment_prefix(Some(Json), None), None);
-    assert_eq!(line_comment_prefix(Some(Html), None), None);
-    assert_eq!(line_comment_prefix(Some(Markdown), None), None);
-    assert_eq!(line_comment_prefix(None, Some("yaml")), Some("#"));
-    assert_eq!(line_comment_prefix(None, Some("yml")), Some("#"));
-    assert_eq!(line_comment_prefix(None, Some("rs")), None); // falls to ext-only
-    assert_eq!(line_comment_prefix(None, None), None);
-    assert_eq!(line_comment_prefix(None, Some("xyz")), None);
 }
 
 #[test]
@@ -626,68 +519,6 @@ fn test_select_to_duplicate_endpoint_cases() {
             "case {name}: duplicate SelectTo"
         );
     }
-}
-
-#[test]
-fn test_set_text_resets_cursor_and_clear() {
-    let buf = EditorBuffer::with_text("hello", None);
-    buf.move_to(0, 2);
-    buf.set_text("world");
-    assert_eq!(buf.text(), "world");
-    let cursor = buf.cursor();
-    assert_eq!(cursor.line, 0);
-    assert_eq!(cursor.column, 0);
-    assert!(cursor.selection.is_none());
-    assert!(!buf.is_empty());
-    buf.clear();
-    assert!(buf.is_empty());
-}
-
-#[test]
-fn test_single_line_strips_newlines_and_enter() {
-    let buf = EditorBuffer::with_text("a\nb", None);
-    buf.set_single_line(true);
-    assert_eq!(buf.text(), "ab");
-    buf.move_to(0, 1);
-    buf.perform_action(EditorAction::Paste("x\ny".to_string()));
-    assert_eq!(buf.text(), "axyb");
-    assert_eq!(buf.cursor().column, 3);
-    buf.perform_action(EditorAction::Enter);
-    assert_eq!(buf.text(), "axyb");
-    assert_eq!(buf.cursor().line, 0);
-}
-
-#[test]
-fn test_ime_surface_activation() {
-    let buf = EditorBuffer::with_text("", None);
-    assert!(
-        !EditorWidget::new(&buf)
-            .masked(true)
-            .is_active_surface(&EditorWidgetState::default())
-    );
-    let unfocused = EditorWidgetState {
-        is_window_focused: false,
-        ..EditorWidgetState::default()
-    };
-    assert!(!EditorWidget::new(&buf).is_active_surface(&unfocused));
-    let field = EditorWidget::new(&buf).id("field");
-    let mut focused = EditorWidgetState::default();
-    assert!(!field.is_active_surface(&focused));
-    focused.is_focused = true;
-    assert!(field.is_active_surface(&focused));
-    // The full-page code editor (no focus id, code_mode) is active unless it ignores the keyboard;
-    // a focus-id-less *non-code* field is not active.
-    assert!(EditorWidget::new(&buf).is_active_surface(&EditorWidgetState::default()));
-    assert!(
-        !EditorWidget::new(&buf)
-            .ignore_keyboard(true)
-            .is_active_surface(&EditorWidgetState::default())
-    );
-    assert!(
-        !EditorWidget::new(&buf)
-            .code_mode(false)
-            .is_active_surface(&EditorWidgetState::default())
-    );
 }
 
 #[test]

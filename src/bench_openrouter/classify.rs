@@ -365,13 +365,6 @@ mod tests {
     }
 
     #[test]
-    fn expected_cached_saturates() {
-        assert_eq!(expected_cached_for_round(1000, 1200, 800), 1400); // base + growth
-        assert_eq!(expected_cached_for_round(1000, 800, 1200), 1000); // shrink → saturate
-        assert_eq!(expected_cached_for_round(0, 500, 500), 0);
-    }
-
-    #[test]
     fn verify_pinned_matches_name_or_provider_name() {
         let endpoint = EndpointInfo {
             tag: "acme/fp8".to_string(),

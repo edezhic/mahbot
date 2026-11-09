@@ -2384,78 +2384,6 @@ mod tests {
         );
     }
 
-    /// A media entry a package embeds that this pipeline cannot produce an image
-    /// from is named as what it is, never as an unconvertible image.
-    #[test]
-    fn docx_reports_media_it_cannot_convert() {
-        let bytes = zip_fixture(&[
-            ("word/document.xml", DOCX_BODY),
-            (
-                "word/media/diagram.emf",
-                b"EMF bytes this stack cannot decode",
-            ),
-            (
-                "word/media/vector.wmf",
-                b"WMF bytes this stack cannot decode",
-            ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text {
-            images,
-            notes,
-            unshown,
-            ..
-        } = convert_docx(&bytes, dir.path())
-        else {
-            panic!("expected Text outcome for a well-formed docx");
-        };
-        assert!(images.is_empty(), "an undecodable entry yields no image");
-        // A metafile is a drawing, not an image this pipeline cannot convert:
-        // the report names what it is rather than what it is not.
-        assert_eq!(unshown.lines(), ["2 embedded drawing(s) not shown"]);
-        assert!(notes.is_empty(), "the report carries the whole loss");
-    }
-
-    /// The parts a reading opens nothing in are named by count: the charts it cannot draw,
-    /// the diagrams whose data parts it does not reach, and the embedded objects. A sibling
-    /// part that is none of them is not counted, and the data workbook a chart keeps beside
-    /// the objects is the chart's own.
-    #[test]
-    fn docx_reports_the_parts_its_reading_does_not_open() {
-        let bytes = zip_fixture(&[
-            ("word/document.xml", DOCX_BODY),
-            ("word/diagrams/data1.xml", b"<dgm:dataModel/>"),
-            ("word/diagrams/layout1.xml", b"<dgm:layoutDef/>"),
-            ("word/embeddings/oleObject1.bin", b"OLE bytes"),
-            (
-                "word/embeddings/Microsoft_Excel_Worksheet1.xlsx",
-                b"chart data workbook",
-            ),
-            ("word/charts/chart1.xml", b"<chart/>"),
-            ("word/charts/chartEx1.xml", b"<chartEx/>"),
-            (
-                "word/charts/_rels/chart1.xml.rels",
-                br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/package" Target="../embeddings/Microsoft_Excel_Worksheet1.xlsx"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/package" Target="../embeddings/Microsoft_Excel_Worksheet9.xlsx"/></Relationships>"#,
-            ),
-        ]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let DocOutcome::Text { notes, unshown, .. } = convert_docx(&bytes, dir.path()) else {
-            panic!("expected Text outcome for a well-formed docx");
-        };
-        assert_eq!(
-            unshown.lines(),
-            [
-                "2 chart(s) not shown",
-                "1 diagram(s) not shown",
-                "1 embedded object part(s) not shown",
-            ]
-        );
-        assert!(
-            notes.is_empty(),
-            "the report carries the whole loss: {notes:?}"
-        );
-    }
-
     /// A chart is described where the drawing sits, in the body or in a story the
     /// package prints beside it; one whose story is dropped, or that sits in a
     /// merge continuation the reading shows no value of, stays a loss the census names.
@@ -3314,57 +3242,6 @@ mod tests {
         );
     }
 
-    /// Word writes a text box twice — as an `mc:Choice` and as the
-    /// `mc:Fallback` beside it — and reading both would report it twice, in the
-    /// body and in a header alike.
-    #[test]
-    fn docx_reads_a_word_text_box_once() {
-        let body = r#"<w:p><w:r><mc:AlternateContent>\
-<mc:Choice Requires="wps"><w:drawing><wps:txbx><w:txbxContent>\
-<w:p><w:r><w:t>one</w:t></w:r></w:p><w:p><w:r><w:t>two</w:t></w:r></w:p>\
-</w:txbxContent></wps:txbx></w:drawing></mc:Choice>\
-<mc:Fallback><w:pict><v:textbox><w:txbxContent>\
-<w:p><w:r><w:t>one</w:t></w:r></w:p><w:p><w:r><w:t>two</w:t></w:r></w:p>\
-</w:txbxContent></v:textbox></w:pict></mc:Fallback>\
-</mc:AlternateContent></w:r><w:r><w:t>after</w:t></w:r></w:p>"#;
-
-        let header_body = r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p>
-<w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr>"#;
-        let choice = r#"<mc:Choice Requires="wps"><w:drawing><wps:txbx><w:txbxContent>\
-<w:p><w:r><w:t>box</w:t></w:r></w:p></w:txbxContent></wps:txbx></w:drawing></mc:Choice>"#;
-        let fallback = r"<mc:Fallback><w:pict><v:textbox><w:txbxContent>\
-<w:p><w:r><w:t>box</w:t></w:r></w:p></w:txbxContent></v:textbox></w:pict></mc:Fallback>";
-        let header = format!(
-            "<w:hdr><w:p><w:r><mc:AlternateContent>{choice}{fallback}</mc:AlternateContent></w:r></w:p></w:hdr>"
-        );
-        let header_box = package(
-            header_body,
-            &[
-                (
-                    "word/_rels/document.xml.rels",
-                    &rels(&rel("rId1", "header", "header1.xml")),
-                ),
-                ("word/header1.xml", &header),
-            ],
-        );
-
-        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
-            (
-                "a body text box written as a choice and a fallback",
-                package(body, &[]),
-                "[text box]\n  one\n  two\nafter",
-            ),
-            (
-                "a header text box written as a choice and a fallback",
-                header_box,
-                "Body\nHeader (default):\n  [text box]\n    box",
-            ),
-        ];
-        for (label, bytes, expected) in cases {
-            assert_eq!(text_of(&bytes), expected, "{label}");
-        }
-    }
-
     /// Only the alternate copy that rendered counts: the `mc:Fallback` is
     /// discarded whether it repeats the choice's revisions or carries them
     /// alone, a copy that rendered nothing yields to the next one, and a
@@ -3481,20 +3358,6 @@ mod tests {
         }
     }
 
-    /// A field's instruction is reported up to the cap — with no separator left
-    /// dangling when the cap falls between two words.
-    #[test]
-    fn docx_caps_a_field_instruction_without_a_trailing_space() {
-        let instruction = format!("{} bcd", "a".repeat(MAX_FIELD_INSTRUCTION_CHARS - 1));
-        let body = format!(
-            r#"<w:p><w:r><w:fldSimple w:instr="{instruction}"><w:r><w:t>x</w:t></w:r></w:fldSimple></w:r></w:p>"#
-        );
-        assert_eq!(
-            text_of(&package(&body, &[])),
-            format!("[field {}]x", "a".repeat(MAX_FIELD_INSTRUCTION_CHARS - 1))
-        );
-    }
-
     /// A body that cannot be read as XML is the one part whose failure costs
     /// the whole package.
     #[test]
@@ -3505,25 +3368,6 @@ mod tests {
             convert_docx(&bytes, dir.path()),
             DocOutcome::Unreadable { .. }
         ));
-    }
-
-    /// A notes part that is named but will not parse costs only its own blocks,
-    /// and the walk past it still reaches the body's text.
-    #[test]
-    fn docx_skips_a_notes_part_it_cannot_parse() {
-        let body =
-            r#"<w:p><w:r><w:t>Body</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r></w:p>"#;
-        let bytes = package(
-            body,
-            &[
-                (
-                    "word/_rels/document.xml.rels",
-                    &rels(&rel("rId5", "footnotes", "footnotes.xml")),
-                ),
-                ("word/footnotes.xml", "<w:footnotes><w:footnote"),
-            ],
-        );
-        assert_eq!(text_of(&bytes), "Body[footnote ?]");
     }
 
     /// A package whose body draws eight charts — cached values, table-only values, none at

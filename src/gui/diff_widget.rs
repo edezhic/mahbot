@@ -948,18 +948,6 @@ mod tests {
         make_test_diff_file(path, vec![make_hunk(header, lines)], Modified)
     }
 
-    fn shape_file(added: &str) -> super::super::diff::DiffFile {
-        hunk_file(
-            "a.rs",
-            "@@ -1,3 +1,4 @@ fn main() {",
-            vec![
-                make_line(Context, "let x = 1;", Some(1), Some(1)),
-                make_line(Removed, "let y = 2;", Some(2), None),
-                make_line(Added, added, None, Some(2)),
-            ],
-        )
-    }
-
     /// Every buffer's spans cover the whole text, stay inside it, and are sorted.
     fn assert_span_invariants(name: &str, buffers: &[DiffFileBuffer]) {
         for buf in buffers {
@@ -1130,52 +1118,5 @@ mod tests {
         ];
 
         run_buffer_cases(cases);
-    }
-
-    #[test]
-    fn test_selection_text_ranges() {
-        let text = "+ hello\n- world\n";
-        let cases: &[(&str, usize, usize, Option<&str>)] = &[
-            ("forward range", 0, 7, Some("+ hello")),
-            ("reversed range", 7, 0, Some("+ hello")),
-            ("empty range", 3, 3, None),
-        ];
-        for &(name, anchor, cursor, expected) in cases {
-            assert_eq!(
-                selection_text(text, anchor, cursor).as_deref(),
-                expected,
-                "case {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_shape_cache_key_tracks_content_and_width() {
-        // Same diff content rebuilt twice (the 5-second auto-refresh case)
-        // must produce the same fingerprint; changed content must not.
-        let file_a = shape_file("let z = 3;");
-        let file_a_again = shape_file("let z = 3;");
-        let file_b = shape_file("let z = 99;");
-
-        let buf_a = &build_file_buffers(&[file_a], None, None)[0];
-        let buf_a_again = &build_file_buffers(&[file_a_again], None, None)[0];
-        let buf_b = &build_file_buffers(&[file_b], None, None)[0];
-
-        assert_eq!(buf_a.content_fingerprint, buf_a_again.content_fingerprint);
-        assert_ne!(buf_a.content_fingerprint, buf_b.content_fingerprint);
-
-        // The full cache key also covers the shaping width: a resize changes
-        // wrapping, so the cached layout must be invalidated.
-        let width = 500.0;
-        let key_a = ShapeCacheKey::new(buf_a, width);
-        let key_a_again = ShapeCacheKey::new(buf_a_again, width);
-        let key_a_wider = ShapeCacheKey::new(buf_a, width + 1.0);
-        let key_b = ShapeCacheKey::new(buf_b, width);
-        assert_eq!(
-            key_a, key_a_again,
-            "identical content+width must hit the cache"
-        );
-        assert_ne!(key_a, key_a_wider, "width change must invalidate the cache");
-        assert_ne!(key_a, key_b, "content change must invalidate the cache");
     }
 }

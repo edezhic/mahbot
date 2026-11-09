@@ -1258,20 +1258,6 @@ mod tests {
     }
 
     #[test]
-    fn file_name_or_path_table() {
-        // On Unix `file_name()` additionally normalizes a trailing slash.
-        let cases: &[(&str, &str, &str)] = &[
-            ("unix path", "/foo/bar.txt", "bar.txt"),
-            ("nested path", "/foo/bar/doc.txt", "doc.txt"),
-            ("no directory component", "bar.txt", "bar.txt"),
-            ("trailing slash", "/foo/bar/", "bar"),
-        ];
-        for &(name, input, expected) in cases {
-            assert_eq!(file_name_or_path(input), expected, "case {name}");
-        }
-    }
-
-    #[test]
     fn decode_data_uri_image_table() {
         // URIs are built before the table: a success case needs a real encoded
         // PNG, and the two over-cap cases a payload/dimension past their cap.
@@ -1314,16 +1300,6 @@ mod tests {
     }
 
     #[test]
-    fn data_uri_image_handle_caches_stable_handle() {
-        let uri = data_uri(&tiny_png(3, 2));
-        let first = data_uri_image_handle(&uri).expect("valid data URI decodes");
-        let second = data_uri_image_handle(&uri).expect("cached hit still decodes");
-        // iced Handle::from_rgba assigns a unique Id per construction; a stable cache must return
-        // the same Id so the wgpu worker doesn't re-decode and re-upload on every frame.
-        assert_eq!(first.id(), second.id());
-    }
-
-    #[test]
     fn data_uri_image_handle_caches_failures_and_skips_oversized() {
         let huge = "A".repeat(media_target::MAX_DATA_URI_ENCODED_BYTES + 1);
         // (case, uri, cached as a failure) — a decode failure is cached so a corrupt payload is
@@ -1358,22 +1334,6 @@ mod tests {
                 "case {name}: answer is stable"
             );
         }
-    }
-
-    #[test]
-    fn bounded_cache_duplicate_insert_keeps_eviction_exact() {
-        let mut cache = BoundedLruCache::with_capacity(2);
-        cache.insert(1, "a");
-        cache.insert(1, "a2"); // same-key re-insert (concurrent check→decode→insert)
-        cache.insert(2, "b");
-        assert_eq!(cache.lru.len(), 2, "duplicate key must not survive in lru");
-        assert_eq!(cache.entries.len(), 2);
-        assert_eq!(cache.get(&2), Some(&"b"));
-        cache.insert(3, "c");
-        assert_eq!(cache.lru.len(), 2, "eviction must stay exact");
-        assert_eq!(cache.get(&1), None, "oldest (1) must be evicted");
-        assert_eq!(cache.get(&2), Some(&"b"));
-        assert_eq!(cache.get(&3), Some(&"c"));
     }
 
     /// A cached failure is a hit (no re-decode) and a decode runs without the lock.

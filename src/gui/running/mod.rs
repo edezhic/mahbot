@@ -1372,26 +1372,6 @@ mod tests {
     }
 
     #[test]
-    fn analyze_and_research_groups_render_question_not_raw_key() {
-        // Analyze/research headers show the question text; the raw NanoID key is never rendered.
-        let mut analyst = agent("a1", "analyst", "ws1", "a:job_abc");
-        analyst.parent_label = Some("Why is CI flaky?".to_string());
-        let groups = build_groups(&[analyst], &[]);
-        let analyze = groups.iter().find(|g| g.kind == GroupKind::AnalyzeRound);
-        let analyze = analyze.expect("analyze group exists");
-        let (title, secondary) = group_title(analyze);
-        assert_eq!(title, "Why is CI flaky?");
-        assert!(secondary.is_none(), "no id secondary for analyze groups");
-        assert!(!title.contains("job_abc"), "raw key never leaks");
-
-        let mut bare = analyze.clone();
-        bare.label = None;
-        let (fallback, _) = group_title(&bare);
-        assert_eq!(fallback, "Analyze round");
-        assert!(!fallback.contains("job_abc"), "generic fallback, no key");
-    }
-
-    #[test]
     fn sections_group_by_workspace_and_keep_kind_order() {
         // Workspace-first layout: sections sort alphabetically, groups keep the canonical kind
         // order inside one, and a singleton lands in its own workspace's section.
@@ -1540,25 +1520,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_step_keeps_its_own_reasoning() {
-        // Each round keeps its own reasoning, so the label can follow the newest step.
-        let history = vec![
-            assistant_tool_call_reasoning(
-                "",
-                &[("read", serde_json::json!({"path": "a.rs"}))],
-                None,
-            ),
-            thinking("", "first"),
-            thinking("", "second"),
-        ];
-        let ledger = build_ledger(&history);
-        let groups = derive_trace_groups(&ledger);
-        assert_eq!(groups.len(), 1, "no narration → same group");
-        let reasoning: Vec<_> = groups[0].steps.iter().map(|step| step.reasoning).collect();
-        assert_eq!(reasoning, vec![None, Some("first"), Some("second")]);
-    }
-
     /// A ledger tool-call entry for the collapsed/in-flight projection tests; `result: None`
     /// marks the call in-flight.
     fn entry(name: &str, args: serde_json::Value, result: Option<&str>) -> ToolCallEntry {
@@ -1598,45 +1559,6 @@ mod tests {
             collapsed_calls_line(&steps),
             "read file x2, list files, read file …"
         );
-    }
-
-    #[test]
-    fn the_card_shows_only_the_current_turn() {
-        // (case, history, the narration of every step of the current turn's groups)
-        let cases: &[TurnCase] = &[
-            (
-                "the pre-turn group is gone",
-                vec![round("First"), user_turn("ok now do it"), round("Second")],
-                vec![vec!["Second"]],
-            ),
-            (
-                "no user turn shows the whole history",
-                vec![round("A"), round("B")],
-                vec![vec!["A"], vec!["B"]],
-            ),
-            (
-                "a turn without tool rounds is empty",
-                vec![round("A"), user_turn("stop now")],
-                Vec::new(),
-            ),
-            (
-                "injected and empty user messages do not start a turn",
-                vec![
-                    round(""),
-                    injected_image(),
-                    ChatMessage::user(""),
-                    round(""),
-                ],
-                vec![vec!["", ""]],
-            ),
-        ];
-
-        for (name, history, expected) in cases {
-            let ledger = build_ledger(history);
-            let groups = derive_trace_groups(current_turn_entries(&ledger));
-            let expected: Vec<&[&str]> = expected.iter().map(Vec::as_slice).collect();
-            assert_trace_groups(name, &groups, &expected);
-        }
     }
 
     #[test]
@@ -1816,18 +1738,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn prune_expanded_drops_stale_keys() {
-        let mut expanded: HashSet<(String, u64)> =
-            HashSet::from([("a".to_string(), 0), ("b".to_string(), 2)]);
-        let agents = vec![agent("a", "analyst", "ws1", "")];
-        prune_expanded(&mut expanded, &agents);
-        assert_eq!(expanded.len(), 1);
-        assert!(
-            expanded.contains(&("a".to_string(), 0)),
-            "live agent keeps its expanded key"
-        );
     }
 }

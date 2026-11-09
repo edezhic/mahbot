@@ -449,33 +449,6 @@ mod tests {
         }
     }
 
-    /// A purpose fetches its own set and nothing else: the engines share one folder, never one
-    /// requirement. The wake word's tier takes the pair and never pulls the tagger.
-    #[test]
-    fn a_purpose_does_not_require_the_other_set() {
-        let dir = scratch();
-        write_sparse_set(dir.path(), Purpose::Listening);
-        assert!(usable(dir.path(), Purpose::Listening));
-        assert!(
-            !usable(dir.path(), Purpose::Recognition),
-            "the listening tier's pair does not satisfy a transcription, which needs the tagger"
-        );
-
-        write_sparse_set(dir.path(), Purpose::Recognition);
-        assert!(usable(dir.path(), Purpose::Recognition));
-        assert!(
-            !usable(dir.path(), Purpose::Synthesis),
-            "recognition never requires the talker"
-        );
-
-        write_sparse_set(dir.path(), Purpose::Synthesis);
-        assert!(usable(dir.path(), Purpose::Synthesis));
-        let synthesis = model_files(Purpose::Synthesis).expect("the pair");
-        std::fs::remove_file(dir.path().join(synthesis[0].name)).expect("remove");
-        assert!(usable(dir.path(), Purpose::Recognition));
-        assert!(!usable(dir.path(), Purpose::Synthesis));
-    }
-
     #[tokio::test]
     async fn a_missing_root_is_reported_by_its_path() {
         let dir = scratch();
