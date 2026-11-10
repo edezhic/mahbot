@@ -866,8 +866,8 @@ pub(crate) fn take_quit_requests() -> Option<tokio::sync::mpsc::UnboundedReceive
     QUIT_REQUESTS.lock().unwrap_poison().take()
 }
 
-/// The platform's ordinary quit asks, brought into the closing path, and the Dock click that
-/// brings a hidden window back.
+/// The platform's ordinary quit asks, brought into the closing path, and the reopen it may ask
+/// about — answered so that no window comes up (see the Dock's reopen below).
 ///
 /// # Why it exists
 ///
@@ -887,10 +887,13 @@ pub(crate) fn take_quit_requests() -> Option<tokio::sync::mpsc::UnboundedReceive
 ///
 /// # The Dock's reopen
 ///
-/// The same class carries `applicationShouldHandleReopen:hasVisibleWindows:`, which hands a show
-/// request to the dashboard (see [`crate::window_requests`]) and answers `YES`, leaving the
-/// platform's own unhiding to run. The same waiter installs it — before boot finishes, so the
-/// Dock works from the moment the window exists, the launch the updater restarted hidden included.
+/// The same class carries `applicationShouldHandleReopen:hasVisibleWindows:`, which answers `NO`
+/// and raises nothing. A Dock click and a programmatic reopen (`open -a`, LaunchServices) arrive
+/// as the one event, so the platform cannot tell a deliberate click from a launch that asked to
+/// reopen the application: a Dock click that does nothing is preferred to a window coming up over
+/// whatever the user is doing, and the tray icon is the way back (see
+/// [`crate::window_requests`]). AppKit's documented answer is the one given — `NO` makes the
+/// application do nothing — so the platform's own default reopen cannot raise it either.
 ///
 /// # Which ask it is
 ///
@@ -925,8 +928,8 @@ pub(crate) fn take_quit_requests() -> Option<tokio::sync::mpsc::UnboundedReceive
 /// - A failure to install (the delegate class never appears, a future winit renames it, the
 ///   class already implements the method, the thread cannot be spawned): an ordinary quit keeps
 ///   today's behaviour — the platform ends the process — reported, never fatal. The same
-///   failure leaves the Dock's reopen uninstalled, which costs that way back and nothing else:
-///   the tray and a second launch still bring the window up.
+///   failure leaves the reopen unanswered, which costs nothing: AppKit's own default reopen
+///   raises no window of this product's either.
 /// - The exit bound firing: a hard end with no closing steps, the same class as a force quit. A
 ///   quit arriving while a self-update is finalizing is armed like any other, so the bound can cut
 ///   that hand-off where the exit path would otherwise wait for it: a tail outrunning the
@@ -1039,8 +1042,8 @@ mod macos_quit {
                 };
                 if !reopened.as_bool() {
                     report(
-                        "winit's delegate already answers a Dock reopen — the tray and a second \
-                         launch still bring the window up",
+                        "winit's delegate already answers a reopen — the platform's own answer \
+                         stands",
                     );
                 }
                 // Success is silent, as the Windows installers are: the class appears inside
@@ -1085,8 +1088,10 @@ mod macos_quit {
     }
 
     /// The delegate method AppKit asks about a reopen — the Dock icon clicked while the
-    /// application runs: the dashboard brings the window up, and answering `YES` leaves the
-    /// platform's own reopen (unhiding the application after ⌘H) to run.
+    /// application runs, and every programmatic reopen (`open -a`), which the platform delivers
+    /// as the same event. Nothing comes up: AppKit documents `NO` as "the application should do
+    /// nothing", which is exactly this, and the tray is the one way back (see
+    /// [`crate::window_requests`]).
     ///
     /// # Safety
     ///
@@ -1100,8 +1105,7 @@ mod macos_quit {
         _sender: *mut AnyObject,
         _has_visible_windows: i8,
     ) -> i8 {
-        let _ = crate::window_requests::show();
-        1
+        0
     }
 
     /// Whether the platform is ending the session rather than asking the product to quit: its

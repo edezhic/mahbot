@@ -1421,7 +1421,8 @@ pub enum EntryPoint {
     /// the poll loop starts.
     Paused,
     /// `mahbot __login-start`: the daemon as the login registration starts it — not a
-    /// second launch, coming up with the tray only.
+    /// second launch, its window hidden until the tray brings it up (and shown at once
+    /// when there is no tray icon to bring it back).
     LoginStart,
     /// `-h`/`--help`.
     Help,

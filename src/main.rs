@@ -822,26 +822,30 @@ fn main() -> Result<()> {
     // Acquired before the Iced runtime starts and stored in a global so the update flow can
     // release and re-acquire it.
     //
-    // A second launch while one is running takes the other way out: the running copy's window
-    // comes up — the only way back to one a close hid — and this process exits 0, wherever the
-    // copy can be reached: a booting instance has not bound its endpoint, and an update hand-off
-    // is not a second launch at all. Everywhere else the launch is refused, filed in the durable
+    // A second launch while one is running starts nothing and raises nothing: the window is the
+    // user's own to bring up, from the tray (`window_requests`), so a keepalive automation's start
+    // branch, an agent's restart and a script's "open the app" all leave it where it is. What the
+    // launch answers stays what it answered on this platform before (the branches below). An
+    // update hand-off is not a second launch at all, and its refusal is filed in the durable
     // failure record under the root resolved above with its text unchanged — the shell tool
     // recognises a stale self-update binary by it (`self_update::second_instance_refusal`). A
     // Windows launch with no console stays silent; a Unix one from a terminal says it there.
     if let Err(refusal) = mahbot::self_update::acquire_lock(&storage_root) {
-        // A login start is not a second launch: the system asked and one is up, so this exits
-        // quietly — no window raised, no failure filed, exit 0. A location that could not be
-        // taken for any other reason is filed like a real failure.
+        // A login start is not a second launch either: the system asked and one is up, so this
+        // exits quietly — no failure filed, exit 0. A location that could not be taken for any
+        // other reason is filed like a real failure.
         if login_start && mahbot::self_update::is_instance_refusal(&refusal) {
             mahbot::detach::report_already_running();
             return Ok(());
         }
+        // Where the window can be hidden, the running copy is asked whether it is taking launches:
+        // answered, this launch reports "already running" and exits 0; a boot that has not bound
+        // its endpoint yet or a drain under way is refused below, as it always was.
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        if !mahbot::self_update::is_handoff() && mahbot::db::ipc::request_window_show(&storage_root)
+        if !mahbot::self_update::is_handoff()
+            && mahbot::self_update::is_instance_refusal(&refusal)
+            && mahbot::db::ipc::launch_taken(&storage_root)
         {
-            // The copy was reached and its window raised: the launch did what it came to do, and
-            // the terminal is told so — not that a service just started.
             mahbot::detach::report_already_running();
             return Ok(());
         }
@@ -850,8 +854,8 @@ fn main() -> Result<()> {
             "self_update::acquire_lock",
             refusal,
         );
-        // Where no window can be raised this refusal is the launch's whole answer, said on the
-        // waiting terminal; the filed block stays the durable half.
+        // This refusal is the launch's whole answer, said on the waiting terminal; the filed
+        // block stays the durable half.
         mahbot::detach::report_failure(&refusal);
         return Err(refusal);
     }
@@ -887,8 +891,8 @@ fn main() -> Result<()> {
     // The icon on the surfaces the window itself does not carry.
     mahbot::app_icon::install_desktop_integration();
 
-    // The tray icon, a second launch and the Dock; plus the product's only in-app quit. The
-    // channel first, so a gesture arriving before the dashboard subscribes waits for it.
+    // The tray icon — the one way back to a window a close hid, and the product's only in-app
+    // quit. The channel first, so a gesture arriving before the dashboard subscribes waits for it.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     mahbot::window_requests::init();
 
@@ -898,13 +902,12 @@ fn main() -> Result<()> {
     mahbot::tray::install();
 
     // A restart the updater made for a hidden window comes back hidden: the window is created
-    // invisible and nothing draws until the tray brings it up. A login start is hidden the same
-    // way; Linux has no windowless mode. An ordinary cold start always shows it.
+    // invisible and stays so until the tray brings it up — or the boot rescue shows it, for a
+    // failed boot or no tray icon (`gui`). A login start is hidden the same way; Linux has no
+    // windowless mode. An ordinary cold start always shows it.
     let start_hidden = cfg!(any(target_os = "macos", target_os = "windows"))
         && (mahbot::self_update::starts_hidden() || login_start);
     mahbot::gui::app_window::set_hidden(start_hidden);
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    mahbot::gui::app_window::set_login_start(login_start);
 
     // The exit path persists the last reported size and position, and a fresh window's start-up
     // width is settled by the board's first read (see `StartupWidth`).

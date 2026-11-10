@@ -1,10 +1,10 @@
 //! The tray icon: the product's own icon in the platform's status area — the macOS menu bar and the
 //! Windows notification area — with a click that brings the window up and a native one-item menu
-//! whose item quits. It is the way back to a window a close hid, and the product's only in-app
-//! quit. Linux has no tray, and nothing here is compiled there. Nothing runs periodically: each
-//! platform hands a gesture to the handlers [`install`] sets, and they only enqueue it. A tray that
-//! cannot be created is not fatal — it is reported, the daemon runs without it, and a window then
-//! never hides (a hidden window with no tray to bring it back would leave no way to quit).
+//! whose item quits. It is the only way back to a window a close hid, and the product's only
+//! in-app quit. Linux has no tray, and nothing here is compiled there. Nothing runs periodically:
+//! each platform hands a gesture to the handlers [`install`] sets, and they only enqueue it. A tray
+//! that cannot be created is not fatal — it is reported, the daemon runs without it, and a window
+//! then never hides (a hidden window with no tray to bring it back would leave no way to quit).
 use std::sync::atomic::{AtomicBool, Ordering};
 use tray_icon::TrayIconBuilder;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
@@ -91,7 +91,7 @@ mod macos {
         /// The tray itself; dropping it takes the status item out of the menu bar.
         tray: TrayIcon,
         /// The event-stream monitor reading the plain click, taken out with the item.
-        monitor: Option<Retained<AnyObject>>,
+        monitor: Retained<AnyObject>,
     }
 
     thread_local! {
@@ -153,6 +153,10 @@ mod macos {
                 &handler,
             )
         };
+        // The monitor is the whole click-to-show path, and a window is only ever hidden while this
+        // icon is the way back: an icon whose click cannot be read is reported as no icon at all,
+        // so the window then never hides (`gui`).
+        let monitor = monitor.ok_or("its click could not be watched")?;
 
         Ok(Installed { tray, monitor })
     }
@@ -192,10 +196,8 @@ mod macos {
         let Some(Installed { tray, monitor }) = ICON.with(|icon| icon.borrow_mut().take()) else {
             return;
         };
-        if let Some(monitor) = &monitor {
-            // SAFETY: a monitor this thread installed, removed once.
-            unsafe { NSEvent::removeMonitor(monitor) };
-        }
+        // SAFETY: a monitor this thread installed, removed once.
+        unsafe { NSEvent::removeMonitor(&monitor) };
         // Dropping the icon takes the status item out of the menu bar.
         drop(tray);
     }

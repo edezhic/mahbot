@@ -10,8 +10,9 @@
 //! payload_len][payload]`): a diagnostic query (`IpcRequest` with no `call`, answered with
 //! `QueryResponse`); a command-line operation (any family [`crate::cli`] publishes, which adds
 //! `call` and names its family's protocol value in `store`, answered with `CallReply`); and, where
-//! the window can be hidden (macOS, Windows), a second launch asking the interface to bring its
-//! window up.
+//! the window can be hidden (macOS, Windows), a second launch asking whether the copy is taking
+//! launches — nothing of the product raises the window on a launch (see
+//! [`crate::window_requests`]).
 //!
 //! The compatibility rule is why the operation rides the old frame: an operation frame carries a
 //! magic `store` value — the generation its family declares ([`CALL_STORE`] /
@@ -206,18 +207,19 @@ pub(crate) const CALL_STORE_VIDEO: &str = "cli3";
 pub(crate) const CALL_STORES: &[&str] = &[CALL_STORE, CALL_STORE_BASE, CALL_STORE_VIDEO];
 
 /// The store value a second launch's frame names: not a store, and nothing is queried — the frame
-/// asks the interface to bring its window up and is answered when it took it. A product that does
-/// not know the value, or cannot show a window, refuses it, which the caller reads as "no window
-/// came up".
+/// asks whether this copy is taking launches, and nothing of the product raises the window on a
+/// launch (see [`crate::window_requests`]). A product that does not know the value refuses it,
+/// which the caller reads as "not taken" — so a launch of an older build cannot raise this copy's
+/// window either, its frame naming the retired `window` value instead.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-const SHOW_WINDOW_STORE: &str = "window";
+const LAUNCH_STORE: &str = "launch";
 
-/// The answer a window raise gets when the socket could not be restricted to the instance's own
+/// The answer a launch probe gets when the socket could not be restricted to the instance's own
 /// user: the fail-closed rule stated for this request.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-const SHOW_WINDOW_UNRESTRICTED_ANSWER: &str = concat!(
-    "the command-line channel could not be restricted to this machine's own user, so a window ",
-    "is not brought up through it"
+const LAUNCH_UNRESTRICTED_ANSWER: &str = concat!(
+    "the command-line channel could not be restricted to this machine's own user, so a launch ",
+    "is not taken through it"
 );
 
 /// One command-line operation: the tool the frontend addressed, its arguments, and the secrets
@@ -415,18 +417,17 @@ async fn handle_connection(
         }
     };
 
-    // A second launch of the product: its one frame asks the interface to bring the window up.
-    // Served only on a channel restricted to the instance's own user, and taken only while the
-    // product can still show a window — a launch that finds a drain or exit under way is refused as
-    // every second launch was. The answer says the request was taken, not that the window is up.
+    // A second launch of the product: its one frame asks whether this copy is taking launches.
+    // Nothing is asked of the interface and nothing is raised — a launch never brings the window
+    // up (see `crate::window_requests`) — so the answer only says whether the launch is answered
+    // as "already running" or refused: served on a channel restricted to the instance's own user,
+    // and not while a drain or exit is under way.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    if req.store == SHOW_WINDOW_STORE {
+    if req.store == LAUNCH_STORE {
         let resp = if !serve_calls {
-            response_error(SHOW_WINDOW_UNRESTRICTED_ANSWER)
+            response_error(LAUNCH_UNRESTRICTED_ANSWER)
         } else if crate::shutdown::aborting() {
-            response_error("the product is shutting down, so no window came up")
-        } else if !crate::window_requests::show() {
-            response_error("the interface is not running, so no window came up")
+            response_error("the product is shutting down, so this launch was not taken")
         } else {
             response_ok()
         };
@@ -839,7 +840,7 @@ fn connect_sync(storage_root: &Path) -> Result<interprocess::local_socket::Strea
 }
 
 /// One request frame out, one answer frame in — the whole of the sync channel's
-/// exchange, shared by the query client and the second-launch request.
+/// exchange.
 fn exchange_sync(
     stream: &mut interprocess::local_socket::Stream,
     req: &IpcRequest,
@@ -880,18 +881,19 @@ fn read_frame_sync(stream: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> 
     Ok(payload)
 }
 
-/// Ask the running instance to bring its window up — the one request a second launch of the
-/// product makes (see `main`).
+/// Ask the running instance whether it is taking launches — the one request a second launch of
+/// the product makes (see `main`). It asks nothing else: no launch raises the window (see
+/// `crate::window_requests`).
 ///
 /// A single short attempt with no retry: this runs at startup, before any interface exists in
 /// this process, and `false` means the instance has not bound the endpoint yet (a boot or an
 /// update hand-off under way), stopped answering, is shutting down, or does not serve the
-/// request at all. The caller then answers the launch the way a second launch always was.
+/// request at all. The caller then answers the launch with the refusal, as it always has.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[must_use]
-pub fn request_window_show(storage_root: &Path) -> bool {
+pub fn launch_taken(storage_root: &Path) -> bool {
     /// Bound on the whole exchange: the instance either answers at once or is not there to,
-    /// and a launch must not wait on one that never will — it has no window to show either way.
+    /// and a launch must not wait on one that never will.
     const WAIT: Duration = Duration::from_secs(2);
 
     // The exchange runs on a thread of its own so the wait has a bound everywhere: a Windows
@@ -900,9 +902,9 @@ pub fn request_window_show(storage_root: &Path) -> bool {
     let (sent, answer) = std::sync::mpsc::channel();
     let root = storage_root.to_path_buf();
     let spawned = std::thread::Builder::new()
-        .name("window-show".to_string())
+        .name("launch-probe".to_string())
         .spawn(move || {
-            let _ = sent.send(ask_window_show(&root));
+            let _ = sent.send(ask_launch_taken(&root));
         });
     if spawned.is_err() {
         return false;
@@ -911,12 +913,12 @@ pub fn request_window_show(storage_root: &Path) -> bool {
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn ask_window_show(storage_root: &Path) -> bool {
+fn ask_launch_taken(storage_root: &Path) -> bool {
     let Ok(mut stream) = connect_sync(storage_root) else {
         return false;
     };
     let request = IpcRequest {
-        store: SHOW_WINDOW_STORE.to_string(),
+        store: LAUNCH_STORE.to_string(),
         sql: String::new(),
         params: Vec::new(),
         call: None,

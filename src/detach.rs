@@ -50,8 +50,8 @@ pub fn report_running() {
     send(RUNNING);
 }
 
-/// Tell the waiting launcher the product is already running, and that this launch did what
-/// it came to do.
+/// Tell the waiting launcher the product is already running — this launch started nothing and
+/// changed nothing.
 pub fn report_already_running() {
     send(ALREADY_RUNNING);
 }

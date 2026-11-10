@@ -763,17 +763,11 @@ impl Dashboard {
                 Task::none()
             }
         };
-        // A failed boot has nothing to keep running hidden, and a launch the updater restarted
-        // hidden has no way back without a tray icon: either way the window comes up. A login
-        // start never does.
+        // A failed boot has nothing to keep running hidden, and a hidden window with no tray icon
+        // has no way back — the tray is the only one, since no launch raises the window. Either
+        // way the window comes up, a quiet login start included.
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         if self::app_window::hidden() && (!self.ready || !crate::tray::available()) {
-            if self::app_window::login_start() {
-                tracing::warn!(
-                    "the login start stays quiet with no way to reach it; a hand launch brings the window up"
-                );
-                return tasks;
-            }
             return tasks.chain(self::app_window::show());
         }
         tasks
@@ -1365,8 +1359,8 @@ impl Dashboard {
             Message::WindowRequested(crate::window_requests::WindowRequest::Quit) => {
                 self.request_exit(Some(crate::shutdown::TRAY_QUIT_TRIGGER))
             }
-            // A window a restart left hidden comes up before boot finishes too. A product on its
-            // way out has none to bring up — and a second launch asks this first (`db::ipc`).
+            // The tray icon's click: a window a restart left hidden comes up before boot finishes
+            // too. A product on its way out has none to bring up.
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             Message::WindowRequested(crate::window_requests::WindowRequest::Show) => {
                 if crate::shutdown::aborting() {
@@ -2696,7 +2690,7 @@ fn quit_requests_subscription() -> impl futures_util::Stream<Item = Message> {
     })
 }
 
-/// Turns the ways into the window from outside it into their messages: a tray or Dock click
+/// Turns the ways into the window from outside it into their messages: the tray icon's click
 /// brings it up, the tray menu's item is an ordinary exit request. Source:
 /// [`crate::window_requests`], filled before iced runs. The platform's handlers only enqueue,
 /// so its menu tracking is never held up by the interface.

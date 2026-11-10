@@ -109,7 +109,7 @@ const HANDOFF_ENV: &str = "MAHBOT_UPDATE_HANDOFF";
 /// never left to inheritance: the parent may itself have come back hidden.
 const START_HIDDEN_ENV: &str = "MAHBOT_START_HIDDEN";
 
-/// The one launch whose window opens hidden: the updater's replacement of a hidden
+/// The launch this marker makes open hidden: the updater's replacement of a hidden
 /// window (see [`START_HIDDEN_ENV`]).
 #[must_use]
 pub fn starts_hidden() -> bool {
@@ -2328,6 +2328,51 @@ mod tests {
         assert!(
             lock_becomes_free(&lock_path).expect("lock the released lock file"),
             "After release, the lock must be acquirable again"
+        );
+    }
+
+    /// Tripwire: a launch of the executable raises nothing, so a window can only come up on a
+    /// user's gesture. The tray icon's click is the one producer of a show request
+    /// ([`crate::window_requests::show`]), and the dashboard's own boot rescue
+    /// ([`crate::gui::app_window::show`]) is the one other place the window is shown — no launch,
+    /// no service channel and no reopen of the application may reach either, nor the iced calls
+    /// they are built on.
+    ///
+    /// It is a source scan, not a proof: line comments are skipped, block comments are not, and
+    /// the patterns are spelled split so this table does not match itself.
+    #[test]
+    fn nothing_but_a_gesture_raises_the_window() {
+        const WINDOW: &[&str] = &["src/gui/app_window.rs"];
+        let patterns = [
+            (concat!("window_requests::", "show()"), &["src/tray.rs"][..]),
+            (concat!("app_window::", "show()"), &["src/gui/mod.rs"][..]),
+            (concat!("Mode::", "Windowed"), WINDOW),
+            (concat!("gain_", "focus"), WINDOW),
+        ];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut violations: Vec<String> = Vec::new();
+        for file in crate::util::test::rs_files_under(&root.join("src")) {
+            let rel = crate::util::test::rel_source_path(root, &file);
+            let content = std::fs::read_to_string(&file).expect("read source file");
+            let code_only: String = content
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for (pattern, allowed) in patterns {
+                if !allowed.contains(&rel.as_str()) && code_only.contains(pattern) {
+                    violations.push(format!("{rel}: {pattern}"));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "the window comes up on a user's gesture alone — the tray icon's click, and the \
+             dashboard's boot rescue when a hidden window has no tray to bring it back. A launch \
+             of the executable must not raise it (a keepalive automation's start branch, an \
+             agent's restart and a script's \"open the app\" all do nothing), and neither must \
+             the service channel or the platform's reopen.\n{}",
+            violations.join("\n")
         );
     }
 

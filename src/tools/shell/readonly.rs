@@ -808,7 +808,7 @@ const PRODUCT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
 
 /// The verdict for the product's own binary: only its read-only forms run.
 ///
-/// Its other command lines change it, drive it or restart it: `config`/
+/// Its other command lines start it, change it or drive it: `config`/
 /// `workspace` carry the owner's configuration and workspace authority, `send`
 /// dispatches the agents the owner's dispatch tool reaches, and the producing
 /// families ([`crate::cli::producing_families`]) make files with the owner's
@@ -836,7 +836,7 @@ fn check_product_segment(segment: &str, second: Option<&str>) -> Result<(), Stri
         segment,
         &format!(
             "{called} is the product's own binary, and not one of its read-only forms ({allowed}). \
-             Its other command lines change the product, drive it or restart it: its \
+             Its other command lines start the product, change it or drive it: its \
              `config`/`workspace` families carry the owner's own configuration and workspace \
              authority, its `send` family dispatches the agents its dispatch tool reaches, and \
              its {producing} families run the assistant's own tools for them, making files with \

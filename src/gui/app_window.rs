@@ -1,7 +1,6 @@
 //! The dashboard's window on the platforms whose window is the app's own: a close HIDES it and
-//! the product keeps running, so the ways back are the tray, a second launch and the Dock (see
-//! `crate::window_requests`; the Dock's reopen is one of the delegate methods the macOS quit
-//! interception installs — see `crate::shutdown`).
+//! the product keeps running, so the one way back is the tray icon (see `crate::window_requests`;
+//! nothing else raises it — not a launch of the executable, not a reopen of the application).
 //!
 //! The window's shape stays the platform's: macOS keeps the system's titled window with its
 //! whole title strip hidden (see [`opened`]), Windows asks the system to round the corners of a
@@ -35,27 +34,9 @@ pub(crate) fn hidden() -> bool {
 }
 
 /// Set the hidden flag — what hiding and showing the window do before they touch it, and what a
-/// launch the updater restarted hidden starts with (see `main`).
+/// launch the updater restarted hidden, and a login start, start with (see `main`).
 pub fn set_hidden(hidden: bool) {
     HIDDEN.store(hidden, Ordering::Relaxed);
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-static LOGIN_START: AtomicBool = AtomicBool::new(false);
-
-/// Record that the system started the process at login (`crate::autostart`). Such a launch is not a
-/// second launch and never brings the window up by itself — see [`login_start`].
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-pub fn set_login_start(login_start: bool) {
-    LOGIN_START.store(login_start, Ordering::Relaxed);
-}
-
-/// It comes up as the tray icon only: the system asked for a quiet start, so neither a failed
-/// boot nor a missing tray may surface the window — the tray, or a hand launch when there is
-/// none, is the way back.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-pub(crate) fn login_start() -> bool {
-    LOGIN_START.load(Ordering::Relaxed)
 }
 
 /// Everything behind it keeps running, the window is hidden the way the platform hides one (its
@@ -163,7 +144,8 @@ fn bring_forward() {
     let app = NSApplication::sharedApplication(marker);
     let window = dashboard_window(marker);
     // An application hidden with ⌘H stays hidden for an activation request: its windows come back
-    // only once it is unhidden, which is what the Dock's own reopen does here.
+    // only once it is unhidden, so the unhiding is done here rather than left to a reopen (which
+    // this product answers with nothing — see `crate::shutdown`).
     app.unhide(None);
     // Deprecated in favour of `activate()`, which the platform grants only to an application it
     // considers user-driven right now — not to one whose windows are all minimized, exactly the
