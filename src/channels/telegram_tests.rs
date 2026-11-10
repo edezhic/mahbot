@@ -2072,7 +2072,8 @@ fn attachment_content_format_rules() {
         assert!(c.starts_with("[FILE:"), "{mime}: should use [FILE:]");
     }
     // A sound file and a recorded voice message both arrive as an [AUDIO:] marker, which the
-    // enrichment pass transcribes — the marker follows the kind, not the platform.
+    // enrichment pass saves into the workspace and transcribes — the marker follows the kind, not
+    // the platform.
     let c = format_attachment_content(
         IncomingAttachmentKind::Audio,
         std::path::Path::new("/tmp/workspace/voice.ogg"),
@@ -2239,6 +2240,79 @@ fn local_attachment_name_uses_sanitized_sender_name_or_fallback() {
             None
         ),
         "file_123_7.bin"
+    );
+}
+
+/// A recording is never given an image extension: the name it is saved under is the name the user
+/// later plays, so a voice note keeps OGG, a declared container keeps its own extension, and only
+/// an unidentifiable sound file stays neutral.
+#[test]
+fn local_attachment_name_gives_a_recording_a_sound_extension() {
+    let attachment = IncomingAttachment {
+        file_id: "f".to_string(),
+        file_name: None,
+        file_size: None,
+        caption: None,
+        kind: IncomingAttachmentKind::Voice,
+        mime_type: Some("audio/ogg".to_string()),
+        urgent: false,
+    };
+    assert_eq!(
+        local_attachment_name(&attachment, "123", 7, None),
+        "audio_123_7.ogg"
+    );
+    // Telegram's own file path names the container when it can, and that wins.
+    assert_eq!(
+        local_attachment_name(&attachment, "123", 7, Some("oga")),
+        "audio_123_7.oga"
+    );
+    // A sound file takes the container its declared type names.
+    let song = IncomingAttachment {
+        kind: IncomingAttachmentKind::Audio,
+        mime_type: Some("audio/mpeg".to_string()),
+        ..attachment.clone()
+    };
+    assert_eq!(
+        local_attachment_name(&song, "123", 7, None),
+        "audio_123_7.mp3"
+    );
+    // With no container named anywhere the extension stays neutral, never an image's.
+    assert_eq!(
+        local_attachment_name(
+            &IncomingAttachment {
+                mime_type: None,
+                ..song.clone()
+            },
+            "123",
+            7,
+            None
+        ),
+        "audio_123_7.bin"
+    );
+    // A sender's name without an extension gets the sound one; a name the sender wrote keeps it.
+    assert_eq!(
+        local_attachment_name(
+            &IncomingAttachment {
+                file_name: Some("song".to_string()),
+                ..song.clone()
+            },
+            "123",
+            7,
+            None
+        ),
+        "song.mp3"
+    );
+    assert_eq!(
+        local_attachment_name(
+            &IncomingAttachment {
+                file_name: Some("song.m4a".to_string()),
+                ..song
+            },
+            "123",
+            7,
+            None
+        ),
+        "song.m4a"
     );
 }
 

@@ -12,7 +12,8 @@
 //! `[AUDIO:…]`/`[VIDEO:…]`/`[FILE:…]` an emoji plus the file name, whose click reveals the file in
 //! the OS file manager; `[Audio transcription of …]`/`[Video transcription of …]` (legacy persisted
 //! forms) an emoji plus the transcribed text; `[Saved image: …]` nothing (the image renders from its
-//! data-URI marker); `[Saved video: …]` the clip name (there is no separate video renderer).
+//! data-URI marker); `[Saved video: …]`/`[Saved audio: …]` the clip's or recording's name, labelled
+//! exactly as its own marker is (there is no separate video or audio renderer).
 //!
 //! # When a marker is an attachment
 //!
@@ -270,11 +271,13 @@ fn media_label(kind: MediaMarkerKind, target: &str) -> String {
 }
 
 /// Handle the `[Saved <kind>: path]` upload annotations produced by the channel enrichment layer.
-/// They are **not** `[KIND:path]` markers and are model-facing only.
+/// They are **not** `[KIND:path]` markers.
 ///
 /// `[Saved image: path]` is stripped entirely: the image already renders from its `[IMAGE:data:…]`
-/// marker. `[Saved video: path]` becomes `🎬 Video: filename`: there is **no** separate video
-/// renderer, so stripping it would hide the clip.
+/// marker. `[Saved video: path]` becomes `🎬 Video: filename` and `[Saved audio: path]`
+/// `🎵 filename`, the same labels their own markers show: there is **no** separate video or audio
+/// renderer, so stripping them would hide the file. A recording's line is model-facing only (the
+/// owner's bubble carries the transcript), while a clip's reaches the bubble in the body.
 fn replace_saved_annotations(s: &str) -> String {
     // `\n*` eats the blank-line separator enrichment inserts before the trailing image annotation
     // so no stray whitespace remains.
@@ -286,12 +289,22 @@ fn replace_saved_annotations(s: &str) -> String {
         regex::Regex::new(r"\[Saved video: ([^\]]*)\]")
             .expect("saved video annotation regex must compile")
     });
+    static SAVED_AUDIO_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\[Saved audio: ([^\]]*)\]")
+            .expect("saved audio annotation regex must compile")
+    });
 
     let s = SAVED_IMAGE_RE.replace_all(s, "").to_string();
-    SAVED_VIDEO_RE
+    let s = SAVED_VIDEO_RE
         .replace_all(&s, |caps: &regex::Captures| {
             let path = caps.get(1).map_or("", |m| m.as_str());
             format!("🎬 Video: {}", file_name_or_path(path))
+        })
+        .to_string();
+    SAVED_AUDIO_RE
+        .replace_all(&s, |caps: &regex::Captures| {
+            let path = caps.get(1).map_or("", |m| m.as_str());
+            format!("🎵 {}", file_name_or_path(path))
         })
         .to_string()
 }
@@ -1105,6 +1118,12 @@ mod tests {
                 "turns a saved video annotation into a visible clip label",
                 "Clip [Saved video: /uploads/clip.mp4] here".into(),
                 "Clip 🎬 Video: clip.mp4 here",
+                Vec::new(),
+            ),
+            (
+                "turns a saved audio annotation into a visible recording label, the way its marker reads",
+                "🔊✍️ hello\n[Saved audio: /uploads/upload_1.oga]".into(),
+                "🔊✍️ hello\n🎵 upload_1.oga",
                 Vec::new(),
             ),
         ];

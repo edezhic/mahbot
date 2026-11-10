@@ -460,7 +460,9 @@ pub struct ChannelMessage {
     pub content: String,
     /// What the owner's own bubble shows, when it differs from [`content`](Self::content): a
     /// video's timeline reaches the model with its pictures as ordinary `[IMAGE:]` markers, and
-    /// the bubble shows the same timeline without the pictures. `None` means the two are the same.
+    /// the bubble shows the same timeline without the pictures; a recording's transcript reaches
+    /// the model with the location it was saved at on the line under it, and the bubble shows the
+    /// transcript alone. `None` means the two are the same.
     pub display_content: Option<String>,
     /// The channel this message originated from (e.g. `"telegram"`, `"gui"`).
     pub channel: String,

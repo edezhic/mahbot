@@ -1496,8 +1496,8 @@ async fn process_channel_message(msg: ChannelMessage) {
     // Before broadcast, so the GUI receives the enriched form instead of raw `[AUDIO:path]`
     // markers. Images become native data-URI parts carrying the original bytes (re-encoded to a
     // bounded JPEG only over the encoded-payload cap); videos become a workspace copy plus the
-    // clip's timeline. The parts are independent and this is the expensive step, so the whole burst
-    // is enriched at once.
+    // clip's timeline; a recording becomes a workspace copy plus its transcript. The parts are
+    // independent and this is the expensive step, so the whole burst is enriched at once.
     futures_util::future::join_all(
         parts
             .iter_mut()

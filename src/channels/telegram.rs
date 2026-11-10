@@ -105,7 +105,7 @@ enum IncomingAttachmentKind {
     Document,
     Photo,
     Video,
-    /// A sound file (the `audio` key): transcribed on macOS, a plain file elsewhere.
+    /// A sound file (the `audio` key): saved into the workspace and transcribed, like a voice note.
     Audio,
     /// A recorded voice message (the `voice` key): OGG/Opus bytes, no file name.
     Voice,
@@ -505,8 +505,8 @@ fn format_attachment_content(
             format!("[VIDEO:{}]", local_path.display())
         }
         IncomingAttachmentKind::Audio | IncomingAttachmentKind::Voice => {
-            // A recording and a sound file both arrive as an AUDIO marker, which enrichment
-            // transcribes.
+            // A recording and a sound file both arrive as an AUDIO marker, which enrichment saves
+            // into the workspace and transcribes.
             format!("[AUDIO:{}]", local_path.display())
         }
         _ => {
@@ -601,6 +601,22 @@ fn sanitize_remote_extension(remote_ext: &str) -> Option<String> {
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
+/// The extension a declared audio type names — the container a sound file really is.
+///
+/// It is what makes a recording saved from a generated name playable, and readable by the
+/// recogniser where its own table names the container (`speech::decode::AUDIO_FORMATS`).
+fn audio_extension(mime_type: Option<&str>) -> Option<&'static str> {
+    match mime_type? {
+        "audio/mpeg" | "audio/mp3" => Some("mp3"),
+        "audio/mp4" | "audio/m4a" | "audio/x-m4a" => Some("m4a"),
+        "audio/ogg" | "audio/opus" => Some("ogg"),
+        "audio/wav" | "audio/x-wav" | "audio/wave" => Some("wav"),
+        "audio/aac" => Some("aac"),
+        "audio/flac" | "audio/x-flac" => Some("flac"),
+        _ => None,
+    }
+}
+
 /// The local save name for an inbound attachment: the sender's `file_name`, else a generated
 /// `<kind>_<chat>_<message>.<ext>`, either way through [`sanitize_attachment_filename`].
 fn local_attachment_name(
@@ -613,9 +629,16 @@ fn local_attachment_name(
     let ext = remote_ext.as_deref().unwrap_or(match attachment.kind {
         // video_note has no file_name or mime_type; a ".jpg" default would misroute it.
         IncomingAttachmentKind::Video => "mp4",
-        // No name and no MIME type: the generic file path, so the default stays neutral.
+        // A voice note is OGG/Opus whatever it is called.
+        IncomingAttachmentKind::Voice => "ogg",
+        IncomingAttachmentKind::Photo => "jpg",
+        // A sound file's container is whatever its declared type names. One that names none keeps a
+        // neutral extension: the saved recording is meant to be played later, so it is never
+        // labelled a format it is not.
+        IncomingAttachmentKind::Audio => {
+            audio_extension(attachment.mime_type.as_deref()).unwrap_or("bin")
+        }
         IncomingAttachmentKind::Document => "bin",
-        _ => "jpg",
     });
     let prefix = match attachment.kind {
         IncomingAttachmentKind::Photo => "photo",
@@ -632,6 +655,17 @@ fn local_attachment_name(
         attachment.file_name.as_deref().unwrap_or(&fallback),
         attachment.mime_type.as_deref(),
     );
+    // A recording the sender named without any extension takes the one its kind or declared type
+    // names (neutral when neither does) — before sanitizing, so the byte budget covers it. An
+    // extension the sender wrote is left as it is: it is the name the user knows.
+    let chosen = match attachment.kind {
+        IncomingAttachmentKind::Audio | IncomingAttachmentKind::Voice
+            if Path::new(&chosen).extension().is_none() =>
+        {
+            format!("{chosen}.{ext}")
+        }
+        _ => chosen,
+    };
     sanitize_attachment_filename(&chosen, &fallback)
 }
 

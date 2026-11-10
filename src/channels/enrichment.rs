@@ -3,8 +3,8 @@
 //!
 //! Media markers (`[IMAGE: ...]`, `[AUDIO: ...]`, `[VIDEO: ...]`, `[FILE: ...]`): an inbound
 //! local image becomes a native data-URI part carrying the original bytes, re-encoded to a
-//! bounded JPEG only when it would exceed the encoded-payload cap; audio is transcribed to
-//! text; video is a workspace copy plus its timeline; an inbound document is copied
+//! bounded JPEG only when it would exceed the encoded-payload cap; audio is a workspace copy
+//! plus its transcript; video is a workspace copy plus its timeline; an inbound document is copied
 //! into the workspace and converted to text and its first
 //! [`crate::document::MAX_READ_PICTURES`] pictures. Link enrichment prepends webpage
 //! summaries for URLs in the message.
@@ -22,7 +22,8 @@
 //! Entry points are [`enrich_message`] and [`enrich_links`]; [`has_inbound_temp_marker`] is
 //! called by `channels::persist_content` to decide what is persisted to chat history.
 //! [`enrich_message`] takes the workspace whose `uploads/` receives saved full-resolution
-//! copies (`None` disables copies) — the path that makes a clip's timeline possible.
+//! copies (`None` disables copies) — the path that makes a clip's timeline possible, and the one
+//! place every kept copy lives, aged out by `research_cleanup::sweep_media`'s mention rule.
 
 use crate::ChannelMessage;
 use crate::document::{DocOutcome, INLINE_TEXT_MAX_CHARS, convert_document_file};
@@ -47,8 +48,8 @@ static URL_RE: LazyLock<Regex> =
 /// suffixes keep concurrent [`enrich_links`] runs from sharing a chrome session.
 static LINK_ENRICHER_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// The audio-transcription icon combo, used as the failure fallback and as the annotation for
-/// out-of-scope `[AUDIO:...]` markers that must never be read or deleted.
+/// What a recording reads as when it could not be transcribed: the icon combo alone, which is also
+/// the annotation for out-of-scope `[AUDIO:...]` markers that must never be read or deleted.
 const AUDIO_ICON: &str = "🔊✍️";
 
 /// A transcribed message as presented: the icon combo, one space, then the text. The one
@@ -59,28 +60,20 @@ pub(crate) fn marked_transcript(text: &str) -> String {
     format!("{AUDIO_ICON} {text}")
 }
 
-/// The content to embed for an `[AUDIO:...]` marker: the icon combo followed by the transcription.
-///
-/// The audio file is a pure intermediate artifact — the caller deletes it regardless of
-/// outcome — so the returned string never contains its name or path. On failure just the
-/// icon combo is returned.
-async fn transcribe_audio_marker(path: &str) -> String {
-    let path_buf = std::path::PathBuf::from(path);
-
+/// One recording into words: the transcript, or `None` when transcription is switched off, fails,
+/// or reads nothing. Saving the file is the caller's business — the recording outlives the words
+/// either way, so this never deletes or renames it.
+async fn transcribe_audio_marker(path: &std::path::Path) -> Option<String> {
     if !crate::audio::voice::is_transcription_disabled() {
         // The 10-minute engine bound: attached audio can be arbitrarily long (voice memos,
         // meeting recordings, etc.).
-        match crate::speech::transcribe_file_async(&path_buf, crate::speech::INFERENCE_TIMEOUT)
-            .await
-        {
+        match crate::speech::transcribe_file_async(path, crate::speech::INFERENCE_TIMEOUT).await {
             Ok(text) => {
                 tracing::debug!("Local audio transcription succeeded");
                 let text = text.trim();
-                return if text.is_empty() {
-                    AUDIO_ICON.to_string()
-                } else {
-                    marked_transcript(text)
-                };
+                if !text.is_empty() {
+                    return Some(marked_transcript(text));
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Local audio transcription failed");
@@ -89,7 +82,7 @@ async fn transcribe_audio_marker(path: &str) -> String {
     }
 
     tracing::warn!("Audio transcription unavailable");
-    AUDIO_ICON.to_string()
+    None
 }
 
 /// Whether `path` is above the size automatic processing stops at.
@@ -113,21 +106,30 @@ struct SavedMedia {
     dest: std::path::PathBuf,
 }
 
-/// Copy a media file (image/video) into the workspace `uploads/` directory
+/// Copy a media file (image/video/audio) into the workspace `uploads/` directory
 /// under a fresh `upload_<millis>.<ext>` name, so the agent can reference it
 /// via tool calls. Returns `None` when no uploads dir is available or the copy fails.
+///
+/// The source's own extension is kept, so the copy is the container it really is. `fallback_ext`
+/// names one only where the source has none and its kind guarantees it; a recording passes `None`,
+/// because an unknown container must not be renamed to one it is not — the copy is then named
+/// `upload_<millis>` with no extension at all.
 async fn save_media_to_workspace(
     media_path: &std::path::Path,
     uploads_dir: Option<&std::path::Path>,
     label: &str,
-    fallback_ext: &str,
+    fallback_ext: Option<&str>,
 ) -> Option<SavedMedia> {
     let dir = uploads_dir?;
-    let ext = media_path
+    let millis = crate::util::unix_millis();
+    let name = match media_path
         .extension()
         .and_then(|e| e.to_str())
-        .unwrap_or(fallback_ext);
-    let name = format!("upload_{}.{ext}", crate::util::unix_millis());
+        .or(fallback_ext)
+    {
+        Some(ext) => format!("upload_{millis}.{ext}"),
+        None => format!("upload_{millis}"),
+    };
     let dest = copy_to_uploads(media_path, dir, &name).await?;
     Some(SavedMedia {
         annotation: format!("[Saved {label}: {}]", dest.display()),
@@ -294,7 +296,7 @@ async fn handle_image(
     // The workspace copy waits until the image converts, so a dead file leaves no junk upload
     // plus a "[Saved image: ...]" annotation beside the invalid ref.
     let saved = match &data_uri {
-        Ok(_) => save_media_to_workspace(path_obj, uploads_dir, "image", "png")
+        Ok(_) => save_media_to_workspace(path_obj, uploads_dir, "image", Some("png"))
             .await
             .map(|saved| saved.annotation),
         Err(_) => None,
@@ -410,7 +412,8 @@ async fn handle_video(
         tracing::warn!(%path, "Video path outside this message's inbound attachments — annotating without copy");
         return VideoAction::annotation(format!("[Video attached: {}]", file_name_or_path(path)));
     }
-    if let Some(saved) = save_media_to_workspace(path_obj, uploads_dir, "video", "mp4").await {
+    if let Some(saved) = save_media_to_workspace(path_obj, uploads_dir, "video", Some("mp4")).await
+    {
         // Read the persistent workspace copy, never the temp file. A failure becomes the
         // timeline's own sentence, carried beside the `[Saved video: ...]` annotation. Every
         // inbound video gets one, whatever its size: the timeline decodes from the file on disk
@@ -422,7 +425,8 @@ async fn handle_video(
         };
     }
     // Copy failed (or no uploads dir): annotate without a timeline, but the in-scope temp file is
-    // still a pure intermediate and is cleaned up.
+    // still a pure intermediate and is cleaned up. A recording is the opposite case — it is the
+    // artifact the user wants, so it is deleted only once its workspace copy exists.
     VideoAction {
         replacement: format!("[Video attached: {}]", file_name_or_path(path)),
         delete_temp: true,
@@ -456,35 +460,77 @@ async fn video_timeline(path: &std::path::Path) -> Annotation {
 /// Handle an AUDIO marker, answering the annotation to add and whether the source temp file may be
 /// deleted.
 ///
-/// Only this message's own inbound attachment is transcribed; a recording above the
-/// automatic-processing bound is saved to the workspace instead (only the local Bot API server
-/// could have delivered it, and receiving it means keeping it). A marker naming anything else —
-/// one typed by the user — is annotated without a transcript and its file is never deleted.
+/// A recording that is this message's own inbound attachment is copied into the workspace before
+/// anything reads it, and lives there by the same rule as every other saved media. Saving does not
+/// depend on the transcript: a format the recogniser cannot read, a failed or empty transcription
+/// and transcription switched off all leave the file saved. A recording above the
+/// automatic-processing bound is saved and never decoded in process (only the local Bot API server
+/// could have delivered it, and receiving it means keeping it). A marker naming anything else — one
+/// typed by the user, another message's attachment — is annotated without a transcript, never
+/// copied, and its file is never deleted.
 async fn handle_audio(
     path: &str,
     path_obj: &std::path::Path,
     uploads_dir: Option<&std::path::Path>,
     staging_dirs: &[String],
     processing_bound: Option<u64>,
-) -> (String, bool) {
-    if path_obj.is_file() && is_inbound_attachment(path_obj, staging_dirs).await {
-        if let Some(bound) = processing_bound
-            && too_large_to_process(path_obj, bound).await
-        {
-            let annotation =
-                match save_media_to_workspace(path_obj, uploads_dir, "audio", "mp3").await {
-                    Some(saved) => saved.annotation,
-                    None => AUDIO_ICON.to_string(),
-                };
-            return (annotation, true);
-        }
-        return (transcribe_audio_marker(path).await, true);
+) -> (Annotation, bool) {
+    if !path_obj.is_file() || !is_inbound_attachment(path_obj, staging_dirs).await {
+        tracing::warn!(
+            %path,
+            "Audio marker is not an inbound attachment file — annotating without transcription"
+        );
+        return (Annotation::shared(AUDIO_ICON.to_string()), false);
     }
-    tracing::warn!(
-        %path,
-        "Audio marker is not an inbound attachment file — annotating without transcription"
-    );
-    (AUDIO_ICON.to_string(), false)
+
+    // Above the bound the recording is kept but not read: the recogniser decodes the whole file in
+    // memory.
+    let too_large = match processing_bound {
+        Some(bound) => too_large_to_process(path_obj, bound).await,
+        None => false,
+    };
+
+    // Save first: the recording outlives the words, so a transcription that fails, reads nothing
+    // or is switched off must not take the file with it.
+    let saved = save_media_to_workspace(path_obj, uploads_dir, "audio", None).await;
+    let transcript = if too_large {
+        None
+    } else {
+        // The persistent workspace copy, never the temp file.
+        let source = saved
+            .as_ref()
+            .map_or(path_obj, |saved| saved.dest.as_path());
+        transcribe_audio_marker(source).await
+    };
+    // Without a workspace copy the temp file stays for the OS sweep rather than being deleted:
+    // losing it is the outcome this path exists to prevent.
+    (
+        audio_annotation(saved.as_ref(), transcript, too_large),
+        saved.is_some(),
+    )
+}
+
+/// What a recording reads as. The model gets the transcript with the saved location on the line
+/// under it; the owner's bubble keeps the transcript alone, because the location is a filesystem
+/// path the user's own message never shows. A recording that produced no words reads as the icon
+/// combo. Above the processing bound it was never read at all, so both forms are the saved
+/// location, as they have always been for a recording kept this way.
+fn audio_annotation(
+    saved: Option<&SavedMedia>,
+    transcript: Option<String>,
+    above_bound: bool,
+) -> Annotation {
+    let display = transcript.unwrap_or_else(|| AUDIO_ICON.to_string());
+    let Some(saved) = saved else {
+        return Annotation::shared(display);
+    };
+    if above_bound {
+        return Annotation::shared(saved.annotation.clone());
+    }
+    Annotation {
+        model: format!("{display}\n{}", saved.annotation),
+        display: Some(display),
+    }
 }
 
 /// An inbound attachment the receive path saved under the daemon's Telegram temp dir. Returns
@@ -734,14 +780,22 @@ async fn extracted_text_annotation(
 /// One line the enriched message carries ahead of its body.
 struct Annotation {
     /// What the model reads: a clip's timeline carries its pictures as ordinary `[IMAGE:]`
-    /// markers.
+    /// markers, and a recording's transcript carries the path it was saved at.
     model: String,
     /// What the owner's own bubble shows instead, when it differs — the same line without the
-    /// pictures. Usually it does not, and then nothing is kept for it.
+    /// pictures, or without the saved path. Usually it does not, and then nothing is kept for it.
     display: Option<String>,
 }
 
 impl Annotation {
+    /// One line both forms read the same.
+    fn shared(text: String) -> Self {
+        Self {
+            model: text,
+            display: None,
+        }
+    }
+
     fn model(&self) -> &str {
         &self.model
     }
@@ -770,10 +824,7 @@ struct EnrichmentBatch {
 impl EnrichmentBatch {
     /// One line both forms share.
     fn annotate(&mut self, text: String) {
-        self.annotations.push(Annotation {
-            model: text,
-            display: None,
-        });
+        self.annotations.push(Annotation::shared(text));
     }
 
     /// Delete the queued artifacts and the message's staging directories, then assemble the
@@ -830,10 +881,11 @@ impl EnrichmentBatch {
             .to_string();
         let cleaned = cleaned.trim().to_string();
 
-        // Prepend the accumulated text descriptions: transcribed AUDIO content, VIDEO
+        // Prepend the accumulated text descriptions: an AUDIO transcript and saved location, VIDEO
         // annotations and a FILE's extracted text. Prepending rather than inlining at the marker
         // keeps marker-shaped text inside a document away from the strip pass above. The owner's
-        // form is built only when an annotation differs from it — usually only a clip's does.
+        // form is built only when an annotation differs from it — for a clip's timeline pictures,
+        // or a recording's saved location.
         let content = composed(&self.annotations, &cleaned, Annotation::model);
         let display = self
             .annotations
@@ -860,7 +912,7 @@ fn composed(annotations: &[Annotation], body: &str, pick: fn(&Annotation) -> &st
 /// | Kind | Behavior |
 /// |------|----------|
 /// | IMAGE | data URI (original bytes, bounded-JPEG re-encode over the cap only) + in-scope copy |
-/// | AUDIO | transcription, or the icon combo when it fails or the file is out of scope |
+/// | AUDIO | workspace copy + `[Saved audio: path]` beside the transcript, or alone |
 /// | VIDEO | workspace copy + `[Saved video: path]` + the clip's timeline |
 /// | FILE | workspace copy + extracted text and images; verbatim when out of scope |
 ///
@@ -935,7 +987,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&st
                 }
             }
             MediaMarkerKind::Audio => {
-                // macOS: containment applies — only this message's own inbound attachment is
+                // Containment applies: only this message's own inbound attachment is saved,
                 // transcribed or deleted; an out-of-scope marker degrades to the icon only.
                 let (annotation, delete_temp) = handle_audio(
                     path,
@@ -945,7 +997,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&st
                     processing_bound,
                 )
                 .await;
-                batch.annotate(annotation);
+                batch.annotations.push(annotation);
                 if delete_temp {
                     batch.files_to_delete.push(path_obj.to_path_buf());
                 }
@@ -975,8 +1027,9 @@ pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&st
 /// A marker naming a path under the daemon's Telegram temp root.
 ///
 /// [`crate::channels::persist_content`] uses it to decide what reaches chat history: those
-/// markers name temp files the daemon deletes right after enrichment, so the enriched content
-/// is persisted instead. Purely syntactic, and deliberately looser than
+/// markers name the staging files a message arrived in — paths that are never what the enriched
+/// form refers to (a kept copy is named by its own `[Saved …]` line) — so the enriched content is
+/// persisted instead. Purely syntactic, and deliberately looser than
 /// [`is_inbound_attachment`]: a hand-typed marker naming that root also qualifies, which is
 /// safe because this only decides which text is replaced — it never reads, copies or deletes.
 #[must_use]
@@ -1558,25 +1611,195 @@ mod tests {
         let _ = tokio::fs::remove_file(&tmp).await;
     }
 
+    /// A recording is kept in the workspace whatever the transcript does: here the bytes are not a
+    /// container the recogniser reads, so there is no transcript at all and the file is still saved
+    /// — the outcome the whole path exists for.
     #[tokio::test]
-    async fn enrich_audio_file_deleted_on_failure() {
-        // Only this message's own inbound attachments are eligible for cleanup
-        // (user-typed markers must never delete arbitrary files).
-        let (_msg_dir, tmp) =
-            inbound_attachment_fixture(7010, "voice.mp3", b"fake audio content").await;
+    async fn enrich_audio_saved_to_workspace_when_transcription_fails() {
+        let tmp_root = crate::util::test::test_root().join("test_enrich_audio_ws");
+        let ws_path = tmp_root.join("myworkspace");
+        tokio::fs::create_dir_all(&ws_path).await.unwrap();
+
+        let bytes: &[u8] = b"fake audio content";
+        let (msg_dir, tmp) = inbound_attachment_fixture(7010, "voice.oga", bytes).await;
         let path_str = tmp.to_string_lossy().to_string();
 
         let mut msg = inbound_msg(7010, &format!("Audio: [AUDIO:{path_str}]"));
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
+
+        // The copy keeps the recording's real container and its bytes, and is the only file left.
+        let uploads = ws_path.join("uploads");
+        let saved: Vec<_> = std::fs::read_dir(&uploads)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(saved.len(), 1, "exactly one saved recording: {saved:?}");
+        assert_eq!(
+            saved[0].extension().and_then(|e| e.to_str()),
+            Some("oga"),
+            "the saved file keeps its real container: {saved:?}"
+        );
+        assert_eq!(tokio::fs::read(&saved[0]).await.unwrap(), bytes);
+        assert!(!tmp.exists(), "Temp file is deleted once the copy exists");
+        assert!(!msg_dir.exists(), "Per-message directory must be deleted");
+
+        // The model reads the icon (no transcript) with the saved location under it, and the temp
+        // path the marker carried is gone; the owner's bubble shows the icon alone.
+        assert_eq!(
+            msg.content,
+            format!(
+                "{AUDIO_ICON}\n[Saved audio: {}]\n\nAudio:",
+                saved[0].display()
+            )
+        );
+        assert_eq!(msg.display_content, Some(format!("{AUDIO_ICON}\n\nAudio:")));
+
+        let _ = tokio::fs::remove_dir_all(&tmp_root).await;
+    }
+
+    /// With no workspace to save into, the temp file is NOT deleted: losing the recording is the one
+    /// outcome this path must not produce.
+    #[tokio::test]
+    async fn enrich_audio_without_workspace_keeps_temp() {
+        let (msg_dir, tmp) =
+            inbound_attachment_fixture(7024, "voice.oga", b"fake audio content").await;
+        let path_str = tmp.to_string_lossy().to_string();
+
+        let mut msg = inbound_msg(7024, &format!("Audio: [AUDIO:{path_str}]"));
         enrich_message(&mut msg, None).await;
 
-        // This message's own inbound audio attachment is consumed, so the pure intermediate
-        // file is deleted even when transcription fails (there is no engine in tests).
         assert!(
-            !tmp.exists(),
-            "Audio temp file must be deleted on transcription failure"
+            tmp.exists(),
+            "A recording is never deleted without a workspace copy"
         );
-        // Defensive cleanup in case the assertion above fails.
+        assert_eq!(
+            msg.content,
+            format!("{AUDIO_ICON}\n\nAudio:"),
+            "Nothing was saved, so nothing is named"
+        );
         let _ = tokio::fs::remove_file(&tmp).await;
+        let _ = tokio::fs::remove_dir_all(&msg_dir).await;
+    }
+
+    /// Another message's attachment is inert: not read, not copied, not deleted.
+    #[tokio::test]
+    async fn enrich_audio_other_message_attachment_left_inert() {
+        let tmp_root = crate::util::test::test_root().join("test_enrich_audio_inert");
+        let ws_path = tmp_root.join("myworkspace");
+        tokio::fs::create_dir_all(&ws_path).await.unwrap();
+
+        // The fixture belongs to message 7025; the message carrying the marker is 7026.
+        let (msg_dir, foreign) =
+            inbound_attachment_fixture(7025, "voice.oga", b"someone else's recording").await;
+        let mut msg = inbound_msg(7026, &format!("Audio: [AUDIO:{}]", foreign.display()));
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
+
+        assert!(
+            msg.content.contains(AUDIO_ICON),
+            "Out-of-scope audio degrades to the icon, got: {}",
+            msg.content
+        );
+        assert!(!msg.content.contains("[Saved audio:"), "{}", msg.content);
+        assert!(
+            !ws_path.join("uploads").exists(),
+            "Nothing may be copied into the workspace"
+        );
+        assert!(foreign.exists(), "Another message's file is never deleted");
+        let _ = tokio::fs::remove_file(&foreign).await;
+        let _ = tokio::fs::remove_dir_all(&msg_dir).await;
+        let _ = tokio::fs::remove_dir_all(&tmp_root).await;
+    }
+
+    /// Above the automatic-processing bound the recording is saved and never decoded in process.
+    #[tokio::test]
+    async fn enrich_audio_above_processing_bound_is_saved_not_transcribed() {
+        let tmp_root = crate::util::test::test_root().join("test_enrich_audio_large");
+        let ws_path = tmp_root.join("myworkspace");
+        tokio::fs::create_dir_all(&ws_path).await.unwrap();
+
+        // A sparse file: the size is what the bound reads, and no page is materialized by writing it.
+        let (msg_dir, tmp) = inbound_attachment_fixture(7027, "song.mp3", b"").await;
+        let oversized = crate::channels::telegram::TELEGRAM_MAX_FILE_DOWNLOAD_BYTES + 1;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp)
+            .unwrap()
+            .set_len(oversized)
+            .unwrap();
+
+        // The bound only exists on the Telegram receive path.
+        let mut msg = inbound_msg(7027, &format!("Song: [AUDIO:{}]", tmp.display()));
+        msg.channel = "telegram".into();
+        enrich_message(&mut msg, Some(ws_path.as_path())).await;
+
+        let uploads = ws_path.join("uploads");
+        let saved: Vec<_> = std::fs::read_dir(&uploads)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(saved.len(), 1, "exactly one saved recording: {saved:?}");
+        assert_eq!(
+            std::fs::metadata(&saved[0]).unwrap().len(),
+            oversized,
+            "the whole file is kept"
+        );
+        assert!(!tmp.exists(), "Temp file is deleted once the copy exists");
+        assert!(!msg_dir.exists(), "Per-message directory must be deleted");
+        // Both forms are the saved location, as they always were for a recording kept this way —
+        // the GUI labels it as a file row, so the bubble never shows the raw path.
+        assert_eq!(
+            msg.content,
+            format!("[Saved audio: {}]\n\nSong:", saved[0].display())
+        );
+        assert_eq!(msg.display_content, None);
+
+        let _ = tokio::fs::remove_dir_all(&tmp_root).await;
+    }
+
+    /// The two forms of a saved recording, and of one that was never decoded at all.
+    #[test]
+    fn audio_annotation_keeps_the_location_for_the_model_alone() {
+        let saved = SavedMedia {
+            annotation: "[Saved audio: /ws/uploads/upload_1.oga]".to_string(),
+            dest: std::path::PathBuf::from("/ws/uploads/upload_1.oga"),
+        };
+        let transcript = Some(marked_transcript("hello there"));
+
+        // The words, then the location for the model; the bubble keeps the words alone.
+        let annotation = audio_annotation(Some(&saved), transcript.clone(), false);
+        assert_eq!(
+            annotation.model(),
+            "🔊✍️ hello there\n[Saved audio: /ws/uploads/upload_1.oga]"
+        );
+        assert_eq!(annotation.display(), "🔊✍️ hello there");
+
+        // Saved with no transcript: the icon still opens the model's form, as it always has, and
+        // the bubble shows the icon rather than a path.
+        let annotation = audio_annotation(Some(&saved), None, false);
+        assert_eq!(
+            annotation.model(),
+            "🔊✍️\n[Saved audio: /ws/uploads/upload_1.oga]"
+        );
+        assert_eq!(annotation.display(), AUDIO_ICON);
+
+        // Above the bound the recording was never read, so both forms are the saved location — what
+        // the message carried before the recording was kept at all.
+        let annotation = audio_annotation(Some(&saved), None, true);
+        assert_eq!(
+            annotation.model(),
+            "[Saved audio: /ws/uploads/upload_1.oga]"
+        );
+        assert_eq!(
+            annotation.display(),
+            "[Saved audio: /ws/uploads/upload_1.oga]"
+        );
+
+        // No copy: one line both forms read the same, the transcript or the icon.
+        let annotation = audio_annotation(None, transcript, false);
+        assert_eq!(annotation.model(), "🔊✍️ hello there");
+        assert_eq!(annotation.display(), "🔊✍️ hello there");
+        let annotation = audio_annotation(None, None, false);
+        assert_eq!(annotation.display(), AUDIO_ICON);
     }
 
     #[tokio::test]
